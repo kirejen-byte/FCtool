@@ -507,6 +507,12 @@ class FCToolGUI:
         self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
+        self._dps_designated: set[str] = set()  # ship names marked as DPS
+        self._dps_ratio_label = tk.Label(comp_left, text="", font=("Consolas", 9, "bold"),
+                                          fg=FG_DIM, bg=BG_PANEL)
+        self._dps_ratio_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
+        self._fleet_total = 0
+        self._fleet_ship_counts: dict[str, int] = {}  # ship_name -> count
 
         # Right panel: Specialized Roles (collapsible sections)
         comp_right_outer = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -991,20 +997,47 @@ class FCToolGUI:
 
         return container, content, count_label
 
+    def _update_dps_ratio(self):
+        """Recalculate and display DPS ratio based on checked ship types."""
+        if not self._dps_designated or self._fleet_total == 0:
+            self._dps_ratio_label.config(text="")
+            return
+        dps_count = sum(self._fleet_ship_counts.get(name, 0)
+                        for name in self._dps_designated)
+        ratio = dps_count / self._fleet_total
+        pct = int(ratio * 100)
+        if ratio >= 0.6:
+            self._dps_ratio_label.config(
+                text=f"\u2705 Good Ratio ({dps_count}/{self._fleet_total}, {pct}%)",
+                fg=FG_GREEN)
+        else:
+            self._dps_ratio_label.config(
+                text=f"\u274c Need more DPS ({dps_count}/{self._fleet_total}, {pct}%)",
+                fg="#ff6666")
+
     def _update_fleet_composition(self, ship_counts: dict[int, int], total: int):
         """Update the Top 10 fleet composition display."""
         from zkill_monitor import resolve_name
 
         self._fleet_size_label.config(text=f"Fleet Size: {total}")
+        self._fleet_total = total
 
         # Build top 10 list
         sorted_ships = sorted(ship_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         new_data = [(resolve_name(tid, "type"), count) for tid, count in sorted_ships]
 
+        # Update name->count mapping for DPS ratio calculation
+        self._fleet_ship_counts = {name: count for name, count in new_data}
+
         # Flicker prevention: only rebuild if data changed
         if new_data == self._fleet_comp_prev:
+            self._update_dps_ratio()
             return
         self._fleet_comp_prev = new_data
+
+        # Prune DPS designations for ship types no longer in fleet
+        current_names = {name for name, _ in new_data}
+        self._dps_designated &= current_names
 
         # Clear and rebuild
         for widget in self._fleet_comp_frame.winfo_children():
@@ -1012,16 +1045,34 @@ class FCToolGUI:
         self._fleet_comp_labels = []
 
         for ship_name, count in new_data:
-            lbl = tk.Label(self._fleet_comp_frame,
-                           text=f"  {ship_name}: {count}",
+            row = tk.Frame(self._fleet_comp_frame, bg=BG_PANEL)
+            row.pack(fill=tk.X)
+
+            is_dps = tk.BooleanVar(value=ship_name in self._dps_designated)
+
+            def on_toggle(name=ship_name, var=is_dps):
+                if var.get():
+                    self._dps_designated.add(name)
+                else:
+                    self._dps_designated.discard(name)
+                self._update_dps_ratio()
+
+            cb = tk.Checkbutton(row, variable=is_dps, command=on_toggle,
+                                 bg=BG_PANEL, selectcolor=BG_ENTRY,
+                                 activebackground=BG_PANEL)
+            cb.pack(side=tk.LEFT)
+
+            lbl = tk.Label(row, text=f"{ship_name}: {count}",
                            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W)
-            lbl.pack(anchor=tk.W)
+            lbl.pack(side=tk.LEFT)
             self._fleet_comp_labels.append(lbl)
 
         if not new_data:
             tk.Label(self._fleet_comp_frame, text="  No fleet data",
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
+
+        self._update_dps_ratio()
 
     def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
         """Update all collapsible specialized role sections."""
@@ -1947,7 +1998,7 @@ class FCToolGUI:
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
             fire_word=xup_cfg.get("fire_word", "FIRE"),
-            threshold=xup_cfg.get("threshold", 30),
+            threshold=xup_cfg.get("threshold", 50),
             case_sensitive=xup_cfg.get("case_sensitive", False),
             on_ready=self._on_xup_ready,
             on_fire=self._on_xup_fire,
@@ -2079,7 +2130,7 @@ class FCToolGUI:
     # ── UI Update Methods ────────────────────────────────────────────────────
 
     def _update_xup_display(self, state: XUpState):
-        threshold = self.config.get("xup", {}).get("threshold", 30)
+        threshold = self.config.get("xup", {}).get("threshold", 50)
         self._xup_count_label.config(text=str(state.count))
         self._xup_threshold_label.config(text=f"/ {threshold}")
 
@@ -2116,7 +2167,7 @@ class FCToolGUI:
             )
 
     def _flash_ready(self, state: XUpState):
-        threshold = self.config.get("xup", {}).get("threshold", 30)
+        threshold = self.config.get("xup", {}).get("threshold", 50)
         self._xup_status.config(text="READY TO FIRE!", fg=FG_GREEN)
         self._append_xup_log(
             f"\n>>> FLEET READY! {state.count}/{threshold} x-ups <<<\n\n", "ready"
