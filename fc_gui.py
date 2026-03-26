@@ -1145,11 +1145,22 @@ class FCToolGUI:
 
         for type_id, pilots in sorted_items:
             ship_name = resolve_name(type_id, "type")
-            tk.Label(content_frame,
-                     text=f"{ship_name} - {len(pilots)}",
-                     font=("Consolas", 9, "bold"), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W
-                     ).pack(anchor=tk.W, pady=(2, 0))
 
+            # Ship type row (collapsed by default, click to expand pilot list)
+            ship_row = tk.Frame(content_frame, bg=BG_PANEL)
+            ship_row.pack(fill=tk.X, pady=(2, 0))
+
+            is_open = tk.BooleanVar(value=False)
+            arrow = tk.Label(ship_row, text="\u25B6", font=("Consolas", 8),
+                              fg=FG_DIM, bg=BG_PANEL)
+            arrow.pack(side=tk.LEFT)
+            ship_label = tk.Label(ship_row, text=f"{ship_name} - {len(pilots)}",
+                                   font=("Consolas", 9, "bold"), fg=FG_TEXT,
+                                   bg=BG_PANEL, cursor="hand2")
+            ship_label.pack(side=tk.LEFT)
+
+            pilot_frame = tk.Frame(content_frame, bg=BG_PANEL)
+            # Populate pilot details (hidden by default)
             for char_name, _char_id in pilots:
                 loc = self._fleet_locations_cache.get(char_name)
                 if loc:
@@ -1157,10 +1168,23 @@ class FCToolGUI:
                     loc_text = f"({sys_name} - {region_name})" if region_name else f"({sys_name})"
                 else:
                     loc_text = ""
-                tk.Label(content_frame,
+                tk.Label(pilot_frame,
                          text=f"    {char_name} {loc_text}",
                          font=("Consolas", 8), fg=FG_GREEN, bg=BG_PANEL, anchor=tk.W
                          ).pack(anchor=tk.W)
+
+            def toggle(event=None, _open=is_open, _arrow=arrow, _pf=pilot_frame):
+                if _open.get():
+                    _pf.pack_forget()
+                    _arrow.config(text="\u25B6")
+                    _open.set(False)
+                else:
+                    _pf.pack(fill=tk.X)
+                    _arrow.config(text="\u25BC")
+                    _open.set(True)
+
+            for w in (ship_row, arrow, ship_label):
+                w.bind("<Button-1>", toggle)
 
     def _clear_waypoint_frame(self):
         """Remove all waypoint buttons."""
