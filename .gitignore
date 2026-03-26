@@ -1,0 +1,27 @@
+# Sensitive / user-specific
+config.json
+esi_tokens.json
+esi_tokens_web.json
+esi_auth_error.log
+
+# Caches (auto-generated)
+esi_cache.json
+routes_cache.json
+regions_cache.json
+systems_cache.json
+stargate_jumps.json
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+.claude/

@@ -1,0 +1,59 @@
+{
+    "eve_logs_path": "C:/Users/YOUR_USER/Documents/EVE/logs/Chatlogs",
+    "poll_interval_seconds": 1.0,
+    "autostart": true,
+    "tracked_character": "",
+    "sound_on_ready": true,
+    "ansiblex_connections": [],
+    "xup": {
+        "trigger_word": "x",
+        "fire_word": "FIRE",
+        "threshold": 50,
+        "channel_name": "Fleet",
+        "case_sensitive": false
+    },
+    "zkillboard": {
+        "enabled": true,
+        "watch_regions": [],
+        "watch_regions_names": {},
+        "watch_alliances": [],
+        "watch_alliances_names": {},
+        "watch_systems": [],
+        "min_kill_value_millions": 0,
+        "min_pilots_involved": 25,
+        "alert_window_seconds": 300,
+        "staging_system": ""
+    },
+    "discord": {
+        "enabled": false,
+        "webhook_url": "",
+        "notify_zkill_alerts": false,
+        "role": "primary"
+    },
+    "esi": {
+        "client_id": "YOUR_ESI_CLIENT_ID",
+        "client_secret": "YOUR_ESI_CLIENT_SECRET",
+        "callback_url": "http://localhost:8834/callback"
+    },
+    "web": {
+        "enabled": false,
+        "host": "0.0.0.0",
+        "port": 8080,
+        "username": "fc",
+        "password": "changeme"
+    },
+    "jump_range": {
+        "origin_system": "",
+        "ship_type": "Dreadnought",
+        "jump_drive_calibration_level": 5,
+        "ranges_ly": {
+            "Dreadnought": 7.0,
+            "Carrier": 7.0,
+            "Supercarrier": 6.0,
+            "Titan": 6.0,
+            "Black Ops": 8.0,
+            "Jump Freighter": 10.0,
+            "Rorqual": 5.0
+        }
+    }
+}

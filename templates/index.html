@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FCTool</title>
+<style>
+:root {
+    --bg-dark: #1a1a2e;
+    --bg-panel: #16213e;
+    --bg-entry: #0f3460;
+    --bg-mid: #2a2a4a;
+    --fg-text: #e0e0e0;
+    --fg-dim: #888899;
+    --fg-accent: #00d4ff;
+    --fg-green: #00ff88;
+    --fg-red: #ff4444;
+    --fg-orange: #ff8c00;
+    --fg-yellow: #ffdd00;
+    --fg-white: #ffffff;
+    --fg-magenta: #ff66ff;
+    --border: #2a2a4a;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: Consolas, 'Courier New', monospace; background: var(--bg-dark); color: var(--fg-text); min-height: 100vh; }
+.header { background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 18px; color: var(--fg-accent); }
+.header .status { font-size: 12px; color: var(--fg-dim); display: flex; align-items: center; gap: 15px; }
+.status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--fg-green); margin-right: 5px; vertical-align: middle; }
+.esi-status { font-size: 11px; }
+.esi-status a { color: var(--fg-accent); text-decoration: none; cursor: pointer; }
+.esi-status a:hover { text-decoration: underline; }
+.tabs { display: flex; background: var(--bg-panel); border-bottom: 2px solid var(--border); }
+.tab { padding: 10px 20px; cursor: pointer; color: var(--fg-dim); border-bottom: 2px solid transparent; transition: all 0.2s; font-family: inherit; font-size: 13px; background: none; border-top: none; border-left: none; border-right: none; }
+.tab:hover { color: var(--fg-text); }
+.tab.active { color: var(--fg-accent); border-bottom-color: var(--fg-accent); }
+.tab-content { display: none; padding: 15px 20px; }
+.tab-content.active { display: block; }
+.form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.form-group { display: flex; flex-direction: column; gap: 3px; }
+.form-group label { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; }
+input[type="text"], select { background: var(--bg-entry); border: 1px solid var(--border); color: var(--fg-text); padding: 7px 10px; font-family: inherit; font-size: 13px; border-radius: 3px; outline: none; min-width: 160px; }
+input[type="text"]:focus, select:focus { border-color: var(--fg-accent); }
+select { cursor: pointer; }
+button { background: var(--bg-entry); border: 1px solid var(--fg-accent); color: var(--fg-accent); padding: 7px 18px; font-family: inherit; font-size: 13px; cursor: pointer; border-radius: 3px; transition: all 0.2s; }
+button:hover { background: var(--fg-accent); color: var(--bg-dark); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.ac-wrap { position: relative; }
+.ac-list { position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-entry); border: 1px solid var(--border); max-height: 200px; overflow-y: auto; z-index: 100; display: none; border-radius: 0 0 3px 3px; }
+.ac-list.open { display: block; }
+.ac-item { padding: 5px 10px; cursor: pointer; font-size: 12px; color: var(--fg-text); }
+.ac-item:hover, .ac-item.selected { background: var(--fg-accent); color: var(--bg-dark); }
+.result-box { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; padding: 12px 15px; margin-top: 10px; }
+.result-title { font-size: 16px; font-weight: bold; margin-bottom: 5px; }
+.result-detail { font-size: 12px; color: var(--fg-dim); margin-bottom: 8px; }
+.in-range { color: var(--fg-green); }
+.out-of-range { color: var(--fg-red); }
+.alert-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; padding: 12px 15px; margin-bottom: 8px; border-left: 3px solid var(--fg-orange); }
+.alert-card.capital { border-left-color: var(--fg-red); }
+.alert-card.update { border-left-color: var(--fg-yellow); }
+.alert-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.alert-system { font-size: 15px; font-weight: bold; color: var(--fg-accent); }
+.alert-region { font-size: 12px; color: var(--fg-dim); margin-left: 8px; }
+.alert-time { font-size: 11px; color: var(--fg-dim); }
+.alert-body { font-size: 12px; display: flex; gap: 20px; flex-wrap: wrap; }
+.alert-stat .label { color: var(--fg-dim); }
+.alert-stat .value { color: var(--fg-text); font-weight: bold; }
+.alert-links { margin-top: 6px; font-size: 11px; }
+.alert-links a { color: var(--fg-accent); text-decoration: none; margin-right: 12px; }
+.alert-links a:hover { text-decoration: underline; }
+.alert-alliances { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+.alert-tag { font-size: 10px; font-weight: bold; padding: 1px 6px; border-radius: 2px; margin-right: 6px; }
+.tag-caps { background: var(--fg-red); color: var(--bg-dark); }
+.tag-update { background: var(--fg-yellow); color: var(--bg-dark); }
+.route-legs { margin-top: 10px; }
+.route-leg { padding: 6px 10px; border-left: 2px solid var(--border); margin-left: 10px; margin-bottom: 2px; font-size: 12px; }
+.route-leg.gate { border-left-color: var(--fg-dim); }
+.route-leg.wormhole { border-left-color: var(--fg-magenta); }
+.leg-type { font-size: 10px; font-weight: bold; text-transform: uppercase; margin-right: 8px; display: inline-block; min-width: 30px; }
+.leg-type.gate-type { color: var(--fg-dim); }
+.leg-type.wh-type { color: var(--fg-magenta); }
+.ansiblex-note { color: var(--fg-yellow); font-size: 11px; margin-left: 20px; }
+.waypoints { margin-top: 8px; padding: 8px 12px; background: var(--bg-entry); border-radius: 3px; font-size: 12px; word-break: break-all; }
+.wp-arrow { color: var(--fg-dim); }
+.wp-wh { color: var(--fg-magenta); }
+.wp-system { color: var(--fg-text); cursor: pointer; }
+.wp-system:hover { color: var(--fg-accent); }
+.conn-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.conn-table th { text-align: left; padding: 6px 10px; color: var(--fg-dim); border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+.conn-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); }
+.conn-table tr:hover { background: var(--bg-mid); }
+.sec-hs { color: var(--fg-green); }
+.sec-ls { color: var(--fg-orange); }
+.sec-ns { color: var(--fg-red); }
+.sec-wh { color: var(--fg-magenta); }
+.sec-table { border-collapse: collapse; margin-top: 8px; }
+.sec-table th { text-align: left; padding: 4px 15px 4px 0; color: var(--fg-dim); font-size: 11px; }
+.sec-table td { padding: 4px 15px 4px 0; font-size: 13px; }
+.sec-table .sys-name { cursor: pointer; }
+.sec-table .sys-name:hover { color: var(--fg-accent); }
+.filter-bar { display: flex; gap: 15px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; padding: 8px 12px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; }
+.filter-bar label { color: var(--fg-dim); }
+.filter-bar input[type="number"] { background: var(--bg-entry); border: 1px solid var(--border); color: var(--fg-text); padding: 3px 6px; width: 60px; font-family: inherit; font-size: 12px; border-radius: 3px; }
+.spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--fg-dim); border-top-color: var(--fg-accent); border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.empty-state { color: var(--fg-dim); font-style: italic; padding: 20px 0; }
+.section-title { font-size: 13px; font-weight: bold; color: var(--fg-accent); margin: 15px 0 8px 0; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.wp-set-btn { background: none; border: 1px solid var(--fg-accent); color: var(--fg-accent); padding: 1px 6px; font-size: 10px; cursor: pointer; border-radius: 2px; margin-left: 4px; font-family: inherit; }
+.wp-set-btn:hover { background: var(--fg-accent); color: var(--bg-dark); }
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>FCTool</h1>
+    <div class="status">
+        <div class="esi-status" id="esi-status">
+            {% if has_esi %}
+            <span id="esi-info">Checking ESI...</span>
+            {% endif %}
+        </div>
+        <div><span class="dot"></span><span id="status-text">Connecting...</span></div>
+    </div>
+</div>
+
+<div class="tabs">
+    <button class="tab active" data-tab="zkill">zKill Intel</button>
+    <button class="tab" data-tab="nav">Navigation</button>
+    <button class="tab" data-tab="jump">Jump Range</button>
+</div>
+
+<!-- zKill Intel -->
+<div id="zkill" class="tab-content active">
+    <div class="filter-bar">
+        <label>Min pilots: <input type="number" id="zkill-min-pilots" value="25" min="1" max="500"></label>
+        <label>Min value (M): <input type="number" id="zkill-min-value" value="0" min="0"></label>
+        <label><input type="checkbox" id="zkill-caps-only"> Capitals only</label>
+    </div>
+    <div id="alerts-feed"><div class="empty-state">Waiting for fight alerts...</div></div>
+</div>
+
+<!-- Navigation -->
+<div id="nav" class="tab-content">
+    <div class="form-row">
+        <div class="form-group">
+            <label>Origin</label>
+            <div class="ac-wrap">
+                <input type="text" id="nav-origin" placeholder="System name" value="{{ staging }}" autocomplete="off">
+                <div class="ac-list" id="nav-origin-ac"></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Destination</label>
+            <div class="ac-wrap">
+                <input type="text" id="nav-dest" placeholder="System name" autocomplete="off">
+                <div class="ac-list" id="nav-dest-ac"></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Ship Size</label>
+            <select id="nav-ship-size">
+                <option value="any">Any</option>
+                <option value="medium">Medium</option>
+                <option value="large">Large</option>
+                <option value="xlarge">XLarge</option>
+                <option value="capital">Capital</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>&nbsp;</label>
+            <button id="nav-search" onclick="doNavSearch()">Search Route</button>
+        </div>
+    </div>
+    <div id="nav-result"></div>
+
+    <div class="section-title">Current Wormhole Connections</div>
+    <div style="margin-bottom:8px"><button onclick="loadConnections()" style="font-size:11px;padding:4px 12px;">Refresh Connections</button></div>
+    <div id="wh-result"><div class="empty-state">Click Refresh to load EVE Scout connections</div></div>
+</div>
+
+<!-- Jump Range -->
+<div id="jump" class="tab-content">
+    <div class="form-row">
+        <div class="form-group">
+            <label>Origin</label>
+            <div class="ac-wrap">
+                <input type="text" id="jump-origin" placeholder="System name" value="{{ staging }}" autocomplete="off">
+                <div class="ac-list" id="jump-origin-ac"></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Destination</label>
+            <div class="ac-wrap">
+                <input type="text" id="jump-dest" placeholder="System name" autocomplete="off">
+                <div class="ac-list" id="jump-dest-ac"></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Ship Type</label>
+            <select id="jump-ship-type">
+                <option value="Dreadnought">Dreadnought</option>
+                <option value="Carrier">Carrier</option>
+                <option value="Force Auxiliary">Force Auxiliary</option>
+                <option value="Supercarrier">Supercarrier</option>
+                <option value="Titan">Titan</option>
+                <option value="Black Ops">Black Ops</option>
+                <option value="Jump Freighter">Jump Freighter</option>
+                <option value="Rorqual">Rorqual</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>&nbsp;</label>
+            <button id="jump-search" onclick="doJumpCheck()">Check Range</button>
+        </div>
+    </div>
+    <div id="jump-result"></div>
+</div>
+
+<script>
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(tab.dataset.tab).classList.add('active');
+    });
+});
+
+// Autocomplete
+function setupAC(inputId, listId) {
+    const input = document.getElementById(inputId);
+    const list = document.getElementById(listId);
+    let timer = null, items = [], sel = -1;
+    input.addEventListener('input', () => {
+        clearTimeout(timer);
+        const q = input.value.trim();
+        if (q.length < 2) { list.classList.remove('open'); return; }
+        timer = setTimeout(async () => {
+            const resp = await fetch('/api/systems/search?q=' + encodeURIComponent(q));
+            items = await resp.json(); sel = -1;
+            if (!items.length) { list.classList.remove('open'); return; }
+            list.innerHTML = items.map((n, i) => `<div class="ac-item" data-i="${i}">${esc(n)}</div>`).join('');
+            list.classList.add('open');
+        }, 150);
+    });
+    input.addEventListener('keydown', e => {
+        if (!list.classList.contains('open')) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(sel+1, items.length-1); updSel(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(sel-1, 0); updSel(); }
+        else if (e.key === 'Enter' && sel >= 0) { e.preventDefault(); pick(items[sel]); }
+        else if (e.key === 'Escape') { list.classList.remove('open'); }
+    });
+    list.addEventListener('click', e => { const it = e.target.closest('.ac-item'); if (it) pick(items[+it.dataset.i]); });
+    input.addEventListener('blur', () => setTimeout(() => list.classList.remove('open'), 200));
+    function pick(v) { input.value = v; list.classList.remove('open'); }
+    function updSel() { list.querySelectorAll('.ac-item').forEach((el, i) => el.classList.toggle('selected', i === sel)); }
+}
+setupAC('nav-origin', 'nav-origin-ac');
+setupAC('nav-dest', 'nav-dest-ac');
+setupAC('jump-origin', 'jump-origin-ac');
+setupAC('jump-dest', 'jump-dest-ac');
+
+// Helpers
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function copyText(t) { navigator.clipboard.writeText(t).catch(() => {}); }
+function fmtIsk(m) { return m >= 1000 ? (m/1000).toFixed(1)+'B' : m.toFixed(0)+'M'; }
+
+// ESI SSO
+let esiAuthenticated = false;
+async function checkESI() {
+    {% if has_esi %}
+    try {
+        const resp = await fetch('/api/sso/status');
+        const data = await resp.json();
+        const el = document.getElementById('esi-info');
+        if (data.authenticated) {
+            esiAuthenticated = true;
+            el.innerHTML = `<span style="color:var(--fg-green)">${esc(data.character_name)}</span> | <a onclick="esiLogout()">Logout</a>`;
+        } else {
+            el.innerHTML = '<a href="/sso/login">EVE Login</a>';
+        }
+    } catch(e) {}
+    {% endif %}
+}
+async function esiLogout() {
+    await fetch('/sso/logout');
+    esiAuthenticated = false;
+    checkESI();
+}
+async function setWaypoint(systemName, clear) {
+    if (!esiAuthenticated) return;
+    try {
+        await fetch('/api/sso/set_waypoint', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({system_name: systemName, clear: !!clear})
+        });
+    } catch(e) {}
+}
+checkESI();
+
+// SSE - zKill
+let alertsData = [];
+function connectSSE() {
+    const es = new EventSource('/api/alerts/stream');
+    es.onmessage = e => { alertsData.unshift(JSON.parse(e.data)); if (alertsData.length > 100) alertsData.pop(); renderAlerts(); };
+    es.onopen = () => { document.getElementById('status-text').textContent = 'Connected - Monitoring'; };
+    es.onerror = () => { document.getElementById('status-text').textContent = 'Reconnecting...'; };
+}
+function renderAlerts() {
+    const feed = document.getElementById('alerts-feed');
+    const minP = parseInt(document.getElementById('zkill-min-pilots').value)||1;
+    const minV = parseInt(document.getElementById('zkill-min-value').value)||0;
+    const capsOnly = document.getElementById('zkill-caps-only').checked;
+    const filtered = alertsData.filter(a => a.pilots_on_field >= minP && a.total_value_millions >= minV && (!capsOnly || a.capitals_involved));
+    if (!filtered.length) { feed.innerHTML = '<div class="empty-state">No alerts match current filters</div>'; return; }
+    feed.innerHTML = filtered.map(a => {
+        let cls = 'alert-card', tags = '';
+        if (a.capitals_involved) { cls += ' capital'; tags += '<span class="alert-tag tag-caps">CAPITALS</span>'; }
+        if (a.is_update) { cls += ' update'; tags += '<span class="alert-tag tag-update">GROWING</span>'; }
+        let caps = a.capital_breakdown ? Object.entries(a.capital_breakdown).map(([k,v])=>`${v}x ${k}`).join(', ') : '';
+        let allies = a.top_alliances && a.top_alliances.length ? '<div class="alert-alliances">'+a.top_alliances.map(([n,c])=>`${esc(n)}: ${c}`).join(' | ')+'</div>' : '';
+        let t = ''; try { t = new Date(a.timestamp).toLocaleTimeString(); } catch(e) {}
+        let wpBtn = esiAuthenticated ? ` <button class="wp-set-btn" onclick="setWaypoint('${a.system_name}',true)" title="Set waypoint">WP</button>` : '';
+        return `<div class="${cls}"><div class="alert-header"><div>${tags}<span class="alert-system">${esc(a.system_name)}</span>${wpBtn}<span class="alert-region">${esc(a.region_name)}</span></div><div class="alert-time">${t}</div></div><div class="alert-body"><div class="alert-stat"><span class="label">Pilots: </span><span class="value">${a.pilots_on_field}</span></div><div class="alert-stat"><span class="label">Kills: </span><span class="value">${a.kill_count}</span></div><div class="alert-stat"><span class="label">Value: </span><span class="value">${fmtIsk(a.total_value_millions)}</span></div>${caps?`<div class="alert-stat"><span class="label">Caps: </span><span class="value" style="color:var(--fg-red)">${caps}</span></div>`:''}</div>${a.route_from_staging?`<div style="font-size:11px;color:var(--fg-dim);margin-top:4px">${esc(a.route_from_staging)}</div>`:''}${allies}<div class="alert-links">${a.zkill_url?`<a href="${a.zkill_url}" target="_blank">zKillboard</a>`:''}${a.dotlan_url?`<a href="${a.dotlan_url}" target="_blank">Dotlan</a>`:''}${a.zkill_related_url?`<a href="${a.zkill_related_url}" target="_blank">Related Kills</a>`:''}${a.warbeacon_url?`<a href="${a.warbeacon_url}" target="_blank">WarBeacon BR</a>`:''}</div></div>`;
+    }).join('');
+}
+['zkill-min-pilots','zkill-min-value','zkill-caps-only'].forEach(id => {
+    document.getElementById(id).addEventListener('change', renderAlerts);
+    document.getElementById(id).addEventListener('input', renderAlerts);
+});
+connectSSE();
+
+// Navigation
+async function doNavSearch() {
+    const origin = document.getElementById('nav-origin').value.trim();
+    const dest = document.getElementById('nav-dest').value.trim();
+    const size = document.getElementById('nav-ship-size').value;
+    const result = document.getElementById('nav-result');
+    const btn = document.getElementById('nav-search');
+    if (!origin || !dest) { result.innerHTML = '<div class="result-box" style="color:var(--fg-orange)">Enter both systems</div>'; return; }
+    btn.disabled = true;
+    result.innerHTML = '<div class="result-box"><span class="spinner"></span>Searching routes...</div>';
+    try {
+        const resp = await fetch('/api/route/find', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({origin, destination:dest, ship_size:size}) });
+        const data = await resp.json();
+        if (data.error) { result.innerHTML = `<div class="result-box" style="color:var(--fg-red)">${esc(data.error)}</div>`; return; }
+        let html = '<div class="result-box">';
+        const directLabel = data.ansiblex_count > 0 ? 'Direct route (with Ansiblex)' : 'Direct gate route';
+        html += `<div class="result-detail">${directLabel}: ${data.gate_jumps_direct !== null ? data.gate_jumps_direct+' jumps' : 'N/A'}</div>`;
+        if (data.total_jumps_via_wh !== null && data.jumps_saved > 0) {
+            html += `<div class="result-title in-range">WH shortcut via ${esc(data.hub_name)}: ${data.total_jumps_via_wh} jumps (${data.jumps_saved} saved)</div>`;
+            if (data.legs && data.legs.length) {
+                html += '<div class="route-legs">';
+                data.legs.forEach((leg, idx) => {
+                    const isWH = leg.type === 'wormhole';
+                    const cls = isWH ? 'wormhole' : 'gate';
+                    const typeCls = isWH ? 'wh-type' : 'gate-type';
+                    const typeLabel = isWH ? 'WH' : 'GATE';
+                    let detail = `${esc(leg.from)} -> ${esc(leg.to)}`;
+                    if (isWH) detail += ` <span style="color:var(--fg-dim)">(${esc(leg.wh_type||'')}, ${esc(leg.max_ship_size||'')}, ${leg.remaining_hours||'?'}h)</span>`;
+                    else detail += ` <span style="color:var(--fg-dim)">(${leg.jumps} jumps)</span>`;
+                    html += `<div class="route-leg ${cls}"><span class="leg-type ${typeCls}">${typeLabel}</span>${detail}</div>`;
+                    const legAns = data.leg_ansiblex && data.leg_ansiblex[String(idx)];
+                    if (legAns && legAns.length) legAns.forEach(p => { html += `<div class="ansiblex-note">-> Ansiblex: ${esc(p[0])} <-> ${esc(p[1])}</div>`; });
+                });
+                html += '</div>';
+                // Waypoints
+                let wp = '';
+                data.legs.forEach((leg, i) => {
+                    if (i === 0) {
+                        let wpb = esiAuthenticated ? `<button class="wp-set-btn" onclick="setWaypoint('${leg.from}',true)">WP</button>` : '';
+                        wp += `<span class="wp-system" onclick="copyText('${leg.from}')">${esc(leg.from)}</span>${wpb}`;
+                    }
+                    const arrow = leg.type === 'wormhole' ? '<span class="wp-wh"> ~WH~ </span>' : '<span class="wp-arrow"> &gt;&gt; </span>';
+                    let wpb = esiAuthenticated ? `<button class="wp-set-btn" onclick="setWaypoint('${leg.to}',false)">WP</button>` : '';
+                    wp += arrow + `<span class="wp-system" onclick="copyText('${leg.to}')">${esc(leg.to)}</span>${wpb}`;
+                });
+                html += `<div class="waypoints">${wp}</div>`;
+            }
+        } else if (data.total_jumps_via_wh === null) {
+            html += '<div class="result-title" style="color:var(--fg-dim)">No wormhole shortcut found</div>';
+        } else {
+            html += '<div class="result-title" style="color:var(--fg-dim)">Wormhole route is not shorter than direct</div>';
+        }
+        html += '</div>';
+        result.innerHTML = html;
+    } catch(e) { result.innerHTML = `<div class="result-box" style="color:var(--fg-red)">Error: ${esc(e.message)}</div>`; }
+    finally { btn.disabled = false; }
+}
+
+// Jump Range
+async function doJumpCheck() {
+    const origin = document.getElementById('jump-origin').value.trim();
+    const dest = document.getElementById('jump-dest').value.trim();
+    const ship = document.getElementById('jump-ship-type').value;
+    const result = document.getElementById('jump-result');
+    const btn = document.getElementById('jump-search');
+    if (!origin || !dest) { result.innerHTML = '<div class="result-box" style="color:var(--fg-orange)">Enter both systems</div>'; return; }
+    btn.disabled = true;
+    result.innerHTML = '<div class="result-box"><span class="spinner"></span>Checking range...</div>';
+    try {
+        const resp = await fetch('/api/jump/check', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({origin, destination:dest, ship_type:ship}) });
+        const data = await resp.json();
+        if (data.error) { result.innerHTML = `<div class="result-box" style="color:var(--fg-red)">${esc(data.error)}</div>`; return; }
+        let html = '<div class="result-box">';
+        html += data.in_range ? '<div class="result-title in-range">IN RANGE</div>' : '<div class="result-title out-of-range">OUT OF RANGE</div>';
+        html += `<div class="result-detail">${esc(data.origin)} -> ${esc(data.destination)}<br>Distance: ${data.distance_ly} LY | ${esc(data.ship_type)} range: ${data.jump_range_ly} LY${data.gate_jumps !== null ? ' | Gate jumps: '+data.gate_jumps : ''}</div>`;
+        if (data.secondary && data.secondary.length) {
+            html += `<div style="margin-top:10px;font-weight:bold;color:var(--fg-accent)">Titan Bridge Range to ${esc(data.destination)}:</div>`;
+            html += '<table class="sec-table"><tr><th>System</th><th>In Range?</th><th>Distance</th></tr>';
+            data.secondary.forEach(s => {
+                const rt = s.in_range ? '<span class="in-range" style="font-weight:bold">YES</span>' : '<span class="out-of-range" style="font-weight:bold">NO</span>';
+                const d = s.distance_ly !== null ? s.distance_ly.toFixed(1)+' LY' : 'N/A';
+                html += `<tr><td class="sys-name" onclick="copyText('${s.system}')" title="Click to copy">${esc(s.system)}</td><td>${rt}</td><td style="color:var(--fg-dim)">${d}</td></tr>`;
+            });
+            html += '</table>';
+        }
+        html += '</div>';
+        result.innerHTML = html;
+    } catch(e) { result.innerHTML = `<div class="result-box" style="color:var(--fg-red)">Error: ${esc(e.message)}</div>`; }
+    finally { btn.disabled = false; }
+}
+
+// WH Connections (inside Navigation tab)
+async function loadConnections() {
+    const result = document.getElementById('wh-result');
+    result.innerHTML = '<div class="result-box"><span class="spinner"></span>Loading from EVE Scout...</div>';
+    try {
+        const resp = await fetch('/api/connections');
+        const data = await resp.json();
+        if (!data.length) { result.innerHTML = '<div class="empty-state">No connections found</div>'; return; }
+        const hubs = {};
+        data.forEach(c => { if (!hubs[c.hub_name]) hubs[c.hub_name] = []; hubs[c.hub_name].push(c); });
+        let html = '';
+        for (const [hub, conns] of Object.entries(hubs)) {
+            html += `<div class="result-box" style="margin-bottom:10px"><div class="result-title" style="color:var(--fg-accent)">${esc(hub)} (${conns.length} connections)</div>`;
+            html += '<table class="conn-table"><tr><th>System</th><th>Region</th><th>Sec</th><th>Sig</th><th>Type</th><th>Size</th><th>Expires</th></tr>';
+            conns.forEach(c => {
+                const sc = c.dest_security_class.startsWith('c')||c.dest_security_class==='wh' ? 'sec-wh' : c.dest_security_class==='hs' ? 'sec-hs' : c.dest_security_class==='ls' ? 'sec-ls' : 'sec-ns';
+                html += `<tr><td><span class="wp-system" onclick="copyText('${c.dest_system_name}')">${esc(c.dest_system_name)}</span></td><td style="color:var(--fg-dim)">${esc(c.dest_region_name)}</td><td class="${sc}">${esc(c.dest_security_class)}</td><td>${esc(c.dest_signature)}</td><td style="color:var(--fg-dim)">${esc(c.wh_type)}</td><td>${esc(c.max_ship_size)}</td><td style="color:${c.remaining_hours<=4?'var(--fg-red)':'var(--fg-dim)'}">${c.remaining_hours}h</td></tr>`;
+            });
+            html += '</table></div>';
+        }
+        result.innerHTML = html;
+    } catch(e) { result.innerHTML = `<div class="result-box" style="color:var(--fg-red)">Error: ${esc(e.message)}</div>`; }
+}
+
+// Status polling
+async function updateStatus() {
+    try {
+        const resp = await fetch('/api/status');
+        const data = await resp.json();
+        let txt = `Up ${data.uptime} | ${data.alerts} alerts | ${data.ansiblex_gates} gates`;
+        if (data.esi_character) txt += ` | ${data.esi_character}`;
+        document.getElementById('status-text').textContent = txt;
+    } catch(e) {}
+}
+setInterval(updateStatus, 30000);
+setTimeout(updateStatus, 2000);
+</script>
+</body>
+</html>
