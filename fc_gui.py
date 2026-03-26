@@ -447,6 +447,8 @@ class FCToolGUI:
         role_header.pack(fill=tk.X, padx=10, pady=(4, 2))
         tk.Label(role_header, text="Role Tracker", font=("Consolas", 10, "bold"),
                  fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Label(role_header, text="(not case sensitive)", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(role_header, text="+ Add Role", style="Dark.TButton",
                    command=self._add_role_slot).pack(side=tk.LEFT, padx=8)
         ttk.Button(role_header, text="Reset All", style="Red.TButton",
@@ -1921,6 +1923,16 @@ class FCToolGUI:
                    command=remove_slot).pack(side=tk.RIGHT, padx=1)
         ttk.Button(top_row, text="Clear", style="Dark.TButton",
                    command=lambda: self._clear_role_slot(slot)).pack(side=tk.RIGHT, padx=1)
+
+        def copy_people():
+            names = "\n".join(sorted(slot["people"].keys()))
+            if names:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(names)
+                self.root.update()
+
+        ttk.Button(top_row, text="Copy", style="Dark.TButton",
+                   command=copy_people).pack(side=tk.RIGHT, padx=1)
 
         # Per-person list: each person gets a row with name + note field
         people_frame = tk.Frame(slot_frame, bg=BG_PANEL)
