@@ -102,6 +102,24 @@ HICS = {
     12021,  # Phobos
 }
 
+FAX = {
+    37604,  # Apostle
+    37606,  # Lif
+    37605,  # Minokawa
+    37607,  # Ninazu
+}
+
+DREADNOUGHTS = {
+    19720,  # Revelation
+    19722,  # Naglfar
+    19724,  # Moros
+    19726,  # Phoenix
+    52907,  # Zirnitra
+    42241,  # Chemosh
+    42243,  # Caiman
+    45647,  # Vehement
+}
+
 TITANS = {
     671,    # Erebus
     3764,   # Leviathan
@@ -126,6 +144,8 @@ ALL_LOGISTICS = (LOGISTICS_CRUISERS | LOGISTICS_FRIGATES
 ALL_CYNO = CYNO_SHIPS
 ALL_WEBS = WEB_SHIPS
 ALL_HICS = HICS
+ALL_FAX = FAX
+ALL_DREADS = DREADNOUGHTS
 ALL_BRIDGE = TITANS | BLACK_OPS
 
 # ── Dynamic group_id resolution cache ───────────────────────────────────────

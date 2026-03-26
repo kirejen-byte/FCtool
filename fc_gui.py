@@ -536,19 +536,28 @@ class FCToolGUI:
         spec_canvas.bind("<MouseWheel>", _on_spec_mousewheel)
         self._spec_roles_frame.bind("<MouseWheel>", _on_spec_mousewheel)
 
-        # Create the three collapsible sections
+        # Note about red color
+        tk.Label(self._spec_roles_frame, text="\u26a0 Red = insufficient numbers",
+                 font=("Consolas", 8), fg="#ff6666", bg=BG_PANEL
+                 ).pack(anchor=tk.W, padx=4, pady=(0, 2))
+
+        # Create collapsible sections (order matters for display)
         self._links_container, self._links_content, self._links_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
-        self._defenders_container, self._defenders_content, self._defenders_count = \
-            self._create_collapsible_section(self._spec_roles_frame, "Defenders")
         self._logi_container, self._logi_content, self._logi_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Logistics")
+        self._defenders_container, self._defenders_content, self._defenders_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Defenders")
         self._cyno_container, self._cyno_content, self._cyno_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Cyno")
         self._webs_container, self._webs_content, self._webs_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Webs")
         self._hics_container, self._hics_content, self._hics_count = \
             self._create_collapsible_section(self._spec_roles_frame, "HICs")
+        self._fax_container, self._fax_content, self._fax_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "FAX")
+        self._dreads_container, self._dreads_content, self._dreads_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Dreadnoughts")
         self._bridge_container, self._bridge_content, self._bridge_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Bridge")
 
@@ -1018,8 +1027,8 @@ class FCToolGUI:
         """Update all collapsible specialized role sections."""
         from ship_classes import (
             ALL_LINKS_COMMAND, ALL_LOGISTICS, ALL_CYNO, ALL_WEBS,
-            ALL_HICS, ALL_BRIDGE, TITANS, BLACK_OPS,
-            TACTICAL_DESTROYERS, is_defender
+            ALL_HICS, ALL_BRIDGE, ALL_FAX, ALL_DREADS,
+            TITANS, BLACK_OPS, TACTICAL_DESTROYERS, is_defender
         )
         from zkill_monitor import resolve_name
 
@@ -1030,7 +1039,8 @@ class FCToolGUI:
         # Categorize members
         categories: dict[str, dict[int, list[tuple[str, str]]]] = {
             "links": {}, "defenders": {}, "logi": {},
-            "cyno": {}, "webs": {}, "hics": {}, "bridge": {},
+            "cyno": {}, "webs": {}, "hics": {},
+            "fax": {}, "dreads": {}, "bridge": {},
         }
 
         for m in members:
@@ -1054,6 +1064,10 @@ class FCToolGUI:
                 categories["webs"].setdefault(stid, []).append(entry)
             if stid in ALL_HICS:
                 categories["hics"].setdefault(stid, []).append(entry)
+            if stid in ALL_FAX:
+                categories["fax"].setdefault(stid, []).append(entry)
+            if stid in ALL_DREADS:
+                categories["dreads"].setdefault(stid, []).append(entry)
             if stid in ALL_BRIDGE:
                 categories["bridge"].setdefault(stid, []).append(entry)
 
@@ -1066,6 +1080,8 @@ class FCToolGUI:
             "webs": 3,
             "cyno": None,   # No threshold
             "hics": None,
+            "fax": None,
+            "dreads": None,
             "bridge": None,
         }
 
@@ -1084,6 +1100,8 @@ class FCToolGUI:
             "cyno": (self._cyno_content, self._cyno_count),
             "webs": (self._webs_content, self._webs_count),
             "hics": (self._hics_content, self._hics_count),
+            "fax": (self._fax_content, self._fax_count),
+            "dreads": (self._dreads_content, self._dreads_count),
             "bridge": (self._bridge_content, self._bridge_count),
         }
 
@@ -1106,7 +1124,7 @@ class FCToolGUI:
         total = sum(len(pilots) for pilots in ship_members.values())
         # Color the count based on threshold
         if threshold is not None:
-            count_color = FG_RED if total < threshold else FG_GREEN
+            count_color = "#ff6666" if total < threshold else FG_GREEN
         else:
             count_color = FG_DIM
         count_label.config(text=f"({total})", fg=count_color)
