@@ -503,6 +503,13 @@ class FCToolGUI:
                                            fg=FG_YELLOW, bg=BG_PANEL)
         self._fleet_size_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
+        comp_header = tk.Frame(comp_left, bg=BG_PANEL)
+        comp_header.pack(fill=tk.X, padx=8)
+        tk.Label(comp_header, text="DPS", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_PANEL, width=4).pack(side=tk.LEFT)
+        tk.Label(comp_header, text="Ship Type", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
+
         self._fleet_comp_frame = tk.Frame(comp_left, bg=BG_PANEL)
         self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         self._fleet_comp_labels: list[tk.Label] = []
@@ -1058,8 +1065,9 @@ class FCToolGUI:
                 self._update_dps_ratio()
 
             cb = tk.Checkbutton(row, variable=is_dps, command=on_toggle,
-                                 bg=BG_PANEL, selectcolor=BG_ENTRY,
-                                 activebackground=BG_PANEL)
+                                 bg=BG_PANEL, fg=FG_TEXT, selectcolor="#2a2a3a",
+                                 activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                                 highlightthickness=0, bd=1, relief=tk.FLAT)
             cb.pack(side=tk.LEFT)
 
             lbl = tk.Label(row, text=f"{ship_name}: {count}",
@@ -2957,8 +2965,8 @@ $bmp.Dispose()
             tk.Label(table, text="System", font=("Consolas", 10, "bold"),
                      fg=FG_DIM, bg=BG_DARK, width=14, anchor=tk.W
                      ).grid(row=0, column=0, padx=(0, 10))
-            tk.Label(table, text="Jumps", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, width=6, anchor=tk.W
+            tk.Label(table, text="Jumps from Staging", font=("Consolas", 10, "bold"),
+                     fg=FG_DIM, bg=BG_DARK, width=18, anchor=tk.W
                      ).grid(row=0, column=1, padx=(0, 10))
             tk.Label(table, text="In Range?", font=("Consolas", 10, "bold"),
                      fg=FG_DIM, bg=BG_DARK, width=10, anchor=tk.W
