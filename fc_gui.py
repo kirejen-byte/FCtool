@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 import requests
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from datetime import datetime
@@ -106,6 +107,9 @@ class FCToolGUI:
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
         self._prewarm_cache_async()
+
+        # Start fleet location refresh loop (updates role tracker locations)
+        self.root.after(5000, self._refresh_fleet_locations)
 
         # Load system names for autocomplete (runs in background if cache miss)
         self._system_names: list[str] = []
@@ -384,7 +388,7 @@ class FCToolGUI:
 
     def _build_xup_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
-        self.notebook.add(tab, text="  X-Up Counter  ")
+        self.notebook.add(tab, text="  Fleet Management  ")
 
         # Top section: compact counter + controls in one row
         counter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -438,6 +442,7 @@ class FCToolGUI:
         )
         self._threshold_spin.pack(side=tk.LEFT)
         self._threshold_spin.bind("<Return>", lambda e: self._on_threshold_change())
+        self._threshold_spin.bind("<FocusOut>", lambda e: self._on_threshold_change())
 
         ttk.Button(counter_right, text="Reset Counter", style="Red.TButton",
                    command=self._reset_xup).pack(pady=(4, 0))
@@ -481,18 +486,79 @@ class FCToolGUI:
         self._role_container.pack(fill=tk.X, padx=10, pady=2)
         self._role_slots: list[dict] = []
 
+        # ── Fleet Composition & Specialized Roles ────────────────────────────
+        comp_outer = tk.Frame(tab, bg=BG_DARK)
+        comp_outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 2))
+
+        # Left panel: Fleet Composition (Top 10 ships)
+        comp_left = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                              highlightbackground=BORDER_COLOR, highlightthickness=1)
+        comp_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        tk.Label(comp_left, text="Fleet Composition", font=("Consolas", 10, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor=tk.W, padx=8, pady=(4, 2))
+
+        self._fleet_size_label = tk.Label(comp_left, text="Fleet Size: --",
+                                           font=("Consolas", 10, "bold"),
+                                           fg=FG_YELLOW, bg=BG_PANEL)
+        self._fleet_size_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
+
+        self._fleet_comp_frame = tk.Frame(comp_left, bg=BG_PANEL)
+        self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._fleet_comp_labels: list[tk.Label] = []
+        self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
+
+        # Right panel: Specialized Roles (collapsible sections)
+        comp_right_outer = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                     highlightbackground=BORDER_COLOR, highlightthickness=1)
+        comp_right_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+
+        tk.Label(comp_right_outer, text="Specialized Roles", font=("Consolas", 10, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor=tk.W, padx=8, pady=(4, 2))
+
+        # Scrollable container for specialized roles
+        spec_canvas = tk.Canvas(comp_right_outer, bg=BG_PANEL, highlightthickness=0)
+        spec_scrollbar = ttk.Scrollbar(comp_right_outer, orient=tk.VERTICAL,
+                                        command=spec_canvas.yview)
+        self._spec_roles_frame = tk.Frame(spec_canvas, bg=BG_PANEL)
+        self._spec_roles_frame.bind(
+            "<Configure>",
+            lambda e: spec_canvas.configure(scrollregion=spec_canvas.bbox("all"))
+        )
+        spec_canvas.create_window((0, 0), window=self._spec_roles_frame, anchor=tk.NW)
+        spec_canvas.configure(yscrollcommand=spec_scrollbar.set)
+        spec_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        spec_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind mousewheel to scroll
+        def _on_spec_mousewheel(event):
+            spec_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        spec_canvas.bind("<MouseWheel>", _on_spec_mousewheel)
+        self._spec_roles_frame.bind("<MouseWheel>", _on_spec_mousewheel)
+
+        # Create the three collapsible sections
+        self._links_container, self._links_content, self._links_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
+        self._defenders_container, self._defenders_content, self._defenders_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Defenders")
+        self._logi_container, self._logi_content, self._logi_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Logistics")
+
+        # Store cached fleet locations for specialized role pilot info
+        self._fleet_locations_cache: dict[str, tuple[str, str, str]] = {}
+
         # ── X-Up Log ─────────────────────────────────────────────────────────
         log_label = tk.Label(tab, text="X-Up Log", font=("Consolas", 10, "bold"),
                               fg=FG_ACCENT, bg=BG_DARK)
         log_label.pack(anchor=tk.W, padx=15, pady=(4, 2))
 
         self._xup_log = scrolledtext.ScrolledText(
-            tab, height=6, font=("Consolas", 9),
+            tab, height=4, font=("Consolas", 9),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
             selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
-        self._xup_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._xup_log.pack(fill=tk.X, padx=10, pady=(0, 10))
         self._xup_log.tag_config("xup", foreground=FG_GREEN)
         self._xup_log.tag_config("fire", foreground=FG_RED, font=("Consolas", 10, "bold"))
         self._xup_log.tag_config("ready", foreground=FG_YELLOW, font=("Consolas", 10, "bold"))
@@ -849,11 +915,171 @@ class FCToolGUI:
 
         threading.Thread(target=do_search, daemon=True).start()
 
-    def _copy_system_name(self, system_name: str):
-        """Copy a system name to clipboard."""
+    def _set_destination_or_copy(self, system_name: str):
+        """Set in-game destination via ESI and copy to clipboard."""
+        # Always copy to clipboard
         self.root.clipboard_clear()
         self.root.clipboard_append(system_name)
         self.root.update()
+        # Also set destination via ESI if authenticated
+        try:
+            if self.esi_auth and self.esi_auth.is_authenticated:
+                sys_id = search_system(system_name)
+                if sys_id and self.esi_auth.set_waypoint(sys_id, clear_other=True):
+                    print(f"[Nav] Set destination + copied: {system_name}")
+                    return
+        except Exception as e:
+            print(f"[Nav] ESI waypoint failed: {e}")
+        print(f"[Nav] Copied to clipboard: {system_name}")
+
+    # ── Fleet Composition & Specialized Roles ────────────────────────────
+
+    def _create_collapsible_section(self, parent, title, collapsed=True):
+        """Create a collapsible section with toggle arrow. Returns (container, content_frame, count_label)."""
+        container = tk.Frame(parent, bg=BG_PANEL)
+        container.pack(fill=tk.X, pady=2)
+
+        is_open = tk.BooleanVar(value=not collapsed)
+        header = tk.Frame(container, bg=BG_PANEL, cursor="hand2")
+        header.pack(fill=tk.X)
+
+        arrow_label = tk.Label(header, text="\u25B6" if collapsed else "\u25BC",
+                                font=("Consolas", 9), fg=FG_ACCENT, bg=BG_PANEL)
+        arrow_label.pack(side=tk.LEFT, padx=(0, 4))
+
+        title_label = tk.Label(header, text=title, font=("Consolas", 10, "bold"),
+                                fg=FG_TEXT, bg=BG_PANEL)
+        title_label.pack(side=tk.LEFT)
+
+        count_label = tk.Label(header, text="(0)", font=("Consolas", 9),
+                                fg=FG_DIM, bg=BG_PANEL)
+        count_label.pack(side=tk.LEFT, padx=(4, 0))
+
+        content = tk.Frame(container, bg=BG_PANEL)
+        if not collapsed:
+            content.pack(fill=tk.X, padx=(16, 0))
+
+        def toggle(event=None):
+            if is_open.get():
+                content.pack_forget()
+                arrow_label.config(text="\u25B6")
+                is_open.set(False)
+            else:
+                content.pack(fill=tk.X, padx=(16, 0))
+                arrow_label.config(text="\u25BC")
+                is_open.set(True)
+
+        for widget in (header, arrow_label, title_label, count_label):
+            widget.bind("<Button-1>", toggle)
+
+        return container, content, count_label
+
+    def _update_fleet_composition(self, ship_counts: dict[int, int], total: int):
+        """Update the Top 10 fleet composition display."""
+        from zkill_monitor import resolve_name
+
+        self._fleet_size_label.config(text=f"Fleet Size: {total}")
+
+        # Build top 10 list
+        sorted_ships = sorted(ship_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        new_data = [(resolve_name(tid, "type"), count) for tid, count in sorted_ships]
+
+        # Flicker prevention: only rebuild if data changed
+        if new_data == self._fleet_comp_prev:
+            return
+        self._fleet_comp_prev = new_data
+
+        # Clear and rebuild
+        for widget in self._fleet_comp_frame.winfo_children():
+            widget.destroy()
+        self._fleet_comp_labels = []
+
+        for ship_name, count in new_data:
+            lbl = tk.Label(self._fleet_comp_frame,
+                           text=f"  {ship_name}: {count}",
+                           font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W)
+            lbl.pack(anchor=tk.W)
+            self._fleet_comp_labels.append(lbl)
+
+        if not new_data:
+            tk.Label(self._fleet_comp_frame, text="  No fleet data",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
+
+    def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
+        """Update the three collapsible specialized role sections."""
+        from ship_classes import (
+            ALL_LINKS_COMMAND, ALL_LOGISTICS, TACTICAL_DESTROYERS,
+            INTERDICTORS, is_defender
+        )
+        from zkill_monitor import resolve_name
+
+        # Check >50% command ship rule
+        command_count = sum(ship_counts.get(tid, 0) for tid in ALL_LINKS_COMMAND)
+        skip_links = total > 0 and (command_count / total) > 0.5
+
+        # Categorize members
+        links_members: dict[int, list[tuple[str, str]]] = {}  # type_id -> [(char_name, char_id_str)]
+        defenders_members: dict[int, list[tuple[str, str]]] = {}
+        logi_members: dict[int, list[tuple[str, str]]] = {}
+
+        for m in members:
+            stid = m.get("ship_type_id", 0)
+            char_id = m.get("character_id", 0)
+            if not stid or not char_id:
+                continue
+
+            char_name = resolve_name(char_id, "character")
+            entry = (char_name, str(char_id))
+
+            if not skip_links and stid in ALL_LINKS_COMMAND:
+                links_members.setdefault(stid, []).append(entry)
+            elif stid in ALL_LOGISTICS:
+                logi_members.setdefault(stid, []).append(entry)
+            elif stid in TACTICAL_DESTROYERS or is_defender(stid):
+                defenders_members.setdefault(stid, []).append(entry)
+
+        # Update each section
+        self._populate_role_section(self._links_content, self._links_count, links_members)
+        self._populate_role_section(self._defenders_content, self._defenders_count, defenders_members)
+        self._populate_role_section(self._logi_content, self._logi_count, logi_members)
+
+    def _populate_role_section(self, content_frame, count_label, ship_members):
+        """Populate a collapsible section with ship type counts and pilot details."""
+        from zkill_monitor import resolve_name
+
+        for widget in content_frame.winfo_children():
+            widget.destroy()
+
+        total = sum(len(pilots) for pilots in ship_members.values())
+        count_label.config(text=f"({total})")
+
+        if not ship_members:
+            tk.Label(content_frame, text="  None detected",
+                     font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
+            return
+
+        # Sort by count descending
+        for type_id, pilots in sorted(ship_members.items(),
+                                       key=lambda x: len(x[1]), reverse=True):
+            ship_name = resolve_name(type_id, "type")
+            tk.Label(content_frame,
+                     text=f"{ship_name} - {len(pilots)}",
+                     font=("Consolas", 9, "bold"), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W, pady=(2, 0))
+
+            for char_name, _char_id in pilots:
+                loc = self._fleet_locations_cache.get(char_name)
+                if loc:
+                    sys_name, region_name, _ship = loc
+                    loc_text = f"({sys_name} - {region_name})" if region_name else f"({sys_name})"
+                else:
+                    loc_text = ""
+                tk.Label(content_frame,
+                         text=f"    {char_name} {loc_text}",
+                         font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                         ).pack(anchor=tk.W)
 
     def _clear_waypoint_frame(self):
         """Remove all waypoint buttons."""
@@ -899,11 +1125,12 @@ class FCToolGUI:
                 font=("Consolas", 9, "bold"), fg=fg, bg=BG_ENTRY,
                 activebackground="#1a5a90", activeforeground=FG_WHITE,
                 borderwidth=1, relief=tk.RIDGE, cursor="hand2",
-                command=lambda s=system: self._copy_system_name(s),
+                command=lambda s=system: self._set_destination_or_copy(s),
             )
             btn.pack(side=tk.LEFT, padx=1)
 
-        tk.Label(self._wh_waypoint_frame, text="  (click to copy)",
+        hint = "  (click to set destination)" if self.esi_auth and self.esi_auth.is_authenticated else "  (click to copy)"
+        tk.Label(self._wh_waypoint_frame, text=hint,
                  font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK
                  ).pack(side=tk.LEFT, padx=5)
 
@@ -1389,7 +1616,7 @@ class FCToolGUI:
                 self._ansiblex_text.insert(tk.END, f"{pair[0]}, {pair[1]}\n")
 
         # ── X-Up Settings ────────────────────────────────────────────────────
-        self._add_section(scroll_frame, "X-Up Counter")
+        self._add_section(scroll_frame, "Fleet Management")
         xup = self.config.get("xup", {})
 
         self._setting_entries = {}
@@ -1565,7 +1792,7 @@ class FCToolGUI:
         self.config["xup"]["trigger_word"] = self._setting_entries["xup_trigger"].get()
         self.config["xup"]["fire_word"] = self._setting_entries["xup_fire"].get()
         self.config["xup"]["channel_name"] = self._setting_entries["xup_channel"].get()
-        # Threshold is controlled from the X-Up Counter tab spinbox only
+        # Threshold is controlled from the Fleet Management tab spinbox only
         self.config["xup"]["threshold"] = self.config.get("xup", {}).get("threshold", 50)
 
         self.config.setdefault("discord", {})
@@ -1610,7 +1837,7 @@ class FCToolGUI:
             self.discord = None
             self._discord_status.config(text="DISCORD: OFF", fg=FG_DIM)
 
-        # X-Up Counter
+        # Fleet Management
         xup_cfg = self.config.get("xup", {})
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
@@ -1790,14 +2017,33 @@ class FCToolGUI:
             f"\n>>> FLEET READY! {state.count}/{threshold} x-ups <<<\n\n", "ready"
         )
         # Flash the window
-        self.root.bell()
         self._flash_title(0)
-        # Optional ping sound
-        if self._sound_enabled and HAS_WINSOUND:
+        # Play fire alert sound (replaces system bell)
+        if self._sound_enabled:
+            self._play_fire_alert()
+
+    def _play_fire_alert(self):
+        """Play the fire alert sound (fire_alert.mp3) using pygame."""
+        def _play():
             try:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                import pygame
+                from app_path import bundle_dir
+                alert_path = os.path.join(app_dir(), "fire_alert.mp3")
+                if not os.path.exists(alert_path):
+                    alert_path = os.path.join(bundle_dir(), "fire_alert.mp3")
+                if not os.path.exists(alert_path):
+                    # Fallback to system beep
+                    if HAS_WINSOUND:
+                        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                    return
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init()
+                pygame.mixer.music.load(alert_path)
+                pygame.mixer.music.play()
             except Exception:
-                pass
+                if HAS_WINSOUND:
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        threading.Thread(target=_play, daemon=True).start()
 
     def _flash_title(self, count):
         if count >= 10:
@@ -1815,7 +2061,6 @@ class FCToolGUI:
         self._append_xup_log(
             f"\n>>> FIRE #{state.fire_count} CALLED - COUNTER RESET <<<\n\n", "fire"
         )
-        self.root.bell()
         # Reset color after 2 seconds
         self.root.after(2000, lambda: self._xup_count_label.config(fg=FG_ACCENT))
 
@@ -1845,8 +2090,28 @@ class FCToolGUI:
     # ── Role Tracker Methods ──────────────────────────────────────────────────
 
     def _add_role_preset(self, letter: str, title: str, cap: int | None):
-        """Add a pre-configured role slot."""
-        self._add_role_slot(letter=letter, title=title, cap=cap)
+        """Add a pre-configured role slot, auto-numbering if duplicates exist."""
+        # Count existing slots with the same base title
+        base = title.rstrip("0123456789 ")
+        count = 0
+        for slot in self._role_slots:
+            existing = slot["title_var"].get().strip()
+            existing_base = existing.rstrip("0123456789 ")
+            if existing_base.lower() == base.lower():
+                count += 1
+        if count > 0:
+            # Rename the first one to "Title 1" if it isn't numbered yet
+            if count == 1:
+                for slot in self._role_slots:
+                    existing = slot["title_var"].get().strip()
+                    existing_base = existing.rstrip("0123456789 ")
+                    if existing_base.lower() == base.lower():
+                        slot["title_var"].set(f"{base} 1")
+                        break
+            numbered_title = f"{base} {count + 1}"
+        else:
+            numbered_title = title
+        self._add_role_slot(letter=letter, title=numbered_title, cap=cap)
 
     def _add_role_slot(self, letter: str = "", title: str = "", cap: int | None = None):
         """Add a new role tracking slot (letter + title + optional cap + per-person notes)."""
@@ -1885,7 +2150,7 @@ class FCToolGUI:
                               fg=FG_DIM, bg=BG_PANEL)
         cap_entry = tk.Entry(top_row, textvariable=cap_var,
                               font=("Consolas", 10), width=3,
-                              bg=BG_ENTRY, fg=FG_ORANGE,
+                              bg=BG_ENTRY, fg=FG_YELLOW,
                               insertbackground=FG_WHITE,
                               borderwidth=1, relief=tk.RIDGE)
         # Cap is hidden by default; toggled by checkbox or preset
@@ -1905,7 +2170,7 @@ class FCToolGUI:
 
         cap_cb = tk.Checkbutton(top_row, text="Cap",
                                  variable=cap_enabled_var,
-                                 font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+                                 font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
                                  selectcolor=BG_ENTRY, activebackground=BG_PANEL,
                                  activeforeground=FG_DIM,
                                  command=toggle_cap)
@@ -1925,10 +2190,11 @@ class FCToolGUI:
                    command=lambda: self._clear_role_slot(slot)).pack(side=tk.RIGHT, padx=1)
 
         def copy_people():
+            title = slot["title_var"].get() or slot["letter_var"].get().upper()
             names = "\n".join(sorted(slot["people"].keys()))
             if names:
                 self.root.clipboard_clear()
-                self.root.clipboard_append(names)
+                self.root.clipboard_append(f"{title}:\n{names}")
                 self.root.update()
 
         ttk.Button(top_row, text="Copy", style="Dark.TButton",
@@ -1975,6 +2241,10 @@ class FCToolGUI:
         tk.Label(row, text=sender, font=("Consolas", 9, "bold"),
                  fg=FG_GREEN, bg=BG_PANEL, width=20, anchor=tk.W).pack(side=tk.LEFT)
 
+        location_label = tk.Label(row, text="", font=("Consolas", 8),
+                                   fg=FG_DIM, bg=BG_PANEL, anchor=tk.W)
+        location_label.pack(side=tk.LEFT, padx=(2, 0))
+
         note_var = tk.StringVar()
         note_entry = tk.Entry(row, textvariable=note_var,
                                font=("Consolas", 9), width=30,
@@ -1994,6 +2264,7 @@ class FCToolGUI:
             "timestamp": timestamp,
             "note_var": note_var,
             "row": row,
+            "location_label": location_label,
         }
         self._update_role_count_label(slot)
 
@@ -2010,6 +2281,70 @@ class FCToolGUI:
             except ValueError:
                 pass
         slot["count_label"].config(text=str(count), fg=FG_ACCENT)
+
+    def _refresh_fleet_locations(self):
+        """Periodically fetch fleet member data and update role tracker + composition."""
+        if not self.esi_auth or not self.esi_auth.is_authenticated:
+            # Clear composition display when not authenticated
+            self.root.after(0, self._update_fleet_composition, {}, 0)
+            self.root.after(30000, self._refresh_fleet_locations)
+            return
+
+        def do_fetch():
+            try:
+                # Single ESI call for fleet members
+                members = self.esi_auth.get_fleet_members()
+                if members:
+                    # Derive locations (pass pre-fetched members to avoid duplicate call)
+                    locations = self.esi_auth.get_fleet_member_locations(members=members)
+                    if locations:
+                        self.root.after(0, self._apply_fleet_locations, locations)
+
+                    # Derive fleet composition
+                    ship_counts: dict[int, int] = {}
+                    for m in members:
+                        stid = m.get("ship_type_id", 0)
+                        if stid:
+                            ship_counts[stid] = ship_counts.get(stid, 0) + 1
+                    total = len(members)
+
+                    self.root.after(0, self._update_fleet_composition, ship_counts, total)
+                    self.root.after(0, self._update_specialized_roles, members, ship_counts, total)
+                else:
+                    self.root.after(0, self._update_fleet_composition, {}, 0)
+            except Exception as e:
+                print(f"[Fleet] Location/composition fetch error: {e}")
+            self.root.after(15000, self._refresh_fleet_locations)
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _apply_fleet_locations(self, locations: dict[str, tuple[str, str, str]]):
+        """Update location labels for all role tracker members."""
+        self._fleet_locations_cache = locations
+        for slot in self._role_slots:
+            for sender, info in slot["people"].items():
+                loc_label = info.get("location_label")
+                if loc_label:
+                    loc_data = locations.get(sender)
+                    if loc_data:
+                        sys_name, region_name, ship_name = loc_data
+                        parts = [sys_name]
+                        if region_name:
+                            parts.append(region_name)
+                        display = f"({' - '.join(parts)})"
+                        if ship_name:
+                            display += f" [{ship_name}]"
+                        loc_label.config(
+                            text=display,
+                            fg=FG_ACCENT, cursor="hand2"
+                        )
+                        loc_label.unbind("<Button-1>")
+                        loc_label.bind("<Button-1>",
+                            lambda e, s=sys_name: webbrowser.open(
+                                f"https://evemaps.dotlan.net/system/{s.replace(' ', '_')}"
+                            ))
+                    else:
+                        loc_label.config(text="", cursor="")
 
     def _clear_role_slot(self, slot):
         """Clear all people from a role slot."""
@@ -2102,20 +2437,53 @@ $bmp.Dispose()
         self._screenshot_link.config(text="")
 
     def _check_role_letters(self, msg):
-        """Check if a chat message matches any role tracker letter."""
+        """Check if a chat message matches any role tracker letter.
+        Fills slots sequentially — if a slot has a cap and is full,
+        the person overflows into the next slot with the same letter.
+        """
+        msg_text = msg.message.strip().lower()
         for slot in self._role_slots:
             letter = slot["letter_var"].get().strip()
             if not letter:
                 continue
-            msg_text = msg.message.strip().lower()
             letter_lower = letter.lower()
-            # Match: exact letter, or letter followed by space (e.g., "d" or "d interdictor")
             if msg_text == letter_lower or msg_text.startswith(letter_lower + " "):
-                self._add_person_to_slot(slot, msg.sender, msg.timestamp)
-                title = slot["title_var"].get() or letter.upper()
-                self._append_xup_log(
-                    f"[{msg.timestamp.strftime('%H:%M:%S')}] {msg.sender} -> {title}\n", "role"
-                )
+                # Check if this person is already in ANY slot with this letter
+                already_placed = False
+                for s in self._role_slots:
+                    if s["letter_var"].get().strip().lower() == letter_lower:
+                        if msg.sender in s["people"]:
+                            already_placed = True
+                            break
+                if already_placed:
+                    return
+                # Find first matching slot that isn't full
+                target = None
+                for s in self._role_slots:
+                    if s["letter_var"].get().strip().lower() != letter_lower:
+                        continue
+                    if s["cap_enabled_var"].get():
+                        try:
+                            cap = int(s["cap_var"].get())
+                            if cap > 0 and len(s["people"]) >= cap:
+                                continue  # This slot is full, try next
+                        except ValueError:
+                            pass
+                    target = s
+                    break
+                if target:
+                    self._add_person_to_slot(target, msg.sender, msg.timestamp)
+                    title = target["title_var"].get() or letter.upper()
+                    self._append_xup_log(
+                        f"[{msg.timestamp.strftime('%H:%M:%S')}] {msg.sender} -> {title}\n", "role"
+                    )
+                else:
+                    # All slots full
+                    title = slot["title_var"].get() or letter.upper()
+                    self._append_xup_log(
+                        f"[{msg.timestamp.strftime('%H:%M:%S')}] {msg.sender} -> {title} (ALL FULL)\n", "dim"
+                    )
+                return  # Only match one letter per message
 
     def _append_xup_log(self, text, tag=None):
         self._xup_log.config(state=tk.NORMAL)
@@ -2443,24 +2811,22 @@ $bmp.Dispose()
                      fg=FG_DIM, bg=BG_DARK, width=12, anchor=tk.W
                      ).grid(row=0, column=3)
 
-            def _copy_system_name(name):
-                self.root.clipboard_clear()
-                self.root.clipboard_append(name)
-
             for i, sr in enumerate(secondary, 1):
                 sys_label = tk.Label(table, text=sr["system"],
                          font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
                          width=14, anchor=tk.W, cursor="hand2")
                 sys_label.grid(row=i, column=0, padx=(0, 10))
-                # Right-click to copy system name
+                # Right-click context menu
                 sys_name = sr["system"]
                 menu = tk.Menu(sys_label, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
                                activebackground=FG_ACCENT, activeforeground=BG_DARK)
+                menu.add_command(label=f"Set destination: {sys_name}",
+                                 command=lambda n=sys_name: self._set_destination_or_copy(n))
                 menu.add_command(label=f"Copy \"{sys_name}\"",
-                                 command=lambda n=sys_name: _copy_system_name(n))
+                                 command=lambda n=sys_name: (self.root.clipboard_clear(), self.root.clipboard_append(n)))
                 sys_label.bind("<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
-                # Left-click also copies for convenience
-                sys_label.bind("<Button-1>", lambda e, n=sys_name: _copy_system_name(n))
+                # Left-click sets destination or copies
+                sys_label.bind("<Button-1>", lambda e, n=sys_name: self._set_destination_or_copy(n))
 
                 # Ansiblex jumps from staging
                 jumps = sr.get("jumps_from_staging")

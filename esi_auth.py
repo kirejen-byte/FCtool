@@ -459,6 +459,70 @@ class ESIAuth:
             print(f"[ESI] Waypoint error: {e}")
             return False
 
+    # ── Fleet ────────────────────────────────────────────────────────────────
+
+    def get_fleet_id(self) -> int | None:
+        """Get the fleet ID the authenticated character is in."""
+        if not self._character_id:
+            return None
+        data = self.esi_get(f"/characters/{self._character_id}/fleet/")
+        if data and "fleet_id" in data:
+            return data["fleet_id"]
+        return None
+
+    def get_fleet_members(self) -> list[dict] | None:
+        """Get all members of the character's current fleet.
+        Returns list of dicts with character_id, solar_system_id, ship_type_id, etc.
+        """
+        fleet_id = self.get_fleet_id()
+        if not fleet_id:
+            return None
+        return self.esi_get(f"/fleets/{fleet_id}/members/")
+
+    def get_fleet_member_locations(self, members=None) -> dict[str, tuple[str, str, str]]:
+        """Get a map of character_name -> (system_name, region_name, ship_name).
+        Accepts optional pre-fetched members list to avoid duplicate ESI calls."""
+        if members is None:
+            members = self.get_fleet_members()
+        if not members:
+            return {}
+
+        from jump_range import get_system_info
+        from zkill_monitor import resolve_name
+
+        result = {}
+        for m in members:
+            char_id = m.get("character_id")
+            sys_id = m.get("solar_system_id")
+            ship_type_id = m.get("ship_type_id")
+            if char_id and sys_id:
+                char_name = resolve_name(char_id, "character")
+                sys_info = get_system_info(sys_id)
+                sys_name = sys_info.get("name", "???") if sys_info else "???"
+                region_name = self._get_region_name(sys_info) if sys_info else ""
+                ship_name = resolve_name(ship_type_id, "type") if ship_type_id else ""
+                result[char_name] = (sys_name, region_name, ship_name)
+        return result
+
+    def _get_region_name(self, sys_info: dict) -> str:
+        """Resolve system info -> constellation -> region name."""
+        try:
+            constellation_id = sys_info.get("constellation_id")
+            if not constellation_id:
+                return ""
+            const_info = self.esi_get(f"/universe/constellations/{constellation_id}/")
+            if not const_info:
+                return ""
+            region_id = const_info.get("region_id")
+            if not region_id:
+                return ""
+            region_info = self.esi_get(f"/universe/regions/{region_id}/")
+            if region_info:
+                return region_info.get("name", "")
+        except Exception:
+            pass
+        return ""
+
     # ── Ansiblex Discovery ───────────────────────────────────────────────────
 
     def _get_character_corp_id(self) -> int | None:
