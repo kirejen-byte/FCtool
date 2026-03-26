@@ -45,9 +45,9 @@ LOGISTICS_CRUISERS = {
 
 LOGISTICS_FRIGATES = {
     37457,  # Deacon
-    37455,  # Thalia
-    37456,  # Kirin
-    37454,  # Scalpel
+    37459,  # Thalia
+    37458,  # Kirin
+    37460,  # Scalpel
 }
 
 T1_LOGI_FRIGATES = {
@@ -79,10 +79,54 @@ INTERDICTORS = {
     22464,  # Heretic
 }
 
+CYNO_SHIPS = {
+    11957,  # Falcon
+    11969,  # Rapier
+    11971,  # Arazu
+    11959,  # Pilgrim
+    44995,  # Enforcer
+}
+
+WEB_SHIPS = {
+    17920,  # Bhaalgorn
+    17922,  # Ashimmu
+    11961,  # Huginn
+    11387,  # Hyena
+    37454,  # Vigil Fleet Issue
+}
+
+HICS = {
+    11995,  # Onyx
+    12013,  # Broadsword
+    12017,  # Devoter
+    12021,  # Phobos
+}
+
+TITANS = {
+    671,    # Erebus
+    3764,   # Leviathan
+    11567,  # Avatar
+    23773,  # Ragnarok
+    42242,  # Molok
+    45649,  # Komodo
+}
+
+BLACK_OPS = {
+    22428,  # Sin
+    22430,  # Widow
+    22436,  # Panther
+    22440,  # Redeemer
+    44996,  # Marshal
+}
+
 # ── Convenience unions ──────────────────────────────────────────────────────
 ALL_LINKS_COMMAND = COMMAND_SHIPS | COMMAND_DESTROYERS
 ALL_LOGISTICS = (LOGISTICS_CRUISERS | LOGISTICS_FRIGATES
                  | T1_LOGI_FRIGATES | T1_LOGI_CRUISERS)
+ALL_CYNO = CYNO_SHIPS
+ALL_WEBS = WEB_SHIPS
+ALL_HICS = HICS
+ALL_BRIDGE = TITANS | BLACK_OPS
 
 # ── Dynamic group_id resolution cache ───────────────────────────────────────
 _group_cache: dict[int, int | None] = {}

@@ -543,6 +543,14 @@ class FCToolGUI:
             self._create_collapsible_section(self._spec_roles_frame, "Defenders")
         self._logi_container, self._logi_content, self._logi_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Logistics")
+        self._cyno_container, self._cyno_content, self._cyno_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Cyno")
+        self._webs_container, self._webs_content, self._webs_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Webs")
+        self._hics_container, self._hics_content, self._hics_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "HICs")
+        self._bridge_container, self._bridge_content, self._bridge_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "Bridge")
 
         # Store cached fleet locations for specialized role pilot info
         self._fleet_locations_cache: dict[str, tuple[str, str, str]] = {}
@@ -1007,10 +1015,11 @@ class FCToolGUI:
                      ).pack(anchor=tk.W)
 
     def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
-        """Update the three collapsible specialized role sections."""
+        """Update all collapsible specialized role sections."""
         from ship_classes import (
-            ALL_LINKS_COMMAND, ALL_LOGISTICS, TACTICAL_DESTROYERS,
-            INTERDICTORS, is_defender
+            ALL_LINKS_COMMAND, ALL_LOGISTICS, ALL_CYNO, ALL_WEBS,
+            ALL_HICS, ALL_BRIDGE, TITANS, BLACK_OPS,
+            TACTICAL_DESTROYERS, is_defender
         )
         from zkill_monitor import resolve_name
 
@@ -1019,9 +1028,10 @@ class FCToolGUI:
         skip_links = total > 0 and (command_count / total) > 0.5
 
         # Categorize members
-        links_members: dict[int, list[tuple[str, str]]] = {}  # type_id -> [(char_name, char_id_str)]
-        defenders_members: dict[int, list[tuple[str, str]]] = {}
-        logi_members: dict[int, list[tuple[str, str]]] = {}
+        categories: dict[str, dict[int, list[tuple[str, str]]]] = {
+            "links": {}, "defenders": {}, "logi": {},
+            "cyno": {}, "webs": {}, "hics": {}, "bridge": {},
+        }
 
         for m in members:
             stid = m.get("ship_type_id", 0)
@@ -1033,18 +1043,60 @@ class FCToolGUI:
             entry = (char_name, str(char_id))
 
             if not skip_links and stid in ALL_LINKS_COMMAND:
-                links_members.setdefault(stid, []).append(entry)
-            elif stid in ALL_LOGISTICS:
-                logi_members.setdefault(stid, []).append(entry)
-            elif stid in TACTICAL_DESTROYERS or is_defender(stid):
-                defenders_members.setdefault(stid, []).append(entry)
+                categories["links"].setdefault(stid, []).append(entry)
+            if stid in ALL_LOGISTICS:
+                categories["logi"].setdefault(stid, []).append(entry)
+            if stid in TACTICAL_DESTROYERS or is_defender(stid):
+                categories["defenders"].setdefault(stid, []).append(entry)
+            if stid in ALL_CYNO:
+                categories["cyno"].setdefault(stid, []).append(entry)
+            if stid in ALL_WEBS:
+                categories["webs"].setdefault(stid, []).append(entry)
+            if stid in ALL_HICS:
+                categories["hics"].setdefault(stid, []).append(entry)
+            if stid in ALL_BRIDGE:
+                categories["bridge"].setdefault(stid, []).append(entry)
+
+        # Threshold checks: (count, min_threshold) -> red if below, green if at or above
+        logi_threshold = max(5, int(total * 0.2)) if total > 0 else 5
+        thresholds = {
+            "links": 5,
+            "defenders": 6,
+            "logi": logi_threshold,
+            "webs": 3,
+            "cyno": None,   # No threshold
+            "hics": None,
+            "bridge": None,
+        }
+
+        # For bridge category, sort titans first
+        bridge_sort_key = {}
+        for tid in TITANS:
+            bridge_sort_key[tid] = (0, tid)  # Titans first
+        for tid in BLACK_OPS:
+            bridge_sort_key[tid] = (1, tid)  # Black Ops second
 
         # Update each section
-        self._populate_role_section(self._links_content, self._links_count, links_members)
-        self._populate_role_section(self._defenders_content, self._defenders_count, defenders_members)
-        self._populate_role_section(self._logi_content, self._logi_count, logi_members)
+        section_map = {
+            "links": (self._links_content, self._links_count),
+            "defenders": (self._defenders_content, self._defenders_count),
+            "logi": (self._logi_content, self._logi_count),
+            "cyno": (self._cyno_content, self._cyno_count),
+            "webs": (self._webs_content, self._webs_count),
+            "hics": (self._hics_content, self._hics_count),
+            "bridge": (self._bridge_content, self._bridge_count),
+        }
 
-    def _populate_role_section(self, content_frame, count_label, ship_members):
+        for cat_key, (content, count_lbl) in section_map.items():
+            members_dict = categories[cat_key]
+            threshold = thresholds.get(cat_key)
+            sort_override = bridge_sort_key if cat_key == "bridge" else None
+            self._populate_role_section(content, count_lbl, members_dict,
+                                        threshold=threshold, sort_override=sort_override)
+
+    def _populate_role_section(self, content_frame, count_label, ship_members,
+                                threshold: int | None = None,
+                                sort_override: dict | None = None):
         """Populate a collapsible section with ship type counts and pilot details."""
         from zkill_monitor import resolve_name
 
@@ -1052,7 +1104,12 @@ class FCToolGUI:
             widget.destroy()
 
         total = sum(len(pilots) for pilots in ship_members.values())
-        count_label.config(text=f"({total})")
+        # Color the count based on threshold
+        if threshold is not None:
+            count_color = FG_RED if total < threshold else FG_GREEN
+        else:
+            count_color = FG_DIM
+        count_label.config(text=f"({total})", fg=count_color)
 
         if not ship_members:
             tk.Label(content_frame, text="  None detected",
@@ -1060,9 +1117,15 @@ class FCToolGUI:
                      ).pack(anchor=tk.W)
             return
 
-        # Sort by count descending
-        for type_id, pilots in sorted(ship_members.items(),
-                                       key=lambda x: len(x[1]), reverse=True):
+        # Sort by count descending, or by sort_override if provided
+        if sort_override:
+            sorted_items = sorted(ship_members.items(),
+                                   key=lambda x: sort_override.get(x[0], (2, x[0])))
+        else:
+            sorted_items = sorted(ship_members.items(),
+                                   key=lambda x: len(x[1]), reverse=True)
+
+        for type_id, pilots in sorted_items:
             ship_name = resolve_name(type_id, "type")
             tk.Label(content_frame,
                      text=f"{ship_name} - {len(pilots)}",
@@ -1078,7 +1141,7 @@ class FCToolGUI:
                     loc_text = ""
                 tk.Label(content_frame,
                          text=f"    {char_name} {loc_text}",
-                         font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                         font=("Consolas", 8), fg=FG_GREEN, bg=BG_PANEL, anchor=tk.W
                          ).pack(anchor=tk.W)
 
     def _clear_waypoint_frame(self):
