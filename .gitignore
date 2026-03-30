@@ -1,6 +1,7 @@
 # Sensitive / user-specific
 config.json
 esi_tokens.json
+esi_tokens_*.json
 esi_tokens_web.json
 esi_auth_error.log
 

@@ -33,6 +33,13 @@ from jump_range import (
 from system_cache import get_sorted_names
 from wh_route import fetch_connections, find_wh_route
 from zkill_monitor import KillAlert, ZKillMonitor
+from chat_monitor import ChatMonitor, ChatMessage
+from intel_monitor import (
+    IntelReport, parse_intel_message, scan_available_channels,
+    INTEL_CHANNELS, DSCAN_URL_PATTERN, parse_dscan_text,
+    make_dscan_summary, resolve_characters, coalesce_report,
+    load_standings_whitelist,
+)
 
 import requests as http_requests
 
@@ -63,6 +70,13 @@ SECONDARY_BRIDGE_SYSTEMS = [
     "6RCQ-V", "F7C-H0", "CL6-ZG", "HPS5-C",
     "Korasen", "Y-2ANO", "NOL-M9",
 ]
+
+# Intel Fusion state
+_intel_monitor: ChatMonitor | None = None
+_intel_enabled: bool = False
+_intel_channels_enabled: set[str] = set()
+_intel_lock = threading.Lock()
+_intel_thread: threading.Thread | None = None
 
 # ESI SSO state
 _esi_tokens: dict = {}  # {access_token, refresh_token, expires_at, character_id, character_name}
@@ -388,6 +402,7 @@ def sso_set_waypoint():
 
 def serialize_alert(alert: KillAlert) -> dict:
     return {
+        "type": "zkill",
         "system_id": alert.system_id,
         "system_name": alert.system_name,
         "region_id": alert.region_id,
@@ -714,6 +729,284 @@ def wh_connections():
             "wh_type": c.wh_type,
         })
     return jsonify(result)
+
+
+# ── Intel Fusion ─────────────────────────────────────────────────────────────
+
+def _check_cyno_beacon(system_id: int) -> bool:
+    """Check if a Pharolux Cynosural Beacon exists in the given system via ESI."""
+    with _esi_lock:
+        char_id = _esi_tokens.get("character_id")
+    if not char_id:
+        return False
+    try:
+        data = _esi_get(
+            f"/characters/{char_id}/search/",
+            params={"categories": "structure", "search": "Pharolux", "strict": "false"},
+        )
+        if not data or "structure" not in data:
+            return False
+        for struct_id in data["structure"][:20]:
+            info = _esi_get(f"/universe/structures/{struct_id}/")
+            if info and info.get("solar_system_id") == system_id:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _on_intel_message(msg: ChatMessage):
+    """Callback for ChatMonitor — processes intel channel messages."""
+    with _intel_lock:
+        enabled_channels = set(_intel_channels_enabled)
+    if msg.channel not in enabled_channels:
+        return
+
+    report = parse_intel_message(msg, search_system)
+    if report is None:
+        return
+
+    # Skip clear reports entirely
+    if report.report_type == "clear":
+        return
+
+    # Skip pure info messages with no system
+    if report.report_type == "info" and not report.system_name:
+        return
+
+    # Coalesce rapid-fire posts from same reporter
+    report, is_new = coalesce_report(report)
+    if not is_new:
+        # This was merged into an existing report — push update
+        data = report.serialize()
+        data["is_update"] = True
+        with _subscribers_lock:
+            dead = []
+            for q in _alert_subscribers:
+                try:
+                    q.put_nowait(data)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                _alert_subscribers.remove(q)
+        return
+
+    # Calculate route from staging
+    staging = config.get("zkillboard", {}).get("staging_system", "")
+    if staging and report.system_id:
+        try:
+            origin_id = search_system(staging)
+            if origin_id:
+                conns = _ansiblex_connections or None
+                route = get_stargate_route(origin_id, report.system_id, connections=conns)
+                if route:
+                    report.route_from_staging = f"{staging} -> {report.system_name}: {len(route) - 1} jumps"
+        except Exception:
+            pass
+
+    # Resolve region name
+    if report.system_id and not report.region_name:
+        try:
+            info = get_system_info(report.system_id)
+            if info:
+                region_id = info.get("constellation", {}).get("region_id") or info.get("region_id")
+                # Try to get region from the system info cache
+                report.region_name = info.get("region_name", "")
+        except Exception:
+            pass
+
+    # Check for Pharolux cyno beacon via ESI (no failure if not authenticated)
+    if report.system_id:
+        try:
+            report.has_cyno_beacon = _check_cyno_beacon(report.system_id)
+        except Exception:
+            pass
+
+    # Resolve character names (public ESI, no auth needed)
+    try:
+        chars = resolve_characters(report.raw_message, report.system_name, search_system)
+        if chars:
+            report.characters = chars
+    except Exception:
+        pass
+
+    data = report.serialize()
+
+    # Push to SSE subscribers (same fan-out as zKill alerts)
+    with _recent_lock:
+        _recent_alerts.insert(0, data)
+        while len(_recent_alerts) > MAX_RECENT:
+            _recent_alerts.pop()
+
+    with _subscribers_lock:
+        dead = []
+        for q in _alert_subscribers:
+            try:
+                q.put_nowait(data)
+            except queue.Full:
+                dead.append(q)
+        for q in dead:
+            _alert_subscribers.remove(q)
+
+    # If there's a dscan URL, try to parse it in background
+    if report.dscan_url:
+        threading.Thread(
+            target=_fetch_and_update_dscan, args=(report, data), daemon=True
+        ).start()
+
+
+def _fetch_and_update_dscan(report: IntelReport, original_data: dict):
+    """Fetch dscan URL and push an updated intel report with ship data."""
+    try:
+        resp = http_requests.get(report.dscan_url, timeout=10)
+        if not resp.ok:
+            return
+        dscan_result = parse_dscan_text(resp.text)
+        if dscan_result["total"] == 0:
+            return
+
+        report.dscan_ships = dscan_result["ships"]
+        report.dscan_total = dscan_result["total"]
+        report.dscan_summary = make_dscan_summary(dscan_result["ships"], dscan_result["total"])
+
+        updated = report.serialize()
+        updated["is_update"] = True
+
+        with _subscribers_lock:
+            dead = []
+            for q in _alert_subscribers:
+                try:
+                    q.put_nowait(updated)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                _alert_subscribers.remove(q)
+    except Exception:
+        pass
+
+
+def _start_intel_monitor():
+    """Start the ChatMonitor for intel channels."""
+    global _intel_monitor, _intel_thread
+    logs_path = config.get("eve_logs_path", "")
+    if not logs_path or not os.path.isdir(logs_path):
+        print(f"[Intel] Chat logs path not found: {logs_path}")
+        return False
+
+    tracked_char = config.get("tracked_character", "")
+    _intel_monitor = ChatMonitor(
+        logs_path=logs_path,
+        poll_interval=config.get("poll_interval_seconds", 1.0),
+        listener_filter=tracked_char or None,
+        channel_filters=sorted(INTEL_CHANNELS),
+    )
+    _intel_monitor.on_message(_on_intel_message)
+    _intel_thread = threading.Thread(target=_intel_monitor.run, daemon=True)
+    _intel_thread.start()
+    print(f"[Intel] Monitor started (path={logs_path}, char={tracked_char})")
+    return True
+
+
+def _stop_intel_monitor():
+    """Stop the ChatMonitor for intel channels."""
+    global _intel_monitor, _intel_thread
+    if _intel_monitor:
+        _intel_monitor.stop()
+        _intel_monitor = None
+    _intel_thread = None
+    print("[Intel] Monitor stopped")
+
+
+@app.route("/api/intel/channels")
+@auth.login_required
+def intel_channels():
+    """Return list of intel channels with their availability status."""
+    logs_path = config.get("eve_logs_path", "")
+    tracked_char = config.get("tracked_character", "")
+    channels = scan_available_channels(logs_path, tracked_char)
+    with _intel_lock:
+        enabled = set(_intel_channels_enabled)
+        fusion_on = _intel_enabled
+    for ch in channels:
+        ch["enabled"] = ch["name"] in enabled
+        del ch["file_path"]  # Don't expose file paths to frontend
+    return jsonify({"enabled": fusion_on, "channels": channels})
+
+
+@app.route("/api/intel/toggle", methods=["POST"])
+@auth.login_required
+def intel_toggle():
+    """Enable or disable intel fusion."""
+    global _intel_enabled
+    data = request.get_json(silent=True) or {}
+    enable = data.get("enabled", not _intel_enabled)
+
+    if enable and not _intel_enabled:
+        success = _start_intel_monitor()
+        if not success:
+            return jsonify({"error": "Could not start intel monitor (check eve_logs_path in config)"}), 400
+        _intel_enabled = True
+        # Auto-enable all active channels
+        logs_path = config.get("eve_logs_path", "")
+        tracked_char = config.get("tracked_character", "")
+        channels = scan_available_channels(logs_path, tracked_char)
+        with _intel_lock:
+            _intel_channels_enabled.clear()
+            for ch in channels:
+                if ch["active"]:
+                    _intel_channels_enabled.add(ch["name"])
+    elif not enable and _intel_enabled:
+        _stop_intel_monitor()
+        _intel_enabled = False
+        with _intel_lock:
+            _intel_channels_enabled.clear()
+
+    return jsonify({"enabled": _intel_enabled})
+
+
+@app.route("/api/intel/channels/update", methods=["POST"])
+@auth.login_required
+def intel_channels_update():
+    """Update which intel channels are enabled."""
+    data = request.get_json(silent=True) or {}
+    channels = data.get("channels", [])
+    with _intel_lock:
+        _intel_channels_enabled.clear()
+        for name in channels:
+            if name in INTEL_CHANNELS:
+                _intel_channels_enabled.add(name)
+    return jsonify({"channels": sorted(_intel_channels_enabled)})
+
+
+@app.route("/api/dscan/parse")
+@auth.login_required
+def dscan_parse():
+    """Fetch and parse a d-scan URL."""
+    url = request.args.get("url", "").strip()
+    if not url:
+        return jsonify({"error": "URL required"}), 400
+
+    # Validate domain
+    allowed_domains = {
+        "dscan.info", "dscan.me", "adashboard.info",
+        "zero.the-initiative.rocks",
+    }
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.hostname not in allowed_domains:
+            return jsonify({"error": f"Domain not allowed: {parsed.hostname}"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid URL"}), 400
+
+    try:
+        resp = http_requests.get(url, timeout=10)
+        if not resp.ok:
+            return jsonify({"error": f"Fetch failed: {resp.status_code}"}), 502
+        result = parse_dscan_text(resp.text)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

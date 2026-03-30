@@ -107,6 +107,32 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .section-title { font-size: 13px; font-weight: bold; color: var(--fg-accent); margin: 15px 0 8px 0; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
 .wp-set-btn { background: none; border: 1px solid var(--fg-accent); color: var(--fg-accent); padding: 1px 6px; font-size: 10px; cursor: pointer; border-radius: 2px; margin-left: 4px; font-family: inherit; }
 .wp-set-btn:hover { background: var(--fg-accent); color: var(--bg-dark); }
+.intel-fusion-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; padding: 8px 12px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; font-size: 12px; }
+.intel-fusion-btn { border-color: var(--fg-magenta); color: var(--fg-magenta); }
+.intel-fusion-btn:hover { background: var(--fg-magenta); color: var(--bg-dark); }
+.intel-fusion-btn.active { background: var(--fg-magenta); color: var(--bg-dark); font-weight: bold; }
+.intel-channels { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.channel-toggle { display: flex; align-items: center; gap: 4px; font-size: 11px; }
+.channel-toggle input[type="checkbox"] { accent-color: var(--fg-magenta); }
+.channel-toggle.inactive { opacity: 0.4; }
+.channel-toggle .dot-stream { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--fg-green); margin-right: 3px; }
+.channel-toggle.inactive .dot-stream { background: var(--fg-dim); }
+.intel-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px; padding: 12px 15px; margin-bottom: 8px; border-left: 3px solid var(--fg-magenta); }
+.intel-card.clear { border-left-color: var(--fg-green); }
+.intel-card.dscan { border-left-color: var(--fg-accent); }
+.tag-intel { background: var(--fg-magenta); color: var(--bg-dark); }
+.tag-clear { background: var(--fg-green); color: var(--bg-dark); }
+.tag-dscan { background: var(--fg-accent); color: var(--bg-dark); }
+.tag-camp { background: var(--fg-orange); color: var(--bg-dark); }
+.tag-spike { background: var(--fg-yellow); color: var(--bg-dark); }
+.intel-meta { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+.intel-ships { font-size: 11px; margin-top: 4px; color: var(--fg-text); }
+.split-pane { display: flex; gap: 10px; height: calc(100vh - 200px); }
+.pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.pane-header { font-size: 12px; font-weight: bold; color: var(--fg-accent); padding: 6px 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 4px 4px 0 0; border-bottom: none; }
+.feed-scroll { flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 0 0 4px 4px; padding: 8px; background: var(--bg-dark); }
+.alert-card.fused, .intel-card.fused { border: 1px solid var(--fg-yellow); box-shadow: 0 0 6px rgba(255,221,0,0.3); }
+.tag-fused { background: var(--fg-yellow); color: var(--bg-dark); cursor: pointer; }
 </style>
 </head>
 <body>
@@ -136,7 +162,21 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
         <label>Min value (M): <input type="number" id="zkill-min-value" value="0" min="0"></label>
         <label><input type="checkbox" id="zkill-caps-only"> Capitals only</label>
     </div>
-    <div id="alerts-feed"><div class="empty-state">Waiting for fight alerts...</div></div>
+    <div class="intel-fusion-bar" id="intel-fusion-bar">
+        <button id="intel-fusion-btn" class="intel-fusion-btn" onclick="toggleIntelFusion()">Intelligence Fusion</button>
+        <label id="intel-min-label" style="display:none;color:var(--fg-dim)">Min reported: <input type="number" id="intel-min-reported" value="0" min="0" max="500" style="background:var(--bg-entry);border:1px solid var(--border);color:var(--fg-text);padding:3px 6px;width:50px;font-family:inherit;font-size:12px;border-radius:3px;"></label>
+        <div id="intel-channels" class="intel-channels" style="display:none"></div>
+    </div>
+    <div class="split-pane" id="split-pane">
+        <div class="pane pane-left">
+            <div class="pane-header">zKillboard Intel</div>
+            <div id="zkill-feed" class="feed-scroll"><div class="empty-state">Waiting for fight alerts...</div></div>
+        </div>
+        <div class="pane pane-right" id="intel-pane" style="display:none">
+            <div class="pane-header" style="color:var(--fg-magenta)">Intel Channels</div>
+            <div id="intel-feed" class="feed-scroll"><div class="empty-state">Enable Intelligence Fusion</div></div>
+        </div>
+    </div>
 </div>
 
 <!-- Navigation -->
@@ -264,6 +304,7 @@ setupAC('jump-dest', 'jump-dest-ac');
 // Helpers
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function copyText(t) { navigator.clipboard.writeText(t).catch(() => {}); }
+function copyAndDestination(sys) { copyText(sys); setWaypoint(sys, true); }
 function fmtIsk(m) { return m >= 1000 ? (m/1000).toFixed(1)+'B' : m.toFixed(0)+'M'; }
 
 // ESI SSO
@@ -303,33 +344,170 @@ checkESI();
 let alertsData = [];
 function connectSSE() {
     const es = new EventSource('/api/alerts/stream');
-    es.onmessage = e => { alertsData.unshift(JSON.parse(e.data)); if (alertsData.length > 100) alertsData.pop(); renderAlerts(); };
+    es.onmessage = e => { alertsData.unshift(JSON.parse(e.data)); if (alertsData.length > 100) alertsData.pop(); renderAllFeeds(); };
     es.onopen = () => { document.getElementById('status-text').textContent = 'Connected - Monitoring'; };
     es.onerror = () => { document.getElementById('status-text').textContent = 'Reconnecting...'; };
 }
-function renderAlerts() {
-    const feed = document.getElementById('alerts-feed');
+// Fusion detection: find systems reported in both zkill and intel within 10 min
+function findFusedSystems() {
+    const zkillSystems = {}, intelSystems = {};
+    const TEN_MIN = 10 * 60 * 1000;
+    alertsData.forEach(a => {
+        if (!a.system_name || !a.timestamp) return;
+        const ts = new Date(a.timestamp).getTime();
+        if (isNaN(ts)) return;
+        if (a.type === 'intel') { if (!intelSystems[a.system_name] || ts > intelSystems[a.system_name]) intelSystems[a.system_name] = ts; }
+        else { if (!zkillSystems[a.system_name] || ts > zkillSystems[a.system_name]) zkillSystems[a.system_name] = ts; }
+    });
+    const fused = new Set();
+    for (const sys of Object.keys(zkillSystems)) {
+        if (intelSystems[sys] && Math.abs(zkillSystems[sys] - intelSystems[sys]) <= TEN_MIN) fused.add(sys);
+    }
+    return fused;
+}
+
+function renderAllFeeds() {
+    const fused = findFusedSystems();
+    renderZkillFeed(fused);
+    if (intelFusionActive) renderIntelFeed(fused);
+}
+
+function renderZkillFeed(fused) {
+    const feed = document.getElementById('zkill-feed');
     const minP = parseInt(document.getElementById('zkill-min-pilots').value)||1;
     const minV = parseInt(document.getElementById('zkill-min-value').value)||0;
     const capsOnly = document.getElementById('zkill-caps-only').checked;
-    const filtered = alertsData.filter(a => a.pilots_on_field >= minP && a.total_value_millions >= minV && (!capsOnly || a.capitals_involved));
+    const filtered = alertsData.filter(a => a.type !== 'intel' && a.pilots_on_field >= minP && a.total_value_millions >= minV && (!capsOnly || a.capitals_involved));
     if (!filtered.length) { feed.innerHTML = '<div class="empty-state">No alerts match current filters</div>'; return; }
     feed.innerHTML = filtered.map(a => {
+        const isFused = fused.has(a.system_name);
         let cls = 'alert-card', tags = '';
+        if (isFused) { cls += ' fused'; tags += '<span class="alert-tag tag-fused" onclick="scrollToFusion(\''+a.system_name+'\',\'intel\')">FUSED</span>'; }
         if (a.capitals_involved) { cls += ' capital'; tags += '<span class="alert-tag tag-caps">CAPITALS</span>'; }
         if (a.is_update) { cls += ' update'; tags += '<span class="alert-tag tag-update">GROWING</span>'; }
         let caps = a.capital_breakdown ? Object.entries(a.capital_breakdown).map(([k,v])=>`${v}x ${k}`).join(', ') : '';
         let allies = a.top_alliances && a.top_alliances.length ? '<div class="alert-alliances">'+a.top_alliances.map(([n,c])=>`${esc(n)}: ${c}`).join(' | ')+'</div>' : '';
         let t = ''; try { t = new Date(a.timestamp).toLocaleTimeString(); } catch(e) {}
         let wpBtn = esiAuthenticated ? ` <button class="wp-set-btn" onclick="setWaypoint('${a.system_name}',true)" title="Set waypoint">WP</button>` : '';
-        return `<div class="${cls}"><div class="alert-header"><div>${tags}<span class="alert-system">${esc(a.system_name)}</span>${wpBtn}<span class="alert-region">${esc(a.region_name)}</span></div><div class="alert-time">${t}</div></div><div class="alert-body"><div class="alert-stat"><span class="label">Pilots: </span><span class="value">${a.pilots_on_field}</span></div><div class="alert-stat"><span class="label">Kills: </span><span class="value">${a.kill_count}</span></div><div class="alert-stat"><span class="label">Value: </span><span class="value">${fmtIsk(a.total_value_millions)}</span></div>${caps?`<div class="alert-stat"><span class="label">Caps: </span><span class="value" style="color:var(--fg-red)">${caps}</span></div>`:''}</div>${a.route_from_staging?`<div style="font-size:11px;color:var(--fg-dim);margin-top:4px">${esc(a.route_from_staging)}</div>`:''}${allies}<div class="alert-links">${a.zkill_url?`<a href="${a.zkill_url}" target="_blank">zKillboard</a>`:''}${a.dotlan_url?`<a href="${a.dotlan_url}" target="_blank">Dotlan</a>`:''}${a.zkill_related_url?`<a href="${a.zkill_related_url}" target="_blank">Related Kills</a>`:''}${a.warbeacon_url?`<a href="${a.warbeacon_url}" target="_blank">WarBeacon BR</a>`:''}</div></div>`;
+        return `<div class="${cls}" data-system="${esc(a.system_name)}"><div class="alert-header"><div>${tags}<span class="alert-system">${esc(a.system_name)}</span>${wpBtn}<span class="alert-region">${esc(a.region_name)}</span></div><div class="alert-time">${t}</div></div><div class="alert-body"><div class="alert-stat"><span class="label">Pilots: </span><span class="value">${a.pilots_on_field}</span></div><div class="alert-stat"><span class="label">Kills: </span><span class="value">${a.kill_count}</span></div><div class="alert-stat"><span class="label">Value: </span><span class="value">${fmtIsk(a.total_value_millions)}</span></div>${caps?`<div class="alert-stat"><span class="label">Caps: </span><span class="value" style="color:var(--fg-red)">${caps}</span></div>`:''}</div>${a.route_from_staging?`<div style="font-size:11px;color:var(--fg-dim);margin-top:4px">${esc(a.route_from_staging)}</div>`:''}${allies}<div class="alert-links">${a.zkill_url?`<a href="${a.zkill_url}" target="_blank">zKillboard</a>`:''}${a.dotlan_url?`<a href="${a.dotlan_url}" target="_blank">Dotlan</a>`:''}${a.zkill_related_url?`<a href="${a.zkill_related_url}" target="_blank">Related Kills</a>`:''}${a.warbeacon_url?`<a href="${a.warbeacon_url}" target="_blank">WarBeacon BR</a>`:''}</div></div>`;
     }).join('');
 }
+
+function renderIntelFeed(fused) {
+    const feed = document.getElementById('intel-feed');
+    const minR = parseInt(document.getElementById('intel-min-reported').value)||0;
+    const filtered = alertsData.filter(a => a.type === 'intel');
+    if (!filtered.length) { feed.innerHTML = '<div class="empty-state">No intel reports</div>'; return; }
+    feed.innerHTML = filtered.map(a => renderIntelCard(a, fused, minR)).join('');
+}
+
+function scrollToFusion(system, pane) {
+    const feedId = pane === 'intel' ? 'intel-feed' : 'zkill-feed';
+    const card = document.querySelector('#' + feedId + ' [data-system="' + system + '"]');
+    if (card) { card.scrollIntoView({behavior:'smooth', block:'center'}); card.style.outline='2px solid var(--fg-yellow)'; setTimeout(()=>card.style.outline='',2000); }
+}
+
 ['zkill-min-pilots','zkill-min-value','zkill-caps-only'].forEach(id => {
-    document.getElementById(id).addEventListener('change', renderAlerts);
-    document.getElementById(id).addEventListener('input', renderAlerts);
+    document.getElementById(id).addEventListener('change', renderAllFeeds);
+    document.getElementById(id).addEventListener('input', renderAllFeeds);
 });
+document.getElementById('intel-min-reported').addEventListener('change', renderAllFeeds);
+document.getElementById('intel-min-reported').addEventListener('input', renderAllFeeds);
 connectSSE();
+
+// Intel Fusion
+let intelFusionActive = false;
+async function toggleIntelFusion() {
+    const btn = document.getElementById('intel-fusion-btn');
+    const chPanel = document.getElementById('intel-channels');
+    const intelPane = document.getElementById('intel-pane');
+    const minLabel = document.getElementById('intel-min-label');
+    try {
+        const resp = await fetch('/api/intel/toggle', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:!intelFusionActive})});
+        const data = await resp.json();
+        if (data.error) { alert(data.error); return; }
+        intelFusionActive = data.enabled;
+        btn.classList.toggle('active', intelFusionActive);
+        btn.textContent = intelFusionActive ? 'Intelligence Fusion: ON' : 'Intelligence Fusion';
+        chPanel.style.display = intelFusionActive ? 'flex' : 'none';
+        intelPane.style.display = intelFusionActive ? 'flex' : 'none';
+        minLabel.style.display = intelFusionActive ? '' : 'none';
+        if (intelFusionActive) loadIntelChannels();
+        renderAllFeeds();
+    } catch(e) { console.error('Intel toggle error:', e); }
+}
+
+async function loadIntelChannels() {
+    const panel = document.getElementById('intel-channels');
+    try {
+        const resp = await fetch('/api/intel/channels');
+        const data = await resp.json();
+        panel.innerHTML = data.channels.map(ch => {
+            const cls = ch.active ? 'channel-toggle' : 'channel-toggle inactive';
+            const checked = ch.enabled && ch.active ? 'checked' : '';
+            const disabled = ch.active ? '' : 'disabled';
+            return `<label class="${cls}"><span class="dot-stream"></span><input type="checkbox" ${checked} ${disabled} onchange="updateIntelChannels()">${esc(ch.name)}</label>`;
+        }).join('');
+    } catch(e) { panel.innerHTML = '<span style="color:var(--fg-red)">Error loading channels</span>'; }
+}
+
+async function updateIntelChannels() {
+    const checks = document.querySelectorAll('#intel-channels input[type="checkbox"]');
+    const labels = document.querySelectorAll('#intel-channels .channel-toggle');
+    const channels = [];
+    checks.forEach((cb, i) => { if (cb.checked) channels.push(labels[i].textContent.trim()); });
+    try {
+        await fetch('/api/intel/channels/update', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({channels})});
+    } catch(e) {}
+}
+
+function renderIntelCard(a, fused, minR) {
+    const isFused = fused && fused.has(a.system_name);
+    const reportCount = a.pilot_count || a.dscan_total || 0;
+    const isAbove = minR > 0 && reportCount >= minR;
+    let cls = 'intel-card';
+    let tags = '<span class="alert-tag tag-intel">INTEL</span>';
+    if (isFused) { cls += ' fused'; tags += '<span class="alert-tag tag-fused" onclick="scrollToFusion(\''+a.system_name+'\',\'zkill\')">FUSED</span>'; }
+    if (a.report_type === 'clear') { cls += ' clear'; tags += '<span class="alert-tag tag-clear">CLEAR</span>'; }
+    if (a.report_type === 'dscan' || a.dscan_url) { cls += ' dscan'; tags += '<span class="alert-tag tag-dscan">DSCAN</span>'; }
+    if (a.has_camp) tags += '<span class="alert-tag tag-camp">CAMP</span>';
+    if (a.has_spike) tags += '<span class="alert-tag tag-spike">SPIKE</span>';
+    if (a.has_cyno_beacon) tags += '<span class="alert-tag tag-fused">CYNO</span>';
+    let t = ''; try { t = new Date(a.timestamp).toLocaleTimeString(); } catch(e) {}
+    // System name: click copies to clipboard + sets destination, region shown inline
+    let sysHtml = a.system_name ? `<span class="alert-system" style="cursor:pointer" onclick="copyAndDestination('${a.system_name}')" title="Copy & set destination">${esc(a.system_name)}</span>` : '<em>Unknown</em>';
+    let regionHtml = a.region_name ? ` <span class="alert-region">${esc(a.region_name)}</span>` : '';
+    let body = '';
+    if (a.pilot_count) {
+        const countStyle = isAbove ? 'color:var(--fg-red);font-weight:bold;font-size:14px' : '';
+        const prefix = isAbove ? '*** ' : '';
+        body += `<div class="alert-stat"><span class="label">Reported: </span><span class="value" style="${countStyle}">${prefix}${a.pilot_count}+ hostiles</span></div>`;
+    }
+    if (a.dscan_summary) {
+        const countStyle = isAbove ? 'color:var(--fg-red);font-weight:bold' : 'color:var(--fg-text)';
+        body += `<div class="intel-ships" style="${countStyle}">${esc(a.dscan_summary)}</div>`;
+    } else if (a.dscan_ships && a.dscan_total) {
+        const countStyle = isAbove ? 'color:var(--fg-red);font-weight:bold' : '';
+        let topEntry = Object.entries(a.dscan_ships).sort((x,y)=>y[1]-x[1])[0];
+        let summary = topEntry ? `${a.dscan_total} ships, ${topEntry[1]} ${esc(topEntry[0])}` : `${a.dscan_total} ships`;
+        body += `<div class="intel-ships" style="${countStyle}">${summary}</div>`;
+    }
+    if (a.has_cyno_beacon) body += `<div class="alert-stat" style="color:var(--fg-yellow);font-weight:bold">PHAROLUX CYNO BEACON IN SYSTEM</div>`;
+    let links = '';
+    if (a.dotlan_url) links += `<a href="${a.dotlan_url}" target="_blank">Dotlan</a>`;
+    if (a.dscan_url) links += `<a href="${a.dscan_url}" target="_blank">D-Scan</a>`;
+    // Render message with character names highlighted
+    let msgHtml = esc(a.raw_message);
+    if (a.characters && a.characters.length) {
+        a.characters.forEach(c => {
+            const tooltip = c.alliance || c.corporation || '';
+            const color = c.hostile === false ? 'var(--fg-green)' : 'var(--fg-red)';
+            const span = `<span style="color:${color};font-weight:bold;cursor:help" title="${esc(tooltip)}">${esc(c.name)}</span>`;
+            msgHtml = msgHtml.replace(esc(c.name), span);
+        });
+    }
+    return `<div class="${cls}" data-system="${a.system_name?esc(a.system_name):''}"><div class="alert-header"><div>${tags}${sysHtml}${regionHtml}</div><div class="alert-time">${t}</div></div>${body?`<div class="alert-body">${body}</div>`:''}${a.route_from_staging?`<div style="font-size:11px;color:var(--fg-dim);margin-top:4px">${esc(a.route_from_staging)}</div>`:''}<div class="intel-meta">${esc(a.channel)} | ${esc(a.reporter)}: ${msgHtml}</div>${links?`<div class="alert-links">${links}</div>`:''}</div>`;
+}
 
 // Navigation
 async function doNavSearch() {

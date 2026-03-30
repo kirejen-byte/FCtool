@@ -106,10 +106,12 @@ class ChatMonitor:
 
     def __init__(self, logs_path: str, poll_interval: float = 1.0,
                  channel_filter: str | None = None,
-                 listener_filter: str | None = None):
+                 listener_filter: str | None = None,
+                 channel_filters: list[str] | None = None):
         self.logs_path = logs_path
         self.poll_interval = poll_interval
         self.channel_filter = channel_filter
+        self.channel_filters = channel_filters  # Multiple channel prefixes
         self.listener_filter = listener_filter  # Character name to track
         self._tracked_files: dict[str, ChatLogFile] = {}
         self._callbacks: list[Callable[[ChatMessage], None]] = []
@@ -121,8 +123,16 @@ class ChatMonitor:
 
     def _discover_files(self):
         """Find chat log files matching the channel and listener filters."""
-        pattern = os.path.join(self.logs_path, "*.txt")
-        for filepath in glob.glob(pattern):
+        # If multiple channel filters are set, glob each one separately (much faster)
+        if self.channel_filters:
+            all_files = []
+            for prefix in self.channel_filters:
+                pat = os.path.join(self.logs_path, f"{prefix}*.txt")
+                all_files.extend(glob.glob(pat))
+        else:
+            all_files = glob.glob(os.path.join(self.logs_path, "*.txt"))
+
+        for filepath in all_files:
             if filepath in self._tracked_files:
                 continue
             basename = os.path.basename(filepath)
@@ -176,12 +186,26 @@ class ChatMonitor:
             self.poll()
             time.sleep(self.poll_interval)
 
-    def get_available_listeners(self) -> list[str]:
-        """Scan log files to find all character names (listeners) with fleet channels."""
+    def get_available_listeners(self, max_age_days: int = 7) -> list[str]:
+        """Scan log files to find all character names (listeners) with fleet channels.
+        Only checks files modified within max_age_days to avoid scanning years of history."""
         listeners = set()
-        pattern = os.path.join(self.logs_path, "*.txt")
         filter_prefix = (self.channel_filter or "").lower()
+        cutoff = time.time() - (max_age_days * 86400)
+
+        # Use targeted glob if we have a channel filter, otherwise scan all
+        if filter_prefix:
+            pattern = os.path.join(self.logs_path, f"{self.channel_filter}*.txt")
+        else:
+            pattern = os.path.join(self.logs_path, "*.txt")
+
         for filepath in glob.glob(pattern):
+            # Skip files older than cutoff
+            try:
+                if os.path.getmtime(filepath) < cutoff:
+                    continue
+            except OSError:
+                continue
             basename = os.path.basename(filepath)
             if filter_prefix and not basename.lower().startswith(filter_prefix):
                 continue

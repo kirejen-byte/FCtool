@@ -15,6 +15,8 @@ class XUpState:
     xups: dict[str, datetime] = field(default_factory=dict)  # sender -> timestamp
     is_ready: bool = False
     fire_count: int = 0  # how many times FIRE has been called this session
+    last_xup_sender: str = ""  # who just x'd up (for display)
+    last_xup_was_new: bool = False  # True if this was a new unique x-up
 
     @property
     def count(self) -> int:
@@ -75,7 +77,10 @@ class XUpCounter:
 
         if self._is_xup(msg.message):
             was_ready = self.state.is_ready
+            is_new = msg.sender not in self.state.xups
             self.state.xups[msg.sender] = msg.timestamp
+            self.state.last_xup_sender = msg.sender
+            self.state.last_xup_was_new = is_new
             self.state.is_ready = self.state.count >= self.threshold
 
             if self.state.is_ready and not was_ready:

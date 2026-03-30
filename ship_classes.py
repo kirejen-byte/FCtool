@@ -118,6 +118,10 @@ DREADNOUGHTS = {
     42241,  # Chemosh
     42243,  # Caiman
     45647,  # Vehement
+    73790,  # Revelation Navy Issue
+    73792,  # Moros Navy Issue
+    73793,  # Phoenix Navy Issue
+    73787,  # Naglfar Fleet Issue
 }
 
 TITANS = {

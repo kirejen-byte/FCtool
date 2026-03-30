@@ -25,7 +25,8 @@ SSO_JWKS_URL = "https://login.eveonline.com/oauth/jwks"
 ESI_BASE = "https://esi.evetech.net/latest"
 HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
 
-TOKEN_FILE = os.path.join(app_dir(), "esi_tokens.json")
+TOKEN_FILE = os.path.join(app_dir(), "esi_tokens.json")  # Legacy single-char file
+TOKEN_DIR = app_dir()  # Directory for per-character token files
 
 SCOPES = [
     "publicData",
@@ -54,6 +55,7 @@ SCOPES = [
     "esi-characters.read_freelance_jobs.v1",
     "esi-structures.read_corporation.v1",
     "esi-structures.read_character.v1",
+    "esi-assets.read_assets.v1",
 ]
 
 
@@ -346,7 +348,20 @@ class ESIAuth:
     # ── Token Persistence ────────────────────────────────────────────────────
 
     def _save_tokens(self):
-        """Save tokens to disk."""
+        """Save tokens to disk (per-character file)."""
+        # Update token_file to per-character path if we have a character_id
+        if self._character_id:
+            new_path = os.path.join(
+                TOKEN_DIR, f"esi_tokens_{self._character_id}.json"
+            )
+            # Clean up old temp file if path changed
+            old_path = self.token_file
+            if old_path != new_path and os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+            self.token_file = new_path
         data = {
             "refresh_token": self._refresh_token,
             "character_id": self._character_id,
@@ -393,7 +408,13 @@ class ESIAuth:
             )
             if resp.ok:
                 return resp.json()
-            print(f"[ESI] {path} returned {resp.status_code}")
+            # Suppress noisy expected errors
+            if resp.status_code == 404 and "/fleet/" in path:
+                pass  # Not in fleet
+            elif resp.status_code == 403 and "/structures/" in path:
+                pass  # No access to structure (different corp/alliance)
+            else:
+                print(f"[ESI] {path} returned {resp.status_code}")
         except Exception as e:
             print(f"[ESI] Error: {e}")
         return None
@@ -458,6 +479,44 @@ class ESIAuth:
         except Exception as e:
             print(f"[ESI] Waypoint error: {e}")
             return False
+
+    # ── Assets ───────────────────────────────────────────────────────────────
+
+    def get_assets(self) -> list[dict]:
+        """Get all character assets (auto-paginated).
+        Returns flat list of asset items with type_id, location_id, etc.
+        Returns empty list if the esi-assets scope is not granted."""
+        if not self._character_id:
+            return []
+        all_assets = []
+        page = 1
+        while True:
+            token = self.access_token
+            if not token:
+                break
+            try:
+                resp = self._session.get(
+                    f"{ESI_BASE}/characters/{self._character_id}/assets/",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"page": page},
+                    timeout=15,
+                )
+                if resp.status_code == 403:
+                    # Scope not granted — silently return empty
+                    print(f"[ESI] Assets scope not granted for {self._character_name}")
+                    return []
+                if not resp.ok:
+                    break
+                items = resp.json()
+                all_assets.extend(items)
+                total_pages = int(resp.headers.get("x-pages", 1))
+                if page >= total_pages:
+                    break
+                page += 1
+            except Exception as e:
+                print(f"[ESI] Assets page {page} error: {e}")
+                break
+        return all_assets
 
     # ── Fleet ────────────────────────────────────────────────────────────────
 
@@ -656,3 +715,51 @@ class ESIAuth:
 
         print(f"[ESI Auth] Discovered {len(gates)} unique Ansiblex gate(s)")
         return gates
+
+
+# ── Multi-character helpers ──────────────────────────────────────────────────
+
+def _migrate_legacy_tokens():
+    """Migrate old single esi_tokens.json to per-character format."""
+    legacy = os.path.join(TOKEN_DIR, "esi_tokens.json")
+    if not os.path.exists(legacy):
+        return
+    try:
+        with open(legacy) as f:
+            data = json.load(f)
+        char_id = data.get("character_id")
+        if char_id:
+            new_path = os.path.join(TOKEN_DIR, f"esi_tokens_{char_id}.json")
+            if not os.path.exists(new_path):
+                with open(new_path, "w") as f:
+                    json.dump(data, f, indent=2)
+                print(f"[ESI Auth] Migrated legacy tokens to {new_path}")
+            os.remove(legacy)
+            print("[ESI Auth] Removed legacy esi_tokens.json")
+    except Exception as e:
+        print(f"[ESI Auth] Legacy migration error: {e}")
+
+
+def load_all_tokens(client_id: str, client_secret: str,
+                    callback_url: str = "http://localhost:8834/callback") -> list[ESIAuth]:
+    """Load all per-character ESI token files and return authenticated ESIAuth instances."""
+    _migrate_legacy_tokens()
+    accounts = []
+    import glob
+    pattern = os.path.join(TOKEN_DIR, "esi_tokens_*.json")
+    for token_file in glob.glob(pattern):
+        try:
+            auth = ESIAuth(
+                client_id=client_id,
+                client_secret=client_secret,
+                callback_url=callback_url,
+                token_file=token_file,
+            )
+            if auth.is_authenticated:
+                accounts.append(auth)
+                print(f"[ESI Auth] Loaded: {auth.character_name} (ID: {auth.character_id})")
+            else:
+                print(f"[ESI Auth] Token expired for {token_file}")
+        except Exception as e:
+            print(f"[ESI Auth] Error loading {token_file}: {e}")
+    return accounts
