@@ -15,6 +15,21 @@ GROUP_LOGISTICS_FRIGATES = 1527
 GROUP_DESTROYERS = 420
 GROUP_TACTICAL_DESTROYERS = 1305  # T3D
 GROUP_INTERDICTORS = 541
+GROUP_FRIGATE = 25                # T1 frigates (combat/exploration/mining)
+GROUP_ASSAULT_FRIGATE = 324       # T2 assault frigates
+GROUP_INTERCEPTOR = 831           # T2 interceptors
+GROUP_ELECTRONIC_ATTACK_SHIP = 893  # T2 EAFs
+
+# Tackle = cheap/expendable ships that should NOT trigger loss alerts in
+# a main (heavy) fleet. Used by loss_tracker to classify "minor" losses.
+TACKLE_GROUP_IDS = {
+    GROUP_FRIGATE,
+    GROUP_ASSAULT_FRIGATE,
+    GROUP_INTERCEPTOR,
+    GROUP_ELECTRONIC_ATTACK_SHIP,
+    GROUP_DESTROYERS,
+    GROUP_TACTICAL_DESTROYERS,
+}
 
 # ── Hardcoded type_id sets ──────────────────────────────────────────────────
 
@@ -41,6 +56,7 @@ LOGISTICS_CRUISERS = {
     11989,  # Oneiros
     11978,  # Scimitar
     11985,  # Basilisk
+    49713,  # Zarmazd (Triglavian)
 }
 
 LOGISTICS_FRIGATES = {
@@ -225,3 +241,27 @@ def is_links_command(type_id: int) -> bool:
 def is_logistics(type_id: int) -> bool:
     """Check if a ship is any logistics ship (T1 or T2, frig or cruiser)."""
     return type_id in ALL_LOGISTICS
+
+
+def is_tackle(type_id: int) -> bool:
+    """Check if a ship is considered 'tackle' (cheap/expendable) for loss tracking.
+
+    Includes: T1 frigates, Assault Frigates, Interceptors, Electronic Attack
+    Frigates, T1 Destroyers, Tactical Destroyers.
+
+    Excludes (major): Logistics frigates (1527), Interdictors (541),
+    Command Destroyers (1534), Covert Ops (830), Stealth Bombers (834).
+    """
+    if not type_id:
+        return False
+    # Explicit exclusions (these share destroyer/frigate hull sizes but are NOT tackle)
+    if type_id in INTERDICTORS or type_id in LOGISTICS_FRIGATES:
+        return False
+    gid = get_group_id(type_id)
+    if gid is None:
+        return False
+    # Interdictors and Command Destroyers happen to inherit from destroyer-ish
+    # groups, so also exclude by group ID just in case future types are added.
+    if gid in (GROUP_INTERDICTORS, GROUP_COMMAND_DESTROYERS, GROUP_LOGISTICS_FRIGATES):
+        return False
+    return gid in TACKLE_GROUP_IDS

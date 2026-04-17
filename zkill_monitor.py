@@ -297,13 +297,13 @@ class ZKillMonitor:
         """Check if a kill matches any of our watch filters."""
         km = kill_data.get("killmail", kill_data)
 
-        # Reject stale kills (older than 10 minutes)
+        # Reject stale kills (older than 30 minutes — allows catchup after restarts)
         kill_time_str = km.get("killmail_time", "")
         if kill_time_str:
             try:
                 kill_time = datetime.fromisoformat(kill_time_str.replace("Z", "+00:00"))
                 age = datetime.now(timezone.utc) - kill_time
-                if age > timedelta(minutes=10):
+                if age > timedelta(minutes=30):
                     return False
             except Exception:
                 pass  # If we can't parse the time, let it through
@@ -437,18 +437,30 @@ class ZKillMonitor:
                 self._poll_loop()
             return
 
-        self._sequence = seq
-        print(f"[zKill] Connected to R2Z2. Starting at sequence {seq}")
+        # Look back to catch recent kills we may have missed (e.g. during restart)
+        # At ~6 kills/min global, 200 sequences ≈ ~30 minutes of catchup
+        lookback = 200
+        self._sequence = max(1, seq - lookback)
+        print(f"[zKill] Connected to R2Z2. Head={seq}, starting at {self._sequence} "
+              f"(lookback {lookback})")
         if self.on_status:
             self.on_status(f"R2Z2 connected (seq {seq})")
 
         consecutive_404s = 0
+        catching_up = True
 
         while self._running:
             try:
                 kill_data = self._fetch_kill(self._sequence)
 
                 if kill_data is None:
+                    if catching_up:
+                        # During catchup, skip missing sequences quickly
+                        self._sequence += 1
+                        if self._sequence >= seq:
+                            catching_up = False
+                            print(f"[zKill] Catchup complete at seq {self._sequence}")
+                        continue
                     # No new kill at this sequence — wait before retrying
                     consecutive_404s += 1
                     # R2Z2 docs say minimum 6 seconds on 404
@@ -461,12 +473,19 @@ class ZKillMonitor:
                 self._kills_processed += 1
                 self._sequence += 1
 
+                if catching_up and self._sequence >= seq:
+                    catching_up = False
+                    print(f"[zKill] Catchup complete at seq {self._sequence}")
+
                 # Wrap in the format our tracker expects
                 # R2Z2 returns the kill directly with killmail + zkb fields
                 self._process_kill(kill_data)
 
-                # Brief pause between successful fetches to stay under 20/s
-                time.sleep(0.1)
+                # During catchup, poll faster; normal mode: 0.1s between fetches
+                if catching_up:
+                    time.sleep(0.05)
+                else:
+                    time.sleep(0.1)
 
             except Exception as e:
                 print(f"[zKill] Poll error: {e}")

@@ -1,3 +1,5 @@
 requests>=2.28.0
 flask>=3.0.0
 flask-httpauth>=4.0.0
+edge-tts>=6.1.0
+pygame>=2.5.0

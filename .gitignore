@@ -11,6 +11,11 @@ routes_cache.json
 regions_cache.json
 systems_cache.json
 stargate_jumps.json
+char_cache.json
+tts_cache/
+
+# Misc
+*.msi
 
 # PyInstaller
 build/

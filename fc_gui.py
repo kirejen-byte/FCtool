@@ -49,6 +49,8 @@ from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
 from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
+from loss_tracker import FleetLossTracker, DeathEvent
+import tts_helper
 from app_path import app_dir
 
 
@@ -68,6 +70,44 @@ FG_YELLOW = "#ffdd00"
 FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
 BORDER_COLOR = "#2a2a4a"
+
+# ── zKill Filter Presets ─────────────────────────────────────────────────────
+
+WATCHED_REGIONS = {
+    10000060: "Delve",        10000050: "Querious",     10000058: "Fountain",
+    10000051: "Cloud Ring",   10000057: "Outer Ring",   10000023: "Pure Blind",
+    10000046: "Fade",         10000054: "Aridia",       10000041: "Syndicate",
+    10000063: "Period Basis", 10000016: "Lonetrek",     10000069: "Black Rise",
+}
+
+IMPERIUM_ALLIANCES = {
+    1354830081,   # Goonswarm Federation
+    1900696668,   # The Initiative.
+    99003214,     # Brave Collective
+    99009163,     # Dracarys.
+    131511956,    # Tactical Narcotics Team
+    99003995,     # Invidia Gloriae Comes
+    99001969,     # SONS of BANE
+    99011223,     # Sigma Grindset
+    99011162,     # Shadow Ultimatum
+    99009331,     # Scumlords
+    99012042,     # Fanatic Legion.
+    99010877,     # Out of the Blue.
+}
+
+WINTER_ALLIANCES = {
+    99003581,     # Fraternity.
+    386292982,    # Pandemic Legion
+    1727758877,   # Northern Coalition.
+    99013537,     # Insidious.
+    99002685,     # Synergy of Steel
+    498125261,    # TEST Alliance Please Ignore
+    99005393,     # Blades of Grass
+    99007203,     # Siberian Squads
+    99014657,     # Ranger Regiment
+    1411711376,   # Legion of xXDEATHXx
+    1042504553,   # Solyaris Chtonium
+}
 
 
 class FCToolGUI:
@@ -94,6 +134,9 @@ class FCToolGUI:
         self._chat_thread: threading.Thread | None = None
         self._is_discord_primary = self.config.get("discord", {}).get("role", "primary") == "primary"
         self._sound_enabled = self.config.get("sound_on_ready", False)
+        # Fleet loss tracker
+        self._loss_tracker = FleetLossTracker()
+        self._loss_audio_enabled = self.config.get("loss_audio_enabled", True)
         self._ansiblex_connections: list[str] = []  # "id1|id2" strings for ESI route
         # Maps (id1, id2) -> (name1, name2) for identifying Ansiblex jumps in routes
         self._ansiblex_id_pairs: dict[tuple[int, int], tuple[str, str]] = {}
@@ -135,6 +178,17 @@ class FCToolGUI:
         self._build_ui()
         self._setup_modules()
         self._start_monitoring()
+
+        # Auto-refresh character data in the background shortly after startup
+        if self.esi_accounts and hasattr(self, '_char_tab_content'):
+            self.root.after(3000, lambda: self._refresh_character_tab(force=True))
+
+        # Pre-generate loss threshold TTS audio in the background
+        tts_helper.pregenerate([
+            "Ten percent of fleet lost",
+            "Twenty five percent of fleet lost",
+            "Fifty percent of fleet lost",
+        ])
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -416,62 +470,72 @@ class FCToolGUI:
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Fleet Management  ")
 
-        # Top section: compact counter + controls in one row
-        counter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
-                                  highlightbackground=BORDER_COLOR, highlightthickness=1)
-        counter_frame.pack(fill=tk.X, padx=10, pady=(8, 4))
+        # ── Combined Fleet Status Bar (X-Up + Losses) ────────────────────────
+        status_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                 highlightbackground=BORDER_COLOR, highlightthickness=1)
+        status_frame.pack(fill=tk.X, padx=10, pady=(8, 4))
 
-        # Counter and status side by side
-        counter_left = tk.Frame(counter_frame, bg=BG_PANEL)
-        counter_left.pack(side=tk.LEFT, padx=15, pady=8)
+        threshold = self.config.get("xup", {}).get("threshold", 50)
 
-        self._xup_count_label = tk.Label(counter_left, text="0",
-                                          font=("Consolas", 48, "bold"),
+        # Left: X-UP section
+        xup_section = tk.Frame(status_frame, bg=BG_PANEL)
+        xup_section.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=6)
+
+        xup_label_row = tk.Frame(xup_section, bg=BG_PANEL)
+        xup_label_row.pack(fill=tk.X)
+
+        tk.Label(xup_label_row, text="X-UP:", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
+
+        self._xup_count_label = tk.Label(xup_label_row, text="0",
+                                          font=("Consolas", 22, "bold"),
                                           fg=FG_ACCENT, bg=BG_PANEL)
         self._xup_count_label.pack(side=tk.LEFT)
 
-        threshold = self.config.get("xup", {}).get("threshold", 50)
-        self._xup_threshold_label = tk.Label(
-            counter_left,
-            text=f"/ {threshold}",
-            font=("Consolas", 20), fg=FG_DIM, bg=BG_PANEL
-        )
-        self._xup_threshold_label.pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(xup_label_row, text="/",
+                 font=("Consolas", 16), fg=FG_DIM, bg=BG_PANEL
+                 ).pack(side=tk.LEFT, padx=(2, 2))
 
-        # Progress bar and status in center
-        counter_center = tk.Frame(counter_frame, bg=BG_PANEL)
-        counter_center.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=8)
-
-        self._xup_canvas = tk.Canvas(counter_center, height=22,
-                                      bg=BG_DARK, highlightthickness=0)
-        self._xup_canvas.pack(fill=tk.X)
-
-        self._xup_status = tk.Label(counter_center, text="Waiting for fleet chat...",
-                                     font=("Consolas", 11, "bold"),
-                                     fg=FG_DIM, bg=BG_PANEL)
-        self._xup_status.pack(pady=(4, 0))
-
-        # Controls on the right
-        counter_right = tk.Frame(counter_frame, bg=BG_PANEL)
-        counter_right.pack(side=tk.RIGHT, padx=10, pady=8)
-
-        ctrl_row = tk.Frame(counter_right, bg=BG_PANEL)
-        ctrl_row.pack()
-        tk.Label(ctrl_row, text="Threshold:", font=("Consolas", 9),
-                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 3))
+        # Editable threshold spinbox inline with the counter
         self._threshold_var = tk.StringVar(value=str(threshold))
         self._threshold_spin = tk.Spinbox(
-            ctrl_row, from_=1, to=500, textvariable=self._threshold_var,
-            font=("Consolas", 11), width=4, bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
-            borderwidth=1, relief=tk.RIDGE, command=self._on_threshold_change
+            xup_label_row, from_=1, to=500,
+            textvariable=self._threshold_var,
+            font=("Consolas", 14, "bold"), width=4,
+            bg=BG_ENTRY, fg=FG_YELLOW, insertbackground=FG_WHITE,
+            buttonbackground=BG_PANEL, borderwidth=1, relief=tk.FLAT,
+            command=self._on_threshold_change,
         )
         self._threshold_spin.pack(side=tk.LEFT)
         self._threshold_spin.bind("<Return>", lambda e: self._on_threshold_change())
         self._threshold_spin.bind("<FocusOut>", lambda e: self._on_threshold_change())
+        # Kept for compatibility with existing update code (no-op display)
+        self._xup_threshold_label = tk.Label(
+            xup_label_row, text="", font=("Consolas", 1), bg=BG_PANEL,
+        )
 
-        ttk.Button(counter_right, text="Reset Counter", style="Red.TButton",
-                   command=self._reset_xup).pack(pady=(4, 0))
+        ttk.Button(xup_label_row, text="Reset", style="Red.TButton",
+                   command=self._reset_xup).pack(side=tk.LEFT, padx=(8, 10))
+
+        self._xup_status = tk.Label(xup_label_row, text="Waiting for fleet chat...",
+                                     font=("Consolas", 10, "bold"),
+                                     fg=FG_DIM, bg=BG_PANEL)
+        self._xup_status.pack(side=tk.LEFT, padx=(5, 0))
+
+        self._xup_canvas = tk.Canvas(xup_section, height=12,
+                                      bg=BG_DARK, highlightthickness=0)
+        self._xup_canvas.pack(fill=tk.X, pady=(3, 0))
+
+        # Vertical divider
+        tk.Frame(status_frame, bg=BORDER_COLOR, width=1
+                 ).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
+
+        # Right: LOSSES section (filled in by _build_loss_bar)
+        self._loss_section = tk.Frame(status_frame, bg=BG_PANEL)
+        self._loss_section.pack(side=tk.LEFT, padx=10, pady=6)
+
+        # Settings gear (overflow menu for Test Audio / Reset Losses)
+        self._build_status_bar_menu(status_frame)
 
         # ── Role Tracker Section ──────────────────────────────────────────────
         role_header = tk.Frame(tab, bg=BG_DARK)
@@ -484,33 +548,81 @@ class FCToolGUI:
                    command=self._add_role_slot).pack(side=tk.LEFT, padx=8)
         ttk.Button(role_header, text="Reset All", style="Red.TButton",
                    command=self._reset_all_roles).pack(side=tk.LEFT, padx=3)
+        ttk.Button(role_header, text="Collapse All", style="Dark.TButton",
+                   command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(role_header, text="Expand All", style="Dark.TButton",
+                   command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
 
-        # Preset role buttons
-        preset_frame = tk.Frame(tab, bg=BG_DARK)
-        preset_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
-        tk.Label(preset_frame, text="Presets:", font=("Consolas", 8),
-                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=(0, 4))
-        presets = [
+        # Preset role buttons — row 1: defaults, row 2: custom
+        preset_container = tk.Frame(tab, bg=BG_DARK)
+        preset_container.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        _PRESET_LABEL_W = 8  # Fixed width so rows align
+        preset_row1 = tk.Frame(preset_container, bg=BG_DARK)
+        preset_row1.pack(fill=tk.X)
+        tk.Label(preset_row1, text="Presets:", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_DARK, width=_PRESET_LABEL_W, anchor=tk.W
+                 ).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._preset_row2 = tk.Frame(preset_container, bg=BG_DARK)
+        # Row 2 only packed when custom presets exist
+
+        self._default_presets = [
             ("C-Cyno", "c", "Cyno", None),
             ("D-Dictors", "d", "Dictors", None),
             ("F-Fax 3", "f", "FAX", 3),
+            ("Z-Defenders-8", "z", "Defenders", 8),
             ("1-Dreads-10", "1", "Dreads", 10),
         ]
-        for label, letter, title, cap in presets:
-            ttk.Button(preset_frame, text=label, style="Dark.TButton",
-                       command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c)
-                       ).pack(side=tk.LEFT, padx=2)
+        self._preset_frame = preset_row1
+        self._MAX_CUSTOM_PRESETS = 8
+        self._rebuild_preset_buttons()
         ttk.Button(role_header, text="Screenshot", style="Dark.TButton",
                    command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
         self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
-                                          fg=FG_ACCENT, bg=BG_DARK, cursor="hand2")
+                                          fg=FG_GREEN, bg=BG_DARK)
         self._screenshot_link.pack(side=tk.RIGHT, padx=5)
-        self._screenshot_link.bind("<Button-1>", self._open_screenshot_link)
 
         # Role tracker container (scrollable)
         self._role_container = tk.Frame(tab, bg=BG_DARK)
         self._role_container.pack(fill=tk.X, padx=10, pady=2)
         self._role_slots: list[dict] = []
+
+        # ── Fleet Loss Tracker (inline in status bar) ────────────────────────
+        tk.Label(self._loss_section, text="LOSSES:",
+                 font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
+        self._loss_status_label = tk.Label(
+            self._loss_section, text="(waiting for fleet)",
+            font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow",
+        )
+        self._loss_status_label.pack(side=tk.LEFT, padx=(0, 10))
+        _loss_tip = (
+            "Mainline Fleet: tackle losses (frigs, dessies, ceptors, AFs, EAFs, T3Ds)\n"
+            "are ignored — only major ship losses count toward alerts.\n"
+            "Support Fleet: all losses count. Mode is auto-detected from fleet comp."
+        )
+        self._loss_status_label.bind(
+            "<Enter>", lambda e, t=_loss_tip: self._show_tooltip(e, t)
+        )
+        self._loss_status_label.bind(
+            "<Leave>", lambda e: self._hide_tooltip()
+        )
+
+        self._loss_audio_var = tk.BooleanVar(value=self._loss_audio_enabled)
+
+        def _on_loss_audio_toggle():
+            self._loss_audio_enabled = self._loss_audio_var.get()
+            self.config["loss_audio_enabled"] = self._loss_audio_enabled
+            self._save_config()
+
+        tk.Checkbutton(self._loss_section, text="Audio",
+                       variable=self._loss_audio_var,
+                       font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                       activeforeground=FG_YELLOW,
+                       command=_on_loss_audio_toggle,
+                       ).pack(side=tk.LEFT)
 
         # ── Fleet Composition & Specialized Roles ────────────────────────────
         comp_outer = tk.Frame(tab, bg=BG_DARK)
@@ -647,33 +759,24 @@ class FCToolGUI:
                        activeforeground=FG_RED,
                        ).pack(side=tk.LEFT, padx=15)
 
-        # All K-Space toggle
-        self._zkill_watch_all_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(header, text="All K-Space",
-                       variable=self._zkill_watch_all_var,
-                       font=("Consolas", 9), fg=FG_ORANGE, bg=BG_DARK,
-                       selectcolor=BG_ENTRY, activebackground=BG_DARK,
-                       activeforeground=FG_ORANGE,
-                       command=self._toggle_watch_all).pack(side=tk.RIGHT, padx=10)
-        tk.Label(header, text="(any fight, any alliance)",
-                 font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK
-                 ).pack(side=tk.RIGHT)
+        # (All K-Space toggle is now in the filter panel below)
 
         # ── Inline filter controls ─────────────────────────────────────────
         filter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                  highlightbackground=BORDER_COLOR, highlightthickness=1)
         filter_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
 
-        filter_row = tk.Frame(filter_frame, bg=BG_PANEL)
-        filter_row.pack(fill=tk.X, padx=10, pady=5)
+        # Row 1: Min Pilots, Max Jumps, All K-Space
+        filter_row1 = tk.Frame(filter_frame, bg=BG_PANEL)
+        filter_row1.pack(fill=tk.X, padx=10, pady=(5, 2))
 
-        tk.Label(filter_row, text="Min Pilots:", font=("Consolas", 9),
+        tk.Label(filter_row1, text="Min Pilots:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
         zk_cfg = self.config.get("zkillboard", {})
         self._zkill_min_pilots_var = tk.StringVar(
             value=str(zk_cfg.get("min_pilots_involved", 25)))
         self._zkill_min_pilots_spin = tk.Spinbox(
-            filter_row, from_=1, to=500, textvariable=self._zkill_min_pilots_var,
+            filter_row1, from_=1, to=500, textvariable=self._zkill_min_pilots_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
             borderwidth=1, relief=tk.RIDGE,
@@ -682,18 +785,82 @@ class FCToolGUI:
         self._zkill_min_pilots_spin.pack(side=tk.LEFT, padx=(4, 15))
         self._zkill_min_pilots_spin.bind("<Return>", lambda e: self._on_zkill_filter_change())
 
-        tk.Label(filter_row, text="Max Jumps from Staging:", font=("Consolas", 9),
+        tk.Label(filter_row1, text="Max Jumps:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
         self._zkill_max_jumps_var = tk.StringVar(value="0")
         self._zkill_max_jumps_spin = tk.Spinbox(
-            filter_row, from_=0, to=200, textvariable=self._zkill_max_jumps_var,
+            filter_row1, from_=0, to=200, textvariable=self._zkill_max_jumps_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
             borderwidth=1, relief=tk.RIDGE,
         )
         self._zkill_max_jumps_spin.pack(side=tk.LEFT, padx=(4, 5))
-        tk.Label(filter_row, text="(0 = no limit)",
+        tk.Label(filter_row1, text="(0=no limit)",
+                 font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 15))
+
+        self._zkill_watch_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(filter_row1, text="All K-Space",
+                       variable=self._zkill_watch_all_var,
+                       font=("Consolas", 10, "bold"), fg=FG_ORANGE, bg=BG_PANEL,
+                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                       activeforeground=FG_ORANGE,
+                       command=self._toggle_watch_all).pack(side=tk.LEFT, padx=(10, 5))
+        tk.Label(filter_row1, text="(overrides region/affiliation filters)",
                  font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
+
+        # Row 2: Region checkboxes
+        filter_row2 = tk.Frame(filter_frame, bg=BG_PANEL)
+        filter_row2.pack(fill=tk.X, padx=10, pady=2)
+
+        tk.Label(filter_row2, text="Regions:", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
+
+        # Determine which regions should be checked by default
+        config_regions = set(zk_cfg.get("watch_regions", []))
+        if not config_regions:
+            config_regions = set(WATCHED_REGIONS.keys())  # All on if no config
+
+        self._zkill_region_vars: dict[int, tk.BooleanVar] = {}
+        for region_id, region_name in sorted(WATCHED_REGIONS.items(), key=lambda x: x[1]):
+            var = tk.BooleanVar(value=(region_id in config_regions))
+            self._zkill_region_vars[region_id] = var
+            tk.Checkbutton(filter_row2, text=region_name,
+                           variable=var, font=("Consolas", 8),
+                           fg=FG_TEXT, bg=BG_PANEL,
+                           selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                           activeforeground=FG_ACCENT,
+                           ).pack(side=tk.LEFT, padx=2)
+
+        # All / None buttons for regions
+        ttk.Button(filter_row2, text="All", style="Dark.TButton",
+                   command=lambda: self._set_all_regions(True)
+                   ).pack(side=tk.RIGHT, padx=2, pady=1)
+        ttk.Button(filter_row2, text="None", style="Dark.TButton",
+                   command=lambda: self._set_all_regions(False)
+                   ).pack(side=tk.RIGHT, padx=2, pady=1)
+
+        # Row 3: Affiliation presets
+        filter_row3 = tk.Frame(filter_frame, bg=BG_PANEL)
+        filter_row3.pack(fill=tk.X, padx=10, pady=(2, 5))
+
+        tk.Label(filter_row3, text="Affiliations:", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
+
+        self._zkill_winter_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(filter_row3, text="Winter Coalition",
+                       variable=self._zkill_winter_var,
+                       font=("Consolas", 9), fg=FG_RED, bg=BG_PANEL,
+                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                       activeforeground=FG_RED,
+                       ).pack(side=tk.LEFT, padx=(0, 15))
+
+        self._zkill_imperium_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(filter_row3, text="The Imperium",
+                       variable=self._zkill_imperium_var,
+                       font=("Consolas", 9), fg=FG_YELLOW, bg=BG_PANEL,
+                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                       activeforeground=FG_YELLOW,
+                       ).pack(side=tk.LEFT, padx=(0, 10))
 
         # ── Intelligence Fusion Panel ─────────────────────────────────────
         intel_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -757,8 +924,12 @@ class FCToolGUI:
 
         # Left pane — zKillboard
         left_frame = tk.Frame(self._paned, bg=BG_DARK)
-        tk.Label(left_frame, text="zKillboard Intel", font=("Consolas", 10, "bold"),
-                 fg=FG_ACCENT, bg=BG_DARK).pack(anchor=tk.W, pady=(0, 2))
+        left_header = tk.Frame(left_frame, bg=BG_DARK)
+        left_header.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(left_header, text="zKillboard Intel", font=("Consolas", 10, "bold"),
+                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT)
+        ttk.Button(left_header, text="Clear", style="Dark.TButton",
+                   command=self._clear_zkill_log).pack(side=tk.RIGHT, padx=2)
         self._zkill_log = scrolledtext.ScrolledText(
             left_frame, height=30, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
@@ -770,9 +941,13 @@ class FCToolGUI:
 
         # Right pane — Intel Channels (initially hidden)
         self._intel_right_frame = tk.Frame(self._paned, bg=BG_DARK)
-        tk.Label(self._intel_right_frame, text="Intel Channels",
+        right_header = tk.Frame(self._intel_right_frame, bg=BG_DARK)
+        right_header.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(right_header, text="Intel Channels",
                  font=("Consolas", 10, "bold"),
-                 fg=FG_MAGENTA, bg=BG_DARK).pack(anchor=tk.W, pady=(0, 2))
+                 fg=FG_MAGENTA, bg=BG_DARK).pack(side=tk.LEFT)
+        ttk.Button(right_header, text="Clear", style="Dark.TButton",
+                   command=self._clear_intel_log).pack(side=tk.RIGHT, padx=2)
         self._intel_log = scrolledtext.ScrolledText(
             self._intel_right_frame, height=30, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
@@ -1352,12 +1527,35 @@ class FCToolGUI:
             "bridge": (self._bridge_content, self._bridge_count),
         }
 
+        # Display names for role categories
+        role_display_names = {
+            "links": "LINKS", "defenders": "DEFENDERS", "logi": "LOGI",
+            "webs": "WEBS", "cyno": "CYNO", "hics": "HICS",
+            "fax": "FAX", "dreads": "DREADS", "bridge": "BRIDGE",
+        }
+
+        # Track which roles are newly filled
+        if not hasattr(self, '_roles_filled'):
+            self._roles_filled: set[str] = set()
+
         for cat_key, (content, count_lbl) in section_map.items():
             members_dict = categories[cat_key]
             threshold = thresholds.get(cat_key)
             sort_override = bridge_sort_key if cat_key == "bridge" else None
             self._populate_role_section(content, count_lbl, members_dict,
                                         threshold=threshold, sort_override=sort_override)
+
+            # Log when a capped role reaches its threshold for the first time
+            if threshold is not None:
+                count = sum(len(pilots) for pilots in members_dict.values())
+                if count >= threshold and cat_key not in self._roles_filled:
+                    self._roles_filled.add(cat_key)
+                    role_name = role_display_names.get(cat_key, cat_key.upper())
+                    self._append_xup_log(
+                        f"[{role_name}] FILLED ({count}/{threshold})\n", "ready"
+                    )
+                elif count < threshold and cat_key in self._roles_filled:
+                    self._roles_filled.discard(cat_key)
 
     def _populate_role_section(self, content_frame, count_label, ship_members,
                                 threshold: int | None = None,
@@ -1662,6 +1860,24 @@ class FCToolGUI:
         else:
             self._zkill_indicator.config(text="  LIVE", fg=FG_GREEN)
 
+    def _set_all_regions(self, state: bool):
+        """Set all region checkboxes to the given state."""
+        for var in self._zkill_region_vars.values():
+            var.set(state)
+
+    def _get_active_zkill_filters(self) -> tuple[set[int], set[int]]:
+        """Get the currently active region IDs and alliance IDs from checkboxes.
+        Returns (active_regions, active_alliances)."""
+        active_regions = {
+            rid for rid, var in self._zkill_region_vars.items() if var.get()
+        }
+        active_alliances: set[int] = set()
+        if self._zkill_winter_var.get():
+            active_alliances |= WINTER_ALLIANCES
+        if self._zkill_imperium_var.get():
+            active_alliances |= IMPERIUM_ALLIANCES
+        return active_regions, active_alliances
+
     def _on_tab_changed(self, event=None):
         """Handle tab switches — clear zkill alerts, refresh character tab."""
         current = self.notebook.index(self.notebook.select())
@@ -1957,7 +2173,7 @@ class FCToolGUI:
         self._char_filter_cap_var = tk.StringVar(value="")
         self._char_filter_cap = ttk.Combobox(
             filter_frame, textvariable=self._char_filter_cap_var,
-            values=["", "FAX", "Dreads", "Blops", "Titans", "Cyno"],
+            values=["", "FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"],
             state="readonly", width=12,
         )
         self._char_filter_cap.pack(side=tk.LEFT, padx=5, pady=5)
@@ -2000,6 +2216,7 @@ class FCToolGUI:
                         add="+")
 
         self._char_panels: list[tk.Frame] = []
+        self._load_char_disk_cache()
         self._populate_character_panels()
 
     def _populate_character_panels(self):
@@ -2017,6 +2234,21 @@ class FCToolGUI:
 
         for acct in self.esi_accounts:
             self._add_character_panel(acct)
+
+        # Apply cached data immediately so panels don't show "loading..."
+        for panel in self._char_panels:
+            acct = panel._acct
+            char_id = acct.character_id or 0
+            cached = self._asset_cache.get(char_id)
+            if cached:
+                _, cap_data = cached
+                info = {"system": "...", "region": "", "ship": "...", "ship_type_id": 0,
+                        "fax": cap_data.get("fax", []), "dreads": cap_data.get("dreads", []),
+                        "blops": cap_data.get("blops", []), "titans": cap_data.get("titans", []),
+                        "cyno": False, "dictor": False}
+                panel._info = info
+                panel._loc_label.config(text="  —  cached, refreshing...", fg=FG_DIM)
+                self._render_capabilities(panel, info)
 
     def _refresh_character_tab(self, force: bool = False):
         """Refresh all character panels with ESI data (runs in background).
@@ -2146,21 +2378,77 @@ class FCToolGUI:
         panel._loc_label.config(text=loc_text, fg=FG_TEXT)
         self._render_capabilities(panel, info)
         self._update_filter_regions()
+        self._save_char_disk_cache()
 
     # Asset cache: {character_id: (timestamp, cap_data_dict)}
     _asset_cache: dict[int, tuple[float, dict]] = {}
     _ASSET_CACHE_TTL = 600  # 10 minutes
+    _CHAR_CACHE_FILE = os.path.join(app_dir(), "char_cache.json")
+
+    @classmethod
+    def _load_char_disk_cache(cls):
+        """Load character asset cache from disk for instant startup."""
+        try:
+            if os.path.exists(cls._CHAR_CACHE_FILE):
+                with open(cls._CHAR_CACHE_FILE) as f:
+                    data = json.load(f)
+                for char_id_str, entry in data.get("assets", {}).items():
+                    char_id = int(char_id_str)
+                    ts = entry.get("ts", 0)
+                    cap_data = entry.get("data", {})
+                    cls._asset_cache[char_id] = (ts, cap_data)
+                for loc_id_str, loc in data.get("locations", {}).items():
+                    loc_id = int(loc_id_str)
+                    cls._location_cache[loc_id] = (loc[0], loc[1])
+                print(f"[Characters] Loaded disk cache: {len(cls._asset_cache)} chars, "
+                      f"{len(cls._location_cache)} locations")
+        except Exception as e:
+            print(f"[Characters] Error loading disk cache: {e}")
+
+    @classmethod
+    def _save_char_disk_cache(cls):
+        """Save character asset cache to disk."""
+        try:
+            data = {
+                "assets": {
+                    str(cid): {"ts": ts, "data": cap_data}
+                    for cid, (ts, cap_data) in cls._asset_cache.items()
+                },
+                "locations": {
+                    str(lid): list(loc)
+                    for lid, loc in cls._location_cache.items()
+                },
+            }
+            with open(cls._CHAR_CACHE_FILE, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"[Characters] Error saving disk cache: {e}")
 
     def _fetch_character_info(self, acct: ESIAuth) -> dict:
         """Fetch location, ship, and capital assets for a character.
         Location/ship are always fresh; assets are cached for 10 minutes."""
-        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS, CYNO_SHIPS
+        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS, CYNO_SHIPS, HICS, INTERDICTORS
         from zkill_monitor import resolve_name
         from jump_range import get_system_info
 
+        # Cyno fitting check constants
+        CYNO_MODULE_TYPES = {
+            21096,  # Cynosural Field Generator I
+            28646,  # Covert Cynosural Field Generator I
+        }
+        LIQUID_OZONE_TYPE_ID = 16273
+        # Ozone cost per activation, by ship type_id (defaults to 250 base)
+        # Force Recons get 80% role bonus → 250 * 0.20 = 50
+        OZONE_COST_PER_ACTIVATION = {
+            tid: 50 for tid in CYNO_SHIPS
+        }
+        DEFAULT_OZONE_COST = 250
+
         info = {"system": "???", "region": "", "ship": "???", "ship_type_id": 0,
+                "ship_item_id": 0,
                 "fax": [], "dreads": [], "blops": [], "titans": [],
-                "cyno": False}  # True if currently in a Force Recon
+                "cyno": False, "cyno_ozone": 0, "cyno_low": False,
+                "dictor": False}
 
         if not acct.is_authenticated:
             info["system"] = "Not authenticated"
@@ -2177,24 +2465,39 @@ class FCToolGUI:
 
         # Current ship
         ship = acct.get_ship_type()
+        in_force_recon = False
         if ship:
             ship_type_id = ship.get("ship_type_id")
+            ship_item_id = ship.get("ship_item_id", 0)
             if ship_type_id:
                 info["ship"] = resolve_name(ship_type_id, "type")
                 info["ship_type_id"] = ship_type_id
-                # Check if currently in a Force Recon (cyno capable)
+                info["ship_item_id"] = ship_item_id
                 if ship_type_id in CYNO_SHIPS:
-                    info["cyno"] = True
+                    in_force_recon = True
+                if ship_type_id in HICS or ship_type_id in INTERDICTORS:
+                    info["dictor"] = True
 
         # Capital ship assets — use cache (10 min TTL) to avoid frequent polling
         char_id = acct.character_id or 0
         now = time.time()
         cached = self._asset_cache.get(char_id)
         if cached and (now - cached[0]) < self._ASSET_CACHE_TTL:
-            # Use cached asset data
             cap_data = cached[1]
             for k in ("fax", "dreads", "blops", "titans"):
                 info[k] = cap_data.get(k, [])
+            # Cyno verification from cached fitting check (per active ship)
+            if in_force_recon:
+                cyno_cache = cap_data.get("cyno_check", {})
+                ship_check = cyno_cache.get(str(info["ship_item_id"]))
+                if ship_check:
+                    if ship_check.get("has_cyno") and ship_check.get("ozone", 0) > 0:
+                        info["cyno"] = True
+                        info["cyno_ozone"] = ship_check["ozone"]
+                        cost = OZONE_COST_PER_ACTIVATION.get(
+                            info["ship_type_id"], DEFAULT_OZONE_COST
+                        )
+                        info["cyno_low"] = info["cyno_ozone"] <= cost
             return info
 
         CAPITAL_TYPES = {
@@ -2204,6 +2507,8 @@ class FCToolGUI:
             "titans": TITANS,
         }
         all_capital_ids = FAX | DREADNOUGHTS | BLACK_OPS | TITANS
+
+        cyno_check_data: dict = {}
 
         try:
             assets = acct.get_assets()
@@ -2235,6 +2540,36 @@ class FCToolGUI:
                         if type_id in cat_ids:
                             info[cat_key].append(entry)
                             break
+
+            # Cyno fitting check: only meaningful if in a Force Recon
+            if in_force_recon and info["ship_item_id"]:
+                ship_iid = info["ship_item_id"]
+                has_cyno = False
+                ozone_amount = 0
+                for a in assets:
+                    if a.get("location_id") != ship_iid:
+                        continue
+                    flag = a.get("location_flag", "")
+                    tid = a.get("type_id", 0)
+                    # Cyno module fitted in any high slot
+                    if flag.startswith("HiSlot") and tid in CYNO_MODULE_TYPES:
+                        has_cyno = True
+                    # Liquid ozone in cargo
+                    elif flag == "Cargo" and tid == LIQUID_OZONE_TYPE_ID:
+                        ozone_amount += a.get("quantity", 0)
+
+                cyno_check_data[str(ship_iid)] = {
+                    "has_cyno": has_cyno,
+                    "ozone": ozone_amount,
+                }
+
+                if has_cyno and ozone_amount > 0:
+                    info["cyno"] = True
+                    info["cyno_ozone"] = ozone_amount
+                    cost = OZONE_COST_PER_ACTIVATION.get(
+                        info["ship_type_id"], DEFAULT_OZONE_COST
+                    )
+                    info["cyno_low"] = ozone_amount <= cost
         except Exception as e:
             print(f"[Characters] Asset fetch error for {acct.character_name}: {e}")
 
@@ -2258,8 +2593,9 @@ class FCToolGUI:
                 deduped.append(e)
             info[cat_key] = deduped
 
-        # Cache the asset results
+        # Cache the asset results (including cyno fitting check)
         cap_data = {k: info[k] for k in ("fax", "dreads", "blops", "titans")}
+        cap_data["cyno_check"] = cyno_check_data
         self._asset_cache[char_id] = (now, cap_data)
 
         return info
@@ -2414,6 +2750,9 @@ class FCToolGUI:
         self._char_refresh_status.config(text="Refreshed", fg=FG_GREEN)
         self._char_refresh_btn.config(state=tk.NORMAL)
 
+        # Persist cache to disk for fast startup next time
+        self._save_char_disk_cache()
+
     def _render_capabilities(self, panel, info: dict, only_cap: str = ""):
         """Render capability rows in a panel's cap_frame.
         If only_cap is set (e.g. 'fax'), only show that capability."""
@@ -2448,13 +2787,34 @@ class FCToolGUI:
                      anchor=tk.W, wraplength=700, justify=tk.LEFT,
                      ).pack(side=tk.LEFT, padx=(5, 0))
 
-        # Cyno capability (current ship is Force Recon)
+        # Cyno capability (current ship is Force Recon with cyno fitted + ozone)
         if info.get("cyno") and (not only_cap or only_cap == "cyno"):
             has_caps = True
             row = tk.Frame(panel._cap_frame, bg=BG_PANEL)
             row.pack(fill=tk.X, pady=1)
             tk.Label(row, text="Cyno:", font=("Consolas", 10, "bold"),
                      fg=FG_YELLOW, bg=BG_PANEL, width=8, anchor=tk.W
+                     ).pack(side=tk.LEFT)
+            tk.Label(row, text=f"Active — {info['ship']} in {info['system']}",
+                     font=("Consolas", 9), fg=FG_GREEN, bg=BG_PANEL,
+                     anchor=tk.W).pack(side=tk.LEFT, padx=(5, 0))
+            ozone = info.get("cyno_ozone", 0)
+            if info.get("cyno_low"):
+                tk.Label(row, text=f"  [LOW OZONE - {ozone}]",
+                         font=("Consolas", 9, "bold"), fg=FG_RED, bg=BG_PANEL,
+                         anchor=tk.W).pack(side=tk.LEFT)
+            else:
+                tk.Label(row, text=f"  ({ozone} ozone)",
+                         font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+                         anchor=tk.W).pack(side=tk.LEFT)
+
+        # Dictor/HIC capability (current ship is interdictor or heavy interdictor)
+        if info.get("dictor") and (not only_cap or only_cap == "hic/dictor"):
+            has_caps = True
+            row = tk.Frame(panel._cap_frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text="Dictor:", font=("Consolas", 10, "bold"),
+                     fg=FG_ORANGE, bg=BG_PANEL, width=8, anchor=tk.W
                      ).pack(side=tk.LEFT)
             tk.Label(row, text=f"Active — {info['ship']} in {info['system']}",
                      font=("Consolas", 9), fg=FG_GREEN, bg=BG_PANEL,
@@ -2498,8 +2858,9 @@ class FCToolGUI:
             info = getattr(panel, '_info', None)
             if not info:
                 continue
-            if cap_key == "cyno":
-                if info.get("cyno") and info.get("region"):
+            if cap_key in ("cyno", "hic/dictor"):
+                flag = "cyno" if cap_key == "cyno" else "dictor"
+                if info.get(flag) and info.get("region"):
                     regions.add(info["region"])
             else:
                 for entry in info.get(cap_key, []):
@@ -2523,8 +2884,8 @@ class FCToolGUI:
 
     def _char_matches_filter(self, info: dict, cap_key: str, region: str) -> bool:
         """Check if a character's info matches the current filter."""
-        if cap_key == "cyno":
-            if not info.get("cyno"):
+        if cap_key in ("cyno", "hic/dictor"):
+            if not info.get("cyno" if cap_key == "cyno" else "dictor"):
                 return False
             if region and info.get("region") != region:
                 return False
@@ -2744,12 +3105,7 @@ class FCToolGUI:
 
         self._add_setting(scroll_frame, "Min Pilots Involved", "zkill_min_pilots",
                           str(zk.get("min_pilots_involved", 10)))
-        self._add_setting(scroll_frame, "Watch Alliance IDs (comma-sep)",
-                          "zkill_alliances",
-                          ",".join(str(x) for x in zk.get("watch_alliances", [])))
-        self._add_setting(scroll_frame, "Watch Region IDs (comma-sep)",
-                          "zkill_regions",
-                          ",".join(str(x) for x in zk.get("watch_regions", [])))
+        # Region/alliance filters are now on the zKill tab inline filter panel
 
         # (Save button is at the top of the settings tab)
 
@@ -2875,15 +3231,6 @@ class FCToolGUI:
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
         self.config["zkillboard"]["min_pilots_involved"] = int(
             self._setting_entries["zkill_min_pilots"].get() or 10)
-
-        alliances_str = self._setting_entries["zkill_alliances"].get()
-        self.config["zkillboard"]["watch_alliances"] = [
-            int(x.strip()) for x in alliances_str.split(",") if x.strip().isdigit()
-        ]
-        regions_str = self._setting_entries["zkill_regions"].get()
-        self.config["zkillboard"]["watch_regions"] = [
-            int(x.strip()) for x in regions_str.split(",") if x.strip().isdigit()
-        ]
 
         self._save_config()
         self._save_status.config(text="Saved! Restart to apply.", fg=FG_GREEN)
@@ -3055,7 +3402,7 @@ class FCToolGUI:
         w = self._xup_canvas.winfo_width()
         if w < 10:
             w = 500
-        h = 22
+        h = 12
         ratio = min(1.0, state.count / max(threshold, 1))
         fill_w = int(w * ratio)
 
@@ -3161,6 +3508,79 @@ class FCToolGUI:
 
     # ── Role Tracker Methods ──────────────────────────────────────────────────
 
+    def _rebuild_preset_buttons(self):
+        """Rebuild preset buttons from defaults + saved custom presets."""
+        # Clear existing buttons from row 1 (keep the "Presets:" label)
+        for w in list(self._preset_frame.winfo_children()):
+            if isinstance(w, ttk.Button):
+                w.destroy()
+
+        # Clear row 2 entirely
+        for w in list(self._preset_row2.winfo_children()):
+            w.destroy()
+        self._preset_row2.pack_forget()
+
+        # Row 1: Default presets
+        for label, letter, title, cap in self._default_presets:
+            ttk.Button(self._preset_frame, text=label, style="Dark.TButton",
+                       command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c)
+                       ).pack(side=tk.LEFT, padx=2)
+
+        # Row 2: Custom presets + Clear button
+        custom = self.config.get("custom_role_presets", [])
+        if custom:
+            self._preset_row2.pack(fill=tk.X)
+            tk.Label(self._preset_row2, text="Custom:", font=("Consolas", 8),
+                     fg=FG_DIM, bg=BG_DARK, width=8, anchor=tk.W
+                     ).pack(side=tk.LEFT, padx=(0, 4))
+            for p in custom:
+                label = p.get("label", "")
+                letter = p.get("letter", "")
+                title = p.get("title", "")
+                cap = p.get("cap")
+                ttk.Button(self._preset_row2, text=label, style="Dark.TButton",
+                           command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c)
+                           ).pack(side=tk.LEFT, padx=2)
+            ttk.Button(self._preset_row2, text="Clear Custom", style="Dark.TButton",
+                       command=self._clear_custom_presets
+                       ).pack(side=tk.RIGHT, padx=2)
+
+    def _save_role_as_preset(self, slot):
+        """Save the current role slot's configuration as a custom preset."""
+        letter = slot["letter_var"].get().strip()
+        title = slot["title_var"].get().strip()
+        if not letter or not title:
+            return
+        cap_str = slot["cap_var"].get().strip()
+        cap = int(cap_str) if cap_str.isdigit() else None
+
+        # Build label: letter-Title or letter-Title-cap
+        label = f"{letter.upper()}-{title}"
+        if cap is not None:
+            label += f"-{cap}"
+
+        # Check for duplicates and limit
+        custom = self.config.get("custom_role_presets", [])
+        if len(custom) >= self._MAX_CUSTOM_PRESETS:
+            return  # At limit
+        for p in custom:
+            if p.get("label") == label:
+                return  # Already exists
+        for dlabel, _, _, _ in self._default_presets:
+            if dlabel == label:
+                return  # Matches a default
+
+        custom.append({"label": label, "letter": letter, "title": title, "cap": cap})
+        self.config["custom_role_presets"] = custom
+        self._save_config()
+        self._rebuild_preset_buttons()
+
+    def _clear_custom_presets(self):
+        """Remove all custom presets."""
+        self.config["custom_role_presets"] = []
+        self._save_config()
+        self._rebuild_preset_buttons()
+
     def _add_role_preset(self, letter: str, title: str, cap: int | None):
         """Add a pre-configured role slot, auto-numbering if duplicates exist."""
         # Count existing slots with the same base title
@@ -3193,6 +3613,12 @@ class FCToolGUI:
 
         top_row = tk.Frame(slot_frame, bg=BG_PANEL)
         top_row.pack(fill=tk.X, padx=6, pady=(4, 1))
+
+        # Collapse toggle
+        expanded_var = tk.BooleanVar(value=True)
+        arrow_label = tk.Label(top_row, text="\u25BC", font=("Consolas", 10),
+                                fg=FG_ACCENT, bg=BG_PANEL, cursor="hand2")
+        arrow_label.pack(side=tk.LEFT, padx=(0, 4))
 
         tk.Label(top_row, text="Key:", font=("Consolas", 8),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 2))
@@ -3260,6 +3686,8 @@ class FCToolGUI:
                    command=remove_slot).pack(side=tk.RIGHT, padx=1)
         ttk.Button(top_row, text="Clear", style="Dark.TButton",
                    command=lambda: self._clear_role_slot(slot)).pack(side=tk.RIGHT, padx=1)
+        ttk.Button(top_row, text="Save Preset", style="Dark.TButton",
+                   command=lambda: self._save_role_as_preset(slot)).pack(side=tk.RIGHT, padx=1)
 
         def copy_people():
             title = slot["title_var"].get() or slot["letter_var"].get().upper()
@@ -3276,6 +3704,18 @@ class FCToolGUI:
         people_frame = tk.Frame(slot_frame, bg=BG_PANEL)
         people_frame.pack(fill=tk.X, padx=8, pady=(0, 3))
 
+        def toggle_collapse(event=None):
+            if expanded_var.get():
+                people_frame.pack_forget()
+                arrow_label.config(text="\u25B6")
+                expanded_var.set(False)
+            else:
+                people_frame.pack(fill=tk.X, padx=8, pady=(0, 3))
+                arrow_label.config(text="\u25BC")
+                expanded_var.set(True)
+
+        arrow_label.bind("<Button-1>", toggle_collapse)
+
         slot = {
             "frame": slot_frame,
             "letter_var": letter_var,
@@ -3283,6 +3723,8 @@ class FCToolGUI:
             "cap_var": cap_var,
             "cap_enabled_var": cap_enabled_var,
             "people_frame": people_frame,
+            "expanded_var": expanded_var,
+            "arrow_label": arrow_label,
             "people": {},  # sender -> {"timestamp": dt, "note_var": StringVar, "row": Frame}
             "count_label": count_label,
         }
@@ -3362,11 +3804,20 @@ class FCToolGUI:
             self.root.after(30000, self._refresh_fleet_locations)
             return
 
+        # Track consecutive "no fleet" results so transient ESI errors don't
+        # wipe state. Only clear after N consecutive misses (~3 min at 60s backoff).
+        if not hasattr(self, "_no_fleet_misses"):
+            self._no_fleet_misses = 0
+        NO_FLEET_GRACE = 3
+
         def do_fetch():
             try:
+                fleet_id = self.esi_auth.get_fleet_id()
                 # Single ESI call for fleet members
-                members = self.esi_auth.get_fleet_members()
+                members = self.esi_auth.get_fleet_members() if fleet_id else None
                 if members:
+                    # Got a real fleet — reset miss counter
+                    self._no_fleet_misses = 0
                     # Derive locations (pass pre-fetched members to avoid duplicate call)
                     locations = self.esi_auth.get_fleet_member_locations(members=members)
                     if locations:
@@ -3382,9 +3833,42 @@ class FCToolGUI:
 
                     self.root.after(0, self._update_fleet_composition, ship_counts, total)
                     self.root.after(0, self._update_specialized_roles, members, ship_counts, total)
+
+                    # Enrich member records with names for loss tracker.
+                    # Pre-compute is_tackle here (BG thread) to avoid ESI calls
+                    # blocking the main thread in loss_tracker.update().
+                    from zkill_monitor import resolve_name
+                    from ship_classes import is_tackle
+                    enriched = []
+                    for m in members:
+                        char_id = m.get("character_id", 0)
+                        stid = m.get("ship_type_id", 0)
+                        sys_id = m.get("solar_system_id", 0)
+                        enriched.append({
+                            "character_id": char_id,
+                            "character_name": resolve_name(char_id, "character") if char_id else "",
+                            "ship_type_id": stid,
+                            "ship_name": resolve_name(stid, "type") if stid else "",
+                            "solar_system_id": sys_id,
+                            "system_name": resolve_name(sys_id, "solar_system") if sys_id else "",
+                            "station_id": m.get("station_id"),
+                            "structure_id": m.get("structure_id"),
+                            "role": m.get("role", ""),
+                            "is_tackle": is_tackle(stid) if stid else False,
+                        })
+                    self.root.after(0, self._process_loss_tracking, fleet_id, enriched)
                 else:
-                    self.root.after(0, self._update_fleet_composition, {}, 0)
-                    # Not in fleet — use longer backoff to reduce ESI 404 spam
+                    # No fleet data this poll — could be genuine (not in fleet)
+                    # OR a transient ESI error. Only clear state after
+                    # NO_FLEET_GRACE consecutive misses to avoid flicker.
+                    self._no_fleet_misses += 1
+                    if self._no_fleet_misses >= NO_FLEET_GRACE:
+                        self.root.after(0, self._update_fleet_composition, {}, 0)
+                        self.root.after(0, self._process_loss_tracking, None, [])
+                    else:
+                        print(f"[Fleet] No fleet data (miss {self._no_fleet_misses}/"
+                              f"{NO_FLEET_GRACE}) — keeping previous state")
+                    # Use longer backoff to reduce ESI 404 spam
                     self.root.after(60000, self._refresh_fleet_locations)
                     return
             except Exception as e:
@@ -3423,6 +3907,114 @@ class FCToolGUI:
             self.root.after(15000, self._refresh_current_system)
 
         threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _build_status_bar_menu(self, parent):
+        """Build the overflow settings gear for the status bar."""
+        gear_btn = tk.Label(parent, text="\u2699", font=("Consolas", 14),
+                             fg=FG_DIM, bg=BG_PANEL, cursor="hand2", padx=10, pady=4)
+        gear_btn.pack(side=tk.RIGHT)
+
+        def show_menu(event=None):
+            menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                           activebackground=FG_ACCENT, activeforeground=BG_DARK)
+            menu.add_command(label="Reset Losses", command=self._reset_loss_tracker)
+            menu.add_separator()
+            menu.add_command(label="Test Audio Alert",
+                             command=lambda: tts_helper.speak(
+                                 "Ten percent of fleet lost"))
+            try:
+                x = gear_btn.winfo_rootx()
+                y = gear_btn.winfo_rooty() + gear_btn.winfo_height()
+                menu.tk_popup(x, y)
+            finally:
+                menu.grab_release()
+
+        gear_btn.bind("<Button-1>", show_menu)
+
+    def _reset_loss_tracker(self):
+        """Manually reset the fleet loss tracker."""
+        self._loss_tracker.reset()
+        if hasattr(self, "_loss_status_label"):
+            self._loss_status_label.config(
+                text="Losses: (reset — waiting for next poll)", fg=FG_DIM
+            )
+        self._append_xup_log("[Loss Tracker] Reset\n", "info")
+
+    def _process_loss_tracking(self, fleet_id, members: list[dict]):
+        """Update the loss tracker and fire UI + audio alerts on threshold cross."""
+        # Reset on fleet change
+        self._loss_tracker.set_fleet_id(fleet_id)
+
+        new_deaths, highest_threshold, fc_docked = self._loss_tracker.update(members)
+
+        # Update UI display
+        if hasattr(self, "_loss_status_label"):
+            pct = self._loss_tracker.loss_percentage
+            relevant = self._loss_tracker.relevant_deaths_count
+            total_deaths = self._loss_tracker.deaths_count
+            baseline = self._loss_tracker.initial_size
+            mode = self._loss_tracker.mode
+            mode_label = "Mainline Fleet" if mode == "main" else "Support Fleet"
+
+            if baseline > 0:
+                color = FG_GREEN
+                if pct >= 50:
+                    color = FG_RED
+                elif pct >= 25:
+                    color = FG_ORANGE
+                elif pct >= 10:
+                    color = FG_YELLOW
+                # In main mode: show relevant (major) deaths, plus tackle deaths as extra
+                if mode == "main" and total_deaths > relevant:
+                    extra = total_deaths - relevant
+                    text = (f"Losses: {relevant} / {baseline} ({pct:.1f}%) "
+                            f"[{mode_label}] (+{extra} tackle)")
+                else:
+                    text = f"Losses: {relevant} / {baseline} ({pct:.1f}%) [{mode_label}]"
+                self._loss_status_label.config(text=text, fg=color)
+            else:
+                self._loss_status_label.config(
+                    text="Losses: (waiting for fleet)", fg=FG_DIM
+                )
+
+        # Log individual deaths (tackle deaths tagged differently)
+        for death in new_deaths:
+            loc = f" in {death.system_name}" if death.system_name else ""
+            ship = f" ({death.ship_name})" if death.ship_name else ""
+            was_tackle = getattr(death, "_was_tackle", False)
+            if was_tackle and self._loss_tracker.mode == "main":
+                self._append_xup_log(
+                    f"[LOSS-tackle] {death.character_name}{ship}{loc}\n", "dim"
+                )
+            else:
+                self._append_xup_log(
+                    f"[LOSS] {death.character_name}{ship}{loc}\n", "fire"
+                )
+
+        # Fire notification for the highest threshold crossed (if any)
+        if highest_threshold is not None:
+            pct_int = int(highest_threshold * 100)
+            lost = self._loss_tracker.deaths_count
+            total = self._loss_tracker.initial_size
+            suffix = " (FC docked — suppressed)" if fc_docked else ""
+            self._append_xup_log(
+                f"\n>>> FLEET LOSS: {pct_int}% ({lost}/{total}){suffix} <<<\n\n",
+                "fire",
+            )
+            # Flash window and play audio only if FC is NOT docked
+            # (FC docked = fleet likely over, pod transitions are ship swaps)
+            if not fc_docked:
+                self._flash_title(0)
+                if self._loss_audio_enabled:
+                    if highest_threshold == 0.10:
+                        phrase = "Ten percent of fleet lost"
+                    elif highest_threshold == 0.25:
+                        phrase = "Twenty five percent of fleet lost"
+                    elif highest_threshold == 0.50:
+                        phrase = "Fifty percent of fleet lost"
+                    else:
+                        phrase = f"{pct_int} percent of fleet lost"
+                    tts_helper.speak(phrase)
 
     def _apply_fleet_locations(self, locations: dict[str, tuple[str, str, str]]):
         """Update location labels for all role tracker members."""
@@ -3464,16 +4056,31 @@ class FCToolGUI:
         for slot in self._role_slots:
             self._clear_role_slot(slot)
 
+    def _set_all_roles_collapsed(self, collapsed: bool):
+        """Expand or collapse all role slots at once."""
+        for slot in self._role_slots:
+            expanded = slot.get("expanded_var")
+            people_frame = slot.get("people_frame")
+            arrow = slot.get("arrow_label")
+            if expanded is None or people_frame is None or arrow is None:
+                continue
+            if collapsed and expanded.get():
+                people_frame.pack_forget()
+                arrow.config(text="\u25B6")
+                expanded.set(False)
+            elif not collapsed and not expanded.get():
+                people_frame.pack(fill=tk.X, padx=8, pady=(0, 3))
+                arrow.config(text="\u25BC")
+                expanded.set(True)
+
     def _take_screenshot(self):
-        """Capture window screenshot and upload to imgur."""
+        """Capture window screenshot and save to clipboard."""
         self._screenshot_link.config(text="Capturing...", fg=FG_DIM)
         self.root.update_idletasks()
 
-        def do_upload():
+        def do_capture():
             try:
                 import subprocess
-                import tempfile
-                import base64
 
                 # Capture the window using the window's geometry
                 x = self.root.winfo_rootx()
@@ -3481,9 +4088,7 @@ class FCToolGUI:
                 w = self.root.winfo_width()
                 h = self.root.winfo_height()
 
-                tmp = os.path.join(tempfile.gettempdir(), "fctool_screenshot.png")
-
-                # Use PowerShell to capture screen region
+                # Use PowerShell to capture screen region and copy to clipboard
                 ps_script = f'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -3491,56 +4096,26 @@ $bmp = New-Object System.Drawing.Bitmap({w}, {h})
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen({x}, {y}, 0, 0, $bmp.Size)
 $g.Dispose()
-$bmp.Save("{tmp.replace(chr(92), '/')}")
+[System.Windows.Forms.Clipboard]::SetImage($bmp)
 $bmp.Dispose()
 '''
-                subprocess.run(["powershell", "-Command", ps_script],
-                               capture_output=True, timeout=10)
-
-                if not os.path.exists(tmp):
-                    self.root.after(0, self._screenshot_link.config,
-                                   {"text": "Capture failed", "fg": FG_RED})
-                    return
-
-                # Read and base64-encode for imgur
-                with open(tmp, "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("utf-8")
-
-                # Upload to imgur (anonymous, no API key needed for client_id)
-                resp = requests.post(
-                    "https://api.imgur.com/3/image",
-                    headers={"Authorization": "Client-ID 546c25a59c58ad7"},
-                    data={"image": img_data, "type": "base64"},
-                    timeout=30,
+                result = subprocess.run(
+                    ["powershell", "-STA", "-Command", ps_script],
+                    capture_output=True, timeout=10,
                 )
 
-                os.remove(tmp)
-
-                if resp.ok:
-                    link = resp.json().get("data", {}).get("link", "")
-                    self._screenshot_url = link
+                if result.returncode == 0:
                     self.root.after(0, self._screenshot_link.config,
-                                   {"text": link, "fg": FG_ACCENT})
+                                   {"text": "Saved to clipboard!", "fg": FG_GREEN})
                 else:
+                    err = result.stderr.decode(errors='replace').strip()[:80]
                     self.root.after(0, self._screenshot_link.config,
-                                   {"text": f"Upload failed ({resp.status_code})", "fg": FG_RED})
+                                   {"text": f"Capture failed: {err}", "fg": FG_RED})
             except Exception as e:
                 self.root.after(0, self._screenshot_link.config,
                                {"text": f"Error: {e}", "fg": FG_RED})
 
-        threading.Thread(target=do_upload, daemon=True).start()
-
-    def _open_screenshot_link(self, event=None):
-        """Open the screenshot URL in browser, or clear it."""
-        url = getattr(self, '_screenshot_url', '')
-        if url:
-            import webbrowser
-            webbrowser.open(url)
-
-    def _clear_screenshot(self):
-        """Clear the screenshot link."""
-        self._screenshot_url = ""
-        self._screenshot_link.config(text="")
+        threading.Thread(target=do_capture, daemon=True).start()
 
     def _check_role_letters(self, msg):
         """Check if a chat message matches any role tracker letter.
@@ -3633,23 +4208,20 @@ $bmp.Dispose()
 
         # All K-Space vs filtered mode
         if not self._zkill_watch_all_var.get():
-            # Filtered mode: only show alerts matching config regions+alliances
-            zk_cfg = self.config.get("zkillboard", {})
-            watch_regions = set(zk_cfg.get("watch_regions", []))
-            watch_alliances = set(zk_cfg.get("watch_alliances", []))
-            watch_systems = set(zk_cfg.get("watch_systems", []))
-            # Check system filter
+            # Filtered mode: independent region + affiliation filters
+            active_regions, active_alliances = self._get_active_zkill_filters()
+            watch_systems = set(self.config.get("zkillboard", {}).get("watch_systems", []))
+
+            # Explicitly watched systems always pass
             if watch_systems and alert.system_id in watch_systems:
-                pass  # Explicitly watched system, always show
-            elif watch_regions or watch_alliances:
-                region_ok = not watch_regions or (alert.region_id in watch_regions)
-                alliance_ok = not watch_alliances or bool(
-                    alert.alliances_involved & watch_alliances)
-                if watch_regions and watch_alliances:
-                    if not (region_ok and alliance_ok):
-                        return
-                elif not region_ok and not alliance_ok:
-                    return
+                pass
+            else:
+                # Independent logic: show if region matches OR alliance matches
+                region_ok = alert.region_id in active_regions if active_regions else False
+                alliance_ok = bool(alert.alliances_involved & active_alliances) if active_alliances else False
+
+                if not region_ok and not alliance_ok:
+                    return  # Matches neither filter
 
         # Proximity filter
         try:
@@ -4218,6 +4790,18 @@ $bmp.Dispose()
         w.see("1.0")
         w.config(state=tk.DISABLED)
 
+    def _clear_zkill_log(self):
+        """Clear the zKillboard intel pane."""
+        self._zkill_log.config(state=tk.NORMAL)
+        self._zkill_log.delete("1.0", tk.END)
+        self._zkill_log.config(state=tk.DISABLED)
+
+    def _clear_intel_log(self):
+        """Clear the Intel Channels pane."""
+        self._intel_log.config(state=tk.NORMAL)
+        self._intel_log.delete("1.0", tk.END)
+        self._intel_log.config(state=tk.DISABLED)
+
     def _append_zkill_log(self, text, tag=None):
         w = self._current_log or self._zkill_log
         w.config(state=tk.NORMAL)
@@ -4254,19 +4838,22 @@ $bmp.Dispose()
         self._range_detail_label.config(text="")
         self.root.update_idletasks()
 
-        # Secondary check systems (defaults + user-added)
-        _default_systems = [
+        # Friendly staging systems (defaults + user-added)
+        _friendly_defaults = [
             "6RCQ-V", "F7C-H0", "CL6-ZG", "HPS5-C",
-            "Korasen", "Y-2ANO", "NOL-M9",
+            "Korasen", "Y-2ANO", "NOL-M9", "O-BDXB",
         ]
-        # Merge defaults + custom, deduplicate, exclude the destination itself
-        seen = set()
-        secondary_systems = []
-        for s in _default_systems + self._range_custom_systems:
+        seen_f = set()
+        friendly_systems = []
+        for s in _friendly_defaults + self._range_custom_systems:
             s_lower = s.lower()
-            if s_lower not in seen and s.lower() != dest.lower():
-                seen.add(s_lower)
-                secondary_systems.append(s)
+            if s_lower not in seen_f and s_lower != dest.lower():
+                seen_f.add(s_lower)
+                friendly_systems.append(s)
+
+        # Hostile staging systems
+        _hostile_defaults = ["B-9C24", "RD-G2R"]
+        hostile_systems = [s for s in _hostile_defaults if s.lower() != dest.lower()]
 
         def do_check():
             try:
@@ -4286,37 +4873,31 @@ $bmp.Dispose()
                     result["origin_region"] = ""
                     result["dest_region"] = ""
 
-                # Always check secondary systems for range checks
                 # Range thresholds at JDC 5
                 titan_range = JumpRangeChecker("Titan", jdc_level=5).jump_range
                 capital_range = JumpRangeChecker("Dreadnought", jdc_level=5).jump_range
                 blops_range = JumpRangeChecker("Black Ops", jdc_level=5).jump_range
                 dest_id = result.get("destination_id")
-                secondary_results = []
-                print(f"[JumpRange] Secondary check: dest_id={dest_id}, titan={titan_range}, cap={capital_range}, blops={blops_range}")
-                if dest_id:
-                    # Pre-resolve all system IDs sequentially (disk cache after first run)
+
+                def _compute_range_list(systems_list):
+                    """Compute range results for a list of systems."""
+                    results_list = []
+                    if not dest_id:
+                        return results_list
                     sec_ids = {}
-                    for sys_name in secondary_systems:
+                    for sys_name in systems_list:
                         sid = search_system(sys_name)
-                        print(f"[JumpRange]   Resolved {sys_name} -> {sid}")
                         if sid:
                             sec_ids[sys_name] = sid
                             get_system_info(sid)
-                    dest_info = get_system_info(dest_id)
-                    print(f"[JumpRange]   Dest info has position: {bool(dest_info and dest_info.get('position'))}")
+                    get_system_info(dest_id)
                     save_route_cache()
-
-                    # Calculate distances (pure math, no API calls)
-                    # Also compute ansiblex jump distance from staging
                     staging = self._get_staging_system()
                     staging_id = search_system(staging) if staging else None
-                    for sys_name in secondary_systems:
+                    for sys_name in systems_list:
                         sid = sec_ids.get(sys_name)
                         if sid:
                             dist = calculate_ly_distance(sid, dest_id)
-                            print(f"[JumpRange]   {sys_name} ({sid}) -> dest: {dist} LY")
-                            # Gate jumps from staging (with ansiblex)
                             gate_jumps = None
                             if staging_id and conns:
                                 from jump_range import get_stargate_route
@@ -4324,7 +4905,7 @@ $bmp.Dispose()
                                 if route:
                                     gate_jumps = len(route) - 1
                             if dist is not None:
-                                secondary_results.append({
+                                results_list.append({
                                     "system": sys_name,
                                     "in_titan_range": dist <= titan_range,
                                     "in_capital_range": dist <= capital_range,
@@ -4332,8 +4913,10 @@ $bmp.Dispose()
                                     "distance_ly": round(dist, 2),
                                     "jumps_from_staging": gate_jumps,
                                 })
-                print(f"[JumpRange] Secondary results: {len(secondary_results)} entries")
-                result["secondary"] = secondary_results
+                    return results_list
+
+                result["secondary"] = _compute_range_list(friendly_systems)
+                result["hostile"] = _compute_range_list(hostile_systems)
 
                 save_route_cache()
                 self.root.after(0, self._show_range_result, result)
@@ -4423,58 +5006,80 @@ $bmp.Dispose()
             details += f"   |   Gate jumps: {result['gate_jumps']}"
         self._range_detail_label.config(text=details, fg=FG_TEXT)
 
-        # Show secondary range check table
-        secondary = result.get("secondary", [])
-        if secondary:
-            tk.Label(
-                self._range_secondary_frame,
-                text=f"Range Check to {result['destination']}:",
-                font=("Consolas", 11, "bold"), fg=FG_ACCENT, bg=BG_DARK,
-            ).pack(anchor=tk.W, pady=(5, 3))
+        # Show friendly range check table
+        friendly = result.get("secondary", [])
+        if friendly:
+            self._render_range_table(
+                result["destination"], friendly,
+                title_suffix="(Friendly)", title_color=FG_GREEN,
+                cross_ref=True,
+            )
 
-            table = tk.Frame(self._range_secondary_frame, bg=BG_DARK)
-            table.pack(anchor=tk.W, padx=10)
+        # Show hostile range check table
+        hostile = result.get("hostile", [])
+        if hostile:
+            self._render_range_table(
+                result["destination"], hostile,
+                title_suffix="(Hostile)", title_color=FG_RED,
+                cross_ref=False, show_jumps=False,
+            )
 
-            # Header row
+    def _render_range_table(self, destination: str, entries: list[dict],
+                            title_suffix: str = "", title_color: str = FG_ACCENT,
+                            cross_ref: bool = False, show_jumps: bool = True):
+        """Render a secondary range check table into the secondary frame."""
+        parent = self._range_secondary_frame
+
+        title = f"Range Check to {destination}"
+        if title_suffix:
+            title += f" {title_suffix}"
+        tk.Label(parent, text=title,
+                 font=("Consolas", 11, "bold"), fg=title_color, bg=BG_DARK,
+                 ).pack(anchor=tk.W, pady=(5, 3))
+
+        table = tk.Frame(parent, bg=BG_DARK)
+        table.pack(anchor=tk.W, padx=10)
+
+        # Header row
+        col = 0
+        tk.Label(table, text="System", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_DARK, width=14, anchor=tk.W
+                 ).grid(row=0, column=col, padx=(0, 10)); col += 1
+        if show_jumps:
+            tk.Label(table, text="Jumps from Staging", font=("Consolas", 10, "bold"),
+                     fg=FG_DIM, bg=BG_DARK, width=18, anchor=tk.W
+                     ).grid(row=0, column=col, padx=(0, 10)); col += 1
+        tk.Label(table, text="Titan (6 LY)", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_DARK, anchor=tk.W
+                 ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
+        tk.Label(table, text="Capital (7 LY)", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_DARK, anchor=tk.W
+                 ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
+        tk.Label(table, text="Blops (8 LY)", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_DARK, anchor=tk.W
+                 ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
+        tk.Label(table, text="Distance", font=("Consolas", 10, "bold"),
+                 fg=FG_DIM, bg=BG_DARK, width=10, anchor=tk.W
+                 ).grid(row=0, column=col)
+
+        for i, sr in enumerate(entries, 1):
             col = 0
-            tk.Label(table, text="System", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, width=14, anchor=tk.W
-                     ).grid(row=0, column=col, padx=(0, 10)); col += 1
-            tk.Label(table, text="Jumps", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, width=6, anchor=tk.W
-                     ).grid(row=0, column=col, padx=(0, 10)); col += 1
-            tk.Label(table, text="Titan (6 LY)", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, anchor=tk.W
-                     ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
-            tk.Label(table, text="Capital (7 LY)", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, anchor=tk.W
-                     ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
-            tk.Label(table, text="Blops (8 LY)", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, anchor=tk.W
-                     ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
-            tk.Label(table, text="Distance", font=("Consolas", 10, "bold"),
-                     fg=FG_DIM, bg=BG_DARK, width=10, anchor=tk.W
-                     ).grid(row=0, column=col)
+            sys_label = tk.Label(table, text=sr["system"],
+                     font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                     width=14, anchor=tk.W, cursor="hand2")
+            sys_label.grid(row=i, column=col, padx=(0, 10)); col += 1
+            sys_name = sr["system"]
+            menu = tk.Menu(sys_label, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                           activebackground=FG_ACCENT, activeforeground=BG_DARK)
+            menu.add_command(label=f"Set destination: {sys_name}",
+                             command=lambda n=sys_name: self._set_destination_or_copy(n))
+            menu.add_command(label=f"Copy \"{sys_name}\"",
+                             command=lambda n=sys_name: (self.root.clipboard_clear(), self.root.clipboard_append(n)))
+            sys_label.bind("<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
+            sys_label.bind("<Button-1>", lambda e, n=sys_name: self._set_destination_or_copy(n))
 
-            for i, sr in enumerate(secondary, 1):
-                col = 0
-                sys_label = tk.Label(table, text=sr["system"],
-                         font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-                         width=14, anchor=tk.W, cursor="hand2")
-                sys_label.grid(row=i, column=col, padx=(0, 10)); col += 1
-                # Right-click context menu
-                sys_name = sr["system"]
-                menu = tk.Menu(sys_label, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
-                               activebackground=FG_ACCENT, activeforeground=BG_DARK)
-                menu.add_command(label=f"Set destination: {sys_name}",
-                                 command=lambda n=sys_name: self._set_destination_or_copy(n))
-                menu.add_command(label=f"Copy \"{sys_name}\"",
-                                 command=lambda n=sys_name: (self.root.clipboard_clear(), self.root.clipboard_append(n)))
-                sys_label.bind("<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
-                # Left-click sets destination or copies
-                sys_label.bind("<Button-1>", lambda e, n=sys_name: self._set_destination_or_copy(n))
-
-                # Ansiblex jumps from staging
+            # Jumps from staging (friendly only)
+            if show_jumps:
                 jumps = sr.get("jumps_from_staging")
                 jumps_text = str(jumps) if jumps is not None else "?"
                 tk.Label(table, text=jumps_text,
@@ -4482,32 +5087,36 @@ $bmp.Dispose()
                          width=6, anchor=tk.W
                          ).grid(row=i, column=col, padx=(0, 10)); col += 1
 
-                # Titan range column — cross-ref with character capabilities
-                titan_chars = self._find_chars_with_cap_at("titans", sys_name) if sr["in_titan_range"] else []
-                self._place_range_cell(
-                    table, i, col, sr["in_titan_range"], titan_chars, padx=(0, 6)
-                ); col += 1
+            # Titan range — cross-ref with character capabilities (friendly only)
+            titan_chars = (self._find_chars_with_cap_at("titans", sys_name)
+                           if cross_ref and sr["in_titan_range"] else [])
+            self._place_range_cell(
+                table, i, col, sr["in_titan_range"], titan_chars, padx=(0, 6)
+            ); col += 1
 
-                # Capital range column — cross-ref dreads + fax
+            # Capital range — cross-ref dreads + fax
+            cap_caps = []
+            if cross_ref and sr["in_capital_range"]:
                 cap_caps = (self._find_chars_with_cap_at("dreads", sys_name)
-                            + self._find_chars_with_cap_at("fax", sys_name)) if sr["in_capital_range"] else []
-                cap_caps = list(dict.fromkeys(cap_caps))  # dedupe preserving order
-                self._place_range_cell(
-                    table, i, col, sr["in_capital_range"], cap_caps, padx=(0, 6)
-                ); col += 1
+                            + self._find_chars_with_cap_at("fax", sys_name))
+                cap_caps = list(dict.fromkeys(cap_caps))
+            self._place_range_cell(
+                table, i, col, sr["in_capital_range"], cap_caps, padx=(0, 6)
+            ); col += 1
 
-                # Blops range column — cross-ref blops
-                blops_chars = self._find_chars_with_cap_at("blops", sys_name) if sr["in_blops_range"] else []
-                self._place_range_cell(
-                    table, i, col, sr["in_blops_range"], blops_chars, padx=(0, 10)
-                ); col += 1
+            # Blops range — cross-ref blops
+            blops_chars = (self._find_chars_with_cap_at("blops", sys_name)
+                           if cross_ref and sr["in_blops_range"] else [])
+            self._place_range_cell(
+                table, i, col, sr["in_blops_range"], blops_chars, padx=(0, 10)
+            ); col += 1
 
-                dist = sr["distance_ly"]
-                dist_text = f"{dist:.1f} LY" if dist is not None else "N/A"
-                tk.Label(table, text=dist_text,
-                         font=("Consolas", 10), fg=FG_DIM, bg=BG_DARK,
-                         width=10, anchor=tk.W
-                         ).grid(row=i, column=col)
+            dist = sr["distance_ly"]
+            dist_text = f"{dist:.1f} LY" if dist is not None else "N/A"
+            tk.Label(table, text=dist_text,
+                     font=("Consolas", 10), fg=FG_DIM, bg=BG_DARK,
+                     width=10, anchor=tk.W
+                     ).grid(row=i, column=col)
 
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
