@@ -150,13 +150,21 @@ class FCToolGUI:
                 client_secret=esi_cfg.get("client_secret", ""),
                 callback_url=esi_cfg.get("callback_url", "http://localhost:8834/callback"),
             )
-        # Primary character: match tracked_character name, or use first account
+        # Primary character: saved primary_character_id first,
+        # then tracked_character name, then first account available.
+        primary_id = self.config.get("primary_character_id")
         tracked = self.config.get("tracked_character", "")
         self.esi_auth = None
-        for acct in self.esi_accounts:
-            if tracked and acct.character_name == tracked:
-                self.esi_auth = acct
-                break
+        if primary_id:
+            for acct in self.esi_accounts:
+                if acct.character_id == primary_id:
+                    self.esi_auth = acct
+                    break
+        if not self.esi_auth and tracked:
+            for acct in self.esi_accounts:
+                if acct.character_name == tracked:
+                    self.esi_auth = acct
+                    break
         if not self.esi_auth and self.esi_accounts:
             self.esi_auth = self.esi_accounts[0]
 
@@ -583,9 +591,53 @@ class FCToolGUI:
                                           fg=FG_GREEN, bg=BG_DARK)
         self._screenshot_link.pack(side=tk.RIGHT, padx=5)
 
-        # Role tracker container (scrollable)
-        self._role_container = tk.Frame(tab, bg=BG_DARK)
-        self._role_container.pack(fill=tk.X, padx=10, pady=2)
+        # Role tracker container — bounded height so it never displaces
+        # Fleet Composition / Specialized Roles below. Scrolls if roles overflow.
+        # Uses a 2-column grid when role count crosses the threshold.
+        self._ROLE_2COL_THRESHOLD = 3
+        self._ROLE_AREA_MAX_HEIGHT = 300  # pixels
+
+        role_outer = tk.Frame(tab, bg=BG_DARK, height=self._ROLE_AREA_MAX_HEIGHT)
+        role_outer.pack(fill=tk.X, padx=10, pady=2)
+        role_outer.pack_propagate(False)  # Respect height even if empty
+
+        self._role_canvas = tk.Canvas(role_outer, bg=BG_DARK, highlightthickness=0)
+        role_scrollbar = ttk.Scrollbar(
+            role_outer, orient=tk.VERTICAL, command=self._role_canvas.yview,
+        )
+        self._role_container = tk.Frame(self._role_canvas, bg=BG_DARK)
+        self._role_container.bind(
+            "<Configure>",
+            lambda e: self._role_canvas.configure(
+                scrollregion=self._role_canvas.bbox("all")
+            ),
+        )
+        self._role_canvas_window = self._role_canvas.create_window(
+            (0, 0), window=self._role_container, anchor=tk.NW,
+        )
+        # Keep inner frame width equal to canvas width so grid columns expand
+        self._role_canvas.bind(
+            "<Configure>",
+            lambda e: self._role_canvas.itemconfig(
+                self._role_canvas_window, width=e.width
+            ),
+        )
+        self._role_canvas.configure(yscrollcommand=role_scrollbar.set)
+        self._role_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        role_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Configure 2 columns with equal weight for grid layout
+        self._role_container.grid_columnconfigure(0, weight=1, uniform="role")
+        self._role_container.grid_columnconfigure(1, weight=1, uniform="role")
+
+        # Mouse wheel scrolling when hovering the role area
+        def _on_role_mousewheel(event):
+            self._role_canvas.yview_scroll(-int(event.delta / 120), "units")
+        self._role_canvas.bind("<Enter>", lambda e: self._role_canvas.bind_all(
+            "<MouseWheel>", _on_role_mousewheel))
+        self._role_canvas.bind("<Leave>", lambda e: self._role_canvas.unbind_all(
+            "<MouseWheel>"))
+
         self._role_slots: list[dict] = []
 
         # ── Fleet Loss Tracker (inline in status bar) ────────────────────────
@@ -1003,7 +1055,10 @@ class FCToolGUI:
                                                 bg=BG_ENTRY, fg=FG_WHITE,
                                                 insertbackground=FG_WHITE, width=20,
                                                 borderwidth=1, relief=tk.RIDGE)
-        self._range_origin.pack(side=tk.LEFT, padx=(10, 20))
+        self._range_origin.pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Button(row1, text="Current", style="Dark.TButton",
+                   command=lambda: self._set_origin_to_current_system(self._range_origin)
+                   ).pack(side=tk.LEFT, padx=(0, 20))
 
         tk.Label(row1, text="Destination:", font=("Consolas", 11),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
@@ -1148,7 +1203,10 @@ class FCToolGUI:
                                              bg=BG_ENTRY, fg=FG_WHITE,
                                              insertbackground=FG_WHITE, width=20,
                                              borderwidth=1, relief=tk.RIDGE)
-        self._wh_origin.pack(side=tk.LEFT, padx=(10, 20))
+        self._wh_origin.pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Button(row1, text="Current", style="Dark.TButton",
+                   command=lambda: self._set_origin_to_current_system(self._wh_origin)
+                   ).pack(side=tk.LEFT, padx=(0, 20))
 
         tk.Label(row1, text="Destination:", font=("Consolas", 11),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
@@ -1959,8 +2017,110 @@ class FCToolGUI:
     def _esi_set_primary(self, acct: ESIAuth):
         """Set a character as the primary ESI account."""
         self.esi_auth = acct
+        # Persist so the choice survives app restarts
+        if acct.character_id:
+            self.config["primary_character_id"] = acct.character_id
+            self._save_config()
+
+        # Immediately reflect the switch in the UI (don't wait for next poll)
         self._rebuild_esi_char_list()
         self._update_esi_status()
+
+        # Show pending state right away
+        if hasattr(self, "_current_system_display"):
+            name = acct.character_name or "..."
+            self._current_system_display.config(
+                text=f"System: (switching to {name}...)", fg=FG_DIM,
+            )
+
+        # Trigger one-off refreshes using the NEW primary character
+        self._fetch_current_system_once()
+
+        # Reset loss tracker — new FC = new fleet context
+        try:
+            self._loss_tracker.reset()
+        except Exception:
+            pass
+
+        # Flush fleet polling miss counter and force a fresh poll
+        self._no_fleet_misses = 0
+        self.root.after(100, self._refresh_fleet_locations)
+
+    def _set_origin_to_current_system(self, entry_widget):
+        """Fill an origin field (Jump Range or Navigation) with the primary
+        character's current system. Uses cached system name when fresh;
+        falls back to a one-off ESI fetch otherwise."""
+        # Prefer in-memory value populated by the periodic refresh
+        current = getattr(self, "_current_system_name", "")
+        if current:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, current)
+            return
+
+        # No cached value — fetch directly (background thread)
+        if not self.esi_auth or not self.esi_auth.is_authenticated:
+            return
+        target_auth = self.esi_auth
+
+        def do_fetch():
+            try:
+                loc = target_auth.get_location()
+                if not loc:
+                    return
+                sys_id = loc.get("solar_system_id")
+                if not sys_id:
+                    return
+                sys_info = get_system_info(sys_id)
+                sys_name = sys_info.get("name", "") if sys_info else ""
+                if sys_name:
+                    def apply():
+                        try:
+                            entry_widget.delete(0, tk.END)
+                            entry_widget.insert(0, sys_name)
+                        except tk.TclError:
+                            pass
+                    self.root.after(0, apply)
+            except Exception as e:
+                print(f"[CurrentSystem] Fetch error: {e}")
+
+        threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _fetch_current_system_once(self):
+        """One-shot fetch of the primary character's location — no rescheduling.
+        Used for immediate refresh after primary switch."""
+        if not self.esi_auth or not self.esi_auth.is_authenticated:
+            return
+
+        # Capture the currently-primary account locally so we can detect
+        # if the user switches again before this fetch returns.
+        target_auth = self.esi_auth
+
+        def do_fetch():
+            try:
+                loc = target_auth.get_location()
+                if loc:
+                    sys_id = loc.get("solar_system_id")
+                    if sys_id:
+                        sys_info = get_system_info(sys_id)
+                        sys_name = sys_info.get("name", "???") if sys_info else "???"
+                        region_name = ""
+                        if sys_info:
+                            region_name = target_auth._get_region_name(sys_info)
+                        # Drop stale result if user switched primary again
+                        if self.esi_auth is not target_auth:
+                            return
+                        self._current_system_name = sys_name
+                        self._current_system_region = region_name
+                        region_str = f" ({region_name})" if region_name else ""
+                        self.root.after(
+                            0,
+                            self._current_system_display.config,
+                            {"text": f"System: {sys_name}{region_str}",
+                             "fg": FG_GREEN},
+                        )
+            except Exception as e:
+                print(f"[Primary Switch] Location fetch error: {e}")
+        threading.Thread(target=do_fetch, daemon=True).start()
 
     def _esi_disconnect(self, acct: ESIAuth):
         """Disconnect a specific ESI character."""
@@ -1969,15 +2129,30 @@ class FCToolGUI:
             self.esi_accounts.remove(acct)
         if self.esi_auth is acct:
             self.esi_auth = self.esi_accounts[0] if self.esi_accounts else None
+            # Persist the new primary choice
+            if self.esi_auth and self.esi_auth.character_id:
+                self.config["primary_character_id"] = self.esi_auth.character_id
+            else:
+                self.config.pop("primary_character_id", None)
+            self._save_config()
+            # Immediately refresh the current system display
+            if self.esi_auth:
+                self._fetch_current_system_once()
+            elif hasattr(self, "_current_system_display"):
+                self._current_system_display.config(text="System: --", fg=FG_DIM)
         self._rebuild_esi_char_list()
         self._update_esi_status()
-        # Remove just the disconnected panel
+        # Remove just the disconnected panel, then relayout the grid
         if hasattr(self, '_char_tab_content'):
+            removed = False
             for p in list(self._char_panels):
                 if p._acct is acct:
                     p.destroy()
                     self._char_panels.remove(p)
+                    removed = True
                     break
+            if removed:
+                self._apply_char_filter()
 
     def _esi_login(self):
         """Start EVE SSO login flow for a new character."""
@@ -2206,16 +2381,39 @@ class FCToolGUI:
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
-        canvas.create_window((0, 0), window=self._char_tab_content, anchor=tk.NW)
+        # Store the window id so we can resize it on canvas <Configure>
+        self._char_canvas = canvas
+        self._char_canvas_window = canvas.create_window(
+            (0, 0), window=self._char_tab_content, anchor=tk.NW,
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Resize the content frame to match the canvas width so the grid
+        # inside redistributes horizontally instead of cards being cut off.
+        # Also updates wraplength on capability labels via _on_char_canvas_resize.
+        canvas.bind("<Configure>", self._on_char_canvas_resize)
+
         # Mousewheel scrolling
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"),
                         add="+")
 
         self._char_panels: list[tk.Frame] = []
+        # Instance-level caches (moved from class-level; see C1 fix)
+        # Structure:
+        #   _asset_cache: {character_id: (monotonic_ts, wall_ts, cap_data_dict)}
+        #   _location_cache: {location_id: (monotonic_ts, system_name, region_name)}
+        self._asset_cache: dict = {}
+        self._location_cache: dict = {}
+        self._char_last_refresh_wall: float = 0.0  # For "last refresh: Xs ago"
+
+        # Two-column grid for character cards (switches to 1 col if only 1 char)
+        self._CHAR_2COL_THRESHOLD = 2
+        self._char_tab_content.grid_columnconfigure(0, weight=1, uniform="char")
+        self._char_tab_content.grid_columnconfigure(1, weight=1, uniform="char")
+
         self._load_char_disk_cache()
         self._populate_character_panels()
 
@@ -2229,79 +2427,140 @@ class FCToolGUI:
             tk.Label(self._char_tab_content,
                      text="No characters connected.\nGo to Settings to add characters via EVE SSO.",
                      font=("Consolas", 11), fg=FG_DIM, bg=BG_DARK,
-                     justify=tk.CENTER).pack(pady=50)
+                     justify=tk.CENTER
+                     ).grid(row=0, column=0, columnspan=2, pady=50)
             return
 
         for acct in self.esi_accounts:
             self._add_character_panel(acct)
 
-        # Apply cached data immediately so panels don't show "loading..."
+        # Apply cached data immediately so panels don't show "loading...".
+        # Cache tuple = (monotonic_ts, wall_ts, cap_data). Route through
+        # the shared _update_panel_display helper so the cached-render path
+        # and the live-ESI render path produce the same header layout —
+        # previously the cached path stuffed a long "[cached Xs ago,
+        # refreshing…]" suffix into loc_label, which in 2-column grid
+        # mode overflowed the card width and caused the system name to
+        # appear clipped/overlapped by the character name.
         for panel in self._char_panels:
             acct = panel._acct
             char_id = acct.character_id or 0
             cached = self._asset_cache.get(char_id)
             if cached:
-                _, cap_data = cached
-                info = {"system": "...", "region": "", "ship": "...", "ship_type_id": 0,
-                        "fax": cap_data.get("fax", []), "dreads": cap_data.get("dreads", []),
-                        "blops": cap_data.get("blops", []), "titans": cap_data.get("titans", []),
-                        "cyno": False, "dictor": False}
+                _mono, wall_ts, cap_data = cached
+                # Rehydrate full info dict from disk-cached state so cyno,
+                # dictor, current ship, etc. all show immediately (B5 fix)
+                info = self._info_from_cap_data(cap_data)
                 panel._info = info
-                panel._loc_label.config(text="  —  cached, refreshing...", fg=FG_DIM)
-                self._render_capabilities(panel, info)
+                age_str = self._format_cache_age(wall_ts)
+                self._update_panel_display(panel, info, cached_age_str=age_str)
+
+        # Lay out the grid
+        self._relayout_character_panels(self._char_panels)
+
+    def _info_from_cap_data(self, cap_data: dict) -> dict:
+        """Build an info dict from cached cap_data. Provides default values
+        for fields that may not be present (older cache format)."""
+        return {
+            "system": cap_data.get("system", "???"),
+            "region": cap_data.get("region", ""),
+            "ship": cap_data.get("ship", "???"),
+            "ship_type_id": cap_data.get("ship_type_id", 0),
+            "ship_item_id": 0,
+            "fax": cap_data.get("fax", []),
+            "dreads": cap_data.get("dreads", []),
+            "blops": cap_data.get("blops", []),
+            "titans": cap_data.get("titans", []),
+            "cyno": cap_data.get("cyno", False),
+            "cyno_ozone": cap_data.get("cyno_ozone", 0),
+            "cyno_low": cap_data.get("cyno_low", False),
+            "dictor": cap_data.get("dictor", False),
+        }
+
+    @staticmethod
+    def _format_cache_age(wall_ts: float) -> str:
+        """Format a wall-clock cache age as 'Xs ago', 'Xm ago', or 'Xh ago'."""
+        if not wall_ts:
+            return "unknown age"
+        delta = max(0, int(time.time() - wall_ts))
+        if delta < 60:
+            return f"{delta}s ago"
+        if delta < 3600:
+            return f"{delta // 60}m ago"
+        if delta < 86400:
+            return f"{delta // 3600}h ago"
+        return f"{delta // 86400}d ago"
 
     def _refresh_character_tab(self, force: bool = False):
         """Refresh all character panels with ESI data (runs in background).
-        Skips if refreshed within the last 60 seconds unless force=True."""
+        Skips if refreshed within the last 60 seconds unless force=True.
+        force=True also bypasses the asset cache TTL so a full re-poll happens."""
         if not self.esi_accounts:
             self._populate_character_panels()
             return
 
         # Cooldown — don't re-poll if recently refreshed (unless forced)
-        now = time.time()
-        last = getattr(self, '_char_last_refresh', 0)
-        if not force and (now - last) < 60:
+        now_mono = time.monotonic()
+        last_mono = getattr(self, '_char_last_refresh_mono', 0)
+        if not force and (now_mono - last_mono) < 60:
             return
-        self._char_last_refresh = now
+        self._char_last_refresh_mono = now_mono
 
         # Sync panels with accounts without destroying existing ones
         self._sync_character_panels()
 
-        self._char_refresh_status.config(text="Refreshing...", fg=FG_YELLOW)
+        self._char_refresh_status.config(text="Refreshing…", fg=FG_YELLOW)
         self._char_refresh_btn.config(state=tk.DISABLED)
+        # Snapshot panels so we don't race with _esi_disconnect
+        target_panels = list(self._char_panels)
+
+        # Tell _fetch_character_info to bypass TTL on forced refreshes
+        self._char_force_refresh = force
 
         def do_refresh():
             results = []
-            for panel in self._char_panels:
+            had_errors = False
+            for panel in target_panels:
                 acct = panel._acct
-                info = self._fetch_character_info(acct)
-                results.append((panel, info))
-            self.root.after(0, self._apply_character_refresh, results)
+                try:
+                    info = self._fetch_character_info(acct)
+                    results.append((panel, info, None))
+                except Exception as e:
+                    had_errors = True
+                    results.append((panel, None, str(e)))
+            self._char_force_refresh = False
+            self.root.after(0, self._apply_character_refresh, results, had_errors)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _sync_character_panels(self):
         """Add panels for new accounts, remove panels for disconnected ones,
         without touching existing panels."""
+        changed = False
         # Remove panels for accounts no longer connected
-        existing_accts = {p._acct for p in self._char_panels}
         for panel in list(self._char_panels):
             if panel._acct not in self.esi_accounts:
                 panel.destroy()
                 self._char_panels.remove(panel)
+                changed = True
 
         # Add panels for newly connected accounts
         panel_accts = {p._acct for p in self._char_panels}
         for acct in self.esi_accounts:
             if acct not in panel_accts:
                 self._add_character_panel(acct)
+                changed = True
+
+        if changed:
+            # Re-apply current filter (which handles the grid layout)
+            self._apply_char_filter()
 
     def _add_character_panel(self, acct: ESIAuth):
         """Add a single character panel to the tab."""
         panel = tk.Frame(self._char_tab_content, bg=BG_PANEL, bd=1,
                          relief=tk.RIDGE, highlightbackground=BORDER_COLOR,
                          highlightthickness=1)
-        panel.pack(fill=tk.X, padx=5, pady=3)
+        # Grid position is assigned by _relayout_character_panels
 
         header = tk.Frame(panel, bg=BG_PANEL, cursor="hand2")
         header.pack(fill=tk.X, padx=10, pady=(5, 2))
@@ -2317,6 +2576,15 @@ class FCToolGUI:
         )
         arrow_label.pack(side=tk.LEFT, padx=(0, 5))
         panel._arrow = arrow_label
+
+        # Star marker for "active in filtered ship" (U3) — hidden by default,
+        # shown via _set_panel_active_marker when a filter highlights this panel
+        star_label = tk.Label(
+            header, text="\u2605", font=("Consolas", 12, "bold"),
+            fg=FG_GREEN, bg=BG_PANEL,
+        )
+        # Don't pack yet — only appears when active under a filter
+        panel._star = star_label
 
         name_label = tk.Label(
             header, text=f"{name}{primary_tag}",
@@ -2365,64 +2633,126 @@ class FCToolGUI:
             panel = self._char_panels[-1]
 
         def do_refresh():
-            info = self._fetch_character_info(acct)
-            self.root.after(0, self._apply_single_refresh, panel, info)
+            try:
+                info = self._fetch_character_info(acct)
+                self.root.after(0, self._apply_single_refresh, panel, info)
+            except Exception as e:
+                print(f"[Characters] Single-refresh error for "
+                      f"{acct.character_name}: {e}")
+                def show_err():
+                    if self._panel_alive(panel):
+                        panel._loc_label.config(
+                            text=f"  —  ⚠ ESI error: {e}", fg=FG_RED,
+                        )
+                self.root.after(0, show_err)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
     def _apply_single_refresh(self, panel, info: dict):
-        """Apply refresh data to a single panel."""
+        """Apply refresh data to a single panel. B1 guard + B7 unify:
+        shares display logic with full refresh, and always reapplies the
+        active filter so newly-added characters get filtered correctly."""
+        if not self._panel_alive(panel):
+            return
         panel._info = info
-        region_str = f" ({info['region']})" if info.get("region") else ""
-        loc_text = f"  —  {info['system']}{region_str}  —  {info['ship']}"
-        panel._loc_label.config(text=loc_text, fg=FG_TEXT)
-        self._render_capabilities(panel, info)
+        self._update_panel_display(panel, info)
         self._update_filter_regions()
+        self._apply_char_filter()  # B7 — keep filter consistent
         self._save_char_disk_cache()
 
-    # Asset cache: {character_id: (timestamp, cap_data_dict)}
-    _asset_cache: dict[int, tuple[float, dict]] = {}
-    _ASSET_CACHE_TTL = 600  # 10 minutes
+    # Constants (class-level = fine, they're immutable)
+    _ASSET_CACHE_TTL = 600  # 10 minutes (monotonic)
+    _LOCATION_CACHE_TTL = 3600  # 1 hour (monotonic)
     _CHAR_CACHE_FILE = os.path.join(app_dir(), "char_cache.json")
 
-    @classmethod
-    def _load_char_disk_cache(cls):
-        """Load character asset cache from disk for instant startup."""
+    def _load_char_disk_cache(self):
+        """Load character asset cache from disk for instant startup.
+        Wall-clock timestamps are loaded; monotonic-time is reset to 0 so
+        cached data always appears 'expired' for TTL purposes (forces a
+        background refresh) but still renders in the UI immediately."""
         try:
-            if os.path.exists(cls._CHAR_CACHE_FILE):
-                with open(cls._CHAR_CACHE_FILE) as f:
+            if os.path.exists(self._CHAR_CACHE_FILE):
+                with open(self._CHAR_CACHE_FILE) as f:
                     data = json.load(f)
                 for char_id_str, entry in data.get("assets", {}).items():
                     char_id = int(char_id_str)
-                    ts = entry.get("ts", 0)
+                    wall_ts = entry.get("ts", 0)  # wall-clock only
                     cap_data = entry.get("data", {})
-                    cls._asset_cache[char_id] = (ts, cap_data)
+                    # Monotonic=0 means "never cached in this session" — next
+                    # fetch will trigger a real ESI pull (no stale-forever risk)
+                    self._asset_cache[char_id] = (0.0, wall_ts, cap_data)
                 for loc_id_str, loc in data.get("locations", {}).items():
                     loc_id = int(loc_id_str)
-                    cls._location_cache[loc_id] = (loc[0], loc[1])
-                print(f"[Characters] Loaded disk cache: {len(cls._asset_cache)} chars, "
-                      f"{len(cls._location_cache)} locations")
+                    # Accept both old 2-tuple and new 3-tuple entries
+                    if len(loc) >= 2:
+                        self._location_cache[loc_id] = (0.0, loc[0], loc[1])
+                print(f"[Characters] Loaded disk cache: {len(self._asset_cache)} chars, "
+                      f"{len(self._location_cache)} locations")
         except Exception as e:
             print(f"[Characters] Error loading disk cache: {e}")
 
-    @classmethod
-    def _save_char_disk_cache(cls):
+    def _save_char_disk_cache(self):
         """Save character asset cache to disk."""
         try:
             data = {
                 "assets": {
-                    str(cid): {"ts": ts, "data": cap_data}
-                    for cid, (ts, cap_data) in cls._asset_cache.items()
+                    str(cid): {"ts": wall_ts, "data": cap_data}
+                    for cid, (_mono, wall_ts, cap_data) in self._asset_cache.items()
                 },
                 "locations": {
-                    str(lid): list(loc)
-                    for lid, loc in cls._location_cache.items()
+                    str(lid): [name, region]
+                    for lid, (_mono, name, region) in self._location_cache.items()
                 },
             }
-            with open(cls._CHAR_CACHE_FILE, "w") as f:
+            with open(self._CHAR_CACHE_FILE, "w") as f:
                 json.dump(data, f)
         except Exception as e:
             print(f"[Characters] Error saving disk cache: {e}")
+
+    def _on_char_canvas_resize(self, event):
+        """Resize the scrollable content frame + all capability text to
+        match the current canvas width so cards don't get cut off on
+        narrower windows."""
+        # Resize the window inside the canvas to match canvas width
+        try:
+            self._char_canvas.itemconfig(self._char_canvas_window, width=event.width)
+        except Exception:
+            return
+
+        # Determine wraplength: 2-col mode splits width, minus padding/margins
+        panel_count = len(self._char_panels)
+        two_col = panel_count >= getattr(self, "_CHAR_2COL_THRESHOLD", 2)
+        # Leave ~40px for card chrome (border, label column, padding)
+        per_card = (event.width // 2) if two_col else event.width
+        wrap = max(200, per_card - 80)
+
+        # Apply new wraplength to every rendered capability text label
+        for panel in self._char_panels:
+            try:
+                cap_frame = getattr(panel, "_cap_frame", None)
+                if not cap_frame:
+                    continue
+                for row in cap_frame.winfo_children():
+                    for child in row.winfo_children():
+                        if isinstance(child, tk.Label):
+                            try:
+                                # Only adjust labels that already have wraplength
+                                if int(child.cget("wraplength") or 0) > 0:
+                                    child.config(wraplength=wrap)
+                            except tk.TclError:
+                                pass
+            except tk.TclError:
+                pass
+
+    def _panel_alive(self, panel) -> bool:
+        """True if the panel still exists and is in our tracked list.
+        Used to guard root.after callbacks against disconnected accounts."""
+        if panel not in self._char_panels:
+            return False
+        try:
+            return bool(panel.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _fetch_character_info(self, acct: ESIAuth) -> dict:
         """Fetch location, ship, and capital assets for a character.
@@ -2480,10 +2810,15 @@ class FCToolGUI:
 
         # Capital ship assets — use cache (10 min TTL) to avoid frequent polling
         char_id = acct.character_id or 0
-        now = time.time()
+        now_mono = time.monotonic()
         cached = self._asset_cache.get(char_id)
-        if cached and (now - cached[0]) < self._ASSET_CACHE_TTL:
-            cap_data = cached[1]
+        # Cache entries are (monotonic_ts, wall_ts, cap_data)
+        # Fresh = cached AND within TTL (monotonic-time)
+        # force_refresh bypasses the TTL
+        force_refresh = getattr(self, "_char_force_refresh", False)
+        if (cached and not force_refresh
+                and (now_mono - cached[0]) < self._ASSET_CACHE_TTL):
+            cap_data = cached[2]
             for k in ("fax", "dreads", "blops", "titans"):
                 info[k] = cap_data.get(k, [])
             # Cyno verification from cached fitting check (per active ship)
@@ -2593,15 +2928,21 @@ class FCToolGUI:
                 deduped.append(e)
             info[cat_key] = deduped
 
-        # Cache the asset results (including cyno fitting check)
+        # Cache the asset results (including cyno fitting check + ship state
+        # so startup-from-disk-cache shows honest data — see B5 fix)
         cap_data = {k: info[k] for k in ("fax", "dreads", "blops", "titans")}
         cap_data["cyno_check"] = cyno_check_data
-        self._asset_cache[char_id] = (now, cap_data)
+        cap_data["ship_type_id"] = info["ship_type_id"]
+        cap_data["ship"] = info["ship"]
+        cap_data["system"] = info["system"]
+        cap_data["region"] = info["region"]
+        cap_data["cyno"] = info["cyno"]
+        cap_data["cyno_ozone"] = info["cyno_ozone"]
+        cap_data["cyno_low"] = info["cyno_low"]
+        cap_data["dictor"] = info["dictor"]
+        self._asset_cache[char_id] = (time.monotonic(), time.time(), cap_data)
 
         return info
-
-    # Location resolution cache shared across all characters and refreshes
-    _location_cache: dict[int, tuple[str, str]] = {}
 
     def _batch_resolve_asset_systems(self, acct: ESIAuth,
                                        capital_assets: list[dict],
@@ -2634,19 +2975,31 @@ class FCToolGUI:
                 loc_type = parent.get("location_type", "")
 
             resolved_locs[item_id] = (loc_id, loc_type)
-            if loc_id not in self._location_cache:
+            # _location_cache entries are (monotonic_ts, system_name, region_name)
+            # Consider stale after _LOCATION_CACHE_TTL (1 hour) so renamed
+            # structures eventually refresh (B8 fix).
+            cached_loc = self._location_cache.get(loc_id)
+            now_mono = time.monotonic()
+            if (cached_loc is None
+                    or (now_mono - cached_loc[0]) > self._LOCATION_CACHE_TTL):
                 unique_locs[loc_id] = loc_type
 
-        # Second pass: resolve only uncached locations
+        # Second pass: resolve only uncached/expired locations
         for loc_id, loc_type in unique_locs.items():
             sys_name, region_name = self._resolve_single_location(
                 acct, loc_id, loc_type
             )
-            self._location_cache[loc_id] = (sys_name, region_name)
+            self._location_cache[loc_id] = (
+                time.monotonic(), sys_name, region_name,
+            )
 
-        # Build result from cache
+        # Build result from cache ((_mono, sys, region) → (sys, region))
         for item_id, (loc_id, _) in resolved_locs.items():
-            result[item_id] = self._location_cache.get(loc_id, (str(loc_id), ""))
+            entry = self._location_cache.get(loc_id)
+            if entry:
+                result[item_id] = (entry[1], entry[2])
+            else:
+                result[item_id] = (str(loc_id), "")
 
         return result
 
@@ -2729,35 +3082,105 @@ class FCToolGUI:
 
         return str(location_id), ""
 
-    def _apply_character_refresh(self, results: list):
+    def _apply_character_refresh(self, results: list, had_errors: bool = False):
         """Apply fetched character data to the panels (runs on main thread)."""
-        # Store results for filtering
         self._char_refresh_data = results
 
-        for panel, info in results:
-            panel._info = info  # Store for filter reapply
-            # Update location/ship label
-            region_str = f" ({info['region']})" if info.get("region") else ""
-            loc_text = f"  —  {info['system']}{region_str}  —  {info['ship']}"
-            panel._loc_label.config(text=loc_text, fg=FG_TEXT)
-
-            self._render_capabilities(panel, info)
+        for item in results:
+            # Tuple shape: (panel, info_or_None, error_or_None)
+            panel, info, err = item
+            # B1: skip panels that were destroyed (account disconnected)
+            if not self._panel_alive(panel):
+                continue
+            if info is None:
+                # ESI fetch failed — show error state (U1/B6)
+                panel._info = getattr(panel, "_info", None) or {}
+                panel._loc_label.config(
+                    text=f"  —  ⚠ ESI error: {err or 'fetch failed'}", fg=FG_RED,
+                )
+                # Keep any existing capabilities rendered (don't blank)
+                continue
+            panel._info = info
+            self._update_panel_display(panel, info)
 
         # Update region dropdown based on current capability filter
         self._update_filter_regions()
         self._apply_char_filter()
 
-        self._char_refresh_status.config(text="Refreshed", fg=FG_GREEN)
+        self._char_last_refresh_wall = time.time()
+        self._update_refresh_status(had_errors=had_errors)
         self._char_refresh_btn.config(state=tk.NORMAL)
 
         # Persist cache to disk for fast startup next time
         self._save_char_disk_cache()
+
+    def _update_panel_display(self, panel, info: dict,
+                              cached_age_str: str = ""):
+        """Unified display updater for a single panel (used by both
+        full-refresh and single-character refresh paths — B7 fix).
+
+        If cached_age_str is non-empty, the panel renders in the dimmed
+        "cached, awaiting refresh" style. Both paths produce the SAME
+        loc_label text shape so the header layout matches between cached
+        and live renders (prevents the system name from being clipped /
+        overlapped by the character name in narrow 2-column mode)."""
+        if not self._panel_alive(panel):
+            return
+        region_str = f" ({info['region']})" if info.get("region") else ""
+        loc_text = f"  —  {info['system']}{region_str}  —  {info['ship']}"
+        if cached_age_str:
+            # Compact suffix so the header stays the same shape as the
+            # live render — detailed "refreshing…" state is already shown
+            # by the tab-level _char_refresh_status label.
+            loc_text += f"  [cached {cached_age_str}]"
+            panel._loc_label.config(text=loc_text, fg=FG_DIM)
+        else:
+            panel._loc_label.config(text=loc_text, fg=FG_TEXT)
+        self._render_capabilities(panel, info)
+
+    def _update_refresh_status(self, had_errors: bool = False):
+        """Update the 'Last refresh: Xs ago' status label (U2)."""
+        if not hasattr(self, "_char_refresh_status"):
+            return
+        wall_ts = getattr(self, "_char_last_refresh_wall", 0)
+        if wall_ts:
+            age = self._format_cache_age(wall_ts)
+            if had_errors:
+                self._char_refresh_status.config(
+                    text=f"Last refresh: {age} ⚠ some errors", fg=FG_ORANGE,
+                )
+            else:
+                self._char_refresh_status.config(
+                    text=f"Last refresh: {age}", fg=FG_GREEN,
+                )
+        else:
+            self._char_refresh_status.config(text="", fg=FG_DIM)
+        # Schedule a repeat update so the "Xs ago" stays current
+        if hasattr(self, "_refresh_status_after_id"):
+            try:
+                self.root.after_cancel(self._refresh_status_after_id)
+            except Exception:
+                pass
+        self._refresh_status_after_id = self.root.after(
+            15000, lambda: self._update_refresh_status(had_errors=had_errors),
+        )
 
     def _render_capabilities(self, panel, info: dict, only_cap: str = ""):
         """Render capability rows in a panel's cap_frame.
         If only_cap is set (e.g. 'fax'), only show that capability."""
         for w in panel._cap_frame.winfo_children():
             w.destroy()
+
+        # Compute a wraplength that fits the current canvas / card width
+        try:
+            canvas_w = self._char_canvas.winfo_width() if hasattr(self, "_char_canvas") else 0
+        except tk.TclError:
+            canvas_w = 0
+        if canvas_w < 100:  # Not yet rendered — use a reasonable default
+            canvas_w = 1100
+        two_col = len(self._char_panels) >= getattr(self, "_CHAR_2COL_THRESHOLD", 2)
+        per_card = (canvas_w // 2) if two_col else canvas_w
+        wraplen = max(200, per_card - 80)
 
         all_caps = [
             ("fax", "FAX:", info.get("fax", [])),
@@ -2784,8 +3207,8 @@ class FCToolGUI:
             )
             tk.Label(row, text=display,
                      font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
-                     anchor=tk.W, wraplength=700, justify=tk.LEFT,
-                     ).pack(side=tk.LEFT, padx=(5, 0))
+                     anchor=tk.W, wraplength=wraplen, justify=tk.LEFT,
+                     ).pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
 
         # Cyno capability (current ship is Force Recon with cyno fitted + ozone)
         if info.get("cyno") and (not only_cap or only_cap == "cyno"):
@@ -2902,35 +3325,131 @@ class FCToolGUI:
                     return True
             return False
 
+    def _is_char_active_in_cap(self, info: dict, cap_key: str) -> bool:
+        """True if the character is CURRENTLY flying a ship matching the filter.
+        (Their current ship type matches, not just something in their hangar.)"""
+        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS
+        ship_tid = info.get("ship_type_id", 0)
+        if not ship_tid:
+            return False
+        if cap_key == "cyno":
+            return bool(info.get("cyno"))
+        if cap_key == "hic/dictor":
+            return bool(info.get("dictor"))
+        if cap_key == "fax":
+            return ship_tid in FAX
+        if cap_key == "dreads":
+            return ship_tid in DREADNOUGHTS
+        if cap_key == "blops":
+            return ship_tid in BLACK_OPS
+        if cap_key == "titans":
+            return ship_tid in TITANS
+        return False
+
+    def _set_panel_highlight(self, panel, active: bool):
+        """Apply/remove 'active ship' highlight on a character panel."""
+        if active:
+            panel.config(highlightbackground=FG_GREEN, highlightthickness=2)
+        else:
+            panel.config(highlightbackground=BORDER_COLOR, highlightthickness=1)
+        # Toggle the star marker next to the name (U3)
+        star = getattr(panel, "_star", None)
+        if star is not None:
+            try:
+                if active:
+                    # Pack before the arrow → appears at the very left
+                    star.pack(side=tk.LEFT, padx=(0, 4), before=panel._arrow)
+                else:
+                    star.pack_forget()
+            except tk.TclError:
+                pass
+
+    def _relayout_character_panels(self, visible_panels: list, active_set=None):
+        """Arrange character panels in the 2-column grid.
+        visible_panels is the ordered list of panels to show (active first).
+        Hidden panels (not in the list) are grid-removed.
+        active_set (optional): set of panels to mark with active highlight."""
+        active_set = active_set or set()
+
+        # Hide everything first
+        for panel in self._char_panels:
+            try:
+                panel.grid_forget()
+            except tk.TclError:
+                pass
+
+        # With only 1 character, use single column; otherwise 2
+        use_two_cols = len(visible_panels) >= self._CHAR_2COL_THRESHOLD
+
+        for i, panel in enumerate(visible_panels):
+            if not self._panel_alive(panel):
+                continue
+            if use_two_cols:
+                row, col = divmod(i, 2)
+                # Span both columns if this is the last odd-indexed item
+                if (i == len(visible_panels) - 1
+                        and len(visible_panels) % 2 == 1):
+                    panel.grid(row=row, column=0, columnspan=2,
+                               sticky="nsew", padx=4, pady=3)
+                else:
+                    panel.grid(row=row, column=col,
+                               sticky="nsew", padx=4, pady=3)
+            else:
+                panel.grid(row=i, column=0, columnspan=2,
+                           sticky="nsew", padx=4, pady=3)
+            # Apply active highlight state
+            self._set_panel_highlight(panel, panel in active_set)
+
+        # Clear highlight + star on hidden panels
+        visible_set = set(visible_panels)
+        for panel in self._char_panels:
+            if panel not in visible_set:
+                self._set_panel_highlight(panel, False)
+
     def _apply_char_filter(self):
-        """Show/hide character panels based on filter selections."""
+        """Show/hide character panels based on filter selections.
+        Characters actively flying a matching ship are highlighted and
+        pinned to the top of the list."""
         cap = self._char_filter_cap_var.get()
         region = self._char_filter_region_var.get()
 
         if not cap:
-            # No filter — show all, render all capabilities
+            # No filter — show all in original order, no highlights
             for panel in self._char_panels:
-                panel.pack(fill=tk.X, padx=5, pady=5)
                 info = getattr(panel, '_info', None)
                 if info:
                     self._render_capabilities(panel, info)
+            self._relayout_character_panels(self._char_panels, active_set=set())
             self._char_filter_count_label.config(text="")
             return
 
         cap_key = cap.lower()
-        visible = 0
+
+        # Separate matching panels into "active in ship" vs "otherwise matching"
+        active_panels = []
+        passive_panels = []
         for panel in self._char_panels:
             info = getattr(panel, '_info', None)
-            if info and self._char_matches_filter(info, cap_key, region):
-                panel.pack(fill=tk.X, padx=5, pady=5)
-                # Re-render showing only the filtered capability
-                self._render_capabilities(panel, info, only_cap=cap_key)
-                visible += 1
+            if not info or not self._char_matches_filter(info, cap_key, region):
+                continue
+            if self._is_char_active_in_cap(info, cap_key):
+                active_panels.append(panel)
             else:
-                panel.pack_forget()
+                passive_panels.append(panel)
+
+        # Render capability content for every visible panel first
+        for panel in active_panels + passive_panels:
+            self._render_capabilities(panel, getattr(panel, '_info', {}),
+                                       only_cap=cap_key)
+
+        # Lay out active first, then passive; active ones get the highlight
+        visible = active_panels + passive_panels
+        self._relayout_character_panels(visible, active_set=set(active_panels))
 
         total = len(self._char_panels)
-        label = f"{visible}/{total} characters"
+        label = f"{len(visible)}/{total} characters"
+        if active_panels:
+            label += f"  ({len(active_panels)} active)"
         if region:
             label += f" in {region}"
         self._char_filter_count_label.config(text=label, fg=FG_ACCENT)
@@ -2985,7 +3504,14 @@ class FCToolGUI:
         self._char_var = tk.StringVar(value=self.config.get("tracked_character", ""))
         self._char_combo = ttk.Combobox(char_frame, textvariable=self._char_var,
                                          font=("Consolas", 10), width=25)
+        # Populate from cache so dropdown is ready on startup (no manual scan needed)
+        cached_chars = self.config.get("cached_tracked_characters", [])
+        if cached_chars:
+            self._char_combo["values"] = [""] + cached_chars
         self._char_combo.pack(side=tk.LEFT, padx=5)
+        # Apply character change instantly — no need to hit "Save Settings"
+        self._char_combo.bind("<<ComboboxSelected>>",
+                               lambda e: self._on_tracked_character_change())
         ttk.Button(char_frame, text="Scan Characters", style="Dark.TButton",
                    command=self._scan_characters).pack(side=tk.LEFT, padx=5)
         tk.Label(char_frame, text="(blank = all accounts)",
@@ -3131,8 +3657,37 @@ class FCToolGUI:
         if path:
             self._logs_path_var.set(path)
 
+    def _on_tracked_character_change(self):
+        """Apply tracked character change instantly — restart chat monitor
+        so the new listener_filter takes effect without a full settings save."""
+        new_tracked = self._char_var.get().strip()
+        old_tracked = self.config.get("tracked_character", "")
+        if new_tracked == old_tracked:
+            return
+
+        self.config["tracked_character"] = new_tracked
+        self._save_config()
+
+        # Recreate the chat monitor with the new listener_filter
+        logs_path = self.config.get("eve_logs_path", "")
+        if logs_path and os.path.isdir(logs_path):
+            channel = self.config.get("xup", {}).get("channel_name", "Fleet")
+            tracked_char = new_tracked or None
+            # Replace existing chat monitor in-place so _chat_poll_loop keeps working
+            self.chat_monitor = ChatMonitor(
+                logs_path=logs_path,
+                poll_interval=self.config.get("poll_interval_seconds", 1.0),
+                channel_filter=channel,
+                listener_filter=tracked_char,
+            )
+            self.chat_monitor.on_message(self._on_chat_message)
+            char_label = f" ({tracked_char})" if tracked_char else ""
+            self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
+
     def _scan_characters(self):
-        """Scan log files to find all character names that have fleet channels."""
+        """Scan log files to find all character names that have fleet channels.
+        Results are cached in config.json so the dropdown stays populated
+        across app restarts without requiring another scan."""
         logs_path = self._logs_path_var.get()
         if not logs_path or not os.path.isdir(logs_path):
             return
@@ -3141,6 +3696,9 @@ class FCToolGUI:
         listeners = temp_monitor.get_available_listeners()
         if listeners:
             self._char_combo["values"] = [""] + listeners
+            # Cache for next startup
+            self.config["cached_tracked_characters"] = listeners
+            self._save_config()
         else:
             self._char_combo["values"] = [""]
 
@@ -3609,7 +4167,7 @@ class FCToolGUI:
         """Add a new role tracking slot (letter + title + optional cap + per-person notes)."""
         slot_frame = tk.Frame(self._role_container, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                highlightbackground=BORDER_COLOR, highlightthickness=1)
-        slot_frame.pack(fill=tk.X, pady=2)
+        # Grid position is assigned by _relayout_role_slots (called at end)
 
         top_row = tk.Frame(slot_frame, bg=BG_PANEL)
         top_row.pack(fill=tk.X, padx=6, pady=(4, 1))
@@ -3633,10 +4191,11 @@ class FCToolGUI:
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 2))
         title_var = tk.StringVar(value=title)
         tk.Entry(top_row, textvariable=title_var,
-                 font=("Consolas", 10), width=18,
+                 font=("Consolas", 10), width=14,
                  bg=BG_ENTRY, fg=FG_WHITE,
                  insertbackground=FG_WHITE,
-                 borderwidth=1, relief=tk.RIDGE).pack(side=tk.LEFT, padx=(0, 6))
+                 borderwidth=1, relief=tk.RIDGE).pack(
+                 side=tk.LEFT, padx=(0, 6), fill=tk.X, expand=True)
 
         count_label = tk.Label(top_row, text="0", font=("Consolas", 10, "bold"),
                                 fg=FG_ACCENT, bg=BG_PANEL)
@@ -3681,24 +4240,33 @@ class FCToolGUI:
         def remove_slot():
             slot_frame.destroy()
             self._role_slots = [s for s in self._role_slots if s["frame"] is not slot_frame]
-
-        ttk.Button(top_row, text="X", style="Red.TButton",
-                   command=remove_slot).pack(side=tk.RIGHT, padx=1)
-        ttk.Button(top_row, text="Clear", style="Dark.TButton",
-                   command=lambda: self._clear_role_slot(slot)).pack(side=tk.RIGHT, padx=1)
-        ttk.Button(top_row, text="Save Preset", style="Dark.TButton",
-                   command=lambda: self._save_role_as_preset(slot)).pack(side=tk.RIGHT, padx=1)
+            self._relayout_role_slots()
 
         def copy_people():
-            title = slot["title_var"].get() or slot["letter_var"].get().upper()
+            title_txt = slot["title_var"].get() or slot["letter_var"].get().upper()
             names = "\n".join(sorted(slot["people"].keys()))
             if names:
                 self.root.clipboard_clear()
-                self.root.clipboard_append(f"{title}:\n{names}")
+                self.root.clipboard_append(f"{title_txt}:\n{names}")
                 self.root.update()
 
-        ttk.Button(top_row, text="Copy", style="Dark.TButton",
-                   command=copy_people).pack(side=tk.RIGHT, padx=1)
+        # Button row — on its own line so buttons stay visible/readable
+        # regardless of whether the card is in 1- or 2-column layout.
+        button_row = tk.Frame(slot_frame, bg=BG_PANEL)
+        button_row.pack(fill=tk.X, padx=6, pady=(0, 3))
+
+        # Delete button packed FIRST on the right so it always claims its
+        # space even when the card is narrow (2-column layout).
+        ttk.Button(button_row, text="X", style="Red.TButton", width=2,
+                   command=remove_slot).pack(side=tk.RIGHT, padx=1)
+        ttk.Button(button_row, text="Copy", style="Dark.TButton", width=5,
+                   command=copy_people).pack(side=tk.LEFT, padx=1)
+        ttk.Button(button_row, text="Save", style="Dark.TButton", width=5,
+                   command=lambda: self._save_role_as_preset(slot)
+                   ).pack(side=tk.LEFT, padx=1)
+        ttk.Button(button_row, text="Clear", style="Dark.TButton", width=5,
+                   command=lambda: self._clear_role_slot(slot)
+                   ).pack(side=tk.LEFT, padx=1)
 
         # Per-person list: each person gets a row with name + note field
         people_frame = tk.Frame(slot_frame, bg=BG_PANEL)
@@ -3729,6 +4297,29 @@ class FCToolGUI:
             "count_label": count_label,
         }
         self._role_slots.append(slot)
+        self._relayout_role_slots()
+
+    def _relayout_role_slots(self):
+        """Arrange role slots in the grid — 1 column when few slots, 2 when many."""
+        count = len(self._role_slots)
+        use_two_cols = count >= self._ROLE_2COL_THRESHOLD
+
+        for i, slot in enumerate(self._role_slots):
+            frame = slot.get("frame")
+            if not frame:
+                continue
+            if use_two_cols:
+                row, col = divmod(i, 2)
+                # Span 2 columns if last odd slot has no neighbor
+                if i == count - 1 and count % 2 == 1:
+                    frame.grid(row=row, column=0, columnspan=2,
+                               sticky="nsew", padx=2, pady=2)
+                else:
+                    frame.grid(row=row, column=col,
+                               sticky="nsew", padx=2, pady=2)
+            else:
+                frame.grid(row=i, column=0, columnspan=2,
+                           sticky="nsew", padx=2, pady=2)
 
     def _add_person_to_slot(self, slot, sender, timestamp):
         """Add a person row to a role slot with their own note field."""

@@ -37,15 +37,43 @@ DSCAN_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Regex for hostile count: "5+ reds", "10 hostiles", "3 neuts", "+30", "30+", etc.
-# Matches numbers followed by keywords OR standalone numbers with +
+# Regex for hostile count: "5+ reds", "10 hostiles", "3 neuts", etc.
+# Matches numbers followed by an explicit hostile/count keyword.
 COUNT_PATTERN = re.compile(
     r"(\d+)\+?\s*(?:reds?|hostiles?|neuts?|pilots?|in\s+local)", re.IGNORECASE
 )
-# Fallback: bare numbers like "+30" or "30+" not attached to system-name-like tokens
-BARE_COUNT_PATTERN = re.compile(
-    r"(?<![A-Za-z\-])[\+]?(\d+)\+?(?![A-Za-z\-\d])", re.IGNORECASE
+
+# Tier 1: explicit plus-sign count forms — "+5", "5+" — unambiguous in EVE intel.
+# Boundary on the non-'+' side prevents matches inside tokens like "1DQ1-A".
+# The right side of "+5" deliberately allows a trailing letter (e.g. "+5s jita")
+# since the plus already disambiguates; same for the left of "5+".
+EXPLICIT_PLUS_COUNT_PATTERN = re.compile(
+    r"(?<![A-Za-z\-\d])\+(\d+)(?![\-\d])"    # +5, +5s, +30 jita
+    r"|"
+    r"(?<![A-Za-z\-\d])(\d+)\+(?![A-Za-z\-\d])"  # 5+, 30+
 )
+
+# Tier 2: bare integer. Kept for callers that want the raw regex, but the parser
+# gates its use with HOSTILE_CONTEXT_PATTERN so bare digits only count when the
+# message has a hostile-context keyword (avoids matching clock times, ticket
+# numbers, ISK amounts, etc.).
+BARE_COUNT_PATTERN = re.compile(
+    r"(?<![A-Za-z\-\d:#/])(\d+)(?![A-Za-z\-\d:])", re.IGNORECASE
+)
+
+# Hostile-context keywords that license a bare digit as a pilot count.
+# Case-insensitive word-boundary match anywhere in the normalized message.
+HOSTILE_CONTEXT_PATTERN = re.compile(
+    r"\b(?:hostiles?|reds?|neuts?|enem(?:y|ies)|clr|pilots?|dudes?|guys?|gang)\b",
+    re.IGNORECASE,
+)
+
+# How close (in characters, either side) a hostile-context keyword must be to
+# a bare-digit candidate for that digit to be accepted as a pilot count.
+# Tuned so the keyword and digit stay in the same clause: small enough to
+# reject "the reds left, 5 jumps to go" but wide enough to accept
+# "gang of 8" and short adjacency phrases like "clr 5".
+BARE_COUNT_PROXIMITY = 10
 
 # Regex for clear reports
 CLEAR_PATTERN = re.compile(r"\bclr\b|\bclear\b|\bnv\b|\bnvi\b", re.IGNORECASE)
@@ -227,19 +255,40 @@ def parse_intel_message(
         else:
             report.report_type = "hostile"
 
-        # Extract pilot count if mentioned (from remaining text, after system name removed)
+        # Extract pilot count using a three-tier approach:
+        #   1. Keyword-adjacent count (COUNT_PATTERN)  — "5 hostiles", "3 neuts"
+        #   2. Explicit plus-sign form (EXPLICIT_PLUS)  — "+5", "5+"
+        #   3. Bare integer, ONLY if a hostile-context keyword
+        #      (HOSTILE_CONTEXT_PATTERN) is *within BARE_COUNT_PROXIMITY
+        #      characters* of the digit on either side. A whole-message
+        #      gate is too loose — e.g. "the reds left, 5 jumps to go"
+        #      would otherwise produce pilot_count=5. Proximity keeps the
+        #      digit and the licensing keyword in the same clause.
+        # Strip system-name-like tokens first (e.g. "in XY-503") so their
+        # digits aren't mistaken for pilot counts.
+        cleaned = _strip_system_refs(remaining, resolve_system)
+
         count_match = COUNT_PATTERN.search(remaining)
         if count_match:
             report.pilot_count = int(count_match.group(1))
         else:
-            # Fallback: try bare numbers like "+30" or "30+"
-            # Strip any other system-name-like tokens first (e.g. "in XY-503")
-            cleaned = _strip_system_refs(remaining, resolve_system)
-            bare_match = BARE_COUNT_PATTERN.search(cleaned)
-            if bare_match:
-                val = int(bare_match.group(1))
+            plus_match = EXPLICIT_PLUS_COUNT_PATTERN.search(cleaned)
+            if plus_match:
+                val = int(plus_match.group(1) or plus_match.group(2))
                 if val >= 1:
                     report.pilot_count = val
+            else:
+                # Proximity-gated bare-digit tier: accept the first bare
+                # digit whose surrounding window contains a hostile keyword.
+                for bare_match in BARE_COUNT_PATTERN.finditer(cleaned):
+                    window_start = max(0, bare_match.start() - BARE_COUNT_PROXIMITY)
+                    window_end = bare_match.end() + BARE_COUNT_PROXIMITY
+                    window = cleaned[window_start:window_end]
+                    if HOSTILE_CONTEXT_PATTERN.search(window):
+                        val = int(bare_match.group(1))
+                        if val >= 1:
+                            report.pilot_count = val
+                            break
 
     elif report.dscan_url:
         # Has dscan link but no system name identified

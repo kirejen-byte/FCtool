@@ -40,6 +40,12 @@ class _MemberState:
     ship_name: str = ""
     character_name: str = ""
     system_name: str = ""
+    # Pending death: snapshot of the last in-space ship when we first saw
+    # this pilot in a pod, used to require two consecutive in-pod
+    # observations before counting a death (avoids single-poll re-ship
+    # false positives where a dock -> undock-in-pod was missed by sparse
+    # ESI polling). None means "no unconfirmed pod transition".
+    pending_death: "_MemberState | None" = None
 
 
 class FleetLossTracker:
@@ -171,27 +177,50 @@ class FleetLossTracker:
 
             prev = self._states.get(char_id)
 
+            now_in_pod = ship_id in CAPSULE_TYPE_IDS
+            pending_next: _MemberState | None = None
+
             if prev is not None:
                 was_in_ship = (
                     prev.ship_type_id not in CAPSULE_TYPE_IDS
                     and not prev.is_docked
                 )
-                now_in_pod = ship_id in CAPSULE_TYPE_IDS
-                if was_in_ship and now_in_pod:
+                # Confirm a pending death: pilot was in-space in a ship,
+                # then seen in pod, and is STILL in pod (same system, not
+                # docked). Two consecutive in-pod observations => real loss.
+                if (
+                    prev.pending_death is not None
+                    and now_in_pod
+                    and not is_docked
+                    and sys_id == prev.system_id
+                ):
+                    snap = prev.pending_death
                     death = DeathEvent(
                         character_id=char_id,
-                        character_name=m.get("character_name", prev.character_name),
-                        ship_type_id=prev.ship_type_id,
-                        ship_name=prev.ship_name,
-                        system_id=prev.system_id,
-                        system_name=prev.system_name,
+                        character_name=m.get("character_name", snap.character_name),
+                        ship_type_id=snap.ship_type_id,
+                        ship_name=snap.ship_name,
+                        system_id=snap.system_id,
+                        system_name=snap.system_name,
                         timestamp=datetime.now(),
                     )
-                    # Tag whether this death counts for threshold in current mode
-                    death_was_tackle = prev.is_tackle
-                    setattr(death, "_was_tackle", death_was_tackle)
+                    setattr(death, "_was_tackle", snap.is_tackle)
                     new_deaths.append(death)
                     self._deaths.append(death)
+                    # pending_next stays None -> cleared after confirmation
+                elif was_in_ship and now_in_pod:
+                    # First pod observation after being in-space in a ship.
+                    # Require a second confirming observation before counting.
+                    # Suppress entirely if system changed (jump-clone): the
+                    # pilot can't have been podded in a different system
+                    # than where we last saw their ship.
+                    if sys_id == prev.system_id:
+                        pending_next = prev  # snapshot of last in-space ship
+                    # else: jump-clone => silently drop, no pending
+                elif prev.pending_death is not None:
+                    # Pending exists but new state is docked or back in a
+                    # real ship => it was a re-ship, not a death. Drop.
+                    pending_next = None
 
             self._states[char_id] = _MemberState(
                 ship_type_id=ship_id,
@@ -201,6 +230,7 @@ class FleetLossTracker:
                 ship_name=m.get("ship_name", ""),
                 character_name=m.get("character_name", ""),
                 system_name=m.get("system_name", ""),
+                pending_death=pending_next,
             )
 
         # Count "relevant" deaths for the current mode

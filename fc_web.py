@@ -43,6 +43,162 @@ from intel_monitor import (
 
 import requests as http_requests
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+# Hard cap on response body size when fetching dscan URLs. A typical dscan
+# paste is well under 200 KB; 1 MB gives generous headroom while preventing
+# a compromised/malicious allowed host from exhausting memory.
+DSCAN_MAX_FETCH_BYTES = 1024 * 1024
+
+# Hosts from which we are willing to fetch dscan pastes. Used both by the
+# /api/dscan/parse route guard and threaded through _fetch_with_size_cap so
+# that redirect targets are re-validated against the same allowlist.
+DSCAN_ALLOWED_HOSTS = frozenset({
+    "dscan.info", "dscan.me", "adashboard.info",
+    "zero.the-initiative.rocks",
+})
+
+
+class FetchSizeCapExceeded(Exception):
+    """Raised when a fetched response exceeds the configured size cap."""
+
+
+def _fetch_with_size_cap(
+    url,
+    *,
+    max_bytes,
+    connect_timeout=5,
+    read_timeout=10,
+    allowed_schemes=("https",),
+    allowed_hosts=None,
+    max_redirects=3,
+):
+    """Fetch a URL with a hard cap on response body size.
+
+    Streams the response and aborts if the body exceeds max_bytes. Rejects
+    URLs whose scheme is not in allowed_schemes (and whose hostname is not
+    in allowed_hosts, if provided).
+
+    Redirects are followed manually, up to max_redirects hops. Each hop's
+    target is re-validated against allowed_schemes and allowed_hosts before
+    being followed; an off-allowlist Location aborts with ok=False so a
+    compromised allowed host cannot exfiltrate via a 3xx redirect.
+
+    Returns a tuple (ok, status_code, text) where:
+      - ok is True on a successful, within-cap fetch;
+      - status_code is the HTTP status (or None if request failed before a response);
+      - text is the decoded body (str) on success, or None on any failure.
+
+    On cap exceeded: logs a warning, closes the response, returns ok=False.
+    On non-HTTPS / disallowed scheme / off-allowlist host: returns ok=False.
+    On too many redirects / redirect without Location: returns ok=False with
+    the status from the last 3xx response.
+    On connection/read/HTTP errors: returns ok=False.
+    """
+    from urllib.parse import urlparse, urljoin
+
+    def _validate(target_url):
+        try:
+            parsed = urlparse(target_url)
+        except Exception:
+            return False, None
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in allowed_schemes:
+            return False, None
+        host = (parsed.hostname or "").lower()
+        if allowed_hosts is not None and host not in allowed_hosts:
+            return False, None
+        return True, parsed
+
+    ok_initial, _parsed = _validate(url)
+    if not ok_initial:
+        print(f"[dscan] Rejecting URL (scheme/host): {url!r}")
+        return (False, None, None)
+
+    current_url = url
+    for hop in range(max_redirects + 1):
+        resp = None
+        try:
+            resp = http_requests.get(
+                current_url,
+                stream=True,
+                timeout=(connect_timeout, read_timeout),
+                allow_redirects=False,
+            )
+            status_code = resp.status_code
+
+            # Handle redirects manually with per-hop allowlist re-validation.
+            if 300 <= status_code < 400:
+                location = resp.headers.get("Location")
+                if not location:
+                    print(f"[dscan] Redirect {status_code} without Location (url={current_url!r})")
+                    return (False, status_code, None)
+                if hop >= max_redirects:
+                    print(
+                        f"[dscan] Redirect chain exceeded {max_redirects} hops "
+                        f"(url={current_url!r})"
+                    )
+                    return (False, status_code, None)
+                next_url = urljoin(current_url, location)
+                ok_next, _np = _validate(next_url)
+                if not ok_next:
+                    print(
+                        f"[dscan] Rejecting redirect target (scheme/host): "
+                        f"{next_url!r} from {current_url!r}"
+                    )
+                    return (False, status_code, None)
+                current_url = next_url
+                continue
+
+            if not resp.ok:
+                return (False, status_code, None)
+
+            # Check declared Content-Length up front
+            content_length = resp.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared = int(content_length)
+                except (TypeError, ValueError):
+                    declared = None
+                if declared is not None and declared > max_bytes:
+                    print(
+                        f"[dscan] Refusing fetch: Content-Length {declared} exceeds cap "
+                        f"{max_bytes} (url={current_url!r})"
+                    )
+                    return (False, status_code, None)
+
+            buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    print(
+                        f"[dscan] Aborting fetch: body exceeded cap {max_bytes} "
+                        f"(url={current_url!r})"
+                    )
+                    return (False, status_code, None)
+
+            encoding = resp.encoding or resp.apparent_encoding or "utf-8"
+            try:
+                text = bytes(buf).decode(encoding, errors="replace")
+            except (LookupError, TypeError):
+                text = bytes(buf).decode("utf-8", errors="replace")
+            return (True, status_code, text)
+        except http_requests.RequestException as e:
+            print(f"[dscan] Fetch error for {current_url!r}: {e}")
+            return (False, None, None)
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+    # Loop exhausted without return (shouldn't happen — redirect branch handles cap).
+    return (False, None, None)
+
+
 # ── Flask App ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__, template_folder=os.path.join(app_dir(), "templates"))
@@ -858,10 +1014,14 @@ def _on_intel_message(msg: ChatMessage):
 def _fetch_and_update_dscan(report: IntelReport, original_data: dict):
     """Fetch dscan URL and push an updated intel report with ship data."""
     try:
-        resp = http_requests.get(report.dscan_url, timeout=10)
-        if not resp.ok:
+        ok, _status, text = _fetch_with_size_cap(
+            report.dscan_url,
+            max_bytes=DSCAN_MAX_FETCH_BYTES,
+            allowed_hosts=DSCAN_ALLOWED_HOSTS,
+        )
+        if not ok or text is None:
             return
-        dscan_result = parse_dscan_text(resp.text)
+        dscan_result = parse_dscan_text(text)
         if dscan_result["total"] == 0:
             return
 
@@ -987,23 +1147,25 @@ def dscan_parse():
         return jsonify({"error": "URL required"}), 400
 
     # Validate domain
-    allowed_domains = {
-        "dscan.info", "dscan.me", "adashboard.info",
-        "zero.the-initiative.rocks",
-    }
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
-        if parsed.hostname not in allowed_domains:
+        if parsed.hostname not in DSCAN_ALLOWED_HOSTS:
             return jsonify({"error": f"Domain not allowed: {parsed.hostname}"}), 400
     except Exception:
         return jsonify({"error": "Invalid URL"}), 400
 
     try:
-        resp = http_requests.get(url, timeout=10)
-        if not resp.ok:
-            return jsonify({"error": f"Fetch failed: {resp.status_code}"}), 502
-        result = parse_dscan_text(resp.text)
+        ok, status_code, text = _fetch_with_size_cap(
+            url,
+            max_bytes=DSCAN_MAX_FETCH_BYTES,
+            allowed_hosts=DSCAN_ALLOWED_HOSTS,
+        )
+        if not ok or text is None:
+            if status_code is not None and not (200 <= status_code < 300):
+                return jsonify({"error": f"Fetch failed: {status_code}"}), 502
+            return jsonify({"error": "Fetch failed"}), 502
+        result = parse_dscan_text(text)
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500

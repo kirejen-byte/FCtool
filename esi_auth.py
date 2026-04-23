@@ -118,6 +118,11 @@ class ESIAuth:
         self._character_id: int | None = None
         self._character_name: str | None = None
 
+        # Re-entrant lock guarding all token state mutation and refresh RPCs.
+        # Re-entrant because _do_refresh() (which acquires) may be called from
+        # within the access_token property (which also acquires).
+        self._refresh_lock = threading.RLock()
+
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
 
@@ -139,14 +144,23 @@ class ESIAuth:
 
     @property
     def access_token(self) -> str | None:
-        if self._access_token and self._expires_at:
-            if datetime.now(timezone.utc) < self._expires_at:
+        # Double-checked locking: fast path first (no lock contention for
+        # the common case of a still-valid token), then re-check under lock
+        # before actually refreshing.
+        margin = timedelta(seconds=5)
+        now = datetime.now(timezone.utc)
+        if self._access_token and self._expires_at and now + margin < self._expires_at:
+            return self._access_token
+        # Expired or near-expiry: take the lock and re-check.
+        with self._refresh_lock:
+            now = datetime.now(timezone.utc)
+            if self._access_token and self._expires_at and now + margin < self._expires_at:
+                # Another thread refreshed while we waited.
                 return self._access_token
-            # Token expired, try refresh
             if self._refresh_token:
                 self._do_refresh()
                 return self._access_token
-        return None
+            return None
 
     # ── Login Flow ────────────────────────────────────────────────────────────
 
@@ -232,6 +246,9 @@ class ESIAuth:
         # Exchange code for tokens
         success = self._exchange_code(_CallbackHandler.auth_code)
         if success:
+            # character_id is known now; move token_file from the temp/legacy
+            # path to the per-character canonical path once, then save.
+            self._migrate_to_per_character_path()
             self._save_tokens()
             print(f"[ESI Auth] Logged in as {self._character_name} "
                   f"(ID: {self._character_id})")
@@ -277,40 +294,97 @@ class ESIAuth:
             return False
 
     def _do_refresh(self) -> bool:
-        """Refresh the access token using the refresh token."""
-        auth_header = base64.b64encode(
-            f"{self.client_id}:{self.client_secret}".encode()
-        ).decode()
+        """Refresh the access token using the refresh token.
 
-        try:
-            resp = self._session.post(
-                SSO_TOKEN_URL,
-                headers={
-                    "Authorization": f"Basic {auth_header}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                },
-            )
-            if not resp.ok:
-                print(f"[ESI Auth] Token refresh failed: {resp.status_code}")
+        Returns True on success. Returns False on transient failure
+        (network error, timeout, 5xx) — the caller may retry later with
+        the existing refresh token still intact. On terminal failure
+        (HTTP 400 invalid_grant — EVE SSO revoked the refresh token),
+        clears all token state and persists an empty token file so the
+        class cannot linger in a zombie-authenticated state.
+
+        RLock guards the body so concurrent callers (access_token property,
+        _load_tokens) don't race on the refresh-token rotation that SSO
+        performs on every successful refresh.
+        """
+        with self._refresh_lock:
+            auth_header = base64.b64encode(
+                f"{self.client_id}:{self.client_secret}".encode()
+            ).decode()
+
+            try:
+                resp = self._session.post(
+                    SSO_TOKEN_URL,
+                    headers={
+                        "Authorization": f"Basic {auth_header}",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": self._refresh_token,
+                    },
+                    timeout=15,
+                )
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # Transient: network didn't reach SSO. Keep refresh token.
+                print(f"[ESI Auth] Token refresh transient network error: {e}")
+                self._access_token = None
+                return False
+            except Exception as e:
+                print(f"[ESI Auth] Refresh error: {e}")
                 self._access_token = None
                 return False
 
-            data = resp.json()
-            self._access_token = data["access_token"]
-            self._refresh_token = data["refresh_token"]
-            self._expires_at = datetime.now(timezone.utc) + timedelta(
-                seconds=data.get("expires_in", 1199)
-            )
-            self._save_tokens()
-            return True
+            if not resp.ok:
+                # Distinguish terminal (invalid_grant = SSO revoked) from
+                # transient (5xx, rate-limit, etc). 400 with invalid_grant
+                # means the refresh token is dead — no point keeping it.
+                terminal = False
+                if resp.status_code == 400:
+                    try:
+                        err = resp.json().get("error", "")
+                    except Exception:
+                        err = ""
+                    if err == "invalid_grant":
+                        terminal = True
+                if terminal:
+                    print(
+                        f"[ESI Auth] Refresh token revoked by SSO "
+                        f"(invalid_grant) for {self._character_name}; "
+                        f"clearing local credentials"
+                    )
+                    self._access_token = None
+                    self._refresh_token = None
+                    self._expires_at = None
+                    # Persist an empty token file so on next start we don't
+                    # silently "restore" a dead session.
+                    try:
+                        self._save_tokens()
+                    except Exception as e:
+                        print(f"[ESI Auth] Could not persist empty tokens: {e}")
+                    return False
+                # Transient server-side failure — preserve refresh_token so
+                # we can retry on the next expiry tick.
+                print(
+                    f"[ESI Auth] Token refresh transient failure: "
+                    f"{resp.status_code}"
+                )
+                self._access_token = None
+                return False
 
-        except Exception as e:
-            print(f"[ESI Auth] Refresh error: {e}")
-            return False
+            try:
+                data = resp.json()
+                self._access_token = data["access_token"]
+                self._refresh_token = data["refresh_token"]
+                self._expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=data.get("expires_in", 1199)
+                )
+                self._save_tokens()
+                return True
+            except Exception as e:
+                print(f"[ESI Auth] Refresh response parse error: {e}")
+                self._access_token = None
+                return False
 
     def _decode_character_info(self):
         """Extract character ID and name from the JWT access token."""
@@ -336,39 +410,79 @@ class ESIAuth:
 
     def logout(self):
         """Clear stored tokens."""
-        self._access_token = None
-        self._refresh_token = None
-        self._expires_at = None
-        self._character_id = None
-        self._character_name = None
-        if os.path.exists(self.token_file):
-            os.remove(self.token_file)
+        with self._refresh_lock:
+            self._access_token = None
+            self._refresh_token = None
+            self._expires_at = None
+            self._character_id = None
+            self._character_name = None
+            if os.path.exists(self.token_file):
+                os.remove(self.token_file)
         print("[ESI Auth] Logged out")
 
     # ── Token Persistence ────────────────────────────────────────────────────
 
-    def _save_tokens(self):
-        """Save tokens to disk (per-character file)."""
-        # Update token_file to per-character path if we have a character_id
+    def _resolve_token_path(self) -> str:
+        """Return the canonical per-character token path if character_id
+        is known, else the currently configured token_file. Pure function
+        — does NOT mutate state or touch the filesystem."""
         if self._character_id:
-            new_path = os.path.join(
+            return os.path.join(
                 TOKEN_DIR, f"esi_tokens_{self._character_id}.json"
             )
-            # Clean up old temp file if path changed
-            old_path = self.token_file
-            if old_path != new_path and os.path.exists(old_path):
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
-            self.token_file = new_path
+        return self.token_file
+
+    def _migrate_to_per_character_path(self):
+        """One-shot transition: after first successful login, move the
+        token file from a temp/legacy path to the per-character canonical
+        path. Idempotent. Called only when character_id just became known
+        (i.e. right after _exchange_code succeeds), not on every save."""
+        if not self._character_id:
+            return
+        target = self._resolve_token_path()
+        if self.token_file == target:
+            return
+        old_path = self.token_file
+        self.token_file = target
+        if old_path and os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+
+    def _save_tokens(self):
+        """Atomically write tokens to self.token_file. No path resolution,
+        no rename side effects. Writes to {path}.tmp then os.replace()s
+        into place so a crash mid-write cannot corrupt the token file."""
         data = {
             "refresh_token": self._refresh_token,
             "character_id": self._character_id,
             "character_name": self._character_name,
         }
-        with open(self.token_file, "w") as f:
+        final_path = self.token_file
+        tmp_path = f"{final_path}.tmp"
+        # Ensure parent exists (tests use tmp_path which already does).
+        parent = os.path.dirname(final_path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except (OSError, AttributeError):
+                pass
+        try:
+            os.replace(tmp_path, final_path)
+        except OSError:
+            # Replace failed (disk full, perms, antivirus lock, etc.).
+            # Don't leave the .tmp orphaned; swallow cleanup errors so we
+            # can re-raise the original write failure to the caller.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _load_tokens(self):
         """Load tokens from disk and refresh if available."""

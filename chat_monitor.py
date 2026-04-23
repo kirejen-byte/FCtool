@@ -1,13 +1,22 @@
 """
 EVE Online Chat Log Monitor
 Tails EVE chat log files in real-time, parsing UTF-16LE encoded messages.
+
+Phase 2a rewrite:
+    * binary-mode reads with 2-byte alignment (UTF-16-LE is 2 bytes / code unit)
+    * rotation / truncation detection via os.stat (size + inode)
+    * partial-line buffering (holds incomplete trailing line until newline arrives)
+    * per-file position persistence across restarts in chat_monitor_state.json
+    * short-lived dedupe set keyed on (channel, timestamp, sender, hash(message))
 """
 
+import glob
+import hashlib
+import json
 import os
 import re
-import glob
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
@@ -38,15 +47,36 @@ HEADER_CHANNEL_PATTERN = re.compile(r"Channel Name:\s+(.+)")
 HEADER_LISTENER_PATTERN = re.compile(r"Listener:\s+(.+)")
 
 
+# Sidecar state file (relative to project root = this module's directory).
+_STATE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE_PATH = os.path.join(_STATE_DIR, "chat_monitor_state.json")
+
+# Dedupe TTL - drop duplicate messages (same channel/ts/sender/body) seen within this window.
+DEDUPE_TTL_SECONDS = 60.0
+
+
 class ChatLogFile:
-    """Tracks a single chat log file, remembering read position."""
+    """Tracks a single chat log file, remembering byte-offset read position."""
 
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.channel_name = ""
         self.listener = ""
-        self._last_pos = 0
+        # Byte offset into the file (not character offset). We always read in "rb".
+        self._last_pos: int = 0
+        # Trailing partial text we decoded but haven't emitted because no newline was
+        # seen yet. On the next poll we re-seek to the start of these bytes and decode
+        # again with the newly-arrived bytes appended.
+        self._partial: str = ""
         self._header_parsed = False
+        # Last observed stat info, used for rotation detection.
+        self._last_ino: int = 0
+        # Rotation fingerprint. Stored fingerprint = raw bytes of the tail of what
+        # we last consumed (the N bytes ending at _last_pos). If a rewrite
+        # happens, those bytes won't match on next poll even if size/inode do.
+        self._tail_fingerprint: bytes = b""
+
+    # -- header parsing -------------------------------------------------
 
     def _parse_header(self, lines: list[str]):
         for line in lines:
@@ -58,43 +88,147 @@ class ChatLogFile:
                 self.listener = m.group(1).strip()
         self._header_parsed = True
 
+    # -- tailing --------------------------------------------------------
+
+    def _check_rotation(self, st_size: int, st_ino: int, tail_sample: bytes) -> bool:
+        """Return True and reset state if the file was truncated or replaced.
+
+        Detection signals (any one triggers a reset):
+          * current size is smaller than our last known position (classic truncate)
+          * inode changed (NTFS file reference / POSIX inode)
+          * tail fingerprint mismatch - the bytes immediately preceding our last
+            read position are no longer what we consumed (catches truncate-then-
+            rewrite even when size/inode both look unchanged)
+        """
+        rotated = False
+        if st_size < self._last_pos:
+            rotated = True
+        # st_ino == 0 on some filesystems (e.g., FAT); require both to be known.
+        if self._last_ino and st_ino and st_ino != self._last_ino:
+            rotated = True
+        if (self._tail_fingerprint and tail_sample
+                and tail_sample != self._tail_fingerprint):
+            rotated = True
+        if rotated:
+            self._last_pos = 0
+            self._partial = ""
+            self._header_parsed = False
+            self._tail_fingerprint = b""
+        return rotated
+
     def read_new_lines(self) -> list[ChatMessage]:
-        """Read any new lines appended since last check."""
-        messages = []
+        """Read any new lines appended since last check.
+
+        Reads the file in binary mode starting at ``self._last_pos`` aligned down
+        to an even byte boundary (UTF-16-LE code units are 2 bytes), decodes the
+        remaining bytes, and emits complete lines. Any trailing partial line (no
+        newline yet) is NOT emitted and ``self._last_pos`` is advanced only to the
+        even byte offset where that partial begins. Next poll re-reads those same
+        bytes plus any newly-arrived ones and tries again.
+        """
+        messages: list[ChatMessage] = []
         try:
-            file_size = os.path.getsize(self.filepath)
-            if file_size <= self._last_pos:
+            st = os.stat(self.filepath)
+            st_size = st.st_size
+            st_ino = getattr(st, "st_ino", 0) or 0
+
+            # Sample tail bytes immediately before our last read position. If the
+            # file was rewritten, these bytes will differ from what we recorded.
+            tail_sample = b""
+            fingerprint_len = len(self._tail_fingerprint)
+            if fingerprint_len and self._last_pos >= fingerprint_len and st_size >= self._last_pos:
+                try:
+                    with open(self.filepath, "rb") as f:
+                        f.seek(self._last_pos - fingerprint_len)
+                        tail_sample = f.read(fingerprint_len)
+                except OSError:
+                    tail_sample = b""
+
+            self._check_rotation(st_size, st_ino, tail_sample)
+
+            # Remember stat info for next poll's rotation check.
+            self._last_ino = st_ino
+
+            # Align read start down to an even byte - UTF-16-LE code units are 2 bytes.
+            read_start = self._last_pos & ~1
+            if st_size <= read_start:
                 return messages
 
-            with open(self.filepath, "r", encoding="utf-16-le", errors="replace") as f:
-                f.seek(self._last_pos)
-                content = f.read()
-                self._last_pos = f.tell()
+            with open(self.filepath, "rb") as f:
+                f.seek(read_start)
+                raw = f.read()
 
-            lines = content.split("\n")
+            if not raw:
+                return messages
+
+            # Drop any trailing half-byte so we only decode whole code units. The
+            # trailing byte will still be on disk and re-read next poll when its
+            # partner arrives.
+            if len(raw) % 2 == 1:
+                raw = raw[:-1]
+
+            if not raw:
+                # Only a half byte available - nothing to do.
+                return messages
+
+            text = raw.decode("utf-16-le", errors="replace")
+
+            # Split on '\n'. If the decoded text does NOT end in a newline the
+            # final split element is an incomplete line we must buffer.
+            ends_with_newline = text.endswith("\n")
+            parts = text.split("\n")
+
+            if ends_with_newline:
+                complete_lines = parts[:-1]  # final element is "" after trailing \n
+                partial_code_units = 0
+            else:
+                complete_lines = parts[:-1]
+                partial_code_units = len(parts[-1])
+
+            # Advance _last_pos to the byte offset where the partial begins.
+            # Each decoded code unit = 2 bytes. Anything unconsumed (partial text +
+            # an unpaired trailing byte, if any) stays on disk for re-read.
+            consumed_code_units = len(text) - partial_code_units
+            self._last_pos = read_start + consumed_code_units * 2
+            # Track partial purely for observability / tests - it's re-read from
+            # disk next poll, not prepended.
+            self._partial = parts[-1] if not ends_with_newline else ""
+
+            # Record tail fingerprint (up to 64 bytes) of what we just consumed.
+            # Used next poll to detect truncate-then-rewrite where size and inode
+            # may be unchanged.
+            fp_len = min(64, self._last_pos - read_start, self._last_pos)
+            if fp_len > 0:
+                consumed_raw = raw[:consumed_code_units * 2]
+                if len(consumed_raw) >= fp_len:
+                    self._tail_fingerprint = consumed_raw[-fp_len:]
 
             if not self._header_parsed:
-                self._parse_header(lines)
+                # Header lines are in the first chunk; parse from complete_lines.
+                self._parse_header(complete_lines)
 
-            for line in lines:
-                line = line.strip()
+            for line in complete_lines:
+                # Strip CR (from CRLF) and any stray whitespace.
+                line = line.rstrip("\r").strip()
                 if not line:
                     continue
                 m = MESSAGE_PATTERN.match(line)
-                if m:
-                    try:
-                        ts = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S")
-                    except ValueError:
-                        ts = datetime.now()
-                    messages.append(ChatMessage(
-                        timestamp=ts,
-                        sender=m.group(2).strip(),
-                        message=m.group(3).strip(),
-                        channel=self.channel_name,
-                        raw_line=line,
-                    ))
-        except (OSError, IOError) as e:
-            pass  # File may be locked by EVE, retry next poll
+                if not m:
+                    continue
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y.%m.%d %H:%M:%S")
+                except ValueError:
+                    ts = datetime.now()
+                messages.append(ChatMessage(
+                    timestamp=ts,
+                    sender=m.group(2).strip(),
+                    message=m.group(3).strip(),
+                    channel=self.channel_name,
+                    raw_line=line,
+                ))
+        except (OSError, IOError):
+            # File may be locked by EVE, retry next poll.
+            pass
         return messages
 
 
@@ -107,7 +241,9 @@ class ChatMonitor:
     def __init__(self, logs_path: str, poll_interval: float = 1.0,
                  channel_filter: str | None = None,
                  listener_filter: str | None = None,
-                 channel_filters: list[str] | None = None):
+                 channel_filters: list[str] | None = None,
+                 state_path: str | None = None,
+                 dedupe_ttl: float = DEDUPE_TTL_SECONDS):
         self.logs_path = logs_path
         self.poll_interval = poll_interval
         self.channel_filter = channel_filter
@@ -117,54 +253,21 @@ class ChatMonitor:
         self._callbacks: list[Callable[[ChatMessage], None]] = []
         self._running = False
 
+        # Persistence
+        self._state_path = state_path or STATE_FILE_PATH
+        self._persisted_state: dict[str, dict] = self._load_state()
+        self._state_dirty = False
+        self._last_state_flush = 0.0
+
+        # Dedupe
+        self._dedupe_ttl = float(dedupe_ttl)
+        self._seen: dict[tuple, float] = {}
+
+    # -- public interface ----------------------------------------------
+
     def on_message(self, callback: Callable[[ChatMessage], None]):
         """Register a callback for new chat messages."""
         self._callbacks.append(callback)
-
-    def _discover_files(self):
-        """Find chat log files matching the channel and listener filters."""
-        # If multiple channel filters are set, glob each one separately (much faster)
-        if self.channel_filters:
-            all_files = []
-            for prefix in self.channel_filters:
-                pat = os.path.join(self.logs_path, f"{prefix}*.txt")
-                all_files.extend(glob.glob(pat))
-        else:
-            all_files = glob.glob(os.path.join(self.logs_path, "*.txt"))
-
-        for filepath in all_files:
-            if filepath in self._tracked_files:
-                continue
-            basename = os.path.basename(filepath)
-            if self.channel_filter:
-                if not basename.lower().startswith(self.channel_filter.lower()):
-                    continue
-            log_file = ChatLogFile(filepath)
-            # Skip to end of existing content so we only get NEW messages
-            try:
-                log_file._last_pos = os.path.getsize(filepath)
-                # But parse the header from existing content
-                with open(filepath, "r", encoding="utf-16-le", errors="replace") as f:
-                    header = f.read(2048)
-                log_file._parse_header(header.split("\n"))
-            except OSError:
-                pass
-
-            # If a listener (character) filter is set, skip files from other characters
-            if self.listener_filter and log_file.listener:
-                if log_file.listener.lower() != self.listener_filter.lower():
-                    continue
-
-            self._tracked_files[filepath] = log_file
-
-    def _poll_once(self) -> list[ChatMessage]:
-        """Single poll cycle: discover new files and read new messages."""
-        self._discover_files()
-        all_messages = []
-        for log_file in self._tracked_files.values():
-            messages = log_file.read_new_lines()
-            all_messages.extend(messages)
-        return all_messages
 
     def poll(self) -> list[ChatMessage]:
         """Public single-poll method for use by the main loop."""
@@ -185,6 +288,9 @@ class ChatMonitor:
         while self._running:
             self.poll()
             time.sleep(self.poll_interval)
+
+    def stop(self):
+        self._running = False
 
     def get_available_listeners(self, max_age_days: int = 7) -> list[str]:
         """Scan log files to find all character names (listeners) with fleet channels.
@@ -210,8 +316,9 @@ class ChatMonitor:
             if filter_prefix and not basename.lower().startswith(filter_prefix):
                 continue
             try:
-                with open(filepath, "r", encoding="utf-16-le", errors="replace") as f:
-                    header = f.read(2048)
+                with open(filepath, "rb") as f:
+                    header_bytes = f.read(4096)
+                header = header_bytes.decode("utf-16-le", errors="replace")
                 for line in header.split("\n"):
                     m = HEADER_LISTENER_PATTERN.search(line)
                     if m:
@@ -220,5 +327,169 @@ class ChatMonitor:
                 pass
         return sorted(listeners)
 
-    def stop(self):
-        self._running = False
+    # -- internals -----------------------------------------------------
+
+    def _discover_files(self):
+        """Find chat log files matching the channel and listener filters."""
+        # If multiple channel filters are set, glob each one separately (much faster)
+        if self.channel_filters:
+            all_files = []
+            for prefix in self.channel_filters:
+                pat = os.path.join(self.logs_path, f"{prefix}*.txt")
+                all_files.extend(glob.glob(pat))
+        else:
+            all_files = glob.glob(os.path.join(self.logs_path, "*.txt"))
+
+        for filepath in all_files:
+            if filepath in self._tracked_files:
+                continue
+            basename = os.path.basename(filepath)
+            if self.channel_filter:
+                if not basename.lower().startswith(self.channel_filter.lower()):
+                    continue
+            log_file = ChatLogFile(filepath)
+
+            # Parse the header up front so the listener filter can be applied.
+            try:
+                with open(filepath, "rb") as f:
+                    header_bytes = f.read(4096)
+                header = header_bytes.decode("utf-16-le", errors="replace")
+                log_file._parse_header(header.split("\n"))
+            except OSError:
+                pass
+
+            # If a listener (character) filter is set, skip files from other characters
+            if self.listener_filter and log_file.listener:
+                if log_file.listener.lower() != self.listener_filter.lower():
+                    continue
+
+            # Seed position. For a previously-seen file, resume from persisted state;
+            # otherwise jump to EOF so we don't replay a day's history.
+            try:
+                st = os.stat(filepath)
+                st_size = st.st_size
+                st_ino = getattr(st, "st_ino", 0) or 0
+            except OSError:
+                st_size = 0
+                st_ino = 0
+
+            key = self._state_key(filepath)
+            prior = self._persisted_state.get(key)
+            resume_pos = st_size  # default: skip to EOF for unknown files
+            if prior:
+                try:
+                    saved_pos = int(prior.get("last_pos", 0))
+                    saved_ino = int(prior.get("last_ino", 0))
+                except (TypeError, ValueError):
+                    saved_pos = 0
+                    saved_ino = 0
+                # Treat as the same file only if inode matches (when both known) and
+                # current size has not shrunk below the saved position.
+                inode_ok = (not saved_ino) or (not st_ino) or (saved_ino == st_ino)
+                if inode_ok and st_size >= saved_pos:
+                    resume_pos = saved_pos
+                # else: treat as rotated/new - start from EOF (resume_pos = st_size).
+
+            log_file._last_pos = resume_pos
+            log_file._last_ino = st_ino
+
+            self._tracked_files[filepath] = log_file
+
+    def _poll_once(self) -> list[ChatMessage]:
+        """Single poll cycle: discover new files and read new messages."""
+        self._discover_files()
+        all_messages: list[ChatMessage] = []
+        had_activity = False
+
+        # Evict stale dedupe entries once per poll.
+        self._evict_dedupe()
+
+        for log_file in self._tracked_files.values():
+            raw_messages = log_file.read_new_lines()
+            if raw_messages:
+                had_activity = True
+                # Update persisted state for this file.
+                self._persisted_state[self._state_key(log_file.filepath)] = {
+                    "last_pos": log_file._last_pos,
+                    "last_ino": log_file._last_ino,
+                    "last_updated": time.time(),
+                }
+                self._state_dirty = True
+
+            for msg in raw_messages:
+                if self._is_duplicate(msg):
+                    continue
+                all_messages.append(msg)
+
+        # Flush state: after any activity, or periodically every ~30s.
+        now = time.time()
+        if self._state_dirty and (had_activity or (now - self._last_state_flush) > 30.0):
+            self._save_state()
+            self._last_state_flush = now
+            self._state_dirty = False
+
+        return all_messages
+
+    # -- dedupe --------------------------------------------------------
+
+    @staticmethod
+    def _dedupe_key(msg: ChatMessage) -> tuple:
+        ts_str = msg.timestamp.strftime("%Y.%m.%d %H:%M:%S") if isinstance(msg.timestamp, datetime) else str(msg.timestamp)
+        body_hash = hashlib.sha1(msg.message.encode("utf-8", errors="replace")).hexdigest()[:16]
+        return (msg.channel, ts_str, msg.sender, body_hash)
+
+    def _is_duplicate(self, msg: ChatMessage) -> bool:
+        key = self._dedupe_key(msg)
+        now = time.time()
+        if key in self._seen:
+            # Refresh (keeps very chatty duplicates suppressed for the full TTL
+            # from last sighting rather than first).
+            self._seen[key] = now
+            return True
+        self._seen[key] = now
+        return False
+
+    def _evict_dedupe(self) -> None:
+        if not self._seen:
+            return
+        cutoff = time.time() - self._dedupe_ttl
+        # Build list of stale keys to avoid mutating during iteration.
+        stale = [k for k, t in self._seen.items() if t < cutoff]
+        for k in stale:
+            self._seen.pop(k, None)
+
+    # -- state persistence --------------------------------------------
+
+    @staticmethod
+    def _state_key(filepath: str) -> str:
+        # EVE filenames already embed channel name + ISO timestamp + characterID,
+        # so the full path is stable enough as a key.
+        return os.path.abspath(filepath)
+
+    def _load_state(self) -> dict[str, dict]:
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    def _save_state(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self._state_path)) or ".", exist_ok=True)
+        except OSError:
+            pass
+        tmp_path = self._state_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self._persisted_state, f)
+            os.replace(tmp_path, self._state_path)
+        except OSError:
+            # Best-effort - if we can't persist, swallow and try again later.
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass

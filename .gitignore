@@ -13,6 +13,7 @@ systems_cache.json
 stargate_jumps.json
 char_cache.json
 tts_cache/
+chat_monitor_state.json
 
 # Misc
 *.msi
