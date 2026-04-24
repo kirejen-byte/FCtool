@@ -21,7 +21,6 @@ chat_monitor_state.json
 # PyInstaller
 build/
 dist/
-*.spec
 
 # Python
 __pycache__/
@@ -32,3 +31,4 @@ __pycache__/
 .vscode/
 .idea/
 .claude/
+CLAUDE.md
