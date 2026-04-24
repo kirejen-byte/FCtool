@@ -21,7 +21,6 @@ chat_monitor_state.json
 # PyInstaller
 build/
 dist/
-*.spec
 
 # Python
 __pycache__/
