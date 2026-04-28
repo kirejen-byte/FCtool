@@ -41,6 +41,8 @@ SCOPES = [
     "esi-location.read_online.v1",
     "esi-characters.read_contacts.v1",
     "esi-characters.write_contacts.v1",
+    "esi-corporations.read_contacts.v1",
+    "esi-alliances.read_contacts.v1",
     "esi-characters.read_loyalty.v1",
     "esi-characters.read_chat_channels.v1",
     "esi-characters.read_medals.v1",
