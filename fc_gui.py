@@ -462,7 +462,7 @@ class FCToolGUI:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         self._build_xup_tab()
-        self._build_zkill_tab()
+        self._build_intel_tab()
         self._build_range_tab()
         self._build_wh_route_tab()
         self._build_character_tab()
@@ -787,9 +787,9 @@ class FCToolGUI:
 
     # ── zKillboard Tab ────────────────────────────────────────────────────────
 
-    def _build_zkill_tab(self):
+    def _build_intel_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
-        self.notebook.add(tab, text="  zKillboard Intel  ")
+        self.notebook.add(tab, text="  Intelligence  ")
 
         header = tk.Frame(tab, bg=BG_DARK)
         header.pack(fill=tk.X, padx=10, pady=(10, 2))
@@ -1942,7 +1942,7 @@ class FCToolGUI:
         if current == 1 and self._zkill_has_unread:
             # Switched to zKill tab — clear notification
             self._zkill_has_unread = False
-            self.notebook.tab(1, text="  zKillboard Intel  ")
+            self.notebook.tab(1, text="  Intelligence  ")
             self._zkill_status.config(bg=BG_DARK)
         elif current == 4 and hasattr(self, '_char_tab_content'):
             # Switched to Characters tab — auto-refresh
@@ -1953,7 +1953,7 @@ class FCToolGUI:
         current = self.notebook.index(self.notebook.select())
         if current != 1:
             self._zkill_has_unread = True
-            self.notebook.tab(1, text="  ** zKill ALERT **  ")
+            self.notebook.tab(1, text="  ** Intel ALERT **  ")
             # Flash the ZKILL status label red
             self._flash_zkill_status(0)
 
