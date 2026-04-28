@@ -219,6 +219,65 @@ def test_format_local_scan_basic():
     assert "Hostile:  7" in text
 
 
+def test_format_local_scan_with_resolver():
+    fakes = {
+        (99005338, "alliance"): "Pandemic Horde",
+        (1354830081, "alliance"): "Goonswarm Federation",
+        (1, "corporation"): "Test Corp",
+    }
+    def fake_resolve(eid, category):
+        return fakes.get((eid, category), f"unknown-{eid}")
+
+    r = LocalScanResult(
+        total=10, friendly_count=2, hostile_count=8,
+        unresolved_names=[],
+        hostile_pilots=[
+            ("Alice", 1, 99005338),
+            ("Bob", 1, 99005338),
+            ("Carol", 1, 1354830081),
+        ],
+        top_hostile_alliances=[(99005338, 6), (1354830081, 2)],
+        top_hostile_corps=[],
+    )
+    text = format_local_scan_result(r, resolve_name=fake_resolve)
+    assert "Pandemic Horde × 6" in text
+    assert "Goonswarm Federation × 2" in text
+    assert "Alice [Pandemic Horde]" in text
+    assert "Bob [Pandemic Horde]" in text
+    assert "Carol [Goonswarm Federation]" in text
+    # No raw IDs leak into output
+    assert "99005338" not in text
+    assert "1354830081" not in text
+
+
+def test_format_local_scan_truncates_pilot_list():
+    r = LocalScanResult(
+        total=10, friendly_count=0, hostile_count=10,
+        unresolved_names=[],
+        hostile_pilots=[(f"P{i}", None, None) for i in range(10)],
+        top_hostile_alliances=[], top_hostile_corps=[],
+    )
+    text = format_local_scan_result(r)
+    assert "P0 [Independent]" in text
+    assert "P4 [Independent]" in text
+    assert "P5" not in text  # 5th index onward truncated
+    assert "… and 5 more" in text
+
+
+def test_format_local_scan_without_resolver_falls_back():
+    r = LocalScanResult(
+        total=2, friendly_count=0, hostile_count=2,
+        unresolved_names=[],
+        hostile_pilots=[("Alice", 100, 200)],
+        top_hostile_alliances=[(200, 1)],
+        top_hostile_corps=[],
+    )
+    text = format_local_scan_result(r)
+    # Without a resolver, falls back to "Alliance <id>"
+    assert "Alliance 200 × 1" in text
+    assert "Alice [Alliance 200]" in text
+
+
 def test_format_dscan_no_source(monkeypatch):
     monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
     r = analyze_dscan(_ship_dscan(["Vulture"]), friendly_source=None, fleet_roster=None)

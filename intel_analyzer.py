@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 from intel_paste import (
     DScan,
@@ -189,7 +190,20 @@ def compute_dscan_trend(
     )
 
 
-def format_local_scan_result(r: LocalScanResult) -> str:
+def format_local_scan_result(
+    r: LocalScanResult,
+    resolve_name: Callable[[int, str], str] | None = None,
+) -> str:
+    def _name(eid: int | None, category: str, fallback: str) -> str:
+        if eid is None:
+            return fallback
+        if resolve_name is None:
+            return f"{fallback} {eid}"
+        try:
+            return resolve_name(eid, category)
+        except Exception:
+            return f"{fallback} {eid}"
+
     lines = [f"Local — {r.total} pilots"]
     lines.append(f"  Friendly: {r.friendly_count}")
     lines.append(f"  Hostile:  {r.hostile_count}")
@@ -198,7 +212,20 @@ def format_local_scan_result(r: LocalScanResult) -> str:
     if r.top_hostile_alliances:
         lines.append("  Top hostile alliances:")
         for aid, count in r.top_hostile_alliances:
-            lines.append(f"    Alliance {aid} × {count}")
+            name = _name(aid, "alliance", "Alliance")
+            lines.append(f"    {name} × {count}")
+    if r.hostile_pilots:
+        shown = r.hostile_pilots[:5]
+        lines.append("  Hostile pilots:")
+        for pilot, corp_id, alliance_id in shown:
+            tag_id = alliance_id if alliance_id is not None else corp_id
+            tag_cat = "alliance" if alliance_id is not None else "corporation"
+            tag_fallback = "Alliance" if alliance_id is not None else "Corp"
+            tag = _name(tag_id, tag_cat, tag_fallback) if tag_id is not None else "Independent"
+            lines.append(f"    {pilot} [{tag}]")
+        remaining = len(r.hostile_pilots) - len(shown)
+        if remaining > 0:
+            lines.append(f"    … and {remaining} more")
     return "\n".join(lines)
 
 

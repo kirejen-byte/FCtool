@@ -5101,7 +5101,10 @@ $bmp.Dispose()
                 own_character_ids=own_chars,
             )
             self._intel_session.add_local_scan(system, parsed)
-            text_out = intel_analyzer.format_local_scan_result(result)
+            from zkill_monitor import resolve_name as _resolve_name
+            text_out = intel_analyzer.format_local_scan_result(
+                result, resolve_name=_resolve_name,
+            )
             self._set_paste_result(text_out)
             self._append_intel_summary_line(
                 f"Local {system} — {result.friendly_count} friendly, "
