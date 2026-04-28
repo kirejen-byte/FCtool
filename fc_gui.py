@@ -5114,9 +5114,9 @@ $bmp.Dispose()
             if latest_fleet is not None:
                 friendly_source = intel_analyzer.DScanSource.PASTED
                 roster = latest_fleet.parsed
-                roster_age_min = int(
+                roster_age_min = max(0, int(
                     (datetime.now(timezone.utc) - latest_fleet.timestamp).total_seconds() / 60
-                )
+                ))
             elif auth is not None and auth.is_fleet_boss():
                 members = auth.get_fleet_members() or []
                 from collections import Counter
@@ -5144,9 +5144,9 @@ $bmp.Dispose()
                 prior_result = intel_analyzer.analyze_dscan(
                     prior.parsed, friendly_source=friendly_source, fleet_roster=roster,
                 )
-                minutes_ago = int(
+                minutes_ago = max(0, int(
                     (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
-                )
+                ))
                 trend = intel_analyzer.compute_dscan_trend(
                     current_result=result, prior_result=prior_result,
                     minutes_ago=minutes_ago,
