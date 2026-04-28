@@ -10,6 +10,7 @@ Supports four EVE Online paste formats:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 
@@ -65,3 +66,17 @@ ParsedScan = LocalScan | DScan | FleetComposition | FleetSummary
 def detect_and_parse(text: str) -> ParsedScan | None:
     """Auto-detect format and parse. Returns None for unrecognized input."""
     raise NotImplementedError
+
+
+_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z' \-]{0,36}[A-Za-z]$")
+
+
+def parse_local_scan(text: str) -> LocalScan:
+    names: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if _NAME_RE.match(line):
+            names.append(line)
+    return LocalScan(pilot_names=names)
