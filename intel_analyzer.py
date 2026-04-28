@@ -187,3 +187,58 @@ def compute_dscan_trend(
         type_delta=sorted_deltas,
         new_types=new_types,
     )
+
+
+def format_local_scan_result(r: LocalScanResult) -> str:
+    lines = [f"Local — {r.total} pilots"]
+    lines.append(f"  Friendly: {r.friendly_count}")
+    lines.append(f"  Hostile:  {r.hostile_count}")
+    if r.unresolved_names:
+        lines.append(f"  Unresolved: {len(r.unresolved_names)}")
+    if r.top_hostile_alliances:
+        lines.append("  Top hostile alliances:")
+        for aid, count in r.top_hostile_alliances:
+            lines.append(f"    Alliance {aid} × {count}")
+    return "\n".join(lines)
+
+
+def format_dscan_result(
+    r: DScanResult,
+    trend: "DScanTrend | None",
+    roster_age_minutes: int | None,
+) -> str:
+    lines = [f"D-Scan — {r.total_ships} ships in range"]
+    if r.source == DScanSource.NONE:
+        lines.append(f"  {r.note}")
+        if r.dscan_by_type:
+            lines.append("  Ships seen:")
+            for type_name, count in r.dscan_by_type:
+                lines.append(f"    {type_name} × {count}")
+        return "\n".join(lines)
+
+    label = "pasted fleet" if r.source == DScanSource.PASTED else "ESI fleet"
+    if roster_age_minutes is not None:
+        lines.append(f"  Friendly (from {label}, {roster_age_minutes}m old): {r.friendly_count}")
+    else:
+        lines.append(f"  Friendly (from {label}): {r.friendly_count}")
+    lines.append(f"  Hostile (estimate):                   {r.hostile_count}")
+    for type_name, count in r.hostile_by_type:
+        lines.append(f"    {type_name} × {count}")
+
+    lines.append("⚠ Other friendly fleets in system would inflate the hostile count.")
+    if roster_age_minutes is not None and roster_age_minutes >= 5:
+        lines.append(f"⚠ Pasted roster is {roster_age_minutes}m old. Refresh if it has changed.")
+
+    if trend is not None:
+        sign = "+" if trend.hostile_delta >= 0 else ""
+        lines.append("")
+        lines.append(f"Trend (vs scan {trend.minutes_ago}m ago):")
+        lines.append(f"  Hostile: {trend.hostile_prior} → {trend.hostile_current} ({sign}{trend.hostile_delta})")
+        if trend.type_delta:
+            parts = []
+            for type_name, delta in trend.type_delta:
+                marker = " (new)" if type_name in trend.new_types else ""
+                parts.append(f"{'+' if delta > 0 else ''}{delta} {type_name}{marker}")
+            lines.append("  " + ", ".join(parts))
+
+    return "\n".join(lines)

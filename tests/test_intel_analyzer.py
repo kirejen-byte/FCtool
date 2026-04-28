@@ -206,3 +206,71 @@ def test_trend_basic_delta(monkeypatch):
     assert diff["Damnation"] == 1
     assert diff["Stiletto"] == -1
     assert "Damnation" in trend.new_types
+
+
+from intel_analyzer import format_dscan_result, format_local_scan_result
+
+
+def test_format_local_scan_basic():
+    r = LocalScanResult(
+        total=10, friendly_count=3, hostile_count=7,
+        unresolved_names=[], hostile_pilots=[],
+        top_hostile_alliances=[], top_hostile_corps=[],
+    )
+    text = format_local_scan_result(r)
+    assert "Local — 10 pilots" in text
+    assert "Friendly: 3" in text
+    assert "Hostile:  7" in text
+
+
+def test_format_dscan_no_source(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    r = analyze_dscan(_ship_dscan(["Vulture"]), friendly_source=None, fleet_roster=None)
+    text = format_dscan_result(r, trend=None, roster_age_minutes=None)
+    assert "D-Scan — 1 ships in range" in text
+    assert "No fleet roster" in text
+
+
+def test_format_dscan_with_breakdown(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    r = analyze_dscan(
+        _ship_dscan(["Vulture", "Sabre", "Sabre"]),
+        friendly_source=DScanSource.PASTED,
+        fleet_roster=FleetSummary(rows=[FleetSummaryRow("Vulture", "Command Ship", 1)]),
+    )
+    text = format_dscan_result(r, trend=None, roster_age_minutes=2)
+    assert "Friendly" in text and "1" in text
+    assert "Hostile" in text and "2" in text
+    assert "Sabre × 2" in text
+
+
+def test_format_dscan_with_stale_roster_warning(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    r = analyze_dscan(
+        _ship_dscan(["Vulture"]),
+        friendly_source=DScanSource.PASTED,
+        fleet_roster=FleetSummary(rows=[FleetSummaryRow("Vulture", "Command Ship", 1)]),
+    )
+    text = format_dscan_result(r, trend=None, roster_age_minutes=8)
+    assert "8m old" in text
+
+
+def test_format_dscan_with_trend(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    r = analyze_dscan(
+        _ship_dscan(["Hurricane"] * 5),
+        friendly_source=DScanSource.PASTED,
+        fleet_roster=FleetSummary(rows=[]),
+    )
+    trend = DScanTrend(
+        minutes_ago=2,
+        hostile_prior=3,
+        hostile_current=5,
+        hostile_delta=2,
+        type_delta=[("Hurricane", 2)],
+        new_types=[],
+    )
+    text = format_dscan_result(r, trend=trend, roster_age_minutes=1)
+    assert "Trend" in text
+    assert "3 → 5" in text
+    assert "+2 Hurricane" in text
