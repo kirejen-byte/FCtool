@@ -1,5 +1,21 @@
-from intel_paste import LocalScan
-from intel_analyzer import LocalScanResult, analyze_local_scan
+from collections import Counter
+
+from intel_paste import (
+    DScan,
+    DScanRow,
+    FleetComposition,
+    FleetMember,
+    FleetSummary,
+    FleetSummaryRow,
+    LocalScan,
+)
+from intel_analyzer import (
+    DScanResult,
+    DScanSource,
+    LocalScanResult,
+    analyze_dscan,
+    analyze_local_scan,
+)
 
 
 class _FakeAuth:
@@ -80,3 +96,75 @@ def test_analyze_local_scan_top_hostile_affiliations():
     counts = dict(result.top_hostile_alliances)
     assert counts[100] == 2
     assert counts[101] == 1
+
+
+def _ship_dscan(types: list[str]) -> DScan:
+    return DScan(rows=[
+        DScanRow(type_id=1000 + i, item_name=f"Ship {i}", type_name=t, distance_au=1.0)
+        for i, t in enumerate(types)
+    ])
+
+
+def test_analyze_dscan_no_source_ships_only(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    scan = _ship_dscan(["Vulture", "Sabre", "Sabre"])
+    result = analyze_dscan(scan, friendly_source=None, fleet_roster=None)
+    assert isinstance(result, DScanResult)
+    assert result.total_ships == 3
+    assert result.source == DScanSource.NONE
+    assert result.friendly_count is None
+    assert result.hostile_count is None
+    assert "No fleet roster" in result.note
+
+
+def test_analyze_dscan_filters_non_ships(monkeypatch):
+    def fake_is_ship(tid):
+        return tid != 1002
+    monkeypatch.setattr("intel_analyzer.is_ship_type", fake_is_ship)
+    rows = [
+        DScanRow(1000, "A", "Vulture", 1.0),
+        DScanRow(1001, "B", "Sabre", 1.0),
+        DScanRow(1002, "Citadel", "Astrahus", 1.0),
+    ]
+    result = analyze_dscan(DScan(rows=rows), friendly_source=None, fleet_roster=None)
+    assert result.total_ships == 2
+
+
+def test_analyze_dscan_with_pasted_summary(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    scan = _ship_dscan(["Vulture", "Sabre", "Sabre", "Sabre"])
+    roster = FleetSummary(rows=[
+        FleetSummaryRow("Vulture", "Command Ship", 1),
+        FleetSummaryRow("Sabre", "Interdictor", 1),
+    ])
+    result = analyze_dscan(scan, friendly_source=DScanSource.PASTED, fleet_roster=roster)
+    assert result.friendly_count == 2
+    assert result.hostile_count == 2
+    breakdown = dict(result.hostile_by_type)
+    assert breakdown.get("Sabre") == 2
+    assert breakdown.get("Vulture", 0) == 0
+
+
+def test_analyze_dscan_with_pasted_composition(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    scan = _ship_dscan(["Archon", "Flycatcher"])
+    roster = FleetComposition(members=[
+        FleetMember("Securitas Protector", "O-BDXB", "Archon", "Carrier",
+                    "Fleet Commander (Boss)", "5 - 5 - 5", ""),
+        FleetMember("Tyreece Arkan", "O-BDXB", "Flycatcher", "Interdictor",
+                    "Squad Member", "0 - 4 - 5", "Wing 1 / Squad 1"),
+    ])
+    result = analyze_dscan(scan, friendly_source=DScanSource.PASTED, fleet_roster=roster)
+    assert result.friendly_count == 2
+    assert result.hostile_count == 0
+
+
+def test_analyze_dscan_does_not_underflow(monkeypatch):
+    """If pasted fleet has more ships of a type than dscan shows (e.g., docked),
+    the hostile count for that type clamps at 0."""
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    scan = _ship_dscan(["Vulture"])
+    roster = FleetSummary(rows=[FleetSummaryRow("Vulture", "Command Ship", 5)])
+    result = analyze_dscan(scan, friendly_source=DScanSource.PASTED, fleet_roster=roster)
+    assert result.friendly_count == 1
+    assert result.hostile_count == 0

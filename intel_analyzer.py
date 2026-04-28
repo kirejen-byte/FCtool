@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from enum import Enum
 
 from intel_paste import (
     DScan,
@@ -16,6 +17,7 @@ from intel_paste import (
     FleetSummary,
     LocalScan,
 )
+from ship_classes import is_ship_type
 from standings_cache import is_friendly
 
 
@@ -73,4 +75,73 @@ def analyze_local_scan(
         hostile_pilots=hostile_pilots,
         top_hostile_alliances=hostile_alliance_counter.most_common(5),
         top_hostile_corps=hostile_corp_counter.most_common(5),
+    )
+
+
+class DScanSource(Enum):
+    PASTED = "pasted"
+    ESI = "esi"
+    NONE = "none"
+
+
+@dataclass
+class DScanResult:
+    total_ships: int
+    source: DScanSource
+    friendly_count: int | None
+    hostile_count: int | None
+    hostile_by_type: list[tuple[str, int]]
+    friendly_by_type: list[tuple[str, int]]
+    dscan_by_type: list[tuple[str, int]]
+    note: str = ""
+
+
+def _roster_type_counts(roster) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if isinstance(roster, FleetSummary):
+        for row in roster.rows:
+            counts[row.ship_name] += row.count
+    elif isinstance(roster, FleetComposition):
+        for member in roster.members:
+            counts[member.ship_name] += 1
+    return counts
+
+
+def analyze_dscan(
+    scan: DScan,
+    friendly_source: DScanSource | None,
+    fleet_roster,
+) -> DScanResult:
+    ship_rows = [r for r in scan.rows if is_ship_type(r.type_id)]
+    dscan_counts: Counter[str] = Counter(r.type_name for r in ship_rows)
+    total = sum(dscan_counts.values())
+
+    if friendly_source is None or friendly_source == DScanSource.NONE or fleet_roster is None:
+        return DScanResult(
+            total_ships=total,
+            source=DScanSource.NONE,
+            friendly_count=None,
+            hostile_count=None,
+            hostile_by_type=[],
+            friendly_by_type=[],
+            dscan_by_type=dscan_counts.most_common(),
+            note="No fleet roster: paste a fleet composition, or be fleet boss to use ESI.",
+        )
+
+    roster_counts = _roster_type_counts(fleet_roster)
+    friendly_counts: Counter[str] = Counter()
+    hostile_counts: Counter[str] = Counter()
+    for type_name, count in dscan_counts.items():
+        f = min(count, roster_counts.get(type_name, 0))
+        friendly_counts[type_name] = f
+        hostile_counts[type_name] = count - f
+
+    return DScanResult(
+        total_ships=total,
+        source=friendly_source,
+        friendly_count=sum(friendly_counts.values()),
+        hostile_count=sum(hostile_counts.values()),
+        hostile_by_type=[(t, c) for t, c in hostile_counts.most_common() if c > 0],
+        friendly_by_type=[(t, c) for t, c in friendly_counts.most_common() if c > 0],
+        dscan_by_type=dscan_counts.most_common(),
     )
