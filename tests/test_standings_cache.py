@@ -103,3 +103,23 @@ def test_is_friendly_unknown_returns_false():
 
 def test_is_friendly_handles_none_ids():
     assert is_friendly(None, None, None, friendly_ids={1}, own_character_ids=set()) is False
+
+
+def test_refresh_handles_getter_failures(tmp_path):
+    """If all three contact getters raise, refresh produces an empty cache without crashing."""
+    cache = StandingsCache(path=str(tmp_path / "fail.json"))
+
+    class FailingAuth:
+        _character_id = 7
+        def get_personal_contacts(self):
+            raise OSError("network down")
+        def get_corp_contacts(self):
+            raise RuntimeError("API limited")
+        def get_alliance_contacts(self):
+            raise ValueError("bad json")
+
+    cache.refresh(FailingAuth())
+    assert cache.friendly_ids == set()
+    assert cache.hostile_ids == set()
+    assert cache.source_character_id == 7
+    assert cache.fetched_at is not None

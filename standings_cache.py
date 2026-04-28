@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+import sys
 from datetime import datetime, timedelta, timezone
 
 
@@ -62,10 +62,24 @@ class StandingsCache:
             "friendly_ids": sorted(self.friendly_ids),
             "hostile_ids": sorted(self.hostile_ids),
         }
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.replace(tmp, self.path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except Exception:
+            # Clean up the orphan temp file on any failure (disk full, AV lock, etc.)
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def is_stale(self, max_age_hours: float = 24.0) -> bool:
         if self.fetched_at is None:
@@ -82,7 +96,8 @@ class StandingsCache:
                        auth.get_alliance_contacts):
             try:
                 rows = getter() or []
-            except Exception:
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"[standings_cache] {getter.__name__} failed: {exc}", file=sys.stderr)
                 rows = []
             for row in rows:
                 cid = row.get("contact_id")
@@ -103,6 +118,8 @@ class StandingsCache:
         if self.fetched_at is None:
             return "never"
         delta = datetime.now(timezone.utc) - self.fetched_at
+        if delta.total_seconds() < 0:
+            return "just now"
         hours = delta.total_seconds() / 3600
         if hours < 1:
             return f"{int(delta.total_seconds() / 60)}m old"
