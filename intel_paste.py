@@ -154,3 +154,23 @@ def parse_fleet_composition(text: str) -> FleetComposition:
             wing_squad=parts[6].strip(),
         ))
     return FleetComposition(members=members)
+
+
+def parse_fleet_summary(text: str) -> FleetSummary:
+    rows: list[FleetSummaryRow] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.rstrip("\n").rstrip("\r").split("\t")
+        if len(parts) != 3:
+            continue
+        try:
+            count = int(parts[2].strip())
+        except ValueError:
+            continue
+        rows.append(FleetSummaryRow(
+            ship_name=parts[0].strip(),
+            ship_class=parts[1].strip(),
+            count=count,
+        ))
+    return FleetSummary(rows=rows)

@@ -139,3 +139,28 @@ def test_parse_fleet_composition_from_fixture():
     result = parse_fleet_composition(_read("fleet_composition.txt"))
     assert len(result.members) == 2
     assert result.members[0].ship_name == "Archon"
+
+
+def test_parse_fleet_summary_basic():
+    from intel_paste import parse_fleet_summary
+    text = "Flycatcher\tInterdictor\t1\nArchon\tCarrier\t1\n"
+    result = parse_fleet_summary(text)
+    assert isinstance(result, FleetSummary)
+    assert len(result.rows) == 2
+    assert result.rows[0].ship_name == "Flycatcher"
+    assert result.rows[0].ship_class == "Interdictor"
+    assert result.rows[0].count == 1
+
+
+def test_parse_fleet_summary_skips_non_integer_count():
+    from intel_paste import parse_fleet_summary
+    text = "Flycatcher\tInterdictor\t1\nGarbage\tRow\tnot-a-number\n"
+    result = parse_fleet_summary(text)
+    assert len(result.rows) == 1
+
+
+def test_parse_fleet_summary_from_fixture():
+    from intel_paste import parse_fleet_summary
+    result = parse_fleet_summary(_read("fleet_summary.txt"))
+    assert len(result.rows) == 2
+    assert result.rows[1].ship_name == "Archon"
