@@ -296,6 +296,8 @@ def _fetch_group_id_for_type(type_id: int) -> int | None:
         if type_id in _type_group_cache:
             return _type_group_cache[type_id]
     try:
+        from rate_limiter import rate_limit
+        rate_limit("esi")
         resp = requests.get(
             f"https://esi.evetech.net/latest/universe/types/{type_id}/",
             timeout=5,
