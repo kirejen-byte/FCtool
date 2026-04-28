@@ -11,7 +11,7 @@ Supports four EVE Online paste formats:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -171,9 +171,7 @@ def parse_fleet_summary(text: str) -> FleetSummary:
     return FleetSummary(rows=rows)
 
 
-import re as _re
-
-_LEADERSHIP_RE = _re.compile(r"\d+\s*-\s*\d+\s*-\s*\d+")
+_LEADERSHIP_RE = re.compile(r"\d+\s*-\s*\d+\s*-\s*\d+")
 _FLEET_KEYWORDS = ("Boss", "Wing ", "Squad ")
 
 

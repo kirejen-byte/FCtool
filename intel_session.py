@@ -11,7 +11,6 @@ from intel_paste import (
     FleetComposition,
     FleetSummary,
     LocalScan,
-    ParsedScan,
 )
 
 T = TypeVar("T")

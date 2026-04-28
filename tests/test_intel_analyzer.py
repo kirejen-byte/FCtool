@@ -1,5 +1,3 @@
-from collections import Counter
-
 from intel_paste import (
     DScan,
     DScanRow,
@@ -12,9 +10,13 @@ from intel_paste import (
 from intel_analyzer import (
     DScanResult,
     DScanSource,
+    DScanTrend,
     LocalScanResult,
     analyze_dscan,
     analyze_local_scan,
+    compute_dscan_trend,
+    format_dscan_result,
+    format_local_scan_result,
 )
 
 
@@ -170,9 +172,6 @@ def test_analyze_dscan_does_not_underflow(monkeypatch):
     assert result.hostile_count == 0
 
 
-from intel_analyzer import DScanTrend, compute_dscan_trend
-
-
 def test_trend_no_prior_returns_none(monkeypatch):
     monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
     current = analyze_dscan(_ship_dscan(["Sabre"]),
@@ -206,9 +205,6 @@ def test_trend_basic_delta(monkeypatch):
     assert diff["Damnation"] == 1
     assert diff["Stiletto"] == -1
     assert "Damnation" in trend.new_types
-
-
-from intel_analyzer import format_dscan_result, format_local_scan_result
 
 
 def test_format_local_scan_basic():

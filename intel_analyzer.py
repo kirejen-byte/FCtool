@@ -8,7 +8,7 @@ session state) and returns a structured result that the GUI renders.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from intel_paste import (
