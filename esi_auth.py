@@ -696,6 +696,79 @@ class ESIAuth:
             pass
         return ""
 
+    # ── Names / Affiliations / Contacts ──────────────────────────────────────
+
+    def resolve_names_to_ids(self, names: list[str]) -> dict[str, int]:
+        """Resolve a list of EVE names to character IDs. Batches of 1000."""
+        out: dict[str, int] = {}
+        if not names:
+            return out
+        for i in range(0, len(names), 1000):
+            chunk = names[i:i + 1000]
+            data = self.esi_post("/universe/ids/", chunk)
+            if not isinstance(data, dict):
+                continue
+            for entry in data.get("characters", []) or []:
+                n = entry.get("name")
+                cid = entry.get("id")
+                if n and cid:
+                    out[n] = cid
+        return out
+
+    def get_affiliations(self, char_ids: list[int]) -> list[dict]:
+        """Resolve characters to corp/alliance affiliations. Batches of 1000."""
+        out: list[dict] = []
+        if not char_ids:
+            return out
+        for i in range(0, len(char_ids), 1000):
+            chunk = char_ids[i:i + 1000]
+            data = self.esi_post("/characters/affiliation/", chunk)
+            if isinstance(data, list):
+                out.extend(data)
+        return out
+
+    def get_personal_contacts(self) -> list[dict]:
+        """Get the authenticated character's personal contacts."""
+        if not self._character_id:
+            return []
+        data = self.esi_get(f"/characters/{self._character_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def get_corp_contacts(self) -> list[dict]:
+        """Get the authenticated character's corporation contacts."""
+        if not self._character_id:
+            return []
+        info = self.esi_get(f"/characters/{self._character_id}/")
+        if not isinstance(info, dict):
+            return []
+        corp_id = info.get("corporation_id")
+        if not corp_id:
+            return []
+        data = self.esi_get(f"/corporations/{corp_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def get_alliance_contacts(self) -> list[dict]:
+        """Get the authenticated character's alliance contacts."""
+        if not self._character_id:
+            return []
+        info = self.esi_get(f"/characters/{self._character_id}/")
+        if not isinstance(info, dict):
+            return []
+        alliance_id = info.get("alliance_id")
+        if not alliance_id:
+            return []
+        data = self.esi_get(f"/alliances/{alliance_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def is_fleet_boss(self) -> bool:
+        """Return True if the authenticated character is fleet commander."""
+        if not self._character_id:
+            return False
+        data = self.esi_get(f"/characters/{self._character_id}/fleet/")
+        if not isinstance(data, dict):
+            return False
+        return data.get("role") == "fleet_commander"
+
     # ── Ansiblex Discovery ───────────────────────────────────────────────────
 
     def _get_character_corp_id(self) -> int | None:

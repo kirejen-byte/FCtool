@@ -410,3 +410,98 @@ def test_refresh_lock_is_reentrant(tmp_path):
     with auth._refresh_lock:
         with auth._refresh_lock:
             pass  # No deadlock.
+
+
+# ── Bulk-name / Affiliations / Contacts / Fleet-boss helpers ────────────────
+
+def test_resolve_names_to_ids_batches(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+    captured: list[list[str]] = []
+
+    def fake_post(path, body, **kw):
+        captured.append(list(body))
+        return {
+            "characters": [
+                {"name": n, "id": 1000 + i} for i, n in enumerate(body)
+            ]
+        }
+
+    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    out = auth.resolve_names_to_ids(["Alice", "Bob"])
+    assert out == {"Alice": 1000, "Bob": 1001}
+    assert captured == [["Alice", "Bob"]]
+
+
+def test_resolve_names_to_ids_chunks_over_1000(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+    seen_batches: list[int] = []
+    # Use a counter rather than enumerate(body) so we never emit id=0,
+    # which the implementation correctly treats as invalid (truthy guard).
+    next_id = [1]
+
+    def fake_post(path, body, **kw):
+        seen_batches.append(len(body))
+        chars = []
+        for n in body:
+            chars.append({"name": n, "id": next_id[0]})
+            next_id[0] += 1
+        return {"characters": chars}
+
+    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    names = [f"P{i}" for i in range(1500)]
+    out = auth.resolve_names_to_ids(names)
+    assert seen_batches == [1000, 500]
+    assert len(out) == 1500
+
+
+def test_get_affiliations_batches(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+
+    def fake_post(path, body, **kw):
+        return [
+            {"character_id": cid, "corporation_id": 100, "alliance_id": 200}
+            for cid in body
+        ]
+
+    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    out = auth.get_affiliations([1, 2, 3])
+    assert len(out) == 3
+    assert out[0] == {
+        "character_id": 1,
+        "corporation_id": 100,
+        "alliance_id": 200,
+    }
+
+
+def test_is_fleet_boss_true(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+
+    def fake_get(path, **kw):
+        return {
+            "fleet_id": 999,
+            "role": "fleet_commander",
+            "wing_id": 0,
+            "squad_id": 0,
+        }
+
+    monkeypatch.setattr(auth, "esi_get", fake_get)
+    assert auth.is_fleet_boss() is True
+
+
+def test_is_fleet_boss_false_when_not_in_fleet(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    monkeypatch.setattr(auth, "esi_get", lambda path, **kw: None)
+    assert auth.is_fleet_boss() is False
+
+
+def test_is_fleet_boss_false_when_member(tmp_path, monkeypatch):
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    monkeypatch.setattr(
+        auth,
+        "esi_get",
+        lambda path, **kw: {"fleet_id": 1, "role": "squad_member"},
+    )
+    assert auth.is_fleet_boss() is False
