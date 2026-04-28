@@ -101,3 +101,41 @@ def test_parse_dscan_from_fixture():
     result = parse_dscan(_read("dscan.txt"))
     assert len(result.rows) == 4
     assert result.rows[0].type_name == "Vulture"
+
+
+def test_parse_fleet_composition_basic():
+    from intel_paste import parse_fleet_composition
+    text = (
+        "Securitas Protector\tO-BDXB (Docked)\tArchon\tCarrier\t"
+        "Fleet Commander (Boss)\t5 - 5 - 5\t\n"
+        "Tyreece Arkan\tC-N4OD (Docked)\tFlycatcher\tInterdictor\t"
+        "Squad Member\t0 - 4 - 5\tWing 1 / Squad 1\n"
+    )
+    result = parse_fleet_composition(text)
+    assert isinstance(result, FleetComposition)
+    assert len(result.members) == 2
+    boss = result.members[0]
+    assert boss.pilot == "Securitas Protector"
+    assert boss.system == "O-BDXB (Docked)"
+    assert boss.ship_name == "Archon"
+    assert boss.ship_class == "Carrier"
+    assert boss.role == "Fleet Commander (Boss)"
+    assert boss.links == "5 - 5 - 5"
+    assert boss.wing_squad == ""
+    member = result.members[1]
+    assert member.wing_squad == "Wing 1 / Squad 1"
+
+
+def test_parse_fleet_composition_handles_trailing_tab():
+    from intel_paste import parse_fleet_composition
+    text = "Alice\tJita\tRifter\tFrigate\tFleet Commander (Boss)\t5 - 5 - 5\t\t\n"
+    result = parse_fleet_composition(text)
+    assert len(result.members) == 1
+    assert result.members[0].wing_squad == ""
+
+
+def test_parse_fleet_composition_from_fixture():
+    from intel_paste import parse_fleet_composition
+    result = parse_fleet_composition(_read("fleet_composition.txt"))
+    assert len(result.members) == 2
+    assert result.members[0].ship_name == "Archon"

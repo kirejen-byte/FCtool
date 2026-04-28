@@ -131,3 +131,26 @@ def parse_dscan(text: str) -> DScan:
             distance_au=_parse_distance(parts[3]),
         ))
     return DScan(rows=rows)
+
+
+def parse_fleet_composition(text: str) -> FleetComposition:
+    members: list[FleetMember] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.rstrip("\n").rstrip("\r").split("\t")
+        if len(parts) < 6:
+            continue
+        # Pad to at least 7 fields so wing_squad is always defined
+        while len(parts) < 7:
+            parts.append("")
+        members.append(FleetMember(
+            pilot=parts[0].strip(),
+            system=parts[1].strip(),
+            ship_name=parts[2].strip(),
+            ship_class=parts[3].strip(),
+            role=parts[4].strip(),
+            links=parts[5].strip(),
+            wing_squad=parts[6].strip(),
+        ))
+    return FleetComposition(members=members)
