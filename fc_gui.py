@@ -5095,20 +5095,35 @@ $bmp.Dispose()
             if auth is None:
                 self._set_paste_result("No active SSO character; cannot resolve names.")
                 return
+            prior = self._intel_session.prior_local_scan(system, window_minutes=15)
             result = intel_analyzer.analyze_local_scan(
                 parsed, auth=auth,
                 friendly_ids=self._standings_cache.friendly_ids,
                 own_character_ids=own_chars,
             )
             self._intel_session.add_local_scan(system, parsed)
+            trend = None
+            if prior is not None:
+                minutes_ago = max(0, int(
+                    (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
+                ))
+                trend = intel_analyzer.compute_local_scan_trend(
+                    current_count=result.total,
+                    prior_count=len(prior.parsed.pilot_names),
+                    minutes_ago=minutes_ago,
+                )
             from zkill_monitor import resolve_name as _resolve_name
             text_out = intel_analyzer.format_local_scan_result(
-                result, resolve_name=_resolve_name,
+                result, trend=trend, resolve_name=_resolve_name,
             )
             self._set_paste_result(text_out)
+            delta_str = ""
+            if trend and trend.delta:
+                sign = "+" if trend.delta > 0 else ""
+                delta_str = f" ({sign}{trend.delta} vs scan {trend.minutes_ago}m ago)"
             self._append_intel_summary_line(
                 f"Local {system} — {result.friendly_count} friendly, "
-                f"{result.hostile_count} hostile"
+                f"{result.hostile_count} hostile{delta_str}"
             )
             return
 

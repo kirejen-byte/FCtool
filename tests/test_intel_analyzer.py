@@ -12,9 +12,11 @@ from intel_analyzer import (
     DScanSource,
     DScanTrend,
     LocalScanResult,
+    LocalScanTrend,
     analyze_dscan,
     analyze_local_scan,
     compute_dscan_trend,
+    compute_local_scan_trend,
     format_dscan_result,
     format_local_scan_result,
 )
@@ -329,3 +331,44 @@ def test_format_dscan_with_trend(monkeypatch):
     assert "Trend" in text
     assert "3 → 5" in text
     assert "+2 Hurricane" in text
+
+
+def test_compute_local_scan_trend_no_prior():
+    assert compute_local_scan_trend(current_count=10, prior_count=None, minutes_ago=0) is None
+
+
+def test_compute_local_scan_trend_basic():
+    trend = compute_local_scan_trend(current_count=15, prior_count=10, minutes_ago=3)
+    assert isinstance(trend, LocalScanTrend)
+    assert trend.minutes_ago == 3
+    assert trend.prior == 10
+    assert trend.current == 15
+    assert trend.delta == 5
+
+
+def test_compute_local_scan_trend_negative():
+    trend = compute_local_scan_trend(current_count=8, prior_count=12, minutes_ago=5)
+    assert trend.delta == -4
+
+
+def test_format_local_scan_with_trend():
+    r = LocalScanResult(
+        total=15, friendly_count=2, hostile_count=13,
+        unresolved_names=[], hostile_pilots=[],
+        top_hostile_alliances=[], top_hostile_corps=[],
+    )
+    trend = LocalScanTrend(minutes_ago=3, prior=10, current=15, delta=5)
+    text = format_local_scan_result(r, trend=trend)
+    assert "Trend (vs scan 3m ago):" in text
+    assert "Pilots: 10 → 15 (+5)" in text
+
+
+def test_format_local_scan_with_negative_trend():
+    r = LocalScanResult(
+        total=8, friendly_count=2, hostile_count=6,
+        unresolved_names=[], hostile_pilots=[],
+        top_hostile_alliances=[], top_hostile_corps=[],
+    )
+    trend = LocalScanTrend(minutes_ago=2, prior=12, current=8, delta=-4)
+    text = format_local_scan_result(r, trend=trend)
+    assert "Pilots: 12 → 8 (-4)" in text

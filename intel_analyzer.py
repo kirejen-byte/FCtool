@@ -79,6 +79,33 @@ def analyze_local_scan(
     )
 
 
+@dataclass
+class LocalScanTrend:
+    minutes_ago: int
+    prior: int
+    current: int
+    delta: int
+
+
+def compute_local_scan_trend(
+    current_count: int,
+    prior_count: int | None,
+    minutes_ago: int,
+) -> LocalScanTrend | None:
+    """Return a trend block comparing the current local-scan total to a prior one.
+
+    Returns None when there is no prior scan.
+    """
+    if prior_count is None:
+        return None
+    return LocalScanTrend(
+        minutes_ago=minutes_ago,
+        prior=prior_count,
+        current=current_count,
+        delta=current_count - prior_count,
+    )
+
+
 class DScanSource(Enum):
     PASTED = "pasted"
     ESI = "esi"
@@ -192,6 +219,7 @@ def compute_dscan_trend(
 
 def format_local_scan_result(
     r: LocalScanResult,
+    trend: "LocalScanTrend | None" = None,
     resolve_name: Callable[[int, str], str] | None = None,
 ) -> str:
     def _name(eid: int | None, category: str, fallback: str) -> str:
@@ -226,6 +254,11 @@ def format_local_scan_result(
         remaining = len(r.hostile_pilots) - len(shown)
         if remaining > 0:
             lines.append(f"    … and {remaining} more")
+    if trend is not None:
+        sign = "+" if trend.delta >= 0 else ""
+        lines.append("")
+        lines.append(f"Trend (vs scan {trend.minutes_ago}m ago):")
+        lines.append(f"  Pilots: {trend.prior} → {trend.current} ({sign}{trend.delta})")
     return "\n".join(lines)
 
 
