@@ -164,3 +164,44 @@ def test_parse_fleet_summary_from_fixture():
     result = parse_fleet_summary(_read("fleet_summary.txt"))
     assert len(result.rows) == 2
     assert result.rows[1].ship_name == "Archon"
+
+
+def test_detect_local_scan():
+    result = detect_and_parse(_read("local_scan.txt"))
+    assert isinstance(result, LocalScan)
+
+
+def test_detect_dscan():
+    result = detect_and_parse(_read("dscan.txt"))
+    assert isinstance(result, DScan)
+    assert len(result.rows) == 4
+
+
+def test_detect_fleet_composition():
+    result = detect_and_parse(_read("fleet_composition.txt"))
+    assert isinstance(result, FleetComposition)
+    assert len(result.members) == 2
+
+
+def test_detect_fleet_summary():
+    result = detect_and_parse(_read("fleet_summary.txt"))
+    assert isinstance(result, FleetSummary)
+    assert len(result.rows) == 2
+
+
+def test_detect_unrecognized_returns_none():
+    assert detect_and_parse("") is None
+    assert detect_and_parse("   \n\n  ") is None
+
+
+def test_detect_priority_fleet_summary_over_dscan_when_three_cols():
+    text = "Flycatcher\tInterdictor\t1\nArchon\tCarrier\t2\n"
+    assert isinstance(detect_and_parse(text), FleetSummary)
+
+
+def test_detect_priority_fleet_composition_over_others():
+    text = (
+        "Alice\tJita\tRifter\tFrigate\tFleet Commander (Boss)\t5 - 5 - 5\t\n"
+        "Bob\tAmarr\tRifter\tFrigate\tSquad Member\t0 - 4 - 5\tWing 1 / Squad 1\n"
+    )
+    assert isinstance(detect_and_parse(text), FleetComposition)

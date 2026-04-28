@@ -63,11 +63,6 @@ class FleetSummary:
 ParsedScan = LocalScan | DScan | FleetComposition | FleetSummary
 
 
-def detect_and_parse(text: str) -> ParsedScan | None:
-    """Auto-detect format and parse. Returns None for unrecognized input."""
-    raise NotImplementedError
-
-
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z' \-]{0,36}[A-Za-z]$")
 
 
@@ -174,3 +169,64 @@ def parse_fleet_summary(text: str) -> FleetSummary:
             count=count,
         ))
     return FleetSummary(rows=rows)
+
+
+import re as _re
+
+_LEADERSHIP_RE = _re.compile(r"\d+\s*-\s*\d+\s*-\s*\d+")
+_FLEET_KEYWORDS = ("Boss", "Wing ", "Squad ")
+
+
+def _looks_like_fleet_composition(non_blank: list[str]) -> bool:
+    if not non_blank:
+        return False
+    if not all(len(line.split("\t")) >= 5 for line in non_blank):
+        return False
+    return any(
+        any(kw in line for kw in _FLEET_KEYWORDS) or _LEADERSHIP_RE.search(line)
+        for line in non_blank
+    )
+
+
+def _looks_like_fleet_summary(non_blank: list[str]) -> bool:
+    if not non_blank:
+        return False
+    for line in non_blank:
+        parts = line.split("\t")
+        if len(parts) != 3:
+            return False
+        try:
+            int(parts[2].strip())
+        except ValueError:
+            return False
+    return True
+
+
+def _looks_like_dscan(non_blank: list[str]) -> bool:
+    for line in non_blank:
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        last = parts[3].strip()
+        if last.endswith("AU") or last.endswith("km") or last == "-":
+            return True
+    return False
+
+
+def detect_and_parse(text: str) -> ParsedScan | None:
+    non_blank = [
+        ln.rstrip("\r") for ln in text.splitlines()
+        if ln.strip()
+    ]
+    if not non_blank:
+        return None
+    if _looks_like_fleet_composition(non_blank):
+        return parse_fleet_composition(text)
+    if _looks_like_fleet_summary(non_blank):
+        return parse_fleet_summary(text)
+    if _looks_like_dscan(non_blank):
+        return parse_dscan(text)
+    parsed = parse_local_scan(text)
+    if parsed.pilot_names:
+        return parsed
+    return None
