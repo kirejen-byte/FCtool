@@ -168,3 +168,41 @@ def test_analyze_dscan_does_not_underflow(monkeypatch):
     result = analyze_dscan(scan, friendly_source=DScanSource.PASTED, fleet_roster=roster)
     assert result.friendly_count == 1
     assert result.hostile_count == 0
+
+
+from intel_analyzer import DScanTrend, compute_dscan_trend
+
+
+def test_trend_no_prior_returns_none(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    current = analyze_dscan(_ship_dscan(["Sabre"]),
+                            friendly_source=None, fleet_roster=None)
+    assert compute_dscan_trend(current_result=current, prior_result=None,
+                               minutes_ago=0) is None
+
+
+def test_trend_basic_delta(monkeypatch):
+    monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
+    prior = analyze_dscan(
+        _ship_dscan(["Hurricane", "Hurricane", "Stiletto"]),
+        friendly_source=DScanSource.PASTED,
+        fleet_roster=FleetSummary(rows=[]),  # everyone hostile
+    )
+    current = analyze_dscan(
+        _ship_dscan(["Hurricane", "Hurricane", "Hurricane",
+                     "Hurricane", "Hurricane",
+                     "Sabre", "Sabre", "Damnation"]),
+        friendly_source=DScanSource.PASTED,
+        fleet_roster=FleetSummary(rows=[]),
+    )
+    trend = compute_dscan_trend(current_result=current, prior_result=prior, minutes_ago=2)
+    assert isinstance(trend, DScanTrend)
+    assert trend.hostile_prior == 3
+    assert trend.hostile_current == 8
+    assert trend.hostile_delta == 5
+    diff = dict(trend.type_delta)
+    assert diff["Hurricane"] == 3
+    assert diff["Sabre"] == 2
+    assert diff["Damnation"] == 1
+    assert diff["Stiletto"] == -1
+    assert "Damnation" in trend.new_types

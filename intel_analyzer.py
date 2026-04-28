@@ -145,3 +145,45 @@ def analyze_dscan(
         friendly_by_type=[(t, c) for t, c in friendly_counts.most_common() if c > 0],
         dscan_by_type=dscan_counts.most_common(),
     )
+
+
+@dataclass
+class DScanTrend:
+    minutes_ago: int
+    hostile_prior: int
+    hostile_current: int
+    hostile_delta: int
+    type_delta: list[tuple[str, int]]
+    new_types: list[str]
+
+
+def compute_dscan_trend(
+    current_result: DScanResult,
+    prior_result: DScanResult | None,
+    minutes_ago: int,
+) -> DScanTrend | None:
+    if prior_result is None:
+        return None
+
+    prior_hostile = dict(prior_result.hostile_by_type)
+    current_hostile = dict(current_result.hostile_by_type)
+
+    type_deltas: dict[str, int] = {}
+    for t in set(prior_hostile) | set(current_hostile):
+        delta = current_hostile.get(t, 0) - prior_hostile.get(t, 0)
+        if delta != 0:
+            type_deltas[t] = delta
+
+    new_types = [t for t in current_hostile if t not in prior_hostile]
+    sorted_deltas = sorted(type_deltas.items(), key=lambda kv: abs(kv[1]), reverse=True)
+
+    prior_total = prior_result.hostile_count or 0
+    current_total = current_result.hostile_count or 0
+    return DScanTrend(
+        minutes_ago=minutes_ago,
+        hostile_prior=prior_total,
+        hostile_current=current_total,
+        hostile_delta=current_total - prior_total,
+        type_delta=sorted_deltas,
+        new_types=new_types,
+    )
