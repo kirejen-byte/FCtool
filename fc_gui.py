@@ -144,6 +144,11 @@ class FCToolGUI:
             path=_os.path.join(_app_dir(), "standings_cache.json")
         )
         self._standings_cache.load()
+        # If the standings cache is older than 24h, refresh in the background.
+        # This can't happen synchronously here because there may not be an
+        # authenticated character yet, and we don't want to block app startup.
+        if self._standings_cache.is_stale(max_age_hours=24):
+            self._schedule_background_standings_refresh()
         self.jump_checker: JumpRangeChecker | None = None
         self._running = False
         self._chat_thread: threading.Thread | None = None
@@ -5096,11 +5101,15 @@ $bmp.Dispose()
                 self._set_paste_result("No active SSO character; cannot resolve names.")
                 return
             prior = self._intel_session.prior_local_scan(system, window_minutes=15)
-            result = intel_analyzer.analyze_local_scan(
-                parsed, auth=auth,
-                friendly_ids=self._standings_cache.friendly_ids,
-                own_character_ids=own_chars,
-            )
+            try:
+                result = intel_analyzer.analyze_local_scan(
+                    parsed, auth=auth,
+                    friendly_ids=self._standings_cache.friendly_ids,
+                    own_character_ids=own_chars,
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._set_paste_result(f"Local-scan analysis failed: {exc}")
+                return
             self._intel_session.add_local_scan(system, parsed)
             trend = None
             if prior is not None:
@@ -5135,40 +5144,53 @@ $bmp.Dispose()
                 roster_age_min = max(0, int(
                     (datetime.now(timezone.utc) - latest_fleet.timestamp).total_seconds() / 60
                 ))
-            elif auth is not None and auth.is_fleet_boss():
-                members = auth.get_fleet_members() or []
-                from collections import Counter
-                counts = Counter(
-                    m.get("ship_type_id") for m in members if m.get("ship_type_id")
-                )
-                from zkill_monitor import resolve_name
-                roster = FleetSummary(rows=[
-                    FleetSummaryRow(resolve_name(tid, "type"), "", count)
-                    for tid, count in counts.items()
-                ])
-                friendly_source = intel_analyzer.DScanSource.ESI
-                roster_age_min = 0
+            elif auth is not None:
+                try:
+                    if auth.is_fleet_boss():
+                        members = auth.get_fleet_members() or []
+                        from collections import Counter
+                        counts = Counter(
+                            m.get("ship_type_id") for m in members if m.get("ship_type_id")
+                        )
+                        from zkill_monitor import resolve_name
+                        roster = FleetSummary(rows=[
+                            FleetSummaryRow(resolve_name(tid, "type"), "", count)
+                            for tid, count in counts.items()
+                        ])
+                        friendly_source = intel_analyzer.DScanSource.ESI
+                        roster_age_min = 0
+                    else:
+                        friendly_source = None
+                        roster = None
+                        roster_age_min = None
+                except (OSError, ValueError, RuntimeError) as exc:
+                    self._set_paste_result(f"Fleet roster fetch failed: {exc}")
+                    return
             else:
                 friendly_source = None
                 roster = None
                 roster_age_min = None
 
             prior = self._intel_session.prior_dscan(system, window_minutes=15)
-            result = intel_analyzer.analyze_dscan(
-                parsed, friendly_source=friendly_source, fleet_roster=roster,
-            )
-            trend = None
-            if prior is not None:
-                prior_result = intel_analyzer.analyze_dscan(
-                    prior.parsed, friendly_source=friendly_source, fleet_roster=roster,
+            try:
+                result = intel_analyzer.analyze_dscan(
+                    parsed, friendly_source=friendly_source, fleet_roster=roster,
                 )
-                minutes_ago = max(0, int(
-                    (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
-                ))
-                trend = intel_analyzer.compute_dscan_trend(
-                    current_result=result, prior_result=prior_result,
-                    minutes_ago=minutes_ago,
-                )
+                trend = None
+                if prior is not None:
+                    prior_result = intel_analyzer.analyze_dscan(
+                        prior.parsed, friendly_source=friendly_source, fleet_roster=roster,
+                    )
+                    minutes_ago = max(0, int(
+                        (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
+                    ))
+                    trend = intel_analyzer.compute_dscan_trend(
+                        current_result=result, prior_result=prior_result,
+                        minutes_ago=minutes_ago,
+                    )
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._set_paste_result(f"D-scan analysis failed: {exc}")
+                return
             self._intel_session.add_dscan(system, parsed)
             text_out = intel_analyzer.format_dscan_result(
                 result, trend=trend, roster_age_minutes=roster_age_min,
@@ -5213,6 +5235,35 @@ $bmp.Dispose()
             f"friendly, {len(self._standings_cache.hostile_ids)} hostile."
         )
 
+    def _schedule_background_standings_refresh(self):
+        """Spawn a daemon thread that refreshes standings if an auth becomes available.
+
+        Retries every 30s for up to 5 minutes so authentication completed after
+        startup still triggers the refresh.
+        """
+        import threading
+        import time
+
+        def _runner():
+            for _ in range(10):  # 10 × 30s = 5 min
+                auth = self._active_auth_for_intel()
+                if auth is not None:
+                    try:
+                        self._standings_cache.refresh(auth)
+                    except (OSError, ValueError, RuntimeError):
+                        return
+                    # Update label on the Tk thread (FCToolGUI uses self.root,
+                    # not subclass-style self).
+                    if hasattr(self, "_paste_standings_age"):
+                        try:
+                            self.root.after(0, self._update_standings_label)
+                        except Exception:
+                            pass
+                    return
+                time.sleep(30)
+
+        threading.Thread(target=_runner, daemon=True, name="StandingsRefresh").start()
+
     # ── Paste Intel helpers ────────────────────────────────────────────────
 
     def _active_auth_for_intel(self):
@@ -5252,20 +5303,30 @@ $bmp.Dispose()
         return ids
 
     def _infer_intel_system(self) -> str:
-        """Best-effort guess of the system the active character is currently in."""
+        """Best-effort guess of the system the active character is currently in.
+
+        Order: ESI location → most recent local-scan system (≤ 60s old) → unknown.
+        """
         auth = self._active_auth_for_intel()
-        if auth is None:
-            return "unknown"
-        try:
-            loc = auth.get_location()
-        except Exception:
-            return "unknown"
-        if not loc:
-            return "unknown"
-        sid = loc.get("solar_system_id")
-        if sid:
-            from zkill_monitor import resolve_name
-            return resolve_name(sid, "solar_system")
+        if auth is not None:
+            try:
+                loc = auth.get_location()
+            except (OSError, ValueError, RuntimeError):
+                loc = None
+            if loc:
+                sid = loc.get("solar_system_id")
+                if sid:
+                    from zkill_monitor import resolve_name
+                    return resolve_name(sid, "solar_system")
+
+        # Fallback: most recent local scan within the last 60 seconds
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+        for entry in reversed(self._intel_session.local_scans):
+            if entry.timestamp >= cutoff and entry.system and entry.system != "unknown":
+                return entry.system
+            if entry.timestamp < cutoff:
+                break  # entries are chronological; older ones won't help
         return "unknown"
 
     def _set_paste_result(self, text: str):
