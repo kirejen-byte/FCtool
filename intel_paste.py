@@ -80,3 +80,54 @@ def parse_local_scan(text: str) -> LocalScan:
         if _NAME_RE.match(line):
             names.append(line)
     return LocalScan(pilot_names=names)
+
+
+_KM_PER_AU = 149_597_870.7
+
+
+def _parse_distance(token: str) -> float | None:
+    token = token.strip()
+    if not token or token == "-":
+        return None
+    cleaned = token.replace(",", "").replace(" ", "")
+    if cleaned.endswith("AU"):
+        try:
+            return float(cleaned[:-2])
+        except ValueError:
+            return None
+    if cleaned.endswith("km"):
+        try:
+            return float(cleaned[:-2]) / _KM_PER_AU
+        except ValueError:
+            return None
+    if cleaned.endswith("m"):
+        try:
+            return float(cleaned[:-1]) / (_KM_PER_AU * 1000)
+        except ValueError:
+            return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def parse_dscan(text: str) -> DScan:
+    rows: list[DScanRow] = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\n").rstrip("\r")
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        try:
+            type_id = int(parts[0].strip())
+        except ValueError:
+            continue
+        rows.append(DScanRow(
+            type_id=type_id,
+            item_name=parts[1].strip(),
+            type_name=parts[2].strip(),
+            distance_au=_parse_distance(parts[3]),
+        ))
+    return DScan(rows=rows)

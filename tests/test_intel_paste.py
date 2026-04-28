@@ -59,3 +59,45 @@ def test_parse_local_scan_from_fixture():
     result = parse_local_scan(_read("local_scan.txt"))
     assert "Securitas Protector" in result.pilot_names
     assert "RandomEnemy123" not in result.pilot_names  # has digits
+
+
+def test_parse_dscan_basic():
+    from intel_paste import parse_dscan
+    text = "12345\tRagnar's Vulture\tVulture\t5.2 AU\n"
+    result = parse_dscan(text)
+    assert isinstance(result, DScan)
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert row.type_id == 12345
+    assert row.item_name == "Ragnar's Vulture"
+    assert row.type_name == "Vulture"
+    assert row.distance_au == pytest.approx(5.2)
+
+
+def test_parse_dscan_handles_km():
+    from intel_paste import parse_dscan
+    text = "999\tThing\tHurricane\t48,231 km\n"
+    result = parse_dscan(text)
+    assert result.rows[0].distance_au == pytest.approx(48231 / 149_597_870.7, rel=1e-3)
+
+
+def test_parse_dscan_handles_dash_distance():
+    from intel_paste import parse_dscan
+    text = "1\tA\tB\t-\n"
+    result = parse_dscan(text)
+    assert result.rows[0].distance_au is None
+
+
+def test_parse_dscan_skips_malformed_lines():
+    from intel_paste import parse_dscan
+    text = "12345\tA\tHurricane\t1.0 AU\nbroken line\n67890\tB\tSabre\t2.0 AU\n"
+    result = parse_dscan(text)
+    assert len(result.rows) == 2
+    assert result.rows[1].type_id == 67890
+
+
+def test_parse_dscan_from_fixture():
+    from intel_paste import parse_dscan
+    result = parse_dscan(_read("dscan.txt"))
+    assert len(result.rows) == 4
+    assert result.rows[0].type_name == "Vulture"
