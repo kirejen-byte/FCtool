@@ -914,6 +914,68 @@ class FCToolGUI:
                        activeforeground=FG_YELLOW,
                        ).pack(side=tk.LEFT, padx=(0, 10))
 
+        # ── Paste Intel drawer (collapsible) ──────────────────────────────
+        self._paste_drawer_expanded = False
+        self._paste_drawer_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                             highlightbackground=BORDER_COLOR,
+                                             highlightthickness=1)
+        self._paste_drawer_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
+
+        self._paste_header = tk.Frame(self._paste_drawer_frame, bg=BG_PANEL)
+        self._paste_header.pack(fill=tk.X, padx=10, pady=4)
+
+        self._paste_toggle_btn = tk.Label(
+            self._paste_header, text="▶ Paste Intel",
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2",
+        )
+        self._paste_toggle_btn.pack(side=tk.LEFT)
+        self._paste_toggle_btn.bind("<Button-1>", lambda e: self._toggle_paste_drawer())
+
+        self._paste_format_chip = tk.Label(
+            self._paste_header, text="", font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_PANEL,
+        )
+        self._paste_format_chip.pack(side=tk.LEFT, padx=15)
+
+        self._paste_standings_age = tk.Label(
+            self._paste_header, text="Standings: never",
+            font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+        )
+        self._paste_standings_age.pack(side=tk.RIGHT, padx=10)
+
+        ttk.Button(
+            self._paste_header, text="Refresh Standings", style="Dark.TButton",
+            command=self._refresh_standings,
+        ).pack(side=tk.RIGHT)
+
+        # Body (hidden by default)
+        self._paste_body = tk.Frame(self._paste_drawer_frame, bg=BG_PANEL)
+
+        self._paste_text = tk.Text(
+            self._paste_body, height=6, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+            borderwidth=1, relief=tk.RIDGE, wrap=tk.WORD,
+        )
+        self._paste_text.pack(fill=tk.X, padx=10, pady=(2, 4))
+        self._paste_text.bind("<<Modified>>", self._on_paste_text_modified)
+
+        paste_btn_row = tk.Frame(self._paste_body, bg=BG_PANEL)
+        paste_btn_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        ttk.Button(paste_btn_row, text="Parse", style="Dark.TButton",
+                   command=self._parse_pasted_intel).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(paste_btn_row, text="Clear", style="Dark.TButton",
+                   command=self._clear_paste).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(paste_btn_row, text="Collapse", style="Dark.TButton",
+                   command=self._toggle_paste_drawer).pack(side=tk.LEFT)
+
+        self._paste_result = tk.Text(
+            self._paste_body, height=8, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_TEXT, state=tk.DISABLED,
+            borderwidth=1, relief=tk.RIDGE, wrap=tk.WORD,
+        )
+        self._paste_result.pack(fill=tk.X, padx=10, pady=(0, 6))
+
         # ── Intelligence Fusion Panel ─────────────────────────────────────
         intel_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -4965,6 +5027,44 @@ $bmp.Dispose()
         if not self._intel_mute_var.get():
             self.root.bell()
         self._notify_zkill_tab()
+
+    # ── Paste Intel drawer ─────────────────────────────────────────────────
+
+    def _toggle_paste_drawer(self):
+        self._paste_drawer_expanded = not self._paste_drawer_expanded
+        if self._paste_drawer_expanded:
+            self._paste_toggle_btn.config(text="▼ Paste Intel")
+            self._paste_body.pack(fill=tk.X, padx=0, pady=0)
+        else:
+            self._paste_toggle_btn.config(text="▶ Paste Intel")
+            self._paste_body.pack_forget()
+
+    def _on_paste_text_modified(self, event=None):
+        # Reset the modified flag so the event fires again next change
+        self._paste_text.edit_modified(False)
+        text = self._paste_text.get("1.0", tk.END)
+        from intel_paste import detect_and_parse
+        parsed = detect_and_parse(text)
+        if parsed is None:
+            self._paste_format_chip.config(text="Detected: --", fg=FG_DIM)
+        else:
+            label = type(parsed).__name__
+            self._paste_format_chip.config(text=f"Detected: {label}", fg=FG_ACCENT)
+
+    def _parse_pasted_intel(self):
+        """Stub — wired in the next task."""
+        pass
+
+    def _clear_paste(self):
+        self._paste_text.delete("1.0", tk.END)
+        self._paste_result.config(state=tk.NORMAL)
+        self._paste_result.delete("1.0", tk.END)
+        self._paste_result.config(state=tk.DISABLED)
+        self._paste_format_chip.config(text="", fg=FG_DIM)
+
+    def _refresh_standings(self):
+        """Stub — wired in the next task."""
+        pass
 
     # ── Intelligence Fusion ────────────────────────────────────────────────
 
