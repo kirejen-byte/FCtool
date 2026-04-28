@@ -5177,6 +5177,7 @@ $bmp.Dispose()
         self._paste_result.delete("1.0", tk.END)
         self._paste_result.config(state=tk.DISABLED)
         self._paste_format_chip.config(text="", fg=FG_DIM)
+        self._intel_session.clear()
 
     def _refresh_standings(self):
         auth = self._active_auth_for_intel()
