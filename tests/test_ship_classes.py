@@ -39,3 +39,24 @@ def test_unknown_falls_back_to_group_lookup(monkeypatch):
 def test_unknown_with_no_group_returns_false(monkeypatch):
     monkeypatch.setattr(ship_classes, "_fetch_group_id_for_type", lambda tid: None)
     assert is_ship_type(99999999) is False
+
+
+def test_known_ship_groups_include_common_combat(monkeypatch):
+    """A pasted d-scan with Hurricanes, Drakes, Ravens, etc. must classify as ships."""
+    # Group 26 = Cruiser, 419 = Battlecruiser, 27 = Battleship
+    # These are the bread-and-butter PvP hulls; d-scan filtering must keep them.
+    monkeypatch.setattr(ship_classes, "_fetch_group_id_for_type", lambda tid: {
+        24700: 419,  # Drake (battlecruiser)
+        638: 27,     # Raven (battleship)
+        621: 26,     # Caracal (cruiser)
+        17738: 358,  # Vagabond (HAC)
+        29984: 963,  # Tengu (T3C)
+    }.get(tid))
+    # Ensure none of these are in the hardcoded type-id set first (else the test is moot)
+    assert 24700 not in ship_classes._KNOWN_SHIP_TYPE_IDS
+    assert 638 not in ship_classes._KNOWN_SHIP_TYPE_IDS
+    assert is_ship_type(24700) is True   # Drake
+    assert is_ship_type(638) is True     # Raven
+    assert is_ship_type(621) is True     # Caracal
+    assert is_ship_type(17738) is True   # Vagabond
+    assert is_ship_type(29984) is True   # Tengu

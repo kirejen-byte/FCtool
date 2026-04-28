@@ -269,7 +269,8 @@ def is_tackle(type_id: int) -> bool:
 
 # ── Ship-type predicate ─────────────────────────────────────────────────────
 
-# Group IDs we already trust as ships
+# Canonical EVE Ship category (category_id 6) groups. Hardcoded so d-scan
+# filtering doesn't depend on a per-type ESI category lookup.
 _SHIP_GROUP_IDS_KNOWN: set[int] = {
     GROUP_COMMAND_SHIPS,
     GROUP_COMMAND_DESTROYERS,
@@ -282,6 +283,14 @@ _SHIP_GROUP_IDS_KNOWN: set[int] = {
     GROUP_ASSAULT_FRIGATE,
     GROUP_INTERCEPTOR,
     GROUP_ELECTRONIC_ATTACK_SHIP,
+    # Combat cruisers / battlecruisers / battleships
+    26, 358, 833, 906, 963, 419, 1201, 27, 900, 898,
+    # Capital classes
+    547, 1538, 485, 4594, 513, 883, 902, 659, 30,
+    # Industrial / mining / hauling (visible on d-scan; treat as ships)
+    28, 380, 463, 543, 941, 1283,
+    # Faction / utility / event
+    894, 1202, 1972,
 }
 
 # Cache for ESI group-id lookups (separate from `_group_cache` so it's
