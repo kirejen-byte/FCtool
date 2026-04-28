@@ -41,6 +41,16 @@ from intel_monitor import (
     INTEL_CHANNELS, parse_dscan_text, make_dscan_summary,
     resolve_characters, coalesce_report, load_standings_whitelist,
 )
+from intel_paste import (
+    DScan, FleetComposition, FleetSummary, FleetSummaryRow, LocalScan,
+    detect_and_parse,
+)
+from intel_session import IntelSession
+from standings_cache import StandingsCache
+import intel_analyzer
+import os as _os
+from app_path import app_dir as _app_dir
+from datetime import timezone
 from xup_counter import XUpCounter, XUpState
 from zkill_monitor import ZKillMonitor, KillAlert
 from discord_notify import DiscordNotifier
@@ -129,6 +139,11 @@ class FCToolGUI:
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
         self.zkill_monitor: ZKillMonitor | None = None
+        self._intel_session = IntelSession()
+        self._standings_cache = StandingsCache(
+            path=_os.path.join(_app_dir(), "standings_cache.json")
+        )
+        self._standings_cache.load()
         self.jump_checker: JumpRangeChecker | None = None
         self._running = False
         self._chat_thread: threading.Thread | None = None
@@ -1095,6 +1110,9 @@ class FCToolGUI:
                            font=("Consolas", 11, "bold"))
             log.tag_config("hostile_char", foreground=FG_RED,
                            font=("Consolas", 10, "bold"))
+
+        # Initialize the standings age label now that the cache has been loaded.
+        self._update_standings_label()
 
     # ── Jump Range Tab ────────────────────────────────────────────────────────
 
@@ -5052,8 +5070,106 @@ $bmp.Dispose()
             self._paste_format_chip.config(text=f"Detected: {label}", fg=FG_ACCENT)
 
     def _parse_pasted_intel(self):
-        """Stub — wired in the next task."""
-        pass
+        text = self._paste_text.get("1.0", tk.END)
+        parsed = detect_and_parse(text)
+        if parsed is None:
+            self._set_paste_result("Unrecognized paste format.")
+            return
+
+        auth = self._active_auth_for_intel()
+        own_chars = self._own_character_ids()
+        system = self._infer_intel_system()
+
+        if isinstance(parsed, FleetComposition) or isinstance(parsed, FleetSummary):
+            self._intel_session.add_fleet_paste(parsed)
+            rows = (parsed.members if isinstance(parsed, FleetComposition)
+                    else parsed.rows)
+            kind = "composition" if isinstance(parsed, FleetComposition) else "summary"
+            self._set_paste_result(f"Stored fleet {kind}: {len(rows)} entries.")
+            self._append_intel_summary_line(
+                f"Fleet {kind} stored ({len(rows)} entries)"
+            )
+            return
+
+        if isinstance(parsed, LocalScan):
+            if auth is None:
+                self._set_paste_result("No active SSO character; cannot resolve names.")
+                return
+            result = intel_analyzer.analyze_local_scan(
+                parsed, auth=auth,
+                friendly_ids=self._standings_cache.friendly_ids,
+                own_character_ids=own_chars,
+            )
+            self._intel_session.add_local_scan(system, parsed)
+            text_out = intel_analyzer.format_local_scan_result(result)
+            self._set_paste_result(text_out)
+            self._append_intel_summary_line(
+                f"Local {system} — {result.friendly_count} friendly, "
+                f"{result.hostile_count} hostile"
+            )
+            return
+
+        if isinstance(parsed, DScan):
+            latest_fleet = self._intel_session.latest_fleet_paste()
+            if latest_fleet is not None:
+                friendly_source = intel_analyzer.DScanSource.PASTED
+                roster = latest_fleet.parsed
+                roster_age_min = int(
+                    (datetime.now(timezone.utc) - latest_fleet.timestamp).total_seconds() / 60
+                )
+            elif auth is not None and auth.is_fleet_boss():
+                members = auth.get_fleet_members() or []
+                from collections import Counter
+                counts = Counter(
+                    m.get("ship_type_id") for m in members if m.get("ship_type_id")
+                )
+                from zkill_monitor import resolve_name
+                roster = FleetSummary(rows=[
+                    FleetSummaryRow(resolve_name(tid, "type"), "", count)
+                    for tid, count in counts.items()
+                ])
+                friendly_source = intel_analyzer.DScanSource.ESI
+                roster_age_min = 0
+            else:
+                friendly_source = None
+                roster = None
+                roster_age_min = None
+
+            prior = self._intel_session.prior_dscan(system, window_minutes=15)
+            result = intel_analyzer.analyze_dscan(
+                parsed, friendly_source=friendly_source, fleet_roster=roster,
+            )
+            trend = None
+            if prior is not None:
+                prior_result = intel_analyzer.analyze_dscan(
+                    prior.parsed, friendly_source=friendly_source, fleet_roster=roster,
+                )
+                minutes_ago = int(
+                    (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
+                )
+                trend = intel_analyzer.compute_dscan_trend(
+                    current_result=result, prior_result=prior_result,
+                    minutes_ago=minutes_ago,
+                )
+            self._intel_session.add_dscan(system, parsed)
+            text_out = intel_analyzer.format_dscan_result(
+                result, trend=trend, roster_age_minutes=roster_age_min,
+            )
+            self._set_paste_result(text_out)
+            delta_str = ""
+            if trend and trend.hostile_delta:
+                sign = "+" if trend.hostile_delta > 0 else ""
+                delta_str = (
+                    f" ({sign}{trend.hostile_delta} hostile vs scan "
+                    f"{trend.minutes_ago}m ago)"
+                )
+            h_str = (str(result.hostile_count)
+                     if result.hostile_count is not None else "?")
+            f_str = (str(result.friendly_count)
+                     if result.friendly_count is not None else "?")
+            self._append_intel_summary_line(
+                f"D-Scan {system} — {h_str} hostile, {f_str} friendly{delta_str}"
+            )
 
     def _clear_paste(self):
         self._paste_text.delete("1.0", tk.END)
@@ -5063,8 +5179,91 @@ $bmp.Dispose()
         self._paste_format_chip.config(text="", fg=FG_DIM)
 
     def _refresh_standings(self):
-        """Stub — wired in the next task."""
-        pass
+        auth = self._active_auth_for_intel()
+        if auth is None:
+            self._set_paste_result("No active SSO character; can't refresh standings.")
+            return
+        try:
+            self._standings_cache.refresh(auth)
+        except Exception as exc:
+            self._set_paste_result(f"Standings refresh failed: {exc}")
+            return
+        self._update_standings_label()
+        self._set_paste_result(
+            f"Standings refreshed. {len(self._standings_cache.friendly_ids)} "
+            f"friendly, {len(self._standings_cache.hostile_ids)} hostile."
+        )
+
+    # ── Paste Intel helpers ────────────────────────────────────────────────
+
+    def _active_auth_for_intel(self):
+        """Return the ESIAuth instance for the user's active character.
+
+        FCToolGUI stores the primary character on self.esi_auth (set in __init__
+        from primary_character_id / tracked_character / first account).
+        """
+        auth = getattr(self, "esi_auth", None)
+        if auth is not None and getattr(auth, "character_id", None):
+            return auth
+        accounts = getattr(self, "esi_accounts", None)
+        if accounts:
+            for acct in accounts:
+                if getattr(acct, "character_id", None):
+                    return acct
+        return None
+
+    def _update_standings_label(self):
+        if hasattr(self, "_paste_standings_age"):
+            self._paste_standings_age.config(
+                text=f"Standings: {self._standings_cache.age_string()}"
+            )
+
+    def _own_character_ids(self) -> set[int]:
+        """Return character IDs of all logged-in SSO characters."""
+        accounts = getattr(self, "esi_accounts", None) or []
+        ids: set[int] = set()
+        for acct in accounts:
+            cid = getattr(acct, "character_id", None)
+            if cid:
+                ids.add(cid)
+        if not ids:
+            auth = self._active_auth_for_intel()
+            if auth is not None and getattr(auth, "character_id", None):
+                ids.add(auth.character_id)
+        return ids
+
+    def _infer_intel_system(self) -> str:
+        """Best-effort guess of the system the active character is currently in."""
+        auth = self._active_auth_for_intel()
+        if auth is None:
+            return "unknown"
+        try:
+            loc = auth.get_location()
+        except Exception:
+            return "unknown"
+        if not loc:
+            return "unknown"
+        sid = loc.get("solar_system_id")
+        if sid:
+            from zkill_monitor import resolve_name
+            return resolve_name(sid, "solar_system")
+        return "unknown"
+
+    def _set_paste_result(self, text: str):
+        self._paste_result.config(state=tk.NORMAL)
+        self._paste_result.delete("1.0", tk.END)
+        self._paste_result.insert(tk.END, text)
+        self._paste_result.config(state=tk.DISABLED)
+
+    def _append_intel_summary_line(self, message: str):
+        """Append a one-line summary to the right-pane intel log."""
+        if not hasattr(self, "_intel_log"):
+            return
+        stamp = datetime.now().strftime("%H:%M")
+        self._intel_log.config(state=tk.NORMAL)
+        self._intel_log.insert(tk.END, f"[{stamp}] {message}\n")
+        self._intel_log.see(tk.END)
+        self._intel_log.config(state=tk.DISABLED)
 
     # ── Intelligence Fusion ────────────────────────────────────────────────
 
