@@ -5265,10 +5265,20 @@ $bmp.Dispose()
             self._set_paste_result(f"Standings refresh failed: {exc}")
             return
         self._update_standings_label()
-        self._set_paste_result(
+        msg = (
             f"Standings refreshed. {len(self._standings_cache.friendly_ids)} "
             f"friendly, {len(self._standings_cache.hostile_ids)} hostile."
         )
+        # If friendly is very small, the user's token probably predates the
+        # corp/alliance contact scopes — nudge them to re-add their character.
+        if len(self._standings_cache.friendly_ids) < 5:
+            msg += (
+                "\n\nIf you expected more friendly entries, your token may "
+                "predate recent scope additions. Remove and re-add your "
+                "character in Settings → EVE SSO Characters to pick up the new "
+                "corp/alliance contact scopes."
+            )
+        self._set_paste_result(msg)
 
     def _schedule_background_standings_refresh(self):
         """Spawn a daemon thread that refreshes standings if an auth becomes available.

@@ -716,54 +716,104 @@ class ESIAuth:
     # ── Names / Affiliations / Contacts ──────────────────────────────────────
 
     def resolve_names_to_ids(self, names: list[str]) -> dict[str, int]:
-        """Resolve a list of EVE names to character IDs. Batches of 1000.
+        """Resolve a list of EVE names to character IDs.
 
-        Tries the public (unauthenticated) ESI endpoint first since /universe/ids/
-        doesn't require scopes. Falls back to the authenticated POST if that fails."""
+        Tries the public ESI endpoint first (no auth required), falls back to the
+        authenticated POST. Names are deduplicated and length-filtered (3-37 chars
+        per EVE's character-name rules) before being sent. On 400/failure, the
+        chunk is recursively split in half and retried — this handles ESI batch
+        limits, duplicate-rejection, and isolated bad names automatically."""
         out: dict[str, int] = {}
         if not names:
             return out
-        for i in range(0, len(names), 1000):
-            chunk = names[i:i + 1000]
-            data = ESIAuth.esi_post_public("/universe/ids/", chunk)
-            if not isinstance(data, dict):
-                data = self.esi_post("/universe/ids/", chunk)
-            if not isinstance(data, dict):
-                print(
-                    f"[esi_auth] /universe/ids/ failed for batch of "
-                    f"{len(chunk)} names",
-                    file=sys.stderr,
-                )
+
+        # Deduplicate (preserve insertion order) and length-filter
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for n in names:
+            if n in seen:
                 continue
+            seen.add(n)
+            if 3 <= len(n) <= 37:
+                cleaned.append(n)
+
+        self._resolve_chunk_recursive(cleaned, out)
+        return out
+
+    def _resolve_chunk_recursive(self, chunk: list[str], out: dict[str, int]) -> None:
+        """Resolve a chunk, splitting in half on failure until each chunk is size 1."""
+        if not chunk:
+            return
+        INITIAL_CHUNK = 500
+        if len(chunk) > INITIAL_CHUNK:
+            for i in range(0, len(chunk), INITIAL_CHUNK):
+                self._resolve_chunk_recursive(chunk[i:i + INITIAL_CHUNK], out)
+            return
+
+        data = ESIAuth.esi_post_public("/universe/ids/", chunk)
+        if not isinstance(data, dict):
+            data = self.esi_post("/universe/ids/", chunk)
+
+        if isinstance(data, dict):
             for entry in data.get("characters", []) or []:
                 n = entry.get("name")
                 cid = entry.get("id")
                 if n and cid:
                     out[n] = cid
-        return out
+            return
+
+        # Failure — split chunk in half and retry
+        if len(chunk) <= 1:
+            # Single name failure: log and drop
+            print(
+                f"[esi_auth] /universe/ids/ rejected single name: "
+                f"{chunk[0] if chunk else '<empty>'}",
+                file=sys.stderr,
+            )
+            return
+        mid = len(chunk) // 2
+        self._resolve_chunk_recursive(chunk[:mid], out)
+        self._resolve_chunk_recursive(chunk[mid:], out)
 
     def get_affiliations(self, char_ids: list[int]) -> list[dict]:
-        """Resolve characters to corp/alliance affiliations. Batches of 1000.
-
-        Public ESI endpoint — uses unauthenticated POST first; falls back to
-        authenticated only if needed."""
+        """Resolve characters to corp/alliance affiliations. Public endpoint with
+        auth fallback; chunks of 1000 with split-on-failure recovery."""
         out: list[dict] = []
         if not char_ids:
             return out
-        for i in range(0, len(char_ids), 1000):
-            chunk = char_ids[i:i + 1000]
-            data = ESIAuth.esi_post_public("/characters/affiliation/", chunk)
-            if not isinstance(data, list):
-                data = self.esi_post("/characters/affiliation/", chunk)
-            if isinstance(data, list):
-                out.extend(data)
-            else:
-                print(
-                    f"[esi_auth] /characters/affiliation/ failed for "
-                    f"{len(chunk)} ids",
-                    file=sys.stderr,
-                )
+        # Dedupe (preserve order)
+        seen: set[int] = set()
+        cleaned: list[int] = []
+        for cid in char_ids:
+            if cid not in seen:
+                seen.add(cid)
+                cleaned.append(cid)
+        self._affiliations_chunk_recursive(cleaned, out)
         return out
+
+    def _affiliations_chunk_recursive(self, chunk: list[int], out: list[dict]) -> None:
+        if not chunk:
+            return
+        if len(chunk) > 1000:
+            for i in range(0, len(chunk), 1000):
+                self._affiliations_chunk_recursive(chunk[i:i + 1000], out)
+            return
+
+        data = ESIAuth.esi_post_public("/characters/affiliation/", chunk)
+        if not isinstance(data, list):
+            data = self.esi_post("/characters/affiliation/", chunk)
+
+        if isinstance(data, list):
+            out.extend(data)
+            return
+
+        if len(chunk) <= 1:
+            print(f"[esi_auth] /characters/affiliation/ rejected id: {chunk[0] if chunk else '<empty>'}",
+                  file=sys.stderr)
+            return
+        mid = len(chunk) // 2
+        self._affiliations_chunk_recursive(chunk[:mid], out)
+        self._affiliations_chunk_recursive(chunk[mid:], out)
 
     def get_personal_contacts(self) -> list[dict]:
         """Get the authenticated character's personal contacts."""

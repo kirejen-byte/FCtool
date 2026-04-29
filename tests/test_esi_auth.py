@@ -452,10 +452,85 @@ def test_resolve_names_to_ids_chunks_over_1000(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ESIAuth, "esi_post_public", staticmethod(fake_post)
     )
-    names = [f"P{i}" for i in range(1500)]
+    # Use 6+ char names so they pass the 3-37 length filter.
+    names = [f"Pilot{i}" for i in range(1500)]
     out = auth.resolve_names_to_ids(names)
-    assert seen_batches == [1000, 500]
+    # New chunk size is 500.
+    assert seen_batches == [500, 500, 500]
     assert len(out) == 1500
+
+
+def test_resolve_names_to_ids_filters_short_names(tmp_path, monkeypatch):
+    """Names < 3 chars are dropped before sending to ESI."""
+    auth = _make_auth(tmp_path)
+    captured: list[list[str]] = []
+
+    def fake_post(path, body, **kw):
+        captured.append(list(body))
+        return {
+            "characters": [
+                {"name": n, "id": i} for i, n in enumerate(body, start=1)
+            ]
+        }
+
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
+    out = auth.resolve_names_to_ids(["Bo", "Alice", "X", "Bobby"])
+    # Bo (2) and X (1) dropped; only Alice and Bobby reach ESI.
+    assert captured == [["Alice", "Bobby"]]
+    assert "Alice" in out and "Bobby" in out
+    assert "Bo" not in out and "X" not in out
+
+
+def test_resolve_names_to_ids_dedupes(tmp_path, monkeypatch):
+    """Duplicates are dropped before sending."""
+    auth = _make_auth(tmp_path)
+    captured: list[list[str]] = []
+
+    def fake_post(path, body, **kw):
+        captured.append(list(body))
+        return {"characters": [{"name": n, "id": 1} for n in body]}
+
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
+    out = auth.resolve_names_to_ids(
+        ["Alice", "Bob", "Alice", "Bob", "Alice"]
+    )
+    assert captured == [["Alice", "Bob"]]
+    assert "Alice" in out and "Bob" in out
+
+
+def test_resolve_names_to_ids_recovers_via_split(tmp_path, monkeypatch):
+    """If a batch returns None (simulating 400), it splits and retries."""
+    auth = _make_auth(tmp_path)
+    call_log: list[list[str]] = []
+
+    def fake_post(path, body, **kw):
+        call_log.append(list(body))
+        # Fail on a specific size threshold to force a split.
+        if len(body) >= 4:
+            return None  # simulate 400
+        return {
+            "characters": [
+                {"name": n, "id": 100 + i} for i, n in enumerate(body)
+            ]
+        }
+
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
+    # Auth fallback also fails so we exercise the split path.
+    monkeypatch.setattr(
+        auth, "esi_post", lambda p, b, **kw: None, raising=False
+    )
+    names = ["Alice", "Bob", "Carol", "Dave"]  # 4 names → split to 2+2.
+    out = auth.resolve_names_to_ids(names)
+    # All 4 should resolve via split-and-retry.
+    assert len(out) == 4
+    # One initial 4-name attempt that fails, then two 2-name retries.
+    assert [len(c) for c in call_log] == [4, 2, 2]
 
 
 def test_resolve_names_to_ids_falls_back_to_auth_post(tmp_path, monkeypatch):
@@ -480,9 +555,10 @@ def test_resolve_names_to_ids_falls_back_to_auth_post(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(auth, "esi_post", fake_auth_post, raising=False)
-    out = auth.resolve_names_to_ids(["X", "Y"])
-    assert out == {"X": 100, "Y": 101}
-    assert captured_bodies == [["X", "Y"]]
+    # Use 3+ char names so they pass the new length filter (3-37 chars).
+    out = auth.resolve_names_to_ids(["Xen", "Yon"])
+    assert out == {"Xen": 100, "Yon": 101}
+    assert captured_bodies == [["Xen", "Yon"]]
 
 
 def test_get_affiliations_batches(tmp_path, monkeypatch):
