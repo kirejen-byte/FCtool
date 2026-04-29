@@ -5101,41 +5101,71 @@ $bmp.Dispose()
                 self._set_paste_result("No active SSO character; cannot resolve names.")
                 return
             prior = self._intel_session.prior_local_scan(system, window_minutes=15)
-            try:
-                result = intel_analyzer.analyze_local_scan(
-                    parsed, auth=auth,
-                    friendly_ids=self._standings_cache.friendly_ids,
-                    own_character_ids=own_chars,
-                )
-            # Broad catch: surface any failure to the user as a friendly message
-            # rather than crashing the Tk mainloop.
-            except Exception as exc:
-                self._set_paste_result(f"Local-scan analysis failed: {exc}")
-                return
             self._intel_session.add_local_scan(system, parsed)
-            trend = None
-            if prior is not None:
-                minutes_ago = max(0, int(
-                    (datetime.now(timezone.utc) - prior.timestamp).total_seconds() / 60
-                ))
-                trend = intel_analyzer.compute_local_scan_trend(
-                    current_count=result.total,
-                    prior_count=len(prior.parsed.pilot_names),
-                    minutes_ago=minutes_ago,
+            self._set_paste_result(
+                f"Analyzing local scan ({len(parsed.pilot_names)} pilots)…"
+            )
+
+            # Snapshot what the worker needs so it doesn't touch self.* state
+            # from the daemon thread.
+            friendly_ids = set(self._standings_cache.friendly_ids)
+            prior_count = len(prior.parsed.pilot_names) if prior else None
+            prior_timestamp = prior.timestamp if prior else None
+
+            def _worker():
+                try:
+                    result = intel_analyzer.analyze_local_scan(
+                        parsed, auth=auth,
+                        friendly_ids=friendly_ids,
+                        own_character_ids=own_chars,
+                    )
+                # Broad catch: surface any failure to the user as a friendly
+                # message rather than crashing the Tk mainloop.
+                except Exception as exc:
+                    self.root.after(
+                        0,
+                        lambda exc=exc: self._set_paste_result(
+                            f"Local-scan analysis failed: {exc}"
+                        ),
+                    )
+                    return
+
+                trend = None
+                if prior_count is not None and prior_timestamp is not None:
+                    minutes_ago = max(0, int(
+                        (datetime.now(timezone.utc) - prior_timestamp)
+                        .total_seconds() / 60
+                    ))
+                    trend = intel_analyzer.compute_local_scan_trend(
+                        current_count=result.total,
+                        prior_count=prior_count,
+                        minutes_ago=minutes_ago,
+                    )
+
+                from zkill_monitor import resolve_name as _resolve_name
+                text_out = intel_analyzer.format_local_scan_result(
+                    result, trend=trend, resolve_name=_resolve_name,
                 )
-            from zkill_monitor import resolve_name as _resolve_name
-            text_out = intel_analyzer.format_local_scan_result(
-                result, trend=trend, resolve_name=_resolve_name,
-            )
-            self._set_paste_result(text_out)
-            delta_str = ""
-            if trend and trend.delta:
-                sign = "+" if trend.delta > 0 else ""
-                delta_str = f" ({sign}{trend.delta} vs scan {trend.minutes_ago}m ago)"
-            self._append_intel_summary_line(
-                f"Local {system} — {result.friendly_count} friendly, "
-                f"{result.hostile_count} hostile{delta_str}"
-            )
+
+                def _finish():
+                    self._set_paste_result(text_out)
+                    delta_str = ""
+                    if trend and trend.delta:
+                        sign = "+" if trend.delta > 0 else ""
+                        delta_str = (
+                            f" ({sign}{trend.delta} vs scan "
+                            f"{trend.minutes_ago}m ago)"
+                        )
+                    self._append_intel_summary_line(
+                        f"Local {system} — {result.friendly_count} friendly, "
+                        f"{result.hostile_count} hostile{delta_str}"
+                    )
+
+                self.root.after(0, _finish)
+
+            threading.Thread(
+                target=_worker, daemon=True, name="LocalScanAnalyze",
+            ).start()
             return
 
         if isinstance(parsed, DScan):
