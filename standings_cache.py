@@ -88,9 +88,33 @@ class StandingsCache:
         return age > timedelta(hours=max_age_hours)
 
     def refresh(self, auth) -> None:
-        """Pull contacts from ESI and rebuild the cache."""
+        """Pull contacts from ESI and rebuild the cache.
+
+        Also marks the active character's own corp and alliance as friendly,
+        because EVE's contact endpoints don't list "yourself" -- your own
+        affiliations aren't entities you have standings toward, so without this
+        explicit handling alliance-mates would silently bucket as hostile.
+        """
         friendly: set[int] = set()
         hostile: set[int] = set()
+
+        own_char_id = (
+            getattr(auth, "character_id", None)
+            or getattr(auth, "_character_id", None)
+        )
+        if own_char_id:
+            try:
+                info = auth.esi_get(f"/characters/{own_char_id}/")
+            except Exception:
+                info = None
+            if isinstance(info, dict):
+                corp_id = info.get("corporation_id")
+                alliance_id = info.get("alliance_id")
+                if corp_id:
+                    friendly.add(int(corp_id))
+                if alliance_id:
+                    friendly.add(int(alliance_id))
+
         for getter in (auth.get_personal_contacts,
                        auth.get_corp_contacts,
                        auth.get_alliance_contacts):
@@ -108,10 +132,11 @@ class StandingsCache:
                     friendly.add(int(cid))
                 elif standing < 0:
                     hostile.add(int(cid))
+
         self.friendly_ids = friendly
         self.hostile_ids = hostile
         self.fetched_at = datetime.now(timezone.utc)
-        self.source_character_id = getattr(auth, "_character_id", None)
+        self.source_character_id = own_char_id
         self.save()
 
     def age_string(self) -> str:

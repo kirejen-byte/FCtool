@@ -123,3 +123,60 @@ def test_refresh_handles_getter_failures(tmp_path):
     assert cache.hostile_ids == set()
     assert cache.source_character_id == 7
     assert cache.fetched_at is not None
+
+
+def test_refresh_adds_own_corp_and_alliance_as_friendly(tmp_path):
+    """The user's own corp and alliance are auto-friendly because EVE's
+    contact endpoints don't list 'yourself'."""
+    cache = StandingsCache(path=str(tmp_path / "x.json"))
+
+    class FakeAuth:
+        character_id = 90143494
+        _character_id = 90143494
+        def esi_get(self, path):
+            assert path == "/characters/90143494/"
+            return {"corporation_id": 5555, "alliance_id": 1900696668, "name": "Securitas"}
+        def get_personal_contacts(self): return []
+        def get_corp_contacts(self): return []
+        def get_alliance_contacts(self): return []
+
+    cache.refresh(FakeAuth())
+    assert 5555 in cache.friendly_ids       # own corp
+    assert 1900696668 in cache.friendly_ids  # own alliance (The Initiative.)
+    assert cache.source_character_id == 90143494
+
+
+def test_refresh_handles_missing_alliance(tmp_path):
+    """Some characters are not in any alliance -- only corp should be added."""
+    cache = StandingsCache(path=str(tmp_path / "x.json"))
+
+    class FakeAuth:
+        character_id = 1
+        def esi_get(self, path):
+            return {"corporation_id": 100, "alliance_id": None, "name": "Lonewolf"}
+        def get_personal_contacts(self): return []
+        def get_corp_contacts(self): return []
+        def get_alliance_contacts(self): return []
+
+    cache.refresh(FakeAuth())
+    assert 100 in cache.friendly_ids
+    # No alliance_id was added (it was None)
+    assert cache.friendly_ids == {100}
+
+
+def test_refresh_handles_esi_get_failure(tmp_path):
+    """If /characters/{id}/ fails, refresh still runs but auto-friendly is empty."""
+    cache = StandingsCache(path=str(tmp_path / "x.json"))
+
+    class FakeAuth:
+        character_id = 1
+        def esi_get(self, path):
+            raise OSError("network down")
+        def get_personal_contacts(self): return [
+            {"contact_id": 42, "standing": 5.0},
+        ]
+        def get_corp_contacts(self): return []
+        def get_alliance_contacts(self): return []
+
+    cache.refresh(FakeAuth())
+    assert cache.friendly_ids == {42}  # contact still added; auto-friendly skipped
