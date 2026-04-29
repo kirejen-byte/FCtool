@@ -5156,9 +5156,12 @@ $bmp.Dispose()
                             f" ({sign}{trend.delta} vs scan "
                             f"{trend.minutes_ago}m ago)"
                         )
+                    effective_hostile = (
+                        result.hostile_count + len(result.unresolved_names)
+                    )
                     self._append_intel_summary_line(
                         f"Local {system} — {result.friendly_count} friendly, "
-                        f"{result.hostile_count} hostile{delta_str}"
+                        f"{effective_hostile} hostile{delta_str}"
                     )
 
                 self.root.after(0, _finish)

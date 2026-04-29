@@ -234,9 +234,14 @@ def format_local_scan_result(
 
     lines = [f"Local — {r.total} pilots"]
     lines.append(f"  Friendly: {r.friendly_count}")
-    lines.append(f"  Hostile:  {r.hostile_count}")
+    effective_hostile = r.hostile_count + len(r.unresolved_names)
     if r.unresolved_names:
-        lines.append(f"  Unresolved: {len(r.unresolved_names)}")
+        lines.append(
+            f"  Hostile:  {effective_hostile} "
+            f"(of which {len(r.unresolved_names)} unresolved — name mismatch or deleted)"
+        )
+    else:
+        lines.append(f"  Hostile:  {r.hostile_count}")
     if r.top_hostile_alliances:
         lines.append("  Top hostile alliances:")
         for aid, count in r.top_hostile_alliances:

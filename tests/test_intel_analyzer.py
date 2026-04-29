@@ -280,6 +280,23 @@ def test_format_local_scan_without_resolver_falls_back():
     assert "Alice [Alliance 200]" in text
 
 
+def test_format_local_scan_folds_unresolved_into_hostile():
+    """Unresolved names (typos / deleted characters) are surfaced as part of
+    the Hostile count rather than as a separate bucket. This avoids confusing
+    the FC with three numbers that don't add up to a useful total."""
+    r = LocalScanResult(
+        total=10, friendly_count=2, hostile_count=5,
+        unresolved_names=["Ghost1", "Ghost2", "Ghost3"],
+        hostile_pilots=[], top_hostile_alliances=[], top_hostile_corps=[],
+    )
+    text = format_local_scan_result(r)
+    assert "Hostile:  8" in text  # 5 resolved hostile + 3 unresolved
+    assert "(of which 3 unresolved" in text
+    # No separate "Unresolved:" line
+    lines = text.splitlines()
+    assert not any(line.strip().startswith("Unresolved:") for line in lines)
+
+
 def test_format_dscan_no_source(monkeypatch):
     monkeypatch.setattr("intel_analyzer.is_ship_type", lambda tid: True)
     r = analyze_dscan(_ship_dscan(["Vulture"]), friendly_source=None, fleet_roster=None)
