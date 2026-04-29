@@ -78,3 +78,23 @@ class IntelSession:
         self.local_scans.clear()
         self.dscan_scans.clear()
         self.fleet_pastes.clear()
+
+
+def find_recent_system(
+    scans: list[ScanEntry[LocalScan]],
+    now: datetime,
+    window_seconds: int = 60,
+) -> str | None:
+    """Find the most recent local-scan system within ``window_seconds``.
+
+    Skips entries with ``system == "unknown"``. Returns ``None`` when no
+    recent entry exists. Assumes scans are appended chronologically
+    (oldest first).
+    """
+    cutoff = now - timedelta(seconds=window_seconds)
+    for entry in reversed(scans):
+        if entry.timestamp < cutoff:
+            break
+        if entry.system and entry.system != "unknown":
+            return entry.system
+    return None

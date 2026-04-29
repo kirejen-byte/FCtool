@@ -12,7 +12,7 @@ import tkinter as tk
 import webbrowser
 import requests
 from tkinter import ttk, scrolledtext, messagebox, filedialog
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Platform-specific sound support
 if sys.platform == "win32":
@@ -5311,7 +5311,7 @@ $bmp.Dispose()
         if auth is not None:
             try:
                 loc = auth.get_location()
-            except (OSError, ValueError, RuntimeError):
+            except Exception:  # broad: any failure → fall through to local-scan
                 loc = None
             if loc:
                 sid = loc.get("solar_system_id")
@@ -5319,15 +5319,13 @@ $bmp.Dispose()
                     from zkill_monitor import resolve_name
                     return resolve_name(sid, "solar_system")
 
-        # Fallback: most recent local scan within the last 60 seconds
-        from datetime import datetime, timezone, timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
-        for entry in reversed(self._intel_session.local_scans):
-            if entry.timestamp >= cutoff and entry.system and entry.system != "unknown":
-                return entry.system
-            if entry.timestamp < cutoff:
-                break  # entries are chronological; older ones won't help
-        return "unknown"
+        from intel_session import find_recent_system
+        recent = find_recent_system(
+            self._intel_session.local_scans,
+            now=datetime.now(timezone.utc),
+            window_seconds=60,
+        )
+        return recent or "unknown"
 
     def _set_paste_result(self, text: str):
         self._paste_result.config(state=tk.NORMAL)

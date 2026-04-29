@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from intel_paste import DScan, DScanRow, FleetSummary, FleetSummaryRow, LocalScan
-from intel_session import IntelSession
+from intel_session import IntelSession, find_recent_system
 
 
 def _dscan(types: list[str]) -> DScan:
@@ -84,3 +84,33 @@ def test_clear_wipes_all():
 def _make_entry(ts, system, parsed):
     from intel_session import ScanEntry
     return ScanEntry(timestamp=ts, system=system, parsed=parsed)
+
+
+def test_find_recent_system_within_window():
+    now = datetime.now(timezone.utc)
+    s = IntelSession()
+    s.local_scans.append(_make_entry(now - timedelta(seconds=30), "O-BDXB",
+                                      LocalScan(pilot_names=["A"])))
+    assert find_recent_system(s.local_scans, now=now) == "O-BDXB"
+
+
+def test_find_recent_system_outside_window():
+    now = datetime.now(timezone.utc)
+    s = IntelSession()
+    s.local_scans.append(_make_entry(now - timedelta(seconds=120), "O-BDXB",
+                                      LocalScan(pilot_names=["A"])))
+    assert find_recent_system(s.local_scans, now=now) is None
+
+
+def test_find_recent_system_skips_unknown():
+    now = datetime.now(timezone.utc)
+    s = IntelSession()
+    s.local_scans.append(_make_entry(now - timedelta(seconds=10), "unknown",
+                                      LocalScan(pilot_names=["A"])))
+    s.local_scans.append(_make_entry(now - timedelta(seconds=5), "Jita",
+                                      LocalScan(pilot_names=["B"])))
+    assert find_recent_system(s.local_scans, now=now) == "Jita"
+
+
+def test_find_recent_system_empty():
+    assert find_recent_system([], now=datetime.now(timezone.utc)) is None
