@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -554,6 +555,20 @@ class ESIAuth:
             print(f"[ESI] Error: {e}")
         return None
 
+    @staticmethod
+    def esi_post_public(path: str, body) -> dict | list | None:
+        """Public ESI POST — no auth, no token. For endpoints that don't require scopes
+        (e.g. /universe/ids/, /characters/affiliation/). Returns None on failure."""
+        url = ESI_BASE + path
+        headers = {**HEADERS, "Content-Type": "application/json"}
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=10)
+            if resp.ok:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
     # ── Character Info ───────────────────────────────────────────────────────
 
     def get_location(self) -> dict | None:
@@ -701,14 +716,24 @@ class ESIAuth:
     # ── Names / Affiliations / Contacts ──────────────────────────────────────
 
     def resolve_names_to_ids(self, names: list[str]) -> dict[str, int]:
-        """Resolve a list of EVE names to character IDs. Batches of 1000."""
+        """Resolve a list of EVE names to character IDs. Batches of 1000.
+
+        Tries the public (unauthenticated) ESI endpoint first since /universe/ids/
+        doesn't require scopes. Falls back to the authenticated POST if that fails."""
         out: dict[str, int] = {}
         if not names:
             return out
         for i in range(0, len(names), 1000):
             chunk = names[i:i + 1000]
-            data = self.esi_post("/universe/ids/", chunk)
+            data = ESIAuth.esi_post_public("/universe/ids/", chunk)
             if not isinstance(data, dict):
+                data = self.esi_post("/universe/ids/", chunk)
+            if not isinstance(data, dict):
+                print(
+                    f"[esi_auth] /universe/ids/ failed for batch of "
+                    f"{len(chunk)} names",
+                    file=sys.stderr,
+                )
                 continue
             for entry in data.get("characters", []) or []:
                 n = entry.get("name")
@@ -718,15 +743,26 @@ class ESIAuth:
         return out
 
     def get_affiliations(self, char_ids: list[int]) -> list[dict]:
-        """Resolve characters to corp/alliance affiliations. Batches of 1000."""
+        """Resolve characters to corp/alliance affiliations. Batches of 1000.
+
+        Public ESI endpoint — uses unauthenticated POST first; falls back to
+        authenticated only if needed."""
         out: list[dict] = []
         if not char_ids:
             return out
         for i in range(0, len(char_ids), 1000):
             chunk = char_ids[i:i + 1000]
-            data = self.esi_post("/characters/affiliation/", chunk)
+            data = ESIAuth.esi_post_public("/characters/affiliation/", chunk)
+            if not isinstance(data, list):
+                data = self.esi_post("/characters/affiliation/", chunk)
             if isinstance(data, list):
                 out.extend(data)
+            else:
+                print(
+                    f"[esi_auth] /characters/affiliation/ failed for "
+                    f"{len(chunk)} ids",
+                    file=sys.stderr,
+                )
         return out
 
     def get_personal_contacts(self) -> list[dict]:

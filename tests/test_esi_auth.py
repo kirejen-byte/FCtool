@@ -426,7 +426,9 @@ def test_resolve_names_to_ids_batches(tmp_path, monkeypatch):
             ]
         }
 
-    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
     out = auth.resolve_names_to_ids(["Alice", "Bob"])
     assert out == {"Alice": 1000, "Bob": 1001}
     assert captured == [["Alice", "Bob"]]
@@ -447,11 +449,40 @@ def test_resolve_names_to_ids_chunks_over_1000(tmp_path, monkeypatch):
             next_id[0] += 1
         return {"characters": chars}
 
-    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
     names = [f"P{i}" for i in range(1500)]
     out = auth.resolve_names_to_ids(names)
     assert seen_batches == [1000, 500]
     assert len(out) == 1500
+
+
+def test_resolve_names_to_ids_falls_back_to_auth_post(tmp_path, monkeypatch):
+    """If the public POST returns None (e.g., network), fall back to the
+    authenticated POST. This guards against regressions in the public-first
+    pattern silently dropping all results when the public path fails."""
+    auth = _make_auth(tmp_path)
+    # Public endpoint fails for every batch.
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public",
+        staticmethod(lambda path, body: None),
+    )
+    # Authenticated fallback succeeds.
+    captured_bodies: list[list[str]] = []
+
+    def fake_auth_post(path, body, **kw):
+        captured_bodies.append(list(body))
+        return {
+            "characters": [
+                {"name": n, "id": 100 + i} for i, n in enumerate(body)
+            ]
+        }
+
+    monkeypatch.setattr(auth, "esi_post", fake_auth_post, raising=False)
+    out = auth.resolve_names_to_ids(["X", "Y"])
+    assert out == {"X": 100, "Y": 101}
+    assert captured_bodies == [["X", "Y"]]
 
 
 def test_get_affiliations_batches(tmp_path, monkeypatch):
@@ -463,7 +494,9 @@ def test_get_affiliations_batches(tmp_path, monkeypatch):
             for cid in body
         ]
 
-    monkeypatch.setattr(auth, "esi_post", fake_post, raising=False)
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public", staticmethod(fake_post)
+    )
     out = auth.get_affiliations([1, 2, 3])
     assert len(out) == 3
     assert out[0] == {
@@ -471,6 +504,29 @@ def test_get_affiliations_batches(tmp_path, monkeypatch):
         "corporation_id": 100,
         "alliance_id": 200,
     }
+
+
+def test_get_affiliations_falls_back_to_auth_post(tmp_path, monkeypatch):
+    """Mirror of the resolve_names_to_ids fallback: if public POST fails,
+    fall through to the authenticated POST so authorized users still get
+    results when (e.g.) an upstream proxy blocks unauthenticated calls."""
+    auth = _make_auth(tmp_path)
+    monkeypatch.setattr(
+        ESIAuth, "esi_post_public",
+        staticmethod(lambda path, body: None),
+    )
+
+    def fake_auth_post(path, body, **kw):
+        return [
+            {"character_id": cid, "corporation_id": 7, "alliance_id": None}
+            for cid in body
+        ]
+
+    monkeypatch.setattr(auth, "esi_post", fake_auth_post, raising=False)
+    out = auth.get_affiliations([10, 11])
+    assert len(out) == 2
+    assert out[0]["character_id"] == 10
+    assert out[1]["character_id"] == 11
 
 
 def test_is_fleet_boss_true(tmp_path, monkeypatch):
