@@ -5107,7 +5107,9 @@ $bmp.Dispose()
                     friendly_ids=self._standings_cache.friendly_ids,
                     own_character_ids=own_chars,
                 )
-            except (OSError, ValueError, RuntimeError) as exc:
+            # Broad catch: surface any failure to the user as a friendly message
+            # rather than crashing the Tk mainloop.
+            except Exception as exc:
                 self._set_paste_result(f"Local-scan analysis failed: {exc}")
                 return
             self._intel_session.add_local_scan(system, parsed)
@@ -5163,7 +5165,7 @@ $bmp.Dispose()
                         friendly_source = None
                         roster = None
                         roster_age_min = None
-                except (OSError, ValueError, RuntimeError) as exc:
+                except Exception as exc:
                     self._set_paste_result(f"Fleet roster fetch failed: {exc}")
                     return
             else:
@@ -5188,7 +5190,7 @@ $bmp.Dispose()
                         current_result=result, prior_result=prior_result,
                         minutes_ago=minutes_ago,
                     )
-            except (OSError, ValueError, RuntimeError) as exc:
+            except Exception as exc:
                 self._set_paste_result(f"D-scan analysis failed: {exc}")
                 return
             self._intel_session.add_dscan(system, parsed)
@@ -5250,7 +5252,7 @@ $bmp.Dispose()
                 if auth is not None:
                     try:
                         self._standings_cache.refresh(auth)
-                    except (OSError, ValueError, RuntimeError):
+                    except Exception:
                         return
                     # Update label on the Tk thread (FCToolGUI uses self.root,
                     # not subclass-style self).
