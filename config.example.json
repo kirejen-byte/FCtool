@@ -26,7 +26,7 @@
     },
     "esi": {
         "client_id": "YOUR_ESI_CLIENT_ID",
-        "client_secret": "YOUR_ESI_CLIENT_SECRET",
+        "client_secret": "",
         "callback_url": "http://localhost:8834/callback"
     },
     "jump_range": {

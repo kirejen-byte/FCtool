@@ -106,20 +106,29 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 class ESIAuth:
     """Manages EVE SSO authentication and token lifecycle."""
 
-    def __init__(self, client_id: str, client_secret: str,
+    def __init__(self, client_id: str, client_secret: str = "",
                  callback_url: str = "http://localhost:8834/callback",
                  token_file: str = TOKEN_FILE):
         self.client_id = client_id
-        self.client_secret = client_secret
+        # client_secret is optional. A non-empty secret selects the
+        # confidential flow (HTTP Basic on token/refresh); a missing or
+        # blank secret selects the PKCE public/native flow (no secret).
+        self.client_secret = client_secret or ""
         self.callback_url = callback_url
         self.callback_port = int(urlparse(callback_url).port or 8834)
         self.token_file = token_file
+
+        # Dual-mode detection point: PKCE iff no usable client_secret.
+        self._use_pkce = not self.client_secret.strip()
 
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._expires_at: datetime | None = None
         self._character_id: int | None = None
         self._character_name: str | None = None
+        # Per-login PKCE code_verifier (set in _login_flow_inner when using
+        # the PKCE flow, consumed by _exchange_code, then cleared).
+        self._code_verifier: str | None = None
 
         # Re-entrant lock guarding all token state mutation and refresh RPCs.
         # Re-entrant because _do_refresh() (which acquires) may be called from
@@ -165,6 +174,22 @@ class ESIAuth:
                 return self._access_token
             return None
 
+    # ── PKCE Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _generate_code_verifier() -> str:
+        """Generate a PKCE code_verifier: base64url of 32 random bytes with
+        trailing '=' padding stripped (RFC 7636 / CCP native SSO)."""
+        return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _code_challenge_for(verifier: str) -> str:
+        """Derive the S256 PKCE code_challenge: base64url of the SHA-256 of
+        the verifier, padding stripped. The hash is taken over the ASCII
+        bytes of the verifier string per RFC 7636."""
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
     # ── Login Flow ────────────────────────────────────────────────────────────
 
     def login(self, on_complete: callable = None):
@@ -197,6 +222,15 @@ class ESIAuth:
         """Run the full OAuth2 authorization code flow (inner)."""
         state = secrets.token_urlsafe(32)
 
+        # PKCE: generate a fresh verifier/challenge for this login attempt.
+        # Stored on the instance so _exchange_code can present the verifier.
+        # In confidential mode these stay None and no PKCE params are sent.
+        self._code_verifier = None
+        code_challenge = None
+        if self._use_pkce:
+            self._code_verifier = self._generate_code_verifier()
+            code_challenge = self._code_challenge_for(self._code_verifier)
+
         # Reset handler state
         _CallbackHandler.auth_code = None
         _CallbackHandler.auth_state = None
@@ -219,6 +253,9 @@ class ESIAuth:
             "scope": " ".join(SCOPES),
             "state": state,
         }
+        if self._use_pkce:
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
         auth_url = f"{SSO_AUTH_URL}?{urlencode(params)}"
         webbrowser.open(auth_url)
         print("[ESI Auth] Opened browser for EVE login...")
@@ -260,22 +297,38 @@ class ESIAuth:
             on_complete(success, self._character_name if success else "Token exchange failed")
 
     def _exchange_code(self, code: str) -> bool:
-        """Exchange authorization code for access + refresh tokens."""
-        auth_header = base64.b64encode(
-            f"{self.client_id}:{self.client_secret}".encode()
-        ).decode()
+        """Exchange authorization code for access + refresh tokens.
+
+        PKCE (public) flow: form body carries grant_type, code, client_id and
+        the code_verifier — no Authorization header, no client_secret.
+        Confidential flow: HTTP Basic client_id:client_secret, body carries
+        only grant_type and code (unchanged legacy behavior)."""
+        if self._use_pkce:
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": self.client_id,
+                "code_verifier": self._code_verifier or "",
+            }
+        else:
+            auth_header = base64.b64encode(
+                f"{self.client_id}:{self.client_secret}".encode()
+            ).decode()
+            headers = {
+                "Authorization": f"Basic {auth_header}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+            }
 
         try:
             resp = self._session.post(
                 SSO_TOKEN_URL,
-                headers={
-                    "Authorization": f"Basic {auth_header}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                },
+                headers=headers,
+                data=data,
             )
             if not resp.ok:
                 print(f"[ESI Auth] Token exchange failed: {resp.status_code} {resp.text}")
@@ -287,6 +340,9 @@ class ESIAuth:
             self._expires_at = datetime.now(timezone.utc) + timedelta(
                 seconds=data.get("expires_in", 1199)
             )
+
+            # Verifier is single-use; drop it once the code is redeemed.
+            self._code_verifier = None
 
             # Decode JWT to get character info
             self._decode_character_info()
@@ -309,23 +365,41 @@ class ESIAuth:
         RLock guards the body so concurrent callers (access_token property,
         _load_tokens) don't race on the refresh-token rotation that SSO
         performs on every successful refresh.
+
+        PKCE (public) flow sends grant_type, refresh_token and client_id form
+        fields with no Authorization header / no client_secret. Confidential
+        flow keeps HTTP Basic client_id:client_secret (unchanged). A 400
+        invalid_grant (e.g. tokens minted under the old confidential app) is
+        treated as terminal for both flows: state is cleared and an empty
+        token file persisted so the user is dropped to the re-auth path
+        instead of crashing.
         """
         with self._refresh_lock:
-            auth_header = base64.b64encode(
-                f"{self.client_id}:{self.client_secret}".encode()
-            ).decode()
+            if self._use_pkce:
+                headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                data = {
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id": self.client_id,
+                }
+            else:
+                auth_header = base64.b64encode(
+                    f"{self.client_id}:{self.client_secret}".encode()
+                ).decode()
+                headers = {
+                    "Authorization": f"Basic {auth_header}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                }
+                data = {
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                }
 
             try:
                 resp = self._session.post(
                     SSO_TOKEN_URL,
-                    headers={
-                        "Authorization": f"Basic {auth_header}",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    data={
-                        "grant_type": "refresh_token",
-                        "refresh_token": self._refresh_token,
-                    },
+                    headers=headers,
+                    data=data,
                     timeout=15,
                 )
             except (requests.Timeout, requests.ConnectionError) as e:
@@ -1261,9 +1335,13 @@ def _migrate_legacy_tokens():
         print(f"[ESI Auth] Legacy migration error: {e}")
 
 
-def load_all_tokens(client_id: str, client_secret: str,
+def load_all_tokens(client_id: str, client_secret: str = "",
                     callback_url: str = "http://localhost:8834/callback") -> list[ESIAuth]:
-    """Load all per-character ESI token files and return authenticated ESIAuth instances."""
+    """Load all per-character ESI token files and return authenticated ESIAuth instances.
+
+    client_secret is optional: pass an empty string (the distribution default)
+    to use the PKCE public-client flow, or a real secret to use the legacy
+    confidential flow. The mode is auto-detected per ESIAuth instance."""
     _migrate_legacy_tokens()
     accounts = []
     import glob

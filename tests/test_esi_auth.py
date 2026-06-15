@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -8,7 +9,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import pytest
 
 import esi_auth
-from esi_auth import ESIAuth, SCOPES, SSO_AUTH_URL
+from esi_auth import ESIAuth, SCOPES, SSO_AUTH_URL, SSO_TOKEN_URL
 
 
 def _make_fake_jwt(character_id: int, character_name: str) -> str:
@@ -1048,3 +1049,411 @@ def test_first_exact_fallback_skips_malformed_entries():
     assert ESIAuth._first_exact(entries, "Nonexistent") == {
         "id": 30000142, "name": "Jita"
     }
+
+
+# ── PKCE (Authorization Code + PKCE / native public-client) flow ─────────────
+#
+# These tests cover the public-client flow selected when no client_secret is
+# configured. The existing confidential-flow tests above (which build their
+# ESIAuth with client_secret="fakesecret") double as the regression guard that
+# the Basic-auth path is unchanged; test_confidential_* below assert it
+# explicitly.
+
+
+def _make_pkce_auth(tmp_path, token_file_name="pkce_tokens.json"):
+    """An ESIAuth with NO client_secret -> PKCE/public-client mode."""
+    tf = tmp_path / token_file_name
+    return ESIAuth(
+        client_id="pkceclient",
+        client_secret="",
+        callback_url="http://localhost:8834/callback",
+        token_file=str(tf),
+    )
+
+
+def _is_unpadded_base64url(s: str) -> bool:
+    """True iff s is non-empty, uses only the URL-safe base64 alphabet, and
+    carries no '=' padding."""
+    if not s or "=" in s:
+        return False
+    import re
+    return re.fullmatch(r"[A-Za-z0-9_-]+", s) is not None
+
+
+class _CapturingResponse:
+    """A _FakeResponse-alike that the POST mock returns."""
+
+    def __init__(self, status_code=200, json_data=None):
+        self.status_code = status_code
+        self._json = json_data or {}
+        self.ok = 200 <= status_code < 300
+        self.text = json.dumps(self._json)
+
+    def json(self):
+        return self._json
+
+
+def _patch_capture_post(auth, mocker, response):
+    """Patch auth._session.post to record (args, kwargs) and return response.
+    Returns a list that will hold a single dict per call: {url, headers, data}.
+    """
+    calls = []
+
+    def fake_post(url, headers=None, data=None, timeout=None, **kw):
+        calls.append({"url": url, "headers": headers or {}, "data": data or {}})
+        return response
+
+    mocker.patch.object(auth._session, "post", side_effect=fake_post)
+    return calls
+
+
+# ── Detection point ──────────────────────────────────────────────────────────
+
+
+def test_pkce_mode_selected_when_secret_blank(tmp_path):
+    """Empty client_secret -> PKCE mode."""
+    assert _make_pkce_auth(tmp_path)._use_pkce is True
+
+
+def test_pkce_mode_selected_when_secret_whitespace(tmp_path):
+    """Whitespace-only client_secret is treated as absent -> PKCE mode."""
+    tf = tmp_path / "ws.json"
+    auth = ESIAuth(client_id="c", client_secret="   ", token_file=str(tf))
+    assert auth._use_pkce is True
+
+
+def test_pkce_mode_selected_when_secret_missing(tmp_path):
+    """client_secret defaulted (not passed) -> PKCE mode, secret stored as ''."""
+    tf = tmp_path / "missing.json"
+    auth = ESIAuth(client_id="c", token_file=str(tf))
+    assert auth._use_pkce is True
+    assert auth.client_secret == ""
+
+
+def test_confidential_mode_selected_when_secret_present(tmp_path):
+    """A real client_secret -> confidential (Basic-auth) mode."""
+    tf = tmp_path / "conf.json"
+    auth = ESIAuth(client_id="c", client_secret="s3cret", token_file=str(tf))
+    assert auth._use_pkce is False
+
+
+# ── code_verifier / code_challenge generation ────────────────────────────────
+
+
+def test_code_verifier_is_unpadded_base64url():
+    v = ESIAuth._generate_code_verifier()
+    assert _is_unpadded_base64url(v)
+    # 32 random bytes -> 43 base64url chars once padding is stripped.
+    assert len(v) == 43
+
+
+def test_code_verifier_is_random_per_call():
+    a = ESIAuth._generate_code_verifier()
+    b = ESIAuth._generate_code_verifier()
+    assert a != b
+
+
+def test_code_challenge_is_unpadded_base64url():
+    v = ESIAuth._generate_code_verifier()
+    c = ESIAuth._code_challenge_for(v)
+    assert _is_unpadded_base64url(c)
+    # SHA-256 -> 32 bytes -> 43 base64url chars unpadded.
+    assert len(c) == 43
+
+
+def test_code_challenge_is_s256_of_verifier():
+    """code_challenge == base64url(sha256(verifier)) with padding stripped."""
+    v = ESIAuth._generate_code_verifier()
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(v.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert ESIAuth._code_challenge_for(v) == expected
+
+
+def test_code_challenge_known_vector():
+    """RFC 7636 Appendix B test vector pins the S256 derivation exactly."""
+    verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    assert ESIAuth._code_challenge_for(verifier) == expected
+
+
+# ── PKCE authorize URL ───────────────────────────────────────────────────────
+
+
+def test_pkce_authorize_url_includes_challenge(tmp_path, mocker):
+    """Driving the real _login_flow_inner in PKCE mode must add
+    code_challenge + code_challenge_method=S256 to the authorize URL, and the
+    emitted challenge must match the stored verifier."""
+    auth = _make_pkce_auth(tmp_path)
+
+    captured = {}
+
+    class _NoReqServer:
+        def __init__(self, *a, **k):
+            pass
+
+        def handle_request(self):
+            # Simulate the user never completing login; we only care about
+            # the authorize URL that was opened.
+            esi_auth._CallbackHandler.auth_code = None
+
+        def server_close(self):
+            pass
+
+    mocker.patch.object(esi_auth, "HTTPServer", _NoReqServer)
+    mocker.patch.object(
+        esi_auth.webbrowser, "open",
+        side_effect=lambda url: captured.setdefault("url", url),
+    )
+
+    auth._login_flow_inner(on_complete=None)
+
+    qs = parse_qs(urlparse(captured["url"]).query)
+    assert qs["response_type"] == ["code"]
+    assert qs["client_id"] == ["pkceclient"]
+    assert qs["code_challenge_method"] == ["S256"]
+    assert "code_challenge" in qs
+    assert _is_unpadded_base64url(qs["code_challenge"][0])
+    assert "state" in qs
+    # The challenge in the URL must be the S256 of the stored verifier.
+    assert qs["code_challenge"][0] == ESIAuth._code_challenge_for(
+        auth._code_verifier
+    )
+
+
+def test_confidential_authorize_url_has_no_pkce(tmp_path, mocker):
+    """With a secret configured, the real login flow must NOT add PKCE
+    params to the authorize URL."""
+    tf = tmp_path / "conf_url.json"
+    auth = ESIAuth(client_id="c", client_secret="s3cret", token_file=str(tf))
+
+    captured = {}
+
+    class _NoReqServer:
+        def __init__(self, *a, **k):
+            pass
+
+        def handle_request(self):
+            esi_auth._CallbackHandler.auth_code = None
+
+        def server_close(self):
+            pass
+
+    mocker.patch.object(esi_auth, "HTTPServer", _NoReqServer)
+    mocker.patch.object(
+        esi_auth.webbrowser, "open",
+        side_effect=lambda url: captured.setdefault("url", url),
+    )
+
+    auth._login_flow_inner(on_complete=None)
+    qs = parse_qs(urlparse(captured["url"]).query)
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    assert auth._code_verifier is None
+
+
+# ── PKCE token exchange request shape ────────────────────────────────────────
+
+
+def test_pkce_token_exchange_request_shape(tmp_path, mocker):
+    """PKCE code exchange: form body has grant_type/code/client_id/code_verifier,
+    NO Authorization header anywhere, and NO client_secret field."""
+    auth = _make_pkce_auth(tmp_path)
+    auth._code_verifier = "verifier-xyz"
+
+    resp = _CapturingResponse(200, {
+        "access_token": _make_fake_jwt(42, "PKCE Pilot"),
+        "refresh_token": "rt-1",
+        "expires_in": 1199,
+    })
+    calls = _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._exchange_code("auth-code-123")
+    assert ok is True
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["url"] == SSO_TOKEN_URL
+
+    # No Authorization header (case-insensitive check).
+    assert not any(k.lower() == "authorization" for k in call["headers"])
+    assert (
+        call["headers"].get("Content-Type")
+        == "application/x-www-form-urlencoded"
+    )
+
+    data = call["data"]
+    assert data["grant_type"] == "authorization_code"
+    assert data["code"] == "auth-code-123"
+    assert data["client_id"] == "pkceclient"
+    assert data["code_verifier"] == "verifier-xyz"
+    # Absolutely no secret material in the body.
+    assert "client_secret" not in data
+    # And no Basic auth string sneaking into the body either.
+    assert not any("Basic" in str(v) for v in data.values())
+
+
+def test_pkce_token_exchange_clears_verifier(tmp_path, mocker):
+    """A redeemed code_verifier is single-use and cleared after exchange."""
+    auth = _make_pkce_auth(tmp_path)
+    auth._code_verifier = "one-time"
+    resp = _CapturingResponse(200, {
+        "access_token": _make_fake_jwt(7, "X"),
+        "refresh_token": "rt",
+        "expires_in": 1199,
+    })
+    _patch_capture_post(auth, mocker, resp)
+    auth._exchange_code("c")
+    assert auth._code_verifier is None
+
+
+def test_confidential_token_exchange_sends_basic_auth(tmp_path, mocker):
+    """Confidential flow still sends HTTP Basic and does NOT include
+    client_id / code_verifier in the body."""
+    tf = tmp_path / "conf_exch.json"
+    auth = ESIAuth(client_id="cid", client_secret="csecret", token_file=str(tf))
+    resp = _CapturingResponse(200, {
+        "access_token": _make_fake_jwt(1, "Y"),
+        "refresh_token": "rt",
+        "expires_in": 1199,
+    })
+    calls = _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._exchange_code("code-abc")
+    assert ok is True
+    call = calls[0]
+    authz = call["headers"].get("Authorization", "")
+    assert authz.startswith("Basic ")
+    decoded = base64.b64decode(authz.split(" ", 1)[1]).decode()
+    assert decoded == "cid:csecret"
+    # Body is the legacy minimal shape — no PKCE fields.
+    assert call["data"] == {"grant_type": "authorization_code", "code": "code-abc"}
+
+
+# ── PKCE refresh request shape ───────────────────────────────────────────────
+
+
+def test_pkce_refresh_request_shape(tmp_path, mocker):
+    """PKCE refresh: form body grant_type/refresh_token/client_id, NO
+    Authorization header, NO client_secret. Rotated refresh token adopted."""
+    auth = _make_pkce_auth(tmp_path)
+    auth._refresh_token = "rt-old"
+    auth._character_id = 5
+    auth._character_name = "Refresher"
+
+    resp = _CapturingResponse(200, {
+        "access_token": "at-new",
+        "refresh_token": "rt-new",
+        "expires_in": 1199,
+    })
+    calls = _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._do_refresh()
+    assert ok is True
+    call = calls[0]
+    assert call["url"] == SSO_TOKEN_URL
+    assert not any(k.lower() == "authorization" for k in call["headers"])
+    assert (
+        call["headers"].get("Content-Type")
+        == "application/x-www-form-urlencoded"
+    )
+    data = call["data"]
+    assert data["grant_type"] == "refresh_token"
+    assert data["refresh_token"] == "rt-old"
+    assert data["client_id"] == "pkceclient"
+    assert "client_secret" not in data
+    # Rotated refresh token must be adopted and persisted.
+    assert auth._refresh_token == "rt-new"
+    with open(auth.token_file) as f:
+        assert json.load(f)["refresh_token"] == "rt-new"
+
+
+def test_confidential_refresh_sends_basic_auth(tmp_path, mocker):
+    """Confidential refresh still uses HTTP Basic and the legacy body shape."""
+    tf = tmp_path / "conf_ref.json"
+    auth = ESIAuth(client_id="cid", client_secret="csecret", token_file=str(tf))
+    auth._refresh_token = "rt-old"
+    auth._character_id = 9
+    auth._character_name = "Conf"
+
+    resp = _CapturingResponse(200, {
+        "access_token": "at",
+        "refresh_token": "rt-new",
+        "expires_in": 1199,
+    })
+    calls = _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._do_refresh()
+    assert ok is True
+    call = calls[0]
+    authz = call["headers"].get("Authorization", "")
+    assert authz.startswith("Basic ")
+    assert base64.b64decode(authz.split(" ", 1)[1]).decode() == "cid:csecret"
+    # Legacy body: no client_id field.
+    assert call["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "rt-old",
+    }
+
+
+def test_pkce_refresh_invalid_grant_is_graceful(tmp_path, mocker):
+    """A PKCE refresh that 400s with invalid_grant (e.g. tokens minted under
+    the old confidential app) must NOT crash: clear state, persist empty
+    token file, and return False so the user is routed to re-auth."""
+    auth = _make_pkce_auth(tmp_path)
+    auth._access_token = "stale"
+    auth._refresh_token = "rt-from-old-app"
+    auth._character_name = "Migrated Pilot"
+    auth._expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    resp = _CapturingResponse(400, {"error": "invalid_grant"})
+    _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._do_refresh()
+    assert ok is False
+    assert auth._access_token is None
+    assert auth._refresh_token is None
+    assert auth._expires_at is None
+    # is_authenticated now False -> the GUI's existing "needs re-auth" path.
+    assert auth.is_authenticated is False
+    # Empty token file persisted so we don't zombie-restore on next start.
+    assert os.path.exists(auth.token_file)
+    with open(auth.token_file) as f:
+        assert json.load(f)["refresh_token"] is None
+
+
+def test_pkce_refresh_transient_preserves_token(tmp_path, mocker):
+    """A 5xx during PKCE refresh is transient: keep the refresh token."""
+    auth = _make_pkce_auth(tmp_path)
+    auth._refresh_token = "rt-keepme"
+    auth._expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    resp = _CapturingResponse(503, {"error": "service_unavailable"})
+    _patch_capture_post(auth, mocker, resp)
+
+    ok = auth._do_refresh()
+    assert ok is False
+    assert auth._refresh_token == "rt-keepme"
+
+
+def test_load_all_tokens_accepts_default_secret(tmp_path, monkeypatch, mocker):
+    """load_all_tokens must work with client_secret defaulted (PKCE), loading
+    existing per-character token files unchanged. Backward-compat: an old
+    token file (refresh_token only) still parses and is restored."""
+    monkeypatch.setattr(esi_auth, "TOKEN_DIR", str(tmp_path))
+    # Write a legacy-shaped per-character token file.
+    tok = tmp_path / "esi_tokens_123.json"
+    tok.write_text(json.dumps({
+        "refresh_token": "legacy-rt",
+        "character_id": 123,
+        "character_name": "Legacy Pilot",
+    }))
+    # Refresh succeeds (mock) so the account is considered authenticated.
+    mocker.patch.object(ESIAuth, "_do_refresh", return_value=True)
+
+    accounts = esi_auth.load_all_tokens(client_id="cid")  # no secret -> PKCE
+    assert len(accounts) == 1
+    assert accounts[0]._use_pkce is True
+    assert accounts[0].character_id == 123
+    assert accounts[0]._refresh_token == "legacy-rt"
