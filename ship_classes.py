@@ -265,3 +265,92 @@ def is_tackle(type_id: int) -> bool:
     if gid in (GROUP_INTERDICTORS, GROUP_COMMAND_DESTROYERS, GROUP_LOGISTICS_FRIGATES):
         return False
     return gid in TACKLE_GROUP_IDS
+
+
+# ── Ship-type predicate ─────────────────────────────────────────────────────
+
+# Canonical EVE Ship category (category_id 6) groups. Hardcoded so d-scan
+# filtering doesn't depend on a per-type ESI category lookup.
+_SHIP_GROUP_IDS_KNOWN: set[int] = {
+    GROUP_COMMAND_SHIPS,
+    GROUP_COMMAND_DESTROYERS,
+    GROUP_LOGISTICS_CRUISERS,
+    GROUP_LOGISTICS_FRIGATES,
+    GROUP_DESTROYERS,
+    GROUP_TACTICAL_DESTROYERS,
+    GROUP_INTERDICTORS,
+    GROUP_FRIGATE,
+    GROUP_ASSAULT_FRIGATE,
+    GROUP_INTERCEPTOR,
+    GROUP_ELECTRONIC_ATTACK_SHIP,
+    # Combat cruisers / battlecruisers / battleships
+    26, 358, 833, 906, 963, 419, 1201, 27, 900, 898,
+    # Capital classes
+    547, 1538, 485, 4594, 513, 883, 902, 659, 30,
+    # Industrial / mining / hauling (visible on d-scan; treat as ships)
+    28, 380, 463, 543, 941, 1283,
+    # Faction / utility / event
+    894, 1202, 1972,
+}
+
+# Cache for ESI group-id lookups (separate from `_group_cache` so it's
+# independently monkeypatchable in tests)
+_type_group_cache: dict[int, int | None] = {}
+_type_group_lock = threading.Lock()
+
+
+def _fetch_group_id_for_type(type_id: int) -> int | None:
+    """Resolve a type_id to its group_id via ESI, with in-memory caching."""
+    with _type_group_lock:
+        if type_id in _type_group_cache:
+            return _type_group_cache[type_id]
+    try:
+        from rate_limiter import rate_limit
+        rate_limit("esi")
+        resp = requests.get(
+            f"https://esi.evetech.net/latest/universe/types/{type_id}/",
+            timeout=5,
+            headers={"User-Agent": "FCTool/1.0 (EVE FC Assistant)"},
+        )
+        if resp.ok:
+            gid = resp.json().get("group_id")
+            with _type_group_lock:
+                _type_group_cache[type_id] = gid
+            return gid
+    except Exception:
+        pass
+    with _type_group_lock:
+        _type_group_cache[type_id] = None
+    return None
+
+
+# Hardcoded ship type_ids we already classify (computed once at module load)
+_KNOWN_SHIP_TYPE_IDS: set[int] = (
+    COMMAND_SHIPS
+    | COMMAND_DESTROYERS
+    | LOGISTICS_CRUISERS
+    | LOGISTICS_FRIGATES
+    | T1_LOGI_FRIGATES
+    | T1_LOGI_CRUISERS
+    | TACTICAL_DESTROYERS
+    | INTERDICTORS
+    | CYNO_SHIPS
+    | WEB_SHIPS
+    | HICS
+    | FAX
+    | DREADNOUGHTS
+    | TITANS
+    | BLACK_OPS
+)
+
+
+def is_ship_type(type_id: int) -> bool:
+    """Return True if type_id is a ship hull, False for structures/drones/etc."""
+    if type_id in _KNOWN_SHIP_TYPE_IDS:
+        return True
+    if classify_ship(type_id) is not None:
+        return True
+    gid = _fetch_group_id_for_type(type_id)
+    if gid is None:
+        return False
+    return gid in _SHIP_GROUP_IDS_KNOWN

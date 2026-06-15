@@ -1,0 +1,4 @@
+12345	Ragnar's Vulture	Vulture	5.2 AU
+12346	Wrecking Ball	Loki	3.1 AU
+12347	Probe	Combat Scanner Probe I	14.3 AU
+12348	A Citadel	Astrahus	9.8 AU

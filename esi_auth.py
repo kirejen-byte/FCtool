@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -41,6 +42,8 @@ SCOPES = [
     "esi-location.read_online.v1",
     "esi-characters.read_contacts.v1",
     "esi-characters.write_contacts.v1",
+    "esi-corporations.read_contacts.v1",
+    "esi-alliances.read_contacts.v1",
     "esi-characters.read_loyalty.v1",
     "esi-characters.read_chat_channels.v1",
     "esi-characters.read_medals.v1",
@@ -552,6 +555,20 @@ class ESIAuth:
             print(f"[ESI] Error: {e}")
         return None
 
+    @staticmethod
+    def esi_post_public(path: str, body) -> dict | list | None:
+        """Public ESI POST — no auth, no token. For endpoints that don't require scopes
+        (e.g. /universe/ids/, /characters/affiliation/). Returns None on failure."""
+        url = ESI_BASE + path
+        headers = {**HEADERS, "Content-Type": "application/json"}
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=10)
+            if resp.ok:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
     # ── Character Info ───────────────────────────────────────────────────────
 
     def get_location(self) -> dict | None:
@@ -695,6 +712,396 @@ class ESIAuth:
         except Exception:
             pass
         return ""
+
+    # ── Names / Affiliations / Contacts ──────────────────────────────────────
+
+    def resolve_names_to_ids(self, names: list[str]) -> dict[str, int]:
+        """Resolve a list of EVE names to character IDs.
+
+        Tries the public ESI endpoint first (no auth required), falls back to the
+        authenticated POST. Names are deduplicated and length-filtered (3-37 chars
+        per EVE's character-name rules) before being sent. On 400/failure, the
+        chunk is recursively split in half and retried — this handles ESI batch
+        limits, duplicate-rejection, and isolated bad names automatically."""
+        out: dict[str, int] = {}
+        if not names:
+            return out
+
+        # Deduplicate (preserve insertion order) and length-filter
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for n in names:
+            if n in seen:
+                continue
+            seen.add(n)
+            if 3 <= len(n) <= 37:
+                cleaned.append(n)
+
+        self._resolve_chunk_recursive(cleaned, out)
+        return out
+
+    def _resolve_chunk_recursive(self, chunk: list[str], out: dict[str, int]) -> None:
+        """Resolve a chunk, splitting in half on failure until each chunk is size 1."""
+        if not chunk:
+            return
+        INITIAL_CHUNK = 500
+        if len(chunk) > INITIAL_CHUNK:
+            for i in range(0, len(chunk), INITIAL_CHUNK):
+                self._resolve_chunk_recursive(chunk[i:i + INITIAL_CHUNK], out)
+            return
+
+        data = ESIAuth.esi_post_public("/universe/ids/", chunk)
+        if not isinstance(data, dict):
+            data = self.esi_post("/universe/ids/", chunk)
+
+        if isinstance(data, dict):
+            for entry in data.get("characters", []) or []:
+                n = entry.get("name")
+                cid = entry.get("id")
+                if n and cid:
+                    out[n] = cid
+            return
+
+        # Failure — split chunk in half and retry
+        if len(chunk) <= 1:
+            # Single name failure: log and drop
+            print(
+                f"[esi_auth] /universe/ids/ rejected single name: "
+                f"{chunk[0] if chunk else '<empty>'}",
+                file=sys.stderr,
+            )
+            return
+        mid = len(chunk) // 2
+        self._resolve_chunk_recursive(chunk[:mid], out)
+        self._resolve_chunk_recursive(chunk[mid:], out)
+
+    # ── Categorized ID resolution (/universe/ids/) ───────────────────────────
+
+    # Categories returned by POST /universe/ids/ that this tool cares about.
+    _ID_CATEGORIES = (
+        "alliances",
+        "corporations",
+        "regions",
+        "systems",
+        "characters",
+    )
+
+    def resolve_ids(self, names: list[str]) -> dict[str, list[dict]]:
+        """Resolve a list of EVE names to categorized {id, name} entries.
+
+        Built on the public POST /universe/ids/ endpoint (exact, case-insensitive
+        name match) with the same split-on-failure robustness used by
+        resolve_names_to_ids — one bad name in a batch does not sink the rest.
+
+        Returns a dict with exactly these keys, each a list of {"id", "name"}:
+            {"alliances": [...], "corporations": [...], "regions": [...],
+             "systems": [...], "characters": [...]}
+        Unknown names simply don't appear. Returns all-empty lists for empty
+        input. Resilient to network failure (empty lists, never raises)."""
+        out: dict[str, list[dict]] = {cat: [] for cat in self._ID_CATEGORIES}
+        if not names:
+            return out
+
+        # Deduplicate (preserve insertion order) and length-filter. The 3-37
+        # bound matches resolve_names_to_ids; it is permissive enough for
+        # alliance/corp/region/system names too (all >= 3 chars in EVE).
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for n in names:
+            if not isinstance(n, str):
+                continue
+            if n in seen:
+                continue
+            seen.add(n)
+            if 3 <= len(n) <= 37:
+                cleaned.append(n)
+
+        self._resolve_ids_chunk_recursive(cleaned, out)
+        return out
+
+    def _resolve_ids_chunk_recursive(
+        self, chunk: list[str], out: dict[str, list[dict]]
+    ) -> None:
+        """Resolve a chunk into categorized buckets, splitting in half on
+        failure until each chunk is size 1 (mirrors _resolve_chunk_recursive)."""
+        if not chunk:
+            return
+        INITIAL_CHUNK = 500
+        if len(chunk) > INITIAL_CHUNK:
+            for i in range(0, len(chunk), INITIAL_CHUNK):
+                self._resolve_ids_chunk_recursive(chunk[i:i + INITIAL_CHUNK], out)
+            return
+
+        data = ESIAuth.esi_post_public("/universe/ids/", chunk)
+        if not isinstance(data, dict):
+            data = self.esi_post("/universe/ids/", chunk)
+
+        if isinstance(data, dict):
+            for cat in self._ID_CATEGORIES:
+                for entry in data.get(cat, []) or []:
+                    cid = entry.get("id")
+                    name = entry.get("name")
+                    if cid and name:
+                        out[cat].append({"id": cid, "name": name})
+            return
+
+        # Failure — split chunk in half and retry.
+        if len(chunk) <= 1:
+            print(
+                f"[esi_auth] /universe/ids/ rejected single name: "
+                f"{chunk[0] if chunk else '<empty>'}",
+                file=sys.stderr,
+            )
+            return
+        mid = len(chunk) // 2
+        self._resolve_ids_chunk_recursive(chunk[:mid], out)
+        self._resolve_ids_chunk_recursive(chunk[mid:], out)
+
+    @staticmethod
+    def _first_exact(entries: list[dict], name: str) -> dict | None:
+        """Return the first {id, name} whose name matches `name`
+        case-insensitively, else None. /universe/ids/ already does an exact
+        (case-insensitive) match, but a single query can in principle return
+        multiple categories/entries — this pins the intended one."""
+        target = name.strip().casefold()
+        for entry in entries:
+            eid = entry.get("id")
+            ename = entry.get("name")
+            if eid and isinstance(ename, str) and ename.casefold() == target:
+                return {"id": eid, "name": ename}
+        # Fall back to the first well-formed entry (ESI matched something).
+        for entry in entries:
+            eid = entry.get("id")
+            ename = entry.get("name")
+            if eid and isinstance(ename, str):
+                return {"id": eid, "name": ename}
+        return None
+
+    def resolve_alliance(self, name: str) -> dict | None:
+        """Resolve a single alliance name -> {"id", "name"} (exact,
+        case-insensitive; first match) or None if not found."""
+        if not name or not name.strip():
+            return None
+        res = self.resolve_ids([name])
+        return self._first_exact(res.get("alliances", []), name)
+
+    def resolve_corporation(self, name: str) -> dict | None:
+        """Resolve a single corporation name -> {"id", "name"} (exact,
+        case-insensitive; first match) or None if not found."""
+        if not name or not name.strip():
+            return None
+        res = self.resolve_ids([name])
+        return self._first_exact(res.get("corporations", []), name)
+
+    def resolve_region(self, name: str) -> dict | None:
+        """Resolve a single region name -> {"id", "name"} (exact,
+        case-insensitive; first match) or None if not found."""
+        if not name or not name.strip():
+            return None
+        res = self.resolve_ids([name])
+        return self._first_exact(res.get("regions", []), name)
+
+    # ── Live type-ahead search (/characters/{id}/search/) ────────────────────
+
+    def _any_authenticated_auth(self) -> "ESIAuth | None":
+        """Return an authenticated ESIAuth usable for endpoints that require a
+        character context (e.g. /search/). Prefers self; otherwise loads any
+        other stored per-character token file. Returns None if none authenticate.
+
+        We reuse self.client_id/secret/callback so no extra credentials are
+        needed. Errors loading sibling tokens are swallowed (best-effort)."""
+        if self.is_authenticated and self.access_token:
+            return self
+        import glob
+        pattern = os.path.join(TOKEN_DIR, "esi_tokens_*.json")
+        for token_file in glob.glob(pattern):
+            try:
+                other = ESIAuth(
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                    callback_url=self.callback_url,
+                    token_file=token_file,
+                )
+                if other.is_authenticated and other.access_token:
+                    return other
+            except Exception:
+                continue
+        return None
+
+    def search_entities(
+        self, query: str,
+        categories: list[str] = ("alliance", "corporation"),
+    ) -> list[dict]:
+        """Live type-ahead search via the authenticated
+        GET /characters/{character_id}/search/ endpoint (non-strict, so it
+        matches substrings/prefixes), then resolve the returned IDs to names
+        via the public POST /universe/names/.
+
+        Returns up to ~20 results as a list of
+            {"id": int, "name": str, "category": str}
+        ordered by category (in the requested order) then by ESI's id order.
+
+        Returns [] gracefully when: query is empty, no authenticated character
+        is available, the esi-search scope is missing, or any network error
+        occurs. Never raises."""
+        MAX_RESULTS = 20
+        if not query or not query.strip():
+            return []
+        cats = [c for c in (categories or ()) if c]
+        if not cats:
+            return []
+
+        auth = self._any_authenticated_auth()
+        if auth is None or not auth.character_id:
+            return []
+
+        try:
+            results = auth.esi_get(
+                f"/characters/{auth.character_id}/search/",
+                params={
+                    "categories": ",".join(cats),
+                    "search": query.strip(),
+                    "strict": "false",
+                },
+            )
+        except Exception:
+            return []
+        if not isinstance(results, dict):
+            return []
+
+        # Collect (id, category) preserving requested-category order, capped.
+        # The /search/ response keys its id arrays by the SAME category names
+        # we requested (alliance, corporation, region, ...), so we read each
+        # bucket by the requested category key directly.
+        id_to_category: dict[int, str] = {}
+        ordered_ids: list[int] = []
+        for cat in cats:
+            ids = results.get(cat) or []
+            if not isinstance(ids, list):
+                continue
+            for cid in ids:
+                if not isinstance(cid, int):
+                    continue
+                if cid not in id_to_category:
+                    id_to_category[cid] = cat
+                    ordered_ids.append(cid)
+                if len(ordered_ids) >= MAX_RESULTS:
+                    break
+            if len(ordered_ids) >= MAX_RESULTS:
+                break
+
+        if not ordered_ids:
+            return []
+
+        # Resolve ids -> names via public /universe/names/ (auth fallback).
+        names_data = ESIAuth.esi_post_public("/universe/names/", ordered_ids)
+        if not isinstance(names_data, list):
+            names_data = auth.esi_post("/universe/names/", ordered_ids)
+        if not isinstance(names_data, list):
+            return []
+
+        name_by_id: dict[int, str] = {}
+        for entry in names_data:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("id")
+            ename = entry.get("name")
+            if isinstance(eid, int) and isinstance(ename, str):
+                name_by_id[eid] = ename
+
+        out: list[dict] = []
+        for cid in ordered_ids:
+            name = name_by_id.get(cid)
+            if not name:
+                continue
+            out.append({
+                "id": cid,
+                "name": name,
+                "category": id_to_category.get(cid, ""),
+            })
+        return out
+
+    def get_affiliations(self, char_ids: list[int]) -> list[dict]:
+        """Resolve characters to corp/alliance affiliations. Public endpoint with
+        auth fallback; chunks of 1000 with split-on-failure recovery."""
+        out: list[dict] = []
+        if not char_ids:
+            return out
+        # Dedupe (preserve order)
+        seen: set[int] = set()
+        cleaned: list[int] = []
+        for cid in char_ids:
+            if cid not in seen:
+                seen.add(cid)
+                cleaned.append(cid)
+        self._affiliations_chunk_recursive(cleaned, out)
+        return out
+
+    def _affiliations_chunk_recursive(self, chunk: list[int], out: list[dict]) -> None:
+        if not chunk:
+            return
+        if len(chunk) > 1000:
+            for i in range(0, len(chunk), 1000):
+                self._affiliations_chunk_recursive(chunk[i:i + 1000], out)
+            return
+
+        data = ESIAuth.esi_post_public("/characters/affiliation/", chunk)
+        if not isinstance(data, list):
+            data = self.esi_post("/characters/affiliation/", chunk)
+
+        if isinstance(data, list):
+            out.extend(data)
+            return
+
+        if len(chunk) <= 1:
+            print(f"[esi_auth] /characters/affiliation/ rejected id: {chunk[0] if chunk else '<empty>'}",
+                  file=sys.stderr)
+            return
+        mid = len(chunk) // 2
+        self._affiliations_chunk_recursive(chunk[:mid], out)
+        self._affiliations_chunk_recursive(chunk[mid:], out)
+
+    def get_personal_contacts(self) -> list[dict]:
+        """Get the authenticated character's personal contacts."""
+        if not self._character_id:
+            return []
+        data = self.esi_get(f"/characters/{self._character_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def get_corp_contacts(self) -> list[dict]:
+        """Get the authenticated character's corporation contacts."""
+        if not self._character_id:
+            return []
+        info = self.esi_get(f"/characters/{self._character_id}/")
+        if not isinstance(info, dict):
+            return []
+        corp_id = info.get("corporation_id")
+        if not corp_id:
+            return []
+        data = self.esi_get(f"/corporations/{corp_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def get_alliance_contacts(self) -> list[dict]:
+        """Get the authenticated character's alliance contacts."""
+        if not self._character_id:
+            return []
+        info = self.esi_get(f"/characters/{self._character_id}/")
+        if not isinstance(info, dict):
+            return []
+        alliance_id = info.get("alliance_id")
+        if not alliance_id:
+            return []
+        data = self.esi_get(f"/alliances/{alliance_id}/contacts/")
+        return data if isinstance(data, list) else []
+
+    def is_fleet_boss(self) -> bool:
+        """Return True if the authenticated character is fleet commander."""
+        if not self._character_id:
+            return False
+        data = self.esi_get(f"/characters/{self._character_id}/fleet/")
+        if not isinstance(data, dict):
+            return False
+        return data.get("role") == "fleet_commander"
 
     # ── Ansiblex Discovery ───────────────────────────────────────────────────
 

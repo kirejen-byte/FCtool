@@ -24,23 +24,10 @@
         "alert_window_seconds": 300,
         "staging_system": ""
     },
-    "discord": {
-        "enabled": false,
-        "webhook_url": "",
-        "notify_zkill_alerts": false,
-        "role": "primary"
-    },
     "esi": {
         "client_id": "YOUR_ESI_CLIENT_ID",
         "client_secret": "YOUR_ESI_CLIENT_SECRET",
         "callback_url": "http://localhost:8834/callback"
-    },
-    "web": {
-        "enabled": false,
-        "host": "0.0.0.0",
-        "port": 8080,
-        "username": "fc",
-        "password": "changeme"
     },
     "jump_range": {
         "origin_system": "",
