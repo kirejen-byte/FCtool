@@ -665,23 +665,23 @@ def test_discover_channels_tracked_character_no_match(tmp_path):
 
 # ── scan_available_channels: backward-compat + generalization ───────────────
 
+def test_intel_channels_seed_is_empty():
+    # The first-run seed is intentionally empty so a fresh install is
+    # group-neutral; users add their own channels in the GUI/web layers.
+    assert INTEL_CHANNELS == set()
+
+
 def test_scan_available_channels_defaults_to_intel_channels(tmp_path):
-    # Create a log for one known intel channel.
+    # Create a log for a channel that is NOT in the (empty) default seed.
     _make_log(tmp_path, "I. Ftn Intel_20231215_010000_1.txt",
               channel="I. Ftn Intel", mtime=_now())
+    # With no channels argument, the default is the empty INTEL_CHANNELS seed,
+    # so nothing is scanned regardless of which logs exist on disk.
     result = scan_available_channels(str(tmp_path))
-    names = [c["name"] for c in result]
-    # All INTEL_CHANNELS appear (sorted), regardless of presence on disk.
-    assert names == sorted(INTEL_CHANNELS)
-    # Return shape is unchanged: name, active, file_path (no last_modified).
+    assert result == []
+    # Each entry still has the unchanged return shape when channels are present.
     for entry in result:
         assert set(entry.keys()) == {"name", "active", "file_path"}
-    by_name = {c["name"]: c for c in result}
-    assert by_name["I. Ftn Intel"]["active"] is True
-    assert by_name["I. Ftn Intel"]["file_path"] is not None
-    # A channel with no file is present but inactive with no path.
-    assert by_name["I. OR Intel"]["active"] is False
-    assert by_name["I. OR Intel"]["file_path"] is None
 
 
 def test_scan_available_channels_custom_channels(tmp_path):

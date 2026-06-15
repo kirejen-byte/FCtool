@@ -22,13 +22,10 @@ _COALESCE_WINDOW_SECONDS = 60  # Merge messages within this window
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-INTEL_CHANNELS = {
-    "I. Ftn Intel",
-    "I. Delve & Q Intel",
-    "I. C Ring Intel",
-    "I. Aridia Intel",
-    "I. OR Intel",
-}
+# First-run seed for the user's tracked intel channels. Intentionally empty so a
+# fresh install is group-neutral; the GUI/web layers let users add their own
+# channels, and this set is imported elsewhere purely as that initial seed.
+INTEL_CHANNELS: set[str] = set()
 
 # EVE writes one UTF-16LE log per channel-session, named
 #   "<ChannelName>_YYYYMMDD_HHMMSS[_<charid>].txt"
@@ -37,10 +34,9 @@ INTEL_CHANNELS = {
 # spaces, dots, dashes, brackets, parentheses, '+', and '&'.
 CHAT_LOG_SUFFIX_PATTERN = re.compile(r"_(\d{8})_(\d{6})(?:_\d+)?\.txt$")
 
-# Regex for detecting d-scan URLs (includes zero.the-initiative.rocks intel scans)
+# Regex for detecting d-scan URLs from the common public d-scan hosts.
 DSCAN_URL_PATTERN = re.compile(
-    r"(https?://(?:dscan\.info|dscan\.me|adashboard\.info"
-    r"|zero\.the-initiative\.rocks/intel/scan)/\S+)",
+    r"(https?://(?:dscan\.info|dscan\.me|adashboard\.info)/\S+)",
     re.IGNORECASE,
 )
 
@@ -586,7 +582,7 @@ def parse_dscan_text(text: str) -> dict:
     Parse d-scan output from various formats:
     - Raw EVE d-scan paste (tab-separated)
     - dscan.info summary pages
-    - Alliance Auth intel tool HTML (zero.the-initiative.rocks/intel/scan/)
+    - Alliance Auth intel tool HTML (e.g. an Alliance-Auth /intel/scan/ page)
 
     Returns: {ships: {name: count}, total: int, capital_count: int}
     """
@@ -634,7 +630,7 @@ def parse_dscan_text(text: str) -> dict:
 def _parse_dscan_html(html: str) -> dict:
     """
     Parse d-scan data from Alliance Auth intel tool HTML pages
-    (e.g. zero.the-initiative.rocks/intel/scan/).
+    (e.g. an Alliance-Auth /intel/scan/ page).
 
     The page has tables with "Ship Class" / "Count" columns.
     The first table under "All Ships" contains the aggregate data.

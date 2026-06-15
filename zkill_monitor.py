@@ -118,21 +118,25 @@ class KillAlert:
     corps_involved: set[int] = field(default_factory=set)  # Corporation IDs in the fight
 
 
-# Alliance IDs considered "friendly" for capital filtering
-FRIENDLY_ALLIANCE_IDS: set[int] = {1900696668}  # The Initiative.
-
-
 class EngagementTracker:
     """
     Tracks kills in a sliding window to detect engagements.
     Groups kills by system and checks if they meet alert thresholds.
     """
 
-    def __init__(self, window_seconds: int = 300, min_pilots: int = 10):
+    def __init__(self, window_seconds: int = 300, min_pilots: int = 10,
+                 friendly_ids: set[int] | None = None):
         self.window = timedelta(seconds=window_seconds)
         self.min_pilots = min_pilots
+        # Corp/alliance IDs considered "friendly" (blue/own) for capital filtering.
+        # Supplied by the GUI from standings; hostile = not in this set.
+        self.friendly_ids = set(friendly_ids or [])
         # system_id -> list of (timestamp, kill_data)
         self._kills: dict[int, list[tuple[datetime, dict]]] = {}
+
+    def set_friendly_ids(self, ids):
+        """Replace the friendly corp/alliance id set (e.g. on standings refresh)."""
+        self.friendly_ids = set(ids or [])
 
     def add_kill(self, kill_data: dict) -> KillAlert | None:
         """Add a kill and check if it triggers an engagement alert."""
@@ -163,12 +167,14 @@ class EngagementTracker:
         alliance_pilots: dict[int, set[int]] = {}  # alliance_id -> set of character_ids
         total_value = 0.0
         total_caps = 0
-        friendly_caps = 0  # Capitals from FRIENDLY_ALLIANCE_IDS
-        cap_counts: dict[str, int] = {}  # class_name -> count
+        friendly_caps = 0  # Caps whose corp/alliance is in the friendly (blue/own) set
+        cap_counts: dict[str, int] = {}  # class_name -> HOSTILE-only count
         # Track capital char IDs per class to avoid double-counting
         cap_chars: dict[str, set[int]] = {}
+        # Snapshot the current friendly set so the closure reads it consistently.
+        friendly_ids = self.friendly_ids
 
-        def _count_capital(ship_type_id: int, char_id: int, alliance_id: int):
+        def _count_capital(ship_type_id: int, char_id: int, corp_id: int, alliance_id: int):
             nonlocal total_caps, friendly_caps
             cls = classify_capital(ship_type_id)
             if not cls:
@@ -178,10 +184,15 @@ class EngagementTracker:
                 return  # Already counted
             if char_id:
                 cap_chars[cls].add(char_id)
-            cap_counts[cls] = cap_counts.get(cls, 0) + 1
             total_caps += 1
-            if alliance_id in FRIENDLY_ALLIANCE_IDS:
+            # Friendly if EITHER its corp or its alliance is in the friendly set.
+            friendly = (corp_id and corp_id in friendly_ids) or \
+                       (alliance_id and alliance_id in friendly_ids)
+            if friendly:
                 friendly_caps += 1
+            else:
+                # Hostile-only breakdown: count toward the threat tally only.
+                cap_counts[cls] = cap_counts.get(cls, 0) + 1
 
         for _, kd in self._kills[system_id]:
             inner_km = kd.get("killmail", kd)
@@ -199,6 +210,7 @@ class EngagementTracker:
             _count_capital(
                 victim.get("ship_type_id", 0),
                 victim.get("character_id", 0),
+                victim.get("corporation_id", 0),
                 victim.get("alliance_id", 0),
             )
             # Attackers
@@ -214,13 +226,15 @@ class EngagementTracker:
                 _count_capital(
                     attacker.get("ship_type_id", 0),
                     attacker.get("character_id", 0),
+                    attacker.get("corporation_id", 0),
                     attacker.get("alliance_id", 0),
                 )
             total_value += inner_zkb.get("totalValue", 0) / 1_000_000
 
-        # Capital fight = capitals present, but ignore if it's only 1 friendly cap
+        # Capital fight = at least one HOSTILE capital present.
+        # Blue/own caps never self-trigger a capital alert.
         non_friendly_caps = total_caps - friendly_caps
-        has_capitals = (non_friendly_caps > 0) or (friendly_caps > 1)
+        has_capitals = non_friendly_caps > 0
 
         # Alert if enough pilots, OR if capitals are involved
         if len(pilots) >= self.min_pilots or has_capitals:
@@ -280,7 +294,8 @@ class ZKillMonitor:
                  min_pilots_involved: int = 10,
                  alert_window_seconds: int = 300,
                  on_alert: Callable[[KillAlert], None] | None = None,
-                 watch_all: bool = False):
+                 watch_all: bool = False,
+                 friendly_ids: set[int] | None = None):
         self.watch_regions = set(watch_regions or [])
         self.watch_alliances = set(watch_alliances or [])
         self.watch_systems = set(watch_systems or [])
@@ -288,7 +303,10 @@ class ZKillMonitor:
         self.min_kill_value = min_kill_value_millions
         self.min_pilots = min_pilots_involved
         self.on_alert = on_alert
-        self._tracker = EngagementTracker(alert_window_seconds, min_pilots_involved)
+        # Friendly (blue/own) corp/alliance ids for capital friend/foe filtering.
+        self._friendly_ids = set(friendly_ids or [])
+        self._tracker = EngagementTracker(alert_window_seconds, min_pilots_involved,
+                                          friendly_ids=self._friendly_ids)
         self._thread: threading.Thread | None = None
         self._running = False
         self._sequence: int = 0
@@ -299,6 +317,13 @@ class ZKillMonitor:
         self._pilot_growth_threshold = 100  # Re-ping Discord if fight grows by this many
         # Status callback for GUI
         self.on_status: Callable[[str], None] | None = None
+
+    def set_friendly_ids(self, ids):
+        """Update the friendly (blue/own) corp/alliance id set without rebuilding
+        the monitor. Forwards to the live tracker so standings refreshes take
+        effect immediately."""
+        self._friendly_ids = set(ids or [])
+        self._tracker.set_friendly_ids(self._friendly_ids)
 
     def _matches_filters(self, kill_data: dict) -> bool:
         """Check if a kill matches any of our watch filters."""

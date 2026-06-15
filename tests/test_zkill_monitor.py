@@ -175,3 +175,203 @@ def test_below_threshold_returns_none():
         attackers=[{"character_id": 2, "corporation_id": 2000, "alliance_id": 88000}],
     ))
     assert alert is None
+
+
+# ── standings-based capital friend/foe ──────────────────────────────────────
+#
+# These exercise the STANDINGS-BASED capital filter that replaced the old
+# hard-coded FRIENDLY_ALLIANCE_IDS constant. A capital is FRIENDLY when its
+# corp OR alliance is in the tracker's `friendly_ids` set; otherwise it is
+# HOSTILE. Only hostile caps drive `capitals_involved` and the
+# `capital_breakdown` (hostile-only count per class).
+#
+# In every test below `min_pilots` is set high enough that pilot count alone
+# can NOT trip the alert, so the capital path is what fires it. Capital ship
+# type ids are pulled from zkill_monitor.CAPITAL_CLASSES so they classify.
+
+# Concrete capital type ids (each in exactly one class).
+DREAD_TYPE_ID = 19720    # -> "Dreads"
+CARRIER_TYPE_ID = 23757  # -> "Carriers"
+TITAN_TYPE_ID = 671      # -> "Titans"
+FAX_TYPE_ID = 37604      # -> "FAX"
+
+
+def _cap_tracker(friendly_ids=None, min_pilots=50, window_seconds=300):
+    """Tracker with a high pilot floor so only the capital path can alert."""
+    return EngagementTracker(window_seconds=window_seconds, min_pilots=min_pilots,
+                             friendly_ids=friendly_ids)
+
+
+def test_hostile_capital_triggers_and_counts_by_class():
+    """A cap whose corp AND alliance are NOT friendly is hostile: it sets
+    capitals_involved and is counted by class in the breakdown."""
+    tracker = _cap_tracker(friendly_ids={99000})  # friendly set does NOT include this cap
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    assert isinstance(alert, KillAlert)
+    assert alert.capitals_involved is True
+    assert alert.capital_breakdown == {"Dreads": 1}
+
+
+def test_friendly_by_alliance_not_counted_hostile():
+    """A cap whose ALLIANCE is friendly is excluded from the hostile tally;
+    if ALL caps are friendly, no capital alert fires."""
+    tracker = _cap_tracker(friendly_ids={88000})  # alliance 88000 is blue
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    # Only a friendly cap and not enough pilots -> no alert at all.
+    assert alert is None
+
+
+def test_friendly_by_corp_not_counted_hostile():
+    """A cap whose CORP is friendly (alliance NOT) is treated friendly."""
+    tracker = _cap_tracker(friendly_ids={2000})  # corp 2000 is blue, alliance 88000 is not
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    assert alert is None
+
+
+def test_two_friendly_caps_do_not_trigger():
+    """The old `friendly_caps > 1` self-trigger is gone: 2+ friendly caps with
+    zero hostiles must NOT set capitals_involved (and not alert)."""
+    tracker = _cap_tracker(friendly_ids={88000})  # both caps' alliance is blue
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[
+            {"character_id": 2, "ship_type_id": CARRIER_TYPE_ID,
+             "corporation_id": 3000, "alliance_id": 88000},
+        ],
+    ))
+    # Two friendly caps, no hostile cap, pilots below floor -> nothing.
+    assert alert is None
+
+
+def test_mixed_caps_breakdown_is_hostile_only():
+    """1 hostile + 2 friendly caps -> capitals_involved True, and the breakdown
+    shows ONLY the single hostile cap."""
+    tracker = _cap_tracker(friendly_ids={88000})  # alliance 88000 is blue
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        # Hostile dread: corp/alliance not in friendly set.
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 77000},
+        attackers=[
+            # Friendly carrier (alliance blue).
+            {"character_id": 2, "ship_type_id": CARRIER_TYPE_ID,
+             "corporation_id": 3000, "alliance_id": 88000},
+            # Friendly titan (alliance blue).
+            {"character_id": 3, "ship_type_id": TITAN_TYPE_ID,
+             "corporation_id": 4000, "alliance_id": 88000},
+        ],
+    ))
+    assert isinstance(alert, KillAlert)
+    assert alert.capitals_involved is True
+    # Only the hostile dread is in the breakdown; friendly carrier/titan absent.
+    assert alert.capital_breakdown == {"Dreads": 1}
+
+
+def test_set_friendly_ids_flips_hostile_to_friendly():
+    """A cap hostile under an empty set becomes friendly after set_friendly_ids
+    adds its alliance — proving the closure reads the *current* set each call."""
+    # First: empty friendly set -> the cap is hostile and alerts.
+    tracker = _cap_tracker(friendly_ids=set())
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    assert isinstance(alert, KillAlert)
+    assert alert.capitals_involved is True
+    assert alert.capital_breakdown == {"Dreads": 1}
+
+    # Now mark its alliance friendly and re-run on a FRESH tracker/window so the
+    # only difference is the friendly set.
+    tracker2 = _cap_tracker(friendly_ids=set())
+    tracker2.set_friendly_ids({88000})
+    alert2 = tracker2.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": DREAD_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    # Same cap, now friendly -> no capital alert.
+    assert alert2 is None
+
+
+def test_empty_friendly_set_all_caps_hostile():
+    """With an empty friendly set, every cap is hostile and trips the alert."""
+    tracker = _cap_tracker(friendly_ids=set())
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": TITAN_TYPE_ID,
+                "corporation_id": 2000, "alliance_id": 88000},
+        attackers=[],
+    ))
+    assert isinstance(alert, KillAlert)
+    assert alert.capitals_involved is True
+    assert alert.capital_breakdown == {"Titans": 1}
+
+
+def test_friendly_by_corp_only_alliance_absent():
+    """corp_id threading: a cap friendly ONLY by corp (alliance absent/None) is
+    still treated friendly — proves corp_id is passed through to the filter."""
+    tracker = _cap_tracker(friendly_ids={2000})  # blue by corp only
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        # No alliance_id key at all; corp 2000 is the only id and it's friendly.
+        victim={"character_id": 1, "ship_type_id": FAX_TYPE_ID,
+                "corporation_id": 2000},
+        attackers=[],
+    ))
+    # Friendly by corp -> no hostile cap -> no alert.
+    assert alert is None
+
+
+def test_hostile_when_only_corp_present_and_not_friendly():
+    """Control for the corp-threading test: a cap with ONLY a corp id that is
+    NOT friendly is hostile (so the previous test isn't passing by accident)."""
+    tracker = _cap_tracker(friendly_ids={9999})  # cap's corp 2000 is not in it
+    alert = tracker.add_kill(_killmail(
+        30000142,
+        victim={"character_id": 1, "ship_type_id": FAX_TYPE_ID,
+                "corporation_id": 2000},
+        attackers=[],
+    ))
+    assert isinstance(alert, KillAlert)
+    assert alert.capitals_involved is True
+    assert alert.capital_breakdown == {"FAX": 1}
+
+
+def test_monitor_set_friendly_ids_forwards_to_tracker():
+    """ZKillMonitor.set_friendly_ids updates its own set AND forwards to the
+    live tracker (no rebuild)."""
+    from zkill_monitor import ZKillMonitor
+
+    monitor = ZKillMonitor(friendly_ids={1})
+    assert monitor._friendly_ids == {1}
+    assert monitor._tracker.friendly_ids == {1}
+
+    monitor.set_friendly_ids({2, 3})
+    assert monitor._friendly_ids == {2, 3}
+    # Forwarded to the same tracker instance, not a rebuilt one.
+    assert monitor._tracker.friendly_ids == {2, 3}
+
+    # None clears it.
+    monitor.set_friendly_ids(None)
+    assert monitor._friendly_ids == set()
+    assert monitor._tracker.friendly_ids == set()

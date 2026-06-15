@@ -54,7 +54,6 @@ from app_path import app_dir as _app_dir
 from datetime import timezone
 from xup_counter import XUpCounter, XUpState
 from zkill_monitor import ZKillMonitor, KillAlert
-from discord_notify import DiscordNotifier
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
 from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
@@ -285,6 +284,75 @@ def filter_suggestion_channels(names) -> list[str]:
     return out
 
 
+def compute_intel_channel_suggestions(discovered, tracked) -> list[str]:
+    """Pure, Tk-free predicate for the Suggested intel-channels panel.
+
+    Returns the discovered channel names whose name contains "intel" or
+    "intelligence" (case-insensitive) and that are NOT already tracked
+    (compared case-insensitively). Order follows ``discovered``; the result is
+    de-duped case-insensitively, preserving first-seen casing. Returns a NEW
+    list; inputs are never mutated, so this is safe to unit-test.
+    """
+    tracked_keys = {
+        (t or "").strip().lower()
+        for t in (tracked or ())
+        if (t or "").strip()
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in (discovered or ()):
+        name = (item or "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if "intel" not in lower and "intelligence" not in lower:
+            continue
+        if lower in tracked_keys or lower in seen:
+            continue
+        seen.add(lower)
+        out.append(name)
+    return out
+
+
+def extract_staging_system_names(staging_system, *lists) -> list[str]:
+    """Pure, Tk-free extractor for the systems worth pre-warming.
+
+    Collects system names the user actually cares about: the single configured
+    ``staging_system`` plus any number of staging *lists*. Each list item may be
+    a plain name string or a ``{"id": ..., "name": ...}`` dict (the jump-range
+    staging lists are persisted as either form, depending on when they were
+    saved), so this normalizes both shapes to a bare name.
+
+    Blanks are skipped and names are de-duped case-insensitively while
+    preserving first-seen order and the original casing of the first
+    occurrence. Returns a NEW list; inputs are never mutated, so this is safe to
+    unit-test and to call from the prewarm worker.
+    """
+    def _name_of(item) -> str:
+        if isinstance(item, dict):
+            return str(item.get("name", "") or "").strip()
+        return str(item or "").strip()
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw):
+        name = _name_of(raw)
+        if not name:
+            return
+        key = name.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(name)
+
+    _add(staging_system)
+    for lst in lists:
+        for item in (lst or ()):
+            _add(item)
+    return out
+
+
 class FCToolGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -319,7 +387,6 @@ class FCToolGUI:
         # channels, then persisted. A missing/empty list falls back to the seed
         # for safety. cached_discovered backs the Settings picker's suggestions.
         self._tracked_intel_channels: list[str] = self._load_tracked_intel_channels()
-        self.discord: DiscordNotifier | None = None
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
         self.zkill_monitor: ZKillMonitor | None = None
@@ -336,7 +403,6 @@ class FCToolGUI:
         self.jump_checker: JumpRangeChecker | None = None
         self._running = False
         self._chat_thread: threading.Thread | None = None
-        self._is_discord_primary = self.config.get("discord", {}).get("role", "primary") == "primary"
         self._sound_enabled = self.config.get("sound_on_ready", False)
         # Fleet loss tracker
         self._loss_tracker = FleetLossTracker()
@@ -572,23 +638,32 @@ class FCToolGUI:
         return resolved or None
 
     def _prewarm_cache_async(self):
-        """Pre-resolve commonly used systems in background so first check is fast."""
+        """Pre-resolve the user's own staging systems in background so the first
+        range check is fast.
+
+        Warms ONLY systems the user actually cares about — no hard-coded group
+        geography: the configured ``zkillboard.staging_system`` plus the
+        friendly/hostile jump-range staging lists
+        (``jump_range.friendly_staging_systems`` / ``hostile_staging_systems``,
+        each a list of name strings or ``{id,name}`` dicts). Names are deduped
+        case-insensitively and blanks are skipped by
+        ``extract_staging_system_names``."""
+        staging = self.config.get("zkillboard", {}).get("staging_system", "")
+        jr_cfg = self.config.get("jump_range", {}) or {}
+        friendly = jr_cfg.get("friendly_staging_systems", []) or []
+        hostile = jr_cfg.get("hostile_staging_systems", []) or []
+        systems = extract_staging_system_names(staging, friendly, hostile)
+        if not systems:
+            return
+
         def prewarm():
             from jump_range import get_system_info, save_route_cache
-            systems = [
-                "C-N4OD", "6RCQ-V", "F7C-H0", "CL6-ZG", "HPS5-C",
-                "Korasen", "Y-2ANO", "NOL-M9",
-            ]
-            # Add staging system if configured
-            staging = self.config.get("zkillboard", {}).get("staging_system", "")
-            if staging and staging not in systems:
-                systems.insert(0, staging)
             for name in systems:
                 sid = search_system(name)
                 if sid:
                     get_system_info(sid)
             save_route_cache()
-            print(f"[Cache] Pre-warmed {len(systems)} system(s)")
+            print(f"[Cache] Pre-warmed {len(systems)} staging system(s)")
 
         threading.Thread(target=prewarm, daemon=True).start()
 
@@ -620,12 +695,11 @@ class FCToolGUI:
         """Return the tracked intel channels from config, seeding on first run.
 
         Reads ``config["intel_channels"]["tracked"]``. If that key is missing or
-        empty, it is SEEDED from ``sorted(INTEL_CHANNELS)`` and persisted to
-        config.json so existing users keep today's channels and the shared key
-        the web UI reads is populated. The returned list is normalized
+        empty, it is SEEDED from ``sorted(INTEL_CHANNELS)`` (empty by default)
+        and persisted to config.json. The returned list is normalized
         (whitespace-stripped, case-insensitively de-duped); a normalized list
         that round-trips to a different value is written back so config stays
-        clean. Mirrors fc_web.get_tracked_channels()'s read + fallback contract.
+        clean.
         """
         seed = sorted(INTEL_CHANNELS)
         ic = self.config.setdefault("intel_channels", {})
@@ -697,14 +771,30 @@ class FCToolGUI:
                 },
                 "min_pilots": seed_min,
                 "max_jumps": 0,
+                "capitals": {"alert": True, "bypass_filter": False},
             }
+            changed = True
+
+        # Bind in-memory criteria to the live config dict.
+        self._intel_filter = self.config["intel_filter"]
+
+        # Backfill the capitals settings for EXISTING configs that have an
+        # intel_filter but predate the capital-alert feature. Never clobber an
+        # already-present capitals dict — only fill in missing keys.
+        caps = self._intel_filter.get("capitals")
+        if not isinstance(caps, dict):
+            caps = {"alert": True, "bypass_filter": False}
+            self._intel_filter["capitals"] = caps
+            changed = True
+        if "alert" not in caps:
+            caps["alert"] = True
+            changed = True
+        if "bypass_filter" not in caps:
+            caps["bypass_filter"] = False
             changed = True
 
         if changed:
             self._save_config()
-
-        # Bind in-memory criteria to the live config dict.
-        self._intel_filter = self.config["intel_filter"]
 
     def _resolve_triumvirate_async(self):
         """Resolve Triumvirate.'s alliance id off-thread and fold it into the
@@ -802,6 +892,59 @@ class FCToolGUI:
                   background=[("selected", BG_ENTRY)],
                   foreground=[("selected", FG_ACCENT)])
 
+        # Dark-theme ALL ttk.Comboboxes app-wide (filter type selectors, ship
+        # menu, WH size, character filters, coalition manager). The base
+        # "TCombobox" style is restyled so every combobox — almost all of which
+        # are state="readonly" here — shows a dark field with light text instead
+        # of the clam default (white field / black text).
+        style.configure(
+            "TCombobox",
+            fieldbackground=BG_ENTRY, background=BG_ENTRY, foreground=FG_TEXT,
+            arrowcolor=FG_TEXT, bordercolor=BORDER_COLOR,
+            lightcolor=BG_ENTRY, darkcolor=BG_ENTRY,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            font=("Consolas", 9),
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BG_ENTRY), ("disabled", BG_PANEL)],
+            foreground=[("readonly", FG_TEXT), ("disabled", FG_DIM)],
+            selectbackground=[("readonly", BG_ENTRY)],
+            selectforeground=[("readonly", FG_TEXT)],
+            background=[("active", BG_ENTRY)],
+            arrowcolor=[("disabled", FG_DIM), ("active", FG_WHITE)],
+        )
+
+        # Dark-theme ALL ttk scrollbars app-wide (Roles, Specialized Roles,
+        # Character tab, Settings tab — all default Vertical.TScrollbar). The
+        # base "Vertical.TScrollbar"/"Horizontal.TScrollbar" styles are restyled
+        # so every ttk scrollbar inherits a dark trough + accent thumb instead of
+        # the clam default (white/grey). Classic tk.Scrollbars (e.g. inside
+        # scrolledtext.ScrolledText) are NOT reached by this — see
+        # _theme_scrolledtext_bar for those.
+        for _sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(
+                _sb,
+                troughcolor=BG_DARK, background=BG_ENTRY, arrowcolor=FG_TEXT,
+                bordercolor=BORDER_COLOR, darkcolor=BG_ENTRY, lightcolor=BG_ENTRY,
+                troughrelief="flat", relief="flat", borderwidth=0,
+            )
+            style.map(
+                _sb,
+                background=[("active", "#1a5a90"), ("disabled", BG_PANEL)],
+                arrowcolor=[("active", FG_WHITE), ("disabled", FG_DIM)],
+            )
+
+        # The drop-down POPUP is a plain Tk Listbox inside the combobox popdown
+        # that ttk styles do NOT reach — theme it via the option database on the
+        # root. This runs before any combobox is created (panels build later),
+        # so the options apply to every popup app-wide.
+        self.root.option_add("*TCombobox*Listbox.background", BG_ENTRY)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG_WHITE)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#1a5a90")
+        self.root.option_add("*TCombobox*Listbox.selectForeground", FG_WHITE)
+        self.root.option_add("*TCombobox*Listbox.font", "Consolas 9")
+
         # ── Title Bar ─────────────────────────────────────────────────────────
         title_frame = tk.Frame(self.root, bg=BG_DARK, pady=8)
         title_frame.pack(fill=tk.X)
@@ -837,9 +980,6 @@ class FCToolGUI:
         self._zkill_status = tk.Label(self._status_frame, text="ZKILL: --",
                                        font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
         self._zkill_status.pack(side=tk.LEFT, padx=8)
-        self._discord_status = tk.Label(self._status_frame, text="DISCORD: OFF",
-                                         font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
-        self._discord_status.pack(side=tk.LEFT, padx=8)
 
         # ── Notebook (Tabs) ──────────────────────────────────────────────────
         self.notebook = ttk.Notebook(self.root, style="Dark.TNotebook")
@@ -1163,6 +1303,7 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE
         )
         self._xup_log.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self._theme_scrolledtext_bar(self._xup_log)
         self._xup_log.tag_config("xup", foreground=FG_GREEN)
         self._xup_log.tag_config("fire", foreground=FG_RED, font=("Consolas", 10, "bold"))
         self._xup_log.tag_config("ready", foreground=FG_YELLOW, font=("Consolas", 10, "bold"))
@@ -1251,15 +1392,54 @@ class FCToolGUI:
                 activeforeground=FG_ACCENT, command=self._on_combine_change,
             ).pack(side=tk.LEFT, padx=(0, 4))
 
+        # ── Capitals row: hostile-capital alert toggles ────────────────────
+        # A "hostile capital" is a cap whose corp AND alliance are both outside
+        # the standings-based friendly set (your own + blues). These two boxes
+        # gate the in-app intel feed only.
+        caps_cfg = flt.setdefault(
+            "capitals", {"alert": True, "bypass_filter": False})
+        cap_row = tk.Frame(filter_frame, bg=BG_PANEL)
+        cap_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        self._cap_alert_var = tk.BooleanVar(
+            value=bool(caps_cfg.get("alert", True)))
+        tk.Checkbutton(
+            cap_row, text="Alert on hostile capitals",
+            variable=self._cap_alert_var,
+            font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_ORANGE, command=self._on_capital_alert_toggle,
+        ).pack(side=tk.LEFT)
+
+        self._cap_bypass_var = tk.BooleanVar(
+            value=bool(caps_cfg.get("bypass_filter", False)))
+        self._cap_bypass_chk = tk.Checkbutton(
+            cap_row, text="…even outside my location/parties filter",
+            variable=self._cap_bypass_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_TEXT, command=self._on_capital_bypass_toggle,
+            disabledforeground=FG_DIM,
+        )
+        self._cap_bypass_chk.pack(side=tk.LEFT, padx=(12, 0))
+        # Checkbox 2 is only meaningful when checkbox 1 is on.
+        self._cap_bypass_chk.config(
+            state=tk.NORMAL if self._cap_alert_var.get() else tk.DISABLED)
+
+        # Dim hint: bypass + no Max-Jumps lets hostile-cap alerts in from all of
+        # K-space; pair with Max Jumps to bound the firehose.
+        tk.Label(
+            filter_frame,
+            text="(bypass + Max Jumps=0 → hostile-cap alerts from all of "
+                 "K-space; set Max Jumps to bound it)",
+            font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+
         # ── Two side-by-side group panels ──────────────────────────────────
         groups = tk.Frame(filter_frame, bg=BG_PANEL)
         groups.pack(fill=tk.X, padx=10, pady=(0, 6))
         groups.columnconfigure(0, weight=1, uniform="grp")
         groups.columnconfigure(1, weight=1, uniform="grp")
-
-        # parallel mapping: listbox index -> (kind, index_within_kind)
-        self._loc_index_map: list[tuple[str, int]] = []
-        self._par_index_map: list[tuple[str, int]] = []
 
         # ---- LOCATION group ----
         loc = tk.Frame(groups, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
@@ -1290,6 +1470,11 @@ class FCToolGUI:
             loc_add, list(self._system_names), width=18,
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
+            # Disabled/readonly (when "Anywhere" is checked) shows a dark muted
+            # red tint instead of Tk's default white, signalling "can't type
+            # here right now" against the dark theme.
+            disabledbackground="#3a1620", readonlybackground="#3a1620",
+            disabledforeground=FG_DIM,
         )
         self._loc_add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
                                  padx=(0, 4))
@@ -1299,19 +1484,21 @@ class FCToolGUI:
         ttk.Button(loc_add, text="Add", style="Dark.TButton",
                    command=self._on_location_add).pack(side=tk.LEFT)
 
-        self._loc_listbox = tk.Listbox(
-            loc, height=4, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
-            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+        # Wrapping chip area: a Text widget into which compact removable chip
+        # frames are embedded via window_create. The Text wraps embedded
+        # windows like words, giving automatic horizontal flow + line wrap so
+        # many selections fit without scrolling. Kept non-editable; embedded
+        # chips stay clickable even while the Text is DISABLED.
+        self._loc_chips = tk.Text(
+            loc, height=4, wrap=tk.CHAR, bg=BG_ENTRY, fg=FG_TEXT,
+            borderwidth=1, relief=tk.RIDGE, cursor="arrow", takefocus=0,
+            highlightthickness=0, padx=4, pady=3, font=("Consolas", 9),
         )
-        self._loc_listbox.pack(fill=tk.X, padx=6, pady=(2, 2))
-        self._loc_listbox.bind("<Double-Button-1>",
-                               lambda e: self._on_location_remove())
+        self._loc_chips.pack(fill=tk.X, padx=6, pady=(2, 2))
+        self._make_chip_text_readonly(self._loc_chips)
 
         loc_btns = tk.Frame(loc, bg=BG_PANEL)
         loc_btns.pack(fill=tk.X, padx=6, pady=(0, 4))
-        ttk.Button(loc_btns, text="Remove Selected", style="Dark.TButton",
-                   command=self._on_location_remove).pack(side=tk.LEFT)
         self._loc_status = tk.Label(loc_btns, text="", font=("Consolas", 8),
                                     fg=FG_DIM, bg=BG_PANEL)
         self._loc_status.pack(side=tk.LEFT, padx=8)
@@ -1346,6 +1533,11 @@ class FCToolGUI:
             par_add, [], width=16, font=("Consolas", 10), bg=BG_ENTRY,
             fg=FG_WHITE, insertbackground=FG_WHITE, borderwidth=1,
             relief=tk.RIDGE,
+            # Disabled/readonly (when "Anyone" is checked) shows a dark muted
+            # red tint instead of Tk's default white, signalling "can't type
+            # here right now" against the dark theme.
+            disabledbackground="#3a1620", readonlybackground="#3a1620",
+            disabledforeground=FG_DIM,
         )
         self._par_add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
                                  padx=(0, 4))
@@ -1361,23 +1553,20 @@ class FCToolGUI:
         # Coalition picker reference (refreshed when coalitions change).
         self._parties_coalition_entry = self._par_add_entry
 
-        self._par_listbox = tk.Listbox(
-            par, height=4, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
-            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+        # Wrapping chip area (see LOCATION group above for technique).
+        self._par_chips = tk.Text(
+            par, height=4, wrap=tk.CHAR, bg=BG_ENTRY, fg=FG_TEXT,
+            borderwidth=1, relief=tk.RIDGE, cursor="arrow", takefocus=0,
+            highlightthickness=0, padx=4, pady=3, font=("Consolas", 9),
         )
-        self._par_listbox.pack(fill=tk.X, padx=6, pady=(2, 2))
-        self._par_listbox.bind("<Double-Button-1>",
-                               lambda e: self._on_parties_remove())
+        self._par_chips.pack(fill=tk.X, padx=6, pady=(2, 2))
+        self._make_chip_text_readonly(self._par_chips)
 
         par_btns = tk.Frame(par, bg=BG_PANEL)
         par_btns.pack(fill=tk.X, padx=6, pady=(0, 4))
-        ttk.Button(par_btns, text="Remove Selected", style="Dark.TButton",
-                   command=self._on_parties_remove).pack(side=tk.LEFT)
         ttk.Button(par_btns, text="Manage coalitions…",
                    style="Dark.TButton",
-                   command=self._open_coalition_manager).pack(side=tk.LEFT,
-                                                              padx=(4, 0))
+                   command=self._open_coalition_manager).pack(side=tk.LEFT)
         self._par_status = tk.Label(par_btns, text="", font=("Consolas", 8),
                                     fg=FG_DIM, bg=BG_PANEL)
         self._par_status.pack(side=tk.LEFT, padx=8)
@@ -1417,6 +1606,27 @@ class FCToolGUI:
         self._intel_filter["combine"] = val
         self._save_intel_filter()
 
+    # ---- Capital-alert toggles ----
+
+    def _on_capital_alert_toggle(self):
+        caps = self._intel_filter.setdefault(
+            "capitals", {"alert": True, "bypass_filter": False})
+        on = bool(self._cap_alert_var.get())
+        caps["alert"] = on
+        # Checkbox 2 (bypass) is only meaningful when alerting is on.
+        try:
+            self._cap_bypass_chk.config(
+                state=tk.NORMAL if on else tk.DISABLED)
+        except Exception:
+            pass
+        self._save_intel_filter()
+
+    def _on_capital_bypass_toggle(self):
+        caps = self._intel_filter.setdefault(
+            "capitals", {"alert": True, "bypass_filter": False})
+        caps["bypass_filter"] = bool(self._cap_bypass_var.get())
+        self._save_intel_filter()
+
     # ---- Anywhere / Anyone toggles ----
 
     def _on_anywhere_toggle(self):
@@ -1436,23 +1646,30 @@ class FCToolGUI:
         self._sync_parties_enabled()
 
     def _sync_location_enabled(self):
-        """Grey out the location list/add-row when Anywhere is checked."""
+        """Dim the location chip area / add-row when Anywhere is checked.
+
+        When Anywhere is on the chip area is ignored by the filter, so it is
+        greyed (darker bg, dim chips) and the add-entry is disabled. The chip
+        ``✕`` buttons remain wired but the muted styling signals they have no
+        effect on matching until Anywhere is unchecked.
+        """
         anywhere = bool(self._loc_anywhere_var.get())
-        state = tk.DISABLED if anywhere else tk.NORMAL
         try:
-            self._loc_listbox.config(state=state)
-            self._loc_add_entry.config(state=state)
+            self._loc_add_entry.config(
+                state=tk.DISABLED if anywhere else tk.NORMAL)
         except Exception:
             pass
+        # Rebuild chips so their dim/normal styling and the ignored hint match.
+        self._refresh_intel_filter_lists()
 
     def _sync_parties_enabled(self):
         anyone = bool(self._par_anyone_var.get())
-        state = tk.DISABLED if anyone else tk.NORMAL
         try:
-            self._par_listbox.config(state=state)
-            self._par_add_entry.config(state=state)
+            self._par_add_entry.config(
+                state=tk.DISABLED if anyone else tk.NORMAL)
         except Exception:
             pass
+        self._refresh_intel_filter_lists()
 
     # ---- Type-selector handlers (swap autocomplete candidates) ----
 
@@ -1537,14 +1754,8 @@ class FCToolGUI:
         self._save_intel_filter()
         self._refresh_intel_filter_lists()
 
-    def _on_location_remove(self):
-        sel = self._loc_listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx >= len(self._loc_index_map):
-            return
-        kind, within = self._loc_index_map[idx]
+    def _remove_location_item(self, kind: str, within: int):
+        """Per-chip removal: drop location[kind][within] (systems/regions)."""
         loc = self._intel_filter.setdefault(
             "location", {"anywhere": True, "systems": [], "regions": []})
         loc[kind] = remove_filter_item(loc.get(kind, []), within)
@@ -1552,7 +1763,9 @@ class FCToolGUI:
         if not loc.get("systems") and not loc.get("regions"):
             loc["anywhere"] = True
             self._loc_anywhere_var.set(True)
-            self._sync_location_enabled()
+            self._save_intel_filter()
+            self._sync_location_enabled()  # also refreshes chips
+            return
         self._save_intel_filter()
         self._refresh_intel_filter_lists()
 
@@ -1637,14 +1850,12 @@ class FCToolGUI:
             self._par_anyone_var.set(False)
             self._sync_parties_enabled()
 
-    def _on_parties_remove(self):
-        sel = self._par_listbox.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        if idx >= len(self._par_index_map):
-            return
-        kind, within = self._par_index_map[idx]
+    def _remove_parties_item(self, kind: str, within: int):
+        """Per-chip removal: drop parties[kind][within].
+
+        ``kind`` is "alliances"/"corporations" (id-dict lists) or "coalitions"
+        (name-string list); ``remove_filter_item`` handles both.
+        """
         par = self._intel_filter.setdefault(
             "parties",
             {"anyone": True, "alliances": [], "corporations": [],
@@ -1654,7 +1865,9 @@ class FCToolGUI:
                 and not par.get("coalitions")):
             par["anyone"] = True
             self._par_anyone_var.set(True)
-            self._sync_parties_enabled()
+            self._save_intel_filter()
+            self._sync_parties_enabled()  # also refreshes chips
+            return
         self._save_intel_filter()
         self._refresh_intel_filter_lists()
 
@@ -1701,46 +1914,132 @@ class FCToolGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---- Listbox refresh ----
+    # ---- Chip rendering ----
+
+    @staticmethod
+    def _make_chip_text_readonly(text: "tk.Text"):
+        """Make a chip ``tk.Text`` non-editable to typing while leaving its
+        embedded chip widgets clickable.
+
+        We bind keystrokes to "break" rather than ``state=DISABLED`` because the
+        Text must accept ``window_create``/``delete`` during rebuilds without
+        the caller toggling state each time. Mouse drag-selection is also
+        suppressed so the area reads as a static display, not an edit field.
+        """
+        def _swallow(_event):
+            return "break"
+        # Block typed input and the common edit/paste/cut accelerators.
+        text.bind("<Key>", _swallow)
+        text.bind("<<Paste>>", _swallow)
+        text.bind("<<Cut>>", _swallow)
+        text.bind("<Button-2>", _swallow)  # X11 middle-click paste
+        text.bind("<B1-Motion>", _swallow)
+
+    def _build_chip(self, parent, label_text, tag_text, on_remove,
+                    ignored=False):
+        """Build one compact removable chip frame.
+
+        ``label_text`` is the entity name, ``tag_text`` the dim type tag
+        (region/system/alliance/corp/coalition), ``on_remove`` a 0-arg callback
+        run when the ✕ is clicked. When ``ignored`` the chip is muted to signal
+        the group is currently bypassed (Anywhere/Anyone on).
+        """
+        chip_bg = BG_PANEL if ignored else "#15406f"
+        name_fg = FG_DIM if ignored else FG_TEXT
+        tag_fg = FG_DIM
+        x_fg = FG_DIM
+        # Abbreviate the dim type tag to save horizontal width so more chips
+        # fit per row. Unknown tags fall through unchanged (lowercased).
+        tag_abbr = {
+            "system": "sys", "region": "reg", "alliance": "alli",
+            "corp": "corp", "corporation": "corp", "coalition": "coal",
+        }
+        short_tag = tag_abbr.get(str(tag_text).lower(), str(tag_text).lower())
+        chip = tk.Frame(parent, bg=chip_bg, bd=0, relief=tk.FLAT,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        tk.Label(chip, text=label_text, font=("Consolas", 8), fg=name_fg,
+                 bg=chip_bg).pack(side=tk.LEFT, padx=(3, 1), pady=0)
+        tk.Label(chip, text=short_tag, font=("Consolas", 7), fg=tag_fg,
+                 bg=chip_bg).pack(side=tk.LEFT, padx=(0, 1), pady=0)
+        x = tk.Label(chip, text="✕", font=("Consolas", 8, "bold"),
+                     fg=x_fg, bg=chip_bg, cursor="hand2")
+        x.pack(side=tk.LEFT, padx=(0, 2), pady=0)
+        x.bind("<Button-1>", lambda e: on_remove())
+        # Subtle hover affordance on the ✕.
+        x.bind("<Enter>", lambda e: x.config(fg=FG_WHITE))
+        x.bind("<Leave>", lambda e: x.config(fg=x_fg))
+        return chip
+
+    def _render_chips(self, text_widget, specs, ignored, empty_hint):
+        """Clear ``text_widget`` and flow chips for ``specs`` into it.
+
+        ``specs`` is a list of ``(label, tag, on_remove)`` tuples. Chips are
+        embedded via ``window_create`` so the Text wraps them like words. When
+        ``ignored`` the whole area is dimmed; when there are no specs a short dim
+        hint is shown instead.
+        """
+        # Reflect the ignored state in the Text background so empty/dimmed
+        # areas read as bypassed.
+        text_widget.config(bg=BG_PANEL if ignored else BG_ENTRY)
+        # Allow programmatic edits regardless of the readonly key bindings.
+        text_widget.delete("1.0", tk.END)
+        if not specs:
+            hint = empty_hint if ignored else "(none — add above)"
+            text_widget.insert(tk.END, hint)
+            text_widget.tag_add("hint", "1.0", tk.END)
+            text_widget.tag_config("hint", foreground=FG_DIM)
+            return
+        for label, tag, on_remove in specs:
+            chip = self._build_chip(text_widget, label, tag, on_remove,
+                                    ignored=ignored)
+            text_widget.window_create(tk.END, window=chip, padx=1, pady=1)
+            # A space between chips lets the Text wrap at chip boundaries.
+            text_widget.insert(tk.END, " ")
 
     def _refresh_intel_filter_lists(self):
-        """Rebuild both listboxes + index maps from the live config."""
+        """Rebuild both chip areas from the live config."""
         flt = self._intel_filter
         loc = flt.get("location", {})
         par = flt.get("parties", {})
 
-        # Location listbox.
-        self._loc_index_map = []
-        loc_was = self._loc_listbox.cget("state")
-        self._loc_listbox.config(state=tk.NORMAL)
-        self._loc_listbox.delete(0, tk.END)
+        # ---- Location chips ----
+        loc_ignored = bool(self._loc_anywhere_var.get())
+        loc_specs = []
         for i, sysitem in enumerate(loc.get("systems", []) or []):
-            self._loc_listbox.insert(
-                tk.END, f"{sysitem.get('name', '?')}  [system]")
-            self._loc_index_map.append(("systems", i))
+            loc_specs.append((
+                sysitem.get("name", "?"), "system",
+                lambda k="systems", idx=i: self._remove_location_item(k, idx),
+            ))
         for i, regitem in enumerate(loc.get("regions", []) or []):
-            self._loc_listbox.insert(
-                tk.END, f"{regitem.get('name', '?')}  [region]")
-            self._loc_index_map.append(("regions", i))
-        self._loc_listbox.config(state=loc_was)
+            loc_specs.append((
+                regitem.get("name", "?"), "region",
+                lambda k="regions", idx=i: self._remove_location_item(k, idx),
+            ))
+        self._render_chips(self._loc_chips, loc_specs, loc_ignored,
+                           "(ignored — Anywhere on)")
 
-        # Parties listbox.
-        self._par_index_map = []
-        par_was = self._par_listbox.cget("state")
-        self._par_listbox.config(state=tk.NORMAL)
-        self._par_listbox.delete(0, tk.END)
+        # ---- Parties chips ----
+        par_ignored = bool(self._par_anyone_var.get())
+        par_specs = []
         for i, al in enumerate(par.get("alliances", []) or []):
-            self._par_listbox.insert(
-                tk.END, f"{al.get('name', '?')}  [alliance]")
-            self._par_index_map.append(("alliances", i))
+            par_specs.append((
+                al.get("name", "?"), "alliance",
+                lambda k="alliances", idx=i: self._remove_parties_item(k, idx),
+            ))
         for i, co in enumerate(par.get("corporations", []) or []):
-            self._par_listbox.insert(
-                tk.END, f"{co.get('name', '?')}  [corp]")
-            self._par_index_map.append(("corporations", i))
+            par_specs.append((
+                co.get("name", "?"), "corp",
+                lambda k="corporations", idx=i:
+                    self._remove_parties_item(k, idx),
+            ))
         for i, cn in enumerate(par.get("coalitions", []) or []):
-            self._par_listbox.insert(tk.END, f"{cn}  [coalition]")
-            self._par_index_map.append(("coalitions", i))
-        self._par_listbox.config(state=par_was)
+            par_specs.append((
+                str(cn), "coalition",
+                lambda k="coalitions", idx=i:
+                    self._remove_parties_item(k, idx),
+            ))
+        self._render_chips(self._par_chips, par_specs, par_ignored,
+                           "(ignored — Anyone on)")
 
     # ── Coalition manager dialog ──────────────────────────────────────────────
 
@@ -2407,6 +2706,7 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE
         )
         self._zkill_log.pack(fill=tk.BOTH, expand=True)
+        self._theme_scrolledtext_bar(self._zkill_log)
         self._paned.add(left_frame, stretch="always")
 
         # Right pane — Intel Channels (initially hidden)
@@ -2425,6 +2725,7 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE
         )
         self._intel_log.pack(fill=tk.BOTH, expand=True)
+        self._theme_scrolledtext_bar(self._intel_log)
         # Don't add to paned yet — added when fusion is toggled on
 
         # Configure text tags for zkill log
@@ -2827,6 +3128,7 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE
         )
         self._wh_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._theme_scrolledtext_bar(self._wh_log)
         self._wh_log.tag_config("header", foreground=FG_ACCENT,
                                  font=("Consolas", 11, "bold"))
         self._wh_log.tag_config("gate", foreground=FG_TEXT)
@@ -5127,9 +5429,15 @@ class FCToolGUI:
 
         self._setting_entries = {}
         self._add_setting(scroll_frame, "Trigger Word", "xup_trigger",
-                          xup.get("trigger_word", "x"))
-        self._add_setting(scroll_frame, "Fire Word", "xup_fire",
-                          xup.get("fire_word", "FIRE"))
+                          xup.get("trigger_word", "x"),
+                          tooltip=("The word a pilot types in the fleet channel "
+                                   "to x-up. Each pilot is counted once; an alert "
+                                   "fires when the count reaches the threshold."))
+        self._add_setting(scroll_frame, "Clear Word", "xup_fire",
+                          xup.get("fire_word", "FIRE"),
+                          tooltip=("Resets the x-up tally to zero, clearing "
+                                   "everyone who has x'd up, so you can start a "
+                                   "fresh count."))
         self._add_setting(scroll_frame, "Channel Name", "xup_channel",
                           xup.get("channel_name", "Fleet"))
 
@@ -5157,17 +5465,23 @@ class FCToolGUI:
                  font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK
                  ).pack(anchor=tk.W, padx=10, pady=(15, 5))
 
-    def _add_setting(self, parent, label, key, default=""):
+    def _add_setting(self, parent, label, key, default="", tooltip=None):
         frame = tk.Frame(parent, bg=BG_DARK)
         frame.pack(fill=tk.X, padx=20, pady=2)
-        tk.Label(frame, text=f"{label}:", font=("Consolas", 10),
-                 fg=FG_TEXT, bg=BG_DARK, width=28, anchor=tk.W).pack(side=tk.LEFT)
+        lbl = tk.Label(frame, text=f"{label}:", font=("Consolas", 10),
+                       fg=FG_TEXT, bg=BG_DARK, width=28, anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
         var = tk.StringVar(value=default)
         entry = tk.Entry(frame, textvariable=var, font=("Consolas", 10),
                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                          width=40, borderwidth=1, relief=tk.RIDGE)
         entry.pack(side=tk.LEFT, padx=5)
         self._setting_entries[key] = var
+        if tooltip:
+            for _w in (lbl, entry):
+                _w.bind("<Enter>",
+                        lambda e, t=tooltip: self._show_tooltip(e, t))
+                _w.bind("<Leave>", lambda e: self._hide_tooltip())
 
     def _browse_logs(self):
         path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
@@ -5241,10 +5555,23 @@ class FCToolGUI:
         ic_cfg = self.config.get("intel_channels", {})
         cached = ic_cfg.get("cached_discovered", []) or []
         self._intel_channel_suggestions: list[str] = filter_suggestion_channels(cached)
+        # Seed the Suggested-panel pool (intel/intelligence-named, not tracked)
+        # from the same cached discovery so the panel is useful before a scan.
+        self._intel_suggested_channels: list[str] = compute_intel_channel_suggestions(
+            cached, self._tracked_intel_channels)
+
+        # Split the curation area: existing add/scan/list controls on the left,
+        # the 1-click Suggested panel on the right.
+        body = tk.Frame(parent, bg=BG_DARK)
+        body.pack(fill=tk.X, padx=20, pady=2)
+        left_col = tk.Frame(body, bg=BG_DARK)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_col = tk.Frame(body, bg=BG_DARK)
+        right_col.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0))
 
         # Add row: searchable entry + Add + Scan Channels + status.
-        add_row = tk.Frame(parent, bg=BG_DARK)
-        add_row.pack(fill=tk.X, padx=20, pady=2)
+        add_row = tk.Frame(left_col, bg=BG_DARK)
+        add_row.pack(fill=tk.X, pady=2)
         tk.Label(add_row, text="Add channel:", font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT, padx=(0, 5))
         self._intel_channel_entry = AutocompleteEntry(
@@ -5266,8 +5593,8 @@ class FCToolGUI:
         self._intel_channels_status.pack(side=tk.LEFT, padx=10)
 
         # Tracked-channel listbox (dark look, matches staging manager).
-        list_row = tk.Frame(parent, bg=BG_DARK)
-        list_row.pack(fill=tk.X, padx=20, pady=2)
+        list_row = tk.Frame(left_col, bg=BG_DARK)
+        list_row.pack(fill=tk.X, pady=2)
         self._intel_channels_listbox = tk.Listbox(
             list_row, height=5, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_MAGENTA, selectbackground="#1a5a90",
@@ -5283,7 +5610,61 @@ class FCToolGUI:
                    command=self._remove_intel_channel
                    ).pack(side=tk.LEFT, padx=(6, 0), anchor=tk.N)
 
+        # Suggested panel: discovered intel-named channels not yet tracked,
+        # each addable in one click. Populated/rebuilt by
+        # _refresh_intel_channel_suggestions().
+        tk.Label(right_col, text="Suggested (intel channels):",
+                 font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+                 ).pack(anchor=tk.W)
+        self._intel_suggested_frame = tk.Frame(
+            right_col, bg=BG_DARK, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, borderwidth=0,
+        )
+        self._intel_suggested_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+
         self._refresh_intel_channels_listbox()
+        self._refresh_intel_channel_suggestions()
+
+    def _refresh_intel_channel_suggestions(self, discovered=None):
+        """(Re)draw the Suggested intel-channels panel.
+
+        Recomputes the suggestion list (intel/intelligence-named, minus the
+        currently tracked set, deduped) and rebuilds one row per suggestion with
+        a 1-click '+ Add' button. When ``discovered`` is provided it becomes the
+        new candidate pool (e.g. a fresh scan); otherwise the cached
+        ``self._intel_suggested_channels`` pool is recomputed against the
+        current tracked list. Shows a dim placeholder when empty. Safe to call
+        before the panel exists (no-op) and idempotent."""
+        if discovered is not None:
+            pool = list(discovered)
+        else:
+            # Recompute from the last known pool so newly-tracked channels drop
+            # out without needing a rescan.
+            pool = list(getattr(self, "_intel_suggested_channels", []))
+        self._intel_suggested_channels = compute_intel_channel_suggestions(
+            pool, self._tracked_intel_channels)
+
+        frame = getattr(self, "_intel_suggested_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+
+        if not self._intel_suggested_channels:
+            tk.Label(frame, text="(none — Scan to refresh)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+                     ).pack(anchor=tk.W, padx=6, pady=4)
+            return
+
+        for name in self._intel_suggested_channels:
+            row = tk.Frame(frame, bg=BG_DARK)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            ttk.Button(row, text="+ Add", style="Green.TButton", width=6,
+                       command=lambda n=name: self._add_intel_channel_by_name(n)
+                       ).pack(side=tk.LEFT)
+            tk.Label(row, text=name, font=("Consolas", 10),
+                     fg=FG_MAGENTA, bg=BG_DARK, anchor=tk.W,
+                     ).pack(side=tk.LEFT, padx=(6, 0))
 
     def _refresh_intel_channels_listbox(self):
         """Redraw the tracked-channel listbox from self._tracked_intel_channels."""
@@ -5295,20 +5676,32 @@ class FCToolGUI:
             box.insert(tk.END, name)
 
     def _add_intel_channel(self):
-        """Add the typed/selected channel to the tracked list, persist, and
-        refresh both the listbox and the Intel-panel checkboxes.
+        """Add the channel typed/selected in the entry to the tracked list.
 
-        Free-typed names are accepted (a channel may have no recent log). The
-        tracked list is de-duped case-insensitively; adding an existing channel
-        is a no-op with an inline notice."""
+        Thin wrapper over :meth:`_add_intel_channel_by_name`; clears the entry
+        on a successful (non-blank) add. Free-typed names are accepted (a
+        channel may have no recent log)."""
         name = self._intel_channel_entry.get().strip()
+        if not name:
+            return
+        self._intel_channel_entry.delete(0, tk.END)
+        self._add_intel_channel_by_name(name)
+
+    def _add_intel_channel_by_name(self, name: str):
+        """Core add path shared by the Add button and the Suggested chips.
+
+        Normalizes (de-dupes case-insensitively) the tracked list with ``name``
+        appended. If the list is unchanged (already tracked, or blank), it is a
+        no-op with an inline notice. Otherwise it persists, refreshes the
+        listbox + Intel-panel checkboxes, refreshes the Suggested panel (so the
+        just-added channel drops out of suggestions), and sets a status."""
+        name = (name or "").strip()
         if not name:
             return
         before = len(self._tracked_intel_channels)
         self._tracked_intel_channels = normalize_tracked_channels(
             self._tracked_intel_channels + [name]
         )
-        self._intel_channel_entry.delete(0, tk.END)
         if len(self._tracked_intel_channels) == before:
             self._intel_channels_status.config(
                 text=f"{name} already tracked", fg=FG_YELLOW)
@@ -5316,6 +5709,7 @@ class FCToolGUI:
         self._save_tracked_intel_channels()
         self._refresh_intel_channels_listbox()
         self._rebuild_intel_channel_checkboxes()
+        self._refresh_intel_channel_suggestions()
         self._intel_channels_status.config(text=f"Added {name}", fg=FG_GREEN)
 
     def _remove_intel_channel(self):
@@ -5335,25 +5729,36 @@ class FCToolGUI:
         self._save_tracked_intel_channels()
         self._refresh_intel_channels_listbox()
         self._rebuild_intel_channel_checkboxes()
+        # If the removed channel is an intel-named one still in the discovered
+        # pool, it re-appears as a suggestion.
+        self._refresh_intel_channel_suggestions()
         self._intel_channels_status.config(text=f"Removed {name}", fg=FG_DIM)
 
     def _scan_intel_channels(self):
         """Discover channels from the logs dir (off the Tk main thread) to
-        populate the picker's suggestion pool and cache them.
+        populate the picker's suggestion pool, the Suggested panel, and the
+        cache.
 
         discover_channels() does directory + header I/O, so it runs on a worker
-        thread; results are applied back on the Tk main thread via root.after."""
+        thread; results are applied back on the Tk main thread via root.after.
+
+        The scan deliberately passes ``tracked_character=None`` (every character)
+        rather than the currently-selected character: intel channels are often
+        logged under an alt, so narrowing to the selected character would miss
+        them. The Suggested panel then surfaces any intel-named channel found in
+        the logs regardless of which alt opened it."""
         logs_path = self._logs_path_var.get()
         if not logs_path or not os.path.isdir(logs_path):
             self._intel_channels_status.config(
                 text="Set a valid EVE Chat Logs path first", fg=FG_ORANGE)
             return
-        tracked_char = self._char_var.get().strip() or None
         self._intel_channels_status.config(text="Scanning...", fg=FG_ACCENT)
 
         def worker():
             try:
-                found = discover_channels(logs_path, tracked_char,
+                # tracked_character=None -> scan across ALL characters so
+                # channels logged under an alt are still surfaced.
+                found = discover_channels(logs_path, tracked_character=None,
                                           max_age_days=30)
                 names = [d["name"] for d in found]
             except Exception:
@@ -5364,19 +5769,24 @@ class FCToolGUI:
 
     def _apply_scanned_intel_channels(self, discovered_names):
         """Apply discovery results on the Tk main thread: cache ALL discovered
-        names and refresh the (noise-filtered) suggestion pool."""
+        names, refresh the (noise-filtered) autocomplete pool, and refresh the
+        Suggested panel from the fresh discovered set."""
         # Cache the full discovery set (unfiltered — anything can be added).
         ic = self.config.setdefault("intel_channels", {})
         ic["cached_discovered"] = list(discovered_names)
         self._save_config()
-        # Suggestions hide obvious non-intel system channels.
+        # Autocomplete suggestions hide obvious non-intel system channels.
         self._intel_channel_suggestions = filter_suggestion_channels(
             discovered_names)
         entry = getattr(self, "_intel_channel_entry", None)
         if entry is not None:
             entry.update_completions(self._intel_channel_suggestions)
+        # Suggested panel uses the intel/intelligence predicate (not the
+        # autocomplete denylist) against the fresh discovered set, minus tracked.
+        self._refresh_intel_channel_suggestions(discovered=discovered_names)
         self._intel_channels_status.config(
-            text=f"Found {len(self._intel_channel_suggestions)} channel(s)",
+            text=f"Found {len(self._intel_channel_suggestions)} channel(s), "
+                 f"{len(self._intel_suggested_channels)} suggested",
             fg=FG_GREEN)
 
     def _set_autostart(self, enabled: bool):
@@ -5502,15 +5912,6 @@ class FCToolGUI:
     # ── Module Setup ──────────────────────────────────────────────────────────
 
     def _setup_modules(self):
-        # Discord
-        dc = self.config.get("discord", {})
-        if dc.get("enabled") and dc.get("webhook_url"):
-            self.discord = DiscordNotifier(dc["webhook_url"])
-            self._discord_status.config(text="DISCORD: ON", fg=FG_GREEN)
-        else:
-            self.discord = None
-            self._discord_status.config(text="DISCORD: OFF", fg=FG_DIM)
-
         # Fleet Management
         xup_cfg = self.config.get("xup", {})
         self.xup_counter = XUpCounter(
@@ -5546,7 +5947,8 @@ class FCToolGUI:
         if zk_cfg.get("enabled"):
             # Monitor runs with watch_all=True and min_pilots=1 to capture
             # everything; GUI-only filters (All K-Space, min pilots, max jumps)
-            # are applied at display time so they don't affect Discord/server.
+            # are applied at display time so they don't affect what the
+            # monitor captures.
             self.zkill_monitor = ZKillMonitor(
                 watch_regions=zk_cfg.get("watch_regions", []),
                 watch_alliances=zk_cfg.get("watch_alliances", []),
@@ -5556,6 +5958,7 @@ class FCToolGUI:
                 alert_window_seconds=zk_cfg.get("alert_window_seconds", 300),
                 on_alert=self._on_zkill_alert,
                 watch_all=True,
+                friendly_ids=set(self._standings_cache.friendly_ids),
             )
             self._zkill_status.config(text="ZKILL: ON", fg=FG_GREEN)
         else:
@@ -5632,20 +6035,6 @@ class FCToolGUI:
             alert.route_from_staging = route_info
 
         self.root.after(0, self._show_zkill_alert, alert)
-        if self.discord and self._is_discord_primary and self.config.get("discord", {}).get("notify_zkill_alerts"):
-            self.discord.notify_zkill_alert(
-                alert.system_name, alert.region_name,
-                alert.kill_count, alert.pilots_on_field,
-                alert.total_value_millions, alert.zkill_url,
-                alert.capitals_involved,
-                alert.dotlan_url,
-                route_info,
-                alert.capital_breakdown,
-                alert.is_update,
-                zkill_related_url=alert.zkill_related_url,
-                warbeacon_url=alert.warbeacon_url,
-                top_alliances=alert.top_alliances,
-            )
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
@@ -6478,6 +6867,20 @@ $bmp.Dispose()
         import webbrowser
         webbrowser.open(url)
 
+    def _theme_scrolledtext_bar(self, st):
+        """Dark-theme the classic tk.Scrollbar inside a scrolledtext.ScrolledText.
+
+        ScrolledText builds a CLASSIC tk.Scrollbar (reachable as st.vbar) that
+        ttk styles do NOT reach, so it must be coloured directly to match the
+        ttk scrollbars themed in the style block above.
+        """
+        st.vbar.configure(
+            bg=BG_ENTRY, troughcolor=BG_DARK, activebackground="#1a5a90",
+            highlightbackground=BG_DARK, highlightcolor=BG_DARK,
+            highlightthickness=0, borderwidth=0, relief="flat",
+            elementborderwidth=0,
+        )
+
     def _show_tooltip(self, event, text):
         """Show a tooltip near the mouse cursor."""
         self._tooltip = tk.Toplevel(self.root)
@@ -6495,28 +6898,40 @@ $bmp.Dispose()
             self._tooltip = None
 
     def _show_zkill_alert(self, alert: KillAlert):
-        # ── GUI-only filters (do not affect Discord/server) ──
+        # ── GUI-only filters (applied at display time only) ──
         # These read the panel vars, which mirror config["intel_filter"]; the
         # criteria (location/parties) come straight from the live config so the
         # display filter always reflects the current panel state.
         #
-        # (a) Min-pilots gate — capitals always bypass.
+        # Capital-alert settings (read live). A hostile capital is a cap whose
+        # corp AND alliance are both outside the standings friendly set, so
+        # alert.capitals_involved is already hostile-only.
+        caps_cfg = self.config.get("intel_filter", {}).get("capitals", {})
+        cap_alert = caps_cfg.get("alert", True)
+        cap_bypass = caps_cfg.get("bypass_filter", False)
+        #
+        # (a) Min-pilots gate — hostile capitals bypass it only when
+        # "Alert on hostile capitals" is on.
         try:
             gui_min_pilots = int(self._zkill_min_pilots_var.get())
         except (ValueError, AttributeError):
             gui_min_pilots = 1
-        if alert.pilots_on_field < gui_min_pilots and not alert.capitals_involved:
+        if (alert.pilots_on_field < gui_min_pilots
+                and not (alert.capitals_involved and cap_alert)):
             return  # Below GUI min pilot threshold
 
         # (b) Criteria gate — location + parties combined per config["combine"].
-        if not intel_filter.matches(
+        # A hostile-cap alert skips this location/parties filter only when BOTH
+        # the capital alert and its bypass toggle are on.
+        ok = intel_filter.matches(
             alert.system_id,
             alert.region_id,
             alert.alliances_involved,
             alert.corps_involved,
             self.config.get("intel_filter", {}),
             self.config.get("coalitions", {}),
-        ):
+        )
+        if not ok and not (alert.capitals_involved and cap_alert and cap_bypass):
             return  # Does not match the configured location/parties criteria
 
         # (c) Max-jumps gate — drop if route distance exceeds the limit.
@@ -6884,6 +7299,11 @@ $bmp.Dispose()
         except Exception as exc:
             self._set_paste_result(f"Standings refresh failed: {exc}")
             return
+        # Push the refreshed friendly set into the live monitor (no rebuild;
+        # thread-safe set swap). Guarded — monitor is None when zkill is off.
+        if self.zkill_monitor:
+            self.zkill_monitor.set_friendly_ids(
+                set(self._standings_cache.friendly_ids))
         self._update_standings_label()
         msg = (
             f"Standings refreshed. {len(self._standings_cache.friendly_ids)} "
@@ -6917,6 +7337,13 @@ $bmp.Dispose()
                         self._standings_cache.refresh(auth)
                     except Exception:
                         return
+                    # Push the refreshed friendly set into the live monitor.
+                    # set_friendly_ids only swaps a set reference (no Tk, no
+                    # rebuild) so it is safe to call directly off-thread. Guard
+                    # — monitor is None when zkill is disabled.
+                    if self.zkill_monitor:
+                        self.zkill_monitor.set_friendly_ids(
+                            set(self._standings_cache.friendly_ids))
                     # Update label on the Tk thread (FCToolGUI uses self.root,
                     # not subclass-style self).
                     if hasattr(self, "_paste_standings_age"):
