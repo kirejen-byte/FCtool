@@ -1332,8 +1332,26 @@ class FCToolGUI:
                                 highlightthickness=1)
         filter_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
 
+        # ── Collapsible header (always visible) ────────────────────────────
+        # Mirrors the "Paste Intel" drawer on this tab: a clickable label with
+        # a ▼/▶ arrow that pack/forgets the body frame so the user can reclaim
+        # vertical space for the live feed. Default = expanded.
+        self._intel_filter_expanded = True
+        self._intel_filter_header = tk.Label(
+            filter_frame, text="▼ Filters",
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2",
+        )
+        self._intel_filter_header.pack(anchor="w", padx=10, pady=4)
+        self._intel_filter_header.bind(
+            "<Button-1>", lambda e: self._toggle_intel_filter_panel())
+
+        # Body holds all filter content; collapsing it pack_forgets this frame.
+        self._intel_filter_body = tk.Frame(filter_frame, bg=BG_PANEL)
+        self._intel_filter_body.pack(fill=tk.X)
+
         # ── Top row: Min Pilots, Max Jumps, Combine ────────────────────────
-        top = tk.Frame(filter_frame, bg=BG_PANEL)
+        top = tk.Frame(self._intel_filter_body, bg=BG_PANEL)
         top.pack(fill=tk.X, padx=10, pady=(5, 4))
 
         tk.Label(top, text="Min Pilots:", font=("Consolas", 9),
@@ -1398,7 +1416,7 @@ class FCToolGUI:
         # gate the in-app intel feed only.
         caps_cfg = flt.setdefault(
             "capitals", {"alert": True, "bypass_filter": False})
-        cap_row = tk.Frame(filter_frame, bg=BG_PANEL)
+        cap_row = tk.Frame(self._intel_filter_body, bg=BG_PANEL)
         cap_row.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         self._cap_alert_var = tk.BooleanVar(
@@ -1429,14 +1447,14 @@ class FCToolGUI:
         # Dim hint: bypass + no Max-Jumps lets hostile-cap alerts in from all of
         # K-space; pair with Max Jumps to bound the firehose.
         tk.Label(
-            filter_frame,
+            self._intel_filter_body,
             text="(bypass + Max Jumps=0 → hostile-cap alerts from all of "
                  "K-space; set Max Jumps to bound it)",
             font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
         ).pack(anchor="w", padx=12, pady=(0, 2))
 
         # ── Two side-by-side group panels ──────────────────────────────────
-        groups = tk.Frame(filter_frame, bg=BG_PANEL)
+        groups = tk.Frame(self._intel_filter_body, bg=BG_PANEL)
         groups.pack(fill=tk.X, padx=10, pady=(0, 6))
         groups.columnconfigure(0, weight=1, uniform="grp")
         groups.columnconfigure(1, weight=1, uniform="grp")
@@ -2655,6 +2673,17 @@ class FCToolGUI:
             command=self._toggle_intel_fusion,
         )
         self._intel_fusion_btn.pack(side=tk.LEFT)
+        _fusion_tip = (
+            "Tails your tracked in-game intel channels (from EVE's chat logs) "
+            "and parses each report — system, pilot count, d-scan link, "
+            "cyno/camp flags — surfacing it in the live feed below, "
+            "cross-referenced with zKillboard activity. "
+            "Pick which channels to watch in Settings → Intel Channels."
+        )
+        self._intel_fusion_btn.bind(
+            "<Enter>", lambda e, t=_fusion_tip: self._show_tooltip(e, t))
+        self._intel_fusion_btn.bind(
+            "<Leave>", lambda e: self._hide_tooltip())
 
         # Min reported filter
         tk.Label(intel_row, text="  Min Reported:", font=("Consolas", 9),
@@ -7096,6 +7125,21 @@ $bmp.Dispose()
         else:
             self._paste_toggle_btn.config(text="▶ Paste Intel")
             self._paste_body.pack_forget()
+
+    def _toggle_intel_filter_panel(self):
+        """Collapse/expand the fight-alert filter body to free up feed space.
+
+        Session-only — the collapse state is intentionally not persisted, so the
+        panel starts expanded on every launch. The header stays visible when
+        collapsed so the user can re-expand.
+        """
+        self._intel_filter_expanded = not self._intel_filter_expanded
+        if self._intel_filter_expanded:
+            self._intel_filter_header.config(text="▼ Filters")
+            self._intel_filter_body.pack(fill=tk.X)
+        else:
+            self._intel_filter_header.config(text="▶ Filters")
+            self._intel_filter_body.pack_forget()
 
     def _on_paste_text_modified(self, event=None):
         # Reset the modified flag so the event fires again next change
