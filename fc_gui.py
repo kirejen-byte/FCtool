@@ -38,7 +38,7 @@ if sys.platform == "win32":
 from chat_monitor import ChatMonitor, ChatMessage
 from intel_monitor import (
     IntelReport, parse_intel_message, scan_available_channels,
-    INTEL_CHANNELS, parse_dscan_text, make_dscan_summary,
+    discover_channels, INTEL_CHANNELS, parse_dscan_text, make_dscan_summary,
     resolve_characters, coalesce_report, load_standings_whitelist,
 )
 from intel_paste import (
@@ -120,6 +120,130 @@ WINTER_ALLIANCES = {
 }
 
 
+def mutate_staging_lists(friendly: list[str], hostile: list[str],
+                         action: str, name: str,
+                         target: str = "friendly") -> tuple[list[str], list[str]]:
+    """Pure, Tk-free mutator for the two staging-system lists.
+
+    Returns NEW (friendly, hostile) lists; inputs are never mutated in place so
+    this is safe to unit-test and to call from the UI.
+
+    action:
+      - "add":    add ``name`` to ``target`` ("friendly"/"hostile"). De-dupes
+                  case-insensitively within the target list. If ``name`` already
+                  exists (case-insensitively) in the OTHER list it is MOVED:
+                  removed from the other list and appended to the target.
+      - "remove": remove ``name`` (case-insensitive) from ``target`` only.
+
+    ``name`` is normalized by stripping surrounding whitespace; the stripped
+    display text is what gets stored (canonicalization beyond this is the
+    caller's job and must not block list mutation). Blank names are ignored.
+    """
+    # Work on copies so callers' lists are never mutated.
+    friendly = list(friendly)
+    hostile = list(hostile)
+
+    clean = (name or "").strip()
+    if not clean:
+        return friendly, hostile
+
+    lower = clean.lower()
+
+    def _without(lst: list[str]) -> list[str]:
+        return [s for s in lst if s.strip().lower() != lower]
+
+    if action == "remove":
+        if target == "hostile":
+            hostile = _without(hostile)
+        else:
+            friendly = _without(friendly)
+        return friendly, hostile
+
+    if action == "add":
+        # Remove any existing copy from BOTH lists (handles de-dupe within the
+        # target list and a move from the other list), then append to target.
+        friendly = _without(friendly)
+        hostile = _without(hostile)
+        if target == "hostile":
+            hostile.append(clean)
+        else:
+            friendly.append(clean)
+        return friendly, hostile
+
+    return friendly, hostile
+
+
+# Channels EVE creates by default that are not intel channels. The picker's
+# *suggestion* list hides these so discovery noise doesn't bury real intel
+# channels; the user can still type any of them in by hand to track them.
+_NON_INTEL_CHANNEL_NAMES = {
+    "local", "corp", "alliance", "fleet", "rookie help",
+}
+_NON_INTEL_CHANNEL_PREFIXES = ("private chat",)
+
+
+def normalize_tracked_channels(names, seed=None) -> list[str]:
+    """Pure, Tk-free normalizer for the tracked intel-channel list.
+
+    Strips surrounding whitespace from each name, drops blanks, and de-dupes
+    case-insensitively while preserving first-seen order and the original
+    casing of the first occurrence. Returns a NEW list; ``names`` is never
+    mutated in place, so this is safe to unit-test and to call from the UI.
+
+    If the cleaned result is empty and ``seed`` is provided, the seed is
+    normalized the same way and returned instead — this implements the
+    "missing/empty tracked list falls back to the seed (sorted INTEL_CHANNELS)"
+    safety behavior in one place.
+    """
+    def _dedupe(raw) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in (raw or ()):
+            clean = (item or "").strip()
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(clean)
+        return out
+
+    result = _dedupe(names)
+    if not result and seed is not None:
+        result = _dedupe(seed)
+    return result
+
+
+def filter_suggestion_channels(names) -> list[str]:
+    """Pure, Tk-free noise filter for the channel-picker *suggestion* pool.
+
+    Given discovered channel names, returns the subset suitable as default
+    autocomplete suggestions: hides obvious non-intel system channels
+    (case-insensitive exact "Local"/"Corp"/"Alliance"/"Fleet"/"Rookie Help"
+    and anything starting with "Private Chat"). Order is preserved and the
+    list is de-duped case-insensitively. This only affects what is *suggested*;
+    callers may still let the user manually add any hidden name. Discovery
+    itself is never filtered by this function.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in (names or ()):
+        clean = (item or "").strip()
+        if not clean:
+            continue
+        lower = clean.lower()
+        if lower in _NON_INTEL_CHANNEL_NAMES:
+            continue
+        if any(lower.startswith(p) for p in _NON_INTEL_CHANNEL_PREFIXES):
+            continue
+        if lower in seen:
+            continue
+        seen.add(lower)
+        out.append(clean)
+    return out
+
+
 class FCToolGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -135,6 +259,20 @@ class FCToolGUI:
             pass
 
         self.config = self._load_config()
+        # User-editable, persisted jump-range staging systems (start empty —
+        # no hard-coded seeds). Loaded from config["jump_range"], managed inline
+        # on the Jump Range tab.
+        _jr_cfg = self.config.get("jump_range", {})
+        self._friendly_staging: list[str] = list(
+            _jr_cfg.get("friendly_staging_systems", []) or [])
+        self._hostile_staging: list[str] = list(
+            _jr_cfg.get("hostile_staging_systems", []) or [])
+        # User-editable, persisted intel channels (shared with the web UI via
+        # config["intel_channels"]["tracked"]). On first run the key is seeded
+        # from the hard-coded INTEL_CHANNELS so existing users keep today's
+        # channels, then persisted. A missing/empty list falls back to the seed
+        # for safety. cached_discovered backs the Settings picker's suggestions.
+        self._tracked_intel_channels: list[str] = self._load_tracked_intel_channels()
         self.discord: DiscordNotifier | None = None
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
@@ -210,6 +348,9 @@ class FCToolGUI:
         # Auto-refresh character data in the background shortly after startup
         if self.esi_accounts and hasattr(self, '_char_tab_content'):
             self.root.after(3000, lambda: self._refresh_character_tab(force=True))
+
+        # Start periodic character tab refresh (location + ship every 5 min)
+        self.root.after(300_000, self._auto_refresh_character_tab)
 
         # Pre-generate loss threshold TTS audio in the background
         tts_helper.pregenerate([
@@ -403,6 +544,48 @@ class FCToolGUI:
     def _save_config(self):
         with open(CONFIG_PATH, "w") as f:
             json.dump(self.config, f, indent=4)
+
+    def _save_staging_systems(self):
+        """Persist the friendly/hostile staging lists into config["jump_range"]
+        and write config.json immediately.
+
+        Deliberately does NOT call _save_settings() and does NOT restart any
+        modules — this is a lightweight config write only.
+        """
+        jr = self.config.setdefault("jump_range", {})
+        jr["friendly_staging_systems"] = list(self._friendly_staging)
+        jr["hostile_staging_systems"] = list(self._hostile_staging)
+        self._save_config()
+
+    def _load_tracked_intel_channels(self) -> list[str]:
+        """Return the tracked intel channels from config, seeding on first run.
+
+        Reads ``config["intel_channels"]["tracked"]``. If that key is missing or
+        empty, it is SEEDED from ``sorted(INTEL_CHANNELS)`` and persisted to
+        config.json so existing users keep today's channels and the shared key
+        the web UI reads is populated. The returned list is normalized
+        (whitespace-stripped, case-insensitively de-duped); a normalized list
+        that round-trips to a different value is written back so config stays
+        clean. Mirrors fc_web.get_tracked_channels()'s read + fallback contract.
+        """
+        seed = sorted(INTEL_CHANNELS)
+        ic = self.config.setdefault("intel_channels", {})
+        raw = ic.get("tracked")
+        tracked = normalize_tracked_channels(raw, seed=seed)
+        # Persist when seeding (key absent/empty) or when normalization changed
+        # the stored value, so the on-disk config matches what we use in memory.
+        if not raw or list(raw) != tracked:
+            ic["tracked"] = list(tracked)
+            self._save_config()
+        return tracked
+
+    def _save_tracked_intel_channels(self):
+        """Persist the tracked intel channels into config["intel_channels"]
+        and write config.json immediately. Lightweight config write only — does
+        not restart modules (mirrors _save_staging_systems)."""
+        ic = self.config.setdefault("intel_channels", {})
+        ic["tracked"] = list(self._tracked_intel_channels)
+        self._save_config()
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -1029,22 +1212,16 @@ class FCToolGUI:
         self._intel_channels_frame = tk.Frame(intel_row, bg=BG_PANEL)
         self._intel_channels_frame.pack(side=tk.LEFT, padx=(15, 0))
 
-        self._intel_channel_vars: dict[str, tk.BooleanVar] = {}
-        for ch_name in sorted(INTEL_CHANNELS):
-            var = tk.BooleanVar(value=False)
-            self._intel_channel_vars[ch_name] = var
-            cb = tk.Checkbutton(
-                self._intel_channels_frame, text=ch_name,
-                variable=var, font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
-                selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                activeforeground=FG_MAGENTA, state=tk.DISABLED,
-                command=self._on_intel_channel_change,
-            )
-            cb.pack(side=tk.LEFT, padx=4)
-
+        # Intel-monitor state must exist before building the checkboxes, since
+        # the (re)build inspects _intel_monitor / _intel_channels_enabled.
         self._intel_monitor: ChatMonitor | None = None
         self._intel_thread: threading.Thread | None = None
         self._intel_channels_enabled: set[str] = set()
+
+        # One checkbox per tracked intel channel (user-configurable, sourced
+        # from config["intel_channels"]["tracked"] via self._tracked_intel_channels).
+        self._intel_channel_vars: dict[str, tk.BooleanVar] = {}
+        self._rebuild_intel_channel_checkboxes()
 
         # Fusion detection state
         self._recent_zkill_systems: dict[str, datetime] = {}
@@ -1203,60 +1380,185 @@ class FCToolGUI:
         self._range_secondary_frame = tk.Frame(tab, bg=BG_DARK)
         self._range_secondary_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
-        # Custom systems for range check
-        self._range_custom_systems: list[str] = []
-        custom_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
-                                highlightbackground=BORDER_COLOR, highlightthickness=1)
-        custom_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        # ── Staging-system manager (persisted friendly/hostile lists) ────────
+        staging_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                 highlightbackground=BORDER_COLOR, highlightthickness=1)
+        staging_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        tk.Label(custom_frame, text="Add system to range check:",
+        add_row = tk.Frame(staging_frame, bg=BG_PANEL)
+        add_row.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        tk.Label(add_row, text="Staging system:",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL
-                 ).pack(side=tk.LEFT, padx=(10, 5), pady=5)
+                 ).pack(side=tk.LEFT, padx=(0, 5))
 
         self._range_add_entry = AutocompleteEntry(
-            custom_frame, self._system_names,
+            add_row, self._system_names,
             labels=self._system_labels,
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=20,
             borderwidth=1, relief=tk.RIDGE,
         )
-        self._range_add_entry.pack(side=tk.LEFT, padx=5, pady=5)
-        self._range_add_entry.bind("<Return>", lambda e: self._add_range_system())
+        self._range_add_entry.pack(side=tk.LEFT, padx=5)
+        # Enter defaults to adding as friendly.
+        self._range_add_entry.bind("<Return>",
+                                   lambda e: self._add_staging_system("friendly"))
 
-        ttk.Button(custom_frame, text="Add", style="Dark.TButton",
-                   command=self._add_range_system).pack(side=tk.LEFT, padx=5, pady=5)
-        ttk.Button(custom_frame, text="Clear Added", style="Dark.TButton",
-                   command=self._clear_range_systems).pack(side=tk.LEFT, padx=5, pady=5)
+        ttk.Button(add_row, text="Add Friendly", style="Green.TButton",
+                   command=lambda: self._add_staging_system("friendly")
+                   ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(add_row, text="Add Hostile", style="Red.TButton",
+                   command=lambda: self._add_staging_system("hostile")
+                   ).pack(side=tk.LEFT, padx=5)
 
         self._range_custom_label = tk.Label(
-            custom_frame, text="", font=("Consolas", 9), fg=FG_ACCENT, bg=BG_PANEL,
+            add_row, text="", font=("Consolas", 9), fg=FG_ACCENT, bg=BG_PANEL,
         )
-        self._range_custom_label.pack(side=tk.LEFT, padx=10, pady=5)
+        self._range_custom_label.pack(side=tk.LEFT, padx=10)
 
-    def _add_range_system(self):
-        """Add a custom system to the range check list and re-run the check."""
+        # Two side-by-side lists: friendly (green-tinted) / hostile (red-tinted)
+        lists_row = tk.Frame(staging_frame, bg=BG_PANEL)
+        lists_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        friendly_col = tk.Frame(lists_row, bg=BG_PANEL)
+        friendly_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        tk.Label(friendly_col, text="Friendly staging",
+                 font=("Consolas", 9, "bold"), fg=FG_GREEN, bg=BG_PANEL
+                 ).pack(anchor=tk.W)
+        self._friendly_listbox = tk.Listbox(
+            friendly_col, height=5, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_GREEN, selectbackground="#1a5a90",
+            selectforeground=FG_WHITE, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, borderwidth=1, relief=tk.RIDGE,
+            activestyle="none", exportselection=False,
+        )
+        self._friendly_listbox.pack(fill=tk.BOTH, expand=True, pady=(2, 2))
+        self._friendly_listbox.bind(
+            "<Double-Button-1>", lambda e: self._remove_staging_system("friendly"))
+        ttk.Button(friendly_col, text="Remove Selected", style="Dark.TButton",
+                   command=lambda: self._remove_staging_system("friendly")
+                   ).pack(anchor=tk.W, pady=(2, 0))
+
+        hostile_col = tk.Frame(lists_row, bg=BG_PANEL)
+        hostile_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        tk.Label(hostile_col, text="Hostile staging",
+                 font=("Consolas", 9, "bold"), fg=FG_RED, bg=BG_PANEL
+                 ).pack(anchor=tk.W)
+        self._hostile_listbox = tk.Listbox(
+            hostile_col, height=5, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_RED, selectbackground="#5a1a1a",
+            selectforeground=FG_WHITE, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, borderwidth=1, relief=tk.RIDGE,
+            activestyle="none", exportselection=False,
+        )
+        self._hostile_listbox.pack(fill=tk.BOTH, expand=True, pady=(2, 2))
+        self._hostile_listbox.bind(
+            "<Double-Button-1>", lambda e: self._remove_staging_system("hostile"))
+        ttk.Button(hostile_col, text="Remove Selected", style="Dark.TButton",
+                   command=lambda: self._remove_staging_system("hostile")
+                   ).pack(anchor=tk.W, pady=(2, 0))
+
+        # Populate the listboxes from the persisted lists loaded at startup.
+        self._refresh_staging_listboxes()
+
+    def _refresh_staging_listboxes(self):
+        """Redraw both staging listboxes from self._friendly/_hostile_staging."""
+        for box, items in (
+            (getattr(self, "_friendly_listbox", None), self._friendly_staging),
+            (getattr(self, "_hostile_listbox", None), self._hostile_staging),
+        ):
+            if box is None:
+                continue
+            box.delete(0, tk.END)
+            for name in items:
+                box.insert(tk.END, name)
+
+    def _rerun_range_check_if_ready(self):
+        """Re-run the range check live if both origin and destination are set."""
+        try:
+            origin = self._range_origin.get().strip()
+            dest = self._range_dest.get().strip()
+        except Exception:
+            return
+        if origin and dest:
+            self._do_range_check()
+
+    def _add_staging_system(self, target: str):
+        """Validate, persist, and add the entry's system to a staging list.
+
+        target: "friendly" or "hostile". Validation is a non-blocking,
+        case-insensitive membership check against the in-memory system-name
+        list (``self._system_names``); it never touches the network on the Tk
+        main thread. On a match we store the canonical-cased name; on a miss we
+        show an inline error and do not mutate the lists. The numeric system ID
+        is resolved later on the range-check background thread, so no lookup is
+        needed here. If the autocomplete list has not finished loading yet we
+        accept the name as-entered (unverified) rather than block. If the
+        system already lives in the other list it is moved here.
+        """
         name = self._range_add_entry.get().strip()
         if not name:
             return
-        # Validate it's a real system
-        sid = search_system(name)
-        if not sid:
-            self._range_custom_label.config(text=f"Unknown system: {name}", fg=FG_RED)
-            return
-        if name not in self._range_custom_systems:
-            self._range_custom_systems.append(name)
-        self._range_add_entry.delete(0, tk.END)
-        self._range_custom_label.config(
-            text=f"Added: {', '.join(self._range_custom_systems)}", fg=FG_ACCENT
-        )
-        # Re-run the range check immediately with the new system included
-        self._do_range_check()
+        # Match against the in-memory autocomplete list (case-insensitive),
+        # preferring the canonical-cased entry ("nol-m9" -> "NOL-M9"). This is
+        # purely a dict/list lookup — no network call on the main thread.
+        canonical = None
+        for known in (self._system_names or ()):
+            if known.lower() == name.lower():
+                canonical = known
+                break
 
-    def _clear_range_systems(self):
-        """Clear all custom range check systems and re-run the check."""
-        self._range_custom_systems.clear()
-        self._range_custom_label.config(text="Cleared", fg=FG_DIM)
-        self._do_range_check()
+        unverified = False
+        if canonical is None:
+            if self._system_names:
+                # List is loaded and the name isn't in it -> reject inline,
+                # matching the existing "Unknown system" error style.
+                self._range_custom_label.config(
+                    text=f"Unknown system: {name}", fg=FG_RED)
+                return
+            # List hasn't finished loading yet: don't block and don't hit the
+            # network. Accept as-entered; it is validated/resolved later on the
+            # range-check background thread.
+            canonical = name
+            unverified = True
+
+        self._friendly_staging, self._hostile_staging = mutate_staging_lists(
+            self._friendly_staging, self._hostile_staging,
+            "add", canonical, target,
+        )
+        self._range_add_entry.delete(0, tk.END)
+        self._refresh_staging_listboxes()
+        self._save_staging_systems()
+        word = "friendly" if target == "friendly" else "hostile"
+        if unverified:
+            # System-name list still loading — flag that we couldn't verify.
+            self._range_custom_label.config(
+                text=f"Added {canonical} ({word}) - unverified, list loading",
+                fg=FG_YELLOW,
+            )
+        else:
+            self._range_custom_label.config(
+                text=f"Added {canonical} ({word})",
+                fg=FG_GREEN if target == "friendly" else FG_RED,
+            )
+        self._rerun_range_check_if_ready()
+
+    def _remove_staging_system(self, target: str):
+        """Remove the selected system from a staging list, persist, and re-check."""
+        box = (self._friendly_listbox if target == "friendly"
+               else self._hostile_listbox)
+        sel = box.curselection()
+        if not sel:
+            return
+        name = box.get(sel[0])
+        self._friendly_staging, self._hostile_staging = mutate_staging_lists(
+            self._friendly_staging, self._hostile_staging,
+            "remove", name, target,
+        )
+        self._refresh_staging_listboxes()
+        self._save_staging_systems()
+        self._range_custom_label.config(text=f"Removed {name}", fg=FG_DIM)
+        self._rerun_range_check_if_ready()
 
     # ── Wormhole Route Tab ────────────────────────────────────────────────────
 
@@ -3689,6 +3991,9 @@ class FCToolGUI:
             if len(pair) == 2:
                 self._ansiblex_text.insert(tk.END, f"{pair[0]}, {pair[1]}\n")
 
+        # ── Intel Channels ────────────────────────────────────────────────
+        self._build_intel_channels_settings(scroll_frame)
+
         # ── X-Up Settings ────────────────────────────────────────────────────
         self._add_section(scroll_frame, "Fleet Management")
         xup = self.config.get("xup", {})
@@ -3787,6 +4092,166 @@ class FCToolGUI:
         else:
             self._char_combo["values"] = [""]
 
+    # ── Intel Channels settings (curation UI) ──────────────────────────────
+
+    def _build_intel_channels_settings(self, parent):
+        """Build the Settings-tab 'Intel Channels' curation section.
+
+        Lets the user view/add/remove the tracked intel channels (shared with
+        the web UI via config["intel_channels"]["tracked"]). The AutocompleteEntry
+        suggests discovered channel names (noise-filtered); the user may still
+        free-type any name. 'Scan Channels' discovers channels from the logs dir
+        and caches them into config["intel_channels"]["cached_discovered"].
+        """
+        self._add_section(parent, "Intel Channels")
+        tk.Label(parent,
+                 text="Channels tracked for Intelligence Fusion "
+                      "(shared with the web UI).",
+                 font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK
+                 ).pack(anchor=tk.W, padx=20)
+
+        # Seed the picker's suggestion pool from cached discovery (noise-filtered).
+        ic_cfg = self.config.get("intel_channels", {})
+        cached = ic_cfg.get("cached_discovered", []) or []
+        self._intel_channel_suggestions: list[str] = filter_suggestion_channels(cached)
+
+        # Add row: searchable entry + Add + Scan Channels + status.
+        add_row = tk.Frame(parent, bg=BG_DARK)
+        add_row.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(add_row, text="Add channel:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT, padx=(0, 5))
+        self._intel_channel_entry = AutocompleteEntry(
+            add_row, self._intel_channel_suggestions,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, width=28,
+            borderwidth=1, relief=tk.RIDGE,
+        )
+        self._intel_channel_entry.pack(side=tk.LEFT, padx=5)
+        self._intel_channel_entry.bind("<Return>",
+                                       lambda e: self._add_intel_channel())
+        ttk.Button(add_row, text="Add", style="Green.TButton",
+                   command=self._add_intel_channel).pack(side=tk.LEFT, padx=5)
+        ttk.Button(add_row, text="Scan Channels", style="Dark.TButton",
+                   command=self._scan_intel_channels).pack(side=tk.LEFT, padx=5)
+        self._intel_channels_status = tk.Label(
+            add_row, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+        )
+        self._intel_channels_status.pack(side=tk.LEFT, padx=10)
+
+        # Tracked-channel listbox (dark look, matches staging manager).
+        list_row = tk.Frame(parent, bg=BG_DARK)
+        list_row.pack(fill=tk.X, padx=20, pady=2)
+        self._intel_channels_listbox = tk.Listbox(
+            list_row, height=5, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_MAGENTA, selectbackground="#1a5a90",
+            selectforeground=FG_WHITE, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, borderwidth=1, relief=tk.RIDGE,
+            activestyle="none", exportselection=False,
+        )
+        self._intel_channels_listbox.pack(side=tk.LEFT, fill=tk.BOTH,
+                                          expand=True, pady=(2, 2))
+        self._intel_channels_listbox.bind(
+            "<Double-Button-1>", lambda e: self._remove_intel_channel())
+        ttk.Button(list_row, text="Remove Selected", style="Dark.TButton",
+                   command=self._remove_intel_channel
+                   ).pack(side=tk.LEFT, padx=(6, 0), anchor=tk.N)
+
+        self._refresh_intel_channels_listbox()
+
+    def _refresh_intel_channels_listbox(self):
+        """Redraw the tracked-channel listbox from self._tracked_intel_channels."""
+        box = getattr(self, "_intel_channels_listbox", None)
+        if box is None:
+            return
+        box.delete(0, tk.END)
+        for name in self._tracked_intel_channels:
+            box.insert(tk.END, name)
+
+    def _add_intel_channel(self):
+        """Add the typed/selected channel to the tracked list, persist, and
+        refresh both the listbox and the Intel-panel checkboxes.
+
+        Free-typed names are accepted (a channel may have no recent log). The
+        tracked list is de-duped case-insensitively; adding an existing channel
+        is a no-op with an inline notice."""
+        name = self._intel_channel_entry.get().strip()
+        if not name:
+            return
+        before = len(self._tracked_intel_channels)
+        self._tracked_intel_channels = normalize_tracked_channels(
+            self._tracked_intel_channels + [name]
+        )
+        self._intel_channel_entry.delete(0, tk.END)
+        if len(self._tracked_intel_channels) == before:
+            self._intel_channels_status.config(
+                text=f"{name} already tracked", fg=FG_YELLOW)
+            return
+        self._save_tracked_intel_channels()
+        self._refresh_intel_channels_listbox()
+        self._rebuild_intel_channel_checkboxes()
+        self._intel_channels_status.config(text=f"Added {name}", fg=FG_GREEN)
+
+    def _remove_intel_channel(self):
+        """Remove the selected channel from the tracked list, persist, and
+        refresh the listbox + Intel-panel checkboxes."""
+        box = getattr(self, "_intel_channels_listbox", None)
+        if box is None:
+            return
+        sel = box.curselection()
+        if not sel:
+            return
+        name = box.get(sel[0])
+        self._tracked_intel_channels = [
+            c for c in self._tracked_intel_channels
+            if c.strip().lower() != name.strip().lower()
+        ]
+        self._save_tracked_intel_channels()
+        self._refresh_intel_channels_listbox()
+        self._rebuild_intel_channel_checkboxes()
+        self._intel_channels_status.config(text=f"Removed {name}", fg=FG_DIM)
+
+    def _scan_intel_channels(self):
+        """Discover channels from the logs dir (off the Tk main thread) to
+        populate the picker's suggestion pool and cache them.
+
+        discover_channels() does directory + header I/O, so it runs on a worker
+        thread; results are applied back on the Tk main thread via root.after."""
+        logs_path = self._logs_path_var.get()
+        if not logs_path or not os.path.isdir(logs_path):
+            self._intel_channels_status.config(
+                text="Set a valid EVE Chat Logs path first", fg=FG_ORANGE)
+            return
+        tracked_char = self._char_var.get().strip() or None
+        self._intel_channels_status.config(text="Scanning...", fg=FG_ACCENT)
+
+        def worker():
+            try:
+                found = discover_channels(logs_path, tracked_char,
+                                          max_age_days=30)
+                names = [d["name"] for d in found]
+            except Exception:
+                names = []
+            self.root.after(0, self._apply_scanned_intel_channels, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_scanned_intel_channels(self, discovered_names):
+        """Apply discovery results on the Tk main thread: cache ALL discovered
+        names and refresh the (noise-filtered) suggestion pool."""
+        # Cache the full discovery set (unfiltered — anything can be added).
+        ic = self.config.setdefault("intel_channels", {})
+        ic["cached_discovered"] = list(discovered_names)
+        self._save_config()
+        # Suggestions hide obvious non-intel system channels.
+        self._intel_channel_suggestions = filter_suggestion_channels(
+            discovered_names)
+        entry = getattr(self, "_intel_channel_entry", None)
+        if entry is not None:
+            entry.update_completions(self._intel_channel_suggestions)
+        self._intel_channels_status.config(
+            text=f"Found {len(self._intel_channel_suggestions)} channel(s)",
+            fg=FG_GREEN)
+
     def _set_autostart(self, enabled: bool):
         """Add or remove FCTool from Windows startup via Start Menu shortcut."""
         try:
@@ -3863,6 +4328,17 @@ class FCToolGUI:
         # Re-resolve Ansiblex IDs
         self._resolve_ansiblex_async()
 
+        # Intel channels — gather the tracked-channel listbox (mirrors the
+        # ansiblex parse-back). The listbox is kept in sync with
+        # self._tracked_intel_channels on every add/remove, but reading it here
+        # guards against drift. cached_discovered is preserved as-is.
+        ic_box = getattr(self, "_intel_channels_listbox", None)
+        if ic_box is not None:
+            listed = [ic_box.get(i) for i in range(ic_box.size())]
+            self._tracked_intel_channels = normalize_tracked_channels(listed)
+        ic_cfg = self.config.setdefault("intel_channels", {})
+        ic_cfg["tracked"] = list(self._tracked_intel_channels)
+
         self.config.setdefault("xup", {})
         self.config["xup"]["trigger_word"] = self._setting_entries["xup_trigger"].get()
         self.config["xup"]["fire_word"] = self._setting_entries["xup_fire"].get()
@@ -3881,6 +4357,15 @@ class FCToolGUI:
         # Restart modules
         self._stop_monitoring()
         self.config = self._load_config()
+        # Re-sync tracked intel channels from the reloaded config and rebuild
+        # the Intel-panel checkboxes so the panel reflects edits without an app
+        # restart. (If intel fusion is currently running, the new channel_filters
+        # apply on the next fusion toggle; the checkboxes/tracked set update now.)
+        self._tracked_intel_channels = normalize_tracked_channels(
+            self.config.get("intel_channels", {}).get("tracked"),
+            seed=sorted(INTEL_CHANNELS),
+        )
+        self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
         self._start_monitoring()
         self._save_status.config(text="Saved & Restarted!", fg=FG_GREEN)
@@ -4552,6 +5037,14 @@ class FCToolGUI:
             self.root.after(15000, self._refresh_fleet_locations)
 
         threading.Thread(target=do_fetch, daemon=True).start()
+
+    def _auto_refresh_character_tab(self):
+        """Periodically refresh the character tab (location + ship type).
+        Runs every 5 minutes.  Uses force=False so asset data is served
+        from cache unless the 10-minute asset TTL has also expired."""
+        if self.esi_accounts and hasattr(self, '_char_tab_content'):
+            self._refresh_character_tab(force=False)
+        self.root.after(300_000, self._auto_refresh_character_tab)
 
     def _refresh_current_system(self):
         """Periodically fetch the tracked character's current system from ESI."""
@@ -5398,6 +5891,53 @@ $bmp.Dispose()
         else:
             self._stop_intel_monitor()
 
+    def _rebuild_intel_channel_checkboxes(self):
+        """(Re)build the Intel-panel channel checkboxes from the tracked list.
+
+        Sourced from ``self._tracked_intel_channels``. Safe to call at build
+        time and again after a Settings save so the panel reflects the new
+        tracked set without an app restart. Existing per-session enabled state
+        is preserved for channels that still exist; channels removed from the
+        tracked list drop out of both the panel and the enabled set. Checkboxes
+        start DISABLED (greyed) until a fusion session activates them; a channel
+        that is already enabled (running session) is re-shown checked + active.
+        """
+        frame = getattr(self, "_intel_channels_frame", None)
+        if frame is None:
+            return
+
+        # Preserve which channels are currently enabled so a live fusion session
+        # keeps its toggles across the rebuild.
+        previously_enabled = set(getattr(self, "_intel_channels_enabled", set()))
+        running = self._intel_monitor is not None
+
+        for child in frame.winfo_children():
+            child.destroy()
+        self._intel_channel_vars = {}
+
+        new_enabled: set[str] = set()
+        for ch_name in self._tracked_intel_channels:
+            still_on = running and ch_name in previously_enabled
+            var = tk.BooleanVar(value=still_on)
+            self._intel_channel_vars[ch_name] = var
+            if still_on:
+                new_enabled.add(ch_name)
+            cb = tk.Checkbutton(
+                frame, text=ch_name,
+                variable=var, font=("Consolas", 8),
+                fg=FG_MAGENTA if still_on else FG_DIM, bg=BG_PANEL,
+                selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                activeforeground=FG_MAGENTA,
+                state=tk.NORMAL if running else tk.DISABLED,
+                command=self._on_intel_channel_change,
+            )
+            cb.pack(side=tk.LEFT, padx=4)
+
+        # Drop enabled entries for channels that no longer exist.
+        if hasattr(self, "_intel_channels_enabled"):
+            self._intel_channels_enabled.clear()
+            self._intel_channels_enabled.update(new_enabled)
+
     def _start_intel_monitor(self):
         """Start the intel channel ChatMonitor."""
         # Load standings whitelist in background (for hostile detection)
@@ -5416,30 +5956,30 @@ $bmp.Dispose()
 
         tracked_char = self.config.get("tracked_character", "") or None
 
-        # Scan for available channels and enable checkboxes
-        channels = scan_available_channels(logs_path, tracked_char)
+        # Scan the tracked channels for which ones are currently active (have a
+        # log modified today). Active channels are auto-enabled; inactive ones
+        # stay toggleable (clickable but dimmed) so the FC can opt in manually.
+        channels = scan_available_channels(
+            logs_path, tracked_char, self._tracked_intel_channels
+        )
+        active_names = {ch["name"] for ch in channels if ch["active"]}
         self._intel_channels_enabled.clear()
-        for ch in channels:
-            var = self._intel_channel_vars.get(ch["name"])
-            if var:
-                if ch["active"]:
-                    var.set(True)
-                    self._intel_channels_enabled.add(ch["name"])
-                    # Enable the checkbox
-                    for w in self._intel_channels_frame.winfo_children():
-                        if isinstance(w, tk.Checkbutton) and w.cget("text") == ch["name"]:
-                            w.config(state=tk.NORMAL, fg=FG_MAGENTA)
-                else:
-                    var.set(False)
-                    for w in self._intel_channels_frame.winfo_children():
-                        if isinstance(w, tk.Checkbutton) and w.cget("text") == ch["name"]:
-                            w.config(state=tk.DISABLED, fg=FG_DIM)
+        for name, var in self._intel_channel_vars.items():
+            is_active = name in active_names
+            var.set(is_active)
+            if is_active:
+                self._intel_channels_enabled.add(name)
+            # Keep every tracked checkbox clickable; colour signals active state.
+            for w in self._intel_channels_frame.winfo_children():
+                if isinstance(w, tk.Checkbutton) and w.cget("text") == name:
+                    w.config(state=tk.NORMAL,
+                             fg=FG_MAGENTA if is_active else FG_DIM)
 
         self._intel_monitor = ChatMonitor(
             logs_path=logs_path,
             poll_interval=self.config.get("poll_interval_seconds", 1.0),
             listener_filter=tracked_char,
-            channel_filters=sorted(INTEL_CHANNELS),
+            channel_filters=list(self._tracked_intel_channels),
         )
         self._intel_monitor.on_message(self._on_intel_message)
         self._intel_thread = threading.Thread(
@@ -5851,22 +6391,25 @@ $bmp.Dispose()
         self._range_detail_label.config(text="")
         self.root.update_idletasks()
 
-        # Friendly staging systems (defaults + user-added)
-        _friendly_defaults = [
-            "6RCQ-V", "F7C-H0", "CL6-ZG", "HPS5-C",
-            "Korasen", "Y-2ANO", "NOL-M9", "O-BDXB",
-        ]
-        seen_f = set()
-        friendly_systems = []
-        for s in _friendly_defaults + self._range_custom_systems:
-            s_lower = s.lower()
-            if s_lower not in seen_f and s_lower != dest.lower():
-                seen_f.add(s_lower)
-                friendly_systems.append(s)
+        # Staging systems come from the user-editable, persisted lists.
+        # Dedupe case-insensitively and exclude any system equal to the
+        # destination (the dest-vs-dest check is meaningless).
+        dest_lower = dest.lower()
 
-        # Hostile staging systems
-        _hostile_defaults = ["B-9C24", "RD-G2R"]
-        hostile_systems = [s for s in _hostile_defaults if s.lower() != dest.lower()]
+        def _build_list(source):
+            seen = set()
+            out = []
+            for s in source:
+                s_lower = s.strip().lower()
+                if not s_lower or s_lower in seen or s_lower == dest_lower:
+                    continue
+                seen.add(s_lower)
+                out.append(s)
+            return out
+
+        friendly_systems = _build_list(self._friendly_staging)
+        hostile_systems = _build_list(self._hostile_staging)
+        no_staging = not self._friendly_staging and not self._hostile_staging
 
         def do_check():
             try:
@@ -5930,6 +6473,7 @@ $bmp.Dispose()
 
                 result["secondary"] = _compute_range_list(friendly_systems)
                 result["hostile"] = _compute_range_list(hostile_systems)
+                result["no_staging"] = no_staging
 
                 save_route_cache()
                 self.root.after(0, self._show_range_result, result)
@@ -6037,6 +6581,17 @@ $bmp.Dispose()
                 cross_ref=False, show_jumps=False,
             )
 
+        # No staging systems configured yet: the origin->dest headline above
+        # still shows, but prompt the user to populate the lists below.
+        if result.get("no_staging"):
+            tk.Label(
+                self._range_secondary_frame,
+                text="No staging systems yet — add friendly/hostile staging "
+                     "systems below to check them against this destination.",
+                font=("Consolas", 10), fg=FG_DIM, bg=BG_DARK,
+                justify=tk.LEFT, wraplength=900,
+            ).pack(anchor=tk.W, pady=(6, 3))
+
     def _render_range_table(self, destination: str, entries: list[dict],
                             title_suffix: str = "", title_color: str = FG_ACCENT,
                             cross_ref: bool = False, show_jumps: bool = True):
@@ -6062,10 +6617,10 @@ $bmp.Dispose()
             tk.Label(table, text="Jumps from Staging", font=("Consolas", 10, "bold"),
                      fg=FG_DIM, bg=BG_DARK, width=18, anchor=tk.W
                      ).grid(row=0, column=col, padx=(0, 10)); col += 1
-        tk.Label(table, text="Titan (6 LY)", font=("Consolas", 10, "bold"),
+        tk.Label(table, text="Super (6 LY)", font=("Consolas", 10, "bold"),
                  fg=FG_DIM, bg=BG_DARK, anchor=tk.W
                  ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
-        tk.Label(table, text="Capital (7 LY)", font=("Consolas", 10, "bold"),
+        tk.Label(table, text="Dread (7 LY)", font=("Consolas", 10, "bold"),
                  fg=FG_DIM, bg=BG_DARK, anchor=tk.W
                  ).grid(row=0, column=col, padx=(0, 10), sticky=tk.W); col += 1
         tk.Label(table, text="Blops (8 LY)", font=("Consolas", 10, "bold"),

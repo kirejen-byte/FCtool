@@ -234,6 +234,20 @@ _intel_channels_enabled: set[str] = set()
 _intel_lock = threading.Lock()
 _intel_thread: threading.Thread | None = None
 
+
+def get_tracked_channels() -> list[str]:
+    """Return the intel channels the user tracks, from shared config.
+
+    Reads ``config["intel_channels"]["tracked"]`` (written by the Tkinter GUI).
+    When that key is missing or empty — e.g. the web runs before the GUI has
+    ever persisted it — falls back to ``sorted(INTEL_CHANNELS)`` to preserve
+    the original hard-coded behavior.
+    """
+    tracked = config.get("intel_channels", {}).get("tracked")
+    if tracked:
+        return list(tracked)
+    return sorted(INTEL_CHANNELS)
+
 # ESI SSO state
 _esi_tokens: dict = {}  # {access_token, refresh_token, expires_at, character_id, character_name}
 _esi_lock = threading.Lock()
@@ -1058,7 +1072,7 @@ def _start_intel_monitor():
         logs_path=logs_path,
         poll_interval=config.get("poll_interval_seconds", 1.0),
         listener_filter=tracked_char or None,
-        channel_filters=sorted(INTEL_CHANNELS),
+        channel_filters=get_tracked_channels(),
     )
     _intel_monitor.on_message(_on_intel_message)
     _intel_thread = threading.Thread(target=_intel_monitor.run, daemon=True)
@@ -1083,7 +1097,7 @@ def intel_channels():
     """Return list of intel channels with their availability status."""
     logs_path = config.get("eve_logs_path", "")
     tracked_char = config.get("tracked_character", "")
-    channels = scan_available_channels(logs_path, tracked_char)
+    channels = scan_available_channels(logs_path, tracked_char, get_tracked_channels())
     with _intel_lock:
         enabled = set(_intel_channels_enabled)
         fusion_on = _intel_enabled
@@ -1109,7 +1123,7 @@ def intel_toggle():
         # Auto-enable all active channels
         logs_path = config.get("eve_logs_path", "")
         tracked_char = config.get("tracked_character", "")
-        channels = scan_available_channels(logs_path, tracked_char)
+        channels = scan_available_channels(logs_path, tracked_char, get_tracked_channels())
         with _intel_lock:
             _intel_channels_enabled.clear()
             for ch in channels:
@@ -1130,10 +1144,11 @@ def intel_channels_update():
     """Update which intel channels are enabled."""
     data = request.get_json(silent=True) or {}
     channels = data.get("channels", [])
+    tracked = set(get_tracked_channels())
     with _intel_lock:
         _intel_channels_enabled.clear()
         for name in channels:
-            if name in INTEL_CHANNELS:
+            if name in tracked:
                 _intel_channels_enabled.add(name)
     return jsonify({"channels": sorted(_intel_channels_enabled)})
 

@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 import pytest
@@ -6,13 +7,17 @@ from chat_monitor import ChatMessage
 from intel_monitor import (
     BARE_COUNT_PATTERN,
     CAMP_PATTERN,
+    CHAT_LOG_SUFFIX_PATTERN,
     CLEAR_PATTERN,
     COUNT_PATTERN,
     EXPLICIT_PLUS_COUNT_PATTERN,
     HOSTILE_CONTEXT_PATTERN,
+    INTEL_CHANNELS,
     SPIKE_PATTERN,
     _extract_system_name,
+    discover_channels,
     parse_intel_message,
+    scan_available_channels,
 )
 
 
@@ -412,3 +417,291 @@ def test_pilot_count_picks_first_valid_candidate_not_misleading_earlier_digit():
     # COUNT_PATTERN would match "3 reds" directly and return 3; either way,
     # the proximity gate must not return 47.
     assert report.pilot_count == 3
+
+
+# ── CHAT_LOG_SUFFIX_PATTERN: filename suffix recognition ────────────────────
+
+def test_suffix_pattern_matches_with_charid():
+    m = CHAT_LOG_SUFFIX_PATTERN.search("Bean-Intel_20211115_043458_1694010657.txt")
+    assert m is not None
+    # Channel name is everything before the match.
+    assert "Bean-Intel_20211115_043458_1694010657.txt"[: m.start()] == "Bean-Intel"
+
+
+def test_suffix_pattern_matches_without_charid():
+    fn = "super serious channel_20131011_002149.txt"
+    m = CHAT_LOG_SUFFIX_PATTERN.search(fn)
+    assert m is not None
+    assert fn[: m.start()] == "super serious channel"
+
+
+def test_suffix_pattern_special_chars_in_name():
+    fn = "I. Delve & Q Intel_20231215_024930_90143494.txt"
+    m = CHAT_LOG_SUFFIX_PATTERN.search(fn)
+    assert m is not None
+    assert fn[: m.start()] == "I. Delve & Q Intel"
+
+
+def test_suffix_pattern_rejects_non_log_names():
+    assert CHAT_LOG_SUFFIX_PATTERN.search("notes.txt") is None
+    assert CHAT_LOG_SUFFIX_PATTERN.search("README.md") is None
+    # Wrong digit widths (date must be 8, time must be 6).
+    assert CHAT_LOG_SUFFIX_PATTERN.search("Channel_2023121_024930.txt") is None
+    assert CHAT_LOG_SUFFIX_PATTERN.search("Channel_20231215_02493.txt") is None
+
+
+# ── discover_channels: helpers ──────────────────────────────────────────────
+
+# Realistic EVE chat-log header (UTF-16LE on disk). Only "Listener:" matters
+# for the character filter; the rest mirrors what EVE writes.
+def _eve_log_text(channel_name, listener):
+    return (
+        "﻿"  # BOM, as EVE writes
+        "---------------------------------------------------------------\n"
+        f"  Channel ID:      intel\n"
+        f"  Channel Name:    {channel_name}\n"
+        f"  Listener:        {listener}\n"
+        "  Session started: 2026.06.14 12:00:00\n"
+        "---------------------------------------------------------------\n"
+        "[ 2026.06.14 12:00:05 ] Some Pilot > Jita clr\n"
+    )
+
+
+def _make_log(dir_path, filename, *, listener="Scout Pilot", channel="Chan",
+              mtime=None):
+    """Create a UTF-16LE EVE-style log file; optionally backdate its mtime."""
+    path = dir_path / filename
+    path.write_text(_eve_log_text(channel, listener), encoding="utf-16-le")
+    if mtime is not None:
+        os.utime(path, (mtime, mtime))
+    return path
+
+
+def _now():
+    return datetime.now().timestamp()
+
+
+def _days_ago(days):
+    return _now() - days * 86400
+
+
+# ── discover_channels: core behavior ────────────────────────────────────────
+
+def test_discover_channels_empty_or_missing_path(tmp_path):
+    # Non-existent directory.
+    assert discover_channels(str(tmp_path / "nope")) == []
+    # Empty string.
+    assert discover_channels("") == []
+    # None.
+    assert discover_channels(None) == []
+    # Existing but empty directory.
+    assert discover_channels(str(tmp_path)) == []
+
+
+def test_discover_channels_extracts_name_with_charid(tmp_path):
+    _make_log(tmp_path, "Bean-Intel_20211115_043458_1694010657.txt",
+              channel="Bean-Intel", mtime=_now())
+    result = discover_channels(str(tmp_path), max_age_days=None)
+    assert [c["name"] for c in result] == ["Bean-Intel"]
+
+
+def test_discover_channels_extracts_name_without_charid(tmp_path):
+    _make_log(tmp_path, "super serious channel_20131011_002149.txt",
+              channel="super serious channel", mtime=_now())
+    result = discover_channels(str(tmp_path), max_age_days=None)
+    assert [c["name"] for c in result] == ["super serious channel"]
+
+
+def test_discover_channels_handles_special_character_names(tmp_path):
+    # Spaces, '.', '&', brackets, '+'.
+    _make_log(tmp_path, "I. Delve & Q Intel_20231215_024930_90143494.txt",
+              channel="I. Delve & Q Intel", mtime=_now())
+    _make_log(tmp_path, "[VG] Region Bookmarks Part 1_20231215_024930_90143494.txt",
+              channel="[VG] Region Bookmarks Part 1", mtime=_now())
+    _make_log(tmp_path, "wc.Vale+Tribute_20231215_024930.txt",
+              channel="wc.Vale+Tribute", mtime=_now())
+    names = [c["name"] for c in discover_channels(str(tmp_path), max_age_days=None)]
+    assert names == [
+        "[VG] Region Bookmarks Part 1",
+        "I. Delve & Q Intel",
+        "wc.Vale+Tribute",
+    ]
+
+
+def test_discover_channels_dedupes_across_sessions_and_charids(tmp_path):
+    """Multiple sessions / different charids of the SAME channel collapse to one."""
+    older = _days_ago(2)
+    newest = _now()
+    # Same channel name, three different session files (two charids + one old client).
+    _make_log(tmp_path, "I. Delve & Q Intel_20231215_010000_90143494.txt",
+              channel="I. Delve & Q Intel", mtime=older)
+    _make_log(tmp_path, "I. Delve & Q Intel_20231216_020000_11112222.txt",
+              channel="I. Delve & Q Intel", mtime=newest)
+    _make_log(tmp_path, "I. Delve & Q Intel_20231214_030000.txt",
+              channel="I. Delve & Q Intel", mtime=_days_ago(3))
+
+    result = discover_channels(str(tmp_path), max_age_days=None)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["name"] == "I. Delve & Q Intel"
+    # Newest file wins for file_path / last_modified.
+    assert entry["file_path"].endswith("I. Delve & Q Intel_20231216_020000_11112222.txt")
+    assert entry["last_modified"] == pytest.approx(newest, abs=1)
+
+
+def test_discover_channels_active_flag(tmp_path):
+    _make_log(tmp_path, "Active Chan_20231215_010000_1.txt",
+              channel="Active Chan", mtime=_now())
+    _make_log(tmp_path, "Stale Chan_20231215_010000_2.txt",
+              channel="Stale Chan", mtime=_days_ago(3))
+    result = {c["name"]: c for c in discover_channels(str(tmp_path), max_age_days=None)}
+    assert result["Active Chan"]["active"] is True
+    assert result["Stale Chan"]["active"] is False
+
+
+def test_discover_channels_max_age_filtering(tmp_path):
+    # Recent channel — kept; very old channel — dropped at default 30 days.
+    _make_log(tmp_path, "Recent_20231215_010000_1.txt",
+              channel="Recent", mtime=_days_ago(5))
+    _make_log(tmp_path, "Ancient_20131011_002149.txt",
+              channel="Ancient", mtime=_days_ago(400))
+
+    default_names = [c["name"] for c in discover_channels(str(tmp_path))]
+    assert default_names == ["Recent"]  # Ancient excluded by default max_age_days=30
+
+    # With max_age_days=None, both are returned.
+    all_names = [c["name"] for c in discover_channels(str(tmp_path), max_age_days=None)]
+    assert all_names == ["Ancient", "Recent"]
+
+    # Tight bound excludes the 5-day-old one too.
+    tight = [c["name"] for c in discover_channels(str(tmp_path), max_age_days=3)]
+    assert tight == []
+
+
+def test_discover_channels_skips_malformed_filenames(tmp_path):
+    # Valid log.
+    _make_log(tmp_path, "Good Chan_20231215_010000_1.txt",
+              channel="Good Chan", mtime=_now())
+    # Assorted junk that must be ignored.
+    (tmp_path / "notes.txt").write_text("just notes", encoding="utf-8")
+    (tmp_path / "README.md").write_text("readme", encoding="utf-8")
+    (tmp_path / "Channel_2023121_024930.txt").write_text("bad date", encoding="utf-8")
+    (tmp_path / "Channel_20231215_02493.txt").write_text("bad time", encoding="utf-8")
+    (tmp_path / "_20231215_010000.txt").write_text("empty name", encoding="utf-8")
+
+    result = discover_channels(str(tmp_path), max_age_days=None)
+    assert [c["name"] for c in result] == ["Good Chan"]
+
+
+def test_discover_channels_sorted_case_insensitive(tmp_path):
+    _make_log(tmp_path, "zeta_20231215_010000_1.txt", channel="zeta", mtime=_now())
+    _make_log(tmp_path, "Alpha_20231215_010000_2.txt", channel="Alpha", mtime=_now())
+    _make_log(tmp_path, "beta_20231215_010000_3.txt", channel="beta", mtime=_now())
+    names = [c["name"] for c in discover_channels(str(tmp_path), max_age_days=None)]
+    assert names == ["Alpha", "beta", "zeta"]
+
+
+def test_discover_channels_return_shape(tmp_path):
+    mtime = _now()
+    _make_log(tmp_path, "Shape Chan_20231215_010000_1.txt",
+              channel="Shape Chan", mtime=mtime)
+    [entry] = discover_channels(str(tmp_path), max_age_days=None)
+    assert set(entry.keys()) == {"name", "active", "last_modified", "file_path"}
+    assert isinstance(entry["name"], str)
+    assert isinstance(entry["active"], bool)
+    assert isinstance(entry["last_modified"], float)
+    assert isinstance(entry["file_path"], str)
+    assert entry["last_modified"] == pytest.approx(mtime, abs=1)
+
+
+def test_discover_channels_no_intel_name_filtering(tmp_path):
+    """Helper is decision-neutral: a non-intel channel is still returned."""
+    _make_log(tmp_path, "Random Corp Chat_20231215_010000_1.txt",
+              channel="Random Corp Chat", mtime=_now())
+    names = [c["name"] for c in discover_channels(str(tmp_path), max_age_days=None)]
+    assert names == ["Random Corp Chat"]
+
+
+# ── discover_channels: tracked_character (header-based) narrowing ────────────
+
+def test_discover_channels_tracked_character_filters_by_listener(tmp_path):
+    _make_log(tmp_path, "Chan A_20231215_010000_1.txt",
+              channel="Chan A", listener="Scout Pilot", mtime=_now())
+    _make_log(tmp_path, "Chan B_20231215_010000_2.txt",
+              channel="Chan B", listener="Other Pilot", mtime=_now())
+
+    names = [
+        c["name"]
+        for c in discover_channels(str(tmp_path), tracked_character="Scout Pilot",
+                                   max_age_days=None)
+    ]
+    assert names == ["Chan A"]
+
+
+def test_discover_channels_tracked_character_uses_newest_file_header(tmp_path):
+    """Only the newest file per channel is consulted for the Listener match."""
+    # Newest session for this channel belongs to "Scout Pilot".
+    _make_log(tmp_path, "Shared_20231216_020000_1.txt",
+              channel="Shared", listener="Scout Pilot", mtime=_now())
+    # Older session belonged to someone else — should not affect the decision.
+    _make_log(tmp_path, "Shared_20231215_010000_2.txt",
+              channel="Shared", listener="Other Pilot", mtime=_days_ago(2))
+
+    names = [
+        c["name"]
+        for c in discover_channels(str(tmp_path), tracked_character="Scout Pilot",
+                                   max_age_days=None)
+    ]
+    assert names == ["Shared"]
+
+
+def test_discover_channels_tracked_character_no_match(tmp_path):
+    _make_log(tmp_path, "Chan A_20231215_010000_1.txt",
+              channel="Chan A", listener="Scout Pilot", mtime=_now())
+    result = discover_channels(str(tmp_path), tracked_character="Nobody Here",
+                               max_age_days=None)
+    assert result == []
+
+
+# ── scan_available_channels: backward-compat + generalization ───────────────
+
+def test_scan_available_channels_defaults_to_intel_channels(tmp_path):
+    # Create a log for one known intel channel.
+    _make_log(tmp_path, "I. Ftn Intel_20231215_010000_1.txt",
+              channel="I. Ftn Intel", mtime=_now())
+    result = scan_available_channels(str(tmp_path))
+    names = [c["name"] for c in result]
+    # All INTEL_CHANNELS appear (sorted), regardless of presence on disk.
+    assert names == sorted(INTEL_CHANNELS)
+    # Return shape is unchanged: name, active, file_path (no last_modified).
+    for entry in result:
+        assert set(entry.keys()) == {"name", "active", "file_path"}
+    by_name = {c["name"]: c for c in result}
+    assert by_name["I. Ftn Intel"]["active"] is True
+    assert by_name["I. Ftn Intel"]["file_path"] is not None
+    # A channel with no file is present but inactive with no path.
+    assert by_name["I. OR Intel"]["active"] is False
+    assert by_name["I. OR Intel"]["file_path"] is None
+
+
+def test_scan_available_channels_custom_channels(tmp_path):
+    _make_log(tmp_path, "My Custom Chan_20231215_010000_1.txt",
+              channel="My Custom Chan", mtime=_now())
+    result = scan_available_channels(str(tmp_path), channels={"My Custom Chan"})
+    assert [c["name"] for c in result] == ["My Custom Chan"]
+    assert result[0]["active"] is True
+
+
+def test_scan_available_channels_character_filter(tmp_path):
+    _make_log(tmp_path, "My Custom Chan_20231215_010000_1.txt",
+              channel="My Custom Chan", listener="Scout Pilot", mtime=_now())
+    # Matching listener → active.
+    match = scan_available_channels(str(tmp_path), tracked_character="Scout Pilot",
+                                    channels={"My Custom Chan"})
+    assert match[0]["active"] is True
+    assert match[0]["file_path"] is not None
+    # Non-matching listener → file filtered out, channel inactive with no path.
+    nomatch = scan_available_channels(str(tmp_path), tracked_character="Nobody",
+                                      channels={"My Custom Chan"})
+    assert nomatch[0]["active"] is False
+    assert nomatch[0]["file_path"] is None

@@ -30,6 +30,13 @@ INTEL_CHANNELS = {
     "I. OR Intel",
 }
 
+# EVE writes one UTF-16LE log per channel-session, named
+#   "<ChannelName>_YYYYMMDD_HHMMSS[_<charid>].txt"
+# The trailing "_<charid>" exists in newer clients and is absent in old ones.
+# The channel name is the substring BEFORE this suffix and may itself contain
+# spaces, dots, dashes, brackets, parentheses, '+', and '&'.
+CHAT_LOG_SUFFIX_PATTERN = re.compile(r"_(\d{8})_(\d{6})(?:_\d+)?\.txt$")
+
 # Regex for detecting d-scan URLs (includes zero.the-initiative.rocks intel scans)
 DSCAN_URL_PATTERN = re.compile(
     r"(https?://(?:dscan\.info|dscan\.me|adashboard\.info"
@@ -356,17 +363,28 @@ def _strip_system_refs(
 def scan_available_channels(
     logs_path: str,
     tracked_character: str | None = None,
+    channels=None,
 ) -> list[dict]:
     """
     Scan chat log directory to find which intel channels are currently active.
 
+    Args:
+        logs_path: Directory containing EVE chat logs.
+        tracked_character: If set, only count log files whose "Listener:" header
+            (matched here against the first 2KB of the file) contains this name.
+        channels: Iterable of channel names to check. Defaults to INTEL_CHANNELS
+            when None, preserving the original behavior for existing callers.
+
     Returns list of dicts: {name, active, file_path}
     A channel is "active" if it has a log file modified today.
     """
+    if channels is None:
+        channels = INTEL_CHANNELS
+
     results = []
     today = date.today()
 
-    for channel_name in sorted(INTEL_CHANNELS):
+    for channel_name in sorted(channels):
         # EVE log filenames start with the channel name
         # Format: "ChannelName_YYYYMMDD_HHMMSS.txt"
         # But spaces and dots in channel names are kept as-is
@@ -405,6 +423,127 @@ def scan_available_channels(
             "file_path": latest_file,
         })
 
+    return results
+
+
+def discover_channels(
+    logs_path: str,
+    tracked_character: str | None = None,
+    max_age_days: int | None = 30,
+) -> list[dict]:
+    """
+    Discover every chat channel that has a log file in ``logs_path``, derived
+    purely from the on-disk filenames.
+
+    Unlike :func:`scan_available_channels`, this does not start from a fixed set
+    of channel names — it returns ALL channels found on disk so a UI layer can
+    filter as it sees fit. This helper is intentionally decision-neutral: no
+    intel-name filtering, no noise filtering beyond the ``max_age_days`` bound.
+
+    Channel-name derivation:
+        EVE log files are named "<ChannelName>_YYYYMMDD_HHMMSS[_<charid>].txt".
+        The channel name is the substring BEFORE the trailing timestamp/charid
+        suffix (see ``CHAT_LOG_SUFFIX_PATTERN``). The "_<charid>" segment is
+        optional (present in newer clients, absent in old ones), and channel
+        names may legitimately contain spaces, '.', '-', '[', ']', '(', ')',
+        '+', and '&'. Files whose names do not match the pattern are skipped,
+        making this robust against unrelated files in the directory.
+
+    Multiple sessions/charids of the same channel collapse into ONE entry,
+    keyed by the derived channel name. The entry reports the newest matching
+    file.
+
+    Args:
+        logs_path: Directory containing EVE chat logs. A missing, empty, or
+            non-directory path yields an empty list.
+        tracked_character: If provided, narrows results to channels whose newest
+            log file lists this character in its "Listener:" header. To stay
+            efficient, the header is read lazily for at most ONE file per
+            distinct channel (the newest), rather than for every session file
+            across years of history. Matching is case-insensitive substring,
+            mirroring :func:`scan_available_channels`.
+        max_age_days: Exclude channels whose newest matching file is older than
+            this many days (bounds noise from years of accumulated logs). Pass
+            ``None`` to include channels of any age.
+
+    Returns:
+        A list of dicts sorted by name (case-insensitive), each shaped::
+
+            {
+                "name": str,            # derived channel name
+                "active": bool,         # newest file modified within the last day (today)
+                "last_modified": float, # epoch seconds of the newest matching file
+                "file_path": str,       # absolute path of the newest matching file
+            }
+    """
+    if not logs_path or not os.path.isdir(logs_path):
+        return []
+
+    try:
+        entries = os.listdir(logs_path)
+    except OSError:
+        return []
+
+    today = date.today()
+
+    # Aggregate newest file per distinct channel name.
+    # name -> {"file_path": str, "last_modified": float}
+    newest: dict[str, dict] = {}
+
+    for filename in entries:
+        match = CHAT_LOG_SUFFIX_PATTERN.search(filename)
+        if not match:
+            continue  # not an EVE chat log filename — skip junk
+
+        channel_name = filename[: match.start()]
+        if not channel_name:
+            continue  # defensive: no name before the suffix
+
+        filepath = os.path.join(logs_path, filename)
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+
+        prev = newest.get(channel_name)
+        if prev is None or mtime > prev["last_modified"]:
+            newest[channel_name] = {
+                "file_path": filepath,
+                "last_modified": mtime,
+            }
+
+    results = []
+    for channel_name, info in newest.items():
+        mtime = info["last_modified"]
+
+        # Age bound: drop channels whose newest file is too old.
+        if max_age_days is not None:
+            age_days = (today - date.fromtimestamp(mtime)).days
+            if age_days > max_age_days:
+                continue
+
+        # Optional character narrowing: read the Listener header of only the
+        # newest file for this channel (one header read per distinct channel).
+        if tracked_character:
+            try:
+                with open(info["file_path"], "r", encoding="utf-16-le",
+                          errors="replace") as f:
+                    header = f.read(2048)
+            except OSError:
+                continue
+            if tracked_character.lower() not in header.lower():
+                continue
+
+        active = date.fromtimestamp(mtime) == today
+
+        results.append({
+            "name": channel_name,
+            "active": active,
+            "last_modified": mtime,
+            "file_path": info["file_path"],
+        })
+
+    results.sort(key=lambda d: d["name"].lower())
     return results
 
 
