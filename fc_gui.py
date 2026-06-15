@@ -35,6 +35,7 @@ if sys.platform == "win32":
     else:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import intel_filter
 from chat_monitor import ChatMonitor, ChatMessage
 from intel_monitor import (
     IntelReport, parse_intel_message, scan_available_channels,
@@ -81,43 +82,83 @@ FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
 BORDER_COLOR = "#2a2a4a"
 
-# ── zKill Filter Presets ─────────────────────────────────────────────────────
+# ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
 
-WATCHED_REGIONS = {
-    10000060: "Delve",        10000050: "Querious",     10000058: "Fountain",
-    10000051: "Cloud Ring",   10000057: "Outer Ring",   10000023: "Pure Blind",
-    10000046: "Fade",         10000054: "Aridia",       10000041: "Syndicate",
-    10000063: "Period Basis", 10000016: "Lonetrek",     10000069: "Black Rise",
-}
 
-IMPERIUM_ALLIANCES = {
-    1354830081,   # Goonswarm Federation
-    1900696668,   # The Initiative.
-    99003214,     # Brave Collective
-    99009163,     # Dracarys.
-    131511956,    # Tactical Narcotics Team
-    99003995,     # Invidia Gloriae Comes
-    99001969,     # SONS of BANE
-    99011223,     # Sigma Grindset
-    99011162,     # Shadow Ultimatum
-    99009331,     # Scumlords
-    99012042,     # Fanatic Legion.
-    99010877,     # Out of the Blue.
-}
+def add_filter_item(items: list, item: dict) -> tuple[list, bool]:
+    """Append ``item`` ({"id", "name"}) to a copy of ``items``, de-duped by id.
 
-WINTER_ALLIANCES = {
-    99003581,     # Fraternity.
-    386292982,    # Pandemic Legion
-    1727758877,   # Northern Coalition.
-    99013537,     # Insidious.
-    99002685,     # Synergy of Steel
-    498125261,    # TEST Alliance Please Ignore
-    99005393,     # Blades of Grass
-    99007203,     # Siberian Squads
-    99014657,     # Ranger Regiment
-    1411711376,   # Legion of xXDEATHXx
-    1042504553,   # Solyaris Chtonium
-}
+    Returns a NEW list and a bool indicating whether the item was added (False
+    if an entry with the same id already existed). Inputs are never mutated, so
+    this is safe to unit-test and to call from the UI. ``item`` must carry an
+    integer-ish ``id``; items with no usable id are rejected (added=False).
+    """
+    out = list(items or [])
+    try:
+        new_id = int(item["id"])
+    except (KeyError, TypeError, ValueError):
+        return out, False
+    for existing in out:
+        try:
+            if int(existing.get("id")) == new_id:
+                return out, False  # already present
+        except (TypeError, ValueError, AttributeError):
+            continue
+    out.append({"id": new_id, "name": str(item.get("name", "")).strip()})
+    return out, True
+
+
+def add_coalition_item(names: list, name: str) -> tuple[list, bool]:
+    """Append a coalition ``name`` to a copy of ``names``, de-duped by value.
+
+    Returns a NEW list and a bool indicating whether it was added (False if the
+    name was blank or already present). Inputs are never mutated.
+    """
+    out = list(names or [])
+    clean = (name or "").strip()
+    if not clean or clean in out:
+        return out, False
+    out.append(clean)
+    return out, True
+
+
+def remove_filter_item(items: list, index: int) -> list:
+    """Return a NEW list with the element at ``index`` removed.
+
+    Out-of-range indices return a copy unchanged. Works for both {"id","name"}
+    dicts and bare coalition-name strings. Inputs are never mutated.
+    """
+    out = list(items or [])
+    if 0 <= index < len(out):
+        del out[index]
+    return out
+
+
+def rename_coalition_in_selection(selected: list, old: str, new: str) -> list:
+    """Return a NEW selected-coalitions list with ``old`` replaced by ``new``.
+
+    Used to keep ``config["intel_filter"]["parties"]["coalitions"]`` consistent
+    when a coalition is renamed in the manager. Every occurrence of ``old`` is
+    swapped for ``new`` in place (order preserved). If ``new`` already appears in
+    the list the rename collapses onto it without creating a duplicate. Inputs
+    are never mutated. ``old``/``new`` are compared exactly (coalition keys are
+    case-sensitive dict keys).
+    """
+    out: list = []
+    for name in list(selected or []):
+        repl = new if name == old else name
+        if repl not in out:
+            out.append(repl)
+    return out
+
+
+def remove_coalition_from_selection(selected: list, name: str) -> list:
+    """Return a NEW selected-coalitions list with every ``name`` removed.
+
+    Used to keep ``config["intel_filter"]["parties"]["coalitions"]`` consistent
+    when a coalition is deleted in the manager. Inputs are never mutated.
+    """
+    return [n for n in list(selected or []) if n != name]
 
 
 def mutate_staging_lists(friendly: list[str], hostile: list[str],
@@ -259,6 +300,11 @@ class FCToolGUI:
             pass
 
         self.config = self._load_config()
+        # One-time migration of the config-driven intel filter + coalition seed
+        # (synchronous part; the Triumvirate. id is resolved off-thread later,
+        # once esi_auth is set up). Must run before _build_ui() because the
+        # Intelligence-tab filter panel reads config["intel_filter"].
+        self._migrate_intel_filter_config()
         # User-editable, persisted jump-range staging systems (start empty —
         # no hard-coded seeds). Loaded from config["jump_range"], managed inline
         # on the Jump Range tab.
@@ -329,6 +375,12 @@ class FCToolGUI:
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
         self._prewarm_cache_async()
+
+        # If the coalition seed was freshly created this run, resolve
+        # Triumvirate.'s alliance id in the background and fold it into the
+        # "The Initiative." coalition. Never blocks startup.
+        if getattr(self, "_coalitions_need_triumvirate", False):
+            self._resolve_triumvirate_async()
 
         # Start fleet location refresh loop (updates role tracker locations)
         self.root.after(5000, self._refresh_fleet_locations)
@@ -414,6 +466,13 @@ class FCToolGUI:
             widget = getattr(self, attr, None)
             if widget and hasattr(widget, 'update_completions'):
                 widget.update_completions(all_names, labels)
+
+        # Refresh the intel-filter location autocomplete if it is in System
+        # mode (system names may have just finished loading).
+        if (getattr(self, '_loc_add_entry', None) is not None
+                and getattr(self, '_loc_type_var', None) is not None
+                and self._loc_type_var.get() == "System"):
+            self._loc_add_entry.update_completions(list(self._system_names))
 
     # ── Ansiblex Connection Resolver ─────────────────────────────────────────
 
@@ -585,6 +644,128 @@ class FCToolGUI:
         not restart modules (mirrors _save_staging_systems)."""
         ic = self.config.setdefault("intel_channels", {})
         ic["tracked"] = list(self._tracked_intel_channels)
+        self._save_config()
+
+    # ── Intel filter config (migration + persistence) ─────────────────────────
+
+    def _migrate_intel_filter_config(self):
+        """One-time migration to the config-driven intel filter schema.
+
+        Idempotent — only seeds keys that are absent, so it is safe to call on
+        every startup. Two independent migrations:
+
+        * ``config["coalitions"]`` — seeded from
+          ``intel_filter.build_default_coalitions()`` (The Initiative. starts
+          with just The Initiative.; Triumvirate. is folded in later by
+          :meth:`_resolve_triumvirate_async` off the main thread). When freshly
+          seeded, ``self._coalitions_need_triumvirate`` is set so __init__ kicks
+          off that background resolution.
+        * ``config["intel_filter"]`` — seeded to "Anywhere + Anyone" (matches
+          all K-space) with ``min_pilots`` carried over from the existing
+          ``zkillboard.min_pilots_involved`` (default 25) and ``max_jumps`` 0.
+
+        After migration the in-memory ``self._intel_filter`` is bound to the
+        live ``config["intel_filter"]`` dict so the panel and the display filter
+        always see the current state; ``_save_config()`` persists it.
+        """
+        self._coalitions_need_triumvirate = False
+        changed = False
+
+        if "coalitions" not in self.config or not isinstance(
+            self.config.get("coalitions"), dict
+        ):
+            self.config["coalitions"] = intel_filter.build_default_coalitions()
+            self._coalitions_need_triumvirate = True
+            changed = True
+
+        if "intel_filter" not in self.config or not isinstance(
+            self.config.get("intel_filter"), dict
+        ):
+            zk_cfg = self.config.get("zkillboard", {})
+            try:
+                seed_min = int(zk_cfg.get("min_pilots_involved", 25))
+            except (TypeError, ValueError):
+                seed_min = 25
+            self.config["intel_filter"] = {
+                "combine": "AND",
+                "location": {"anywhere": True, "systems": [], "regions": []},
+                "parties": {
+                    "anyone": True,
+                    "alliances": [],
+                    "corporations": [],
+                    "coalitions": [],
+                },
+                "min_pilots": seed_min,
+                "max_jumps": 0,
+            }
+            changed = True
+
+        if changed:
+            self._save_config()
+
+        # Bind in-memory criteria to the live config dict.
+        self._intel_filter = self.config["intel_filter"]
+
+    def _resolve_triumvirate_async(self):
+        """Resolve Triumvirate.'s alliance id off-thread and fold it into the
+        "The Initiative." coalition. Best-effort; never blocks or raises.
+
+        On success appends ``{"id","name"}`` to
+        ``config["coalitions"]["The Initiative."]["alliances"]`` (de-duped),
+        persists, and refreshes any open coalition pickers on the main thread.
+        """
+        def worker():
+            try:
+                if not self.esi_auth:
+                    return
+                res = self.esi_auth.resolve_alliance("Triumvirate.")
+            except Exception:
+                return
+            if not res or "id" not in res:
+                return
+            self.root.after(0, self._apply_triumvirate_resolution, res)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_triumvirate_resolution(self, res: dict):
+        """Main-thread: add resolved Triumvirate. to The Initiative. + persist."""
+        try:
+            coalitions = self.config.setdefault("coalitions", {})
+            init = coalitions.setdefault(
+                "The Initiative.", {"alliances": [], "corporations": []}
+            )
+            alliances = init.setdefault("alliances", [])
+            new_list, added = add_filter_item(alliances, res)
+            if added:
+                init["alliances"] = new_list
+                self._save_config()
+                self._refresh_coalition_pickers()
+        except Exception as e:
+            print(f"[IntelFilter] Triumvirate fold-in failed: {e}")
+
+    def _refresh_coalition_pickers(self):
+        """Refresh the coalition autocomplete candidates if the parties picker
+        is currently in Coalition mode. Safe to call before the panel exists.
+
+        The parties add-entry is shared across Alliance/Corporation/Coalition,
+        so we only push coalition names when Coalition is the active type — that
+        avoids clobbering live alliance/corp type-ahead suggestions."""
+        type_var = getattr(self, "_par_type_var", None)
+        entry = getattr(self, "_parties_coalition_entry", None)
+        if (type_var is not None and entry is not None
+                and type_var.get() == "Coalition"
+                and hasattr(entry, "update_completions")):
+            entry.update_completions(
+                sorted(self.config.get("coalitions", {}).keys()))
+
+    def _save_intel_filter(self):
+        """Persist the intel filter to config (lightweight write, no restart).
+
+        ``self._intel_filter`` is the same dict object as
+        ``config["intel_filter"]`` so it is already current; this just flushes
+        config.json. The display filter reads config live, so no module reload
+        is needed (mirrors _save_staging_systems)."""
+        self.config["intel_filter"] = self._intel_filter
         self._save_config()
 
     # ── UI Construction ───────────────────────────────────────────────────────
@@ -988,6 +1169,1084 @@ class FCToolGUI:
         self._xup_log.tag_config("dim", foreground=FG_DIM)
         self._xup_log.tag_config("role", foreground=FG_MAGENTA)
 
+    # ── Config-driven intel filter panel ──────────────────────────────────────
+
+    def _build_intel_filter_panel(self, parent):
+        """Build the criteria-based fight-alert filter panel.
+
+        Layout:
+          * Top row — Min Pilots spinbox, Max Jumps spinbox, Combine toggle
+            ("Location AND/OR Parties").
+          * Two side-by-side group panels — LOCATION and INVOLVED PARTIES —
+            each with an Anywhere/Anyone checkbox, an add-row (type selector +
+            AutocompleteEntry + Add), and a listbox (Remove + double-click).
+
+        Every change persists immediately to ``config["intel_filter"]`` via
+        :meth:`_save_intel_filter` and the display filter reads it live.
+        """
+        flt = self._intel_filter
+
+        filter_frame = tk.Frame(parent, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                highlightbackground=BORDER_COLOR,
+                                highlightthickness=1)
+        filter_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
+
+        # ── Top row: Min Pilots, Max Jumps, Combine ────────────────────────
+        top = tk.Frame(filter_frame, bg=BG_PANEL)
+        top.pack(fill=tk.X, padx=10, pady=(5, 4))
+
+        tk.Label(top, text="Min Pilots:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
+        try:
+            _min0 = int(flt.get("min_pilots", 25))
+        except (TypeError, ValueError):
+            _min0 = 25
+        self._zkill_min_pilots_var = tk.StringVar(value=str(_min0))
+        self._zkill_min_pilots_spin = tk.Spinbox(
+            top, from_=1, to=500, textvariable=self._zkill_min_pilots_var,
+            font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
+            borderwidth=1, relief=tk.RIDGE,
+            command=self._on_min_pilots_change,
+        )
+        self._zkill_min_pilots_spin.pack(side=tk.LEFT, padx=(4, 15))
+        self._zkill_min_pilots_spin.bind(
+            "<Return>", lambda e: self._on_min_pilots_change())
+        self._zkill_min_pilots_spin.bind(
+            "<FocusOut>", lambda e: self._on_min_pilots_change())
+
+        tk.Label(top, text="Max Jumps:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
+        try:
+            _max0 = int(flt.get("max_jumps", 0))
+        except (TypeError, ValueError):
+            _max0 = 0
+        self._zkill_max_jumps_var = tk.StringVar(value=str(_max0))
+        self._zkill_max_jumps_spin = tk.Spinbox(
+            top, from_=0, to=200, textvariable=self._zkill_max_jumps_var,
+            font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
+            borderwidth=1, relief=tk.RIDGE,
+            command=self._on_max_jumps_change,
+        )
+        self._zkill_max_jumps_spin.pack(side=tk.LEFT, padx=(4, 5))
+        self._zkill_max_jumps_spin.bind(
+            "<Return>", lambda e: self._on_max_jumps_change())
+        self._zkill_max_jumps_spin.bind(
+            "<FocusOut>", lambda e: self._on_max_jumps_change())
+        tk.Label(top, text="(0=no limit)", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 20))
+
+        # Combine toggle
+        tk.Label(top, text="Match:", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 4))
+        combine0 = "OR" if str(flt.get("combine", "AND")).upper() == "OR" else "AND"
+        self._intel_combine_var = tk.StringVar(value=combine0)
+        for label, val in (("Location AND Parties", "AND"),
+                           ("Location OR Parties", "OR")):
+            tk.Radiobutton(
+                top, text=label, value=val, variable=self._intel_combine_var,
+                font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                activeforeground=FG_ACCENT, command=self._on_combine_change,
+            ).pack(side=tk.LEFT, padx=(0, 4))
+
+        # ── Two side-by-side group panels ──────────────────────────────────
+        groups = tk.Frame(filter_frame, bg=BG_PANEL)
+        groups.pack(fill=tk.X, padx=10, pady=(0, 6))
+        groups.columnconfigure(0, weight=1, uniform="grp")
+        groups.columnconfigure(1, weight=1, uniform="grp")
+
+        # parallel mapping: listbox index -> (kind, index_within_kind)
+        self._loc_index_map: list[tuple[str, int]] = []
+        self._par_index_map: list[tuple[str, int]] = []
+
+        # ---- LOCATION group ----
+        loc = tk.Frame(groups, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                       highlightbackground=BORDER_COLOR, highlightthickness=1)
+        loc.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+
+        tk.Label(loc, text="LOCATION", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor="w", padx=6, pady=(4, 0))
+
+        self._loc_anywhere_var = tk.BooleanVar(
+            value=bool(flt.get("location", {}).get("anywhere", True)))
+        tk.Checkbutton(
+            loc, text="Anywhere (all K-space)", variable=self._loc_anywhere_var,
+            font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_ORANGE, command=self._on_anywhere_toggle,
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+
+        loc_add = tk.Frame(loc, bg=BG_PANEL)
+        loc_add.pack(fill=tk.X, padx=6, pady=2)
+        self._loc_type_var = tk.StringVar(value="System")
+        loc_type = ttk.Combobox(
+            loc_add, textvariable=self._loc_type_var, state="readonly",
+            values=["System", "Region"], width=8, font=("Consolas", 9),
+        )
+        loc_type.pack(side=tk.LEFT, padx=(0, 4))
+        self._loc_add_entry = AutocompleteEntry(
+            loc_add, list(self._system_names), width=18,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
+        )
+        self._loc_add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                 padx=(0, 4))
+        self._loc_add_entry.bind("<Return>", lambda e: self._on_location_add())
+        loc_type.bind("<<ComboboxSelected>>",
+                      lambda e: self._on_location_type_change())
+        ttk.Button(loc_add, text="Add", style="Dark.TButton",
+                   command=self._on_location_add).pack(side=tk.LEFT)
+
+        self._loc_listbox = tk.Listbox(
+            loc, height=4, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+        )
+        self._loc_listbox.pack(fill=tk.X, padx=6, pady=(2, 2))
+        self._loc_listbox.bind("<Double-Button-1>",
+                               lambda e: self._on_location_remove())
+
+        loc_btns = tk.Frame(loc, bg=BG_PANEL)
+        loc_btns.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Button(loc_btns, text="Remove Selected", style="Dark.TButton",
+                   command=self._on_location_remove).pack(side=tk.LEFT)
+        self._loc_status = tk.Label(loc_btns, text="", font=("Consolas", 8),
+                                    fg=FG_DIM, bg=BG_PANEL)
+        self._loc_status.pack(side=tk.LEFT, padx=8)
+
+        # ---- INVOLVED PARTIES group ----
+        par = tk.Frame(groups, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                       highlightbackground=BORDER_COLOR, highlightthickness=1)
+        par.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        tk.Label(par, text="INVOLVED PARTIES", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor="w", padx=6, pady=(4, 0))
+
+        self._par_anyone_var = tk.BooleanVar(
+            value=bool(flt.get("parties", {}).get("anyone", True)))
+        tk.Checkbutton(
+            par, text="Anyone", variable=self._par_anyone_var,
+            font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_ORANGE, command=self._on_anyone_toggle,
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+
+        par_add = tk.Frame(par, bg=BG_PANEL)
+        par_add.pack(fill=tk.X, padx=6, pady=2)
+        self._par_type_var = tk.StringVar(value="Alliance")
+        par_type = ttk.Combobox(
+            par_add, textvariable=self._par_type_var, state="readonly",
+            values=["Alliance", "Corporation", "Coalition"], width=11,
+            font=("Consolas", 9),
+        )
+        par_type.pack(side=tk.LEFT, padx=(0, 4))
+        self._par_add_entry = AutocompleteEntry(
+            par_add, [], width=16, font=("Consolas", 10), bg=BG_ENTRY,
+            fg=FG_WHITE, insertbackground=FG_WHITE, borderwidth=1,
+            relief=tk.RIDGE,
+        )
+        self._par_add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                 padx=(0, 4))
+        self._par_add_entry.bind("<Return>", lambda e: self._on_parties_add())
+        # add="+" so we DON'T clobber AutocompleteEntry's own <KeyRelease>
+        # dropdown handler — both fire (local dropdown + live ESI type-ahead).
+        self._par_add_entry.bind(
+            "<KeyRelease>", self._on_parties_typeahead, add="+")
+        par_type.bind("<<ComboboxSelected>>",
+                      lambda e: self._on_parties_type_change())
+        ttk.Button(par_add, text="Add", style="Dark.TButton",
+                   command=self._on_parties_add).pack(side=tk.LEFT)
+        # Coalition picker reference (refreshed when coalitions change).
+        self._parties_coalition_entry = self._par_add_entry
+
+        self._par_listbox = tk.Listbox(
+            par, height=4, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+        )
+        self._par_listbox.pack(fill=tk.X, padx=6, pady=(2, 2))
+        self._par_listbox.bind("<Double-Button-1>",
+                               lambda e: self._on_parties_remove())
+
+        par_btns = tk.Frame(par, bg=BG_PANEL)
+        par_btns.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Button(par_btns, text="Remove Selected", style="Dark.TButton",
+                   command=self._on_parties_remove).pack(side=tk.LEFT)
+        ttk.Button(par_btns, text="Manage coalitions…",
+                   style="Dark.TButton",
+                   command=self._open_coalition_manager).pack(side=tk.LEFT,
+                                                              padx=(4, 0))
+        self._par_status = tk.Label(par_btns, text="", font=("Consolas", 8),
+                                    fg=FG_DIM, bg=BG_PANEL)
+        self._par_status.pack(side=tk.LEFT, padx=8)
+
+        # Debounce handle for parties type-ahead.
+        self._par_typeahead_after = None
+
+        # Populate listboxes + enabled-state from current config.
+        self._on_location_type_change()
+        self._on_parties_type_change()
+        self._refresh_intel_filter_lists()
+        self._sync_location_enabled()
+        self._sync_parties_enabled()
+
+    # ---- Top-row handlers ----
+
+    def _on_min_pilots_change(self):
+        try:
+            val = int(self._zkill_min_pilots_var.get())
+        except ValueError:
+            return
+        val = max(1, min(500, val))
+        self._intel_filter["min_pilots"] = val
+        self._save_intel_filter()
+
+    def _on_max_jumps_change(self):
+        try:
+            val = int(self._zkill_max_jumps_var.get())
+        except ValueError:
+            return
+        val = max(0, min(200, val))
+        self._intel_filter["max_jumps"] = val
+        self._save_intel_filter()
+
+    def _on_combine_change(self):
+        val = "OR" if self._intel_combine_var.get() == "OR" else "AND"
+        self._intel_filter["combine"] = val
+        self._save_intel_filter()
+
+    # ---- Anywhere / Anyone toggles ----
+
+    def _on_anywhere_toggle(self):
+        loc = self._intel_filter.setdefault(
+            "location", {"anywhere": True, "systems": [], "regions": []})
+        loc["anywhere"] = bool(self._loc_anywhere_var.get())
+        self._save_intel_filter()
+        self._sync_location_enabled()
+
+    def _on_anyone_toggle(self):
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        par["anyone"] = bool(self._par_anyone_var.get())
+        self._save_intel_filter()
+        self._sync_parties_enabled()
+
+    def _sync_location_enabled(self):
+        """Grey out the location list/add-row when Anywhere is checked."""
+        anywhere = bool(self._loc_anywhere_var.get())
+        state = tk.DISABLED if anywhere else tk.NORMAL
+        try:
+            self._loc_listbox.config(state=state)
+            self._loc_add_entry.config(state=state)
+        except Exception:
+            pass
+
+    def _sync_parties_enabled(self):
+        anyone = bool(self._par_anyone_var.get())
+        state = tk.DISABLED if anyone else tk.NORMAL
+        try:
+            self._par_listbox.config(state=state)
+            self._par_add_entry.config(state=state)
+        except Exception:
+            pass
+
+    # ---- Type-selector handlers (swap autocomplete candidates) ----
+
+    def _on_location_type_change(self):
+        kind = self._loc_type_var.get()
+        if kind == "Region":
+            try:
+                names = sorted(set(get_region_map().values()))
+            except Exception:
+                names = []
+        else:
+            names = list(self._system_names)
+        self._loc_add_entry.update_completions(names)
+
+    def _on_parties_type_change(self):
+        kind = self._par_type_var.get()
+        if kind == "Coalition":
+            names = sorted(self.config.get("coalitions", {}).keys())
+        else:
+            # Alliance / Corporation: live type-ahead only (no local list).
+            names = []
+        self._par_add_entry.update_completions(names)
+
+    # ---- Location add / remove ----
+
+    def _on_location_add(self):
+        if self._loc_anywhere_var.get():
+            return
+        kind = self._loc_type_var.get()
+        name = self._loc_add_entry.get().strip()
+        if not name:
+            return
+        if kind == "System":
+            self._loc_status.config(text=f"resolving {name}…", fg=FG_DIM)
+
+            def worker():
+                try:
+                    sid = search_system(name)
+                except Exception:
+                    sid = None
+                self.root.after(
+                    0, self._apply_location_add, "systems", sid, name)
+
+            threading.Thread(target=worker, daemon=True).start()
+        else:  # Region
+            self._loc_status.config(text=f"resolving {name}…", fg=FG_DIM)
+
+            def worker():
+                res = None
+                try:
+                    if self.esi_auth:
+                        res = self.esi_auth.resolve_region(name)
+                except Exception:
+                    res = None
+                rid = res.get("id") if res else None
+                rname = res.get("name") if res else name
+                self.root.after(
+                    0, self._apply_location_add, "regions", rid, rname)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_location_add(self, kind: str, item_id, name: str):
+        """Main-thread: add a resolved {id,name} to location[kind]."""
+        if item_id is None:
+            self._loc_status.config(text=f"couldn't resolve {name}", fg=FG_RED)
+            return
+        loc = self._intel_filter.setdefault(
+            "location", {"anywhere": True, "systems": [], "regions": []})
+        new_list, added = add_filter_item(
+            loc.get(kind, []), {"id": item_id, "name": name})
+        loc[kind] = new_list
+        if added:
+            # Adding the first concrete item auto-unchecks Anywhere.
+            if loc.get("anywhere"):
+                loc["anywhere"] = False
+                self._loc_anywhere_var.set(False)
+                self._sync_location_enabled()
+            self._loc_add_entry.delete(0, tk.END)
+            self._loc_status.config(text=f"added {name}", fg=FG_GREEN)
+        else:
+            self._loc_status.config(text=f"{name} already listed", fg=FG_DIM)
+        self._save_intel_filter()
+        self._refresh_intel_filter_lists()
+
+    def _on_location_remove(self):
+        sel = self._loc_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._loc_index_map):
+            return
+        kind, within = self._loc_index_map[idx]
+        loc = self._intel_filter.setdefault(
+            "location", {"anywhere": True, "systems": [], "regions": []})
+        loc[kind] = remove_filter_item(loc.get(kind, []), within)
+        # Removing the last concrete item re-checks Anywhere.
+        if not loc.get("systems") and not loc.get("regions"):
+            loc["anywhere"] = True
+            self._loc_anywhere_var.set(True)
+            self._sync_location_enabled()
+        self._save_intel_filter()
+        self._refresh_intel_filter_lists()
+
+    # ---- Parties add / remove ----
+
+    def _on_parties_add(self):
+        if self._par_anyone_var.get():
+            return
+        kind = self._par_type_var.get()
+        name = self._par_add_entry.get().strip()
+        if not name:
+            return
+        if kind == "Coalition":
+            # Local: store the coalition name string.
+            self._apply_parties_coalition_add(name)
+            return
+        category = "alliance" if kind == "Alliance" else "corporation"
+        self._par_status.config(text=f"resolving {name}…", fg=FG_DIM)
+
+        def worker():
+            res = None
+            try:
+                if self.esi_auth:
+                    if category == "alliance":
+                        res = self.esi_auth.resolve_alliance(name)
+                    else:
+                        res = self.esi_auth.resolve_corporation(name)
+            except Exception:
+                res = None
+            dest = "alliances" if category == "alliance" else "corporations"
+            self.root.after(0, self._apply_parties_add, dest, res, name)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_parties_add(self, dest: str, res, name: str):
+        """Main-thread: add a resolved alliance/corp {id,name} to parties."""
+        if not res or "id" not in res:
+            self._par_status.config(text=f"couldn't resolve {name}", fg=FG_RED)
+            return
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        new_list, added = add_filter_item(
+            par.get(dest, []),
+            {"id": res["id"], "name": res.get("name", name)})
+        par[dest] = new_list
+        if added:
+            self._uncheck_anyone_if_set(par)
+            self._par_add_entry.delete(0, tk.END)
+            self._par_status.config(text=f"added {res.get('name', name)}",
+                                    fg=FG_GREEN)
+        else:
+            self._par_status.config(text=f"{name} already listed", fg=FG_DIM)
+        self._save_intel_filter()
+        self._refresh_intel_filter_lists()
+
+    def _apply_parties_coalition_add(self, name: str):
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        # Only accept known coalitions.
+        if name not in self.config.get("coalitions", {}):
+            self._par_status.config(text=f"unknown coalition {name}", fg=FG_RED)
+            return
+        new_list, added = add_coalition_item(par.get("coalitions", []), name)
+        par["coalitions"] = new_list
+        if added:
+            self._uncheck_anyone_if_set(par)
+            self._par_add_entry.delete(0, tk.END)
+            self._par_status.config(text=f"added {name}", fg=FG_GREEN)
+        else:
+            self._par_status.config(text=f"{name} already listed", fg=FG_DIM)
+        self._save_intel_filter()
+        self._refresh_intel_filter_lists()
+
+    def _uncheck_anyone_if_set(self, par: dict):
+        """Adding the first concrete party auto-unchecks Anyone."""
+        if par.get("anyone"):
+            par["anyone"] = False
+            self._par_anyone_var.set(False)
+            self._sync_parties_enabled()
+
+    def _on_parties_remove(self):
+        sel = self._par_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._par_index_map):
+            return
+        kind, within = self._par_index_map[idx]
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        par[kind] = remove_filter_item(par.get(kind, []), within)
+        if (not par.get("alliances") and not par.get("corporations")
+                and not par.get("coalitions")):
+            par["anyone"] = True
+            self._par_anyone_var.set(True)
+            self._sync_parties_enabled()
+        self._save_intel_filter()
+        self._refresh_intel_filter_lists()
+
+    def _on_parties_typeahead(self, event=None):
+        """Best-effort live ESI type-ahead for Alliance/Corporation (debounced).
+
+        Never blocks the UI thread. Silently no-ops for Coalition (local) or
+        when the query is short. If search_entities returns [] (e.g. no search
+        scope) the user simply relies on resolve-on-Add."""
+        if event is not None and event.keysym in (
+                "Return", "Up", "Down", "Tab", "Escape",
+                "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return
+        kind = self._par_type_var.get()
+        if kind == "Coalition":
+            return
+        query = self._par_add_entry.get().strip()
+        if len(query) < 3:
+            return
+        category = "alliance" if kind == "Alliance" else "corporation"
+        if self._par_typeahead_after is not None:
+            try:
+                self.root.after_cancel(self._par_typeahead_after)
+            except Exception:
+                pass
+        self._par_typeahead_after = self.root.after(
+            300, lambda: self._do_parties_typeahead(query, category))
+
+    def _do_parties_typeahead(self, query: str, category: str):
+        self._par_typeahead_after = None
+
+        def worker():
+            results = []
+            try:
+                if self.esi_auth:
+                    results = self.esi_auth.search_entities(query, [category])
+            except Exception:
+                results = []
+            names = [r["name"] for r in results
+                     if isinstance(r, dict) and r.get("name")]
+            if names:
+                self.root.after(
+                    0, self._par_add_entry.update_completions, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Listbox refresh ----
+
+    def _refresh_intel_filter_lists(self):
+        """Rebuild both listboxes + index maps from the live config."""
+        flt = self._intel_filter
+        loc = flt.get("location", {})
+        par = flt.get("parties", {})
+
+        # Location listbox.
+        self._loc_index_map = []
+        loc_was = self._loc_listbox.cget("state")
+        self._loc_listbox.config(state=tk.NORMAL)
+        self._loc_listbox.delete(0, tk.END)
+        for i, sysitem in enumerate(loc.get("systems", []) or []):
+            self._loc_listbox.insert(
+                tk.END, f"{sysitem.get('name', '?')}  [system]")
+            self._loc_index_map.append(("systems", i))
+        for i, regitem in enumerate(loc.get("regions", []) or []):
+            self._loc_listbox.insert(
+                tk.END, f"{regitem.get('name', '?')}  [region]")
+            self._loc_index_map.append(("regions", i))
+        self._loc_listbox.config(state=loc_was)
+
+        # Parties listbox.
+        self._par_index_map = []
+        par_was = self._par_listbox.cget("state")
+        self._par_listbox.config(state=tk.NORMAL)
+        self._par_listbox.delete(0, tk.END)
+        for i, al in enumerate(par.get("alliances", []) or []):
+            self._par_listbox.insert(
+                tk.END, f"{al.get('name', '?')}  [alliance]")
+            self._par_index_map.append(("alliances", i))
+        for i, co in enumerate(par.get("corporations", []) or []):
+            self._par_listbox.insert(
+                tk.END, f"{co.get('name', '?')}  [corp]")
+            self._par_index_map.append(("corporations", i))
+        for i, cn in enumerate(par.get("coalitions", []) or []):
+            self._par_listbox.insert(tk.END, f"{cn}  [coalition]")
+            self._par_index_map.append(("coalitions", i))
+        self._par_listbox.config(state=par_was)
+
+    # ── Coalition manager dialog ──────────────────────────────────────────────
+
+    def _open_coalition_manager(self):
+        """Open the modal-ish coalition manager (create/rename/delete coalitions
+        and edit their member alliances/corporations).
+
+        All mutations write ``config["coalitions"]`` and persist via
+        :meth:`_save_config`; rename/delete also propagate into
+        ``config["intel_filter"]["parties"]["coalitions"]`` (the filter's
+        selected-coalitions list) and refresh the filter panel listbox.
+        After any create/rename/delete/member change the parties Coalition
+        autocomplete is refreshed via :meth:`_refresh_coalition_pickers`.
+        ESI resolution for member-add runs off the Tk main thread.
+        """
+        # Re-focus an already-open dialog instead of stacking duplicates.
+        existing = getattr(self, "_coalition_mgr", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        win = tk.Toplevel(self.root)
+        self._coalition_mgr = win
+        win.title("Manage Coalitions")
+        win.configure(bg=BG_DARK)
+        win.geometry("680x420")
+        win.minsize(560, 360)
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        # Per-dialog state.
+        self._cm_selected_name: str | None = None
+        self._cm_member_index_map: list[tuple[str, int]] = []
+        self._cm_typeahead_after = None
+
+        def _on_close():
+            self._coalition_mgr = None
+            self._cm_member_index_map = []
+            self._cm_typeahead_after = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        win.bind("<Escape>", lambda e: _on_close())
+
+        body = tk.Frame(win, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        body.columnconfigure(0, weight=1, uniform="cm")
+        body.columnconfigure(1, weight=1, uniform="cm")
+        body.rowconfigure(0, weight=1)
+
+        # ---- LEFT: coalition list + New/Rename/Delete ----
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        tk.Label(left, text="COALITIONS", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor="w", padx=6, pady=(6, 2))
+
+        self._cm_listbox = tk.Listbox(
+            left, height=12, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False,
+        )
+        self._cm_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 4))
+        self._cm_listbox.bind(
+            "<<ListboxSelect>>", lambda e: self._cm_on_select())
+
+        left_btns = tk.Frame(left, bg=BG_PANEL)
+        left_btns.pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Button(left_btns, text="New", style="Dark.TButton",
+                   command=self._cm_new_coalition).pack(side=tk.LEFT)
+        ttk.Button(left_btns, text="Rename", style="Dark.TButton",
+                   command=self._cm_rename_coalition).pack(side=tk.LEFT,
+                                                           padx=(4, 0))
+        ttk.Button(left_btns, text="Delete", style="Red.TButton",
+                   command=self._cm_delete_coalition).pack(side=tk.LEFT,
+                                                           padx=(4, 0))
+        self._cm_left_status = tk.Label(left, text="", font=("Consolas", 8),
+                                        fg=FG_DIM, bg=BG_PANEL, anchor="w",
+                                        justify=tk.LEFT, wraplength=300)
+        self._cm_left_status.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        # ---- RIGHT: members of the selected coalition ----
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        self._cm_members_label = tk.Label(
+            right, text="MEMBERS", font=("Consolas", 9, "bold"),
+            fg=FG_ACCENT, bg=BG_PANEL)
+        self._cm_members_label.pack(anchor="w", padx=6, pady=(6, 2))
+
+        self._cm_members_listbox = tk.Listbox(
+            right, height=10, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False,
+        )
+        self._cm_members_listbox.pack(fill=tk.BOTH, expand=True, padx=6,
+                                      pady=(0, 2))
+        self._cm_members_listbox.bind(
+            "<Double-Button-1>", lambda e: self._cm_remove_member())
+
+        mem_btns = tk.Frame(right, bg=BG_PANEL)
+        mem_btns.pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Button(mem_btns, text="Remove Selected", style="Dark.TButton",
+                   command=self._cm_remove_member).pack(side=tk.LEFT)
+
+        # Add-row: type selector + AutocompleteEntry + Add.
+        add_row = tk.Frame(right, bg=BG_PANEL)
+        add_row.pack(fill=tk.X, padx=6, pady=(0, 2))
+        self._cm_type_var = tk.StringVar(value="Alliance")
+        cm_type = ttk.Combobox(
+            add_row, textvariable=self._cm_type_var, state="readonly",
+            values=["Alliance", "Corporation"], width=11,
+            font=("Consolas", 9),
+        )
+        cm_type.pack(side=tk.LEFT, padx=(0, 4))
+        self._cm_add_entry = AutocompleteEntry(
+            add_row, [], width=16, font=("Consolas", 10), bg=BG_ENTRY,
+            fg=FG_WHITE, insertbackground=FG_WHITE, borderwidth=1,
+            relief=tk.RIDGE,
+        )
+        self._cm_add_entry.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                padx=(0, 4))
+        self._cm_add_entry.bind("<Return>", lambda e: self._cm_add_member())
+        # add="+" so we don't clobber AutocompleteEntry's own <KeyRelease>.
+        self._cm_add_entry.bind(
+            "<KeyRelease>", self._cm_on_typeahead, add="+")
+        cm_type.bind("<<ComboboxSelected>>",
+                     lambda e: self._cm_add_entry.update_completions([]))
+        ttk.Button(add_row, text="Add", style="Dark.TButton",
+                   command=self._cm_add_member).pack(side=tk.LEFT)
+
+        self._cm_member_status = tk.Label(
+            right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+            anchor="w", justify=tk.LEFT, wraplength=300)
+        self._cm_member_status.pack(fill=tk.X, padx=6, pady=(0, 6))
+
+        # Initial population.
+        self._cm_refresh_list()
+        self._cm_refresh_members()
+
+    # ---- Coalition manager: list (left) ----
+
+    def _cm_refresh_list(self, select: str | None = None):
+        """Rebuild the left coalition listbox from config; optionally select
+        ``select`` (falls back to the current selection if still present)."""
+        box = getattr(self, "_cm_listbox", None)
+        if box is None:
+            return
+        target = select if select is not None else self._cm_selected_name
+        names = sorted(self.config.get("coalitions", {}).keys())
+        box.delete(0, tk.END)
+        for name in names:
+            box.insert(tk.END, name)
+        # Restore selection.
+        if target in names:
+            idx = names.index(target)
+            box.selection_clear(0, tk.END)
+            box.selection_set(idx)
+            box.see(idx)
+            self._cm_selected_name = target
+        else:
+            self._cm_selected_name = None
+
+    def _cm_on_select(self):
+        box = getattr(self, "_cm_listbox", None)
+        if box is None:
+            return
+        sel = box.curselection()
+        if not sel:
+            return
+        self._cm_selected_name = box.get(sel[0])
+        self._cm_member_status.config(text="")
+        self._cm_refresh_members()
+
+    def _cm_new_coalition(self):
+        name = self._cm_prompt_name("New Coalition", "Coalition name:")
+        if name is None:
+            return  # cancelled
+        clean = name.strip()
+        coalitions = self.config.setdefault("coalitions", {})
+        if not clean:
+            self._cm_left_status.config(text="Name can't be empty.", fg=FG_RED)
+            return
+        if self._cm_name_exists(clean):
+            self._cm_left_status.config(
+                text=f"'{clean}' already exists.", fg=FG_RED)
+            return
+        coalitions[clean] = {"alliances": [], "corporations": []}
+        self._save_config()
+        self._refresh_coalition_pickers()
+        self._cm_refresh_list(select=clean)
+        self._cm_refresh_members()
+        self._cm_left_status.config(text=f"Created '{clean}'.", fg=FG_GREEN)
+
+    def _cm_rename_coalition(self):
+        old = self._cm_selected_name
+        if not old or old not in self.config.get("coalitions", {}):
+            self._cm_left_status.config(
+                text="Select a coalition to rename.", fg=FG_DIM)
+            return
+        name = self._cm_prompt_name("Rename Coalition",
+                                    f"New name for '{old}':", initial=old)
+        if name is None:
+            return  # cancelled
+        new = name.strip()
+        if not new:
+            self._cm_left_status.config(text="Name can't be empty.", fg=FG_RED)
+            return
+        if new == old:
+            return  # no-op
+        # A case-only rename of the SAME coalition (e.g. "Imperium" ->
+        # "imperium") is allowed; reject only a genuine collision with a
+        # DIFFERENT existing coalition.
+        if new.lower() != old.lower() and self._cm_name_exists(new):
+            self._cm_left_status.config(
+                text=f"'{new}' already exists.", fg=FG_RED)
+            return
+        coalitions = self.config["coalitions"]
+        # Preserve ordering by rebuilding the dict with the key renamed.
+        coalitions[new] = coalitions.pop(old)
+        # Propagate into the filter's selected-coalitions list.
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        par["coalitions"] = rename_coalition_in_selection(
+            par.get("coalitions", []), old, new)
+        self._save_config()
+        self._refresh_coalition_pickers()
+        self._refresh_intel_filter_lists()
+        self._cm_refresh_list(select=new)
+        self._cm_refresh_members()
+        self._cm_left_status.config(
+            text=f"Renamed to '{new}'.", fg=FG_GREEN)
+
+    def _cm_delete_coalition(self):
+        name = self._cm_selected_name
+        coalitions = self.config.get("coalitions", {})
+        if not name or name not in coalitions:
+            self._cm_left_status.config(
+                text="Select a coalition to delete.", fg=FG_DIM)
+            return
+        del coalitions[name]
+        # Drop any filter reference to the deleted coalition.
+        par = self._intel_filter.setdefault(
+            "parties",
+            {"anyone": True, "alliances": [], "corporations": [],
+             "coalitions": []})
+        par["coalitions"] = remove_coalition_from_selection(
+            par.get("coalitions", []), name)
+        # If that emptied all party criteria, fall back to "Anyone".
+        if (not par.get("alliances") and not par.get("corporations")
+                and not par.get("coalitions")):
+            par["anyone"] = True
+            anyone_var = getattr(self, "_par_anyone_var", None)
+            if anyone_var is not None:
+                anyone_var.set(True)
+                self._sync_parties_enabled()
+        self._save_config()
+        self._refresh_coalition_pickers()
+        self._refresh_intel_filter_lists()
+        self._cm_selected_name = None
+        self._cm_refresh_list()
+        self._cm_refresh_members()
+        self._cm_left_status.config(text=f"Deleted '{name}'.", fg=FG_ORANGE)
+
+    def _cm_name_exists(self, name: str) -> bool:
+        """Case-insensitive duplicate check against existing coalition keys."""
+        lower = name.strip().lower()
+        return any(k.lower() == lower
+                   for k in self.config.get("coalitions", {}).keys())
+
+    def _cm_prompt_name(self, title: str, prompt: str,
+                        initial: str = "") -> str | None:
+        """Dark-themed modal text prompt. Returns the entered string (possibly
+        blank — caller validates) or None if cancelled/closed."""
+        dlg = tk.Toplevel(self._coalition_mgr or self.root)
+        dlg.title(title)
+        dlg.configure(bg=BG_DARK)
+        dlg.resizable(False, False)
+        try:
+            dlg.transient(self._coalition_mgr or self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(dlg, text=prompt, font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor="w", padx=12, pady=(12, 4))
+        var = tk.StringVar(value=initial)
+        entry = tk.Entry(dlg, textvariable=var, font=("Consolas", 11),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         width=32, borderwidth=1, relief=tk.RIDGE)
+        entry.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        result: dict[str, str | None] = {"value": None}
+
+        def _ok():
+            result["value"] = var.get()
+            dlg.destroy()
+
+        def _cancel():
+            result["value"] = None
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT, padx=(0, 6))
+
+        entry.bind("<Return>", lambda e: _ok())
+        entry.bind("<Escape>", lambda e: _cancel())
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+
+        # Center over the manager dialog and make modal.
+        dlg.update_idletasks()
+        parent = self._coalition_mgr or self.root
+        try:
+            px = parent.winfo_rootx() + max(
+                0, (parent.winfo_width() - dlg.winfo_width()) // 2)
+            py = parent.winfo_rooty() + 60
+            dlg.geometry(f"+{px}+{py}")
+        except tk.TclError:
+            pass
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        try:
+            dlg.grab_set()
+        except tk.TclError:
+            pass
+        dlg.wait_window()
+        return result["value"]
+
+    # ---- Coalition manager: members (right) ----
+
+    def _cm_current_coalition(self) -> dict | None:
+        """Return the selected coalition's dict (creating member lists if the
+        stored value is malformed) or None when nothing is selected."""
+        name = self._cm_selected_name
+        if not name:
+            return None
+        coalitions = self.config.get("coalitions", {})
+        entry = coalitions.get(name)
+        if not isinstance(entry, dict):
+            return None
+        entry.setdefault("alliances", [])
+        entry.setdefault("corporations", [])
+        return entry
+
+    def _cm_refresh_members(self):
+        """Rebuild the right member listbox from the selected coalition."""
+        box = getattr(self, "_cm_members_listbox", None)
+        if box is None:
+            return
+        self._cm_member_index_map = []
+        box.delete(0, tk.END)
+        label = getattr(self, "_cm_members_label", None)
+        coalition = self._cm_current_coalition()
+        if coalition is None:
+            if label is not None:
+                label.config(text="MEMBERS")
+            return
+        if label is not None:
+            label.config(text=f"MEMBERS — {self._cm_selected_name}")
+        for i, al in enumerate(coalition.get("alliances", []) or []):
+            box.insert(tk.END, f"{al.get('name', '?')}  [alliance]")
+            self._cm_member_index_map.append(("alliances", i))
+        for i, co in enumerate(coalition.get("corporations", []) or []):
+            box.insert(tk.END, f"{co.get('name', '?')}  [corp]")
+            self._cm_member_index_map.append(("corporations", i))
+
+    def _cm_remove_member(self):
+        box = getattr(self, "_cm_members_listbox", None)
+        coalition = self._cm_current_coalition()
+        if box is None or coalition is None:
+            return
+        sel = box.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._cm_member_index_map):
+            return
+        kind, within = self._cm_member_index_map[idx]
+        coalition[kind] = remove_filter_item(coalition.get(kind, []), within)
+        self._save_config()
+        self._refresh_coalition_pickers()
+        self._cm_refresh_members()
+        self._cm_member_status.config(text="Removed.", fg=FG_DIM)
+
+    def _cm_add_member(self):
+        coalition = self._cm_current_coalition()
+        if coalition is None:
+            self._cm_member_status.config(
+                text="Select a coalition first.", fg=FG_DIM)
+            return
+        name = self._cm_add_entry.get().strip()
+        if not name:
+            return
+        kind = self._cm_type_var.get()
+        category = "alliance" if kind == "Alliance" else "corporation"
+        target_name = self._cm_selected_name  # snapshot for the callback
+        self._cm_member_status.config(text=f"resolving {name}…", fg=FG_DIM)
+
+        def worker():
+            res = None
+            try:
+                if self.esi_auth:
+                    if category == "alliance":
+                        res = self.esi_auth.resolve_alliance(name)
+                    else:
+                        res = self.esi_auth.resolve_corporation(name)
+            except Exception:
+                res = None
+            dest = "alliances" if category == "alliance" else "corporations"
+            self.root.after(
+                0, self._cm_apply_member_add, target_name, dest, res, name)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cm_apply_member_add(self, target_name: str, dest: str, res, name: str):
+        """Main-thread: add a resolved {id,name} into the coalition's member
+        list. Guards against the selection/coalition having changed while the
+        ESI call was in flight."""
+        # Dialog closed while resolving?
+        if getattr(self, "_coalition_mgr", None) is None:
+            return
+        coalitions = self.config.get("coalitions", {})
+        coalition = coalitions.get(target_name)
+        if not isinstance(coalition, dict):
+            return  # coalition was renamed/deleted mid-flight
+        if not res or "id" not in res:
+            if self._cm_selected_name == target_name:
+                self._cm_member_status.config(
+                    text=f"couldn't resolve {name}", fg=FG_RED)
+            return
+        coalition.setdefault(dest, [])
+        new_list, added = add_filter_item(
+            coalition.get(dest, []),
+            {"id": res["id"], "name": res.get("name", name)})
+        coalition[dest] = new_list
+        self._save_config()
+        self._refresh_coalition_pickers()
+        # Only touch the UI if the user is still viewing this coalition.
+        if self._cm_selected_name == target_name:
+            if added:
+                self._cm_add_entry.delete(0, tk.END)
+                self._cm_member_status.config(
+                    text=f"added {res.get('name', name)}", fg=FG_GREEN)
+            else:
+                self._cm_member_status.config(
+                    text=f"{res.get('name', name)} already a member",
+                    fg=FG_DIM)
+            self._cm_refresh_members()
+
+    def _cm_on_typeahead(self, event=None):
+        """Best-effort debounced ESI type-ahead for the member add-entry.
+
+        Never blocks the UI thread; if search_entities returns [] the user just
+        relies on resolve-on-Add."""
+        if event is not None and event.keysym in (
+                "Return", "Up", "Down", "Tab", "Escape",
+                "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return
+        query = self._cm_add_entry.get().strip()
+        if len(query) < 3:
+            return
+        kind = self._cm_type_var.get()
+        category = "alliance" if kind == "Alliance" else "corporation"
+        if self._cm_typeahead_after is not None:
+            try:
+                self.root.after_cancel(self._cm_typeahead_after)
+            except Exception:
+                pass
+        self._cm_typeahead_after = self.root.after(
+            300, lambda: self._cm_do_typeahead(query, category))
+
+    def _cm_do_typeahead(self, query: str, category: str):
+        self._cm_typeahead_after = None
+
+        def worker():
+            results = []
+            try:
+                if self.esi_auth:
+                    results = self.esi_auth.search_entities(query, [category])
+            except Exception:
+                results = []
+            names = [r["name"] for r in results
+                     if isinstance(r, dict) and r.get("name")]
+            if names and getattr(self, "_coalition_mgr", None) is not None:
+                self.root.after(
+                    0, self._cm_add_entry.update_completions, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # ── zKillboard Tab ────────────────────────────────────────────────────────
 
     def _build_intel_tab(self):
@@ -1014,108 +2273,8 @@ class FCToolGUI:
                        activeforeground=FG_RED,
                        ).pack(side=tk.LEFT, padx=15)
 
-        # (All K-Space toggle is now in the filter panel below)
-
-        # ── Inline filter controls ─────────────────────────────────────────
-        filter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
-                                 highlightbackground=BORDER_COLOR, highlightthickness=1)
-        filter_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
-
-        # Row 1: Min Pilots, Max Jumps, All K-Space
-        filter_row1 = tk.Frame(filter_frame, bg=BG_PANEL)
-        filter_row1.pack(fill=tk.X, padx=10, pady=(5, 2))
-
-        tk.Label(filter_row1, text="Min Pilots:", font=("Consolas", 9),
-                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
-        zk_cfg = self.config.get("zkillboard", {})
-        self._zkill_min_pilots_var = tk.StringVar(
-            value=str(zk_cfg.get("min_pilots_involved", 25)))
-        self._zkill_min_pilots_spin = tk.Spinbox(
-            filter_row1, from_=1, to=500, textvariable=self._zkill_min_pilots_var,
-            font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
-            borderwidth=1, relief=tk.RIDGE,
-            command=self._on_zkill_filter_change,
-        )
-        self._zkill_min_pilots_spin.pack(side=tk.LEFT, padx=(4, 15))
-        self._zkill_min_pilots_spin.bind("<Return>", lambda e: self._on_zkill_filter_change())
-
-        tk.Label(filter_row1, text="Max Jumps:", font=("Consolas", 9),
-                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
-        self._zkill_max_jumps_var = tk.StringVar(value="0")
-        self._zkill_max_jumps_spin = tk.Spinbox(
-            filter_row1, from_=0, to=200, textvariable=self._zkill_max_jumps_var,
-            font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
-            borderwidth=1, relief=tk.RIDGE,
-        )
-        self._zkill_max_jumps_spin.pack(side=tk.LEFT, padx=(4, 5))
-        tk.Label(filter_row1, text="(0=no limit)",
-                 font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 15))
-
-        self._zkill_watch_all_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(filter_row1, text="All K-Space",
-                       variable=self._zkill_watch_all_var,
-                       font=("Consolas", 10, "bold"), fg=FG_ORANGE, bg=BG_PANEL,
-                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                       activeforeground=FG_ORANGE,
-                       command=self._toggle_watch_all).pack(side=tk.LEFT, padx=(10, 5))
-        tk.Label(filter_row1, text="(overrides region/affiliation filters)",
-                 font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
-
-        # Row 2: Region checkboxes
-        filter_row2 = tk.Frame(filter_frame, bg=BG_PANEL)
-        filter_row2.pack(fill=tk.X, padx=10, pady=2)
-
-        tk.Label(filter_row2, text="Regions:", font=("Consolas", 9, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
-
-        # Determine which regions should be checked by default
-        config_regions = set(zk_cfg.get("watch_regions", []))
-        if not config_regions:
-            config_regions = set(WATCHED_REGIONS.keys())  # All on if no config
-
-        self._zkill_region_vars: dict[int, tk.BooleanVar] = {}
-        for region_id, region_name in sorted(WATCHED_REGIONS.items(), key=lambda x: x[1]):
-            var = tk.BooleanVar(value=(region_id in config_regions))
-            self._zkill_region_vars[region_id] = var
-            tk.Checkbutton(filter_row2, text=region_name,
-                           variable=var, font=("Consolas", 8),
-                           fg=FG_TEXT, bg=BG_PANEL,
-                           selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                           activeforeground=FG_ACCENT,
-                           ).pack(side=tk.LEFT, padx=2)
-
-        # All / None buttons for regions
-        ttk.Button(filter_row2, text="All", style="Dark.TButton",
-                   command=lambda: self._set_all_regions(True)
-                   ).pack(side=tk.RIGHT, padx=2, pady=1)
-        ttk.Button(filter_row2, text="None", style="Dark.TButton",
-                   command=lambda: self._set_all_regions(False)
-                   ).pack(side=tk.RIGHT, padx=2, pady=1)
-
-        # Row 3: Affiliation presets
-        filter_row3 = tk.Frame(filter_frame, bg=BG_PANEL)
-        filter_row3.pack(fill=tk.X, padx=10, pady=(2, 5))
-
-        tk.Label(filter_row3, text="Affiliations:", font=("Consolas", 9, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
-
-        self._zkill_winter_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(filter_row3, text="Winter Coalition",
-                       variable=self._zkill_winter_var,
-                       font=("Consolas", 9), fg=FG_RED, bg=BG_PANEL,
-                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                       activeforeground=FG_RED,
-                       ).pack(side=tk.LEFT, padx=(0, 15))
-
-        self._zkill_imperium_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(filter_row3, text="The Imperium",
-                       variable=self._zkill_imperium_var,
-                       font=("Consolas", 9), fg=FG_YELLOW, bg=BG_PANEL,
-                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                       activeforeground=FG_YELLOW,
-                       ).pack(side=tk.LEFT, padx=(0, 10))
+        # ── Config-driven intel filter panel ───────────────────────────────
+        self._build_intel_filter_panel(tab)
 
         # ── Paste Intel drawer (collapsible) ──────────────────────────────
         self._paste_drawer_expanded = False
@@ -2295,34 +3454,6 @@ class FCToolGUI:
                 )
             self._append_wh_log("\n", "dim")
 
-    def _toggle_watch_all(self):
-        """Toggle All K-Space display filter (GUI-only, does not affect Discord)."""
-        watch_all = self._zkill_watch_all_var.get()
-        mode = "ALL K-SPACE" if watch_all else "FILTERED"
-        self._append_zkill_log(f"\n[Mode] Display switched to {mode}\n", "info")
-        if watch_all:
-            self._zkill_indicator.config(text="  LIVE (ALL)", fg=FG_ORANGE)
-        else:
-            self._zkill_indicator.config(text="  LIVE", fg=FG_GREEN)
-
-    def _set_all_regions(self, state: bool):
-        """Set all region checkboxes to the given state."""
-        for var in self._zkill_region_vars.values():
-            var.set(state)
-
-    def _get_active_zkill_filters(self) -> tuple[set[int], set[int]]:
-        """Get the currently active region IDs and alliance IDs from checkboxes.
-        Returns (active_regions, active_alliances)."""
-        active_regions = {
-            rid for rid, var in self._zkill_region_vars.items() if var.get()
-        }
-        active_alliances: set[int] = set()
-        if self._zkill_winter_var.get():
-            active_alliances |= WINTER_ALLIANCES
-        if self._zkill_imperium_var.get():
-            active_alliances |= IMPERIUM_ALLIANCES
-        return active_regions, active_alliances
-
     def _on_tab_changed(self, event=None):
         """Handle tab switches — clear zkill alerts, refresh character tab."""
         current = self.notebook.index(self.notebook.select())
@@ -2646,10 +3777,6 @@ class FCToolGUI:
         self.config["ansiblex_connections"] = gates
         self._save_config()
         threading.Thread(target=self._resolve_ansiblex_sync, daemon=True).start()
-
-    def _on_zkill_filter_change(self):
-        """Update min pilots display filter (GUI-only, does not affect Discord)."""
-        pass  # Value is read from _zkill_min_pilots_var at display time
 
     def _get_staging_system(self) -> str:
         """Get the current staging system name."""
@@ -4019,8 +5146,8 @@ class FCToolGUI:
                        selectcolor=BG_ENTRY, activebackground=BG_DARK,
                        activeforeground=FG_TEXT).pack(anchor=tk.W)
 
-        self._add_setting(scroll_frame, "Min Pilots Involved", "zkill_min_pilots",
-                          str(zk.get("min_pilots_involved", 10)))
+        # Min-pilots gate lives on the Intelligence tab's filter panel
+        # (config["intel_filter"]["min_pilots"]) — the single source of truth.
         # Region/alliance filters are now on the zKill tab inline filter panel
 
         # (Save button is at the top of the settings tab)
@@ -4348,8 +5475,10 @@ class FCToolGUI:
 
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
-        self.config["zkillboard"]["min_pilots_involved"] = int(
-            self._setting_entries["zkill_min_pilots"].get() or 10)
+        # min_pilots_involved is no longer edited here; the Intelligence-tab
+        # spinbox (config["intel_filter"]["min_pilots"]) is the single source of
+        # truth. The key is preserved as-is so the one-time migration seed and
+        # any existing readers keep working.
 
         self._save_config()
         self._save_status.config(text="Saved! Restart to apply.", fg=FG_GREEN)
@@ -5367,35 +6496,33 @@ $bmp.Dispose()
 
     def _show_zkill_alert(self, alert: KillAlert):
         # ── GUI-only filters (do not affect Discord/server) ──
-        # Min pilots filter
+        # These read the panel vars, which mirror config["intel_filter"]; the
+        # criteria (location/parties) come straight from the live config so the
+        # display filter always reflects the current panel state.
+        #
+        # (a) Min-pilots gate — capitals always bypass.
         try:
             gui_min_pilots = int(self._zkill_min_pilots_var.get())
-        except ValueError:
+        except (ValueError, AttributeError):
             gui_min_pilots = 1
         if alert.pilots_on_field < gui_min_pilots and not alert.capitals_involved:
             return  # Below GUI min pilot threshold
 
-        # All K-Space vs filtered mode
-        if not self._zkill_watch_all_var.get():
-            # Filtered mode: independent region + affiliation filters
-            active_regions, active_alliances = self._get_active_zkill_filters()
-            watch_systems = set(self.config.get("zkillboard", {}).get("watch_systems", []))
+        # (b) Criteria gate — location + parties combined per config["combine"].
+        if not intel_filter.matches(
+            alert.system_id,
+            alert.region_id,
+            alert.alliances_involved,
+            alert.corps_involved,
+            self.config.get("intel_filter", {}),
+            self.config.get("coalitions", {}),
+        ):
+            return  # Does not match the configured location/parties criteria
 
-            # Explicitly watched systems always pass
-            if watch_systems and alert.system_id in watch_systems:
-                pass
-            else:
-                # Independent logic: show if region matches OR alliance matches
-                region_ok = alert.region_id in active_regions if active_regions else False
-                alliance_ok = bool(alert.alliances_involved & active_alliances) if active_alliances else False
-
-                if not region_ok and not alliance_ok:
-                    return  # Matches neither filter
-
-        # Proximity filter
+        # (c) Max-jumps gate — drop if route distance exceeds the limit.
         try:
             max_jumps = int(self._zkill_max_jumps_var.get())
-        except ValueError:
+        except (ValueError, AttributeError):
             max_jumps = 0
         if max_jumps > 0 and alert.route_from_staging:
             import re

@@ -9,7 +9,7 @@ R2Z2 docs: https://github.com/zKillboard/zKillboard/wiki/API-(R2Z2)
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -115,6 +115,7 @@ class KillAlert:
     top_alliances: list[tuple[str, int]] | None = None  # Top 3 alliances by pilot count [(name, count)]
     route_from_staging: str = ""
     is_update: bool = False  # True if this is an update to an existing fight
+    corps_involved: set[int] = field(default_factory=set)  # Corporation IDs in the fight
 
 
 # Alliance IDs considered "friendly" for capital filtering
@@ -158,6 +159,7 @@ class EngagementTracker:
         # Count unique pilots involved across all kills in this system
         pilots = set()
         alliances = set()
+        corps = set()
         alliance_pilots: dict[int, set[int]] = {}  # alliance_id -> set of character_ids
         total_value = 0.0
         total_caps = 0
@@ -192,6 +194,8 @@ class EngagementTracker:
                     alliance_pilots.setdefault(victim["alliance_id"], set()).add(victim["character_id"])
             if victim.get("alliance_id"):
                 alliances.add(victim["alliance_id"])
+            if victim.get("corporation_id"):
+                corps.add(victim["corporation_id"])
             _count_capital(
                 victim.get("ship_type_id", 0),
                 victim.get("character_id", 0),
@@ -205,6 +209,8 @@ class EngagementTracker:
                         alliance_pilots.setdefault(attacker["alliance_id"], set()).add(attacker["character_id"])
                 if attacker.get("alliance_id"):
                     alliances.add(attacker["alliance_id"])
+                if attacker.get("corporation_id"):
+                    corps.add(attacker["corporation_id"])
                 _count_capital(
                     attacker.get("ship_type_id", 0),
                     attacker.get("character_id", 0),
@@ -247,6 +253,7 @@ class EngagementTracker:
                 kill_count=len(self._kills[system_id]),
                 total_value_millions=round(total_value, 1),
                 alliances_involved=alliances,
+                corps_involved=corps,
                 timestamp=now,
                 zkill_url=f"https://zkillboard.com/system/{system_id}/",
                 pilots_on_field=len(pilots),
