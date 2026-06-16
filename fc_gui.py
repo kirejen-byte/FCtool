@@ -14,7 +14,7 @@ import time
 import tkinter as tk
 import webbrowser
 import requests
-from tkinter import ttk, scrolledtext, messagebox, filedialog
+from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
 from datetime import datetime, timedelta
 
 # Platform-specific sound support
@@ -78,6 +78,7 @@ import fit_models
 import fit_parser
 import fit_dna
 import pyfa_import
+import motd_builder
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -6357,14 +6358,787 @@ class FCToolGUI:
         self.root.wait_window(win)
         return result["value"]
 
+    # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
+
+    # Tags pre-checked by default on a fresh MOTD (the common doctrine roles).
+    _MOTD_DEFAULT_TAGS = ("DPS", "Logistics", "Links")
+    # Debounce window (ms) for live preview rebuilds while typing/toggling.
+    _MOTD_PREVIEW_DEBOUNCE_MS = 250
+    # Per-attribute soft limit for a single <url=fitting:...> link (spec §3.5,
+    # medium confidence). We warn, never block, when a link's DNA blows past it.
+    _MOTD_LINK_ATTR_WARN = 128
+    # "(leave blank)" sentinel shown in the FC/Anchor dropdown.
+    _MOTD_FC_BLANK = "(leave blank)"
+
     def _build_motd_subtab(self):
-        """Placeholder. Phase 7 (Tasks 7.1-7.3) replaces this with the MOTD
-        builder inputs, live preview, length meter and set/copy/import."""
+        """MOTD writer: compose a fleet MOTD from a doctrine (FC link, doctrine
+        name, role-grouped clickable fit links, optional logi channel + free
+        header/footer), preview it live with a length-budget meter, and either
+        set it on the active character's fleet (boss-only) or copy the markup.
+        Also imports an existing fleet MOTD back into the tool.
+
+        Tasks 7.1 (inputs + channel picker), 7.2 (preview/meter/set/copy) and
+        7.3 (import current MOTD + save/restore template)."""
         tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
         self._fitting_subnb.add(tab, text="  MOTD  ")
-        tk.Label(tab, text="MOTD writer — coming soon",
-                 font=("Consolas", 12, "bold"), fg=FG_DIM, bg=BG_DARK
-                 ).pack(expand=True)
+
+        # Per-tag include vars, keyed by tag name (rebuilt on doctrine change).
+        self._motd_tag_vars: dict[str, tk.BooleanVar] = {}
+        self._motd_preview_job = None        # pending root.after debounce id
+        self._motd_set_btn = None
+        self._motd_fleet_id = None           # resolved active-FC fleet id
+        self._motd_is_boss = False
+
+        # ── Master split: inputs (left) | preview (right) ────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        body.columnconfigure(0, weight=2, uniform="motd")
+        body.columnconfigure(1, weight=3, uniform="motd")
+        body.rowconfigure(0, weight=1)
+
+        # Left: scrollable inputs panel.
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        in_canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0)
+        in_canvas.grid(row=0, column=0, sticky="nsew")
+        in_sb = ttk.Scrollbar(left, orient="vertical", command=in_canvas.yview)
+        in_sb.grid(row=0, column=1, sticky="ns")
+        in_canvas.configure(yscrollcommand=in_sb.set)
+        self._register_scroll_canvas(in_canvas)
+
+        inputs = tk.Frame(in_canvas, bg=BG_PANEL)
+        _in_win = in_canvas.create_window((0, 0), window=inputs, anchor="nw")
+        inputs.bind("<Configure>",
+                    lambda e: in_canvas.configure(
+                        scrollregion=in_canvas.bbox("all")))
+        in_canvas.bind("<Configure>",
+                       lambda e: in_canvas.itemconfig(_in_win, width=e.width))
+
+        def _lbl(parent, text):
+            return tk.Label(parent, text=text, font=("Consolas", 9, "bold"),
+                            fg=FG_ACCENT, bg=BG_PANEL)
+
+        # Doctrine dropdown.
+        _lbl(inputs, "DOCTRINE").pack(anchor=tk.W, padx=8, pady=(8, 2))
+        self._motd_doctrine_var = tk.StringVar()
+        self._motd_doctrine_combo = ttk.Combobox(
+            inputs, textvariable=self._motd_doctrine_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_doctrine_combo.pack(fill=tk.X, padx=8)
+        self._motd_doctrine_combo.bind(
+            "<<ComboboxSelected>>", self._motd_on_doctrine_change)
+
+        # FC / Anchor dropdown.
+        _lbl(inputs, "FC / ANCHOR").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_fc_var = tk.StringVar()
+        self._motd_fc_combo = ttk.Combobox(
+            inputs, textvariable=self._motd_fc_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_fc_combo.pack(fill=tk.X, padx=8)
+        self._motd_fc_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_motd_fc_change())
+
+        # Logi / cap channel: AutocompleteEntry + Scan.
+        _lbl(inputs, "LOGI / CAP CHANNEL").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        ch_row = tk.Frame(inputs, bg=BG_PANEL)
+        ch_row.pack(fill=tk.X, padx=8)
+        self._motd_channel_entry = AutocompleteEntry(
+            ch_row, list(getattr(self, "_intel_channel_suggestions", []) or []),
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, width=22,
+            borderwidth=1, relief=tk.RIDGE)
+        self._motd_channel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # add="+" so we don't clobber AutocompleteEntry's own <KeyRelease>.
+        self._motd_channel_entry.bind(
+            "<KeyRelease>", lambda e: self._schedule_motd_preview(), add="+")
+        ttk.Button(ch_row, text="Scan", style="Dark.TButton", width=6,
+                   command=self._motd_scan_channels).pack(side=tk.LEFT, padx=(5, 0))
+        self._motd_channel_status = tk.Label(
+            inputs, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
+        self._motd_channel_status.pack(anchor=tk.W, padx=8)
+
+        # Per-tag include checkboxes (rebuilt per doctrine).
+        _lbl(inputs, "INCLUDE TAGS").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_tag_frame = tk.Frame(inputs, bg=BG_PANEL)
+        self._motd_tag_frame.pack(fill=tk.X, padx=8)
+
+        # Header / footer free text.
+        _lbl(inputs, "HEADER").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_header_var = tk.StringVar()
+        tk.Entry(inputs, textvariable=self._motd_header_var,
+                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
+                 ).pack(fill=tk.X, padx=8)
+        self._motd_header_var.trace_add(
+            "write", lambda *a: self._schedule_motd_preview())
+
+        _lbl(inputs, "FOOTER").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_footer_var = tk.StringVar()
+        tk.Entry(inputs, textvariable=self._motd_footer_var,
+                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
+                 ).pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._motd_footer_var.trace_add(
+            "write", lambda *a: self._schedule_motd_preview())
+
+        # Template save/restore (Task 7.3 Step 2).
+        tmpl_row = tk.Frame(inputs, bg=BG_PANEL)
+        tmpl_row.pack(fill=tk.X, padx=8, pady=(10, 8))
+        ttk.Button(tmpl_row, text="Save template", style="Dark.TButton",
+                   command=self._save_motd_template).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tmpl_row, text="Import current MOTD", style="Dark.TButton",
+                   command=self._import_current_motd).pack(side=tk.LEFT, padx=2)
+
+        # Right: preview + meter + actions.
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        tk.Label(right, text="PREVIEW (raw markup)", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=8, pady=(8, 2))
+
+        self._motd_preview = scrolledtext.ScrolledText(
+            right, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=12,
+            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
+        self._motd_preview.grid(row=1, column=0, sticky="nsew", padx=8)
+        self._theme_scrolledtext_bar(self._motd_preview)
+
+        # Length meter: a colored bar + numeric label.
+        meter_wrap = tk.Frame(right, bg=BG_PANEL)
+        meter_wrap.grid(row=2, column=0, sticky="ew", padx=8, pady=(6, 0))
+        meter_wrap.columnconfigure(0, weight=1)
+        self._motd_meter_canvas = tk.Canvas(
+            meter_wrap, height=14, bg=BG_ENTRY, highlightthickness=1,
+            highlightbackground=BORDER_COLOR)
+        self._motd_meter_canvas.grid(row=0, column=0, sticky="ew")
+        self._motd_meter_label = tk.Label(
+            meter_wrap, text="0 / 3000", font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_PANEL, width=14, anchor=tk.E)
+        self._motd_meter_label.grid(row=0, column=1, padx=(6, 0))
+
+        # Non-blocking warnings (over-budget / long link attribute).
+        self._motd_warn_label = tk.Label(
+            right, text="", font=("Consolas", 8), fg=FG_YELLOW, bg=BG_PANEL,
+            anchor=tk.W, justify=tk.LEFT, wraplength=380)
+        self._motd_warn_label.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 0))
+
+        # Actions: Set as fleet MOTD (boss-gated) + Copy.
+        act_row = tk.Frame(right, bg=BG_PANEL)
+        act_row.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+        self._motd_set_btn = ttk.Button(
+            act_row, text="Set as fleet MOTD", style="Green.TButton",
+            command=self._set_fleet_motd, state=tk.DISABLED)
+        self._motd_set_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(act_row, text="Copy markup", style="Dark.TButton",
+                   command=self._copy_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
+                   command=self._motd_refresh_fleet_status).pack(
+                       side=tk.LEFT, padx=2)
+        self._motd_fleet_status = tk.Label(
+            right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+            anchor=tk.W, justify=tk.LEFT, wraplength=380)
+        self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
+                                     pady=(0, 8))
+
+        # Populate dropdowns + restore the saved template, then first preview.
+        self._motd_refresh_doctrines()
+        self._motd_refresh_fc_choices()
+        self._motd_restore_template()
+        self._motd_rebuild_tag_checkboxes()
+        self._rebuild_motd_preview()
+
+    # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
+
+    def _motd_refresh_doctrines(self):
+        """Fill the doctrine dropdown from the library, preserving selection."""
+        combo = getattr(self, "_motd_doctrine_combo", None)
+        if combo is None:
+            return
+        names = sorted((d.name or "") for d in self.fittings.list_doctrines())
+        combo["values"] = names
+        cur = self._motd_doctrine_var.get()
+        if cur not in names:
+            self._motd_doctrine_var.set(names[0] if names else "")
+
+    def _motd_refresh_fc_choices(self):
+        """Fill the FC/Anchor dropdown with authed characters + '(leave blank)'.
+
+        Default is the primary character (``self.esi_auth``); the blank option
+        omits the FC line entirely from the MOTD."""
+        combo = getattr(self, "_motd_fc_combo", None)
+        if combo is None:
+            return
+        names = [a.character_name or "Unknown" for a in self.esi_accounts]
+        values = names + [self._MOTD_FC_BLANK]
+        combo["values"] = values
+        cur = self._motd_fc_var.get()
+        if cur not in values:
+            default = None
+            if self.esi_auth is not None:
+                default = self.esi_auth.character_name
+            self._motd_fc_var.set(default or (names[0] if names else
+                                              self._MOTD_FC_BLANK))
+
+    def _motd_selected_doctrine(self):
+        """Return the Doctrine matching the dropdown name, or None."""
+        name = self._motd_doctrine_var.get()
+        if not name:
+            return None
+        for d in self.fittings.list_doctrines():
+            if (d.name or "") == name:
+                return d
+        return None
+
+    def _motd_selected_fc_auth(self):
+        """Return the ESIAuth for the FC dropdown selection, or None if blank
+        / no match (used both for the FC link identity and fleet resolution)."""
+        name = self._motd_fc_var.get()
+        if not name or name == self._MOTD_FC_BLANK:
+            return None
+        for a in self.esi_accounts:
+            if (a.character_name or "Unknown") == name:
+                return a
+        return None
+
+    def _motd_on_doctrine_change(self, event=None):
+        """Doctrine changed: rebuild the per-tag checkboxes from its tags and
+        refresh the preview."""
+        self._motd_rebuild_tag_checkboxes()
+        self._rebuild_motd_preview()
+
+    def _on_motd_fc_change(self):
+        """FC changed: re-resolve fleet/boss status (changes which fleet the
+        Set button targets) and refresh the preview's FC line."""
+        self._motd_refresh_fleet_status()
+        self._schedule_motd_preview()
+
+    def _motd_rebuild_tag_checkboxes(self):
+        """Rebuild the include-tag checkboxes from the selected doctrine's tags.
+
+        Tags present on the doctrine's members (in canonical order, then any
+        extras) each get a checkbox; DPS/Logistics/Links default checked. Prior
+        check states are preserved across rebuilds for tags that persist."""
+        frame = getattr(self, "_motd_tag_frame", None)
+        if frame is None:
+            return
+        prev = {t: v.get() for t, v in self._motd_tag_vars.items()}
+        for child in frame.winfo_children():
+            child.destroy()
+        self._motd_tag_vars = {}
+
+        doctrine = self._motd_selected_doctrine()
+        tags: list[str] = []
+        if doctrine is not None:
+            present = set()
+            for mem in doctrine.members:
+                present.update(mem.tags or [])
+            for t in self._DOCTRINE_TAG_ORDER:
+                if t in present:
+                    tags.append(t)
+            for t in sorted(present):
+                if t not in tags:
+                    tags.append(t)
+
+        if not tags:
+            tk.Label(frame, text="(no tagged fits in this doctrine)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                         anchor=tk.W)
+            return
+
+        # A one-shot saved-template tag set (from _motd_restore_template) wins on
+        # the first build; thereafter we preserve the live check state (prev),
+        # falling back to the default-on roles for newly-appearing tags.
+        tmpl_tags = getattr(self, "_motd_template_tags", None)
+        self._motd_template_tags = None      # consume — only applies once
+
+        for t in tags:
+            if tmpl_tags is not None:
+                default = t in tmpl_tags
+            elif t in prev:
+                default = prev[t]
+            else:
+                default = t in self._MOTD_DEFAULT_TAGS
+            var = tk.BooleanVar(value=default)
+            self._motd_tag_vars[t] = var
+            cb = tk.Checkbutton(
+                frame, text=t, variable=var, font=("Consolas", 10),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                anchor=tk.W, command=self._schedule_motd_preview)
+            cb.pack(anchor=tk.W)
+
+    def _motd_scan_channels(self):
+        """Discover chat channels (off the Tk thread) to seed the channel
+        AutocompleteEntry, mirroring :meth:`_scan_intel_channels`.
+
+        discover_channels() does directory + header I/O, so it runs on a worker
+        thread; the resulting names are applied back on the Tk main thread."""
+        try:
+            logs_path = resolve_eve_logs_path(
+                self.config.get("eve_logs_path", ""))
+        except Exception:
+            logs_path = self.config.get("eve_logs_path", "")
+        if not logs_path or not os.path.isdir(logs_path):
+            self._motd_channel_status.config(
+                text="Set a valid EVE Chat Logs path first (Settings)",
+                fg=FG_ORANGE)
+            return
+        self._motd_channel_status.config(text="Scanning...", fg=FG_ACCENT)
+
+        def worker():
+            try:
+                found = discover_channels(logs_path, tracked_character=None,
+                                          max_age_days=30)
+                names = [d["name"] for d in found]
+            except Exception:
+                names = []
+            self.root.after(0, self._apply_motd_scanned_channels, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_motd_scanned_channels(self, names):
+        """Apply channel-scan results on the Tk thread: update the entry's
+        completion pool and the status line."""
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None:
+            try:
+                entry.update_completions(list(names))
+            except Exception:
+                pass
+        self._motd_channel_status.config(
+            text=f"Found {len(names)} channel(s)", fg=FG_GREEN)
+
+    # ── MOTD: live preview + length meter (Task 7.2) ──────────────────────────
+
+    def _schedule_motd_preview(self, *args):
+        """Debounce a preview rebuild via root.after (coalesces rapid edits)."""
+        job = getattr(self, "_motd_preview_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._motd_preview_job = self.root.after(
+            self._MOTD_PREVIEW_DEBOUNCE_MS, self._rebuild_motd_preview)
+
+    def _motd_build_fits_by_tag(self, doctrine):
+        """Assemble ``{tag: [(dna, name), ...]}`` for the checked tags of a
+        doctrine. A fit appears under each checked tag it carries; fits with no
+        DNA are skipped (can't be linked). Pure assembly — no business logic."""
+        fits_by_tag: dict[str, list[tuple[str, str]]] = {}
+        if doctrine is None:
+            return fits_by_tag
+        checked = {t for t, v in self._motd_tag_vars.items() if v.get()}
+        for mem in doctrine.members:
+            fit = self.fittings.get_fit(mem.fit_id)
+            if fit is None or not fit.dna:
+                continue
+            for tag in (mem.tags or []):
+                if tag not in checked:
+                    continue
+                fits_by_tag.setdefault(tag, []).append((fit.dna, fit.name))
+        return fits_by_tag
+
+    def _current_motd_markup(self):
+        """Build the MOTD markup string from the current input selections."""
+        doctrine = self._motd_selected_doctrine()
+        fits_by_tag = self._motd_build_fits_by_tag(doctrine)
+
+        fc_auth = self._motd_selected_fc_auth()
+        fc_name = fc_auth.character_name if fc_auth else None
+        fc_cid = fc_auth.character_id if fc_auth else None
+
+        channel = (self._motd_channel_entry.get().strip()
+                   if getattr(self, "_motd_channel_entry", None) else "")
+        return motd_builder.build_motd(
+            fc_name=fc_name,
+            fc_character_id=fc_cid,
+            doctrine_name=(doctrine.name if doctrine else ""),
+            fits_by_tag=fits_by_tag,
+            channel=channel or None,
+            header=self._motd_header_var.get(),
+            footer=self._motd_footer_var.get(),
+        )
+
+    def _motd_budget(self) -> int:
+        """The configured raw-markup MOTD ceiling (defaults to ~3000)."""
+        try:
+            val = int(self.config.get("fittings", {}).get(
+                "motd_budget", motd_builder.MOTD_BUDGET_DEFAULT))
+            return val if val > 0 else motd_builder.MOTD_BUDGET_DEFAULT
+        except (TypeError, ValueError):
+            return motd_builder.MOTD_BUDGET_DEFAULT
+
+    def _rebuild_motd_preview(self):
+        """Rebuild the preview Text, the length meter, and the warnings line.
+
+        Meter color: green < 80% of budget, yellow < 100%, red >= 100%. Warns
+        (non-blocking) if any single ``<url=fitting:...>`` attribute exceeds
+        ``_MOTD_LINK_ATTR_WARN`` chars (spec §3.5)."""
+        self._motd_preview_job = None
+        preview = getattr(self, "_motd_preview", None)
+        if preview is None:
+            return
+
+        markup = self._current_motd_markup()
+
+        preview.config(state=tk.NORMAL)
+        preview.delete("1.0", tk.END)
+        preview.insert("1.0", markup)
+        preview.config(state=tk.DISABLED)
+
+        length = motd_builder.estimate_length(markup)
+        budget = self._motd_budget()
+        frac = (length / budget) if budget else 0.0
+        if frac < 0.8:
+            color = FG_GREEN
+        elif frac < 1.0:
+            color = FG_YELLOW
+        else:
+            color = FG_RED
+
+        canvas = self._motd_meter_canvas
+        canvas.delete("all")
+        try:
+            w = canvas.winfo_width() or 1
+        except Exception:
+            w = 1
+        fill_w = int(min(frac, 1.0) * w)
+        if fill_w > 0:
+            canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
+        self._motd_meter_label.config(
+            text=f"{length} / {budget}", fg=color)
+
+        # Non-blocking warnings.
+        warns = []
+        if length >= budget:
+            warns.append(f"Over budget by {length - budget} chars — the server "
+                         f"may truncate this MOTD.")
+        long_links = [
+            m.group("dna")
+            for m in motd_builder._FITTING_RE.finditer(markup)
+            if len(m.group("dna")) > self._MOTD_LINK_ATTR_WARN
+        ]
+        if long_links:
+            warns.append(
+                f"{len(long_links)} fit link(s) exceed "
+                f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
+                f"not render in-game.")
+        self._motd_warn_label.config(text="  ".join(warns))
+
+    # ── MOTD: fleet resolution + set/copy (Task 7.2) ──────────────────────────
+
+    def _motd_refresh_fleet_status(self):
+        """Resolve the active FC character's current fleet + boss flag off the
+        Tk thread (reuses ESIAuth.get_fleet_info / is_boss) and update the Set
+        button + status line on the Tk thread."""
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            self._motd_fleet_id = None
+            self._motd_is_boss = False
+            self._apply_motd_fleet_status(
+                None, False, "No authenticated FC character selected.")
+            return
+        self._motd_fleet_status.config(text="Checking fleet...", fg=FG_ACCENT)
+
+        def worker():
+            fleet_id = None
+            is_boss = False
+            msg = "Not in a fleet."
+            try:
+                info = auth.get_fleet_info()
+                if info:
+                    fleet_id = info.get("fleet_id")
+                    is_boss = auth.is_boss(info, auth.character_id)
+                    msg = ("You are the fleet boss — Set is enabled."
+                           if is_boss else
+                           "In a fleet but not the boss — only the boss can "
+                           "set the MOTD.")
+            except Exception as e:
+                msg = f"Could not read fleet status: {e}"
+            self.root.after(0, self._apply_motd_fleet_status,
+                            fleet_id, is_boss, msg)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_motd_fleet_status(self, fleet_id, is_boss, msg):
+        """Apply fleet-resolution results on the Tk thread: store fleet/boss and
+        enable the Set button only when the selected FC is the fleet boss."""
+        self._motd_fleet_id = fleet_id
+        self._motd_is_boss = bool(is_boss)
+        btn = getattr(self, "_motd_set_btn", None)
+        if btn is not None:
+            btn.config(state=(tk.NORMAL if self._motd_is_boss else tk.DISABLED))
+        color = FG_GREEN if is_boss else (FG_YELLOW if fleet_id else FG_DIM)
+        self._motd_fleet_status.config(text=msg, fg=color)
+
+    def _set_fleet_motd(self):
+        """Write the composed MOTD to the active FC's fleet (boss-only).
+
+        Gated on the resolved boss flag; if the markup is over budget, confirms
+        first. The PUT runs on a daemon thread; 204 -> success, anything else ->
+        an error (403 not-boss / over-length truncation surfaced)."""
+        if not self._motd_is_boss or not self._motd_fleet_id:
+            messagebox.showwarning(
+                "Cannot set MOTD",
+                "The selected FC character must be the current fleet boss. "
+                "Use 'Refresh fleet' after forming/joining a fleet.")
+            return
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Cannot set MOTD",
+                                   "No authenticated FC character selected.")
+            return
+
+        markup = self._current_motd_markup()
+        length = motd_builder.estimate_length(markup)
+        budget = self._motd_budget()
+        if length >= budget:
+            if not messagebox.askyesno(
+                    "Over budget",
+                    f"This MOTD is {length} chars (budget {budget}). The "
+                    f"server may truncate it. Set it anyway?"):
+                return
+
+        fleet_id = self._motd_fleet_id
+        self._motd_fleet_status.config(text="Setting MOTD...", fg=FG_ACCENT)
+
+        def worker():
+            ok = False
+            err = None
+            try:
+                ok = auth.set_fleet_motd(fleet_id, markup)
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _done, ok, err)
+
+        def _done(ok, err):
+            if ok:
+                self._motd_fleet_status.config(
+                    text="MOTD set successfully (204).", fg=FG_GREEN)
+            else:
+                detail = (f"\n\n{err}" if err else
+                          "\n\nESI rejected the request (403 if you are no "
+                          "longer the boss, or the MOTD was too long).")
+                self._motd_fleet_status.config(
+                    text="Failed to set MOTD.", fg=FG_RED)
+                messagebox.showerror("Set MOTD failed",
+                                     f"Could not set the fleet MOTD.{detail}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _copy_motd(self):
+        """Copy the raw MOTD markup to the clipboard (manual-paste fallback)."""
+        markup = self._current_motd_markup()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(markup)
+            self._motd_fleet_status.config(
+                text="Markup copied to clipboard.", fg=FG_GREEN)
+        except Exception as e:
+            messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}")
+
+    # ── MOTD: import current MOTD + template persistence (Task 7.3) ────────────
+
+    def _import_current_motd(self):
+        """Load the active FC's current fleet MOTD, parse it, and offer to import
+        any embedded fit DNAs into the library + save the raw MOTD as a named
+        template snapshot.
+
+        Reads ``get_fleet(fleet_id)['motd']`` on a daemon thread (reusing the
+        get_fleet_info fleet path), then parses with motd_builder.parse_motd."""
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Import MOTD",
+                                   "No authenticated FC character selected.")
+            return
+        self._motd_fleet_status.config(text="Loading current MOTD...",
+                                       fg=FG_ACCENT)
+
+        def worker():
+            raw = None
+            err = None
+            try:
+                info = auth.get_fleet_info()
+                fleet_id = info.get("fleet_id") if info else None
+                if not fleet_id:
+                    err = "The selected FC character is not in a fleet."
+                else:
+                    fleet = auth.get_fleet(fleet_id)
+                    if not isinstance(fleet, dict):
+                        err = ("Could not read the fleet (only the fleet boss "
+                               "may read the MOTD).")
+                    else:
+                        raw = fleet.get("motd", "") or ""
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, self._apply_imported_motd, raw, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_imported_motd(self, raw, err):
+        """Tk-thread handler for an imported MOTD: show it, offer fit import,
+        and save it as a named template snapshot."""
+        if err is not None or raw is None:
+            self._motd_fleet_status.config(text="Import failed.", fg=FG_RED)
+            messagebox.showerror("Import MOTD",
+                                 err or "Could not load the current MOTD.")
+            return
+
+        parsed = motd_builder.parse_motd(raw)
+        self._motd_fleet_status.config(
+            text=f"Imported MOTD ({len(raw)} chars, "
+                 f"{len(parsed['fittings'])} fit link(s)).", fg=FG_GREEN)
+
+        # Show the raw markup in the preview, and offer to load it as a header.
+        preview = getattr(self, "_motd_preview", None)
+        if preview is not None:
+            preview.config(state=tk.NORMAL)
+            preview.delete("1.0", tk.END)
+            preview.insert("1.0", raw)
+            preview.config(state=tk.DISABLED)
+        if raw and messagebox.askyesno(
+                "Imported MOTD",
+                "Load the imported MOTD text into the Header field "
+                "(so you can re-use it as a starting point)?"):
+            self._motd_header_var.set(raw)
+
+        # Offer to import each embedded fit DNA into the library (de-duped).
+        fittings = parsed.get("fittings") or []
+        if fittings and messagebox.askyesno(
+                "Import fits",
+                f"Import {len(fittings)} fit link(s) from this MOTD into the "
+                f"library? Duplicates are skipped automatically."):
+            added, reused, failed = self._import_motd_fits(fittings)
+            messagebox.showinfo(
+                "Fit import",
+                f"Imported {added} new fit(s); {reused} already in the "
+                f"library; {failed} could not be parsed.")
+
+        # Save the raw MOTD as a named template snapshot.
+        if raw:
+            name = simpledialog.askstring(
+                "Save MOTD snapshot",
+                "Name this imported MOTD snapshot (blank to skip):",
+                parent=self.root)
+            if name and name.strip():
+                self._save_motd_snapshot(name.strip(), raw)
+
+    def _import_motd_fits(self, fittings):
+        """Import a list of ``{dna, name}`` dicts into the library, de-duped by
+        content hash (reusing the Phase-5 ``_add_parsed_fit`` path). Returns
+        ``(added, reused, failed)`` counts. Runs on the Tk thread."""
+        added = reused = failed = 0
+        existing_hashes = {}
+        for f in self.fittings.list_fits():
+            try:
+                existing_hashes[fit_models.fit_content_hash(f.parsed)] = f.id
+            except Exception:
+                pass
+        for entry in fittings:
+            dna = entry.get("dna", "")
+            name = entry.get("name") or "Imported Fit"
+            if not dna:
+                failed += 1
+                continue
+            try:
+                result = fit_parser.parse_dna(dna, self.type_catalog)
+                parsed = result.fit
+                h = fit_models.fit_content_hash(parsed)
+            except Exception:
+                failed += 1
+                continue
+            if h in existing_hashes:
+                reused += 1
+                continue
+            fid = self._add_parsed_fit(parsed, source="dna", raw_text=dna,
+                                       name=name)
+            if fid:
+                existing_hashes[h] = fid
+                added += 1
+            else:
+                failed += 1
+        if added:
+            # Refresh doctrine dropdown is unaffected, but new fits may change
+            # the library view; the fittings sub-tab refreshes itself.
+            self._motd_refresh_doctrines()
+        return added, reused, failed
+
+    def _save_motd_snapshot(self, name, raw):
+        """Persist a raw MOTD under config['fittings']['motd_template']['saved']."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        tmpl = fit_cfg.setdefault("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+            fit_cfg["motd_template"] = tmpl
+        saved = tmpl.setdefault("saved", {})
+        if not isinstance(saved, dict):
+            saved = {}
+            tmpl["saved"] = saved
+        saved[name] = raw
+        self._save_config()
+        self._motd_fleet_status.config(
+            text=f"Saved snapshot '{name}'.", fg=FG_GREEN)
+
+    def _save_motd_template(self):
+        """Persist the current field selections (checked tags, header/footer,
+        channel, doctrine, FC) to config['fittings']['motd_template'] so they
+        restore on next open."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        tmpl = fit_cfg.setdefault("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+            fit_cfg["motd_template"] = tmpl
+        tmpl["tags"] = [t for t, v in self._motd_tag_vars.items() if v.get()]
+        tmpl["header"] = self._motd_header_var.get()
+        tmpl["footer"] = self._motd_footer_var.get()
+        tmpl["channel"] = (self._motd_channel_entry.get().strip()
+                           if getattr(self, "_motd_channel_entry", None) else "")
+        tmpl["doctrine"] = self._motd_doctrine_var.get()
+        tmpl["fc"] = self._motd_fc_var.get()
+        # Persist the chosen channel to the dedicated config key too.
+        fit_cfg["logi_channel"] = tmpl["channel"]
+        self._save_config()
+        self._motd_fleet_status.config(text="Template saved.", fg=FG_GREEN)
+
+    def _motd_restore_template(self):
+        """Restore saved field selections from config['fittings']['motd_template']
+        (called once while building the sub-tab, before the first preview).
+
+        Tag selections are applied later in _motd_rebuild_tag_checkboxes via the
+        persisted set; here we restore the scalar fields and seed the channel
+        from the dedicated logi_channel key when no template channel exists."""
+        fit_cfg = self.config.get("fittings", {})
+        tmpl = fit_cfg.get("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+
+        doctrine = tmpl.get("doctrine")
+        if doctrine and doctrine in (self._motd_doctrine_combo["values"] or ()):
+            self._motd_doctrine_var.set(doctrine)
+        fc = tmpl.get("fc")
+        if fc and fc in (self._motd_fc_combo["values"] or ()):
+            self._motd_fc_var.set(fc)
+        self._motd_header_var.set(tmpl.get("header", "") or "")
+        self._motd_footer_var.set(tmpl.get("footer", "") or "")
+
+        channel = tmpl.get("channel") or fit_cfg.get("logi_channel", "") or ""
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None and channel:
+            entry.delete(0, tk.END)
+            entry.insert(0, channel)
+
+        # Remember which tags the template wants checked; consumed by the
+        # tag-checkbox builder (which only knows the doctrine's actual tags).
+        self._motd_template_tags = tmpl.get("tags")
 
     # ── Fittings library sub-tab (Task 5.2) ───────────────────────────────────
 
