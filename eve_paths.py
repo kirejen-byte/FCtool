@@ -28,9 +28,9 @@ _EVE_LOGS_SUBPATH = ("EVE", "logs", "Chatlogs")
 def _looks_like_placeholder(value: str) -> bool:
     """Return True if ``value`` is whitespace-only or a known placeholder.
 
-    The shipped ``config.example.json`` uses ``.../YOUR_USER/...`` as a stand-in
-    for the real user folder; treat any occurrence of "YOUR_USER" (in any case)
-    as not-a-real-setting.
+    Older configs (and copy-paste setups) sometimes carry a ``.../YOUR_USER/...``
+    stand-in for the real user folder; treat any occurrence of "YOUR_USER" (in
+    any case) as not-a-real-setting so auto-detection kicks in.
     """
     if not value or not value.strip():
         return True

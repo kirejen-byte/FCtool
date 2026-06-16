@@ -32,8 +32,7 @@ Requires **Python 3.11+** (3.13 recommended) on Windows.
 git clone https://github.com/kirejen-byte/FCtool.git
 cd FCtool
 pip install -r requirements.txt
-copy config.example.json config.json   # Client ID pre-set; EVE logs folder auto-detected
-python fc_gui.py              # run from source
+python fc_gui.py             # runs out of the box: built-in Client ID, logs auto-detected
 python -m pytest -q          # run the test suite
 ```
 

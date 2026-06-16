@@ -63,6 +63,7 @@ from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker, DeathEvent
 from cyno_check import analyze_character as cyno_analyze_character
 from eve_paths import resolve_eve_logs_path
+from default_config import DEFAULT_CONFIG
 import tts_helper
 from app_path import app_dir
 
@@ -683,10 +684,15 @@ class FCToolGUI:
     # ── Config ────────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        cfg = {}
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r") as f:
                 cfg = json.load(f)
+        else:
+            # No config.json (e.g. a fresh source clone or first run): run on
+            # the built-in defaults so the app works out of the box — the public
+            # Client ID is baked in (PKCE, no secret). Deep-copied so the
+            # module-level default is never mutated.
+            cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         # Auto-detect the EVE chat-logs folder when it's blank or a placeholder
         # (handles OneDrive-redirected Documents). Explicit user paths are kept.
         cfg["eve_logs_path"] = resolve_eve_logs_path(cfg.get("eve_logs_path", ""))
