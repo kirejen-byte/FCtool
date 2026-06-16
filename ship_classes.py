@@ -60,21 +60,21 @@ TACKLE_GROUP_IDS = {
 # ── Hardcoded type_id sets ──────────────────────────────────────────────────
 
 COMMAND_SHIPS = {
-    22448,  # Vulture
-    24690,  # Absolution
-    22468,  # Claymore
-    22444,  # Sleipnir
-    24692,  # Damnation
-    22470,  # Nighthawk
-    24688,  # Eos
-    22466,  # Astarte
+    22448,  # Absolution  (Armor + Information)
+    22474,  # Damnation   (Armor + Information)
+    22470,  # Nighthawk   (Shield + Information)
+    22446,  # Vulture     (Shield + Information)
+    22466,  # Astarte     (Armor + Skirmish)
+    22442,  # Eos         (Armor + Skirmish)
+    22444,  # Sleipnir    (Shield + Skirmish)
+    22468,  # Claymore    (Shield + Skirmish)
 }
 
 COMMAND_DESTROYERS = {
-    37483,  # Bifrost
-    37481,  # Stork
-    37482,  # Pontifex
-    37480,  # Magus
+    37480,  # Bifrost   (Shield + Skirmish)
+    37481,  # Pontifex  (Armor + Information)
+    37482,  # Stork     (Shield + Information)
+    37483,  # Magus     (Armor + Skirmish)
 }
 
 LOGISTICS_CRUISERS = {
