@@ -22,6 +22,17 @@ _id_of_name: dict[str, int] = {}                       # lowercased name -> id
 _loaded = False
 _lock = threading.Lock()
 
+# --- Jump-drive legality (verified IDs; see plan) ----------------------------
+EXCLUDED_REGION_IDS = {
+    10000070,   # Pochven       -- jump drives can exit but not enter
+    10000004,   # UUA-F4 (Jove) -- inaccessible
+    10000017,   # J7HZ-F (Jove) -- inaccessible
+    10000019,   # A821-A (Jove) -- inaccessible
+    10001000,   # Yasna Zakh    -- Zarzakh's region; cyno beacon blocked
+}
+ZARZAKH_SYSTEM_ID = 30100000   # true-sec -1.00, so exclude by ID not security
+HIGHSEC_CUTOFF = 0.45          # true_security >= 0.45 is highsec (cyno blocked)
+
 
 def _data_path() -> str | None:
     """Prefer a writable copy next to the exe, else the bundled read-only copy."""
@@ -76,3 +87,21 @@ def resolve_name(name: str) -> int | None:
     """Exact (case-insensitive) name -> system_id, or None. No fuzzy matching."""
     _load()
     return _id_of_name.get(name.lower())
+
+
+def is_legal_jump_destination(system_id: int) -> bool:
+    """True iff a capital/JF/Black-Ops jump can land here: K-space, not Zarzakh,
+    not Pochven/Jove, and lowsec/nullsec (true-sec < 0.45). Cyno-jammers are
+    dynamic state and not considered here."""
+    _load()
+    if not (30_000_000 <= system_id <= 30_999_999):
+        return False
+    if system_id == ZARZAKH_SYSTEM_ID:
+        return False
+    region = _region_of.get(system_id)
+    if region is None or region in EXCLUDED_REGION_IDS:
+        return False
+    sec = _security_of.get(system_id)
+    if sec is None or sec >= HIGHSEC_CUTOFF:
+        return False
+    return True

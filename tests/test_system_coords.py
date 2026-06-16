@@ -57,3 +57,31 @@ def test_resolve_name_is_case_insensitive(monkeypatch, tmp_path):
     assert system_coords.resolve_name("jita") == 30000142
     assert system_coords.resolve_name("AMARR") == 30002187
     assert system_coords.resolve_name("Nowhere") is None
+
+
+LEGALITY_FIXTURE = {
+    "30000142": {"name": "Jita", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10000002, "security": 0.9459},     # highsec -> illegal
+    "30000789": {"name": "Nullhole", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10000060, "security": -0.21},      # nullsec -> legal
+    "30001161": {"name": "Lowhole", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10000040, "security": 0.31},       # lowsec -> legal
+    "30000021": {"name": "Kuharah", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10000070, "security": -0.05},      # Pochven -> illegal
+    "30100000": {"name": "Zarzakh", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10001000, "security": -1.0},       # Zarzakh -> illegal
+    "30000444": {"name": "Edgecase", "x": 0.0, "y": 0.0, "z": 0.0,
+                 "region_id": 10000050, "security": 0.45},       # 0.45 == highsec -> illegal
+}
+
+
+def test_is_legal_jump_destination(monkeypatch, tmp_path):
+    _load_fixture(monkeypatch, tmp_path, LEGALITY_FIXTURE)
+    assert system_coords.is_legal_jump_destination(30000789) is True   # nullsec
+    assert system_coords.is_legal_jump_destination(30001161) is True   # lowsec
+    assert system_coords.is_legal_jump_destination(30000142) is False  # highsec
+    assert system_coords.is_legal_jump_destination(30000021) is False  # Pochven region
+    assert system_coords.is_legal_jump_destination(30100000) is False  # Zarzakh id
+    assert system_coords.is_legal_jump_destination(30000444) is False  # 0.45 is highsec
+    assert system_coords.is_legal_jump_destination(31000001) is False  # WH id range
+    assert system_coords.is_legal_jump_destination(99999999) is False  # unknown
