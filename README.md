@@ -22,7 +22,7 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 2. Unzip it anywhere — you'll get `FCTool.exe` and `config.example.json`.
 3. Copy `config.example.json` to **`config.json`** (in the same folder as the exe) and edit:
    - **`eve_logs_path`** — your EVE chat-logs folder, e.g. `C:/Users/<you>/Documents/EVE/logs/Chatlogs`.
-   - **`esi`** — register a free application at **[developers.eveonline.com](https://developers.eveonline.com/)** with callback URL `http://localhost:8834/callback`, then paste its `client_id` and `client_secret`.
+   - **`esi`** — register a free application at **[developers.eveonline.com](https://developers.eveonline.com/)** with callback URL `http://localhost:8834/callback`. **Recommended:** choose the **native / PKCE** app type (it issues a `client_id` with no secret) — paste that `client_id` and **leave `client_secret` blank**. *(A confidential app also works: paste both its `client_id` and `client_secret`.)*
 4. Run **`FCTool.exe`** and log your character in via the in-app ESI SSO button. Set your intel channels, staging system, and filters in **Settings**.
 
 > Your `config.json` and ESI token files stay on your machine — don't share them.
@@ -50,5 +50,16 @@ pyinstaller --clean --noconfirm FCTool.spec
 ## Notes
 
 - Windows desktop app (Tkinter). Needs internet access for ESI, zKillboard, and TTS.
+- **Sharing the app:** sign-in uses PKCE, so you can hand someone `FCTool.exe` + a `config.json` containing only your **`client_id`** (with `client_secret` left blank) — there's no secret to leak. Each person signs in with their own EVE character.
 - Runtime caches (`esi_cache.json`, `systems_cache.json`, `regions_cache.json`, …) plus your `config.json` and ESI tokens are gitignored and regenerate locally on first run. The static EVE stargate graph (`stargate_jumps.json`) **is** committed so the project builds from a clean clone.
 - Built with `requests`, `pygame` (audio), and `edge-tts` (text-to-speech).
+
+### System coordinate table
+
+`system_coords.json` is a committed, bundled snapshot of New Eden system
+coordinates/names/regions/security used for instant, offline jump-range checks.
+Regenerate it after a CCP expansion that changes the universe:
+
+    py -3.13 tools/gen_system_coords.py
+
+Coordinates are static and change very rarely, so refreshes are infrequent.

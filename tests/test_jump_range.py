@@ -103,6 +103,7 @@ def test_ansiblex_shortens_route(mocker):
 
 
 def test_search_system_exact_match(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {
@@ -122,6 +123,7 @@ def test_search_system_exact_match(mocker):
 
 
 def test_search_system_ambiguous_falls_back_to_first(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {
@@ -140,6 +142,7 @@ def test_search_system_ambiguous_falls_back_to_first(mocker):
 
 
 def test_search_system_no_results(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {"systems": []}
@@ -159,3 +162,82 @@ def test_search_system_uses_cache_without_network(mocker):
     result = search_system("CachedSystem")
     assert result == 12345
     post_mock.assert_not_called()
+
+
+def test_ly_constant_matches_ccp_official_value():
+    # CCP's official in-game light year is exactly 9,460,000,000,000,000.0 m.
+    # Not the physical 9.4607e15, not the old wrong 9.4605e15.
+    assert jump_range.LY_IN_METERS == 9_460_000_000_000_000.0
+
+
+def test_calculate_ly_distance_uses_ly_constant(mocker):
+    # Two points exactly 9.46e15 m apart on the x-axis must read as 1.00 ly.
+    mocker.patch(
+        "jump_range.system_coords.get_position",
+        side_effect=lambda sid: {
+            1: {"x": 0.0, "y": 0.0, "z": 0.0},
+            2: {"x": 9.46e15, "y": 0.0, "z": 0.0},
+        }.get(sid),
+    )
+    dist = jump_range.calculate_ly_distance(1, 2)
+    assert dist == pytest.approx(1.0, abs=1e-9)
+
+
+def test_search_system_prefers_local_table_no_network(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=30000142)
+    post = mocker.patch("jump_range.requests.post")
+    assert jump_range.search_system("Jita") == 30000142
+    post.assert_not_called()  # local hit must not touch ESI
+
+
+def test_search_system_falls_back_to_esi_when_not_local(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
+    fake = mocker.MagicMock()
+    fake.ok = True
+    fake.json.return_value = {"systems": [{"id": 30009999, "name": "Weirdspace"}]}
+    mocker.patch("jump_range.requests.post", return_value=fake)
+    mocker.patch("jump_range.rate_limit")
+    jump_range._system_name_cache.pop("weirdspace", None)
+    assert jump_range.search_system("Weirdspace") == 30009999
+
+
+def test_calculate_ly_distance_falls_back_to_esi_position(mocker):
+    # Origin known locally, destination only available via ESI get_system_info.
+    mocker.patch(
+        "jump_range.system_coords.get_position",
+        side_effect=lambda sid: {"x": 0.0, "y": 0.0, "z": 0.0} if sid == 1 else None,
+    )
+    mocker.patch(
+        "jump_range.get_system_info",
+        return_value={"position": {"x": 9.46e15, "y": 0.0, "z": 0.0}},
+    )
+    assert jump_range.calculate_ly_distance(1, 2) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_check_range_can_skip_route(mocker):
+    mocker.patch("jump_range.search_system", side_effect=lambda n: {"a": 1, "b": 2}[n.lower()])
+    mocker.patch("jump_range.calculate_ly_distance", return_value=3.0)
+    mocker.patch("jump_range.system_coords.is_legal_jump_destination", return_value=True)
+    route = mocker.patch("jump_range.get_stargate_route")
+    checker = jump_range.JumpRangeChecker(ship_type="Dreadnought", jdc_level=5)
+
+    result = checker.check_range("A", "B", include_route=False)
+    assert result["in_range"] is True          # 3.0 <= 7.0
+    assert result["legal_destination"] is True
+    assert result["reachable"] is True
+    assert result["gate_jumps"] is None
+    route.assert_not_called()                  # route skipped
+
+
+def test_range_to_targets_marks_range_and_legality(mocker):
+    mocker.patch("jump_range.calculate_ly_distance",
+                 side_effect=lambda o, t: {10: 3.0, 11: 9.0, 12: None}[t])
+    mocker.patch("jump_range.system_coords.is_legal_jump_destination",
+                 side_effect=lambda sid: sid != 11)
+    checker = jump_range.JumpRangeChecker(ship_type="Dreadnought", jdc_level=5)  # 7 ly
+
+    rows = checker.range_to_targets(1, [10, 11, 12])
+    by_id = {r["system_id"]: r for r in rows}
+    assert by_id[10]["in_range"] is True and by_id[10]["legal_destination"] is True
+    assert by_id[11]["in_range"] is False and by_id[11]["legal_destination"] is False
+    assert by_id[12]["distance_ly"] is None and by_id[12]["in_range"] is False

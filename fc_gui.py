@@ -57,9 +57,11 @@ from zkill_monitor import ZKillMonitor, KillAlert
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
 from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
+import system_cache
 from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker, DeathEvent
+from cyno_check import analyze_character as cyno_analyze_character
 import tts_helper
 from app_path import app_dir
 
@@ -479,6 +481,11 @@ class FCToolGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Global mouse-wheel router: scroll whatever scrollable area is hovered.
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_global_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_global_mousewheel)
+
     # ── System Names for Autocomplete ─────────────────────────────────────────
 
     def _load_system_names_async(self):
@@ -657,13 +664,18 @@ class FCToolGUI:
             return
 
         def prewarm():
-            from jump_range import get_system_info, save_route_cache
+            from jump_range import save_route_cache
+            import system_coords
+            system_coords._load()          # load the local table once, off the UI thread
             for name in systems:
-                sid = search_system(name)
-                if sid:
-                    get_system_info(sid)
+                search_system(name)        # local-first; only ESI for unknown systems
             save_route_cache()
             print(f"[Cache] Pre-warmed {len(systems)} staging system(s)")
+            try:
+                import system_cache
+                system_cache.get_region_map()  # build/load region label map off the UI thread
+            except Exception:
+                pass
 
         threading.Thread(target=prewarm, daemon=True).start()
 
@@ -1154,13 +1166,8 @@ class FCToolGUI:
         self._role_container.grid_columnconfigure(0, weight=1, uniform="role")
         self._role_container.grid_columnconfigure(1, weight=1, uniform="role")
 
-        # Mouse wheel scrolling when hovering the role area
-        def _on_role_mousewheel(event):
-            self._role_canvas.yview_scroll(-int(event.delta / 120), "units")
-        self._role_canvas.bind("<Enter>", lambda e: self._role_canvas.bind_all(
-            "<MouseWheel>", _on_role_mousewheel))
-        self._role_canvas.bind("<Leave>", lambda e: self._role_canvas.unbind_all(
-            "<MouseWheel>"))
+        # Mouse-wheel scrolling handled by the global router (_on_global_mousewheel).
+        self._register_scroll_canvas(self._role_canvas)
 
         self._role_slots: list[dict] = []
 
@@ -1257,11 +1264,8 @@ class FCToolGUI:
         spec_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         spec_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Bind mousewheel to scroll
-        def _on_spec_mousewheel(event):
-            spec_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        spec_canvas.bind("<MouseWheel>", _on_spec_mousewheel)
-        self._spec_roles_frame.bind("<MouseWheel>", _on_spec_mousewheel)
+        # Mouse-wheel scrolling handled by the global router.
+        self._register_scroll_canvas(spec_canvas)
 
         # Note about red color
         tk.Label(self._spec_roles_frame, text="\u26a0 Red = insufficient numbers",
@@ -2714,6 +2718,9 @@ class FCToolGUI:
         self._recent_zkill_systems: dict[str, datetime] = {}
         self._recent_intel_systems: dict[str, datetime] = {}
         self._current_log = None  # Tracks active log widget for append helpers
+
+        # ── Cyno Check drawer (collapsible) ───────────────────────────────
+        self._build_cyno_check_drawer(tab)
 
         # ── Split pane: zKill (left) | Intel (right) ─────────────────────
         self._paned = tk.PanedWindow(tab, orient=tk.HORIZONTAL, bg=BG_DARK,
@@ -4240,10 +4247,8 @@ class FCToolGUI:
         # Also updates wraplength on capability labels via _on_char_canvas_resize.
         canvas.bind("<Configure>", self._on_char_canvas_resize)
 
-        # Mousewheel scrolling
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"),
-                        add="+")
+        # Mouse-wheel scrolling handled by the global router.
+        self._register_scroll_canvas(canvas)
 
         self._char_panels: list[tk.Frame] = []
         # Instance-level caches (moved from class-level; see C1 fix)
@@ -5327,6 +5332,7 @@ class FCToolGUI:
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._register_scroll_canvas(canvas)
 
         # ── EVE Logs Path ────────────────────────────────────────────────────
         self._add_section(scroll_frame, "EVE Chat Logs")
@@ -5488,6 +5494,41 @@ class FCToolGUI:
         # Region/alliance filters are now on the zKill tab inline filter panel
 
         # (Save button is at the top of the settings tab)
+
+    def _register_scroll_canvas(self, canvas):
+        """Register a scrollable canvas so the global mouse-wheel router can
+        scroll it when the pointer is over it (or any of its children)."""
+        if not hasattr(self, "_scroll_canvases"):
+            self._scroll_canvases = set()
+        self._scroll_canvases.add(canvas)
+
+    def _on_global_mousewheel(self, event):
+        """Route the wheel to the scrollable canvas under the pointer.
+
+        Tk does not auto-deliver <MouseWheel> to the hovered widget, so we find
+        it via winfo_containing and walk up to the nearest registered scroll
+        canvas. Handles Windows/Mac (event.delta) and Linux (Button-4/5)."""
+        scroll_canvases = getattr(self, "_scroll_canvases", None)
+        if not scroll_canvases:
+            return None
+        if event.num == 4:
+            amount = -1
+        elif event.num == 5:
+            amount = 1
+        else:
+            amount = -1 * int(event.delta / 120)
+            if amount == 0 and event.delta:
+                amount = -1 if event.delta > 0 else 1
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return None
+        while w is not None:
+            if w in scroll_canvases:
+                w.yview_scroll(amount, "units")
+                return "break"
+            w = getattr(w, "master", None)
+        return None
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",
@@ -7126,6 +7167,344 @@ $bmp.Dispose()
             self._paste_toggle_btn.config(text="▶ Paste Intel")
             self._paste_body.pack_forget()
 
+    # ── Cyno Check drawer ──────────────────────────────────────────────────
+
+    def _build_cyno_check_drawer(self, tab):
+        """Build the collapsible 'Cyno Check' drawer on the Intel tab.
+
+        Baseline footprint is a single header row (▶ Cyno Check); the body is
+        pack()/pack_forget()'d on toggle and starts COLLAPSED. The body holds a
+        one-line hint, a character AutocompleteEntry (debounced ESI search), a
+        Check button, a status line, and a DISABLED ScrolledText result area.
+        """
+        # Session-only state (mirrors the Paste Intel drawer pattern).
+        self._cyno_drawer_expanded = False
+        self._cyno_typeahead_after = None
+        self._cyno_name_to_id: dict[str, int] = {}  # name(lower) -> character_id
+        self._cyno_busy = False
+        self._cyno_latest_url: str | None = None
+
+        self._cyno_drawer_frame = tk.Frame(
+            tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+            highlightbackground=BORDER_COLOR, highlightthickness=1)
+        self._cyno_drawer_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        cyno_header = tk.Frame(self._cyno_drawer_frame, bg=BG_PANEL)
+        cyno_header.pack(fill=tk.X, padx=10, pady=4)
+
+        self._cyno_toggle_btn = tk.Label(
+            cyno_header, text="▶ Cyno Check",
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2",
+        )
+        self._cyno_toggle_btn.pack(side=tk.LEFT)
+        self._cyno_toggle_btn.bind(
+            "<Button-1>", lambda e: self._toggle_cyno_drawer())
+
+        # Body (hidden by default)
+        self._cyno_body = tk.Frame(self._cyno_drawer_frame, bg=BG_PANEL)
+
+        tk.Label(
+            self._cyno_body,
+            text=("Find a character's cyno-ship LOSSES over the last 6 months "
+                  "(public zKillboard data; no login required)."),
+            font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+            justify=tk.LEFT, anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(2, 4))
+
+        cyno_input_row = tk.Frame(self._cyno_body, bg=BG_PANEL)
+        cyno_input_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Label(cyno_input_row, text="Character:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._cyno_entry = AutocompleteEntry(
+            cyno_input_row, completions=[], max_shown=12,
+            font=("Consolas", 10), width=28,
+            bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+            borderwidth=1, relief=tk.RIDGE,
+        )
+        self._cyno_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Debounced ESI type-ahead (only when logged in); Return submits.
+        self._cyno_entry.bind("<KeyRelease>", self._cyno_on_typeahead, add="+")
+        self._cyno_entry.bind("<Return>", lambda e: self._cyno_submit())
+
+        self._cyno_check_btn = ttk.Button(
+            cyno_input_row, text="Check", style="Dark.TButton",
+            command=self._cyno_submit)
+        self._cyno_check_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Hint shown only when login-gated autocomplete is unavailable.
+        if not (self.esi_auth and self.esi_auth.is_authenticated):
+            tk.Label(
+                self._cyno_body,
+                text="Log in (Settings) to enable name autocomplete.",
+                font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+                justify=tk.LEFT, anchor="w",
+            ).pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._cyno_status = tk.Label(
+            self._cyno_body, text="", font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_PANEL, justify=tk.LEFT, anchor="w",
+        )
+        self._cyno_status.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._cyno_result = scrolledtext.ScrolledText(
+            self._cyno_body, height=8, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            borderwidth=1, relief=tk.RIDGE,
+        )
+        self._cyno_result.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self._theme_scrolledtext_bar(self._cyno_result)
+        # Clickable link tag for the latest-loss zKill URL.
+        self._cyno_result.tag_configure(
+            "cyno_link", foreground=FG_ACCENT, underline=True)
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Enter>",
+            lambda e: self._cyno_result.config(cursor="hand2"))
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Leave>",
+            lambda e: self._cyno_result.config(cursor=""))
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Button-1>", self._cyno_open_latest)
+
+    def _toggle_cyno_drawer(self):
+        self._cyno_drawer_expanded = not self._cyno_drawer_expanded
+        if self._cyno_drawer_expanded:
+            self._cyno_toggle_btn.config(text="▼ Cyno Check")
+            self._cyno_body.pack(fill=tk.X, padx=0, pady=0)
+        else:
+            self._cyno_toggle_btn.config(text="▶ Cyno Check")
+            self._cyno_body.pack_forget()
+
+    def _cyno_on_typeahead(self, event=None):
+        """Best-effort debounced ESI character type-ahead.
+
+        Mirrors _cm_on_typeahead: ignore nav keys, require >= 3 chars, 300ms
+        debounce. Skipped entirely when not logged in (search needs auth)."""
+        if event is not None and event.keysym in (
+                "Return", "Up", "Down", "Tab", "Escape",
+                "Shift_L", "Shift_R", "Control_L", "Control_R",
+                "Alt_L", "Alt_R"):
+            return
+        if not (self.esi_auth and self.esi_auth.is_authenticated):
+            return
+        query = self._cyno_entry.get().strip()
+        if len(query) < 3:
+            return
+        if self._cyno_typeahead_after is not None:
+            try:
+                self.root.after_cancel(self._cyno_typeahead_after)
+            except Exception:
+                pass
+        self._cyno_typeahead_after = self.root.after(
+            300, lambda: self._cyno_do_typeahead(query))
+
+    def _cyno_do_typeahead(self, query: str):
+        self._cyno_typeahead_after = None
+
+        def worker():
+            results = []
+            try:
+                if self.esi_auth:
+                    results = self.esi_auth.search_entities(query, ["character"])
+            except Exception:
+                results = []
+            names = []
+            name_map: dict[str, int] = {}
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                nm = r.get("name")
+                rid = r.get("id")
+                if nm and isinstance(rid, int):
+                    names.append(nm)
+                    name_map[nm.lower()] = rid
+            if getattr(self, "_cyno_entry", None) is not None:
+                self.root.after(0, self._cyno_apply_typeahead, names, name_map)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cyno_apply_typeahead(self, names, name_map):
+        """Marshal search results back onto the Tk thread."""
+        # Merge into the name->id map so a later submit can resolve without a
+        # second network round-trip.
+        self._cyno_name_to_id.update(name_map)
+        self._cyno_entry.update_completions(names)
+
+    def _cyno_submit(self):
+        """Resolve the typed character name -> id and kick off the analysis."""
+        if self._cyno_busy:
+            return
+        name = self._cyno_entry.get().strip()
+        if not name:
+            self._cyno_set_status("Enter a character name.", FG_DIM)
+            return
+
+        self._cyno_set_status(f"Resolving '{name}' ...", FG_DIM)
+        self._cyno_set_result("")
+        self._cyno_latest_url = None
+        self._cyno_busy = True
+        self._cyno_check_btn.config(state=tk.DISABLED)
+
+        def worker():
+            cid = self._cyno_resolve_character_id(name)
+            if not cid:
+                self.root.after(
+                    0, self._cyno_resolve_failed, name)
+                return
+            self.root.after(
+                0, self._cyno_set_status,
+                f"Checking {name} ...", FG_DIM)
+
+            def progress(msg):
+                # Marshal each backend status line to the UI thread.
+                self.root.after(0, self._cyno_set_status, msg, FG_DIM)
+
+            try:
+                result = cyno_analyze_character(cid, progress=progress)
+            except Exception as exc:
+                self.root.after(0, self._cyno_render_error, str(exc))
+                return
+            self.root.after(0, self._cyno_render_result, name, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cyno_resolve_character_id(self, name: str):
+        """Resolve a character name to an id (worker-thread only, no Tk).
+
+        Tries the cached type-ahead map first, then a public exact-name resolve
+        via resolve_ids()'s 'characters' bucket (case-insensitive)."""
+        cached = self._cyno_name_to_id.get(name.lower())
+        if cached:
+            return cached
+        try:
+            if self.esi_auth:
+                resolved = self.esi_auth.resolve_ids([name])
+                for entry in resolved.get("characters", []) or []:
+                    nm = entry.get("name")
+                    rid = entry.get("id")
+                    if nm and isinstance(rid, int) and nm.lower() == name.lower():
+                        return rid
+        except Exception:
+            pass
+        return None
+
+    def _cyno_resolve_failed(self, name: str):
+        self._cyno_busy = False
+        self._cyno_check_btn.config(state=tk.NORMAL)
+        self._cyno_set_status(f"No character found for '{name}'.", FG_RED)
+
+    def _cyno_render_error(self, message: str):
+        self._cyno_busy = False
+        self._cyno_check_btn.config(state=tk.NORMAL)
+        self._cyno_set_status(f"Error: {message}", FG_RED)
+
+    def _cyno_render_result(self, name: str, result: dict):
+        """Render a completed analysis into the result area (Tk thread)."""
+        try:
+            total = int(result.get("total", 0) or 0)
+            breakdown = result.get("breakdown") or {}
+            latest = result.get("latest")
+            association = result.get("association") or {"kind": "unknown"}
+            status = result.get("status") or ""
+
+            lines = [f"{name}", ""]
+            if total == 0:
+                lines.append("No cyno-ship losses in the last 6 months.")
+            else:
+                lines.append(
+                    f"{total} cyno-ship loss"
+                    f"{'es' if total != 1 else ''} in the last 6 months")
+                if breakdown:
+                    parts = [f"{hull} {cnt}"
+                             for hull, cnt in sorted(breakdown.items())]
+                    lines.append("  " + " · ".join(parts))
+
+            # Association line. `basis` distinguishes the battle-inferred signal
+            # (who the pilot's blues were in the fights around recent losses)
+            # from the all-time stats fallback.
+            if isinstance(association, dict) and \
+                    association.get("kind") != "unknown" and \
+                    association.get("name"):
+                kind = association.get("kind", "")
+                basis = association.get("basis")
+                aname = association["name"]
+                if basis == "battles":
+                    bc = association.get("battle_count")
+                    sample = association.get("sample_total")
+                    confident = association.get("confident", True)
+                    if bc and sample:
+                        ratio = (f"{bc} of {sample} "
+                                 f"battle{'s' if sample != 1 else ''}")
+                    elif sample:
+                        ratio = (f"from {sample} "
+                                 f"battle{'s' if sample != 1 else ''}")
+                    else:
+                        ratio = "battles"
+                    if confident:
+                        lines.append(
+                            f"Flies with: {aname} ({kind} · {ratio})")
+                    else:
+                        lines.append(
+                            f"No clear bloc · top: {aname} ({kind} · {ratio})")
+                    runners = association.get("runners_up") or []
+                    extra = " · ".join(
+                        f"{r.get('name')} {r.get('battle_count')}"
+                        for r in runners
+                        if isinstance(r, dict) and r.get("name"))
+                    if extra:
+                        lines.append(f"  also: {extra}")
+                elif basis == "stats":
+                    lines.append(
+                        f"Flies with: {aname} ({kind} · all-time)")
+                else:
+                    lines.append(f"Flies with: {aname} ({kind})")
+            else:
+                lines.append("Association: unknown")
+
+            # Surface a partial/error note from the backend status if present.
+            low = status.lower()
+            if "partial" in low or "unavailable" in low:
+                lines.append(f"Note: {status}")
+
+            self._cyno_set_result("\n".join(lines) + "\n")
+
+            # Append the latest-loss link as a clickable tagged run.
+            if isinstance(latest, dict) and latest.get("url"):
+                self._cyno_latest_url = latest["url"]
+                time_txt = latest.get("time") or ""
+                self._cyno_result.config(state=tk.NORMAL)
+                self._cyno_result.insert(tk.END, "Latest loss: ")
+                label = f"open on zKillboard{(' (' + time_txt + ')') if time_txt else ''}"
+                self._cyno_result.insert(tk.END, label, "cyno_link")
+                self._cyno_result.insert(tk.END, "\n")
+                self._cyno_result.config(state=tk.DISABLED)
+
+            self._cyno_set_status(status or "Done", FG_GREEN)
+        finally:
+            self._cyno_busy = False
+            self._cyno_check_btn.config(state=tk.NORMAL)
+
+    def _cyno_open_latest(self, event=None):
+        if self._cyno_latest_url:
+            try:
+                webbrowser.open(self._cyno_latest_url)
+            except Exception:
+                pass
+
+    def _cyno_set_status(self, text: str, color: str = FG_DIM):
+        self._cyno_status.config(text=text, fg=color)
+
+    def _cyno_set_result(self, text: str):
+        """Replace the DISABLED ScrolledText body with ``text``."""
+        self._cyno_result.config(state=tk.NORMAL)
+        self._cyno_result.delete("1.0", tk.END)
+        if text:
+            self._cyno_result.insert("1.0", text)
+        self._cyno_result.config(state=tk.DISABLED)
+
     def _toggle_intel_filter_panel(self):
         """Collapse/expand the fight-alert filter body to free up feed space.
 
@@ -8011,18 +8390,16 @@ $bmp.Dispose()
 
         def do_check():
             try:
-                from zkill_monitor import get_region_for_system, resolve_name
-                from jump_range import is_in_jump_range, save_route_cache
-                from jump_range import calculate_ly_distance, get_system_info
+                from jump_range import save_route_cache, calculate_ly_distance
                 checker = JumpRangeChecker(ship, jdc_level=5)
                 conns = self._get_ansiblex_connections()
                 result = checker.check_range(origin, dest, connections=conns)
-                # Add region names
+                # Add region names (local lookup; the region map is cached in
+                # regions_cache.json and prewarmed at startup — no per-check ESI).
                 try:
-                    r1 = get_region_for_system(result.get("origin_id", 0))
-                    r2 = get_region_for_system(result.get("destination_id", 0))
-                    result["origin_region"] = resolve_name(r1, "region") if r1 else ""
-                    result["dest_region"] = resolve_name(r2, "region") if r2 else ""
+                    region_map = system_cache.get_region_map()
+                    result["origin_region"] = region_map.get(str(result.get("origin_id", 0)), "")
+                    result["dest_region"] = region_map.get(str(result.get("destination_id", 0)), "")
                 except Exception:
                     result["origin_region"] = ""
                     result["dest_region"] = ""
@@ -8043,9 +8420,6 @@ $bmp.Dispose()
                         sid = search_system(sys_name)
                         if sid:
                             sec_ids[sys_name] = sid
-                            get_system_info(sid)
-                    get_system_info(dest_id)
-                    save_route_cache()
                     staging = self._get_staging_system()
                     staging_id = search_system(staging) if staging else None
                     for sys_name in systems_list:

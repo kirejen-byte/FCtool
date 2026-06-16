@@ -13,13 +13,15 @@ import requests
 import threading
 from collections import deque
 from rate_limiter import rate_limit
-from app_path import app_dir
+from app_path import app_dir, bundle_dir
+import system_coords
 
 ESI_BASE = "https://esi.evetech.net/latest"
 HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
 
-# 1 light year in meters (EVE uses this constant)
-LY_IN_METERS = 9.4605e15
+# 1 light year in meters — CCP's official in-game value: 9,460,000,000,000,000.0 m (9.46e15).
+# Source: EVE map-data developer docs. Used for jump-drive LY distance calculations.
+LY_IN_METERS = 9.46e15
 
 # ── Persistent disk caches ─────────────────────────────────────────────────
 # System data essentially never changes, so cache everything to disk.
@@ -96,10 +98,15 @@ def _load_stargate_graph():
         if _stargate_graph_loaded:
             return
 
-        # Try loading from disk cache first
-        if os.path.exists(_JUMPS_CACHE_FILE):
+        # Try loading from disk cache first (app_dir), then the bundled copy.
+        jumps_file = _JUMPS_CACHE_FILE
+        if not os.path.exists(jumps_file):
+            bundled = os.path.join(bundle_dir(), "stargate_jumps.json")
+            if os.path.exists(bundled):
+                jumps_file = bundled
+        if os.path.exists(jumps_file):
             try:
-                with open(_JUMPS_CACHE_FILE, "r") as f:
+                with open(jumps_file, "r") as f:
                     data = json.load(f)
                 for sys_id, neighbors in data.items():
                     _stargate_graph[int(sys_id)] = set(neighbors)
@@ -113,7 +120,7 @@ def _load_stargate_graph():
         try:
             print("[Graph] Downloading stargate connection map...")
             resp = requests.get(
-                "https://www.fuzzwork.co.uk/dump/latest/mapSolarSystemJumps.csv",
+                "https://www.fuzzwork.co.uk/dump/latest/csv/mapSolarSystemJumps.csv",
                 timeout=30
             )
             if resp.ok:
@@ -218,6 +225,9 @@ def get_system_info(system_id: int) -> dict | None:
 def search_system(name: str) -> int | None:
     """Search for a system by name, return its ID. Persistently cached to disk."""
     global _cache_dirty
+    local_id = system_coords.resolve_name(name)
+    if local_id is not None:
+        return local_id
     lower = name.lower()
     with _cache_lock:
         if lower in _system_name_cache:
@@ -295,21 +305,23 @@ def get_stargate_route(origin_id: int, destination_id: int,
 
 
 def calculate_ly_distance(system_a_id: int, system_b_id: int) -> float | None:
-    """Calculate the light-year distance between two systems."""
-    info_a = get_system_info(system_a_id)
-    info_b = get_system_info(system_b_id)
-    if not info_a or not info_b:
-        return None
-
-    pos_a = info_a.get("position", {})
-    pos_b = info_b.get("position", {})
+    """Light-year distance between two systems. Uses the local coordinate table
+    when available; falls back to ESI get_system_info for systems not in it."""
+    pos_a = system_coords.get_position(system_a_id)
+    if pos_a is None:
+        info_a = get_system_info(system_a_id)
+        pos_a = info_a.get("position") if info_a else None
+    pos_b = system_coords.get_position(system_b_id)
+    if pos_b is None:
+        info_b = get_system_info(system_b_id)
+        pos_b = info_b.get("position") if info_b else None
     if not pos_a or not pos_b:
         return None
 
     dx = pos_a["x"] - pos_b["x"]
     dy = pos_a["y"] - pos_b["y"]
     dz = pos_a["z"] - pos_b["z"]
-    distance_m = math.sqrt(dx*dx + dy*dy + dz*dz)
+    distance_m = math.sqrt(dx * dx + dy * dy + dz * dz)
     return distance_m / LY_IN_METERS
 
 
@@ -356,7 +368,8 @@ class JumpRangeChecker:
         return base * (1 + 0.25 * self.jdc_level) / (1 + 0.25 * 5)
 
     def check_range(self, origin: str, destination: str,
-                    connections: list[str] | None = None) -> dict:
+                    connections: list[str] | None = None,
+                    include_route: bool = True) -> dict:
         """
         Check if destination is in jump range of origin.
         Accepts system names.
@@ -383,14 +396,31 @@ class JumpRangeChecker:
             "in_range": in_range,
         }
 
-        # Also get stargate route for context
-        route = get_stargate_route(origin_id, dest_id, connections=connections)
-        if route:
-            result["gate_jumps"] = len(route) - 1
+        result["legal_destination"] = system_coords.is_legal_jump_destination(dest_id)
+        result["reachable"] = bool(in_range and result["legal_destination"])
+
+        if include_route:
+            route = get_stargate_route(origin_id, dest_id, connections=connections)
+            result["gate_jumps"] = len(route) - 1 if route else None
         else:
             result["gate_jumps"] = None
 
         return result
+
+    def range_to_targets(self, origin_id: int, target_ids: list[int]) -> list[dict]:
+        """Distance + in-range + legality from origin to each target id.
+        Pure local when the coordinate table covers the systems. No BFS routing."""
+        rng = self.jump_range
+        rows: list[dict] = []
+        for tid in target_ids:
+            dist = calculate_ly_distance(origin_id, tid)
+            rows.append({
+                "system_id": tid,
+                "distance_ly": round(dist, 2) if dist is not None else None,
+                "in_range": dist is not None and dist <= rng,
+                "legal_destination": system_coords.is_legal_jump_destination(tid),
+            })
+        return rows
 
     def find_systems_in_range(self, origin: str, system_list: list[str]) -> list[dict]:
         """Check which systems from a list are in jump range."""
