@@ -159,3 +159,23 @@ def test_search_system_uses_cache_without_network(mocker):
     result = search_system("CachedSystem")
     assert result == 12345
     post_mock.assert_not_called()
+
+
+def test_ly_constant_matches_ccp_official_value():
+    # CCP's official in-game light year is exactly 9,460,000,000,000,000.0 m.
+    # Not the physical 9.4607e15, not the old wrong 9.4605e15.
+    assert jump_range.LY_IN_METERS == 9_460_000_000_000_000.0
+
+
+@pytest.mark.skip(reason="enabled in Task 5 when system_coords seam lands")
+def test_calculate_ly_distance_uses_ly_constant(mocker):
+    # Two points exactly 9.46e15 m apart on the x-axis must read as 1.00 ly.
+    mocker.patch(
+        "jump_range.system_coords.get_position",
+        side_effect=lambda sid: {
+            1: {"x": 0.0, "y": 0.0, "z": 0.0},
+            2: {"x": 9.46e15, "y": 0.0, "z": 0.0},
+        }.get(sid),
+    )
+    dist = jump_range.calculate_ly_distance(1, 2)
+    assert dist == pytest.approx(1.0, abs=1e-9)
