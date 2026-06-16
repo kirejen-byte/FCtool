@@ -11,15 +11,18 @@ Covered: loss pagination + 6-month cutoff; cyno detection positives (cyno in a
 high slot on a Force Recon) and negatives (combat Falcon w/o cyno; cyno only in
 cargo / a low slot; non-cyno hull); hull-class mapping; latest-loss selection;
 battle-inferred association (enemy-set seeding from the loss attackers; both
-friendly-inference branches; own-corp/alliance + NPC exclusion; MAX_BATTLES and
-MAX_KILLS_PER_BATTLE bounds; related-battle cache; fallback to the stats
-aggregate when battles yield nothing; graceful partial on a related-endpoint
-error); stats-aggregate association parsing (topLists primary + topAllTime
-fallback) with self-exclusion; cache round-trip + is_stale; graceful handling of
-network errors and missing fields.
+friendly-inference branches read from the related endpoint's INLINE camelCase
+team-summary data; own-corp/alliance + NPC exclusion; MAX_BATTLES bound;
+hour-floored timestamp + previous-hour fallback; related-battle cache; fallback
+to the stats aggregate when battles yield nothing; graceful partial on a
+related-endpoint error; an END-TO-END run over a real captured zKill response);
+stats-aggregate association parsing (topLists primary + topAllTime fallback) with
+self-exclusion; cache round-trip + is_stale; graceful handling of network errors
+and missing fields.
 """
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -91,8 +94,11 @@ class FakeFetcher:
     stats: dict | None
     affiliation: dict | None  (the character's own corp/alliance)
     names: {id: name}
-    related: {(system_id, "YYYYMMDDHHMM"): [<battle-mail stub>, ...]}
-        A value of None simulates a related-endpoint fetch failure for that key.
+    related: {(system_id, "YYYYMMDDHH00"): <team-summary dict>}
+        Keyed by the HOUR-FLOORED battle timestamp (zKill's related endpoint
+        rejects non-hour-aligned values). The value is the modern team-summary
+        response ({"summary": {"teamA": {...}, "teamB": {...}}}); a value of None
+        simulates a related-endpoint fetch failure for that key.
     """
 
     def __init__(self, losses_by_group=None, killmails=None, stats=None,
@@ -120,9 +126,9 @@ class FakeFetcher:
     def zkill_stats(self, character_id):
         return self.stats
 
-    def zkill_related(self, solar_system_id, ts_minute):
-        self.related_calls.append((solar_system_id, ts_minute))
-        return self.related.get((solar_system_id, ts_minute))
+    def zkill_related(self, solar_system_id, ts_hour):
+        self.related_calls.append((solar_system_id, ts_hour))
+        return self.related.get((solar_system_id, ts_hour))
 
     def esi_killmail(self, killmail_id, killmail_hash):
         self.km_calls.append((killmail_id, killmail_hash))
@@ -169,24 +175,61 @@ def _party(character_id=1, corporation_id=None, alliance_id=None,
     return p
 
 
-def _battle_km(victim_party, attacker_parties, ship_type_id=RIFTER,
-               when=None, system_id=30000142):
-    """Build a battle killmail with explicit victim + attacker party affiliations
-    (the cyno-module items don't matter for battle scoring)."""
-    if when is None:
-        when = datetime.now(timezone.utc)
+def _inline(character_id=1, corporation_id=None, alliance_id=None,
+            faction_id=None, corporation_name=None, alliance_name=None):
+    """Build an INLINE related-battle party dict (camelCase, as zKill returns).
+
+    These are the parties carried inline on each related kill's ``victim`` /
+    ``involved`` — DISTINCT from the snake_case ESI ``_party`` used on the loss
+    killmail. Omitting ``character_id`` (None) marks the party as an NPC/structure
+    so cyno_check excludes it from the friendly/enemy tallies.
+    """
+    p = {}
+    if character_id is not None:
+        p["characterID"] = character_id
+    if corporation_id is not None:
+        p["corporationID"] = corporation_id
+    if alliance_id is not None:
+        p["allianceID"] = alliance_id
+    if faction_id is not None:
+        p["factionID"] = faction_id
+    if corporation_name is not None:
+        p["corporationName"] = corporation_name
+    if alliance_name is not None:
+        p["allianceName"] = alliance_name
+    return p
+
+
+def _battle_kill(kill_id, victim_party, attacker_parties, ship_type_id=RIFTER):
+    """Build ONE related-battle kill object: the victim plus an ``involved`` list
+    that includes EVERY participant (the victim flagged ``isVictim`` + attackers),
+    matching the real zKill team-summary shape."""
     victim = dict(victim_party)
-    victim["ship_type_id"] = ship_type_id
+    victim["shipTypeID"] = ship_type_id
+    victim["isVictim"] = True
+    involved = [dict(victim)]
+    for a in attacker_parties:
+        ap = dict(a)
+        ap["isVictim"] = False
+        involved.append(ap)
     return {
-        "killmail_time": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "solar_system_id": system_id,
+        "killID": kill_id,
         "victim": victim,
-        "attackers": list(attacker_parties),
+        "involved": involved,
     }
 
 
-def _stub(killmail_id, hash="h"):
-    """A zKill 'related' battle-mail stub."""
+def _battle(*kills, team="teamA"):
+    """Wrap kill objects into a zKill 'related' team-summary response.
+
+    ``{"summary": {"<team>": {"kills": {"<killID>": <kill>, ...}}}}``.
+    """
+    kills_dict = {str(k.get("killID", i)): k for i, k in enumerate(kills)}
+    return {"summary": {team: {"kills": kills_dict}}}
+
+
+def _loss_stub(killmail_id, hash="h"):
+    """A zKill character-LOSSES list entry (still {killmail_id, zkb:{hash}})."""
     return {"killmail_id": killmail_id, "zkb": {"hash": hash}}
 
 
@@ -540,9 +583,12 @@ def test_association_handles_missing_affiliation(tmp_path):
 #
 # Convention for these tests:
 #   * The pilot (victim) flies a cyno Rapier and dies in system SYS at time T.
-#   * The loss killmail carries attackers[] -> these seed the ENEMY set E.
-#   * related[(SYS, T_MINUTE)] returns the surrounding battle's mail stubs;
-#     killmails[...] supplies each battle killmail (victim + attackers).
+#   * The loss killmail (ESI, snake_case) carries attackers[] -> these seed the
+#     ENEMY set E.
+#   * related[(SYS, T_HOUR)] returns the surrounding battle as the modern zKill
+#     team-summary response ({"summary": {"teamA": {"kills": {...}}}}); each kill
+#     carries its victim + attackers INLINE in camelCase (with inline names), so
+#     there is NO per-killmail ESI fetch and no /universe/names/ call.
 #   * We assert the inferred "Flies with" entity is the pilot's blue, never the
 #     enemy / the pilot's own corp/alliance / an NPC.
 
@@ -554,9 +600,19 @@ PILOT_ALLY = 900001          # the pilot's OWN alliance (must be excluded)
 PILOT_CORP = 900002          # the pilot's OWN corp (must be excluded)
 
 
-def _km_minute(when):
-    """The YYYYMMDDHHMM key cyno_check derives from a killmail time."""
-    return when.astimezone(timezone.utc).strftime("%Y%m%d%H%M")
+def _km_hour(when):
+    """The YYYYMMDDHH00 (hour-floored) related-battle key cyno_check derives from
+    a killmail time."""
+    floored = when.astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0)
+    return floored.strftime("%Y%m%d%H00")
+
+
+def _prev_hour(when):
+    """The previous-hour YYYYMMDDHH00 key (the boundary fallback)."""
+    floored = when.astimezone(timezone.utc).replace(
+        minute=0, second=0, microsecond=0)
+    return (floored - timedelta(hours=1)).strftime("%Y%m%d%H00")
 
 
 def _pilot_loss(when, attackers, hash="lh"):
@@ -566,63 +622,66 @@ def _pilot_loss(when, attackers, hash="lh"):
 
 
 def test_enemy_seed_and_friendly_from_killing_an_enemy(tmp_path):
-    """Branch A: a battle mail whose VICTIM is in the enemy set means that mail's
-    ATTACKERS fought the enemy -> they are the pilot's friends."""
+    """Branch A: a battle kill whose VICTIM is in the enemy set means that kill's
+    ATTACKERS fought the enemy -> they are the pilot's friends. Read from the
+    inline team-summary data (camelCase), no per-killmail fetch."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
     # Battle: an ENEMY ship dies to the pilot's blue (FRIEND_ALLY).
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
-        attacker_parties=[_party(3, alliance_id=FRIEND_ALLY)],
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        50,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                  alliance_name="Blue Alliance")],
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 50: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(50)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
     assert assoc["basis"] == "battles"
     assert assoc["kind"] == "alliance"
     assert assoc["id"] == FRIEND_ALLY
-    assert assoc["name"] == "Blue Alliance"
+    assert assoc["name"] == "Blue Alliance"     # inline allianceName, no ESI
     assert assoc["count"] == 1
     assert assoc["sample_total"] == 1     # one battle scanned
-    # The related endpoint was queried with the loss's system + minute.
-    assert (SYS, _km_minute(when)) in f.related_calls
+    # The related endpoint was queried with the loss's system + HOUR-FLOORED time.
+    assert (SYS, _km_hour(when)) in f.related_calls
+    # No /universe/names/ fetch happened (FakeFetcher.names is empty anyway).
 
 
 def test_friendly_from_being_killed_by_enemy(tmp_path):
-    """Branch B: a battle mail whose ATTACKERS include the enemy and whose VICTIM
+    """Branch B: a battle kill whose ATTACKERS include the enemy and whose VICTIM
     is NOT an enemy means the victim was killed BY the enemy -> the victim is the
     pilot's friend."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
     # Battle: the pilot's blue (FRIEND_ALLY) dies to the enemy.
-    battle_mail = _battle_km(
-        victim_party=_party(4, alliance_id=FRIEND_ALLY),
-        attacker_parties=[_party(5, alliance_id=ENEMY_ALLY)],
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        60,
+        victim_party=_inline(4, alliance_id=FRIEND_ALLY,
+                             alliance_name="Blue Alliance"),
+        attacker_parties=[_inline(5, alliance_id=ENEMY_ALLY)],
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 60: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(60)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
     assert assoc["basis"] == "battles"
     assert assoc["id"] == FRIEND_ALLY
+    assert assoc["name"] == "Blue Alliance"
     assert assoc["count"] == 1
 
 
 def test_excludes_own_and_npc_keeps_blue(tmp_path):
-    """The pilot's own corp/alliance and NPCs (no character_id) never enter the
+    """The pilot's own corp/alliance and NPCs (no characterID) never enter the
     friendly tally; only the genuine blue is reported."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[
@@ -631,22 +690,22 @@ def test_excludes_own_and_npc_keeps_blue(tmp_path):
     ])
     # Enemy ship dies; on the killing side: the pilot's own alliance, an NPC, and
     # the real blue. Only the blue should be tallied.
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
+    battle = _battle(_battle_kill(
+        70,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
         attacker_parties=[
-            _party(10, alliance_id=PILOT_ALLY),          # own alliance -> excluded
-            _party(11, corporation_id=PILOT_CORP),       # own corp -> excluded
-            _party(None, faction_id=500001),             # NPC -> excluded
-            _party(12, alliance_id=FRIEND_ALLY),         # the blue -> counted
+            _inline(10, alliance_id=PILOT_ALLY),          # own alliance -> excluded
+            _inline(11, corporation_id=PILOT_CORP),       # own corp -> excluded
+            _inline(None, faction_id=500001),             # NPC -> excluded
+            _inline(12, alliance_id=FRIEND_ALLY,
+                    alliance_name="Blue Alliance"),        # the blue -> counted
         ],
-        when=when, system_id=SYS,
-    )
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 70: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(70)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
@@ -659,23 +718,24 @@ def test_corp_only_friend_uses_corporation_kind(tmp_path):
     """A blue with no alliance (corp only) is reported as kind 'corporation'."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
-        attacker_parties=[_party(3, corporation_id=808080)],   # no alliance
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        80,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, corporation_id=808080,
+                                  corporation_name="Blue Corp")],   # no alliance
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 80: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(80)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={808080: "Blue Corp"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
     assert assoc["basis"] == "battles"
     assert assoc["kind"] == "corporation"
     assert assoc["id"] == 808080
+    assert assoc["name"] == "Blue Corp"     # inline corporationName
 
 
 def test_alliance_preferred_over_corp_when_both_tied(tmp_path):
@@ -683,20 +743,21 @@ def test_alliance_preferred_over_corp_when_both_tied(tmp_path):
     chosen (prefer alliance)."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
+    battle = _battle(_battle_kill(
+        90,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
         attacker_parties=[
-            _party(3, corporation_id=808080),            # corp-only blue (count 1)
-            _party(4, alliance_id=FRIEND_ALLY),          # alliance blue (count 1)
+            _inline(3, corporation_id=808080,
+                    corporation_name="Blue Corp"),          # corp-only blue (1)
+            _inline(4, alliance_id=FRIEND_ALLY,
+                    alliance_name="Blue Alliance"),          # alliance blue (1)
         ],
-        when=when, system_id=SYS,
-    )
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 90: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(90)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance", 808080: "Blue Corp"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
@@ -706,97 +767,175 @@ def test_alliance_preferred_over_corp_when_both_tied(tmp_path):
 
 def test_max_battles_bound(tmp_path):
     """Only the MAX_BATTLES most-recent losses are turned into battle fetches."""
-    base = datetime(2026, 3, 15, 14, 0, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 3, 15, 14, 30, 0, tzinfo=timezone.utc)
     n_losses = cyno_check.MAX_BATTLES + 3
     stubs, kms, related = [], {}, {}
     for i in range(n_losses):
-        when = base - timedelta(minutes=i)          # each loss a distinct minute
+        # Each loss in a DISTINCT hour so each maps to its own related key (and
+        # the floored hour is non-empty, so the prev-hour fallback never fires).
+        when = base - timedelta(hours=i)
         km_id = 1000 + i
-        stubs.append(_stub(km_id, f"h{i}"))
+        stubs.append(_loss_stub(km_id, f"h{i}"))
         kms[km_id] = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)],
                                  hash=f"h{i}")
         # Every battle yields the same blue, so any scanned battle would score.
-        bk_id = 2000 + i
-        kms[bk_id] = _battle_km(
-            victim_party=_party(2, alliance_id=ENEMY_ALLY),
-            attacker_parties=[_party(3, alliance_id=FRIEND_ALLY)],
-            when=when, system_id=SYS,
-        )
-        related[(SYS, _km_minute(when))] = [_stub(bk_id)]
+        related[(SYS, _km_hour(when))] = _battle(_battle_kill(
+            2000 + i,
+            victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+            attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                      alliance_name="Blue Alliance")],
+        ))
     f = FakeFetcher(
         losses_by_group={833: [stubs]},
         killmails=kms,
         related=related,
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     assoc = _checker(f, tmp_path).analyze_character(100)["association"]
-    # At most MAX_BATTLES related fetches, despite more qualifying losses.
+    # At most MAX_BATTLES related fetches, despite more qualifying losses. (Each
+    # floored hour is non-empty, so no previous-hour fallback fetch is issued.)
     assert len(f.related_calls) == cyno_check.MAX_BATTLES
     assert assoc["sample_total"] == cyno_check.MAX_BATTLES
     assert assoc["id"] == FRIEND_ALLY
 
 
-def test_max_kills_per_battle_bound(tmp_path):
-    """A single battle scans at most MAX_KILLS_PER_BATTLE killmails."""
+def test_all_battle_kills_scanned_no_cap(tmp_path):
+    """A single battle scans ALL of its kills in ONE fetch with NO per-battle cap
+    and NO per-killmail ESI re-fetch.
+
+    Build a battle with more kills than the old MAX_KILLS_PER_BATTLE (40) cap, all
+    feeding the SAME blue alliance. Under the old capped behaviour the blue's
+    count would top out at 40; with the cap removed every kill is tallied, so the
+    count equals the full kill count — proving the cap is gone."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    n_mails = cyno_check.MAX_KILLS_PER_BATTLE + 10
-    stubs, kms = [], {1: loss}
-    for i in range(n_mails):
-        bk_id = 3000 + i
-        stubs.append(_stub(bk_id, f"bh{i}"))
-        kms[bk_id] = _battle_km(
-            victim_party=_party(2, alliance_id=ENEMY_ALLY),
-            attacker_parties=[_party(3, alliance_id=FRIEND_ALLY)],
-            when=when, system_id=SYS,
-        )
+    n_kills = 55          # > the former MAX_KILLS_PER_BATTLE (40)
+    kills = []
+    for i in range(n_kills):
+        kills.append(_battle_kill(
+            3000 + i,
+            victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+            attacker_parties=[_inline(3000 + i, alliance_id=FRIEND_ALLY,
+                                      alliance_name="Blue Alliance")],
+        ))
+    battle = _battle(*kills)
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails=kms,
-        related={(SYS, _km_minute(when)): stubs},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
-    _checker(f, tmp_path).analyze_character(100)
-    # Battle killmail fetches are capped. (The loss killmail itself is also
-    # fetched, so total esi_killmail calls = 1 loss + MAX_KILLS_PER_BATTLE.)
-    battle_km_fetches = [c for c in f.km_calls if c[0] >= 3000]
-    assert len(battle_km_fetches) == cyno_check.MAX_KILLS_PER_BATTLE
+    res = _checker(f, tmp_path).analyze_character(100)
+    assoc = res["association"]
+    # Exactly ONE related fetch (the whole battle is in one response).
+    assert len(f.related_calls) == 1
+    # Every kill was scanned (no cap): the blue's count == the full kill count.
+    assert assoc["basis"] == "battles"
+    assert assoc["id"] == FRIEND_ALLY
+    assert assoc["count"] == n_kills
+    # No per-killmail ESI fetches in the battle path (only the loss km was fetched).
+    assert f.km_calls == [(1, "lh")]
+
+
+def test_prev_hour_fallback_when_floored_hour_empty(tmp_path):
+    """If the floored-hour battle is empty/missing, the scan also queries the
+    PREVIOUS hour and uses that battle (boundary robustness)."""
+    # A loss right after the top of the hour: the fight may be filed under the
+    # previous hour's battle.
+    when = datetime(2026, 3, 15, 15, 2, 9, tzinfo=timezone.utc)
+    loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
+    prev_battle = _battle(_battle_kill(
+        50,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                  alliance_name="Blue Alliance")],
+    ))
+    f = FakeFetcher(
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={
+            # Floored hour (1500) returns an EMPTY battle (no kills) ...
+            (SYS, _km_hour(when)): _battle(),
+            # ... but the previous hour (1400) holds the real fight.
+            (SYS, _prev_hour(when)): prev_battle,
+        },
+        affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
+        stats=None,
+    )
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["basis"] == "battles"
+    assert assoc["id"] == FRIEND_ALLY
+    assert assoc["name"] == "Blue Alliance"
+    # Both hours were queried (floored first, then the previous-hour fallback).
+    assert (SYS, _km_hour(when)) in f.related_calls
+    assert (SYS, _prev_hour(when)) in f.related_calls
+
+
+def test_floored_hour_hit_skips_prev_hour(tmp_path):
+    """When the floored hour already has a usable battle, the previous hour is
+    NOT queried."""
+    when = datetime(2026, 3, 15, 15, 47, 9, tzinfo=timezone.utc)
+    loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
+    battle = _battle(_battle_kill(
+        50,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                  alliance_name="Blue Alliance")],
+    ))
+    f = FakeFetcher(
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},   # only the floored hour seeded
+        affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
+        stats=None,
+    )
+    res = _checker(f, tmp_path).analyze_character(100)
+    assoc = res["association"]
+    assert assoc["basis"] == "battles"
+    assert assoc["id"] == FRIEND_ALLY
+    # The previous-hour key was never requested (floored hour sufficed) ...
+    assert (SYS, _prev_hour(when)) not in f.related_calls
+    # ... and the run is NOT marked partial (the missing prev hour wasn't fetched).
+    assert "partial" not in res["status"]
 
 
 def test_related_cache_round_trip(tmp_path):
-    """CynoCache stores related battles forever and survives a reload."""
+    """CynoCache stores related battles (team-summary dicts) forever and survives
+    a reload, keyed by the hour-floored timestamp."""
     path = str(tmp_path / "cyno_cache.json")
     cache = CynoCache(path=path)
     cache.load()
-    mails = [_stub(111), _stub(222)]
-    cache.put_related(SYS, "202603151423", mails)
+    battle = _battle(_battle_kill(
+        111,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY)],
+    ))
+    cache.put_related(SYS, "202603151400", battle)
     cache.save()
 
     cache2 = CynoCache(path=path)
     cache2.load()
-    assert cache2.get_related(SYS, "202603151423") == mails
-    assert cache2.get_related(SYS, "999912312359") is None  # miss -> None
+    assert cache2.get_related(SYS, "202603151400") == battle
+    assert cache2.get_related(SYS, "999912312300") is None  # miss -> None
 
 
 def test_related_cache_avoids_refetch(tmp_path):
     """A cached related battle is reused; the related endpoint isn't re-hit."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
-        attacker_parties=[_party(3, alliance_id=FRIEND_ALLY)],
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        50,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                  alliance_name="Blue Alliance")],
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 50: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(50)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     checker = _checker(f, tmp_path)
@@ -817,7 +956,7 @@ def test_falls_back_to_stats_when_battles_empty(tmp_path):
     loss = _km(RAPIER, items=[_hi(NORMAL_CYNO)], when=when, system_id=SYS)
     stats = _stats_topalltime(alliances=[(FRIEND_ALLY, 500)], corps=[(222, 50)])
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
         killmails={1: loss},
         related={},
         stats=stats,
@@ -833,15 +972,19 @@ def test_falls_back_to_stats_when_battles_empty(tmp_path):
 
 
 def test_related_error_marks_partial_and_falls_back(tmp_path):
-    """A related-endpoint failure (None) marks the run partial and falls back to
-    the stats aggregate rather than crashing or returning unknown."""
+    """A related-endpoint failure (None on BOTH the floored and previous hour)
+    marks the run partial and falls back to the stats aggregate rather than
+    crashing or returning unknown."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
     stats = _stats_topalltime(alliances=[(FRIEND_ALLY, 500)], corps=[(222, 50)])
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
         killmails={1: loss},
-        related={(SYS, _km_minute(when)): None},   # related fetch fails
+        related={
+            (SYS, _km_hour(when)): None,    # floored-hour fetch fails
+            (SYS, _prev_hour(when)): None,  # previous-hour fallback also fails
+        },
         stats=stats,
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
         names={FRIEND_ALLY: "Blue Alliance"},
@@ -860,18 +1003,18 @@ def test_battles_yield_only_enemy_falls_back_to_stats(tmp_path):
     there is no friendly tally -> fall back to stats."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    # Battle mail: enemy kills an NPC (no character_id). Victim entity is None,
+    # Battle kill: enemy kills an NPC (no characterID). Victim entity is None,
     # attackers are all enemy -> nothing friendly is added.
-    battle_mail = _battle_km(
-        victim_party=_party(None, faction_id=500001),
-        attacker_parties=[_party(9, alliance_id=ENEMY_ALLY)],
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        55,
+        victim_party=_inline(None, faction_id=500001),
+        attacker_parties=[_inline(9, alliance_id=ENEMY_ALLY)],
+    ))
     stats = _stats_topalltime(alliances=[(FRIEND_ALLY, 500)], corps=[(222, 50)])
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 55: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(55)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         stats=stats,
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
         names={FRIEND_ALLY: "Blue Alliance"},
@@ -881,26 +1024,123 @@ def test_battles_yield_only_enemy_falls_back_to_stats(tmp_path):
     assert assoc["id"] == FRIEND_ALLY
 
 
+def test_odd_related_shape_degrades_to_stats(tmp_path):
+    """A related response of an unexpected shape (e.g. a bare list, or summary
+    without team kills) must not crash; it yields no battle and falls back to
+    stats."""
+    when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
+    loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
+    stats = _stats_topalltime(alliances=[(FRIEND_ALLY, 500)], corps=[(222, 50)])
+    f = FakeFetcher(
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={
+            # Legacy-list shape AND a malformed summary both seeded; neither hour
+            # yields kills, so the scan degrades.
+            (SYS, _km_hour(when)): [{"killmail_id": 9, "zkb": {"hash": "x"}}],
+            (SYS, _prev_hour(when)): {"summary": {"teamA": {"kills": "nope"}}},
+        },
+        stats=stats,
+        affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
+        names={FRIEND_ALLY: "Blue Alliance"},
+    )
+    res = _checker(f, tmp_path).analyze_character(100)
+    assoc = res["association"]
+    assert assoc["basis"] == "stats"     # degraded cleanly, no crash
+    assert assoc["id"] == FRIEND_ALLY
+
+
 def test_battle_progress_lines_emitted(tmp_path):
     """The scan emits 'Reading battle i/n ...' progress lines."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
-    battle_mail = _battle_km(
-        victim_party=_party(2, alliance_id=ENEMY_ALLY),
-        attacker_parties=[_party(3, alliance_id=FRIEND_ALLY)],
-        when=when, system_id=SYS,
-    )
+    battle = _battle(_battle_kill(
+        50,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=[_inline(3, alliance_id=FRIEND_ALLY,
+                                  alliance_name="Blue Alliance")],
+    ))
     f = FakeFetcher(
-        losses_by_group={833: [[_stub(1, "lh")]]},
-        killmails={1: loss, 50: battle_mail},
-        related={(SYS, _km_minute(when)): [_stub(50)]},
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={(SYS, _km_hour(when)): battle},
         affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
-        names={FRIEND_ALLY: "Blue Alliance"},
         stats=None,
     )
     msgs = []
     _checker(f, tmp_path).analyze_character(100, progress=msgs.append)
     assert any("Reading battle" in m for m in msgs)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# END-TO-END over a real captured zKill 'related' response
+# ════════════════════════════════════════════════════════════════════════════
+
+_FIXTURE = os.path.join(
+    os.path.dirname(__file__), "fixtures", "cyno",
+    "related_30002019_202602110100.json")
+
+# Ground-truth facts from the captured Calypso Yaken battle (F-NMX6, 30002019):
+#   * Calypso's Falcon (Force Recon, type 11957) loss — victim characterID below.
+#   * Killed by TEST (498125261) + Fraternity (99003581 / 99013541).
+#   * The friendly side that fought the killers is The Initiative. (1900696668).
+CALYPSO_ID = 2112710733
+CALYPSO_CORP = 98823198            # his corp (no alliance) — must be excluded
+INITIATIVE = 1900696668            # the inferred association
+TEST_ALLY = 498125261
+FRAT_A = 99003581
+FRAT_B = 99013541
+F_NMX6 = 30002019
+
+
+def test_end_to_end_real_related_resolves_initiative(tmp_path):
+    """Load the REAL captured related response, point a qualifying Falcon loss at
+    Calypso's killmail, and assert the battle-inferred association resolves to
+    The Initiative. (1900696668) with basis 'battles' — entirely from the inline
+    team-summary data (no ESI battle fetch, no /universe/names/)."""
+    with open(_FIXTURE, encoding="utf-8") as fh:
+        battle = json.load(fh)
+
+    # Calypso's Falcon loss as an ESI killmail (snake_case): a high-slot cyno so
+    # it qualifies, and the three killers as attackers seeding the enemy set.
+    when = datetime(2026, 2, 11, 1, 46, 0, tzinfo=timezone.utc)
+    loss = {
+        "killmail_time": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "solar_system_id": F_NMX6,
+        "victim": {
+            "character_id": CALYPSO_ID,
+            "corporation_id": CALYPSO_CORP,
+            "ship_type_id": FALCON,
+            "items": [_hi(NORMAL_CYNO)],
+        },
+        "attackers": [
+            {"character_id": 11, "alliance_id": FRAT_A},
+            {"character_id": 12, "alliance_id": FRAT_B},
+            {"character_id": 13, "alliance_id": TEST_ALLY},
+        ],
+    }
+
+    # The Falcon is group 833 (Force Recon) per the static group map.
+    f = FakeFetcher(
+        losses_by_group={833: [[_loss_stub(133279149, "lh")]]},
+        killmails={133279149: loss},
+        related={(F_NMX6, "202602110100"): battle},   # the floored hour key
+        # Calypso's own corp (no alliance), so INITIATIVE is never self-excluded.
+        affiliation={"corporation_id": CALYPSO_CORP, "alliance_id": None},
+        stats=None,
+    )
+    res = _checker(f, tmp_path).analyze_character(100)
+    assert res["total"] == 1
+    assoc = res["association"]
+    assert assoc["basis"] == "battles"
+    assert assoc["kind"] == "alliance"
+    assert assoc["id"] == INITIATIVE
+    assert assoc["name"] == "The Initiative."     # inline allianceName
+    assert assoc["sample_total"] == 1
+    # The floored hour was queried; the related response carried everything inline
+    # so only the loss killmail itself was ESI-fetched.
+    assert (F_NMX6, "202602110100") in f.related_calls
+    assert f.km_calls == [(133279149, "lh")]
 
 
 # ════════════════════════════════════════════════════════════════════════════

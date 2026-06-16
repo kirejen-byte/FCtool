@@ -21,13 +21,23 @@ Data sources
 * ESI killmail (public, immutable):
   ``{ESI_BASE}/killmails/{killmail_id}/{hash}/`` — gives ``victim.ship_type_id``,
   ``victim.items[]`` and ``killmail_time``. Cached forever.
-* zKillboard "related" battle: ``https://zkillboard.com/api/related/{system_id}/{YYYYMMDDHHMM}/``
+* zKillboard "related" battle: ``https://zkillboard.com/api/related/{system_id}/{YYYYMMDDHH00}/``
   — the cluster of killmails around a fight (the ~1h battle report for a system
-  at a given minute). This is the PRIMARY association signal: for each recent
+  at a given HOUR). zKill's related endpoint only accepts an HOUR-ALIGNED
+  timestamp (``…HH00``); a non-aligned minute returns HTTP 500, so we floor the
+  loss time to the hour (and, near hour boundaries, also try the previous hour).
+  The response is a team-summary object, NOT a bare list of killmail stubs:
+  ``{"summary": {"teamA": {...}, "teamB": {...}}}`` where each team carries a
+  ``kills`` DICT keyed by killID. Each kill object holds the ``victim`` party and
+  an ``involved`` list (ALL participants, the victim included with
+  ``isVictim: true``) INLINE — camelCase fields (``characterID``,
+  ``corporationID``, ``allianceID``, ``shipTypeID``) plus ``allianceName`` /
+  ``corporationName``. This is the PRIMARY association signal: for each recent
   cyno LOSS we read who killed the pilot (the loss's attackers = the "enemy")
   and then scan the surrounding battle to find who fought ON THE PILOT'S SIDE
-  (i.e. the pilot's blues — the bridge's friends). Cached FOREVER (immutable
-  history), keyed by ``(system_id, YYYYMMDDHHMM)``.
+  (i.e. the pilot's blues — the bridge's friends), all from the inline data — no
+  per-killmail ESI re-fetch. Cached FOREVER (immutable history), keyed by
+  ``(system_id, YYYYMMDDHH00)``.
 * zKillboard character stats: ``https://zkillboard.com/api/stats/characterID/{cid}/``
   — the FALLBACK association signal (an all-time aggregate of who the character
   most flies with). zKill's ``topLists`` is frequently empty in practice, so we
@@ -40,7 +50,8 @@ Data sources
 Association
 -----------
 The reported ``association`` carries a ``basis`` field:
-  * ``"battles"`` — inferred from the battle around recent cyno losses (primary).
+  * ``"battles"`` — inferred from the battle around recent cyno losses (primary),
+    read entirely from the related endpoint's inline team-summary data.
   * ``"stats"``   — the all-time zKill stats aggregate (hybrid fallback, used
     when the battle scan yields no usable friendly entity or is unavailable).
 A degraded/unavailable battle scan never crashes the run: it marks the result
@@ -52,7 +63,8 @@ Caching
 atomic-write pattern) stores the per-character analysis result + a timestamp and
 exposes ``is_stale(max_age_hours)``. Individual killmails (immutable) are cached
 forever in the same file under ``"killmails"``; "related" battle clusters
-(immutable history) are cached forever under ``"related"``.
+(immutable history) are cached forever under ``"related"``, keyed by
+``<system_id>:<YYYYMMDDHH00>`` (the hour-floored battle key).
 """
 
 from __future__ import annotations
@@ -88,12 +100,11 @@ MAX_PAGES_PER_GROUP = 10  # safety bound: 10 * 1000 = 10000 mails/group max
 
 LOOKBACK_DAYS = 182  # ~6 months
 
-# Battle-inferred association bounds. We sample at most the MAX_BATTLES most
-# recent qualifying cyno losses, and within each battle scan at most
-# MAX_KILLS_PER_BATTLE killmails — keeping the (rate-limited) zKill+ESI fan-out
-# bounded regardless of how busy the fight was.
+# Battle-inferred association bound. We sample at most the MAX_BATTLES most
+# recent qualifying cyno losses. Each battle is ONE related-endpoint fetch whose
+# response already carries every kill's victim + attackers inline, so there is no
+# per-killmail fan-out to bound — we scan all of a battle's kills in memory.
 MAX_BATTLES = 8
-MAX_KILLS_PER_BATTLE = 40
 
 # High-slot inventory flags (EVE SDE). A cyno generator only counts if it is
 # actually FITTED in a high slot, not sitting in cargo/hold. HiSlot0..HiSlot7.
@@ -235,23 +246,24 @@ class _HttpFetcher:
         data = self._get(url, "zkill_api", extra_headers={"Accept-Encoding": "gzip"})
         return data if isinstance(data, dict) else None
 
-    def zkill_related(self, solar_system_id: int, ts_minute: str):
-        """GET the zKillboard "related" battle for a system at a given minute.
+    def zkill_related(self, solar_system_id: int, ts_hour: str):
+        """GET the zKillboard "related" battle for a system at a given HOUR.
 
-        ``ts_minute`` is the killmail time as ``YYYYMMDDHHMM`` (UTC, minute
-        precision). Returns the list of battle-mail entries
-        ({"killmail_id", "zkb": {"hash": ...}}), or None on failure. TRAILING
-        SLASH is required by zKill's REST router. The result is an immutable
-        slice of history, so the caller caches it forever.
+        ``ts_hour`` is the killmail time floored to the hour as ``YYYYMMDDHH00``
+        (UTC). zKill's related endpoint returns HTTP 500 for any non-hour-aligned
+        timestamp, so the caller MUST pass an ``…HH00`` value. Returns the parsed
+        team-summary object (a dict ``{"summary": {"teamA": {...},
+        "teamB": {...}}}``), or None on failure. TRAILING SLASH is required by
+        zKill's REST router. The result is an immutable slice of history, so the
+        caller caches it forever.
         """
-        url = f"{ZKILL_API}/related/{solar_system_id}/{ts_minute}/"
+        url = f"{ZKILL_API}/related/{solar_system_id}/{ts_hour}/"
         data = self._get(url, "zkill_api", extra_headers={"Accept-Encoding": "gzip"})
         if data is None:
             return None
-        # zKill returns a JSON list of killmail stubs; an error object is a dict.
-        if isinstance(data, list):
-            return data
-        return []
+        # zKill returns a team-summary dict; tolerate anything else by returning
+        # it as-is and letting the parser degrade (it never crashes on odd shapes).
+        return data
 
     # -- ESI (public) -----------------------------------------------------
     def esi_killmail(self, killmail_id: int, killmail_hash: str):
@@ -325,15 +337,16 @@ class CynoCache:
     pattern. Stores:
       * ``results``  : {str(character_id): {"result": <analysis>, "fetched_at": iso}}
       * ``killmails``: {str(killmail_id): <esi killmail dict>}  (immutable, forever)
-      * ``related``  : {"<system_id>:<YYYYMMDDHHMM>": [<battle-mail stub>, ...]}
-                       (immutable battle history, forever)
+      * ``related``  : {"<system_id>:<YYYYMMDDHH00>": <team-summary dict>}
+                       (immutable battle history, forever; keyed by the
+                       hour-floored battle timestamp)
     """
 
     def __init__(self, path: str):
         self.path = path
         self.results: dict[str, dict] = {}
         self.killmails: dict[str, dict] = {}
-        self.related: dict[str, list] = {}
+        self.related: dict[str, dict] = {}
         self._loaded = False
 
     def load(self) -> None:
@@ -420,18 +433,18 @@ class CynoCache:
 
     # -- related-battle cache (immutable history) -------------------------
     @staticmethod
-    def _related_key(system_id, ts_minute) -> str:
-        return f"{system_id}:{ts_minute}"
+    def _related_key(system_id, ts_hour) -> str:
+        return f"{system_id}:{ts_hour}"
 
-    def get_related(self, system_id, ts_minute):
+    def get_related(self, system_id, ts_hour):
         if not self._loaded:
             self.load()
-        return self.related.get(self._related_key(system_id, ts_minute))
+        return self.related.get(self._related_key(system_id, ts_hour))
 
-    def put_related(self, system_id, ts_minute, mails: list) -> None:
+    def put_related(self, system_id, ts_hour, battle) -> None:
         if not self._loaded:
             self.load()
-        self.related[self._related_key(system_id, ts_minute)] = mails
+        self.related[self._related_key(system_id, ts_hour)] = battle
 
 
 def default_cache_path() -> str:
@@ -668,8 +681,9 @@ class CynoChecker:
     # -- association: battle-inferred (primary) ---------------------------
     @staticmethod
     def _entity_of(party) -> int | None:
-        """Reduce an attacker/victim dict to its association entity id.
+        """Reduce an ESI attacker/victim dict to its association entity id.
 
+        Used for the pilot's OWN loss killmail (fetched from ESI, snake_case).
         Prefer alliance, else corporation. Returns None for NPCs (no
         ``character_id``) and faction-only / structure parties (no corp or
         alliance), so they never pollute the friendly/enemy tallies.
@@ -679,6 +693,57 @@ class CynoChecker:
         if not party.get("character_id"):
             return None  # NPC / structure / faction-only — not a real pilot
         return party.get("alliance_id") or party.get("corporation_id")
+
+    @staticmethod
+    def _entity_of_inline(party) -> int | None:
+        """Reduce a zKill related-battle party to its association entity id.
+
+        The related endpoint's inline ``victim``/``involved`` parties use
+        **camelCase** keys (``characterID``, ``allianceID``, ``corporationID``)
+        — NOT the snake_case of the ESI killmail format. Prefer alliance, else
+        corporation. Returns None for NPCs/structures (no ``characterID``), so
+        they never pollute the tallies.
+        """
+        if not isinstance(party, dict):
+            return None
+        if not party.get("characterID"):
+            return None  # NPC / structure — not a real pilot
+        return party.get("allianceID") or party.get("corporationID")
+
+    @staticmethod
+    def _iter_battle_kills(battle):
+        """Yield each kill object from a zKill related team-summary response.
+
+        The real shape is ``{"summary": {"teamA": {...}, "teamB": {...}}}`` where
+        each team carries a ``kills`` DICT keyed by killID; each value is a kill
+        object holding ``victim`` and ``involved`` (the full participant list,
+        victim included with ``isVictim: true``) INLINE in camelCase. Both teams
+        can report the same killID (one per side), so we DEDUPE by killID.
+
+        Degrades silently on any missing/odd shape (yields nothing) so the caller
+        falls back to stats and never crashes.
+        """
+        if not isinstance(battle, dict):
+            return
+        summary = battle.get("summary")
+        if not isinstance(summary, dict):
+            return
+        seen: set = set()
+        for team_key in ("teamA", "teamB"):
+            team = summary.get(team_key)
+            if not isinstance(team, dict):
+                continue
+            kills = team.get("kills")
+            if not isinstance(kills, dict):
+                continue
+            for kid, kill in kills.items():
+                if not isinstance(kill, dict):
+                    continue
+                key = kill.get("killID") or kid
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield kill
 
     @classmethod
     def _enemy_set(cls, loss_killmail) -> set[int]:
@@ -693,6 +758,20 @@ class CynoChecker:
                 enemies.add(eid)
         return enemies
 
+    @staticmethod
+    def _hour_keys(kt) -> list[str]:
+        """Return the related-battle hour keys to try for a loss time ``kt``.
+
+        zKill's related endpoint only accepts an HOUR-ALIGNED timestamp; the
+        loss minute (~never ``:00``) would 500. We floor to the hour and, for
+        robustness near hour boundaries (a fight that straddles ``:59``/``:00``),
+        ALSO offer the previous hour as a fallback. Each is ``YYYYMMDDHH00``.
+        """
+        floored = kt.astimezone(timezone.utc).replace(
+            minute=0, second=0, microsecond=0)
+        prev = floored - timedelta(hours=1)
+        return [floored.strftime("%Y%m%d%H00"), prev.strftime("%Y%m%d%H00")]
+
     def _associate_from_battles(self, qualifying, own_corp_id, own_alliance_id,
                                 emit):
         """Infer the pilot's blues from the battles around recent cyno losses.
@@ -703,19 +782,26 @@ class CynoChecker:
         (so the run is marked partial). Never raises.
 
         For each of the MAX_BATTLES newest losses (pilot = victim):
-          * enemy set E = entities of the loss's attackers (who killed us);
-          * fetch the battle (cached forever); for up to MAX_KILLS_PER_BATTLE of
-            its killmails K, score who fought ON OUR SIDE:
+          * enemy set E = entities of the loss's attackers (who killed us), read
+            from the ESI loss killmail (snake_case);
+          * fetch the hour-floored battle (cached forever); if that hour yields no
+            usable battle, also try the PREVIOUS hour. The related response
+            carries every kill's victim + attackers INLINE (camelCase), so we scan
+            ALL of a battle's kills in memory — no per-killmail ESI re-fetch.
+            Score who fought ON OUR SIDE:
               - K.victim in E  -> K's (non-enemy) attackers are friendly;
               - K.attackers hit E (and K.victim not in E) -> K.victim is friendly.
           * skip NPCs, and skip the pilot's own corp/alliance.
-        Top friendly entity (prefer alliance) = the association.
+        Top friendly entity (prefer alliance) = the association; its display name
+        is taken from the inline ``allianceName`` / ``corporationName``.
         """
         own_ids = {i for i in (own_corp_id, own_alliance_id) if i}
         friendly: dict[int, int] = {}
         # Track which friendly ids came in as an alliance vs only-corporation so
         # we can prefer alliances when picking the top (mirrors the stats path).
         kinds: dict[int, str] = {}
+        # Collected inline display names: {entity_id: name}.
+        names: dict[int, str] = {}
         partial = False
         battles_scanned = 0
 
@@ -728,28 +814,38 @@ class CynoChecker:
             if kt is None:
                 continue
             system_id = row.get("solar_system_id")
-            ts_minute = kt.astimezone(timezone.utc).strftime("%Y%m%d%H%M")
 
             loss_km = self._get_killmail(row["killmail_id"], row.get("killmail_hash"))
             enemies = self._enemy_set(loss_km)
             if not enemies:
                 continue  # solo gank / unknown attackers — nothing to anchor on
 
-            mails = self._get_related(system_id, ts_minute)
-            if mails is None:
-                partial = True
-                continue
+            # Try the floored hour first; if it has no usable battle, fall back to
+            # the previous hour (boundary robustness). A None fetch -> partial.
+            battle = None
+            for ts_hour in self._hour_keys(kt):
+                fetched = self._get_related(system_id, ts_hour)
+                if fetched is None:
+                    partial = True
+                    continue
+                if self.fetcher.zkill_blocked:
+                    break
+                if self._has_kills(fetched):
+                    battle = fetched
+                    break  # usable battle found — don't query the other hour
             if self.fetcher.zkill_blocked:
                 partial = True
                 break
+            if battle is None:
+                continue
             battles_scanned += 1
-            self._score_battle(mails, enemies, own_ids, friendly, kinds)
+            self._score_battle(battle, enemies, own_ids, friendly, kinds, names)
 
         chosen = self._pick_top_kind(friendly, kinds)
         if chosen is None:
             return None, partial
         entity_id, count, kind = chosen
-        name = self._resolve_name(entity_id)
+        name = names.get(entity_id) or str(entity_id)
         return {
             "name": name,
             "id": entity_id,
@@ -759,63 +855,70 @@ class CynoChecker:
             "basis": "battles",
         }, partial
 
-    def _score_battle(self, mails, enemies, own_ids, friendly, kinds):
-        """Tally friendly observations from one battle's killmails (in place).
+    @classmethod
+    def _has_kills(cls, battle) -> bool:
+        """True if a related team-summary response holds at least one kill."""
+        for _ in cls._iter_battle_kills(battle):
+            return True
+        return False
 
-        Bounded to MAX_KILLS_PER_BATTLE killmail fetches.
+    def _score_battle(self, battle, enemies, own_ids, friendly, kinds, names):
+        """Tally friendly observations from one battle's INLINE kills (in place).
+
+        ``battle`` is the zKill related team-summary dict. Every kill's victim and
+        attackers (``involved`` minus the victim) are read inline in camelCase —
+        no killmail fetch, no per-battle cap (one in-memory scan of all kills).
+        Inline ``allianceName`` / ``corporationName`` are collected into ``names``
+        so the association can be labelled without an ESI /universe/names/ call.
         """
         def _bump(eid, party):
             if not eid or eid in own_ids or eid in enemies:
                 return
             friendly[eid] = friendly.get(eid, 0) + 1
-            # An alliance id (party carried alliance_id) outranks a bare corp.
-            if isinstance(party, dict) and party.get("alliance_id") == eid:
+            # An alliance id (party carried allianceID) outranks a bare corp.
+            if isinstance(party, dict) and party.get("allianceID") == eid:
                 kinds[eid] = "alliance"
+                nm = party.get("allianceName")
             else:
                 kinds.setdefault(eid, "corporation")
+                nm = party.get("corporationName") if isinstance(party, dict) else None
+            if nm and eid not in names:
+                names[eid] = nm
 
-        scanned = 0
-        for stub in mails or []:
-            if scanned >= MAX_KILLS_PER_BATTLE:
-                break
-            if not isinstance(stub, dict):
-                continue
-            km_id = stub.get("killmail_id")
-            zkb = stub.get("zkb") or {}
-            km_hash = zkb.get("hash")
-            if not km_id or not km_hash:
-                continue
-            scanned += 1
-            km = self._get_killmail(km_id, km_hash)
-            if not isinstance(km, dict):
-                continue
-            victim = km.get("victim") if isinstance(km.get("victim"), dict) else {}
-            victim_e = self._entity_of(victim)
-            attackers = km.get("attackers") or []
-            attacker_es = {self._entity_of(a) for a in attackers}
+        for kill in self._iter_battle_kills(battle):
+            victim = kill.get("victim") if isinstance(kill.get("victim"), dict) else {}
+            victim_e = self._entity_of_inline(victim)
+            # Attackers = every `involved` party that is not the victim.
+            attackers = [p for p in (kill.get("involved") or [])
+                         if isinstance(p, dict) and not p.get("isVictim")]
+            attacker_es = {self._entity_of_inline(a) for a in attackers}
             attacker_es.discard(None)
 
             if victim_e in enemies:
                 # K's attackers fought the enemy -> they're on our side.
                 for atk in attackers:
-                    _bump(self._entity_of(atk), atk)
+                    _bump(self._entity_of_inline(atk), atk)
             elif (attacker_es & enemies) and victim_e not in enemies:
                 # K's victim was killed BY the enemy -> the victim is on our side.
                 _bump(victim_e, victim)
 
-    def _get_related(self, system_id, ts_minute):
-        """Fetch a related battle with a forever-cache (immutable history)."""
+    def _get_related(self, system_id, ts_hour):
+        """Fetch a related battle with a forever-cache (immutable history).
+
+        Cached per hour key so the floored hour and the previous-hour fallback
+        are stored independently.
+        """
         if self.cache is not None:
-            cached = self.cache.get_related(system_id, ts_minute)
+            cached = self.cache.get_related(system_id, ts_hour)
             if cached is not None:
                 return cached
-        mails = self.fetcher.zkill_related(system_id, ts_minute)
-        if mails is not None and self.cache is not None:
+        battle = self.fetcher.zkill_related(system_id, ts_hour)
+        if battle is not None and self.cache is not None:
             try:
-                self.cache.put_related(system_id, ts_minute, mails)
+                self.cache.put_related(system_id, ts_hour, battle)
             except Exception:
                 pass
-        return mails
+        return battle
 
     @staticmethod
     def _pick_top_kind(counts: dict[int, int], kinds: dict[int, str]):
