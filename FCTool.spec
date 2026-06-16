@@ -5,7 +5,7 @@ a = Analysis(
     ['fc_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('fire_alert.mp3', '.'), ('stargate_jumps.json', '.')],
+    datas=[('fire_alert.mp3', '.'), ('stargate_jumps.json', '.'), ('system_coords.json', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

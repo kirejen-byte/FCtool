@@ -53,3 +53,13 @@ pyinstaller --clean --noconfirm FCTool.spec
 - **Sharing the app:** sign-in uses PKCE, so you can hand someone `FCTool.exe` + a `config.json` containing only your **`client_id`** (with `client_secret` left blank) — there's no secret to leak. Each person signs in with their own EVE character.
 - Runtime caches (`esi_cache.json`, `systems_cache.json`, `regions_cache.json`, …) plus your `config.json` and ESI tokens are gitignored and regenerate locally on first run. The static EVE stargate graph (`stargate_jumps.json`) **is** committed so the project builds from a clean clone.
 - Built with `requests`, `pygame` (audio), and `edge-tts` (text-to-speech).
+
+### System coordinate table
+
+`system_coords.json` is a committed, bundled snapshot of New Eden system
+coordinates/names/regions/security used for instant, offline jump-range checks.
+Regenerate it after a CCP expansion that changes the universe:
+
+    py -3.13 tools/gen_system_coords.py
+
+Coordinates are static and change very rarely, so refreshes are infrequent.
