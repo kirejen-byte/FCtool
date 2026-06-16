@@ -481,6 +481,11 @@ class FCToolGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Global mouse-wheel router: scroll whatever scrollable area is hovered.
+        self.root.bind_all("<MouseWheel>", self._on_global_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_global_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_global_mousewheel)
+
     # ── System Names for Autocomplete ─────────────────────────────────────────
 
     def _load_system_names_async(self):
@@ -1161,13 +1166,8 @@ class FCToolGUI:
         self._role_container.grid_columnconfigure(0, weight=1, uniform="role")
         self._role_container.grid_columnconfigure(1, weight=1, uniform="role")
 
-        # Mouse wheel scrolling when hovering the role area
-        def _on_role_mousewheel(event):
-            self._role_canvas.yview_scroll(-int(event.delta / 120), "units")
-        self._role_canvas.bind("<Enter>", lambda e: self._role_canvas.bind_all(
-            "<MouseWheel>", _on_role_mousewheel))
-        self._role_canvas.bind("<Leave>", lambda e: self._role_canvas.unbind_all(
-            "<MouseWheel>"))
+        # Mouse-wheel scrolling handled by the global router (_on_global_mousewheel).
+        self._register_scroll_canvas(self._role_canvas)
 
         self._role_slots: list[dict] = []
 
@@ -1264,11 +1264,8 @@ class FCToolGUI:
         spec_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         spec_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Bind mousewheel to scroll
-        def _on_spec_mousewheel(event):
-            spec_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        spec_canvas.bind("<MouseWheel>", _on_spec_mousewheel)
-        self._spec_roles_frame.bind("<MouseWheel>", _on_spec_mousewheel)
+        # Mouse-wheel scrolling handled by the global router.
+        self._register_scroll_canvas(spec_canvas)
 
         # Note about red color
         tk.Label(self._spec_roles_frame, text="\u26a0 Red = insufficient numbers",
@@ -4250,10 +4247,8 @@ class FCToolGUI:
         # Also updates wraplength on capability labels via _on_char_canvas_resize.
         canvas.bind("<Configure>", self._on_char_canvas_resize)
 
-        # Mousewheel scrolling
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"),
-                        add="+")
+        # Mouse-wheel scrolling handled by the global router.
+        self._register_scroll_canvas(canvas)
 
         self._char_panels: list[tk.Frame] = []
         # Instance-level caches (moved from class-level; see C1 fix)
@@ -5337,6 +5332,7 @@ class FCToolGUI:
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._register_scroll_canvas(canvas)
 
         # ── EVE Logs Path ────────────────────────────────────────────────────
         self._add_section(scroll_frame, "EVE Chat Logs")
@@ -5498,6 +5494,41 @@ class FCToolGUI:
         # Region/alliance filters are now on the zKill tab inline filter panel
 
         # (Save button is at the top of the settings tab)
+
+    def _register_scroll_canvas(self, canvas):
+        """Register a scrollable canvas so the global mouse-wheel router can
+        scroll it when the pointer is over it (or any of its children)."""
+        if not hasattr(self, "_scroll_canvases"):
+            self._scroll_canvases = set()
+        self._scroll_canvases.add(canvas)
+
+    def _on_global_mousewheel(self, event):
+        """Route the wheel to the scrollable canvas under the pointer.
+
+        Tk does not auto-deliver <MouseWheel> to the hovered widget, so we find
+        it via winfo_containing and walk up to the nearest registered scroll
+        canvas. Handles Windows/Mac (event.delta) and Linux (Button-4/5)."""
+        scroll_canvases = getattr(self, "_scroll_canvases", None)
+        if not scroll_canvases:
+            return None
+        if event.num == 4:
+            amount = -1
+        elif event.num == 5:
+            amount = 1
+        else:
+            amount = -1 * int(event.delta / 120)
+            if amount == 0 and event.delta:
+                amount = -1 if event.delta > 0 else 1
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return None
+        while w is not None:
+            if w in scroll_canvases:
+                w.yview_scroll(amount, "units")
+                return "break"
+            w = getattr(w, "master", None)
+        return None
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",
