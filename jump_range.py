@@ -363,7 +363,8 @@ class JumpRangeChecker:
         return base * (1 + 0.25 * self.jdc_level) / (1 + 0.25 * 5)
 
     def check_range(self, origin: str, destination: str,
-                    connections: list[str] | None = None) -> dict:
+                    connections: list[str] | None = None,
+                    include_route: bool = True) -> dict:
         """
         Check if destination is in jump range of origin.
         Accepts system names.
@@ -390,14 +391,31 @@ class JumpRangeChecker:
             "in_range": in_range,
         }
 
-        # Also get stargate route for context
-        route = get_stargate_route(origin_id, dest_id, connections=connections)
-        if route:
-            result["gate_jumps"] = len(route) - 1
+        result["legal_destination"] = system_coords.is_legal_jump_destination(dest_id)
+        result["reachable"] = bool(in_range and result["legal_destination"])
+
+        if include_route:
+            route = get_stargate_route(origin_id, dest_id, connections=connections)
+            result["gate_jumps"] = len(route) - 1 if route else None
         else:
             result["gate_jumps"] = None
 
         return result
+
+    def range_to_targets(self, origin_id: int, target_ids: list[int]) -> list[dict]:
+        """Distance + in-range + legality from origin to each target id.
+        Pure local when the coordinate table covers the systems. No BFS routing."""
+        rng = self.jump_range
+        rows: list[dict] = []
+        for tid in target_ids:
+            dist = calculate_ly_distance(origin_id, tid)
+            rows.append({
+                "system_id": tid,
+                "distance_ly": round(dist, 2) if dist is not None else None,
+                "in_range": dist is not None and dist <= rng,
+                "legal_destination": system_coords.is_legal_jump_destination(tid),
+            })
+        return rows
 
     def find_systems_in_range(self, origin: str, system_list: list[str]) -> list[dict]:
         """Check which systems from a list are in jump range."""

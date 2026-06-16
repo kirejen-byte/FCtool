@@ -212,3 +212,32 @@ def test_calculate_ly_distance_falls_back_to_esi_position(mocker):
         return_value={"position": {"x": 9.46e15, "y": 0.0, "z": 0.0}},
     )
     assert jump_range.calculate_ly_distance(1, 2) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_check_range_can_skip_route(mocker):
+    mocker.patch("jump_range.search_system", side_effect=lambda n: {"a": 1, "b": 2}[n.lower()])
+    mocker.patch("jump_range.calculate_ly_distance", return_value=3.0)
+    mocker.patch("jump_range.system_coords.is_legal_jump_destination", return_value=True)
+    route = mocker.patch("jump_range.get_stargate_route")
+    checker = jump_range.JumpRangeChecker(ship_type="Dreadnought", jdc_level=5)
+
+    result = checker.check_range("A", "B", include_route=False)
+    assert result["in_range"] is True          # 3.0 <= 7.0
+    assert result["legal_destination"] is True
+    assert result["reachable"] is True
+    assert result["gate_jumps"] is None
+    route.assert_not_called()                  # route skipped
+
+
+def test_range_to_targets_marks_range_and_legality(mocker):
+    mocker.patch("jump_range.calculate_ly_distance",
+                 side_effect=lambda o, t: {10: 3.0, 11: 9.0, 12: None}[t])
+    mocker.patch("jump_range.system_coords.is_legal_jump_destination",
+                 side_effect=lambda sid: sid != 11)
+    checker = jump_range.JumpRangeChecker(ship_type="Dreadnought", jdc_level=5)  # 7 ly
+
+    rows = checker.range_to_targets(1, [10, 11, 12])
+    by_id = {r["system_id"]: r for r in rows}
+    assert by_id[10]["in_range"] is True and by_id[10]["legal_destination"] is True
+    assert by_id[11]["in_range"] is False and by_id[11]["legal_destination"] is False
+    assert by_id[12]["distance_ly"] is None and by_id[12]["in_range"] is False
