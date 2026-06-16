@@ -19,11 +19,9 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 ## Download & run (end users)
 
 1. Open **[releases/latest](https://github.com/kirejen-byte/FCtool/releases/latest)** and download the `.zip`.
-2. Unzip it anywhere — you'll get `FCTool.exe` and `config.example.json`.
-3. Copy `config.example.json` to **`config.json`** (in the same folder as the exe) and edit:
-   - **`eve_logs_path`** — your EVE chat-logs folder, e.g. `C:/Users/<you>/Documents/EVE/logs/Chatlogs`.
-   - **`esi`** — register a free application at **[developers.eveonline.com](https://developers.eveonline.com/)** with callback URL `http://localhost:8834/callback`. **Recommended:** choose the **native / PKCE** app type (it issues a `client_id` with no secret) — paste that `client_id` and **leave `client_secret` blank**. *(A confidential app also works: paste both its `client_id` and `client_secret`.)*
-4. Run **`FCTool.exe`** and log your character in via the in-app ESI SSO button. Set your intel channels, staging system, and filters in **Settings**.
+2. Unzip it anywhere — you'll get `FCTool.exe` and a ready-to-go **`config.json`** (the ESI Client ID is already set; PKCE sign-in, no secret, no app to register).
+3. Open `config.json` and set **`eve_logs_path`** to your EVE chat-logs folder, e.g. `C:/Users/<you>/Documents/EVE/logs/Chatlogs`.
+4. Run **`FCTool.exe`** and sign in via the in-app ESI SSO button — as your own character. Set your intel channels, staging system, and filters in **Settings**.
 
 > Your `config.json` and ESI token files stay on your machine — don't share them.
 
