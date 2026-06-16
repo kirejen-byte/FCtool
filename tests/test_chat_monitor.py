@@ -315,6 +315,28 @@ def test_state_file_roundtrip_resumes_from_stored_position(tmp_path):
     assert [m.message for m in resumed] == ["four", "five"]
 
 
+def test_discover_files_case_insensitive_channel_filter(tmp_path):
+    """On a case-sensitive filesystem (Linux), a channel filter configured in a
+    different case than the on-disk filename must still be discovered. The file
+    on disk is "Ftn Intel_..." but the configured filter is lowercase "ftn intel"."""
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    fp = logs_dir / "Ftn Intel_20990101_120000_123.txt"
+    _write_utf16le(fp, _FULL_HEADER + (
+        "﻿[ 2026.03.25 20:38:22 ] Alpha > Jita clr\r\n"
+    ))
+
+    monitor = ChatMonitor(
+        str(logs_dir),
+        channel_filters=["ftn intel"],
+        state_path=str(tmp_path / "state.json"),
+    )
+    monitor._discover_files()
+
+    assert str(fp) in monitor._tracked_files
+
+
 def test_dedupe_ttl_eviction(tmp_path):
     """Entries older than TTL should be evicted from the seen set."""
     monitor = ChatMonitor(

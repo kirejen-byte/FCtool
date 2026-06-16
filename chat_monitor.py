@@ -332,13 +332,17 @@ class ChatMonitor:
     def _discover_files(self):
         """Find chat log files matching the channel and listener filters."""
         # If multiple channel filters are set, glob each one separately (much faster)
+        # Glob once and match channel prefixes case-INSENSITIVELY so a
+        # case-sensitive filesystem (Linux) behaves like Windows.
+        all_txt = glob.glob(os.path.join(self.logs_path, "*.txt"))
         if self.channel_filters:
-            all_files = []
-            for prefix in self.channel_filters:
-                pat = os.path.join(self.logs_path, f"{prefix}*.txt")
-                all_files.extend(glob.glob(pat))
+            prefixes = tuple(p.lower() for p in self.channel_filters)
+            all_files = [
+                fp for fp in all_txt
+                if os.path.basename(fp).lower().startswith(prefixes)
+            ]
         else:
-            all_files = glob.glob(os.path.join(self.logs_path, "*.txt"))
+            all_files = all_txt
 
         for filepath in all_files:
             if filepath in self._tracked_files:

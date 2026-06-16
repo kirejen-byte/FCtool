@@ -705,3 +705,15 @@ def test_scan_available_channels_character_filter(tmp_path):
                                       channels={"My Custom Chan"})
     assert nomatch[0]["active"] is False
     assert nomatch[0]["file_path"] is None
+
+
+def test_scan_available_channels_case_insensitive_match(tmp_path):
+    """On a case-sensitive filesystem (Linux), a channel name configured in a
+    different case than the on-disk filename must still match. The on-disk file
+    is "Ftn Intel_..." but the configured channel is the lowercase "ftn intel"."""
+    _make_log(tmp_path, "Ftn Intel_20990101_120000_123.txt",
+              channel="Ftn Intel", mtime=_now())
+    result = scan_available_channels(str(tmp_path), channels=["ftn intel"])
+    by_name = {c["name"]: c for c in result}
+    assert by_name["ftn intel"]["active"] is True
+    assert by_name["ftn intel"]["file_path"] is not None

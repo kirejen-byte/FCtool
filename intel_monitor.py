@@ -380,12 +380,16 @@ def scan_available_channels(
     results = []
     today = date.today()
 
+    # Glob the logs dir once and match channel-name prefixes case-INSENSITIVELY,
+    # so case-sensitive filesystems (Linux) behave like Windows.
+    all_txt = glob.glob(os.path.join(logs_path, "*.txt"))
+
     for channel_name in sorted(channels):
-        # EVE log filenames start with the channel name
-        # Format: "ChannelName_YYYYMMDD_HHMMSS.txt"
-        # But spaces and dots in channel names are kept as-is
-        pattern = os.path.join(logs_path, f"{channel_name}*.txt")
-        matching_files = glob.glob(pattern)
+        cn_lower = channel_name.lower()
+        matching_files = [
+            fp for fp in all_txt
+            if os.path.basename(fp).lower().startswith(cn_lower)
+        ]
 
         active = False
         latest_file = None
