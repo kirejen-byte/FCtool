@@ -6229,9 +6229,22 @@ class FCToolGUI:
         roster = dict(self._booster_roster)
 
         def work():
+            from zkill_monitor import resolve_name
             rows = command_bursts.build_pilot_rows(
                 snapshot, roster, self._group_of_safe)
-            self.root.after(0, lambda: self._render_booster_block(rows, coverage))
+            # Resolve hull names here (off the Tk thread) — resolve_name can
+            # block on a synchronous network call on a cache miss, so it must
+            # not run inside _render_booster_block (which runs on the UI thread).
+            ship_names = {}
+            for row in rows:
+                tid = row.ship_type_id
+                if tid is not None and tid not in ship_names:
+                    try:
+                        ship_names[tid] = resolve_name(tid, "type")
+                    except Exception:
+                        ship_names[tid] = None
+            self.root.after(
+                0, lambda: self._render_booster_block(rows, coverage, ship_names))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -6242,14 +6255,17 @@ class FCToolGUI:
         except Exception:
             return None
 
-    def _render_booster_block(self, rows, coverage):
+    def _render_booster_block(self, rows, coverage, ship_names):
         """Render the fleet-aggregate coverage strip + per-pilot booster list.
 
         Runs on the Tk thread (always invoked via root.after). Only clears the
         children of its own persistent containers (_booster_strip, _booster_list)
         and reconfigures _booster_banner — never the surrounding panel widgets.
+
+        ``ship_names`` maps ship_type_id -> resolved hull name (or None); it is
+        built off-thread in _run_booster_refresh so this method does pure Tk
+        work and never blocks the UI on a name-resolution network call.
         """
-        from zkill_monitor import resolve_name
         verdict_color = {
             command_bursts.Verdict.BONUSED: FG_GREEN,
             command_bursts.Verdict.BONUSED_CONDITIONAL: FG_GREEN,
@@ -6287,6 +6303,9 @@ class FCToolGUI:
         # ── Non-boss banner ──
         # Roster is only populated when we can read fleet member ships (fleet
         # boss). Empty roster => hulls can't be verified, so warn the FC.
+        # NOTE: this is a best-effort heuristic. An empty roster also occurs
+        # when we ARE the boss but the fleet is empty, or when the ESI member
+        # fetch failed — so the "not fleet boss" banner can be a false positive.
         is_boss = bool(self._booster_roster)
         if not is_boss:
             self._booster_banner.config(
@@ -6303,7 +6322,7 @@ class FCToolGUI:
         for row in rows:
             rf = tk.Frame(self._booster_list, bg=BG_PANEL)
             rf.pack(fill=tk.X, anchor=tk.W)
-            ship_name = resolve_name(row.ship_type_id, "type") if row.ship_type_id else None
+            ship_name = ship_names.get(row.ship_type_id) if row.ship_type_id is not None else None
             label = f"  {row.name}" + (f" · {ship_name}" if ship_name else "")
             name_lbl = tk.Label(rf, text=label, bg=BG_PANEL, fg=FG_TEXT,
                                 font=("Consolas", 9), anchor=tk.W)
