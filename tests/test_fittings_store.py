@@ -89,3 +89,34 @@ def test_import_dedupes_identical_fit_by_content_hash(tmp_path):
     summary = dst.import_share(src.export_doctrines([d]))
     assert summary.fits_added == 0 and summary.fits_reused == 1   # same parsed content -> reused
     assert dst.get_doctrine(dst.list_doctrines()[0].id).members[0].fit_id == existing
+
+
+def test_push_fit_creates_and_records_id(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    fid = s.add_fit(_fit())
+
+    class FakeAuth:
+        def __init__(self): self.created = []; self.deleted = []
+        def create_fitting(self, cid, body): self.created.append((cid, body)); return 4242
+        def delete_fitting(self, cid, fitid): self.deleted.append((cid, fitid)); return True
+    auth = FakeAuth()
+
+    assert s.push_fit_to_character(fid, 100, auth) is True
+    assert s.get_fit(fid).esi_fitting_ids == {100: 4242}      # id recorded
+    assert auth.deleted == []                                  # nothing to delete first time
+
+
+def test_push_fit_deletes_prior_id_then_recreates(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    fid = s.add_fit(_fit())
+    f = s.get_fit(fid); f.esi_fitting_ids = {100: 1111}; s.update_fit(f)
+
+    class FakeAuth:
+        def __init__(self): self.deleted = []
+        def create_fitting(self, cid, body): return 5555
+        def delete_fitting(self, cid, fitid): self.deleted.append((cid, fitid)); return True
+    auth = FakeAuth()
+
+    assert s.push_fit_to_character(fid, 100, auth) is True
+    assert auth.deleted == [(100, 1111)]                      # old id deleted (edit = delete+recreate)
+    assert s.get_fit(fid).esi_fitting_ids == {100: 5555}

@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 from uuid import uuid4
 
+import fit_dna
 from fit_models import (
     DEFAULT_TAGS,
     Doctrine,
@@ -39,6 +40,11 @@ from fit_models import (
 )
 
 SCHEMA_VERSION = 1
+
+# ESI character-fittings field limits (see esi_auth.create_fitting). The body is
+# pre-trimmed here so the GUI never hands ESI an over-length name/description.
+_FITTING_NAME_MAX = 50
+_FITTING_DESC_MAX = 500
 
 
 class ImportSummary(NamedTuple):
@@ -161,6 +167,47 @@ class FittingsStore:
 
     def list_fits(self) -> list[Fit]:
         return list(self._fits.values())
+
+    # ── ESI push (service-layer wrapper; keeps ESI out of the GUI) ─────────────
+
+    def push_fit_to_character(
+        self, fit_id: str, character_id: int, esi_auth
+    ) -> bool:
+        """Save a fit to a character's in-game Fittings via ESI.
+
+        ESI has no fitting-update endpoint, so editing is delete + recreate:
+        if this fit already has a stored fitting id for `character_id`, that
+        in-game fitting is deleted first. The POST body is built from the fit's
+        parsed contents (name <= 50 from the fit name, description <= 500 from
+        notes, ship_type_id, and `to_esi_items` for the slot-flagged items).
+
+        On success the returned fitting id is recorded in
+        `Fit.esi_fitting_ids[character_id]`, the fit is updated + the library
+        saved, and True is returned. If the fit is unknown or ESI returns no
+        id (failure), no state is mutated and False is returned.
+        """
+        fit = self._fits.get(fit_id)
+        if fit is None:
+            return False
+
+        prior_id = fit.esi_fitting_ids.get(character_id)
+        if prior_id is not None:
+            esi_auth.delete_fitting(character_id, prior_id)
+
+        body = {
+            "name": (fit.name or "")[:_FITTING_NAME_MAX],
+            "description": (fit.notes or "")[:_FITTING_DESC_MAX],
+            "ship_type_id": fit.parsed.ship_type_id,
+            "items": fit_dna.to_esi_items(fit.parsed),
+        }
+        new_id = esi_auth.create_fitting(character_id, body)
+        if new_id is None:
+            return False
+
+        fit.esi_fitting_ids[character_id] = new_id
+        self.update_fit(fit)
+        self.save()
+        return True
 
     # ── Doctrine CRUD ─────────────────────────────────────────────────────────
 

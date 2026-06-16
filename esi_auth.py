@@ -59,6 +59,8 @@ SCOPES = [
     "esi-structures.read_corporation.v1",
     "esi-structures.read_character.v1",
     "esi-assets.read_assets.v1",
+    "esi-fittings.read_fittings.v1",
+    "esi-fittings.write_fittings.v1",
 ]
 
 
@@ -629,6 +631,54 @@ class ESIAuth:
             print(f"[ESI] Error: {e}")
         return None
 
+    def esi_put(self, path: str, json_data: dict = None) -> bool:
+        """Make an authenticated PUT request to ESI.
+
+        Returns True when ESI accepts the write (any 2xx, e.g. the 204 that
+        PUT /fleets/{id}/ returns); returns False and logs on a non-2xx
+        status, a missing token, or a network error — mirroring the
+        non-raising error convention of esi_post so failures don't surface
+        into the GUI as exceptions."""
+        token = self.access_token
+        if not token:
+            return False
+        try:
+            resp = self._session.put(
+                f"{ESI_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=json_data,
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+            print(f"[ESI] PUT {path} returned {resp.status_code}")
+        except Exception as e:
+            print(f"[ESI] Error: {e}")
+        return False
+
+    def esi_delete(self, path: str) -> bool:
+        """Make an authenticated DELETE request to ESI.
+
+        Returns True when ESI accepts the delete (any 2xx, e.g. the 204 that
+        DELETE /characters/{id}/fittings/{fid}/ returns); returns False and
+        logs on a non-2xx status, a missing token, or a network error
+        (same non-raising convention as esi_post/esi_put)."""
+        token = self.access_token
+        if not token:
+            return False
+        try:
+            resp = self._session.delete(
+                f"{ESI_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+            print(f"[ESI] DELETE {path} returned {resp.status_code}")
+        except Exception as e:
+            print(f"[ESI] Error: {e}")
+        return False
+
     @staticmethod
     def esi_post_public(path: str, body) -> dict | list | None:
         """Public ESI POST — no auth, no token. For endpoints that don't require scopes
@@ -805,6 +855,88 @@ class ESIAuth:
         except Exception:
             pass
         return ""
+
+    def get_fleet(self, fleet_id: int) -> dict | None:
+        """Read a fleet's settings, including its current MOTD.
+
+        GET /fleets/{fleet_id}/ -> {motd, is_free_move, is_registered}.
+        Boss-only on ESI's side; returns None on any error (esi_get convention).
+        """
+        return self.esi_get(f"/fleets/{fleet_id}/")
+
+    def set_fleet_motd(self, fleet_id: int, motd: str) -> bool:
+        """Write a fleet's MOTD via PUT /fleets/{fleet_id}/ (204 on success).
+
+        Sends a motd-only body. Boss-only — ESI returns 403 for non-boss
+        callers; the GUI gates on fleet_boss_id before calling. Returns True
+        on success, False otherwise (esi_put convention)."""
+        return self.esi_put(f"/fleets/{fleet_id}/", {"motd": motd})
+
+    # ── Character Fittings ───────────────────────────────────────────────────
+
+    # Per-fitting field limits enforced before POST (ESI rejects out-of-range).
+    _FITTING_NAME_MAX = 50
+    _FITTING_DESC_MAX = 500
+    _FITTING_ITEMS_MIN = 1
+    _FITTING_ITEMS_MAX = 512
+
+    def get_fittings(self, character_id: int) -> list[dict]:
+        """List a character's in-game saved fittings.
+
+        GET /characters/{character_id}/fittings/ -> array of
+        {fitting_id, name, description, ship_type_id, items[]}. Each item is
+        {type_id, flag(string), quantity}. Returns [] on any error."""
+        data = self.esi_get(f"/characters/{character_id}/fittings/")
+        return data if isinstance(data, list) else []
+
+    def create_fitting(self, character_id: int, body: dict) -> int | None:
+        """Save a fitting to a character's in-game Fittings.
+
+        POST /characters/{character_id}/fittings/ -> {fitting_id}. Applies the
+        client-side guards ESI enforces (name <= 50, description <= 500,
+        1..512 items, drop any Invalid-flagged items) so a borderline fit is
+        trimmed rather than rejected. Returns the new fitting_id, or None on
+        failure / a rejected body."""
+        body = self._sanitize_fitting_body(body)
+        if body is None:
+            return None
+        resp = self.esi_post(f"/characters/{character_id}/fittings/", body)
+        if isinstance(resp, dict):
+            return resp.get("fitting_id")
+        return None
+
+    def delete_fitting(self, character_id: int, fitting_id: int) -> bool:
+        """Delete one of a character's in-game saved fittings.
+
+        DELETE /characters/{character_id}/fittings/{fitting_id}/ (204). There
+        is no ESI update endpoint, so editing is delete + recreate. Returns
+        True on success, False otherwise."""
+        return self.esi_delete(
+            f"/characters/{character_id}/fittings/{fitting_id}/"
+        )
+
+    def _sanitize_fitting_body(self, body: dict) -> dict | None:
+        """Clamp/validate a fitting body to ESI's limits before POST.
+
+        Truncates name/description, drops Invalid-flagged items, and rejects
+        (returns None) a body whose item count falls outside 1..512 after
+        filtering — the only case ESI cannot satisfy. The input dict is not
+        mutated; a shallow copy with a filtered items list is returned."""
+        if not isinstance(body, dict):
+            return None
+        clean = dict(body)
+        name = clean.get("name") or ""
+        clean["name"] = name[: self._FITTING_NAME_MAX]
+        desc = clean.get("description") or ""
+        clean["description"] = desc[: self._FITTING_DESC_MAX]
+        items = [
+            it for it in (clean.get("items") or [])
+            if it.get("flag") != "Invalid"
+        ]
+        if not (self._FITTING_ITEMS_MIN <= len(items) <= self._FITTING_ITEMS_MAX):
+            return None
+        clean["items"] = items
+        return clean
 
     # ── Names / Affiliations / Contacts ──────────────────────────────────────
 
