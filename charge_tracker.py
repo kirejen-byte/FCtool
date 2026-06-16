@@ -17,6 +17,7 @@ class CoverageStatus:
     present: list[str]
     missing: list[str]
     full: bool
+    redundancy: int
 
 
 class ChargeTracker:
@@ -44,20 +45,25 @@ class ChargeTracker:
 
     def coverage(self) -> dict[str, CoverageStatus]:
         with self._lock:
-            linked: dict[str, set[str]] = {d: set() for d in DISCIPLINES}
+            # Distinct-pilot count per (discipline, charge). Each pilot's set
+            # holds a given (disc, charge) at most once, so one increment per
+            # pilot == number of distinct pilots that linked it.
+            counts: dict[tuple[str, str], int] = {}
             for charges in self._by_pilot.values():
-                for disc, charge in charges:
-                    linked[disc].add(charge)
+                for key in charges:
+                    counts[key] = counts.get(key, 0) + 1
         result: dict[str, CoverageStatus] = {}
         for disc in DISCIPLINES:
-            all_charges = set(DISCIPLINE_CHARGES[disc])
-            present = linked[disc] & all_charges
-            missing = all_charges - present
+            disc_charges = DISCIPLINE_CHARGES[disc]
+            present = [c for c in disc_charges if counts.get((disc, c), 0) > 0]
+            missing = [c for c in disc_charges if counts.get((disc, c), 0) == 0]
+            redundancy = min(counts.get((disc, c), 0) for c in disc_charges)
             result[disc] = CoverageStatus(
                 discipline=disc,
                 present=sorted(present),
                 missing=sorted(missing),
                 full=not missing,
+                redundancy=redundancy,
             )
         return result
 

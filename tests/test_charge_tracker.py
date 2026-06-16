@@ -48,3 +48,45 @@ def test_clear_empties_state():
     t.clear()
     assert t.snapshot() == []
     assert t.coverage()[SHIELD].full is False
+
+
+def test_coverage_redundancy_single_pilot_full_is_one():
+    t = ChargeTracker()
+    t.record("A", "Active Shielding Charge  Shield Extension Charge  Shield Harmonizing Charge")
+    cov = t.coverage()
+    assert cov[SHIELD].full is True
+    assert cov[SHIELD].redundancy == 1
+
+
+def test_coverage_redundancy_double():
+    t = ChargeTracker()
+    full = "Active Shielding Charge  Shield Extension Charge  Shield Harmonizing Charge"
+    t.record("A", full)
+    t.record("B", full)
+    assert t.coverage()[SHIELD].redundancy == 2
+
+
+def test_coverage_redundancy_triple():
+    t = ChargeTracker()
+    full = "Active Shielding Charge  Shield Extension Charge  Shield Harmonizing Charge"
+    t.record("A", full)
+    t.record("B", full)
+    t.record("C", full)
+    assert t.coverage()[SHIELD].redundancy == 3
+
+
+def test_coverage_redundancy_is_min_across_charges():
+    t = ChargeTracker()
+    t.record("A", "Active Shielding Charge  Shield Extension Charge  Shield Harmonizing Charge")
+    t.record("B", "Active Shielding Charge  Shield Extension Charge")  # missing Harmonizing
+    cov = t.coverage()
+    assert cov[SHIELD].full is True       # all 3 present (A covers Harmonizing)
+    assert cov[SHIELD].redundancy == 1    # Harmonizing covered by only A -> min is 1
+
+
+def test_coverage_redundancy_zero_when_not_full():
+    t = ChargeTracker()
+    t.record("A", "Active Shielding Charge  Shield Extension Charge")  # missing Harmonizing
+    cov = t.coverage()
+    assert cov[SHIELD].full is False
+    assert cov[SHIELD].redundancy == 0
