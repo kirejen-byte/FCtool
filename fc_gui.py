@@ -440,9 +440,12 @@ class FCToolGUI:
         self.charge_tracker = charge_tracker.ChargeTracker()
         self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
         self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
-        # Deliberately lock-free best-effort coalescing flag: only ever touched
-        # on the Tk thread (set in _schedule_booster_refresh / cleared in
-        # _run_booster_refresh), so no synchronization is required.
+        # Best-effort coalescing flag for booster-UI refreshes. It is read/written
+        # from multiple threads (chat-monitor thread, fleet-fetch thread, Tk thread),
+        # but is deliberately lock-free: the worst case of a race is one redundant or
+        # briefly-skipped root.after(250, ...), which self-corrects on the next event.
+        # The actual cross-thread hand-off is root.after, used the same way throughout
+        # this file. (Set False again in _run_booster_refresh on the Tk thread.)
         self._booster_refresh_pending = False
         self.zkill_monitor: ZKillMonitor | None = None
         self._intel_session = IntelSession()

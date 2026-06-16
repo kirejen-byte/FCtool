@@ -118,9 +118,9 @@ HULL_BURST_BONUS: dict[int, frozenset[str]] = {
 
 T3C_HULL_IDS: frozenset[int] = frozenset({29986, 29984, 29988, 29990})
 
-# Ship group_ids that can fit a command burst module at all (CCP hull restriction).
-# 540/1534/963 already exist in ship_classes.py; the rest are from recall and
-# MUST be confirmed against the SDE during implementation before relying on them.
+# Ship group_ids that can fit a command burst module at all (CCP hull
+# restriction). Verified 2026-06-16; combat-vs-attack BC distinction
+# (1201 fits-no-bonus, 1202 absent => can't-fit) is covered by tests.
 BURST_CAPABLE_GROUP_IDS: frozenset[int] = frozenset({
     540,   # Command Ship
     1534,  # Command Destroyer
