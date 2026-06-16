@@ -57,6 +57,7 @@ from zkill_monitor import ZKillMonitor, KillAlert
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
 from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
+import system_cache
 from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker, DeathEvent
@@ -665,6 +666,11 @@ class FCToolGUI:
                 search_system(name)        # local-first; only ESI for unknown systems
             save_route_cache()
             print(f"[Cache] Pre-warmed {len(systems)} staging system(s)")
+            try:
+                import system_cache
+                system_cache.get_region_map()  # build/load region label map off the UI thread
+            except Exception:
+                pass
 
         threading.Thread(target=prewarm, daemon=True).start()
 
@@ -8333,18 +8339,16 @@ $bmp.Dispose()
 
         def do_check():
             try:
-                from zkill_monitor import get_region_for_system, resolve_name
-                from jump_range import is_in_jump_range, save_route_cache
-                from jump_range import calculate_ly_distance, get_system_info
+                from jump_range import save_route_cache, calculate_ly_distance
                 checker = JumpRangeChecker(ship, jdc_level=5)
                 conns = self._get_ansiblex_connections()
                 result = checker.check_range(origin, dest, connections=conns)
-                # Add region names
+                # Add region names (local lookup; the region map is cached in
+                # regions_cache.json and prewarmed at startup — no per-check ESI).
                 try:
-                    r1 = get_region_for_system(result.get("origin_id", 0))
-                    r2 = get_region_for_system(result.get("destination_id", 0))
-                    result["origin_region"] = resolve_name(r1, "region") if r1 else ""
-                    result["dest_region"] = resolve_name(r2, "region") if r2 else ""
+                    region_map = system_cache.get_region_map()
+                    result["origin_region"] = region_map.get(str(result.get("origin_id", 0)), "")
+                    result["dest_region"] = region_map.get(str(result.get("destination_id", 0)), "")
                 except Exception:
                     result["origin_region"] = ""
                     result["dest_region"] = ""
