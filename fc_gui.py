@@ -658,11 +658,11 @@ class FCToolGUI:
             return
 
         def prewarm():
-            from jump_range import get_system_info, save_route_cache
+            from jump_range import save_route_cache
+            import system_coords
+            system_coords._load()          # load the local table once, off the UI thread
             for name in systems:
-                sid = search_system(name)
-                if sid:
-                    get_system_info(sid)
+                search_system(name)        # local-first; only ESI for unknown systems
             save_route_cache()
             print(f"[Cache] Pre-warmed {len(systems)} staging system(s)")
 
@@ -8365,9 +8365,6 @@ $bmp.Dispose()
                         sid = search_system(sys_name)
                         if sid:
                             sec_ids[sys_name] = sid
-                            get_system_info(sid)
-                    get_system_info(dest_id)
-                    save_route_cache()
                     staging = self._get_staging_system()
                     staging_id = search_system(staging) if staging else None
                     for sys_name in systems_list:
