@@ -89,3 +89,73 @@ def test_evaluate_missing_data_is_unknown():
 
 def test_hull_table_covers_sixteen_hulls():
     assert len(HULL_BURST_BONUS) == 16
+
+
+from command_bursts import (
+    PilotRow, DisciplineCell, MAX_CHARGES, build_pilot_rows,
+    VERDICT_GLYPH, verdict_text,
+)
+
+
+def _group_of_none(_type_id):
+    return None
+
+
+def test_build_rows_bonused_pilot_on_roster():
+    snapshot = [("Sansha Lord", {(SHIELD, "Shield Extension Charge"),
+                                 (SKIRMISH, "Interdiction Maneuvers Charge")})]
+    rows = build_pilot_rows(snapshot, {"sansha lord": CLAYMORE}, _group_of_none)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.name == "Sansha Lord"
+    assert row.ship_type_id == CLAYMORE
+    assert row.over_limit is False
+    verdicts = {c.discipline: c.verdict for c in row.cells}
+    assert verdicts == {SHIELD: Verdict.BONUSED, SKIRMISH: Verdict.BONUSED}
+
+
+def test_build_rows_pilot_not_on_roster_is_unknown():
+    snapshot = [("Random Guy", {(SHIELD, "Active Shielding Charge")})]
+    rows = build_pilot_rows(snapshot, {}, _group_of_none)
+    assert rows[0].ship_type_id is None
+    assert rows[0].cells[0].verdict is Verdict.UNKNOWN
+
+
+def test_build_rows_over_limit_flag():
+    charges = {
+        (SHIELD, "Active Shielding Charge"),
+        (SHIELD, "Shield Extension Charge"),
+        (SHIELD, "Shield Harmonizing Charge"),
+        (ARMOR, "Rapid Repair Charge"),
+    }
+    rows = build_pilot_rows([("Greedy", charges)], {}, _group_of_none)
+    assert rows[0].charge_count == 4
+    assert rows[0].over_limit is True
+
+
+def test_build_rows_uses_group_resolver_for_unknown_hull():
+    calls = []
+
+    def group_of(type_id):
+        calls.append(type_id)
+        return 1201  # combat BC
+
+    snapshot = [("BC Pilot", {(SHIELD, "Active Shielding Charge")})]
+    rows = build_pilot_rows(snapshot, {"bc pilot": UNKNOWN_HULL}, group_of)
+    assert calls == [UNKNOWN_HULL]
+    assert rows[0].cells[0].verdict is Verdict.FITS_NO_BONUS
+
+
+def test_build_rows_sorted_by_name():
+    snap = [("zeta", {(SHIELD, "Active Shielding Charge")}),
+            ("alpha", {(ARMOR, "Rapid Repair Charge")})]
+    rows = build_pilot_rows(snap, {}, _group_of_none)
+    assert [r.name for r in rows] == ["alpha", "zeta"]
+
+
+def test_glyph_and_text_helpers_cover_all_verdicts():
+    for v in Verdict:
+        assert v in VERDICT_GLYPH
+    assert "bonused" in verdict_text(Verdict.BONUSED, "Shield", ["Active Shielding Charge"])
+    assert "subsystem" in verdict_text(Verdict.BONUSED_CONDITIONAL, "Shield", ["x"])
+    assert "cannot fit" in verdict_text(Verdict.CANT_FIT, "Shield", ["x"], ship_name="Rifter")

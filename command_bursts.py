@@ -9,6 +9,7 @@ docs/superpowers/specs/2026-06-16-booster-link-tracking-design.md.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from enum import Enum
 
 # ── Disciplines ──────────────────────────────────────────────────────────────
@@ -153,3 +154,77 @@ def evaluate_discipline(discipline: str, ship_type_id, group_id) -> Verdict:
             return Verdict.BONUSED_CONDITIONAL
         return Verdict.BONUSED
     return Verdict.FITS_NO_BONUS
+
+
+# ── Render model + text/glyph helpers ────────────────────────────────────────
+MAX_CHARGES = 3
+
+VERDICT_GLYPH = {
+    Verdict.BONUSED: "✓",              # ✓
+    Verdict.BONUSED_CONDITIONAL: "✓",  # ✓ (tooltip carries the caveat)
+    Verdict.FITS_NO_BONUS: "⚠",        # ⚠
+    Verdict.CANT_FIT: "✗",             # ✗
+    Verdict.UNKNOWN: "?",
+}
+
+
+@dataclass
+class DisciplineCell:
+    discipline: str
+    charges: list[str]
+    verdict: Verdict
+
+
+@dataclass
+class PilotRow:
+    name: str
+    ship_type_id: int | None
+    charge_count: int
+    over_limit: bool
+    cells: list[DisciplineCell] = field(default_factory=list)
+
+
+def build_pilot_rows(snapshot, name_to_ship_type_id, group_of) -> list[PilotRow]:
+    """Build the per-pilot render model.
+
+    snapshot: list of (pilot_name, set[(discipline, charge)]).
+    name_to_ship_type_id: dict of lowercased pilot name -> hull type_id (roster).
+    group_of: callable(type_id) -> group_id | None (e.g. ship_classes.get_group_id).
+    Cells are emitted in DISCIPLINES order, only for disciplines the pilot linked.
+    """
+    rows: list[PilotRow] = []
+    for name, charges in snapshot:
+        ship_type_id = name_to_ship_type_id.get(name.lower())
+        group_id = group_of(ship_type_id) if ship_type_id is not None else None
+        by_disc: dict[str, list[str]] = {}
+        for disc, charge in charges:
+            by_disc.setdefault(disc, []).append(charge)
+        cells = [
+            DisciplineCell(disc, sorted(by_disc[disc]),
+                           evaluate_discipline(disc, ship_type_id, group_id))
+            for disc in DISCIPLINES if disc in by_disc
+        ]
+        rows.append(PilotRow(
+            name=name,
+            ship_type_id=ship_type_id,
+            charge_count=len(charges),
+            over_limit=len(charges) > MAX_CHARGES,
+            cells=cells,
+        ))
+    rows.sort(key=lambda r: r.name.lower())
+    return rows
+
+
+def verdict_text(verdict: Verdict, discipline_label: str, charges, ship_name=None) -> str:
+    base = f"{discipline_label}: {', '.join(charges)}"
+    if verdict is Verdict.BONUSED:
+        return f"{base} — bonused"
+    if verdict is Verdict.BONUSED_CONDITIONAL:
+        return f"{base} — bonused (requires Offensive – Support Processor subsystem)"
+    if verdict is Verdict.FITS_NO_BONUS:
+        who = ship_name or "ship"
+        return f"{base} — fits but {who} is not bonused for {discipline_label}"
+    if verdict is Verdict.CANT_FIT:
+        who = ship_name or "ship"
+        return f"{base} — {who} cannot fit a command burst"
+    return f"{base} — ship unknown"
