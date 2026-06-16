@@ -7399,17 +7399,37 @@ $bmp.Dispose()
                     association.get("name"):
                 kind = association.get("kind", "")
                 basis = association.get("basis")
+                aname = association["name"]
                 if basis == "battles":
+                    bc = association.get("battle_count")
                     sample = association.get("sample_total")
-                    src = f"from {sample} battle{'s' if sample != 1 else ''}" \
-                        if sample else "battles"
-                    qual = f" · {src}"
+                    confident = association.get("confident", True)
+                    if bc and sample:
+                        ratio = (f"{bc} of {sample} "
+                                 f"battle{'s' if sample != 1 else ''}")
+                    elif sample:
+                        ratio = (f"from {sample} "
+                                 f"battle{'s' if sample != 1 else ''}")
+                    else:
+                        ratio = "battles"
+                    if confident:
+                        lines.append(
+                            f"Flies with: {aname} ({kind} · {ratio})")
+                    else:
+                        lines.append(
+                            f"No clear bloc · top: {aname} ({kind} · {ratio})")
+                    runners = association.get("runners_up") or []
+                    extra = " · ".join(
+                        f"{r.get('name')} {r.get('battle_count')}"
+                        for r in runners
+                        if isinstance(r, dict) and r.get("name"))
+                    if extra:
+                        lines.append(f"  also: {extra}")
                 elif basis == "stats":
-                    qual = " · all-time"
+                    lines.append(
+                        f"Flies with: {aname} ({kind} · all-time)")
                 else:
-                    qual = ""
-                lines.append(
-                    f"Flies with: {association['name']} ({kind}{qual})")
+                    lines.append(f"Flies with: {aname} ({kind})")
             else:
                 lines.append("Association: unknown")
 
