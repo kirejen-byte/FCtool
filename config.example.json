@@ -1,5 +1,5 @@
 {
-    "eve_logs_path": "C:/Users/YOUR_USER/Documents/EVE/logs/Chatlogs",
+    "eve_logs_path": "",
     "poll_interval_seconds": 1.0,
     "autostart": true,
     "tracked_character": "",
@@ -25,7 +25,7 @@
         "staging_system": ""
     },
     "esi": {
-        "client_id": "YOUR_ESI_CLIENT_ID",
+        "client_id": "5373b3f588614a7eae20f409c5adbdc4",
         "client_secret": "",
         "callback_url": "http://localhost:8834/callback"
     },

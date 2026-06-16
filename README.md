@@ -20,8 +20,7 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 
 1. Open **[releases/latest](https://github.com/kirejen-byte/FCtool/releases/latest)** and download the `.zip`.
 2. Unzip it anywhere — you'll get `FCTool.exe` and a ready-to-go **`config.json`** (the ESI Client ID is already set; PKCE sign-in, no secret, no app to register).
-3. Open `config.json` and set **`eve_logs_path`** to your EVE chat-logs folder, e.g. `C:/Users/<you>/Documents/EVE/logs/Chatlogs`.
-4. Run **`FCTool.exe`** and sign in via the in-app ESI SSO button — as your own character. Set your intel channels, staging system, and filters in **Settings**.
+3. Run **`FCTool.exe`** and sign in via the in-app ESI SSO button — as your own character. Your EVE chat-logs folder is auto-detected; intel channels, staging system, and filters live in **Settings**.
 
 > Your `config.json` and ESI token files stay on your machine — don't share them.
 
@@ -33,6 +32,7 @@ Requires **Python 3.11+** (3.13 recommended) on Windows.
 git clone https://github.com/kirejen-byte/FCtool.git
 cd FCtool
 pip install -r requirements.txt
+copy config.example.json config.json   # Client ID pre-set; EVE logs folder auto-detected
 python fc_gui.py              # run from source
 python -m pytest -q          # run the test suite
 ```

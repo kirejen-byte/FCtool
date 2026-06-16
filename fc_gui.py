@@ -62,6 +62,7 @@ from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker, DeathEvent
 from cyno_check import analyze_character as cyno_analyze_character
+from eve_paths import resolve_eve_logs_path
 import tts_helper
 from app_path import app_dir
 
@@ -682,10 +683,14 @@ class FCToolGUI:
     # ── Config ────────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
+        cfg = {}
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
-        return {}
+                cfg = json.load(f)
+        # Auto-detect the EVE chat-logs folder when it's blank or a placeholder
+        # (handles OneDrive-redirected Documents). Explicit user paths are kept.
+        cfg["eve_logs_path"] = resolve_eve_logs_path(cfg.get("eve_logs_path", ""))
+        return cfg
 
     def _save_config(self):
         with open(CONFIG_PATH, "w") as f:
