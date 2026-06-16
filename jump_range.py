@@ -18,8 +18,9 @@ from app_path import app_dir
 ESI_BASE = "https://esi.evetech.net/latest"
 HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
 
-# 1 light year in meters (EVE uses this constant)
-LY_IN_METERS = 9.4605e15
+# 1 light year in meters — CCP's official in-game value: 9,460,000,000,000,000.0 m (9.46e15).
+# Source: EVE map-data developer docs. Used for jump-drive LY distance calculations.
+LY_IN_METERS = 9.46e15
 
 # ── Persistent disk caches ─────────────────────────────────────────────────
 # System data essentially never changes, so cache everything to disk.
