@@ -3502,7 +3502,10 @@ class FCToolGUI:
 
         # Check >50% command ship rule
         command_count = sum(ship_counts.get(tid, 0) for tid in ALL_LINKS_COMMAND)
-        skip_links = total > 0 and (command_count / total) > 0.5
+        # Only suppress the links listing in a real fleet (>=10) that is majority
+        # command ships; in small/solo fleets always list them so a lone command
+        # ship (e.g. the FC's own links Claymore) isn't hidden behind "(0)".
+        skip_links = total >= 10 and (command_count / total) > 0.5
 
         # Categorize members
         categories: dict[str, dict[int, list[tuple[str, str]]]] = {
@@ -6350,7 +6353,7 @@ class FCToolGUI:
             for cell in row.cells:
                 cf = tk.Frame(rf, bg=BG_PANEL)
                 cf.pack(side=tk.LEFT, padx=(8, 0))
-                icon = self._burst_icons.get(cell.discipline)
+                icon = self._burst_icons_small.get(cell.discipline)
                 if icon is not None:
                     di = tk.Label(cf, image=icon, bg=BG_PANEL)
                 else:
