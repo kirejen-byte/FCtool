@@ -109,6 +109,11 @@ CHARACTERS_TAB_INDEX = 4
 FITTINGS_TAB_INDEX = 5
 SETTINGS_TAB_INDEX = 6
 
+# ESI fittings scopes (added after some characters were already authed; SSO
+# grants scopes only at login, so older tokens lack these and need re-auth).
+SCOPE_FITTINGS_READ = "esi-fittings.read_fittings.v1"
+SCOPE_FITTINGS_WRITE = "esi-fittings.write_fittings.v1"
+
 # Verdict -> color map for command-burst rendering. Hoisted to module level so
 # both the per-pilot Links rows and the off-hull rows share one source of truth
 # (command_bursts is imported above; the FG_* constants are in scope here).
@@ -4188,6 +4193,26 @@ class FCToolGUI:
                        command=lambda a=acct: self._esi_disconnect(a)
                        ).pack(side=tk.LEFT, padx=2)
 
+            # If this character's token predates the esi-fittings scopes, it
+            # cannot import/push fits until re-authorized. Show a one-line
+            # notice + a Re-authorize button that reuses the SSO login flow
+            # (re-logging in as the same character refreshes its tokens with
+            # the full current SCOPES via _esi_login_complete's dup handling).
+            if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+                notice = tk.Frame(self._esi_chars_frame, bg=BG_DARK)
+                notice.pack(fill=tk.X, padx=(20, 0), pady=(0, 2))
+                tk.Label(
+                    notice,
+                    text="⚠ Re-authorize to enable in-game fittings "
+                         "import/push.",
+                    font=("Consolas", 9), fg=FG_ORANGE, bg=BG_DARK,
+                    anchor=tk.W,
+                ).pack(side=tk.LEFT, padx=(0, 8))
+                ttk.Button(
+                    notice, text="Re-authorize", style="Dark.TButton",
+                    command=self._esi_login,
+                ).pack(side=tk.LEFT, padx=2)
+
     def _esi_set_primary(self, acct: ESIAuth):
         """Set a character as the primary ESI account."""
         self.esi_auth = acct
@@ -4785,6 +4810,23 @@ class FCToolGUI:
 
         for widget in (header, arrow_label, name_label, loc_label):
             widget.bind("<Button-1>", lambda e, p=panel: toggle(p))
+
+        # Re-auth notice for characters whose token predates the esi-fittings
+        # scopes — without re-authorizing they can't import/push in-game fits.
+        # The Re-authorize button reuses the SSO login flow (re-logging in as
+        # the same character refreshes its tokens with the full current SCOPES).
+        if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+            reauth_row = tk.Frame(panel, bg=BG_PANEL)
+            reauth_row.pack(fill=tk.X, padx=20, pady=(0, 5))
+            tk.Label(
+                reauth_row,
+                text="⚠ Re-authorize to enable in-game fittings import/push",
+                font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL, anchor=tk.W,
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(
+                reauth_row, text="Re-authorize", style="Dark.TButton",
+                command=self._esi_login,
+            ).pack(side=tk.LEFT)
 
         panel._acct = acct
         panel._loc_label = loc_label
@@ -7585,6 +7627,15 @@ class FCToolGUI:
                 "Connect a character (Characters tab) before saving to in-game "
                 "Fittings.")
             return
+        if not char.has_scope(SCOPE_FITTINGS_WRITE):
+            messagebox.showwarning(
+                "Re-authorize required",
+                f"{char.character_name or 'This character'} was authorized "
+                "before in-game fittings support was added, so it cannot save "
+                "fits to its in-game Fittings yet.\n\nOpen the Characters or "
+                "Settings tab and click \"Re-authorize\" for this character, "
+                "then try again.")
+            return
         self._push_fit_to_eve(fit, char)
 
     # ── Shared dialogs / prompts ──────────────────────────────────────────────
@@ -7989,6 +8040,14 @@ class FCToolGUI:
             messagebox.showwarning(
                 "No character",
                 "Connect a character (Characters tab) before importing from EVE.")
+            return
+        if not char.has_scope(SCOPE_FITTINGS_READ):
+            messagebox.showwarning(
+                "Re-authorize required",
+                f"{char.character_name or 'This character'} was authorized "
+                "before in-game fittings support was added, so it cannot read "
+                "in-game fittings yet.\n\nOpen the Characters or Settings tab "
+                "and click \"Re-authorize\" for this character, then try again.")
             return
         char_id = char.character_id
 

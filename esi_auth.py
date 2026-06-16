@@ -465,16 +465,31 @@ class ESIAuth:
                 self._access_token = None
                 return False
 
-    def _decode_character_info(self):
-        """Extract character ID and name from the JWT access token."""
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict:
+        """Decode the (unverified) payload segment of a JWT into a dict.
+
+        Returns {} on any malformed/empty input. The token signature is NOT
+        verified — we only read claims SSO already issued to us (sub, name,
+        scp), so this is purely a local decode, not a trust boundary."""
         try:
-            # JWT is three base64 segments separated by dots
-            payload_b64 = self._access_token.split(".")[1]
-            # Add padding
+            payload_b64 = token.split(".")[1]
             padding = 4 - len(payload_b64) % 4
             if padding != 4:
                 payload_b64 += "=" * padding
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            return json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception:
+            return {}
+
+    def _decode_character_info(self):
+        """Extract character ID and name from the JWT access token."""
+        try:
+            payload = self._decode_jwt_payload(self._access_token or "")
+            if not payload:
+                # Undecodable/absent token — leave any previously-loaded
+                # character_id/name intact (matches prior behavior where a
+                # decode failure was swallowed without overwriting state).
+                return
 
             # Subject format: "CHARACTER:EVE:1234567890"
             sub = payload.get("sub", "")
@@ -486,6 +501,38 @@ class ESIAuth:
 
         except Exception as e:
             print(f"[ESI Auth] Error decoding JWT: {e}")
+
+    def granted_scopes(self) -> set[str]:
+        """Return the set of ESI scopes this character's token was granted.
+
+        Reads the `scp` claim from the access-token JWT (SSO grants scopes
+        only at login, so a token minted before a new scope was added will
+        not carry it). The claim may be a list of scope strings or a single
+        space-separated string — both are handled. Triggers a refresh via the
+        access_token property if no decoded token is in memory yet. Returns an
+        empty set on any error (missing/expired token, malformed JWT), so
+        callers can treat 'unknown' as 'not granted' and route to re-auth."""
+        token = self._access_token
+        if not token:
+            # Lazily obtain a valid access token (may refresh) so a freshly
+            # loaded account still reports its scopes. Never raises.
+            try:
+                token = self.access_token
+            except Exception:
+                token = None
+        if not token:
+            return set()
+        scp = self._decode_jwt_payload(token).get("scp")
+        if isinstance(scp, str):
+            return {s for s in scp.split(" ") if s}
+        if isinstance(scp, (list, tuple)):
+            return {s for s in scp if isinstance(s, str) and s}
+        return set()
+
+    def has_scope(self, scope: str) -> bool:
+        """True iff this character's token was granted `scope`. Defensive:
+        returns False on any decode error or missing token."""
+        return scope in self.granted_scopes()
 
     def logout(self):
         """Clear stored tokens."""

@@ -1,9 +1,65 @@
+import base64
+import json
+
 import esi_auth
 
 
 def test_scopes_include_fittings():
     assert "esi-fittings.read_fittings.v1" in esi_auth.SCOPES
     assert "esi-fittings.write_fittings.v1" in esi_auth.SCOPES
+
+
+def _jwt_with_scp(scp):
+    """Build a fake (unsigned) JWT whose payload carries the given `scp`
+    claim. `scp` may be a list, a space-separated string, or omitted (None
+    => no scp claim at all)."""
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
+    ).rstrip(b"=").decode()
+    claims = {"sub": "CHARACTER:EVE:100", "name": "Tester"}
+    if scp is not None:
+        claims["scp"] = scp
+    payload = base64.urlsafe_b64encode(
+        json.dumps(claims).encode()
+    ).rstrip(b"=").decode()
+    sig = base64.urlsafe_b64encode(b"fake-sig").rstrip(b"=").decode()
+    return f"{header}.{payload}.{sig}"
+
+
+def _auth_with_token(token):
+    a = esi_auth.ESIAuth.__new__(esi_auth.ESIAuth)   # bypass __init__/network
+    a._access_token = token
+    return a
+
+
+def test_granted_scopes_reads_list_claim():
+    a = _auth_with_token(_jwt_with_scp(
+        ["esi-fittings.read_fittings.v1", "esi-fittings.write_fittings.v1"]))
+    scopes = a.granted_scopes()
+    assert "esi-fittings.read_fittings.v1" in scopes
+    assert "esi-fittings.write_fittings.v1" in scopes
+
+
+def test_granted_scopes_reads_space_separated_string_claim():
+    a = _auth_with_token(_jwt_with_scp(
+        "publicData esi-fittings.read_fittings.v1"))
+    assert a.granted_scopes() == {"publicData", "esi-fittings.read_fittings.v1"}
+
+
+def test_has_scope_true_and_false():
+    a = _auth_with_token(_jwt_with_scp(["esi-fittings.read_fittings.v1"]))
+    assert a.has_scope("esi-fittings.read_fittings.v1") is True
+    assert a.has_scope("esi-fittings.write_fittings.v1") is False
+
+
+def test_granted_scopes_empty_on_missing_claim_or_no_token():
+    assert _auth_with_token(_jwt_with_scp(None)).granted_scopes() == set()
+    assert _auth_with_token(None).granted_scopes() == set()
+
+
+def test_granted_scopes_empty_on_malformed_token():
+    assert _auth_with_token("not-a-jwt").granted_scopes() == set()
+    assert _auth_with_token("not-a-jwt").has_scope("anything") is False
 
 
 def _auth(monkeypatch, responses):
