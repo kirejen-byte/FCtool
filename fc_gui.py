@@ -6208,10 +6208,12 @@ class FCToolGUI:
     # ── Command-burst / charge tracking ───────────────────────────────────────
 
     def _load_burst_icons(self):
-        """Load discipline icons once: self._burst_icons (full 64px, used by the
-        per-pilot list) and self._burst_icons_small (32px, used by the compact
-        inline top coverage strip). Glyph fallback on any failure. Called during
-        UI build, after self.root exists."""
+        """Load discipline icons once. self._burst_icons holds the full 64px
+        PhotoImages; self._burst_icons_small holds 32px subsample(2,2) copies.
+        Both the top coverage strip and the per-pilot list render the 32px set;
+        the full-size set is kept only as the source for the subsample copies.
+        Glyph fallback on any failure. Called during UI build, after self.root
+        exists."""
         from app_path import bundle_dir
         files = {
             command_bursts.SHIELD: "shield.png",
