@@ -6609,9 +6609,14 @@ class FCToolGUI:
 
         def do_fetch():
             try:
-                fleet_id = self.esi_auth.get_fleet_id()
-                # Single ESI call for fleet members
-                members = self.esi_auth.get_fleet_members() if fleet_id else None
+                info = self.esi_auth.get_fleet_info()
+                fleet_id = info["fleet_id"] if info else None
+                # Only the fleet boss may read /fleets/{id}/members/ (others get
+                # a guaranteed 403); non-boss falls into the existing back-off.
+                if info and self.esi_auth.is_boss(info, self.esi_auth.character_id):
+                    members = self.esi_auth.get_fleet_members(fleet_id=fleet_id)
+                else:
+                    members = None
                 if members:
                     # Got a real fleet — reset miss counter
                     self._no_fleet_misses = 0

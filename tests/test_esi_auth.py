@@ -606,38 +606,138 @@ def test_get_affiliations_falls_back_to_auth_post(tmp_path, monkeypatch):
     assert out[1]["character_id"] == 11
 
 
-def test_is_fleet_boss_true(tmp_path, monkeypatch):
+def test_get_fleet_info_returns_id_boss_and_role(tmp_path, mocker):
+    """get_fleet_info surfaces fleet_id, fleet_boss_id, and role from the
+    single /characters/{id}/fleet/ response."""
     auth = _make_auth(tmp_path)
     auth._character_id = 42
-
-    def fake_get(path, **kw):
-        return {
+    spy = mocker.patch.object(
+        auth,
+        "esi_get",
+        return_value={
             "fleet_id": 999,
+            "fleet_boss_id": 42,
             "role": "fleet_commander",
             "wing_id": 0,
             "squad_id": 0,
-        }
+        },
+    )
+    info = auth.get_fleet_info()
+    assert info == {
+        "fleet_id": 999,
+        "fleet_boss_id": 42,
+        "role": "fleet_commander",
+    }
+    spy.assert_called_once_with("/characters/42/fleet/")
 
-    monkeypatch.setattr(auth, "esi_get", fake_get)
+
+def test_get_fleet_info_none_when_not_in_fleet(tmp_path, mocker):
+    """esi_get returns None on a 404 (not in a fleet) -> get_fleet_info None."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    mocker.patch.object(auth, "esi_get", return_value=None)
+    assert auth.get_fleet_info() is None
+
+
+def test_get_fleet_id_returns_fleet_id(tmp_path, mocker):
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    mocker.patch.object(
+        auth,
+        "esi_get",
+        return_value={"fleet_id": 777, "fleet_boss_id": 1, "role": "x"},
+    )
+    assert auth.get_fleet_id() == 777
+
+
+def test_get_fleet_id_none_when_404(tmp_path, mocker):
+    """When /fleet/ 404s (esi_get returns None), get_fleet_id is None."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    mocker.patch.object(auth, "esi_get", return_value=None)
+    assert auth.get_fleet_id() is None
+
+
+def test_is_boss_static(tmp_path):
+    """ESIAuth.is_boss compares fleet_boss_id against the given character_id."""
+    assert ESIAuth.is_boss({"fleet_boss_id": 7}, 7) is True
+    assert ESIAuth.is_boss({"fleet_boss_id": 8}, 7) is False
+    assert ESIAuth.is_boss(None, 7) is False
+
+
+def test_is_fleet_boss_true(tmp_path, mocker):
+    """True when the authed character_id equals the fleet_boss_id."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    mocker.patch.object(
+        auth,
+        "esi_get",
+        return_value={
+            "fleet_id": 999,
+            "fleet_boss_id": 42,
+            "role": "fleet_commander",
+        },
+    )
     assert auth.is_fleet_boss() is True
 
 
-def test_is_fleet_boss_false_when_not_in_fleet(tmp_path, monkeypatch):
+def test_is_fleet_boss_false_when_not_in_fleet(tmp_path, mocker):
     auth = _make_auth(tmp_path)
     auth._character_id = 42
-    monkeypatch.setattr(auth, "esi_get", lambda path, **kw: None)
+    mocker.patch.object(auth, "esi_get", return_value=None)
     assert auth.is_fleet_boss() is False
 
 
-def test_is_fleet_boss_false_when_member(tmp_path, monkeypatch):
+def test_is_fleet_boss_false_when_member(tmp_path, mocker):
+    """A non-boss member's id differs from fleet_boss_id -> False."""
     auth = _make_auth(tmp_path)
     auth._character_id = 42
-    monkeypatch.setattr(
+    mocker.patch.object(
         auth,
         "esi_get",
-        lambda path, **kw: {"fleet_id": 1, "role": "squad_member"},
+        return_value={
+            "fleet_id": 1,
+            "fleet_boss_id": 1000,
+            "role": "squad_member",
+        },
     )
     assert auth.is_fleet_boss() is False
+
+
+def test_get_fleet_members_with_known_id_skips_fleet_lookup(tmp_path, mocker):
+    """Passing fleet_id=5 must hit /fleets/5/members/ exactly once and NOT
+    trigger a /characters/{id}/fleet/ lookup."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+    spy = mocker.patch.object(
+        auth, "esi_get", return_value=[{"character_id": 1}]
+    )
+    members = auth.get_fleet_members(fleet_id=5)
+    assert members == [{"character_id": 1}]
+    spy.assert_called_once_with("/fleets/5/members/")
+    # No /fleet/ resolution call leaked in.
+    for call in spy.call_args_list:
+        assert "/fleet/" not in call.args[0] or call.args[0].startswith("/fleets/")
+
+
+def test_get_fleet_members_no_arg_resolves_fleet_first(tmp_path, mocker):
+    """With no fleet_id, get_fleet_members first resolves the fleet id via
+    /characters/.../fleet/ then reads /fleets/.../members/."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 42
+
+    def fake_get(path, *a, **kw):
+        if path == "/characters/42/fleet/":
+            return {"fleet_id": 88, "fleet_boss_id": 42, "role": "x"}
+        if path == "/fleets/88/members/":
+            return [{"character_id": 1}]
+        raise AssertionError(f"unexpected path {path}")
+
+    spy = mocker.patch.object(auth, "esi_get", side_effect=fake_get)
+    members = auth.get_fleet_members()
+    assert members == [{"character_id": 1}]
+    called_paths = [c.args[0] for c in spy.call_args_list]
+    assert called_paths == ["/characters/42/fleet/", "/fleets/88/members/"]
 
 
 # ── Categorized ID resolution (resolve_ids / resolve_* convenience) ──────────

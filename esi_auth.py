@@ -725,20 +725,39 @@ class ESIAuth:
 
     # ── Fleet ────────────────────────────────────────────────────────────────
 
-    def get_fleet_id(self) -> int | None:
-        """Get the fleet ID the authenticated character is in."""
+    def get_fleet_info(self) -> dict | None:
+        """Return the authed character's current fleet info as
+        {'fleet_id', 'fleet_boss_id', 'role'}, or None if not in a fleet."""
         if not self._character_id:
             return None
         data = self.esi_get(f"/characters/{self._character_id}/fleet/")
-        if data and "fleet_id" in data:
-            return data["fleet_id"]
+        if isinstance(data, dict) and "fleet_id" in data:
+            return {
+                "fleet_id": data["fleet_id"],
+                "fleet_boss_id": data.get("fleet_boss_id"),
+                "role": data.get("role"),
+            }
         return None
 
-    def get_fleet_members(self) -> list[dict] | None:
-        """Get all members of the character's current fleet.
+    @staticmethod
+    def is_boss(info, character_id) -> bool:
+        """True iff `info` (from get_fleet_info) shows `character_id` is the fleet
+        boss — the only member allowed to read /fleets/{id}/members/."""
+        return bool(info and info.get("fleet_boss_id") == character_id)
+
+    def get_fleet_id(self) -> int | None:
+        """The authed character's current fleet_id, or None if not in a fleet."""
+        info = self.get_fleet_info()
+        return info["fleet_id"] if info else None
+
+    def get_fleet_members(self, fleet_id=None) -> list[dict] | None:
+        """Fleet member roster. Pass a known fleet_id to avoid a redundant
+        /characters/{id}/fleet/ lookup. ESI returns 403 unless the authed char
+        is the fleet boss.
         Returns list of dicts with character_id, solar_system_id, ship_type_id, etc.
         """
-        fleet_id = self.get_fleet_id()
+        if fleet_id is None:
+            fleet_id = self.get_fleet_id()
         if not fleet_id:
             return None
         return self.esi_get(f"/fleets/{fleet_id}/members/")
@@ -1169,13 +1188,8 @@ class ESIAuth:
         return data if isinstance(data, list) else []
 
     def is_fleet_boss(self) -> bool:
-        """Return True if the authenticated character is fleet commander."""
-        if not self._character_id:
-            return False
-        data = self.esi_get(f"/characters/{self._character_id}/fleet/")
-        if not isinstance(data, dict):
-            return False
-        return data.get("role") == "fleet_commander"
+        """True iff the authed character is the fleet boss (can read members)."""
+        return self.is_boss(self.get_fleet_info(), self._character_id)
 
     # ── Ansiblex Discovery ───────────────────────────────────────────────────
 
