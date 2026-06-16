@@ -465,6 +465,11 @@ class FCToolGUI:
         self._booster_rows_by_name: dict = {}    # lowercased pilot name -> command_bursts.PilotRow
         self._booster_ship_names: dict = {}       # ship_type_id -> resolved hull name (or None)
         self._booster_is_boss: bool = False
+        # Per-section ship-type expand state, keyed by id(content_frame) -> set of
+        # open type_ids. Lets _populate_role_section preserve user expansions
+        # across its frequent destroy/recreate rebuilds (every fleet poll and
+        # every debounced charge-post).
+        self._role_expand_state: dict = {}
         self._links_categories: dict = {}         # {ship_type_id: [(name, char_id), ...]} cached each poll
         self._links_threshold = 5
         self.zkill_monitor: ZKillMonitor | None = None
@@ -3650,6 +3655,14 @@ class FCToolGUI:
         """
         from zkill_monitor import resolve_name
 
+        # Drop any tooltip still bound to a child about to be destroyed (its
+        # <Leave> never fires once destroyed, which would orphan the tooltip).
+        self._hide_tooltip()
+
+        # Per-section expand state (keyed by this content frame so sections don't
+        # bleed into each other). Lets expanded ship-type rows survive rebuilds.
+        expanded = self._role_expand_state.setdefault(id(content_frame), set())
+
         for widget in content_frame.winfo_children():
             widget.destroy()
 
@@ -3682,7 +3695,7 @@ class FCToolGUI:
             ship_row = tk.Frame(content_frame, bg=BG_PANEL)
             ship_row.pack(fill=tk.X, pady=(2, 0))
 
-            is_open = tk.BooleanVar(value=False)
+            is_open = tk.BooleanVar(value=(type_id in expanded))
             arrow = tk.Label(ship_row, text="\u25B6", font=("Consolas", 8),
                               fg=FG_DIM, bg=BG_PANEL)
             arrow.pack(side=tk.LEFT)
@@ -3709,16 +3722,24 @@ class FCToolGUI:
                     prow = rows_by_name.get(char_name.lower())
                     self._build_decorated_pilot_row(pilot_frame, char_name, loc_text, prow)
 
+            # If this ship type was expanded before the rebuild, restore the
+            # open state immediately (mirrors the toggle's "open" branch).
+            if is_open.get():
+                pilot_frame.pack(fill=tk.X, after=ship_row)
+                arrow.config(text="\u25BC")
+
             def toggle(event=None, _open=is_open, _arrow=arrow,
-                       _pf=pilot_frame, _sr=ship_row):
+                       _pf=pilot_frame, _sr=ship_row, _tid=type_id):
                 if _open.get():
                     _pf.pack_forget()
                     _arrow.config(text="\u25B6")
                     _open.set(False)
+                    expanded.discard(_tid)
                 else:
                     _pf.pack(fill=tk.X, after=_sr)
                     _arrow.config(text="\u25BC")
                     _open.set(True)
+                    expanded.add(_tid)
 
             for w in (ship_row, arrow, ship_label):
                 w.bind("<Button-1>", toggle)
@@ -6392,6 +6413,9 @@ class FCToolGUI:
         Clears and rebuilds the children of the persistent _booster_strip, one
         cell per discipline showing the small icon + a ✓/✗ full/missing glyph
         with a tooltip. Runs regardless of boss status."""
+        # Drop any tooltip bound to a strip cell about to be destroyed (its
+        # <Leave> never fires once destroyed, which would orphan the tooltip).
+        self._hide_tooltip()
         for w in self._booster_strip.winfo_children():
             w.destroy()
         for disc in command_bursts.DISCIPLINES:
@@ -6410,8 +6434,13 @@ class FCToolGUI:
             mark = tk.Label(cell, text=glyph, bg=BG_PANEL, fg=color,
                             font=("Consolas", 10, "bold"))
             mark.pack(side=tk.LEFT)
+            if status.full and status.redundancy >= 2:
+                tk.Label(cell, text=f"{status.redundancy}x", bg=BG_PANEL,
+                         fg=FG_ACCENT, font=("Consolas", 8, "bold")).pack(side=tk.LEFT)
             if status.full:
                 tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} links full (all 3 charges)"
+                if status.redundancy >= 2:
+                    tip += f" — covered {status.redundancy}x"
             else:
                 tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} missing: " + ", ".join(status.missing)
             for wdg in (lbl, mark):
@@ -7404,6 +7433,7 @@ $bmp.Dispose()
 
     def _show_tooltip(self, event, text):
         """Show a tooltip near the mouse cursor."""
+        self._hide_tooltip()  # destroy any existing tooltip first (idempotent)
         self._tooltip = tk.Toplevel(self.root)
         self._tooltip.wm_overrideredirect(True)
         self._tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
