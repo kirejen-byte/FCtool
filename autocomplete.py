@@ -42,6 +42,11 @@ class AutocompleteEntry(tk.Entry):
         self._completions_lower = [(c, c.lower()) for c in completions]
         if labels is not None:
             self._labels = labels
+        try:
+            if self.focus_get() is self:
+                self._refresh_dropdown()
+        except tk.TclError:
+            pass
 
     def _on_key(self, event):
         if event.keysym in ("Down", "Up", "Return", "Tab", "Escape",
@@ -49,6 +54,9 @@ class AutocompleteEntry(tk.Entry):
                             "Alt_L", "Alt_R"):
             return
 
+        self._refresh_dropdown()
+
+    def _refresh_dropdown(self):
         text = self.get().strip()
         if len(text) < 1:
             self._close_dropdown()
