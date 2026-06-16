@@ -68,6 +68,9 @@ from eve_paths import resolve_eve_logs_path
 from default_config import DEFAULT_CONFIG
 import tts_helper
 from app_path import app_dir
+import ship_classes
+import charge_tracker
+import command_bursts
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -430,6 +433,14 @@ class FCToolGUI:
         self._tracked_intel_channels: list[str] = self._load_tracked_intel_channels()
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
+        # Command-burst charge tracking. The tracker records "charge up" calls
+        # parsed from fleet chat; the roster maps lowercased pilot name ->
+        # ship_type_id (rebuilt each fleet poll) so build_pilot_rows can match
+        # charge senders to their booster ships off-thread.
+        self.charge_tracker = charge_tracker.ChargeTracker()
+        self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
+        self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
+        self._booster_refresh_pending = False
         self.zkill_monitor: ZKillMonitor | None = None
         self._intel_session = IntelSession()
         self._standings_cache = StandingsCache(
@@ -3444,6 +3455,23 @@ class FCToolGUI:
         )
         from zkill_monitor import resolve_name
 
+        # Rebuild the command-burst roster (lowercased pilot name -> ship_type_id)
+        # so charge-up calls in fleet chat can be matched to booster ships. The
+        # raw ESI member dicts carry character_id (not character_name), so resolve
+        # names the same way the role categorisation below does. Runs on the UI
+        # thread (this method is always invoked via root.after); the heavy
+        # build_pilot_rows work happens off-thread in _run_booster_refresh.
+        roster: dict[str, int] = {}
+        for m in (members or []):
+            char_id = m.get("character_id")
+            tid = m.get("ship_type_id")
+            if char_id and tid is not None:
+                name = resolve_name(char_id, "character") or ""
+                if name:
+                    roster[name.lower()] = tid
+        self._booster_roster = roster
+        self._schedule_booster_refresh()
+
         # Check >50% command ship rule
         command_count = sum(ship_counts.get(tid, 0) for tid in ALL_LINKS_COMMAND)
         skip_links = total > 0 and (command_count / total) > 0.5
@@ -4029,6 +4057,9 @@ class FCToolGUI:
     def _esi_disconnect(self, acct: ESIAuth):
         """Disconnect a specific ESI character."""
         acct.logout()
+        # Drop any command-burst state tied to the (now-stale) fleet context;
+        # the next successful fleet poll rebuilds the roster from the new primary.
+        self._clear_booster_state()
         if acct in self.esi_accounts:
             self.esi_accounts.remove(acct)
         if self.esi_auth is acct:
@@ -6122,6 +6153,15 @@ class FCToolGUI:
     def _on_chat_message(self, msg: ChatMessage):
         if self.xup_counter:
             self.xup_counter.process_message(msg)
+        # Record command-burst "charge up" calls. This callback is only ever
+        # registered on self.chat_monitor, which is constructed with
+        # channel_filter=<fleet channel name>; the monitor only tails log files
+        # whose basename starts with that channel (chat_monitor._discover_files),
+        # so every msg reaching here is already a fleet-channel message — the
+        # same structural filter the x-up counter above relies on. There is no
+        # per-message channel predicate to reuse, so we record unconditionally.
+        if self.charge_tracker.record(msg.sender, msg.message):
+            self._schedule_booster_refresh()
         # Check role tracker letters (must run on main thread for UI updates)
         self.root.after(0, self._check_role_letters, msg)
 
@@ -6133,6 +6173,47 @@ class FCToolGUI:
 
     def _on_xup_fire(self, state: XUpState):
         self.root.after(0, self._show_fire, state)
+
+    # ── Command-burst / charge tracking ───────────────────────────────────────
+
+    def _schedule_booster_refresh(self):
+        """Coalesce refresh requests onto the Tk loop, then compute off-thread."""
+        if self._booster_refresh_pending:
+            return
+        self._booster_refresh_pending = True
+        self.root.after(250, self._run_booster_refresh)
+
+    def _run_booster_refresh(self):
+        self._booster_refresh_pending = False
+        snapshot = self.charge_tracker.snapshot()
+        coverage = self.charge_tracker.coverage()
+        roster = dict(self._booster_roster)
+
+        def work():
+            rows = command_bursts.build_pilot_rows(
+                snapshot, roster, self._group_of_safe)
+            self.root.after(0, lambda: self._render_booster_block(rows, coverage))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _group_of_safe(self, type_id):
+        """group_id resolver that never raises (network failure -> None)."""
+        try:
+            return ship_classes.get_group_id(type_id)
+        except Exception:
+            return None
+
+    def _render_booster_block(self, rows, coverage):
+        # TEMPORARY STUB — Task 8 implements the real rendering.
+        pass
+
+    def _clear_booster_state(self):
+        """Reset charge tracking + roster when the fleet/auth context goes away.
+        Safe to call from any thread: it only touches plain attributes and
+        schedules the refresh via root.after (Tk-thread-safe)."""
+        self.charge_tracker.clear()
+        self._booster_roster = {}
+        self._schedule_booster_refresh()
 
     def _on_zkill_alert(self, alert: KillAlert):
         # Get route from staging
@@ -6598,6 +6679,7 @@ class FCToolGUI:
         if not self.esi_auth or not self.esi_auth.is_authenticated:
             # Clear composition display when not authenticated
             self.root.after(0, self._update_fleet_composition, {}, 0)
+            self._clear_booster_state()
             self.root.after(30000, self._refresh_fleet_locations)
             return
 
@@ -6667,6 +6749,7 @@ class FCToolGUI:
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
                         self.root.after(0, self._update_fleet_composition, {}, 0)
                         self.root.after(0, self._process_loss_tracking, None, [])
+                        self._clear_booster_state()
                     else:
                         print(f"[Fleet] No fleet data (miss {self._no_fleet_misses}/"
                               f"{NO_FLEET_GRACE}) — keeping previous state")
