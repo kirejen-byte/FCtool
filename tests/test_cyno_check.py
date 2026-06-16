@@ -805,9 +805,11 @@ def test_all_battle_kills_scanned_no_cap(tmp_path):
     and NO per-killmail ESI re-fetch.
 
     Build a battle with more kills than the old MAX_KILLS_PER_BATTLE (40) cap, all
-    feeding the SAME blue alliance. Under the old capped behaviour the blue's
-    count would top out at 40; with the cap removed every kill is tallied, so the
-    count equals the full kill count — proving the cap is gone."""
+    feeding the SAME blue alliance. The whole battle is read from ONE related
+    response (no per-killmail ESI re-fetch). Under the PER-BATTLE PRESENCE metric
+    the blue's ``count``/``battle_count`` is 1 (present in this one battle),
+    regardless of how many kills it appears across — the raw-observation count is
+    an internal tiebreak only and is NOT surfaced as ``count`` anymore."""
     when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
     loss = _pilot_loss(when, attackers=[_party(1, alliance_id=ENEMY_ALLY)])
     n_kills = 55          # > the former MAX_KILLS_PER_BATTLE (40)
@@ -831,10 +833,14 @@ def test_all_battle_kills_scanned_no_cap(tmp_path):
     assoc = res["association"]
     # Exactly ONE related fetch (the whole battle is in one response).
     assert len(f.related_calls) == 1
-    # Every kill was scanned (no cap): the blue's count == the full kill count.
+    # Every kill was scanned in that single fetch (no per-killmail ESI re-fetch).
     assert assoc["basis"] == "battles"
     assert assoc["id"] == FRIEND_ALLY
-    assert assoc["count"] == n_kills
+    # PER-BATTLE PRESENCE: one battle present -> count == battle_count == 1,
+    # NOT the 55 raw kill-observations (which only break ties internally).
+    assert assoc["count"] == 1
+    assert assoc["battle_count"] == 1
+    assert assoc["sample_total"] == 1
     # No per-killmail ESI fetches in the battle path (only the loss km was fetched).
     assert f.km_calls == [(1, "lh")]
 
@@ -1073,6 +1079,263 @@ def test_battle_progress_lines_emitted(tmp_path):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# PER-BATTLE PRESENCE metric: distinct-battle presence, not raw observations
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Each loss is in a DISTINCT hour so it maps to its own related-battle key, and
+# the floored hour is always populated (so the previous-hour fallback never
+# fires). Branch A of the side-inference is exercised: an ENEMY ship is the
+# victim, so that kill's friendly attackers are tallied.
+
+def _enemy_killed_by(*friendly_parties, kill_id):
+    """A battle kill where an ENEMY ship is the victim and the given friendly
+    parties are the attackers (Branch A: they fought the enemy -> friendly)."""
+    return _battle_kill(
+        kill_id,
+        victim_party=_inline(2, alliance_id=ENEMY_ALLY),
+        attacker_parties=list(friendly_parties),
+    )
+
+
+def _multi_battle_fetcher(battles, *, base=None, stats=None,
+                          affiliation=None):
+    """Build a FakeFetcher driving one cyno loss per entry in ``battles``.
+
+    ``battles`` is a list of (kill_objects) tuples; each becomes its OWN loss in
+    its OWN distinct hour (so a separate related key) with the same enemy anchor.
+    Returns the fetcher; the caller runs analyze_character(100).
+    """
+    if base is None:
+        base = datetime(2026, 3, 15, 18, 30, 0, tzinfo=timezone.utc)
+    if affiliation is None:
+        affiliation = {"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY}
+    stubs, kms, related = [], {}, {}
+    for i, kills in enumerate(battles):
+        when = base - timedelta(hours=i)
+        km_id = 5000 + i
+        stubs.append(_loss_stub(km_id, f"h{i}"))
+        kms[km_id] = _pilot_loss(
+            when, attackers=[_party(1, alliance_id=ENEMY_ALLY)], hash=f"h{i}")
+        related[(SYS, _km_hour(when))] = _battle(*kills)
+    return FakeFetcher(
+        losses_by_group={833: [stubs]},
+        killmails=kms,
+        related=related,
+        affiliation=affiliation,
+        stats=stats,
+    )
+
+
+def test_more_battles_beats_one_big_battle(tmp_path):
+    """THE inflation fix.
+
+    Entity X (FRIEND_ALLY_2) appears in ONE battle with MANY friendly kills;
+    entity Y (FRIEND_ALLY) appears in MORE battles with FEW kills each. Under the
+    OLD raw-observation metric X (many kills in one fight) out-tallies Y and would
+    be (wrongly) reported. Under the PER-BATTLE PRESENCE metric Y — present in
+    more DISTINCT battles — wins.
+
+    Raw observations here: X = 20 (one battle), Y = 3 (one per battle, 3 battles).
+    Old metric would pick X (20 > 3); new metric picks Y (battle_count 3 > 1).
+    """
+    # Battle 0: ONE battle where X racks up 20 friendly kill-observations.
+    big_battle_kills = [
+        _enemy_killed_by(
+            _inline(3000 + j, alliance_id=FRIEND_ALLY_2,
+                    alliance_name="Big Fleet Alliance"),
+            kill_id=6000 + j,
+        )
+        for j in range(20)
+    ]
+    # Battles 1..3: Y present in each with just ONE friendly kill-observation.
+    y_battle = [_enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="Consistent Blue"),
+        kill_id=7000,
+    )]
+    battles = [big_battle_kills, list(y_battle), list(y_battle), list(y_battle)]
+    f = _multi_battle_fetcher(battles, stats=None)
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["basis"] == "battles"
+    # Y (more distinct battles) wins, NOT X (one big battle).
+    assert assoc["id"] == FRIEND_ALLY
+    assert assoc["name"] == "Consistent Blue"
+    assert assoc["battle_count"] == 3
+    assert assoc["count"] == 3            # count mirrors battle_count
+    assert assoc["sample_total"] == 4
+    # X is the runner-up (present in only its single big battle).
+    runner_ids = [r["id"] for r in assoc["runners_up"]]
+    assert FRIEND_ALLY_2 in runner_ids
+    x_runner = next(r for r in assoc["runners_up"] if r["id"] == FRIEND_ALLY_2)
+    assert x_runner["battle_count"] == 1
+
+
+def test_obs_breaks_tie_when_battle_count_equal(tmp_path):
+    """When two blues are present in the SAME number of distinct battles, raw
+    observations (summed over kills) break the tie."""
+    # Both X and Y present in 2 battles each, but in battle 0 X has 5 kill-obs
+    # while Y has 1 -> X's total obs (6) > Y's (2). Same kind (both alliances),
+    # so the alliance tiebreak is neutral and obs decides.
+    b0 = [
+        _enemy_killed_by(
+            _inline(3000 + j, alliance_id=FRIEND_ALLY_2,
+                    alliance_name="Higher Obs"),
+            kill_id=6100 + j,
+        ) for j in range(5)
+    ] + [_enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="Lower Obs"),
+        kill_id=6200,
+    )]
+    b1 = [
+        _enemy_killed_by(
+            _inline(3001, alliance_id=FRIEND_ALLY_2, alliance_name="Higher Obs"),
+            kill_id=6300),
+        _enemy_killed_by(
+            _inline(41, alliance_id=FRIEND_ALLY, alliance_name="Lower Obs"),
+            kill_id=6400),
+    ]
+    f = _multi_battle_fetcher([b0, b1], stats=None)
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["battle_count"] == 2          # both present in 2 battles
+    assert assoc["id"] == FRIEND_ALLY_2        # higher raw obs wins the tie
+    assert assoc["name"] == "Higher Obs"
+    # The other blue (same battle_count, fewer obs) is the runner-up.
+    assert assoc["runners_up"][0]["id"] == FRIEND_ALLY
+    assert assoc["runners_up"][0]["battle_count"] == 2
+
+
+def test_alliance_preferred_over_corp_when_battle_count_tied(tmp_path):
+    """An alliance and a corp-only blue tie on battle_count -> the ALLIANCE wins
+    (alliance-over-bare-corp tiebreak), even if the corp has equal/more raw
+    observations."""
+    blue_corp_id = 808080
+    # Both present in 2 battles. The corp even has MORE raw obs in battle 0, but
+    # the alliance still wins on the is-alliance tiebreak (which precedes obs).
+    b0 = [
+        _enemy_killed_by(
+            _inline(3000 + j, corporation_id=blue_corp_id,
+                    corporation_name="Blue Corp"),
+            kill_id=6500 + j,
+        ) for j in range(4)
+    ] + [_enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="Blue Alliance"),
+        kill_id=6600,
+    )]
+    b1 = [
+        _enemy_killed_by(
+            _inline(3100, corporation_id=blue_corp_id,
+                    corporation_name="Blue Corp"),
+            kill_id=6700),
+        _enemy_killed_by(
+            _inline(41, alliance_id=FRIEND_ALLY, alliance_name="Blue Alliance"),
+            kill_id=6800),
+    ]
+    f = _multi_battle_fetcher([b0, b1], stats=None)
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["battle_count"] == 2
+    assert assoc["kind"] == "alliance"
+    assert assoc["id"] == FRIEND_ALLY          # alliance beats the corp tie
+    # The corp-only blue (equal battle_count) is the runner-up.
+    assert assoc["runners_up"][0]["id"] == blue_corp_id
+    assert assoc["runners_up"][0]["kind"] == "corporation"
+
+
+def test_confident_true_on_strict_majority(tmp_path):
+    """The top entity present in a STRICT majority of scanned battles -> confident.
+    Here Y is present in 3 of 3 scanned battles (3*2 > 3)."""
+    y_battle = [_enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="Blue"), kill_id=7100)]
+    f = _multi_battle_fetcher([list(y_battle)] * 3, stats=None)
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["sample_total"] == 3
+    assert assoc["battle_count"] == 3
+    assert assoc["confident"] is True
+
+
+def test_not_confident_without_strict_majority(tmp_path):
+    """The top entity present in only a MINORITY (or exactly half) of scanned
+    battles -> NOT confident. Here the top blue is present in 3 of 8 battles
+    (3*2 == 6, not > 8), so confident is False."""
+    # 3 battles feature FRIEND_ALLY; the other 5 feature FRIEND_ALLY_2 once each
+    # but each of THOSE is a distinct entity present in exactly 1 battle, so the
+    # top (FRIEND_ALLY, present in 3) is still the winner but not a majority of 8.
+    a = [_enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="Blue"), kill_id=7200)]
+    others = []
+    for i in range(5):
+        others.append([_enemy_killed_by(
+            _inline(50 + i, alliance_id=900100 + i,
+                    alliance_name=f"One-Off {i}"), kill_id=7300 + i)])
+    battles = [list(a), list(a), list(a)] + others
+    f = _multi_battle_fetcher(battles, stats=None)
+    res = _checker(f, tmp_path).analyze_character(100)
+    assoc = res["association"]
+    assert assoc["sample_total"] == 8
+    assert assoc["id"] == FRIEND_ALLY
+    assert assoc["battle_count"] == 3
+    # 3 of 8 is not a strict majority -> not confident.
+    assert assoc["confident"] is False
+
+
+def test_runners_up_ordered_and_capped(tmp_path):
+    """runners_up holds up to the next 2 entities by the SAME ranking, ordered."""
+    # Top: A present in 4 battles; B in 3; C in 2; D in 1. runners_up should be
+    # [B, C] (the next two), in that order; D is dropped (cap of 2).
+    A = lambda kid: _enemy_killed_by(
+        _inline(40, alliance_id=FRIEND_ALLY, alliance_name="A"), kill_id=kid)
+    B = lambda kid: _enemy_killed_by(
+        _inline(41, alliance_id=FRIEND_ALLY_2, alliance_name="B"), kill_id=kid)
+    C = lambda kid: _enemy_killed_by(
+        _inline(42, alliance_id=810003, alliance_name="C"), kill_id=kid)
+    D = lambda kid: _enemy_killed_by(
+        _inline(43, alliance_id=810004, alliance_name="D"), kill_id=kid)
+    # Build 4 battles; each battle includes whichever entities should be "present"
+    # so the presence counts are A=4, B=3, C=2, D=1.
+    battles = [
+        [A(8000), B(8001), C(8002), D(8003)],   # battle 0: A,B,C,D
+        [A(8010), B(8011), C(8012)],            # battle 1: A,B,C
+        [A(8020), B(8021)],                     # battle 2: A,B
+        [A(8030)],                              # battle 3: A
+    ]
+    f = _multi_battle_fetcher(battles, stats=None)
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["id"] == FRIEND_ALLY          # A, present in all 4
+    assert assoc["battle_count"] == 4
+    ru = assoc["runners_up"]
+    assert len(ru) == 2                          # capped at 2
+    assert [r["id"] for r in ru] == [FRIEND_ALLY_2, 810003]   # B then C
+    assert [r["battle_count"] for r in ru] == [3, 2]
+    # Each runner-up carries the documented shape.
+    assert set(ru[0].keys()) == {"name", "id", "kind", "battle_count"}
+    assert ru[0]["name"] == "B"
+
+
+def test_stats_fallback_exposes_new_fields_defensively(tmp_path):
+    """The stats fallback path sets the new fields so a GUI reading them won't
+    break: confident=True, runners_up=[], battle_count=None."""
+    when = datetime(2026, 3, 15, 14, 23, 9, tzinfo=timezone.utc)
+    # Solo gank: loss has no attackers -> empty enemy set -> stats fallback.
+    loss = _km(RAPIER, items=[_hi(NORMAL_CYNO)], when=when, system_id=SYS)
+    stats = _stats_topalltime(alliances=[(FRIEND_ALLY, 500)], corps=[(222, 50)])
+    f = FakeFetcher(
+        losses_by_group={833: [[_loss_stub(1, "lh")]]},
+        killmails={1: loss},
+        related={},
+        stats=stats,
+        affiliation={"corporation_id": PILOT_CORP, "alliance_id": PILOT_ALLY},
+        names={FRIEND_ALLY: "Blue Alliance"},
+    )
+    assoc = _checker(f, tmp_path).analyze_character(100)["association"]
+    assert assoc["basis"] == "stats"
+    assert assoc["confident"] is True
+    assert assoc["runners_up"] == []
+    assert assoc["battle_count"] is None
+    # Existing stats fields still present.
+    assert assoc["kind"] == "alliance"
+    assert assoc["id"] == FRIEND_ALLY
+    assert assoc["count"] == 500
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # END-TO-END over a real captured zKill 'related' response
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1137,6 +1400,10 @@ def test_end_to_end_real_related_resolves_initiative(tmp_path):
     assert assoc["id"] == INITIATIVE
     assert assoc["name"] == "The Initiative."     # inline allianceName
     assert assoc["sample_total"] == 1
+    # Per-battle presence: Initiative is present in the single scanned battle, so
+    # battle_count == 1 and that is a strict majority of 1 -> confident.
+    assert assoc["battle_count"] == 1
+    assert assoc["confident"] is True
     # The floored hour was queried; the related response carried everything inline
     # so only the loss killmail itself was ESI-fetched.
     assert (F_NMX6, "202602110100") in f.related_calls

@@ -476,9 +476,17 @@ class CynoChecker:
           * ``total``       : int — number of qualifying cyno losses
           * ``breakdown``   : dict[str, int] — count per hull class
           * ``latest``      : {"killmail_id", "url", "time"} | None — most recent
-          * ``association`` : dict — {name, id, kind, count, sample_total, basis}
-                              where basis is "battles" (primary) or "stats"
-                              (fallback); or {"kind": "unknown"}
+          * ``association`` : dict — {name, id, kind, count, sample_total, basis,
+                              battle_count, confident, runners_up} where basis is
+                              "battles" (primary) or "stats" (fallback); or
+                              {"kind": "unknown"}. For basis "battles", count ==
+                              battle_count (the top entity's distinct-battle
+                              presence), confident is True when the top entity is
+                              present in a strict majority of scanned battles, and
+                              runners_up lists up to the next 2 entities
+                              ({name, id, kind, battle_count}). For basis "stats"
+                              battle_count is None, confident is True, runners_up
+                              is []
           * ``losses``      : list[dict] — per-loss display rows (newest first)
           * ``status``      : str — human-readable status / partial-result note
 
@@ -792,11 +800,23 @@ class CynoChecker:
               - K.victim in E  -> K's (non-enemy) attackers are friendly;
               - K.attackers hit E (and K.victim not in E) -> K.victim is friendly.
           * skip NPCs, and skip the pilot's own corp/alliance.
-        Top friendly entity (prefer alliance) = the association; its display name
-        is taken from the inline ``allianceName`` / ``corporationName``.
+
+        Counting is PER-BATTLE PRESENCE, not raw observations: each battle
+        contributes a SET of friendly entities, and an entity's ``battle_count``
+        increments by ONE per distinct battle it is present in. Raw observations
+        (summed over kills) are kept as ``obs`` and used only as a tiebreak. This
+        stops a single huge-fleet battle from out-tallying a group the pilot flies
+        with consistently across MORE battles.
+
+        The top friendly entity (most battles present, alliance-over-corp and raw
+        obs as tiebreaks) is the association; its display name comes from the
+        inline ``allianceName`` / ``corporationName``.
         """
         own_ids = {i for i in (own_corp_id, own_alliance_id) if i}
-        friendly: dict[int, int] = {}
+        # Distinct battles each friendly entity was PRESENT in (the primary rank).
+        battle_count: dict[int, int] = {}
+        # Raw friendly observations summed over kills across all battles (tiebreak).
+        obs: dict[int, int] = {}
         # Track which friendly ids came in as an alliance vs only-corporation so
         # we can prefer alliances when picking the top (mirrors the stats path).
         kinds: dict[int, str] = {}
@@ -839,19 +859,52 @@ class CynoChecker:
             if battle is None:
                 continue
             battles_scanned += 1
-            self._score_battle(battle, enemies, own_ids, friendly, kinds, names)
+            # Per-battle fold: PRESENCE bumps battle_count once; obs accumulates.
+            b_present, b_obs, b_kinds, b_names = self._score_battle(
+                battle, enemies, own_ids)
+            for eid in b_present:
+                battle_count[eid] = battle_count.get(eid, 0) + 1
+            for eid, c in b_obs.items():
+                obs[eid] = obs.get(eid, 0) + c
+            for eid, k in b_kinds.items():
+                # Alliance evidence (from any battle) wins over a bare corp.
+                if k == "alliance":
+                    kinds[eid] = "alliance"
+                else:
+                    kinds.setdefault(eid, "corporation")
+            for eid, nm in b_names.items():
+                if eid not in names:
+                    names[eid] = nm
 
-        chosen = self._pick_top_kind(friendly, kinds)
-        if chosen is None:
+        ranked = self._rank_entities(battle_count, obs, kinds)
+        if not ranked:
             return None, partial
-        entity_id, count, kind = chosen
-        name = names.get(entity_id) or str(entity_id)
+
+        top_eid = ranked[0]
+        top_battle_count = battle_count.get(top_eid, 0)
+        kind = "alliance" if kinds.get(top_eid) == "alliance" else "corporation"
+        name = names.get(top_eid) or str(top_eid)
+        # Confident when the top entity is present in a STRICT majority of the
+        # scanned battles. False when no battles were scanned.
+        confident = top_battle_count * 2 > battles_scanned
+        runners_up = []
+        for eid in ranked[1:3]:
+            runners_up.append({
+                "name": names.get(eid) or str(eid),
+                "id": eid,
+                "kind": "alliance" if kinds.get(eid) == "alliance" else "corporation",
+                "battle_count": battle_count.get(eid, 0),
+            })
         return {
             "name": name,
-            "id": entity_id,
+            "id": top_eid,
             "kind": kind,
-            "count": count,
+            # count mirrors battle_count (per-battle presence of the top entity).
+            "count": top_battle_count,
+            "battle_count": top_battle_count,
             "sample_total": battles_scanned,
+            "confident": confident,
+            "runners_up": runners_up,
             "basis": "battles",
         }, partial
 
@@ -862,19 +915,38 @@ class CynoChecker:
             return True
         return False
 
-    def _score_battle(self, battle, enemies, own_ids, friendly, kinds, names):
-        """Tally friendly observations from one battle's INLINE kills (in place).
+    def _score_battle(self, battle, enemies, own_ids):
+        """Reduce ONE battle's INLINE kills to its per-battle friendly tallies.
 
         ``battle`` is the zKill related team-summary dict. Every kill's victim and
         attackers (``involved`` minus the victim) are read inline in camelCase —
         no killmail fetch, no per-battle cap (one in-memory scan of all kills).
-        Inline ``allianceName`` / ``corporationName`` are collected into ``names``
-        so the association can be labelled without an ESI /universe/names/ call.
+
+        Returns ``(present, obs, kinds, names)`` for THIS battle alone:
+          * ``present``: set[int] — every friendly entity that the two-branch
+            side-inference bumps at least once in this battle (the per-battle
+            PRESENCE set);
+          * ``obs``: dict[int, int] — raw friendly observation count per entity
+            (sum over this battle's kills), used downstream as a TIEBREAK;
+          * ``kinds``: dict[int, str] — "alliance" vs "corporation" per entity;
+          * ``names``: dict[int, str] — inline ``allianceName`` /
+            ``corporationName`` per entity, so the association can be labelled
+            without an ESI /universe/names/ call.
+
+        The own-corp/alliance + enemy exclusion and BOTH side-inference branches
+        are unchanged from the previous in-place version — only the counting
+        granularity (per-battle, folded by the caller) differs.
         """
+        present: set[int] = set()
+        obs: dict[int, int] = {}
+        kinds: dict[int, str] = {}
+        names: dict[int, str] = {}
+
         def _bump(eid, party):
             if not eid or eid in own_ids or eid in enemies:
                 return
-            friendly[eid] = friendly.get(eid, 0) + 1
+            present.add(eid)
+            obs[eid] = obs.get(eid, 0) + 1
             # An alliance id (party carried allianceID) outranks a bare corp.
             if isinstance(party, dict) and party.get("allianceID") == eid:
                 kinds[eid] = "alliance"
@@ -902,6 +974,8 @@ class CynoChecker:
                 # K's victim was killed BY the enemy -> the victim is on our side.
                 _bump(victim_e, victim)
 
+        return present, obs, kinds, names
+
     def _get_related(self, system_id, ts_hour):
         """Fetch a related battle with a forever-cache (immutable history).
 
@@ -921,21 +995,28 @@ class CynoChecker:
         return battle
 
     @staticmethod
-    def _pick_top_kind(counts: dict[int, int], kinds: dict[int, str]):
-        """Return (entity_id, count, kind) for the top friendly entity, preferring
-        alliances over bare corporations, then by count. None if empty."""
-        best = None  # (is_alliance, count, eid)
-        for eid, cnt in counts.items():
-            if not eid:
-                continue
-            is_alliance = 1 if kinds.get(eid) == "alliance" else 0
-            key = (is_alliance, cnt, eid)
-            if best is None or key > best:
-                best = key
-        if best is None:
-            return None
-        eid = best[2]
-        return eid, counts[eid], ("alliance" if best[0] else "corporation")
+    def _rank_entities(battle_count: dict[int, int], obs: dict[int, int],
+                       kinds: dict[int, str]) -> list[int]:
+        """Return friendly entity ids ranked best-first.
+
+        Ranking key (each successive field is a tiebreak):
+          1. ``battle_count`` DESC — present-as-friendly in the MOST distinct
+             battles wins (the inflation fix: distinct-battle presence, not raw
+             kill-observation tallies);
+          2. is-alliance DESC — an alliance outranks a bare corp on a tie;
+          3. ``obs`` DESC — raw friendly observations break a further tie;
+          4. ``eid`` ASC — final deterministic tiebreak.
+
+        Returns ``[]`` when there is no friendly entity.
+        """
+        eids = [e for e in battle_count if e]
+        eids.sort(key=lambda e: (
+            -battle_count.get(e, 0),
+            0 if kinds.get(e) == "alliance" else 1,
+            -obs.get(e, 0),
+            e,
+        ))
+        return eids
 
     # -- association: stats aggregate (fallback) --------------------------
     def _compute_association(self, character_id, own_corp_id, own_alliance_id,
@@ -976,7 +1057,14 @@ class CynoChecker:
             "id": entity_id,
             "kind": kind,
             "count": count,
+            # The stats path has no per-battle notion; expose the new fields
+            # defensively so a GUI that reads them won't break. battle_count is
+            # None (not a per-battle presence), the all-time aggregate is treated
+            # as confident, and there are no battle runners-up.
+            "battle_count": None,
             "sample_total": sample_total,
+            "confident": True,
+            "runners_up": [],
             "basis": "stats",
         }
 
