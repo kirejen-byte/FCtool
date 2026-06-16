@@ -6,6 +6,8 @@ Tkinter-based GUI that wraps all FCTool modules.
 import json
 import os
 import sys
+import shutil
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -355,6 +357,41 @@ def extract_staging_system_names(staging_system, *lists) -> list[str]:
         for item in (lst or ()):
             _add(item)
     return out
+
+
+def build_linux_screenshot_cmds(wayland, available, x, y, w, h, out_path):
+    """Choose Linux screenshot capture + clipboard commands.
+
+    wayland: bool (True for a Wayland session). available: a set of tool names
+    found on PATH. Returns (capture_cmd, clipboard_cmd, error):
+      - capture_cmd: argv list that writes the region PNG to out_path, or None.
+      - clipboard_cmd: argv list that reads a PNG from STDIN onto the clipboard,
+        or None when no clipboard tool is available (caller saves a file).
+      - error: a user-facing string when no capture tool exists, else None.
+    """
+    capture_cmd = None
+    if wayland:
+        if "grim" in available:
+            capture_cmd = ["grim", "-g", f"{x},{y} {w}x{h}", out_path]
+    else:
+        if "maim" in available:
+            capture_cmd = ["maim", "-g", f"{w}x{h}+{x}+{y}", out_path]
+        elif "scrot" in available:
+            capture_cmd = ["scrot", "-a", f"{x},{y},{w},{h}", out_path]
+        elif "import" in available:
+            capture_cmd = ["import", "-window", "root", "-crop", f"{w}x{h}+{x}+{y}", out_path]
+    if capture_cmd is None:
+        if wayland:
+            return None, None, "No screenshot tool found (install grim for Wayland)"
+        return None, None, "No screenshot tool found (install maim, scrot, or imagemagick)"
+    clipboard_cmd = None
+    if wayland:
+        if "wl-copy" in available:
+            clipboard_cmd = ["wl-copy", "--type", "image/png"]
+    else:
+        if "xclip" in available:
+            clipboard_cmd = ["xclip", "-selection", "clipboard", "-t", "image/png"]
+    return capture_cmd, clipboard_cmd, None
 
 
 class FCToolGUI:
@@ -6848,16 +6885,32 @@ class FCToolGUI:
 
         def do_capture():
             try:
-                import subprocess
-
                 # Capture the window using the window's geometry
                 x = self.root.winfo_rootx()
                 y = self.root.winfo_rooty()
                 w = self.root.winfo_width()
                 h = self.root.winfo_height()
 
-                # Use PowerShell to capture screen region and copy to clipboard
-                ps_script = f'''
+                if sys.platform == "win32":
+                    ok, msg = self._capture_screenshot_windows(x, y, w, h)
+                elif sys.platform.startswith("linux"):
+                    ok, msg = self._capture_screenshot_linux(x, y, w, h)
+                else:
+                    ok, msg = False, "Screenshot not supported on this platform"
+                color = FG_GREEN if ok else FG_RED
+                self.root.after(0, self._screenshot_link.config, {"text": msg, "fg": color})
+            except Exception as e:
+                self.root.after(0, self._screenshot_link.config,
+                               {"text": f"Error: {e}", "fg": FG_RED})
+
+        threading.Thread(target=do_capture, daemon=True).start()
+
+    def _capture_screenshot_windows(self, x, y, w, h) -> tuple[bool, str]:
+        """Capture the screen region to the Windows clipboard via PowerShell."""
+        import subprocess
+
+        # Use PowerShell to capture screen region and copy to clipboard
+        ps_script = f'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $bmp = New-Object System.Drawing.Bitmap({w}, {h})
@@ -6867,23 +6920,59 @@ $g.Dispose()
 [System.Windows.Forms.Clipboard]::SetImage($bmp)
 $bmp.Dispose()
 '''
-                result = subprocess.run(
-                    ["powershell", "-STA", "-Command", ps_script],
-                    capture_output=True, timeout=10,
-                )
+        result = subprocess.run(
+            ["powershell", "-STA", "-Command", ps_script],
+            capture_output=True, timeout=10,
+        )
 
-                if result.returncode == 0:
-                    self.root.after(0, self._screenshot_link.config,
-                                   {"text": "Saved to clipboard!", "fg": FG_GREEN})
-                else:
-                    err = result.stderr.decode(errors='replace').strip()[:80]
-                    self.root.after(0, self._screenshot_link.config,
-                                   {"text": f"Capture failed: {err}", "fg": FG_RED})
-            except Exception as e:
-                self.root.after(0, self._screenshot_link.config,
-                               {"text": f"Error: {e}", "fg": FG_RED})
+        if result.returncode == 0:
+            return True, "Saved to clipboard!"
+        err = result.stderr.decode(errors='replace').strip()[:80]
+        return False, f"Capture failed: {err}"
 
-        threading.Thread(target=do_capture, daemon=True).start()
+    def _capture_screenshot_linux(self, x, y, w, h) -> tuple[bool, str]:
+        """Capture the screen region on Linux: clipboard first, file-save fallback."""
+        import subprocess
+
+        wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or \
+            os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        tools = ("grim", "maim", "scrot", "import", "xclip", "wl-copy")
+        available = {t for t in tools if shutil.which(t)}
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        out_path = tmp.name
+        tmp.close()
+
+        capture_cmd, clipboard_cmd, error = build_linux_screenshot_cmds(
+            wayland, available, x, y, w, h, out_path)
+        try:
+            if error:
+                return False, error
+            result = subprocess.run(capture_cmd, capture_output=True, timeout=10)
+            if result.returncode != 0 or os.path.getsize(out_path) == 0:
+                err = result.stderr.decode(errors='replace').strip()[:80]
+                return False, "Capture failed: " + err
+            if clipboard_cmd is not None:
+                with open(out_path, "rb") as f:
+                    png = f.read()
+                r = subprocess.run(clipboard_cmd, input=png, capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    return True, "Saved to clipboard!"
+                # else fall through to file-save
+            # No clipboard tool, or clipboard failed -> save the file:
+            pictures = os.path.expanduser("~/Pictures")
+            dest_dir = pictures if os.path.isdir(pictures) else app_dir()
+            dest = os.path.join(
+                dest_dir,
+                f"fctool_screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            )
+            shutil.copyfile(out_path, dest)
+            return True, f"Saved to {dest}"
+        finally:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
 
     def _check_role_letters(self, msg):
         """Check if a chat message matches any role tracker letter.
