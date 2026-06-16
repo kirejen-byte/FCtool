@@ -40,3 +40,7 @@ __pycache__/
 .idea/
 .claude/
 CLAUDE.md
+
+# AI-agent dev artifacts (local only)
+docs/superpowers/
+docs/eve_reference/
