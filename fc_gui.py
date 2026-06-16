@@ -90,6 +90,17 @@ FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
 BORDER_COLOR = "#2a2a4a"
 
+# Verdict -> color map for command-burst rendering. Hoisted to module level so
+# both the per-pilot Links rows and the off-hull rows share one source of truth
+# (command_bursts is imported above; the FG_* constants are in scope here).
+VERDICT_COLOR = {
+    command_bursts.Verdict.BONUSED: FG_GREEN,
+    command_bursts.Verdict.BONUSED_CONDITIONAL: FG_GREEN,
+    command_bursts.Verdict.FITS_NO_BONUS: FG_YELLOW,
+    command_bursts.Verdict.CANT_FIT: FG_RED,
+    command_bursts.Verdict.UNKNOWN: FG_DIM,
+}
+
 # ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
 
 
@@ -448,6 +459,14 @@ class FCToolGUI:
         # The actual cross-thread hand-off is root.after, used the same way throughout
         # this file. (Set False again in _run_booster_refresh on the Tk thread.)
         self._booster_refresh_pending = False
+        # Tk-thread-only booster render state (written/read only on the Tk thread,
+        # so no lock is needed). Populated by _apply_booster_compute /
+        # _update_specialized_roles and consumed by _render_links_section.
+        self._booster_rows_by_name: dict = {}    # lowercased pilot name -> command_bursts.PilotRow
+        self._booster_ship_names: dict = {}       # ship_type_id -> resolved hull name (or None)
+        self._booster_is_boss: bool = False
+        self._links_categories: dict = {}         # {ship_type_id: [(name, char_id), ...]} cached each poll
+        self._links_threshold = 5
         self.zkill_monitor: ZKillMonitor | None = None
         self._intel_session = IntelSession()
         self._standings_cache = StandingsCache(
@@ -1343,22 +1362,21 @@ class FCToolGUI:
                  font=("Consolas", 8), fg="#ff6666", bg=BG_PANEL
                  ).pack(side=tk.LEFT, anchor=tk.W)
         # Persistent container created once; only its children are rebuilt by
-        # _render_booster_block on each poll.
+        # _render_coverage_strip on each poll.
         self._booster_strip = tk.Frame(spec_top_row, bg=BG_PANEL)
         self._booster_strip.pack(side=tk.RIGHT, anchor=tk.E)
 
         # Create collapsible sections (order matters for display)
         self._links_container, self._links_content, self._links_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
-        # Per-pilot booster widgets live in the *persistent* Links container (not
-        # _links_content, which _populate_role_section destroys+rebuilds each
-        # poll). Packed after _links_content so they sit under the ship-type
-        # breakdown; only their own children are cleared in _render_booster_block.
+        # Non-boss banner. Created on _spec_roles_frame (NOT _links_container) so
+        # it stays visible even when the Links section is collapsed. Packed /
+        # forgotten dynamically by _render_boss_banner (just before the Links
+        # container). Per-pilot booster charges now render INSIDE _links_content
+        # via _render_links_section, so they collapse with the section.
         self._booster_banner = tk.Label(
-            self._links_container, bg=BG_PANEL, fg=FG_YELLOW,
+            self._spec_roles_frame, bg=BG_PANEL, fg=FG_YELLOW,
             font=("Consolas", 8), anchor=tk.W, justify=tk.LEFT, wraplength=320)
-        self._booster_list = tk.Frame(self._links_container, bg=BG_PANEL)
-        self._booster_list.pack(fill=tk.X, padx=(16, 0))
         self._logi_container, self._logi_content, self._logi_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Logistics")
         self._defenders_container, self._defenders_content, self._defenders_count = \
@@ -3556,6 +3574,12 @@ class FCToolGUI:
             "bridge": None,
         }
 
+        # Cache the Links categorization + threshold for _render_links_section,
+        # which owns _links_content and re-renders it whenever booster compute
+        # results arrive (independent of this poll). Tk-thread-only state.
+        self._links_categories = categories["links"]
+        self._links_threshold = thresholds["links"]
+
         # For bridge category, sort titans first
         bridge_sort_key = {}
         for tid in TITANS:
@@ -3591,8 +3615,14 @@ class FCToolGUI:
             members_dict = categories[cat_key]
             threshold = thresholds.get(cat_key)
             sort_override = bridge_sort_key if cat_key == "bridge" else None
-            self._populate_role_section(content, count_lbl, members_dict,
-                                        threshold=threshold, sort_override=sort_override)
+            if cat_key == "links":
+                # Links is owned by _render_links_section so per-pilot booster
+                # charges + off-hull posters render (and collapse) inside it. It
+                # reads the _links_categories/_links_threshold cached just above.
+                self._render_links_section()
+            else:
+                self._populate_role_section(content, count_lbl, members_dict,
+                                            threshold=threshold, sort_override=sort_override)
 
             # Log when a capped role reaches its threshold for the first time
             if threshold is not None:
@@ -3608,8 +3638,16 @@ class FCToolGUI:
 
     def _populate_role_section(self, content_frame, count_label, ship_members,
                                 threshold: int | None = None,
-                                sort_override: dict | None = None):
-        """Populate a collapsible section with ship type counts and pilot details."""
+                                sort_override: dict | None = None,
+                                rows_by_name: dict | None = None):
+        """Populate a collapsible section with ship type counts and pilot details.
+
+        ``rows_by_name`` (lowercased pilot name -> command_bursts.PilotRow) is
+        only passed for the Links section when we are fleet boss; when provided,
+        each pilot row is rendered decorated with inline booster-charge cells via
+        _build_decorated_pilot_row. The default None keeps all other sections (and
+        the non-boss Links section) rendering the plain single-label pilot rows.
+        """
         from zkill_monitor import resolve_name
 
         for widget in content_frame.winfo_children():
@@ -3662,10 +3700,14 @@ class FCToolGUI:
                     loc_text = f"({sys_name} - {region_name})" if region_name else f"({sys_name})"
                 else:
                     loc_text = ""
-                tk.Label(pilot_frame,
-                         text=f"    {char_name} {loc_text}",
-                         font=("Consolas", 8), fg=FG_GREEN, bg=BG_PANEL, anchor=tk.W
-                         ).pack(anchor=tk.W)
+                if rows_by_name is None:
+                    tk.Label(pilot_frame,
+                             text=f"    {char_name} {loc_text}",
+                             font=("Consolas", 8), fg=FG_GREEN, bg=BG_PANEL, anchor=tk.W
+                             ).pack(anchor=tk.W)
+                else:
+                    prow = rows_by_name.get(char_name.lower())
+                    self._build_decorated_pilot_row(pilot_frame, char_name, loc_text, prow)
 
             def toggle(event=None, _open=is_open, _arrow=arrow,
                        _pf=pilot_frame, _sr=ship_row):
@@ -3680,6 +3722,52 @@ class FCToolGUI:
 
             for w in (ship_row, arrow, ship_label):
                 w.bind("<Button-1>", toggle)
+
+    def _build_decorated_pilot_row(self, parent, char_name, loc_text, prow):
+        """Render one pilot row, optionally decorated with inline booster cells.
+
+        The name label matches the plain (undecorated) pilot label exactly so a
+        pilot with no charges looks identical to the rows_by_name=None path. When
+        ``prow`` (a command_bursts.PilotRow) has .cells, an over-limit warning and
+        one icon+glyph cell per discipline are appended inline, each with a
+        verdict tooltip. Pure Tk work (no network) — hull names are pre-resolved
+        off-thread into self._booster_ship_names."""
+        rf = tk.Frame(parent, bg=BG_PANEL)
+        rf.pack(anchor=tk.W, fill=tk.X)
+        tk.Label(rf, text=f"    {char_name} {loc_text}",
+                 font=("Consolas", 8), fg=FG_GREEN, bg=BG_PANEL, anchor=tk.W
+                 ).pack(side=tk.LEFT)
+        if prow is None or not prow.cells:
+            return
+        if prow.over_limit:
+            warn = tk.Label(rf, text=" ⚠", bg=BG_PANEL, fg=FG_YELLOW,
+                            font=("Consolas", 8, "bold"))
+            warn.pack(side=tk.LEFT)
+            wt = f"{prow.charge_count} charges linked — fit may be unusual/bad"
+            warn.bind("<Enter>", lambda e, t=wt: self._show_tooltip(e, t))
+            warn.bind("<Leave>", lambda e: self._hide_tooltip())
+        ship_name = (self._booster_ship_names.get(prow.ship_type_id)
+                     if prow.ship_type_id is not None else None)
+        for cell in prow.cells:
+            cf = tk.Frame(rf, bg=BG_PANEL)
+            cf.pack(side=tk.LEFT, padx=(8, 0))
+            icon = self._burst_icons_small.get(cell.discipline)
+            if icon is not None:
+                di = tk.Label(cf, image=icon, bg=BG_PANEL)
+            else:
+                di = tk.Label(cf, text=command_bursts.DISCIPLINE_LABEL[cell.discipline][:2],
+                              bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 8))
+            di.pack(side=tk.LEFT)
+            gl = tk.Label(cf, text=command_bursts.VERDICT_GLYPH[cell.verdict],
+                          bg=BG_PANEL, fg=VERDICT_COLOR[cell.verdict],
+                          font=("Consolas", 9, "bold"))
+            gl.pack(side=tk.LEFT)
+            tip = command_bursts.verdict_text(
+                cell.verdict, command_bursts.DISCIPLINE_LABEL[cell.discipline],
+                cell.charges, ship_name)
+            for wdg in (di, gl):
+                wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
+                wdg.bind("<Leave>", lambda e: self._hide_tooltip())
 
     def _clear_waypoint_frame(self):
         """Remove all waypoint buttons."""
@@ -6209,11 +6297,11 @@ class FCToolGUI:
 
     def _load_burst_icons(self):
         """Load discipline icons once. self._burst_icons holds the full 64px
-        PhotoImages; self._burst_icons_small holds 32px subsample(2,2) copies.
-        Both the top coverage strip and the per-pilot list render the 32px set;
-        the full-size set is kept only as the source for the subsample copies.
-        Glyph fallback on any failure. Called during UI build, after self.root
-        exists."""
+        PhotoImages; self._burst_icons_small holds ~16px subsample(4,4) copies.
+        Both the top coverage strip and the per-pilot Links rows render the
+        small (~16px) set; the full-size set is kept only as the source for the
+        subsample copies. Glyph fallback on any failure. Called during UI build,
+        after self.root exists."""
         from app_path import bundle_dir
         files = {
             command_bursts.SHIELD: "shield.png",
@@ -6226,9 +6314,10 @@ class FCToolGUI:
                 path = os.path.join(bundle_dir(), "assets", "bursts", fname)
                 full = tk.PhotoImage(file=path)
                 self._burst_icons[disc] = full
-                # Half-size copy (64px -> 32px) for the inline top strip; the
-                # reference is retained in the dict so Tk won't GC it.
-                self._burst_icons_small[disc] = full.subsample(2, 2)
+                # Small copy (64px -> ~16px) for the inline top strip and the
+                # per-pilot Links rows; the reference is retained in the dict so
+                # Tk won't GC it.
+                self._burst_icons_small[disc] = full.subsample(4, 4)
             except Exception:
                 self._burst_icons[disc] = None  # fall back to Unicode glyph
                 self._burst_icons_small[disc] = None
@@ -6252,7 +6341,7 @@ class FCToolGUI:
                 snapshot, roster, self._group_of_safe)
             # Resolve hull names here (off the Tk thread) — resolve_name can
             # block on a synchronous network call on a cache miss, so it must
-            # not run inside _render_booster_block (which runs on the UI thread).
+            # not run inside the Tk-thread render path.
             ship_names = {}
             for row in rows:
                 tid = row.ship_type_id
@@ -6261,8 +6350,11 @@ class FCToolGUI:
                         ship_names[tid] = resolve_name(tid, "type")
                     except Exception:
                         ship_names[tid] = None
+            # Pre-index rows by lowercased pilot name (off-thread) so the Tk-thread
+            # Links render does pure dict lookups when matching pilots to charges.
+            rows_by_name = {r.name.lower(): r for r in rows}
             self.root.after(
-                0, lambda: self._render_booster_block(rows, coverage, ship_names))
+                0, lambda: self._apply_booster_compute(rows_by_name, coverage, ship_names))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -6273,25 +6365,33 @@ class FCToolGUI:
         except Exception:
             return None
 
-    def _render_booster_block(self, rows, coverage, ship_names):
-        """Render the fleet-aggregate coverage strip + per-pilot booster list.
+    def _apply_booster_compute(self, rows_by_name, coverage, ship_names):
+        """Apply off-thread booster compute results, then render (Tk thread only).
 
-        Runs on the Tk thread (always invoked via root.after). Only clears the
-        children of its own persistent containers (_booster_strip, _booster_list)
-        and reconfigures _booster_banner — never the surrounding panel widgets.
-
-        ``ship_names`` maps ship_type_id -> resolved hull name (or None); it is
-        built off-thread in _run_booster_refresh so this method does pure Tk
-        work and never blocks the UI on a name-resolution network call.
+        Stores the pre-indexed rows / hull names / boss flag on self (read only on
+        the Tk thread, so no lock is needed) and drives the three render steps:
+        the always-visible top coverage strip, the non-boss banner, and the Links
+        section (per-pilot charges + off-hull posters). Always invoked via
+        root.after. Must NOT trigger another refresh / role update (no re-entrancy).
         """
-        verdict_color = {
-            command_bursts.Verdict.BONUSED: FG_GREEN,
-            command_bursts.Verdict.BONUSED_CONDITIONAL: FG_GREEN,
-            command_bursts.Verdict.FITS_NO_BONUS: FG_YELLOW,
-            command_bursts.Verdict.CANT_FIT: FG_RED,
-            command_bursts.Verdict.UNKNOWN: FG_DIM,
-        }
-        # ── Top coverage strip (fleet-aggregate) ──
+        self._booster_rows_by_name = rows_by_name
+        self._booster_ship_names = ship_names
+        # Roster is only populated when we can read fleet member ships (fleet
+        # boss). Empty roster => hulls can't be verified, so we are treated as
+        # non-boss. NOTE: best-effort heuristic — an empty roster also occurs when
+        # we ARE the boss but the fleet is empty, or the ESI member fetch failed,
+        # so this can be a false positive.
+        self._booster_is_boss = bool(self._booster_roster)
+        self._render_coverage_strip(coverage)
+        self._render_boss_banner()
+        self._render_links_section()
+
+    def _render_coverage_strip(self, coverage):
+        """Render the always-visible fleet-aggregate coverage strip (Tk thread).
+
+        Clears and rebuilds the children of the persistent _booster_strip, one
+        cell per discipline showing the small icon + a ✓/✗ full/missing glyph
+        with a tooltip. Runs regardless of boss status."""
         for w in self._booster_strip.winfo_children():
             w.destroy()
         for disc in command_bursts.DISCIPLINES:
@@ -6318,60 +6418,57 @@ class FCToolGUI:
                 wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
                 wdg.bind("<Leave>", lambda e: self._hide_tooltip())
 
-        # ── Non-boss banner ──
-        # Roster is only populated when we can read fleet member ships (fleet
-        # boss). Empty roster => hulls can't be verified, so warn the FC.
-        # NOTE: this is a best-effort heuristic. An empty roster also occurs
-        # when we ARE the boss but the fleet is empty, or when the ESI member
-        # fetch failed — so the "not fleet boss" banner can be a false positive.
-        is_boss = bool(self._booster_roster)
-        if not is_boss:
+    def _render_boss_banner(self):
+        """Show/hide the non-boss warning banner (Tk thread).
+
+        Packed on _spec_roles_frame just before the Links container (so it stays
+        visible even when the Links section is collapsed); forgotten when boss."""
+        if not self._booster_is_boss:
             self._booster_banner.config(
                 text="⚠ Ship verification unavailable (not fleet boss) — "
                      "charges shown, hulls not checked")
-            self._booster_banner.pack(fill=tk.X, padx=(16, 0), pady=(2, 2),
-                                      before=self._booster_list)
+            self._booster_banner.pack(fill=tk.X, padx=4, pady=(0, 2),
+                                      before=self._links_container)
         else:
             self._booster_banner.pack_forget()
 
-        # ── Per-pilot rows ──
-        for w in self._booster_list.winfo_children():
-            w.destroy()
-        for row in rows:
-            rf = tk.Frame(self._booster_list, bg=BG_PANEL)
-            rf.pack(fill=tk.X, anchor=tk.W)
-            ship_name = ship_names.get(row.ship_type_id) if row.ship_type_id is not None else None
-            label = f"  {row.name}" + (f" · {ship_name}" if ship_name else "")
-            name_lbl = tk.Label(rf, text=label, bg=BG_PANEL, fg=FG_TEXT,
-                                font=("Consolas", 9), anchor=tk.W)
-            name_lbl.pack(side=tk.LEFT)
-            if row.over_limit:
-                warn = tk.Label(rf, text=" ⚠", bg=BG_PANEL, fg=FG_YELLOW,
-                                font=("Consolas", 9, "bold"))
-                warn.pack(side=tk.LEFT)
-                wt = f"{row.charge_count} charges linked — fit may be unusual/bad"
-                warn.bind("<Enter>", lambda e, t=wt: self._show_tooltip(e, t))
-                warn.bind("<Leave>", lambda e: self._hide_tooltip())
-            for cell in row.cells:
-                cf = tk.Frame(rf, bg=BG_PANEL)
-                cf.pack(side=tk.LEFT, padx=(8, 0))
-                icon = self._burst_icons_small.get(cell.discipline)
-                if icon is not None:
-                    di = tk.Label(cf, image=icon, bg=BG_PANEL)
-                else:
-                    di = tk.Label(cf, text=command_bursts.DISCIPLINE_LABEL[cell.discipline][:2],
-                                  bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 8))
-                di.pack(side=tk.LEFT)
-                gl = tk.Label(cf, text=command_bursts.VERDICT_GLYPH[cell.verdict],
-                              bg=BG_PANEL, fg=verdict_color[cell.verdict],
-                              font=("Consolas", 9, "bold"))
-                gl.pack(side=tk.LEFT)
-                tip = command_bursts.verdict_text(
-                    cell.verdict, command_bursts.DISCIPLINE_LABEL[cell.discipline],
-                    cell.charges, ship_name)
-                for wdg in (di, gl):
-                    wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
-                    wdg.bind("<Leave>", lambda e: self._hide_tooltip())
+    def _render_links_section(self):
+        """Render the Links / Command Ships section (Tk thread; pure lookups).
+
+        Single owner of _links_content. When fleet boss, the per-pilot rows are
+        decorated with inline booster charges (rows_by_name) and off-hull
+        charge-posters are appended flagged; when not boss, charges are hidden and
+        only the plain ship-type/pilot listing renders. Uses pre-computed dict
+        state only (no network). Must NOT trigger a refresh / role update."""
+        rows_by_name = self._booster_rows_by_name if self._booster_is_boss else None
+        self._populate_role_section(self._links_content, self._links_count,
+                                    self._links_categories,
+                                    threshold=self._links_threshold,
+                                    rows_by_name=rows_by_name)
+        if self._booster_is_boss:
+            self._append_offhull_rows()
+
+    def _append_offhull_rows(self):
+        """Append off-hull charge-posters into _links_content, flagged (Tk thread).
+
+        Surfaces pilots who posted charges but are NOT in the command-ship
+        listing (off-hull / non-command hull). Appended inside _links_content so
+        they collapse with the section. The ``listed`` (command-ship) and
+        ``offhull`` sets are disjoint, so no pilot is double-rendered."""
+        listed = {name.lower()
+                  for pilots in self._links_categories.values()
+                  for (name, _cid) in pilots}
+        offhull = sorted(
+            [prow for lname, prow in self._booster_rows_by_name.items()
+             if lname not in listed and prow.cells],
+            key=lambda r: r.name.lower())
+        if not offhull:
+            return
+        tk.Label(self._links_content, text="  Off-hull charge posters:",
+                 font=("Consolas", 8, "bold"), fg=FG_YELLOW, bg=BG_PANEL,
+                 anchor=tk.W).pack(anchor=tk.W)
+        for prow in offhull:
+            self._build_decorated_pilot_row(self._links_content, prow.name, "", prow)
 
     def _clear_booster_state(self):
         """Reset charge tracking + roster when the fleet/auth context goes away.
