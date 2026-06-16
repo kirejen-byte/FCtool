@@ -5,6 +5,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 
 import json
 import os
+import re
 import sys
 import shutil
 import tempfile
@@ -71,6 +72,12 @@ from app_path import app_dir
 import ship_classes
 import charge_tracker
 import command_bursts
+# Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
+# type_catalog and fittings_store are instantiated per-app in __init__.
+import fit_models
+import fit_parser
+import fit_dna
+import pyfa_import
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -89,6 +96,17 @@ FG_YELLOW = "#ffdd00"
 FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
 BORDER_COLOR = "#2a2a4a"
+
+# ── Notebook tab indices ────────────────────────────────────────────────────────
+# Order of self.notebook.add() calls in _build_ui:
+#   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
+#   4 Characters, 5 Fittings, 6 Settings.
+# Inserting Fittings at index 5 leaves the earlier tabs (Intel=1, Characters=4)
+# unchanged; only the Settings tab shifts 5 -> 6.
+INTEL_TAB_INDEX = 1
+CHARACTERS_TAB_INDEX = 4
+FITTINGS_TAB_INDEX = 5
+SETTINGS_TAB_INDEX = 6
 
 # Verdict -> color map for command-burst rendering. Hoisted to module level so
 # both the per-pilot Links rows and the off-hull rows share one source of truth
@@ -516,6 +534,21 @@ class FCToolGUI:
         if not self.esi_auth and self.esi_accounts:
             self.esi_auth = self.esi_accounts[0]
 
+        # Fitting / doctrine services (Fittings tab). Built AFTER esi_auth so the
+        # type catalog's id->name fallback can reach the public ESI endpoint via
+        # _catalog_esi_adapter. The catalog resolves names/slots from the bundled
+        # fit_types.json (and caches ESI fallbacks to fit_types_cache.json); the
+        # store persists the fittings library to app_dir()/fittings_library.json.
+        import type_catalog as _type_catalog
+        import fittings_store as _fittings_store
+        self._migrate_fittings_config()
+        self.type_catalog = _type_catalog.TypeCatalog(esi=self._catalog_esi_adapter())
+        self.fittings = _fittings_store.FittingsStore(
+            os.path.join(app_dir(), "fittings_library.json"))
+        self.fittings.load()
+        # Per-dialog/sub-tab state placeholders (populated as the tab is built).
+        self._fit_selected_id: str | None = None
+
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
         self._prewarm_cache_async()
@@ -893,6 +926,69 @@ class FCToolGUI:
         if changed:
             self._save_config()
 
+    def _migrate_fittings_config(self):
+        """Seed ``config['fittings']`` on first run (idempotent).
+
+        Mirrors :meth:`_migrate_intel_filter_config`: only fills in keys that are
+        absent, so it is safe to call on every startup. The block holds the
+        Fittings-tab preferences kept outside the fittings library file (the tag
+        vocabulary lives in the library; everything UI/session-scoped lives here):
+
+        * ``pyfa_path``    — last-used pyfa savepath/dir for the pyfa importer.
+        * ``motd_budget``  — conservative raw-markup MOTD length ceiling (~3000).
+        * ``motd_template``— persisted MOTD-writer field selections (Phase 7).
+        * ``logi_channel`` — remembered logi/cap channel for the MOTD writer.
+        """
+        changed = False
+        fit_cfg = self.config.get("fittings")
+        if not isinstance(fit_cfg, dict):
+            fit_cfg = {}
+            self.config["fittings"] = fit_cfg
+            changed = True
+        defaults = {
+            "pyfa_path": "",
+            "motd_budget": 3000,
+            "motd_template": {},
+            "logi_channel": "",
+        }
+        for key, val in defaults.items():
+            if key not in fit_cfg:
+                fit_cfg[key] = val
+                changed = True
+        if changed:
+            self._save_config()
+
+    def _catalog_esi_adapter(self):
+        """Return an id->name resolver for TypeCatalog's unknown-ID fallback.
+
+        The app's ESIAuth has no id->name method (its resolve_ids/resolve_names
+        are name->id). TypeCatalog needs the inverse, served by the public
+        ``POST /universe/names/`` endpoint (no auth, batched up to 1000 ids),
+        which returns ``[{id, name, category}]``. We reshape that into the
+        ``{id: {"name", "category"}}`` map the catalog expects. TypeCatalog
+        caches results to fit_types_cache.json, so this is hit only for IDs
+        absent from the bundled fit_types.json.
+        """
+        gui = self
+
+        class _Adapter:
+            def resolve_names(self, type_ids):
+                try:
+                    rows = gui.esi_auth.esi_post_public(
+                        "/universe/names/", list(type_ids)) or []
+                except Exception:
+                    return {}
+                out = {}
+                for r in rows:
+                    if isinstance(r, dict) and "id" in r:
+                        out[r["id"]] = {
+                            "name": r.get("name"),
+                            "category": r.get("category"),
+                        }
+                return out
+
+        return _Adapter()
+
     def _resolve_triumvirate_async(self):
         """Resolve Triumvirate.'s alliance id off-thread and fold it into the
         "The Initiative." coalition. Best-effort; never blocks or raises.
@@ -1032,6 +1128,30 @@ class FCToolGUI:
                 arrowcolor=[("active", FG_WHITE), ("disabled", FG_DIM)],
             )
 
+        # Dark-theme the Treeview used by the Fittings library list (the only
+        # ttk.Treeview in the app). Heading + rows get the dark palette; the
+        # selected row uses the same accent-blue as listboxes/comboboxes.
+        style.configure(
+            "Dark.Treeview",
+            background=BG_ENTRY, fieldbackground=BG_ENTRY, foreground=FG_TEXT,
+            bordercolor=BORDER_COLOR, borderwidth=0, font=("Consolas", 9),
+            rowheight=20,
+        )
+        style.map(
+            "Dark.Treeview",
+            background=[("selected", "#1a5a90")],
+            foreground=[("selected", FG_WHITE)],
+        )
+        style.configure(
+            "Dark.Treeview.Heading",
+            background=BG_PANEL, foreground=FG_ACCENT, font=("Consolas", 9, "bold"),
+            relief="flat",
+        )
+        style.map(
+            "Dark.Treeview.Heading",
+            background=[("active", BG_ENTRY)],
+        )
+
         # The drop-down POPUP is a plain Tk Listbox inside the combobox popdown
         # that ttk styles do NOT reach — theme it via the option database on the
         # root. This runs before any combobox is created (panels build later),
@@ -1087,6 +1207,7 @@ class FCToolGUI:
         self._build_range_tab()
         self._build_wh_route_tab()
         self._build_character_tab()
+        self._build_fitting_tab()
         self._build_settings_tab()
 
         # Track zkill alert notifications
@@ -5501,6 +5622,1036 @@ class FCToolGUI:
         if region:
             label += f" in {region}"
         self._char_filter_count_label.config(text=label, fg=FG_ACCENT)
+
+    # ── Fittings Tab ──────────────────────────────────────────────────────────
+    #
+    # Hosts a nested ttk.Notebook with three sub-tabs: Fittings (library
+    # master/detail, fully implemented below), Doctrines and MOTD (placeholders
+    # replaced by Phases 6 and 7). The shared services self.type_catalog and
+    # self.fittings are constructed in __init__ (after esi_auth).
+
+    # Canonical slot display order for the read-only module list.
+    _FIT_SLOT_ORDER = ("high", "med", "low", "rig", "subsystem", "service")
+    _FIT_SLOT_LABELS = {
+        "high": "High Slots", "med": "Mid Slots", "low": "Low Slots",
+        "rig": "Rigs", "subsystem": "Subsystems", "service": "Service Slots",
+    }
+
+    def _build_fitting_tab(self):
+        tab = tk.Frame(self.notebook, bg=BG_DARK)
+        self.notebook.add(tab, text="  Fittings  ")
+        self._fitting_subnb = ttk.Notebook(tab, style="Dark.TNotebook")
+        self._fitting_subnb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._build_fittings_subtab()     # Task 5.2/5.3 — full implementation
+        self._build_doctrines_subtab()    # Phase 6 — placeholder
+        self._build_motd_subtab()         # Phase 7 — placeholder
+
+    def _build_doctrines_subtab(self):
+        """Placeholder. Phase 6 (Tasks 6.1/6.2) replaces this with the doctrine
+        list + role-grouped detail + .fctdoc import/export."""
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  Doctrines  ")
+        tk.Label(tab, text="Doctrines — coming soon",
+                 font=("Consolas", 12, "bold"), fg=FG_DIM, bg=BG_DARK
+                 ).pack(expand=True)
+
+    def _build_motd_subtab(self):
+        """Placeholder. Phase 7 (Tasks 7.1-7.3) replaces this with the MOTD
+        builder inputs, live preview, length meter and set/copy/import."""
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  MOTD  ")
+        tk.Label(tab, text="MOTD writer — coming soon",
+                 font=("Consolas", 12, "bold"), fg=FG_DIM, bg=BG_DARK
+                 ).pack(expand=True)
+
+    # ── Fittings library sub-tab (Task 5.2) ───────────────────────────────────
+
+    def _build_fittings_subtab(self):
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  Fittings  ")
+
+        # ── Toolbar: search + import buttons ─────────────────────────────────
+        toolbar = tk.Frame(tab, bg=BG_DARK)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        tk.Label(toolbar, text="Search:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT)
+        self._fit_search_var = tk.StringVar()
+        self._fit_search_var.trace_add(
+            "write", lambda *a: self._refresh_fit_list(self._fit_search_var.get()))
+        search_entry = tk.Entry(
+            toolbar, textvariable=self._fit_search_var, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=26,
+            borderwidth=1, relief=tk.RIDGE)
+        search_entry.pack(side=tk.LEFT, padx=(5, 15))
+
+        ttk.Button(toolbar, text="Import from EVE", style="Dark.TButton",
+                   command=self._import_esi_fittings).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import from pyfa", style="Dark.TButton",
+                   command=self._import_pyfa).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Paste EFT/DNA", style="Dark.TButton",
+                   command=self._import_paste_fit).pack(side=tk.LEFT, padx=2)
+
+        # ── Master / detail split ────────────────────────────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=3, uniform="fit")
+        body.columnconfigure(1, weight=4, uniform="fit")
+        body.rowconfigure(0, weight=1)
+
+        # Left: fittings list (Treeview)
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        tk.Label(left, text="LIBRARY", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+
+        tree_wrap = tk.Frame(left, bg=BG_PANEL)
+        tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
+        columns = ("name", "hull", "tags", "doctrines")
+        self._fit_tree = ttk.Treeview(
+            tree_wrap, columns=columns, show="headings",
+            style="Dark.Treeview", selectmode="browse")
+        self._fit_tree.heading("name", text="Name")
+        self._fit_tree.heading("hull", text="Hull")
+        self._fit_tree.heading("tags", text="Tags")
+        self._fit_tree.heading("doctrines", text="#Doc")
+        self._fit_tree.column("name", width=150, anchor=tk.W)
+        self._fit_tree.column("hull", width=110, anchor=tk.W)
+        self._fit_tree.column("tags", width=120, anchor=tk.W)
+        self._fit_tree.column("doctrines", width=44, anchor=tk.CENTER, stretch=False)
+        self._fit_tree.grid(row=0, column=0, sticky="nsew")
+        self._fit_tree.bind("<<TreeviewSelect>>", self._on_fit_tree_select)
+
+        tree_sb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                command=self._fit_tree.yview)
+        self._fit_tree.configure(yscrollcommand=tree_sb.set)
+        tree_sb.grid(row=0, column=1, sticky="ns")
+
+        # Right: detail (scrollable)
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        detail_canvas = tk.Canvas(right, bg=BG_PANEL, highlightthickness=0)
+        detail_canvas.grid(row=0, column=0, sticky="nsew")
+        detail_sb = ttk.Scrollbar(right, orient="vertical",
+                                  command=detail_canvas.yview)
+        detail_sb.grid(row=0, column=1, sticky="ns")
+        detail_canvas.configure(yscrollcommand=detail_sb.set)
+        self._register_scroll_canvas(detail_canvas)
+
+        self._fit_detail = tk.Frame(detail_canvas, bg=BG_PANEL)
+        _detail_win = detail_canvas.create_window(
+            (0, 0), window=self._fit_detail, anchor="nw")
+
+        def _on_detail_config(event=None):
+            detail_canvas.configure(scrollregion=detail_canvas.bbox("all"))
+        self._fit_detail.bind("<Configure>", _on_detail_config)
+
+        def _on_canvas_config(event):
+            detail_canvas.itemconfig(_detail_win, width=event.width)
+        detail_canvas.bind("<Configure>", _on_canvas_config)
+
+        # Populate.
+        self._refresh_fit_list()
+        self._show_fit_detail(None)
+
+    # ── Fittings library controllers (Task 5.2) ───────────────────────────────
+
+    def _doctrine_count_for_fit(self, fit_id: str) -> int:
+        """How many doctrines reference this fit (for the list's #Doc column)."""
+        count = 0
+        try:
+            for doc in self.fittings.list_doctrines():
+                if any(m.fit_id == fit_id for m in doc.members):
+                    count += 1
+        except Exception:
+            pass
+        return count
+
+    def _fit_member_tags(self, fit_id: str) -> list[str]:
+        """Union of this fit's per-membership tags across all doctrines."""
+        tags: list[str] = []
+        try:
+            for doc in self.fittings.list_doctrines():
+                for m in doc.members:
+                    if m.fit_id == fit_id:
+                        for t in m.tags:
+                            if t not in tags:
+                                tags.append(t)
+        except Exception:
+            pass
+        return tags
+
+    def _refresh_fit_list(self, filter_text: str = ""):
+        """Clear + repopulate the fittings Treeview, filtering case-insensitively
+        on name / hull / tags. Preserves the current selection when possible."""
+        tree = getattr(self, "_fit_tree", None)
+        if tree is None:
+            return
+        prev = self._fit_selected_id
+        for iid in tree.get_children():
+            tree.delete(iid)
+        needle = (filter_text or "").strip().lower()
+        restored = False
+        for fit in sorted(self.fittings.list_fits(),
+                          key=lambda f: (f.name or "").lower()):
+            tags = self._fit_member_tags(fit.id)
+            tags_str = ", ".join(tags)
+            hay = " ".join([fit.name or "", fit.hull_name or "", tags_str]).lower()
+            if needle and needle not in hay:
+                continue
+            n_doc = self._doctrine_count_for_fit(fit.id)
+            tree.insert("", tk.END, iid=fit.id,
+                        values=(fit.name, fit.hull_name, tags_str, n_doc))
+            if fit.id == prev:
+                restored = True
+        if restored:
+            tree.selection_set(prev)
+        elif prev is not None and self.fittings.get_fit(prev) is None:
+            # Selected fit was deleted/filtered away — clear the detail pane.
+            self._fit_selected_id = None
+            self._show_fit_detail(None)
+
+    def _on_fit_tree_select(self, event=None):
+        tree = self._fit_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        self._fit_selected_id = sel[0]
+        self._show_fit_detail(sel[0])
+
+    def _clear_fit_detail(self):
+        for w in self._fit_detail.winfo_children():
+            w.destroy()
+
+    def _show_fit_detail(self, fit_id):
+        """Render the selected fit: hull/name header, slot-grouped read-only
+        module list, drones/cargo, notes, doctrine membership, and actions."""
+        self._clear_fit_detail()
+        parent = self._fit_detail
+
+        if not fit_id:
+            tk.Label(parent, text="Select a fitting to view details.",
+                     font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=360, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            tk.Label(parent, text="Fitting not found.",
+                     font=("Consolas", 10), fg=FG_RED, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+
+        # Header: name + hull + source.
+        tk.Label(parent, text=fit.name, font=("Consolas", 13, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=380).pack(anchor=tk.W, padx=10, pady=(10, 0))
+        tk.Label(parent, text=f"{fit.hull_name}  ·  source: {fit.source}",
+                 font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                     anchor=tk.W, padx=10, pady=(0, 6))
+
+        # Slot-grouped module list.
+        parsed = fit.parsed
+        by_slot: dict[str, list] = {}
+        for m in parsed.modules:
+            by_slot.setdefault(m.slot or "other", []).append(m)
+        for slot in self._FIT_SLOT_ORDER:
+            mods = by_slot.get(slot)
+            if not mods:
+                continue
+            tk.Label(parent, text=self._FIT_SLOT_LABELS.get(slot, slot.title()),
+                     font=("Consolas", 9, "bold"), fg=FG_GREEN, bg=BG_PANEL
+                     ).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for m in mods:
+                line = m.name or f"Type {m.type_id}"
+                if m.charge_name:
+                    line += f", {m.charge_name}"
+                if m.offline:
+                    line += " /offline"
+                tk.Label(parent, text=f"  {line}", font=("Consolas", 9),
+                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=380).pack(anchor=tk.W, padx=14)
+        # Any modules with an unrecognized slot bucket.
+        other_mods = [m for s, ms in by_slot.items()
+                      if s not in self._FIT_SLOT_ORDER for m in ms]
+        if other_mods:
+            tk.Label(parent, text="Other", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for m in other_mods:
+                tk.Label(parent, text=f"  {m.name or m.type_id}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+
+        if parsed.drones:
+            tk.Label(parent, text="Drones", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for d in parsed.drones:
+                tk.Label(parent, text=f"  {d.name or d.type_id} x{d.quantity}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+        if parsed.cargo:
+            tk.Label(parent, text="Cargo", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for c in parsed.cargo:
+                tk.Label(parent, text=f"  {c.name or c.type_id} x{c.quantity}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+
+        # Notes.
+        if (fit.notes or "").strip():
+            tk.Label(parent, text="Notes", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(8, 0))
+            tk.Label(parent, text=fit.notes, font=("Consolas", 9),
+                     fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=380).pack(anchor=tk.W, padx=14)
+
+        # Doctrine membership.
+        member_docs = []
+        for doc in self.fittings.list_doctrines():
+            mem = next((m for m in doc.members if m.fit_id == fit.id), None)
+            if mem is not None:
+                member_docs.append((doc.name, mem.tags))
+        tk.Label(parent, text="Doctrines", font=("Consolas", 9, "bold"),
+                 fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(8, 0))
+        if member_docs:
+            for dname, dtags in member_docs:
+                tag_txt = f" [{', '.join(dtags)}]" if dtags else ""
+                tk.Label(parent, text=f"  {dname}{tag_txt}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W, wraplength=380, justify=tk.LEFT).pack(
+                             anchor=tk.W, padx=14)
+        else:
+            tk.Label(parent, text="  (not in any doctrine)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=14)
+
+        # Action buttons.
+        actions = tk.Frame(parent, bg=BG_PANEL)
+        actions.pack(fill=tk.X, padx=10, pady=(12, 10))
+        row1 = tk.Frame(actions, bg=BG_PANEL)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Button(row1, text="Rename", style="Dark.TButton",
+                   command=lambda: self._rename_fit(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="Edit notes", style="Dark.TButton",
+                   command=lambda: self._edit_fit_notes(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="Replace fit text", style="Dark.TButton",
+                   command=lambda: self._replace_fit_text(fit.id)).pack(side=tk.LEFT, padx=2)
+        row2 = tk.Frame(actions, bg=BG_PANEL)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Button(row2, text="Copy EFT", style="Dark.TButton",
+                   command=lambda: self._copy_fit_eft(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Copy DNA", style="Dark.TButton",
+                   command=lambda: self._copy_fit_dna(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Save to in-game Fittings", style="Dark.TButton",
+                   command=lambda: self._save_fit_to_ingame(fit.id)).pack(side=tk.LEFT, padx=2)
+        row3 = tk.Frame(actions, bg=BG_PANEL)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Button(row3, text="Delete", style="Red.TButton",
+                   command=lambda: self._delete_fit(fit.id)).pack(side=tk.LEFT, padx=2)
+
+    def _rename_fit(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        new_name = self._prompt_text_line("Rename Fitting", "Name:", fit.name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == fit.name:
+            return
+        fit.name = new_name
+        self.fittings.update_fit(fit)
+        self.fittings.save()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(fit_id)
+
+    def _edit_fit_notes(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        new_notes = self._prompt_text_block(
+            "Edit Notes", "Notes for this fit:", fit.notes or "")
+        if new_notes is None:
+            return
+        fit.notes = new_notes
+        self.fittings.update_fit(fit)
+        self.fittings.save()
+        self._show_fit_detail(fit_id)
+
+    def _replace_fit_text(self, fit_id):
+        """Re-paste the fit body; keep id/name/membership, rebuild parsed/dna/raw."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+
+        def _on_parsed(parse_result, source, raw_text):
+            warnings = list(parse_result.warnings)
+            parsed = parse_result.fit
+            try:
+                dna = fit_dna.to_dna(parsed)
+            except Exception:
+                dna = fit.dna
+            fit.source = source
+            fit.raw_text = raw_text
+            fit.parsed = parsed
+            fit.dna = dna
+            fit.hull_type_id = parsed.ship_type_id
+            fit.hull_name = parsed.ship_name or fit.hull_name
+            self.fittings.update_fit(fit)
+            self.fittings.save()
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_fit_detail(fit_id)
+            if warnings:
+                messagebox.showwarning(
+                    "Replaced with warnings",
+                    "Fit replaced. Some items were not recognized:\n\n"
+                    + "\n".join(warnings[:12]))
+
+        self._open_paste_dialog(
+            title="Replace Fit Text",
+            instruction="Paste the new EFT or DNA for this fit:",
+            on_success=_on_parsed)
+
+    def _copy_fit_eft(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        text = fit.raw_text if (fit.raw_text or "").strip() else self._render_eft(fit)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _copy_fit_dna(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        dna = fit.dna
+        if not dna:
+            try:
+                dna = fit_dna.to_dna(fit.parsed)
+            except Exception:
+                dna = ""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(dna)
+
+    def _render_eft(self, fit) -> str:
+        """Re-emit a minimal EFT block from parsed contents (fallback when a fit
+        has no raw_text, e.g. ESI/DNA-sourced). Modules are grouped by slot in
+        the canonical order; charges and drones/cargo use the ` xN` form."""
+        parsed = fit.parsed
+        lines = [f"[{fit.hull_name}, {fit.name}]"]
+        by_slot: dict[str, list] = {}
+        for m in parsed.modules:
+            by_slot.setdefault(m.slot or "other", []).append(m)
+        first = True
+        for slot in self._FIT_SLOT_ORDER:
+            mods = by_slot.get(slot)
+            if not mods:
+                continue
+            if not first:
+                lines.append("")
+            first = False
+            for m in mods:
+                line = m.name or f"Type {m.type_id}"
+                if m.charge_name:
+                    line += f", {m.charge_name}"
+                if m.offline:
+                    line += " /offline"
+                lines.append(line)
+        if parsed.drones:
+            lines.append("")
+            for d in parsed.drones:
+                lines.append(f"{d.name or d.type_id} x{d.quantity}")
+        if parsed.cargo:
+            lines.append("")
+            for c in parsed.cargo:
+                lines.append(f"{c.name or c.type_id} x{c.quantity}")
+        return "\n".join(lines)
+
+    def _delete_fit(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        if not messagebox.askyesno(
+                "Delete Fitting",
+                f"Delete '{fit.name}'?\n\nThis also removes it from any doctrine."):
+            return
+        self.fittings.delete_fit(fit_id)   # cascades doctrine membership
+        self.fittings.save()
+        if self._fit_selected_id == fit_id:
+            self._fit_selected_id = None
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(None)
+
+    def _save_fit_to_ingame(self, fit_id):
+        """Push a fit to the primary character's in-game Fittings via ESI."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        char = self.esi_auth
+        if char is None or not char.character_id:
+            messagebox.showwarning(
+                "No character",
+                "Connect a character (Characters tab) before saving to in-game "
+                "Fittings.")
+            return
+        self._push_fit_to_eve(fit, char)
+
+    # ── Shared dialogs / prompts ──────────────────────────────────────────────
+
+    def _prompt_text_line(self, title, label, initial=""):
+        """A small modal single-line text prompt. Returns the string or None."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("420x130")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        var = tk.StringVar(value=initial)
+        entry = tk.Entry(win, textvariable=var, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         width=46, borderwidth=1, relief=tk.RIDGE)
+        entry.pack(fill=tk.X, padx=12)
+        entry.focus_set()
+        entry.icursor(tk.END)
+
+        def _ok():
+            result["value"] = var.get()
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        entry.bind("<Return>", lambda e: _ok())
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _prompt_text_block(self, title, label, initial=""):
+        """A modal multi-line text prompt. Returns the string or None."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("520x320")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        txt = scrolledtext.ScrolledText(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, height=10, wrap=tk.WORD,
+            borderwidth=1, relief=tk.RIDGE)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12)
+        self._theme_scrolledtext_bar(txt)
+        txt.insert("1.0", initial)
+        txt.focus_set()
+
+        def _ok():
+            result["value"] = txt.get("1.0", tk.END).rstrip("\n")
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Save", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _open_paste_dialog(self, title, instruction, on_success):
+        """Open a paste-fit modal: a Text box + status label. On submit, parse on
+        a daemon thread via fit_parser.detect_and_parse and marshal the result
+        back to the Tk thread. `on_success(parse_result, source, raw_text)` runs
+        on the Tk thread when parsing yields a valid hull. Parse failures show a
+        status message and never close the dialog."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("560x420")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text=instruction, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 4))
+        txt = scrolledtext.ScrolledText(
+            win, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, height=16, wrap=tk.NONE,
+            borderwidth=1, relief=tk.RIDGE)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12)
+        self._theme_scrolledtext_bar(txt)
+        txt.focus_set()
+
+        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                          bg=BG_DARK, anchor=tk.W, justify=tk.LEFT, wraplength=520)
+        status.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        state = {"busy": False}
+
+        def _submit():
+            if state["busy"]:
+                return
+            raw_text = txt.get("1.0", tk.END).rstrip("\n")
+            if not raw_text.strip():
+                status.config(text="Paste a fit first.", fg=FG_ORANGE)
+                return
+            state["busy"] = True
+            status.config(text="Parsing...", fg=FG_ACCENT)
+
+            def worker():
+                try:
+                    result = fit_parser.detect_and_parse(
+                        raw_text, self.type_catalog)
+                    err = None
+                except fit_parser.FitParseError as e:
+                    result, err = None, str(getattr(e, "message", e) or e)
+                except Exception as e:  # pragma: no cover - defensive
+                    result, err = None, str(e)
+                self.root.after(0, _apply, result, err, raw_text)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply(result, err, raw_text):
+            state["busy"] = False
+            if err is not None or result is None:
+                status.config(text=f"Could not parse: {err}", fg=FG_RED)
+                return
+            # Detect source from the text shape (matches detect_and_parse).
+            source = "dna" if self._looks_like_dna(raw_text) else "eft"
+            try:
+                on_success(result, source, raw_text)
+            finally:
+                win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import", style="Green.TButton",
+                   command=_submit).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+
+    @staticmethod
+    def _looks_like_dna(text: str) -> bool:
+        """Heuristic mirroring fit_parser.detect_and_parse: DNA has no '['
+        header and matches the leading numeric-id grammar."""
+        stripped = (text or "").lstrip("﻿").strip()
+        if not stripped or stripped.startswith("["):
+            return False
+        return bool(re.match(r"^\d+(:[\d;_]*)*::", stripped))
+
+    # ── Import dialogs (Task 5.3) ──────────────────────────────────────────────
+
+    def _import_paste_fit(self):
+        """Paste EFT/DNA -> detect_and_parse (threaded) -> new Fit -> add."""
+        def _on_parsed(parse_result, source, raw_text):
+            warnings = list(parse_result.warnings)
+            parsed = parse_result.fit
+            name = parsed.name_hint or self._prompt_text_line(
+                "Name Fitting", "Name for this fit:",
+                parsed.ship_name or "New Fit")
+            if name is None:
+                return
+            name = (name or "").strip() or (parsed.ship_name or "New Fit")
+            self._add_parsed_fit(parsed, source=source, raw_text=raw_text,
+                                 name=name)
+            if warnings:
+                messagebox.showwarning(
+                    "Imported with warnings",
+                    "Fit imported. Some items were not recognized:\n\n"
+                    + "\n".join(warnings[:12]))
+
+        self._open_paste_dialog(
+            title="Paste EFT / DNA",
+            instruction="Paste an EFT block or a fitting DNA string:",
+            on_success=_on_parsed)
+
+    def _add_parsed_fit(self, parsed, source, raw_text, name, notes=""):
+        """Build a fit_models.Fit from a ParsedFit and add it to the library.
+        Returns the new fit id (or None on failure). Runs on the Tk thread."""
+        try:
+            dna = fit_dna.to_dna(parsed)
+        except Exception:
+            dna = ""
+        fit = fit_models.Fit(
+            id="",                                  # assigned by add_fit
+            name=name,
+            hull_type_id=parsed.ship_type_id,
+            hull_name=parsed.ship_name or "",
+            source=source,
+            raw_text=raw_text,
+            parsed=parsed,
+            dna=dna,
+            notes=notes,
+            esi_fitting_ids={},
+            created="",                             # stamped by the store
+            modified="",
+        )
+        try:
+            fid = self.fittings.add_fit(fit)
+            self.fittings.save()
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Could not add fit:\n{e}")
+            return None
+        self._fit_selected_id = fid
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(fid)
+        return fid
+
+    def _import_pyfa(self):
+        """Import from a pyfa saveddata.db (browse-by-ship+name), falling back to
+        an EFT-text export file when the DB is missing/unreadable."""
+        cfg = self.config.get("fittings", {})
+        start = cfg.get("pyfa_path") or None
+        self._pyfa_status_win = None
+
+        def worker():
+            db_path = None
+            fits = None
+            err = None
+            try:
+                db_path = pyfa_import.find_pyfa_db(start)
+                if db_path:
+                    fits = pyfa_import.list_pyfa_fits(db_path)
+            except pyfa_import.PyfaImportError as e:
+                err = str(e)
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _apply, db_path, fits, err)
+
+        def _apply(db_path, fits, err):
+            if db_path and fits is not None:
+                # Persist the directory we read from.
+                try:
+                    cfg2 = self.config.setdefault("fittings", {})
+                    cfg2["pyfa_path"] = os.path.dirname(db_path)
+                    self._save_config()
+                except Exception:
+                    pass
+                if not fits:
+                    messagebox.showinfo(
+                        "pyfa import",
+                        "The pyfa database has no saved fits.")
+                    return
+                self._show_pyfa_picker(db_path, fits)
+            else:
+                # Fallback: EFT-text export file.
+                msg = ("Could not read a pyfa database"
+                       + (f" ({err})" if err else "")
+                       + ".\n\nChoose an EFT-text export file (.txt/.cfg) "
+                         "to import instead.")
+                messagebox.showinfo("pyfa import", msg)
+                self._import_eft_text_file()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_eft_text_file(self):
+        """Fallback path: pick an EFT-text export file and parse it."""
+        path = filedialog.askopenfilename(
+            title="Select EFT text export",
+            filetypes=[("EFT/text exports", "*.txt *.cfg"), ("All files", "*.*")])
+        if not path:
+            return
+
+        def worker():
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+                result = fit_parser.detect_and_parse(raw_text, self.type_catalog)
+                err = None
+            except Exception as e:
+                result, raw_text, err = None, "", str(e)
+            self.root.after(0, _apply, result, raw_text, err)
+
+        def _apply(result, raw_text, err):
+            if err is not None or result is None:
+                messagebox.showerror("Import failed",
+                                     f"Could not parse the file:\n{err}")
+                return
+            parsed = result.fit
+            name = parsed.name_hint or (parsed.ship_name or "Imported Fit")
+            self._add_parsed_fit(parsed, source="eft", raw_text=raw_text,
+                                 name=name)
+            if result.warnings:
+                messagebox.showwarning(
+                    "Imported with warnings",
+                    "Fit imported. Some items were not recognized:\n\n"
+                    + "\n".join(result.warnings[:12]))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_pyfa_picker(self, db_path, fits):
+        """Searchable picker over pyfa fits; on selection read + add the fit."""
+        win = tk.Toplevel(self.root)
+        win.title("Import from pyfa")
+        win.configure(bg=BG_DARK)
+        win.geometry("440x460")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select a fit to import:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        search_var = tk.StringVar()
+        search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          borderwidth=1, relief=tk.RIDGE)
+        search.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                          bg=BG_DARK, anchor=tk.W)
+        status.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        index_map: list[dict] = []
+
+        def _repopulate(*_a):
+            needle = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            index_map.clear()
+            for f in fits:
+                label = f"{f.get('name', '?')}"
+                if needle and needle not in label.lower():
+                    continue
+                listbox.insert(tk.END, label)
+                index_map.append(f)
+        search_var.trace_add("write", _repopulate)
+        _repopulate()
+
+        def _do_import():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            entry = index_map[sel[0]]
+            status.config(text="Reading fit...", fg=FG_ACCENT)
+
+            def worker():
+                try:
+                    parsed = pyfa_import.read_pyfa_fit(
+                        db_path, entry["fit_id"], self.type_catalog)
+                    err = None
+                except Exception as e:
+                    parsed, err = None, str(e)
+                self.root.after(0, _applied, parsed, err)
+
+            def _applied(parsed, err):
+                if err is not None or parsed is None:
+                    status.config(text=f"Failed: {err}", fg=FG_RED)
+                    return
+                name = parsed.name_hint or entry.get("name") \
+                    or parsed.ship_name or "pyfa Fit"
+                self._add_parsed_fit(parsed, source="pyfa", raw_text="",
+                                     name=name)
+                win.destroy()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import", style="Green.TButton",
+                   command=_do_import).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_import())
+
+    def _import_esi_fittings(self):
+        """Import the active character's in-game fittings via ESI (threaded),
+        then show a checklist to pick which to add."""
+        char = self.esi_auth
+        if char is None or not char.character_id:
+            messagebox.showwarning(
+                "No character",
+                "Connect a character (Characters tab) before importing from EVE.")
+            return
+        char_id = char.character_id
+
+        def worker():
+            try:
+                raw = char.get_fittings(char_id) or []
+                err = None
+            except Exception as e:
+                raw, err = [], str(e)
+            # Map each ESI fitting -> ParsedFit (off the Tk thread; uses the
+            # catalog which may do cached ESI lookups).
+            entries = []
+            for f in raw:
+                try:
+                    items = f.get("items", []) or []
+                    parsed = fit_dna.esi_items_to_parsed(items, self.type_catalog)
+                    parsed.ship_type_id = f.get("ship_type_id", 0)
+                    parsed.ship_name = (
+                        self.type_catalog.resolve_name(parsed.ship_type_id)
+                        or "")
+                    parsed.name_hint = f.get("name")
+                    entries.append({
+                        "name": f.get("name") or parsed.ship_name or "Fit",
+                        "ship_name": parsed.ship_name,
+                        "parsed": parsed,
+                    })
+                except Exception:
+                    continue
+            self.root.after(0, _apply, entries, err)
+
+        def _apply(entries, err):
+            if err is not None:
+                messagebox.showerror(
+                    "Import from EVE failed",
+                    f"Could not read in-game fittings:\n{err}\n\n"
+                    "If this character was authorized before fittings support "
+                    "was added, re-authorize it on the Characters tab.")
+                return
+            if not entries:
+                messagebox.showinfo(
+                    "Import from EVE",
+                    "No in-game fittings found for this character.")
+                return
+            self._show_esi_import_checklist(entries)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_esi_import_checklist(self, entries):
+        """Checklist of ESI fittings to import; adds the checked ones."""
+        win = tk.Toplevel(self.root)
+        win.title("Import from EVE")
+        win.configure(bg=BG_DARK)
+        win.geometry("460x480")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select fittings to import:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 4))
+
+        canvas = tk.Canvas(win, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=12)
+        sb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+        self._register_scroll_canvas(canvas)
+
+        vars_ = []
+        for entry in entries:
+            v = tk.BooleanVar(value=True)
+            vars_.append((v, entry))
+            label = entry["name"]
+            if entry.get("ship_name"):
+                label += f"  ({entry['ship_name']})"
+            cb = tk.Checkbutton(
+                inner, text=label, variable=v, font=("Consolas", 9),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                anchor=tk.W, highlightthickness=0)
+            cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+
+        def _do_import():
+            added = 0
+            for v, entry in vars_:
+                if not v.get():
+                    continue
+                parsed = entry["parsed"]
+                name = entry["name"]
+                if self._add_parsed_fit(parsed, source="esi", raw_text="",
+                                        name=name) is not None:
+                    added += 1
+            win.destroy()
+            if added:
+                messagebox.showinfo(
+                    "Import from EVE",
+                    f"Imported {added} fitting(s).")
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import selected", style="Green.TButton",
+                   command=_do_import).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+
+    def _push_fit_to_eve(self, fit, char):
+        """Push a fit to a character's in-game Fittings via the store wrapper
+        (threaded). The wrapper builds the body, deletes any prior id, records
+        the new fitting_id and saves; we just surface the result."""
+        char_id = char.character_id
+
+        def worker():
+            try:
+                ok = self.fittings.push_fit_to_character(
+                    fit.id, char_id, self.esi_auth)
+                err = None
+            except Exception as e:
+                ok, err = False, str(e)
+            self.root.after(0, _apply, ok, err)
+
+        def _apply(ok, err):
+            if ok:
+                messagebox.showinfo(
+                    "Saved to in-game Fittings",
+                    f"'{fit.name}' was saved to {char.character_name}'s in-game "
+                    "Fittings.")
+                self._show_fit_detail(fit.id)
+            else:
+                detail = f"\n\n{err}" if err else ""
+                messagebox.showerror(
+                    "Save failed",
+                    "Could not save the fit to in-game Fittings. The character "
+                    "may need to re-authorize (Characters tab) to grant the "
+                    "fittings write scope, or ESI rejected the fit."
+                    + detail)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── Settings Tab ──────────────────────────────────────────────────────────
 
