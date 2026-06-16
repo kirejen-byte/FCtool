@@ -60,6 +60,7 @@ from autocomplete import AutocompleteEntry
 from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker, DeathEvent
+from cyno_check import analyze_character as cyno_analyze_character
 import tts_helper
 from app_path import app_dir
 
@@ -2714,6 +2715,9 @@ class FCToolGUI:
         self._recent_zkill_systems: dict[str, datetime] = {}
         self._recent_intel_systems: dict[str, datetime] = {}
         self._current_log = None  # Tracks active log widget for append helpers
+
+        # ── Cyno Check drawer (collapsible) ───────────────────────────────
+        self._build_cyno_check_drawer(tab)
 
         # ── Split pane: zKill (left) | Intel (right) ─────────────────────
         self._paned = tk.PanedWindow(tab, orient=tk.HORIZONTAL, bg=BG_DARK,
@@ -7125,6 +7129,324 @@ $bmp.Dispose()
         else:
             self._paste_toggle_btn.config(text="▶ Paste Intel")
             self._paste_body.pack_forget()
+
+    # ── Cyno Check drawer ──────────────────────────────────────────────────
+
+    def _build_cyno_check_drawer(self, tab):
+        """Build the collapsible 'Cyno Check' drawer on the Intel tab.
+
+        Baseline footprint is a single header row (▶ Cyno Check); the body is
+        pack()/pack_forget()'d on toggle and starts COLLAPSED. The body holds a
+        one-line hint, a character AutocompleteEntry (debounced ESI search), a
+        Check button, a status line, and a DISABLED ScrolledText result area.
+        """
+        # Session-only state (mirrors the Paste Intel drawer pattern).
+        self._cyno_drawer_expanded = False
+        self._cyno_typeahead_after = None
+        self._cyno_name_to_id: dict[str, int] = {}  # name(lower) -> character_id
+        self._cyno_busy = False
+        self._cyno_latest_url: str | None = None
+
+        self._cyno_drawer_frame = tk.Frame(
+            tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+            highlightbackground=BORDER_COLOR, highlightthickness=1)
+        self._cyno_drawer_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        cyno_header = tk.Frame(self._cyno_drawer_frame, bg=BG_PANEL)
+        cyno_header.pack(fill=tk.X, padx=10, pady=4)
+
+        self._cyno_toggle_btn = tk.Label(
+            cyno_header, text="▶ Cyno Check",
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2",
+        )
+        self._cyno_toggle_btn.pack(side=tk.LEFT)
+        self._cyno_toggle_btn.bind(
+            "<Button-1>", lambda e: self._toggle_cyno_drawer())
+
+        # Body (hidden by default)
+        self._cyno_body = tk.Frame(self._cyno_drawer_frame, bg=BG_PANEL)
+
+        tk.Label(
+            self._cyno_body,
+            text=("Find a character's cyno-ship LOSSES over the last 6 months "
+                  "(public zKillboard data; no login required)."),
+            font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+            justify=tk.LEFT, anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(2, 4))
+
+        cyno_input_row = tk.Frame(self._cyno_body, bg=BG_PANEL)
+        cyno_input_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Label(cyno_input_row, text="Character:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._cyno_entry = AutocompleteEntry(
+            cyno_input_row, completions=[], max_shown=12,
+            font=("Consolas", 10), width=28,
+            bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+            borderwidth=1, relief=tk.RIDGE,
+        )
+        self._cyno_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Debounced ESI type-ahead (only when logged in); Return submits.
+        self._cyno_entry.bind("<KeyRelease>", self._cyno_on_typeahead, add="+")
+        self._cyno_entry.bind("<Return>", lambda e: self._cyno_submit())
+
+        self._cyno_check_btn = ttk.Button(
+            cyno_input_row, text="Check", style="Dark.TButton",
+            command=self._cyno_submit)
+        self._cyno_check_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Hint shown only when login-gated autocomplete is unavailable.
+        if not (self.esi_auth and self.esi_auth.is_authenticated):
+            tk.Label(
+                self._cyno_body,
+                text="Log in (Settings) to enable name autocomplete.",
+                font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+                justify=tk.LEFT, anchor="w",
+            ).pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._cyno_status = tk.Label(
+            self._cyno_body, text="", font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_PANEL, justify=tk.LEFT, anchor="w",
+        )
+        self._cyno_status.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        self._cyno_result = scrolledtext.ScrolledText(
+            self._cyno_body, height=8, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            borderwidth=1, relief=tk.RIDGE,
+        )
+        self._cyno_result.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self._theme_scrolledtext_bar(self._cyno_result)
+        # Clickable link tag for the latest-loss zKill URL.
+        self._cyno_result.tag_configure(
+            "cyno_link", foreground=FG_ACCENT, underline=True)
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Enter>",
+            lambda e: self._cyno_result.config(cursor="hand2"))
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Leave>",
+            lambda e: self._cyno_result.config(cursor=""))
+        self._cyno_result.tag_bind(
+            "cyno_link", "<Button-1>", self._cyno_open_latest)
+
+    def _toggle_cyno_drawer(self):
+        self._cyno_drawer_expanded = not self._cyno_drawer_expanded
+        if self._cyno_drawer_expanded:
+            self._cyno_toggle_btn.config(text="▼ Cyno Check")
+            self._cyno_body.pack(fill=tk.X, padx=0, pady=0)
+        else:
+            self._cyno_toggle_btn.config(text="▶ Cyno Check")
+            self._cyno_body.pack_forget()
+
+    def _cyno_on_typeahead(self, event=None):
+        """Best-effort debounced ESI character type-ahead.
+
+        Mirrors _cm_on_typeahead: ignore nav keys, require >= 3 chars, 300ms
+        debounce. Skipped entirely when not logged in (search needs auth)."""
+        if event is not None and event.keysym in (
+                "Return", "Up", "Down", "Tab", "Escape",
+                "Shift_L", "Shift_R", "Control_L", "Control_R",
+                "Alt_L", "Alt_R"):
+            return
+        if not (self.esi_auth and self.esi_auth.is_authenticated):
+            return
+        query = self._cyno_entry.get().strip()
+        if len(query) < 3:
+            return
+        if self._cyno_typeahead_after is not None:
+            try:
+                self.root.after_cancel(self._cyno_typeahead_after)
+            except Exception:
+                pass
+        self._cyno_typeahead_after = self.root.after(
+            300, lambda: self._cyno_do_typeahead(query))
+
+    def _cyno_do_typeahead(self, query: str):
+        self._cyno_typeahead_after = None
+
+        def worker():
+            results = []
+            try:
+                if self.esi_auth:
+                    results = self.esi_auth.search_entities(query, ["character"])
+            except Exception:
+                results = []
+            names = []
+            name_map: dict[str, int] = {}
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                nm = r.get("name")
+                rid = r.get("id")
+                if nm and isinstance(rid, int):
+                    names.append(nm)
+                    name_map[nm.lower()] = rid
+            if getattr(self, "_cyno_entry", None) is not None:
+                self.root.after(0, self._cyno_apply_typeahead, names, name_map)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cyno_apply_typeahead(self, names, name_map):
+        """Marshal search results back onto the Tk thread."""
+        # Merge into the name->id map so a later submit can resolve without a
+        # second network round-trip.
+        self._cyno_name_to_id.update(name_map)
+        self._cyno_entry.update_completions(names)
+
+    def _cyno_submit(self):
+        """Resolve the typed character name -> id and kick off the analysis."""
+        if self._cyno_busy:
+            return
+        name = self._cyno_entry.get().strip()
+        if not name:
+            self._cyno_set_status("Enter a character name.", FG_DIM)
+            return
+
+        self._cyno_set_status(f"Resolving '{name}' ...", FG_DIM)
+        self._cyno_set_result("")
+        self._cyno_latest_url = None
+        self._cyno_busy = True
+        self._cyno_check_btn.config(state=tk.DISABLED)
+
+        def worker():
+            cid = self._cyno_resolve_character_id(name)
+            if not cid:
+                self.root.after(
+                    0, self._cyno_resolve_failed, name)
+                return
+            self.root.after(
+                0, self._cyno_set_status,
+                f"Checking {name} ...", FG_DIM)
+
+            def progress(msg):
+                # Marshal each backend status line to the UI thread.
+                self.root.after(0, self._cyno_set_status, msg, FG_DIM)
+
+            try:
+                result = cyno_analyze_character(cid, progress=progress)
+            except Exception as exc:
+                self.root.after(0, self._cyno_render_error, str(exc))
+                return
+            self.root.after(0, self._cyno_render_result, name, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cyno_resolve_character_id(self, name: str):
+        """Resolve a character name to an id (worker-thread only, no Tk).
+
+        Tries the cached type-ahead map first, then a public exact-name resolve
+        via resolve_ids()'s 'characters' bucket (case-insensitive)."""
+        cached = self._cyno_name_to_id.get(name.lower())
+        if cached:
+            return cached
+        try:
+            if self.esi_auth:
+                resolved = self.esi_auth.resolve_ids([name])
+                for entry in resolved.get("characters", []) or []:
+                    nm = entry.get("name")
+                    rid = entry.get("id")
+                    if nm and isinstance(rid, int) and nm.lower() == name.lower():
+                        return rid
+        except Exception:
+            pass
+        return None
+
+    def _cyno_resolve_failed(self, name: str):
+        self._cyno_busy = False
+        self._cyno_check_btn.config(state=tk.NORMAL)
+        self._cyno_set_status(f"No character found for '{name}'.", FG_RED)
+
+    def _cyno_render_error(self, message: str):
+        self._cyno_busy = False
+        self._cyno_check_btn.config(state=tk.NORMAL)
+        self._cyno_set_status(f"Error: {message}", FG_RED)
+
+    def _cyno_render_result(self, name: str, result: dict):
+        """Render a completed analysis into the result area (Tk thread)."""
+        try:
+            total = int(result.get("total", 0) or 0)
+            breakdown = result.get("breakdown") or {}
+            latest = result.get("latest")
+            association = result.get("association") or {"kind": "unknown"}
+            status = result.get("status") or ""
+
+            lines = [f"{name}", ""]
+            if total == 0:
+                lines.append("No cyno-ship losses in the last 6 months.")
+            else:
+                lines.append(
+                    f"{total} cyno-ship loss"
+                    f"{'es' if total != 1 else ''} in the last 6 months")
+                if breakdown:
+                    parts = [f"{hull} {cnt}"
+                             for hull, cnt in sorted(breakdown.items())]
+                    lines.append("  " + " · ".join(parts))
+
+            # Association line. `basis` distinguishes the battle-inferred signal
+            # (who the pilot's blues were in the fights around recent losses)
+            # from the all-time stats fallback.
+            if isinstance(association, dict) and \
+                    association.get("kind") != "unknown" and \
+                    association.get("name"):
+                kind = association.get("kind", "")
+                basis = association.get("basis")
+                if basis == "battles":
+                    sample = association.get("sample_total")
+                    src = f"from {sample} battle{'s' if sample != 1 else ''}" \
+                        if sample else "battles"
+                    qual = f" · {src}"
+                elif basis == "stats":
+                    qual = " · all-time"
+                else:
+                    qual = ""
+                lines.append(
+                    f"Flies with: {association['name']} ({kind}{qual})")
+            else:
+                lines.append("Association: unknown")
+
+            # Surface a partial/error note from the backend status if present.
+            low = status.lower()
+            if "partial" in low or "unavailable" in low:
+                lines.append(f"Note: {status}")
+
+            self._cyno_set_result("\n".join(lines) + "\n")
+
+            # Append the latest-loss link as a clickable tagged run.
+            if isinstance(latest, dict) and latest.get("url"):
+                self._cyno_latest_url = latest["url"]
+                time_txt = latest.get("time") or ""
+                self._cyno_result.config(state=tk.NORMAL)
+                self._cyno_result.insert(tk.END, "Latest loss: ")
+                label = f"open on zKillboard{(' (' + time_txt + ')') if time_txt else ''}"
+                self._cyno_result.insert(tk.END, label, "cyno_link")
+                self._cyno_result.insert(tk.END, "\n")
+                self._cyno_result.config(state=tk.DISABLED)
+
+            self._cyno_set_status(status or "Done", FG_GREEN)
+        finally:
+            self._cyno_busy = False
+            self._cyno_check_btn.config(state=tk.NORMAL)
+
+    def _cyno_open_latest(self, event=None):
+        if self._cyno_latest_url:
+            try:
+                webbrowser.open(self._cyno_latest_url)
+            except Exception:
+                pass
+
+    def _cyno_set_status(self, text: str, color: str = FG_DIM):
+        self._cyno_status.config(text=text, fg=color)
+
+    def _cyno_set_result(self, text: str):
+        """Replace the DISABLED ScrolledText body with ``text``."""
+        self._cyno_result.config(state=tk.NORMAL)
+        self._cyno_result.delete("1.0", tk.END)
+        if text:
+            self._cyno_result.insert("1.0", text)
+        self._cyno_result.config(state=tk.DISABLED)
 
     def _toggle_intel_filter_panel(self):
         """Collapse/expand the fight-alert filter body to free up feed space.

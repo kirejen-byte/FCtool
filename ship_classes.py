@@ -20,6 +20,32 @@ GROUP_ASSAULT_FRIGATE = 324       # T2 assault frigates
 GROUP_INTERCEPTOR = 831           # T2 interceptors
 GROUP_ELECTRONIC_ATTACK_SHIP = 893  # T2 EAFs
 
+# Cyno-capable hull groups (used by CynoCheck). A character flying one of
+# these with a Cynosural Field Generator fitted is a cyno alt / lightswitch.
+GROUP_HIC = 894                    # Heavy Interdiction Cruiser (normal cyno)
+GROUP_FORCE_RECON = 833            # Force Recon Ship (normal OR covert cyno)
+GROUP_STRATEGIC_CRUISER = 963      # Strategic Cruiser / T3C (covert cyno)
+GROUP_STEALTH_BOMBER = 834         # Stealth Bomber (covert cyno)
+GROUP_COVERT_OPS = 830             # Covert Ops (covert cyno)
+
+# Map of cyno-capable victim hull group_id -> short human label. A killmail
+# qualifies for CynoCheck when the victim's hull is in one of these groups AND
+# a cyno module was fitted in a high slot. See cyno_check.py.
+CYNO_LOSS_GROUPS: dict[int, str] = {
+    GROUP_HIC: "HIC",
+    GROUP_FORCE_RECON: "Force Recon",
+    GROUP_STRATEGIC_CRUISER: "Strategic Cruiser",
+    GROUP_STEALTH_BOMBER: "Stealth Bomber",
+    GROUP_COVERT_OPS: "Covert Ops",
+}
+
+# Cynosural Field Generator type_ids. A fit containing either of these in a
+# high slot makes the hull a cyno ship for CynoCheck's purposes.
+CYNO_MODULE_IDS: set[int] = {
+    21096,  # Cynosural Field Generator I (normal cyno)
+    28646,  # Covert Cynosural Field Generator I (covert cyno)
+}
+
 # Tackle = cheap/expendable ships that should NOT trigger loss alerts in
 # a main (heavy) fleet. Used by loss_tracker to classify "minor" losses.
 TACKLE_GROUP_IDS = {
@@ -223,6 +249,38 @@ def classify_ship(type_id: int) -> str | None:
     return None
 
 
+def cyno_loss_hull_class(type_id: int) -> str | None:
+    """Return the CynoCheck hull-class label if `type_id` is a cyno-capable
+    hull (HIC / Force Recon / Strategic Cruiser / Stealth Bomber / Covert Ops),
+    else None.
+
+    Resolves the hull's group via get_group_id (ESI + cache) rather than a
+    hard-coded type-id roster, so newly released hulls in these groups are
+    covered automatically. A falsy/None type_id yields None.
+    """
+    if not type_id:
+        return None
+    gid = get_group_id(type_id)
+    if gid is None:
+        return None
+    return CYNO_LOSS_GROUPS.get(gid)
+
+
+def has_cyno_module(item_type_ids) -> bool:
+    """Return True if any type_id in `item_type_ids` is a Cynosural Field
+    Generator (normal or covert).
+
+    `item_type_ids` is any iterable of type_ids (ints). Non-int / None entries
+    are ignored. A None or empty iterable yields False.
+    """
+    if not item_type_ids:
+        return False
+    for tid in item_type_ids:
+        if tid in CYNO_MODULE_IDS:
+            return True
+    return False
+
+
 def is_defender(type_id: int) -> bool:
     """Check if a ship is a destroyer-class hull but NOT an interdictor."""
     if type_id in INTERDICTORS:
@@ -285,6 +343,9 @@ _SHIP_GROUP_IDS_KNOWN: set[int] = {
     GROUP_ELECTRONIC_ATTACK_SHIP,
     # Combat cruisers / battlecruisers / battleships
     26, 358, 833, 906, 963, 419, 1201, 27, 900, 898,
+    # Cyno-capable covert hulls (Covert Ops 830, Stealth Bomber 834);
+    # Force Recon 833, T3C 963, HIC 894 already covered above/below.
+    GROUP_COVERT_OPS, GROUP_STEALTH_BOMBER,
     # Capital classes
     547, 1538, 485, 4594, 513, 883, 902, 659, 30,
     # Industrial / mining / hauling (visible on d-scan; treat as ships)
