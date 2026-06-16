@@ -548,6 +548,7 @@ class FCToolGUI:
         self.fittings.load()
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
+        self._doctrine_selected_id: str | None = None
 
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
@@ -5646,14 +5647,715 @@ class FCToolGUI:
         self._build_doctrines_subtab()    # Phase 6 — placeholder
         self._build_motd_subtab()         # Phase 7 — placeholder
 
+    # ── Doctrines sub-tab (Tasks 6.1 / 6.2) ───────────────────────────────────
+
+    # Canonical tag display order for the role-grouped doctrine detail. Members
+    # carrying a tag outside this list are grouped last under "Other".
+    _DOCTRINE_TAG_ORDER = (
+        "DPS", "Logistics", "Links",
+        "Support - EWAR", "Support - Webs", "Tackle", "Special",
+    )
+
     def _build_doctrines_subtab(self):
-        """Placeholder. Phase 6 (Tasks 6.1/6.2) replaces this with the doctrine
-        list + role-grouped detail + .fctdoc import/export."""
+        """Doctrine manager: master list of doctrines (left) + a role-grouped,
+        editable detail pane (right). New/Import/Export live above the list."""
         tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
         self._fitting_subnb.add(tab, text="  Doctrines  ")
-        tk.Label(tab, text="Doctrines — coming soon",
-                 font=("Consolas", 12, "bold"), fg=FG_DIM, bg=BG_DARK
-                 ).pack(expand=True)
+
+        # ── Toolbar: New / Import / Export ───────────────────────────────────
+        toolbar = tk.Frame(tab, bg=BG_DARK)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Button(toolbar, text="New doctrine", style="Green.TButton",
+                   command=self._new_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import file", style="Dark.TButton",
+                   command=self._import_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Export file", style="Dark.TButton",
+                   command=self._export_doctrine).pack(side=tk.LEFT, padx=2)
+
+        # ── Master / detail split ────────────────────────────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=2, uniform="doc")
+        body.columnconfigure(1, weight=5, uniform="doc")
+        body.rowconfigure(0, weight=1)
+
+        # Left: doctrines list (Treeview).
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        tk.Label(left, text="DOCTRINES", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+
+        tree_wrap = tk.Frame(left, bg=BG_PANEL)
+        tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
+        columns = ("name", "fits")
+        self._doctrine_tree = ttk.Treeview(
+            tree_wrap, columns=columns, show="headings",
+            style="Dark.Treeview", selectmode="browse")
+        self._doctrine_tree.heading("name", text="Name")
+        self._doctrine_tree.heading("fits", text="#Fits")
+        self._doctrine_tree.column("name", width=150, anchor=tk.W)
+        self._doctrine_tree.column("fits", width=44, anchor=tk.CENTER,
+                                   stretch=False)
+        self._doctrine_tree.grid(row=0, column=0, sticky="nsew")
+        self._doctrine_tree.bind("<<TreeviewSelect>>",
+                                 self._on_doctrine_select)
+
+        tree_sb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                command=self._doctrine_tree.yview)
+        self._doctrine_tree.configure(yscrollcommand=tree_sb.set)
+        tree_sb.grid(row=0, column=1, sticky="ns")
+
+        # Right: detail (scrollable).
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        detail_canvas = tk.Canvas(right, bg=BG_PANEL, highlightthickness=0)
+        detail_canvas.grid(row=0, column=0, sticky="nsew")
+        detail_sb = ttk.Scrollbar(right, orient="vertical",
+                                  command=detail_canvas.yview)
+        detail_sb.grid(row=0, column=1, sticky="ns")
+        detail_canvas.configure(yscrollcommand=detail_sb.set)
+        self._register_scroll_canvas(detail_canvas)
+
+        self._doctrine_detail = tk.Frame(detail_canvas, bg=BG_PANEL)
+        _detail_win = detail_canvas.create_window(
+            (0, 0), window=self._doctrine_detail, anchor="nw")
+
+        def _on_detail_config(event=None):
+            detail_canvas.configure(scrollregion=detail_canvas.bbox("all"))
+        self._doctrine_detail.bind("<Configure>", _on_detail_config)
+
+        def _on_canvas_config(event):
+            detail_canvas.itemconfig(_detail_win, width=event.width)
+        detail_canvas.bind("<Configure>", _on_canvas_config)
+
+        # Populate.
+        self._refresh_doctrine_list()
+        self._show_doctrine_detail(None)
+
+    # ── Doctrine list / detail rendering (Task 6.1) ───────────────────────────
+
+    def _doctrine_list_visible(self) -> bool:
+        """True once the doctrines sub-tab has been built (its tree exists)."""
+        return getattr(self, "_doctrine_tree", None) is not None
+
+    def _refresh_doctrine_list(self):
+        """Clear + repopulate the doctrines Treeview, preserving the current
+        selection when possible. Safe to call before the sub-tab exists."""
+        tree = getattr(self, "_doctrine_tree", None)
+        if tree is None:
+            return
+        prev = self._doctrine_selected_id
+        for iid in tree.get_children():
+            tree.delete(iid)
+        restored = False
+        for doc in sorted(self.fittings.list_doctrines(),
+                          key=lambda d: (d.name or "").lower()):
+            tree.insert("", tk.END, iid=doc.id,
+                        values=(doc.name, len(doc.members)))
+            if doc.id == prev:
+                restored = True
+        if restored:
+            tree.selection_set(prev)
+        elif prev is not None and self.fittings.get_doctrine(prev) is None:
+            # Selected doctrine was deleted — clear the detail pane.
+            self._doctrine_selected_id = None
+            self._show_doctrine_detail(None)
+
+    def _on_doctrine_select(self, event=None):
+        tree = self._doctrine_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        self._doctrine_selected_id = sel[0]
+        self._show_doctrine_detail(sel[0])
+
+    def _clear_doctrine_detail(self):
+        for w in self._doctrine_detail.winfo_children():
+            w.destroy()
+
+    def _group_members_by_tag(self, doctrine):
+        """Return an ordered list of (tag_label, [members]) groups in canonical
+        tag order. A member appears under each of its tags; an untagged member
+        falls into a trailing 'Untagged' group. Tags not in the canonical order
+        are appended (sorted) before 'Untagged'."""
+        by_tag: dict[str, list] = {}
+        untagged: list = []
+        extra_tags: list[str] = []
+        for mem in doctrine.members:
+            if not mem.tags:
+                untagged.append(mem)
+                continue
+            for tag in mem.tags:
+                by_tag.setdefault(tag, []).append(mem)
+                if (tag not in self._DOCTRINE_TAG_ORDER
+                        and tag not in extra_tags):
+                    extra_tags.append(tag)
+        groups: list[tuple[str, list]] = []
+        for tag in self._DOCTRINE_TAG_ORDER:
+            if by_tag.get(tag):
+                groups.append((tag, by_tag[tag]))
+        for tag in sorted(extra_tags):
+            groups.append((tag, by_tag[tag]))
+        if untagged:
+            groups.append(("Untagged", untagged))
+        return groups
+
+    def _show_doctrine_detail(self, doctrine_id):
+        """Render the selected doctrine: editable name/description, members
+        grouped by tag (canonical order) with per-member tag chips and
+        edit/remove controls, plus an 'Add fit' affordance."""
+        self._clear_doctrine_detail()
+        parent = self._doctrine_detail
+
+        if not doctrine_id:
+            tk.Label(parent, text="Select a doctrine, or create one with "
+                                  "'New doctrine'.",
+                     font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=420, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            tk.Label(parent, text="Doctrine not found.",
+                     font=("Consolas", 10), fg=FG_RED, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+
+        # Header: name + rename/delete.
+        head = tk.Frame(parent, bg=BG_PANEL)
+        head.pack(fill=tk.X, padx=10, pady=(10, 0))
+        tk.Label(head, text=doctrine.name, font=("Consolas", 13, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=380).pack(side=tk.LEFT)
+
+        head_btns = tk.Frame(parent, bg=BG_PANEL)
+        head_btns.pack(fill=tk.X, padx=10, pady=(4, 0))
+        ttk.Button(head_btns, text="Rename", style="Dark.TButton",
+                   command=lambda: self._rename_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Edit description", style="Dark.TButton",
+                   command=lambda: self._edit_doctrine_desc(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Export file", style="Dark.TButton",
+                   command=lambda: self._export_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Delete", style="Red.TButton",
+                   command=lambda: self._delete_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+
+        # Description.
+        if (doctrine.description or "").strip():
+            tk.Label(parent, text=doctrine.description, font=("Consolas", 9),
+                     fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=420).pack(anchor=tk.W, padx=12, pady=(6, 0))
+
+        # Add-fit affordance.
+        add_row = tk.Frame(parent, bg=BG_PANEL)
+        add_row.pack(fill=tk.X, padx=10, pady=(8, 2))
+        ttk.Button(add_row, text="Add fit…", style="Green.TButton",
+                   command=lambda: self._add_fit_to_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
+                   command=lambda: self._add_custom_tag(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+
+        if not doctrine.members:
+            tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
+                                  "to this doctrine.",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=420, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=12, pady=(8, 10))
+            return
+
+        # Members grouped by tag (canonical order).
+        for tag_label, members in self._group_members_by_tag(doctrine):
+            tk.Label(parent, text=tag_label, font=("Consolas", 10, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=12, pady=(8, 2))
+            for mem in members:
+                self._render_doctrine_member_row(parent, doctrine, mem)
+
+    def _render_doctrine_member_row(self, parent, doctrine, mem):
+        """One member row: fit name + its tag-chip cluster within this doctrine
+        + Tags/Remove controls."""
+        fit = self.fittings.get_fit(mem.fit_id)
+        name = fit.name if fit is not None else f"(missing fit {mem.fit_id})"
+        hull = f"  ·  {fit.hull_name}" if fit is not None and fit.hull_name \
+            else ""
+
+        row = tk.Frame(parent, bg=BG_PANEL)
+        row.pack(fill=tk.X, padx=14, pady=1)
+
+        info = tk.Frame(row, bg=BG_PANEL)
+        info.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(info, text=f"{name}{hull}", font=("Consolas", 9),
+                 fg=FG_TEXT if fit is not None else FG_RED, bg=BG_PANEL,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=300).pack(anchor=tk.W)
+        # Tag-chip cluster: shows all tags this member carries in this doctrine.
+        if mem.tags:
+            chips = tk.Frame(info, bg=BG_PANEL)
+            chips.pack(anchor=tk.W, pady=(1, 0))
+            for tag in mem.tags:
+                tk.Label(chips, text=f" {tag} ", font=("Consolas", 8),
+                         fg=BG_DARK, bg=FG_ACCENT, padx=2).pack(
+                             side=tk.LEFT, padx=(0, 3))
+        else:
+            tk.Label(info, text="(no tags)", font=("Consolas", 8),
+                     fg=FG_DIM, bg=BG_PANEL).pack(anchor=tk.W, pady=(1, 0))
+
+        ctrls = tk.Frame(row, bg=BG_PANEL)
+        ctrls.pack(side=tk.RIGHT)
+        ttk.Button(ctrls, text="Tags", style="Dark.TButton",
+                   command=lambda: self._edit_member_tags(
+                       doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(ctrls, text="Remove", style="Red.TButton",
+                   command=lambda: self._remove_doctrine_member(
+                       doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    # ── Doctrine CRUD controllers (Task 6.1) ──────────────────────────────────
+
+    def _new_doctrine(self):
+        name = self._prompt_text_line("New Doctrine", "Doctrine name:", "")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        did = self.fittings.add_doctrine(name)
+        self.fittings.save()
+        self._doctrine_selected_id = did
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(did)
+
+    def _rename_doctrine(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        new_name = self._prompt_text_line(
+            "Rename Doctrine", "Name:", doctrine.name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == doctrine.name:
+            return
+        doctrine.name = new_name
+        self.fittings.update_doctrine(doctrine)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._show_doctrine_detail(doctrine_id)
+
+    def _edit_doctrine_desc(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        new_desc = self._prompt_text_block(
+            "Edit Description", "Description for this doctrine:",
+            doctrine.description or "")
+        if new_desc is None:
+            return
+        doctrine.description = new_desc
+        self.fittings.update_doctrine(doctrine)
+        self.fittings.save()
+        self._show_doctrine_detail(doctrine_id)
+
+    def _delete_doctrine(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        if not messagebox.askyesno(
+                "Delete Doctrine",
+                f"Delete doctrine '{doctrine.name}'?\n\nThe fits themselves "
+                "stay in the library."):
+            return
+        self.fittings.delete_doctrine(doctrine_id)
+        self.fittings.save()
+        if self._doctrine_selected_id == doctrine_id:
+            self._doctrine_selected_id = None
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(None)
+
+    # ── Doctrine import / export (Task 6.1) ───────────────────────────────────
+
+    def _export_doctrine(self, doctrine_id=None):
+        """Export a doctrine to a self-contained .fctdoc (JSON) file."""
+        if doctrine_id is None:
+            doctrine_id = self._doctrine_selected_id
+        if not doctrine_id:
+            messagebox.showinfo(
+                "Export doctrine",
+                "Select a doctrine to export first.")
+            return
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9 _-]", "_", doctrine.name or "doctrine")
+        path = filedialog.asksaveasfilename(
+            title="Export doctrine",
+            defaultextension=".fctdoc",
+            initialfile=f"{safe_name}.fctdoc",
+            filetypes=[("FCTool doctrine", "*.fctdoc"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            payload = self.fittings.export_doctrines([doctrine_id])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Export failed",
+                                 f"Could not write the doctrine file:\n{e}")
+            return
+        messagebox.showinfo(
+            "Export doctrine",
+            f"Exported '{doctrine.name}' to:\n{path}")
+
+    def _import_doctrine(self):
+        """Import a .fctdoc share file: read JSON -> import_share -> summary."""
+        path = filedialog.askopenfilename(
+            title="Import doctrine",
+            filetypes=[("FCTool doctrine", "*.fctdoc"),
+                       ("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import failed",
+                                 f"Could not read the doctrine file:\n{e}")
+            return
+        try:
+            summary = self.fittings.import_share(payload)
+            self.fittings.save()
+        except Exception as e:
+            messagebox.showerror("Import failed",
+                                 f"Could not import the doctrine:\n{e}")
+            return
+        # Refresh both the doctrine list and the fittings list (new fits may
+        # have been added to the library).
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(self._doctrine_selected_id)
+        messagebox.showinfo(
+            "Import doctrine",
+            f"Imported {summary.doctrines_added} doctrine(s).\n\n"
+            f"Fits added: {summary.fits_added}\n"
+            f"Fits reused (already in library): {summary.fits_reused}")
+
+    # ── Doctrine membership + tags (Task 6.2) ─────────────────────────────────
+
+    def _add_fit_to_doctrine(self, doctrine_id):
+        """Searchable picker over library fits not already in the doctrine; on
+        pick, prompt for tags, then add the membership."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        existing = {m.fit_id for m in doctrine.members}
+        candidates = [f for f in sorted(self.fittings.list_fits(),
+                                        key=lambda f: (f.name or "").lower())
+                      if f.id not in existing]
+        if not candidates:
+            messagebox.showinfo(
+                "Add fit",
+                "Every fit in the library is already in this doctrine, or the "
+                "library is empty. Import fits on the Fittings sub-tab first.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Add fit to doctrine")
+        win.configure(bg=BG_DARK)
+        win.geometry("440x460")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select a fit to add:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        search_var = tk.StringVar()
+        search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          borderwidth=1, relief=tk.RIDGE)
+        search.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        index_map: list = []
+
+        def _repopulate(*_a):
+            needle = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            index_map.clear()
+            for f in candidates:
+                label = f.name or "?"
+                if f.hull_name:
+                    label += f"  ({f.hull_name})"
+                hay = f"{f.name or ''} {f.hull_name or ''}".lower()
+                if needle and needle not in hay:
+                    continue
+                listbox.insert(tk.END, label)
+                index_map.append(f)
+        search_var.trace_add("write", _repopulate)
+        _repopulate()
+
+        def _do_pick():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            fit = index_map[sel[0]]
+            win.destroy()
+            tags = self._prompt_tag_multiselect(
+                "Tags for this fit",
+                f"Choose tags for '{fit.name}' in this doctrine:",
+                selected=[])
+            if tags is None:
+                return
+            self.fittings.add_fit_to_doctrine(doctrine_id, fit.id, tags)
+            self.fittings.save()
+            self._refresh_doctrine_list()
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_doctrine_detail(doctrine_id)
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Add", style="Green.TButton",
+                   command=_do_pick).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+
+    def _edit_member_tags(self, doctrine_id, fit_id):
+        """Multi-select the tag vocabulary for one (doctrine, fit) membership."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = next((m for m in doctrine.members if m.fit_id == fit_id), None)
+        if mem is None:
+            return
+        fit = self.fittings.get_fit(fit_id)
+        label_name = fit.name if fit is not None else fit_id
+        tags = self._prompt_tag_multiselect(
+            "Edit tags",
+            f"Tags for '{label_name}' in '{doctrine.name}':",
+            selected=list(mem.tags))
+        if tags is None:
+            return
+        self.fittings.set_member_tags(doctrine_id, fit_id, tags)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(doctrine_id)
+
+    def _remove_doctrine_member(self, doctrine_id, fit_id):
+        self.fittings.remove_fit_from_doctrine(doctrine_id, fit_id)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(doctrine_id)
+
+    def _add_fit_to_doctrine_from_fit(self, fit_id):
+        """Cross-link from the Fittings detail pane: pick a doctrine (excluding
+        ones already containing this fit), choose tags, then add the fit."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        candidates = []
+        for doc in sorted(self.fittings.list_doctrines(),
+                          key=lambda d: (d.name or "").lower()):
+            if not any(m.fit_id == fit_id for m in doc.members):
+                candidates.append(doc)
+        if not candidates:
+            if self.fittings.list_doctrines():
+                messagebox.showinfo(
+                    "Add to doctrine",
+                    f"'{fit.name}' is already in every doctrine.")
+            else:
+                messagebox.showinfo(
+                    "Add to doctrine",
+                    "No doctrines yet. Create one on the Doctrines sub-tab "
+                    "first.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Add fit to doctrine")
+        win.configure(bg=BG_DARK)
+        win.geometry("400x420")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text=f"Add '{fit.name}' to which doctrine?",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=370).pack(
+                     anchor=tk.W, padx=12, pady=(12, 2))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+        for doc in candidates:
+            listbox.insert(tk.END, f"{doc.name}  ({len(doc.members)} fits)")
+
+        def _do_pick():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            doctrine = candidates[sel[0]]
+            win.destroy()
+            tags = self._prompt_tag_multiselect(
+                "Tags for this fit",
+                f"Choose tags for '{fit.name}' in '{doctrine.name}':",
+                selected=[])
+            if tags is None:
+                return
+            self.fittings.add_fit_to_doctrine(doctrine.id, fit_id, tags)
+            self.fittings.save()
+            if self._doctrine_list_visible():
+                self._refresh_doctrine_list()
+                if self._doctrine_selected_id == doctrine.id:
+                    self._show_doctrine_detail(doctrine.id)
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_fit_detail(fit_id)
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Add", style="Green.TButton",
+                   command=_do_pick).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+
+    def _add_custom_tag(self, doctrine_id=None):
+        """Append a custom tag to the library's tag vocabulary."""
+        name = self._prompt_text_line(
+            "Add Tag", "New tag name (added to the vocabulary):", "")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.fittings.tags:
+            messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+            return
+        self.fittings.add_tag(name)
+        self.fittings.save()
+        messagebox.showinfo(
+            "Add tag",
+            f"Added tag '{name}'. It is now available when tagging fits.")
+
+    def _prompt_tag_multiselect(self, title, label, selected):
+        """Modal multi-select of the library tag vocabulary via checkbuttons.
+        Returns the chosen list of tags, or None if cancelled. Includes an
+        inline 'Add tag' button that extends the vocabulary live."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("360x420")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK, anchor=tk.W, justify=tk.LEFT, wraplength=330).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        selected_set = set(selected or [])
+        tag_vars: dict[str, tk.BooleanVar] = {}
+
+        def _rebuild_checks():
+            for w in inner.winfo_children():
+                w.destroy()
+            tag_vars.clear()
+            for tag in self.fittings.tags:
+                v = tk.BooleanVar(value=tag in selected_set)
+                tag_vars[tag] = v
+                cb = tk.Checkbutton(
+                    inner, text=tag, variable=v, font=("Consolas", 9),
+                    fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                    activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                    anchor=tk.W, highlightthickness=0)
+                cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+        _rebuild_checks()
+
+        def _add_tag_inline():
+            name = self._prompt_text_line("Add Tag", "New tag name:", "")
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                return
+            # Preserve current checkbox selections across the rebuild.
+            for tag, v in tag_vars.items():
+                if v.get():
+                    selected_set.add(tag)
+                else:
+                    selected_set.discard(tag)
+            if name not in self.fittings.tags:
+                self.fittings.add_tag(name)
+                self.fittings.save()
+            selected_set.add(name)
+            _rebuild_checks()
+
+        add_row = tk.Frame(win, bg=BG_DARK)
+        add_row.pack(fill=tk.X, padx=12, pady=(4, 0))
+        ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
+                   command=_add_tag_inline).pack(side=tk.LEFT)
+
+        def _ok():
+            result["value"] = [t for t, v in tag_vars.items() if v.get()]
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
 
     def _build_motd_subtab(self):
         """Placeholder. Phase 7 (Tasks 7.1-7.3) replaces this with the MOTD
@@ -5958,6 +6660,9 @@ class FCToolGUI:
                    command=lambda: self._save_fit_to_ingame(fit.id)).pack(side=tk.LEFT, padx=2)
         row3 = tk.Frame(actions, bg=BG_PANEL)
         row3.pack(fill=tk.X, pady=2)
+        ttk.Button(row3, text="Add to doctrine…", style="Dark.TButton",
+                   command=lambda: self._add_fit_to_doctrine_from_fit(
+                       fit.id)).pack(side=tk.LEFT, padx=2)
         ttk.Button(row3, text="Delete", style="Red.TButton",
                    command=lambda: self._delete_fit(fit.id)).pack(side=tk.LEFT, padx=2)
 
