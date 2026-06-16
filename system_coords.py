@@ -61,3 +61,18 @@ def _load() -> None:
         except Exception as e:  # corrupt/partial file: degrade, don't crash the app
             print(f"[Coords] Failed to load {path}: {e}")
         _loaded = True
+
+
+def get_position(system_id: int) -> dict | None:
+    """Return {"x","y","z"} (ESI-compatible shape) or None if not in the table."""
+    _load()
+    xyz = _coords.get(system_id)
+    if xyz is None:
+        return None
+    return {"x": xyz[0], "y": xyz[1], "z": xyz[2]}
+
+
+def resolve_name(name: str) -> int | None:
+    """Exact (case-insensitive) name -> system_id, or None. No fuzzy matching."""
+    _load()
+    return _id_of_name.get(name.lower())

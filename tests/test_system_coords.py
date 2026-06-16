@@ -42,3 +42,18 @@ def test_load_missing_file_degrades_gracefully(monkeypatch):
     system_coords._load()  # must not raise
     assert system_coords._coords == {}
     assert system_coords._loaded is True
+
+
+def test_get_position_returns_esi_compatible_dict(monkeypatch, tmp_path):
+    _load_fixture(monkeypatch, tmp_path, FIXTURE)
+    pos = system_coords.get_position(30000142)
+    assert pos == {"x": 1.0, "y": 0.0, "z": 0.0}
+    assert system_coords.get_position(39999999) is None  # unknown id
+
+
+def test_resolve_name_is_case_insensitive(monkeypatch, tmp_path):
+    _load_fixture(monkeypatch, tmp_path, FIXTURE)
+    assert system_coords.resolve_name("Jita") == 30000142
+    assert system_coords.resolve_name("jita") == 30000142
+    assert system_coords.resolve_name("AMARR") == 30002187
+    assert system_coords.resolve_name("Nowhere") is None
