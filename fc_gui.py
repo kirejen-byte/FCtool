@@ -440,6 +440,9 @@ class FCToolGUI:
         self.charge_tracker = charge_tracker.ChargeTracker()
         self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
         self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
+        # Deliberately lock-free best-effort coalescing flag: only ever touched
+        # on the Tk thread (set in _schedule_booster_refresh / cleared in
+        # _run_booster_refresh), so no synchronization is required.
         self._booster_refresh_pending = False
         self.zkill_monitor: ZKillMonitor | None = None
         self._intel_session = IntelSession()
@@ -1331,9 +1334,25 @@ class FCToolGUI:
                  font=("Consolas", 8), fg="#ff6666", bg=BG_PANEL
                  ).pack(anchor=tk.W, padx=4, pady=(0, 2))
 
+        # Command-burst coverage strip (fleet-aggregate \u2713/\u2717 per discipline).
+        # Persistent container created once; only its children are rebuilt by
+        # _render_booster_block on each poll.
+        self._load_burst_icons()
+        self._booster_strip = tk.Frame(self._spec_roles_frame, bg=BG_PANEL)
+        self._booster_strip.pack(anchor=tk.W, fill=tk.X, padx=4, pady=(0, 2))
+
         # Create collapsible sections (order matters for display)
         self._links_container, self._links_content, self._links_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
+        # Per-pilot booster widgets live in the *persistent* Links container (not
+        # _links_content, which _populate_role_section destroys+rebuilds each
+        # poll). Packed after _links_content so they sit under the ship-type
+        # breakdown; only their own children are cleared in _render_booster_block.
+        self._booster_banner = tk.Label(
+            self._links_container, bg=BG_PANEL, fg=FG_YELLOW,
+            font=("Consolas", 8), anchor=tk.W, justify=tk.LEFT, wraplength=320)
+        self._booster_list = tk.Frame(self._links_container, bg=BG_PANEL)
+        self._booster_list.pack(fill=tk.X, padx=(16, 0))
         self._logi_container, self._logi_content, self._logi_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Logistics")
         self._defenders_container, self._defenders_content, self._defenders_count = \
@@ -1372,6 +1391,9 @@ class FCToolGUI:
         self._xup_log.tag_config("ready", foreground=FG_YELLOW, font=("Consolas", 10, "bold"))
         self._xup_log.tag_config("dim", foreground=FG_DIM)
         self._xup_log.tag_config("role", foreground=FG_MAGENTA)
+
+        # Paint the empty-state coverage strip (all ✗) on startup.
+        self._schedule_booster_refresh()
 
     # ── Config-driven intel filter panel ──────────────────────────────────────
 
@@ -6176,6 +6198,23 @@ class FCToolGUI:
 
     # ── Command-burst / charge tracking ───────────────────────────────────────
 
+    def _load_burst_icons(self):
+        """Load discipline icons once into self._burst_icons (glyph fallback on
+        any failure). Called during UI build, after self.root exists."""
+        from app_path import bundle_dir
+        files = {
+            command_bursts.SHIELD: "shield.png",
+            command_bursts.ARMOR: "armor.png",
+            command_bursts.SKIRMISH: "skirmish.png",
+            command_bursts.INFORMATION: "info.png",
+        }
+        for disc, fname in files.items():
+            try:
+                path = os.path.join(bundle_dir(), "assets", "bursts", fname)
+                self._burst_icons[disc] = tk.PhotoImage(file=path)
+            except Exception:
+                self._burst_icons[disc] = None  # fall back to Unicode glyph
+
     def _schedule_booster_refresh(self):
         """Coalesce refresh requests onto the Tk loop, then compute off-thread."""
         if self._booster_refresh_pending:
@@ -6204,8 +6243,98 @@ class FCToolGUI:
             return None
 
     def _render_booster_block(self, rows, coverage):
-        # TEMPORARY STUB — Task 8 implements the real rendering.
-        pass
+        """Render the fleet-aggregate coverage strip + per-pilot booster list.
+
+        Runs on the Tk thread (always invoked via root.after). Only clears the
+        children of its own persistent containers (_booster_strip, _booster_list)
+        and reconfigures _booster_banner — never the surrounding panel widgets.
+        """
+        from zkill_monitor import resolve_name
+        verdict_color = {
+            command_bursts.Verdict.BONUSED: FG_GREEN,
+            command_bursts.Verdict.BONUSED_CONDITIONAL: FG_GREEN,
+            command_bursts.Verdict.FITS_NO_BONUS: FG_YELLOW,
+            command_bursts.Verdict.CANT_FIT: FG_RED,
+            command_bursts.Verdict.UNKNOWN: FG_DIM,
+        }
+        # ── Top coverage strip (fleet-aggregate) ──
+        for w in self._booster_strip.winfo_children():
+            w.destroy()
+        for disc in command_bursts.DISCIPLINES:
+            status = coverage[disc]
+            cell = tk.Frame(self._booster_strip, bg=BG_PANEL)
+            cell.pack(side=tk.LEFT, padx=(0, 10))
+            icon = self._burst_icons.get(disc)
+            if icon is not None:
+                lbl = tk.Label(cell, image=icon, bg=BG_PANEL)
+            else:
+                lbl = tk.Label(cell, text=command_bursts.DISCIPLINE_LABEL[disc][:2],
+                               bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 9, "bold"))
+            lbl.pack(side=tk.LEFT)
+            glyph = "✓" if status.full else "✗"
+            color = FG_GREEN if status.full else FG_RED
+            mark = tk.Label(cell, text=glyph, bg=BG_PANEL, fg=color,
+                            font=("Consolas", 10, "bold"))
+            mark.pack(side=tk.LEFT)
+            if status.full:
+                tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} links full (all 3 charges)"
+            else:
+                tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} missing: " + ", ".join(status.missing)
+            for wdg in (lbl, mark):
+                wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
+                wdg.bind("<Leave>", lambda e: self._hide_tooltip())
+
+        # ── Non-boss banner ──
+        # Roster is only populated when we can read fleet member ships (fleet
+        # boss). Empty roster => hulls can't be verified, so warn the FC.
+        is_boss = bool(self._booster_roster)
+        if not is_boss:
+            self._booster_banner.config(
+                text="⚠ Ship verification unavailable (not fleet boss) — "
+                     "charges shown, hulls not checked")
+            self._booster_banner.pack(fill=tk.X, padx=(16, 0), pady=(2, 2),
+                                      before=self._booster_list)
+        else:
+            self._booster_banner.pack_forget()
+
+        # ── Per-pilot rows ──
+        for w in self._booster_list.winfo_children():
+            w.destroy()
+        for row in rows:
+            rf = tk.Frame(self._booster_list, bg=BG_PANEL)
+            rf.pack(fill=tk.X, anchor=tk.W)
+            ship_name = resolve_name(row.ship_type_id, "type") if row.ship_type_id else None
+            label = f"  {row.name}" + (f" · {ship_name}" if ship_name else "")
+            name_lbl = tk.Label(rf, text=label, bg=BG_PANEL, fg=FG_TEXT,
+                                font=("Consolas", 9), anchor=tk.W)
+            name_lbl.pack(side=tk.LEFT)
+            if row.over_limit:
+                warn = tk.Label(rf, text=" ⚠", bg=BG_PANEL, fg=FG_YELLOW,
+                                font=("Consolas", 9, "bold"))
+                warn.pack(side=tk.LEFT)
+                wt = f"{row.charge_count} charges linked — fit may be unusual/bad"
+                warn.bind("<Enter>", lambda e, t=wt: self._show_tooltip(e, t))
+                warn.bind("<Leave>", lambda e: self._hide_tooltip())
+            for cell in row.cells:
+                cf = tk.Frame(rf, bg=BG_PANEL)
+                cf.pack(side=tk.LEFT, padx=(8, 0))
+                icon = self._burst_icons.get(cell.discipline)
+                if icon is not None:
+                    di = tk.Label(cf, image=icon, bg=BG_PANEL)
+                else:
+                    di = tk.Label(cf, text=command_bursts.DISCIPLINE_LABEL[cell.discipline][:2],
+                                  bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 8))
+                di.pack(side=tk.LEFT)
+                gl = tk.Label(cf, text=command_bursts.VERDICT_GLYPH[cell.verdict],
+                              bg=BG_PANEL, fg=verdict_color[cell.verdict],
+                              font=("Consolas", 9, "bold"))
+                gl.pack(side=tk.LEFT)
+                tip = command_bursts.verdict_text(
+                    cell.verdict, command_bursts.DISCIPLINE_LABEL[cell.discipline],
+                    cell.charges, ship_name)
+                for wdg in (di, gl):
+                    wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
+                    wdg.bind("<Leave>", lambda e: self._hide_tooltip())
 
     def _clear_booster_state(self):
         """Reset charge tracking + roster when the fleet/auth context goes away.
