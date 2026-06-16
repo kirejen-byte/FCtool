@@ -105,3 +105,34 @@ def is_legal_jump_destination(system_id: int) -> bool:
     if sec is None or sec >= HIGHSEC_CUTOFF:
         return False
     return True
+
+
+def systems_within_range(origin_id: int, range_ly: float,
+                         legal_only: bool = True) -> list[tuple[int, float]]:
+    """All systems within range_ly of origin_id, as (system_id, distance_ly),
+    sorted nearest-first. O(n) over the ~5,500 K-space systems -- a few ms,
+    pure stdlib. Compares squared distance to avoid sqrt on non-matches."""
+    from jump_range import LY_IN_METERS  # lazy import avoids a circular import
+    _load()
+    origin = _coords.get(origin_id)
+    if origin is None:
+        return []
+    ox, oy, oz = origin
+    max_m = range_ly * LY_IN_METERS
+    max_m_sq = max_m * max_m
+
+    out: list[tuple[int, float]] = []
+    for sid, (x, y, z) in _coords.items():
+        if sid == origin_id:
+            continue
+        dx = ox - x
+        dy = oy - y
+        dz = oz - z
+        d_sq = dx * dx + dy * dy + dz * dz
+        if d_sq > max_m_sq:
+            continue
+        if legal_only and not is_legal_jump_destination(sid):
+            continue
+        out.append((sid, (d_sq ** 0.5) / LY_IN_METERS))
+    out.sort(key=lambda t: t[1])
+    return out

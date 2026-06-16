@@ -85,3 +85,26 @@ def test_is_legal_jump_destination(monkeypatch, tmp_path):
     assert system_coords.is_legal_jump_destination(30000444) is False  # 0.45 is highsec
     assert system_coords.is_legal_jump_destination(31000001) is False  # WH id range
     assert system_coords.is_legal_jump_destination(99999999) is False  # unknown
+
+
+def test_systems_within_range_filters_and_sorts(monkeypatch, tmp_path):
+    LY = 9.46e15
+    table = {
+        "30000001": {"name": "Origin", "x": 0.0, "y": 0.0, "z": 0.0,
+                     "region_id": 10000060, "security": -0.2},
+        "30000002": {"name": "Near", "x": 1.0 * LY, "y": 0.0, "z": 0.0,
+                     "region_id": 10000060, "security": -0.2},   # 1 ly, legal
+        "30000003": {"name": "Far", "x": 8.0 * LY, "y": 0.0, "z": 0.0,
+                     "region_id": 10000060, "security": -0.2},   # 8 ly, out of 5 ly
+        "30000004": {"name": "NearHigh", "x": 2.0 * LY, "y": 0.0, "z": 0.0,
+                     "region_id": 10000002, "security": 0.9},    # 2 ly but highsec
+    }
+    _load_fixture(monkeypatch, tmp_path, table)
+
+    legal = system_coords.systems_within_range(30000001, 5.0, legal_only=True)
+    assert [sid for sid, _ in legal] == [30000002]  # Far out of range, NearHigh illegal
+
+    everything = system_coords.systems_within_range(30000001, 5.0, legal_only=False)
+    assert [sid for sid, _ in everything] == [30000002, 30000004]  # sorted by distance
+    assert everything[0][1] == pytest.approx(1.0, abs=1e-6)
+    assert everything[1][1] == pytest.approx(2.0, abs=1e-6)
