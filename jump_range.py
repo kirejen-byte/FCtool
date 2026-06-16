@@ -13,7 +13,7 @@ import requests
 import threading
 from collections import deque
 from rate_limiter import rate_limit
-from app_path import app_dir
+from app_path import app_dir, bundle_dir
 import system_coords
 
 ESI_BASE = "https://esi.evetech.net/latest"
@@ -98,10 +98,15 @@ def _load_stargate_graph():
         if _stargate_graph_loaded:
             return
 
-        # Try loading from disk cache first
-        if os.path.exists(_JUMPS_CACHE_FILE):
+        # Try loading from disk cache first (app_dir), then the bundled copy.
+        jumps_file = _JUMPS_CACHE_FILE
+        if not os.path.exists(jumps_file):
+            bundled = os.path.join(bundle_dir(), "stargate_jumps.json")
+            if os.path.exists(bundled):
+                jumps_file = bundled
+        if os.path.exists(jumps_file):
             try:
-                with open(_JUMPS_CACHE_FILE, "r") as f:
+                with open(jumps_file, "r") as f:
                     data = json.load(f)
                 for sys_id, neighbors in data.items():
                     _stargate_graph[int(sys_id)] = set(neighbors)
@@ -115,7 +120,7 @@ def _load_stargate_graph():
         try:
             print("[Graph] Downloading stargate connection map...")
             resp = requests.get(
-                "https://www.fuzzwork.co.uk/dump/latest/mapSolarSystemJumps.csv",
+                "https://www.fuzzwork.co.uk/dump/latest/csv/mapSolarSystemJumps.csv",
                 timeout=30
             )
             if resp.ok:
