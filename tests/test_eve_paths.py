@@ -223,6 +223,54 @@ def test_candidate_paths_discovers_onedrive_glob(monkeypatch):
     assert _logs(os.path.join(company_od, "Documents")) in paths
 
 
+# ── Linux Wine/Proton/Lutris prefix discovery ────────────────────────────────
+
+
+def test_candidate_paths_include_wine_prefix(tmp_path):
+    """On Linux, EVE logs live inside a Wine prefix. Create a real fake prefix
+    under tmp_path and assert its Chatlogs path is among the candidates.
+
+    Uses real dirs (works on Windows too) rather than stubbing glob, so the
+    actual filesystem globbing in candidate_logs_paths is exercised."""
+    home = str(tmp_path)
+    documents = os.path.join(home, "Documents")
+
+    # ~/.wine/drive_c/users/alice/Documents/EVE/logs/Chatlogs
+    wine_logs = _logs(
+        os.path.join(home, ".wine", "drive_c", "users", "alice", "Documents")
+    )
+    os.makedirs(wine_logs)
+
+    paths = eve_paths.candidate_logs_paths(documents=documents, home=home)
+
+    assert wine_logs in paths
+
+
+def test_resolve_picks_steam_proton_prefix_when_documents_missing(tmp_path):
+    """resolve_eve_logs_path auto-detects a Steam-Proton compatdata prefix.
+
+    The Documents-based candidate does not exist on disk, so resolution should
+    fall through to the existing prefix Chatlogs path. Uses os.path.exists
+    against real dirs created under tmp_path."""
+    home = str(tmp_path)
+    documents = os.path.join(home, "Documents")  # intentionally NOT created
+
+    # ~/.local/share/Steam/steamapps/compatdata/8500/pfx/drive_c/users/
+    #   steamuser/Documents/EVE/logs/Chatlogs
+    proton_logs = _logs(
+        os.path.join(
+            home, ".local", "share", "Steam", "steamapps", "compatdata",
+            "8500", "pfx", "drive_c", "users", "steamuser", "Documents",
+        )
+    )
+    os.makedirs(proton_logs)
+
+    out = eve_paths.resolve_eve_logs_path(
+        "", home=home, documents=documents, exists=os.path.exists
+    )
+    assert out == proton_logs
+
+
 # ── get_documents_dir (platform-stubbed, no real APIs) ───────────────────────
 
 
