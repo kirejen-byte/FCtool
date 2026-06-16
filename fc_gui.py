@@ -440,6 +440,7 @@ class FCToolGUI:
         self.charge_tracker = charge_tracker.ChargeTracker()
         self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
         self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
+        self._burst_icons_small: dict[str, object] = {}   # half-size copies for the inline top strip
         # Best-effort coalescing flag for booster-UI refreshes. It is read/written
         # from multiple threads (chat-monitor thread, fleet-fetch thread, Tk thread),
         # but is deliberately lock-free: the worst case of a race is one redundant or
@@ -1332,17 +1333,19 @@ class FCToolGUI:
         # Mouse-wheel scrolling handled by the global router.
         self._register_scroll_canvas(spec_canvas)
 
-        # Note about red color
-        tk.Label(self._spec_roles_frame, text="\u26a0 Red = insufficient numbers",
+        # Top row: the red-color note on the left, and the command-burst coverage
+        # strip (fleet-aggregate \u2713/\u2717 per discipline) inline on the right, so the
+        # icons sit high and compact instead of taking their own full-height row.
+        self._load_burst_icons()
+        spec_top_row = tk.Frame(self._spec_roles_frame, bg=BG_PANEL)
+        spec_top_row.pack(fill=tk.X, padx=4, pady=(0, 2))
+        tk.Label(spec_top_row, text="\u26a0 Red = insufficient numbers",
                  font=("Consolas", 8), fg="#ff6666", bg=BG_PANEL
-                 ).pack(anchor=tk.W, padx=4, pady=(0, 2))
-
-        # Command-burst coverage strip (fleet-aggregate \u2713/\u2717 per discipline).
+                 ).pack(side=tk.LEFT, anchor=tk.W)
         # Persistent container created once; only its children are rebuilt by
         # _render_booster_block on each poll.
-        self._load_burst_icons()
-        self._booster_strip = tk.Frame(self._spec_roles_frame, bg=BG_PANEL)
-        self._booster_strip.pack(anchor=tk.W, fill=tk.X, padx=4, pady=(0, 2))
+        self._booster_strip = tk.Frame(spec_top_row, bg=BG_PANEL)
+        self._booster_strip.pack(side=tk.RIGHT, anchor=tk.E)
 
         # Create collapsible sections (order matters for display)
         self._links_container, self._links_content, self._links_count = \
@@ -6202,8 +6205,10 @@ class FCToolGUI:
     # ── Command-burst / charge tracking ───────────────────────────────────────
 
     def _load_burst_icons(self):
-        """Load discipline icons once into self._burst_icons (glyph fallback on
-        any failure). Called during UI build, after self.root exists."""
+        """Load discipline icons once: self._burst_icons (full 64px, used by the
+        per-pilot list) and self._burst_icons_small (32px, used by the compact
+        inline top coverage strip). Glyph fallback on any failure. Called during
+        UI build, after self.root exists."""
         from app_path import bundle_dir
         files = {
             command_bursts.SHIELD: "shield.png",
@@ -6214,9 +6219,14 @@ class FCToolGUI:
         for disc, fname in files.items():
             try:
                 path = os.path.join(bundle_dir(), "assets", "bursts", fname)
-                self._burst_icons[disc] = tk.PhotoImage(file=path)
+                full = tk.PhotoImage(file=path)
+                self._burst_icons[disc] = full
+                # Half-size copy (64px -> 32px) for the inline top strip; the
+                # reference is retained in the dict so Tk won't GC it.
+                self._burst_icons_small[disc] = full.subsample(2, 2)
             except Exception:
                 self._burst_icons[disc] = None  # fall back to Unicode glyph
+                self._burst_icons_small[disc] = None
 
     def _schedule_booster_refresh(self):
         """Coalesce refresh requests onto the Tk loop, then compute off-thread."""
@@ -6283,7 +6293,7 @@ class FCToolGUI:
             status = coverage[disc]
             cell = tk.Frame(self._booster_strip, bg=BG_PANEL)
             cell.pack(side=tk.LEFT, padx=(0, 10))
-            icon = self._burst_icons.get(disc)
+            icon = self._burst_icons_small.get(disc)
             if icon is not None:
                 lbl = tk.Label(cell, image=icon, bg=BG_PANEL)
             else:
