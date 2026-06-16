@@ -103,6 +103,7 @@ def test_ansiblex_shortens_route(mocker):
 
 
 def test_search_system_exact_match(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {
@@ -122,6 +123,7 @@ def test_search_system_exact_match(mocker):
 
 
 def test_search_system_ambiguous_falls_back_to_first(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {
@@ -140,6 +142,7 @@ def test_search_system_ambiguous_falls_back_to_first(mocker):
 
 
 def test_search_system_no_results(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
     fake_resp = mocker.MagicMock()
     fake_resp.ok = True
     fake_resp.json.return_value = {"systems": []}
@@ -167,7 +170,6 @@ def test_ly_constant_matches_ccp_official_value():
     assert jump_range.LY_IN_METERS == 9_460_000_000_000_000.0
 
 
-@pytest.mark.skip(reason="enabled in Task 5 when system_coords seam lands")
 def test_calculate_ly_distance_uses_ly_constant(mocker):
     # Two points exactly 9.46e15 m apart on the x-axis must read as 1.00 ly.
     mocker.patch(
@@ -179,3 +181,34 @@ def test_calculate_ly_distance_uses_ly_constant(mocker):
     )
     dist = jump_range.calculate_ly_distance(1, 2)
     assert dist == pytest.approx(1.0, abs=1e-9)
+
+
+def test_search_system_prefers_local_table_no_network(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=30000142)
+    post = mocker.patch("jump_range.requests.post")
+    assert jump_range.search_system("Jita") == 30000142
+    post.assert_not_called()  # local hit must not touch ESI
+
+
+def test_search_system_falls_back_to_esi_when_not_local(mocker):
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
+    fake = mocker.MagicMock()
+    fake.ok = True
+    fake.json.return_value = {"systems": [{"id": 30009999, "name": "Weirdspace"}]}
+    mocker.patch("jump_range.requests.post", return_value=fake)
+    mocker.patch("jump_range.rate_limit")
+    jump_range._system_name_cache.pop("weirdspace", None)
+    assert jump_range.search_system("Weirdspace") == 30009999
+
+
+def test_calculate_ly_distance_falls_back_to_esi_position(mocker):
+    # Origin known locally, destination only available via ESI get_system_info.
+    mocker.patch(
+        "jump_range.system_coords.get_position",
+        side_effect=lambda sid: {"x": 0.0, "y": 0.0, "z": 0.0} if sid == 1 else None,
+    )
+    mocker.patch(
+        "jump_range.get_system_info",
+        return_value={"position": {"x": 9.46e15, "y": 0.0, "z": 0.0}},
+    )
+    assert jump_range.calculate_ly_distance(1, 2) == pytest.approx(1.0, abs=1e-9)

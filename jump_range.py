@@ -14,6 +14,7 @@ import threading
 from collections import deque
 from rate_limiter import rate_limit
 from app_path import app_dir
+import system_coords
 
 ESI_BASE = "https://esi.evetech.net/latest"
 HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
@@ -219,6 +220,9 @@ def get_system_info(system_id: int) -> dict | None:
 def search_system(name: str) -> int | None:
     """Search for a system by name, return its ID. Persistently cached to disk."""
     global _cache_dirty
+    local_id = system_coords.resolve_name(name)
+    if local_id is not None:
+        return local_id
     lower = name.lower()
     with _cache_lock:
         if lower in _system_name_cache:
@@ -296,21 +300,23 @@ def get_stargate_route(origin_id: int, destination_id: int,
 
 
 def calculate_ly_distance(system_a_id: int, system_b_id: int) -> float | None:
-    """Calculate the light-year distance between two systems."""
-    info_a = get_system_info(system_a_id)
-    info_b = get_system_info(system_b_id)
-    if not info_a or not info_b:
-        return None
-
-    pos_a = info_a.get("position", {})
-    pos_b = info_b.get("position", {})
+    """Light-year distance between two systems. Uses the local coordinate table
+    when available; falls back to ESI get_system_info for systems not in it."""
+    pos_a = system_coords.get_position(system_a_id)
+    if pos_a is None:
+        info_a = get_system_info(system_a_id)
+        pos_a = info_a.get("position") if info_a else None
+    pos_b = system_coords.get_position(system_b_id)
+    if pos_b is None:
+        info_b = get_system_info(system_b_id)
+        pos_b = info_b.get("position") if info_b else None
     if not pos_a or not pos_b:
         return None
 
     dx = pos_a["x"] - pos_b["x"]
     dy = pos_a["y"] - pos_b["y"]
     dz = pos_a["z"] - pos_b["z"]
-    distance_m = math.sqrt(dx*dx + dy*dy + dz*dz)
+    distance_m = math.sqrt(dx * dx + dy * dy + dz * dz)
     return distance_m / LY_IN_METERS
 
 
