@@ -5935,6 +5935,8 @@ class FCToolGUI:
                    command=self._import_doctrine).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Export file", style="Dark.TButton",
                    command=self._export_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Manage tags…", style="Dark.TButton",
+                   command=self._manage_tags_dialog).pack(side=tk.LEFT, padx=2)
 
         # ── Master / detail split ────────────────────────────────────────────
         body = tk.Frame(tab, bg=BG_DARK)
@@ -6746,6 +6748,113 @@ class FCToolGUI:
         win.protocol("WM_DELETE_WINDOW", _cancel)
         self.root.wait_window(win)
         return result["value"]
+
+    def _manage_tags_dialog(self):
+        """Modal manager for the library tag vocabulary: add custom tags and
+        delete them (built-in DEFAULT_TAGS are protected). Deleting a tag also
+        strips it from every doctrine member that carries it."""
+        win = tk.Toplevel(self.root)
+        win.title("Manage Tags")
+        win.configure(bg=BG_DARK)
+        win.geometry("380x460")
+        win.minsize(360, 360)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win,
+                 text="Add or remove custom tags. Built-in tags cannot be "
+                      "removed.",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=350).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        def _close():
+            win.destroy()
+
+        def _rebuild():
+            for w in inner.winfo_children():
+                w.destroy()
+            for tag in self.fittings.tags:
+                row = tk.Frame(inner, bg=BG_PANEL)
+                row.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                tk.Label(row, text=tag, font=("Consolas", 9), fg=FG_TEXT,
+                         bg=BG_PANEL, anchor=tk.W).pack(
+                             side=tk.LEFT, fill=tk.X, expand=True)
+                if tag not in fit_models.DEFAULT_TAGS:
+                    ttk.Button(row, text="Delete", style="Red.TButton",
+                               command=lambda t=tag: _delete(t)).pack(
+                                   side=tk.RIGHT)
+
+        def _delete(tag):
+            used = sum(1 for d in self.fittings.list_doctrines()
+                       for m in d.members if tag in m.tags)
+            if used > 0:
+                if not messagebox.askyesno(
+                        "Delete tag",
+                        f"Delete tag '{tag}'? It is used by {used} fit(s) "
+                        "across your doctrines and will be removed from them."):
+                    return
+            self.fittings.remove_tag(tag)
+            self.fittings.save()
+            _rebuild()
+            self._refresh_doctrine_list()
+            if self._doctrine_selected_id:
+                self._show_doctrine_detail(self._doctrine_selected_id)
+            self._refresh_fit_list(self._fit_search_var.get())
+
+        entry_var = tk.StringVar()
+
+        def _add():
+            name = entry_var.get().strip()
+            if not name:
+                return
+            if name in self.fittings.tags:
+                messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+                return
+            self.fittings.add_tag(name)
+            self.fittings.save()
+            entry_var.set("")
+            _rebuild()
+
+        add_row = tk.Frame(win, bg=BG_DARK)
+        entry = tk.Entry(add_row, textvariable=entry_var, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         borderwidth=1, relief=tk.RIDGE)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        entry.bind("<Return>", lambda e: _add())
+        ttk.Button(add_row, text="Add", style="Dark.TButton",
+                   command=_add).pack(side=tk.RIGHT, padx=(4, 0))
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        ttk.Button(btns, text="Close", style="Dark.TButton",
+                   command=_close).pack(side=tk.RIGHT)
+
+        # Pack order matters: pin the two action rows to the bottom FIRST so they
+        # always reserve their space, then let list_wrap expand into what's left.
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        add_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        _rebuild()
+        win.bind("<Escape>", lambda e: _close())
+        win.protocol("WM_DELETE_WINDOW", _close)
+        self.root.wait_window(win)
 
     # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
 

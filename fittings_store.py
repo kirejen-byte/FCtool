@@ -311,6 +311,20 @@ class FittingsStore:
         if name and name not in self._tags:
             self._tags.append(name)
 
+    def remove_tag(self, name: str) -> None:
+        """Remove a tag from the vocabulary and strip it from every doctrine
+        member that carries it."""
+        if name in self._tags:
+            self._tags.remove(name)
+        for doctrine in self._doctrines.values():
+            changed = False
+            for member in doctrine.members:
+                if name in member.tags:
+                    member.tags = [t for t in member.tags if t != name]
+                    changed = True
+            if changed:
+                doctrine.modified = _now()
+
     # ── Share (.fctdoc) export / import ───────────────────────────────────────
 
     def export_doctrines(self, doctrine_ids: list[str]) -> dict:
