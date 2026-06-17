@@ -140,6 +140,63 @@ class TypeCatalog:
         slot = entry.get("s")
         return slot if isinstance(slot, str) else None
 
+    # ── Batch priming ────────────────────────────────────────────────────────
+
+    def prime(self, type_ids) -> None:
+        """Resolve every currently-unknown id in ``type_ids`` in ONE ESI batch.
+
+        Deduplicates the input, keeps only ids not already known (neither in the
+        bundled table nor the cache), and — if any remain and an ESI adapter is
+        set — resolves them all with a single ``esi.resolve_names`` call (the
+        adapter batches via POST /universe/names/). Each resolved entry is
+        registered in-memory and persisted to the same ``fit_types_cache.json``
+        that ``resolve_name``/``category_of`` read from, in a single disk write.
+
+        Fully defensive: any failure (bad input, ESI error, malformed response,
+        disk error) is swallowed — priming is an optimization, never a hard
+        dependency, so this method never raises. After ``prime(ids)``,
+        ``resolve_name(id)`` for those ids returns the primed name without a
+        further ESI call."""
+        if self._esi is None:
+            return
+        try:
+            unknown: list[int] = []
+            seen: set[int] = set()
+            for raw in type_ids or ():
+                try:
+                    tid = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                if tid not in self._by_id:
+                    unknown.append(tid)
+            if not unknown:
+                return
+            try:
+                resolved = self._esi.resolve_names(unknown)
+            except Exception:
+                return
+            if not isinstance(resolved, dict):
+                return
+            new_entries: dict[int, dict] = {}
+            for tid in unknown:
+                info = resolved.get(tid)
+                if not isinstance(info, dict):
+                    continue
+                name = info.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                entry = {"n": name, "c": None, "g": None, "s": None}
+                self._register(tid, entry)
+                new_entries[tid] = entry
+            if new_entries:
+                self._write_cache_entries(new_entries)
+        except Exception:
+            # Priming is best-effort; never let it propagate.
+            return
+
     # ── ESI fallback + cache ─────────────────────────────────────────────────
 
     def _resolve_unknown(self, type_id: int) -> dict | None:
@@ -170,10 +227,17 @@ class TypeCatalog:
         return entry
 
     def _write_cache_entry(self, type_id: int, entry: dict) -> None:
-        """Merge one resolved entry into the on-disk cache (atomic temp+replace).
+        """Merge one resolved entry into the on-disk cache (atomic temp+replace)."""
+        self._write_cache_entries({type_id: entry})
+
+    def _write_cache_entries(self, entries: dict[int, dict]) -> None:
+        """Merge one or more resolved entries into the on-disk cache in a SINGLE
+        atomic temp+replace write.
 
         Re-reads the current cache so concurrent catalogs don't clobber each
         other's additions, then writes the union back."""
+        if not entries:
+            return
         cache: dict[str, dict] = {}
         if os.path.exists(self._cache_path):
             try:
@@ -183,7 +247,8 @@ class TypeCatalog:
                     cache = existing
             except (OSError, ValueError):
                 cache = {}
-        cache[str(type_id)] = entry
+        for type_id, entry in entries.items():
+            cache[str(type_id)] = entry
 
         tmp_path = f"{self._cache_path}.tmp"
         parent = os.path.dirname(self._cache_path)

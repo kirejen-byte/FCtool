@@ -469,6 +469,14 @@ class FCToolGUI:
         self._tracked_intel_channels: list[str] = self._load_tracked_intel_channels()
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
+        # Re-entry guard for the "Import from EVE" (ESI in-game fittings) flow.
+        # Set True for the duration of a single import so a second click while
+        # the (slow) ESI fetch is in flight is ignored instead of spawning a
+        # second worker + picker window. Reset on every terminating path. The
+        # button reference is stored in _build_fittings_subtab so it can be
+        # disabled while busy. Touched only on the Tk thread.
+        self._esi_import_busy = False
+        self._esi_import_btn = None
         # Command-burst charge tracking. The tracker records "charge up" calls
         # parsed from fleet chat; the roster maps lowercased pilot name ->
         # ship_type_id (rebuilt each fleet poll) so build_pilot_rows can match
@@ -7532,8 +7540,10 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE)
         search_entry.pack(side=tk.LEFT, padx=(5, 15))
 
-        ttk.Button(toolbar, text="Import from EVE", style="Green.TButton",
-                   command=self._import_esi_fittings).pack(side=tk.LEFT, padx=2)
+        self._esi_import_btn = ttk.Button(
+            toolbar, text="Import from EVE", style="Green.TButton",
+            command=self._import_esi_fittings)
+        self._esi_import_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Import from pyfa", style="Green.TButton",
                    command=self._import_pyfa).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Paste EFT/DNA", style="Green.TButton",
@@ -8467,8 +8477,11 @@ class FCToolGUI:
             count_label.config(text=f"({n} selected)")
             import_sel_btn.config(text=f"Import selected ({n})")
 
-        # Build every checkbutton once; filtering only re-packs the visible set.
-        row_widgets: list = []   # (item_dict, checkbutton)
+        # Build every checkbutton once; filtering only re-packs rows whose
+        # visibility actually changes. Each row carries a precomputed lowercased
+        # label (so the filter never re-lowercases per keystroke) and a "shown"
+        # flag tracking whether it is currently packed.
+        row_widgets: list = []   # list of dicts: {item, cb, label_lc, shown}
         for it in items:
             cb = tk.Checkbutton(
                 inner, text=it["label"], variable=check_vars[it["id"]],
@@ -8476,22 +8489,56 @@ class FCToolGUI:
                 selectcolor=BG_ENTRY, activebackground=BG_PANEL,
                 activeforeground=FG_WHITE, anchor=tk.W, highlightthickness=0,
                 command=_update_count)
-            row_widgets.append((it, cb))
+            row_widgets.append({
+                "item": it,
+                "cb": cb,
+                "label_lc": it["label"].lower(),
+                "shown": False,
+            })
 
         # Track which items are currently visible (for select-all over filter).
         visible_items: list = []
+        # Pending debounce after-id so rapid keystrokes coalesce into one filter.
+        filter_after = {"id": None}
 
-        def _repopulate(*_a):
+        def _apply_filter():
+            """Show only rows matching the needle. Incremental: a row is only
+            (re-)packed or hidden when its visibility actually flips, so a row
+            that stays visible/hidden is left untouched (no churn). Checked
+            state lives in persistent BooleanVars, untouched here."""
             needle = search_var.get().strip().lower()
             visible_items.clear()
-            for it, cb in row_widgets:
-                if needle and needle not in it["label"].lower():
-                    cb.pack_forget()
-                    continue
-                cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
-                visible_items.append(it)
+            for row in row_widgets:
+                should_show = (not needle) or (needle in row["label_lc"])
+                if should_show:
+                    visible_items.append(row["item"])
+                    if not row["shown"]:
+                        row["cb"].pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                        row["shown"] = True
+                elif row["shown"]:
+                    row["cb"].pack_forget()
+                    row["shown"] = False
             canvas.configure(scrollregion=canvas.bbox("all"))
-        search_var.trace_add("write", _repopulate)
+
+        def _schedule_filter(*_a):
+            """Debounce: run _apply_filter ~180ms after the last keystroke,
+            cancelling any previously-scheduled run so it fires once."""
+            if filter_after["id"] is not None:
+                try:
+                    self.root.after_cancel(filter_after["id"])
+                except (tk.TclError, ValueError):
+                    pass
+            filter_after["id"] = self.root.after(180, _run_scheduled_filter)
+
+        def _run_scheduled_filter():
+            filter_after["id"] = None
+            # The window may have been destroyed between scheduling and firing
+            # (e.g. user typed then cancelled); touching dead widgets is a no-op.
+            try:
+                _apply_filter()
+            except tk.TclError:
+                pass
+        search_var.trace_add("write", _schedule_filter)
 
         def _select_all():
             for it in visible_items:
@@ -8566,7 +8613,9 @@ class FCToolGUI:
                        command=(lambda c=command: c(ctl))).pack(side=tk.LEFT,
                                                                 padx=4)
 
-        _repopulate()
+        # Initial population runs synchronously (no debounce) so the list is
+        # fully visible the moment the window opens.
+        _apply_filter()
         _update_count()
 
     def _show_pyfa_picker(self, db_path, fits):
@@ -8685,7 +8734,17 @@ class FCToolGUI:
 
     def _import_esi_fittings(self):
         """Import the active character's in-game fittings via ESI (threaded),
-        then show a checklist to pick which to add."""
+        then show a checklist to pick which to add.
+
+        Guarded against re-entry: a second click while the (slow) ESI fetch is
+        in flight is ignored (``_esi_import_busy``) and the button is disabled
+        for the duration, so we never spawn a second worker + picker window.
+        Before parsing, every referenced type_id is primed in ONE ESI batch so
+        the per-fit parse is all-local (no per-module serial /universe/names/)."""
+        # Re-entry guard: ignore the click if an import is already in flight.
+        if self._esi_import_busy:
+            return
+
         char = self.esi_auth
         if char is None or not char.character_id:
             messagebox.showwarning(
@@ -8702,14 +8761,43 @@ class FCToolGUI:
             return
         char_id = char.character_id
 
+        # Mark busy + disable the button now (on the Tk thread). Both are reset
+        # in _finish, which runs on every terminating path.
+        self._esi_import_busy = True
+        self._set_esi_import_btn_state(tk.DISABLED)
+
         def worker():
             try:
                 raw = char.get_fittings(char_id) or []
                 err = None
             except Exception as e:
                 raw, err = [], str(e)
-            # Map each ESI fitting -> ParsedFit (off the Tk thread; uses the
-            # catalog which may do cached ESI lookups).
+
+            # Single batch prime: collect EVERY referenced type_id (each item's
+            # type_id across all fittings + each fitting's ship_type_id) and
+            # resolve all unknowns in ONE ESI call. This eliminates the old
+            # 20-30s serial /universe/names/ fallback (one call per unknown id).
+            if err is None:
+                try:
+                    all_ids = set()
+                    for f in raw:
+                        try:
+                            ship_id = f.get("ship_type_id", 0)
+                            if ship_id:
+                                all_ids.add(ship_id)
+                            for it in (f.get("items", []) or []):
+                                tid = it.get("type_id")
+                                if tid:
+                                    all_ids.add(tid)
+                        except Exception:
+                            continue
+                    if all_ids:
+                        self.type_catalog.prime(all_ids)
+                except Exception:
+                    pass  # priming is best-effort; parse still works locally
+
+            # Map each ESI fitting -> ParsedFit (off the Tk thread; now all-local
+            # because every referenced id was just primed into the catalog).
             entries = []
             for f in raw:
                 try:
@@ -8729,22 +8817,41 @@ class FCToolGUI:
                     continue
             self.root.after(0, _apply, entries, err)
 
+        def _finish():
+            """Reset the busy flag + re-enable the button. Runs on the Tk thread
+            on EVERY terminating path (error, empty, or picker opened)."""
+            self._esi_import_busy = False
+            self._set_esi_import_btn_state(tk.NORMAL)
+
         def _apply(entries, err):
-            if err is not None:
-                messagebox.showerror(
-                    "Import from EVE failed",
-                    f"Could not read in-game fittings:\n{err}\n\n"
-                    "If this character was authorized before fittings support "
-                    "was added, re-authorize it on the Characters tab.")
-                return
-            if not entries:
-                messagebox.showinfo(
-                    "Import from EVE",
-                    "No in-game fittings found for this character.")
-                return
-            self._show_esi_import_picker(entries)
+            try:
+                if err is not None:
+                    messagebox.showerror(
+                        "Import from EVE failed",
+                        f"Could not read in-game fittings:\n{err}\n\n"
+                        "If this character was authorized before fittings support "
+                        "was added, re-authorize it on the Characters tab.")
+                    return
+                if not entries:
+                    messagebox.showinfo(
+                        "Import from EVE",
+                        "No in-game fittings found for this character.")
+                    return
+                self._show_esi_import_picker(entries)
+            finally:
+                _finish()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _set_esi_import_btn_state(self, state):
+        """Best-effort enable/disable of the 'Import from EVE' button (Tk thread)."""
+        btn = self._esi_import_btn
+        if btn is None:
+            return
+        try:
+            btn.config(state=state)
+        except tk.TclError:
+            pass
 
     def _show_esi_import_picker(self, entries):
         """Searchable, multi-select picker over ESI in-game fittings.

@@ -45,3 +45,67 @@ def test_unknown_falls_back_to_esi_and_caches(tmp_path):
     cat2 = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache, esi=FakeESI())
     assert cat2.resolve_name(99999) == "New Module"
     assert calls["n"] == 1
+
+
+def test_prime_batches_unknowns_in_one_call(tmp_path):
+    """prime() resolves only the unknown ids and does so in a SINGLE ESI call;
+    afterwards resolve_name() for those ids hits no further ESI."""
+    calls = {"n": 0, "ids": []}
+
+    class FakeESI:
+        def resolve_names(self, ids):
+            calls["n"] += 1
+            calls["ids"].append(sorted(ids))
+            return {
+                88888: {"name": "Unknown Alpha", "category": "inventory_type"},
+                77777: {"name": "Unknown Bravo", "category": "inventory_type"},
+            }
+
+    cache = str(tmp_path / "c.json")
+    cat = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache, esi=FakeESI())
+
+    # Mix of a known (bundled) id and two unknowns, with a duplicate unknown.
+    cat.prime([12015, 88888, 77777, 88888])
+
+    # Exactly ONE ESI call, carrying only the two distinct unknown ids.
+    assert calls["n"] == 1
+    assert calls["ids"] == [[77777, 88888]]
+
+    # Primed names resolve with NO further ESI calls.
+    assert cat.resolve_name(88888) == "Unknown Alpha"
+    assert cat.resolve_name(77777) == "Unknown Bravo"
+    assert cat.resolve_name(12015) == "Muninn"
+    assert calls["n"] == 1
+
+    # Primed entries persisted to cache: a fresh catalog (no esi) still resolves.
+    cat2 = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache)
+    assert cat2.resolve_name(88888) == "Unknown Alpha"
+    assert cat2.resolve_name(77777) == "Unknown Bravo"
+
+
+def test_prime_noops_when_all_known(tmp_path):
+    """prime() makes no ESI call when every id is already known."""
+    calls = {"n": 0}
+
+    class FakeESI:
+        def resolve_names(self, ids):
+            calls["n"] += 1
+            return {}
+
+    cache = str(tmp_path / "c.json")
+    cat = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache, esi=FakeESI())
+    cat.prime([12015, 2048, 215])
+    assert calls["n"] == 0
+
+
+def test_prime_is_defensive_on_esi_failure(tmp_path):
+    """prime() never raises if the ESI adapter blows up."""
+
+    class BoomESI:
+        def resolve_names(self, ids):
+            raise RuntimeError("network down")
+
+    cache = str(tmp_path / "c.json")
+    cat = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache, esi=BoomESI())
+    cat.prime([12015, 55555])  # must not raise
+    assert cat.resolve_name(12015) == "Muninn"
