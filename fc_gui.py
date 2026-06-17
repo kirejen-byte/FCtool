@@ -1515,8 +1515,6 @@ class FCToolGUI:
         self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
-        self._fleet_total = 0
-        self._fleet_ship_counts: dict[str, int] = {}  # ship_name -> count
 
         # Right panel: Specialized Roles (collapsible sections)
         comp_right_outer = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -3612,14 +3610,10 @@ class FCToolGUI:
         from zkill_monitor import resolve_name
 
         self._fleet_size_label.config(text=f"Fleet Size: {total}")
-        self._fleet_total = total
 
         # Build top 10 list
         sorted_ships = sorted(ship_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         new_data = [(resolve_name(tid, "type"), count) for tid, count in sorted_ships]
-
-        # Update name->count mapping for DPS ratio calculation
-        self._fleet_ship_counts = {name: count for name, count in new_data}
 
         # Flicker prevention: only rebuild if data changed
         if new_data == self._fleet_comp_prev:
