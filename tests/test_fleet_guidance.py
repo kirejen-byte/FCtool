@@ -110,3 +110,74 @@ def test_compute_delta_under_in_over():
     assert fg.compute_delta(14, 10, 12) == ("over", -2)
     assert fg.compute_delta(5, 8, None) == ("under", 3)   # no upper bound
     assert fg.compute_delta(20, 8, None) == ("in", 0)
+
+
+from fit_models import Fit
+
+def _fit(fit_id, hull, parsed):
+    return Fit(id=fit_id, name=fit_id, hull_type_id=hull, hull_name=str(hull),
+               source="dna", raw_text="", parsed=parsed, dna="", notes="",
+               esi_fitting_ids={}, created="", modified="")
+
+class _Doc:
+    def __init__(self, members): self.members = members; self.name = "Doc"
+
+def _build():
+    cat = _Cat(groups={42529: 1770, 42530: 1770, 88261: 1770})
+    # Retribution(17740) DPS, Deacon(33816) Logi, Claymore(22468) Links 3 bursts
+    fits = {
+        "ret": _fit("ret", 17740, _parsed(17740, [])),
+        "dea": _fit("dea", 33816, _parsed(33816, [])),
+        "cla": _fit("cla", 22468, _parsed(22468, [42529, 42530, 88261])),
+    }
+    doc = _Doc([
+        _mem2("ret", ["DPS"]), _mem2("dea", ["Logistics"]), _mem2("cla", ["Links"]),
+    ])
+    return doc, (lambda fid: fits.get(fid)), cat
+
+def _mem2(fit_id, tags, mode=None, mn=None, mx=None):
+    return DoctrineMember(fit_id=fit_id, tags=tags, order=0,
+                          ideal_mode=mode, ideal_min=mn, ideal_max=mx)
+
+def test_compute_guidance_basic_targets_and_deltas():
+    doc, get_fit, cat = _build()
+    # fleet of 20: 7 Retribution(17740), 6 Deacon(33816), 2 Claymore(22468)
+    counts = {17740: 7, 33816: 6, 22468: 2}
+    rep = fg.compute_fleet_guidance(doc, get_fit, cat, counts, 20, command_ship_fraction=0.1)
+    by = {f.fit_id: f for f in rep.fits}
+    # DPS 50-60% of 20 = 10-12; current 7 -> under +3
+    assert by["ret"].target_min == 10 and by["ret"].target_max == 12
+    assert by["ret"].status == "under" and by["ret"].delta == 3
+    # Logi 25-35% of 20 = 5-7; current 6 -> in
+    assert by["dea"].status == "in" and by["dea"].delta == 0
+    # Links 3-6; current 2 -> under +1
+    assert by["cla"].target_min == 3 and by["cla"].target_max == 6
+    assert by["cla"].status == "under" and by["cla"].delta == 1
+    assert rep.links_suppressed is False and rep.has_live_fleet is True
+
+def test_compute_guidance_links_suppressed_above_threshold():
+    doc, get_fit, cat = _build()
+    counts = {17740: 7, 33816: 6, 22468: 2}
+    rep = fg.compute_fleet_guidance(doc, get_fit, cat, counts, 20, command_ship_fraction=0.5)
+    assert rep.links_suppressed is True
+    assert all(f.role != "Links" for f in rep.fits)
+
+def test_compute_guidance_defenders_overlay():
+    cat = _Cat(groups={})
+    ret_parsed = _parsed(17740, [44102])  # Retribution with a defender launcher
+    fits = {"ret": _fit("ret", 17740, ret_parsed)}
+    doc = _Doc([_mem2("ret", ["DPS", "Defenders"])])
+    counts = {17740: 6}
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 12,
+                                    command_ship_fraction=0.0)
+    d = rep.roles["Defenders"]
+    assert d.target_min == 8 and d.target_max is None
+    assert d.current == 6 and d.status == "under" and d.delta == 2
+    # The same fit still carries its DPS composition guidance.
+    assert any(f.role == "DPS" for f in rep.fits)
+
+def test_compute_guidance_no_live_fleet_unknown():
+    doc, get_fit, cat = _build()
+    rep = fg.compute_fleet_guidance(doc, get_fit, cat, {}, None, command_ship_fraction=0.0)
+    assert rep.has_live_fleet is False
+    assert all(f.current is None and f.status == "unknown" for f in rep.fits)

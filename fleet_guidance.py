@@ -133,3 +133,125 @@ def compute_delta(current, target_min, target_max):
     if target_max is not None and current > target_max:
         return ("over", -(current - target_max))
     return ("in", 0)
+
+
+@dataclass
+class FitGuidance:
+    fit_id: str
+    hull_type_id: int
+    label: str
+    role: str
+    mode: str
+    target_min: int
+    target_max: int | None
+    current: int | None
+    status: str          # "under" | "in" | "over" | "unknown"
+    delta: int
+
+
+@dataclass
+class RoleRollup:
+    tag: str
+    target_min: int
+    target_max: int | None
+    current: int | None
+    status: str
+    delta: int
+
+
+@dataclass
+class GuidanceReport:
+    fits: list[FitGuidance]
+    roles: dict
+    links_suppressed: bool
+    has_live_fleet: bool
+
+
+def _targets_in_pilots(ideal: EffectiveIdeal, fleet_total):
+    if ideal.mode == "percent":
+        tmin = percent_to_pilots(ideal.min, fleet_total)
+        tmax = percent_to_pilots(ideal.max, fleet_total) if ideal.max is not None else None
+        return tmin, tmax
+    return ideal.min, ideal.max
+
+
+def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
+                           fleet_total, command_ship_fraction=0.0) -> GuidanceReport:
+    """Compute per-fit composition guidance + a Defenders overlay rollup.
+
+    ``get_fit(fit_id) -> Fit | None``. ``fleet_ship_counts`` maps hull type id ->
+    live count; ``fleet_total`` is the current fleet size, or None when there is no
+    live (boss) fleet."""
+    has_live = fleet_total is not None
+    members = list(getattr(doctrine, "members", []))
+
+    # Precompute the links range from the doctrine's links fits.
+    links_parsed = []
+    for m in members:
+        if "Links" in m.tags:
+            f = get_fit(m.fit_id)
+            if f is not None:
+                links_parsed.append(f.parsed)
+    links_range = links_ideal_range(links_parsed, catalog)
+    links_suppressed = command_ship_fraction > COMMAND_SHIP_SKIP_FRACTION
+
+    fits: list[FitGuidance] = []
+    for m in members:
+        f = get_fit(m.fit_id)
+        if f is None:
+            continue
+        ideal = resolve_composition_ideal(m, links_range)
+        if ideal is None:
+            continue
+        if ideal.role == "Links" and links_suppressed:
+            continue
+        if has_live:
+            tmin, tmax = _targets_in_pilots(ideal, fleet_total)
+            current = fleet_ship_counts.get(f.hull_type_id, 0)
+            status, delta = compute_delta(current, tmin, tmax)
+        else:
+            tmin, tmax = _targets_in_pilots(ideal, fleet_total or 0)
+            current, status, delta = None, "unknown", 0
+        fits.append(FitGuidance(
+            fit_id=m.fit_id, hull_type_id=f.hull_type_id,
+            label=(f.hull_name or f.name or str(f.hull_type_id)),
+            role=ideal.role, mode=ideal.mode,
+            target_min=tmin, target_max=tmax,
+            current=current, status=status, delta=delta))
+
+    roles = _rollup_by_role(fits, has_live)
+    roles["Defenders"] = _defenders_overlay(members, get_fit, fleet_ship_counts, has_live)
+    return GuidanceReport(fits=fits, roles=roles,
+                          links_suppressed=links_suppressed, has_live_fleet=has_live)
+
+
+def _rollup_by_role(fits, has_live) -> dict:
+    out: dict = {}
+    grouped: dict[str, list[FitGuidance]] = {}
+    for f in fits:
+        grouped.setdefault(f.role, []).append(f)
+    for role, group in grouped.items():
+        tmin = sum(g.target_min for g in group)
+        tmax = None if any(g.target_max is None for g in group) else sum(g.target_max for g in group)
+        if has_live:
+            current = sum(g.current for g in group)
+            status, delta = compute_delta(current, tmin, tmax)
+        else:
+            current, status, delta = None, "unknown", 0
+        out[role] = RoleRollup(role, tmin, tmax, current, status, delta)
+    return out
+
+
+def _defenders_overlay(members, get_fit, fleet_ship_counts, has_live) -> RoleRollup:
+    hulls = set()
+    for m in members:
+        if DEFENDER_TAG in m.tags:
+            f = get_fit(m.fit_id)
+            if f is not None:
+                hulls.add(f.hull_type_id)
+    if has_live:
+        current = sum(fleet_ship_counts.get(h, 0) for h in hulls)
+        status, delta = compute_delta(current, DEFENDER_TARGET_MIN, None)
+    else:
+        current, status, delta = None, "unknown", 0
+    return RoleRollup(DEFENDER_TAG, DEFENDER_TARGET_MIN, None, current, status, delta)
