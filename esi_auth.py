@@ -59,6 +59,8 @@ SCOPES = [
     "esi-structures.read_corporation.v1",
     "esi-structures.read_character.v1",
     "esi-assets.read_assets.v1",
+    "esi-fittings.read_fittings.v1",
+    "esi-fittings.write_fittings.v1",
 ]
 
 
@@ -463,16 +465,31 @@ class ESIAuth:
                 self._access_token = None
                 return False
 
-    def _decode_character_info(self):
-        """Extract character ID and name from the JWT access token."""
+    @staticmethod
+    def _decode_jwt_payload(token: str) -> dict:
+        """Decode the (unverified) payload segment of a JWT into a dict.
+
+        Returns {} on any malformed/empty input. The token signature is NOT
+        verified — we only read claims SSO already issued to us (sub, name,
+        scp), so this is purely a local decode, not a trust boundary."""
         try:
-            # JWT is three base64 segments separated by dots
-            payload_b64 = self._access_token.split(".")[1]
-            # Add padding
+            payload_b64 = token.split(".")[1]
             padding = 4 - len(payload_b64) % 4
             if padding != 4:
                 payload_b64 += "=" * padding
-            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            return json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception:
+            return {}
+
+    def _decode_character_info(self):
+        """Extract character ID and name from the JWT access token."""
+        try:
+            payload = self._decode_jwt_payload(self._access_token or "")
+            if not payload:
+                # Undecodable/absent token — leave any previously-loaded
+                # character_id/name intact (matches prior behavior where a
+                # decode failure was swallowed without overwriting state).
+                return
 
             # Subject format: "CHARACTER:EVE:1234567890"
             sub = payload.get("sub", "")
@@ -484,6 +501,38 @@ class ESIAuth:
 
         except Exception as e:
             print(f"[ESI Auth] Error decoding JWT: {e}")
+
+    def granted_scopes(self) -> set[str]:
+        """Return the set of ESI scopes this character's token was granted.
+
+        Reads the `scp` claim from the access-token JWT (SSO grants scopes
+        only at login, so a token minted before a new scope was added will
+        not carry it). The claim may be a list of scope strings or a single
+        space-separated string — both are handled. Triggers a refresh via the
+        access_token property if no decoded token is in memory yet. Returns an
+        empty set on any error (missing/expired token, malformed JWT), so
+        callers can treat 'unknown' as 'not granted' and route to re-auth."""
+        token = self._access_token
+        if not token:
+            # Lazily obtain a valid access token (may refresh) so a freshly
+            # loaded account still reports its scopes. Never raises.
+            try:
+                token = self.access_token
+            except Exception:
+                token = None
+        if not token:
+            return set()
+        scp = self._decode_jwt_payload(token).get("scp")
+        if isinstance(scp, str):
+            return {s for s in scp.split(" ") if s}
+        if isinstance(scp, (list, tuple)):
+            return {s for s in scp if isinstance(s, str) and s}
+        return set()
+
+    def has_scope(self, scope: str) -> bool:
+        """True iff this character's token was granted `scope`. Defensive:
+        returns False on any decode error or missing token."""
+        return scope in self.granted_scopes()
 
     def logout(self):
         """Clear stored tokens."""
@@ -629,6 +678,54 @@ class ESIAuth:
             print(f"[ESI] Error: {e}")
         return None
 
+    def esi_put(self, path: str, json_data: dict = None) -> bool:
+        """Make an authenticated PUT request to ESI.
+
+        Returns True when ESI accepts the write (any 2xx, e.g. the 204 that
+        PUT /fleets/{id}/ returns); returns False and logs on a non-2xx
+        status, a missing token, or a network error — mirroring the
+        non-raising error convention of esi_post so failures don't surface
+        into the GUI as exceptions."""
+        token = self.access_token
+        if not token:
+            return False
+        try:
+            resp = self._session.put(
+                f"{ESI_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=json_data,
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+            print(f"[ESI] PUT {path} returned {resp.status_code}")
+        except Exception as e:
+            print(f"[ESI] Error: {e}")
+        return False
+
+    def esi_delete(self, path: str) -> bool:
+        """Make an authenticated DELETE request to ESI.
+
+        Returns True when ESI accepts the delete (any 2xx, e.g. the 204 that
+        DELETE /characters/{id}/fittings/{fid}/ returns); returns False and
+        logs on a non-2xx status, a missing token, or a network error
+        (same non-raising convention as esi_post/esi_put)."""
+        token = self.access_token
+        if not token:
+            return False
+        try:
+            resp = self._session.delete(
+                f"{ESI_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+            print(f"[ESI] DELETE {path} returned {resp.status_code}")
+        except Exception as e:
+            print(f"[ESI] Error: {e}")
+        return False
+
     @staticmethod
     def esi_post_public(path: str, body) -> dict | list | None:
         """Public ESI POST — no auth, no token. For endpoints that don't require scopes
@@ -725,20 +822,39 @@ class ESIAuth:
 
     # ── Fleet ────────────────────────────────────────────────────────────────
 
-    def get_fleet_id(self) -> int | None:
-        """Get the fleet ID the authenticated character is in."""
+    def get_fleet_info(self) -> dict | None:
+        """Return the authed character's current fleet info as
+        {'fleet_id', 'fleet_boss_id', 'role'}, or None if not in a fleet."""
         if not self._character_id:
             return None
         data = self.esi_get(f"/characters/{self._character_id}/fleet/")
-        if data and "fleet_id" in data:
-            return data["fleet_id"]
+        if isinstance(data, dict) and "fleet_id" in data:
+            return {
+                "fleet_id": data["fleet_id"],
+                "fleet_boss_id": data.get("fleet_boss_id"),
+                "role": data.get("role"),
+            }
         return None
 
-    def get_fleet_members(self) -> list[dict] | None:
-        """Get all members of the character's current fleet.
+    @staticmethod
+    def is_boss(info, character_id) -> bool:
+        """True iff `info` (from get_fleet_info) shows `character_id` is the fleet
+        boss — the only member allowed to read /fleets/{id}/members/."""
+        return bool(info and info.get("fleet_boss_id") == character_id)
+
+    def get_fleet_id(self) -> int | None:
+        """The authed character's current fleet_id, or None if not in a fleet."""
+        info = self.get_fleet_info()
+        return info["fleet_id"] if info else None
+
+    def get_fleet_members(self, fleet_id=None) -> list[dict] | None:
+        """Fleet member roster. Pass a known fleet_id to avoid a redundant
+        /characters/{id}/fleet/ lookup. ESI returns 403 unless the authed char
+        is the fleet boss.
         Returns list of dicts with character_id, solar_system_id, ship_type_id, etc.
         """
-        fleet_id = self.get_fleet_id()
+        if fleet_id is None:
+            fleet_id = self.get_fleet_id()
         if not fleet_id:
             return None
         return self.esi_get(f"/fleets/{fleet_id}/members/")
@@ -786,6 +902,88 @@ class ESIAuth:
         except Exception:
             pass
         return ""
+
+    def get_fleet(self, fleet_id: int) -> dict | None:
+        """Read a fleet's settings, including its current MOTD.
+
+        GET /fleets/{fleet_id}/ -> {motd, is_free_move, is_registered}.
+        Boss-only on ESI's side; returns None on any error (esi_get convention).
+        """
+        return self.esi_get(f"/fleets/{fleet_id}/")
+
+    def set_fleet_motd(self, fleet_id: int, motd: str) -> bool:
+        """Write a fleet's MOTD via PUT /fleets/{fleet_id}/ (204 on success).
+
+        Sends a motd-only body. Boss-only — ESI returns 403 for non-boss
+        callers; the GUI gates on fleet_boss_id before calling. Returns True
+        on success, False otherwise (esi_put convention)."""
+        return self.esi_put(f"/fleets/{fleet_id}/", {"motd": motd})
+
+    # ── Character Fittings ───────────────────────────────────────────────────
+
+    # Per-fitting field limits enforced before POST (ESI rejects out-of-range).
+    _FITTING_NAME_MAX = 50
+    _FITTING_DESC_MAX = 500
+    _FITTING_ITEMS_MIN = 1
+    _FITTING_ITEMS_MAX = 512
+
+    def get_fittings(self, character_id: int) -> list[dict]:
+        """List a character's in-game saved fittings.
+
+        GET /characters/{character_id}/fittings/ -> array of
+        {fitting_id, name, description, ship_type_id, items[]}. Each item is
+        {type_id, flag(string), quantity}. Returns [] on any error."""
+        data = self.esi_get(f"/characters/{character_id}/fittings/")
+        return data if isinstance(data, list) else []
+
+    def create_fitting(self, character_id: int, body: dict) -> int | None:
+        """Save a fitting to a character's in-game Fittings.
+
+        POST /characters/{character_id}/fittings/ -> {fitting_id}. Applies the
+        client-side guards ESI enforces (name <= 50, description <= 500,
+        1..512 items, drop any Invalid-flagged items) so a borderline fit is
+        trimmed rather than rejected. Returns the new fitting_id, or None on
+        failure / a rejected body."""
+        body = self._sanitize_fitting_body(body)
+        if body is None:
+            return None
+        resp = self.esi_post(f"/characters/{character_id}/fittings/", body)
+        if isinstance(resp, dict):
+            return resp.get("fitting_id")
+        return None
+
+    def delete_fitting(self, character_id: int, fitting_id: int) -> bool:
+        """Delete one of a character's in-game saved fittings.
+
+        DELETE /characters/{character_id}/fittings/{fitting_id}/ (204). There
+        is no ESI update endpoint, so editing is delete + recreate. Returns
+        True on success, False otherwise."""
+        return self.esi_delete(
+            f"/characters/{character_id}/fittings/{fitting_id}/"
+        )
+
+    def _sanitize_fitting_body(self, body: dict) -> dict | None:
+        """Clamp/validate a fitting body to ESI's limits before POST.
+
+        Truncates name/description, drops Invalid-flagged items, and rejects
+        (returns None) a body whose item count falls outside 1..512 after
+        filtering — the only case ESI cannot satisfy. The input dict is not
+        mutated; a shallow copy with a filtered items list is returned."""
+        if not isinstance(body, dict):
+            return None
+        clean = dict(body)
+        name = clean.get("name") or ""
+        clean["name"] = name[: self._FITTING_NAME_MAX]
+        desc = clean.get("description") or ""
+        clean["description"] = desc[: self._FITTING_DESC_MAX]
+        items = [
+            it for it in (clean.get("items") or [])
+            if it.get("flag") != "Invalid"
+        ]
+        if not (self._FITTING_ITEMS_MIN <= len(items) <= self._FITTING_ITEMS_MAX):
+            return None
+        clean["items"] = items
+        return clean
 
     # ── Names / Affiliations / Contacts ──────────────────────────────────────
 
@@ -1169,13 +1367,8 @@ class ESIAuth:
         return data if isinstance(data, list) else []
 
     def is_fleet_boss(self) -> bool:
-        """Return True if the authenticated character is fleet commander."""
-        if not self._character_id:
-            return False
-        data = self.esi_get(f"/characters/{self._character_id}/fleet/")
-        if not isinstance(data, dict):
-            return False
-        return data.get("role") == "fleet_commander"
+        """True iff the authed character is the fleet boss (can read members)."""
+        return self.is_boss(self.get_fleet_info(), self._character_id)
 
     # ── Ansiblex Discovery ───────────────────────────────────────────────────
 

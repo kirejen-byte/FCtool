@@ -34,6 +34,19 @@ INTEL_CHANNELS: set[str] = set()
 # spaces, dots, dashes, brackets, parentheses, '+', and '&'.
 CHAT_LOG_SUFFIX_PATTERN = re.compile(r"_(\d{8})_(\d{6})(?:_\d+)?\.txt$")
 
+# EVE chat-log header lines, e.g. "  Channel ID:      -84651075". The value is
+# captured raw (string): player channels use a NEGATIVE integer, built-in
+# channels a small positive one, and the token could in principle be a
+# non-integer — so callers must NOT int()-parse it. The leading "﻿?" tolerates a
+# stray BOM if the line is read without BOM-stripping; ``open(encoding="utf-16")``
+# already consumes the BOM, but the optional match keeps this robust either way.
+CHANNEL_ID_HEADER_PATTERN = re.compile(
+    r"^﻿?\s*Channel ID:\s*(.+?)\s*$", re.MULTILINE
+)
+CHANNEL_NAME_HEADER_PATTERN = re.compile(
+    r"^﻿?\s*Channel Name:\s*(.+?)\s*$", re.MULTILINE
+)
+
 # Regex for detecting d-scan URLs from the common public d-scan hosts.
 DSCAN_URL_PATTERN = re.compile(
     r"(https?://(?:dscan\.info|dscan\.me|adashboard\.info)/\S+)",
@@ -380,12 +393,16 @@ def scan_available_channels(
     results = []
     today = date.today()
 
+    # Glob the logs dir once and match channel-name prefixes case-INSENSITIVELY,
+    # so case-sensitive filesystems (Linux) behave like Windows.
+    all_txt = glob.glob(os.path.join(logs_path, "*.txt"))
+
     for channel_name in sorted(channels):
-        # EVE log filenames start with the channel name
-        # Format: "ChannelName_YYYYMMDD_HHMMSS.txt"
-        # But spaces and dots in channel names are kept as-is
-        pattern = os.path.join(logs_path, f"{channel_name}*.txt")
-        matching_files = glob.glob(pattern)
+        cn_lower = channel_name.lower()
+        matching_files = [
+            fp for fp in all_txt
+            if os.path.basename(fp).lower().startswith(cn_lower)
+        ]
 
         active = False
         latest_file = None
@@ -541,6 +558,85 @@ def discover_channels(
 
     results.sort(key=lambda d: d["name"].lower())
     return results
+
+
+def read_channel_id(logs_path: str, channel_name: str) -> str | None:
+    """Read a channel's numeric ID from the header of its newest log file.
+
+    EVE chat logs begin (after a UTF-16 BOM) with a header block that, for a
+    PLAYER channel, carries ``Channel ID:  -84651075`` (a NEGATIVE integer) and
+    ``Channel Name:  <name>``. This finds the candidate ``.txt`` logs for
+    ``channel_name`` using the SAME case-insensitive filename-prefix matching as
+    :func:`scan_available_channels`/:func:`discover_channels`, then — among those
+    whose header ``Channel Name:`` equals ``channel_name`` (case-insensitive,
+    stripped) — reads the NEWEST by mtime and returns its raw ``Channel ID``.
+
+    The id is returned as a STRING with any leading minus preserved and is NOT
+    int()-parsed: it is treated as an opaque token (it could be a hex/UUID form
+    in some clients), and the caller decides how to interpret it.
+
+    Args:
+        logs_path: Directory containing EVE chat logs.
+        channel_name: The channel's display name (matched case-insensitively).
+
+    Returns:
+        The raw ``Channel ID`` value as a string, or ``None`` if no candidate
+        log, no name-matching header, or no id could be read (including on any
+        I/O or decode error).
+    """
+    if not logs_path or not channel_name or not os.path.isdir(logs_path):
+        return None
+
+    cn_lower = channel_name.lower()
+    want_name = channel_name.strip().lower()
+
+    # Same case-insensitive filename-prefix match used elsewhere in this module.
+    all_txt = glob.glob(os.path.join(logs_path, "*.txt"))
+    candidates = [
+        fp for fp in all_txt
+        if os.path.basename(fp).lower().startswith(cn_lower)
+    ]
+
+    # Sort newest-first so the first header whose Channel Name matches wins.
+    def _mtime(fp: str) -> float:
+        try:
+            return os.path.getmtime(fp)
+        except OSError:
+            return -1.0
+
+    candidates.sort(key=_mtime, reverse=True)
+
+    # Bound the header reads: a real channel's newest session file matches on the
+    # first read, so reading more than a handful means the name never matches
+    # (e.g. a partial/renamed channel). Cap the work so a folder with years of
+    # logs can't turn this into a multi-second scan.
+    reads = 0
+    for filepath in candidates:
+        if reads >= 60:
+            break
+        try:
+            # encoding="utf-16" consumes the BOM EVE writes at the top of the file.
+            with open(filepath, encoding="utf-16") as f:
+                header = f.read(2048)
+            reads += 1
+        except (OSError, UnicodeError, ValueError):
+            continue
+
+        name_match = CHANNEL_NAME_HEADER_PATTERN.search(header)
+        if not name_match:
+            continue
+        if name_match.group(1).strip().lower() != want_name:
+            continue
+
+        id_match = CHANNEL_ID_HEADER_PATTERN.search(header)
+        if not id_match:
+            # Newest name-matching file has no id — treat as not found rather
+            # than falling back to an older session that might be a different
+            # channel that merely shares this filename prefix.
+            return None
+        return id_match.group(1).strip()
+
+    return None
 
 
 # ── D-Scan Parsing ───────────────────────────────────────────────────────────

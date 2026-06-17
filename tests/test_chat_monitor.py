@@ -1,7 +1,9 @@
+import glob
 import json
 import os
 from datetime import datetime
 
+import chat_monitor
 from chat_monitor import (
     ChatLogFile,
     ChatMessage,
@@ -313,6 +315,42 @@ def test_state_file_roundtrip_resumes_from_stored_position(tmp_path):
     )
     resumed = monitor2.poll()
     assert [m.message for m in resumed] == ["four", "five"]
+
+
+def test_discover_files_case_insensitive_channel_filter(tmp_path, monkeypatch):
+    """On a case-sensitive filesystem (Linux), a channel filter configured in a
+    different case than the on-disk filename must still be discovered. The file
+    on disk is "Ftn Intel_..." but the configured filter is lowercase "ftn intel"."""
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+
+    fp = logs_dir / "Ftn Intel_20990101_120000_123.txt"
+    _write_utf16le(fp, _FULL_HEADER + (
+        "﻿[ 2026.03.25 20:38:22 ] Alpha > Jita clr\r\n"
+    ))
+
+    # Force CASE-SENSITIVE globbing to simulate Linux's filesystem, so this test
+    # discriminates the fix on Windows (whose native glob is case-insensitive).
+    # The old per-channel glob ("ftn intel*.txt") would not match the on-disk
+    # "Ftn Intel_...txt" under fnmatchcase and the file would not be tracked; the
+    # new code globs "*.txt" once and lowercases the basename prefix, so it is.
+    import fnmatch
+    _real_glob = glob.glob
+    def _cs_glob(pattern):
+        d = os.path.dirname(pattern)
+        pat = os.path.basename(pattern)
+        return [p for p in _real_glob(os.path.join(d, "*"))
+                if fnmatch.fnmatchcase(os.path.basename(p), pat)]
+    monkeypatch.setattr(chat_monitor.glob, "glob", _cs_glob)
+
+    monitor = ChatMonitor(
+        str(logs_dir),
+        channel_filters=["ftn intel"],
+        state_path=str(tmp_path / "state.json"),
+    )
+    monitor._discover_files()
+
+    assert str(fp) in monitor._tracked_files
 
 
 def test_dedupe_ttl_eviction(tmp_path):

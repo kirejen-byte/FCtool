@@ -1,9 +1,11 @@
+import glob
 import os
 from datetime import datetime
 
 import pytest
 
 from chat_monitor import ChatMessage
+import intel_monitor
 from intel_monitor import (
     BARE_COUNT_PATTERN,
     CAMP_PATTERN,
@@ -705,3 +707,30 @@ def test_scan_available_channels_character_filter(tmp_path):
                                       channels={"My Custom Chan"})
     assert nomatch[0]["active"] is False
     assert nomatch[0]["file_path"] is None
+
+
+def test_scan_available_channels_case_insensitive_match(tmp_path, monkeypatch):
+    """On a case-sensitive filesystem (Linux), a channel name configured in a
+    different case than the on-disk filename must still match. The on-disk file
+    is "Ftn Intel_..." but the configured channel is the lowercase "ftn intel"."""
+    _make_log(tmp_path, "Ftn Intel_20990101_120000_123.txt",
+              channel="Ftn Intel", mtime=_now())
+
+    # Force CASE-SENSITIVE globbing to simulate Linux's filesystem, so this test
+    # discriminates the fix on Windows (whose native glob is case-insensitive).
+    # The old per-channel glob ("ftn intel*.txt") would not match the on-disk
+    # "Ftn Intel_...txt" under fnmatchcase and the test would fail; the new code
+    # globs "*.txt" once and lowercases the basename prefix, so it still matches.
+    import fnmatch
+    _real_glob = glob.glob
+    def _cs_glob(pattern):
+        d = os.path.dirname(pattern)
+        pat = os.path.basename(pattern)
+        return [p for p in _real_glob(os.path.join(d, "*"))
+                if fnmatch.fnmatchcase(os.path.basename(p), pat)]
+    monkeypatch.setattr(intel_monitor.glob, "glob", _cs_glob)
+
+    result = scan_available_channels(str(tmp_path), channels=["ftn intel"])
+    by_name = {c["name"]: c for c in result}
+    assert by_name["ftn intel"]["active"] is True
+    assert by_name["ftn intel"]["file_path"] is not None

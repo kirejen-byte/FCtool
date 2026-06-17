@@ -51,6 +51,17 @@ pyinstaller --clean --noconfirm FCTool.spec
 - Runtime caches (`esi_cache.json`, `systems_cache.json`, `regions_cache.json`, …) plus your `config.json` and ESI tokens are gitignored and regenerate locally on first run. The static EVE stargate graph (`stargate_jumps.json`) **is** committed so the project builds from a clean clone.
 - Built with `requests`, `pygame` (audio), and `edge-tts` (text-to-speech).
 
+### EVE logs on Linux (Wine / Proton / Lutris)
+
+EVE doesn't run natively on Linux, so its chat logs live inside the Wine/Proton
+prefix instead of a normal `~/Documents`. The tool now auto-detects the common
+prefix locations — `~/.wine`, Steam-Proton `compatdata`, and Lutris `~/Games`
+prefixes — and looks for `.../drive_c/users/<user>/Documents/EVE/logs/Chatlogs`.
+
+If auto-detection can't find your logs, set **`eve_logs_path`** in `config.json`
+to your prefix's chat-logs folder, e.g.
+`~/.wine/drive_c/users/<user>/Documents/EVE/logs/Chatlogs`.
+
 ### System coordinate table
 
 `system_coords.json` is a committed, bundled snapshot of New Eden system

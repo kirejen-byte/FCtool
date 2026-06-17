@@ -17,12 +17,16 @@ class AutocompleteEntry(tk.Entry):
     """
 
     def __init__(self, master, completions: list[str], max_shown: int = 12,
-                 labels: dict[str, str] | None = None, **kwargs):
+                 labels: dict[str, str] | None = None, on_select=None, **kwargs):
         super().__init__(master, **kwargs)
         self._completions = completions
         self._completions_lower = [(c, c.lower()) for c in completions]
         self._labels = labels or {}  # value -> display text
         self._max_shown = max_shown
+        # Optional callback fired when a value is chosen from the dropdown
+        # (click/Enter/Tab). Lets callers react to a SELECTION, which — unlike
+        # typing — never raises <KeyRelease>.
+        self._on_select = on_select
         self._listbox: tk.Toplevel | None = None
         self._lb: tk.Listbox | None = None
         self._current_matches: list[str] = []  # stores values (not display text)
@@ -136,6 +140,11 @@ class AutocompleteEntry(tk.Entry):
         """Insert a value into the entry field."""
         self.delete(0, tk.END)
         self.insert(0, value)
+        if self._on_select is not None:
+            try:
+                self._on_select()
+            except Exception:
+                pass
 
     def _close_dropdown(self, event=None):
         if self._listbox:

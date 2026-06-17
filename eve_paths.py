@@ -165,6 +165,24 @@ def candidate_logs_paths(documents=None, home=None):
         except Exception:
             pass
 
+    # Linux: EVE runs under Wine/Proton/Lutris, so its logs live inside a prefix.
+    # These globs simply match nothing on Windows, so adding them is harmless there.
+    if home:
+        prefix_user_globs = [
+            os.path.join(home, ".wine", "drive_c", "users", "*"),
+            os.path.join(home, ".local", "share", "Steam", "steamapps",
+                         "compatdata", "*", "pfx", "drive_c", "users", "*"),
+            os.path.join(home, ".steam", "steam", "steamapps",
+                         "compatdata", "*", "pfx", "drive_c", "users", "*"),
+            os.path.join(home, "Games", "*", "drive_c", "users", "*"),
+        ]
+        for g in prefix_user_globs:
+            try:
+                for user_dir in sorted(glob.glob(g)):
+                    candidates.append(_logs_under(os.path.join(user_dir, "Documents")))
+            except Exception:
+                pass
+
     # De-dupe while preserving order; drop blanks/None.
     seen = set()
     ordered = []
