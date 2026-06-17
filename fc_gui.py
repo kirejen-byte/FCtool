@@ -77,6 +77,7 @@ import command_bursts
 # Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
 # type_catalog and fittings_store are instantiated per-app in __init__.
 import fit_models
+import fleet_guidance
 import fit_parser
 import fit_dna
 import pyfa_import
@@ -100,6 +101,7 @@ FG_ORANGE = "#ff8c00"
 FG_YELLOW = "#ffdd00"
 FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
+FG_UNDER = "#ff6666"
 BORDER_COLOR = "#2a2a4a"
 
 # ── Notebook tab indices ────────────────────────────────────────────────────────
@@ -111,6 +113,7 @@ BORDER_COLOR = "#2a2a4a"
 INTEL_TAB_INDEX = 1
 CHARACTERS_TAB_INDEX = 4
 FITTINGS_TAB_INDEX = 5
+DOCTRINES_SUBTAB_INDEX = 1
 SETTINGS_TAB_INDEX = 6
 
 # ESI fittings scopes (added after some characters were already authed; SSO
@@ -569,6 +572,8 @@ class FCToolGUI:
         self.fittings = _fittings_store.FittingsStore(
             os.path.join(app_dir(), "fittings_library.json"))
         self.fittings.load()
+        self.fittings.catalog = self.type_catalog   # enables Defenders auto-tag on add
+        self._heal_fit_dna()   # one-time: rewrite legacy bare-id T3 DNA to canonical
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
         self._doctrine_selected_id: str | None = None
@@ -1480,10 +1485,29 @@ class FCToolGUI:
                                            fg=FG_YELLOW, bg=BG_PANEL)
         self._fleet_size_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
+        # Doctrine selector + clickable link → Fittings ▸ Doctrines (Phase C).
+        doc_row = tk.Frame(comp_left, bg=BG_PANEL)
+        doc_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 2))
+        tk.Label(doc_row, text="Doctrine:", font=("Consolas", 9),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
+        self._fleet_doctrine_var = tk.StringVar(
+            value=self.config.get("fleet", {}).get("active_doctrine", ""))
+        self._fleet_doctrine_combo = ttk.Combobox(
+            doc_row, textvariable=self._fleet_doctrine_var, state="readonly",
+            font=("Consolas", 9), width=22)
+        self._fleet_doctrine_combo.pack(side=tk.LEFT, padx=4)
+        self._fleet_doctrine_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_fleet_doctrine_change())
+        self._fleet_doctrine_link = tk.Label(
+            doc_row, text="↗ open", font=("Consolas", 9, "underline"),
+            fg=FG_ACCENT, bg=BG_PANEL, cursor="hand2")
+        self._fleet_doctrine_link.pack(side=tk.LEFT, padx=6)
+        self._fleet_doctrine_link.bind(
+            "<Button-1>", lambda e: self._open_active_doctrine())
+        self._refresh_fleet_doctrine_combo()
+
         comp_header = tk.Frame(comp_left, bg=BG_PANEL)
         comp_header.pack(fill=tk.X, padx=8)
-        tk.Label(comp_header, text="DPS", font=("Consolas", 8),
-                 fg=FG_DIM, bg=BG_PANEL, width=4).pack(side=tk.LEFT)
         tk.Label(comp_header, text="Ship Type", font=("Consolas", 8),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
 
@@ -1491,12 +1515,6 @@ class FCToolGUI:
         self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
-        self._dps_designated: set[str] = set()  # ship names marked as DPS
-        self._dps_ratio_label = tk.Label(comp_left, text="", font=("Consolas", 9, "bold"),
-                                          fg=FG_DIM, bg=BG_PANEL)
-        self._dps_ratio_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
-        self._fleet_total = 0
-        self._fleet_ship_counts: dict[str, int] = {}  # ship_name -> count
 
         # Right panel: Specialized Roles (collapsible sections)
         comp_right_outer = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -1538,6 +1556,8 @@ class FCToolGUI:
         self._booster_strip.pack(side=tk.RIGHT, anchor=tk.E)
 
         # Create collapsible sections (order matters for display)
+        self._dps_container, self._dps_content, self._dps_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "DPS")
         self._links_container, self._links_content, self._links_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
         # Non-boss banner. Created on _spec_roles_frame (NOT _links_container) so
@@ -3585,47 +3605,20 @@ class FCToolGUI:
 
         return container, content, count_label
 
-    def _update_dps_ratio(self):
-        """Recalculate and display DPS ratio based on checked ship types."""
-        if not self._dps_designated or self._fleet_total == 0:
-            self._dps_ratio_label.config(text="")
-            return
-        dps_count = sum(self._fleet_ship_counts.get(name, 0)
-                        for name in self._dps_designated)
-        ratio = dps_count / self._fleet_total
-        pct = int(ratio * 100)
-        if ratio >= 0.6:
-            self._dps_ratio_label.config(
-                text=f"\u2705 Good Ratio ({dps_count}/{self._fleet_total}, {pct}%)",
-                fg=FG_GREEN)
-        else:
-            self._dps_ratio_label.config(
-                text=f"\u274c Need more DPS ({dps_count}/{self._fleet_total}, {pct}%)",
-                fg="#ff6666")
-
     def _update_fleet_composition(self, ship_counts: dict[int, int], total: int):
         """Update the Top 10 fleet composition display."""
         from zkill_monitor import resolve_name
 
         self._fleet_size_label.config(text=f"Fleet Size: {total}")
-        self._fleet_total = total
 
         # Build top 10 list
         sorted_ships = sorted(ship_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         new_data = [(resolve_name(tid, "type"), count) for tid, count in sorted_ships]
 
-        # Update name->count mapping for DPS ratio calculation
-        self._fleet_ship_counts = {name: count for name, count in new_data}
-
         # Flicker prevention: only rebuild if data changed
         if new_data == self._fleet_comp_prev:
-            self._update_dps_ratio()
             return
         self._fleet_comp_prev = new_data
-
-        # Prune DPS designations for ship types no longer in fleet
-        current_names = {name for name, _ in new_data}
-        self._dps_designated &= current_names
 
         # Clear and rebuild
         for widget in self._fleet_comp_frame.winfo_children():
@@ -3635,22 +3628,6 @@ class FCToolGUI:
         for ship_name, count in new_data:
             row = tk.Frame(self._fleet_comp_frame, bg=BG_PANEL)
             row.pack(fill=tk.X)
-
-            is_dps = tk.BooleanVar(value=ship_name in self._dps_designated)
-
-            def on_toggle(name=ship_name, var=is_dps):
-                if var.get():
-                    self._dps_designated.add(name)
-                else:
-                    self._dps_designated.discard(name)
-                self._update_dps_ratio()
-
-            cb = tk.Checkbutton(row, variable=is_dps, command=on_toggle,
-                                 bg=BG_PANEL, fg=FG_TEXT, selectcolor="#2a2a3a",
-                                 activebackground=BG_PANEL, activeforeground=FG_TEXT,
-                                 highlightthickness=0, bd=1, relief=tk.FLAT)
-            cb.pack(side=tk.LEFT)
-
             lbl = tk.Label(row, text=f"{ship_name}: {count}",
                            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W)
             lbl.pack(side=tk.LEFT)
@@ -3661,8 +3638,6 @@ class FCToolGUI:
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
 
-        self._update_dps_ratio()
-
     def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
         """Update all collapsible specialized role sections."""
         from ship_classes import (
@@ -3671,6 +3646,25 @@ class FCToolGUI:
             TITANS, BLACK_OPS, TACTICAL_DESTROYERS, is_defender
         )
         from zkill_monitor import resolve_name
+
+        # Cache this snapshot so a doctrine change can re-render without waiting
+        # for the next fleet poll (consumed by _refresh_specialized_roles_from_cache).
+        self._last_specialized_args = (members, ship_counts, total)
+
+        # Compute doctrine-driven guidance when a doctrine is active (Phase C).
+        self._fleet_guidance = None
+        doc = self._active_fleet_doctrine()
+        if doc is not None:
+            cmd = sum(c for tid, c in ship_counts.items()
+                      if tid in ALL_LINKS_COMMAND)
+            frac = (cmd / total) if total else 0.0
+            try:
+                self._fleet_guidance = fleet_guidance.compute_fleet_guidance(
+                    doc, self.fittings.get_fit, self.type_catalog,
+                    ship_counts, total, command_ship_fraction=frac)
+            except Exception as exc:
+                print(f"[Fleet] guidance compute failed: {exc}")
+                self._fleet_guidance = None
 
         # Rebuild the command-burst roster (lowercased pilot name -> ship_type_id)
         # so charge-up calls in fleet chat can be matched to booster ships. The
@@ -3786,14 +3780,20 @@ class FCToolGUI:
             members_dict = categories[cat_key]
             threshold = thresholds.get(cat_key)
             sort_override = bridge_sort_key if cat_key == "bridge" else None
+            status_override = None if cat_key == "links" else self._role_guidance_badge(cat_key)
             if cat_key == "links":
                 # Links is owned by _render_links_section so per-pilot booster
                 # charges + off-hull posters render (and collapse) inside it. It
                 # reads the _links_categories/_links_threshold cached just above.
+                # The guided badge is applied INSIDE _render_links_section (it
+                # also re-renders asynchronously from the booster refresh, which
+                # would clobber a badge we set here), so nothing to do here.
                 self._render_links_section()
             else:
                 self._populate_role_section(content, count_lbl, members_dict,
-                                            threshold=threshold, sort_override=sort_override)
+                                            threshold=threshold,
+                                            sort_override=sort_override,
+                                            status_override=status_override)
 
             # Log when a capped role reaches its threshold for the first time
             if threshold is not None:
@@ -3807,10 +3807,81 @@ class FCToolGUI:
                 elif count < threshold and cat_key in self._roles_filled:
                     self._roles_filled.discard(cat_key)
 
+        # DPS is doctrine-driven: counted as the active doctrine's DPS-tagged
+        # hulls in the live fleet (read from the guidance rollup). Unlike the
+        # other roles it has no hull-class fallback, so the section is empty
+        # when no doctrine is active. Drive the section's count badge from the
+        # rollup; the content frame just carries a short explanatory note.
+        dps_badge = self._role_guidance_badge("dps")
+        for w in self._dps_content.winfo_children():
+            w.destroy()
+        if dps_badge is not None:
+            text, colour = dps_badge
+            self._dps_count.config(text=text, fg=colour)
+            tk.Label(self._dps_content, text="  Doctrine DPS hulls in fleet",
+                     font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
+        else:
+            self._dps_count.config(text="—", fg=FG_DIM)
+            tk.Label(self._dps_content, text="  No doctrine",
+                     font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
+
+        # Keep the MOTD +/- deltas current as the live fleet changes.
+        if hasattr(self, "_schedule_motd_preview"):
+            self._schedule_motd_preview()
+
+    # Panel role-section key -> doctrine rollup tag (Phase C guidance).
+    _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logistics",
+                        "defenders": "Defenders", "webs": "Support - Webs"}
+
+    def _format_rollup(self, rr) -> tuple[str, str]:
+        """Format a role rollup's live current/target into (text, colour).
+        Shared by the DPS guidance line and _role_guidance_badge so the badge
+        text and status colours stay identical. Assumes rr.current is not None
+        (the 'live current value' path); callers handle the no-current case."""
+        hi = "∞" if rr.target_max is None else str(rr.target_max)
+        if rr.delta == 0:
+            badge = ""
+        elif rr.delta > 0:
+            badge = f"+{rr.delta}"
+        else:
+            badge = str(rr.delta)  # already negative
+        if rr.status == "in":
+            colour = FG_GREEN
+        elif rr.status == "under":
+            colour = FG_UNDER
+        else:  # over
+            colour = FG_ORANGE
+        text = f"{rr.current} / {rr.target_min}-{hi} {badge}".strip()
+        return (text, colour)
+
+    def _role_guidance_badge(self, role_key):
+        """Return (text, colour) for a guided role's count badge, or None to fall
+        back to the existing fixed-threshold rendering. Uses the active doctrine's
+        role rollup (current / target range + under/in/over status). For 'links',
+        returns None when the guidance suppressed links (high command-ship fraction)
+        so the fixed-threshold behaviour is kept."""
+        rep = getattr(self, "_fleet_guidance", None)
+        if rep is None:
+            return None
+        tag = self._ROLE_KEY_TO_TAG.get(role_key)
+        if not tag or tag not in rep.roles:
+            return None
+        if role_key == "links" and getattr(rep, "links_suppressed", False):
+            return None
+        rr = rep.roles[tag]
+        if not rep.has_live_fleet or rr.current is None:
+            # No live fleet: show the target range with no current/status.
+            hi = "∞" if rr.target_max is None else str(rr.target_max)
+            return (f"— / {rr.target_min}-{hi}", FG_DIM)
+        return self._format_rollup(rr)
+
     def _populate_role_section(self, content_frame, count_label, ship_members,
                                 threshold: int | None = None,
                                 sort_override: dict | None = None,
-                                rows_by_name: dict | None = None):
+                                rows_by_name: dict | None = None,
+                                status_override: tuple | None = None):
         """Populate a collapsible section with ship type counts and pilot details.
 
         ``rows_by_name`` (lowercased pilot name -> command_bursts.PilotRow) is
@@ -3833,12 +3904,17 @@ class FCToolGUI:
             widget.destroy()
 
         total = sum(len(pilots) for pilots in ship_members.values())
-        # Color the count based on threshold
-        if threshold is not None:
-            count_color = "#ff6666" if total < threshold else FG_GREEN
+        if status_override is not None:
+            # Doctrine guidance owns the badge (current / target range + status).
+            text, count_color = status_override
+            count_label.config(text=text, fg=count_color)
         else:
-            count_color = FG_DIM
-        count_label.config(text=f"({total})", fg=count_color)
+            # Color the count based on threshold
+            if threshold is not None:
+                count_color = "#ff6666" if total < threshold else FG_GREEN
+            else:
+                count_color = FG_DIM
+            count_label.config(text=f"({total})", fg=count_color)
 
         if not ship_members:
             tk.Label(content_frame, text="  None detected",
@@ -4185,6 +4261,12 @@ class FCToolGUI:
         elif current == 4 and hasattr(self, '_char_tab_content'):
             # Switched to Characters tab — auto-refresh
             self._refresh_character_tab()
+        elif current == 0:
+            # Switched to Fleet Management — keep the doctrine dropdown fresh.
+            try:
+                self._refresh_fleet_doctrine_combo()
+            except Exception:
+                pass
 
     def _notify_zkill_tab(self):
         """Flash the zKill tab to indicate a new alert if not currently viewing it."""
@@ -5793,7 +5875,7 @@ class FCToolGUI:
     # carrying a tag outside this list are grouped last under "Other".
     _DOCTRINE_TAG_ORDER = (
         "DPS", "Logistics", "Links",
-        "Support - EWAR", "Support - Webs", "Tackle", "Special",
+        "Support - EWAR", "Support - Webs", "Defenders", "Tackle", "Special",
     )
 
     def _build_doctrines_subtab(self):
@@ -5811,6 +5893,8 @@ class FCToolGUI:
                    command=self._import_doctrine).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Export file", style="Dark.TButton",
                    command=self._export_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Manage tags…", style="Dark.TButton",
+                   command=self._manage_tags_dialog).pack(side=tk.LEFT, padx=2)
 
         # ── Master / detail split ────────────────────────────────────────────
         body = tk.Frame(tab, bg=BG_DARK)
@@ -5927,6 +6011,11 @@ class FCToolGUI:
             # Selected doctrine was deleted — clear the detail pane.
             self._doctrine_selected_id = None
             self._show_doctrine_detail(None)
+        # Keep the Fleet-Management doctrine dropdown in sync (Phase C).
+        try:
+            self._refresh_fleet_doctrine_combo()
+        except Exception:
+            pass
 
     def _on_doctrine_tree_motion(self, event):
         """Show a warning tooltip while hovering a doctrine that has untagged
@@ -6048,14 +6137,15 @@ class FCToolGUI:
             return
 
         # Members grouped by tag (canonical order).
+        links_range = self._doctrine_links_range(doctrine)
         for tag_label, members in self._group_members_by_tag(doctrine):
             tk.Label(parent, text=tag_label, font=("Consolas", 10, "bold"),
                      fg=FG_GREEN, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=12, pady=(8, 2))
             for mem in members:
-                self._render_doctrine_member_row(parent, doctrine, mem)
+                self._render_doctrine_member_row(parent, doctrine, mem, links_range)
 
-    def _render_doctrine_member_row(self, parent, doctrine, mem):
+    def _render_doctrine_member_row(self, parent, doctrine, mem, links_range):
         """One member row: fit name + its tag-chip cluster within this doctrine
         + Tags/Remove controls."""
         fit = self.fittings.get_fit(mem.fit_id)
@@ -6085,12 +6175,117 @@ class FCToolGUI:
 
         ctrls = tk.Frame(row, bg=BG_PANEL)
         ctrls.pack(side=tk.RIGHT)
+        # Effective ideal summary (explicit value, tag default, or "off").
+        eff = fleet_guidance.resolve_composition_ideal(mem, links_range)
+        if mem.ideal_mode == "off":
+            summary = "off"
+        elif eff is None:
+            summary = "—"  # em dash: no guidance for this fit
+        else:
+            hi = "∞" if eff.max is None else str(eff.max)  # infinity
+            unit = "%" if eff.mode == "percent" else "#"
+            auto = "" if mem.ideal_mode in ("percent", "count") else " (auto)"
+            summary = f"{eff.min}-{hi}{unit}{auto}"
+        tk.Label(ctrls, text=f"Ideal {summary}", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrls, text="Ideal…", style="Dark.TButton",
+                   command=lambda d=doctrine.id, f=mem.fit_id:
+                       self._edit_member_ideal(d, f)).pack(side=tk.LEFT, padx=1)
         ttk.Button(ctrls, text="Tags", style="Dark.TButton",
                    command=lambda: self._edit_member_tags(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
         ttk.Button(ctrls, text="Remove", style="Red.TButton",
                    command=lambda: self._remove_doctrine_member(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    def _doctrine_links_range(self, doctrine):
+        """Computed ideal links-ship count range for this doctrine (or None)."""
+        parsed = []
+        for m in doctrine.members:
+            if "Links" in (m.tags or []):
+                fit = self.fittings.get_fit(m.fit_id)
+                if fit is not None:
+                    parsed.append(fit.parsed)
+        return fleet_guidance.links_ideal_range(parsed, self.type_catalog)
+
+    def _edit_member_ideal(self, doctrine_id, fit_id):
+        """Modal: pick %/#/off and a min-max range for a member's ideal."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = next((m for m in doctrine.members if m.fit_id == fit_id), None)
+        if mem is None:
+            return
+        links_range = self._doctrine_links_range(doctrine)
+        eff = fleet_guidance.resolve_composition_ideal(mem, links_range)
+
+        win = tk.Toplevel(self.root)
+        win.title("Ideal composition")
+        win.configure(bg=BG_DARK)
+        win.transient(self.root)
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        mode_var = tk.StringVar(
+            value=(mem.ideal_mode if mem.ideal_mode in ("percent", "count", "off")
+                   else (eff.mode if eff else "off")))
+        min_var = tk.StringVar(
+            value=str(mem.ideal_min if mem.ideal_min is not None
+                      else (eff.min if eff else "")))
+        max_var = tk.StringVar(
+            value=("" if (mem.ideal_max is None and (eff is None or eff.max is None))
+                   else str(mem.ideal_max if mem.ideal_max is not None else eff.max)))
+
+        tk.Label(win, text="Mode:", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        mode_row = tk.Frame(win, bg=BG_DARK)
+        mode_row.pack(anchor=tk.W, padx=12)
+        for label, val in (("% of fleet", "percent"), ("# pilots", "count"),
+                           ("off", "off")):
+            tk.Radiobutton(mode_row, text=label, value=val, variable=mode_var,
+                           font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                           selectcolor=BG_ENTRY, activebackground=BG_DARK,
+                           activeforeground=FG_TEXT).pack(side=tk.LEFT, padx=4)
+
+        rng = tk.Frame(win, bg=BG_DARK)
+        rng.pack(anchor=tk.W, padx=12, pady=(8, 0))
+        tk.Label(rng, text="Min:", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Entry(rng, textvariable=min_var, width=5, font=("Consolas", 10),
+                 bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
+                     side=tk.LEFT, padx=(2, 8))
+        tk.Label(rng, text="Max (blank = none):", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Entry(rng, textvariable=max_var, width=5, font=("Consolas", 10),
+                 bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
+                     side=tk.LEFT, padx=2)
+
+        def _save():
+            mode = mode_var.get()
+            if mode == "off":
+                self.fittings.set_member_ideal(doctrine_id, fit_id, "off", None, None)
+            else:
+                def _int(s):
+                    s = (s or "").strip()
+                    return int(s) if s.isdigit() else None
+                self.fittings.set_member_ideal(
+                    doctrine_id, fit_id, mode, _int(min_var.get()), _int(max_var.get()))
+            self.fittings.save()
+            win.destroy()
+            # Ideal changes don't affect the doctrine-list untagged-warning or fit-list membership counts, so refresh only the detail + MOTD preview.
+            self._show_doctrine_detail(doctrine_id)
+            if hasattr(self, "_rebuild_motd_preview"):
+                self._rebuild_motd_preview()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Save", style="Green.TButton",
+                   command=_save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        self.root.wait_window(win)
 
     # ── Doctrine CRUD controllers (Task 6.1) ──────────────────────────────────
 
@@ -6423,6 +6618,7 @@ class FCToolGUI:
         win.title(title)
         win.configure(bg=BG_DARK)
         win.geometry("360x420")
+        win.minsize(360, 340)
         try:
             win.transient(self.root)
             win.grab_set()
@@ -6435,7 +6631,6 @@ class FCToolGUI:
                      anchor=tk.W, padx=12, pady=(12, 4))
 
         list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
-        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
@@ -6486,7 +6681,6 @@ class FCToolGUI:
             _rebuild_checks()
 
         add_row = tk.Frame(win, bg=BG_DARK)
-        add_row.pack(fill=tk.X, padx=12, pady=(4, 0))
         ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
                    command=_add_tag_inline).pack(side=tk.LEFT)
 
@@ -6498,15 +6692,127 @@ class FCToolGUI:
             win.destroy()
 
         btns = tk.Frame(win, bg=BG_DARK)
-        btns.pack(fill=tk.X, padx=12, pady=12)
         ttk.Button(btns, text="OK", style="Green.TButton",
                    command=_ok).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=_cancel).pack(side=tk.RIGHT)
+        # Pack order matters: pin the two action rows to the bottom FIRST so they
+        # always reserve their space, then let list_wrap expand into what's left.
+        # This prevents the OK/Cancel row from being clipped on a short window.
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        add_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
         self.root.wait_window(win)
         return result["value"]
+
+    def _manage_tags_dialog(self):
+        """Modal manager for the library tag vocabulary: add custom tags and
+        delete them (built-in DEFAULT_TAGS are protected). Deleting a tag also
+        strips it from every doctrine member that carries it."""
+        win = tk.Toplevel(self.root)
+        win.title("Manage Tags")
+        win.configure(bg=BG_DARK)
+        win.geometry("380x460")
+        win.minsize(360, 360)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win,
+                 text="Add or remove custom tags. Built-in tags cannot be "
+                      "removed.",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=350).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        def _close():
+            win.destroy()
+
+        def _rebuild():
+            for w in inner.winfo_children():
+                w.destroy()
+            for tag in self.fittings.tags:
+                row = tk.Frame(inner, bg=BG_PANEL)
+                row.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                tk.Label(row, text=tag, font=("Consolas", 9), fg=FG_TEXT,
+                         bg=BG_PANEL, anchor=tk.W).pack(
+                             side=tk.LEFT, fill=tk.X, expand=True)
+                if tag not in fit_models.DEFAULT_TAGS:
+                    ttk.Button(row, text="Delete", style="Red.TButton",
+                               command=lambda t=tag: _delete(t)).pack(
+                                   side=tk.RIGHT)
+
+        def _delete(tag):
+            used = sum(1 for d in self.fittings.list_doctrines()
+                       for m in d.members if tag in m.tags)
+            if used > 0:
+                if not messagebox.askyesno(
+                        "Delete tag",
+                        f"Delete tag '{tag}'? It is used by {used} fit(s) "
+                        "across your doctrines and will be removed from them."):
+                    return
+            self.fittings.remove_tag(tag)
+            self.fittings.save()
+            _rebuild()
+            self._refresh_doctrine_list()
+            if self._doctrine_selected_id:
+                self._show_doctrine_detail(self._doctrine_selected_id)
+            self._refresh_fit_list(self._fit_search_var.get())
+
+        entry_var = tk.StringVar()
+
+        def _add():
+            name = entry_var.get().strip()
+            if not name:
+                return
+            if name in self.fittings.tags:
+                messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+                return
+            self.fittings.add_tag(name)
+            self.fittings.save()
+            entry_var.set("")
+            _rebuild()
+
+        add_row = tk.Frame(win, bg=BG_DARK)
+        entry = tk.Entry(add_row, textvariable=entry_var, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         borderwidth=1, relief=tk.RIDGE)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        entry.bind("<Return>", lambda e: _add())
+        ttk.Button(add_row, text="Add", style="Dark.TButton",
+                   command=_add).pack(side=tk.RIGHT, padx=(4, 0))
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        ttk.Button(btns, text="Close", style="Dark.TButton",
+                   command=_close).pack(side=tk.RIGHT)
+
+        # Pack order matters: pin the two action rows to the bottom FIRST so they
+        # always reserve their space, then let list_wrap expand into what's left.
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        add_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        _rebuild()
+        win.bind("<Escape>", lambda e: _close())
+        win.protocol("WM_DELETE_WINDOW", _close)
+        self.root.wait_window(win)
 
     # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
 
@@ -6819,6 +7125,88 @@ class FCToolGUI:
                 default = self.esi_auth.character_name
             self._motd_fc_var.set(default or (names[0] if names else
                                               self._MOTD_FC_BLANK))
+
+    def _active_fleet_doctrine(self):
+        """The doctrine driving Fleet-Mgmt guidance: the explicit Fleet-tab pick
+        if set, else the MOTD-selected doctrine, else None."""
+        name = ""
+        var = getattr(self, "_fleet_doctrine_var", None)
+        if var is not None:
+            name = var.get() or ""
+        if not name:
+            mvar = getattr(self, "_motd_doctrine_var", None)
+            if mvar is not None:
+                name = mvar.get() or ""
+        if not name:
+            return None
+        for d in self.fittings.list_doctrines():
+            if (d.name or "") == name:
+                return d
+        return None
+
+    def _refresh_fleet_doctrine_combo(self):
+        """Keep the Fleet-tab doctrine dropdown's values in sync with the library.
+        Preserves the current selection if it still exists."""
+        combo = getattr(self, "_fleet_doctrine_combo", None)
+        if combo is None:
+            return
+        names = sorted((d.name or "") for d in self.fittings.list_doctrines())
+        try:
+            combo["values"] = [""] + names
+        except Exception:
+            pass
+
+    def _on_fleet_doctrine_change(self):
+        """Persist the Fleet-tab doctrine pick and re-render the role sections."""
+        var = getattr(self, "_fleet_doctrine_var", None)
+        if var is None:
+            return
+        self.config.setdefault("fleet", {})["active_doctrine"] = var.get()
+        self._save_config()
+        self._refresh_specialized_roles_from_cache()
+
+    def _open_active_doctrine(self):
+        """Navigate to the active doctrine in Fittings ▸ Doctrines (best-effort)."""
+        doc = self._active_fleet_doctrine()
+        if doc is None:
+            return
+        try:
+            # Switch to the Fittings top-level tab and its Doctrines sub-tab,
+            # then select the doctrine in the tree (which fires the tree-select
+            # binding and renders the detail). Only render directly on a tree miss.
+            self.notebook.select(FITTINGS_TAB_INDEX)
+            subnb = getattr(self, "_fitting_subnb", None)
+            if subnb is not None:
+                subnb.select(DOCTRINES_SUBTAB_INDEX)
+            tree = getattr(self, "_doctrine_tree", None)
+            rendered = False
+            if tree is not None:
+                try:
+                    if doc.id in tree.get_children(""):
+                        tree.selection_set(doc.id)
+                        tree.see(doc.id)
+                        rendered = True
+                except Exception:
+                    pass
+            if not rendered:
+                self._doctrine_selected_id = doc.id
+                if hasattr(self, "_show_doctrine_detail"):
+                    self._show_doctrine_detail(doc.id)
+        except Exception as exc:
+            print(f"[Fleet] open doctrine navigation failed: {exc}")
+
+    def _refresh_specialized_roles_from_cache(self):
+        """Re-run the specialized-role render using the last polled fleet snapshot,
+        so a doctrine change re-colours the guided sections without waiting for the
+        next fleet poll. No-op when there is no cached snapshot yet."""
+        cached = getattr(self, "_last_specialized_args", None)
+        if not cached:
+            return
+        members, ship_counts, total = cached
+        try:
+            self._update_specialized_roles(members, ship_counts, total)
+        except Exception as exc:
+            print(f"[Fleet] re-render specialized roles failed: {exc}")
 
     def _motd_selected_doctrine(self):
         """Return the Doctrine matching the dropdown name, or None."""
@@ -7533,6 +7921,51 @@ class FCToolGUI:
         except Exception:
             return dna
 
+    def _heal_fit_dna(self):
+        """One-time: re-encode legacy bare-id T3 fit DNA to the canonical id;1
+        form so pre-fix imports are correct for copy-DNA / in-game links."""
+        changed = False
+        for fit in self.fittings.list_fits():
+            try:
+                canon = self._canonical_fit_dna(fit.dna, fit.parsed)
+            except Exception:
+                continue
+            if canon and canon != fit.dna:
+                fit.dna = canon
+                changed = True
+        if changed:
+            try:
+                self.fittings.save()
+            except Exception:
+                pass
+
+    def _motd_fit_deltas(self) -> dict:
+        """Map ``hull_type_id -> +/- pilot delta`` for the active doctrine's guided
+        fits versus the live fleet. Returns ``{}`` when there is no active doctrine
+        or no live-fleet snapshot (so the MOTD builds with no annotations).
+
+        Note: the active Fleet-tab doctrine may differ from the doctrine whose
+        fits the MOTD emits, so deltas only land where hulls coincide (matching
+        is by ``hull_type_id``, intentional)."""
+        doc = self._active_fleet_doctrine()
+        cached = getattr(self, "_last_specialized_args", None)
+        if doc is None or not cached:
+            return {}
+        _members, counts, total = cached
+        if not counts or not total:
+            return {}
+        cmd = sum(c for tid, c in counts.items()
+                  if tid in ship_classes.ALL_LINKS_COMMAND)
+        frac = (cmd / total) if total else 0.0
+        try:
+            rep = fleet_guidance.compute_fleet_guidance(
+                doc, self.fittings.get_fit, self.type_catalog,
+                counts, total, command_ship_fraction=frac)
+        except Exception as exc:
+            print(f"[MOTD] fit-delta compute failed: {exc}")
+            return {}
+        return {f.hull_type_id: f.delta for f in rep.fits if f.delta != 0}
+
     def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
 
@@ -7563,10 +7996,25 @@ class FCToolGUI:
         # the "id;1" subsystem form here — the bare-id form makes the client
         # mis-render a subsystem as the hull ("Tengu propulsion"). Idempotent
         # for already-canonical DNA; raw DNA is kept if it cannot be parsed.
-        fits_by_tag = {
-            tag: [(self._canonical_fit_dna(dna), name) for dna, name in fits]
-            for tag, fits in fits_by_tag.items()
-        }
+        # Each displayed DNA is parsed exactly once here and the parsed fit feeds
+        # BOTH the T3 canonicalisation (passed in to skip a re-parse) and the live-
+        # fleet delta lookup. No live fleet / no active doctrine => empty deltas =>
+        # labels untouched. Parsing/canonicalisation failures keep the raw DNA.
+        deltas = self._motd_fit_deltas()
+
+        def _finalize(dna, name):
+            try:
+                parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
+            except Exception:
+                return (self._canonical_fit_dna(dna), name)
+            canon = self._canonical_fit_dna(dna, parsed)
+            d = deltas.get(parsed.ship_type_id) if deltas else 0
+            if d:
+                name = f"{name} ({'+' if d > 0 else ''}{d})"
+            return (canon, name)
+
+        fits_by_tag = {tag: [_finalize(dna, name) for dna, name in fits]
+                       for tag, fits in fits_by_tag.items()}
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
@@ -8487,9 +8935,12 @@ class FCToolGUI:
         by_slot: dict[str, list] = {}
         for m in parsed.modules:
             by_slot.setdefault(m.slot or "other", []).append(m)
+        sub_names = [self.type_catalog.resolve_name(t) or f"Type {t}"
+                     for t in (parsed.subsystems or [])]
         for slot in self._FIT_SLOT_ORDER:
-            mods = by_slot.get(slot)
-            if not mods:
+            mods = by_slot.get(slot) or []
+            extra = sub_names if slot == "subsystem" else []
+            if not mods and not extra:
                 continue
             tk.Label(parent, text=self._FIT_SLOT_LABELS.get(slot, slot.title()),
                      font=("Consolas", 9, "bold"), fg=FG_GREEN, bg=BG_PANEL
@@ -8501,6 +8952,10 @@ class FCToolGUI:
                 if m.offline:
                     line += " /offline"
                 tk.Label(parent, text=f"  {line}", font=("Consolas", 9),
+                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=380).pack(anchor=tk.W, padx=14)
+            for nm in extra:
+                tk.Label(parent, text=f"  {nm}", font=("Consolas", 9),
                          fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
                          wraplength=380).pack(anchor=tk.W, padx=14)
         # Any modules with an unrecognized slot bucket.
@@ -8650,10 +9105,13 @@ class FCToolGUI:
         by_slot: dict[str, list] = {}
         for m in parsed.modules:
             by_slot.setdefault(m.slot or "other", []).append(m)
+        sub_names = [self.type_catalog.resolve_name(t) or f"Type {t}"
+                     for t in (parsed.subsystems or [])]
         first = True
         for slot in self._FIT_SLOT_ORDER:
-            mods = by_slot.get(slot)
-            if not mods:
+            mods = by_slot.get(slot) or []
+            extra = sub_names if slot == "subsystem" else []
+            if not mods and not extra:
                 continue
             if not first:
                 lines.append("")
@@ -8665,6 +9123,8 @@ class FCToolGUI:
                 if m.offline:
                     line += " /offline"
                 lines.append(line)
+            for nm in extra:
+                lines.append(nm)
         if parsed.drones:
             lines.append("")
             for d in parsed.drones:
@@ -9659,7 +10119,7 @@ class FCToolGUI:
         save_bar = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                             highlightbackground=BORDER_COLOR, highlightthickness=1)
         save_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
-        ttk.Button(save_bar, text="Save Settings & Restart",
+        ttk.Button(save_bar, text="Save Settings",
                    style="Green.TButton",
                    command=self._save_settings).pack(side=tk.LEFT, padx=10, pady=5)
         self._save_status = tk.Label(save_bar, text="",
@@ -9723,12 +10183,15 @@ class FCToolGUI:
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=25,
             borderwidth=1, relief=tk.RIDGE,
+            on_select=self._autosave_staging_system,
         )
         self._staging_entry.pack(side=tk.LEFT, padx=5)
         # Pre-fill with saved staging system
         saved_staging = self.config.get("zkillboard", {}).get("staging_system", "")
         if saved_staging:
             self._staging_entry.insert(0, saved_staging)
+        # Persist typed values on focus-out (dropdown picks fire on_select).
+        self._staging_entry.bind("<FocusOut>", self._autosave_staging_system, add="+")
         tk.Label(staging_frame, text="(used for route calcs & jump range)",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=5)
 
@@ -10306,7 +10769,7 @@ class FCToolGUI:
         # any existing readers keep working.
 
         self._save_config()
-        self._save_status.config(text="Saved! Restart to apply.", fg=FG_GREEN)
+        self._save_status.config(text="Saved!", fg=FG_GREEN)
 
         # Restart modules
         self._stop_monitoring()
@@ -10322,7 +10785,12 @@ class FCToolGUI:
         self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
         self._start_monitoring()
-        self._save_status.config(text="Saved & Restarted!", fg=FG_GREEN)
+        self._save_status.config(text="Saved!", fg=FG_GREEN)
+
+    def _autosave_staging_system(self, *args):
+        val = self._staging_entry.get().strip()
+        self.config.setdefault("zkillboard", {})["staging_system"] = val
+        self._save_config()
 
     # ── Module Setup ──────────────────────────────────────────────────────────
 
@@ -10603,10 +11071,18 @@ class FCToolGUI:
         only the plain ship-type/pilot listing renders. Uses pre-computed dict
         state only (no network). Must NOT trigger a refresh / role update."""
         rows_by_name = self._booster_rows_by_name if self._booster_is_boss else None
+        # Apply doctrine guidance to the links count badge if present. Computed
+        # here (not just in the synchronous section loop) because this method also
+        # re-renders asynchronously from the booster refresh; recomputing keeps the
+        # guided badge after that async render instead of reverting to "(N)".
+        # _role_guidance_badge returns None when links are suppressed (high
+        # command-ship fraction) or no doctrine is active -> fixed-threshold badge.
+        status_override = self._role_guidance_badge("links")
         self._populate_role_section(self._links_content, self._links_count,
                                     self._links_categories,
                                     threshold=self._links_threshold,
-                                    rows_by_name=rows_by_name)
+                                    rows_by_name=rows_by_name,
+                                    status_override=status_override)
         if self._booster_is_boss:
             self._append_offhull_rows()
 
@@ -11174,10 +11650,19 @@ class FCToolGUI:
                             "is_tackle": is_tackle(stid) if stid else False,
                         })
                     self.root.after(0, self._process_loss_tracking, fleet_id, enriched)
+                elif fleet_id:
+                    # In a fleet but not boss (can't read members → members is None).
+                    # Keep chat-fed command-burst charges; only the hull roster is
+                    # unknown. Do NOT run the grace/clear path (that wipes charges).
+                    self._no_fleet_misses = 0
+                    self._booster_roster = {}        # hulls unverified; charges kept
+                    self._schedule_booster_refresh()
+                    self.root.after(60000, self._refresh_fleet_locations)
+                    return
                 else:
-                    # No fleet data this poll — could be genuine (not in fleet)
-                    # OR a transient ESI error. Only clear state after
-                    # NO_FLEET_GRACE consecutive misses to avoid flicker.
+                    # Genuinely not in a fleet (no fleet_id) — could also be a
+                    # transient ESI error. Only clear state after NO_FLEET_GRACE
+                    # consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
                         self.root.after(0, self._update_fleet_composition, {}, 0)

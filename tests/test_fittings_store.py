@@ -120,3 +120,68 @@ def test_push_fit_deletes_prior_id_then_recreates(tmp_path):
     assert s.push_fit_to_character(fid, 100, auth) is True
     assert auth.deleted == [(100, 1111)]                      # old id deleted (edit = delete+recreate)
     assert s.get_fit(fid).esi_fitting_ids == {100: 5555}
+
+
+from fit_models import ParsedFit, ParsedModule, Fit
+
+
+class _StubCat:
+    """Minimal catalog: group_of/resolve_name for defender detection."""
+    def group_of(self, tid):
+        return None
+    def resolve_name(self, tid):
+        return str(tid)
+
+
+def _store_with_fit(tmp_path, hull, module_type_ids):
+    store = FittingsStore(str(tmp_path / "lib.json"))
+    store.load()
+    store.catalog = _StubCat()
+    parsed = ParsedFit(ship_type_id=hull, ship_name="X",
+                       modules=[ParsedModule(t, str(t), "high") for t in module_type_ids],
+                       drones=[], cargo=[], subsystems=[])
+    fit = Fit(id="", name="X", hull_type_id=hull, hull_name="X", source="dna",
+              raw_text="", parsed=parsed, dna="", notes="", esi_fitting_ids={},
+              created="", modified="")
+    fid = store.add_fit(fit)
+    return store, fid
+
+
+def test_add_fit_to_doctrine_auto_tags_defender(tmp_path):
+    store, fid = _store_with_fit(tmp_path, 17740, [44102])  # has defender launcher
+    did = store.add_doctrine("D")
+    store.add_fit_to_doctrine(did, fid, ["DPS"])
+    mem = next(m for m in store.get_doctrine(did).members if m.fit_id == fid)
+    assert "Defenders" in mem.tags and "DPS" in mem.tags
+
+
+def test_add_fit_to_doctrine_no_defender_no_autotag(tmp_path):
+    store, fid = _store_with_fit(tmp_path, 17740, [1, 2])
+    did = store.add_doctrine("D")
+    store.add_fit_to_doctrine(did, fid, ["DPS"])
+    mem = next(m for m in store.get_doctrine(did).members if m.fit_id == fid)
+    assert "Defenders" not in mem.tags
+
+
+def test_set_member_ideal_persists(tmp_path):
+    store, fid = _store_with_fit(tmp_path, 17740, [])
+    did = store.add_doctrine("D")
+    store.add_fit_to_doctrine(did, fid, ["DPS"])
+    store.set_member_ideal(did, fid, "percent", 45, 55)
+    store.save()
+    store2 = FittingsStore(str(tmp_path / "lib.json")); store2.load()
+    mem = next(m for m in store2.get_doctrine(did).members if m.fit_id == fid)
+    assert (mem.ideal_mode, mem.ideal_min, mem.ideal_max) == ("percent", 45, 55)
+
+
+def test_share_import_preserves_per_fit_ideals(tmp_path):
+    src = FittingsStore(str(tmp_path / "a.json")); src.load()
+    fid = src.add_fit(_fit("Arty Muninn")); did = src.add_doctrine("Shield HACs")
+    src.add_fit_to_doctrine(did, fid, ["DPS"])
+    src.set_member_ideal(did, fid, "percent", 55, 65)
+    payload = src.export_doctrines([did])
+
+    dst = FittingsStore(str(tmp_path / "b.json")); dst.load()
+    summary = dst.import_share(payload)
+    member = dst.list_doctrines()[0].members[0]
+    assert (member.ideal_mode, member.ideal_min, member.ideal_max) == ("percent", 55, 65)

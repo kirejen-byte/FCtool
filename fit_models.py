@@ -29,6 +29,7 @@ DEFAULT_TAGS = [
     "Logistics",
     "Support - EWAR",
     "Support - Webs",
+    "Defenders",
     "Tackle",
     "Special",
 ]
@@ -93,6 +94,9 @@ class DoctrineMember:
     fit_id: str
     tags: list[str]
     order: int
+    ideal_mode: str | None = None      # "percent" | "count" | "off" | None
+    ideal_min: int | None = None
+    ideal_max: int | None = None       # None = no upper bound (e.g. defenders)
 
 
 @dataclass
@@ -227,18 +231,24 @@ def fit_from_dict(data: dict) -> Fit:
 
 
 def doctrine_member_to_dict(member: DoctrineMember) -> dict:
-    return {
-        "fit_id": member.fit_id,
-        "tags": list(member.tags),
-        "order": member.order,
-    }
+    d = {"fit_id": member.fit_id, "tags": list(member.tags), "order": member.order}
+    if member.ideal_mode is not None:
+        d["ideal_mode"] = member.ideal_mode
+    if member.ideal_min is not None:
+        d["ideal_min"] = member.ideal_min
+    if member.ideal_max is not None:
+        d["ideal_max"] = member.ideal_max
+    return d
 
 
-def doctrine_member_from_dict(data: dict) -> DoctrineMember:
+def doctrine_member_from_dict(d: dict) -> DoctrineMember:
     return DoctrineMember(
-        fit_id=data["fit_id"],
-        tags=list(data.get("tags", [])),
-        order=data.get("order", 0),
+        fit_id=d["fit_id"],
+        tags=list(d.get("tags", [])),
+        order=d.get("order", 0),
+        ideal_mode=d.get("ideal_mode"),
+        ideal_min=d.get("ideal_min"),
+        ideal_max=d.get("ideal_max"),
     )
 
 
