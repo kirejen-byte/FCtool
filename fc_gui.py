@@ -3873,6 +3873,10 @@ class FCToolGUI:
             else:
                 lbl.config(text="", fg=FG_DIM)
 
+        # Keep the MOTD +/- deltas current as the live fleet changes.
+        if hasattr(self, "_schedule_motd_preview"):
+            self._schedule_motd_preview()
+
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"links": "Links", "logi": "Logistics",
                         "defenders": "Defenders", "webs": "Support - Webs"}
