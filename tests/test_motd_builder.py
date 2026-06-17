@@ -176,3 +176,18 @@ def test_parse_motd_extracts_fc_and_fits():
 def test_parse_motd_no_links_is_empty():
     out = parse_motd("just text")
     assert out["fc"] is None and out["fittings"] == []
+
+
+def test_build_motd_has_leading_break_by_default():
+    motd = build_motd(fc_name="FC", fc_character_id=1, doctrine_name="D",
+                      fits_by_tag={"DPS": [("670::", "Pod")]})
+    # The content (inside the white wrapper) starts with a <br> so the first
+    # line begins on a fresh line in-game.
+    assert motd.startswith("<color=0xffffffff><br>")
+
+
+def test_build_motd_leading_break_can_be_disabled():
+    motd = build_motd(fc_name="FC", fc_character_id=1, doctrine_name="D",
+                      fits_by_tag={"DPS": [("670::", "Pod")]}, leading_break=False)
+    assert not motd.startswith("<color=0xffffffff><br>")
+    assert motd.startswith("<color=0xffffffff>FC:")

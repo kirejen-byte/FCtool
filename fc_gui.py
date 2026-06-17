@@ -7783,7 +7783,7 @@ class FCToolGUI:
              lambda: self._replace_fit_text(fit.id)),
             ("Copy EFT", "Dark.TButton", lambda: self._copy_fit_eft(fit.id)),
             ("Copy DNA", "Dark.TButton", lambda: self._copy_fit_dna(fit.id)),
-            ("Save to in-game Fittings", "Dark.TButton",
+            ("Save to in-game", "Dark.TButton",
              lambda: self._save_fit_to_ingame(fit.id)),
             ("Add to doctrine…", "Dark.TButton",
              lambda: self._add_fit_to_doctrine_from_fit(fit.id)),

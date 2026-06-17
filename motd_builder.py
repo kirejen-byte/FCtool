@@ -151,6 +151,7 @@ def build_motd(
     staging_name: str | None = None,
     staging_system_id: int | None = None,
     text_color: str | None = "0xffffffff",
+    leading_break: bool = True,
 ) -> str:
     """Compose a fleet MOTD from a doctrine's fits.
 
@@ -204,6 +205,11 @@ def build_motd(
         lines.append(footer)
 
     body = LINE_BREAK.join(lines)
+
+    # A leading line break (default on) so the first line (FC/header) starts on a
+    # fresh line in-game rather than butting against the MOTD field's top edge.
+    if leading_break and body:
+        body = LINE_BREAK + body
 
     # Wrap the whole body in a colour tag (white by default — the in-game
     # default renders red/hard-to-read). text_color=None skips the wrapper.
