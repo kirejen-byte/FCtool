@@ -15,6 +15,7 @@ import tkinter as tk
 import webbrowser
 import requests
 from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
+from tkinter import font as tkfont
 from datetime import datetime, timedelta
 
 # Platform-specific sound support
@@ -80,6 +81,8 @@ import fit_parser
 import fit_dna
 import pyfa_import
 import motd_builder
+import motd_markup
+from markup_editor import MarkupEditor
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -6594,24 +6597,23 @@ class FCToolGUI:
         self._motd_tag_frame = tk.Frame(inputs, bg=BG_PANEL)
         self._motd_tag_frame.pack(fill=tk.X, padx=8)
 
-        # Header / footer free text.
-        _lbl(inputs, "HEADER").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_header_var = tk.StringVar()
-        tk.Entry(inputs, textvariable=self._motd_header_var,
-                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
-                 ).pack(fill=tk.X, padx=8)
-        self._motd_header_var.trace_add(
-            "write", lambda *a: self._schedule_motd_preview())
+        # Intro / outro free text — WYSIWYG markup editors (replacing the old
+        # plain header/footer Entrys). Each is a compact toolbar + Text that
+        # serialises to EVE markup via get_markup() / restores via set_markup().
+        # They map to the same saved-MOTD "header"/"footer" keys (now markup).
+        _lbl(inputs, "INTRO (header)").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_intro = MarkupEditor(
+            inputs, height=3, on_change=self._schedule_motd_preview,
+            bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
+            fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
+        self._motd_intro.pack(fill=tk.X, padx=8)
 
-        _lbl(inputs, "FOOTER").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_footer_var = tk.StringVar()
-        tk.Entry(inputs, textvariable=self._motd_footer_var,
-                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
-                 ).pack(fill=tk.X, padx=8, pady=(0, 4))
-        self._motd_footer_var.trace_add(
-            "write", lambda *a: self._schedule_motd_preview())
+        _lbl(inputs, "OUTRO (footer)").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_outro = MarkupEditor(
+            inputs, height=3, on_change=self._schedule_motd_preview,
+            bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
+            fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
+        self._motd_outro.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         # Save (link to doctrine) + import.
         tmpl_row = tk.Frame(inputs, bg=BG_PANEL)
@@ -6628,16 +6630,38 @@ class FCToolGUI:
         right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
-        tk.Label(right, text="PREVIEW (raw markup)", font=("Consolas", 9, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).grid(
-                     row=0, column=0, sticky="w", padx=8, pady=(8, 2))
+        # Dual preview: Raw markup (top) + Rendered (bottom), both read-only.
+        panes = tk.Frame(right, bg=BG_PANEL)
+        panes.grid(row=1, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        panes.columnconfigure(0, weight=1)
+        panes.rowconfigure(1, weight=1)   # Raw pane grows
+        panes.rowconfigure(3, weight=1)   # Rendered pane grows
 
+        tk.Label(panes, text="RAW MARKUP", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", pady=(0, 2))
         self._motd_preview = scrolledtext.ScrolledText(
-            right, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
-            insertbackground=FG_WHITE, wrap=tk.WORD, height=12,
+            panes, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
             borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
-        self._motd_preview.grid(row=1, column=0, sticky="nsew", padx=8)
+        self._motd_preview.grid(row=1, column=0, sticky="nsew")
         self._theme_scrolledtext_bar(self._motd_preview)
+
+        tk.Label(panes, text="RENDERED", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=2, column=0, sticky="w", pady=(6, 2))
+        self._motd_rendered = scrolledtext.ScrolledText(
+            panes, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
+            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
+        self._motd_rendered.grid(row=3, column=0, sticky="nsew")
+        self._theme_scrolledtext_bar(self._motd_rendered)
+        # Cache of configured render tags, keyed by
+        # (hex|None, bold, italic, underline, size|None, is_link).
+        self._motd_render_tags = {}
+        # Monotonic id for per-link hover tags (reset each render — see
+        # _render_motd_markup, which deletes the prior link tags first).
+        self._motd_link_seq = 0
 
         # Length meter: a colored bar + numeric label.
         meter_wrap = tk.Frame(right, bg=BG_PANEL)
@@ -6855,8 +6879,8 @@ class FCToolGUI:
             "staging_enabled": staging_enabled,
             "staging": staging,
             "channel": channel,
-            "header": self._motd_header_var.get(),
-            "footer": self._motd_footer_var.get(),
+            "header": self._motd_intro.get_markup(),
+            "footer": self._motd_outro.get_markup(),
             "tags": tags,
             "fits": fits_pairs,
         }
@@ -6893,8 +6917,8 @@ class FCToolGUI:
                 entry.insert(0, data.get("channel", "") or "")
             except Exception:
                 pass
-        self._motd_header_var.set(data.get("header", "") or "")
-        self._motd_footer_var.set(data.get("footer", "") or "")
+        self._motd_intro.set_markup(data.get("header", "") or "")
+        self._motd_outro.set_markup(data.get("footer", "") or "")
 
         # Tags: check exactly the saved set, uncheck the rest. Programmatic
         # var.set() does NOT fire the Checkbutton command, so this does not
@@ -7130,10 +7154,10 @@ class FCToolGUI:
         parsed = motd_builder.parse_motd(raw)
         self._motd_populate_fields_from_parsed(parsed, fallback_fittings=fittings)
 
-        # Do NOT dump the raw markup into the header anymore — the fields above
+        # Do NOT dump the raw markup into the intro anymore — the fields above
         # now carry the imported content, and build_motd re-renders it cleanly.
-        if getattr(self, "_motd_header_var", None) is not None:
-            self._motd_header_var.set("")
+        if getattr(self, "_motd_intro", None) is not None:
+            self._motd_intro.set_markup("")
 
         # NOW capture the (fully-populated) fields into a doctrine-linked saved
         # MOTD so a later load restores staging/channel/fits.
@@ -7430,8 +7454,8 @@ class FCToolGUI:
             fits_by_tag=fits_by_tag,
             channel=channel or None,
             channel_id=channel_id,
-            header=self._motd_header_var.get(),
-            footer=self._motd_footer_var.get(),
+            header=self._motd_intro.get_markup(),
+            footer=self._motd_outro.get_markup(),
             staging_name=staging_name,
             staging_system_id=staging_system_id,
         )
@@ -7479,10 +7503,15 @@ class FCToolGUI:
         budget = self._motd_budget()
         markup, compacted = self._motd_output_markup()
 
+        # Raw pane: the built markup verbatim.
         preview.config(state=tk.NORMAL)
         preview.delete("1.0", tk.END)
         preview.insert("1.0", markup)
         preview.config(state=tk.DISABLED)
+
+        # Rendered pane: parse the markup into styled segments and lay them out
+        # with Tk tags (colours/bold/italic/underline/size + link styling).
+        self._render_motd_markup(markup)
 
         length = motd_builder.estimate_length(markup)
         frac = (length / budget) if budget else 0.0
@@ -7527,6 +7556,77 @@ class FCToolGUI:
                 f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
                 f"not render in-game.")
         self._motd_warn_label.config(text="  ".join(warns))
+
+    def _motd_render_tag(self, hexcolor, bold, italic, underline, size,
+                         is_link):
+        """Return (configuring on first use) a cached Tk tag for the Rendered
+        pane matching the given style. Keyed so identical styles reuse one tag,
+        avoiding per-rebuild tag churn."""
+        key = (hexcolor, bold, italic, underline, size, is_link)
+        tag = self._motd_render_tags.get(key)
+        if tag is not None:
+            return tag
+        tag = "r%d" % len(self._motd_render_tags)
+        # Font: Consolas at the run's size (or the pane default 10), with the
+        # requested weight/slant/underline. Links are always underlined.
+        fnt = tkfont.Font(
+            family="Consolas", size=(size or 10),
+            weight=("bold" if bold else "normal"),
+            slant=("italic" if italic else "roman"),
+            underline=bool(underline or is_link))
+        fg = FG_ACCENT if is_link else (hexcolor or FG_TEXT)
+        self._motd_rendered.tag_configure(tag, font=fnt, foreground=fg)
+        self._motd_render_tags[key] = tag
+        return tag
+
+    def _render_motd_markup(self, markup: str):
+        """Lay the built ``markup`` into the read-only Rendered pane with Tk tags.
+
+        Parses via :func:`motd_markup.parse_markup`; each segment's text is
+        inserted with a cached style tag (colour via ``eve``→hex already done by
+        the parser, bold/italic/underline/size). Link segments are shown
+        underlined + accent-coloured with a hover tooltip carrying the target
+        (non-clickable — this is a preview). Newline segments emit ``"\\n"``."""
+        rendered = getattr(self, "_motd_rendered", None)
+        if rendered is None:
+            return
+
+        rendered.config(state=tk.NORMAL)
+        # Drop the prior render's per-link hover tags (and their bindings) so
+        # they do not accumulate across rebuilds; the cached *style* tags
+        # (_motd_render_tags) are reused and intentionally kept.
+        for tag in rendered.tag_names():
+            if tag.startswith("lnk"):
+                rendered.tag_delete(tag)
+        self._motd_link_seq = 0
+        rendered.delete("1.0", tk.END)
+
+        for seg in motd_markup.parse_markup(markup or ""):
+            if seg.newline:
+                rendered.insert(tk.END, "\n")
+                continue
+            if not seg.text:
+                continue
+            is_link = seg.link is not None
+            tag = self._motd_render_tag(
+                seg.color, seg.bold, seg.italic, seg.underline, seg.size,
+                is_link)
+            if is_link:
+                # A per-insertion unique tag carries the hover tooltip so each
+                # link run shows its own target; the style tag handles the look.
+                link_tag = "lnk%d" % self._motd_link_seq
+                self._motd_link_seq += 1
+                rendered.insert(tk.END, seg.text, (tag, link_tag))
+                target = seg.link
+                rendered.tag_bind(
+                    link_tag, "<Enter>",
+                    lambda e, t=target: self._show_tooltip(e, t))
+                rendered.tag_bind(
+                    link_tag, "<Leave>", lambda e: self._hide_tooltip())
+            else:
+                rendered.insert(tk.END, seg.text, (tag,))
+
+        rendered.config(state=tk.DISABLED)
 
     # ── MOTD: fleet resolution + set/copy (Task 7.2) ──────────────────────────
 
@@ -7706,11 +7806,11 @@ class FCToolGUI:
         empties the per-fit/tag include checkboxes), and rebuilds the now-empty
         preview. Used by 'Clear MOTD' and by the import path (so an imported
         MOTD replaces, rather than appends to, the current builder)."""
-        # Header / footer free text.
-        if getattr(self, "_motd_header_var", None) is not None:
-            self._motd_header_var.set("")
-        if getattr(self, "_motd_footer_var", None) is not None:
-            self._motd_footer_var.set("")
+        # Intro / outro free text (markup editors).
+        if getattr(self, "_motd_intro", None) is not None:
+            self._motd_intro.set_markup("")
+        if getattr(self, "_motd_outro", None) is not None:
+            self._motd_outro.set_markup("")
 
         # Staging system: checkbox off + entry empty.
         if getattr(self, "_motd_staging_enabled", None) is not None:
