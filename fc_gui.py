@@ -77,6 +77,7 @@ import command_bursts
 # Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
 # type_catalog and fittings_store are instantiated per-app in __init__.
 import fit_models
+import fleet_guidance
 import fit_parser
 import fit_dna
 import pyfa_import
@@ -569,6 +570,7 @@ class FCToolGUI:
         self.fittings = _fittings_store.FittingsStore(
             os.path.join(app_dir(), "fittings_library.json"))
         self.fittings.load()
+        self.fittings.catalog = self.type_catalog   # enables Defenders auto-tag on add
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
         self._doctrine_selected_id: str | None = None
@@ -5793,7 +5795,7 @@ class FCToolGUI:
     # carrying a tag outside this list are grouped last under "Other".
     _DOCTRINE_TAG_ORDER = (
         "DPS", "Logistics", "Links",
-        "Support - EWAR", "Support - Webs", "Tackle", "Special",
+        "Support - EWAR", "Support - Webs", "Defenders", "Tackle", "Special",
     )
 
     def _build_doctrines_subtab(self):
@@ -6085,12 +6087,117 @@ class FCToolGUI:
 
         ctrls = tk.Frame(row, bg=BG_PANEL)
         ctrls.pack(side=tk.RIGHT)
+        # Effective ideal summary (explicit value, tag default, or "off").
+        links_range = self._doctrine_links_range(doctrine)
+        eff = fleet_guidance.resolve_composition_ideal(mem, links_range)
+        if mem.ideal_mode == "off":
+            summary = "off"
+        elif eff is None:
+            summary = "—"  # em dash: no guidance for this fit
+        else:
+            hi = "∞" if eff.max is None else str(eff.max)  # infinity
+            unit = "%" if eff.mode == "percent" else "#"
+            auto = "" if mem.ideal_mode in ("percent", "count") else " (auto)"
+            summary = f"{eff.min}-{hi}{unit}{auto}"
+        tk.Label(ctrls, text=f"Ideal {summary}", font=("Consolas", 8),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(ctrls, text="Ideal…", style="Dark.TButton",
+                   command=lambda d=doctrine.id, f=mem.fit_id:
+                       self._edit_member_ideal(d, f)).pack(side=tk.LEFT, padx=1)
         ttk.Button(ctrls, text="Tags", style="Dark.TButton",
                    command=lambda: self._edit_member_tags(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
         ttk.Button(ctrls, text="Remove", style="Red.TButton",
                    command=lambda: self._remove_doctrine_member(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    def _doctrine_links_range(self, doctrine):
+        """Computed ideal links-ship count range for this doctrine (or None)."""
+        parsed = []
+        for m in doctrine.members:
+            if "Links" in (m.tags or []):
+                fit = self.fittings.get_fit(m.fit_id)
+                if fit is not None:
+                    parsed.append(fit.parsed)
+        return fleet_guidance.links_ideal_range(parsed, self.type_catalog)
+
+    def _edit_member_ideal(self, doctrine_id, fit_id):
+        """Modal: pick %/#/off and a min-max range for a member's ideal."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = next((m for m in doctrine.members if m.fit_id == fit_id), None)
+        if mem is None:
+            return
+        links_range = self._doctrine_links_range(doctrine)
+        eff = fleet_guidance.resolve_composition_ideal(mem, links_range)
+
+        win = tk.Toplevel(self.root)
+        win.title("Ideal composition")
+        win.configure(bg=BG_PANEL)
+        win.transient(self.root)
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        mode_var = tk.StringVar(
+            value=(mem.ideal_mode if mem.ideal_mode in ("percent", "count", "off")
+                   else (eff.mode if eff else "off")))
+        min_var = tk.StringVar(
+            value=str(mem.ideal_min if mem.ideal_min is not None
+                      else (eff.min if eff else "")))
+        max_var = tk.StringVar(
+            value=("" if (mem.ideal_max is None and (eff is None or eff.max is None))
+                   else str(mem.ideal_max if mem.ideal_max is not None else eff.max)))
+
+        tk.Label(win, text="Mode:", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        mode_row = tk.Frame(win, bg=BG_PANEL)
+        mode_row.pack(anchor=tk.W, padx=12)
+        for label, val in (("% of fleet", "percent"), ("# pilots", "count"),
+                           ("off", "off")):
+            tk.Radiobutton(mode_row, text=label, value=val, variable=mode_var,
+                           font=("Consolas", 10), fg=FG_TEXT, bg=BG_PANEL,
+                           selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                           activeforeground=FG_TEXT).pack(side=tk.LEFT, padx=4)
+
+        rng = tk.Frame(win, bg=BG_PANEL)
+        rng.pack(anchor=tk.W, padx=12, pady=(8, 0))
+        tk.Label(rng, text="Min:", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_PANEL).pack(side=tk.LEFT)
+        tk.Entry(rng, textvariable=min_var, width=5, font=("Consolas", 10),
+                 bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
+                     side=tk.LEFT, padx=(2, 8))
+        tk.Label(rng, text="Max (blank = none):", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
+        tk.Entry(rng, textvariable=max_var, width=5, font=("Consolas", 10),
+                 bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
+                     side=tk.LEFT, padx=2)
+
+        def _save():
+            mode = mode_var.get()
+            if mode == "off":
+                self.fittings.set_member_ideal(doctrine_id, fit_id, "off", None, None)
+            else:
+                def _int(s):
+                    s = (s or "").strip()
+                    return int(s) if s.isdigit() else None
+                self.fittings.set_member_ideal(
+                    doctrine_id, fit_id, mode, _int(min_var.get()), _int(max_var.get()))
+            self.fittings.save()
+            win.destroy()
+            self._show_doctrine_detail(doctrine_id)
+            if hasattr(self, "_rebuild_motd_preview"):
+                self._rebuild_motd_preview()
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Save", style="Green.TButton",
+                   command=_save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        self.root.wait_window(win)
 
     # ── Doctrine CRUD controllers (Task 6.1) ──────────────────────────────────
 
