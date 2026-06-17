@@ -6657,6 +6657,7 @@ class FCToolGUI:
         win.title(title)
         win.configure(bg=BG_DARK)
         win.geometry("360x420")
+        win.minsize(360, 340)
         try:
             win.transient(self.root)
             win.grab_set()
@@ -6669,7 +6670,6 @@ class FCToolGUI:
                      anchor=tk.W, padx=12, pady=(12, 4))
 
         list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
-        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
@@ -6720,7 +6720,6 @@ class FCToolGUI:
             _rebuild_checks()
 
         add_row = tk.Frame(win, bg=BG_DARK)
-        add_row.pack(fill=tk.X, padx=12, pady=(4, 0))
         ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
                    command=_add_tag_inline).pack(side=tk.LEFT)
 
@@ -6732,11 +6731,16 @@ class FCToolGUI:
             win.destroy()
 
         btns = tk.Frame(win, bg=BG_DARK)
-        btns.pack(fill=tk.X, padx=12, pady=12)
         ttk.Button(btns, text="OK", style="Green.TButton",
                    command=_ok).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=_cancel).pack(side=tk.RIGHT)
+        # Pack order matters: pin the two action rows to the bottom FIRST so they
+        # always reserve their space, then let list_wrap expand into what's left.
+        # This prevents the OK/Cancel row from being clipped on a short window.
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        add_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
         self.root.wait_window(win)
