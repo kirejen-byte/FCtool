@@ -7927,7 +7927,20 @@ class FCToolGUI:
                     return
                 self._show_pyfa_picker(db_path, fits)
             else:
-                # Fallback: EFT-text export file.
+                # No DB found/readable. First offer to locate it, since users
+                # who ran pyfa with -s/--savepath keep saveddata.db elsewhere.
+                locate = messagebox.askyesno(
+                    "pyfa not found",
+                    "Couldn't find pyfa's saved fits (saveddata.db). "
+                    "Locate it now?\n\n"
+                    "pyfa stores all fits in a single file 'saveddata.db', by "
+                    "default in your user folder under .pyfa "
+                    "(Windows: %USERPROFILE%\\.pyfa). If you used pyfa's "
+                    "-s/--savepath option it may be elsewhere.")
+                if locate:
+                    self._set_pyfa_folder()
+                    return
+                # Otherwise fall back to an EFT-text export file.
                 msg = ("Could not read a pyfa database"
                        + (f" ({err})" if err else "")
                        + ".\n\nChoose an EFT-text export file (.txt/.cfg) "
@@ -7936,6 +7949,21 @@ class FCToolGUI:
                 self._import_eft_text_file()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _set_pyfa_folder(self):
+        """Let the user point FCTool at a pyfa saveddata.db (for non-default
+        install/savepath locations), persist its directory, then re-list."""
+        path = filedialog.askopenfilename(
+            title="Locate your pyfa saveddata.db",
+            filetypes=[("pyfa database", "saveddata.db"),
+                       ("SQLite db", "*.db"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        cfg = self.config.setdefault("fittings", {})
+        cfg["pyfa_path"] = os.path.dirname(path)
+        self._save_config()
+        self._import_pyfa()
 
     def _import_eft_text_file(self):
         """Fallback path: pick an EFT-text export file and parse it."""
@@ -7973,17 +8001,42 @@ class FCToolGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_pyfa_picker(self, db_path, fits):
-        """Searchable picker over pyfa fits; on selection read + add the fit."""
+        """Checkbox multi-select picker over pyfa fits with bulk import.
+
+        Scales to hundreds of fits: one persistent BooleanVar per fit (keyed by
+        fit_id) so a search filters which rows are *visible* without losing
+        checked state, and bulk import runs off the Tk thread with a single
+        save() at the end and content-hash de-dupe against the library.
+        """
         win = tk.Toplevel(self.root)
         win.title("Import from pyfa")
         win.configure(bg=BG_DARK)
-        win.geometry("440x460")
+        win.geometry("540x600")
         try:
             win.transient(self.root)
         except tk.TclError:
             pass
 
-        tk.Label(win, text="Select a fit (search by ship or fit name):",
+        # Resolve each fit's ship class name once (local bundled SDE lookup) so
+        # the picker shows "ShipClass — FitName" (ship first) and is searchable
+        # by either. Then group by ship class, then fit name.
+        for f in fits:
+            if "ship_name" not in f:
+                try:
+                    f["ship_name"] = self.type_catalog.resolve_name(
+                        f.get("ship_type_id")) or ""
+                except Exception:
+                    f["ship_name"] = ""
+        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
+                                 (f.get("name") or "").lower()))
+
+        # Persistent checked-state vars keyed by fit_id, so filtering never
+        # drops a selection. Built once and reused for the window's lifetime.
+        check_vars: dict = {}
+        for f in fits:
+            check_vars[f["fit_id"]] = tk.BooleanVar(value=False)
+
+        tk.Label(win, text="Select fits to import (search by ship or fit name):",
                  font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
         search_var = tk.StringVar()
@@ -7992,82 +8045,192 @@ class FCToolGUI:
                           borderwidth=1, relief=tk.RIDGE)
         search.pack(fill=tk.X, padx=12, pady=(0, 4))
 
-        listbox = tk.Listbox(
-            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
-            borderwidth=1, relief=tk.RIDGE, activestyle="none",
-            exportselection=False)
-        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+        # Toolbar: select-all/none (over the *visible* rows) + a live count.
+        toolbar = tk.Frame(win, bg=BG_DARK)
+        toolbar.pack(fill=tk.X, padx=12, pady=(0, 4))
+        count_label = tk.Label(toolbar, text="(0 selected)", font=("Consolas", 9),
+                               fg=FG_DIM, bg=BG_DARK, anchor=tk.E)
+        count_label.pack(side=tk.RIGHT)
 
-        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
-                          bg=BG_DARK, anchor=tk.W)
-        status.pack(fill=tk.X, padx=12, pady=(4, 0))
+        # Bottom controls are packed FIRST so the expanding list never squeezes
+        # them off-screen (Tk pack gives prior siblings their space first).
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        progress = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                            bg=BG_DARK, anchor=tk.W)
+        progress.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
 
-        index_map: list[dict] = []
+        # Scrollable frame of checkbuttons (reuse the canvas+scrollbar pattern).
+        body = tk.Frame(win, bg=BG_DARK)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(body, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        sb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win_id, width=e.width))
+        self._register_scroll_canvas(canvas)
 
-        # Resolve each fit's ship class name once (local bundled SDE lookup) so the
-        # picker shows "ShipClass - FitName" (ship first) and can be searched by either.
+        def _update_count(*_a):
+            n = sum(1 for v in check_vars.values() if v.get())
+            count_label.config(text=f"({n} selected)")
+            import_sel_btn.config(text=f"Import selected ({n})")
+
+        # Build every checkbutton once; filtering only re-packs the visible set.
+        row_widgets: list = []   # (fit_dict, checkbutton)
         for f in fits:
-            if "ship_name" not in f:
-                try:
-                    f["ship_name"] = self.type_catalog.resolve_name(
-                        f.get("ship_type_id")) or ""
-                except Exception:
-                    f["ship_name"] = ""
-        # Group by ship class, then fit name, so same-hull fits sit together.
-        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
-                                 (f.get("name") or "").lower()))
+            ship = f.get("ship_name") or "?"
+            fit_name = f.get("name") or "?"
+            label = f"{ship}  —  {fit_name}"
+            cb = tk.Checkbutton(
+                inner, text=label, variable=check_vars[f["fit_id"]],
+                font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                activeforeground=FG_WHITE, anchor=tk.W, highlightthickness=0,
+                command=_update_count)
+            row_widgets.append((f, cb))
+
+        # Track which fits are currently visible (for select-all over filter).
+        visible_fits: list = []
 
         def _repopulate(*_a):
             needle = search_var.get().strip().lower()
-            listbox.delete(0, tk.END)
-            index_map.clear()
-            for f in fits:
+            visible_fits.clear()
+            for f, cb in row_widgets:
                 ship = f.get("ship_name") or "?"
-                fit_name = f.get("name", "?")
-                label = f"{ship}  —  {fit_name}"
+                fit_name = f.get("name") or "?"
                 if needle and needle not in f"{ship} {fit_name}".lower():
+                    cb.pack_forget()
                     continue
-                listbox.insert(tk.END, label)
-                index_map.append(f)
+                cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                visible_fits.append(f)
+            canvas.configure(scrollregion=canvas.bbox("all"))
         search_var.trace_add("write", _repopulate)
-        _repopulate()
 
-        def _do_import():
-            sel = listbox.curselection()
-            if not sel:
+        def _select_all():
+            for f in visible_fits:
+                check_vars[f["fit_id"]].set(True)
+            _update_count()
+
+        def _select_none():
+            for v in check_vars.values():
+                v.set(False)
+            _update_count()
+
+        ttk.Button(toolbar, text="Select all", style="Dark.TButton",
+                   command=_select_all).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Select none", style="Dark.TButton",
+                   command=_select_none).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Change pyfa folder…", style="Dark.TButton",
+                   command=lambda: (win.destroy(),
+                                    self._set_pyfa_folder())).pack(side=tk.LEFT,
+                                                                   padx=4)
+
+        # ── Bulk import (threaded, single save, de-dupe) ──────────────────────
+        def _run_bulk_import(chosen):
+            if not chosen:
                 return
-            entry = index_map[sel[0]]
-            status.config(text="Reading fit...", fg=FG_ACCENT)
+            # Disable the action buttons for the duration of the batch.
+            for b in (import_sel_btn, import_all_btn, cancel_btn):
+                b.config(state=tk.DISABLED)
+            progress.config(text=f"Importing 0/{len(chosen)}…", fg=FG_ACCENT)
+
+            def _set_progress(i, total):
+                progress.config(text=f"Importing {i}/{total}…", fg=FG_ACCENT)
 
             def worker():
-                try:
-                    parsed = pyfa_import.read_pyfa_fit(
-                        db_path, entry["fit_id"], self.type_catalog)
-                    err = None
-                except Exception as e:
-                    parsed, err = None, str(e)
-                self.root.after(0, _applied, parsed, err)
+                total = len(chosen)
+                imported = skipped = failed = 0
+                # De-dupe: collect existing content hashes up front so re-runs
+                # of "Import all" are idempotent.
+                existing = set()
+                for ef in self.fittings.list_fits():
+                    try:
+                        existing.add(fit_models.fit_content_hash(ef.parsed))
+                    except Exception:
+                        pass
+                for i, entry in enumerate(chosen, start=1):
+                    try:
+                        parsed = pyfa_import.read_pyfa_fit(
+                            db_path, entry["fit_id"], self.type_catalog)
+                        h = fit_models.fit_content_hash(parsed)
+                        if h in existing:
+                            skipped += 1
+                        else:
+                            name = (parsed.name_hint or entry.get("name")
+                                    or parsed.ship_name or "pyfa Fit")
+                            try:
+                                dna = fit_dna.to_dna(parsed)
+                            except Exception:
+                                dna = ""
+                            fit = fit_models.Fit(
+                                id="",
+                                name=name,
+                                hull_type_id=parsed.ship_type_id,
+                                hull_name=parsed.ship_name or "",
+                                source="pyfa",
+                                raw_text="",
+                                parsed=parsed,
+                                dna=dna,
+                                notes="",
+                                esi_fitting_ids={},
+                                created="",
+                                modified="",
+                            )
+                            self.fittings.add_fit(fit)
+                            existing.add(h)
+                            imported += 1
+                    except Exception:
+                        failed += 1
+                    # Per-fit save would be O(n^2); update progress occasionally.
+                    if i % 5 == 0 or i == total:
+                        self.root.after(0, _set_progress, i, total)
+                self.root.after(0, _done, imported, skipped, failed)
 
-            def _applied(parsed, err):
-                if err is not None or parsed is None:
-                    status.config(text=f"Failed: {err}", fg=FG_RED)
-                    return
-                name = parsed.name_hint or entry.get("name") \
-                    or parsed.ship_name or "pyfa Fit"
-                self._add_parsed_fit(parsed, source="pyfa", raw_text="",
-                                     name=name)
+            def _done(imported, skipped, failed):
+                # Single save at the very end (one disk write for the batch).
+                try:
+                    self.fittings.save()
+                except Exception as e:
+                    messagebox.showerror("Import failed",
+                                         f"Could not save imported fits:\n{e}")
+                try:
+                    self._refresh_fit_list(self._fit_search_var.get())
+                except Exception:
+                    pass
                 win.destroy()
+                messagebox.showinfo(
+                    "pyfa import",
+                    f"Imported {imported}, skipped {skipped} duplicate(s), "
+                    f"{failed} failed.")
 
             threading.Thread(target=worker, daemon=True).start()
 
-        btns = tk.Frame(win, bg=BG_DARK)
-        btns.pack(fill=tk.X, padx=12, pady=12)
-        ttk.Button(btns, text="Import", style="Green.TButton",
-                   command=_do_import).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="Cancel", style="Dark.TButton",
-                   command=win.destroy).pack(side=tk.RIGHT)
-        listbox.bind("<Double-Button-1>", lambda e: _do_import())
+        def _import_selected():
+            chosen = [f for f in fits if check_vars[f["fit_id"]].get()]
+            _run_bulk_import(chosen)
+
+        def _import_all():
+            _run_bulk_import(list(fits))
+
+        cancel_btn = ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                                command=win.destroy)
+        cancel_btn.pack(side=tk.RIGHT)
+        import_all_btn = ttk.Button(btns, text="Import all", style="Dark.TButton",
+                                    command=_import_all)
+        import_all_btn.pack(side=tk.RIGHT, padx=4)
+        import_sel_btn = ttk.Button(btns, text="Import selected (0)",
+                                    style="Green.TButton",
+                                    command=_import_selected)
+        import_sel_btn.pack(side=tk.RIGHT, padx=4)
+
+        _repopulate()
+        _update_count()
 
     def _import_esi_fittings(self):
         """Import the active character's in-game fittings via ESI (threaded),
@@ -9023,27 +9186,34 @@ class FCToolGUI:
 
     def _load_burst_icons(self):
         """Load discipline icons once. self._burst_icons holds the full 64px
-        PhotoImages; self._burst_icons_small holds ~16px subsample(4,4) copies.
-        Both the top coverage strip and the per-pilot Links rows render the
-        small (~16px) set; the full-size set is kept only as the source for the
-        subsample copies. Glyph fallback on any failure. Called during UI build,
-        after self.root exists."""
+        PhotoImages; self._burst_icons_small holds crisp ~21px copies used by
+        both the top coverage strip and the per-pilot Links rows (33% larger
+        than the former 16px). The small set is a pre-rendered LANCZOS downscale
+        of the 64px master (assets/bursts/<disc>_21.png) loaded natively to
+        avoid runtime scaling artifacts; if that asset is absent we fall back to
+        an integer subsample of the master. Glyph fallback on any failure.
+        Called during UI build, after self.root exists."""
         from app_path import bundle_dir
         files = {
-            command_bursts.SHIELD: "shield.png",
-            command_bursts.ARMOR: "armor.png",
-            command_bursts.SKIRMISH: "skirmish.png",
-            command_bursts.INFORMATION: "info.png",
+            command_bursts.SHIELD: "shield",
+            command_bursts.ARMOR: "armor",
+            command_bursts.SKIRMISH: "skirmish",
+            command_bursts.INFORMATION: "info",
         }
-        for disc, fname in files.items():
+        base = os.path.join(bundle_dir(), "assets", "bursts")
+        for disc, stem in files.items():
             try:
-                path = os.path.join(bundle_dir(), "assets", "bursts", fname)
-                full = tk.PhotoImage(file=path)
+                full = tk.PhotoImage(file=os.path.join(base, f"{stem}.png"))
                 self._burst_icons[disc] = full
-                # Small copy (64px -> ~16px) for the inline top strip and the
-                # per-pilot Links rows; the reference is retained in the dict so
-                # Tk won't GC it.
-                self._burst_icons_small[disc] = full.subsample(4, 4)
+                # Crisp ~21px copy for the inline top strip and per-pilot Links
+                # rows. Prefer the pre-rendered downscale; fall back to an
+                # integer subsample of the 64px master (no upscaling). References
+                # are retained in the dict so Tk won't GC them.
+                small_path = os.path.join(base, f"{stem}_21.png")
+                if os.path.exists(small_path):
+                    self._burst_icons_small[disc] = tk.PhotoImage(file=small_path)
+                else:
+                    self._burst_icons_small[disc] = full.subsample(3, 3)
             except Exception:
                 self._burst_icons[disc] = None  # fall back to Unicode glyph
                 self._burst_icons_small[disc] = None
