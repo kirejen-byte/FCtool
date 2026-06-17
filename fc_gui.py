@@ -6050,14 +6050,15 @@ class FCToolGUI:
             return
 
         # Members grouped by tag (canonical order).
+        links_range = self._doctrine_links_range(doctrine)
         for tag_label, members in self._group_members_by_tag(doctrine):
             tk.Label(parent, text=tag_label, font=("Consolas", 10, "bold"),
                      fg=FG_GREEN, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=12, pady=(8, 2))
             for mem in members:
-                self._render_doctrine_member_row(parent, doctrine, mem)
+                self._render_doctrine_member_row(parent, doctrine, mem, links_range)
 
-    def _render_doctrine_member_row(self, parent, doctrine, mem):
+    def _render_doctrine_member_row(self, parent, doctrine, mem, links_range):
         """One member row: fit name + its tag-chip cluster within this doctrine
         + Tags/Remove controls."""
         fit = self.fittings.get_fit(mem.fit_id)
@@ -6088,7 +6089,6 @@ class FCToolGUI:
         ctrls = tk.Frame(row, bg=BG_PANEL)
         ctrls.pack(side=tk.RIGHT)
         # Effective ideal summary (explicit value, tag default, or "off").
-        links_range = self._doctrine_links_range(doctrine)
         eff = fleet_guidance.resolve_composition_ideal(mem, links_range)
         if mem.ideal_mode == "off":
             summary = "off"
@@ -6134,7 +6134,7 @@ class FCToolGUI:
 
         win = tk.Toplevel(self.root)
         win.title("Ideal composition")
-        win.configure(bg=BG_PANEL)
+        win.configure(bg=BG_DARK)
         win.transient(self.root)
         try:
             win.grab_set()
@@ -6152,25 +6152,25 @@ class FCToolGUI:
                    else str(mem.ideal_max if mem.ideal_max is not None else eff.max)))
 
         tk.Label(win, text="Mode:", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(12, 2))
-        mode_row = tk.Frame(win, bg=BG_PANEL)
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        mode_row = tk.Frame(win, bg=BG_DARK)
         mode_row.pack(anchor=tk.W, padx=12)
         for label, val in (("% of fleet", "percent"), ("# pilots", "count"),
                            ("off", "off")):
             tk.Radiobutton(mode_row, text=label, value=val, variable=mode_var,
-                           font=("Consolas", 10), fg=FG_TEXT, bg=BG_PANEL,
-                           selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                           font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                           selectcolor=BG_ENTRY, activebackground=BG_DARK,
                            activeforeground=FG_TEXT).pack(side=tk.LEFT, padx=4)
 
-        rng = tk.Frame(win, bg=BG_PANEL)
+        rng = tk.Frame(win, bg=BG_DARK)
         rng.pack(anchor=tk.W, padx=12, pady=(8, 0))
         tk.Label(rng, text="Min:", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_PANEL).pack(side=tk.LEFT)
+                 bg=BG_DARK).pack(side=tk.LEFT)
         tk.Entry(rng, textvariable=min_var, width=5, font=("Consolas", 10),
                  bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
                      side=tk.LEFT, padx=(2, 8))
         tk.Label(rng, text="Max (blank = none):", font=("Consolas", 10),
-                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT)
         tk.Entry(rng, textvariable=max_var, width=5, font=("Consolas", 10),
                  bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE).pack(
                      side=tk.LEFT, padx=2)
@@ -6187,11 +6187,12 @@ class FCToolGUI:
                     doctrine_id, fit_id, mode, _int(min_var.get()), _int(max_var.get()))
             self.fittings.save()
             win.destroy()
+            # Ideal changes don't affect the doctrine-list untagged-warning or fit-list membership counts, so refresh only the detail + MOTD preview.
             self._show_doctrine_detail(doctrine_id)
             if hasattr(self, "_rebuild_motd_preview"):
                 self._rebuild_motd_preview()
 
-        btns = tk.Frame(win, bg=BG_PANEL)
+        btns = tk.Frame(win, bg=BG_DARK)
         btns.pack(fill=tk.X, padx=12, pady=12)
         ttk.Button(btns, text="Save", style="Green.TButton",
                    command=_save).pack(side=tk.RIGHT, padx=4)
