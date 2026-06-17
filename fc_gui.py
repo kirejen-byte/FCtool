@@ -5753,6 +5753,14 @@ class FCToolGUI:
         if "MOTD" in text:
             self._motd_refresh_doctrines()
             self._motd_refresh_fc_choices()
+            # Rebuild the include-tag checkboxes and preview from the selected
+            # doctrine's CURRENT members. Fixing a doctrine in the Doctrines tab
+            # (adding ships, or tagging previously-untagged ones) is reflected
+            # the next time the MOTD tab is shown, instead of staying blank.
+            # Done directly (not via _motd_on_doctrine_change) so any explicitly
+            # loaded-fits fallback from a linked MOTD is preserved.
+            self._motd_rebuild_tag_checkboxes()
+            self._rebuild_motd_preview()
             # Run the fleet-boss check automatically on MOTD-tab open so the
             # Set button enables without the user clicking "Refresh fleet".
             self._motd_refresh_fleet_status()
@@ -6616,7 +6624,10 @@ class FCToolGUI:
             ch_row, list(getattr(self, "_intel_channel_suggestions", []) or []),
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=22,
-            borderwidth=1, relief=tk.RIDGE)
+            borderwidth=1, relief=tk.RIDGE,
+            # Selecting a channel from the dropdown must also refresh the preview
+            # (a dropdown pick doesn't fire <KeyRelease>).
+            on_select=self._schedule_motd_preview)
         self._motd_channel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         # add="+" so we don't clobber AutocompleteEntry's own <KeyRelease>.
         self._motd_channel_entry.bind(
@@ -7866,10 +7877,15 @@ class FCToolGUI:
         # otherwise clear it).
         self._motd_loaded_fits = None
 
-        # Deselect the doctrine, then rebuild the (now empty) tag checkboxes so
-        # the per-fit include boxes are cleared along with their selection.
+        # Deselect the doctrine and clear the linked-MOTD selection, then rebuild
+        # the (now empty) tag checkboxes so the per-fit include boxes are cleared
+        # along with their selection. Clearing both means the user does not have
+        # to manually deselect/reselect a doctrine or linked MOTD to reload.
         if getattr(self, "_motd_doctrine_var", None) is not None:
             self._motd_doctrine_var.set("")
+        if getattr(self, "_motd_saved_var", None) is not None:
+            self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
+        self._motd_refresh_saved_dropdown()
         self._motd_rebuild_tag_checkboxes()
 
         # Rebuild the (now empty) preview immediately.
