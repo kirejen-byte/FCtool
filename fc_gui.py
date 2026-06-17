@@ -6463,6 +6463,12 @@ class FCToolGUI:
         self._motd_set_btn = None
         self._motd_fleet_id = None           # resolved active-FC fleet id
         self._motd_is_boss = False
+        # FALLBACK source of fit links (a list of (dna, name) tuples, or None),
+        # used ONLY when the tag-based fits are empty (e.g. a tagless imported
+        # doctrine). Cleared on doctrine change / tag toggle so editing reverts
+        # to live tag-based fits; restored by _apply_motd_fields after the
+        # doctrine-change clear. See _current_motd_markup / _capture_motd_fields.
+        self._motd_loaded_fits = None
 
         # ── Master split: inputs (left) | preview (right) ────────────────────
         body = tk.Frame(tab, bg=BG_DARK)
@@ -6729,7 +6735,13 @@ class FCToolGUI:
     def _motd_on_doctrine_change(self, event=None):
         """Doctrine changed: rebuild the per-tag checkboxes from its tags,
         refresh the linked-MOTD dropdown for the new doctrine, and refresh the
-        preview."""
+        preview.
+
+        Changing the doctrine invalidates any explicit loaded-fits fallback
+        (those belonged to the previously-loaded MOTD), so it is cleared here.
+        ``_apply_motd_fields`` calls this first and re-sets the loaded fits
+        AFTER, so loading a saved MOTD survives this clear."""
+        self._motd_loaded_fits = None
         self._motd_rebuild_tag_checkboxes()
         self._motd_refresh_saved_dropdown()
         self._rebuild_motd_preview()
@@ -6787,8 +6799,17 @@ class FCToolGUI:
                 frame, text=t, variable=var, font=("Consolas", 10),
                 fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
                 activebackground=BG_PANEL, activeforeground=FG_WHITE,
-                anchor=tk.W, command=self._schedule_motd_preview)
+                anchor=tk.W, command=self._on_motd_tag_toggle)
             cb.pack(anchor=tk.W)
+
+    def _on_motd_tag_toggle(self):
+        """A USER toggle of an include-tag checkbox: drop any explicit loaded-fits
+        fallback (the user is now driving the fit set via live tags) and refresh
+        the preview. Only fires on user clicks — the programmatic ``var.set()``
+        in :meth:`_apply_motd_fields` does NOT invoke a Checkbutton command, so a
+        loaded MOTD's explicit fits survive an apply."""
+        self._motd_loaded_fits = None
+        self._schedule_motd_preview()
 
     # ── MOTD: saved (doctrine-linked) MOTDs ───────────────────────────────────
 
@@ -6811,6 +6832,17 @@ class FCToolGUI:
             if getattr(self, "_motd_staging_var", None) is not None else ""
         channel = self._motd_channel_entry.get() \
             if getattr(self, "_motd_channel_entry", None) is not None else ""
+        # Snapshot the CURRENT fits so a saved MOTD remembers them as a fallback
+        # (e.g. a tagless imported doctrine, whose tags yield nothing). Prefer
+        # the live tag-based fits; fall back to any explicit loaded fits. Stored
+        # as [dna, name] pairs (JSON-friendly lists, not tuples).
+        fits_by_tag = self._motd_build_fits_by_tag(self._motd_selected_doctrine())
+        fits_pairs: list[list] = []
+        for group in fits_by_tag.values():
+            for dna, name in group:
+                fits_pairs.append([dna, name])
+        if not fits_pairs and self._motd_loaded_fits:
+            fits_pairs = [[dna, name] for dna, name in self._motd_loaded_fits]
         return {
             "fc": self._motd_fc_var.get(),
             "staging_enabled": staging_enabled,
@@ -6819,6 +6851,7 @@ class FCToolGUI:
             "header": self._motd_header_var.get(),
             "footer": self._motd_footer_var.get(),
             "tags": tags,
+            "fits": fits_pairs,
         }
 
     def _apply_motd_fields(self, data: dict):
@@ -6856,10 +6889,19 @@ class FCToolGUI:
         self._motd_header_var.set(data.get("header", "") or "")
         self._motd_footer_var.set(data.get("footer", "") or "")
 
-        # Tags: check exactly the saved set, uncheck the rest.
+        # Tags: check exactly the saved set, uncheck the rest. Programmatic
+        # var.set() does NOT fire the Checkbutton command, so this does not
+        # clear the loaded fits set just below.
         want = set(data.get("tags") or [])
         for t, v in self._motd_tag_vars.items():
             v.set(t in want)
+
+        # Explicit loaded fits last: _motd_on_doctrine_change (called above)
+        # cleared self._motd_loaded_fits, so restore the saved MOTD's fits HERE
+        # as the fallback used when the checked tags yield nothing.
+        self._motd_loaded_fits = [
+            tuple(x) for x in (data.get("fits") or [])
+        ] or None
 
         self._schedule_motd_preview()
 
@@ -7058,8 +7100,36 @@ class FCToolGUI:
             # TAGLESS membership (empty tag list).
             self.fittings.add_fit_to_doctrine(doctrine_id, fid, [])
 
-        # Save the imported MOTD as a doctrine-linked saved MOTD. The import path
-        # already loaded header=raw etc., so capture the live fields.
+        try:
+            self.fittings.save()
+        except Exception:
+            pass
+
+        # Refresh the doctrine views + select the NEW doctrine in the MOTD combo
+        # FIRST, so the fields we populate below are captured against the right
+        # doctrine. _motd_on_doctrine_change rebuilds the (empty, tagless) tag
+        # set and clears any loaded-fits fallback — so set loaded fits AFTER it.
+        self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
+        if name in (self._motd_doctrine_combo["values"] or ()):
+            self._motd_doctrine_var.set(name)
+        self._motd_on_doctrine_change()
+
+        # Parse the imported MOTD and POPULATE the builder fields so the captured
+        # linked MOTD is COMPLETE (staging/channel/fits restore on later load).
+        # Previously the import path only dumped raw markup into the header, so
+        # these editable fields were empty and the saved MOTD lost them. Falls
+        # back to the caller-supplied fittings if the parse found no fit links.
+        parsed = motd_builder.parse_motd(raw)
+        self._motd_populate_fields_from_parsed(parsed, fallback_fittings=fittings)
+
+        # Do NOT dump the raw markup into the header anymore — the fields above
+        # now carry the imported content, and build_motd re-renders it cleanly.
+        if getattr(self, "_motd_header_var", None) is not None:
+            self._motd_header_var.set("")
+
+        # NOW capture the (fully-populated) fields into a doctrine-linked saved
+        # MOTD so a later load restores staging/channel/fits.
         data = self._capture_motd_fields()
         data["name"] = name
         data["doctrine"] = name
@@ -7071,24 +7141,61 @@ class FCToolGUI:
         saved.append(data)
         self._save_config()
 
-        try:
-            self.fittings.save()
-        except Exception:
-            pass
-
-        # Refresh the doctrine views + select the new doctrine in the MOTD combo.
-        self._refresh_doctrine_list()
-        self._motd_refresh_doctrines()
-        if name in (self._motd_doctrine_combo["values"] or ()):
-            self._motd_doctrine_var.set(name)
-        self._motd_on_doctrine_change()
+        # Reflect the new linked MOTD in the dropdown + rebuild the preview from
+        # the populated fields (no longer the verbatim raw markup).
         self._motd_refresh_saved_dropdown()
+        self._rebuild_motd_preview()
         try:
             self._refresh_fit_list(self._fit_search_var.get())
         except Exception:
             pass
 
         return doctrine_id, name, added, reused, failed
+
+    def _motd_populate_fields_from_parsed(self, parsed, fallback_fittings=None):
+        """Populate the editable MOTD builder fields from a parsed MOTD dict.
+
+        Sets the staging checkbox + system name, the logi/cap channel entry, a
+        best-effort FC selection, and the explicit loaded-fits fallback. Does
+        NOT touch the doctrine selection or the header — the caller owns those
+        (the import-create path selects the new doctrine first; the decline path
+        leaves the doctrine cleared). ``parsed`` is the dict from
+        :func:`motd_builder.parse_motd`; ``fallback_fittings`` is the raw
+        ``[{dna,name}]`` list used for the loaded-fits fallback when the parse
+        found no fit links."""
+        # Staging system → check the box + fill the system name.
+        if parsed.get("staging"):
+            if getattr(self, "_motd_staging_enabled", None) is not None:
+                self._motd_staging_enabled.set(True)
+            if getattr(self, "_motd_staging_var", None) is not None:
+                self._motd_staging_var.set(parsed["staging"]["name"])
+
+        # Logi/cap channel → fill the channel entry with the display name.
+        if parsed.get("channel"):
+            entry = getattr(self, "_motd_channel_entry", None)
+            if entry is not None:
+                try:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, parsed["channel"]["name"])
+                except Exception:
+                    pass
+
+        # Best-effort FC: select a loaded character whose name matches the FC in
+        # the imported MOTD; otherwise leave the current selection untouched.
+        if parsed.get("fc"):
+            fc_name = parsed["fc"].get("name") or ""
+            combo = getattr(self, "_motd_fc_combo", None)
+            values = (combo["values"] if combo is not None else ()) or ()
+            if fc_name in values:
+                self._motd_fc_var.set(fc_name)
+
+        # Explicit loaded-fits fallback: the parsed fit links (these survive even
+        # when the doctrine is TAGLESS, so its checked tags yield no fits). Falls
+        # back to the caller-supplied fittings if the parse found none.
+        self._motd_loaded_fits = [
+            (f["dna"], f["name"])
+            for f in (parsed.get("fittings") or fallback_fittings or [])
+        ] or None
 
     def _motd_scan_channels(self):
         """Discover chat channels (off the Tk thread) to seed the channel
@@ -7258,6 +7365,14 @@ class FCToolGUI:
         :meth:`_rebuild_motd_preview` folds into the warnings line."""
         doctrine = self._motd_selected_doctrine()
         fits_by_tag = self._motd_build_fits_by_tag(doctrine, compact=compact)
+
+        # Explicit-fits fallback: when the checked tags produce NO fits (e.g. a
+        # tagless imported doctrine) but a saved/imported MOTD carried explicit
+        # fit links, render those instead so the saved fits still appear. When
+        # tags DO produce fits we ignore the override — tags are live/current.
+        if (self._motd_loaded_fits
+                and not any(fits_by_tag.get(t) for t in fits_by_tag)):
+            fits_by_tag = {"Fits": list(self._motd_loaded_fits)}
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
@@ -7594,6 +7709,11 @@ class FCToolGUI:
             except Exception:
                 pass
 
+        # Drop any explicit loaded-fits fallback so a cleared builder renders no
+        # fits (this method bypasses _motd_on_doctrine_change, which would
+        # otherwise clear it).
+        self._motd_loaded_fits = None
+
         # Deselect the doctrine, then rebuild the (now empty) tag checkboxes so
         # the per-fit include boxes are cleared along with their selection.
         if getattr(self, "_motd_doctrine_var", None) is not None:
@@ -7681,15 +7801,14 @@ class FCToolGUI:
 
         # Clear the existing builder FIRST so the imported MOTD replaces it
         # (the user reported the import being ADDED to the existing build), then
-        # load the raw markup as the sole content via the header var.
+        # PARSE the imported MOTD into the editable fields (staging/channel/FC/
+        # fits) rather than dumping the raw markup into the header. This keeps
+        # the builder editable and means the saved linked MOTD captures the
+        # imported staging/channel/fits instead of empty fields.
         self._clear_motd_builder()
-        self._motd_header_var.set(raw)
-
-        # Show ONLY the imported raw markup in the preview (verbatim, not the
-        # re-wrapped build of header=raw). See _motd_set_preview_raw.
-        self._motd_set_preview_raw(raw)
-
         fittings = parsed.get("fittings") or []
+        self._motd_populate_fields_from_parsed(parsed, fallback_fittings=fittings)
+        self._rebuild_motd_preview()
 
         # Primary offer: build a new doctrine from this MOTD — import its linked
         # fits (tagless) and save it as a doctrine-linked MOTD.
@@ -7718,10 +7837,12 @@ class FCToolGUI:
                 f"Imported {added} new fit(s); {reused} already in the "
                 f"library; {failed} could not be parsed.")
 
-        # Re-assert the verbatim preview as the LAST step: the modal dialogs
-        # above run nested Tk event loops that can fire the debounced preview
-        # rebuild scheduled by the header-var set, which would re-wrap the raw.
-        self._motd_set_preview_raw(raw)
+        # Rebuild the preview from the populated fields as the LAST step. The
+        # modal dialogs above run nested Tk event loops that can fire a
+        # debounced preview rebuild mid-flow; a final clean rebuild (after any
+        # doctrine creation has settled the fields) ensures the preview reflects
+        # the final builder state rather than a stale intermediate.
+        self._rebuild_motd_preview()
 
     def _motd_set_preview_raw(self, raw):
         """Cancel any pending debounced preview rebuild and show ``raw``

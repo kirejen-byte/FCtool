@@ -178,6 +178,50 @@ def test_parse_motd_no_links_is_empty():
     assert out["fc"] is None and out["fittings"] == []
 
 
+def test_parse_motd_extracts_staging_and_channel():
+    raw = (
+        "<color=0xffffffff><br>FC: "
+        "<url=showinfo:1377//90000001>Securitas Protector</url><br>"
+        "Staging: <url=showinfo:5//30000142>Jita</url><br>"
+        "Doctrine: Shield HACs<br>"
+        "DPS: <url=fitting:12015:2185;5::>Arty Muninn</url><br>"
+        "Logi: <url=joinChannel:player_-84651075//None//None>Cap Chain</url>"
+        "</color>"
+    )
+    out = parse_motd(raw)
+    # Staging from the FIRST showinfo:5 (Solar System typeID) link.
+    assert out["staging"] == {"system_id": 30000142, "name": "Jita"}
+    # Channel from the FIRST joinChannel link: raw token id, display name.
+    assert out["channel"]["name"] == "Cap Chain"
+    assert out["channel"]["id"] == "player_-84651075//None//None"
+    # FC + fittings unchanged by the new extraction.
+    assert out["fc"]["character_id"] == 90000001
+    assert {f["dna"] for f in out["fittings"]} == {"12015:2185;5::"}
+
+
+def test_parse_motd_staging_only_first_system_link():
+    raw = (
+        "Staging: <url=showinfo:5//30000142>Jita</url> "
+        "alt <url=showinfo:5//30002187>Amarr</url>"
+    )
+    out = parse_motd(raw)
+    assert out["staging"] == {"system_id": 30000142, "name": "Jita"}
+
+
+def test_parse_motd_channel_bare_builtin_id():
+    raw = "Logi: <url=joinChannel:2>Help</url>"
+    out = parse_motd(raw)
+    assert out["channel"] == {"name": "Help", "id": "2"}
+
+
+def test_parse_motd_no_staging_or_channel_is_none():
+    # A character showinfo link (type 1377) is NOT a staging system link.
+    raw = "<url=showinfo:1377//90000001>Securitas Protector</url> just text"
+    out = parse_motd(raw)
+    assert out["staging"] is None
+    assert out["channel"] is None
+
+
 def test_build_motd_has_leading_break_by_default():
     motd = build_motd(fc_name="FC", fc_character_id=1, doctrine_name="D",
                       fits_by_tag={"DPS": [("670::", "Pod")]})

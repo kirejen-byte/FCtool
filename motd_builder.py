@@ -228,15 +228,30 @@ def estimate_length(motd: str) -> int:
 # everything up to the link's closing ``>``.
 _FITTING_RE = re.compile(r"<url=fitting:(?P<dna>[^>]+)>(?P<name>.*?)</url>")
 _SHOWINFO_RE = re.compile(r"<url=showinfo:\d+//(?P<cid>\d+)>(?P<name>.*?)</url>")
+# Solar-system showinfo links use typeID 5 (vs. 1377 for characters); this only
+# matches staging-system links so a character link never reads as a staging one.
+_STAGING_RE = re.compile(r"<url=showinfo:5//(?P<sid>\d+)>(?P<name>.*?)</url>")
+# joinChannel links: the id token is everything up to the link's closing ``>``
+# (kept raw — it may be a bare positive id or a compound
+# ``player_-84651075//None//None`` form); the name is the display text.
+_CHANNEL_RE = re.compile(r"<url=joinChannel:(?P<id>[^>]+)>(?P<name>.*?)</url>")
 
 
 def parse_motd(markup: str) -> dict:
-    """Extract the FC and embedded fitting links from an existing MOTD.
+    """Extract the FC, staging, channel and fitting links from an existing MOTD.
 
-    Returns a dict ``{"fc", "fittings", "raw"}`` where:
+    Returns a dict ``{"fc", "staging", "channel", "fittings", "raw"}`` where:
 
     * ``fc`` is ``{"name", "character_id"}`` for the **first** showinfo character
       link, or ``None`` if there is no character link,
+    * ``staging`` is ``{"system_id", "name"}`` parsed from the **first**
+      ``<url=showinfo:5//{id}>{name}</url>`` link (typeID 5 = Solar System), or
+      ``None`` when there is no system link (a character link is typeID 1377 and
+      is not matched),
+    * ``channel`` is ``{"name", "id"}`` parsed from the **first**
+      ``<url=joinChannel:{id}>{name}</url>`` link, where ``id`` is the raw token
+      (a bare positive id, or a compound ``player_-…//None//None`` form) and
+      ``name`` is the display text, or ``None`` when there is no channel link,
     * ``fittings`` is a list of ``{"dna", "name"}`` for every embedded
       ``<url=fitting:…>`` link, in order of appearance,
     * ``raw`` is the original ``markup`` unchanged.
@@ -257,4 +272,26 @@ def parse_motd(markup: str) -> dict:
             "character_id": int(char_match.group("cid")),
         }
 
-    return {"fc": fc, "fittings": fittings, "raw": markup}
+    staging = None
+    staging_match = _STAGING_RE.search(markup)
+    if staging_match is not None:
+        staging = {
+            "system_id": int(staging_match.group("sid")),
+            "name": staging_match.group("name"),
+        }
+
+    channel = None
+    channel_match = _CHANNEL_RE.search(markup)
+    if channel_match is not None:
+        channel = {
+            "name": channel_match.group("name"),
+            "id": channel_match.group("id"),
+        }
+
+    return {
+        "fc": fc,
+        "staging": staging,
+        "channel": channel,
+        "fittings": fittings,
+        "raw": markup,
+    }
