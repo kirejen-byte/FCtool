@@ -1482,6 +1482,32 @@ class FCToolGUI:
                                            fg=FG_YELLOW, bg=BG_PANEL)
         self._fleet_size_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
 
+        # Doctrine selector + clickable link → Fittings ▸ Doctrines (Phase C).
+        doc_row = tk.Frame(comp_left, bg=BG_PANEL)
+        doc_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 2))
+        tk.Label(doc_row, text="Doctrine:", font=("Consolas", 9),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
+        self._fleet_doctrine_var = tk.StringVar(
+            value=self.config.get("fleet", {}).get("active_doctrine", ""))
+        self._fleet_doctrine_combo = ttk.Combobox(
+            doc_row, textvariable=self._fleet_doctrine_var, state="readonly",
+            font=("Consolas", 9), width=22)
+        self._fleet_doctrine_combo.pack(side=tk.LEFT, padx=4)
+        self._fleet_doctrine_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_fleet_doctrine_change())
+        self._fleet_doctrine_link = tk.Label(
+            doc_row, text="↗ open", font=("Consolas", 9, "underline"),
+            fg=FG_ACCENT, bg=BG_PANEL, cursor="hand2")
+        self._fleet_doctrine_link.pack(side=tk.LEFT, padx=6)
+        self._fleet_doctrine_link.bind(
+            "<Button-1>", lambda e: self._open_active_doctrine())
+        # DPS guidance summary line (populated by guidance when a doctrine is active).
+        self._dps_guidance_label = tk.Label(
+            comp_left, text="", font=("Consolas", 9, "bold"),
+            fg=FG_DIM, bg=BG_PANEL)
+        self._dps_guidance_label.pack(anchor=tk.W, padx=8, pady=(0, 2))
+        self._refresh_fleet_doctrine_combo()
+
         comp_header = tk.Frame(comp_left, bg=BG_PANEL)
         comp_header.pack(fill=tk.X, padx=8)
         tk.Label(comp_header, text="DPS", font=("Consolas", 8),
@@ -4187,6 +4213,12 @@ class FCToolGUI:
         elif current == 4 and hasattr(self, '_char_tab_content'):
             # Switched to Characters tab — auto-refresh
             self._refresh_character_tab()
+        elif current == 0:
+            # Switched to Fleet Management — keep the doctrine dropdown fresh.
+            try:
+                self._refresh_fleet_doctrine_combo()
+            except Exception:
+                pass
 
     def _notify_zkill_tab(self):
         """Flash the zKill tab to indicate a new alert if not currently viewing it."""
@@ -5929,6 +5961,11 @@ class FCToolGUI:
             # Selected doctrine was deleted — clear the detail pane.
             self._doctrine_selected_id = None
             self._show_doctrine_detail(None)
+        # Keep the Fleet-Management doctrine dropdown in sync (Phase C).
+        try:
+            self._refresh_fleet_doctrine_combo()
+        except Exception:
+            pass
 
     def _on_doctrine_tree_motion(self, event):
         """Show a warning tooltip while hovering a doctrine that has untagged
@@ -6927,6 +6964,84 @@ class FCToolGUI:
                 default = self.esi_auth.character_name
             self._motd_fc_var.set(default or (names[0] if names else
                                               self._MOTD_FC_BLANK))
+
+    def _active_fleet_doctrine(self):
+        """The doctrine driving Fleet-Mgmt guidance: the explicit Fleet-tab pick
+        if set, else the MOTD-selected doctrine, else None."""
+        name = ""
+        var = getattr(self, "_fleet_doctrine_var", None)
+        if var is not None:
+            name = var.get() or ""
+        if not name:
+            mvar = getattr(self, "_motd_doctrine_var", None)
+            if mvar is not None:
+                name = mvar.get() or ""
+        if not name:
+            return None
+        for d in self.fittings.list_doctrines():
+            if (d.name or "") == name:
+                return d
+        return None
+
+    def _refresh_fleet_doctrine_combo(self):
+        """Keep the Fleet-tab doctrine dropdown's values in sync with the library.
+        Preserves the current selection if it still exists."""
+        combo = getattr(self, "_fleet_doctrine_combo", None)
+        if combo is None:
+            return
+        names = sorted((d.name or "") for d in self.fittings.list_doctrines())
+        try:
+            combo["values"] = [""] + names
+        except Exception:
+            pass
+
+    def _on_fleet_doctrine_change(self):
+        """Persist the Fleet-tab doctrine pick and re-render the role sections."""
+        var = getattr(self, "_fleet_doctrine_var", None)
+        if var is None:
+            return
+        self.config.setdefault("fleet", {})["active_doctrine"] = var.get()
+        self._save_config()
+        self._refresh_specialized_roles_from_cache()
+
+    def _open_active_doctrine(self):
+        """Navigate to the active doctrine in Fittings ▸ Doctrines (best-effort)."""
+        doc = self._active_fleet_doctrine()
+        if doc is None:
+            return
+        try:
+            # Switch to the Fittings top-level tab (index 5) and its Doctrines
+            # sub-tab (index 1), then select the doctrine in the tree + show it.
+            self.notebook.select(5)
+            subnb = getattr(self, "_fitting_subnb", None)
+            if subnb is not None:
+                subnb.select(1)
+            tree = getattr(self, "_doctrine_tree", None)
+            if tree is not None:
+                try:
+                    if doc.id in tree.get_children(""):
+                        tree.selection_set(doc.id)
+                        tree.see(doc.id)
+                except Exception:
+                    pass
+            self._doctrine_selected_id = doc.id
+            if hasattr(self, "_show_doctrine_detail"):
+                self._show_doctrine_detail(doc.id)
+        except Exception as exc:
+            print(f"[Fleet] open doctrine navigation failed: {exc}")
+
+    def _refresh_specialized_roles_from_cache(self):
+        """Re-run the specialized-role render using the last polled fleet snapshot,
+        so a doctrine change re-colours the guided sections without waiting for the
+        next fleet poll. No-op when there is no cached snapshot yet."""
+        cached = getattr(self, "_last_specialized_args", None)
+        if not cached:
+            return
+        members, ship_counts, total = cached
+        try:
+            self._update_specialized_roles(members, ship_counts, total)
+        except Exception as exc:
+            print(f"[Fleet] re-render specialized roles failed: {exc}")
 
     def _motd_selected_doctrine(self):
         """Return the Doctrine matching the dropdown name, or None."""
