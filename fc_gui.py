@@ -6590,7 +6590,7 @@ class FCToolGUI:
 
         # Linked (saved) MOTD dropdown: lists the saved MOTDs attached to the
         # currently-selected doctrine; picking one re-applies its saved fields.
-        _lbl(inputs, "LINKED MOTD").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        _lbl(inputs, "MOTD TEMPLATE").pack(anchor=tk.W, padx=8, pady=(10, 2))
         saved_row = tk.Frame(inputs, bg=BG_PANEL)
         saved_row.pack(fill=tk.X, padx=8)
         self._motd_saved_var = tk.StringVar()
@@ -7066,13 +7066,13 @@ class FCToolGUI:
         name = self._motd_saved_var.get()
         if not name or name == self._MOTD_SAVED_BLANK:
             messagebox.showinfo(
-                "Delete linked MOTD",
-                "Select a linked MOTD from the dropdown first.")
+                "Delete MOTD template",
+                "Select an MOTD template from the dropdown first.")
             return
         doctrine = self._motd_doctrine_var.get()
         if not messagebox.askyesno(
-                "Delete linked MOTD",
-                f"Delete linked MOTD '{name}'"
+                "Delete MOTD template",
+                f"Delete MOTD template '{name}'"
                 + (f" from doctrine '{doctrine}'?" if doctrine else "?")):
             return
         fit_cfg = self.config.setdefault("fittings", {})
@@ -7087,7 +7087,7 @@ class FCToolGUI:
         self._motd_refresh_saved_dropdown()
         status = getattr(self, "_motd_fleet_status", None)
         if status is not None:
-            status.config(text=f"Deleted linked MOTD '{name}'.", fg=FG_GREEN)
+            status.config(text=f"Deleted MOTD template '{name}'.", fg=FG_GREEN)
 
     def _save_linked_motd(self, doctrine_name: str, motd_name: str):
         """Capture the current builder fields and persist them as a saved MOTD
@@ -7124,7 +7124,7 @@ class FCToolGUI:
         status = getattr(self, "_motd_fleet_status", None)
         if status is not None:
             status.config(
-                text=f"Linked MOTD '{motd_name}' saved to doctrine "
+                text=f"MOTD template '{motd_name}' saved to doctrine "
                      f"'{doctrine_name}'.", fg=FG_GREEN)
 
     def _link_motd_to_doctrine(self):
@@ -7185,7 +7185,7 @@ class FCToolGUI:
             return
         motd_name = simpledialog.askstring(
             "Name this MOTD",
-            "Name for this linked MOTD:",
+            "Name for this MOTD template:",
             initialvalue=doctrine_name, parent=self.root)
         if not motd_name or not motd_name.strip():
             return
@@ -7242,7 +7242,9 @@ class FCToolGUI:
                     source="dna",
                     raw_text="",
                     parsed=parsed,
-                    dna=dna,
+                    # Store the canonical (to_dna) form so the library fit isn't
+                    # saddled with a legacy bare-id T3 DNA from the source MOTD.
+                    dna=self._canonical_fit_dna(dna, parsed),
                     notes="",
                     esi_fitting_ids={},
                     created="",
@@ -7512,6 +7514,25 @@ class FCToolGUI:
             threading.Thread(target=worker, daemon=True).start()
         return None
 
+    def _canonical_fit_dna(self, dna: str, parsed=None) -> str:
+        """Re-encode a fit DNA through ``parse_dna`` → ``to_dna`` so it always
+        uses the modern, client-correct form.
+
+        Chiefly this rewrites legacy bare-id Tech-III subsystems (``id``) to the
+        ``id;1`` quantity form: the bare-id form makes the live client mis-render
+        a subsystem as the hull (the reported "Tengu propulsion" bug). Imported
+        MOTD DNA is the only fit source that isn't already routed through
+        ``to_dna``, so a legacy MOTD's raw DNA would otherwise reach the client
+        unchanged. Pass a pre-parsed ``ParsedFit`` to skip a re-parse. Returns
+        ``dna`` unchanged if it cannot be parsed (defensive — never drops a
+        link); idempotent for already-canonical DNA."""
+        try:
+            if parsed is None:
+                parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
+            return fit_dna.to_dna(parsed, self.type_catalog)
+        except Exception:
+            return dna
+
     def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
 
@@ -7534,6 +7555,18 @@ class FCToolGUI:
         if (self._motd_loaded_fits
                 and not any(fits_by_tag.get(t) for t in fits_by_tag)):
             fits_by_tag = {"Fits": list(self._motd_loaded_fits)}
+
+        # Canonicalise every fit DNA so the emitted <url=fitting:...> links use
+        # the client-correct form regardless of how the fit was stored. This is
+        # the single chokepoint for preview / Set / Copy, so a legacy bare-id
+        # T3 DNA (from an imported MOTD or an older library fit) is normalised to
+        # the "id;1" subsystem form here — the bare-id form makes the client
+        # mis-render a subsystem as the hull ("Tengu propulsion"). Idempotent
+        # for already-canonical DNA; raw DNA is kept if it cannot be parsed.
+        fits_by_tag = {
+            tag: [(self._canonical_fit_dna(dna), name) for dna, name in fits]
+            for tag, fits in fits_by_tag.items()
+        }
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
@@ -8069,7 +8102,7 @@ class FCToolGUI:
         if messagebox.askyesno(
                 "Create doctrine?",
                 "Create a new doctrine from this MOTD and import its linked "
-                "fits? (You can save it as a linked MOTD afterwards via "
+                "fits? (You can save it as an MOTD template afterwards via "
                 "'Link to doctrine'.)"):
             result = self._create_doctrine_from_motd(raw, fittings)
             if result is not None:

@@ -192,3 +192,59 @@ def test_non_t3_dna_unchanged_regression():
     assert "216;1000" in groups                         # 1000 Plasma cargo
     # No bare subsystem tokens leaked in.
     assert all(";" in g for g in groups[1:])
+
+
+# ── Legacy bare-id normalisation (the MOTD-import "Tengu propulsion" bug) ──────
+#
+# A MOTD authored by an older tool/client carries T3 subsystems as BARE ids
+# (29990:45631:45595:...), which the modern client mis-renders as the hull. The
+# MOTD import path was emitting that raw DNA verbatim; the fix routes imported
+# DNA through parse_dna → to_dna, which must NORMALISE the legacy form to the
+# slot-sorted `id;1` form. These tests pin that round-trip.
+
+
+def test_t3_legacy_bare_id_dna_normalizes_to_quantity_form():
+    from fit_parser import parse_dna
+
+    # Bare-id subsystems, deliberately scrambled, plus one low module.
+    legacy = f"{_LOKI}:{_SUB_PROP}:{_SUB_OFF}:{_SUB_DEF}:{_SUB_CORE}:2048;1::"
+    parsed = parse_dna(legacy, T3Cat()).fit
+    assert parsed.ship_type_id == _LOKI                    # hull, not a subsystem
+    assert sorted(parsed.subsystems) == sorted(
+        [_SUB_CORE, _SUB_DEF, _SUB_OFF, _SUB_PROP])         # 4 subsystems recovered
+    canon = to_dna(parsed, T3Cat())
+    assert canon == (
+        f"{_LOKI}:{_SUB_CORE};1:{_SUB_DEF};1:{_SUB_OFF};1:{_SUB_PROP};1:2048;1::"
+    )
+    groups = canon.rstrip(":").split(":")
+    for sub in (_SUB_CORE, _SUB_DEF, _SUB_OFF, _SUB_PROP):
+        assert str(sub) not in groups                       # only `id;1`, never bare
+
+
+def test_real_catalog_normalizes_legacy_tengu_dna():
+    # The exact reported hull (Tengu 29984) against the BUNDLED catalog, using
+    # the real subsystem ids confirmed during investigation. Guards/​skips if the
+    # catalog can't be built in this environment.
+    try:
+        import type_catalog
+        from fit_parser import parse_dna
+        cat = type_catalog.TypeCatalog(esi=None)
+    except Exception as exc:                                # pragma: no cover
+        import pytest
+        pytest.skip(f"type catalog unavailable: {exc}")
+
+    TENGU = 29984
+    core, defen, offen, prop = 45625, 45589, 45601, 45613   # Core/Def/Off/Prop
+    # Legacy bare-id Tengu, subsystems scrambled, plus a high + low module.
+    legacy = f"{TENGU}:{prop}:{offen}:{defen}:{core}:405;1:506;1::"
+    parsed = parse_dna(legacy, cat).fit
+    if parsed.ship_type_id != TENGU or len(parsed.subsystems) != 4:
+        import pytest
+        pytest.skip("bundled catalog lacks Tengu subsystem data")
+    canon = to_dna(parsed, cat)
+    groups = canon.rstrip(":").split(":")
+    assert groups[0] == str(TENGU)                          # hull first, not a sub
+    # Subsystems normalised to `id;1` in Core→Def→Off→Prop order.
+    assert groups[1:5] == [f"{core};1", f"{defen};1", f"{offen};1", f"{prop};1"]
+    for sub in (core, defen, offen, prop):
+        assert str(sub) not in groups                       # no bare-id leak
