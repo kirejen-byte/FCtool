@@ -21,6 +21,7 @@ and ``MOTD_BUDGET_DEFAULT`` is the conservative ceiling callers warn against.
 """
 from __future__ import annotations
 
+import html
 import re
 
 # Generic "character" group type id used in showinfo links. 1377 (or 1) resolves
@@ -223,6 +224,23 @@ def estimate_length(motd: str) -> int:
     return len(motd)
 
 
+# A MOTD authored or edited in the EVE client and read back via ESI uses the
+# client's native anchor form, <a href="target">name</a> (single or double
+# quoted, often wrapped in <font ...> runs), rather than the <url=target>name
+# </url> form this tool generates. Normalising anchors to the <url=...> form lets
+# the extraction regexes below match a client-authored MOTD as well as ours.
+_ANCHOR_LINK_RE = re.compile(
+    r'<a\s+href=(?P<q>["\'])(?P<target>.*?)(?P=q)\s*>(?P<name>.*?)</a>',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _normalize_links(markup: str) -> str:
+    """Rewrite client-native ``<a href="X">name</a>`` anchors to the canonical
+    ``<url=X>name</url>`` form so :func:`parse_motd` recognises both."""
+    return _ANCHOR_LINK_RE.sub(
+        lambda m: f"<url={m.group('target')}>{m.group('name')}</url>", markup)
+
+
 # EVE link markup is not valid XML, so these are matched with regex, not a parser.
 # Non-greedy name capture stops at the first closing tag; the DNA capture is
 # everything up to the link's closing ``>``.
@@ -256,35 +274,43 @@ def parse_motd(markup: str) -> dict:
       ``<url=fitting:…>`` link, in order of appearance,
     * ``raw`` is the original ``markup`` unchanged.
 
+    Both the ``<url=…>`` form this tool generates and the EVE client's native
+    ``<a href="…">name</a>`` anchor form (single or double quoted, possibly
+    wrapped in ``<font …>`` runs) are accepted — anchors are normalised to the
+    ``<url=…>`` form before extraction. Display names are HTML-entity-decoded
+    (e.g. ``&amp;`` → ``&``); link targets/ids are left raw.
+
     The extracted DNAs can be fed to ``fit_parser.parse_dna`` to offer importing
     those fits into the library.
     """
+    normalized = _normalize_links(markup)
+
     fittings = [
-        {"dna": m.group("dna"), "name": m.group("name")}
-        for m in _FITTING_RE.finditer(markup)
+        {"dna": m.group("dna"), "name": html.unescape(m.group("name"))}
+        for m in _FITTING_RE.finditer(normalized)
     ]
 
     fc = None
-    char_match = _SHOWINFO_RE.search(markup)
+    char_match = _SHOWINFO_RE.search(normalized)
     if char_match is not None:
         fc = {
-            "name": char_match.group("name"),
+            "name": html.unescape(char_match.group("name")),
             "character_id": int(char_match.group("cid")),
         }
 
     staging = None
-    staging_match = _STAGING_RE.search(markup)
+    staging_match = _STAGING_RE.search(normalized)
     if staging_match is not None:
         staging = {
             "system_id": int(staging_match.group("sid")),
-            "name": staging_match.group("name"),
+            "name": html.unescape(staging_match.group("name")),
         }
 
     channel = None
-    channel_match = _CHANNEL_RE.search(markup)
+    channel_match = _CHANNEL_RE.search(normalized)
     if channel_match is not None:
         channel = {
-            "name": channel_match.group("name"),
+            "name": html.unescape(channel_match.group("name")),
             "id": channel_match.group("id"),
         }
 

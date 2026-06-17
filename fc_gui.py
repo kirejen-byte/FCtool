@@ -1092,17 +1092,34 @@ class FCToolGUI:
                          font=("Consolas", 14, "bold"))
         style.configure("Status.TLabel", background=BG_PANEL, foreground=FG_TEXT,
                          font=("Consolas", 10))
+        # Resolve a guaranteed-available monospace family ONCE and build concrete
+        # Font objects for the shared button styles. A bare ("Consolas", 10) tuple
+        # can fail to resolve on some machines (style.lookup -> ''), which under
+        # the clam theme collapses ttk.Buttons to ~6x6 px with invisible text.
+        # Consolas is first so Windows is visually unchanged; TkFixedFont is a Tk
+        # built-in alias that always exists, as the final fallback.
+        _families = set(tkfont.families(self.root))
+        _btn_family = next(
+            (f for f in ("Consolas", "Courier New", "DejaVu Sans Mono",
+                         "Liberation Mono", "Lucida Console", "Monaco",
+                         "TkFixedFont")
+             if f in _families),
+            "TkFixedFont")
+        # Kept on self so they are not garbage-collected.
+        self._btn_font = tkfont.Font(family=_btn_family, size=10)
+        self._btn_font_bold = tkfont.Font(family=_btn_family, size=10, weight="bold")
+
         style.configure("Dark.TButton", background=BG_ENTRY, foreground=FG_TEXT,
-                         font=("Consolas", 10), borderwidth=1)
+                         font=self._btn_font, borderwidth=1, padding=(8, 4))
         style.map("Dark.TButton",
                   background=[("active", "#1a5a90")],
                   foreground=[("active", FG_WHITE)])
         style.configure("Green.TButton", background="#006644", foreground=FG_WHITE,
-                         font=("Consolas", 10, "bold"))
+                         font=self._btn_font_bold, padding=(8, 4))
         style.map("Green.TButton",
                   background=[("active", "#008855")])
         style.configure("Red.TButton", background="#660022", foreground=FG_WHITE,
-                         font=("Consolas", 10, "bold"))
+                         font=self._btn_font_bold, padding=(8, 4))
         style.map("Red.TButton",
                   background=[("active", "#882233")])
         style.configure("Dark.TNotebook", background=BG_DARK, borderwidth=0)
@@ -7963,9 +7980,20 @@ class FCToolGUI:
             return
 
         parsed = motd_builder.parse_motd(raw)
-        self._motd_fleet_status.config(
-            text=f"Imported MOTD ({len(raw)} chars, "
-                 f"{len(parsed['fittings'])} fit link(s)).", fg=FG_GREEN)
+        # Disambiguate the "imported but no fits" case: a non-empty MOTD that
+        # yields zero fit links almost always means the fit markup was not
+        # recognized (rather than the MOTD genuinely containing none). Flag it
+        # with a warning colour and an explicit note so the user knows the import
+        # itself worked even though no fits came across.
+        if raw and not parsed["fittings"]:
+            self._motd_fleet_status.config(
+                text=f"Imported MOTD ({len(raw)} chars, 0 fit link(s)) "
+                     f"— no fit links recognized in the MOTD markup.",
+                fg=FG_ORANGE)
+        else:
+            self._motd_fleet_status.config(
+                text=f"Imported MOTD ({len(raw)} chars, "
+                     f"{len(parsed['fittings'])} fit link(s)).", fg=FG_GREEN)
 
         # Clear the existing builder FIRST so the imported MOTD replaces it
         # (the user reported the import being ADDED to the existing build), then

@@ -93,6 +93,9 @@ class MarkupEditor(tk.Frame):
         # Track which colour tags we have configured so set_markup can register
         # arbitrary colours on the fly (fg_<hex>).
         self._configured_fg = set()
+        self._pending_tags = set()      # Tk tag names to apply to the next typed chars
+        self._pending_press_idx = None  # insert index captured on a self-inserting KeyPress
+        self._pending_armed = False
         self._tooltip = None
 
         self.columnconfigure(0, weight=1)
@@ -112,8 +115,13 @@ class MarkupEditor(tk.Frame):
         self._configure_static_tags()
 
         # Change notification: <<Modified>> (reset the flag each fire) + key/mouse.
+        # NOTE: the KeyRelease change-fire MUST pass add="+" so the pending
+        # typing-style handlers below do not clobber it (bind() without add
+        # REPLACES the prior callback).
         self.text.bind("<<Modified>>", self._on_modified)
-        self.text.bind("<KeyRelease>", lambda e: self._fire_change())
+        self.text.bind("<KeyRelease>", lambda e: self._fire_change(), add="+")
+        self.text.bind("<KeyPress>", self._pending_keypress, add="+")
+        self.text.bind("<KeyRelease>", self._pending_keyrelease, add="+")
         self.text.bind("<ButtonRelease-1>", lambda e: None)
 
     # ── construction helpers ────────────────────────────────────────────────
@@ -243,6 +251,51 @@ class MarkupEditor(tk.Frame):
         except tk.TclError:
             return None
 
+    # ── pending (typing-style) helpers ──────────────────────────────────────
+
+    def _set_pending(self, tag, exclusive_prefix=None):
+        """Arm a pending typing style. With exclusive_prefix (e.g. 'fg_'/'size_'),
+        drop any other pending tag with that prefix first (one colour / one size)."""
+        if exclusive_prefix:
+            self._pending_tags = {t for t in self._pending_tags
+                                  if not t.startswith(exclusive_prefix)}
+        if tag:
+            self._pending_tags.add(tag)
+
+    def _toggle_pending(self, tag):
+        if tag in self._pending_tags:
+            self._pending_tags.discard(tag)
+        else:
+            self._pending_tags.add(tag)
+
+    def _clear_pending(self):
+        self._pending_tags.clear()
+
+    def _pending_keypress(self, e):
+        # Arm only when a style is pending AND this key is a real self-inserting
+        # printable char (not a modifier/navigation/control combo). e.state bits:
+        # Control=0x4, Mod1/Alt(X11)=0x8, Alt(Windows)=0x20000.
+        if not self._pending_tags:
+            self._pending_armed = False
+            return
+        is_insert = (bool(e.char) and len(e.char) == 1 and e.char.isprintable()
+                     and not (e.state & (0x4 | 0x8 | 0x20000)))
+        if is_insert:
+            self._pending_press_idx = self.text.index("insert")
+            self._pending_armed = True
+        else:
+            self._pending_armed = False
+
+    def _pending_keyrelease(self, e):
+        if not (self._pending_armed and self._pending_tags):
+            return
+        self._pending_armed = False
+        start = self._pending_press_idx
+        cur = self.text.index("insert")
+        if start is not None and self.text.compare(cur, ">", start):
+            for tag in self._pending_tags:
+                self.text.tag_add(tag, start, cur)
+
     # ── toolbar actions ─────────────────────────────────────────────────────
 
     def apply_color(self, hexcolor: str):
@@ -250,6 +303,9 @@ class MarkupEditor(tk.Frame):
         other foreground colour on that range (one colour per run)."""
         rng = self._selection_range()
         if rng is None:
+            # No selection: arm a pending colour for the next typed chars.
+            self._set_pending(self._fg_tag(hexcolor), exclusive_prefix="fg_")
+            self._fire_change()
             return
         start, end = rng
         # Strip any existing fg_* tag from the range first.
@@ -260,22 +316,30 @@ class MarkupEditor(tk.Frame):
         self._fire_change()
 
     def _pick_custom_color(self):
+        # Always open the dialog (a selection is no longer required); a chosen
+        # colour applies to the selection if any, else arms a pending colour.
         rng = self._selection_range()
-        if rng is None:
-            return
         try:
             _rgb, hexval = colorchooser.askcolor(parent=self,
                                                  title="Pick a colour")
         except Exception:
             hexval = None
-        if hexval:
+        if not hexval:
+            return
+        if rng is not None:
             self.apply_color(hexval)
+        else:
+            self._set_pending(self._fg_tag(hexval), exclusive_prefix="fg_")
+            self._fire_change()
 
     def _toggle_tag(self, tag: str):
         """Toggle ``tag`` over the selection: remove it if the *whole* selection
         already carries it, otherwise add it."""
         rng = self._selection_range()
         if rng is None:
+            # No selection: toggle the pending style for the next typed chars.
+            self._toggle_pending(tag)
+            self._fire_change()
             return
         start, end = rng
         if self._range_fully_tagged(tag, start, end):
@@ -328,6 +392,18 @@ class MarkupEditor(tk.Frame):
         """Apply font size ``n`` to the selection, replacing any other size."""
         rng = self._selection_range()
         if rng is None:
+            # No selection: arm a pending size for the next typed chars (base
+            # size drops any pending size; otherwise configure the size_n tag
+            # ad-hoc — like set_markup — before it is applied).
+            if n == _BASE_SIZE:
+                self._set_pending(None, exclusive_prefix="size_")
+            else:
+                tag = f"size_{n}"
+                if tag not in self.text.tag_names():
+                    self.text.tag_configure(
+                        tag, font=tkfont.Font(family=_BASE_FAMILY, size=n))
+                self._set_pending(tag, exclusive_prefix="size_")
+            self._fire_change()
             return
         start, end = rng
         for tag in self.text.tag_names():
@@ -341,6 +417,9 @@ class MarkupEditor(tk.Frame):
         """Remove every formatting tag from the selection (plain text)."""
         rng = self._selection_range()
         if rng is None:
+            # No selection: drop any armed pending styles.
+            self._clear_pending()
+            self._fire_change()
             return
         start, end = rng
         for tag in self.text.tag_names():

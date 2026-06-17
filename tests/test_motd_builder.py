@@ -222,6 +222,57 @@ def test_parse_motd_no_staging_or_channel_is_none():
     assert out["channel"] is None
 
 
+def test_parse_motd_extracts_fits_from_anchor_form():
+    # The EVE client's native anchor form, as read back via ESI.
+    raw = ('DPS: <a href="fitting:12015:2185;5::">Arty Muninn</a> '
+           '<a href="fitting:11985::">Shield Scimitar</a>')
+    out = parse_motd(raw)
+    assert {f["dna"] for f in out["fittings"]} == {"12015:2185;5::", "11985::"}
+
+
+def test_parse_motd_anchor_fc_staging_channel():
+    raw = (
+        'FC: <a href="showinfo:1377//90000001">Securitas Protector</a><br>'
+        'Staging: <a href="showinfo:5//30000142">Jita</a><br>'
+        'Logi: <a href="joinChannel:player_-84651075//None//None">Cap Chain</a>'
+    )
+    out = parse_motd(raw)
+    assert out["fc"]["character_id"] == 90000001
+    assert out["staging"] == {"system_id": 30000142, "name": "Jita"}
+    assert out["channel"]["id"] == "player_-84651075//None//None"
+
+
+def test_parse_motd_anchor_single_quoted_href():
+    raw = "<a href='fitting:12015:2185;5::'>Arty Muninn</a>"
+    out = parse_motd(raw)
+    assert {f["dna"] for f in out["fittings"]} == {"12015:2185;5::"}
+
+
+def test_parse_motd_anchor_font_wrapped_and_entity_decoded():
+    # Display names are HTML-entity-encoded and links sit inside <font ...> runs.
+    raw = (
+        '<font size=14 color=0xffd98d00>'
+        'FC: <a href="showinfo:1377//90000001">Securitas &amp; Co</a> '
+        'DPS: <a href="fitting:12015:2185;5::">Arty &gt;Muninn&lt;</a>'
+        '</font>'
+    )
+    out = parse_motd(raw)
+    assert out["fittings"][0]["name"] == "Arty >Muninn<"
+    assert out["fc"]["name"] == "Securitas & Co"
+
+
+def test_parse_motd_url_form_still_works():
+    # Regression: the legacy <url=...> form must parse exactly as before.
+    raw = ("Form up<br><url=showinfo:1377//90000001>Securitas Protector</url><br>"
+           "<url=fitting:12015:2185;5::>Arty Muninn</url> "
+           "<url=fitting:11985::>Shield Scimitar</url>")
+    out = parse_motd(raw)
+    assert out["fc"]["character_id"] == 90000001
+    assert out["fc"]["name"] == "Securitas Protector"
+    assert {f["dna"] for f in out["fittings"]} == {"12015:2185;5::", "11985::"}
+    assert out["raw"] == raw
+
+
 def test_build_motd_has_leading_break_by_default():
     motd = build_motd(fc_name="FC", fc_character_id=1, doctrine_name="D",
                       fits_by_tag={"DPS": [("670::", "Pod")]})
