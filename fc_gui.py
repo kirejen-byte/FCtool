@@ -608,6 +608,11 @@ class FCToolGUI:
         # Start periodic character tab refresh (location + ship every 5 min)
         self.root.after(300_000, self._auto_refresh_character_tab)
 
+        # Refresh the logi/cap channel cache shortly after startup so the MOTD
+        # channel autocomplete reflects the latest logs (cached names are
+        # already seeded synchronously above). No-ops if the logs path is unset.
+        self.root.after(2500, self._motd_scan_channels)
+
         # Pre-generate loss threshold TTS audio in the background
         tts_helper.pregenerate([
             "Ten percent of fleet lost",
@@ -6586,13 +6591,18 @@ class FCToolGUI:
         # Linked (saved) MOTD dropdown: lists the saved MOTDs attached to the
         # currently-selected doctrine; picking one re-applies its saved fields.
         _lbl(inputs, "LINKED MOTD").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        saved_row = tk.Frame(inputs, bg=BG_PANEL)
+        saved_row.pack(fill=tk.X, padx=8)
         self._motd_saved_var = tk.StringVar()
         self._motd_saved_combo = ttk.Combobox(
-            inputs, textvariable=self._motd_saved_var, state="readonly",
+            saved_row, textvariable=self._motd_saved_var, state="readonly",
             font=("Consolas", 10))
-        self._motd_saved_combo.pack(fill=tk.X, padx=8)
+        self._motd_saved_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._motd_saved_combo.bind(
             "<<ComboboxSelected>>", self._on_saved_motd_change)
+        ttk.Button(saved_row, text="Delete", style="Red.TButton", width=7,
+                   command=self._delete_linked_motd).pack(side=tk.LEFT,
+                                                          padx=(5, 0))
 
         # FC / Anchor dropdown.
         _lbl(inputs, "FC / ANCHOR").pack(anchor=tk.W, padx=8, pady=(10, 2))
@@ -6619,7 +6629,7 @@ class FCToolGUI:
             font=("Consolas", 9, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
             activebackground=BG_PANEL, activeforeground=FG_ACCENT,
             selectcolor=BG_ENTRY, anchor=tk.W,
-            command=self._schedule_motd_preview)
+            command=self._motd_on_staging_toggle)
         st_chk.pack(anchor=tk.W, padx=6, pady=(10, 2))
         self._motd_staging_entry = AutocompleteEntry(
             inputs, list(getattr(self, "_system_names", []) or []),
@@ -6637,8 +6647,13 @@ class FCToolGUI:
         _lbl(inputs, "LOGI / CAP CHANNEL").pack(anchor=tk.W, padx=8, pady=(10, 2))
         ch_row = tk.Frame(inputs, bg=BG_PANEL)
         ch_row.pack(fill=tk.X, padx=8)
+        # Seed completions from the shared discovered-channel cache (the full
+        # set, not the noise-filtered intel suggestions) so previously-scanned
+        # channels are available immediately, regardless of tab build order.
+        _cached_channels = (self.config.get("intel_channels", {})
+                            .get("cached_discovered", []) or [])
         self._motd_channel_entry = AutocompleteEntry(
-            ch_row, list(getattr(self, "_intel_channel_suggestions", []) or []),
+            ch_row, list(_cached_channels),
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=22,
             borderwidth=1, relief=tk.RIDGE,
@@ -6846,6 +6861,24 @@ class FCToolGUI:
         self._motd_refresh_fleet_status()
         self._schedule_motd_preview()
 
+    def _motd_on_staging_toggle(self):
+        """Checkbox toggle for 'Include staging system'.
+
+        When enabled and the staging entry is empty, auto-populate it with the
+        user's designated staging system (config zkillboard.staging_system) so the
+        preview reflects it without the user typing/selecting anything. Setting the
+        StringVar fires its write-trace, which schedules the preview; the explicit
+        schedule below covers the disable case (and a no-fill enable)."""
+        if (getattr(self, "_motd_staging_enabled", None) is not None
+                and self._motd_staging_enabled.get()):
+            cur = (self._motd_staging_var.get() or "").strip()
+            if not cur:
+                designated = (self.config.get("zkillboard", {})
+                              .get("staging_system", "") or "").strip()
+                if designated:
+                    self._motd_staging_var.set(designated)
+        self._schedule_motd_preview()
+
     def _motd_rebuild_tag_checkboxes(self):
         """Rebuild the include-tag checkboxes from the selected doctrine's tags.
 
@@ -7024,6 +7057,38 @@ class FCToolGUI:
                 self._apply_motd_fields(m)
                 return
 
+    def _delete_linked_motd(self):
+        """Delete the currently-selected linked (saved) MOTD after confirmation.
+
+        Removes the entry matching the selected (doctrine, name) from
+        config["fittings"]["saved_motds"], persists, refreshes the dropdown, and
+        resets the selection to blank. No-op when nothing is selected."""
+        name = self._motd_saved_var.get()
+        if not name or name == self._MOTD_SAVED_BLANK:
+            messagebox.showinfo(
+                "Delete linked MOTD",
+                "Select a linked MOTD from the dropdown first.")
+            return
+        doctrine = self._motd_doctrine_var.get()
+        if not messagebox.askyesno(
+                "Delete linked MOTD",
+                f"Delete linked MOTD '{name}'"
+                + (f" from doctrine '{doctrine}'?" if doctrine else "?")):
+            return
+        fit_cfg = self.config.setdefault("fittings", {})
+        saved = fit_cfg.get("saved_motds")
+        if isinstance(saved, list):
+            fit_cfg["saved_motds"] = [
+                m for m in saved
+                if not ((m.get("doctrine") or "") == doctrine
+                        and m.get("name") == name)]
+            self._save_config()
+        self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
+        self._motd_refresh_saved_dropdown()
+        status = getattr(self, "_motd_fleet_status", None)
+        if status is not None:
+            status.config(text=f"Deleted linked MOTD '{name}'.", fg=FG_GREEN)
+
     def _save_linked_motd(self, doctrine_name: str, motd_name: str):
         """Capture the current builder fields and persist them as a saved MOTD
         linked to ``doctrine_name`` under ``motd_name``.
@@ -7128,7 +7193,8 @@ class FCToolGUI:
 
     def _create_doctrine_from_motd(self, raw, fittings):
         """Create a new doctrine from an imported MOTD: import its linked fits
-        (TAGLESS), and save the imported MOTD as a doctrine-linked saved MOTD.
+        (TAGLESS), and POPULATE the live builder fields from it (it does NOT save
+        a doctrine-linked MOTD — the user creates those via 'Link to doctrine').
 
         ``raw`` is the imported MOTD markup (already loaded into the header var
         by the import path). ``fittings`` is the list of ``{dna, name}`` dicts
@@ -7222,22 +7288,9 @@ class FCToolGUI:
         if getattr(self, "_motd_intro", None) is not None:
             self._motd_intro.set_markup("")
 
-        # NOW capture the (fully-populated) fields into a doctrine-linked saved
-        # MOTD so a later load restores staging/channel/fits.
-        data = self._capture_motd_fields()
-        data["name"] = name
-        data["doctrine"] = name
-        fit_cfg = self.config.setdefault("fittings", {})
-        saved = fit_cfg.get("saved_motds")
-        if not isinstance(saved, list):
-            saved = []
-            fit_cfg["saved_motds"] = saved
-        saved.append(data)
-        self._save_config()
-
-        # Reflect the new linked MOTD in the dropdown + rebuild the preview from
-        # the populated fields (no longer the verbatim raw markup).
-        self._motd_refresh_saved_dropdown()
+        # Do NOT auto-save a doctrine-linked MOTD here — the user creates linked
+        # MOTDs explicitly via "Link to doctrine". Just rebuild the preview from the
+        # populated fields so the imported content is visible and editable.
         self._rebuild_motd_preview()
         try:
             self._refresh_fit_list(self._fit_search_var.get())
@@ -7321,8 +7374,12 @@ class FCToolGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_motd_scanned_channels(self, names):
-        """Apply channel-scan results on the Tk thread: update the entry's
-        completion pool and the status line."""
+        """Apply channel-scan results on the Tk thread: cache the discovered
+        names (shared with the intel cache), update the entry's completion pool,
+        and the status line."""
+        ic = self.config.setdefault("intel_channels", {})
+        ic["cached_discovered"] = list(names)
+        self._save_config()
         entry = getattr(self, "_motd_channel_entry", None)
         if entry is not None:
             try:
@@ -8007,11 +8064,13 @@ class FCToolGUI:
         self._rebuild_motd_preview()
 
         # Primary offer: build a new doctrine from this MOTD — import its linked
-        # fits (tagless) and save it as a doctrine-linked MOTD.
+        # fits (tagless) and populate the builder. It does NOT save a linked
+        # MOTD; the user creates those explicitly via "Link to doctrine".
         if messagebox.askyesno(
                 "Create doctrine?",
-                "Create a new doctrine from this MOTD — import its linked fits "
-                "and save it as a linked MOTD?"):
+                "Create a new doctrine from this MOTD and import its linked "
+                "fits? (You can save it as a linked MOTD afterwards via "
+                "'Link to doctrine'.)"):
             result = self._create_doctrine_from_motd(raw, fittings)
             if result is not None:
                 _did, name, added, reused, failed = result
@@ -8020,7 +8079,7 @@ class FCToolGUI:
                     f"Created doctrine '{name}' with "
                     f"{added + reused} fit(s) ({added} new, {reused} reused"
                     + (f", {failed} unparsable" if failed else "")
-                    + ").\nSaved as a linked MOTD.")
+                    + ").")
         # Fallback: still let the user import the embedded fits into the library
         # without creating a doctrine.
         elif fittings and messagebox.askyesno(
