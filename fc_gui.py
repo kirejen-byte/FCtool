@@ -8002,43 +8002,56 @@ class FCToolGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_pyfa_picker(self, db_path, fits):
-        """Checkbox multi-select picker over pyfa fits with bulk import.
+    def _show_multi_select_picker(self, items, on_import, *, title,
+                                  window_size=(540, 600), extra_buttons=None):
+        """Generic searchable + multi-select checkbox picker.
 
-        Scales to hundreds of fits: one persistent BooleanVar per fit (keyed by
-        fit_id) so a search filters which rows are *visible* without losing
-        checked state, and bulk import runs off the Tk thread with a single
-        save() at the end and content-hash de-dupe against the library.
+        Shared by the pyfa and ESI import flows so both have the identical
+        layout: a search box that filters which rows are *visible* without
+        touching checked state, a toolbar with a live "(N selected)" count and
+        Select all/none (over the visible/filtered rows), a scrollable list of
+        one tk.Checkbutton per item (persistent BooleanVar keyed by item id,
+        default UNCHECKED), and a bottom row of Import selected / Import all /
+        Cancel.
+
+        Parameters
+        ----------
+        items : list[dict]
+            Each dict is ``{"id": <unique hashable>, "label": <display str>,
+            "row_data": <opaque>}``. The label already encodes ship + name and
+            is what search matches against (lowercased).
+        on_import : callable
+            ``on_import(chosen_items, ctl)`` is invoked when the user clicks
+            Import selected (the checked items) or Import all (every item).
+            ``ctl`` is a tiny controller the callback uses to drive progress
+            and closing; the callback owns its own threading and MUST call
+            ``ctl.close()`` when finished.
+        title : str
+            Window title (also used to label the picker).
+        window_size : (int, int)
+            Initial window geometry.
+        extra_buttons : list[(str, callable)] | None
+            Optional ``(label, command)`` tuples appended to the toolbar. Each
+            command is called with the controller, e.g.
+            ``lambda ctl: (ctl.close(), self._set_pyfa_folder())``.
         """
         win = tk.Toplevel(self.root)
-        win.title("Import from pyfa")
+        win.title(title)
         win.configure(bg=BG_DARK)
-        win.geometry("540x600")
+        win.geometry(f"{window_size[0]}x{window_size[1]}")
         try:
             win.transient(self.root)
         except tk.TclError:
             pass
 
-        # Resolve each fit's ship class name once (local bundled SDE lookup) so
-        # the picker shows "ShipClass — FitName" (ship first) and is searchable
-        # by either. Then group by ship class, then fit name.
-        for f in fits:
-            if "ship_name" not in f:
-                try:
-                    f["ship_name"] = self.type_catalog.resolve_name(
-                        f.get("ship_type_id")) or ""
-                except Exception:
-                    f["ship_name"] = ""
-        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
-                                 (f.get("name") or "").lower()))
-
-        # Persistent checked-state vars keyed by fit_id, so filtering never
+        # Persistent checked-state vars keyed by item id, so filtering never
         # drops a selection. Built once and reused for the window's lifetime.
         check_vars: dict = {}
-        for f in fits:
-            check_vars[f["fit_id"]] = tk.BooleanVar(value=False)
+        for it in items:
+            check_vars[it["id"]] = tk.BooleanVar(value=False)
 
-        tk.Label(win, text="Select fits to import (search by ship or fit name):",
+        tk.Label(win,
+                 text="Select fits to import (search by ship or fit name):",
                  font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
         search_var = tk.StringVar()
@@ -8058,9 +8071,9 @@ class FCToolGUI:
         # them off-screen (Tk pack gives prior siblings their space first).
         btns = tk.Frame(win, bg=BG_DARK)
         btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
-        progress = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
-                            bg=BG_DARK, anchor=tk.W)
-        progress.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                          bg=BG_DARK, anchor=tk.W)
+        status.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
 
         # Scrollable frame of checkbuttons (reuse the canvas+scrollbar pattern).
         body = tk.Frame(win, bg=BG_DARK)
@@ -8084,39 +8097,34 @@ class FCToolGUI:
             import_sel_btn.config(text=f"Import selected ({n})")
 
         # Build every checkbutton once; filtering only re-packs the visible set.
-        row_widgets: list = []   # (fit_dict, checkbutton)
-        for f in fits:
-            ship = f.get("ship_name") or "?"
-            fit_name = f.get("name") or "?"
-            label = f"{ship}  —  {fit_name}"
+        row_widgets: list = []   # (item_dict, checkbutton)
+        for it in items:
             cb = tk.Checkbutton(
-                inner, text=label, variable=check_vars[f["fit_id"]],
+                inner, text=it["label"], variable=check_vars[it["id"]],
                 font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
                 selectcolor=BG_ENTRY, activebackground=BG_PANEL,
                 activeforeground=FG_WHITE, anchor=tk.W, highlightthickness=0,
                 command=_update_count)
-            row_widgets.append((f, cb))
+            row_widgets.append((it, cb))
 
-        # Track which fits are currently visible (for select-all over filter).
-        visible_fits: list = []
+        # Track which items are currently visible (for select-all over filter).
+        visible_items: list = []
 
         def _repopulate(*_a):
             needle = search_var.get().strip().lower()
-            visible_fits.clear()
-            for f, cb in row_widgets:
-                ship = f.get("ship_name") or "?"
-                fit_name = f.get("name") or "?"
-                if needle and needle not in f"{ship} {fit_name}".lower():
+            visible_items.clear()
+            for it, cb in row_widgets:
+                if needle and needle not in it["label"].lower():
                     cb.pack_forget()
                     continue
                 cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
-                visible_fits.append(f)
+                visible_items.append(it)
             canvas.configure(scrollregion=canvas.bbox("all"))
         search_var.trace_add("write", _repopulate)
 
         def _select_all():
-            for f in visible_fits:
-                check_vars[f["fit_id"]].set(True)
+            for it in visible_items:
+                check_vars[it["id"]].set(True)
             _update_count()
 
         def _select_none():
@@ -8128,22 +8136,106 @@ class FCToolGUI:
                    command=_select_all).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Select none", style="Dark.TButton",
                    command=_select_none).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="Change pyfa folder…", style="Dark.TButton",
-                   command=lambda: (win.destroy(),
-                                    self._set_pyfa_folder())).pack(side=tk.LEFT,
-                                                                   padx=4)
 
-        # ── Bulk import (threaded, single save, de-dupe) ──────────────────────
-        def _run_bulk_import(chosen):
+        # ── Controller handed to the import callback ──────────────────────────
+        class _Controller:
+            """Minimal surface the callback drives during import."""
+
+            def __init__(self, app, window, status_label, action_btns):
+                self.root = app.root
+                self._window = window
+                self._status = status_label
+                self._action_btns = action_btns
+
+            def set_status(self, text):
+                try:
+                    self._status.config(text=text, fg=FG_ACCENT)
+                except tk.TclError:
+                    pass
+
+            def disable(self):
+                for b in self._action_btns:
+                    try:
+                        b.config(state=tk.DISABLED)
+                    except tk.TclError:
+                        pass
+
+            def close(self):
+                try:
+                    self._window.destroy()
+                except tk.TclError:
+                    pass
+
+        def _import_selected():
+            chosen = [it for it in items if check_vars[it["id"]].get()]
             if not chosen:
                 return
-            # Disable the action buttons for the duration of the batch.
-            for b in (import_sel_btn, import_all_btn, cancel_btn):
-                b.config(state=tk.DISABLED)
-            progress.config(text=f"Importing 0/{len(chosen)}…", fg=FG_ACCENT)
+            on_import(chosen, ctl)
 
-            def _set_progress(i, total):
-                progress.config(text=f"Importing {i}/{total}…", fg=FG_ACCENT)
+        def _import_all():
+            on_import(list(items), ctl)
+
+        cancel_btn = ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                                command=win.destroy)
+        cancel_btn.pack(side=tk.RIGHT)
+        import_all_btn = ttk.Button(btns, text="Import all", style="Dark.TButton",
+                                    command=_import_all)
+        import_all_btn.pack(side=tk.RIGHT, padx=4)
+        import_sel_btn = ttk.Button(btns, text="Import selected (0)",
+                                    style="Green.TButton",
+                                    command=_import_selected)
+        import_sel_btn.pack(side=tk.RIGHT, padx=4)
+
+        ctl = _Controller(self, win,
+                          status, (import_sel_btn, import_all_btn, cancel_btn))
+
+        # Extra toolbar buttons (e.g. "Change pyfa folder…") get the controller.
+        for label, command in (extra_buttons or []):
+            ttk.Button(toolbar, text=label, style="Dark.TButton",
+                       command=(lambda c=command: c(ctl))).pack(side=tk.LEFT,
+                                                                padx=4)
+
+        _repopulate()
+        _update_count()
+
+    def _show_pyfa_picker(self, db_path, fits):
+        """Searchable, multi-select picker over pyfa fits with bulk import.
+
+        Scales to hundreds of fits via the shared multi-select picker: one
+        persistent BooleanVar per fit so a search filters which rows are
+        *visible* without losing checked state, and bulk import runs off the Tk
+        thread with a single save() at the end and content-hash de-dupe against
+        the library.
+        """
+        # Resolve each fit's ship class name once (local bundled SDE lookup) so
+        # the picker shows "ShipClass — FitName" (ship first) and is searchable
+        # by either. Then group by ship class, then fit name.
+        for f in fits:
+            if "ship_name" not in f:
+                try:
+                    f["ship_name"] = self.type_catalog.resolve_name(
+                        f.get("ship_type_id")) or ""
+                except Exception:
+                    f["ship_name"] = ""
+        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
+                                 (f.get("name") or "").lower()))
+
+        items = []
+        for f in fits:
+            ship = f.get("ship_name") or "?"
+            fit_name = f.get("name") or "?"
+            items.append({
+                "id": f["fit_id"],
+                "label": f"{ship}  —  {fit_name}",
+                "row_data": f,
+            })
+
+        # ── Bulk import (threaded, single save, de-dupe) ──────────────────────
+        def _on_import(chosen, ctl):
+            if not chosen:
+                return
+            ctl.disable()
+            ctl.set_status(f"Importing 0/{len(chosen)}…")
 
             def worker():
                 total = len(chosen)
@@ -8156,7 +8248,8 @@ class FCToolGUI:
                         existing.add(fit_models.fit_content_hash(ef.parsed))
                     except Exception:
                         pass
-                for i, entry in enumerate(chosen, start=1):
+                for i, item in enumerate(chosen, start=1):
+                    entry = item["row_data"]
                     try:
                         parsed = pyfa_import.read_pyfa_fit(
                             db_path, entry["fit_id"], self.type_catalog)
@@ -8191,7 +8284,8 @@ class FCToolGUI:
                         failed += 1
                     # Per-fit save would be O(n^2); update progress occasionally.
                     if i % 5 == 0 or i == total:
-                        self.root.after(0, _set_progress, i, total)
+                        self.root.after(
+                            0, ctl.set_status, f"Importing {i}/{total}…")
                 self.root.after(0, _done, imported, skipped, failed)
 
             def _done(imported, skipped, failed):
@@ -8205,7 +8299,7 @@ class FCToolGUI:
                     self._refresh_fit_list(self._fit_search_var.get())
                 except Exception:
                     pass
-                win.destroy()
+                ctl.close()
                 messagebox.showinfo(
                     "pyfa import",
                     f"Imported {imported}, skipped {skipped} duplicate(s), "
@@ -8213,26 +8307,10 @@ class FCToolGUI:
 
             threading.Thread(target=worker, daemon=True).start()
 
-        def _import_selected():
-            chosen = [f for f in fits if check_vars[f["fit_id"]].get()]
-            _run_bulk_import(chosen)
-
-        def _import_all():
-            _run_bulk_import(list(fits))
-
-        cancel_btn = ttk.Button(btns, text="Cancel", style="Dark.TButton",
-                                command=win.destroy)
-        cancel_btn.pack(side=tk.RIGHT)
-        import_all_btn = ttk.Button(btns, text="Import all", style="Dark.TButton",
-                                    command=_import_all)
-        import_all_btn.pack(side=tk.RIGHT, padx=4)
-        import_sel_btn = ttk.Button(btns, text="Import selected (0)",
-                                    style="Green.TButton",
-                                    command=_import_selected)
-        import_sel_btn.pack(side=tk.RIGHT, padx=4)
-
-        _repopulate()
-        _update_count()
+        self._show_multi_select_picker(
+            items, on_import=_on_import, title="Import from pyfa",
+            extra_buttons=[("Change pyfa folder…",
+                            lambda ctl: (ctl.close(), self._set_pyfa_folder()))])
 
     def _import_esi_fittings(self):
         """Import the active character's in-game fittings via ESI (threaded),
@@ -8293,72 +8371,101 @@ class FCToolGUI:
                     "Import from EVE",
                     "No in-game fittings found for this character.")
                 return
-            self._show_esi_import_checklist(entries)
+            self._show_esi_import_picker(entries)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_esi_import_checklist(self, entries):
-        """Checklist of ESI fittings to import; adds the checked ones."""
-        win = tk.Toplevel(self.root)
-        win.title("Import from EVE")
-        win.configure(bg=BG_DARK)
-        win.geometry("460x480")
-        try:
-            win.transient(self.root)
-        except tk.TclError:
-            pass
+    def _show_esi_import_picker(self, entries):
+        """Searchable, multi-select picker over ESI in-game fittings.
 
-        tk.Label(win, text="Select fittings to import:", font=("Consolas", 10),
-                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 4))
+        Uses the shared multi-select picker (same layout as the pyfa flow):
+        ship-first labels, search + checkboxes with preserved state, content-
+        hash de-dupe against the library, and a single save() at the end.
+        """
+        items = []
+        for i, entry in enumerate(entries):
+            ship = entry.get("ship_name") or ""
+            name = entry.get("name") or "?"
+            label = f"{ship}  —  {name}" if ship else name
+            items.append({"id": i, "label": label, "row_data": entry})
 
-        canvas = tk.Canvas(win, bg=BG_PANEL, highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True, padx=12)
-        sb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
-        inner = tk.Frame(canvas, bg=BG_PANEL)
-        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(_win, width=e.width))
-        self._register_scroll_canvas(canvas)
+        def _on_import(chosen, ctl):
+            if not chosen:
+                return
+            ctl.disable()
+            ctl.set_status(f"Importing 0/{len(chosen)}…")
 
-        vars_ = []
-        for entry in entries:
-            v = tk.BooleanVar(value=True)
-            vars_.append((v, entry))
-            label = entry["name"]
-            if entry.get("ship_name"):
-                label += f"  ({entry['ship_name']})"
-            cb = tk.Checkbutton(
-                inner, text=label, variable=v, font=("Consolas", 9),
-                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
-                activebackground=BG_PANEL, activeforeground=FG_WHITE,
-                anchor=tk.W, highlightthickness=0)
-            cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+            def worker():
+                total = len(chosen)
+                imported = skipped = failed = 0
+                # De-dupe: collect existing content hashes up front so re-runs
+                # are idempotent (parity with the pyfa flow).
+                existing = set()
+                for ef in self.fittings.list_fits():
+                    try:
+                        existing.add(fit_models.fit_content_hash(ef.parsed))
+                    except Exception:
+                        pass
+                for i, item in enumerate(chosen, start=1):
+                    entry = item["row_data"]
+                    try:
+                        parsed = entry["parsed"]
+                        h = fit_models.fit_content_hash(parsed)
+                        if h in existing:
+                            skipped += 1
+                        else:
+                            name = (entry.get("name") or parsed.name_hint
+                                    or parsed.ship_name or "Fit")
+                            try:
+                                dna = fit_dna.to_dna(parsed)
+                            except Exception:
+                                dna = ""
+                            fit = fit_models.Fit(
+                                id="",
+                                name=name,
+                                hull_type_id=parsed.ship_type_id,
+                                hull_name=parsed.ship_name or "",
+                                source="esi",
+                                raw_text="",
+                                parsed=parsed,
+                                dna=dna,
+                                notes="",
+                                esi_fitting_ids={},
+                                created="",
+                                modified="",
+                            )
+                            self.fittings.add_fit(fit)
+                            existing.add(h)
+                            imported += 1
+                    except Exception:
+                        failed += 1
+                    if i % 5 == 0 or i == total:
+                        self.root.after(
+                            0, ctl.set_status, f"Importing {i}/{total}…")
+                self.root.after(0, _done, imported, skipped, failed)
 
-        def _do_import():
-            added = 0
-            for v, entry in vars_:
-                if not v.get():
-                    continue
-                parsed = entry["parsed"]
-                name = entry["name"]
-                if self._add_parsed_fit(parsed, source="esi", raw_text="",
-                                        name=name) is not None:
-                    added += 1
-            win.destroy()
-            if added:
+            def _done(imported, skipped, failed):
+                # Single save at the very end (one disk write for the batch).
+                try:
+                    self.fittings.save()
+                except Exception as e:
+                    messagebox.showerror("Import failed",
+                                         f"Could not save imported fits:\n{e}")
+                try:
+                    self._refresh_fit_list(self._fit_search_var.get())
+                except Exception:
+                    pass
+                ctl.close()
                 messagebox.showinfo(
                     "Import from EVE",
-                    f"Imported {added} fitting(s).")
+                    f"Imported {imported}, skipped {skipped} duplicate(s), "
+                    f"{failed} failed.")
 
-        btns = tk.Frame(win, bg=BG_DARK)
-        btns.pack(fill=tk.X, padx=12, pady=12)
-        ttk.Button(btns, text="Import selected", style="Green.TButton",
-                   command=_do_import).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="Cancel", style="Dark.TButton",
-                   command=win.destroy).pack(side=tk.RIGHT)
+            threading.Thread(target=worker, daemon=True).start()
+
+        self._show_multi_select_picker(
+            items, on_import=_on_import,
+            title="Import from EVE (in-game fittings)")
 
     def _push_fit_to_eve(self, fit, char):
         """Push a fit to a character's in-game Fittings via the store wrapper
