@@ -5866,14 +5866,29 @@ class FCToolGUI:
         tree = getattr(self, "_doctrine_tree", None)
         if tree is None:
             return
+        # Red foreground for doctrines that have any untagged fit, + a hover
+        # tooltip (bound once).
+        tree.tag_configure("warn", foreground=FG_RED)
+        if not getattr(self, "_doctrine_tree_motion_bound", False):
+            tree.bind("<Motion>", self._on_doctrine_tree_motion, add="+")
+            tree.bind("<Leave>", lambda e: self._hide_tooltip(), add="+")
+            self._doctrine_tree_motion_bound = True
         prev = self._doctrine_selected_id
         for iid in tree.get_children():
             tree.delete(iid)
+        self._doctrine_warn = {}
         restored = False
         for doc in sorted(self.fittings.list_doctrines(),
                           key=lambda d: (d.name or "").lower()):
+            # Warn when the doctrine has members and at least one carries no tags
+            # (such fits can't be selected by role for the MOTD).
+            warn = bool(doc.members) and any(
+                not (m.tags or []) for m in doc.members)
+            self._doctrine_warn[doc.id] = warn
+            display = f"⚠  {doc.name}" if warn else doc.name
             tree.insert("", tk.END, iid=doc.id,
-                        values=(doc.name, len(doc.members)))
+                        values=(display, len(doc.members)),
+                        tags=("warn",) if warn else ())
             if doc.id == prev:
                 restored = True
         if restored:
@@ -5882,6 +5897,22 @@ class FCToolGUI:
             # Selected doctrine was deleted — clear the detail pane.
             self._doctrine_selected_id = None
             self._show_doctrine_detail(None)
+
+    def _on_doctrine_tree_motion(self, event):
+        """Show a warning tooltip while hovering a doctrine that has untagged
+        fits (re-shown only when the hovered row changes, to avoid flicker)."""
+        tree = self._doctrine_tree
+        row = tree.identify_row(event.y)
+        if getattr(self, "_doctrine_warn", {}).get(row):
+            if row != getattr(self, "_doctrine_warn_hover", None):
+                self._doctrine_warn_hover = row
+                self._show_tooltip(
+                    event,
+                    "Some fits without tags assigned — MOTD function may not "
+                    "work properly.")
+        else:
+            self._doctrine_warn_hover = None
+            self._hide_tooltip()
 
     def _on_doctrine_select(self, event=None):
         tree = self._doctrine_tree
@@ -6206,11 +6237,15 @@ class FCToolGUI:
         def _on_import(chosen, ctl):
             if not chosen:
                 return
-            # Prompt tags ONCE; the same chosen tags apply to every selected
-            # fit (this is a bulk add).
+            # Prompt tags ONCE. Any chosen tags apply to every selected fit;
+            # leaving them all UNCHECKED adds the fits TAGLESS so you can tag
+            # each one individually afterwards (per-fit "Tags" in the doctrine
+            # detail). Cancel aborts the add entirely.
             tags = self._prompt_tag_multiselect(
                 "Tags for these fits",
-                "Choose tags to apply to all selected fits in this doctrine:",
+                "Optional: choose tags to apply to ALL selected fits.\n"
+                "Leave everything unchecked to add them WITHOUT tags — you can "
+                "tag each fit individually later.",
                 selected=[])
             if tags is None:
                 return
@@ -11412,14 +11447,33 @@ $bmp.Dispose()
                          borderwidth=1, relief=tk.SOLID, padx=4, pady=2,
                          wraplength=420, justify=tk.LEFT)
         label.pack()
-        # Measure the laid-out popup, then clamp its top-left so the full
-        # tooltip stays within the screen bounds.
+        # Measure the laid-out popup, then clamp its top-left to the full
+        # VIRTUAL desktop (all monitors), not just the primary screen —
+        # winfo_screenwidth/height report only the primary monitor, which would
+        # yank a tooltip back onto screen 1 when the app is on screen 2.
         tip.update_idletasks()
-        x = max(0, min(event.x_root + 12,
-                       self.root.winfo_screenwidth() - tip.winfo_width() - 8))
-        y = max(0, min(event.y_root + 12,
-                       self.root.winfo_screenheight() - tip.winfo_height() - 8))
+        x0, y0, x1, y1 = self._virtual_screen_bounds()
+        x = max(x0, min(event.x_root + 12, x1 - tip.winfo_width() - 8))
+        y = max(y0, min(event.y_root + 12, y1 - tip.winfo_height() - 8))
         tip.wm_geometry(f"+{x}+{y}")
+
+    def _virtual_screen_bounds(self):
+        """Return (x0, y0, x1, y1) of the full virtual desktop spanning every
+        monitor. On Windows this uses the SM_*VIRTUALSCREEN metrics so popups
+        can sit on a secondary screen; elsewhere (or on failure) it falls back
+        to the primary screen reported by Tk."""
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                gsm = ctypes.windll.user32.GetSystemMetrics
+                x0, y0 = gsm(76), gsm(77)          # SM_X/Y VIRTUALSCREEN
+                x1, y1 = x0 + gsm(78), y0 + gsm(79)  # + SM_CX/CY VIRTUALSCREEN
+                if x1 > x0 and y1 > y0:
+                    return x0, y0, x1, y1
+        except Exception:
+            pass
+        return (0, 0, self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight())
 
     def _hide_tooltip(self):
         """Hide the current tooltip."""
