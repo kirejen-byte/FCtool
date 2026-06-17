@@ -656,7 +656,7 @@ class FCToolGUI:
         except Exception:
             pass
 
-        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry']:
+        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_motd_staging_entry']:
             widget = getattr(self, attr, None)
             if widget and hasattr(widget, 'update_completions'):
                 widget.update_completions(all_names, labels)
@@ -5710,6 +5710,26 @@ class FCToolGUI:
         self._build_fittings_subtab()     # Task 5.2/5.3 — full implementation
         self._build_doctrines_subtab()    # Phase 6 — placeholder
         self._build_motd_subtab()         # Phase 7 — placeholder
+        # Refresh the MOTD dropdowns whenever its sub-tab is shown so doctrines
+        # created/imported after this tab was built still appear there.
+        self._fitting_subnb.bind(
+            "<<NotebookTabChanged>>", self._on_fitting_subnb_changed)
+
+    def _on_fitting_subnb_changed(self, event=None):
+        """Inner sub-notebook tab changed: when the MOTD sub-tab becomes the
+        selected one, refresh its doctrine + FC dropdowns so they reflect the
+        current library (the MOTD tab is built once, but doctrines/characters
+        can change after that). Detected by tab TEXT, never a hardcoded index."""
+        nb = getattr(self, "_fitting_subnb", None)
+        if nb is None:
+            return
+        try:
+            text = nb.tab(nb.select(), "text") or ""
+        except tk.TclError:
+            return
+        if "MOTD" in text:
+            self._motd_refresh_doctrines()
+            self._motd_refresh_fc_choices()
 
     # ── Doctrines sub-tab (Tasks 6.1 / 6.2) ───────────────────────────────────
 
@@ -5998,6 +6018,7 @@ class FCToolGUI:
         self.fittings.save()
         self._doctrine_selected_id = did
         self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
         self._refresh_fit_list(self._fit_search_var.get())
         self._show_doctrine_detail(did)
 
@@ -6046,6 +6067,7 @@ class FCToolGUI:
         if self._doctrine_selected_id == doctrine_id:
             self._doctrine_selected_id = None
         self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
         self._refresh_fit_list(self._fit_search_var.get())
         self._show_doctrine_detail(None)
 
@@ -6108,6 +6130,7 @@ class FCToolGUI:
         # Refresh both the doctrine list and the fittings list (new fits may
         # have been added to the library).
         self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
         self._refresh_fit_list(self._fit_search_var.get())
         self._show_doctrine_detail(self._doctrine_selected_id)
         messagebox.showinfo(
@@ -6192,6 +6215,7 @@ class FCToolGUI:
             self.fittings.add_fit_to_doctrine(doctrine_id, fit.id, tags)
             self.fittings.save()
             self._refresh_doctrine_list()
+            self._motd_refresh_doctrines()
             self._refresh_fit_list(self._fit_search_var.get())
             self._show_doctrine_detail(doctrine_id)
 
@@ -6296,6 +6320,7 @@ class FCToolGUI:
                 self._refresh_doctrine_list()
                 if self._doctrine_selected_id == doctrine.id:
                     self._show_doctrine_detail(doctrine.id)
+            self._motd_refresh_doctrines()
             self._refresh_fit_list(self._fit_search_var.get())
             self._show_fit_detail(fit_id)
 
@@ -6501,6 +6526,35 @@ class FCToolGUI:
         self._motd_fc_combo.pack(fill=tk.X, padx=8)
         self._motd_fc_combo.bind(
             "<<ComboboxSelected>>", lambda e: self._on_motd_fc_change())
+
+        # Staging system (optional, checkbox-gated). Defaults to the FC's
+        # configured staging system (zkillboard.staging_system, a system NAME);
+        # the box is pre-checked when one is configured. Produces an in-game
+        # SYSTEM link in the MOTD. Mirrors the logi/cap channel row below.
+        _default_staging = self.config.get("zkillboard", {}).get(
+            "staging_system", "") or ""
+        self._motd_staging_enabled = tk.BooleanVar(
+            value=bool(_default_staging.strip()))
+        self._motd_staging_var = tk.StringVar(value=_default_staging)
+        st_chk = tk.Checkbutton(
+            inputs, text="Include staging system",
+            variable=self._motd_staging_enabled,
+            font=("Consolas", 9, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            activebackground=BG_PANEL, activeforeground=FG_ACCENT,
+            selectcolor=BG_ENTRY, anchor=tk.W,
+            command=self._schedule_motd_preview)
+        st_chk.pack(anchor=tk.W, padx=6, pady=(10, 2))
+        self._motd_staging_entry = AutocompleteEntry(
+            inputs, list(getattr(self, "_system_names", []) or []),
+            labels=dict(getattr(self, "_system_labels", {}) or {}),
+            textvariable=self._motd_staging_var,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE)
+        self._motd_staging_entry.pack(fill=tk.X, padx=8)
+        # The StringVar trace covers both typed and programmatic changes; no
+        # separate <KeyRelease> binding needed (and AutocompleteEntry owns it).
+        self._motd_staging_var.trace_add(
+            "write", lambda *a: self._schedule_motd_preview())
 
         # Logi / cap channel: AutocompleteEntry + Scan.
         _lbl(inputs, "LOGI / CAP CHANNEL").pack(anchor=tk.W, padx=8, pady=(10, 2))
@@ -6808,7 +6862,11 @@ class FCToolGUI:
         return fits_by_tag
 
     def _current_motd_markup(self):
-        """Build the MOTD markup string from the current input selections."""
+        """Build the MOTD markup string from the current input selections.
+
+        Side effect: sets ``self._motd_staging_warn`` to a non-blocking warning
+        string (or "") describing an unresolvable staging system, which
+        :meth:`_rebuild_motd_preview` folds into the warnings line."""
         doctrine = self._motd_selected_doctrine()
         fits_by_tag = self._motd_build_fits_by_tag(doctrine)
 
@@ -6818,6 +6876,27 @@ class FCToolGUI:
 
         channel = (self._motd_channel_entry.get().strip()
                    if getattr(self, "_motd_channel_entry", None) else "")
+
+        # Optional staging system → in-game SYSTEM link. Only when the checkbox
+        # is on and the entry resolves to a real system; otherwise warn (non-
+        # blocking) and omit the line. resolve_name is a pure local lookup.
+        self._motd_staging_warn = ""
+        staging_name = None
+        staging_system_id = None
+        if (getattr(self, "_motd_staging_enabled", None) is not None
+                and self._motd_staging_enabled.get()):
+            raw = (self._motd_staging_var.get() or "").strip()
+            if raw:
+                import system_coords
+                sid = system_coords.resolve_name(raw)
+                if sid is not None:
+                    staging_name = raw
+                    staging_system_id = sid
+                else:
+                    self._motd_staging_warn = (
+                        f"Staging system '{raw}' did not resolve to a known "
+                        f"system — the staging line was omitted.")
+
         return motd_builder.build_motd(
             fc_name=fc_name,
             fc_character_id=fc_cid,
@@ -6826,6 +6905,8 @@ class FCToolGUI:
             channel=channel or None,
             header=self._motd_header_var.get(),
             footer=self._motd_footer_var.get(),
+            staging_name=staging_name,
+            staging_system_id=staging_system_id,
         )
 
     def _motd_budget(self) -> int:
@@ -6879,6 +6960,9 @@ class FCToolGUI:
 
         # Non-blocking warnings.
         warns = []
+        staging_warn = getattr(self, "_motd_staging_warn", "")
+        if staging_warn:
+            warns.append(staging_warn)
         if length >= budget:
             warns.append(f"Over budget by {length - budget} chars — the server "
                          f"may truncate this MOTD.")
@@ -7164,6 +7248,9 @@ class FCToolGUI:
                            if getattr(self, "_motd_channel_entry", None) else "")
         tmpl["doctrine"] = self._motd_doctrine_var.get()
         tmpl["fc"] = self._motd_fc_var.get()
+        if getattr(self, "_motd_staging_enabled", None) is not None:
+            tmpl["staging_enabled"] = bool(self._motd_staging_enabled.get())
+            tmpl["staging"] = (self._motd_staging_var.get() or "").strip()
         # Persist the chosen channel to the dedicated config key too.
         fit_cfg["logi_channel"] = tmpl["channel"]
         self._save_config()
@@ -7189,6 +7276,15 @@ class FCToolGUI:
             self._motd_fc_var.set(fc)
         self._motd_header_var.set(tmpl.get("header", "") or "")
         self._motd_footer_var.set(tmpl.get("footer", "") or "")
+
+        # Staging: only override the construction defaults when the template
+        # actually persisted these keys, so a fresh template keeps the FC's
+        # configured staging system (set when the widgets were built).
+        if "staging" in tmpl and getattr(self, "_motd_staging_var", None):
+            self._motd_staging_var.set(tmpl.get("staging", "") or "")
+        if ("staging_enabled" in tmpl
+                and getattr(self, "_motd_staging_enabled", None) is not None):
+            self._motd_staging_enabled.set(bool(tmpl.get("staging_enabled")))
 
         channel = tmpl.get("channel") or fit_cfg.get("logi_channel", "") or ""
         entry = getattr(self, "_motd_channel_entry", None)

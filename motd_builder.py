@@ -64,6 +64,18 @@ def char_link(character_id: int, name: str, type_id: int = CHAR_SHOWINFO_TYPE_ID
     return f"<url=showinfo:{type_id}//{character_id}>{name}</url>"
 
 
+def system_link(system_id: int, name: str) -> str:
+    """Build a showinfo link to a solar system.
+
+    Type id ``5`` is EVE's Solar System typeID, so the client opens the system
+    info window on click::
+
+        system_link(30000142, "Jita")
+        -> "<url=showinfo:5//30000142>Jita</url>"
+    """
+    return f"<url=showinfo:5//{system_id}>{name}</url>"
+
+
 def channel_text(name: str, channel_id: int | None = None) -> str:
     """Render a chat channel name, clickable only when a numeric id is known.
 
@@ -95,6 +107,8 @@ def build_motd(
     channel: str | None = None,
     header: str = "",
     footer: str = "",
+    staging_name: str | None = None,
+    staging_system_id: int | None = None,
 ) -> str:
     """Compose a fleet MOTD from a doctrine's fits.
 
@@ -102,6 +116,9 @@ def build_motd(
 
     * optional ``header`` free text,
     * an FC line ``FC: <char_link>`` — omitted entirely when ``fc_name`` is None,
+    * an optional ``Staging: <system_link>`` line, emitted only when BOTH
+      ``staging_name`` and ``staging_system_id`` are provided (sits right after
+      the FC line and before the Doctrine line),
     * ``Doctrine: <name>`` with the name as plain text (no markup),
     * one labelled line per tag (``<Tag>: <fitting_link> | <fitting_link> …``),
       ordered by :data:`TAG_PRIORITY` then the caller's order, each ``(dna, name)``
@@ -119,6 +136,9 @@ def build_motd(
 
     if fc_name is not None and fc_character_id is not None:
         lines.append(f"FC: {char_link(fc_character_id, fc_name)}")
+
+    if staging_name is not None and staging_system_id is not None:
+        lines.append(f"Staging: {system_link(staging_system_id, staging_name)}")
 
     lines.append(f"Doctrine: {doctrine_name}")
 

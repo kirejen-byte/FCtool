@@ -1,9 +1,17 @@
-from motd_builder import fitting_link, char_link, channel_text, estimate_length, MOTD_BUDGET_DEFAULT
+from motd_builder import (
+    fitting_link, char_link, channel_text, system_link, estimate_length,
+    MOTD_BUDGET_DEFAULT,
+)
 
 
 def test_fitting_link_is_self_contained_dna():
     link = fitting_link("12015:2185;5::", "Arty Muninn")
     assert link == "<url=fitting:12015:2185;5::>Arty Muninn</url>"
+
+
+def test_system_link_uses_showinfo_type_5():
+    assert system_link(30000142, "Jita") == \
+        "<url=showinfo:5//30000142>Jita</url>"
 
 
 def test_char_link_uses_showinfo():
@@ -45,6 +53,39 @@ def test_build_motd_blank_fc_omits_fc_line():
     motd = build_motd(fc_name=None, fc_character_id=None, doctrine_name="D",
                       fits_by_tag={"DPS": [("670::", "Pod")]})
     assert "showinfo" not in motd
+
+
+def test_build_motd_staging_line_after_fc_before_doctrine():
+    motd = build_motd(
+        fc_name="Securitas Protector", fc_character_id=90000001,
+        doctrine_name="Shield HACs",
+        fits_by_tag={"DPS": [("12015:2185;5::", "Arty Muninn")]},
+        staging_name="Jita", staging_system_id=30000142)
+    assert "Staging: <url=showinfo:5//30000142>Jita</url>" in motd
+    # Staging sits between the FC line and the Doctrine line.
+    fc_idx = motd.index("FC: ")
+    staging_idx = motd.index("Staging: ")
+    doctrine_idx = motd.index("Doctrine: ")
+    assert fc_idx < staging_idx < doctrine_idx
+
+
+def test_build_motd_no_staging_when_absent():
+    motd = build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="D",
+        fits_by_tag={"DPS": [("670::", "Pod")]})
+    assert "Staging:" not in motd
+
+
+def test_build_motd_staging_omitted_when_only_one_arg():
+    # Both name and id are required; one alone is ignored entirely.
+    motd_name_only = build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="D",
+        fits_by_tag={"DPS": [("670::", "Pod")]}, staging_name="Jita")
+    motd_id_only = build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="D",
+        fits_by_tag={"DPS": [("670::", "Pod")]}, staging_system_id=30000142)
+    assert "Staging:" not in motd_name_only
+    assert "Staging:" not in motd_id_only
 
 
 from motd_builder import parse_motd
