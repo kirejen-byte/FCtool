@@ -181,3 +181,31 @@ def test_compute_guidance_no_live_fleet_unknown():
     rep = fg.compute_fleet_guidance(doc, get_fit, cat, {}, None, command_ship_fraction=0.0)
     assert rep.has_live_fleet is False
     assert all(f.current is None and f.status == "unknown" for f in rep.fits)
+
+
+def test_resolve_percent_blank_min_falls_through_to_dps_default():
+    # mode="percent" with a blank (None) min must NOT be treated as an authoritative
+    # override; it falls through to the DPS tag default and does not raise.
+    e = fg.resolve_composition_ideal(_mem(["DPS"], mode="percent", mn=None), links_range=None)
+    assert (e.mode, e.min, e.max, e.role) == ("percent", 50, 60, "DPS")
+
+def test_resolve_count_blank_min_falls_through_to_webs_default():
+    # mode="count" with a blank (None) min falls through to the Support - Webs default.
+    e = fg.resolve_composition_ideal(_mem(["Support - Webs"], mode="count", mn=None), links_range=None)
+    assert (e.mode, e.min, e.max, e.role) == ("count", 2, 6, "Support - Webs")
+
+def test_compute_guidance_percent_blank_min_uses_dps_default_live():
+    # End-to-end: a DPS member with ideal_mode="percent" but a blank (None) min must
+    # not raise against a live fleet; it uses the default 50-60% targets.
+    cat = _Cat(groups={})
+    fits = {"ret": _fit("ret", 17740, _parsed(17740, []))}
+    doc = _Doc([_mem2("ret", ["DPS"], mode="percent", mn=None)])
+    counts = {17740: 7}
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 20,
+                                    command_ship_fraction=0.0)
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["ret"].mode == "percent" and by["ret"].role == "DPS"
+    # 50-60% of 20 = 10-12 (via percent_to_pilots), current 7 -> under +3
+    assert by["ret"].target_min == fg.percent_to_pilots(50, 20) == 10
+    assert by["ret"].target_max == fg.percent_to_pilots(60, 20) == 12
+    assert by["ret"].status == "under" and by["ret"].delta == 3

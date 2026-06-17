@@ -107,10 +107,11 @@ def resolve_composition_ideal(member, links_range) -> EffectiveIdeal | None:
     mode = member.ideal_mode
     if mode == "off":
         return None
-    if mode in ("percent", "count"):
+    if mode in ("percent", "count") and member.ideal_min is not None:
         # Explicit override; min/max stored as-is (max may be None = no upper bound).
         return EffectiveIdeal(mode=mode, min=member.ideal_min, max=member.ideal_max, role=role)
-    # Unset -> tag default.
+    # Unset mode, or an explicit mode with a blank (None) min: fall through to the
+    # tag default for this role (Links -> computed range; else TAG_DEFAULTS).
     if role == "Links":
         if links_range is None:
             return None
@@ -123,6 +124,7 @@ def resolve_composition_ideal(member, links_range) -> EffectiveIdeal | None:
 
 
 def percent_to_pilots(pct, fleet_total) -> int:
+    # round() is half-to-even (banker's rounding); that's intentional for pilot targets.
     return int(round((pct / 100.0) * fleet_total))
 
 
@@ -234,6 +236,7 @@ def _rollup_by_role(fits, has_live) -> dict:
         tmin = sum(g.target_min for g in group)
         tmax = None if any(g.target_max is None for g in group) else sum(g.target_max for g in group)
         if has_live:
+            # g.current is guaranteed non-None inside the has_live branch, so this sum is safe.
             current = sum(g.current for g in group)
             status, delta = compute_delta(current, tmin, tmax)
         else:
