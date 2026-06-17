@@ -3700,6 +3700,25 @@ class FCToolGUI:
         )
         from zkill_monitor import resolve_name
 
+        # Cache this snapshot so a doctrine change can re-render without waiting
+        # for the next fleet poll (consumed by _refresh_specialized_roles_from_cache).
+        self._last_specialized_args = (members, ship_counts, total)
+
+        # Compute doctrine-driven guidance when a doctrine is active (Phase C).
+        self._fleet_guidance = None
+        doc = self._active_fleet_doctrine()
+        if doc is not None:
+            cmd = sum(c for tid, c in ship_counts.items()
+                      if tid in ship_classes.ALL_LINKS_COMMAND)
+            frac = (cmd / total) if total else 0.0
+            try:
+                self._fleet_guidance = fleet_guidance.compute_fleet_guidance(
+                    doc, self.fittings.get_fit, self.type_catalog,
+                    ship_counts, total, command_ship_fraction=frac)
+            except Exception as exc:
+                print(f"[Fleet] guidance compute failed: {exc}")
+                self._fleet_guidance = None
+
         # Rebuild the command-burst roster (lowercased pilot name -> ship_type_id)
         # so charge-up calls in fleet chat can be matched to booster ships. The
         # raw ESI member dicts carry character_id (not character_name), so resolve
@@ -3814,14 +3833,20 @@ class FCToolGUI:
             members_dict = categories[cat_key]
             threshold = thresholds.get(cat_key)
             sort_override = bridge_sort_key if cat_key == "bridge" else None
+            status_override = self._role_guidance_badge(cat_key)
             if cat_key == "links":
                 # Links is owned by _render_links_section so per-pilot booster
                 # charges + off-hull posters render (and collapse) inside it. It
                 # reads the _links_categories/_links_threshold cached just above.
+                # The guided badge is applied INSIDE _render_links_section (it
+                # also re-renders asynchronously from the booster refresh, which
+                # would clobber a badge we set here), so nothing to do here.
                 self._render_links_section()
             else:
                 self._populate_role_section(content, count_lbl, members_dict,
-                                            threshold=threshold, sort_override=sort_override)
+                                            threshold=threshold,
+                                            sort_override=sort_override,
+                                            status_override=status_override)
 
             # Log when a capped role reaches its threshold for the first time
             if threshold is not None:
@@ -3835,10 +3860,74 @@ class FCToolGUI:
                 elif count < threshold and cat_key in self._roles_filled:
                     self._roles_filled.discard(cat_key)
 
+        # DPS guidance summary line (Phase C).
+        rep = getattr(self, "_fleet_guidance", None)
+        lbl = getattr(self, "_dps_guidance_label", None)
+        if lbl is not None:
+            if rep is not None and "DPS" in rep.roles and rep.has_live_fleet:
+                rr = rep.roles["DPS"]
+                hi = "∞" if rr.target_max is None else str(rr.target_max)
+                if rr.delta == 0:
+                    badge = ""
+                elif rr.delta > 0:
+                    badge = f"+{rr.delta}"
+                else:
+                    badge = str(rr.delta)
+                if rr.status == "in":
+                    colour = FG_GREEN
+                elif rr.status == "under":
+                    colour = "#ff6666"
+                else:
+                    colour = FG_ORANGE
+                lbl.config(text=f"DPS: {rr.current} / {rr.target_min}-{hi} {badge}".strip(),
+                           fg=colour)
+            else:
+                lbl.config(text="", fg=FG_DIM)
+
+    # Panel role-section key -> doctrine rollup tag (Phase C guidance).
+    _ROLE_KEY_TO_TAG = {"links": "Links", "logi": "Logistics",
+                        "defenders": "Defenders", "webs": "Support - Webs"}
+
+    def _role_guidance_badge(self, role_key):
+        """Return (text, colour) for a guided role's count badge, or None to fall
+        back to the existing fixed-threshold rendering. Uses the active doctrine's
+        role rollup (current / target range + under/in/over status). For 'links',
+        returns None when the guidance suppressed links (high command-ship fraction)
+        so the fixed-threshold behaviour is kept."""
+        rep = getattr(self, "_fleet_guidance", None)
+        if rep is None:
+            return None
+        tag = self._ROLE_KEY_TO_TAG.get(role_key)
+        if not tag or tag not in rep.roles:
+            return None
+        if role_key == "links" and getattr(rep, "links_suppressed", False):
+            return None
+        rr = rep.roles[tag]
+        if not rep.has_live_fleet or rr.current is None:
+            # No live fleet: show the target range with no current/status.
+            hi = "∞" if rr.target_max is None else str(rr.target_max)
+            return (f"— / {rr.target_min}-{hi}", FG_DIM)
+        hi = "∞" if rr.target_max is None else str(rr.target_max)
+        if rr.delta == 0:
+            badge = ""
+        elif rr.delta > 0:
+            badge = f"+{rr.delta}"
+        else:
+            badge = str(rr.delta)  # already negative
+        if rr.status == "in":
+            colour = FG_GREEN
+        elif rr.status == "under":
+            colour = "#ff6666"
+        else:  # over
+            colour = FG_ORANGE
+        text = f"{rr.current} / {rr.target_min}-{hi} {badge}".strip()
+        return (text, colour)
+
     def _populate_role_section(self, content_frame, count_label, ship_members,
                                 threshold: int | None = None,
                                 sort_override: dict | None = None,
-                                rows_by_name: dict | None = None):
+                                rows_by_name: dict | None = None,
+                                status_override: tuple | None = None):
         """Populate a collapsible section with ship type counts and pilot details.
 
         ``rows_by_name`` (lowercased pilot name -> command_bursts.PilotRow) is
@@ -3861,12 +3950,17 @@ class FCToolGUI:
             widget.destroy()
 
         total = sum(len(pilots) for pilots in ship_members.values())
-        # Color the count based on threshold
-        if threshold is not None:
-            count_color = "#ff6666" if total < threshold else FG_GREEN
+        if status_override is not None:
+            # Doctrine guidance owns the badge (current / target range + status).
+            text, count_color = status_override
+            count_label.config(text=text, fg=count_color)
         else:
-            count_color = FG_DIM
-        count_label.config(text=f"({total})", fg=count_color)
+            # Color the count based on threshold
+            if threshold is not None:
+                count_color = "#ff6666" if total < threshold else FG_GREEN
+            else:
+                count_color = FG_DIM
+            count_label.config(text=f"({total})", fg=count_color)
 
         if not ship_members:
             tk.Label(content_frame, text="  None detected",
@@ -10826,10 +10920,18 @@ class FCToolGUI:
         only the plain ship-type/pilot listing renders. Uses pre-computed dict
         state only (no network). Must NOT trigger a refresh / role update."""
         rows_by_name = self._booster_rows_by_name if self._booster_is_boss else None
+        # Apply doctrine guidance to the links count badge if present. Computed
+        # here (not just in the synchronous section loop) because this method also
+        # re-renders asynchronously from the booster refresh; recomputing keeps the
+        # guided badge after that async render instead of reverting to "(N)".
+        # _role_guidance_badge returns None when links are suppressed (high
+        # command-ship fraction) or no doctrine is active -> fixed-threshold badge.
+        status_override = self._role_guidance_badge("links")
         self._populate_role_section(self._links_content, self._links_count,
                                     self._links_categories,
                                     threshold=self._links_threshold,
-                                    rows_by_name=rows_by_name)
+                                    rows_by_name=rows_by_name,
+                                    status_override=status_override)
         if self._booster_is_boss:
             self._append_offhull_rows()
 
