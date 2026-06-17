@@ -7872,19 +7872,6 @@ class FCToolGUI:
             return {}
         return {f.hull_type_id: f.delta for f in rep.fits if f.delta != 0}
 
-    def _label_with_delta(self, dna: str, name: str, deltas: dict) -> str:
-        """Append ``(+N)``/``(-N)`` to a fit label when the active doctrine wants
-        more/fewer of that hull. Returns ``name`` unchanged when the DNA can't be
-        parsed to a hull or there is no non-zero delta for it."""
-        try:
-            hull = fit_parser.parse_dna(dna, self.type_catalog).fit.ship_type_id
-        except Exception:
-            return name
-        d = deltas.get(hull)
-        if not d:
-            return name
-        return f"{name} ({'+' if d > 0 else ''}{d})"
-
     def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
 
@@ -7915,21 +7902,25 @@ class FCToolGUI:
         # the "id;1" subsystem form here — the bare-id form makes the client
         # mis-render a subsystem as the hull ("Tengu propulsion"). Idempotent
         # for already-canonical DNA; raw DNA is kept if it cannot be parsed.
-        fits_by_tag = {
-            tag: [(self._canonical_fit_dna(dna), name) for dna, name in fits]
-            for tag, fits in fits_by_tag.items()
-        }
-
-        # Annotate each fit label with the doctrine's +X/-Y pilot delta vs the live
-        # fleet (GUI bakes the delta into the label so motd_builder stays pure). No
-        # live fleet / no active doctrine => empty map => labels are untouched.
+        # Each displayed DNA is parsed exactly once here and the parsed fit feeds
+        # BOTH the T3 canonicalisation (passed in to skip a re-parse) and the live-
+        # fleet delta lookup. No live fleet / no active doctrine => empty deltas =>
+        # labels untouched. Parsing/canonicalisation failures keep the raw DNA.
         deltas = self._motd_fit_deltas()
-        if deltas:
-            fits_by_tag = {
-                tag: [(dna, self._label_with_delta(dna, name, deltas))
-                      for dna, name in fits]
-                for tag, fits in fits_by_tag.items()
-            }
+
+        def _finalize(dna, name):
+            try:
+                parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
+            except Exception:
+                return (self._canonical_fit_dna(dna), name)
+            canon = self._canonical_fit_dna(dna, parsed)
+            d = deltas.get(parsed.ship_type_id) if deltas else 0
+            if d:
+                name = f"{name} ({'+' if d > 0 else ''}{d})"
+            return (canon, name)
+
+        fits_by_tag = {tag: [_finalize(dna, name) for dna, name in fits]
+                       for tag, fits in fits_by_tag.items()}
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
