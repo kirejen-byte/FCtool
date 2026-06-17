@@ -101,6 +101,7 @@ FG_ORANGE = "#ff8c00"
 FG_YELLOW = "#ffdd00"
 FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
+FG_UNDER = "#ff6666"
 BORDER_COLOR = "#2a2a4a"
 
 # ── Notebook tab indices ────────────────────────────────────────────────────────
@@ -112,6 +113,7 @@ BORDER_COLOR = "#2a2a4a"
 INTEL_TAB_INDEX = 1
 CHARACTERS_TAB_INDEX = 4
 FITTINGS_TAB_INDEX = 5
+DOCTRINES_SUBTAB_INDEX = 1
 SETTINGS_TAB_INDEX = 6
 
 # ESI fittings scopes (added after some characters were already authed; SSO
@@ -3709,7 +3711,7 @@ class FCToolGUI:
         doc = self._active_fleet_doctrine()
         if doc is not None:
             cmd = sum(c for tid, c in ship_counts.items()
-                      if tid in ship_classes.ALL_LINKS_COMMAND)
+                      if tid in ALL_LINKS_COMMAND)
             frac = (cmd / total) if total else 0.0
             try:
                 self._fleet_guidance = fleet_guidance.compute_fleet_guidance(
@@ -3833,7 +3835,7 @@ class FCToolGUI:
             members_dict = categories[cat_key]
             threshold = thresholds.get(cat_key)
             sort_override = bridge_sort_key if cat_key == "bridge" else None
-            status_override = self._role_guidance_badge(cat_key)
+            status_override = None if cat_key == "links" else self._role_guidance_badge(cat_key)
             if cat_key == "links":
                 # Links is owned by _render_links_section so per-pilot booster
                 # charges + off-hull posters render (and collapse) inside it. It
@@ -3865,28 +3867,35 @@ class FCToolGUI:
         lbl = getattr(self, "_dps_guidance_label", None)
         if lbl is not None:
             if rep is not None and "DPS" in rep.roles and rep.has_live_fleet:
-                rr = rep.roles["DPS"]
-                hi = "∞" if rr.target_max is None else str(rr.target_max)
-                if rr.delta == 0:
-                    badge = ""
-                elif rr.delta > 0:
-                    badge = f"+{rr.delta}"
-                else:
-                    badge = str(rr.delta)
-                if rr.status == "in":
-                    colour = FG_GREEN
-                elif rr.status == "under":
-                    colour = "#ff6666"
-                else:
-                    colour = FG_ORANGE
-                lbl.config(text=f"DPS: {rr.current} / {rr.target_min}-{hi} {badge}".strip(),
-                           fg=colour)
+                text, colour = self._format_rollup(rep.roles["DPS"])
+                lbl.config(text=f"DPS: {text}", fg=colour)
             else:
                 lbl.config(text="", fg=FG_DIM)
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"links": "Links", "logi": "Logistics",
                         "defenders": "Defenders", "webs": "Support - Webs"}
+
+    def _format_rollup(self, rr) -> tuple[str, str]:
+        """Format a role rollup's live current/target into (text, colour).
+        Shared by the DPS guidance line and _role_guidance_badge so the badge
+        text and status colours stay identical. Assumes rr.current is not None
+        (the 'live current value' path); callers handle the no-current case."""
+        hi = "∞" if rr.target_max is None else str(rr.target_max)
+        if rr.delta == 0:
+            badge = ""
+        elif rr.delta > 0:
+            badge = f"+{rr.delta}"
+        else:
+            badge = str(rr.delta)  # already negative
+        if rr.status == "in":
+            colour = FG_GREEN
+        elif rr.status == "under":
+            colour = FG_UNDER
+        else:  # over
+            colour = FG_ORANGE
+        text = f"{rr.current} / {rr.target_min}-{hi} {badge}".strip()
+        return (text, colour)
 
     def _role_guidance_badge(self, role_key):
         """Return (text, colour) for a guided role's count badge, or None to fall
@@ -3907,21 +3916,7 @@ class FCToolGUI:
             # No live fleet: show the target range with no current/status.
             hi = "∞" if rr.target_max is None else str(rr.target_max)
             return (f"— / {rr.target_min}-{hi}", FG_DIM)
-        hi = "∞" if rr.target_max is None else str(rr.target_max)
-        if rr.delta == 0:
-            badge = ""
-        elif rr.delta > 0:
-            badge = f"+{rr.delta}"
-        else:
-            badge = str(rr.delta)  # already negative
-        if rr.status == "in":
-            colour = FG_GREEN
-        elif rr.status == "under":
-            colour = "#ff6666"
-        else:  # over
-            colour = FG_ORANGE
-        text = f"{rr.current} / {rr.target_min}-{hi} {badge}".strip()
-        return (text, colour)
+        return self._format_rollup(rr)
 
     def _populate_role_section(self, content_frame, count_label, ship_members,
                                 threshold: int | None = None,
@@ -7104,23 +7099,27 @@ class FCToolGUI:
         if doc is None:
             return
         try:
-            # Switch to the Fittings top-level tab (index 5) and its Doctrines
-            # sub-tab (index 1), then select the doctrine in the tree + show it.
-            self.notebook.select(5)
+            # Switch to the Fittings top-level tab and its Doctrines sub-tab,
+            # then select the doctrine in the tree (which fires the tree-select
+            # binding and renders the detail). Only render directly on a tree miss.
+            self.notebook.select(FITTINGS_TAB_INDEX)
             subnb = getattr(self, "_fitting_subnb", None)
             if subnb is not None:
-                subnb.select(1)
+                subnb.select(DOCTRINES_SUBTAB_INDEX)
             tree = getattr(self, "_doctrine_tree", None)
+            rendered = False
             if tree is not None:
                 try:
                     if doc.id in tree.get_children(""):
                         tree.selection_set(doc.id)
                         tree.see(doc.id)
+                        rendered = True
                 except Exception:
                     pass
-            self._doctrine_selected_id = doc.id
-            if hasattr(self, "_show_doctrine_detail"):
-                self._show_doctrine_detail(doc.id)
+            if not rendered:
+                self._doctrine_selected_id = doc.id
+                if hasattr(self, "_show_doctrine_detail"):
+                    self._show_doctrine_detail(doc.id)
         except Exception as exc:
             print(f"[Fleet] open doctrine navigation failed: {exc}")
 
