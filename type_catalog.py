@@ -129,6 +129,20 @@ class TypeCatalog:
             return None
         return CATEGORY_NAMES.get(entry.get("c"), "other")
 
+    def group_of(self, type_id: int) -> int | None:
+        """Return the SDE groupID for ``type_id``, or ``None`` if unknown.
+
+        Used to order Tech III subsystems by subsystem slot when serializing a
+        fit to DNA/ESI. ESI-only entries carry no group, so they return ``None``.
+        """
+        entry = self._by_id.get(type_id)
+        if entry is None:
+            entry = self._resolve_unknown(type_id)
+        if entry is None:
+            return None
+        group = entry.get("g")
+        return group if isinstance(group, int) else None
+
     def slot_of(self, type_id: int) -> str | None:
         """Return the fitting slot (high/med/low/rig/subsystem/service) or
         ``None`` — for non-modules and for ESI-only entries with no slot data."""

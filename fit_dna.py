@@ -46,6 +46,69 @@ _FLAG_PREFIX_TO_SLOT: list[tuple[str, str]] = sorted(
 # The order modules are emitted in (DNA sections and ESI flag assignment).
 _SLOT_EMIT_ORDER = [SLOT_HIGH, SLOT_MED, SLOT_LOW, SLOT_RIG, SLOT_SUBSYSTEM]
 
+# ── Tech III subsystem slot ordering ─────────────────────────────────────────
+#
+# A strategic cruiser's hull + subsystems must be encoded the way the live
+# client (and pyfa's authoritative service/port/dna.py) does it: each subsystem
+# as a ``typeID;1`` quantity item, sorted by the ``subSystemSlot`` attribute —
+# Core (125) → Defensive (126) → Offensive (127) → Propulsion (128). Emitting
+# subsystems as BARE ids in the ship token makes the modern client mis-render a
+# subsystem as the hull (the reported "Loki Propulsion - …" bug).
+#
+# fit_types.json carries the SDE groupID (``g``) but not the subSystemSlot
+# attribute, so we map groupID -> slot order. These four group IDs are constant
+# across all four races (Loki/Tengu/Proteus/Legion).
+_SUBSYSTEM_GROUP_ORDER: dict[int, int] = {
+    958: 0,  # Core       (subSystemSlot 125)
+    954: 1,  # Defensive  (subSystemSlot 126)
+    956: 2,  # Offensive  (subSystemSlot 127)
+    957: 3,  # Propulsion (subSystemSlot 128)
+}
+
+# Fallback when no catalog is available: the type-ID ranges are contiguous per
+# slot in the current SDE. Used only to order subsystems for clients that pass
+# no catalog; an id outside every range keeps its input position (stable sort).
+_SUBSYSTEM_ID_RANGE_ORDER: list[tuple[range, int]] = [
+    (range(45622, 45634), 0),  # Core
+    (range(45586, 45598), 1),  # Defensive
+    (range(45598, 45610), 2),  # Offensive
+    (range(45610, 45622), 3),  # Propulsion
+]
+_SUBSYSTEM_ORDER_FALLBACK = len(_SUBSYSTEM_GROUP_ORDER)  # unknown slots sort last
+
+
+def _subsystem_slot_rank(type_id: int, catalog=None) -> int:
+    """Return the subSystemSlot sort rank for a subsystem type id.
+
+    Prefers the catalog's group id (duck-typed ``group_of``) so any current or
+    future subsystem sorts correctly; falls back to the bundled id ranges, then
+    to a constant that parks unknown ids after the known slots (a stable sort
+    then preserves their relative input order)."""
+    if catalog is not None:
+        group_of = getattr(catalog, "group_of", None)
+        if callable(group_of):
+            try:
+                rank = _SUBSYSTEM_GROUP_ORDER.get(group_of(type_id))
+            except Exception:
+                rank = None
+            if rank is not None:
+                return rank
+    for id_range, rank in _SUBSYSTEM_ID_RANGE_ORDER:
+        if type_id in id_range:
+            return rank
+    return _SUBSYSTEM_ORDER_FALLBACK
+
+
+def _sorted_subsystems(parsed: ParsedFit, catalog=None) -> list[int]:
+    """Subsystem type ids ordered Core→Defensive→Offensive→Propulsion.
+
+    A stable sort means unrecognized ids keep their relative input order and
+    duplicates are preserved (callers may carry malformed fits)."""
+    return sorted(
+        parsed.subsystems,
+        key=lambda type_id: _subsystem_slot_rank(type_id, catalog),
+    )
+
 
 def _modules_by_slot(parsed: ParsedFit) -> dict[str, list[ParsedModule]]:
     by_slot: dict[str, list[ParsedModule]] = {slot: [] for slot in _SLOT_EMIT_ORDER}
@@ -54,10 +117,19 @@ def _modules_by_slot(parsed: ParsedFit) -> dict[str, list[ParsedModule]]:
     return by_slot
 
 
-def to_dna(parsed: ParsedFit) -> str:
-    """Render a `ParsedFit` as a fitting-DNA string, terminated with ``::``."""
+def to_dna(parsed: ParsedFit, catalog=None) -> str:
+    """Render a `ParsedFit` as a fitting-DNA string, terminated with ``::``.
+
+    The hull type id is always the first colon-group. Tech III subsystems follow
+    the hull as ``typeID;1`` quantity items, sorted by subsystem slot (Core,
+    Defensive, Offensive, Propulsion) — matching pyfa's generator and what the
+    live client expects. They are NOT emitted as bare ids, which the modern
+    client mis-renders as the hull. Pass an optional ``catalog`` exposing
+    ``group_of(type_id)`` to order any subsystem id; without one, a bundled
+    id-range table handles every current strategic-cruiser subsystem.
+    """
     parts: list[str] = [str(parsed.ship_type_id)]
-    parts.extend(str(sub) for sub in parsed.subsystems)
+    parts.extend(f"{sub};1" for sub in _sorted_subsystems(parsed, catalog))
 
     by_slot = _modules_by_slot(parsed)
 
@@ -87,13 +159,16 @@ def to_dna(parsed: ParsedFit) -> str:
     return ":".join(parts) + "::"
 
 
-def to_esi_items(parsed: ParsedFit) -> list[dict]:
+def to_esi_items(parsed: ParsedFit, catalog=None) -> list[dict]:
     """Render a `ParsedFit` as ESI fitting ``items[]`` with string flag enums.
 
     Modules get sequential per-section flags (``HiSlot0``, ``HiSlot1``, …) and
-    ``quantity=1``. Loaded charges are emitted as separate ``Cargo`` items (ESI
-    does not bind charges to a module slot). Drones go to ``DroneBay``, cargo to
-    ``Cargo``, fighters to ``FighterBay``. Integer flags are never emitted.
+    ``quantity=1``. Tech III subsystems (held on ``parsed.subsystems``, not on
+    ``parsed.modules``) get ``SubSystemSlot0…3`` flags in subsystem-slot order
+    (Core, Defensive, Offensive, Propulsion). Loaded charges are emitted as
+    separate ``Cargo`` items (ESI does not bind charges to a module slot). Drones
+    go to ``DroneBay``, cargo to ``Cargo``, fighters to ``FighterBay``. Integer
+    flags are never emitted.
     """
     items: list[dict] = []
     by_slot = _modules_by_slot(parsed)
@@ -111,6 +186,12 @@ def to_esi_items(parsed: ParsedFit) -> list[dict]:
                 charge_counts[module.charge_type_id] = (
                     charge_counts.get(module.charge_type_id, 0) + 1
                 )
+
+    subsystem_prefix = ESI_FLAGS[SLOT_SUBSYSTEM]
+    for index, type_id in enumerate(_sorted_subsystems(parsed, catalog)):
+        items.append(
+            {"type_id": type_id, "flag": f"{subsystem_prefix}{index}", "quantity": 1}
+        )
 
     for drone in parsed.drones:
         items.append(
