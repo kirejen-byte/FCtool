@@ -7852,7 +7852,11 @@ class FCToolGUI:
     def _motd_fit_deltas(self) -> dict:
         """Map ``hull_type_id -> +/- pilot delta`` for the active doctrine's guided
         fits versus the live fleet. Returns ``{}`` when there is no active doctrine
-        or no live-fleet snapshot (so the MOTD builds with no annotations)."""
+        or no live-fleet snapshot (so the MOTD builds with no annotations).
+
+        Note: the active Fleet-tab doctrine may differ from the doctrine whose
+        fits the MOTD emits, so deltas only land where hulls coincide (matching
+        is by ``hull_type_id``, intentional)."""
         doc = self._active_fleet_doctrine()
         cached = getattr(self, "_last_specialized_args", None)
         if doc is None or not cached:

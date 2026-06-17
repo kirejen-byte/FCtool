@@ -405,6 +405,9 @@ class FittingsStore:
                         fit_id=local_fit_id,
                         tags=list(member.tags),
                         order=len(remapped),
+                        ideal_mode=member.ideal_mode,
+                        ideal_min=member.ideal_min,
+                        ideal_max=member.ideal_max,
                     )
                 )
             incoming.members = remapped

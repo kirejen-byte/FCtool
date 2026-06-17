@@ -172,3 +172,16 @@ def test_set_member_ideal_persists(tmp_path):
     store2 = FittingsStore(str(tmp_path / "lib.json")); store2.load()
     mem = next(m for m in store2.get_doctrine(did).members if m.fit_id == fid)
     assert (mem.ideal_mode, mem.ideal_min, mem.ideal_max) == ("percent", 45, 55)
+
+
+def test_share_import_preserves_per_fit_ideals(tmp_path):
+    src = FittingsStore(str(tmp_path / "a.json")); src.load()
+    fid = src.add_fit(_fit("Arty Muninn")); did = src.add_doctrine("Shield HACs")
+    src.add_fit_to_doctrine(did, fid, ["DPS"])
+    src.set_member_ideal(did, fid, "percent", 55, 65)
+    payload = src.export_doctrines([did])
+
+    dst = FittingsStore(str(tmp_path / "b.json")); dst.load()
+    summary = dst.import_share(payload)
+    member = dst.list_doctrines()[0].members[0]
+    assert (member.ideal_mode, member.ideal_min, member.ideal_max) == ("percent", 55, 65)
