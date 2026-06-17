@@ -606,11 +606,19 @@ def read_channel_id(logs_path: str, channel_name: str) -> str | None:
 
     candidates.sort(key=_mtime, reverse=True)
 
+    # Bound the header reads: a real channel's newest session file matches on the
+    # first read, so reading more than a handful means the name never matches
+    # (e.g. a partial/renamed channel). Cap the work so a folder with years of
+    # logs can't turn this into a multi-second scan.
+    reads = 0
     for filepath in candidates:
+        if reads >= 60:
+            break
         try:
             # encoding="utf-16" consumes the BOM EVE writes at the top of the file.
             with open(filepath, encoding="utf-16") as f:
                 header = f.read(2048)
+            reads += 1
         except (OSError, UnicodeError, ValueError):
             continue
 

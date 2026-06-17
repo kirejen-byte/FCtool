@@ -7209,18 +7209,40 @@ class FCToolGUI:
             cache = self._motd_channel_id_cache = {}
         if name in cache:
             return cache[name]
-        try:
-            logs_path = resolve_eve_logs_path(
-                self.config.get("eve_logs_path", ""))
-        except Exception:
-            logs_path = self.config.get("eve_logs_path", "")
-        cid = None
-        try:
-            cid = intel_monitor.read_channel_id(logs_path, name)
-        except Exception:
-            cid = None
-        cache[name] = cid
-        return cid
+        # Not cached: resolving reads chat-log headers off disk, which can be
+        # slow on a large Chatlogs folder — NEVER do it on the Tk thread (that
+        # froze the UI for ~30s). Kick off a one-shot background resolution and
+        # return None now (plain-text channel); when it lands we cache the id
+        # and re-render the preview so the link appears.
+        pending = getattr(self, "_motd_channel_id_pending", None)
+        if pending is None:
+            pending = self._motd_channel_id_pending = set()
+        if name not in pending:
+            pending.add(name)
+
+            def worker(n=name):
+                try:
+                    logs_path = resolve_eve_logs_path(
+                        self.config.get("eve_logs_path", ""))
+                except Exception:
+                    logs_path = self.config.get("eve_logs_path", "")
+                try:
+                    cid = intel_monitor.read_channel_id(logs_path, n)
+                except Exception:
+                    cid = None
+
+                def done():
+                    self._motd_channel_id_cache[n] = cid
+                    self._motd_channel_id_pending.discard(n)
+                    self._rebuild_motd_preview()
+
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+        return None
 
     def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
