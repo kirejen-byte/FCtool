@@ -21,8 +21,34 @@ def test_char_link_uses_showinfo():
 
 def test_channel_text_plain_without_id_clickable_with_id():
     assert channel_text("Cap Chain Alpha") == "Cap Chain Alpha"
+    # Player channels (negative id) now use the COMPOUND joinChannel form.
     assert channel_text("Cap Chain Alpha", channel_id=-99) == \
-        "<url=joinChannel:-99>Cap Chain Alpha</url>"
+        "<url=joinChannel:player_-99//None//None>Cap Chain Alpha</url>"
+
+
+def test_channel_text_compound_player_id_from_string():
+    # A negative-id string is a player channel → compound form, core kept raw.
+    assert channel_text("Cap Chain Alpha", channel_id="-84651075") == \
+        "<url=joinChannel:player_-84651075//None//None>Cap Chain Alpha</url>"
+
+
+def test_channel_text_already_player_prefixed_not_double_prefixed():
+    # "player_"-prefixed ids must not be double-prefixed.
+    assert channel_text("Services", channel_id="player_-84651075") == \
+        "<url=joinChannel:player_-84651075//None//None>Services</url>"
+
+
+def test_channel_text_positive_builtin_id_is_bare():
+    # Built-in channels use a bare positive id, no compound wrapper.
+    assert channel_text("Help", channel_id=2) == \
+        "<url=joinChannel:2>Help</url>"
+    assert channel_text("Help", channel_id="2") == \
+        "<url=joinChannel:2>Help</url>"
+
+
+def test_channel_text_empty_or_none_is_plain():
+    assert channel_text("Cap Chain Alpha", channel_id=None) == "Cap Chain Alpha"
+    assert channel_text("Cap Chain Alpha", channel_id="") == "Cap Chain Alpha"
 
 
 def test_estimate_length_counts_raw_markup():
@@ -86,6 +112,50 @@ def test_build_motd_staging_omitted_when_only_one_arg():
         fits_by_tag={"DPS": [("670::", "Pod")]}, staging_system_id=30000142)
     assert "Staging:" not in motd_name_only
     assert "Staging:" not in motd_id_only
+
+
+def test_build_motd_wraps_body_in_white_color_by_default():
+    motd = build_motd(
+        fc_name="Securitas Protector", fc_character_id=90000001,
+        doctrine_name="Shield HACs",
+        fits_by_tag={"DPS": [("12015:2185;5::", "Arty Muninn")]})
+    # White wrapper present by default (in-game default text renders red).
+    assert motd.startswith("<color=0xffffffff>")
+    assert motd.endswith("</color>")
+    # Inner content survives inside the wrapper.
+    assert "<url=showinfo:1377//90000001>Securitas Protector</url>" in motd
+    assert "<url=fitting:12015:2185;5::>Arty Muninn</url>" in motd
+
+
+def test_build_motd_no_color_wrapper_when_text_color_none():
+    motd = build_motd(
+        fc_name="Securitas Protector", fc_character_id=90000001,
+        doctrine_name="Shield HACs",
+        fits_by_tag={"DPS": [("12015:2185;5::", "Arty Muninn")]},
+        text_color=None)
+    assert "<color=" not in motd
+    assert not motd.startswith("<color=")
+    # Inner content still present, just unwrapped.
+    assert "<url=showinfo:1377//90000001>Securitas Protector</url>" in motd
+    assert "<url=fitting:12015:2185;5::>Arty Muninn</url>" in motd
+
+
+def test_build_motd_channel_id_makes_logi_clickable_compound():
+    motd = build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="D",
+        fits_by_tag={"DPS": [("670::", "Pod")]},
+        channel="Cap Chain Alpha", channel_id="-84651075")
+    assert ("<url=joinChannel:player_-84651075//None//None>"
+            "Cap Chain Alpha</url>") in motd
+
+
+def test_build_motd_channel_without_id_stays_plain():
+    motd = build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="D",
+        fits_by_tag={"DPS": [("670::", "Pod")]},
+        channel="Cap Chain Alpha")
+    assert "joinChannel" not in motd
+    assert "Logi: Cap Chain Alpha" in motd
 
 
 from motd_builder import parse_motd

@@ -12,7 +12,8 @@ docs/superpowers/specs/2026-06-16-fitting-doctrine-motd-design.md §3.4/§3.5):
 
     Fitting link   <url=fitting:{DNA}>{name}</url>
     Character link <url=showinfo:{type_id}//{character_id}>{name}</url>
-    Channel link   <url=joinChannel:{channel_id}>{name}</url>   (numeric id only)
+    Channel link   player:   <url=joinChannel:player_{id}//None//None>{name}</url>
+                   built-in: <url=joinChannel:{id}>{name}</url>   (positive id)
 
 The server truncates a MOTD around ~3,000 raw-markup characters, and markup
 counts toward that budget, so ``estimate_length`` measures the raw markup length
@@ -33,6 +34,15 @@ MOTD_BUDGET_DEFAULT = 3000
 
 # Line separator in MOTD markup (not a newline — EVE uses the <br> tag).
 LINE_BREAK = "<br>"
+
+# Player-channel joinChannel links: the MODERN client emits a COMPOUND form,
+# ``<url=joinChannel:player_-84651075//None//None>Name</url>``, where the core is
+# the channel id (the negative integer from the chat-log header). Built-in
+# channels keep a bare positive id. We default to the compound form for player
+# channels (high confidence it works today); flip this to ``False`` if a live
+# client ever requires the bare ``<url=joinChannel:{id}>`` form for player
+# channels too.
+CHANNEL_LINK_COMPOUND = True
 
 # Tags are emitted in this stable priority; any tag not listed follows in the
 # caller's iteration order. Keeps DPS/Logistics/Links at the top regardless of
@@ -76,19 +86,49 @@ def system_link(system_id: int, name: str) -> str:
     return f"<url=showinfo:5//{system_id}>{name}</url>"
 
 
-def channel_text(name: str, channel_id: int | None = None) -> str:
-    """Render a chat channel name, clickable only when a numeric id is known.
+def channel_text(name: str, channel_id: str | int | None = None) -> str:
+    """Render a chat channel name, clickable only when an id is known.
 
-    Chat logs do not expose channel ids, so the default is plain text. A numeric
-    ``channel_id`` (negative for player channels) yields a joinChannel link::
+    Chat logs expose a ``Channel ID`` in the log header (see
+    ``intel_monitor.read_channel_id``): a NEGATIVE integer for PLAYER channels,
+    a small POSITIVE one for built-in channels. With no id the result is plain
+    text. With an id the link form depends on the channel kind:
 
-        channel_text("Cap Chain Alpha")               -> "Cap Chain Alpha"
-        channel_text("Cap Chain Alpha", channel_id=-99)
-        -> "<url=joinChannel:-99>Cap Chain Alpha</url>"
+    * Player channel — id string starts with ``-`` or ``player_``. The modern
+      client wants the COMPOUND form
+      ``<url=joinChannel:player_{core}//None//None>{name}</url>`` where ``core``
+      is the id with any leading ``player_`` stripped (so ``-84651075`` →
+      ``player_-84651075//None//None``; ``player_-84651075`` is not
+      double-prefixed). When :data:`CHANNEL_LINK_COMPOUND` is False, a bare
+      ``<url=joinChannel:{id}>{name}</url>`` is emitted instead.
+    * Built-in channel — a positive id (digits, no minus) → always bare
+      ``<url=joinChannel:{id}>{name}</url>``.
+
+    Examples::
+
+        channel_text("Cap Chain Alpha")                       -> "Cap Chain Alpha"
+        channel_text("Cap Chain Alpha", channel_id="-84651075")
+        -> "<url=joinChannel:player_-84651075//None//None>Cap Chain Alpha</url>"
+        channel_text("Help", channel_id=2)
+        -> "<url=joinChannel:2>Help</url>"
     """
     if channel_id is None:
         return name
-    return f"<url=joinChannel:{channel_id}>{name}</url>"
+
+    id_str = str(channel_id).strip()
+    if not id_str:
+        return name
+
+    is_player = id_str.startswith("-") or id_str.startswith("player_")
+    if is_player:
+        # Normalise to the bare core id (strip a leading "player_" if present).
+        core = id_str[len("player_"):] if id_str.startswith("player_") else id_str
+        if CHANNEL_LINK_COMPOUND:
+            return f"<url=joinChannel:player_{core}//None//None>{name}</url>"
+        return f"<url=joinChannel:{core}>{name}</url>"
+
+    # Built-in / positive id: always the bare form.
+    return f"<url=joinChannel:{id_str}>{name}</url>"
 
 
 def _ordered_tags(tags: list[str]) -> list[str]:
@@ -105,10 +145,12 @@ def build_motd(
     doctrine_name: str,
     fits_by_tag: dict[str, list[tuple[str, str]]],
     channel: str | None = None,
+    channel_id: str | int | None = None,
     header: str = "",
     footer: str = "",
     staging_name: str | None = None,
     staging_system_id: int | None = None,
+    text_color: str | None = "0xffffffff",
 ) -> str:
     """Compose a fleet MOTD from a doctrine's fits.
 
@@ -123,11 +165,17 @@ def build_motd(
     * one labelled line per tag (``<Tag>: <fitting_link> | <fitting_link> …``),
       ordered by :data:`TAG_PRIORITY` then the caller's order, each ``(dna, name)``
       rendered via :func:`fitting_link`,
-    * an optional ``Logi: <channel_text>`` line,
+    * an optional ``Logi: <channel_text>`` line — clickable when ``channel_id``
+      is supplied (see :func:`channel_text`), plain text otherwise,
     * optional ``footer`` free text.
 
     Each fit tuple is ``(dna, name)``. Empty header/footer and empty tag lists are
     skipped so the result has no dangling blank lines.
+
+    Finally, when ``text_color`` is non-None (default ``"0xffffffff"``, white),
+    the FULL assembled body is wrapped in ``<color={text_color}>…</color>``. The
+    in-game default text colour renders red/hard-to-read, so white is the sane
+    default; pass ``text_color=None`` to emit no wrapper.
     """
     lines: list[str] = []
 
@@ -150,12 +198,18 @@ def build_motd(
         lines.append(f"{tag}: {links}")
 
     if channel:
-        lines.append(f"Logi: {channel_text(channel)}")
+        lines.append(f"Logi: {channel_text(channel, channel_id)}")
 
     if footer:
         lines.append(footer)
 
-    return LINE_BREAK.join(lines)
+    body = LINE_BREAK.join(lines)
+
+    # Wrap the whole body in a colour tag (white by default — the in-game
+    # default renders red/hard-to-read). text_color=None skips the wrapper.
+    if text_color is not None:
+        return f"<color={text_color}>{body}</color>"
+    return body
 
 
 def estimate_length(motd: str) -> int:
