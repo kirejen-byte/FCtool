@@ -7849,6 +7849,42 @@ class FCToolGUI:
         except Exception:
             return dna
 
+    def _motd_fit_deltas(self) -> dict:
+        """Map ``hull_type_id -> +/- pilot delta`` for the active doctrine's guided
+        fits versus the live fleet. Returns ``{}`` when there is no active doctrine
+        or no live-fleet snapshot (so the MOTD builds with no annotations)."""
+        doc = self._active_fleet_doctrine()
+        cached = getattr(self, "_last_specialized_args", None)
+        if doc is None or not cached:
+            return {}
+        _members, counts, total = cached
+        if not counts or not total:
+            return {}
+        cmd = sum(c for tid, c in counts.items()
+                  if tid in ship_classes.ALL_LINKS_COMMAND)
+        frac = (cmd / total) if total else 0.0
+        try:
+            rep = fleet_guidance.compute_fleet_guidance(
+                doc, self.fittings.get_fit, self.type_catalog,
+                counts, total, command_ship_fraction=frac)
+        except Exception as exc:
+            print(f"[MOTD] fit-delta compute failed: {exc}")
+            return {}
+        return {f.hull_type_id: f.delta for f in rep.fits if f.delta != 0}
+
+    def _label_with_delta(self, dna: str, name: str, deltas: dict) -> str:
+        """Append ``(+N)``/``(-N)`` to a fit label when the active doctrine wants
+        more/fewer of that hull. Returns ``name`` unchanged when the DNA can't be
+        parsed to a hull or there is no non-zero delta for it."""
+        try:
+            hull = fit_parser.parse_dna(dna, self.type_catalog).fit.ship_type_id
+        except Exception:
+            return name
+        d = deltas.get(hull)
+        if not d:
+            return name
+        return f"{name} ({'+' if d > 0 else ''}{d})"
+
     def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
 
@@ -7883,6 +7919,17 @@ class FCToolGUI:
             tag: [(self._canonical_fit_dna(dna), name) for dna, name in fits]
             for tag, fits in fits_by_tag.items()
         }
+
+        # Annotate each fit label with the doctrine's +X/-Y pilot delta vs the live
+        # fleet (GUI bakes the delta into the label so motd_builder stays pure). No
+        # live fleet / no active doctrine => empty map => labels are untouched.
+        deltas = self._motd_fit_deltas()
+        if deltas:
+            fits_by_tag = {
+                tag: [(dna, self._label_with_delta(dna, name, deltas))
+                      for dna, name in fits]
+                for tag, fits in fits_by_tag.items()
+            }
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
