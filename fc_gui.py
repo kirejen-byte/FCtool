@@ -5912,9 +5912,6 @@ class FCToolGUI:
         ttk.Button(head_btns, text="Edit description", style="Dark.TButton",
                    command=lambda: self._edit_doctrine_desc(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
-        ttk.Button(head_btns, text="Export file", style="Dark.TButton",
-                   command=lambda: self._export_doctrine(doctrine.id)).pack(
-                       side=tk.LEFT, padx=2)
         ttk.Button(head_btns, text="Delete", style="Red.TButton",
                    command=lambda: self._delete_doctrine(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
@@ -7274,18 +7271,23 @@ class FCToolGUI:
         self._fit_tree.configure(yscrollcommand=tree_sb.set)
         tree_sb.grid(row=0, column=1, sticky="ns")
 
-        # Right: detail (scrollable)
+        # Right: fixed action bar (row 0) + scrollable detail (row 1)
         right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
                          highlightbackground=BORDER_COLOR, highlightthickness=1)
         right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        right.rowconfigure(0, weight=1)
+        right.rowconfigure(0, weight=0)
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
+        # Fixed action-button bar — does NOT scroll, always visible at top.
+        self._fit_actions = tk.Frame(right, bg=BG_PANEL)
+        self._fit_actions.grid(row=0, column=0, columnspan=2, sticky="ew")
+
         detail_canvas = tk.Canvas(right, bg=BG_PANEL, highlightthickness=0)
-        detail_canvas.grid(row=0, column=0, sticky="nsew")
+        detail_canvas.grid(row=1, column=0, sticky="nsew")
         detail_sb = ttk.Scrollbar(right, orient="vertical",
                                   command=detail_canvas.yview)
-        detail_sb.grid(row=0, column=1, sticky="ns")
+        detail_sb.grid(row=1, column=1, sticky="ns")
         detail_canvas.configure(yscrollcommand=detail_sb.set)
         self._register_scroll_canvas(detail_canvas)
 
@@ -7373,6 +7375,11 @@ class FCToolGUI:
     def _clear_fit_detail(self):
         for w in self._fit_detail.winfo_children():
             w.destroy()
+        # Also clear the fixed action bar so stale buttons don't linger.
+        actions = getattr(self, "_fit_actions", None)
+        if actions is not None:
+            for w in actions.winfo_children():
+                w.destroy()
 
     def _show_fit_detail(self, fit_id):
         """Render the selected fit: hull/name header, slot-grouped read-only
@@ -7392,6 +7399,28 @@ class FCToolGUI:
                      font=("Consolas", 10), fg=FG_RED, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=10, pady=10)
             return
+
+        # Fixed action bar (top, non-scrolling): 8 buttons in a wrapped grid
+        # (2 rows × 4 columns) with uniform column weights so they size evenly.
+        actions = self._fit_actions
+        for c in range(4):
+            actions.grid_columnconfigure(c, weight=1, uniform="fitbtn")
+        action_specs = [
+            ("Rename", "Dark.TButton", lambda: self._rename_fit(fit.id)),
+            ("Edit notes", "Dark.TButton", lambda: self._edit_fit_notes(fit.id)),
+            ("Replace fit text", "Dark.TButton",
+             lambda: self._replace_fit_text(fit.id)),
+            ("Copy EFT", "Dark.TButton", lambda: self._copy_fit_eft(fit.id)),
+            ("Copy DNA", "Dark.TButton", lambda: self._copy_fit_dna(fit.id)),
+            ("Save to in-game Fittings", "Dark.TButton",
+             lambda: self._save_fit_to_ingame(fit.id)),
+            ("Add to doctrine…", "Dark.TButton",
+             lambda: self._add_fit_to_doctrine_from_fit(fit.id)),
+            ("Delete", "Red.TButton", lambda: self._delete_fit(fit.id)),
+        ]
+        for idx, (label, style, cmd) in enumerate(action_specs):
+            ttk.Button(actions, text=label, style=style, command=cmd).grid(
+                row=idx // 4, column=idx % 4, sticky="ew", padx=2, pady=3)
 
         # Header: name + hull + source.
         tk.Label(parent, text=fit.name, font=("Consolas", 13, "bold"),
@@ -7475,33 +7504,6 @@ class FCToolGUI:
             tk.Label(parent, text="  (not in any doctrine)",
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=14)
-
-        # Action buttons.
-        actions = tk.Frame(parent, bg=BG_PANEL)
-        actions.pack(fill=tk.X, padx=10, pady=(12, 10))
-        row1 = tk.Frame(actions, bg=BG_PANEL)
-        row1.pack(fill=tk.X, pady=2)
-        ttk.Button(row1, text="Rename", style="Dark.TButton",
-                   command=lambda: self._rename_fit(fit.id)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row1, text="Edit notes", style="Dark.TButton",
-                   command=lambda: self._edit_fit_notes(fit.id)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row1, text="Replace fit text", style="Dark.TButton",
-                   command=lambda: self._replace_fit_text(fit.id)).pack(side=tk.LEFT, padx=2)
-        row2 = tk.Frame(actions, bg=BG_PANEL)
-        row2.pack(fill=tk.X, pady=2)
-        ttk.Button(row2, text="Copy EFT", style="Dark.TButton",
-                   command=lambda: self._copy_fit_eft(fit.id)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row2, text="Copy DNA", style="Dark.TButton",
-                   command=lambda: self._copy_fit_dna(fit.id)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row2, text="Save to in-game Fittings", style="Dark.TButton",
-                   command=lambda: self._save_fit_to_ingame(fit.id)).pack(side=tk.LEFT, padx=2)
-        row3 = tk.Frame(actions, bg=BG_PANEL)
-        row3.pack(fill=tk.X, pady=2)
-        ttk.Button(row3, text="Add to doctrine…", style="Dark.TButton",
-                   command=lambda: self._add_fit_to_doctrine_from_fit(
-                       fit.id)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(row3, text="Delete", style="Red.TButton",
-                   command=lambda: self._delete_fit(fit.id)).pack(side=tk.LEFT, padx=2)
 
     def _rename_fit(self, fit_id):
         fit = self.fittings.get_fit(fit_id)
