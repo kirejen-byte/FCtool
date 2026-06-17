@@ -573,6 +573,7 @@ class FCToolGUI:
             os.path.join(app_dir(), "fittings_library.json"))
         self.fittings.load()
         self.fittings.catalog = self.type_catalog   # enables Defenders auto-tag on add
+        self._heal_fit_dna()   # one-time: rewrite legacy bare-id T3 DNA to canonical
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
         self._doctrine_selected_id: str | None = None
@@ -7853,6 +7854,24 @@ class FCToolGUI:
         except Exception:
             return dna
 
+    def _heal_fit_dna(self):
+        """One-time: re-encode legacy bare-id T3 fit DNA to the canonical id;1
+        form so pre-fix imports are correct for copy-DNA / in-game links."""
+        changed = False
+        for fit in self.fittings.list_fits():
+            try:
+                canon = self._canonical_fit_dna(fit.dna, fit.parsed)
+            except Exception:
+                continue
+            if canon and canon != fit.dna:
+                fit.dna = canon
+                changed = True
+        if changed:
+            try:
+                self.fittings.save()
+            except Exception:
+                pass
+
     def _motd_fit_deltas(self) -> dict:
         """Map ``hull_type_id -> +/- pilot delta`` for the active doctrine's guided
         fits versus the live fleet. Returns ``{}`` when there is no active doctrine
@@ -8849,9 +8868,12 @@ class FCToolGUI:
         by_slot: dict[str, list] = {}
         for m in parsed.modules:
             by_slot.setdefault(m.slot or "other", []).append(m)
+        sub_names = [self.type_catalog.resolve_name(t) or f"Type {t}"
+                     for t in (parsed.subsystems or [])]
         for slot in self._FIT_SLOT_ORDER:
-            mods = by_slot.get(slot)
-            if not mods:
+            mods = by_slot.get(slot) or []
+            extra = sub_names if slot == "subsystem" else []
+            if not mods and not extra:
                 continue
             tk.Label(parent, text=self._FIT_SLOT_LABELS.get(slot, slot.title()),
                      font=("Consolas", 9, "bold"), fg=FG_GREEN, bg=BG_PANEL
@@ -8863,6 +8885,10 @@ class FCToolGUI:
                 if m.offline:
                     line += " /offline"
                 tk.Label(parent, text=f"  {line}", font=("Consolas", 9),
+                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=380).pack(anchor=tk.W, padx=14)
+            for nm in extra:
+                tk.Label(parent, text=f"  {nm}", font=("Consolas", 9),
                          fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
                          wraplength=380).pack(anchor=tk.W, padx=14)
         # Any modules with an unrecognized slot bucket.
@@ -9012,10 +9038,13 @@ class FCToolGUI:
         by_slot: dict[str, list] = {}
         for m in parsed.modules:
             by_slot.setdefault(m.slot or "other", []).append(m)
+        sub_names = [self.type_catalog.resolve_name(t) or f"Type {t}"
+                     for t in (parsed.subsystems or [])]
         first = True
         for slot in self._FIT_SLOT_ORDER:
-            mods = by_slot.get(slot)
-            if not mods:
+            mods = by_slot.get(slot) or []
+            extra = sub_names if slot == "subsystem" else []
+            if not mods and not extra:
                 continue
             if not first:
                 lines.append("")
@@ -9027,6 +9056,8 @@ class FCToolGUI:
                 if m.offline:
                     line += " /offline"
                 lines.append(line)
+            for nm in extra:
+                lines.append(nm)
         if parsed.drones:
             lines.append("")
             for d in parsed.drones:
