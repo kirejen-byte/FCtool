@@ -79,3 +79,57 @@ def links_ideal_range(links_parsed_fits, catalog) -> tuple[int, int] | None:
     lo = math.ceil(BURST_TARGET_MIN / avg)
     hi = math.ceil(BURST_TARGET_MAX / avg)
     return (lo, hi)
+
+
+@dataclass
+class EffectiveIdeal:
+    mode: str          # "percent" | "count"
+    min: int
+    max: int | None
+    role: str          # the composition tag it came from
+
+
+def _composition_role(tags) -> str | None:
+    for role in COMPOSITION_ROLE_ORDER:
+        if role in tags:
+            return role
+    return None
+
+
+def resolve_composition_ideal(member, links_range) -> EffectiveIdeal | None:
+    """Effective composition ideal for a member, or None if it has none.
+
+    Explicit value wins; "off" disables; otherwise the tag default (Links uses the
+    precomputed ``links_range``). Defenders is NOT a composition role here."""
+    role = _composition_role(member.tags)
+    if role is None:
+        return None
+    mode = member.ideal_mode
+    if mode == "off":
+        return None
+    if mode in ("percent", "count"):
+        # Explicit override; min/max stored as-is (max may be None = no upper bound).
+        return EffectiveIdeal(mode=mode, min=member.ideal_min, max=member.ideal_max, role=role)
+    # Unset -> tag default.
+    if role == "Links":
+        if links_range is None:
+            return None
+        return EffectiveIdeal(mode="count", min=links_range[0], max=links_range[1], role=role)
+    default = TAG_DEFAULTS.get(role)
+    if default is None:
+        return None
+    dmode, dmin, dmax = default
+    return EffectiveIdeal(mode=dmode, min=dmin, max=dmax, role=role)
+
+
+def percent_to_pilots(pct, fleet_total) -> int:
+    return int(round((pct / 100.0) * fleet_total))
+
+
+def compute_delta(current, target_min, target_max):
+    """Return (status, delta): under (+need), in (0), over (-excess)."""
+    if current < target_min:
+        return ("under", target_min - current)
+    if target_max is not None and current > target_max:
+        return ("over", -(current - target_max))
+    return ("in", 0)

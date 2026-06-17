@@ -62,3 +62,51 @@ def test_links_ideal_range_none_when_no_bursts():
 
 def test_links_ideal_range_none_when_no_fits():
     assert fg.links_ideal_range([], _Cat()) is None
+
+
+from fit_models import DoctrineMember
+
+def _mem(tags, mode=None, mn=None, mx=None):
+    return DoctrineMember(fit_id="f", tags=tags, order=0,
+                          ideal_mode=mode, ideal_min=mn, ideal_max=mx)
+
+def test_resolve_uses_tag_default_when_unset():
+    e = fg.resolve_composition_ideal(_mem(["DPS"]), links_range=None)
+    assert (e.mode, e.min, e.max) == ("percent", 50, 60)
+
+def test_resolve_logistics_default():
+    e = fg.resolve_composition_ideal(_mem(["Logistics"]), links_range=None)
+    assert (e.mode, e.min, e.max) == ("percent", 25, 35)
+
+def test_resolve_links_uses_computed_range():
+    e = fg.resolve_composition_ideal(_mem(["Links"]), links_range=(3, 6))
+    assert (e.mode, e.min, e.max) == ("count", 3, 6)
+
+def test_resolve_links_none_when_no_range():
+    assert fg.resolve_composition_ideal(_mem(["Links"]), links_range=None) is None
+
+def test_resolve_off_returns_none():
+    assert fg.resolve_composition_ideal(_mem(["DPS"], mode="off"), links_range=None) is None
+
+def test_resolve_explicit_override():
+    e = fg.resolve_composition_ideal(_mem(["DPS"], mode="count", mn=4, mx=8), links_range=None)
+    assert (e.mode, e.min, e.max) == ("count", 4, 8)
+
+def test_resolve_first_role_wins_defenders_excluded():
+    # A DPS+Defenders fit resolves its composition ideal as DPS (Defenders is overlay).
+    e = fg.resolve_composition_ideal(_mem(["Defenders", "DPS"]), links_range=None)
+    assert (e.mode, e.min, e.max) == ("percent", 50, 60)
+
+def test_resolve_no_composition_tag_returns_none():
+    assert fg.resolve_composition_ideal(_mem(["Tackle"]), links_range=None) is None
+
+def test_percent_to_pilots_rounds():
+    assert fg.percent_to_pilots(50, 20) == 10
+    assert fg.percent_to_pilots(55, 21) == 12   # 11.55 -> 12
+
+def test_compute_delta_under_in_over():
+    assert fg.compute_delta(7, 10, 12) == ("under", 3)
+    assert fg.compute_delta(11, 10, 12) == ("in", 0)
+    assert fg.compute_delta(14, 10, 12) == ("over", -2)
+    assert fg.compute_delta(5, 8, None) == ("under", 3)   # no upper bound
+    assert fg.compute_delta(20, 8, None) == ("in", 0)
