@@ -14,6 +14,7 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 - **Standings-based capital alerts** — flags hostile capitals using **your own** corp/alliance + ESI standings (nothing hard-coded to any group), with toggles to alert on hostile caps and to bypass the filter for them.
 - **Intelligence Fusion** — tails your tracked in-game intel channels (from EVE's chat logs), parses each report (system, pilot count, d-scan link, cyno/camp flags), and cross-references it with live zKillboard activity. Includes a **suggested-channels** picker that scans your logs across all characters.
 - **Jump-range checker** — Dread / Carrier / FAX / Super / Titan / Black Ops / Jump Freighter / Rorqual ranges, Ansiblex-aware routing, and editable friendly/hostile staging lists.
+- **Fittings, doctrines & MOTD writer** — import fits from **pyfa** or **in-game** (ESI), organize them into **doctrines** with role tags, and compose a clickable fleet **MOTD** (FC link, staging system, role-grouped fit links, logi channel) with a WYSIWYG markup editor and a live raw/rendered preview. **Doctrine-driven fleet guidance** sets an ideal composition (% or # per fit), shows live *in / under / over* status in **Fleet Management**, and annotates the MOTD with `+X / -Y` pilot deltas for the current fleet. Command-burst (links) coverage is tracked from fleet chat.
 - **Wormhole routing**, an **X-up fleet counter** (configurable trigger / clear words + threshold), **character & asset tracking**, and **text-to-speech audio alerts**.
 
 ## Download & run (end users)
