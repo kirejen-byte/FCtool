@@ -974,6 +974,7 @@ class FCToolGUI:
             "motd_budget": 3000,
             "motd_template": {},
             "logi_channel": "",
+            "saved_motds": [],
         }
         for key, val in defaults.items():
             if key not in fit_cfg:
@@ -6506,6 +6507,17 @@ class FCToolGUI:
         self._motd_doctrine_combo.bind(
             "<<ComboboxSelected>>", self._motd_on_doctrine_change)
 
+        # Linked (saved) MOTD dropdown: lists the saved MOTDs attached to the
+        # currently-selected doctrine; picking one re-applies its saved fields.
+        _lbl(inputs, "LINKED MOTD").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_saved_var = tk.StringVar()
+        self._motd_saved_combo = ttk.Combobox(
+            inputs, textvariable=self._motd_saved_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_saved_combo.pack(fill=tk.X, padx=8)
+        self._motd_saved_combo.bind(
+            "<<ComboboxSelected>>", self._on_saved_motd_change)
+
         # FC / Anchor dropdown.
         _lbl(inputs, "FC / ANCHOR").pack(anchor=tk.W, padx=8, pady=(10, 2))
         self._motd_fc_var = tk.StringVar()
@@ -6588,11 +6600,11 @@ class FCToolGUI:
         self._motd_footer_var.trace_add(
             "write", lambda *a: self._schedule_motd_preview())
 
-        # Template save/restore (Task 7.3 Step 2).
+        # Save (link to doctrine) + import.
         tmpl_row = tk.Frame(inputs, bg=BG_PANEL)
         tmpl_row.pack(fill=tk.X, padx=8, pady=(10, 8))
-        ttk.Button(tmpl_row, text="Save template", style="Dark.TButton",
-                   command=self._save_motd_template).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tmpl_row, text="Link to doctrine", style="Green.TButton",
+                   command=self._link_motd_to_doctrine).pack(side=tk.LEFT, padx=2)
         ttk.Button(tmpl_row, text="Import current MOTD", style="Dark.TButton",
                    command=self._import_current_motd).pack(side=tk.LEFT, padx=2)
 
@@ -6653,11 +6665,12 @@ class FCToolGUI:
         self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
                                      pady=(0, 8))
 
-        # Populate dropdowns + restore the saved template, then first preview.
+        # Populate dropdowns, then first preview. The tab opens clean (no sticky
+        # single template); linked MOTDs are loaded on demand from the dropdown.
         self._motd_refresh_doctrines()
         self._motd_refresh_fc_choices()
-        self._motd_restore_template()
         self._motd_rebuild_tag_checkboxes()
+        self._motd_refresh_saved_dropdown()
         self._rebuild_motd_preview()
 
     # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
@@ -6714,9 +6727,11 @@ class FCToolGUI:
         return None
 
     def _motd_on_doctrine_change(self, event=None):
-        """Doctrine changed: rebuild the per-tag checkboxes from its tags and
-        refresh the preview."""
+        """Doctrine changed: rebuild the per-tag checkboxes from its tags,
+        refresh the linked-MOTD dropdown for the new doctrine, and refresh the
+        preview."""
         self._motd_rebuild_tag_checkboxes()
+        self._motd_refresh_saved_dropdown()
         self._rebuild_motd_preview()
 
     def _on_motd_fc_change(self):
@@ -6758,16 +6773,11 @@ class FCToolGUI:
                          anchor=tk.W)
             return
 
-        # A one-shot saved-template tag set (from _motd_restore_template) wins on
-        # the first build; thereafter we preserve the live check state (prev),
-        # falling back to the default-on roles for newly-appearing tags.
-        tmpl_tags = getattr(self, "_motd_template_tags", None)
-        self._motd_template_tags = None      # consume — only applies once
-
+        # Preserve the live check state (prev) across rebuilds, falling back to
+        # the default-on roles for newly-appearing tags. Loading a saved/linked
+        # MOTD applies its tag set afterwards via _apply_motd_fields.
         for t in tags:
-            if tmpl_tags is not None:
-                default = t in tmpl_tags
-            elif t in prev:
+            if t in prev:
                 default = prev[t]
             else:
                 default = t in self._MOTD_DEFAULT_TAGS
@@ -6779,6 +6789,306 @@ class FCToolGUI:
                 activebackground=BG_PANEL, activeforeground=FG_WHITE,
                 anchor=tk.W, command=self._schedule_motd_preview)
             cb.pack(anchor=tk.W)
+
+    # ── MOTD: saved (doctrine-linked) MOTDs ───────────────────────────────────
+
+    _MOTD_SAVED_BLANK = "—"
+
+    def _saved_motds(self):
+        """Return the list of saved-MOTD dicts from config (never None)."""
+        fit_cfg = self.config.get("fittings", {})
+        saved = fit_cfg.get("saved_motds")
+        return saved if isinstance(saved, list) else []
+
+    def _capture_motd_fields(self) -> dict:
+        """Read the current MOTD inputs into a dict (without name/doctrine,
+        which the caller sets). Factored so the save path can be exercised in
+        tests without touching the dialogs."""
+        tags = [t for t, v in self._motd_tag_vars.items() if v.get()]
+        staging_enabled = bool(self._motd_staging_enabled.get()) \
+            if getattr(self, "_motd_staging_enabled", None) is not None else False
+        staging = (self._motd_staging_var.get() or "") \
+            if getattr(self, "_motd_staging_var", None) is not None else ""
+        channel = self._motd_channel_entry.get() \
+            if getattr(self, "_motd_channel_entry", None) is not None else ""
+        return {
+            "fc": self._motd_fc_var.get(),
+            "staging_enabled": staging_enabled,
+            "staging": staging,
+            "channel": channel,
+            "header": self._motd_header_var.get(),
+            "footer": self._motd_footer_var.get(),
+            "tags": tags,
+        }
+
+    def _apply_motd_fields(self, data: dict):
+        """Apply a saved-MOTD dict back onto the builder inputs.
+
+        Sets the doctrine (rebuilding its tag checkboxes), then the scalar
+        fields, then checks exactly the tags named in ``data['tags']`` (the rest
+        unchecked). Defensive when the saved doctrine no longer exists — the
+        other fields still apply. Schedules a preview refresh at the end."""
+        if not isinstance(data, dict):
+            return
+
+        # Doctrine first so the tag checkboxes reflect the right doctrine.
+        doctrine = data.get("doctrine") or ""
+        combo = getattr(self, "_motd_doctrine_combo", None)
+        if combo is not None and doctrine in (combo["values"] or ()):
+            self._motd_doctrine_var.set(doctrine)
+        # Rebuild tag checkboxes for the (possibly changed) doctrine. Use the
+        # full doctrine-change handler so the linked-MOTD dropdown stays in sync.
+        self._motd_on_doctrine_change()
+
+        # Scalar fields.
+        self._motd_fc_var.set(data.get("fc", "") or "")
+        if getattr(self, "_motd_staging_enabled", None) is not None:
+            self._motd_staging_enabled.set(bool(data.get("staging_enabled")))
+        if getattr(self, "_motd_staging_var", None) is not None:
+            self._motd_staging_var.set(data.get("staging", "") or "")
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None:
+            try:
+                entry.delete(0, tk.END)
+                entry.insert(0, data.get("channel", "") or "")
+            except Exception:
+                pass
+        self._motd_header_var.set(data.get("header", "") or "")
+        self._motd_footer_var.set(data.get("footer", "") or "")
+
+        # Tags: check exactly the saved set, uncheck the rest.
+        want = set(data.get("tags") or [])
+        for t, v in self._motd_tag_vars.items():
+            v.set(t in want)
+
+        self._schedule_motd_preview()
+
+    def _motd_refresh_saved_dropdown(self):
+        """Populate the LINKED MOTD combo with a leading blank plus the names of
+        saved MOTDs whose doctrine matches the currently-selected doctrine."""
+        combo = getattr(self, "_motd_saved_combo", None)
+        if combo is None:
+            return
+        doctrine = self._motd_doctrine_var.get()
+        names = [m.get("name", "") for m in self._saved_motds()
+                 if (m.get("doctrine") or "") == doctrine and m.get("name")]
+        values = [self._MOTD_SAVED_BLANK] + sorted(names, key=str.lower)
+        combo["values"] = values
+        if self._motd_saved_var.get() not in values:
+            self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
+
+    def _on_saved_motd_change(self, event=None):
+        """A linked MOTD was picked: load its saved fields onto the builder."""
+        name = self._motd_saved_var.get()
+        if not name or name == self._MOTD_SAVED_BLANK:
+            return
+        doctrine = self._motd_doctrine_var.get()
+        for m in self._saved_motds():
+            if (m.get("doctrine") or "") == doctrine and m.get("name") == name:
+                self._apply_motd_fields(m)
+                return
+
+    def _save_linked_motd(self, doctrine_name: str, motd_name: str):
+        """Capture the current builder fields and persist them as a saved MOTD
+        linked to ``doctrine_name`` under ``motd_name``.
+
+        Replaces any existing saved MOTD with the same (doctrine, name); else
+        appends. Persists, then refreshes the linked-MOTD dropdown. Testable —
+        no dialogs."""
+        data = self._capture_motd_fields()
+        data["name"] = motd_name
+        data["doctrine"] = doctrine_name
+
+        fit_cfg = self.config.setdefault("fittings", {})
+        saved = fit_cfg.get("saved_motds")
+        if not isinstance(saved, list):
+            saved = []
+            fit_cfg["saved_motds"] = saved
+        for i, m in enumerate(saved):
+            if (m.get("doctrine") or "") == doctrine_name \
+                    and m.get("name") == motd_name:
+                saved[i] = data
+                break
+        else:
+            saved.append(data)
+        self._save_config()
+
+        # Reflect the new save in the dropdown (and select it when the current
+        # doctrine matches, so it reads back as the active linked MOTD).
+        self._motd_refresh_saved_dropdown()
+        if self._motd_doctrine_var.get() == doctrine_name:
+            combo = getattr(self, "_motd_saved_combo", None)
+            if combo is not None and motd_name in (combo["values"] or ()):
+                self._motd_saved_var.set(motd_name)
+        status = getattr(self, "_motd_fleet_status", None)
+        if status is not None:
+            status.config(
+                text=f"Linked MOTD '{motd_name}' saved to doctrine "
+                     f"'{doctrine_name}'.", fg=FG_GREEN)
+
+    def _link_motd_to_doctrine(self):
+        """'Link to doctrine' button: pick an existing doctrine + name, then
+        save the current builder fields as a doctrine-linked MOTD."""
+        doctrines = sorted((d.name or "") for d in self.fittings.list_doctrines()
+                           if (d.name or ""))
+        if not doctrines:
+            messagebox.showinfo(
+                "Link to doctrine",
+                "No doctrines exist yet. Create a doctrine first (Doctrines "
+                "tab) or import a MOTD to create one.")
+            return
+
+        # Small modal: pick a doctrine, then name the linked MOTD.
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Link MOTD to doctrine")
+        dlg.configure(bg=BG_PANEL)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        tk.Label(dlg, text="Link this MOTD to which doctrine?",
+                 font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+        pick_var = tk.StringVar(
+            value=self._motd_doctrine_var.get()
+            if self._motd_doctrine_var.get() in doctrines else doctrines[0])
+        pick = ttk.Combobox(dlg, textvariable=pick_var, state="readonly",
+                            values=doctrines, font=("Consolas", 10), width=34)
+        pick.pack(fill=tk.X, padx=12)
+
+        result = {"ok": False}
+
+        def _confirm():
+            result["ok"] = True
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        btns = tk.Frame(dlg, bg=BG_PANEL)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Continue", style="Green.TButton",
+                   command=_confirm).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.LEFT, padx=2)
+        dlg.bind("<Return>", lambda e: _confirm())
+        dlg.bind("<Escape>", lambda e: _cancel())
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+        self.root.wait_window(dlg)
+
+        if not result["ok"]:
+            return
+        doctrine_name = pick_var.get()
+        if not doctrine_name:
+            return
+        motd_name = simpledialog.askstring(
+            "Name this MOTD",
+            "Name for this linked MOTD:",
+            initialvalue=doctrine_name, parent=self.root)
+        if not motd_name or not motd_name.strip():
+            return
+        self._save_linked_motd(doctrine_name, motd_name.strip())
+
+    def _create_doctrine_from_motd(self, raw, fittings):
+        """Create a new doctrine from an imported MOTD: import its linked fits
+        (TAGLESS), and save the imported MOTD as a doctrine-linked saved MOTD.
+
+        ``raw`` is the imported MOTD markup (already loaded into the header var
+        by the import path). ``fittings`` is the list of ``{dna, name}`` dicts
+        parsed from it. Returns ``(doctrine_id, name, added, reused, failed)``
+        or ``None`` if the user cancels the name prompt. Testable — the only
+        dialog is the name prompt (monkeypatchable)."""
+        name = simpledialog.askstring(
+            "Create doctrine",
+            "Name for the new doctrine:",
+            initialvalue="Imported doctrine", parent=self.root)
+        if not name or not name.strip():
+            return None
+        name = name.strip()
+
+        doctrine_id = self.fittings.add_doctrine(name)
+
+        # Pre-index existing fits by content hash for de-dupe.
+        existing = {}
+        for f in self.fittings.list_fits():
+            try:
+                existing[fit_models.fit_content_hash(f.parsed)] = f.id
+            except Exception:
+                pass
+
+        added = reused = failed = 0
+        for entry in fittings or []:
+            dna = (entry or {}).get("dna", "")
+            fit_name = (entry or {}).get("name") or ""
+            if not dna:
+                failed += 1
+                continue
+            try:
+                parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
+                h = fit_models.fit_content_hash(parsed)
+            except Exception:
+                failed += 1
+                continue
+            fid = existing.get(h)
+            if fid is None:
+                fit = fit_models.Fit(
+                    id="",
+                    name=fit_name or parsed.ship_name or "",
+                    hull_type_id=parsed.ship_type_id,
+                    hull_name=parsed.ship_name or "",
+                    source="dna",
+                    raw_text="",
+                    parsed=parsed,
+                    dna=dna,
+                    notes="",
+                    esi_fitting_ids={},
+                    created="",
+                    modified="",
+                )
+                try:
+                    fid = self.fittings.add_fit(fit)
+                    existing[h] = fid
+                    added += 1
+                except Exception:
+                    failed += 1
+                    continue
+            else:
+                reused += 1
+            # TAGLESS membership (empty tag list).
+            self.fittings.add_fit_to_doctrine(doctrine_id, fid, [])
+
+        # Save the imported MOTD as a doctrine-linked saved MOTD. The import path
+        # already loaded header=raw etc., so capture the live fields.
+        data = self._capture_motd_fields()
+        data["name"] = name
+        data["doctrine"] = name
+        fit_cfg = self.config.setdefault("fittings", {})
+        saved = fit_cfg.get("saved_motds")
+        if not isinstance(saved, list):
+            saved = []
+            fit_cfg["saved_motds"] = saved
+        saved.append(data)
+        self._save_config()
+
+        try:
+            self.fittings.save()
+        except Exception:
+            pass
+
+        # Refresh the doctrine views + select the new doctrine in the MOTD combo.
+        self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
+        if name in (self._motd_doctrine_combo["values"] or ()):
+            self._motd_doctrine_var.set(name)
+        self._motd_on_doctrine_change()
+        self._motd_refresh_saved_dropdown()
+        try:
+            self._refresh_fit_list(self._fit_search_var.get())
+        except Exception:
+            pass
+
+        return doctrine_id, name, added, reused, failed
 
     def _motd_scan_channels(self):
         """Discover chat channels (off the Tk thread) to seed the channel
@@ -7332,8 +7642,10 @@ class FCToolGUI:
 
     def _apply_imported_motd(self, raw, err):
         """Tk-thread handler for an imported MOTD: clear the existing builder,
-        load the imported MOTD as the sole content, offer fit import, and save
-        it as a named template snapshot."""
+        load the imported MOTD as the sole content, then offer to create a new
+        doctrine from it (importing its linked fits tagless + saving the MOTD as
+        a doctrine-linked saved MOTD). Falls back to a plain fit-import offer
+        when the user declines doctrine creation."""
         if err is not None or raw is None:
             self._motd_fleet_status.config(text="Import failed.", fg=FG_RED)
             messagebox.showerror("Import MOTD",
@@ -7355,9 +7667,26 @@ class FCToolGUI:
         # re-wrapped build of header=raw). See _motd_set_preview_raw.
         self._motd_set_preview_raw(raw)
 
-        # Offer to import each embedded fit DNA into the library (de-duped).
         fittings = parsed.get("fittings") or []
-        if fittings and messagebox.askyesno(
+
+        # Primary offer: build a new doctrine from this MOTD — import its linked
+        # fits (tagless) and save it as a doctrine-linked MOTD.
+        if messagebox.askyesno(
+                "Create doctrine?",
+                "Create a new doctrine from this MOTD — import its linked fits "
+                "and save it as a linked MOTD?"):
+            result = self._create_doctrine_from_motd(raw, fittings)
+            if result is not None:
+                _did, name, added, reused, failed = result
+                messagebox.showinfo(
+                    "Doctrine created",
+                    f"Created doctrine '{name}' with "
+                    f"{added + reused} fit(s) ({added} new, {reused} reused"
+                    + (f", {failed} unparsable" if failed else "")
+                    + ").\nSaved as a linked MOTD.")
+        # Fallback: still let the user import the embedded fits into the library
+        # without creating a doctrine.
+        elif fittings and messagebox.askyesno(
                 "Import fits",
                 f"Import {len(fittings)} fit link(s) from this MOTD into the "
                 f"library? Duplicates are skipped automatically."):
@@ -7366,15 +7695,6 @@ class FCToolGUI:
                 "Fit import",
                 f"Imported {added} new fit(s); {reused} already in the "
                 f"library; {failed} could not be parsed.")
-
-        # Save the raw MOTD as a named template snapshot.
-        if raw:
-            name = simpledialog.askstring(
-                "Save MOTD snapshot",
-                "Name this imported MOTD snapshot (blank to skip):",
-                parent=self.root)
-            if name and name.strip():
-                self._save_motd_snapshot(name.strip(), raw)
 
         # Re-assert the verbatim preview as the LAST step: the modal dialogs
         # above run nested Tk event loops that can fire the debounced preview
@@ -7438,86 +7758,6 @@ class FCToolGUI:
             # the library view; the fittings sub-tab refreshes itself.
             self._motd_refresh_doctrines()
         return added, reused, failed
-
-    def _save_motd_snapshot(self, name, raw):
-        """Persist a raw MOTD under config['fittings']['motd_template']['saved']."""
-        fit_cfg = self.config.setdefault("fittings", {})
-        tmpl = fit_cfg.setdefault("motd_template", {})
-        if not isinstance(tmpl, dict):
-            tmpl = {}
-            fit_cfg["motd_template"] = tmpl
-        saved = tmpl.setdefault("saved", {})
-        if not isinstance(saved, dict):
-            saved = {}
-            tmpl["saved"] = saved
-        saved[name] = raw
-        self._save_config()
-        self._motd_fleet_status.config(
-            text=f"Saved snapshot '{name}'.", fg=FG_GREEN)
-
-    def _save_motd_template(self):
-        """Persist the current field selections (checked tags, header/footer,
-        channel, doctrine, FC) to config['fittings']['motd_template'] so they
-        restore on next open."""
-        fit_cfg = self.config.setdefault("fittings", {})
-        tmpl = fit_cfg.setdefault("motd_template", {})
-        if not isinstance(tmpl, dict):
-            tmpl = {}
-            fit_cfg["motd_template"] = tmpl
-        tmpl["tags"] = [t for t, v in self._motd_tag_vars.items() if v.get()]
-        tmpl["header"] = self._motd_header_var.get()
-        tmpl["footer"] = self._motd_footer_var.get()
-        tmpl["channel"] = (self._motd_channel_entry.get().strip()
-                           if getattr(self, "_motd_channel_entry", None) else "")
-        tmpl["doctrine"] = self._motd_doctrine_var.get()
-        tmpl["fc"] = self._motd_fc_var.get()
-        if getattr(self, "_motd_staging_enabled", None) is not None:
-            tmpl["staging_enabled"] = bool(self._motd_staging_enabled.get())
-            tmpl["staging"] = (self._motd_staging_var.get() or "").strip()
-        # Persist the chosen channel to the dedicated config key too.
-        fit_cfg["logi_channel"] = tmpl["channel"]
-        self._save_config()
-        self._motd_fleet_status.config(text="Template saved.", fg=FG_GREEN)
-
-    def _motd_restore_template(self):
-        """Restore saved field selections from config['fittings']['motd_template']
-        (called once while building the sub-tab, before the first preview).
-
-        Tag selections are applied later in _motd_rebuild_tag_checkboxes via the
-        persisted set; here we restore the scalar fields and seed the channel
-        from the dedicated logi_channel key when no template channel exists."""
-        fit_cfg = self.config.get("fittings", {})
-        tmpl = fit_cfg.get("motd_template", {})
-        if not isinstance(tmpl, dict):
-            tmpl = {}
-
-        doctrine = tmpl.get("doctrine")
-        if doctrine and doctrine in (self._motd_doctrine_combo["values"] or ()):
-            self._motd_doctrine_var.set(doctrine)
-        fc = tmpl.get("fc")
-        if fc and fc in (self._motd_fc_combo["values"] or ()):
-            self._motd_fc_var.set(fc)
-        self._motd_header_var.set(tmpl.get("header", "") or "")
-        self._motd_footer_var.set(tmpl.get("footer", "") or "")
-
-        # Staging: only override the construction defaults when the template
-        # actually persisted these keys, so a fresh template keeps the FC's
-        # configured staging system (set when the widgets were built).
-        if "staging" in tmpl and getattr(self, "_motd_staging_var", None):
-            self._motd_staging_var.set(tmpl.get("staging", "") or "")
-        if ("staging_enabled" in tmpl
-                and getattr(self, "_motd_staging_enabled", None) is not None):
-            self._motd_staging_enabled.set(bool(tmpl.get("staging_enabled")))
-
-        channel = tmpl.get("channel") or fit_cfg.get("logi_channel", "") or ""
-        entry = getattr(self, "_motd_channel_entry", None)
-        if entry is not None and channel:
-            entry.delete(0, tk.END)
-            entry.insert(0, channel)
-
-        # Remember which tags the template wants checked; consumed by the
-        # tag-checkbox builder (which only knows the doctrine's actual tags).
-        self._motd_template_tags = tmpl.get("tags")
 
     # ── Fittings library sub-tab (Task 5.2) ───────────────────────────────────
 
