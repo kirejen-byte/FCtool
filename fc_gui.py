@@ -11692,10 +11692,19 @@ class FCToolGUI:
                             "is_tackle": is_tackle(stid) if stid else False,
                         })
                     self.root.after(0, self._process_loss_tracking, fleet_id, enriched)
+                elif fleet_id:
+                    # In a fleet but not boss (can't read members → members is None).
+                    # Keep chat-fed command-burst charges; only the hull roster is
+                    # unknown. Do NOT run the grace/clear path (that wipes charges).
+                    self._no_fleet_misses = 0
+                    self._booster_roster = {}        # hulls unverified; charges kept
+                    self._schedule_booster_refresh()
+                    self.root.after(60000, self._refresh_fleet_locations)
+                    return
                 else:
-                    # No fleet data this poll — could be genuine (not in fleet)
-                    # OR a transient ESI error. Only clear state after
-                    # NO_FLEET_GRACE consecutive misses to avoid flicker.
+                    # Genuinely not in a fleet (no fleet_id) — could also be a
+                    # transient ESI error. Only clear state after NO_FLEET_GRACE
+                    # consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
                         self.root.after(0, self._update_fleet_composition, {}, 0)
