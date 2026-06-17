@@ -1504,17 +1504,10 @@ class FCToolGUI:
         self._fleet_doctrine_link.pack(side=tk.LEFT, padx=6)
         self._fleet_doctrine_link.bind(
             "<Button-1>", lambda e: self._open_active_doctrine())
-        # DPS guidance summary line (populated by guidance when a doctrine is active).
-        self._dps_guidance_label = tk.Label(
-            comp_left, text="", font=("Consolas", 9, "bold"),
-            fg=FG_DIM, bg=BG_PANEL)
-        self._dps_guidance_label.pack(anchor=tk.W, padx=8, pady=(0, 2))
         self._refresh_fleet_doctrine_combo()
 
         comp_header = tk.Frame(comp_left, bg=BG_PANEL)
         comp_header.pack(fill=tk.X, padx=8)
-        tk.Label(comp_header, text="DPS", font=("Consolas", 8),
-                 fg=FG_DIM, bg=BG_PANEL, width=4).pack(side=tk.LEFT)
         tk.Label(comp_header, text="Ship Type", font=("Consolas", 8),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
 
@@ -1522,10 +1515,6 @@ class FCToolGUI:
         self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
-        self._dps_designated: set[str] = set()  # ship names marked as DPS
-        self._dps_ratio_label = tk.Label(comp_left, text="", font=("Consolas", 9, "bold"),
-                                          fg=FG_DIM, bg=BG_PANEL)
-        self._dps_ratio_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
         self._fleet_total = 0
         self._fleet_ship_counts: dict[str, int] = {}  # ship_name -> count
 
@@ -1569,6 +1558,8 @@ class FCToolGUI:
         self._booster_strip.pack(side=tk.RIGHT, anchor=tk.E)
 
         # Create collapsible sections (order matters for display)
+        self._dps_container, self._dps_content, self._dps_count = \
+            self._create_collapsible_section(self._spec_roles_frame, "DPS")
         self._links_container, self._links_content, self._links_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
         # Non-boss banner. Created on _spec_roles_frame (NOT _links_container) so
@@ -3616,24 +3607,6 @@ class FCToolGUI:
 
         return container, content, count_label
 
-    def _update_dps_ratio(self):
-        """Recalculate and display DPS ratio based on checked ship types."""
-        if not self._dps_designated or self._fleet_total == 0:
-            self._dps_ratio_label.config(text="")
-            return
-        dps_count = sum(self._fleet_ship_counts.get(name, 0)
-                        for name in self._dps_designated)
-        ratio = dps_count / self._fleet_total
-        pct = int(ratio * 100)
-        if ratio >= 0.6:
-            self._dps_ratio_label.config(
-                text=f"\u2705 Good Ratio ({dps_count}/{self._fleet_total}, {pct}%)",
-                fg=FG_GREEN)
-        else:
-            self._dps_ratio_label.config(
-                text=f"\u274c Need more DPS ({dps_count}/{self._fleet_total}, {pct}%)",
-                fg="#ff6666")
-
     def _update_fleet_composition(self, ship_counts: dict[int, int], total: int):
         """Update the Top 10 fleet composition display."""
         from zkill_monitor import resolve_name
@@ -3650,13 +3623,8 @@ class FCToolGUI:
 
         # Flicker prevention: only rebuild if data changed
         if new_data == self._fleet_comp_prev:
-            self._update_dps_ratio()
             return
         self._fleet_comp_prev = new_data
-
-        # Prune DPS designations for ship types no longer in fleet
-        current_names = {name for name, _ in new_data}
-        self._dps_designated &= current_names
 
         # Clear and rebuild
         for widget in self._fleet_comp_frame.winfo_children():
@@ -3666,22 +3634,6 @@ class FCToolGUI:
         for ship_name, count in new_data:
             row = tk.Frame(self._fleet_comp_frame, bg=BG_PANEL)
             row.pack(fill=tk.X)
-
-            is_dps = tk.BooleanVar(value=ship_name in self._dps_designated)
-
-            def on_toggle(name=ship_name, var=is_dps):
-                if var.get():
-                    self._dps_designated.add(name)
-                else:
-                    self._dps_designated.discard(name)
-                self._update_dps_ratio()
-
-            cb = tk.Checkbutton(row, variable=is_dps, command=on_toggle,
-                                 bg=BG_PANEL, fg=FG_TEXT, selectcolor="#2a2a3a",
-                                 activebackground=BG_PANEL, activeforeground=FG_TEXT,
-                                 highlightthickness=0, bd=1, relief=tk.FLAT)
-            cb.pack(side=tk.LEFT)
-
             lbl = tk.Label(row, text=f"{ship_name}: {count}",
                            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W)
             lbl.pack(side=tk.LEFT)
@@ -3691,8 +3643,6 @@ class FCToolGUI:
             tk.Label(self._fleet_comp_frame, text="  No fleet data",
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
-
-        self._update_dps_ratio()
 
     def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
         """Update all collapsible specialized role sections."""
@@ -3863,22 +3813,32 @@ class FCToolGUI:
                 elif count < threshold and cat_key in self._roles_filled:
                     self._roles_filled.discard(cat_key)
 
-        # DPS guidance summary line (Phase C).
-        rep = getattr(self, "_fleet_guidance", None)
-        lbl = getattr(self, "_dps_guidance_label", None)
-        if lbl is not None:
-            if rep is not None and "DPS" in rep.roles and rep.has_live_fleet:
-                text, colour = self._format_rollup(rep.roles["DPS"])
-                lbl.config(text=f"DPS: {text}", fg=colour)
-            else:
-                lbl.config(text="", fg=FG_DIM)
+        # DPS is doctrine-driven: counted as the active doctrine's DPS-tagged
+        # hulls in the live fleet (read from the guidance rollup). Unlike the
+        # other roles it has no hull-class fallback, so the section is empty
+        # when no doctrine is active. Drive the section's count badge from the
+        # rollup; the content frame just carries a short explanatory note.
+        dps_badge = self._role_guidance_badge("dps")
+        for w in self._dps_content.winfo_children():
+            w.destroy()
+        if dps_badge is not None:
+            text, colour = dps_badge
+            self._dps_count.config(text=text, fg=colour)
+            tk.Label(self._dps_content, text="  Doctrine DPS hulls in fleet",
+                     font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
+        else:
+            self._dps_count.config(text="—", fg=FG_DIM)
+            tk.Label(self._dps_content, text="  No doctrine",
+                     font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                     ).pack(anchor=tk.W)
 
         # Keep the MOTD +/- deltas current as the live fleet changes.
         if hasattr(self, "_schedule_motd_preview"):
             self._schedule_motd_preview()
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
-    _ROLE_KEY_TO_TAG = {"links": "Links", "logi": "Logistics",
+    _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logistics",
                         "defenders": "Defenders", "webs": "Support - Webs"}
 
     def _format_rollup(self, rr) -> tuple[str, str]:
