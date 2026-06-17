@@ -27,6 +27,7 @@ from typing import NamedTuple
 from uuid import uuid4
 
 import fit_dna
+import fleet_guidance
 from fit_models import (
     DEFAULT_TAGS,
     Doctrine,
@@ -69,6 +70,9 @@ class FittingsStore:
         self._fits: dict[str, Fit] = {}
         self._doctrines: dict[str, Doctrine] = {}
         self._tags: list[str] = list(DEFAULT_TAGS)
+        # Optional duck-typed TypeCatalog (group_of/resolve_name), set by the GUI
+        # after construction. Used to auto-tag fits that mount a Defender Launcher.
+        self.catalog = None
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -251,6 +255,11 @@ class FittingsStore:
         doctrine = self._doctrines.get(doctrine_id)
         if doctrine is None:
             return
+        tags = list(tags or [])
+        if self.catalog is not None and "Defenders" not in tags:
+            fit = self.get_fit(fit_id)
+            if fit is not None and fleet_guidance.has_defender_launcher(fit.parsed, self.catalog):
+                tags.append("Defenders")
         doctrine.members.append(
             DoctrineMember(fit_id=fit_id, tags=list(tags), order=len(doctrine.members))
         )
@@ -266,6 +275,21 @@ class FittingsStore:
         for member in doctrine.members:
             if member.fit_id == fit_id:
                 member.tags = list(tags)
+        doctrine.modified = _now()
+
+    def set_member_ideal(
+        self, doctrine_id: str, fit_id: str,
+        mode: str | None, ideal_min: int | None, ideal_max: int | None,
+    ) -> None:
+        """Set the per-fit ideal (mode/min/max) on a (doctrine, fit) membership."""
+        doctrine = self._doctrines.get(doctrine_id)
+        if doctrine is None:
+            return
+        for member in doctrine.members:
+            if member.fit_id == fit_id:
+                member.ideal_mode = mode
+                member.ideal_min = ideal_min
+                member.ideal_max = ideal_max
         doctrine.modified = _now()
 
     def remove_fit_from_doctrine(self, doctrine_id: str, fit_id: str) -> None:
