@@ -10161,7 +10161,7 @@ class FCToolGUI:
         save_bar = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                             highlightbackground=BORDER_COLOR, highlightthickness=1)
         save_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
-        ttk.Button(save_bar, text="Save Settings & Restart",
+        ttk.Button(save_bar, text="Save Settings",
                    style="Green.TButton",
                    command=self._save_settings).pack(side=tk.LEFT, padx=10, pady=5)
         self._save_status = tk.Label(save_bar, text="",
@@ -10225,12 +10225,15 @@ class FCToolGUI:
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=25,
             borderwidth=1, relief=tk.RIDGE,
+            on_select=self._autosave_staging_system,
         )
         self._staging_entry.pack(side=tk.LEFT, padx=5)
         # Pre-fill with saved staging system
         saved_staging = self.config.get("zkillboard", {}).get("staging_system", "")
         if saved_staging:
             self._staging_entry.insert(0, saved_staging)
+        # Persist typed values on focus-out (dropdown picks fire on_select).
+        self._staging_entry.bind("<FocusOut>", self._autosave_staging_system, add="+")
         tk.Label(staging_frame, text="(used for route calcs & jump range)",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=5)
 
@@ -10808,7 +10811,7 @@ class FCToolGUI:
         # any existing readers keep working.
 
         self._save_config()
-        self._save_status.config(text="Saved! Restart to apply.", fg=FG_GREEN)
+        self._save_status.config(text="Saved!", fg=FG_GREEN)
 
         # Restart modules
         self._stop_monitoring()
@@ -10824,7 +10827,12 @@ class FCToolGUI:
         self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
         self._start_monitoring()
-        self._save_status.config(text="Saved & Restarted!", fg=FG_GREEN)
+        self._save_status.config(text="Saved!", fg=FG_GREEN)
+
+    def _autosave_staging_system(self, *args):
+        val = self._staging_entry.get().strip()
+        self.config.setdefault("zkillboard", {})["staging_system"] = val
+        self._save_config()
 
     # ── Module Setup ──────────────────────────────────────────────────────────
 
