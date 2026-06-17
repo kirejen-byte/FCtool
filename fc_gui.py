@@ -39,6 +39,7 @@ if sys.platform == "win32":
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import intel_filter
+import intel_monitor
 from chat_monitor import ChatMonitor, ChatMessage
 from intel_monitor import (
     IntelReport, parse_intel_message, scan_available_channels,
@@ -5733,6 +5734,9 @@ class FCToolGUI:
         if "MOTD" in text:
             self._motd_refresh_doctrines()
             self._motd_refresh_fc_choices()
+            # Run the fleet-boss check automatically on MOTD-tab open so the
+            # Set button enables without the user clicking "Refresh fleet".
+            self._motd_refresh_fleet_status()
 
     # ── Doctrines sub-tab (Tasks 6.1 / 6.2) ───────────────────────────────────
 
@@ -6553,7 +6557,7 @@ class FCToolGUI:
         self._motd_channel_status.pack(anchor=tk.W, padx=8)
 
         # Per-tag include checkboxes (rebuilt per doctrine).
-        _lbl(inputs, "INCLUDE TAGS").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        _lbl(inputs, "INCLUDE FITS").pack(anchor=tk.W, padx=8, pady=(10, 2))
         self._motd_tag_frame = tk.Frame(inputs, bg=BG_PANEL)
         self._motd_tag_frame.pack(fill=tk.X, padx=8)
 
@@ -6630,6 +6634,8 @@ class FCToolGUI:
         self._motd_set_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(act_row, text="Copy markup", style="Dark.TButton",
                    command=self._copy_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(act_row, text="Clear MOTD", style="Red.TButton",
+                   command=self._clear_motd).pack(side=tk.LEFT, padx=2)
         ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
                    command=self._motd_refresh_fleet_status).pack(
                        side=tk.LEFT, padx=2)
@@ -6820,10 +6826,34 @@ class FCToolGUI:
         self._motd_preview_job = self.root.after(
             self._MOTD_PREVIEW_DEBOUNCE_MS, self._rebuild_motd_preview)
 
-    def _motd_build_fits_by_tag(self, doctrine):
-        """Assemble ``{tag: [(dna, name), ...]}`` for the checked tags of a
+    def _motd_fit_compact_label(self, fit):
+        """Return a short link label for a fit: the ship CLASS (hull) name.
+
+        Prefers the stored ``hull_name``; falls back to resolving
+        ``hull_type_id`` via the shared type catalog, then to the full
+        ``fit.name`` if neither yields a usable class name. Used by
+        :meth:`_motd_build_fits_by_tag` when ``compact=True`` to shrink the
+        MOTD (e.g. "Muninn" instead of "MWD Heavy Muninn")."""
+        name = (getattr(fit, "hull_name", "") or "").strip()
+        if name:
+            return name
+        try:
+            resolved = self.type_catalog.resolve_name(
+                getattr(fit, "hull_type_id", 0)) or ""
+        except Exception:
+            resolved = ""
+        resolved = resolved.strip()
+        return resolved or fit.name
+
+    def _motd_build_fits_by_tag(self, doctrine, compact: bool = False):
+        """Assemble ``{tag: [(dna, label), ...]}`` for the checked tags of a
         doctrine. A fit appears under each checked tag it carries; fits with no
-        DNA are skipped (can't be linked). Pure assembly — no business logic."""
+        DNA are skipped (can't be linked). Pure assembly — no business logic.
+
+        When ``compact`` is True the link LABEL is the ship class name (via
+        :meth:`_motd_fit_compact_label`) instead of the full ``fit.name``, to
+        save room when the MOTD is at risk of overflow; the DNA is unchanged so
+        the link still rebuilds the exact fit on click."""
         fits_by_tag: dict[str, list[tuple[str, str]]] = {}
         if doctrine is None:
             return fits_by_tag
@@ -6832,20 +6862,62 @@ class FCToolGUI:
             fit = self.fittings.get_fit(mem.fit_id)
             if fit is None or not fit.dna:
                 continue
+            label = self._motd_fit_compact_label(fit) if compact else fit.name
             for tag in (mem.tags or []):
                 if tag not in checked:
                     continue
-                fits_by_tag.setdefault(tag, []).append((fit.dna, fit.name))
+                fits_by_tag.setdefault(tag, []).append((fit.dna, label))
         return fits_by_tag
 
-    def _current_motd_markup(self):
+    def _motd_resolve_channel_id(self, channel_name):
+        """Resolve a logi/cap channel NAME to its numeric chat-channel id.
+
+        Reads the channel's chat-log header via
+        :func:`intel_monitor.read_channel_id` (a single small header read),
+        using the same logs path the channel scan uses. The result is cached
+        per channel name (``self._motd_channel_id_cache``) so a header is read
+        at most once per distinct channel between cache resets — repeated
+        previews/builds for the same channel reuse the cached id rather than
+        hitting disk on every debounce.
+
+        Returns the id as a string (leading minus preserved) or ``None`` when
+        the channel is blank, no matching log exists, or no id could be read
+        (in which case the caller falls back to a plain-text channel)."""
+        name = (channel_name or "").strip()
+        if not name:
+            return None
+        cache = getattr(self, "_motd_channel_id_cache", None)
+        if cache is None:
+            cache = self._motd_channel_id_cache = {}
+        if name in cache:
+            return cache[name]
+        try:
+            logs_path = resolve_eve_logs_path(
+                self.config.get("eve_logs_path", ""))
+        except Exception:
+            logs_path = self.config.get("eve_logs_path", "")
+        cid = None
+        try:
+            cid = intel_monitor.read_channel_id(logs_path, name)
+        except Exception:
+            cid = None
+        cache[name] = cid
+        return cid
+
+    def _current_motd_markup(self, compact: bool = False):
         """Build the MOTD markup string from the current input selections.
+
+        When ``compact`` is True, fit link labels collapse to the ship class
+        name (see :meth:`_motd_build_fits_by_tag`) to save room; otherwise full
+        fit names are used. The text colour is left at ``build_motd``'s white
+        default (``0xffffffff``) — the in-game default red is hard to read — so
+        the wrapper is always emitted and counted by the length meter.
 
         Side effect: sets ``self._motd_staging_warn`` to a non-blocking warning
         string (or "") describing an unresolvable staging system, which
         :meth:`_rebuild_motd_preview` folds into the warnings line."""
         doctrine = self._motd_selected_doctrine()
-        fits_by_tag = self._motd_build_fits_by_tag(doctrine)
+        fits_by_tag = self._motd_build_fits_by_tag(doctrine, compact=compact)
 
         fc_auth = self._motd_selected_fc_auth()
         fc_name = fc_auth.character_name if fc_auth else None
@@ -6853,6 +6925,11 @@ class FCToolGUI:
 
         channel = (self._motd_channel_entry.get().strip()
                    if getattr(self, "_motd_channel_entry", None) else "")
+        # Resolve the channel name to its numeric id so the Logi line becomes a
+        # clickable joinChannel link; None falls back to plain text. Cached per
+        # name to avoid re-reading the log header on every debounce.
+        channel_id = (self._motd_resolve_channel_id(channel)
+                      if channel else None)
 
         # Optional staging system → in-game SYSTEM link. Only when the checkbox
         # is on and the entry resolves to a real system; otherwise warn (non-
@@ -6880,6 +6957,7 @@ class FCToolGUI:
             doctrine_name=(doctrine.name if doctrine else ""),
             fits_by_tag=fits_by_tag,
             channel=channel or None,
+            channel_id=channel_id,
             header=self._motd_header_var.get(),
             footer=self._motd_footer_var.get(),
             staging_name=staging_name,
@@ -6895,6 +6973,26 @@ class FCToolGUI:
         except (TypeError, ValueError):
             return motd_builder.MOTD_BUDGET_DEFAULT
 
+    def _motd_output_markup(self):
+        """Return ``(markup, compacted)`` — the MOTD to preview/copy/push.
+
+        Builds with full fit names first; only when that overflows the budget
+        does it rebuild with compact (ship-class) labels to claw back room, and
+        only adopts the compact form if it is actually shorter (a doctrine
+        already named by hull yields no gain — full names are kept then). Used
+        by the preview, the Set-as-fleet-MOTD push, and Copy so all three agree
+        on the same output."""
+        budget = self._motd_budget()
+        markup = self._current_motd_markup()
+        compacted = False
+        if motd_builder.estimate_length(markup) > budget:
+            compact_markup = self._current_motd_markup(compact=True)
+            if (motd_builder.estimate_length(compact_markup)
+                    < motd_builder.estimate_length(markup)):
+                markup = compact_markup
+                compacted = True
+        return markup, compacted
+
     def _rebuild_motd_preview(self):
         """Rebuild the preview Text, the length meter, and the warnings line.
 
@@ -6906,7 +7004,8 @@ class FCToolGUI:
         if preview is None:
             return
 
-        markup = self._current_motd_markup()
+        budget = self._motd_budget()
+        markup, compacted = self._motd_output_markup()
 
         preview.config(state=tk.NORMAL)
         preview.delete("1.0", tk.END)
@@ -6914,7 +7013,6 @@ class FCToolGUI:
         preview.config(state=tk.DISABLED)
 
         length = motd_builder.estimate_length(markup)
-        budget = self._motd_budget()
         frac = (length / budget) if budget else 0.0
         if frac < 0.8:
             color = FG_GREEN
@@ -6940,6 +7038,9 @@ class FCToolGUI:
         staging_warn = getattr(self, "_motd_staging_warn", "")
         if staging_warn:
             warns.append(staging_warn)
+        if compacted:
+            warns.append("Shortened fit names to ship class to fit the MOTD "
+                         "length limit.")
         if length >= budget:
             warns.append(f"Over budget by {length - budget} chars — the server "
                          f"may truncate this MOTD.")
@@ -6960,7 +7061,13 @@ class FCToolGUI:
     def _motd_refresh_fleet_status(self):
         """Resolve the active FC character's current fleet + boss flag off the
         Tk thread (reuses ESIAuth.get_fleet_info / is_boss) and update the Set
-        button + status line on the Tk thread."""
+        button + status line on the Tk thread.
+
+        For instant feedback in the common case, when the selected FC is the
+        primary/polled character we first SEED the Set button from the fleet
+        state cached by :meth:`_refresh_fleet_locations` (the ~15s poll), then
+        confirm with a fresh async ESI check below. Seeding only applies to the
+        primary character; other characters rely solely on the async check."""
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             self._motd_fleet_id = None
@@ -6968,6 +7075,20 @@ class FCToolGUI:
             self._apply_motd_fleet_status(
                 None, False, "No authenticated FC character selected.")
             return
+
+        # Instant feedback: seed from the polled cache when the selected FC is
+        # the primary (polled) character, so the Set button enables immediately
+        # for the common case while the async check below confirms.
+        if (auth is self.esi_auth
+                and hasattr(self, "_last_polled_fleet_id")):
+            cached_id = self._last_polled_fleet_id
+            cached_boss = bool(getattr(self, "_last_polled_fleet_is_boss",
+                                       False))
+            if cached_boss and cached_id:
+                self._apply_motd_fleet_status(
+                    cached_id, True,
+                    "You are the fleet boss — Set is enabled.")
+
         self._motd_fleet_status.config(text="Checking fleet...", fg=FG_ACCENT)
 
         def worker():
@@ -7019,7 +7140,7 @@ class FCToolGUI:
                                    "No authenticated FC character selected.")
             return
 
-        markup = self._current_motd_markup()
+        markup, _compacted = self._motd_output_markup()
         length = motd_builder.estimate_length(markup)
         budget = self._motd_budget()
         if length >= budget:
@@ -7058,7 +7179,7 @@ class FCToolGUI:
 
     def _copy_motd(self):
         """Copy the raw MOTD markup to the clipboard (manual-paste fallback)."""
-        markup = self._current_motd_markup()
+        markup, _compacted = self._motd_output_markup()
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(markup)
@@ -7105,9 +7226,106 @@ class FCToolGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _clear_motd_builder(self):
+        """Reset the MOTD builder to an empty state.
+
+        Clears the header/footer, turns the staging checkbox off and empties
+        its entry, blanks the logi/cap channel, deselects the doctrine (which
+        empties the per-fit/tag include checkboxes), and rebuilds the now-empty
+        preview. Used by 'Clear MOTD' and by the import path (so an imported
+        MOTD replaces, rather than appends to, the current builder)."""
+        # Header / footer free text.
+        if getattr(self, "_motd_header_var", None) is not None:
+            self._motd_header_var.set("")
+        if getattr(self, "_motd_footer_var", None) is not None:
+            self._motd_footer_var.set("")
+
+        # Staging system: checkbox off + entry empty.
+        if getattr(self, "_motd_staging_enabled", None) is not None:
+            self._motd_staging_enabled.set(False)
+        if getattr(self, "_motd_staging_var", None) is not None:
+            self._motd_staging_var.set("")
+
+        # Logi / cap channel entry.
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None:
+            try:
+                entry.delete(0, tk.END)
+            except Exception:
+                pass
+
+        # Deselect the doctrine, then rebuild the (now empty) tag checkboxes so
+        # the per-fit include boxes are cleared along with their selection.
+        if getattr(self, "_motd_doctrine_var", None) is not None:
+            self._motd_doctrine_var.set("")
+        self._motd_rebuild_tag_checkboxes()
+
+        # Rebuild the (now empty) preview immediately.
+        self._rebuild_motd_preview()
+
+    def _clear_motd(self):
+        """'Clear MOTD' button: wipe the local builder, then — if the active FC
+        is the current fleet boss — offer to also clear the in-game fleet MOTD
+        (the user needs a way to remove a too-large MOTD already pushed).
+
+        Always clears locally first. When boss + fleet are known, asks for
+        confirmation and, if accepted, pushes an EMPTY MOTD on a daemon thread
+        (reusing the :meth:`_set_fleet_motd` threading pattern). When not boss
+        or not in a fleet, only the local builder is cleared."""
+        self._clear_motd_builder()
+
+        if not getattr(self, "_motd_is_boss", False) or not getattr(
+                self, "_motd_fleet_id", None):
+            self._motd_fleet_status.config(
+                text="Cleared the local MOTD builder.", fg=FG_GREEN)
+            return
+
+        if not messagebox.askyesno(
+                "Clear MOTD",
+                "Also clear the current in-game fleet MOTD?"):
+            self._motd_fleet_status.config(
+                text="Cleared the local MOTD builder.", fg=FG_GREEN)
+            return
+
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Clear MOTD",
+                                   "No authenticated FC character selected.")
+            return
+
+        fleet_id = self._motd_fleet_id
+        self._motd_fleet_status.config(text="Clearing in-game MOTD...",
+                                       fg=FG_ACCENT)
+
+        def worker():
+            ok = False
+            err = None
+            try:
+                ok = auth.set_fleet_motd(fleet_id, "")
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _done, ok, err)
+
+        def _done(ok, err):
+            if ok:
+                self._motd_fleet_status.config(
+                    text="In-game MOTD cleared (204).", fg=FG_GREEN)
+            else:
+                detail = (f"\n\n{err}" if err else
+                          "\n\nESI rejected the request (403 if you are no "
+                          "longer the boss).")
+                self._motd_fleet_status.config(
+                    text="Failed to clear in-game MOTD.", fg=FG_RED)
+                messagebox.showerror(
+                    "Clear MOTD failed",
+                    f"Could not clear the fleet MOTD.{detail}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _apply_imported_motd(self, raw, err):
-        """Tk-thread handler for an imported MOTD: show it, offer fit import,
-        and save it as a named template snapshot."""
+        """Tk-thread handler for an imported MOTD: clear the existing builder,
+        load the imported MOTD as the sole content, offer fit import, and save
+        it as a named template snapshot."""
         if err is not None or raw is None:
             self._motd_fleet_status.config(text="Import failed.", fg=FG_RED)
             messagebox.showerror("Import MOTD",
@@ -7119,18 +7337,15 @@ class FCToolGUI:
             text=f"Imported MOTD ({len(raw)} chars, "
                  f"{len(parsed['fittings'])} fit link(s)).", fg=FG_GREEN)
 
-        # Show the raw markup in the preview, and offer to load it as a header.
-        preview = getattr(self, "_motd_preview", None)
-        if preview is not None:
-            preview.config(state=tk.NORMAL)
-            preview.delete("1.0", tk.END)
-            preview.insert("1.0", raw)
-            preview.config(state=tk.DISABLED)
-        if raw and messagebox.askyesno(
-                "Imported MOTD",
-                "Load the imported MOTD text into the Header field "
-                "(so you can re-use it as a starting point)?"):
-            self._motd_header_var.set(raw)
+        # Clear the existing builder FIRST so the imported MOTD replaces it
+        # (the user reported the import being ADDED to the existing build), then
+        # load the raw markup as the sole content via the header var.
+        self._clear_motd_builder()
+        self._motd_header_var.set(raw)
+
+        # Show ONLY the imported raw markup in the preview (verbatim, not the
+        # re-wrapped build of header=raw). See _motd_set_preview_raw.
+        self._motd_set_preview_raw(raw)
 
         # Offer to import each embedded fit DNA into the library (de-duped).
         fittings = parsed.get("fittings") or []
@@ -7152,6 +7367,29 @@ class FCToolGUI:
                 parent=self.root)
             if name and name.strip():
                 self._save_motd_snapshot(name.strip(), raw)
+
+        # Re-assert the verbatim preview as the LAST step: the modal dialogs
+        # above run nested Tk event loops that can fire the debounced preview
+        # rebuild scheduled by the header-var set, which would re-wrap the raw.
+        self._motd_set_preview_raw(raw)
+
+    def _motd_set_preview_raw(self, raw):
+        """Cancel any pending debounced preview rebuild and show ``raw``
+        verbatim in the preview pane. Used by the import path so the imported
+        MOTD is displayed exactly as received (not re-wrapped via build_motd)."""
+        job = getattr(self, "_motd_preview_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+            self._motd_preview_job = None
+        preview = getattr(self, "_motd_preview", None)
+        if preview is not None:
+            preview.config(state=tk.NORMAL)
+            preview.delete("1.0", tk.END)
+            preview.insert("1.0", raw)
+            preview.config(state=tk.DISABLED)
 
     def _import_motd_fits(self, fittings):
         """Import a list of ``{dna, name}`` dicts into the library, de-duped by
@@ -10104,7 +10342,15 @@ class FCToolGUI:
                 fleet_id = info["fleet_id"] if info else None
                 # Only the fleet boss may read /fleets/{id}/members/ (others get
                 # a guaranteed 403); non-boss falls into the existing back-off.
-                if info and self.esi_auth.is_boss(info, self.esi_auth.character_id):
+                polled_is_boss = bool(
+                    info and self.esi_auth.is_boss(
+                        info, self.esi_auth.character_id))
+                # Cache the primary character's fleet/boss state so the MOTD tab
+                # can give instant Set-button feedback without re-querying ESI
+                # (see _motd_refresh_fleet_status).
+                self._last_polled_fleet_id = fleet_id if info else None
+                self._last_polled_fleet_is_boss = polled_is_boss
+                if polled_is_boss:
                     members = self.esi_auth.get_fleet_members(fleet_id=fleet_id)
                 else:
                     members = None
