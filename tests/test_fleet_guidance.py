@@ -43,3 +43,22 @@ def test_has_defender_launcher_by_name():
 def test_has_defender_launcher_absent():
     parsed = _parsed(587, [1, 2])
     assert fg.has_defender_launcher(parsed, _Cat()) is False
+
+
+def test_links_ideal_range_claymore_3_bursts():
+    cat = _Cat(groups={42529: 1770, 42530: 1770, 88261: 1770})
+    claymore = _parsed(22468, [42529, 42530, 88261])  # 3 bursts
+    assert fg.links_ideal_range([claymore], cat) == (3, 6)
+
+def test_links_ideal_range_averages_multiple_fits():
+    cat = _Cat(groups={1: 1770, 2: 1770})
+    a = _parsed(22468, [1, 2])          # 2 bursts
+    b = _parsed(22468, [1, 2, 1, 2])    # 4 bursts  -> avg 3
+    assert fg.links_ideal_range([a, b], cat) == (3, 6)
+
+def test_links_ideal_range_none_when_no_bursts():
+    cat = _Cat(groups={})
+    assert fg.links_ideal_range([_parsed(22468, [1])], cat) is None
+
+def test_links_ideal_range_none_when_no_fits():
+    assert fg.links_ideal_range([], _Cat()) is None

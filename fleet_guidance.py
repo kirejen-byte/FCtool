@@ -61,3 +61,21 @@ def has_defender_launcher(parsed, catalog) -> bool:
         if "defender" in low and "launcher" in low:
             return True
     return False
+
+
+def links_ideal_range(links_parsed_fits, catalog) -> tuple[int, int] | None:
+    """Ideal (min, max) number of links ships to secure 9..18 total command bursts.
+
+    avg = mean burst count across the doctrine's links fits; min = ceil(9/avg),
+    max = ceil(18/avg). Returns None when there are no links fits or they carry no
+    bursts (avg 0)."""
+    if not links_parsed_fits:
+        return None
+    counts = [count_command_bursts(p, catalog) for p in links_parsed_fits]
+    total = sum(counts)
+    if total <= 0:
+        return None
+    avg = total / len(counts)
+    lo = math.ceil(BURST_TARGET_MIN / avg)
+    hi = math.ceil(BURST_TARGET_MAX / avg)
+    return (lo, hi)
