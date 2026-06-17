@@ -42,6 +42,40 @@ def test_read_fit_builds_parsedfit(tmp_path):
     assert all(m.type_id is not None for m in fit.modules)        # NULL itemID row skipped
 
 
+def test_offline_only_for_pyfa_offline_state(tmp_path):
+    # pyfa State enum: OFFLINE=-1, ONLINE=0, ACTIVE=1, OVERHEATED=2.
+    # Only state == -1 is offline; online/active modules must NOT be flagged offline.
+    p = str(tmp_path / "states.db"); con = sqlite3.connect(p)
+    con.executescript("""
+        CREATE TABLE fits(ID INTEGER PRIMARY KEY, shipID INTEGER, name TEXT);
+        CREATE TABLE modules(ID INTEGER PRIMARY KEY, fitID INTEGER, itemID INTEGER,
+                             chargeID INTEGER, state INTEGER, position INTEGER);
+        INSERT INTO fits VALUES (1, 12015, 'States');
+        INSERT INTO modules VALUES (1, 1, 2048, NULL, 0, 0);   -- ONLINE  -> not offline
+        INSERT INTO modules VALUES (2, 1, 2185, NULL, -1, 1);  -- OFFLINE -> offline
+        INSERT INTO modules VALUES (3, 1, 2048, NULL, 1, 2);   -- ACTIVE  -> not offline
+    """)
+    con.commit(); con.close()
+    fit = read_pyfa_fit(p, 1, Cat())
+    offline_flags = [m.offline for m in fit.modules]  # ordered by position
+    assert offline_flags == [False, True, False], offline_flags
+
+
+def test_null_state_is_not_offline(tmp_path):
+    # a module with NULL state must default to online (not offline).
+    p = str(tmp_path / "nullstate.db"); con = sqlite3.connect(p)
+    con.executescript("""
+        CREATE TABLE fits(ID INTEGER PRIMARY KEY, shipID INTEGER, name TEXT);
+        CREATE TABLE modules(ID INTEGER PRIMARY KEY, fitID INTEGER, itemID INTEGER,
+                             chargeID INTEGER, state INTEGER, position INTEGER);
+        INSERT INTO fits VALUES (1, 12015, 'NullState');
+        INSERT INTO modules VALUES (1, 1, 2048, NULL, NULL, 0);
+    """)
+    con.commit(); con.close()
+    fit = read_pyfa_fit(p, 1, Cat())
+    assert fit.modules[0].offline is False
+
+
 def test_missing_optional_column_is_tolerated(tmp_path):
     # a DB without chargeID should still read (older pyfa schema)
     p = str(tmp_path / "old.db"); con = sqlite3.connect(p)

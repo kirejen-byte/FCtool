@@ -156,8 +156,11 @@ def _read_modules(con, fit_id, catalog) -> list[ParsedModule]:
             if cid is not None:
                 charge_type_id = cid
                 charge_name = catalog.resolve_name(cid)
-        # pyfa module state: a value of 0 means offline (online states are > 0).
-        offline = bool(has_state and row["state"] == 0)
+        # pyfa State enum: OFFLINE=-1, ONLINE=0, ACTIVE=1, OVERHEATED=2.
+        # Only an explicit OFFLINE state (-1) means offline; online/active/
+        # overheated (and a NULL/absent state) are all online. The prior code
+        # treated 0 (ONLINE) as offline, which flagged most modules offline.
+        offline = bool(has_state and row["state"] == -1)
         modules.append(
             ParsedModule(
                 type_id=type_id,
