@@ -560,6 +560,9 @@ class FCToolGUI:
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
         self._doctrine_selected_id: str | None = None
+        # Fittings-library column sort state (click-to-sort headers).
+        self._fit_sort_column: str = "name"
+        self._fit_sort_reverse: bool = False
 
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
@@ -6142,8 +6145,9 @@ class FCToolGUI:
     # ── Doctrine membership + tags (Task 6.2) ─────────────────────────────────
 
     def _add_fit_to_doctrine(self, doctrine_id):
-        """Searchable picker over library fits not already in the doctrine; on
-        pick, prompt for tags, then add the membership."""
+        """Bulk-add library fits to a doctrine via the shared multi-select
+        picker. Candidates are fits not already in the doctrine; the chosen
+        fits all receive the SAME tag set (prompted once) on add."""
         doctrine = self.fittings.get_doctrine(doctrine_id)
         if doctrine is None:
             return
@@ -6153,79 +6157,52 @@ class FCToolGUI:
                       if f.id not in existing]
         if not candidates:
             messagebox.showinfo(
-                "Add fit",
+                "Add fits",
                 "Every fit in the library is already in this doctrine, or the "
                 "library is empty. Import fits on the Fittings sub-tab first.")
             return
 
-        win = tk.Toplevel(self.root)
-        win.title("Add fit to doctrine")
-        win.configure(bg=BG_DARK)
-        win.geometry("440x460")
-        try:
-            win.transient(self.root)
-        except tk.TclError:
-            pass
+        # Build picker items ship-first ("ShipClass — FitName"), consistent
+        # with the pyfa/ESI import pickers. Resolve ship class via the SDE
+        # catalog, falling back to the stored hull name.
+        items = []
+        for f in candidates:
+            ship = ""
+            try:
+                ship = self.type_catalog.resolve_name(f.hull_type_id) or ""
+            except Exception:
+                ship = ""
+            if not ship:
+                ship = f.hull_name or "?"
+            items.append({
+                "id": f.id,
+                "label": f"{ship}  —  {f.name or '?'}",
+                "row_data": f,
+            })
 
-        tk.Label(win, text="Select a fit to add:", font=("Consolas", 10),
-                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
-        search_var = tk.StringVar()
-        search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
-                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
-                          borderwidth=1, relief=tk.RIDGE)
-        search.pack(fill=tk.X, padx=12, pady=(0, 4))
-
-        listbox = tk.Listbox(
-            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
-            borderwidth=1, relief=tk.RIDGE, activestyle="none",
-            exportselection=False)
-        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
-
-        index_map: list = []
-
-        def _repopulate(*_a):
-            needle = search_var.get().strip().lower()
-            listbox.delete(0, tk.END)
-            index_map.clear()
-            for f in candidates:
-                label = f.name or "?"
-                if f.hull_name:
-                    label += f"  ({f.hull_name})"
-                hay = f"{f.name or ''} {f.hull_name or ''}".lower()
-                if needle and needle not in hay:
-                    continue
-                listbox.insert(tk.END, label)
-                index_map.append(f)
-        search_var.trace_add("write", _repopulate)
-        _repopulate()
-
-        def _do_pick():
-            sel = listbox.curselection()
-            if not sel:
+        def _on_import(chosen, ctl):
+            if not chosen:
                 return
-            fit = index_map[sel[0]]
-            win.destroy()
+            # Prompt tags ONCE; the same chosen tags apply to every selected
+            # fit (this is a bulk add).
             tags = self._prompt_tag_multiselect(
-                "Tags for this fit",
-                f"Choose tags for '{fit.name}' in this doctrine:",
+                "Tags for these fits",
+                "Choose tags to apply to all selected fits in this doctrine:",
                 selected=[])
             if tags is None:
                 return
-            self.fittings.add_fit_to_doctrine(doctrine_id, fit.id, tags)
+            for item in chosen:
+                self.fittings.add_fit_to_doctrine(
+                    doctrine_id, item["row_data"].id, tags)
             self.fittings.save()
             self._refresh_doctrine_list()
-            self._motd_refresh_doctrines()
-            self._refresh_fit_list(self._fit_search_var.get())
             self._show_doctrine_detail(doctrine_id)
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._motd_refresh_doctrines()
+            ctl.close()
 
-        btns = tk.Frame(win, bg=BG_DARK)
-        btns.pack(fill=tk.X, padx=12, pady=12)
-        ttk.Button(btns, text="Add", style="Green.TButton",
-                   command=_do_pick).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="Cancel", style="Dark.TButton",
-                   command=win.destroy).pack(side=tk.RIGHT)
-        listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+        self._show_multi_select_picker(
+            items, on_import=_on_import, title="Add fits to doctrine")
 
     def _edit_member_tags(self, doctrine_id, fit_id):
         """Multi-select the tag vocabulary for one (doctrine, fit) membership."""
@@ -7317,11 +7294,11 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE)
         search_entry.pack(side=tk.LEFT, padx=(5, 15))
 
-        ttk.Button(toolbar, text="Import from EVE", style="Dark.TButton",
+        ttk.Button(toolbar, text="Import from EVE", style="Green.TButton",
                    command=self._import_esi_fittings).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Import from pyfa", style="Dark.TButton",
+        ttk.Button(toolbar, text="Import from pyfa", style="Green.TButton",
                    command=self._import_pyfa).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Paste EFT/DNA", style="Dark.TButton",
+        ttk.Button(toolbar, text="Paste EFT/DNA", style="Green.TButton",
                    command=self._import_paste_fit).pack(side=tk.LEFT, padx=2)
 
         # ── Master / detail split ────────────────────────────────────────────
@@ -7351,10 +7328,18 @@ class FCToolGUI:
         self._fit_tree = ttk.Treeview(
             tree_wrap, columns=columns, show="headings",
             style="Dark.Treeview", selectmode="browse")
-        self._fit_tree.heading("name", text="Name")
-        self._fit_tree.heading("hull", text="Hull")
-        self._fit_tree.heading("tags", text="Tags")
-        self._fit_tree.heading("doctrines", text="#Doc")
+        self._fit_tree.heading(
+            "name", text="Name",
+            command=lambda: self._on_fit_tree_sort("name"))
+        self._fit_tree.heading(
+            "hull", text="Hull",
+            command=lambda: self._on_fit_tree_sort("hull"))
+        self._fit_tree.heading(
+            "tags", text="Tags",
+            command=lambda: self._on_fit_tree_sort("tags"))
+        self._fit_tree.heading(
+            "doctrines", text="#Doc",
+            command=lambda: self._on_fit_tree_sort("doctrines"))
         self._fit_tree.column("name", width=150, anchor=tk.W)
         self._fit_tree.column("hull", width=110, anchor=tk.W)
         self._fit_tree.column("tags", width=120, anchor=tk.W)
@@ -7430,9 +7415,39 @@ class FCToolGUI:
             pass
         return tags
 
+    # Base (undecorated) heading text per sortable column.
+    _FIT_HEADINGS = {
+        "name": "Name",
+        "hull": "Hull",
+        "tags": "Tags",
+        "doctrines": "#Doc",
+    }
+
+    def _update_fit_headings(self):
+        """Refresh column heading text so the active sort column shows a
+        ▲/▼ direction marker and the others show their plain label."""
+        tree = getattr(self, "_fit_tree", None)
+        if tree is None:
+            return
+        arrow = " ▼" if self._fit_sort_reverse else " ▲"
+        for col, base in self._FIT_HEADINGS.items():
+            text = base + arrow if col == self._fit_sort_column else base
+            tree.heading(col, text=text)
+
+    def _on_fit_tree_sort(self, col: str):
+        """Header click: sort by ``col`` ascending, or flip direction if it is
+        already the active column. Re-renders via _refresh_fit_list."""
+        if col == self._fit_sort_column:
+            self._fit_sort_reverse = not self._fit_sort_reverse
+        else:
+            self._fit_sort_column = col
+            self._fit_sort_reverse = False
+        self._refresh_fit_list(self._fit_search_var.get())
+
     def _refresh_fit_list(self, filter_text: str = ""):
         """Clear + repopulate the fittings Treeview, filtering case-insensitively
-        on name / hull / tags. Preserves the current selection when possible."""
+        on name / hull / tags and sorting by the active column (click-to-sort).
+        Preserves the current selection when possible."""
         tree = getattr(self, "_fit_tree", None)
         if tree is None:
             return
@@ -7440,19 +7455,41 @@ class FCToolGUI:
         for iid in tree.get_children():
             tree.delete(iid)
         needle = (filter_text or "").strip().lower()
-        restored = False
-        for fit in sorted(self.fittings.list_fits(),
-                          key=lambda f: (f.name or "").lower()):
+
+        # Build the (filtered) row set with the values each column sorts on.
+        rows = []
+        for fit in self.fittings.list_fits():
             tags = self._fit_member_tags(fit.id)
             tags_str = ", ".join(tags)
             hay = " ".join([fit.name or "", fit.hull_name or "", tags_str]).lower()
             if needle and needle not in hay:
                 continue
             n_doc = self._doctrine_count_for_fit(fit.id)
+            rows.append((fit, tags_str, n_doc))
+
+        # Sort by the active column. #Doc is a NUMERIC sort; the rest are
+        # case-insensitive string sorts. Tie-break on name for stable ordering.
+        col = self._fit_sort_column
+        if col == "hull":
+            key = lambda r: ((r[0].hull_name or "").lower(),
+                             (r[0].name or "").lower())
+        elif col == "tags":
+            key = lambda r: (r[1].lower(), (r[0].name or "").lower())
+        elif col == "doctrines":
+            key = lambda r: (r[2], (r[0].name or "").lower())
+        else:  # "name"
+            key = lambda r: (r[0].name or "").lower()
+        rows.sort(key=key, reverse=self._fit_sort_reverse)
+
+        restored = False
+        for fit, tags_str, n_doc in rows:
             tree.insert("", tk.END, iid=fit.id,
                         values=(fit.name, fit.hull_name, tags_str, n_doc))
             if fit.id == prev:
                 restored = True
+
+        self._update_fit_headings()
+
         if restored:
             tree.selection_set(prev)
         elif prev is not None and self.fittings.get_fit(prev) is None:
@@ -10512,15 +10549,24 @@ $bmp.Dispose()
         )
 
     def _show_tooltip(self, event, text):
-        """Show a tooltip near the mouse cursor."""
+        """Show a tooltip near the mouse cursor. Long text wraps to multiple
+        rows and the popup is clamped to stay fully on-screen."""
         self._hide_tooltip()  # destroy any existing tooltip first (idempotent)
-        self._tooltip = tk.Toplevel(self.root)
-        self._tooltip.wm_overrideredirect(True)
-        self._tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")
-        label = tk.Label(self._tooltip, text=text,
+        tip = self._tooltip = tk.Toplevel(self.root)
+        tip.wm_overrideredirect(True)
+        label = tk.Label(tip, text=text,
                          font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
-                         borderwidth=1, relief=tk.SOLID, padx=4, pady=2)
+                         borderwidth=1, relief=tk.SOLID, padx=4, pady=2,
+                         wraplength=420, justify=tk.LEFT)
         label.pack()
+        # Measure the laid-out popup, then clamp its top-left so the full
+        # tooltip stays within the screen bounds.
+        tip.update_idletasks()
+        x = max(0, min(event.x_root + 12,
+                       self.root.winfo_screenwidth() - tip.winfo_width() - 8))
+        y = max(0, min(event.y_root + 12,
+                       self.root.winfo_screenheight() - tip.winfo_height() - 8))
+        tip.wm_geometry(f"+{x}+{y}")
 
     def _hide_tooltip(self):
         """Hide the current tooltip."""
