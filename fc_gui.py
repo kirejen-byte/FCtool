@@ -7279,13 +7279,18 @@ class FCToolGUI:
 
     def _motd_build_fits_by_tag(self, doctrine, compact: bool = False):
         """Assemble ``{tag: [(dna, label), ...]}`` for the checked tags of a
-        doctrine. A fit appears under each checked tag it carries; fits with no
-        DNA are skipped (can't be linked). Pure assembly — no business logic.
+        doctrine. Pure assembly — no business logic. Fits with no DNA are skipped.
 
-        When ``compact`` is True the link LABEL is the ship class name (via
-        :meth:`_motd_fit_compact_label`) instead of the full ``fit.name``, to
-        save room when the MOTD is at risk of overflow; the DNA is unchanged so
-        the link still rebuilds the exact fit on click."""
+        Two MOTD conventions are applied here:
+
+        * The link LABEL is ALWAYS the ship class name (e.g. "Tengu") via
+          :meth:`_motd_fit_compact_label`, not the saved fit name — the DNA is
+          unchanged so the link still rebuilds the exact fit on click, and the
+          fit's name in the library is untouched. (``compact`` is retained for
+          call-site compatibility but no longer changes the label.)
+        * Role precedence: a fit tagged DPS *and* at least one other role is
+          placed under the OTHER role(s) only, never DPS — e.g. a ship tagged
+          DPS + Links shows under Links."""
         fits_by_tag: dict[str, list[tuple[str, str]]] = {}
         if doctrine is None:
             return fits_by_tag
@@ -7294,8 +7299,13 @@ class FCToolGUI:
             fit = self.fittings.get_fit(mem.fit_id)
             if fit is None or not fit.dna:
                 continue
-            label = self._motd_fit_compact_label(fit) if compact else fit.name
-            for tag in (mem.tags or []):
+            label = self._motd_fit_compact_label(fit)
+            member_tags = list(mem.tags or [])
+            non_dps = [t for t in member_tags if t != "DPS"]
+            # Drop DPS when the fit also carries a non-DPS role.
+            effective_tags = non_dps if ("DPS" in member_tags and non_dps) \
+                else member_tags
+            for tag in effective_tags:
                 if tag not in checked:
                     continue
                 fits_by_tag.setdefault(tag, []).append((fit.dna, label))
