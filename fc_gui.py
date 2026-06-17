@@ -7962,7 +7962,8 @@ class FCToolGUI:
         except tk.TclError:
             pass
 
-        tk.Label(win, text="Select a fit to import:", font=("Consolas", 10),
+        tk.Label(win, text="Select a fit (search by ship or fit name):",
+                 font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
         search_var = tk.StringVar()
         search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
@@ -7983,13 +7984,28 @@ class FCToolGUI:
 
         index_map: list[dict] = []
 
+        # Resolve each fit's ship class name once (local bundled SDE lookup) so the
+        # picker shows "ShipClass - FitName" (ship first) and can be searched by either.
+        for f in fits:
+            if "ship_name" not in f:
+                try:
+                    f["ship_name"] = self.type_catalog.resolve_name(
+                        f.get("ship_type_id")) or ""
+                except Exception:
+                    f["ship_name"] = ""
+        # Group by ship class, then fit name, so same-hull fits sit together.
+        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
+                                 (f.get("name") or "").lower()))
+
         def _repopulate(*_a):
             needle = search_var.get().strip().lower()
             listbox.delete(0, tk.END)
             index_map.clear()
             for f in fits:
-                label = f"{f.get('name', '?')}"
-                if needle and needle not in label.lower():
+                ship = f.get("ship_name") or "?"
+                fit_name = f.get("name", "?")
+                label = f"{ship}  —  {fit_name}"
+                if needle and needle not in f"{ship} {fit_name}".lower():
                     continue
                 listbox.insert(tk.END, label)
                 index_map.append(f)
