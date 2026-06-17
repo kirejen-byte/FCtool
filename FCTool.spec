@@ -9,6 +9,7 @@ a = Analysis(
         ('fire_alert.mp3', '.'),
         ('stargate_jumps.json', '.'),
         ('system_coords.json', '.'),
+        ('fit_types.json', '.'),
         ('assets/bursts/shield.png', 'assets/bursts'),
         ('assets/bursts/armor.png', 'assets/bursts'),
         ('assets/bursts/skirmish.png', 'assets/bursts'),

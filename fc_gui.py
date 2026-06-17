@@ -5,6 +5,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 
 import json
 import os
+import re
 import sys
 import shutil
 import tempfile
@@ -13,7 +14,7 @@ import time
 import tkinter as tk
 import webbrowser
 import requests
-from tkinter import ttk, scrolledtext, messagebox, filedialog
+from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
 from datetime import datetime, timedelta
 
 # Platform-specific sound support
@@ -71,6 +72,13 @@ from app_path import app_dir
 import ship_classes
 import charge_tracker
 import command_bursts
+# Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
+# type_catalog and fittings_store are instantiated per-app in __init__.
+import fit_models
+import fit_parser
+import fit_dna
+import pyfa_import
+import motd_builder
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -89,6 +97,22 @@ FG_YELLOW = "#ffdd00"
 FG_WHITE = "#ffffff"
 FG_MAGENTA = "#ff66ff"
 BORDER_COLOR = "#2a2a4a"
+
+# ── Notebook tab indices ────────────────────────────────────────────────────────
+# Order of self.notebook.add() calls in _build_ui:
+#   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
+#   4 Characters, 5 Fittings, 6 Settings.
+# Inserting Fittings at index 5 leaves the earlier tabs (Intel=1, Characters=4)
+# unchanged; only the Settings tab shifts 5 -> 6.
+INTEL_TAB_INDEX = 1
+CHARACTERS_TAB_INDEX = 4
+FITTINGS_TAB_INDEX = 5
+SETTINGS_TAB_INDEX = 6
+
+# ESI fittings scopes (added after some characters were already authed; SSO
+# grants scopes only at login, so older tokens lack these and need re-auth).
+SCOPE_FITTINGS_READ = "esi-fittings.read_fittings.v1"
+SCOPE_FITTINGS_WRITE = "esi-fittings.write_fittings.v1"
 
 # Verdict -> color map for command-burst rendering. Hoisted to module level so
 # both the per-pilot Links rows and the off-hull rows share one source of truth
@@ -521,6 +545,22 @@ class FCToolGUI:
         if not self.esi_auth and self.esi_accounts:
             self.esi_auth = self.esi_accounts[0]
 
+        # Fitting / doctrine services (Fittings tab). Built AFTER esi_auth so the
+        # type catalog's id->name fallback can reach the public ESI endpoint via
+        # _catalog_esi_adapter. The catalog resolves names/slots from the bundled
+        # fit_types.json (and caches ESI fallbacks to fit_types_cache.json); the
+        # store persists the fittings library to app_dir()/fittings_library.json.
+        import type_catalog as _type_catalog
+        import fittings_store as _fittings_store
+        self._migrate_fittings_config()
+        self.type_catalog = _type_catalog.TypeCatalog(esi=self._catalog_esi_adapter())
+        self.fittings = _fittings_store.FittingsStore(
+            os.path.join(app_dir(), "fittings_library.json"))
+        self.fittings.load()
+        # Per-dialog/sub-tab state placeholders (populated as the tab is built).
+        self._fit_selected_id: str | None = None
+        self._doctrine_selected_id: str | None = None
+
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
         self._prewarm_cache_async()
@@ -898,6 +938,69 @@ class FCToolGUI:
         if changed:
             self._save_config()
 
+    def _migrate_fittings_config(self):
+        """Seed ``config['fittings']`` on first run (idempotent).
+
+        Mirrors :meth:`_migrate_intel_filter_config`: only fills in keys that are
+        absent, so it is safe to call on every startup. The block holds the
+        Fittings-tab preferences kept outside the fittings library file (the tag
+        vocabulary lives in the library; everything UI/session-scoped lives here):
+
+        * ``pyfa_path``    — last-used pyfa savepath/dir for the pyfa importer.
+        * ``motd_budget``  — conservative raw-markup MOTD length ceiling (~3000).
+        * ``motd_template``— persisted MOTD-writer field selections (Phase 7).
+        * ``logi_channel`` — remembered logi/cap channel for the MOTD writer.
+        """
+        changed = False
+        fit_cfg = self.config.get("fittings")
+        if not isinstance(fit_cfg, dict):
+            fit_cfg = {}
+            self.config["fittings"] = fit_cfg
+            changed = True
+        defaults = {
+            "pyfa_path": "",
+            "motd_budget": 3000,
+            "motd_template": {},
+            "logi_channel": "",
+        }
+        for key, val in defaults.items():
+            if key not in fit_cfg:
+                fit_cfg[key] = val
+                changed = True
+        if changed:
+            self._save_config()
+
+    def _catalog_esi_adapter(self):
+        """Return an id->name resolver for TypeCatalog's unknown-ID fallback.
+
+        The app's ESIAuth has no id->name method (its resolve_ids/resolve_names
+        are name->id). TypeCatalog needs the inverse, served by the public
+        ``POST /universe/names/`` endpoint (no auth, batched up to 1000 ids),
+        which returns ``[{id, name, category}]``. We reshape that into the
+        ``{id: {"name", "category"}}`` map the catalog expects. TypeCatalog
+        caches results to fit_types_cache.json, so this is hit only for IDs
+        absent from the bundled fit_types.json.
+        """
+        gui = self
+
+        class _Adapter:
+            def resolve_names(self, type_ids):
+                try:
+                    rows = gui.esi_auth.esi_post_public(
+                        "/universe/names/", list(type_ids)) or []
+                except Exception:
+                    return {}
+                out = {}
+                for r in rows:
+                    if isinstance(r, dict) and "id" in r:
+                        out[r["id"]] = {
+                            "name": r.get("name"),
+                            "category": r.get("category"),
+                        }
+                return out
+
+        return _Adapter()
+
     def _resolve_triumvirate_async(self):
         """Resolve Triumvirate.'s alliance id off-thread and fold it into the
         "The Initiative." coalition. Best-effort; never blocks or raises.
@@ -1037,6 +1140,30 @@ class FCToolGUI:
                 arrowcolor=[("active", FG_WHITE), ("disabled", FG_DIM)],
             )
 
+        # Dark-theme the Treeview used by the Fittings library list (the only
+        # ttk.Treeview in the app). Heading + rows get the dark palette; the
+        # selected row uses the same accent-blue as listboxes/comboboxes.
+        style.configure(
+            "Dark.Treeview",
+            background=BG_ENTRY, fieldbackground=BG_ENTRY, foreground=FG_TEXT,
+            bordercolor=BORDER_COLOR, borderwidth=0, font=("Consolas", 9),
+            rowheight=20,
+        )
+        style.map(
+            "Dark.Treeview",
+            background=[("selected", "#1a5a90")],
+            foreground=[("selected", FG_WHITE)],
+        )
+        style.configure(
+            "Dark.Treeview.Heading",
+            background=BG_PANEL, foreground=FG_ACCENT, font=("Consolas", 9, "bold"),
+            relief="flat",
+        )
+        style.map(
+            "Dark.Treeview.Heading",
+            background=[("active", BG_ENTRY)],
+        )
+
         # The drop-down POPUP is a plain Tk Listbox inside the combobox popdown
         # that ttk styles do NOT reach — theme it via the option database on the
         # root. This runs before any combobox is created (panels build later),
@@ -1092,6 +1219,7 @@ class FCToolGUI:
         self._build_range_tab()
         self._build_wh_route_tab()
         self._build_character_tab()
+        self._build_fitting_tab()
         self._build_settings_tab()
 
         # Track zkill alert notifications
@@ -4086,6 +4214,26 @@ class FCToolGUI:
                        command=lambda a=acct: self._esi_disconnect(a)
                        ).pack(side=tk.LEFT, padx=2)
 
+            # If this character's token predates the esi-fittings scopes, it
+            # cannot import/push fits until re-authorized. Show a one-line
+            # notice + a Re-authorize button that reuses the SSO login flow
+            # (re-logging in as the same character refreshes its tokens with
+            # the full current SCOPES via _esi_login_complete's dup handling).
+            if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+                notice = tk.Frame(self._esi_chars_frame, bg=BG_DARK)
+                notice.pack(fill=tk.X, padx=(20, 0), pady=(0, 2))
+                tk.Label(
+                    notice,
+                    text="⚠ Re-authorize to enable in-game fittings "
+                         "import/push.",
+                    font=("Consolas", 9), fg=FG_ORANGE, bg=BG_DARK,
+                    anchor=tk.W,
+                ).pack(side=tk.LEFT, padx=(0, 8))
+                ttk.Button(
+                    notice, text="Re-authorize", style="Dark.TButton",
+                    command=self._esi_login,
+                ).pack(side=tk.LEFT, padx=2)
+
     def _esi_set_primary(self, acct: ESIAuth):
         """Set a character as the primary ESI account."""
         self.esi_auth = acct
@@ -4683,6 +4831,23 @@ class FCToolGUI:
 
         for widget in (header, arrow_label, name_label, loc_label):
             widget.bind("<Button-1>", lambda e, p=panel: toggle(p))
+
+        # Re-auth notice for characters whose token predates the esi-fittings
+        # scopes — without re-authorizing they can't import/push in-game fits.
+        # The Re-authorize button reuses the SSO login flow (re-logging in as
+        # the same character refreshes its tokens with the full current SCOPES).
+        if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+            reauth_row = tk.Frame(panel, bg=BG_PANEL)
+            reauth_row.pack(fill=tk.X, padx=20, pady=(0, 5))
+            tk.Label(
+                reauth_row,
+                text="⚠ Re-authorize to enable in-game fittings import/push",
+                font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL, anchor=tk.W,
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(
+                reauth_row, text="Re-authorize", style="Dark.TButton",
+                command=self._esi_login,
+            ).pack(side=tk.LEFT)
 
         panel._acct = acct
         panel._loc_label = loc_label
@@ -5522,6 +5687,2546 @@ class FCToolGUI:
         if region:
             label += f" in {region}"
         self._char_filter_count_label.config(text=label, fg=FG_ACCENT)
+
+    # ── Fittings Tab ──────────────────────────────────────────────────────────
+    #
+    # Hosts a nested ttk.Notebook with three sub-tabs: Fittings (library
+    # master/detail, fully implemented below), Doctrines and MOTD (placeholders
+    # replaced by Phases 6 and 7). The shared services self.type_catalog and
+    # self.fittings are constructed in __init__ (after esi_auth).
+
+    # Canonical slot display order for the read-only module list.
+    _FIT_SLOT_ORDER = ("high", "med", "low", "rig", "subsystem", "service")
+    _FIT_SLOT_LABELS = {
+        "high": "High Slots", "med": "Mid Slots", "low": "Low Slots",
+        "rig": "Rigs", "subsystem": "Subsystems", "service": "Service Slots",
+    }
+
+    def _build_fitting_tab(self):
+        tab = tk.Frame(self.notebook, bg=BG_DARK)
+        self.notebook.add(tab, text="  Fittings  ")
+        self._fitting_subnb = ttk.Notebook(tab, style="Dark.TNotebook")
+        self._fitting_subnb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._build_fittings_subtab()     # Task 5.2/5.3 — full implementation
+        self._build_doctrines_subtab()    # Phase 6 — placeholder
+        self._build_motd_subtab()         # Phase 7 — placeholder
+
+    # ── Doctrines sub-tab (Tasks 6.1 / 6.2) ───────────────────────────────────
+
+    # Canonical tag display order for the role-grouped doctrine detail. Members
+    # carrying a tag outside this list are grouped last under "Other".
+    _DOCTRINE_TAG_ORDER = (
+        "DPS", "Logistics", "Links",
+        "Support - EWAR", "Support - Webs", "Tackle", "Special",
+    )
+
+    def _build_doctrines_subtab(self):
+        """Doctrine manager: master list of doctrines (left) + a role-grouped,
+        editable detail pane (right). New/Import/Export live above the list."""
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  Doctrines  ")
+
+        # ── Toolbar: New / Import / Export ───────────────────────────────────
+        toolbar = tk.Frame(tab, bg=BG_DARK)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Button(toolbar, text="New doctrine", style="Green.TButton",
+                   command=self._new_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import file", style="Dark.TButton",
+                   command=self._import_doctrine).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Export file", style="Dark.TButton",
+                   command=self._export_doctrine).pack(side=tk.LEFT, padx=2)
+
+        # ── Master / detail split ────────────────────────────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=2, uniform="doc")
+        body.columnconfigure(1, weight=5, uniform="doc")
+        body.rowconfigure(0, weight=1)
+
+        # Left: doctrines list (Treeview).
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        tk.Label(left, text="DOCTRINES", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+
+        tree_wrap = tk.Frame(left, bg=BG_PANEL)
+        tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
+        columns = ("name", "fits")
+        self._doctrine_tree = ttk.Treeview(
+            tree_wrap, columns=columns, show="headings",
+            style="Dark.Treeview", selectmode="browse")
+        self._doctrine_tree.heading("name", text="Name")
+        self._doctrine_tree.heading("fits", text="#Fits")
+        self._doctrine_tree.column("name", width=150, anchor=tk.W)
+        self._doctrine_tree.column("fits", width=44, anchor=tk.CENTER,
+                                   stretch=False)
+        self._doctrine_tree.grid(row=0, column=0, sticky="nsew")
+        self._doctrine_tree.bind("<<TreeviewSelect>>",
+                                 self._on_doctrine_select)
+
+        tree_sb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                command=self._doctrine_tree.yview)
+        self._doctrine_tree.configure(yscrollcommand=tree_sb.set)
+        tree_sb.grid(row=0, column=1, sticky="ns")
+
+        # Right: detail (scrollable).
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        detail_canvas = tk.Canvas(right, bg=BG_PANEL, highlightthickness=0)
+        detail_canvas.grid(row=0, column=0, sticky="nsew")
+        detail_sb = ttk.Scrollbar(right, orient="vertical",
+                                  command=detail_canvas.yview)
+        detail_sb.grid(row=0, column=1, sticky="ns")
+        detail_canvas.configure(yscrollcommand=detail_sb.set)
+        self._register_scroll_canvas(detail_canvas)
+
+        self._doctrine_detail = tk.Frame(detail_canvas, bg=BG_PANEL)
+        _detail_win = detail_canvas.create_window(
+            (0, 0), window=self._doctrine_detail, anchor="nw")
+
+        def _on_detail_config(event=None):
+            detail_canvas.configure(scrollregion=detail_canvas.bbox("all"))
+        self._doctrine_detail.bind("<Configure>", _on_detail_config)
+
+        def _on_canvas_config(event):
+            detail_canvas.itemconfig(_detail_win, width=event.width)
+        detail_canvas.bind("<Configure>", _on_canvas_config)
+
+        # Populate.
+        self._refresh_doctrine_list()
+        self._show_doctrine_detail(None)
+
+    # ── Doctrine list / detail rendering (Task 6.1) ───────────────────────────
+
+    def _doctrine_list_visible(self) -> bool:
+        """True once the doctrines sub-tab has been built (its tree exists)."""
+        return getattr(self, "_doctrine_tree", None) is not None
+
+    def _refresh_doctrine_list(self):
+        """Clear + repopulate the doctrines Treeview, preserving the current
+        selection when possible. Safe to call before the sub-tab exists."""
+        tree = getattr(self, "_doctrine_tree", None)
+        if tree is None:
+            return
+        prev = self._doctrine_selected_id
+        for iid in tree.get_children():
+            tree.delete(iid)
+        restored = False
+        for doc in sorted(self.fittings.list_doctrines(),
+                          key=lambda d: (d.name or "").lower()):
+            tree.insert("", tk.END, iid=doc.id,
+                        values=(doc.name, len(doc.members)))
+            if doc.id == prev:
+                restored = True
+        if restored:
+            tree.selection_set(prev)
+        elif prev is not None and self.fittings.get_doctrine(prev) is None:
+            # Selected doctrine was deleted — clear the detail pane.
+            self._doctrine_selected_id = None
+            self._show_doctrine_detail(None)
+
+    def _on_doctrine_select(self, event=None):
+        tree = self._doctrine_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        self._doctrine_selected_id = sel[0]
+        self._show_doctrine_detail(sel[0])
+
+    def _clear_doctrine_detail(self):
+        for w in self._doctrine_detail.winfo_children():
+            w.destroy()
+
+    def _group_members_by_tag(self, doctrine):
+        """Return an ordered list of (tag_label, [members]) groups in canonical
+        tag order. A member appears under each of its tags; an untagged member
+        falls into a trailing 'Untagged' group. Tags not in the canonical order
+        are appended (sorted) before 'Untagged'."""
+        by_tag: dict[str, list] = {}
+        untagged: list = []
+        extra_tags: list[str] = []
+        for mem in doctrine.members:
+            if not mem.tags:
+                untagged.append(mem)
+                continue
+            for tag in mem.tags:
+                by_tag.setdefault(tag, []).append(mem)
+                if (tag not in self._DOCTRINE_TAG_ORDER
+                        and tag not in extra_tags):
+                    extra_tags.append(tag)
+        groups: list[tuple[str, list]] = []
+        for tag in self._DOCTRINE_TAG_ORDER:
+            if by_tag.get(tag):
+                groups.append((tag, by_tag[tag]))
+        for tag in sorted(extra_tags):
+            groups.append((tag, by_tag[tag]))
+        if untagged:
+            groups.append(("Untagged", untagged))
+        return groups
+
+    def _show_doctrine_detail(self, doctrine_id):
+        """Render the selected doctrine: editable name/description, members
+        grouped by tag (canonical order) with per-member tag chips and
+        edit/remove controls, plus an 'Add fit' affordance."""
+        self._clear_doctrine_detail()
+        parent = self._doctrine_detail
+
+        if not doctrine_id:
+            tk.Label(parent, text="Select a doctrine, or create one with "
+                                  "'New doctrine'.",
+                     font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=420, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            tk.Label(parent, text="Doctrine not found.",
+                     font=("Consolas", 10), fg=FG_RED, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+
+        # Header: name + rename/delete.
+        head = tk.Frame(parent, bg=BG_PANEL)
+        head.pack(fill=tk.X, padx=10, pady=(10, 0))
+        tk.Label(head, text=doctrine.name, font=("Consolas", 13, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=380).pack(side=tk.LEFT)
+
+        head_btns = tk.Frame(parent, bg=BG_PANEL)
+        head_btns.pack(fill=tk.X, padx=10, pady=(4, 0))
+        ttk.Button(head_btns, text="Rename", style="Dark.TButton",
+                   command=lambda: self._rename_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Edit description", style="Dark.TButton",
+                   command=lambda: self._edit_doctrine_desc(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Export file", style="Dark.TButton",
+                   command=lambda: self._export_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Delete", style="Red.TButton",
+                   command=lambda: self._delete_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+
+        # Description.
+        if (doctrine.description or "").strip():
+            tk.Label(parent, text=doctrine.description, font=("Consolas", 9),
+                     fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=420).pack(anchor=tk.W, padx=12, pady=(6, 0))
+
+        # Add-fit affordance.
+        add_row = tk.Frame(parent, bg=BG_PANEL)
+        add_row.pack(fill=tk.X, padx=10, pady=(8, 2))
+        ttk.Button(add_row, text="Add fit…", style="Green.TButton",
+                   command=lambda: self._add_fit_to_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+        ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
+                   command=lambda: self._add_custom_tag(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
+
+        if not doctrine.members:
+            tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
+                                  "to this doctrine.",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=420, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=12, pady=(8, 10))
+            return
+
+        # Members grouped by tag (canonical order).
+        for tag_label, members in self._group_members_by_tag(doctrine):
+            tk.Label(parent, text=tag_label, font=("Consolas", 10, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=12, pady=(8, 2))
+            for mem in members:
+                self._render_doctrine_member_row(parent, doctrine, mem)
+
+    def _render_doctrine_member_row(self, parent, doctrine, mem):
+        """One member row: fit name + its tag-chip cluster within this doctrine
+        + Tags/Remove controls."""
+        fit = self.fittings.get_fit(mem.fit_id)
+        name = fit.name if fit is not None else f"(missing fit {mem.fit_id})"
+        hull = f"  ·  {fit.hull_name}" if fit is not None and fit.hull_name \
+            else ""
+
+        row = tk.Frame(parent, bg=BG_PANEL)
+        row.pack(fill=tk.X, padx=14, pady=1)
+
+        info = tk.Frame(row, bg=BG_PANEL)
+        info.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(info, text=f"{name}{hull}", font=("Consolas", 9),
+                 fg=FG_TEXT if fit is not None else FG_RED, bg=BG_PANEL,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=300).pack(anchor=tk.W)
+        # Tag-chip cluster: shows all tags this member carries in this doctrine.
+        if mem.tags:
+            chips = tk.Frame(info, bg=BG_PANEL)
+            chips.pack(anchor=tk.W, pady=(1, 0))
+            for tag in mem.tags:
+                tk.Label(chips, text=f" {tag} ", font=("Consolas", 8),
+                         fg=BG_DARK, bg=FG_ACCENT, padx=2).pack(
+                             side=tk.LEFT, padx=(0, 3))
+        else:
+            tk.Label(info, text="(no tags)", font=("Consolas", 8),
+                     fg=FG_DIM, bg=BG_PANEL).pack(anchor=tk.W, pady=(1, 0))
+
+        ctrls = tk.Frame(row, bg=BG_PANEL)
+        ctrls.pack(side=tk.RIGHT)
+        ttk.Button(ctrls, text="Tags", style="Dark.TButton",
+                   command=lambda: self._edit_member_tags(
+                       doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(ctrls, text="Remove", style="Red.TButton",
+                   command=lambda: self._remove_doctrine_member(
+                       doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    # ── Doctrine CRUD controllers (Task 6.1) ──────────────────────────────────
+
+    def _new_doctrine(self):
+        name = self._prompt_text_line("New Doctrine", "Doctrine name:", "")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        did = self.fittings.add_doctrine(name)
+        self.fittings.save()
+        self._doctrine_selected_id = did
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(did)
+
+    def _rename_doctrine(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        new_name = self._prompt_text_line(
+            "Rename Doctrine", "Name:", doctrine.name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == doctrine.name:
+            return
+        doctrine.name = new_name
+        self.fittings.update_doctrine(doctrine)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._show_doctrine_detail(doctrine_id)
+
+    def _edit_doctrine_desc(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        new_desc = self._prompt_text_block(
+            "Edit Description", "Description for this doctrine:",
+            doctrine.description or "")
+        if new_desc is None:
+            return
+        doctrine.description = new_desc
+        self.fittings.update_doctrine(doctrine)
+        self.fittings.save()
+        self._show_doctrine_detail(doctrine_id)
+
+    def _delete_doctrine(self, doctrine_id):
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        if not messagebox.askyesno(
+                "Delete Doctrine",
+                f"Delete doctrine '{doctrine.name}'?\n\nThe fits themselves "
+                "stay in the library."):
+            return
+        self.fittings.delete_doctrine(doctrine_id)
+        self.fittings.save()
+        if self._doctrine_selected_id == doctrine_id:
+            self._doctrine_selected_id = None
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(None)
+
+    # ── Doctrine import / export (Task 6.1) ───────────────────────────────────
+
+    def _export_doctrine(self, doctrine_id=None):
+        """Export a doctrine to a self-contained .fctdoc (JSON) file."""
+        if doctrine_id is None:
+            doctrine_id = self._doctrine_selected_id
+        if not doctrine_id:
+            messagebox.showinfo(
+                "Export doctrine",
+                "Select a doctrine to export first.")
+            return
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        safe_name = re.sub(r"[^A-Za-z0-9 _-]", "_", doctrine.name or "doctrine")
+        path = filedialog.asksaveasfilename(
+            title="Export doctrine",
+            defaultextension=".fctdoc",
+            initialfile=f"{safe_name}.fctdoc",
+            filetypes=[("FCTool doctrine", "*.fctdoc"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            payload = self.fittings.export_doctrines([doctrine_id])
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Export failed",
+                                 f"Could not write the doctrine file:\n{e}")
+            return
+        messagebox.showinfo(
+            "Export doctrine",
+            f"Exported '{doctrine.name}' to:\n{path}")
+
+    def _import_doctrine(self):
+        """Import a .fctdoc share file: read JSON -> import_share -> summary."""
+        path = filedialog.askopenfilename(
+            title="Import doctrine",
+            filetypes=[("FCTool doctrine", "*.fctdoc"),
+                       ("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import failed",
+                                 f"Could not read the doctrine file:\n{e}")
+            return
+        try:
+            summary = self.fittings.import_share(payload)
+            self.fittings.save()
+        except Exception as e:
+            messagebox.showerror("Import failed",
+                                 f"Could not import the doctrine:\n{e}")
+            return
+        # Refresh both the doctrine list and the fittings list (new fits may
+        # have been added to the library).
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(self._doctrine_selected_id)
+        messagebox.showinfo(
+            "Import doctrine",
+            f"Imported {summary.doctrines_added} doctrine(s).\n\n"
+            f"Fits added: {summary.fits_added}\n"
+            f"Fits reused (already in library): {summary.fits_reused}")
+
+    # ── Doctrine membership + tags (Task 6.2) ─────────────────────────────────
+
+    def _add_fit_to_doctrine(self, doctrine_id):
+        """Searchable picker over library fits not already in the doctrine; on
+        pick, prompt for tags, then add the membership."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        existing = {m.fit_id for m in doctrine.members}
+        candidates = [f for f in sorted(self.fittings.list_fits(),
+                                        key=lambda f: (f.name or "").lower())
+                      if f.id not in existing]
+        if not candidates:
+            messagebox.showinfo(
+                "Add fit",
+                "Every fit in the library is already in this doctrine, or the "
+                "library is empty. Import fits on the Fittings sub-tab first.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Add fit to doctrine")
+        win.configure(bg=BG_DARK)
+        win.geometry("440x460")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select a fit to add:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        search_var = tk.StringVar()
+        search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          borderwidth=1, relief=tk.RIDGE)
+        search.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        index_map: list = []
+
+        def _repopulate(*_a):
+            needle = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            index_map.clear()
+            for f in candidates:
+                label = f.name or "?"
+                if f.hull_name:
+                    label += f"  ({f.hull_name})"
+                hay = f"{f.name or ''} {f.hull_name or ''}".lower()
+                if needle and needle not in hay:
+                    continue
+                listbox.insert(tk.END, label)
+                index_map.append(f)
+        search_var.trace_add("write", _repopulate)
+        _repopulate()
+
+        def _do_pick():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            fit = index_map[sel[0]]
+            win.destroy()
+            tags = self._prompt_tag_multiselect(
+                "Tags for this fit",
+                f"Choose tags for '{fit.name}' in this doctrine:",
+                selected=[])
+            if tags is None:
+                return
+            self.fittings.add_fit_to_doctrine(doctrine_id, fit.id, tags)
+            self.fittings.save()
+            self._refresh_doctrine_list()
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_doctrine_detail(doctrine_id)
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Add", style="Green.TButton",
+                   command=_do_pick).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+
+    def _edit_member_tags(self, doctrine_id, fit_id):
+        """Multi-select the tag vocabulary for one (doctrine, fit) membership."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = next((m for m in doctrine.members if m.fit_id == fit_id), None)
+        if mem is None:
+            return
+        fit = self.fittings.get_fit(fit_id)
+        label_name = fit.name if fit is not None else fit_id
+        tags = self._prompt_tag_multiselect(
+            "Edit tags",
+            f"Tags for '{label_name}' in '{doctrine.name}':",
+            selected=list(mem.tags))
+        if tags is None:
+            return
+        self.fittings.set_member_tags(doctrine_id, fit_id, tags)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(doctrine_id)
+
+    def _remove_doctrine_member(self, doctrine_id, fit_id):
+        self.fittings.remove_fit_from_doctrine(doctrine_id, fit_id)
+        self.fittings.save()
+        self._refresh_doctrine_list()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(doctrine_id)
+
+    def _add_fit_to_doctrine_from_fit(self, fit_id):
+        """Cross-link from the Fittings detail pane: pick a doctrine (excluding
+        ones already containing this fit), choose tags, then add the fit."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        candidates = []
+        for doc in sorted(self.fittings.list_doctrines(),
+                          key=lambda d: (d.name or "").lower()):
+            if not any(m.fit_id == fit_id for m in doc.members):
+                candidates.append(doc)
+        if not candidates:
+            if self.fittings.list_doctrines():
+                messagebox.showinfo(
+                    "Add to doctrine",
+                    f"'{fit.name}' is already in every doctrine.")
+            else:
+                messagebox.showinfo(
+                    "Add to doctrine",
+                    "No doctrines yet. Create one on the Doctrines sub-tab "
+                    "first.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Add fit to doctrine")
+        win.configure(bg=BG_DARK)
+        win.geometry("400x420")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text=f"Add '{fit.name}' to which doctrine?",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=370).pack(
+                     anchor=tk.W, padx=12, pady=(12, 2))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
+        for doc in candidates:
+            listbox.insert(tk.END, f"{doc.name}  ({len(doc.members)} fits)")
+
+        def _do_pick():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            doctrine = candidates[sel[0]]
+            win.destroy()
+            tags = self._prompt_tag_multiselect(
+                "Tags for this fit",
+                f"Choose tags for '{fit.name}' in '{doctrine.name}':",
+                selected=[])
+            if tags is None:
+                return
+            self.fittings.add_fit_to_doctrine(doctrine.id, fit_id, tags)
+            self.fittings.save()
+            if self._doctrine_list_visible():
+                self._refresh_doctrine_list()
+                if self._doctrine_selected_id == doctrine.id:
+                    self._show_doctrine_detail(doctrine.id)
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_fit_detail(fit_id)
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Add", style="Green.TButton",
+                   command=_do_pick).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+
+    def _add_custom_tag(self, doctrine_id=None):
+        """Append a custom tag to the library's tag vocabulary."""
+        name = self._prompt_text_line(
+            "Add Tag", "New tag name (added to the vocabulary):", "")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.fittings.tags:
+            messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+            return
+        self.fittings.add_tag(name)
+        self.fittings.save()
+        messagebox.showinfo(
+            "Add tag",
+            f"Added tag '{name}'. It is now available when tagging fits.")
+
+    def _prompt_tag_multiselect(self, title, label, selected):
+        """Modal multi-select of the library tag vocabulary via checkbuttons.
+        Returns the chosen list of tags, or None if cancelled. Includes an
+        inline 'Add tag' button that extends the vocabulary live."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("360x420")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK, anchor=tk.W, justify=tk.LEFT, wraplength=330).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        selected_set = set(selected or [])
+        tag_vars: dict[str, tk.BooleanVar] = {}
+
+        def _rebuild_checks():
+            for w in inner.winfo_children():
+                w.destroy()
+            tag_vars.clear()
+            for tag in self.fittings.tags:
+                v = tk.BooleanVar(value=tag in selected_set)
+                tag_vars[tag] = v
+                cb = tk.Checkbutton(
+                    inner, text=tag, variable=v, font=("Consolas", 9),
+                    fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                    activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                    anchor=tk.W, highlightthickness=0)
+                cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+        _rebuild_checks()
+
+        def _add_tag_inline():
+            name = self._prompt_text_line("Add Tag", "New tag name:", "")
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                return
+            # Preserve current checkbox selections across the rebuild.
+            for tag, v in tag_vars.items():
+                if v.get():
+                    selected_set.add(tag)
+                else:
+                    selected_set.discard(tag)
+            if name not in self.fittings.tags:
+                self.fittings.add_tag(name)
+                self.fittings.save()
+            selected_set.add(name)
+            _rebuild_checks()
+
+        add_row = tk.Frame(win, bg=BG_DARK)
+        add_row.pack(fill=tk.X, padx=12, pady=(4, 0))
+        ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
+                   command=_add_tag_inline).pack(side=tk.LEFT)
+
+        def _ok():
+            result["value"] = [t for t, v in tag_vars.items() if v.get()]
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
+
+    # Tags pre-checked by default on a fresh MOTD (the common doctrine roles).
+    _MOTD_DEFAULT_TAGS = ("DPS", "Logistics", "Links")
+    # Debounce window (ms) for live preview rebuilds while typing/toggling.
+    _MOTD_PREVIEW_DEBOUNCE_MS = 250
+    # Per-attribute soft limit for a single <url=fitting:...> link (spec §3.5,
+    # medium confidence). We warn, never block, when a link's DNA blows past it.
+    _MOTD_LINK_ATTR_WARN = 128
+    # "(leave blank)" sentinel shown in the FC/Anchor dropdown.
+    _MOTD_FC_BLANK = "(leave blank)"
+
+    def _build_motd_subtab(self):
+        """MOTD writer: compose a fleet MOTD from a doctrine (FC link, doctrine
+        name, role-grouped clickable fit links, optional logi channel + free
+        header/footer), preview it live with a length-budget meter, and either
+        set it on the active character's fleet (boss-only) or copy the markup.
+        Also imports an existing fleet MOTD back into the tool.
+
+        Tasks 7.1 (inputs + channel picker), 7.2 (preview/meter/set/copy) and
+        7.3 (import current MOTD + save/restore template)."""
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  MOTD  ")
+
+        # Per-tag include vars, keyed by tag name (rebuilt on doctrine change).
+        self._motd_tag_vars: dict[str, tk.BooleanVar] = {}
+        self._motd_preview_job = None        # pending root.after debounce id
+        self._motd_set_btn = None
+        self._motd_fleet_id = None           # resolved active-FC fleet id
+        self._motd_is_boss = False
+
+        # ── Master split: inputs (left) | preview (right) ────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        body.columnconfigure(0, weight=2, uniform="motd")
+        body.columnconfigure(1, weight=3, uniform="motd")
+        body.rowconfigure(0, weight=1)
+
+        # Left: scrollable inputs panel.
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        in_canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0)
+        in_canvas.grid(row=0, column=0, sticky="nsew")
+        in_sb = ttk.Scrollbar(left, orient="vertical", command=in_canvas.yview)
+        in_sb.grid(row=0, column=1, sticky="ns")
+        in_canvas.configure(yscrollcommand=in_sb.set)
+        self._register_scroll_canvas(in_canvas)
+
+        inputs = tk.Frame(in_canvas, bg=BG_PANEL)
+        _in_win = in_canvas.create_window((0, 0), window=inputs, anchor="nw")
+        inputs.bind("<Configure>",
+                    lambda e: in_canvas.configure(
+                        scrollregion=in_canvas.bbox("all")))
+        in_canvas.bind("<Configure>",
+                       lambda e: in_canvas.itemconfig(_in_win, width=e.width))
+
+        def _lbl(parent, text):
+            return tk.Label(parent, text=text, font=("Consolas", 9, "bold"),
+                            fg=FG_ACCENT, bg=BG_PANEL)
+
+        # Doctrine dropdown.
+        _lbl(inputs, "DOCTRINE").pack(anchor=tk.W, padx=8, pady=(8, 2))
+        self._motd_doctrine_var = tk.StringVar()
+        self._motd_doctrine_combo = ttk.Combobox(
+            inputs, textvariable=self._motd_doctrine_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_doctrine_combo.pack(fill=tk.X, padx=8)
+        self._motd_doctrine_combo.bind(
+            "<<ComboboxSelected>>", self._motd_on_doctrine_change)
+
+        # FC / Anchor dropdown.
+        _lbl(inputs, "FC / ANCHOR").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_fc_var = tk.StringVar()
+        self._motd_fc_combo = ttk.Combobox(
+            inputs, textvariable=self._motd_fc_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_fc_combo.pack(fill=tk.X, padx=8)
+        self._motd_fc_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_motd_fc_change())
+
+        # Logi / cap channel: AutocompleteEntry + Scan.
+        _lbl(inputs, "LOGI / CAP CHANNEL").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        ch_row = tk.Frame(inputs, bg=BG_PANEL)
+        ch_row.pack(fill=tk.X, padx=8)
+        self._motd_channel_entry = AutocompleteEntry(
+            ch_row, list(getattr(self, "_intel_channel_suggestions", []) or []),
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, width=22,
+            borderwidth=1, relief=tk.RIDGE)
+        self._motd_channel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # add="+" so we don't clobber AutocompleteEntry's own <KeyRelease>.
+        self._motd_channel_entry.bind(
+            "<KeyRelease>", lambda e: self._schedule_motd_preview(), add="+")
+        ttk.Button(ch_row, text="Scan", style="Dark.TButton", width=6,
+                   command=self._motd_scan_channels).pack(side=tk.LEFT, padx=(5, 0))
+        self._motd_channel_status = tk.Label(
+            inputs, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
+        self._motd_channel_status.pack(anchor=tk.W, padx=8)
+
+        # Per-tag include checkboxes (rebuilt per doctrine).
+        _lbl(inputs, "INCLUDE TAGS").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_tag_frame = tk.Frame(inputs, bg=BG_PANEL)
+        self._motd_tag_frame.pack(fill=tk.X, padx=8)
+
+        # Header / footer free text.
+        _lbl(inputs, "HEADER").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_header_var = tk.StringVar()
+        tk.Entry(inputs, textvariable=self._motd_header_var,
+                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
+                 ).pack(fill=tk.X, padx=8)
+        self._motd_header_var.trace_add(
+            "write", lambda *a: self._schedule_motd_preview())
+
+        _lbl(inputs, "FOOTER").pack(anchor=tk.W, padx=8, pady=(10, 2))
+        self._motd_footer_var = tk.StringVar()
+        tk.Entry(inputs, textvariable=self._motd_footer_var,
+                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                 insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE
+                 ).pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._motd_footer_var.trace_add(
+            "write", lambda *a: self._schedule_motd_preview())
+
+        # Template save/restore (Task 7.3 Step 2).
+        tmpl_row = tk.Frame(inputs, bg=BG_PANEL)
+        tmpl_row.pack(fill=tk.X, padx=8, pady=(10, 8))
+        ttk.Button(tmpl_row, text="Save template", style="Dark.TButton",
+                   command=self._save_motd_template).pack(side=tk.LEFT, padx=2)
+        ttk.Button(tmpl_row, text="Import current MOTD", style="Dark.TButton",
+                   command=self._import_current_motd).pack(side=tk.LEFT, padx=2)
+
+        # Right: preview + meter + actions.
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        tk.Label(right, text="PREVIEW (raw markup)", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=8, pady=(8, 2))
+
+        self._motd_preview = scrolledtext.ScrolledText(
+            right, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=12,
+            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
+        self._motd_preview.grid(row=1, column=0, sticky="nsew", padx=8)
+        self._theme_scrolledtext_bar(self._motd_preview)
+
+        # Length meter: a colored bar + numeric label.
+        meter_wrap = tk.Frame(right, bg=BG_PANEL)
+        meter_wrap.grid(row=2, column=0, sticky="ew", padx=8, pady=(6, 0))
+        meter_wrap.columnconfigure(0, weight=1)
+        self._motd_meter_canvas = tk.Canvas(
+            meter_wrap, height=14, bg=BG_ENTRY, highlightthickness=1,
+            highlightbackground=BORDER_COLOR)
+        self._motd_meter_canvas.grid(row=0, column=0, sticky="ew")
+        self._motd_meter_label = tk.Label(
+            meter_wrap, text="0 / 3000", font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_PANEL, width=14, anchor=tk.E)
+        self._motd_meter_label.grid(row=0, column=1, padx=(6, 0))
+
+        # Non-blocking warnings (over-budget / long link attribute).
+        self._motd_warn_label = tk.Label(
+            right, text="", font=("Consolas", 8), fg=FG_YELLOW, bg=BG_PANEL,
+            anchor=tk.W, justify=tk.LEFT, wraplength=380)
+        self._motd_warn_label.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 0))
+
+        # Actions: Set as fleet MOTD (boss-gated) + Copy.
+        act_row = tk.Frame(right, bg=BG_PANEL)
+        act_row.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+        self._motd_set_btn = ttk.Button(
+            act_row, text="Set as fleet MOTD", style="Green.TButton",
+            command=self._set_fleet_motd, state=tk.DISABLED)
+        self._motd_set_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(act_row, text="Copy markup", style="Dark.TButton",
+                   command=self._copy_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
+                   command=self._motd_refresh_fleet_status).pack(
+                       side=tk.LEFT, padx=2)
+        self._motd_fleet_status = tk.Label(
+            right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+            anchor=tk.W, justify=tk.LEFT, wraplength=380)
+        self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
+                                     pady=(0, 8))
+
+        # Populate dropdowns + restore the saved template, then first preview.
+        self._motd_refresh_doctrines()
+        self._motd_refresh_fc_choices()
+        self._motd_restore_template()
+        self._motd_rebuild_tag_checkboxes()
+        self._rebuild_motd_preview()
+
+    # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
+
+    def _motd_refresh_doctrines(self):
+        """Fill the doctrine dropdown from the library, preserving selection."""
+        combo = getattr(self, "_motd_doctrine_combo", None)
+        if combo is None:
+            return
+        names = sorted((d.name or "") for d in self.fittings.list_doctrines())
+        combo["values"] = names
+        cur = self._motd_doctrine_var.get()
+        if cur not in names:
+            self._motd_doctrine_var.set(names[0] if names else "")
+
+    def _motd_refresh_fc_choices(self):
+        """Fill the FC/Anchor dropdown with authed characters + '(leave blank)'.
+
+        Default is the primary character (``self.esi_auth``); the blank option
+        omits the FC line entirely from the MOTD."""
+        combo = getattr(self, "_motd_fc_combo", None)
+        if combo is None:
+            return
+        names = [a.character_name or "Unknown" for a in self.esi_accounts]
+        values = names + [self._MOTD_FC_BLANK]
+        combo["values"] = values
+        cur = self._motd_fc_var.get()
+        if cur not in values:
+            default = None
+            if self.esi_auth is not None:
+                default = self.esi_auth.character_name
+            self._motd_fc_var.set(default or (names[0] if names else
+                                              self._MOTD_FC_BLANK))
+
+    def _motd_selected_doctrine(self):
+        """Return the Doctrine matching the dropdown name, or None."""
+        name = self._motd_doctrine_var.get()
+        if not name:
+            return None
+        for d in self.fittings.list_doctrines():
+            if (d.name or "") == name:
+                return d
+        return None
+
+    def _motd_selected_fc_auth(self):
+        """Return the ESIAuth for the FC dropdown selection, or None if blank
+        / no match (used both for the FC link identity and fleet resolution)."""
+        name = self._motd_fc_var.get()
+        if not name or name == self._MOTD_FC_BLANK:
+            return None
+        for a in self.esi_accounts:
+            if (a.character_name or "Unknown") == name:
+                return a
+        return None
+
+    def _motd_on_doctrine_change(self, event=None):
+        """Doctrine changed: rebuild the per-tag checkboxes from its tags and
+        refresh the preview."""
+        self._motd_rebuild_tag_checkboxes()
+        self._rebuild_motd_preview()
+
+    def _on_motd_fc_change(self):
+        """FC changed: re-resolve fleet/boss status (changes which fleet the
+        Set button targets) and refresh the preview's FC line."""
+        self._motd_refresh_fleet_status()
+        self._schedule_motd_preview()
+
+    def _motd_rebuild_tag_checkboxes(self):
+        """Rebuild the include-tag checkboxes from the selected doctrine's tags.
+
+        Tags present on the doctrine's members (in canonical order, then any
+        extras) each get a checkbox; DPS/Logistics/Links default checked. Prior
+        check states are preserved across rebuilds for tags that persist."""
+        frame = getattr(self, "_motd_tag_frame", None)
+        if frame is None:
+            return
+        prev = {t: v.get() for t, v in self._motd_tag_vars.items()}
+        for child in frame.winfo_children():
+            child.destroy()
+        self._motd_tag_vars = {}
+
+        doctrine = self._motd_selected_doctrine()
+        tags: list[str] = []
+        if doctrine is not None:
+            present = set()
+            for mem in doctrine.members:
+                present.update(mem.tags or [])
+            for t in self._DOCTRINE_TAG_ORDER:
+                if t in present:
+                    tags.append(t)
+            for t in sorted(present):
+                if t not in tags:
+                    tags.append(t)
+
+        if not tags:
+            tk.Label(frame, text="(no tagged fits in this doctrine)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                         anchor=tk.W)
+            return
+
+        # A one-shot saved-template tag set (from _motd_restore_template) wins on
+        # the first build; thereafter we preserve the live check state (prev),
+        # falling back to the default-on roles for newly-appearing tags.
+        tmpl_tags = getattr(self, "_motd_template_tags", None)
+        self._motd_template_tags = None      # consume — only applies once
+
+        for t in tags:
+            if tmpl_tags is not None:
+                default = t in tmpl_tags
+            elif t in prev:
+                default = prev[t]
+            else:
+                default = t in self._MOTD_DEFAULT_TAGS
+            var = tk.BooleanVar(value=default)
+            self._motd_tag_vars[t] = var
+            cb = tk.Checkbutton(
+                frame, text=t, variable=var, font=("Consolas", 10),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                anchor=tk.W, command=self._schedule_motd_preview)
+            cb.pack(anchor=tk.W)
+
+    def _motd_scan_channels(self):
+        """Discover chat channels (off the Tk thread) to seed the channel
+        AutocompleteEntry, mirroring :meth:`_scan_intel_channels`.
+
+        discover_channels() does directory + header I/O, so it runs on a worker
+        thread; the resulting names are applied back on the Tk main thread."""
+        try:
+            logs_path = resolve_eve_logs_path(
+                self.config.get("eve_logs_path", ""))
+        except Exception:
+            logs_path = self.config.get("eve_logs_path", "")
+        if not logs_path or not os.path.isdir(logs_path):
+            self._motd_channel_status.config(
+                text="Set a valid EVE Chat Logs path first (Settings)",
+                fg=FG_ORANGE)
+            return
+        self._motd_channel_status.config(text="Scanning...", fg=FG_ACCENT)
+
+        def worker():
+            try:
+                found = discover_channels(logs_path, tracked_character=None,
+                                          max_age_days=30)
+                names = [d["name"] for d in found]
+            except Exception:
+                names = []
+            self.root.after(0, self._apply_motd_scanned_channels, names)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_motd_scanned_channels(self, names):
+        """Apply channel-scan results on the Tk thread: update the entry's
+        completion pool and the status line."""
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None:
+            try:
+                entry.update_completions(list(names))
+            except Exception:
+                pass
+        self._motd_channel_status.config(
+            text=f"Found {len(names)} channel(s)", fg=FG_GREEN)
+
+    # ── MOTD: live preview + length meter (Task 7.2) ──────────────────────────
+
+    def _schedule_motd_preview(self, *args):
+        """Debounce a preview rebuild via root.after (coalesces rapid edits)."""
+        job = getattr(self, "_motd_preview_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._motd_preview_job = self.root.after(
+            self._MOTD_PREVIEW_DEBOUNCE_MS, self._rebuild_motd_preview)
+
+    def _motd_build_fits_by_tag(self, doctrine):
+        """Assemble ``{tag: [(dna, name), ...]}`` for the checked tags of a
+        doctrine. A fit appears under each checked tag it carries; fits with no
+        DNA are skipped (can't be linked). Pure assembly — no business logic."""
+        fits_by_tag: dict[str, list[tuple[str, str]]] = {}
+        if doctrine is None:
+            return fits_by_tag
+        checked = {t for t, v in self._motd_tag_vars.items() if v.get()}
+        for mem in doctrine.members:
+            fit = self.fittings.get_fit(mem.fit_id)
+            if fit is None or not fit.dna:
+                continue
+            for tag in (mem.tags or []):
+                if tag not in checked:
+                    continue
+                fits_by_tag.setdefault(tag, []).append((fit.dna, fit.name))
+        return fits_by_tag
+
+    def _current_motd_markup(self):
+        """Build the MOTD markup string from the current input selections."""
+        doctrine = self._motd_selected_doctrine()
+        fits_by_tag = self._motd_build_fits_by_tag(doctrine)
+
+        fc_auth = self._motd_selected_fc_auth()
+        fc_name = fc_auth.character_name if fc_auth else None
+        fc_cid = fc_auth.character_id if fc_auth else None
+
+        channel = (self._motd_channel_entry.get().strip()
+                   if getattr(self, "_motd_channel_entry", None) else "")
+        return motd_builder.build_motd(
+            fc_name=fc_name,
+            fc_character_id=fc_cid,
+            doctrine_name=(doctrine.name if doctrine else ""),
+            fits_by_tag=fits_by_tag,
+            channel=channel or None,
+            header=self._motd_header_var.get(),
+            footer=self._motd_footer_var.get(),
+        )
+
+    def _motd_budget(self) -> int:
+        """The configured raw-markup MOTD ceiling (defaults to ~3000)."""
+        try:
+            val = int(self.config.get("fittings", {}).get(
+                "motd_budget", motd_builder.MOTD_BUDGET_DEFAULT))
+            return val if val > 0 else motd_builder.MOTD_BUDGET_DEFAULT
+        except (TypeError, ValueError):
+            return motd_builder.MOTD_BUDGET_DEFAULT
+
+    def _rebuild_motd_preview(self):
+        """Rebuild the preview Text, the length meter, and the warnings line.
+
+        Meter color: green < 80% of budget, yellow < 100%, red >= 100%. Warns
+        (non-blocking) if any single ``<url=fitting:...>`` attribute exceeds
+        ``_MOTD_LINK_ATTR_WARN`` chars (spec §3.5)."""
+        self._motd_preview_job = None
+        preview = getattr(self, "_motd_preview", None)
+        if preview is None:
+            return
+
+        markup = self._current_motd_markup()
+
+        preview.config(state=tk.NORMAL)
+        preview.delete("1.0", tk.END)
+        preview.insert("1.0", markup)
+        preview.config(state=tk.DISABLED)
+
+        length = motd_builder.estimate_length(markup)
+        budget = self._motd_budget()
+        frac = (length / budget) if budget else 0.0
+        if frac < 0.8:
+            color = FG_GREEN
+        elif frac < 1.0:
+            color = FG_YELLOW
+        else:
+            color = FG_RED
+
+        canvas = self._motd_meter_canvas
+        canvas.delete("all")
+        try:
+            w = canvas.winfo_width() or 1
+        except Exception:
+            w = 1
+        fill_w = int(min(frac, 1.0) * w)
+        if fill_w > 0:
+            canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
+        self._motd_meter_label.config(
+            text=f"{length} / {budget}", fg=color)
+
+        # Non-blocking warnings.
+        warns = []
+        if length >= budget:
+            warns.append(f"Over budget by {length - budget} chars — the server "
+                         f"may truncate this MOTD.")
+        long_links = [
+            m.group("dna")
+            for m in motd_builder._FITTING_RE.finditer(markup)
+            if len(m.group("dna")) > self._MOTD_LINK_ATTR_WARN
+        ]
+        if long_links:
+            warns.append(
+                f"{len(long_links)} fit link(s) exceed "
+                f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
+                f"not render in-game.")
+        self._motd_warn_label.config(text="  ".join(warns))
+
+    # ── MOTD: fleet resolution + set/copy (Task 7.2) ──────────────────────────
+
+    def _motd_refresh_fleet_status(self):
+        """Resolve the active FC character's current fleet + boss flag off the
+        Tk thread (reuses ESIAuth.get_fleet_info / is_boss) and update the Set
+        button + status line on the Tk thread."""
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            self._motd_fleet_id = None
+            self._motd_is_boss = False
+            self._apply_motd_fleet_status(
+                None, False, "No authenticated FC character selected.")
+            return
+        self._motd_fleet_status.config(text="Checking fleet...", fg=FG_ACCENT)
+
+        def worker():
+            fleet_id = None
+            is_boss = False
+            msg = "Not in a fleet."
+            try:
+                info = auth.get_fleet_info()
+                if info:
+                    fleet_id = info.get("fleet_id")
+                    is_boss = auth.is_boss(info, auth.character_id)
+                    msg = ("You are the fleet boss — Set is enabled."
+                           if is_boss else
+                           "In a fleet but not the boss — only the boss can "
+                           "set the MOTD.")
+            except Exception as e:
+                msg = f"Could not read fleet status: {e}"
+            self.root.after(0, self._apply_motd_fleet_status,
+                            fleet_id, is_boss, msg)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_motd_fleet_status(self, fleet_id, is_boss, msg):
+        """Apply fleet-resolution results on the Tk thread: store fleet/boss and
+        enable the Set button only when the selected FC is the fleet boss."""
+        self._motd_fleet_id = fleet_id
+        self._motd_is_boss = bool(is_boss)
+        btn = getattr(self, "_motd_set_btn", None)
+        if btn is not None:
+            btn.config(state=(tk.NORMAL if self._motd_is_boss else tk.DISABLED))
+        color = FG_GREEN if is_boss else (FG_YELLOW if fleet_id else FG_DIM)
+        self._motd_fleet_status.config(text=msg, fg=color)
+
+    def _set_fleet_motd(self):
+        """Write the composed MOTD to the active FC's fleet (boss-only).
+
+        Gated on the resolved boss flag; if the markup is over budget, confirms
+        first. The PUT runs on a daemon thread; 204 -> success, anything else ->
+        an error (403 not-boss / over-length truncation surfaced)."""
+        if not self._motd_is_boss or not self._motd_fleet_id:
+            messagebox.showwarning(
+                "Cannot set MOTD",
+                "The selected FC character must be the current fleet boss. "
+                "Use 'Refresh fleet' after forming/joining a fleet.")
+            return
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Cannot set MOTD",
+                                   "No authenticated FC character selected.")
+            return
+
+        markup = self._current_motd_markup()
+        length = motd_builder.estimate_length(markup)
+        budget = self._motd_budget()
+        if length >= budget:
+            if not messagebox.askyesno(
+                    "Over budget",
+                    f"This MOTD is {length} chars (budget {budget}). The "
+                    f"server may truncate it. Set it anyway?"):
+                return
+
+        fleet_id = self._motd_fleet_id
+        self._motd_fleet_status.config(text="Setting MOTD...", fg=FG_ACCENT)
+
+        def worker():
+            ok = False
+            err = None
+            try:
+                ok = auth.set_fleet_motd(fleet_id, markup)
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _done, ok, err)
+
+        def _done(ok, err):
+            if ok:
+                self._motd_fleet_status.config(
+                    text="MOTD set successfully (204).", fg=FG_GREEN)
+            else:
+                detail = (f"\n\n{err}" if err else
+                          "\n\nESI rejected the request (403 if you are no "
+                          "longer the boss, or the MOTD was too long).")
+                self._motd_fleet_status.config(
+                    text="Failed to set MOTD.", fg=FG_RED)
+                messagebox.showerror("Set MOTD failed",
+                                     f"Could not set the fleet MOTD.{detail}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _copy_motd(self):
+        """Copy the raw MOTD markup to the clipboard (manual-paste fallback)."""
+        markup = self._current_motd_markup()
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(markup)
+            self._motd_fleet_status.config(
+                text="Markup copied to clipboard.", fg=FG_GREEN)
+        except Exception as e:
+            messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}")
+
+    # ── MOTD: import current MOTD + template persistence (Task 7.3) ────────────
+
+    def _import_current_motd(self):
+        """Load the active FC's current fleet MOTD, parse it, and offer to import
+        any embedded fit DNAs into the library + save the raw MOTD as a named
+        template snapshot.
+
+        Reads ``get_fleet(fleet_id)['motd']`` on a daemon thread (reusing the
+        get_fleet_info fleet path), then parses with motd_builder.parse_motd."""
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Import MOTD",
+                                   "No authenticated FC character selected.")
+            return
+        self._motd_fleet_status.config(text="Loading current MOTD...",
+                                       fg=FG_ACCENT)
+
+        def worker():
+            raw = None
+            err = None
+            try:
+                info = auth.get_fleet_info()
+                fleet_id = info.get("fleet_id") if info else None
+                if not fleet_id:
+                    err = "The selected FC character is not in a fleet."
+                else:
+                    fleet = auth.get_fleet(fleet_id)
+                    if not isinstance(fleet, dict):
+                        err = ("Could not read the fleet (only the fleet boss "
+                               "may read the MOTD).")
+                    else:
+                        raw = fleet.get("motd", "") or ""
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, self._apply_imported_motd, raw, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_imported_motd(self, raw, err):
+        """Tk-thread handler for an imported MOTD: show it, offer fit import,
+        and save it as a named template snapshot."""
+        if err is not None or raw is None:
+            self._motd_fleet_status.config(text="Import failed.", fg=FG_RED)
+            messagebox.showerror("Import MOTD",
+                                 err or "Could not load the current MOTD.")
+            return
+
+        parsed = motd_builder.parse_motd(raw)
+        self._motd_fleet_status.config(
+            text=f"Imported MOTD ({len(raw)} chars, "
+                 f"{len(parsed['fittings'])} fit link(s)).", fg=FG_GREEN)
+
+        # Show the raw markup in the preview, and offer to load it as a header.
+        preview = getattr(self, "_motd_preview", None)
+        if preview is not None:
+            preview.config(state=tk.NORMAL)
+            preview.delete("1.0", tk.END)
+            preview.insert("1.0", raw)
+            preview.config(state=tk.DISABLED)
+        if raw and messagebox.askyesno(
+                "Imported MOTD",
+                "Load the imported MOTD text into the Header field "
+                "(so you can re-use it as a starting point)?"):
+            self._motd_header_var.set(raw)
+
+        # Offer to import each embedded fit DNA into the library (de-duped).
+        fittings = parsed.get("fittings") or []
+        if fittings and messagebox.askyesno(
+                "Import fits",
+                f"Import {len(fittings)} fit link(s) from this MOTD into the "
+                f"library? Duplicates are skipped automatically."):
+            added, reused, failed = self._import_motd_fits(fittings)
+            messagebox.showinfo(
+                "Fit import",
+                f"Imported {added} new fit(s); {reused} already in the "
+                f"library; {failed} could not be parsed.")
+
+        # Save the raw MOTD as a named template snapshot.
+        if raw:
+            name = simpledialog.askstring(
+                "Save MOTD snapshot",
+                "Name this imported MOTD snapshot (blank to skip):",
+                parent=self.root)
+            if name and name.strip():
+                self._save_motd_snapshot(name.strip(), raw)
+
+    def _import_motd_fits(self, fittings):
+        """Import a list of ``{dna, name}`` dicts into the library, de-duped by
+        content hash (reusing the Phase-5 ``_add_parsed_fit`` path). Returns
+        ``(added, reused, failed)`` counts. Runs on the Tk thread."""
+        added = reused = failed = 0
+        existing_hashes = {}
+        for f in self.fittings.list_fits():
+            try:
+                existing_hashes[fit_models.fit_content_hash(f.parsed)] = f.id
+            except Exception:
+                pass
+        for entry in fittings:
+            dna = entry.get("dna", "")
+            name = entry.get("name") or "Imported Fit"
+            if not dna:
+                failed += 1
+                continue
+            try:
+                result = fit_parser.parse_dna(dna, self.type_catalog)
+                parsed = result.fit
+                h = fit_models.fit_content_hash(parsed)
+            except Exception:
+                failed += 1
+                continue
+            if h in existing_hashes:
+                reused += 1
+                continue
+            fid = self._add_parsed_fit(parsed, source="dna", raw_text=dna,
+                                       name=name)
+            if fid:
+                existing_hashes[h] = fid
+                added += 1
+            else:
+                failed += 1
+        if added:
+            # Refresh doctrine dropdown is unaffected, but new fits may change
+            # the library view; the fittings sub-tab refreshes itself.
+            self._motd_refresh_doctrines()
+        return added, reused, failed
+
+    def _save_motd_snapshot(self, name, raw):
+        """Persist a raw MOTD under config['fittings']['motd_template']['saved']."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        tmpl = fit_cfg.setdefault("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+            fit_cfg["motd_template"] = tmpl
+        saved = tmpl.setdefault("saved", {})
+        if not isinstance(saved, dict):
+            saved = {}
+            tmpl["saved"] = saved
+        saved[name] = raw
+        self._save_config()
+        self._motd_fleet_status.config(
+            text=f"Saved snapshot '{name}'.", fg=FG_GREEN)
+
+    def _save_motd_template(self):
+        """Persist the current field selections (checked tags, header/footer,
+        channel, doctrine, FC) to config['fittings']['motd_template'] so they
+        restore on next open."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        tmpl = fit_cfg.setdefault("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+            fit_cfg["motd_template"] = tmpl
+        tmpl["tags"] = [t for t, v in self._motd_tag_vars.items() if v.get()]
+        tmpl["header"] = self._motd_header_var.get()
+        tmpl["footer"] = self._motd_footer_var.get()
+        tmpl["channel"] = (self._motd_channel_entry.get().strip()
+                           if getattr(self, "_motd_channel_entry", None) else "")
+        tmpl["doctrine"] = self._motd_doctrine_var.get()
+        tmpl["fc"] = self._motd_fc_var.get()
+        # Persist the chosen channel to the dedicated config key too.
+        fit_cfg["logi_channel"] = tmpl["channel"]
+        self._save_config()
+        self._motd_fleet_status.config(text="Template saved.", fg=FG_GREEN)
+
+    def _motd_restore_template(self):
+        """Restore saved field selections from config['fittings']['motd_template']
+        (called once while building the sub-tab, before the first preview).
+
+        Tag selections are applied later in _motd_rebuild_tag_checkboxes via the
+        persisted set; here we restore the scalar fields and seed the channel
+        from the dedicated logi_channel key when no template channel exists."""
+        fit_cfg = self.config.get("fittings", {})
+        tmpl = fit_cfg.get("motd_template", {})
+        if not isinstance(tmpl, dict):
+            tmpl = {}
+
+        doctrine = tmpl.get("doctrine")
+        if doctrine and doctrine in (self._motd_doctrine_combo["values"] or ()):
+            self._motd_doctrine_var.set(doctrine)
+        fc = tmpl.get("fc")
+        if fc and fc in (self._motd_fc_combo["values"] or ()):
+            self._motd_fc_var.set(fc)
+        self._motd_header_var.set(tmpl.get("header", "") or "")
+        self._motd_footer_var.set(tmpl.get("footer", "") or "")
+
+        channel = tmpl.get("channel") or fit_cfg.get("logi_channel", "") or ""
+        entry = getattr(self, "_motd_channel_entry", None)
+        if entry is not None and channel:
+            entry.delete(0, tk.END)
+            entry.insert(0, channel)
+
+        # Remember which tags the template wants checked; consumed by the
+        # tag-checkbox builder (which only knows the doctrine's actual tags).
+        self._motd_template_tags = tmpl.get("tags")
+
+    # ── Fittings library sub-tab (Task 5.2) ───────────────────────────────────
+
+    def _build_fittings_subtab(self):
+        tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
+        self._fitting_subnb.add(tab, text="  Fittings  ")
+
+        # ── Toolbar: search + import buttons ─────────────────────────────────
+        toolbar = tk.Frame(tab, bg=BG_DARK)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        tk.Label(toolbar, text="Search:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT)
+        self._fit_search_var = tk.StringVar()
+        self._fit_search_var.trace_add(
+            "write", lambda *a: self._refresh_fit_list(self._fit_search_var.get()))
+        search_entry = tk.Entry(
+            toolbar, textvariable=self._fit_search_var, font=("Consolas", 10),
+            bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=26,
+            borderwidth=1, relief=tk.RIDGE)
+        search_entry.pack(side=tk.LEFT, padx=(5, 15))
+
+        ttk.Button(toolbar, text="Import from EVE", style="Dark.TButton",
+                   command=self._import_esi_fittings).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import from pyfa", style="Dark.TButton",
+                   command=self._import_pyfa).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Paste EFT/DNA", style="Dark.TButton",
+                   command=self._import_paste_fit).pack(side=tk.LEFT, padx=2)
+
+        # ── Master / detail split ────────────────────────────────────────────
+        body = tk.Frame(tab, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        body.columnconfigure(0, weight=3, uniform="fit")
+        body.columnconfigure(1, weight=4, uniform="fit")
+        body.rowconfigure(0, weight=1)
+
+        # Left: fittings list (Treeview)
+        left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        tk.Label(left, text="LIBRARY", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).grid(
+                     row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+
+        tree_wrap = tk.Frame(left, bg=BG_PANEL)
+        tree_wrap.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+
+        columns = ("name", "hull", "tags", "doctrines")
+        self._fit_tree = ttk.Treeview(
+            tree_wrap, columns=columns, show="headings",
+            style="Dark.Treeview", selectmode="browse")
+        self._fit_tree.heading("name", text="Name")
+        self._fit_tree.heading("hull", text="Hull")
+        self._fit_tree.heading("tags", text="Tags")
+        self._fit_tree.heading("doctrines", text="#Doc")
+        self._fit_tree.column("name", width=150, anchor=tk.W)
+        self._fit_tree.column("hull", width=110, anchor=tk.W)
+        self._fit_tree.column("tags", width=120, anchor=tk.W)
+        self._fit_tree.column("doctrines", width=44, anchor=tk.CENTER, stretch=False)
+        self._fit_tree.grid(row=0, column=0, sticky="nsew")
+        self._fit_tree.bind("<<TreeviewSelect>>", self._on_fit_tree_select)
+
+        tree_sb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                                command=self._fit_tree.yview)
+        self._fit_tree.configure(yscrollcommand=tree_sb.set)
+        tree_sb.grid(row=0, column=1, sticky="ns")
+
+        # Right: detail (scrollable)
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        detail_canvas = tk.Canvas(right, bg=BG_PANEL, highlightthickness=0)
+        detail_canvas.grid(row=0, column=0, sticky="nsew")
+        detail_sb = ttk.Scrollbar(right, orient="vertical",
+                                  command=detail_canvas.yview)
+        detail_sb.grid(row=0, column=1, sticky="ns")
+        detail_canvas.configure(yscrollcommand=detail_sb.set)
+        self._register_scroll_canvas(detail_canvas)
+
+        self._fit_detail = tk.Frame(detail_canvas, bg=BG_PANEL)
+        _detail_win = detail_canvas.create_window(
+            (0, 0), window=self._fit_detail, anchor="nw")
+
+        def _on_detail_config(event=None):
+            detail_canvas.configure(scrollregion=detail_canvas.bbox("all"))
+        self._fit_detail.bind("<Configure>", _on_detail_config)
+
+        def _on_canvas_config(event):
+            detail_canvas.itemconfig(_detail_win, width=event.width)
+        detail_canvas.bind("<Configure>", _on_canvas_config)
+
+        # Populate.
+        self._refresh_fit_list()
+        self._show_fit_detail(None)
+
+    # ── Fittings library controllers (Task 5.2) ───────────────────────────────
+
+    def _doctrine_count_for_fit(self, fit_id: str) -> int:
+        """How many doctrines reference this fit (for the list's #Doc column)."""
+        count = 0
+        try:
+            for doc in self.fittings.list_doctrines():
+                if any(m.fit_id == fit_id for m in doc.members):
+                    count += 1
+        except Exception:
+            pass
+        return count
+
+    def _fit_member_tags(self, fit_id: str) -> list[str]:
+        """Union of this fit's per-membership tags across all doctrines."""
+        tags: list[str] = []
+        try:
+            for doc in self.fittings.list_doctrines():
+                for m in doc.members:
+                    if m.fit_id == fit_id:
+                        for t in m.tags:
+                            if t not in tags:
+                                tags.append(t)
+        except Exception:
+            pass
+        return tags
+
+    def _refresh_fit_list(self, filter_text: str = ""):
+        """Clear + repopulate the fittings Treeview, filtering case-insensitively
+        on name / hull / tags. Preserves the current selection when possible."""
+        tree = getattr(self, "_fit_tree", None)
+        if tree is None:
+            return
+        prev = self._fit_selected_id
+        for iid in tree.get_children():
+            tree.delete(iid)
+        needle = (filter_text or "").strip().lower()
+        restored = False
+        for fit in sorted(self.fittings.list_fits(),
+                          key=lambda f: (f.name or "").lower()):
+            tags = self._fit_member_tags(fit.id)
+            tags_str = ", ".join(tags)
+            hay = " ".join([fit.name or "", fit.hull_name or "", tags_str]).lower()
+            if needle and needle not in hay:
+                continue
+            n_doc = self._doctrine_count_for_fit(fit.id)
+            tree.insert("", tk.END, iid=fit.id,
+                        values=(fit.name, fit.hull_name, tags_str, n_doc))
+            if fit.id == prev:
+                restored = True
+        if restored:
+            tree.selection_set(prev)
+        elif prev is not None and self.fittings.get_fit(prev) is None:
+            # Selected fit was deleted/filtered away — clear the detail pane.
+            self._fit_selected_id = None
+            self._show_fit_detail(None)
+
+    def _on_fit_tree_select(self, event=None):
+        tree = self._fit_tree
+        sel = tree.selection()
+        if not sel:
+            return
+        self._fit_selected_id = sel[0]
+        self._show_fit_detail(sel[0])
+
+    def _clear_fit_detail(self):
+        for w in self._fit_detail.winfo_children():
+            w.destroy()
+
+    def _show_fit_detail(self, fit_id):
+        """Render the selected fit: hull/name header, slot-grouped read-only
+        module list, drones/cargo, notes, doctrine membership, and actions."""
+        self._clear_fit_detail()
+        parent = self._fit_detail
+
+        if not fit_id:
+            tk.Label(parent, text="Select a fitting to view details.",
+                     font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
+                     wraplength=360, justify=tk.LEFT).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            tk.Label(parent, text="Fitting not found.",
+                     font=("Consolas", 10), fg=FG_RED, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=10, pady=10)
+            return
+
+        # Header: name + hull + source.
+        tk.Label(parent, text=fit.name, font=("Consolas", 13, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=380).pack(anchor=tk.W, padx=10, pady=(10, 0))
+        tk.Label(parent, text=f"{fit.hull_name}  ·  source: {fit.source}",
+                 font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                     anchor=tk.W, padx=10, pady=(0, 6))
+
+        # Slot-grouped module list.
+        parsed = fit.parsed
+        by_slot: dict[str, list] = {}
+        for m in parsed.modules:
+            by_slot.setdefault(m.slot or "other", []).append(m)
+        for slot in self._FIT_SLOT_ORDER:
+            mods = by_slot.get(slot)
+            if not mods:
+                continue
+            tk.Label(parent, text=self._FIT_SLOT_LABELS.get(slot, slot.title()),
+                     font=("Consolas", 9, "bold"), fg=FG_GREEN, bg=BG_PANEL
+                     ).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for m in mods:
+                line = m.name or f"Type {m.type_id}"
+                if m.charge_name:
+                    line += f", {m.charge_name}"
+                if m.offline:
+                    line += " /offline"
+                tk.Label(parent, text=f"  {line}", font=("Consolas", 9),
+                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                         wraplength=380).pack(anchor=tk.W, padx=14)
+        # Any modules with an unrecognized slot bucket.
+        other_mods = [m for s, ms in by_slot.items()
+                      if s not in self._FIT_SLOT_ORDER for m in ms]
+        if other_mods:
+            tk.Label(parent, text="Other", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for m in other_mods:
+                tk.Label(parent, text=f"  {m.name or m.type_id}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+
+        if parsed.drones:
+            tk.Label(parent, text="Drones", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for d in parsed.drones:
+                tk.Label(parent, text=f"  {d.name or d.type_id} x{d.quantity}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+        if parsed.cargo:
+            tk.Label(parent, text="Cargo", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
+            for c in parsed.cargo:
+                tk.Label(parent, text=f"  {c.name or c.type_id} x{c.quantity}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+
+        # Notes.
+        if (fit.notes or "").strip():
+            tk.Label(parent, text="Notes", font=("Consolas", 9, "bold"),
+                     fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(8, 0))
+            tk.Label(parent, text=fit.notes, font=("Consolas", 9),
+                     fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=380).pack(anchor=tk.W, padx=14)
+
+        # Doctrine membership.
+        member_docs = []
+        for doc in self.fittings.list_doctrines():
+            mem = next((m for m in doc.members if m.fit_id == fit.id), None)
+            if mem is not None:
+                member_docs.append((doc.name, mem.tags))
+        tk.Label(parent, text="Doctrines", font=("Consolas", 9, "bold"),
+                 fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(8, 0))
+        if member_docs:
+            for dname, dtags in member_docs:
+                tag_txt = f" [{', '.join(dtags)}]" if dtags else ""
+                tk.Label(parent, text=f"  {dname}{tag_txt}",
+                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                         anchor=tk.W, wraplength=380, justify=tk.LEFT).pack(
+                             anchor=tk.W, padx=14)
+        else:
+            tk.Label(parent, text="  (not in any doctrine)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
+                         anchor=tk.W, padx=14)
+
+        # Action buttons.
+        actions = tk.Frame(parent, bg=BG_PANEL)
+        actions.pack(fill=tk.X, padx=10, pady=(12, 10))
+        row1 = tk.Frame(actions, bg=BG_PANEL)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Button(row1, text="Rename", style="Dark.TButton",
+                   command=lambda: self._rename_fit(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="Edit notes", style="Dark.TButton",
+                   command=lambda: self._edit_fit_notes(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1, text="Replace fit text", style="Dark.TButton",
+                   command=lambda: self._replace_fit_text(fit.id)).pack(side=tk.LEFT, padx=2)
+        row2 = tk.Frame(actions, bg=BG_PANEL)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Button(row2, text="Copy EFT", style="Dark.TButton",
+                   command=lambda: self._copy_fit_eft(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Copy DNA", style="Dark.TButton",
+                   command=lambda: self._copy_fit_dna(fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row2, text="Save to in-game Fittings", style="Dark.TButton",
+                   command=lambda: self._save_fit_to_ingame(fit.id)).pack(side=tk.LEFT, padx=2)
+        row3 = tk.Frame(actions, bg=BG_PANEL)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Button(row3, text="Add to doctrine…", style="Dark.TButton",
+                   command=lambda: self._add_fit_to_doctrine_from_fit(
+                       fit.id)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row3, text="Delete", style="Red.TButton",
+                   command=lambda: self._delete_fit(fit.id)).pack(side=tk.LEFT, padx=2)
+
+    def _rename_fit(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        new_name = self._prompt_text_line("Rename Fitting", "Name:", fit.name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == fit.name:
+            return
+        fit.name = new_name
+        self.fittings.update_fit(fit)
+        self.fittings.save()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(fit_id)
+
+    def _edit_fit_notes(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        new_notes = self._prompt_text_block(
+            "Edit Notes", "Notes for this fit:", fit.notes or "")
+        if new_notes is None:
+            return
+        fit.notes = new_notes
+        self.fittings.update_fit(fit)
+        self.fittings.save()
+        self._show_fit_detail(fit_id)
+
+    def _replace_fit_text(self, fit_id):
+        """Re-paste the fit body; keep id/name/membership, rebuild parsed/dna/raw."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+
+        def _on_parsed(parse_result, source, raw_text):
+            warnings = list(parse_result.warnings)
+            parsed = parse_result.fit
+            try:
+                dna = fit_dna.to_dna(parsed)
+            except Exception:
+                dna = fit.dna
+            fit.source = source
+            fit.raw_text = raw_text
+            fit.parsed = parsed
+            fit.dna = dna
+            fit.hull_type_id = parsed.ship_type_id
+            fit.hull_name = parsed.ship_name or fit.hull_name
+            self.fittings.update_fit(fit)
+            self.fittings.save()
+            self._refresh_fit_list(self._fit_search_var.get())
+            self._show_fit_detail(fit_id)
+            if warnings:
+                messagebox.showwarning(
+                    "Replaced with warnings",
+                    "Fit replaced. Some items were not recognized:\n\n"
+                    + "\n".join(warnings[:12]))
+
+        self._open_paste_dialog(
+            title="Replace Fit Text",
+            instruction="Paste the new EFT or DNA for this fit:",
+            on_success=_on_parsed)
+
+    def _copy_fit_eft(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        text = fit.raw_text if (fit.raw_text or "").strip() else self._render_eft(fit)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _copy_fit_dna(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        dna = fit.dna
+        if not dna:
+            try:
+                dna = fit_dna.to_dna(fit.parsed)
+            except Exception:
+                dna = ""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(dna)
+
+    def _render_eft(self, fit) -> str:
+        """Re-emit a minimal EFT block from parsed contents (fallback when a fit
+        has no raw_text, e.g. ESI/DNA-sourced). Modules are grouped by slot in
+        the canonical order; charges and drones/cargo use the ` xN` form."""
+        parsed = fit.parsed
+        lines = [f"[{fit.hull_name}, {fit.name}]"]
+        by_slot: dict[str, list] = {}
+        for m in parsed.modules:
+            by_slot.setdefault(m.slot or "other", []).append(m)
+        first = True
+        for slot in self._FIT_SLOT_ORDER:
+            mods = by_slot.get(slot)
+            if not mods:
+                continue
+            if not first:
+                lines.append("")
+            first = False
+            for m in mods:
+                line = m.name or f"Type {m.type_id}"
+                if m.charge_name:
+                    line += f", {m.charge_name}"
+                if m.offline:
+                    line += " /offline"
+                lines.append(line)
+        if parsed.drones:
+            lines.append("")
+            for d in parsed.drones:
+                lines.append(f"{d.name or d.type_id} x{d.quantity}")
+        if parsed.cargo:
+            lines.append("")
+            for c in parsed.cargo:
+                lines.append(f"{c.name or c.type_id} x{c.quantity}")
+        return "\n".join(lines)
+
+    def _delete_fit(self, fit_id):
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        if not messagebox.askyesno(
+                "Delete Fitting",
+                f"Delete '{fit.name}'?\n\nThis also removes it from any doctrine."):
+            return
+        self.fittings.delete_fit(fit_id)   # cascades doctrine membership
+        self.fittings.save()
+        if self._fit_selected_id == fit_id:
+            self._fit_selected_id = None
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(None)
+
+    def _save_fit_to_ingame(self, fit_id):
+        """Push a fit to the primary character's in-game Fittings via ESI."""
+        fit = self.fittings.get_fit(fit_id)
+        if fit is None:
+            return
+        char = self.esi_auth
+        if char is None or not char.character_id:
+            messagebox.showwarning(
+                "No character",
+                "Connect a character (Characters tab) before saving to in-game "
+                "Fittings.")
+            return
+        if not char.has_scope(SCOPE_FITTINGS_WRITE):
+            messagebox.showwarning(
+                "Re-authorize required",
+                f"{char.character_name or 'This character'} was authorized "
+                "before in-game fittings support was added, so it cannot save "
+                "fits to its in-game Fittings yet.\n\nOpen the Characters or "
+                "Settings tab and click \"Re-authorize\" for this character, "
+                "then try again.")
+            return
+        self._push_fit_to_eve(fit, char)
+
+    # ── Shared dialogs / prompts ──────────────────────────────────────────────
+
+    def _prompt_text_line(self, title, label, initial=""):
+        """A small modal single-line text prompt. Returns the string or None."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("420x130")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        var = tk.StringVar(value=initial)
+        entry = tk.Entry(win, textvariable=var, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         width=46, borderwidth=1, relief=tk.RIDGE)
+        entry.pack(fill=tk.X, padx=12)
+        entry.focus_set()
+        entry.icursor(tk.END)
+
+        def _ok():
+            result["value"] = var.get()
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        entry.bind("<Return>", lambda e: _ok())
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _prompt_text_block(self, title, label, initial=""):
+        """A modal multi-line text prompt. Returns the string or None."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("520x320")
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        txt = scrolledtext.ScrolledText(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, height=10, wrap=tk.WORD,
+            borderwidth=1, relief=tk.RIDGE)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12)
+        self._theme_scrolledtext_bar(txt)
+        txt.insert("1.0", initial)
+        txt.focus_set()
+
+        def _ok():
+            result["value"] = txt.get("1.0", tk.END).rstrip("\n")
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Save", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _open_paste_dialog(self, title, instruction, on_success):
+        """Open a paste-fit modal: a Text box + status label. On submit, parse on
+        a daemon thread via fit_parser.detect_and_parse and marshal the result
+        back to the Tk thread. `on_success(parse_result, source, raw_text)` runs
+        on the Tk thread when parsing yields a valid hull. Parse failures show a
+        status message and never close the dialog."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("560x420")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text=instruction, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 4))
+        txt = scrolledtext.ScrolledText(
+            win, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, height=16, wrap=tk.NONE,
+            borderwidth=1, relief=tk.RIDGE)
+        txt.pack(fill=tk.BOTH, expand=True, padx=12)
+        self._theme_scrolledtext_bar(txt)
+        txt.focus_set()
+
+        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                          bg=BG_DARK, anchor=tk.W, justify=tk.LEFT, wraplength=520)
+        status.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        state = {"busy": False}
+
+        def _submit():
+            if state["busy"]:
+                return
+            raw_text = txt.get("1.0", tk.END).rstrip("\n")
+            if not raw_text.strip():
+                status.config(text="Paste a fit first.", fg=FG_ORANGE)
+                return
+            state["busy"] = True
+            status.config(text="Parsing...", fg=FG_ACCENT)
+
+            def worker():
+                try:
+                    result = fit_parser.detect_and_parse(
+                        raw_text, self.type_catalog)
+                    err = None
+                except fit_parser.FitParseError as e:
+                    result, err = None, str(getattr(e, "message", e) or e)
+                except Exception as e:  # pragma: no cover - defensive
+                    result, err = None, str(e)
+                self.root.after(0, _apply, result, err, raw_text)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _apply(result, err, raw_text):
+            state["busy"] = False
+            if err is not None or result is None:
+                status.config(text=f"Could not parse: {err}", fg=FG_RED)
+                return
+            # Detect source from the text shape (matches detect_and_parse).
+            source = "dna" if self._looks_like_dna(raw_text) else "eft"
+            try:
+                on_success(result, source, raw_text)
+            finally:
+                win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import", style="Green.TButton",
+                   command=_submit).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+
+    @staticmethod
+    def _looks_like_dna(text: str) -> bool:
+        """Heuristic mirroring fit_parser.detect_and_parse: DNA has no '['
+        header and matches the leading numeric-id grammar."""
+        stripped = (text or "").lstrip("﻿").strip()
+        if not stripped or stripped.startswith("["):
+            return False
+        return bool(re.match(r"^\d+(:[\d;_]*)*::", stripped))
+
+    # ── Import dialogs (Task 5.3) ──────────────────────────────────────────────
+
+    def _import_paste_fit(self):
+        """Paste EFT/DNA -> detect_and_parse (threaded) -> new Fit -> add."""
+        def _on_parsed(parse_result, source, raw_text):
+            warnings = list(parse_result.warnings)
+            parsed = parse_result.fit
+            name = parsed.name_hint or self._prompt_text_line(
+                "Name Fitting", "Name for this fit:",
+                parsed.ship_name or "New Fit")
+            if name is None:
+                return
+            name = (name or "").strip() or (parsed.ship_name or "New Fit")
+            self._add_parsed_fit(parsed, source=source, raw_text=raw_text,
+                                 name=name)
+            if warnings:
+                messagebox.showwarning(
+                    "Imported with warnings",
+                    "Fit imported. Some items were not recognized:\n\n"
+                    + "\n".join(warnings[:12]))
+
+        self._open_paste_dialog(
+            title="Paste EFT / DNA",
+            instruction="Paste an EFT block or a fitting DNA string:",
+            on_success=_on_parsed)
+
+    def _add_parsed_fit(self, parsed, source, raw_text, name, notes=""):
+        """Build a fit_models.Fit from a ParsedFit and add it to the library.
+        Returns the new fit id (or None on failure). Runs on the Tk thread."""
+        try:
+            dna = fit_dna.to_dna(parsed)
+        except Exception:
+            dna = ""
+        fit = fit_models.Fit(
+            id="",                                  # assigned by add_fit
+            name=name,
+            hull_type_id=parsed.ship_type_id,
+            hull_name=parsed.ship_name or "",
+            source=source,
+            raw_text=raw_text,
+            parsed=parsed,
+            dna=dna,
+            notes=notes,
+            esi_fitting_ids={},
+            created="",                             # stamped by the store
+            modified="",
+        )
+        try:
+            fid = self.fittings.add_fit(fit)
+            self.fittings.save()
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Could not add fit:\n{e}")
+            return None
+        self._fit_selected_id = fid
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(fid)
+        return fid
+
+    def _import_pyfa(self):
+        """Import from a pyfa saveddata.db (browse-by-ship+name), falling back to
+        an EFT-text export file when the DB is missing/unreadable."""
+        cfg = self.config.get("fittings", {})
+        start = cfg.get("pyfa_path") or None
+        self._pyfa_status_win = None
+
+        def worker():
+            db_path = None
+            fits = None
+            err = None
+            try:
+                db_path = pyfa_import.find_pyfa_db(start)
+                if db_path:
+                    fits = pyfa_import.list_pyfa_fits(db_path)
+            except pyfa_import.PyfaImportError as e:
+                err = str(e)
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _apply, db_path, fits, err)
+
+        def _apply(db_path, fits, err):
+            if db_path and fits is not None:
+                # Persist the directory we read from.
+                try:
+                    cfg2 = self.config.setdefault("fittings", {})
+                    cfg2["pyfa_path"] = os.path.dirname(db_path)
+                    self._save_config()
+                except Exception:
+                    pass
+                if not fits:
+                    messagebox.showinfo(
+                        "pyfa import",
+                        "The pyfa database has no saved fits.")
+                    return
+                self._show_pyfa_picker(db_path, fits)
+            else:
+                # Fallback: EFT-text export file.
+                msg = ("Could not read a pyfa database"
+                       + (f" ({err})" if err else "")
+                       + ".\n\nChoose an EFT-text export file (.txt/.cfg) "
+                         "to import instead.")
+                messagebox.showinfo("pyfa import", msg)
+                self._import_eft_text_file()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_eft_text_file(self):
+        """Fallback path: pick an EFT-text export file and parse it."""
+        path = filedialog.askopenfilename(
+            title="Select EFT text export",
+            filetypes=[("EFT/text exports", "*.txt *.cfg"), ("All files", "*.*")])
+        if not path:
+            return
+
+        def worker():
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    raw_text = f.read()
+                result = fit_parser.detect_and_parse(raw_text, self.type_catalog)
+                err = None
+            except Exception as e:
+                result, raw_text, err = None, "", str(e)
+            self.root.after(0, _apply, result, raw_text, err)
+
+        def _apply(result, raw_text, err):
+            if err is not None or result is None:
+                messagebox.showerror("Import failed",
+                                     f"Could not parse the file:\n{err}")
+                return
+            parsed = result.fit
+            name = parsed.name_hint or (parsed.ship_name or "Imported Fit")
+            self._add_parsed_fit(parsed, source="eft", raw_text=raw_text,
+                                 name=name)
+            if result.warnings:
+                messagebox.showwarning(
+                    "Imported with warnings",
+                    "Fit imported. Some items were not recognized:\n\n"
+                    + "\n".join(result.warnings[:12]))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_pyfa_picker(self, db_path, fits):
+        """Searchable picker over pyfa fits; on selection read + add the fit."""
+        win = tk.Toplevel(self.root)
+        win.title("Import from pyfa")
+        win.configure(bg=BG_DARK)
+        win.geometry("440x460")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select a fit (search by ship or fit name):",
+                 font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 2))
+        search_var = tk.StringVar()
+        search = tk.Entry(win, textvariable=search_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          borderwidth=1, relief=tk.RIDGE)
+        search.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        listbox = tk.Listbox(
+            win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            borderwidth=1, relief=tk.RIDGE, activestyle="none",
+            exportselection=False)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        status = tk.Label(win, text="", font=("Consolas", 9), fg=FG_DIM,
+                          bg=BG_DARK, anchor=tk.W)
+        status.pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        index_map: list[dict] = []
+
+        # Resolve each fit's ship class name once (local bundled SDE lookup) so the
+        # picker shows "ShipClass - FitName" (ship first) and can be searched by either.
+        for f in fits:
+            if "ship_name" not in f:
+                try:
+                    f["ship_name"] = self.type_catalog.resolve_name(
+                        f.get("ship_type_id")) or ""
+                except Exception:
+                    f["ship_name"] = ""
+        # Group by ship class, then fit name, so same-hull fits sit together.
+        fits.sort(key=lambda f: ((f.get("ship_name") or "").lower(),
+                                 (f.get("name") or "").lower()))
+
+        def _repopulate(*_a):
+            needle = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            index_map.clear()
+            for f in fits:
+                ship = f.get("ship_name") or "?"
+                fit_name = f.get("name", "?")
+                label = f"{ship}  —  {fit_name}"
+                if needle and needle not in f"{ship} {fit_name}".lower():
+                    continue
+                listbox.insert(tk.END, label)
+                index_map.append(f)
+        search_var.trace_add("write", _repopulate)
+        _repopulate()
+
+        def _do_import():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            entry = index_map[sel[0]]
+            status.config(text="Reading fit...", fg=FG_ACCENT)
+
+            def worker():
+                try:
+                    parsed = pyfa_import.read_pyfa_fit(
+                        db_path, entry["fit_id"], self.type_catalog)
+                    err = None
+                except Exception as e:
+                    parsed, err = None, str(e)
+                self.root.after(0, _applied, parsed, err)
+
+            def _applied(parsed, err):
+                if err is not None or parsed is None:
+                    status.config(text=f"Failed: {err}", fg=FG_RED)
+                    return
+                name = parsed.name_hint or entry.get("name") \
+                    or parsed.ship_name or "pyfa Fit"
+                self._add_parsed_fit(parsed, source="pyfa", raw_text="",
+                                     name=name)
+                win.destroy()
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import", style="Green.TButton",
+                   command=_do_import).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+        listbox.bind("<Double-Button-1>", lambda e: _do_import())
+
+    def _import_esi_fittings(self):
+        """Import the active character's in-game fittings via ESI (threaded),
+        then show a checklist to pick which to add."""
+        char = self.esi_auth
+        if char is None or not char.character_id:
+            messagebox.showwarning(
+                "No character",
+                "Connect a character (Characters tab) before importing from EVE.")
+            return
+        if not char.has_scope(SCOPE_FITTINGS_READ):
+            messagebox.showwarning(
+                "Re-authorize required",
+                f"{char.character_name or 'This character'} was authorized "
+                "before in-game fittings support was added, so it cannot read "
+                "in-game fittings yet.\n\nOpen the Characters or Settings tab "
+                "and click \"Re-authorize\" for this character, then try again.")
+            return
+        char_id = char.character_id
+
+        def worker():
+            try:
+                raw = char.get_fittings(char_id) or []
+                err = None
+            except Exception as e:
+                raw, err = [], str(e)
+            # Map each ESI fitting -> ParsedFit (off the Tk thread; uses the
+            # catalog which may do cached ESI lookups).
+            entries = []
+            for f in raw:
+                try:
+                    items = f.get("items", []) or []
+                    parsed = fit_dna.esi_items_to_parsed(items, self.type_catalog)
+                    parsed.ship_type_id = f.get("ship_type_id", 0)
+                    parsed.ship_name = (
+                        self.type_catalog.resolve_name(parsed.ship_type_id)
+                        or "")
+                    parsed.name_hint = f.get("name")
+                    entries.append({
+                        "name": f.get("name") or parsed.ship_name or "Fit",
+                        "ship_name": parsed.ship_name,
+                        "parsed": parsed,
+                    })
+                except Exception:
+                    continue
+            self.root.after(0, _apply, entries, err)
+
+        def _apply(entries, err):
+            if err is not None:
+                messagebox.showerror(
+                    "Import from EVE failed",
+                    f"Could not read in-game fittings:\n{err}\n\n"
+                    "If this character was authorized before fittings support "
+                    "was added, re-authorize it on the Characters tab.")
+                return
+            if not entries:
+                messagebox.showinfo(
+                    "Import from EVE",
+                    "No in-game fittings found for this character.")
+                return
+            self._show_esi_import_checklist(entries)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_esi_import_checklist(self, entries):
+        """Checklist of ESI fittings to import; adds the checked ones."""
+        win = tk.Toplevel(self.root)
+        win.title("Import from EVE")
+        win.configure(bg=BG_DARK)
+        win.geometry("460x480")
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Select fittings to import:", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).pack(anchor=tk.W, padx=12, pady=(12, 4))
+
+        canvas = tk.Canvas(win, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=12)
+        sb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+        self._register_scroll_canvas(canvas)
+
+        vars_ = []
+        for entry in entries:
+            v = tk.BooleanVar(value=True)
+            vars_.append((v, entry))
+            label = entry["name"]
+            if entry.get("ship_name"):
+                label += f"  ({entry['ship_name']})"
+            cb = tk.Checkbutton(
+                inner, text=label, variable=v, font=("Consolas", 9),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_WHITE,
+                anchor=tk.W, highlightthickness=0)
+            cb.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+
+        def _do_import():
+            added = 0
+            for v, entry in vars_:
+                if not v.get():
+                    continue
+                parsed = entry["parsed"]
+                name = entry["name"]
+                if self._add_parsed_fit(parsed, source="esi", raw_text="",
+                                        name=name) is not None:
+                    added += 1
+            win.destroy()
+            if added:
+                messagebox.showinfo(
+                    "Import from EVE",
+                    f"Imported {added} fitting(s).")
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Import selected", style="Green.TButton",
+                   command=_do_import).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT)
+
+    def _push_fit_to_eve(self, fit, char):
+        """Push a fit to a character's in-game Fittings via the store wrapper
+        (threaded). The wrapper builds the body, deletes any prior id, records
+        the new fitting_id and saves; we just surface the result."""
+        char_id = char.character_id
+
+        def worker():
+            try:
+                ok = self.fittings.push_fit_to_character(
+                    fit.id, char_id, self.esi_auth)
+                err = None
+            except Exception as e:
+                ok, err = False, str(e)
+            self.root.after(0, _apply, ok, err)
+
+        def _apply(ok, err):
+            if ok:
+                messagebox.showinfo(
+                    "Saved to in-game Fittings",
+                    f"'{fit.name}' was saved to {char.character_name}'s in-game "
+                    "Fittings.")
+                self._show_fit_detail(fit.id)
+            else:
+                detail = f"\n\n{err}" if err else ""
+                messagebox.showerror(
+                    "Save failed",
+                    "Could not save the fit to in-game Fittings. The character "
+                    "may need to re-authorize (Characters tab) to grant the "
+                    "fittings write scope, or ESI rejected the fit."
+                    + detail)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── Settings Tab ──────────────────────────────────────────────────────────
 
