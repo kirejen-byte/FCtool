@@ -4435,6 +4435,13 @@ class FCToolGUI:
                         text=f"Updated: {info}", fg=FG_GREEN
                     )
                     self._rebuild_esi_char_list()
+                    # Re-auth may have granted new scopes (e.g. fittings), so
+                    # rebuild the Characters-tab cards — the per-card
+                    # "Re-authorize" notice is built from has_scope() at panel
+                    # construction, so without a rebuild it lingered until the
+                    # next program restart.
+                    if hasattr(self, "_char_tab_content"):
+                        self._populate_character_panels()
                     return
 
             # New character — add to accounts list
