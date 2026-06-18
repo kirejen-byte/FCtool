@@ -7842,7 +7842,8 @@ class FCToolGUI:
             for tag in effective_tags:
                 if tag not in checked:
                     continue
-                fits_by_tag.setdefault(tag, []).append((fit.dna, label))
+                fits_by_tag.setdefault(tag, []).append(
+                    (self._canonical_fit_dna(fit.dna, fit.parsed), label))
         return fits_by_tag
 
     def _motd_resolve_channel_id(self, channel_name):
@@ -9051,7 +9052,7 @@ class FCToolGUI:
             warnings = list(parse_result.warnings)
             parsed = parse_result.fit
             try:
-                dna = fit_dna.to_dna(parsed)
+                dna = fit_dna.to_dna(parsed, self.type_catalog)
             except Exception:
                 dna = fit.dna
             fit.source = source
@@ -9090,7 +9091,7 @@ class FCToolGUI:
         dna = fit.dna
         if not dna:
             try:
-                dna = fit_dna.to_dna(fit.parsed)
+                dna = fit_dna.to_dna(fit.parsed, self.type_catalog)
             except Exception:
                 dna = ""
         self.root.clipboard_clear()
@@ -9376,7 +9377,7 @@ class FCToolGUI:
         """Build a fit_models.Fit from a ParsedFit and add it to the library.
         Returns the new fit id (or None on failure). Runs on the Tk thread."""
         try:
-            dna = fit_dna.to_dna(parsed)
+            dna = fit_dna.to_dna(parsed, self.type_catalog)
         except Exception:
             dna = ""
         fit = fit_models.Fit(
@@ -9811,7 +9812,7 @@ class FCToolGUI:
                             name = (parsed.name_hint or entry.get("name")
                                     or parsed.ship_name or "pyfa Fit")
                             try:
-                                dna = fit_dna.to_dna(parsed)
+                                dna = fit_dna.to_dna(parsed, self.type_catalog)
                             except Exception:
                                 dna = ""
                             fit = fit_models.Fit(
@@ -10026,7 +10027,7 @@ class FCToolGUI:
                             name = (entry.get("name") or parsed.name_hint
                                     or parsed.ship_name or "Fit")
                             try:
-                                dna = fit_dna.to_dna(parsed)
+                                dna = fit_dna.to_dna(parsed, self.type_catalog)
                             except Exception:
                                 dna = ""
                             fit = fit_models.Fit(
