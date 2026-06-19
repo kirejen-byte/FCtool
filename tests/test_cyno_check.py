@@ -1432,6 +1432,28 @@ def test_cache_round_trip(tmp_path):
     assert cache2.get_killmail(999) == {"killmail_time": "2026-01-01T00:00:00Z"}
 
 
+def test_corrupt_cache_is_discarded_and_logged(tmp_path, caplog):
+    """A corrupt cache file is discarded (empty caches) but the discard is now
+    LOGGED at WARNING rather than swallowed silently."""
+    import logging
+
+    path = str(tmp_path / "cyno_cache.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("{ this is not valid json ]")
+    cache = CynoCache(path=path)
+    with caplog.at_level(logging.WARNING, logger="cyno_check"):
+        cache.load()
+    # Behavior preserved: corrupt file => empty caches, no crash.
+    assert cache.results == {}
+    assert cache.killmails == {}
+    assert cache.related == {}
+    assert cache.get_result(123) is None
+    # New behavior: the discard emitted a WARNING log line.
+    assert any(rec.levelno == logging.WARNING
+               and "cyno cache load failed" in rec.getMessage()
+               for rec in caplog.records)
+
+
 def test_cache_is_stale_when_missing(tmp_path):
     cache = CynoCache(path=str(tmp_path / "c.json"))
     cache.load()

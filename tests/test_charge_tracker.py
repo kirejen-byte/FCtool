@@ -90,3 +90,29 @@ def test_coverage_redundancy_zero_when_not_full():
     cov = t.coverage()
     assert cov[SHIELD].full is False
     assert cov[SHIELD].redundancy == 0
+
+
+def test_remove_pilot_removes_and_returns_true():
+    t = ChargeTracker()
+    t.record("A", "Active Shielding Charge")
+    t.record("B", "Shield Extension Charge")
+    assert t.remove_pilot("A") is True
+    snap = dict(t.snapshot())
+    assert "A" not in snap
+    assert snap["B"] == {(SHIELD, "Shield Extension Charge")}
+
+
+def test_remove_pilot_unknown_returns_false():
+    t = ChargeTracker()
+    t.record("A", "Active Shielding Charge")
+    assert t.remove_pilot("Ghost") is False
+    assert dict(t.snapshot()).keys() == {"A"}
+
+
+def test_remove_pilot_updates_coverage():
+    t = ChargeTracker()
+    full = "Active Shielding Charge  Shield Extension Charge  Shield Harmonizing Charge"
+    t.record("A", full)
+    assert t.coverage()[SHIELD].full is True
+    assert t.remove_pilot("A") is True
+    assert t.coverage()[SHIELD].full is False

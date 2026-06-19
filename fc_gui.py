@@ -16,7 +16,7 @@ import webbrowser
 import requests
 from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
 from tkinter import font as tkfont
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Platform-specific sound support
 if sys.platform == "win32":
@@ -65,7 +65,7 @@ from autocomplete import AutocompleteEntry
 import system_cache
 from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
-from loss_tracker import FleetLossTracker, DeathEvent
+from loss_tracker import FleetLossTracker
 from cyno_check import analyze_character as cyno_analyze_character
 from eve_paths import resolve_eve_logs_path
 from default_config import DEFAULT_CONFIG
@@ -84,6 +84,12 @@ import pyfa_import
 import motd_builder
 import motd_markup
 from markup_editor import MarkupEditor
+from app_io import atomic_write_json
+from app_log import get_logger
+from rate_limiter import rate_limit
+from esi_constants import ESI_BASE, ESI_HEADERS
+
+log = get_logger(__name__)
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
@@ -110,11 +116,8 @@ BORDER_COLOR = "#2a2a4a"
 #   4 Characters, 5 Fittings, 6 Settings.
 # Inserting Fittings at index 5 leaves the earlier tabs (Intel=1, Characters=4)
 # unchanged; only the Settings tab shifts 5 -> 6.
-INTEL_TAB_INDEX = 1
-CHARACTERS_TAB_INDEX = 4
 FITTINGS_TAB_INDEX = 5
 DOCTRINES_SUBTAB_INDEX = 1
-SETTINGS_TAB_INDEX = 6
 
 # ESI fittings scopes (added after some characters were already authed; SSO
 # grants scopes only at login, so older tokens lack these and need re-auth).
@@ -453,6 +456,11 @@ class FCToolGUI:
         except Exception:
             pass
 
+        # Serializes config.json writes across the Tk thread and background
+        # workers (e.g. _refresh_ansiblex_from_esi) so a read-modify-write on
+        # one thread cannot interleave with a write on another and corrupt or
+        # clobber settings. Created before any save path can run.
+        self._config_lock = threading.Lock()
         self.config = self._load_config()
         # One-time migration of the config-driven intel filter + coalition seed
         # (synchronous part; the Triumvirate. id is resolved off-thread later,
@@ -703,8 +711,20 @@ class FCToolGUI:
                 try:
                     gates = self.esi_auth.discover_ansiblex_gates()
                     if gates:
-                        self.config["ansiblex_connections"] = gates
-                        self._save_config()
+                        # Hold the config lock across the mutate-then-write so
+                        # this background thread cannot interleave its
+                        # read-modify-write with a save on the Tk thread. The
+                        # write is done inline (not via _save_config) because
+                        # the lock is non-reentrant. A failed save must not
+                        # crash the worker.
+                        with self._config_lock:
+                            self.config["ansiblex_connections"] = gates
+                            try:
+                                atomic_write_json(
+                                    CONFIG_PATH, self.config, indent=4)
+                            except Exception:
+                                log.exception(
+                                    "Failed to save config.json (ansiblex refresh)")
                         print(f"[Ansiblex] ESI refresh: {len(gates)} gate(s)")
                     else:
                         print("[Ansiblex] ESI returned no gates, keeping config")
@@ -829,8 +849,27 @@ class FCToolGUI:
 
     def _load_config(self) -> dict:
         if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH, "r") as f:
-                cfg = json.load(f)
+            try:
+                with open(CONFIG_PATH, "r") as f:
+                    cfg = json.load(f)
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                # An existing config.json that is corrupt/unreadable would
+                # otherwise crash startup — and in the frozen windowed exe the
+                # traceback is invisible, so the app just fails to open.
+                # Preserve the bad file for recovery and fall back to defaults
+                # so the app ALWAYS starts.
+                backup = f"{CONFIG_PATH}.corrupt"
+                try:
+                    shutil.copy2(CONFIG_PATH, backup)
+                    log.warning(
+                        "config.json is corrupt/unreadable (%s); backed up to "
+                        "%s and reverting to defaults", e, backup)
+                except OSError as copy_err:
+                    log.warning(
+                        "config.json is corrupt/unreadable (%s) and the backup "
+                        "to %s failed (%s); reverting to defaults",
+                        e, backup, copy_err)
+                cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         else:
             # No config.json (e.g. a fresh source clone or first run): run on
             # the built-in defaults so the app works out of the box — the public
@@ -843,8 +882,15 @@ class FCToolGUI:
         return cfg
 
     def _save_config(self):
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(self.config, f, indent=4)
+        # Atomic write (temp file + os.replace) so a crash/full-disk/lock
+        # mid-write cannot corrupt every setting at once. Locked so the Tk
+        # thread and background workers cannot interleave writes. A failed
+        # settings save must never crash the UI.
+        try:
+            with self._config_lock:
+                atomic_write_json(CONFIG_PATH, self.config, indent=4)
+        except Exception:
+            log.exception("Failed to save config.json")
 
     def _save_staging_systems(self):
         """Persist the friendly/hostile staging lists into config["jump_range"]
@@ -1314,13 +1360,11 @@ class FCToolGUI:
         self._threshold_spin.pack(side=tk.LEFT)
         self._threshold_spin.bind("<Return>", lambda e: self._on_threshold_change())
         self._threshold_spin.bind("<FocusOut>", lambda e: self._on_threshold_change())
-        # Kept for compatibility with existing update code (no-op display)
-        self._xup_threshold_label = tk.Label(
-            xup_label_row, text="", font=("Consolas", 1), bg=BG_PANEL,
-        )
 
         ttk.Button(xup_label_row, text="Reset", style="Red.TButton",
                    command=self._reset_xup).pack(side=tk.LEFT, padx=(8, 10))
+        ttk.Button(xup_label_row, text="Remove…", style="Dark.TButton",
+                   command=self._open_remove_xup_dialog).pack(side=tk.LEFT, padx=(0, 8))
 
         self._xup_status = tk.Label(xup_label_row, text="Waiting for fleet chat...",
                                      font=("Consolas", 10, "bold"),
@@ -1554,6 +1598,9 @@ class FCToolGUI:
         # _render_coverage_strip on each poll.
         self._booster_strip = tk.Frame(spec_top_row, bg=BG_PANEL)
         self._booster_strip.pack(side=tk.RIGHT, anchor=tk.E)
+        ttk.Button(spec_top_row, text="Remove link…", style="Dark.TButton",
+                   command=self._open_remove_charge_dialog
+                   ).pack(side=tk.RIGHT, padx=(0, 6))
 
         # Create collapsible sections (order matters for display)
         self._dps_container, self._dps_content, self._dps_count = \
@@ -2876,10 +2923,9 @@ class FCToolGUI:
                  font=("Consolas", 13, "bold"), fg=FG_ACCENT, bg=BG_DARK
                  ).pack(side=tk.LEFT)
 
-        self._zkill_indicator = tk.Label(header, text="  LIVE",
-                                          font=("Consolas", 10, "bold"),
-                                          fg=FG_GREEN, bg=BG_DARK)
-        self._zkill_indicator.pack(side=tk.LEFT, padx=10)
+        tk.Label(header, text="  LIVE",
+                 font=("Consolas", 10, "bold"),
+                 fg=FG_GREEN, bg=BG_DARK).pack(side=tk.LEFT, padx=10)
 
         # Mute all alert sounds on this tab
         self._intel_mute_var = tk.BooleanVar(value=False)
@@ -5065,9 +5111,13 @@ class FCToolGUI:
                     for lid, (_mono, name, region) in self._location_cache.items()
                 },
             }
-            with open(self._CHAR_CACHE_FILE, "w") as f:
-                json.dump(data, f)
+            # Atomic write (temp + os.replace) so a crash mid-write cannot
+            # corrupt the cache. Preserve the previous json.dump kwargs:
+            # default indent (None / compact) and ensure_ascii=True.
+            atomic_write_json(
+                self._CHAR_CACHE_FILE, data, indent=None, ensure_ascii=True)
         except Exception as e:
+            log.exception("Failed to save character disk cache")
             print(f"[Characters] Error saving disk cache: {e}")
 
     def _on_char_canvas_resize(self, event):
@@ -5380,9 +5430,10 @@ class FCToolGUI:
         if location_type == "station" or 60_000_000 <= location_id <= 64_000_000:
             try:
                 import requests as _req
+                rate_limit('esi')
                 resp = _req.get(
-                    f"https://esi.evetech.net/latest/universe/stations/{location_id}/",
-                    headers={"User-Agent": "FCTool/1.0"}, timeout=8,
+                    f"{ESI_BASE}/universe/stations/{location_id}/",
+                    headers=ESI_HEADERS, timeout=8,
                 )
                 if resp.ok:
                     data = resp.json()
@@ -5406,30 +5457,15 @@ class FCToolGUI:
                         region = acct._get_region_name(si)
                         return si.get("name", str(location_id)), region
 
-            # Structure lookup failed (403) — try /assets/locations/ as last resort
+            # Structure lookup failed (403) — try /assets/names/ as last resort
             token = acct.access_token
             if token:
-                try:
-                    # Find any asset at this location to use for the locations endpoint
-                    # We need item_ids of assets AT this location
-                    resp = acct._session.post(
-                        f"https://esi.evetech.net/latest/characters/{acct.character_id}/assets/locations/",
-                        headers={"Authorization": f"Bearer {token}"},
-                        json=[location_id],
-                        timeout=10,
-                    )
-                    if resp.ok:
-                        locs = resp.json()
-                        # This returns positions — not directly useful for system name
-                        # But we can try /assets/names/ to at least get a readable name
-                except Exception:
-                    pass
-
                 # Try /assets/names/ for a human-readable location name
                 try:
+                    rate_limit('esi')
                     resp = acct._session.post(
-                        f"https://esi.evetech.net/latest/characters/{acct.character_id}/assets/names/",
-                        headers={"Authorization": f"Bearer {token}"},
+                        f"{ESI_BASE}/characters/{acct.character_id}/assets/names/",
+                        headers={**ESI_HEADERS, "Authorization": f"Bearer {token}"},
                         json=[location_id],
                         timeout=10,
                     )
@@ -6723,8 +6759,8 @@ class FCToolGUI:
             pass
 
         tk.Label(win,
-                 text="Add or remove custom tags. Built-in tags cannot be "
-                      "removed.",
+                 text="Add, rename, or remove custom tags. Built-in tags "
+                      "cannot be changed.",
                  font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
                  anchor=tk.W, justify=tk.LEFT, wraplength=350).pack(
                      anchor=tk.W, padx=12, pady=(12, 4))
@@ -6758,6 +6794,55 @@ class FCToolGUI:
                     ttk.Button(row, text="Delete", style="Red.TButton",
                                command=lambda t=tag: _delete(t)).pack(
                                    side=tk.RIGHT)
+                    ttk.Button(row, text="Rename", style="Dark.TButton",
+                               command=lambda t=tag: _rename(t)).pack(
+                                   side=tk.RIGHT, padx=(0, 4))
+
+        def _refresh_after_tag_change():
+            """Refresh every UI surface a tag add/delete/rename can affect.
+            Mirrors what the delete handler refreshes so renames stay in sync."""
+            _rebuild()
+            self._refresh_doctrine_list()
+            if self._doctrine_selected_id:
+                self._show_doctrine_detail(self._doctrine_selected_id)
+            self._refresh_fit_list(self._fit_search_var.get())
+
+        def _rename(tag):
+            new_name = simpledialog.askstring(
+                "Rename tag",
+                f"New name for tag '{tag}':",
+                initialvalue=tag, parent=win)
+            if new_name is None:
+                return
+            new_name = new_name.strip()
+            if not new_name:
+                messagebox.showwarning(
+                    "Rename tag", "The new tag name cannot be blank.")
+                return
+            if new_name == tag:
+                return
+            if new_name in self.fittings.tags:
+                messagebox.showwarning(
+                    "Rename tag", f"'{new_name}' is already a tag.")
+                return
+            try:
+                # rename_tag persists internally (calls save()); do NOT save
+                # again here.
+                ok = self.fittings.rename_tag(tag, new_name)
+            except Exception:
+                log.exception("Failed to rename tag %r to %r", tag, new_name)
+                messagebox.showwarning(
+                    "Rename tag",
+                    f"Could not rename '{tag}'. See the log for details.")
+                return
+            if not ok:
+                messagebox.showwarning(
+                    "Rename tag",
+                    f"Could not rename '{tag}' to '{new_name}'. The original "
+                    "tag may no longer exist, or the new name is already in "
+                    "use.")
+                return
+            _refresh_after_tag_change()
 
         def _delete(tag):
             used = sum(1 for d in self.fittings.list_doctrines()
@@ -6770,11 +6855,7 @@ class FCToolGUI:
                     return
             self.fittings.remove_tag(tag)
             self.fittings.save()
-            _rebuild()
-            self._refresh_doctrine_list()
-            if self._doctrine_selected_id:
-                self._show_doctrine_detail(self._doctrine_selected_id)
-            self._refresh_fit_list(self._fit_search_var.get())
+            _refresh_after_tag_change()
 
         entry_var = tk.StringVar()
 
@@ -6906,6 +6987,9 @@ class FCToolGUI:
         self._motd_saved_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._motd_saved_combo.bind(
             "<<ComboboxSelected>>", self._on_saved_motd_change)
+        ttk.Button(saved_row, text="Rename", style="Dark.TButton", width=7,
+                   command=self._rename_linked_motd).pack(side=tk.LEFT,
+                                                          padx=(5, 0))
         ttk.Button(saved_row, text="Delete", style="Red.TButton", width=7,
                    command=self._delete_linked_motd).pack(side=tk.LEFT,
                                                           padx=(5, 0))
@@ -7477,6 +7561,79 @@ class FCToolGUI:
         if status is not None:
             status.config(text=f"Deleted MOTD template '{name}'.", fg=FG_GREEN)
 
+    def _rename_linked_motd(self):
+        """Rename the currently-selected linked (saved) MOTD template in place.
+
+        Identity is keyed on (doctrine, name). Prompts for a new name,
+        validates it (non-blank, not colliding with another template under the
+        SAME doctrine), updates the stored template's name key in place,
+        persists via the same mechanism the save/delete handlers use, and
+        refreshes the dropdown/selector. No-op when nothing is selected."""
+        name = self._motd_saved_var.get()
+        if not name or name == self._MOTD_SAVED_BLANK:
+            messagebox.showinfo(
+                "Rename MOTD template",
+                "Select an MOTD template from the dropdown first.")
+            return
+        doctrine = self._motd_doctrine_var.get()
+        new_name = simpledialog.askstring(
+            "Rename MOTD template",
+            "New name for this MOTD template:",
+            initialvalue=name, parent=self.root)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name:
+            messagebox.showwarning(
+                "Rename MOTD template",
+                "The new template name cannot be blank.")
+            return
+        if new_name == name:
+            return
+        # Collision check within the same doctrine only.
+        if any((m.get("doctrine") or "") == doctrine
+               and m.get("name") == new_name
+               for m in self._saved_motds()):
+            messagebox.showwarning(
+                "Rename MOTD template",
+                f"A MOTD template named '{new_name}' already exists under "
+                + (f"doctrine '{doctrine}'." if doctrine
+                   else "this (blank) doctrine."))
+            return
+        try:
+            fit_cfg = self.config.setdefault("fittings", {})
+            saved = fit_cfg.get("saved_motds")
+            target = None
+            if isinstance(saved, list):
+                for m in saved:
+                    if (m.get("doctrine") or "") == doctrine \
+                            and m.get("name") == name:
+                        target = m
+                        break
+            if target is None:
+                messagebox.showwarning(
+                    "Rename MOTD template",
+                    f"Could not find template '{name}' to rename. It may have "
+                    "been removed.")
+                return
+            target["name"] = new_name
+            self._save_config()
+        except Exception:
+            log.exception(
+                "Failed to rename MOTD template %r to %r (doctrine %r)",
+                name, new_name, doctrine)
+            messagebox.showwarning(
+                "Rename MOTD template",
+                f"Could not rename '{name}'. See the log for details.")
+            return
+        self._motd_saved_var.set(new_name)
+        self._motd_refresh_saved_dropdown()
+        status = getattr(self, "_motd_fleet_status", None)
+        if status is not None:
+            status.config(
+                text=f"Renamed MOTD template '{name}' to '{new_name}'.",
+                fg=FG_GREEN)
+
     def _save_linked_motd(self, doctrine_name: str, motd_name: str):
         """Capture the current builder fields and persist them as a saved MOTD
         linked to ``doctrine_name`` under ``motd_name``.
@@ -7577,7 +7734,19 @@ class FCToolGUI:
             initialvalue=doctrine_name, parent=self.root)
         if not motd_name or not motd_name.strip():
             return
-        self._save_linked_motd(doctrine_name, motd_name.strip())
+        motd_name = motd_name.strip()
+        # Confirm before silently clobbering an existing template under the
+        # same doctrine. The non-colliding save path is unchanged.
+        collides = any(
+            (m.get("doctrine") or "") == doctrine_name
+            and m.get("name") == motd_name
+            for m in self._saved_motds())
+        if collides and not messagebox.askyesno(
+                "Overwrite?",
+                f"A MOTD template named '{motd_name}' already exists under "
+                f"doctrine '{doctrine_name}'. Overwrite it?"):
+            return
+        self._save_linked_motd(doctrine_name, motd_name)
 
     def _create_doctrine_from_motd(self, raw, fittings):
         """Create a new doctrine from an imported MOTD: import its linked fits
@@ -7918,6 +8087,8 @@ class FCToolGUI:
         try:
             if parsed is None:
                 parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
+            # Limitation mirrors fit_dna.to_dna: DNA cannot represent a module's
+            # offline state, so re-encoding here drops offline modules to online.
             return fit_dna.to_dna(parsed, self.type_catalog)
         except Exception:
             return dna
@@ -8580,24 +8751,6 @@ class FCToolGUI:
         # doctrine creation has settled the fields) ensures the preview reflects
         # the final builder state rather than a stale intermediate.
         self._rebuild_motd_preview()
-
-    def _motd_set_preview_raw(self, raw):
-        """Cancel any pending debounced preview rebuild and show ``raw``
-        verbatim in the preview pane. Used by the import path so the imported
-        MOTD is displayed exactly as received (not re-wrapped via build_motd)."""
-        job = getattr(self, "_motd_preview_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._motd_preview_job = None
-        preview = getattr(self, "_motd_preview", None)
-        if preview is not None:
-            preview.config(state=tk.NORMAL)
-            preview.delete("1.0", tk.END)
-            preview.insert("1.0", raw)
-            preview.config(state=tk.DISABLED)
 
     def _import_motd_fits(self, fittings):
         """Import a list of ``{dna, name}`` dicts into the library, de-duped by
@@ -11117,6 +11270,85 @@ class FCToolGUI:
         self._booster_roster = {}
         self._schedule_booster_refresh()
 
+    def _open_remove_charge_dialog(self):
+        """Modal listing pilots with a tracked command-burst/charge record, each
+        with an X to remove just that one. Additive to the fleet-wide clear —
+        uses the backend ChargeTracker.remove_pilot and mirrors the add-path
+        refresh (_schedule_booster_refresh)."""
+        pilots = sorted(name for (name, _charges) in self.charge_tracker.snapshot())
+        if not pilots:
+            messagebox.showinfo(
+                "Remove link",
+                "There are no tracked command-burst links to remove.",
+                parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Remove command-burst link")
+        win.configure(bg=BG_DARK)
+        win.geometry("340x420")
+        win.minsize(320, 320)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win,
+                 text="Remove a single pilot's tracked command-burst charges. "
+                      "This does not clear the whole fleet.",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=310).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        def _rebuild():
+            for w in inner.winfo_children():
+                w.destroy()
+            current = {name: ch for (name, ch) in self.charge_tracker.snapshot()}
+            if not current:
+                tk.Label(inner, text="(no tracked links)", font=("Consolas", 9),
+                         fg=FG_DIM, bg=BG_PANEL, anchor=tk.W).pack(
+                             anchor=tk.W, padx=4, pady=2)
+                return
+            for name in sorted(current):
+                row = tk.Frame(inner, bg=BG_PANEL)
+                row.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                label = f"{name}  ({len(current[name])})"
+                tk.Label(row, text=label, font=("Consolas", 9), fg=FG_TEXT,
+                         bg=BG_PANEL, anchor=tk.W).pack(
+                             side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Button(row, text="X", style="Red.TButton", width=2,
+                           command=lambda n=name: _remove(n)).pack(side=tk.RIGHT)
+
+        def _remove(name):
+            try:
+                removed = self.charge_tracker.remove_pilot(name)
+                if removed:
+                    self._schedule_booster_refresh()
+                    _rebuild()
+            except Exception:
+                log.exception(
+                    "Failed to remove command-burst link for pilot %r", name)
+
+        ttk.Button(win, text="Close", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.BOTTOM, padx=12, pady=12)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+        win.bind("<Escape>", lambda e: win.destroy())
+        _rebuild()
+
     def _on_zkill_alert(self, alert: KillAlert):
         # Get route from staging
         staging = self.config.get("zkillboard", {}).get("staging_system", "")
@@ -11142,7 +11374,6 @@ class FCToolGUI:
     def _update_xup_display(self, state: XUpState):
         threshold = self.config.get("xup", {}).get("threshold", 50)
         self._xup_count_label.config(text=str(state.count))
-        self._xup_threshold_label.config(text=f"/ {threshold}")
 
         # Update progress bar
         self._xup_canvas.delete("all")
@@ -11253,6 +11484,83 @@ class FCToolGUI:
             self._update_xup_display(self.xup_counter.state)
             self._append_xup_log("[Manual Reset]\n", "dim")
 
+    def _open_remove_xup_dialog(self):
+        """Modal listing current x-up pilots, each with an X to remove just that
+        one. Additive to the full Reset control — uses the backend
+        XUpCounter.remove_pilot and mirrors the add-path display refresh."""
+        if not self.xup_counter or not self.xup_counter.state.xups:
+            messagebox.showinfo(
+                "Remove X-up",
+                "There are no x-ups to remove.",
+                parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Remove X-up")
+        win.configure(bg=BG_DARK)
+        win.geometry("320x420")
+        win.minsize(300, 320)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win,
+                 text="Remove a single pilot's x-up. This does not reset the "
+                      "counter.",
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=290).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        def _rebuild():
+            for w in inner.winfo_children():
+                w.destroy()
+            if not self.xup_counter or not self.xup_counter.state.xups:
+                tk.Label(inner, text="(no x-ups)", font=("Consolas", 9),
+                         fg=FG_DIM, bg=BG_PANEL, anchor=tk.W).pack(
+                             anchor=tk.W, padx=4, pady=2)
+                return
+            for name in sorted(self.xup_counter.state.xups):
+                row = tk.Frame(inner, bg=BG_PANEL)
+                row.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                tk.Label(row, text=name, font=("Consolas", 9), fg=FG_TEXT,
+                         bg=BG_PANEL, anchor=tk.W).pack(
+                             side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Button(row, text="X", style="Red.TButton", width=2,
+                           command=lambda n=name: _remove(n)).pack(side=tk.RIGHT)
+
+        def _remove(name):
+            try:
+                if not self.xup_counter:
+                    return
+                removed = self.xup_counter.remove_pilot(name)
+                if removed:
+                    self._update_xup_display(self.xup_counter.state)
+                    self._append_xup_log(f"[Removed {name}]\n", "dim")
+                    _rebuild()
+            except Exception:
+                log.exception("Failed to remove x-up for pilot %r", name)
+
+        ttk.Button(win, text="Close", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.BOTTOM, padx=12, pady=12)
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+        win.bind("<Escape>", lambda e: win.destroy())
+        _rebuild()
+
     # ── Role Tracker Methods ──────────────────────────────────────────────────
 
     def _rebuild_preset_buttons(self):
@@ -11285,9 +11593,18 @@ class FCToolGUI:
                 letter = p.get("letter", "")
                 title = p.get("title", "")
                 cap = p.get("cap")
-                ttk.Button(self._preset_row2, text=label, style="Dark.TButton",
+                # Each custom preset is a group: apply button + rename + delete.
+                group = tk.Frame(self._preset_row2, bg=BG_DARK)
+                group.pack(side=tk.LEFT, padx=2)
+                ttk.Button(group, text=label, style="Dark.TButton",
                            command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c)
-                           ).pack(side=tk.LEFT, padx=2)
+                           ).pack(side=tk.LEFT)
+                ttk.Button(group, text="R", style="Dark.TButton", width=2,
+                           command=lambda lbl=label: self._rename_custom_preset(lbl)
+                           ).pack(side=tk.LEFT, padx=(2, 0))
+                ttk.Button(group, text="X", style="Red.TButton", width=2,
+                           command=lambda lbl=label: self._delete_custom_preset(lbl)
+                           ).pack(side=tk.LEFT, padx=(1, 0))
             ttk.Button(self._preset_row2, text="Clear Custom", style="Dark.TButton",
                        command=self._clear_custom_presets
                        ).pack(side=tk.RIGHT, padx=2)
@@ -11297,6 +11614,10 @@ class FCToolGUI:
         letter = slot["letter_var"].get().strip()
         title = slot["title_var"].get().strip()
         if not letter or not title:
+            messagebox.showwarning(
+                "Save preset",
+                "Both a key and a role name are required to save a preset.",
+                parent=self.root)
             return
         cap_str = slot["cap_var"].get().strip()
         cap = int(cap_str) if cap_str.isdigit() else None
@@ -11309,12 +11630,26 @@ class FCToolGUI:
         # Check for duplicates and limit
         custom = self.config.get("custom_role_presets", [])
         if len(custom) >= self._MAX_CUSTOM_PRESETS:
+            messagebox.showwarning(
+                "Save preset",
+                f"You already have the maximum of {self._MAX_CUSTOM_PRESETS} "
+                "custom presets. Delete one before saving a new preset.",
+                parent=self.root)
             return  # At limit
         for p in custom:
             if p.get("label") == label:
+                messagebox.showwarning(
+                    "Save preset",
+                    f"A custom preset named '{label}' already exists.",
+                    parent=self.root)
                 return  # Already exists
         for dlabel, _, _, _ in self._default_presets:
             if dlabel == label:
+                messagebox.showwarning(
+                    "Save preset",
+                    f"'{label}' matches a built-in preset and cannot be saved "
+                    "as a custom preset.",
+                    parent=self.root)
                 return  # Matches a default
 
         custom.append({"label": label, "letter": letter, "title": title, "cap": cap})
@@ -11324,9 +11659,107 @@ class FCToolGUI:
 
     def _clear_custom_presets(self):
         """Remove all custom presets."""
+        if not messagebox.askyesno(
+                "Clear custom presets",
+                "Remove ALL custom role presets? This cannot be undone.",
+                parent=self.root):
+            return
         self.config["custom_role_presets"] = []
         self._save_config()
         self._rebuild_preset_buttons()
+
+    def _delete_custom_preset(self, label):
+        """Delete a single custom preset identified by its label.
+
+        Only custom presets are deletable; built-in/default presets are never
+        passed here (no delete control is attached to them)."""
+        try:
+            custom = self.config.get("custom_role_presets", [])
+            if not any(p.get("label") == label for p in custom):
+                return  # Already gone (stale button) — nothing to do.
+            if not messagebox.askyesno(
+                    "Delete preset",
+                    f"Delete the custom preset '{label}'?",
+                    parent=self.root):
+                return
+            custom = [p for p in custom if p.get("label") != label]
+            self.config["custom_role_presets"] = custom
+            self._save_config()
+            self._rebuild_preset_buttons()
+        except Exception:
+            log.exception("Failed to delete custom preset %r", label)
+            messagebox.showerror(
+                "Delete preset",
+                "Could not delete the preset. See the log for details.",
+                parent=self.root)
+
+    def _rename_custom_preset(self, label):
+        """Rename a single custom preset identified by its current label.
+
+        Prompts for a new role name, validates it (non-blank, no collision with
+        an existing custom or built-in preset), then rebuilds the label from the
+        new name while preserving the preset's letter and cap."""
+        try:
+            custom = self.config.get("custom_role_presets", [])
+            target = next((p for p in custom if p.get("label") == label), None)
+            if target is None:
+                return  # Stale button — preset no longer exists.
+
+            letter = target.get("letter", "")
+            cap = target.get("cap")
+            current_title = target.get("title", "")
+
+            new_title = simpledialog.askstring(
+                "Rename preset",
+                "New role name for this preset:",
+                initialvalue=current_title, parent=self.root)
+            if new_title is None:
+                return  # Cancelled.
+            new_title = new_title.strip()
+            if not new_title:
+                messagebox.showwarning(
+                    "Rename preset",
+                    "The role name cannot be blank.",
+                    parent=self.root)
+                return
+
+            # Rebuild label the same way _save_role_as_preset does.
+            new_label = f"{letter.upper()}-{new_title}"
+            if cap is not None:
+                new_label += f"-{cap}"
+
+            if new_label == label:
+                return  # No change.
+
+            for p in custom:
+                if p is target:
+                    continue
+                if p.get("label") == new_label:
+                    messagebox.showwarning(
+                        "Rename preset",
+                        f"A custom preset named '{new_label}' already exists.",
+                        parent=self.root)
+                    return
+            for dlabel, _, _, _ in self._default_presets:
+                if dlabel == new_label:
+                    messagebox.showwarning(
+                        "Rename preset",
+                        f"'{new_label}' matches a built-in preset and cannot "
+                        "be used.",
+                        parent=self.root)
+                    return
+
+            target["title"] = new_title
+            target["label"] = new_label
+            self.config["custom_role_presets"] = custom
+            self._save_config()
+            self._rebuild_preset_buttons()
+        except Exception:
+            log.exception("Failed to rename custom preset %r", label)
+            messagebox.showerror(
+                "Rename preset",
+                "Could not rename the preset. See the log for details.",
+                parent=self.root)
 
     def _add_role_preset(self, letter: str, title: str, cap: int | None):
         """Add a pre-configured role slot, auto-numbering if duplicates exist."""
@@ -11539,6 +11972,19 @@ class FCToolGUI:
                                    fg=FG_DIM, bg=BG_PANEL, anchor=tk.W)
         location_label.pack(side=tk.LEFT, padx=(2, 0))
 
+        # Per-person remove control. Pack RIGHT first so it reserves its
+        # space at the right edge before the note entry is packed LEFT.
+        def remove_person(_sender=sender, _slot=slot, _row=row):
+            try:
+                _row.destroy()
+                if _sender in _slot["people"]:
+                    del _slot["people"][_sender]
+                self._update_role_count_label(_slot)
+            except Exception:
+                log.exception("Failed to remove person %r from role slot", _sender)
+        ttk.Button(row, text="X", style="Red.TButton", width=2,
+                   command=remove_person).pack(side=tk.RIGHT, padx=(4, 0))
+
         note_var = tk.StringVar()
         note_entry = tk.Entry(row, textvariable=note_var,
                                font=("Consolas", 9), width=30,
@@ -11547,12 +11993,40 @@ class FCToolGUI:
                                borderwidth=1, relief=tk.RIDGE)
         note_entry.pack(side=tk.LEFT, padx=(4, 0))
 
-        # Limit note to 30 characters
+        # Placeholder hint so the inline-note field reads as an intentional,
+        # editable affordance. The placeholder string is greyed (FG_DIM) and is
+        # never treated as a real note: limit_note ignores it, and the field is
+        # cleared on focus-in / restored on focus-out only while empty.
+        NOTE_PLACEHOLDER = "note..."
+
+        def show_placeholder():
+            note_var.set(NOTE_PLACEHOLDER)
+            note_entry.config(fg=FG_DIM)
+
+        def clear_placeholder():
+            note_var.set("")
+            note_entry.config(fg=FG_ORANGE)
+
+        def on_note_focus_in(_=None):
+            if note_var.get() == NOTE_PLACEHOLDER:
+                clear_placeholder()
+
+        def on_note_focus_out(_=None):
+            if not note_var.get():
+                show_placeholder()
+
+        # Limit real note input to 30 characters (placeholder is exempt).
         def limit_note(*_):
             val = note_var.get()
+            if val == NOTE_PLACEHOLDER:
+                return
             if len(val) > 30:
                 note_var.set(val[:30])
         note_var.trace_add("write", limit_note)
+
+        note_entry.bind("<FocusIn>", on_note_focus_in)
+        note_entry.bind("<FocusOut>", on_note_focus_out)
+        show_placeholder()  # start in placeholder state (field is empty)
 
         slot["people"][sender] = {
             "timestamp": timestamp,
@@ -11686,7 +12160,10 @@ class FCToolGUI:
         Runs every 5 minutes.  Uses force=False so asset data is served
         from cache unless the 10-minute asset TTL has also expired."""
         if self.esi_accounts and hasattr(self, '_char_tab_content'):
-            self._refresh_character_tab(force=False)
+            try:
+                self._refresh_character_tab(force=False)
+            except Exception:
+                log.exception("Auto-refresh of character tab failed; will retry next cycle")
         self.root.after(300_000, self._auto_refresh_character_tab)
 
     def _refresh_current_system(self):
@@ -12041,7 +12518,6 @@ $bmp.Dispose()
 
     def _open_url(self, url: str):
         """Open a URL in the default browser."""
-        import webbrowser
         webbrowser.open(url)
 
     def _theme_scrolledtext_bar(self, st):
@@ -12146,7 +12622,6 @@ $bmp.Dispose()
         except (ValueError, AttributeError):
             max_jumps = 0
         if max_jumps > 0 and alert.route_from_staging:
-            import re
             m = re.search(r"\*\*(\d+) jumps\*\*", alert.route_from_staging)
             if m and int(m.group(1)) > max_jumps:
                 return  # Too far, skip this alert
@@ -13136,7 +13611,7 @@ $bmp.Dispose()
             try:
                 self._intel_monitor.poll()
             except Exception:
-                pass
+                log.exception("Intel poll loop iteration failed; continuing to poll")
             time.sleep(self.config.get("poll_interval_seconds", 1.0))
 
     def _on_intel_channel_change(self):
@@ -13181,11 +13656,13 @@ $bmp.Dispose()
                         import requests as _rq
                         cid = sys_info.get("constellation_id")
                         if cid:
-                            cr = _rq.get(f"https://esi.evetech.net/latest/universe/constellations/{cid}/", timeout=5)
+                            rate_limit('esi')
+                            cr = _rq.get(f"{ESI_BASE}/universe/constellations/{cid}/", headers=ESI_HEADERS, timeout=5)
                             if cr.ok:
                                 rid = cr.json().get("region_id")
                                 if rid:
-                                    rr = _rq.get(f"https://esi.evetech.net/latest/universe/regions/{rid}/", timeout=5)
+                                    rate_limit('esi')
+                                    rr = _rq.get(f"{ESI_BASE}/universe/regions/{rid}/", headers=ESI_HEADERS, timeout=5)
                                     if rr.ok:
                                         report.region_name = rr.json().get("name", "")
             except Exception:

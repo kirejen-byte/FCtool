@@ -18,6 +18,7 @@ from intel_monitor import (
     SPIKE_PATTERN,
     _extract_system_name,
     discover_channels,
+    is_hostile,
     parse_intel_message,
     scan_available_channels,
 )
@@ -734,3 +735,53 @@ def test_scan_available_channels_case_insensitive_match(tmp_path, monkeypatch):
     by_name = {c["name"]: c for c in result}
     assert by_name["ftn intel"]["active"] is True
     assert by_name["ftn intel"]["file_path"] is not None
+
+
+# ── is_hostile: corp/alliance whitelist matching (blue-pilot fix) ────────────
+
+def test_is_hostile_character_id_whitelisted_is_friendly():
+    """A directly whitelisted character_id is friendly."""
+    whitelist = {12345}
+    info = {"character_id": 12345, "corporation_id": 999, "alliance_id": 888}
+    assert is_hostile(info, whitelist) is False
+
+
+def test_is_hostile_alliance_id_whitelisted_is_friendly():
+    """Pilot whose alliance_id is blue but whose character_id is NOT must be friendly.
+    This is the blue-alliance fix: prior code mis-flagged such pilots as hostile."""
+    whitelist = {99000001}  # an alliance id
+    info = {
+        "character_id": 12345,        # not in whitelist
+        "corporation_id": 5000,       # not in whitelist
+        "alliance_id": 99000001,      # blue
+    }
+    assert is_hostile(info, whitelist) is False
+
+
+def test_is_hostile_corporation_id_whitelisted_is_friendly():
+    """Pilot whose corporation_id is blue but whose character_id is NOT must be friendly."""
+    whitelist = {98000001}  # a corp id
+    info = {
+        "character_id": 12345,        # not in whitelist
+        "corporation_id": 98000001,   # blue
+        "alliance_id": 77000001,      # not in whitelist
+    }
+    assert is_hostile(info, whitelist) is False
+
+
+def test_is_hostile_no_match_stays_hostile():
+    """Pilot with character/corp/alliance ids none of which are whitelisted is hostile."""
+    whitelist = {99000001}
+    info = {
+        "character_id": 12345,
+        "corporation_id": 5000,
+        "alliance_id": 6000,
+    }
+    assert is_hostile(info, whitelist) is True
+
+
+def test_is_hostile_missing_ids_stays_hostile():
+    """Absent corp/alliance ids must not crash and must not whitelist by accident."""
+    whitelist = {99000001}
+    info = {"character_id": 12345}  # no corp/alliance keys at all
+    assert is_hostile(info, whitelist) is True

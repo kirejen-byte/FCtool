@@ -39,6 +39,11 @@ class ChargeTracker:
             self._by_pilot[sender] = charges
             return True
 
+    def remove_pilot(self, sender: str) -> bool:
+        """Drop a single pilot's charge record. Returns True if one was removed."""
+        with self._lock:
+            return self._by_pilot.pop(sender, None) is not None
+
     def snapshot(self) -> list[tuple[str, set[tuple[str, str]]]]:
         with self._lock:
             return [(name, set(ch)) for name, ch in self._by_pilot.items()]

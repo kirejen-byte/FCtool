@@ -76,7 +76,10 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from app_io import atomic_write_json
+from app_log import get_logger
 from app_path import app_dir
+from esi_constants import ESI_BASE, ESI_HEADERS_JSON as HEADERS
 from rate_limiter import rate_limit
 from ship_classes import (
     CYNO_LOSS_GROUPS,
@@ -84,13 +87,9 @@ from ship_classes import (
     cyno_loss_hull_class,
 )
 
-ESI_BASE = "https://esi.evetech.net/latest"
+log = get_logger(__name__)
+
 ZKILL_API = "https://zkillboard.com/api"
-HEADERS = {
-    # zKillboard asks for a descriptive User-Agent identifying the app + contact.
-    "User-Agent": "FCTool/1.0 (EVE FC Assistant; CynoCheck)",
-    "Accept": "application/json",
-}
 
 # zKillboard REST returns up to 1000 mails per page (the documented hard cap).
 # We stop a group early on the first page whose mails are entirely older than
@@ -357,6 +356,9 @@ class CynoCache:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
+            # A corrupt/unreadable cache is silently discarded (we just start with
+            # empty caches). Log it so the discard isn't invisible.
+            log.warning("cyno cache load failed; starting empty", exc_info=True)
             return
         if isinstance(data, dict):
             res = data.get("results")
@@ -378,23 +380,10 @@ class CynoCache:
         parent = os.path.dirname(self.path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except (OSError, AttributeError):
-                    pass
-            os.replace(tmp, self.path)
-        except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            raise
+        # The original hand-rolled tmp+os.replace used json.dump(payload, f) with
+        # no indent kwarg (compact) and the default ensure_ascii=True. Preserve
+        # both: indent=None keeps the file compact, ensure_ascii=True matches.
+        atomic_write_json(self.path, payload, indent=None, ensure_ascii=True)
 
     # -- result cache -----------------------------------------------------
     def get_result(self, character_id: int):

@@ -10,7 +10,6 @@ import os
 import secrets
 import sys
 import threading
-import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -19,12 +18,15 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 from app_path import app_dir
+from app_io import atomic_write_json
+from app_log import get_logger
+from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
+from rate_limiter import rate_limit
+
+log = get_logger(__name__)
 
 SSO_AUTH_URL = "https://login.eveonline.com/v2/oauth/authorize"
 SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
-SSO_JWKS_URL = "https://login.eveonline.com/oauth/jwks"
-ESI_BASE = "https://esi.evetech.net/latest"
-HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
 
 TOKEN_FILE = os.path.join(app_dir(), "esi_tokens.json")  # Legacy single-char file
 TOKEN_DIR = app_dir()  # Directory for per-character token files
@@ -441,6 +443,10 @@ class ESIAuth:
                         self._save_tokens()
                     except Exception as e:
                         print(f"[ESI Auth] Could not persist empty tokens: {e}")
+                        log.exception(
+                            "[ESI Auth] Could not persist empty tokens after "
+                            "invalid_grant for %s", self._character_name
+                        )
                     return False
                 # Transient server-side failure — preserve refresh_token so
                 # we can retry on the next expiry tick.
@@ -578,37 +584,21 @@ class ESIAuth:
 
     def _save_tokens(self):
         """Atomically write tokens to self.token_file. No path resolution,
-        no rename side effects. Writes to {path}.tmp then os.replace()s
-        into place so a crash mid-write cannot corrupt the token file."""
+        no rename side effects. Delegates to app_io.atomic_write_json, which
+        writes to {path}.tmp then os.replace()s into place so a crash
+        mid-write cannot corrupt the token file (and cleans up the .tmp on
+        failure before re-raising)."""
         data = {
             "refresh_token": self._refresh_token,
             "character_id": self._character_id,
             "character_name": self._character_name,
         }
         final_path = self.token_file
-        tmp_path = f"{final_path}.tmp"
         # Ensure parent exists (tests use tmp_path which already does).
         parent = os.path.dirname(final_path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except (OSError, AttributeError):
-                pass
-        try:
-            os.replace(tmp_path, final_path)
-        except OSError:
-            # Replace failed (disk full, perms, antivirus lock, etc.).
-            # Don't leave the .tmp orphaned; swallow cleanup errors so we
-            # can re-raise the original write failure to the caller.
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
+        atomic_write_json(final_path, data, indent=2)
 
     def _load_tokens(self):
         """Load tokens from disk and refresh if available."""
@@ -640,6 +630,7 @@ class ESIAuth:
         if not token:
             return None
         try:
+            rate_limit('esi')
             resp = self._session.get(
                 f"{ESI_BASE}{path}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -665,6 +656,7 @@ class ESIAuth:
         if not token:
             return None
         try:
+            rate_limit('esi')
             resp = self._session.post(
                 f"{ESI_BASE}{path}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -690,6 +682,7 @@ class ESIAuth:
         if not token:
             return False
         try:
+            rate_limit('esi')
             resp = self._session.put(
                 f"{ESI_BASE}{path}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -714,6 +707,7 @@ class ESIAuth:
         if not token:
             return False
         try:
+            rate_limit('esi')
             resp = self._session.delete(
                 f"{ESI_BASE}{path}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -733,11 +727,12 @@ class ESIAuth:
         url = ESI_BASE + path
         headers = {**HEADERS, "Content-Type": "application/json"}
         try:
+            rate_limit('esi')
             resp = requests.post(url, json=body, headers=headers, timeout=10)
             if resp.ok:
                 return resp.json()
         except Exception:
-            pass
+            log.exception("[ESI] public POST %s failed", path)
         return None
 
     # ── Character Info ───────────────────────────────────────────────────────
@@ -754,12 +749,6 @@ class ESIAuth:
             return None
         return self.esi_get(f"/characters/{self._character_id}/ship/")
 
-    def get_online_status(self) -> dict | None:
-        """Check if the character is currently online."""
-        if not self._character_id:
-            return None
-        return self.esi_get(f"/characters/{self._character_id}/online/")
-
     def set_waypoint(self, destination_id: int, clear_other: bool = False,
                      add_to_beginning: bool = False) -> bool:
         """Set an in-game waypoint."""
@@ -767,6 +756,7 @@ class ESIAuth:
         if not token:
             return False
         try:
+            rate_limit('esi')
             resp = self._session.post(
                 f"{ESI_BASE}/ui/autopilot/waypoint/",
                 headers={"Authorization": f"Bearer {token}"},
@@ -797,6 +787,7 @@ class ESIAuth:
             if not token:
                 break
             try:
+                rate_limit('esi')
                 resp = self._session.get(
                     f"{ESI_BASE}/characters/{self._character_id}/assets/",
                     headers={"Authorization": f"Bearer {token}"},
@@ -1381,15 +1372,6 @@ class ESIAuth:
             return info.get("corporation_id")
         return None
 
-    def _get_character_alliance_id(self) -> int | None:
-        """Get the character's alliance ID."""
-        if not self._character_id:
-            return None
-        info = self.esi_get(f"/characters/{self._character_id}/")
-        if info:
-            return info.get("alliance_id")
-        return None
-
     def _parse_gate_name(self, name: str) -> list[str] | None:
         """
         Parse a gate name into [sys_a, sys_b].
@@ -1519,8 +1501,7 @@ def _migrate_legacy_tokens():
         if char_id:
             new_path = os.path.join(TOKEN_DIR, f"esi_tokens_{char_id}.json")
             if not os.path.exists(new_path):
-                with open(new_path, "w") as f:
-                    json.dump(data, f, indent=2)
+                atomic_write_json(new_path, data, indent=2)
                 print(f"[ESI Auth] Migrated legacy tokens to {new_path}")
             os.remove(legacy)
             print("[ESI Auth] Removed legacy esi_tokens.json")

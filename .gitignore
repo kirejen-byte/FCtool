@@ -18,6 +18,10 @@ tts_cache/
 chat_monitor_state.json
 fit_types_cache.json
 
+# Runtime log (rotating file handler in app_log.py)
+fctool.log
+fctool.log.*
+
 # stargate_jumps.json is intentionally committed: it is bundled by FCTool.spec
 # (a static EVE SDE stargate graph), so the source must build from a clean clone.
 

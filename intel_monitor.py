@@ -7,11 +7,14 @@ d-scan links, and fuses intel data for the web dashboard.
 import os
 import re
 import glob
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Callable
 
 from chat_monitor import ChatMessage
+from app_log import get_logger
+
+log = get_logger(__name__)
 
 # ── Report Coalescing ────────────────────────────────────────────────────────
 # Tracks recent reports by (reporter, channel) to merge rapid-fire posts.
@@ -698,7 +701,7 @@ def parse_dscan_text(text: str) -> dict:
         # Try tab-separated format (raw dscan paste)
         parts = line.split("\t")
         if len(parts) >= 2:
-            ship_name = parts[1].strip() if len(parts) > 1 else parts[0].strip()
+            ship_name = parts[1].strip()
             # Count each line as 1 ship
             ships[ship_name] = ships.get(ship_name, 0) + 1
             total += 1
@@ -793,8 +796,7 @@ def _parse_dscan_html(html: str) -> dict:
 
 # ── Character Resolution ─────────────────────────────────────────────────────
 
-ESI_BASE = "https://esi.evetech.net/latest"
-ESI_HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
+from esi_constants import ESI_BASE, ESI_HEADERS
 
 # ── Standings Whitelist ──────────────────────────────────────────────────────
 # Cache of entity IDs (characters, corps, alliances) with positive standing.
@@ -881,9 +883,18 @@ def is_hostile(character_info: dict, whitelist: set[int] | None = None) -> bool:
     if char_id and char_id in whitelist:
         return False
 
-    # Check corp/alliance membership
-    # (resolve_characters stores corp and alliance as names, not IDs)
-    # For now, if the character_id isn't directly in the whitelist, they're hostile
+    # Check corp/alliance membership: a pilot in a blue corp or alliance is
+    # friendly even when their own character_id is not individually whitelisted.
+    # resolve_characters stores both the names and the numeric ids, so match on
+    # the ids against the standings whitelist (which holds entity ids).
+    corp_id = character_info.get("corporation_id", 0)
+    if corp_id and corp_id in whitelist:
+        return False
+
+    alliance_id = character_info.get("alliance_id", 0)
+    if alliance_id and alliance_id in whitelist:
+        return False
+
     return True
 
 # Keywords/tokens that should NOT be treated as character names
@@ -970,6 +981,10 @@ def resolve_characters(
                     cdata = cresp.json()
                     corp_id = cdata.get("corporation_id")
                     alliance_id = cdata.get("alliance_id")
+                    if corp_id:
+                        info["corporation_id"] = corp_id
+                    if alliance_id:
+                        info["alliance_id"] = alliance_id
                     if alliance_id:
                         aresp = _req.get(
                             f"{ESI_BASE}/alliances/{alliance_id}/",
@@ -985,9 +1000,15 @@ def resolve_characters(
                         if cresp2.ok:
                             info["corporation"] = cresp2.json().get("name", "")
             except Exception:
-                pass
+                log.exception(
+                    "resolve_characters: failed to fetch corp/alliance detail "
+                    "for character_id=%s", char.get("id"),
+                )
             info["hostile"] = is_hostile(info)
             results.append(info)
     except Exception:
-        pass
+        log.exception(
+            "resolve_characters: ESI /universe/ids/ resolution failed for "
+            "%d candidate(s)", len(candidates),
+        )
     return results

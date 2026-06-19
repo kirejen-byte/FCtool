@@ -183,6 +183,19 @@ def test_compute_guidance_no_live_fleet_unknown():
     assert all(f.current is None and f.status == "unknown" for f in rep.fits)
 
 
+def test_defenders_overlay_no_live_fleet_unknown():
+    # With no live fleet, the Defenders overlay reports the static target but an
+    # unknown current (the hull computation is skipped, output is unchanged).
+    cat = _Cat(groups={})
+    fits = {"ret": _fit("ret", 17740, _parsed(17740, [44102]))}
+    doc = _Doc([_mem2("ret", ["DPS", "Defenders"])])
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, {}, None,
+                                    command_ship_fraction=0.0)
+    d = rep.roles["Defenders"]
+    assert d.target_min == 8 and d.target_max is None
+    assert d.current is None and d.status == "unknown" and d.delta == 0
+
+
 def test_resolve_percent_blank_min_falls_through_to_dps_default():
     # mode="percent" with a blank (None) min must NOT be treated as an authoritative
     # override; it falls through to the DPS tag default and does not raise.

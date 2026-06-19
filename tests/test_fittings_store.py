@@ -185,3 +185,135 @@ def test_share_import_preserves_per_fit_ideals(tmp_path):
     summary = dst.import_share(payload)
     member = dst.list_doctrines()[0].members[0]
     assert (member.ideal_mode, member.ideal_min, member.ideal_max) == ("percent", 55, 65)
+
+
+# ── Corrupt-file recovery (ITEM 2) ──────────────────────────────────────────
+
+def test_corrupt_library_is_backed_up_and_degrades_to_empty(tmp_path):
+    path = tmp_path / "lib.json"
+    original_bytes = b'{ this is not valid json'
+    path.write_bytes(original_bytes)
+
+    s = FittingsStore(str(path))
+    s.load()                                      # (a) must not raise
+
+    # (b) degrades to an empty store with default tags
+    assert s.list_fits() == []
+    assert s.list_doctrines() == []
+    assert "DPS" in s.tags
+
+    # (c) a "<path>.corrupt" copy of the original bytes is left behind
+    backup = tmp_path / "lib.json.corrupt"
+    assert backup.exists()
+    assert backup.read_bytes() == original_bytes
+
+
+def test_corrupt_backup_then_save_does_not_destroy_recoverable_data(tmp_path):
+    # After a corrupt load + save(), the original is recoverable from .corrupt
+    # even though the live file was overwritten with an empty store.
+    path = tmp_path / "lib.json"
+    original_bytes = b'\x00\x01 totally bogus'
+    path.write_bytes(original_bytes)
+
+    s = FittingsStore(str(path))
+    s.load()
+    s.save()                                      # would have clobbered the original
+
+    assert (tmp_path / "lib.json.corrupt").read_bytes() == original_bytes
+
+
+def test_corrupt_backup_overwrites_previous_corrupt(tmp_path):
+    path = tmp_path / "lib.json"
+    backup = tmp_path / "lib.json.corrupt"
+    backup.write_bytes(b"stale previous corrupt")
+
+    path.write_bytes(b"new corrupt contents")
+    FittingsStore(str(path)).load()
+
+    assert backup.read_bytes() == b"new corrupt contents"
+
+
+def test_invalid_utf8_library_is_backed_up_and_degrades_to_empty(tmp_path):
+    # UnicodeDecodeError case: the bytes are not valid UTF-8.
+    path = tmp_path / "lib.json"
+    original_bytes = b'\xff\xfe invalid utf8 \x80\x81'
+    path.write_bytes(original_bytes)
+
+    s = FittingsStore(str(path))
+    s.load()                                      # (a) must not raise
+
+    # (b) degrades to an empty store with default tags
+    assert s.list_fits() == []
+    assert s.list_doctrines() == []
+    assert "DPS" in s.tags
+
+    # (c) a "<path>.corrupt" copy of the original bytes is left behind
+    backup = tmp_path / "lib.json.corrupt"
+    assert backup.exists()
+    assert backup.read_bytes() == original_bytes
+
+
+# ── rename_tag (ITEM 6a) ────────────────────────────────────────────────────
+
+def test_rename_tag_updates_vocabulary_and_cascades_to_members(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    fid = s.add_fit(_fit())
+    d1 = s.add_doctrine("D1"); d2 = s.add_doctrine("D2")
+    s.add_fit_to_doctrine(d1, fid, ["DPS", "Links"])
+    s.add_fit_to_doctrine(d2, fid, ["DPS"])
+
+    assert s.rename_tag("DPS", "Damage") is True
+
+    # vocabulary renamed (in place), old gone
+    assert "Damage" in s.tags and "DPS" not in s.tags
+    # cascade across every member that carried it
+    m1 = next(m for m in s.get_doctrine(d1).members if m.fit_id == fid)
+    m2 = next(m for m in s.get_doctrine(d2).members if m.fit_id == fid)
+    assert "Damage" in m1.tags and "DPS" not in m1.tags
+    assert "Links" in m1.tags                      # other tags untouched
+    assert m2.tags == ["Damage"]
+
+    # persisted: a reload sees the renamed tag and cascaded membership
+    s2 = FittingsStore(str(tmp_path / "lib.json")); s2.load()
+    assert "Damage" in s2.tags and "DPS" not in s2.tags
+    rm = next(m for m in s2.get_doctrine(d1).members if m.fit_id == fid)
+    assert "Damage" in rm.tags and "DPS" not in rm.tags
+
+
+def test_rename_tag_absent_old_is_noop_false(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    before = list(s.tags)
+    assert s.rename_tag("NotARealTag", "Whatever") is False
+    assert s.tags == before
+
+
+def test_rename_tag_to_existing_name_is_noop_false(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    # Both DPS and Logistics are default tags.
+    before = list(s.tags)
+    assert s.rename_tag("DPS", "Logistics") is False
+    assert s.tags == before
+
+
+# ── update_* return values (ITEM 6b) ────────────────────────────────────────
+
+def test_update_fit_returns_true_for_known_false_for_unknown(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    fid = s.add_fit(_fit())
+    known = s.get_fit(fid)
+    assert s.update_fit(known) is True
+
+    ghost = _fit("Ghost"); ghost.id = "does-not-exist"
+    assert s.update_fit(ghost) is False
+    assert s.get_fit("does-not-exist") is None     # unknown id not inserted
+
+
+def test_update_doctrine_returns_true_for_known_false_for_unknown(tmp_path):
+    s = FittingsStore(str(tmp_path / "lib.json")); s.load()
+    did = s.add_doctrine("D")
+    d = s.get_doctrine(did)
+    assert s.update_doctrine(d) is True
+
+    d.id = "nope"
+    assert s.update_doctrine(d) is False
+    assert s.get_doctrine("nope") is None

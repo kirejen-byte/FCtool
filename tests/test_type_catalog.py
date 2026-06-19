@@ -109,3 +109,41 @@ def test_prime_is_defensive_on_esi_failure(tmp_path):
     cat = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=cache, esi=BoomESI())
     cat.prime([12015, 55555])  # must not raise
     assert cat.resolve_name(12015) == "Muninn"
+
+
+def test_corrupt_cache_discarded_and_logged(tmp_path, caplog):
+    """A corrupt cache file is discarded (not fatal) with a warning logged,
+    and the catalog still resolves bundled ids."""
+    cache = tmp_path / "c.json"
+    cache.write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        cat = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=str(cache))
+
+    assert cat.resolve_name(12015) == "Muninn"  # bundled still works
+    assert any("corrupt" in r.message.lower() for r in caplog.records)
+
+
+def test_cache_write_roundtrips_via_atomic_writer(tmp_path):
+    """A resolved ESI entry is persisted through atomic_write_json and read back
+    by a fresh catalog with no ESI adapter (valid, parseable JSON on disk)."""
+
+    class FakeESI:
+        def resolve_names(self, ids):
+            return {424242: {"name": "Atomic Module", "category": "inventory_type"}}
+
+    cache = tmp_path / "c.json"
+    cat = TypeCatalog(
+        bundled_path=_fixture(tmp_path), cache_path=str(cache), esi=FakeESI()
+    )
+    assert cat.resolve_name(424242) == "Atomic Module"
+
+    # On-disk cache is valid JSON containing the resolved entry.
+    written = json.loads(cache.read_text(encoding="utf-8"))
+    assert written["424242"]["n"] == "Atomic Module"
+    # No leftover temp file from the atomic write.
+    assert not (tmp_path / "c.json.tmp").exists()
+
+    # Fresh catalog (no esi) still resolves from the persisted cache.
+    cat2 = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=str(cache))
+    assert cat2.resolve_name(424242) == "Atomic Module"

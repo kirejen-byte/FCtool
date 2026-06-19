@@ -16,9 +16,14 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
+
+from app_io import atomic_write_json
+from app_log import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -227,8 +232,9 @@ class ChatLogFile:
                     raw_line=line,
                 ))
         except (OSError, IOError):
-            # File may be locked by EVE, retry next poll.
-            pass
+            # File may be transiently locked by EVE (retry next poll), but a
+            # permanently unreadable chat file would otherwise be invisible.
+            log.warning("read_new_lines failed for %s", self.filepath, exc_info=True)
         return messages
 
 
@@ -485,15 +491,14 @@ class ChatMonitor:
             os.makedirs(os.path.dirname(os.path.abspath(self._state_path)) or ".", exist_ok=True)
         except OSError:
             pass
-        tmp_path = self._state_path + ".tmp"
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self._persisted_state, f)
-            os.replace(tmp_path, self._state_path)
-        except OSError:
-            # Best-effort - if we can't persist, swallow and try again later.
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+            # Preserve the original compact (no-indent) JSON formatting.
+            atomic_write_json(
+                self._state_path,
+                self._persisted_state,
+                indent=None,
+                ensure_ascii=True,
+            )
+        except Exception:
+            # Best-effort - if we can't persist, log and try again later.
+            log.exception("Failed to persist chat monitor state to %s", self._state_path)
