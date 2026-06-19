@@ -246,13 +246,13 @@ def _rollup_by_role(fits, has_live) -> dict:
 
 
 def _defenders_overlay(members, get_fit, fleet_ship_counts, has_live) -> RoleRollup:
-    hulls = set()
-    for m in members:
-        if DEFENDER_TAG in m.tags:
-            f = get_fit(m.fit_id)
-            if f is not None:
-                hulls.add(f.hull_type_id)
     if has_live:
+        hulls = set()
+        for m in members:
+            if DEFENDER_TAG in m.tags:
+                f = get_fit(m.fit_id)
+                if f is not None:
+                    hulls.add(f.hull_type_id)
         current = sum(fleet_ship_counts.get(h, 0) for h in hulls)
         status, delta = compute_delta(current, DEFENDER_TARGET_MIN, None)
     else:

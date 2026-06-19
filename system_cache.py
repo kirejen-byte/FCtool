@@ -12,9 +12,12 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from rate_limiter import rate_limit
 from app_path import app_dir
+from app_io import atomic_write_json
+from app_log import get_logger
+from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
 
-ESI_BASE = "https://esi.evetech.net/latest"
-HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
+log = get_logger(__name__)
+
 CACHE_FILE = os.path.join(app_dir(), "systems_cache.json")
 REGION_CACHE_FILE = os.path.join(app_dir(), "regions_cache.json")
 CACHE_MAX_AGE = 7 * 24 * 3600  # Refresh weekly (system list rarely changes)
@@ -77,8 +80,7 @@ def save_cache(systems: dict[str, int]):
         "timestamp": time.time(),
         "systems": systems,
     }
-    with open(CACHE_FILE, "w") as f:
-        json.dump(data, f)
+    atomic_write_json(CACHE_FILE, data, indent=None)
 
 
 def load_cache() -> dict[str, int] | None:
@@ -94,6 +96,7 @@ def load_cache() -> dict[str, int] | None:
             return None
         return data.get("systems", {})
     except Exception:
+        log.exception("Failed to load system cache %s; discarding", CACHE_FILE)
         return None
 
 
@@ -196,18 +199,6 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
     return system_to_region, region_name_to_id
 
 
-def download_region_map() -> dict[str, str]:
-    """
-    Build a system_id -> region_name mapping via top-down ESI traversal.
-    Returns {str(system_id): region_name} dict.
-
-    Backward-compatible wrapper around _download_region_data(); existing
-    callers that only need the system->region map are unaffected.
-    """
-    system_to_region, _ = _download_region_data()
-    return system_to_region
-
-
 def save_region_cache(region_map: dict[str, str],
                       region_ids: dict[str, int] | None = None):
     """Save region mapping to disk.
@@ -219,8 +210,7 @@ def save_region_cache(region_map: dict[str, str],
     data = {"timestamp": time.time(), "regions": region_map}
     if region_ids:
         data["region_ids"] = region_ids
-    with open(REGION_CACHE_FILE, "w") as f:
-        json.dump(data, f)
+    atomic_write_json(REGION_CACHE_FILE, data, indent=None)
 
 
 def load_region_cache() -> dict[str, str] | None:
@@ -233,6 +223,9 @@ def load_region_cache() -> dict[str, str] | None:
         # Region assignments never change, so no expiry needed
         return data.get("regions", {})
     except Exception:
+        log.exception(
+            "Failed to load region cache %s; discarding", REGION_CACHE_FILE
+        )
         return None
 
 
@@ -258,6 +251,9 @@ def load_region_ids_cache() -> dict[str, int] | None:
             return out or None
         return None
     except Exception:
+        log.exception(
+            "Failed to load region id cache %s; discarding", REGION_CACHE_FILE
+        )
         return None
 
 

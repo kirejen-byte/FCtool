@@ -26,7 +26,11 @@ from __future__ import annotations
 import json
 import os
 
+from app_io import atomic_write_json
+from app_log import get_logger
 from app_path import app_dir, bundle_dir
+
+log = get_logger(__name__)
 
 # Numeric SDE categoryID -> our string category. categoryID 87 here is the
 # Fighter inventory category (a different namespace from the SDE flagID 87 =
@@ -83,6 +87,7 @@ class TypeCatalog:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
+            log.warning("Discarding unreadable/corrupt type catalog file: %s", path)
             return
         if not isinstance(data, dict):
             return
@@ -260,11 +265,14 @@ class TypeCatalog:
                 if isinstance(existing, dict):
                     cache = existing
             except (OSError, ValueError):
+                log.warning(
+                    "Discarding unreadable/corrupt type catalog cache: %s",
+                    self._cache_path,
+                )
                 cache = {}
         for type_id, entry in entries.items():
             cache[str(type_id)] = entry
 
-        tmp_path = f"{self._cache_path}.tmp"
         parent = os.path.dirname(self._cache_path)
         if parent and not os.path.isdir(parent):
             try:
@@ -272,16 +280,8 @@ class TypeCatalog:
             except OSError:
                 return
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(cache, f, separators=(",", ":"))
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except (OSError, AttributeError):
-                    pass
-            os.replace(tmp_path, self._cache_path)
-        except OSError:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+            atomic_write_json(self._cache_path, cache, indent=None)
+        except Exception:
+            log.exception(
+                "Failed to write type catalog cache: %s", self._cache_path
+            )

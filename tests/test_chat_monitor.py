@@ -375,3 +375,47 @@ def test_dedupe_ttl_eviction(tmp_path):
     monitor._evict_dedupe()
     assert key not in monitor._seen
     assert monitor._is_duplicate(msg) is False
+
+
+def test_save_state_writes_atomically_and_roundtrips(tmp_path):
+    """_save_state persists compact JSON via the shared atomic writer and
+    leaves no leftover .tmp file."""
+    state_file = tmp_path / "state.json"
+    monitor = ChatMonitor(
+        str(tmp_path),
+        state_path=str(state_file),
+    )
+    key = os.path.abspath(str(tmp_path / "fleet_x.txt"))
+    monitor._persisted_state[key] = {"last_pos": 42, "last_ino": 7, "last_updated": 1.0}
+
+    monitor._save_state()
+
+    assert state_file.exists()
+    assert not (tmp_path / "state.json.tmp").exists()  # atomic writer cleaned up
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved[key]["last_pos"] == 42
+    assert saved[key]["last_ino"] == 7
+
+
+def test_save_state_failure_is_logged_not_raised(tmp_path, monkeypatch, caplog):
+    """A persistence failure must be logged (no longer a silent swallow) and
+    must not propagate out of _save_state."""
+    state_file = tmp_path / "state.json"
+    monitor = ChatMonitor(
+        str(tmp_path),
+        state_path=str(state_file),
+    )
+    monitor._persisted_state["k"] = {"last_pos": 1}
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(chat_monitor, "atomic_write_json", _boom)
+
+    import logging
+    with caplog.at_level(logging.ERROR):
+        # Must not raise.
+        monitor._save_state()
+
+    assert any("chat monitor state" in rec.getMessage().lower()
+               for rec in caplog.records)

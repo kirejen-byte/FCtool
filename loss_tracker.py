@@ -4,7 +4,7 @@ Detects likely fleet member deaths by observing ship->capsule transitions
 across ESI fleet polls. Fires threshold notifications at 10%, 25%, 50% loss.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 # EVE capsule ship type IDs

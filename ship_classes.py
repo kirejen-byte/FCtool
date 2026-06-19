@@ -7,6 +7,8 @@ fallback for unknown destroyer-class hulls.
 import requests
 import threading
 
+from esi_constants import ESI_BASE, ESI_HEADERS_JSON as HEADERS
+
 # ── EVE Online Group IDs (from SDE) ─────────────────────────────────────────
 GROUP_COMMAND_SHIPS = 540
 GROUP_COMMAND_DESTROYERS = 1534
@@ -198,9 +200,6 @@ ALL_BRIDGE = TITANS | BLACK_OPS
 _group_cache: dict[int, int | None] = {}
 _group_cache_lock = threading.Lock()
 
-ESI_BASE = "https://esi.evetech.net/latest"
-HEADERS = {"User-Agent": "FCTool/1.0", "Accept": "application/json"}
-
 
 def get_group_id(type_id: int) -> int | None:
     """Resolve a type_id to its group_id via ESI, with thread-safe caching."""
@@ -291,16 +290,6 @@ def is_defender(type_id: int) -> bool:
     return gid == GROUP_DESTROYERS
 
 
-def is_links_command(type_id: int) -> bool:
-    """Check if a ship is a command ship or command destroyer."""
-    return type_id in ALL_LINKS_COMMAND
-
-
-def is_logistics(type_id: int) -> bool:
-    """Check if a ship is any logistics ship (T1 or T2, frig or cruiser)."""
-    return type_id in ALL_LOGISTICS
-
-
 def is_tackle(type_id: int) -> bool:
     """Check if a ship is considered 'tackle' (cheap/expendable) for loss tracking.
 
@@ -369,9 +358,9 @@ def _fetch_group_id_for_type(type_id: int) -> int | None:
         from rate_limiter import rate_limit
         rate_limit("esi")
         resp = requests.get(
-            f"https://esi.evetech.net/latest/universe/types/{type_id}/",
+            f"{ESI_BASE}/universe/types/{type_id}/",
             timeout=5,
-            headers={"User-Agent": "FCTool/1.0 (EVE FC Assistant)"},
+            headers=HEADERS,
         )
         if resp.ok:
             gid = resp.json().get("group_id")

@@ -46,6 +46,12 @@ _FLAG_PREFIX_TO_SLOT: list[tuple[str, str]] = sorted(
 # The order modules are emitted in (DNA sections and ESI flag assignment).
 _SLOT_EMIT_ORDER = [SLOT_HIGH, SLOT_MED, SLOT_LOW, SLOT_RIG, SLOT_SUBSYSTEM]
 
+# Cargo whose category is one of these is "safe" to emit in fitting-DNA: the EVE
+# client routes it to cargo/bays, not into a slot. Anything else (module/ship/
+# subsystem/unknown) would re-fit into a slot when the DNA link is clicked
+# ("ghost slots"), so it is dropped from DNA when a catalog can classify it.
+_CARGO_SAFE_CATEGORIES = frozenset({"charge", "other", "drone", "fighter"})
+
 # ── Tech III subsystem slot ordering ─────────────────────────────────────────
 #
 # A strategic cruiser's hull + subsystems must be encoded the way the live
@@ -133,28 +139,63 @@ def to_dna(parsed: ParsedFit, catalog=None) -> str:
 
     by_slot = _modules_by_slot(parsed)
 
-    # Modules, grouped by slot section then stacked by identical type id.
+    # Modules, grouped by slot section then stacked by (type id, offline).
+    #
+    # NOTE: a module's `offline` state IS representable in DNA via a trailing `_`
+    # on the id (`typeID_;qty`), which `parse_dna` reads back as `offline=True`,
+    # so offline state round-trips through DNA. Online and offline instances of
+    # the same type are emitted as SEPARATE tokens (never merged into one stack),
+    # because they differ in identity. `to_esi_items` still drops offline: the
+    # ESI items[] format has no offline field, and it is intentionally left
+    # unchanged. `fit_content_hash` (fit_models.py) folds `offline` into a fit's
+    # identity, consistent with DNA now preserving it.
     charge_counts: dict[int, int] = {}
     for slot in _SLOT_EMIT_ORDER:
-        counts: dict[int, int] = {}
+        # Key on (type_id, offline) so online/offline of the same id each get
+        # their own token; dict insertion order keeps first-seen token order.
+        counts: dict[tuple[int, bool], int] = {}
         for module in by_slot.get(slot, []):
-            counts[module.type_id] = counts.get(module.type_id, 0) + 1
+            key = (module.type_id, bool(module.offline))
+            counts[key] = counts.get(key, 0) + 1
             if module.charge_type_id is not None:
                 charge_counts[module.charge_type_id] = (
                     charge_counts.get(module.charge_type_id, 0) + 1
                 )
-        for type_id, count in counts.items():
-            parts.append(f"{type_id};{count}")
+        for (type_id, offline), count in counts.items():
+            parts.append(f"{type_id}_;{count}" if offline else f"{type_id};{count}")
 
-    # Drones then cargo, each as typeID;qty.
+    # Drones are emitted before cargo, each as typeID;qty, and are NOT merged
+    # with cargo/charges.
     for drone in parsed.drones:
         parts.append(f"{drone.type_id};{drone.quantity}")
-    for cargo in parsed.cargo:
-        parts.append(f"{cargo.type_id};{cargo.quantity}")
 
-    # Loaded charges appended to the charge section.
+    # Cargo + loaded charges, merged by type id so the SAME id carried in cargo
+    # and loaded in guns yields ONE token with the summed quantity (mirrors
+    # `to_esi_items`). First-seen order is preserved: cargo first, then
+    # charge-only ids. Module-category cargo is dropped when a catalog can
+    # classify it — EVE fitting-DNA has no cargo section, so a module carried as
+    # cargo would otherwise re-fit into a slot ("ghost slots"). Without a catalog
+    # (or one that cannot classify), all cargo is kept for back-compat.
+    def _cargo_is_safe(type_id: int) -> bool:
+        if catalog is None:
+            return True
+        category_of = getattr(catalog, "category_of", None)
+        if not callable(category_of):
+            return True  # no way to classify -> keep (back-compat)
+        try:
+            return category_of(type_id) in _CARGO_SAFE_CATEGORIES
+        except Exception:
+            return False  # cannot classify confidently -> drop (avoid ghost-fit)
+
+    cargo_to_emit: dict[int, int] = {}
+    for cargo in parsed.cargo:
+        if not _cargo_is_safe(cargo.type_id):
+            continue
+        cargo_to_emit[cargo.type_id] = cargo_to_emit.get(cargo.type_id, 0) + cargo.quantity
     for type_id, count in charge_counts.items():
-        parts.append(f"{type_id};{count}")
+        cargo_to_emit[type_id] = cargo_to_emit.get(type_id, 0) + count
+    for type_id, quantity in cargo_to_emit.items():
+        parts.append(f"{type_id};{quantity}")
 
     return ":".join(parts) + "::"
 
@@ -197,12 +238,18 @@ def to_esi_items(parsed: ParsedFit, catalog=None) -> list[dict]:
         items.append(
             {"type_id": drone.type_id, "flag": DRONE_FLAG, "quantity": drone.quantity}
         )
+
+    # Merge cargo + loaded-charge counts by type_id so the SAME ammo carried in
+    # cargo and loaded in guns yields ONE Cargo item with the summed quantity,
+    # never two separate Cargo entries for the same type. First-seen order is
+    # preserved (parsed.cargo first, then charge-only types).
+    cargo_totals: dict[int, int] = {}
     for cargo in parsed.cargo:
-        items.append(
-            {"type_id": cargo.type_id, "flag": CARGO_FLAG, "quantity": cargo.quantity}
-        )
+        cargo_totals[cargo.type_id] = cargo_totals.get(cargo.type_id, 0) + cargo.quantity
     for type_id, count in charge_counts.items():
-        items.append({"type_id": type_id, "flag": CARGO_FLAG, "quantity": count})
+        cargo_totals[type_id] = cargo_totals.get(type_id, 0) + count
+    for type_id, quantity in cargo_totals.items():
+        items.append({"type_id": type_id, "flag": CARGO_FLAG, "quantity": quantity})
 
     return items
 

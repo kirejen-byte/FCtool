@@ -16,9 +16,12 @@ from typing import Callable
 import requests
 from rate_limiter import rate_limit
 
-ESI_BASE = "https://esi.evetech.net/latest"
+from app_log import get_logger
+from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
+
+log = get_logger(__name__)
+
 R2Z2_BASE = "https://r2z2.zkillboard.com/ephemeral"
-HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
 
 # Capital ship type IDs grouped by class for breakdown display
 CAPITAL_CLASSES: dict[str, set[int]] = {
@@ -315,8 +318,6 @@ class ZKillMonitor:
         # Maps system_id -> {"time": datetime, "pilots": int}
         self._alerted_systems: dict[int, dict] = {}
         self._pilot_growth_threshold = 100  # Re-ping Discord if fight grows by this many
-        # Status callback for GUI
-        self.on_status: Callable[[str], None] | None = None
 
     def set_friendly_ids(self, ids):
         """Update the friendly (blue/own) corp/alliance id set without rebuilding
@@ -442,7 +443,14 @@ class ZKillMonitor:
         return None
 
     def _fetch_kill(self, sequence_id: int) -> dict | None:
-        """Fetch a single killmail by sequence ID from R2Z2."""
+        """Fetch a single killmail by sequence ID from R2Z2.
+
+        Returns the kill dict on success, or None for the legitimate idle case
+        (a 404 means "no kill at this sequence yet"). Any other outcome — a
+        non-404 HTTP error or a request exception — signals an outage rather
+        than idleness, so it is logged (with context) while still returning
+        None to preserve the caller's polling behavior.
+        """
         try:
             resp = requests.get(
                 f"{R2Z2_BASE}/{sequence_id}.json",
@@ -451,9 +459,15 @@ class ZKillMonitor:
             if resp.ok:
                 return resp.json()
             elif resp.status_code == 404:
-                return None  # No kill at this sequence yet
+                return None  # No kill at this sequence yet (idle, not an outage)
+            # Any other status is an unexpected R2Z2 response (possible outage).
+            log.warning(
+                "R2Z2 _fetch_kill seq=%s returned HTTP %s (not OK / not 404)",
+                sequence_id, resp.status_code,
+            )
         except Exception:
-            pass
+            # Network/parse failure — an outage, distinct from the idle None above.
+            log.exception("R2Z2 _fetch_kill seq=%s failed (request error)", sequence_id)
         return None
 
     def _poll_loop(self):
@@ -475,8 +489,6 @@ class ZKillMonitor:
         self._sequence = max(1, seq - lookback)
         print(f"[zKill] Connected to R2Z2. Head={seq}, starting at {self._sequence} "
               f"(lookback {lookback})")
-        if self.on_status:
-            self.on_status(f"R2Z2 connected (seq {seq})")
 
         consecutive_404s = 0
         catching_up = True
@@ -533,11 +545,3 @@ class ZKillMonitor:
 
     def stop(self):
         self._running = False
-
-    @property
-    def kills_processed(self) -> int:
-        return self._kills_processed
-
-    @property
-    def current_sequence(self) -> int:
-        return self._sequence

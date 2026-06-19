@@ -27,9 +27,7 @@ DEFAULT_CONFIG = {
     "zkillboard": {
         "enabled": True,
         "watch_regions": [],
-        "watch_regions_names": {},
         "watch_alliances": [],
-        "watch_alliances_names": {},
         "watch_systems": [],
         "min_kill_value_millions": 0,
         "min_pilots_involved": 25,

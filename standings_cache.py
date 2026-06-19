@@ -13,6 +13,11 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+from app_io import atomic_write_json
+from app_log import get_logger
+
+log = get_logger(__name__)
+
 
 def is_friendly(
     char_id: int | None,
@@ -44,6 +49,11 @@ class StandingsCache:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
+            log.warning(
+                "standings cache at %s unreadable/corrupt; ignoring",
+                self.path,
+                exc_info=True,
+            )
             return
         self.friendly_ids = set(data.get("friendly_ids") or [])
         self.hostile_ids = set(data.get("hostile_ids") or [])
@@ -65,21 +75,8 @@ class StandingsCache:
         parent = os.path.dirname(self.path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        tmp = self.path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except Exception:
-            # Clean up the orphan temp file on any failure (disk full, AV lock, etc.)
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-            raise
+        # Preserve the original compact (no-indent) format and ascii escaping.
+        atomic_write_json(self.path, payload, indent=None, ensure_ascii=True)
 
     def is_stale(self, max_age_hours: float = 24.0) -> bool:
         if self.fetched_at is None:

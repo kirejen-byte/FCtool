@@ -90,6 +90,18 @@ class XUpCounter:
             if self.on_update:
                 self.on_update(self.state)
 
+    def remove_pilot(self, name: str) -> bool:
+        """Remove a single pilot's x-up. Returns True if one was removed.
+
+        Drops the pilot from the tracked set and recomputes is_ready. Does not
+        fire callbacks; the GUI wiring decides whether to refresh.
+        """
+        if name not in self.state.xups:
+            return False
+        del self.state.xups[name]
+        self.state.is_ready = self.state.count >= self.threshold
+        return True
+
     def reset(self):
         """Manual reset."""
         self.state = XUpState()

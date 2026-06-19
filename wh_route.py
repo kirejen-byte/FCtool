@@ -5,20 +5,14 @@ Compares direct stargate route vs routes using wormhole hubs.
 """
 
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
-from functools import lru_cache
 
-from jump_range import search_system, get_stargate_route, get_system_info, save_route_cache
+from esi_constants import ESI_HEADERS_JSON as HEADERS
+from jump_range import search_system, get_stargate_route, save_route_cache
 from rate_limiter import rate_limit
 
 EVESCOUT_API = "https://api.eve-scout.com/v2/public/signatures"
-HEADERS = {"User-Agent": "FCTool/1.0", "Accept": "application/json"}
-
-# Thera and Turnur system IDs
-THERA_ID = 31000005
-TURNUR_ID = 30002086
 
 
 @dataclass

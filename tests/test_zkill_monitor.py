@@ -14,6 +14,7 @@ constructed directly in the internal normalized format
 """
 
 import pytest
+import requests
 
 import zkill_monitor
 from zkill_monitor import EngagementTracker, KillAlert
@@ -375,3 +376,79 @@ def test_monitor_set_friendly_ids_forwards_to_tracker():
     monitor.set_friendly_ids(None)
     assert monitor._friendly_ids == set()
     assert monitor._tracker.friendly_ids == set()
+
+
+# ── _fetch_kill: outage vs idle logging ─────────────────────────────────────
+#
+# _fetch_kill must distinguish an OUTAGE (HTTP error / request exception ->
+# logged) from IDLE (200 with a body, or a legitimate 404 -> silent). All four
+# branches still return None or the body without raising, preserving the
+# polling loop's behavior. We patch zkill_monitor.requests.get directly (the
+# autouse `_no_network` fixture also patches it, but we override per-test).
+
+from zkill_monitor import ZKillMonitor
+
+
+class _FakeResp:
+    """Minimal stand-in for requests.Response covering _fetch_kill's branches."""
+
+    def __init__(self, ok, status_code, body=None):
+        self.ok = ok
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def test_fetch_kill_success_returns_body_no_log(mocker):
+    """A 200 with a body returns it and logs nothing (idle/normal path)."""
+    body = {"killmail": {"solar_system_id": 30000142}, "zkb": {}}
+    mocker.patch.object(zkill_monitor.requests, "get",
+                        return_value=_FakeResp(ok=True, status_code=200, body=body))
+    log_warn = mocker.patch.object(zkill_monitor.log, "warning")
+    log_exc = mocker.patch.object(zkill_monitor.log, "exception")
+
+    monitor = ZKillMonitor()
+    assert monitor._fetch_kill(5) == body
+    log_warn.assert_not_called()
+    log_exc.assert_not_called()
+
+
+def test_fetch_kill_404_returns_none_no_log(mocker):
+    """A 404 is the legitimate idle case: returns None and logs nothing."""
+    mocker.patch.object(zkill_monitor.requests, "get",
+                        return_value=_FakeResp(ok=False, status_code=404))
+    log_warn = mocker.patch.object(zkill_monitor.log, "warning")
+    log_exc = mocker.patch.object(zkill_monitor.log, "exception")
+
+    monitor = ZKillMonitor()
+    assert monitor._fetch_kill(5) is None
+    log_warn.assert_not_called()
+    log_exc.assert_not_called()
+
+
+def test_fetch_kill_non_404_error_warns(mocker):
+    """A non-404 HTTP error (e.g. 503) is an outage: returns None and warns."""
+    mocker.patch.object(zkill_monitor.requests, "get",
+                        return_value=_FakeResp(ok=False, status_code=503))
+    log_warn = mocker.patch.object(zkill_monitor.log, "warning")
+    log_exc = mocker.patch.object(zkill_monitor.log, "exception")
+
+    monitor = ZKillMonitor()
+    assert monitor._fetch_kill(7) is None
+    assert log_warn.call_count == 1
+    log_exc.assert_not_called()
+
+
+def test_fetch_kill_exception_logs_and_returns_none(mocker):
+    """A request exception is an outage: returns None and log.exception fires."""
+    mocker.patch.object(zkill_monitor.requests, "get",
+                        side_effect=requests.exceptions.ConnectionError("boom"))
+    log_warn = mocker.patch.object(zkill_monitor.log, "warning")
+    log_exc = mocker.patch.object(zkill_monitor.log, "exception")
+
+    monitor = ZKillMonitor()
+    assert monitor._fetch_kill(9) is None
+    log_exc.assert_called_once()
+    log_warn.assert_not_called()

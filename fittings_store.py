@@ -22,12 +22,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from typing import NamedTuple
 from uuid import uuid4
 
 import fit_dna
 import fleet_guidance
+from app_io import atomic_write_json
+from app_log import get_logger
 from fit_models import (
     DEFAULT_TAGS,
     Doctrine,
@@ -39,6 +42,8 @@ from fit_models import (
     fit_from_dict,
     fit_to_dict,
 )
+
+log = get_logger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -87,7 +92,28 @@ class FittingsStore:
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # The file exists but is unreadable (corrupt JSON, locked, perms).
+            # Copy it aside BEFORE degrading to an empty store, otherwise the
+            # next save() would atomically overwrite the user's recoverable
+            # fits/doctrines/tags. The sidecar has a fixed name (no timestamp)
+            # and is overwritten on each corrupt load.
+            backup = f"{self.path}.corrupt"
+            try:
+                shutil.copy2(self.path, backup)
+                log.warning(
+                    "Fittings library at %s is unreadable; backed up to %s "
+                    "before resetting to an empty store.",
+                    self.path,
+                    backup,
+                )
+            except OSError:
+                log.exception(
+                    "Fittings library at %s is unreadable and could not be "
+                    "backed up to %s; resetting to an empty store.",
+                    self.path,
+                    backup,
+                )
             self._fits = {}
             self._doctrines = {}
             self._tags = list(DEFAULT_TAGS)
@@ -117,24 +143,12 @@ class FittingsStore:
         parent = os.path.dirname(self.path)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
-        tmp = f"{self.path}.tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except (OSError, AttributeError):
-                    pass
-            os.replace(tmp, self.path)
+            # atomic_write_json writes <path>.tmp, fsyncs, then os.replace;
+            # it cleans up the temp file and re-raises on any failure.
+            atomic_write_json(self.path, payload, indent=2)
         except Exception:
-            # Don't leave an orphan temp file on any failure (disk full, AV
-            # lock, perms); re-raise the original error to the caller.
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+            log.exception("Failed to save fittings library to %s", self.path)
             raise
 
     # ── Fit CRUD ──────────────────────────────────────────────────────────────
@@ -151,12 +165,17 @@ class FittingsStore:
         self._fits[fid] = fit
         return fid
 
-    def update_fit(self, fit: Fit) -> None:
-        """Replace an existing fit (by id), refreshing its modified stamp."""
+    def update_fit(self, fit: Fit) -> bool:
+        """Replace an existing fit (by id), refreshing its modified stamp.
+
+        Returns True if the fit existed and was updated, False for an unknown
+        id. (Additive: callers that ignore the return value are unaffected.)
+        """
         if fit.id not in self._fits:
-            return
+            return False
         fit.modified = _now()
         self._fits[fit.id] = fit
+        return True
 
     def delete_fit(self, fit_id: str) -> None:
         """Delete a fit and cascade-remove it from every doctrine's members."""
@@ -196,7 +215,18 @@ class FittingsStore:
 
         prior_id = fit.esi_fitting_ids.get(character_id)
         if prior_id is not None:
-            esi_auth.delete_fitting(character_id, prior_id)
+            deleted = esi_auth.delete_fitting(character_id, prior_id)
+            if not deleted:
+                # ESI couldn't delete the old in-game fitting (already gone,
+                # transient error, etc.). We proceed to recreate anyway, which
+                # may leave a stale duplicate in-game; log so it's diagnosable.
+                log.warning(
+                    "delete_fitting failed for character %s, fitting %s "
+                    "(fit %s); recreating may leave a duplicate in-game.",
+                    character_id,
+                    prior_id,
+                    fit_id,
+                )
 
         body = {
             "name": (fit.name or "")[:_FITTING_NAME_MAX],
@@ -229,12 +259,17 @@ class FittingsStore:
         )
         return did
 
-    def update_doctrine(self, doctrine: Doctrine) -> None:
-        """Replace an existing doctrine (by id), refreshing its modified stamp."""
+    def update_doctrine(self, doctrine: Doctrine) -> bool:
+        """Replace an existing doctrine (by id), refreshing its modified stamp.
+
+        Returns True if the doctrine existed and was updated, False for an
+        unknown id. (Additive: callers ignoring the return are unaffected.)
+        """
         if doctrine.id not in self._doctrines:
-            return
+            return False
         doctrine.modified = _now()
         self._doctrines[doctrine.id] = doctrine
+        return True
 
     def delete_doctrine(self, doctrine_id: str) -> None:
         self._doctrines.pop(doctrine_id, None)
@@ -324,6 +359,31 @@ class FittingsStore:
                     changed = True
             if changed:
                 doctrine.modified = _now()
+
+    def rename_tag(self, old_name: str, new_name: str) -> bool:
+        """Rename a tag in the vocabulary and cascade across every doctrine
+        member that carries it, then persist.
+
+        No-op (returns False) if `old_name` is not in the vocabulary or
+        `new_name` already exists. Returns True on success.
+        """
+        if old_name not in self._tags or new_name in self._tags:
+            return False
+        # Rename in the vocabulary, preserving position.
+        self._tags = [new_name if t == old_name else t for t in self._tags]
+        # Cascade to every doctrine member carrying the old tag.
+        for doctrine in self._doctrines.values():
+            changed = False
+            for member in doctrine.members:
+                if old_name in member.tags:
+                    member.tags = [
+                        new_name if t == old_name else t for t in member.tags
+                    ]
+                    changed = True
+            if changed:
+                doctrine.modified = _now()
+        self.save()
+        return True
 
     # ── Share (.fctdoc) export / import ───────────────────────────────────────
 

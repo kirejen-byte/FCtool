@@ -24,6 +24,71 @@ def _write_cache(path, regions=None, region_ids=None, timestamp=123.0):
         json.dump(data, f)
 
 
+# ── corrupt-cache logging (silent-discard paths now log) ────────────────────
+
+
+def test_load_region_cache_corrupt_returns_none_and_logs(
+    tmp_path, monkeypatch, caplog
+):
+    """A corrupt region cache file -> None, and the failure is logged."""
+    cache_file = tmp_path / "regions_cache.json"
+    cache_file.write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setattr(system_cache, "REGION_CACHE_FILE", str(cache_file))
+
+    with caplog.at_level("ERROR"):
+        assert system_cache.load_region_cache() is None
+    assert any(
+        "Failed to load region cache" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_load_region_ids_cache_corrupt_returns_none_and_logs(
+    tmp_path, monkeypatch, caplog
+):
+    """A corrupt region cache file -> None for region_ids, and logs."""
+    cache_file = tmp_path / "regions_cache.json"
+    cache_file.write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setattr(system_cache, "REGION_CACHE_FILE", str(cache_file))
+
+    with caplog.at_level("ERROR"):
+        assert system_cache.load_region_ids_cache() is None
+    assert any(
+        "Failed to load region id cache" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_load_cache_corrupt_returns_none_and_logs(
+    tmp_path, monkeypatch, caplog
+):
+    """A corrupt system cache file -> None, and the failure is logged."""
+    cache_file = tmp_path / "systems_cache.json"
+    cache_file.write_text("{ not valid json", encoding="utf-8")
+    monkeypatch.setattr(system_cache, "CACHE_FILE", str(cache_file))
+
+    with caplog.at_level("ERROR"):
+        assert system_cache.load_cache() is None
+    assert any(
+        "Failed to load system cache" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_save_cache_uses_atomic_write(tmp_path, monkeypatch):
+    """save_cache persists via atomic_write_json (round-trips through disk)."""
+    cache_file = tmp_path / "systems_cache.json"
+    monkeypatch.setattr(system_cache, "CACHE_FILE", str(cache_file))
+
+    system_cache.save_cache({"Jita": 30000142})
+
+    # No leftover temp file from the atomic write.
+    assert not (tmp_path / "systems_cache.json.tmp").exists()
+    with open(cache_file) as f:
+        data = json.load(f)
+    assert data["systems"] == {"Jita": 30000142}
+    assert "timestamp" in data
+
+
 # ── save / load round-trip + backward compat ────────────────────────────────
 
 

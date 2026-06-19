@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 import jump_range
 from jump_range import (
@@ -241,3 +242,55 @@ def test_range_to_targets_marks_range_and_legality(mocker):
     assert by_id[10]["in_range"] is True and by_id[10]["legal_destination"] is True
     assert by_id[11]["in_range"] is False and by_id[11]["legal_destination"] is False
     assert by_id[12]["distance_ly"] is None and by_id[12]["in_range"] is False
+
+
+def test_search_system_logs_on_esi_exception(mocker, caplog):
+    # An ESI request that raises (network down) must be logged AND still
+    # return None — so callers can distinguish "ESI down" from "no such system".
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
+    mocker.patch("jump_range.rate_limit")
+    mocker.patch("jump_range.requests.post",
+                 side_effect=requests.RequestException("boom"))
+    jump_range._system_name_cache.pop("downsystem", None)
+
+    with caplog.at_level("ERROR"):
+        result = jump_range.search_system("DownSystem")
+
+    assert result is None
+    assert any("search_system" in r.message for r in caplog.records)
+
+
+def test_search_system_no_results_does_not_log_esi_error(mocker, caplog):
+    # A clean "no such system" response must NOT log an ESI-failure line.
+    mocker.patch("jump_range.system_coords.resolve_name", return_value=None)
+    mocker.patch("jump_range.rate_limit")
+    fake_resp = mocker.MagicMock()
+    fake_resp.ok = True
+    fake_resp.json.return_value = {"systems": []}
+    mocker.patch("jump_range.requests.post", return_value=fake_resp)
+    jump_range._system_name_cache.pop("nosuchsystem", None)
+
+    with caplog.at_level("ERROR"):
+        result = jump_range.search_system("NoSuchSystem")
+
+    assert result is None
+    assert not any("search_system" in r.message for r in caplog.records)
+
+
+def test_get_system_info_logs_on_esi_exception(mocker, caplog):
+    # ESI failure inside get_system_info is logged and returns None.
+    mocker.patch("jump_range.rate_limit")
+    mocker.patch("jump_range.requests.get",
+                 side_effect=requests.RequestException("boom"))
+    jump_range._system_disk_cache.pop("99999999", None)
+
+    with caplog.at_level("ERROR"):
+        result = jump_range.get_system_info(99999999)
+
+    assert result is None
+    assert any("get_system_info" in r.message for r in caplog.records)
+
+
+def test_find_systems_in_range_method_removed():
+    # Dead method superseded by system_coords.systems_within_range.
+    assert not hasattr(JumpRangeChecker, "find_systems_in_range")

@@ -1557,3 +1557,114 @@ def test_load_all_tokens_accepts_default_secret(tmp_path, monkeypatch, mocker):
     assert accounts[0]._use_pkce is True
     assert accounts[0].character_id == 123
     assert accounts[0]._refresh_token == "legacy-rt"
+
+
+# ── Rate limiting (paces ESI requests; never changes return values) ──────────
+
+
+def _stub_token(auth):
+    """Give an auth instance a valid in-memory access token so the low-level
+    helpers proceed to the HTTP call without triggering a refresh."""
+    auth._access_token = "valid-access-token"
+    auth._refresh_token = "refresh"
+    auth._expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+
+
+def test_esi_get_calls_rate_limit_before_request(tmp_path, mocker):
+    """esi_get paces via rate_limit('esi') before issuing the GET, and the
+    rate-limit call does not alter the returned payload."""
+    auth = _make_auth(tmp_path)
+    _stub_token(auth)
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        auth._session, "get",
+        return_value=_FakeResponse(200, {"ok": 1}),
+    )
+    assert auth.esi_get("/characters/1/location/") == {"ok": 1}
+    rl.assert_called_once_with("esi")
+
+
+def test_esi_post_calls_rate_limit_before_request(tmp_path, mocker):
+    auth = _make_auth(tmp_path)
+    _stub_token(auth)
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        auth._session, "post",
+        return_value=_FakeResponse(200, {"posted": True}),
+    )
+    assert auth.esi_post("/some/path/", {"a": 1}) == {"posted": True}
+    rl.assert_called_once_with("esi")
+
+
+def test_esi_put_calls_rate_limit_before_request(tmp_path, mocker):
+    auth = _make_auth(tmp_path)
+    _stub_token(auth)
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        auth._session, "put", return_value=_FakeResponse(204),
+    )
+    assert auth.esi_put("/fleets/1/", {"motd": "x"}) is True
+    rl.assert_called_once_with("esi")
+
+
+def test_esi_delete_calls_rate_limit_before_request(tmp_path, mocker):
+    auth = _make_auth(tmp_path)
+    _stub_token(auth)
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        auth._session, "delete", return_value=_FakeResponse(204),
+    )
+    assert auth.esi_delete("/characters/1/fittings/2/") is True
+    rl.assert_called_once_with("esi")
+
+
+def test_esi_post_public_calls_rate_limit_before_request(mocker):
+    """The public (no-auth) POST is paced too, and still returns the payload."""
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        esi_auth.requests, "post",
+        return_value=_FakeResponse(200, [{"id": 1, "name": "Jita"}]),
+    )
+    out = ESIAuth.esi_post_public("/universe/names/", [30000142])
+    assert out == [{"id": 1, "name": "Jita"}]
+    rl.assert_called_once_with("esi")
+
+
+def test_esi_post_public_logs_on_exception(mocker):
+    """A network error in the public POST is logged (no longer a silent pass)
+    and still returns None."""
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+    mocker.patch.object(
+        esi_auth.requests, "post", side_effect=RuntimeError("boom"),
+    )
+    log_spy = mocker.patch.object(esi_auth.log, "exception")
+    assert ESIAuth.esi_post_public("/universe/ids/", ["X"]) is None
+    rl.assert_called_once_with("esi")
+    log_spy.assert_called_once()
+
+
+def test_get_assets_rate_limits_each_page(tmp_path, mocker):
+    """Each paginated assets request is paced; the flattened list is unchanged
+    by the rate-limit calls."""
+    auth = _make_auth(tmp_path)
+    auth._character_id = 100
+    _stub_token(auth)
+    rl = mocker.patch.object(esi_auth, "rate_limit")
+
+    pages = {
+        1: _FakeResponse(200, [{"item_id": 1}]),
+        2: _FakeResponse(200, [{"item_id": 2}]),
+    }
+    for r in pages.values():
+        r.headers = {"x-pages": "2"}
+
+    def fake_get(url, headers=None, params=None, timeout=None, **kw):
+        return pages[params["page"]]
+
+    mocker.patch.object(auth._session, "get", side_effect=fake_get)
+    out = auth.get_assets()
+    assert out == [{"item_id": 1}, {"item_id": 2}]
+    # One rate-limit call per page request.
+    assert rl.call_count == 2
+    for c in rl.call_args_list:
+        assert c.args == ("esi",)

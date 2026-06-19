@@ -14,10 +14,12 @@ import threading
 from collections import deque
 from rate_limiter import rate_limit
 from app_path import app_dir, bundle_dir
+from app_io import atomic_write_json
+from app_log import get_logger
+from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
 import system_coords
 
-ESI_BASE = "https://esi.evetech.net/latest"
-HEADERS = {"User-Agent": "FCTool/1.0 (EVE FC Assistant)"}
+log = get_logger(__name__)
 
 # 1 light year in meters — CCP's official in-game value: 9,460,000,000,000,000.0 m (9.46e15).
 # Source: EVE map-data developer docs. Used for jump-drive LY distance calculations.
@@ -44,6 +46,7 @@ def _load_caches():
                 _route_disk_cache = json.load(f)
             print(f"[Cache] Loaded {len(_route_disk_cache)} cached routes")
     except Exception:
+        log.warning("Route cache unreadable/corrupt; ignoring", exc_info=True)
         _route_disk_cache = {}
     try:
         if os.path.exists(_SYSTEM_CACHE_FILE):
@@ -53,6 +56,7 @@ def _load_caches():
             _system_name_cache = data.get("names", {})
             print(f"[Cache] Loaded {len(_system_disk_cache)} systems, {len(_system_name_cache)} name lookups")
     except Exception:
+        log.warning("System cache unreadable/corrupt; ignoring", exc_info=True)
         _system_disk_cache = {}
         _system_name_cache = {}
 
@@ -64,13 +68,15 @@ def save_route_cache():
         return
     try:
         with _cache_lock:
-            with open(_ROUTE_CACHE_FILE, "w") as f:
-                json.dump(_route_disk_cache, f)
-            with open(_SYSTEM_CACHE_FILE, "w") as f:
-                json.dump({"systems": _system_disk_cache, "names": _system_name_cache}, f)
+            atomic_write_json(_ROUTE_CACHE_FILE, _route_disk_cache, indent=None)
+            atomic_write_json(
+                _SYSTEM_CACHE_FILE,
+                {"systems": _system_disk_cache, "names": _system_name_cache},
+                indent=None,
+            )
             _cache_dirty = False
     except Exception:
-        pass
+        log.exception("Failed to save jump-range caches to disk")
 
 
 # Load on import
@@ -114,7 +120,11 @@ def _load_stargate_graph():
                 print(f"[Graph] Loaded stargate graph: {len(_stargate_graph)} systems")
                 return
             except Exception:
-                pass
+                log.warning(
+                    "Stargate graph cache unreadable/corrupt (%s); will re-download",
+                    jumps_file,
+                    exc_info=True,
+                )
 
         # Download from fuzzwork SDE
         try:
@@ -133,8 +143,7 @@ def _load_stargate_graph():
 
                 # Save to disk
                 serializable = {str(k): list(v) for k, v in _stargate_graph.items()}
-                with open(_JUMPS_CACHE_FILE, "w") as f:
-                    json.dump(serializable, f)
+                atomic_write_json(_JUMPS_CACHE_FILE, serializable, indent=None)
                 _stargate_graph_loaded = True
                 print(f"[Graph] Downloaded stargate graph: {len(_stargate_graph)} systems")
         except Exception as e:
@@ -218,7 +227,8 @@ def get_system_info(system_id: int) -> dict | None:
                 _cache_dirty = True
             return data
     except Exception:
-        pass
+        # ESI unreachable/error — distinct from a valid "no such system".
+        log.exception("get_system_info: ESI request failed for system %s", system_id)
     return None
 
 
@@ -256,7 +266,8 @@ def search_system(name: str) -> int | None:
                     _cache_dirty = True
                 return result_id
     except Exception:
-        pass
+        # ESI unreachable/error — distinct from a valid "no such system".
+        log.exception("search_system: ESI request failed for name %r", name)
     return None
 
 
@@ -421,11 +432,3 @@ class JumpRangeChecker:
                 "legal_destination": system_coords.is_legal_jump_destination(tid),
             })
         return rows
-
-    def find_systems_in_range(self, origin: str, system_list: list[str]) -> list[dict]:
-        """Check which systems from a list are in jump range."""
-        results = []
-        for system_name in system_list:
-            result = self.check_range(origin, system_name)
-            results.append(result)
-        return [r for r in results if r.get("in_range")]

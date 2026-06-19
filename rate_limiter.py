@@ -21,7 +21,6 @@ class RateLimiter:
         "esi": {"calls_per_second": 15, "burst": 30},       # ESI allows ~20/s, we use 15
         "zkill_api": {"calls_per_second": 1, "burst": 2},   # zKill REST is strict
         "evescout": {"calls_per_second": 1, "burst": 3},    # EVE Scout: be polite
-        "discord": {"calls_per_second": 2, "burst": 5},     # Discord webhook ~5/s
     }
 
     def __init__(self):
@@ -53,15 +52,6 @@ class RateLimiter:
 
             # Sleep outside the lock so other threads/endpoints aren't blocked
             time.sleep(max(0.01, wait_time))
-
-    def get_stats(self) -> dict[str, int]:
-        """Get current call counts per endpoint (in last second)."""
-        now = time.monotonic()
-        stats = {}
-        for ep, times in self._call_times.items():
-            recent = [t for t in times if now - t < 1.0]
-            stats[ep] = len(recent)
-        return stats
 
 
 # Global singleton

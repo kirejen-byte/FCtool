@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -46,6 +47,38 @@ def test_save_then_load(tmp_path):
     assert cache2.friendly_ids == {10, 20}
     assert cache2.hostile_ids == {30}
     assert cache2.source_character_id == 99
+
+
+def test_load_corrupt_file_logs_and_resets(tmp_path, caplog):
+    """A corrupt cache file is discarded (left empty) and the discard is logged."""
+    path = tmp_path / "corrupt.json"
+    path.write_text("{ this is not valid json ")
+    cache = StandingsCache(path=str(path))
+    cache.friendly_ids = {1}  # pre-existing state must be left untouched on failure
+    cache.hostile_ids = {2}
+    with caplog.at_level(logging.WARNING):
+        cache.load()
+    # load() returns early on corruption, leaving the in-memory state as-is.
+    assert cache.friendly_ids == {1}
+    assert cache.hostile_ids == {2}
+    assert any("corrupt" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_save_round_trip_is_valid_json(tmp_path):
+    """save() (now via atomic_write_json) writes a fully-valid, re-loadable file."""
+    path = tmp_path / "rt.json"
+    cache = StandingsCache(path=str(path))
+    cache.friendly_ids = {5, 6}
+    cache.hostile_ids = {7}
+    cache.fetched_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    cache.source_character_id = 11
+    cache.save()
+    # No orphan temp file left behind by the atomic write.
+    assert not (tmp_path / "rt.json.tmp").exists()
+    on_disk = json.loads(path.read_text())
+    assert on_disk["friendly_ids"] == [5, 6]
+    assert on_disk["hostile_ids"] == [7]
+    assert on_disk["source_character_id"] == 11
 
 
 def test_is_stale_when_old(tmp_path):
