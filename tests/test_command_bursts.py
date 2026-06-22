@@ -87,8 +87,8 @@ def test_evaluate_missing_data_is_unknown():
     assert evaluate_discipline(SHIELD, UNKNOWN_HULL, group_id=None) is Verdict.UNKNOWN
 
 
-def test_hull_table_covers_sixteen_hulls():
-    assert len(HULL_BURST_BONUS) == 16
+def test_hull_table_covers_all_bonused_hulls():
+    assert len(HULL_BURST_BONUS) == 28
 
 
 from command_bursts import (
@@ -159,3 +159,45 @@ def test_glyph_and_text_helpers_cover_all_verdicts():
     assert "bonused" in verdict_text(Verdict.BONUSED, "Shield", ["Active Shielding Charge"])
     assert "subsystem" in verdict_text(Verdict.BONUSED_CONDITIONAL, "Shield", ["x"])
     assert "cannot fit" in verdict_text(Verdict.CANT_FIT, "Shield", ["x"], ship_name="Rifter")
+
+
+# ── Capital hull verdicts ─────────────────────────────────────────────────────
+GRP_CARRIER = 547
+GRP_FAX = 1538
+GRP_TITAN = 30
+
+ARCHON = 23757    # Amarr Carrier  — Armor + Information
+APOSTLE = 37604   # Amarr FAX      — Armor + Information
+CHIMERA = 23915   # Caldari Carrier — Shield + Information
+AVATAR = 11567    # Amarr Titan    — no strength bonus (range only)
+
+
+def test_carrier_bonused_for_correct_disciplines():
+    assert evaluate_discipline(ARMOR, ARCHON, group_id=GRP_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, ARCHON, group_id=GRP_CARRIER) is Verdict.BONUSED
+
+
+def test_carrier_not_bonused_for_wrong_discipline():
+    assert evaluate_discipline(SKIRMISH, ARCHON, group_id=GRP_CARRIER) is Verdict.FITS_NO_BONUS
+    assert evaluate_discipline(SHIELD, ARCHON, group_id=GRP_CARRIER) is Verdict.FITS_NO_BONUS
+
+
+def test_fax_has_two_bonused_disciplines():
+    assert evaluate_discipline(ARMOR, APOSTLE, group_id=GRP_FAX) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, APOSTLE, group_id=GRP_FAX) is Verdict.BONUSED
+
+
+def test_fax_not_bonused_for_wrong_discipline():
+    assert evaluate_discipline(SHIELD, APOSTLE, group_id=GRP_FAX) is Verdict.FITS_NO_BONUS
+    assert evaluate_discipline(SKIRMISH, APOSTLE, group_id=GRP_FAX) is Verdict.FITS_NO_BONUS
+
+
+def test_caldari_carrier_bonused_for_shield_and_information():
+    assert evaluate_discipline(SHIELD, CHIMERA, group_id=GRP_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, CHIMERA, group_id=GRP_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(ARMOR, CHIMERA, group_id=GRP_CARRIER) is Verdict.FITS_NO_BONUS
+
+
+def test_titan_fits_no_bonus_any_discipline():
+    assert evaluate_discipline(ARMOR, AVATAR, group_id=GRP_TITAN) is Verdict.FITS_NO_BONUS
+    assert evaluate_discipline(INFORMATION, AVATAR, group_id=GRP_TITAN) is Verdict.FITS_NO_BONUS
