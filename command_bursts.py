@@ -114,6 +114,21 @@ HULL_BURST_BONUS: dict[int, frozenset[str]] = {
     29984: frozenset({SHIELD, INFORMATION, SKIRMISH}),  # Tengu
     29988: frozenset({ARMOR, INFORMATION, SKIRMISH}),   # Proteus
     29990: frozenset({ARMOR, SHIELD, SKIRMISH}),        # Loki
+    # Carriers (group 547)
+    23757: frozenset({ARMOR, INFORMATION}),  # Archon    (Amarr)
+    23911: frozenset({ARMOR, SKIRMISH}),     # Thanatos  (Gallente)
+    23915: frozenset({SHIELD, INFORMATION}), # Chimera   (Caldari)
+    24483: frozenset({SHIELD, SKIRMISH}),    # Nidhoggur (Minmatar)
+    # Force Auxiliaries (group 1538)
+    37604: frozenset({ARMOR, INFORMATION}),  # Apostle   (Amarr)
+    37607: frozenset({ARMOR, SKIRMISH}),     # Ninazu    (Gallente)
+    37606: frozenset({SHIELD, SKIRMISH}),    # Lif       (Minmatar)
+    37605: frozenset({SHIELD, INFORMATION}), # Minokawa  (Caldari)
+    # Supercarriers (group 659)
+    23919: frozenset({ARMOR, INFORMATION}),  # Aeon      (Amarr)
+    23913: frozenset({ARMOR, SKIRMISH}),     # Nyx       (Gallente)
+    23917: frozenset({SHIELD, INFORMATION}), # Wyvern    (Caldari)
+    22852: frozenset({SHIELD, SKIRMISH}),    # Hel       (Minmatar)
 }
 
 T3C_HULL_IDS: frozenset[int] = frozenset({29986, 29984, 29988, 29990})
