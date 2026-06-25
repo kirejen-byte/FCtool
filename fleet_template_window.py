@@ -882,6 +882,14 @@ class FleetTemplateWindow:
         # UI sync read every ~30 s (spec §9 budget).
         self._sync_after_id = self.win.after(30_000, self._sync_tick)
 
+    def _post(self, fn, *args):
+        """Schedule fn on the Tk thread from a worker; ignore TclError if the
+        window was destroyed mid-flight (the daemon worker outlived the GUI)."""
+        try:
+            self.win.after(0, fn, *args)
+        except tk.TclError:
+            pass
+
     def _sync_tick(self):
         if self.mode != "live":
             return
@@ -899,18 +907,19 @@ class FleetTemplateWindow:
             structure, members = {"wings": []}, []
             try:
                 structure = {"wings": fleet_esi.get_wings(session, self._fleet_id)}
-                from esi_auth import ESIAuth  # only for type clarity; not required
-                members = self._read_members(session)
+                # Enrich (name + ship_class resolution) HERE, off the Tk thread —
+                # ship_class_label may hit ESI on cache-miss.
+                members = self._enrich_members(self._read_members(session))
             except fleet_esi.FleetESIError as e:
                 err = e
-            self.win.after(0, _done, structure, members, err)
+            self._post(_done, structure, members, err)
 
         def _done(structure, members, err):
             if err is not None:
                 self._status.config(text=f"Sync failed: {err.reason}", fg=FG_RED)
                 return
             self._live_structure = structure
-            self._live_members = self._enrich_members(members)
+            self._live_members = members          # already enriched on the worker
             self._status.config(text="● Synced", fg=FG_GREEN)
             self._reload_tree()
 
@@ -1013,9 +1022,9 @@ class FleetTemplateWindow:
                                           wing_id=wing_id, squad_id=squad_id,
                                           role=mv.target_role)
                     done += 1
-                    self.win.after(0, lambda d=done, n=len(moves):
-                                   self._status.config(text=f"Moving pilots… {d}/{n}",
-                                                       fg=FG_ACCENT))
+                    self._post(lambda d=done, n=len(moves):
+                               self._status.config(text=f"Moving pilots… {d}/{n}",
+                                                   fg=FG_ACCENT))
                 except fleet_esi.FleetESIError as e:
                     if e.reason == "boss_lost":
                         abort = e
@@ -1023,9 +1032,12 @@ class FleetTemplateWindow:
                     skipped += 1   # 404 pilot-left / other → skip, continue
                 import time
                 time.sleep(0.5)    # sequential pacing (spec §8)
-            self.win.after(0, _finish, done, skipped, abort)
+            self._post(_finish, done, skipped, abort)
 
         def _finish(done, skipped, abort):
+            if done:
+                import time
+                self._last_write_monotonic = time.monotonic()
             if abort is not None:
                 messagebox.showerror("Apply aborted",
                                      "Lost fleet-boss role (403). No further moves "
@@ -1090,7 +1102,7 @@ class FleetTemplateWindow:
                     members, structure, max_sizes=max_sizes)
             except fleet_esi.FleetESIError as e:
                 err = e
-            self.win.after(0, _apply_action, structure, action, err)
+            self._post(_apply_action, structure, action, err)
 
         def _apply_action(structure, action, err):
             self._live_structure = structure
@@ -1135,7 +1147,7 @@ class FleetTemplateWindow:
                                       role="squad_member")
             except fleet_esi.FleetESIError as e:
                 err = e
-            self.win.after(0, _done, err)
+            self._post(_done, err)
 
         def _done(err):
             import time
