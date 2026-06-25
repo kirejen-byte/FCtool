@@ -424,8 +424,174 @@ class FleetTemplateWindow:
     def _on_drag_drop(self, event): self._drag_item = None   # Task D8
     def _manual_assign(self, path): pass              # Task D5
 
-    def _build_rules_tab(self): pass            # Task D3
-    def _reload_rules(self): pass               # Task D3
+    def _build_rules_tab(self):
+        top = tk.Frame(self._rules_tab, bg=BG_PANEL)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="+ Add Rule", style="Dark.TButton",
+                   command=self._add_rule).pack(side=tk.LEFT, padx=6, pady=4)
+        ttk.Button(top, text="Test Rules", style="Dark.TButton",
+                   command=self._test_rules).pack(side=tk.LEFT, padx=2)
+        self._rules_hint = tk.Label(top, text="", font=("Consolas", 8),
+                                    fg=FG_YELLOW, bg=BG_PANEL)
+        self._rules_hint.pack(side=tk.LEFT, padx=6)
+        self._rules_list = tk.Frame(self._rules_tab, bg=BG_PANEL)
+        self._rules_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._reload_rules()
+
+    def _wing_names(self):
+        t = self.current_template()
+        return [""] + [w.name for w in (t.wings if t else [])]
+
+    def _squad_names(self):
+        t = self.current_template()
+        names = [""]
+        for w in (t.wings if t else []):
+            names += [s.name for s in w.squads]
+        return names
+
+    def _reload_rules(self):
+        for child in self._rules_list.winfo_children():
+            child.destroy()
+        t = self.current_template()
+        if t is None:
+            return
+        doctrine_active = self._doctrine_provider() is not None
+        self._rules_hint.config(
+            text="" if doctrine_active else "No doctrine active — tag rules inactive")
+        t.rules.sort(key=lambda r: r.priority)
+        for idx, rule in enumerate(t.rules):
+            self._render_rule_row(idx, rule, doctrine_active)
+
+    def _render_rule_row(self, idx, rule, doctrine_active):
+        row = tk.Frame(self._rules_list, bg=BG_PANEL)
+        row.pack(fill=tk.X, pady=1)
+        inactive = (rule.condition.type == "doctrine_tag" and not doctrine_active)
+        fg = FG_DIM if (inactive or rule.broken) else FG_TEXT
+
+        ttk.Button(row, text="↑", width=2, style="Dark.TButton",
+                   command=lambda: self._move_rule(idx, -1)).pack(side=tk.LEFT)
+        ttk.Button(row, text="↓", width=2, style="Dark.TButton",
+                   command=lambda: self._move_rule(idx, +1)).pack(side=tk.LEFT)
+
+        warn = "⚠ " if rule.broken else ""
+        tk.Label(row, text=f"{warn}IF", fg=fg, bg=BG_PANEL,
+                 font=("Consolas", 9)).pack(side=tk.LEFT, padx=2)
+
+        ctype = ttk.Combobox(row, values=CONDITION_TYPES, width=11, state="readonly")
+        ctype.set(rule.condition.type)
+        ctype.pack(side=tk.LEFT, padx=1)
+        ctype.bind("<<ComboboxSelected>>",
+                   lambda e: self._update_rule(idx, ctype=ctype.get()))
+
+        cval = ttk.Combobox(row, width=16, values=self._condition_values(rule.condition.type))
+        cval.set(rule.condition.value)
+        cval.pack(side=tk.LEFT, padx=1)
+        cval.bind("<FocusOut>", lambda e: self._update_rule(idx, cval=cval.get()))
+        cval.bind("<<ComboboxSelected>>", lambda e: self._update_rule(idx, cval=cval.get()))
+
+        tk.Label(row, text="→", fg=fg, bg=BG_PANEL).pack(side=tk.LEFT, padx=2)
+
+        role = ttk.Combobox(row, values=ROLE_VALUES, width=15, state="readonly")
+        role.set(rule.action.role)
+        role.pack(side=tk.LEFT, padx=1)
+        role.bind("<<ComboboxSelected>>", lambda e: self._update_rule(idx, role=role.get()))
+
+        wing = ttk.Combobox(row, values=self._wing_names(), width=10, state="readonly")
+        wing.set(rule.action.wing_name or "")
+        wing.pack(side=tk.LEFT, padx=1)
+        wing.bind("<<ComboboxSelected>>", lambda e: self._update_rule(idx, wing=wing.get()))
+
+        squad = ttk.Combobox(row, values=self._squad_names(), width=10, state="readonly")
+        squad.set(rule.action.squad_name or "")
+        squad.pack(side=tk.LEFT, padx=1)
+        squad.bind("<<ComboboxSelected>>", lambda e: self._update_rule(idx, squad=squad.get()))
+
+        ttk.Button(row, text="✕", width=2, style="Red.TButton",
+                   command=lambda: self._delete_rule(idx)).pack(side=tk.LEFT, padx=2)
+
+    def _condition_values(self, ctype):
+        if ctype == "doctrine_tag":
+            return list(getattr(self.fittings, "tags", []))
+        if ctype == "character":
+            return sorted(self._character_names_provider())
+        return []   # ship_type / ship_class: free text
+
+    def _add_rule(self):
+        t = self.current_template()
+        if t is None:
+            return
+        t.rules.append(AssignmentRule(
+            priority=len(t.rules),
+            condition=RuleCondition("ship_type", ""),
+            action=RuleAction("squad_member", None, None)))
+        self._renumber_and_save()
+
+    def _update_rule(self, idx, *, ctype=None, cval=None, role=None, wing=None, squad=None):
+        t = self.current_template()
+        if t is None or idx >= len(t.rules):
+            return
+        r = t.rules[idx]
+        if ctype is not None:
+            r.condition.type = ctype
+        if cval is not None:
+            r.condition.value = cval
+        if role is not None:
+            r.action.role = role
+        if wing is not None:
+            r.action.wing_name = wing or None
+        if squad is not None:
+            r.action.squad_name = squad or None
+        validate_template(t)
+        self.store.save()
+        self._reload_rules()
+
+    def _move_rule(self, idx, delta):
+        t = self.current_template()
+        j = idx + delta
+        if t is None or not (0 <= j < len(t.rules)):
+            return
+        t.rules[idx], t.rules[j] = t.rules[j], t.rules[idx]
+        self._renumber_and_save()
+
+    def _delete_rule(self, idx):
+        t = self.current_template()
+        if t is None or idx >= len(t.rules):
+            return
+        del t.rules[idx]
+        self._renumber_and_save()
+
+    def _renumber_and_save(self):
+        t = self.current_template()
+        for i, r in enumerate(t.rules):
+            r.priority = i
+        validate_template(t)
+        self.store.save()
+        self._reload_rules()
+
+    def _test_rules(self):
+        """Preview the rules. Live mode: dry-run compose() against the real fleet
+        and report move/unfilled/unassigned counts + warnings. Template mode:
+        static validation summary (broken-ref count)."""
+        t = self.current_template()
+        if t is None:
+            return
+        if self.mode != "live":
+            broken = sum(1 for r in t.rules if r.broken)
+            messagebox.showinfo(
+                "Test Rules",
+                f"{len(t.rules)} rules, {broken} broken (⚠).\n"
+                "Switch to Live mode to dry-run against the real fleet.",
+                parent=self.win)
+            return
+        res = self._compose_preview()
+        if res is None:
+            return
+        s = fleet_composer.summarize_moves(res)
+        lines = [f"{s['executable']} moves, {s['unfilled']} slots unfilled, "
+                 f"{s['unassigned']} unassigned."]
+        lines += res.warnings[:10]
+        messagebox.showinfo("Test Rules", "\n".join(lines), parent=self.win)
+
     def _build_settings_tab(self): pass         # Task D4
     def _reload_settings(self): pass            # Task D4
     def _enter_live_mode(self): pass            # Task D5
