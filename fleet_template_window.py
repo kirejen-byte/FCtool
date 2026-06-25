@@ -42,6 +42,14 @@ ROLE_ABBR = {"squad_member": "", "squad_commander": "SC",
              "wing_commander": "WC", "fleet_commander": "FC"}
 CONDITION_TYPES = ["ship_type", "ship_class", "character", "doctrine_tag"]
 
+# group_id → ship_class rule label (covers the doctrine-relevant hull groups).
+_GROUP_LABELS = {
+    540: "Command Ship", 1534: "Command Destroyer", 832: "Logistics Cruiser",
+    1527: "Logistics Frigate", 963: "Strategic Cruiser", 547: "Carrier",
+    1538: "Force Auxiliary", 485: "Dreadnought", 30: "Titan", 659: "Supercarrier",
+    1201: "Combat Battlecruiser", 419: "Combat Battlecruiser",
+}
+
 
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
@@ -422,7 +430,6 @@ class FleetTemplateWindow:
     def _on_drag_start(self, event): self._drag_item = self._tree.identify_row(event.y)
     def _on_drag_motion(self, event): pass            # Task D8
     def _on_drag_drop(self, event): self._drag_item = None   # Task D8
-    def _manual_assign(self, path): pass              # Task D5
 
     def _build_rules_tab(self):
         top = tk.Frame(self._rules_tab, bg=BG_PANEL)
@@ -638,8 +645,138 @@ class FleetTemplateWindow:
             setattr(t.settings, key, val)
         self.store.save()
 
-    def _enter_live_mode(self): pass            # Task D5
-    def _exit_live_mode(self): pass             # Task D5
+    def ship_class_label(self, type_id):
+        """Human label for a hull's group (for ship_class rule conditions)."""
+        if not type_id:
+            return None
+        try:
+            import ship_classes
+            gid = ship_classes.get_group_id(type_id)
+        except Exception:
+            return None
+        return _GROUP_LABELS.get(gid)
+
+    def _enrich_members(self, raw_members):
+        """ESI member dicts → composer-shaped dicts. Runs on the background sync
+        worker (see _sync_live), so the name/ship-class resolution here may hit
+        ESI without blocking the UI thread."""
+        from zkill_monitor import resolve_name
+        out = []
+        for m in raw_members:
+            cid = m.get("character_id")
+            tid = m.get("ship_type_id")
+            out.append({
+                "character_id": cid,
+                "name": resolve_name(cid, "character") if cid else "",
+                "ship_type_id": tid,
+                "ship_type_name": resolve_name(tid, "type") if tid else "",
+                "ship_class": self.ship_class_label(tid),   # pre-resolve off the Tk thread
+                "role": m.get("role", "squad_member"),
+                "wing_id": m.get("wing_id"),
+                "squad_id": m.get("squad_id"),
+                "join_time": m.get("join_time") or "",
+            })
+        return out
+
+    def _enter_live_mode(self):
+        info = self._fleet_info_provider()
+        if not info or not info.get("is_boss"):
+            messagebox.showwarning(
+                "Live mode unavailable",
+                "The selected FC character must be the current fleet boss to "
+                "read and manage fleet structure.", parent=self.win)
+            self.set_mode("template")
+            return
+        self._fleet_id = info["fleet_id"]
+        self._sync_live(initial=True)
+        self._schedule_sync()
+
+    def _exit_live_mode(self):
+        if self._sync_after_id:
+            try:
+                self.win.after_cancel(self._sync_after_id)
+            except Exception:
+                pass
+            self._sync_after_id = None
+        self._reload_tree()   # revert to stored template
+
+    def _schedule_sync(self):
+        # UI sync read every ~30 s (spec §9 budget).
+        self._sync_after_id = self.win.after(30_000, self._sync_tick)
+
+    def _sync_tick(self):
+        if self.mode != "live":
+            return
+        self._sync_live(initial=False)
+        self._schedule_sync()
+
+    def _sync_live(self, *, initial):
+        session = self._esi_session_provider()
+        if session is None:
+            self._status.config(text="No fleet-boss session.", fg=FG_RED)
+            return
+
+        def worker():
+            err = None
+            structure, members = {"wings": []}, []
+            try:
+                structure = {"wings": fleet_esi.get_wings(session, self._fleet_id)}
+                from esi_auth import ESIAuth  # only for type clarity; not required
+                members = self._read_members(session)
+            except fleet_esi.FleetESIError as e:
+                err = e
+            self.win.after(0, _done, structure, members, err)
+
+        def _done(structure, members, err):
+            if err is not None:
+                self._status.config(text=f"Sync failed: {err.reason}", fg=FG_RED)
+                return
+            self._live_structure = structure
+            self._live_members = self._enrich_members(members)
+            self._status.config(text="● Synced", fg=FG_GREEN)
+            self._reload_tree()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _read_members(self, session):
+        """GET /fleets/{id}/members/ via the session adapter."""
+        resp = fleet_esi._call(session, "GET",
+                               f"/fleets/{self._fleet_id}/members/", expect=(200,))
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def _compose_preview(self):
+        """Compose against the cached live snapshot and cache the result on
+        self._last_preview so the tree + Unassigned render share one compose()
+        call per reload (no network — ship_class is pre-resolved)."""
+        t = self.current_template()
+        if t is None:
+            self._last_preview = None
+            return None
+        self._last_preview = fleet_composer.compose(
+            t, self._live_members, self._live_structure,
+            doctrine=self._doctrine_provider(), fittings=self.fittings)
+        return self._last_preview
+
+    def _render_unassigned(self):
+        # Task D5 calls compose() here directly; Task D10 switches this to the
+        # cached self._last_preview so the tree + Unassigned share one compose().
+        res = self._compose_preview()
+        if res is None or not res.unassigned:
+            return
+        head = self._tree.insert("", "end", text="── Unassigned ──", open=True)
+        self._node_meta[head] = ("unassigned_header", ())
+        for m in res.unassigned:
+            nid = self._tree.insert(head, "end",
+                                    text=f"· {m['name']} — {m['ship_type_name']}")
+            self._node_meta[nid] = ("unassigned", (m["character_id"],))
+
+    def _manual_assign(self, path):
+        # path = (character_id,). Prompt for wing/squad then queue a single move.
+        messagebox.showinfo("Manual move",
+                            "Use drag-and-drop onto a squad to move this pilot.",
+                            parent=self.win)
+
     def _apply(self): pass                       # Task D6
     def _toggle_rebalance(self): pass            # Task D7
 
