@@ -427,9 +427,101 @@ class FleetTemplateWindow:
             return
         self._after_structure_change()
 
-    def _on_drag_start(self, event): self._drag_item = self._tree.identify_row(event.y)
-    def _on_drag_motion(self, event): pass            # Task D8
-    def _on_drag_drop(self, event): self._drag_item = None   # Task D8
+    def _on_drag_start(self, event):
+        item = self._tree.identify_row(event.y)
+        meta = self._node_meta.get(item)
+        # Slots and unassigned pilots are always draggable; whole squads are
+        # draggable in template mode only (live tree mirrors ESI structure).
+        draggable = {"slot", "unassigned"}
+        if self.mode == "template":
+            draggable.add("squad")
+        if meta and meta[0] in draggable:
+            self._drag_item = item
+        else:
+            self._drag_item = None
+
+    def _on_drag_motion(self, event):
+        if self._drag_item:
+            target = self._tree.identify_row(event.y)
+            self._tree.selection_set(target) if target else None
+
+    def _on_drag_drop(self, event):
+        src = self._drag_item
+        self._drag_item = None
+        if not src:
+            return
+        dst = self._tree.identify_row(event.y)
+        src_meta = self._node_meta.get(src)
+        dst_meta = self._node_meta.get(dst)
+        if not src_meta or not dst_meta:
+            return
+        # A dragged squad targets a WING (move the whole squad between wings).
+        if src_meta[0] == "squad":
+            dst_wing = self._wing_path_of(dst_meta)
+            if dst_wing is None:
+                self._flash_reject(dst)
+                return
+            self._drop_squad_into_wing(src_meta[1], dst_wing)
+            return
+        # Slots / pilots target a SQUAD (squad node or a slot's parent squad).
+        dst_squad = self._squad_path_of(dst_meta)
+        if dst_squad is None:
+            self._flash_reject(dst)
+            return
+        if src_meta[0] == "slot":
+            self._drop_slot_into_squad(src_meta[1], dst_squad)
+        elif src_meta[0] == "unassigned" and self.mode == "live":
+            self._drop_pilot_into_squad(src_meta[1][0], dst_squad)
+
+    def _squad_path_of(self, meta):
+        kind, path = meta
+        if kind == "squad":
+            return path
+        if kind == "slot":
+            return (path[0], path[1])
+        return None
+
+    def _wing_path_of(self, meta):
+        kind, path = meta
+        if kind in ("wing", "squad", "slot"):
+            return (path[0],)
+        return None
+
+    def _drop_squad_into_wing(self, squad_path, wing_path):
+        wi, si = squad_path
+        twi = wing_path[0]
+        if twi == wi:
+            return   # same wing → no-op
+        t = self.current_template()
+        squad = t.wings[wi].squads.pop(si)
+        t.wings[twi].squads.append(squad)
+        self._after_structure_change()
+
+    def _drop_slot_into_squad(self, slot_path, squad_path):
+        wi, si, li = slot_path
+        t = self.current_template()
+        slot = t.wings[wi].squads[si].slots.pop(li)
+        t.wings[squad_path[0]].squads[squad_path[1]].slots.append(slot)
+        self._after_structure_change()
+
+    def _drop_pilot_into_squad(self, character_id, squad_path):
+        # Live: queue a single ESI move for this pilot into the target squad.
+        session = self._esi_session_provider()
+        if session is None:
+            return
+        t = self.current_template()
+        wing = t.wings[squad_path[0]]
+        squad = wing.squads[squad_path[1]]
+        mv = fleet_composer.Move(pilot_id=character_id, pilot_name="",
+                                 target_wing_name=wing.name,
+                                 target_squad_name=squad.name,
+                                 target_role="squad_member")
+        self._execute_moves(session, [mv])
+
+    def _flash_reject(self, item):
+        if not item:
+            return
+        self._status.config(text="Invalid drop target.", fg=FG_YELLOW)
 
     def _build_rules_tab(self):
         top = tk.Frame(self._rules_tab, bg=BG_PANEL)
