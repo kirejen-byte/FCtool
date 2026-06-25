@@ -102,3 +102,14 @@ def test_validate_flags_broken_wing_and_squad_refs():
     )
     validate_template(t)
     assert [r.broken for r in t.rules] == [False, True, True, False, True]
+
+
+# append to tests/test_fleet_template_store.py
+def test_cache_character_dedups_case_insensitively(tmp_path):
+    store = FleetTemplateStore(str(tmp_path / "f.json"))
+    assert store.cache_character("Kyra Dawnfall") is True
+    assert store.cache_character("  kyra dawnfall  ") is False   # dup (ci, trimmed)
+    assert store.cache_character("Alt Pilot") is True
+    assert store.cache_character("") is False
+    assert store.cache_character("   ") is False
+    assert store.cached_characters == ["Kyra Dawnfall", "Alt Pilot"]

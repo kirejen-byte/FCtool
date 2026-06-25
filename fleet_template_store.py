@@ -238,6 +238,20 @@ class FleetTemplateStore:
     def delete_template(self, template_id: str) -> None:
         self.templates = [t for t in self.templates if t.id != template_id]
 
+    def cache_character(self, name: str) -> bool:
+        """Add a free-typed character name to the roster cache.
+
+        Trims whitespace; de-dupes case-insensitively, preserving the first-seen
+        casing. Returns True if a new name was added, False otherwise."""
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return False
+        lowered = cleaned.lower()
+        if any(c.lower() == lowered for c in self.cached_characters):
+            return False
+        self.cached_characters.append(cleaned)
+        return True
+
 
 # fleet_template_store.py — replace the placeholder validate_template
 def validate_template(template: FleetTemplate) -> None:
