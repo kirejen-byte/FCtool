@@ -682,6 +682,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# compose() synthesizes an implicit doctrine_tag rule per tagged slot, so it
+# needs the store's rule dataclasses.
+from fleet_template_store import AssignmentRule, RuleCondition, RuleAction
+
 # Lowest-priority sentinel so an implicit tag-rule never outranks a user rule.
 _IMPLICIT_PRIORITY = 1_000_000
 
