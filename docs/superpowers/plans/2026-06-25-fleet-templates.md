@@ -3562,3 +3562,18 @@ git commit -m "test(fleet-templates): verification pass — full suite green"
 **Deliberate v1 deferrals (beyond spec §13):** the §6 context-menu item **"Kick from fleet"** is intentionally omitted — it is a destructive ESI action outside the tool's "manage structure only" remit; revisit if requested. The §6 **"Assign role"** action for Unassigned pilots is folded into drag-drop / Move-to-squad. `overflow_strategy` is reserved (see §9 row).
 
 **Type-consistency check:** `Move`, `ComposeResult`, `RebalanceAction`, `FleetESIError`, `AuthEsiSession`, and the store dataclasses are named identically everywhere they appear (B1/B2/B4/C1/C3/D5/D6/D7/D10). Member dict keys (`character_id`, `name`, `ship_type_id`, `ship_type_name`, `ship_class`, `role`, `wing_id`, `squad_id`, `join_time`) match between `_enrich_members` (D5), `compose`/`_pilot_matches` (B2 — `ship_class` read directly, no callable), and `plan_rebalance` (B4). Live-structure shape (`{"wings":[{"id","name","squads":[{"id","name"}]}]}`) matches between `get_wings` (C2), `compose` (B2), `plan_rebalance` (B4), and the executors (D6/D7). The cached compose preview (`self._last_preview`) is written once per reload in `_reload_tree` (D10) and read by `_slot_match_map` + `_render_unassigned` (D10) — one `compose()` per reload.
+
+---
+
+## Post-implementation amendments (applied during the build, 2026-06-25)
+
+The feature was implemented from this plan; three independent review passes (composer, window, integration) surfaced fixes that are now in the code AND folded back into the relevant tasks above. Recorded here for traceability:
+
+1. **`fleet_composer` imports store rule dataclasses** (Task B1) — `compose()` synthesizes implicit `doctrine_tag` rules, so the module imports `AssignmentRule, RuleCondition, RuleAction` from `fleet_template_store`. (Caught in Phase B.)
+2. **Member enrichment runs off the Tk thread** (Task D5) — `ship_class` resolution (`ship_classes.get_group_id`, blocking on cache-miss) happens inside `_sync_live`'s worker, never in `_done`/on the main thread.
+3. **`_post` helper for all worker→UI dispatches** (Tasks D5–D7) — wraps `self.win.after(0, …)` and swallows `(tk.TclError, RuntimeError)` so a daemon ESI worker can't crash or print a traceback during window/app teardown.
+4. **Provider network calls moved off the main thread in recurring paths** — `_sync_live` and `_rebalance_tick` call `self._esi_session_provider()` (which does a blocking `get_fleet_info()`) *inside* their worker thread, not before `Thread.start()`. One-shot calls in `_apply` / `_enter_live_mode` stay on the main thread (user-initiated). The rebalancer worker threads the resolved `session` through `_apply_action` → `_execute_rebalance`.
+5. **Apply stamps the rebalancer cooldown** (Task D6) — `_execute_moves._finish` sets `self._last_write_monotonic` when ≥1 move succeeds, so an apply burst delays the next rebalancer move by `move_cooldown_s` (session-timer safety).
+6. **`FleetTemplateStore.load()` is crash-proof** (Task A2) — the per-template deserialization loop is wrapped in try/except so a corrupt `fleet_templates.json` is skipped-and-logged rather than crashing app startup. Regression test: `test_load_skips_malformed_template_entry_without_crashing`.
+
+**Final state:** 847 repo tests pass (43 fleet-specific); all five modules compile; `fc_gui` imports clean. Branch `feat/fleet-templates`.
