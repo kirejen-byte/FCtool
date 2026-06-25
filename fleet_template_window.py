@@ -281,6 +281,9 @@ class FleetTemplateWindow:
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._tree.tag_configure("inpos", foreground=FG_GREEN)   # in correct position
+        self._tree.tag_configure("moveme", foreground=FG_YELLOW)  # present, needs moving
+        self._tree.tag_configure("empty", foreground=FG_DIM)      # unfilled slot
         # node-id → ("wing"|"squad"|"slot"|"unassigned", path tuple)
         self._node_meta: dict[str, tuple] = {}
         self._tree.bind("<Button-3>", self._on_tree_right_click)
@@ -312,7 +315,11 @@ class FleetTemplateWindow:
         self._node_meta.clear()
         t = self.current_template()
         if t is None:
+            self._last_preview = None
             return
+        # Exactly one compose() per reload (live only); template mode skips it.
+        self._last_preview = self._compose_preview() if self.mode == "live" else None
+        match_map = self._slot_match_map() if self.mode == "live" else {}
         for wi, wing in enumerate(t.wings):
             cap = f"  (max {wing.max_size})" if wing.max_size else ""
             wid = self._tree.insert("", "end", text=f"▼ {wing.name}{cap}", open=True)
@@ -322,11 +329,46 @@ class FleetTemplateWindow:
                 sid = self._tree.insert(wid, "end",
                                         text=f"▼ {squad.name}{scap}", open=True)
                 self._node_meta[sid] = ("squad", (wi, si))
+                pending = list(match_map.get((wing.name, squad.name), []))
                 for li, slot in enumerate(squad.slots):
-                    nid = self._tree.insert(sid, "end", text=self._slot_label(slot))
+                    if self.mode == "live" and pending:
+                        p = pending.pop(0)
+                        text = (f"✓ {p['name']} — {p['ship_type_name']}"
+                                f"{self._role_suffix(slot.role)}")
+                        nid = self._tree.insert(
+                            sid, "end", text=text,
+                            tags=("inpos" if p["in_position"] else "moveme",))
+                    elif self.mode == "live":
+                        nid = self._tree.insert(sid, "end",
+                                                text=self._slot_label(slot),
+                                                tags=("empty",))
+                    else:
+                        nid = self._tree.insert(sid, "end", text=self._slot_label(slot))
                     self._node_meta[nid] = ("slot", (wi, si, li))
         if self.mode == "live":
-            self._render_unassigned()   # Task D5
+            self._render_unassigned()
+
+    def _role_suffix(self, role):
+        abbr = ROLE_ABBR.get(role, "")
+        return f" [{abbr}]" if abbr else ""
+
+    def _slot_match_map(self):
+        """(wing_name, squad_name) → ordered [{name, ship_type_name, in_position}]
+        for the slots in that squad, derived from the cached compose preview."""
+        res = self._last_preview
+        out: dict[tuple, list] = {}
+        if res is None:
+            return out
+        type_by_id = {m["character_id"]: m.get("ship_type_name", "")
+                      for m in self._live_members}
+        for mv in res.moves:
+            key = (mv.target_wing_name, mv.target_squad_name)
+            out.setdefault(key, []).append({
+                "name": mv.pilot_name,
+                "ship_type_name": type_by_id.get(mv.pilot_id, ""),
+                "in_position": mv.skip_reason == "already_correct",
+            })
+        return out
 
     # ── structural edits ─────────────────────────────────────────────────────
     def _add_wing(self):
@@ -895,9 +937,7 @@ class FleetTemplateWindow:
         return self._last_preview
 
     def _render_unassigned(self):
-        # Task D5 calls compose() here directly; Task D10 switches this to the
-        # cached self._last_preview so the tree + Unassigned share one compose().
-        res = self._compose_preview()
+        res = self._last_preview   # set by _reload_tree's single compose() call
         if res is None or not res.unassigned:
             return
         head = self._tree.insert("", "end", text="── Unassigned ──", open=True)
