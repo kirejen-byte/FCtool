@@ -592,8 +592,52 @@ class FleetTemplateWindow:
         lines += res.warnings[:10]
         messagebox.showinfo("Test Rules", "\n".join(lines), parent=self.win)
 
-    def _build_settings_tab(self): pass         # Task D4
-    def _reload_settings(self): pass            # Task D4
+    def _build_settings_tab(self):
+        self._settings_vars = {}
+        fields = [
+            ("rebalance_interval_s", "Rebalance interval (s)", 10, 600),
+            ("move_cooldown_s", "Move cooldown (s)", 30, 600),
+            ("bulk_apply_threshold", "Bulk apply threshold (moves)", 1, 100),
+        ]
+        for i, (key, label, lo, hi) in enumerate(fields):
+            tk.Label(self._settings_tab, text=label, bg=BG_PANEL, fg=FG_TEXT,
+                     font=("Consolas", 9)).grid(row=i, column=0, sticky="w",
+                                                padx=8, pady=6)
+            var = tk.IntVar()
+            self._settings_vars[key] = (var, lo, hi)
+            tk.Spinbox(self._settings_tab, from_=lo, to=hi, textvariable=var,
+                       width=8, bg=BG_ENTRY, fg=FG_TEXT,
+                       command=self._on_settings_changed).grid(row=i, column=1,
+                                                               padx=8, pady=6)
+        tk.Label(self._settings_tab,
+                 text="Each pilot move triggers a ~30 s EVE session timer.\n"
+                      "Cooldown ≥ 45 s keeps the rebalancer under that limit.",
+                 bg=BG_PANEL, fg=FG_DIM, font=("Consolas", 8),
+                 justify=tk.LEFT).grid(row=len(fields), column=0, columnspan=2,
+                                       sticky="w", padx=8, pady=8)
+        self._reload_settings()
+
+    def _reload_settings(self):
+        t = self.current_template()
+        if t is None:
+            return
+        s = t.settings
+        self._settings_vars["rebalance_interval_s"][0].set(s.rebalance_interval_s)
+        self._settings_vars["move_cooldown_s"][0].set(s.move_cooldown_s)
+        self._settings_vars["bulk_apply_threshold"][0].set(s.bulk_apply_threshold)
+
+    def _on_settings_changed(self):
+        t = self.current_template()
+        if t is None:
+            return
+        for key, (var, lo, hi) in self._settings_vars.items():
+            try:
+                val = max(lo, min(hi, int(var.get())))
+            except (tk.TclError, ValueError):
+                continue
+            setattr(t.settings, key, val)
+        self.store.save()
+
     def _enter_live_mode(self): pass            # Task D5
     def _exit_live_mode(self): pass             # Task D5
     def _apply(self): pass                       # Task D6
