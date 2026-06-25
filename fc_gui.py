@@ -582,6 +582,11 @@ class FCToolGUI:
         self.fittings.load()
         self.fittings.catalog = self.type_catalog   # enables Defenders auto-tag on add
         self._heal_fit_dna()   # one-time: rewrite legacy bare-id T3 DNA to canonical
+        import fleet_template_store as _fleet_template_store
+        self.fleet_templates = _fleet_template_store.FleetTemplateStore(
+            os.path.join(app_dir(), "fleet_templates.json"))
+        self.fleet_templates.load()
+        self._fleet_template_window = None
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
         self._doctrine_selected_id: str | None = None
@@ -1401,6 +1406,8 @@ class FCToolGUI:
                    command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(role_header, text="Expand All", style="Dark.TButton",
                    command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
+                   command=self._open_fleet_templates).pack(side=tk.LEFT, padx=8)
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -7278,6 +7285,79 @@ class FCToolGUI:
                     self._show_doctrine_detail(doc.id)
         except Exception as exc:
             print(f"[Fleet] open doctrine navigation failed: {exc}")
+
+    def _active_doctrine_obj(self):
+        """Resolve config['fleet']['active_doctrine'] (name or id) to a Doctrine."""
+        key = self.config.get("fleet", {}).get("active_doctrine", "")
+        if not key:
+            return None
+        for d in self.fittings.list_doctrines():
+            if d.id == key or d.name == key:
+                return d
+        return None
+
+    def _fleet_boss_session(self):
+        """Current fleet-boss AuthEsiSession, or None if no authed boss."""
+        import fleet_esi
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            return None
+        if not auth.has_scope("esi-fleets.write_fleet.v1"):
+            return None
+        info = auth.get_fleet_info()
+        if not info or not auth.is_boss(info, auth.character_id):
+            return None
+        return fleet_esi.AuthEsiSession(auth)
+
+    def _fleet_boss_info(self):
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            return None
+        info = auth.get_fleet_info()
+        if not info:
+            return None
+        return {"fleet_id": info["fleet_id"],
+                "is_boss": auth.is_boss(info, auth.character_id)}
+
+    def _authed_character_names(self):
+        names = []
+        for acct in getattr(self, "esi_accounts", []) or []:
+            nm = getattr(acct, "character_name", None)
+            if nm:
+                names.append(nm)
+        names += list(self.fleet_templates.cached_characters)
+        return sorted(set(names))
+
+    def _open_fleet_templates(self):
+        from fleet_template_window import FleetTemplateWindow
+        existing = self._fleet_template_window
+        if existing is not None:
+            try:
+                existing.win.lift()
+                existing.win.focus_force()
+                return
+            except Exception:
+                self._fleet_template_window = None
+        self._fleet_template_window = FleetTemplateWindow(
+            self.root,
+            store=self.fleet_templates,
+            fittings=self.fittings,
+            config=self.config,
+            esi_session_provider=self._fleet_boss_session,
+            fleet_info_provider=self._fleet_boss_info,
+            doctrine_provider=self._active_doctrine_obj,
+            character_names_provider=self._authed_character_names,
+        )
+        # Clear the handle when the window closes so re-open works.
+        win = self._fleet_template_window
+        orig_destroy = win.destroy
+
+        def _wrapped_destroy():
+            orig_destroy()
+            self._fleet_template_window = None
+
+        win.destroy = _wrapped_destroy
+        win.win.protocol("WM_DELETE_WINDOW", _wrapped_destroy)
 
     def _refresh_specialized_roles_from_cache(self):
         """Re-run the specialized-role render using the last polled fleet snapshot,
