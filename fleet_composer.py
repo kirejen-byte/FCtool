@@ -185,3 +185,17 @@ def compose(template, live_members, live_structure, *, doctrine=None,
     # Pass 5 — leftover pool → Unassigned.
     result.unassigned = [m for m in pool if m["character_id"] not in claimed]
     return result
+
+
+# append to fleet_composer.py
+def summarize_moves(result: ComposeResult) -> dict:
+    """Counts for the apply confirm dialog. `esi_calls` is the move count;
+    the apply layer adds wing/squad creates on top, so this is a lower bound."""
+    executable = len(result.executable)
+    unfilled = sum(1 for w in result.warnings if "unfilled" in w)
+    return {
+        "executable": executable,
+        "unfilled": unfilled,
+        "unassigned": len(result.unassigned),
+        "esi_calls": executable,
+    }

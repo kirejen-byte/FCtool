@@ -207,3 +207,24 @@ def test_rule_slot_with_no_match_emits_unfilled_warning():
     assert res.executable == []                       # tag slot stays empty, no ESI call
     assert any("unfilled" in w for w in res.warnings)
     assert [m["character_id"] for m in res.unassigned] == [1]
+
+
+# append to tests/test_fleet_composer.py
+from fleet_composer import summarize_moves
+
+
+def test_summarize_counts_repositions_role_changes_and_unfilled():
+    res = ComposeResult(
+        moves=[
+            Move(1, "A", "W", "S1", "squad_member"),                 # reposition
+            Move(2, "B", "W", "S1", "squad_commander"),              # reposition
+            Move(3, "C", "W", "S1", "squad_member", skip_reason="already_correct"),
+        ],
+        unassigned=[{"character_id": 9}],
+        warnings=["1 slot unfilled (no match): W/S2 [Logistics]"],
+    )
+    s = summarize_moves(res)
+    assert s["executable"] == 2
+    assert s["unfilled"] == 1
+    assert s["unassigned"] == 1
+    assert s["esi_calls"] == 2
