@@ -77,3 +77,28 @@ def test_load_corrupt_file_is_empty_not_crash(tmp_path):
     store.load()
     assert store.templates == []
     assert store.cached_characters == []
+
+
+# append to tests/test_fleet_template_store.py
+from fleet_template_store import validate_template
+
+
+def test_validate_flags_broken_wing_and_squad_refs():
+    t = FleetTemplate(
+        id="t", name="n", doctrine_id=None,
+        wings=[Wing("Alpha Wing", None, [Squad("Logi Squad", None, [])])],
+        rules=[
+            AssignmentRule(0, RuleCondition("ship_type", "Damnation"),
+                           RuleAction("squad_commander", "Alpha Wing", "Logi Squad")),
+            AssignmentRule(1, RuleCondition("ship_type", "Guardian"),
+                           RuleAction("squad_member", "Ghost Wing", None)),   # wing gone
+            AssignmentRule(2, RuleCondition("ship_type", "Scimitar"),
+                           RuleAction("squad_member", "Alpha Wing", "Ghost Squad")),  # squad gone
+            AssignmentRule(3, RuleCondition("ship_type", "Eos"),
+                           RuleAction("squad_member", None, None)),           # anywhere = OK
+            AssignmentRule(4, RuleCondition("ship_type", "Sleipnir"),
+                           RuleAction("squad_member", None, "Logi Squad")),   # squad w/o wing = broken
+        ],
+    )
+    validate_template(t)
+    assert [r.broken for r in t.rules] == [False, True, True, False, True]

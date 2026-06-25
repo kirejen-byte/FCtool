@@ -239,7 +239,27 @@ class FleetTemplateStore:
         self.templates = [t for t in self.templates if t.id != template_id]
 
 
-# append to fleet_template_store.py (replaced with full logic in Task A3)
+# fleet_template_store.py — replace the placeholder validate_template
 def validate_template(template: FleetTemplate) -> None:
-    """Placeholder — full implementation in Task A3."""
-    return None
+    """Mark rules whose wing/squad reference no longer exists with broken=True.
+
+    Rule semantics:
+      - wing_name None & squad_name None  → "anywhere", never broken.
+      - wing_name set, squad_name None    → broken iff that wing is missing.
+      - wing_name set, squad_name set     → broken iff that (wing, squad) is missing.
+      - wing_name None, squad_name set    → broken (a squad ref needs a wing).
+    Mutates each rule's `broken` flag in place.
+    """
+    wing_names = {w.name for w in template.wings}
+    squad_pairs = {(w.name, s.name) for w in template.wings for s in w.squads}
+    for rule in template.rules:
+        wn = rule.action.wing_name
+        sn = rule.action.squad_name
+        if wn is None and sn is None:
+            rule.broken = False
+        elif wn is None and sn is not None:
+            rule.broken = True
+        elif sn is None:
+            rule.broken = wn not in wing_names
+        else:
+            rule.broken = (wn, sn) not in squad_pairs
