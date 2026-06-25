@@ -883,11 +883,13 @@ class FleetTemplateWindow:
         self._sync_after_id = self.win.after(30_000, self._sync_tick)
 
     def _post(self, fn, *args):
-        """Schedule fn on the Tk thread from a worker; ignore TclError if the
-        window was destroyed mid-flight (the daemon worker outlived the GUI)."""
+        """Schedule fn on the Tk thread from a worker; ignore the teardown race
+        when a daemon worker outlives the GUI. Tk raises TclError (widget gone)
+        or RuntimeError ('main thread is not in main loop') during shutdown —
+        both mean 'the window is gone', so both are safe to swallow here."""
         try:
             self.win.after(0, fn, *args)
-        except tk.TclError:
+        except (tk.TclError, RuntimeError):
             pass
 
     def _sync_tick(self):
