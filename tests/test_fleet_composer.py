@@ -228,3 +228,50 @@ def test_summarize_counts_repositions_role_changes_and_unfilled():
     assert s["unfilled"] == 1
     assert s["unassigned"] == 1
     assert s["esi_calls"] == 2
+
+
+# append to tests/test_fleet_composer.py
+from fleet_composer import plan_rebalance, RebalanceAction
+
+
+def _struct(wings):
+    return {"wings": wings}
+
+
+def test_rebalance_moves_last_joined_overflow_to_undercap_squad_same_wing():
+    # Wing W: S1 cap 2 has 3 members; S2 cap 5 has 0 → move newest from S1 to S2.
+    struct = _struct([{"id": 1, "name": "W", "squads": [
+        {"id": 10, "name": "S1"}, {"id": 11, "name": "S2"}]}])
+    members = [
+        {"character_id": 1, "name": "A", "wing_id": 1, "squad_id": 10,
+         "join_time": "2026-01-01T00:00:00Z"},
+        {"character_id": 2, "name": "B", "wing_id": 1, "squad_id": 10,
+         "join_time": "2026-01-02T00:00:00Z"},
+        {"character_id": 3, "name": "C", "wing_id": 1, "squad_id": 10,
+         "join_time": "2026-01-03T00:00:00Z"},   # newest → overflow
+    ]
+    max_sizes = {("W", "S1"): 2, ("W", "S2"): 5}
+    act = plan_rebalance(members, struct, max_sizes=max_sizes)
+    assert isinstance(act, RebalanceAction)
+    assert act.pilot_id == 3
+    assert act.target_wing_name == "W"
+    assert act.target_squad_name == "S2"
+    assert act.create_squad is False
+
+
+def test_rebalance_returns_none_when_all_within_cap():
+    struct = _struct([{"id": 1, "name": "W", "squads": [{"id": 10, "name": "S1"}]}])
+    members = [{"character_id": 1, "name": "A", "wing_id": 1, "squad_id": 10,
+                "join_time": "2026-01-01T00:00:00Z"}]
+    assert plan_rebalance(members, struct, max_sizes={("W", "S1"): 5}) is None
+
+
+def test_rebalance_signals_create_when_no_undercap_target_exists():
+    struct = _struct([{"id": 1, "name": "W", "squads": [{"id": 10, "name": "S1"}]}])
+    members = [{"character_id": i, "name": str(i), "wing_id": 1, "squad_id": 10,
+                "join_time": f"2026-01-0{i}T00:00:00Z"} for i in (1, 2, 3)]
+    act = plan_rebalance(members, struct, max_sizes={("W", "S1"): 2})
+    assert act.pilot_id == 3
+    assert act.target_wing_name == "W"
+    assert act.create_squad is True
+    assert act.target_squad_name is None
