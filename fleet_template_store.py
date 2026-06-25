@@ -176,3 +176,70 @@ def template_from_dict(d: dict) -> FleetTemplate:
         rules=[_rule_from_dict(r) for r in d.get("rules", [])],
         settings=_settings_from_dict(d.get("settings", {})),
     )
+
+
+# append to fleet_template_store.py
+import json
+
+
+class FleetTemplateStore:
+    """Owns fleet_templates.json: a list of FleetTemplate plus a character cache."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.templates: list[FleetTemplate] = []
+        self.cached_characters: list[str] = []
+
+    # ── persistence ──────────────────────────────────────────────────────────
+    def load(self) -> None:
+        """Load from disk. Missing or corrupt file → empty store (never raises)."""
+        self.templates = []
+        self.cached_characters = []
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            log.exception("[fleet-templates] could not read %s; starting empty",
+                          self.path)
+            return
+        for raw in data.get("templates", []):
+            t = template_from_dict(raw)
+            validate_template(t)
+            self.templates.append(t)
+        self.cached_characters = [c for c in data.get("cached_characters", [])
+                                  if isinstance(c, str) and c.strip()]
+
+    def save(self) -> None:
+        """Atomically persist the store. Raises on serialization/IO error."""
+        data = {
+            "version": SCHEMA_VERSION,
+            "templates": [template_to_dict(t) for t in self.templates],
+            "cached_characters": self.cached_characters,
+        }
+        atomic_write_json(self.path, data)
+
+    # ── template CRUD ────────────────────────────────────────────────────────
+    def get_template(self, template_id: str) -> FleetTemplate | None:
+        return next((t for t in self.templates if t.id == template_id), None)
+
+    def add_template(self, name: str, doctrine_id: str | None = None) -> FleetTemplate:
+        t = FleetTemplate(id=uuid4().hex, name=name or "Untitled",
+                          doctrine_id=doctrine_id)
+        self.templates.append(t)
+        return t
+
+    def rename_template(self, template_id: str, new_name: str) -> None:
+        t = self.get_template(template_id)
+        if t is not None and new_name.strip():
+            t.name = new_name.strip()
+
+    def delete_template(self, template_id: str) -> None:
+        self.templates = [t for t in self.templates if t.id != template_id]
+
+
+# append to fleet_template_store.py (replaced with full logic in Task A3)
+def validate_template(template: FleetTemplate) -> None:
+    """Placeholder — full implementation in Task A3."""
+    return None
