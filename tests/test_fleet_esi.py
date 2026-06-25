@@ -130,3 +130,42 @@ def test_delete_wing_and_squad():
     fleet_esi.delete_squad(sess, 999, 8)
     assert sess.calls == [("DELETE", "/fleets/999/wings/5/", None),
                           ("DELETE", "/fleets/999/squads/8/", None)]
+
+
+class _FakeRequestsSession:
+    def __init__(self):
+        self.last = None
+
+    def request(self, method, url, headers=None, json=None, timeout=None):
+        self.last = {"method": method, "url": url, "headers": headers,
+                     "json": json, "timeout": timeout}
+        return FakeResp(204)
+
+
+class _FakeAuth:
+    def __init__(self, token="tok"):
+        self.access_token = token
+        self._session = _FakeRequestsSession()
+
+
+def test_auth_session_builds_authorized_request(monkeypatch):
+    # Don't actually sleep in the rate limiter during tests.
+    monkeypatch.setattr("rate_limiter.rate_limit", lambda *a, **k: None)
+    auth = _FakeAuth()
+    sess = fleet_esi.AuthEsiSession(auth)
+    resp = sess.request("PUT", "/fleets/1/members/2/", json={"role": "squad_member"})
+    assert resp.status_code == 204
+    call = auth._session.last
+    assert call["method"] == "PUT"
+    assert call["url"].endswith("/fleets/1/members/2/")
+    assert call["headers"]["Authorization"] == "Bearer tok"
+    assert call["json"] == {"role": "squad_member"}
+
+
+def test_auth_session_raises_no_token_when_unauthenticated(monkeypatch):
+    monkeypatch.setattr("rate_limiter.rate_limit", lambda *a, **k: None)
+    auth = _FakeAuth(token=None)
+    sess = fleet_esi.AuthEsiSession(auth)
+    with pytest.raises(FleetESIError) as ei:
+        sess.request("GET", "/fleets/1/wings/")
+    assert ei.value.reason == "no_token"

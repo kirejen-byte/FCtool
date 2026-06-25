@@ -109,3 +109,26 @@ def move_member(session, fleet_id: int, member_id: int, *, wing_id, squad_id,
         body["squad_id"] = squad_id
     _call(session, "PUT", f"/fleets/{fleet_id}/members/{member_id}/",
           json=body, expect=(204,))
+
+
+class AuthEsiSession:
+    """Adapts an ESIAuth into the `session` protocol `_call` expects.
+
+    Each request applies the ESI rate limiter, attaches the bearer token, and
+    calls through the auth's live requests.Session. Raises FleetESIError
+    ("no_token") if the auth has no valid token (e.g. not the fleet boss yet)."""
+
+    def __init__(self, auth):
+        self._auth = auth
+
+    def request(self, method, path, json=None):
+        from rate_limiter import rate_limit
+        from esi_constants import ESI_BASE
+        token = self._auth.access_token
+        if not token:
+            raise FleetESIError("no_token")
+        rate_limit("esi")
+        return self._auth._session.request(
+            method, f"{ESI_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=json, timeout=10)
