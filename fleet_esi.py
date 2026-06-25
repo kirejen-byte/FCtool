@@ -50,3 +50,62 @@ def _call(session, method: str, path: str, *, json=None, expect=(200, 201, 204))
                             detail=getattr(resp, "text", ""))
     # Unreachable: loop either returns or raises.
     raise FleetESIError("network", detail=str(last_exc))
+
+
+def get_wings(session, fleet_id: int) -> list:
+    """GET /fleets/{id}/wings/ → list of {id, name, squads:[{id, name}]}."""
+    resp = _call(session, "GET", f"/fleets/{fleet_id}/wings/", expect=(200,))
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+def create_wing(session, fleet_id: int, name: str | None = None) -> int:
+    """POST a new wing; rename it if `name` is given. Returns the new wing_id."""
+    resp = _call(session, "POST", f"/fleets/{fleet_id}/wings/", expect=(201, 200))
+    wing_id = resp.json().get("wing_id")
+    if name and name.strip():
+        rename_wing(session, fleet_id, wing_id, name)
+    return wing_id
+
+
+def create_squad(session, fleet_id: int, wing_id: int, name: str | None = None) -> int:
+    """POST a new squad into a wing; rename it if `name` is given. Returns squad_id."""
+    resp = _call(session, "POST", f"/fleets/{fleet_id}/wings/{wing_id}/squads/",
+                 expect=(201, 200))
+    squad_id = resp.json().get("squad_id")
+    if name and name.strip():
+        rename_squad(session, fleet_id, squad_id, name)
+    return squad_id
+
+
+def rename_wing(session, fleet_id: int, wing_id: int, name: str) -> None:
+    _call(session, "PUT", f"/fleets/{fleet_id}/wings/{wing_id}/",
+          json={"name": name[:_NAME_MAX]}, expect=(204,))
+
+
+def rename_squad(session, fleet_id: int, squad_id: int, name: str) -> None:
+    _call(session, "PUT", f"/fleets/{fleet_id}/squads/{squad_id}/",
+          json={"name": name[:_NAME_MAX]}, expect=(204,))
+
+
+def delete_wing(session, fleet_id: int, wing_id: int) -> None:
+    _call(session, "DELETE", f"/fleets/{fleet_id}/wings/{wing_id}/", expect=(204,))
+
+
+def delete_squad(session, fleet_id: int, squad_id: int) -> None:
+    _call(session, "DELETE", f"/fleets/{fleet_id}/squads/{squad_id}/", expect=(204,))
+
+
+def move_member(session, fleet_id: int, member_id: int, *, wing_id, squad_id,
+                role: str) -> None:
+    """PUT /fleets/{id}/members/{member_id}/ — move a pilot to a role/position.
+
+    Body shape by role: fleet_commander → role only; wing_commander → +wing_id;
+    squad_commander / squad_member → +wing_id +squad_id."""
+    body: dict = {"role": role}
+    if wing_id is not None:
+        body["wing_id"] = wing_id
+    if squad_id is not None:
+        body["squad_id"] = squad_id
+    _call(session, "PUT", f"/fleets/{fleet_id}/members/{member_id}/",
+          json=body, expect=(204,))
