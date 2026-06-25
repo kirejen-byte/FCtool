@@ -113,3 +113,23 @@ def test_cache_character_dedups_case_insensitively(tmp_path):
     assert store.cache_character("") is False
     assert store.cache_character("   ") is False
     assert store.cached_characters == ["Kyra Dawnfall", "Alt Pilot"]
+
+
+def test_load_skips_malformed_template_entry_without_crashing(tmp_path):
+    import json
+    path = tmp_path / "fleet_templates.json"
+    # One good template, one structurally broken (wings is a string, not a list).
+    path.write_text(json.dumps({
+        "version": 1,
+        "templates": [
+            {"id": "good", "name": "Good", "doctrine_id": None,
+             "wings": [], "rules": [], "settings": {}},
+            {"id": "bad", "name": "Bad", "wings": "not-a-list"},
+        ],
+        "cached_characters": [],
+    }), encoding="utf-8")
+    store = FleetTemplateStore(str(path))
+    store.load()   # must not raise
+    ids = [t.id for t in store.templates]
+    assert "good" in ids
+    assert "bad" not in ids

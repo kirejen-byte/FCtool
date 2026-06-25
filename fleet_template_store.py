@@ -205,9 +205,13 @@ class FleetTemplateStore:
                           self.path)
             return
         for raw in data.get("templates", []):
-            t = template_from_dict(raw)
-            validate_template(t)
-            self.templates.append(t)
+            try:
+                t = template_from_dict(raw)
+                validate_template(t)
+                self.templates.append(t)
+            except Exception:
+                log.exception("[fleet-templates] skipping malformed template in %s",
+                              self.path)
         self.cached_characters = [c for c in data.get("cached_characters", [])
                                   if isinstance(c, str) and c.strip()]
 

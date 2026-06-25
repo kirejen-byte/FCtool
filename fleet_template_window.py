@@ -897,17 +897,17 @@ class FleetTemplateWindow:
         self._schedule_sync()
 
     def _sync_live(self, *, initial):
-        session = self._esi_session_provider()
-        if session is None:
-            self._status.config(text="No fleet-boss session.", fg=FG_RED)
-            return
-
         def worker():
+            session = self._esi_session_provider()   # blocking get_fleet_info — off the Tk thread
+            if session is None:
+                self._post(lambda: self._status.config(
+                    text="No fleet-boss session.", fg=FG_RED))
+                return
             err = None
             structure, members = {"wings": []}, []
             try:
                 structure = {"wings": fleet_esi.get_wings(session, self._fleet_id)}
-                # Enrich (name + ship_class resolution) HERE, off the Tk thread —
+                # Enrich (name + ship_class) here, off the Tk thread —
                 # ship_class_label may hit ESI on cache-miss.
                 members = self._enrich_members(self._read_members(session))
             except fleet_esi.FleetESIError as e:
@@ -967,7 +967,7 @@ class FleetTemplateWindow:
             return
         session = self._esi_session_provider()
         if session is None:
-            messagebox.showwarning("Apply", "No fleet-boss session.", parent=self.win)
+            messagebox.showwarning("Apply", "No fleet-boss session — you must be the current fleet boss with the fleet-write scope (re-authenticate if your token is old).", parent=self.win)
             return
         res = self._compose_preview()
         if res is None:
@@ -1074,12 +1074,10 @@ class FleetTemplateWindow:
     def _rebalance_tick(self):
         if not self._rebalance_on or self.mode != "live":
             return
-        session = self._esi_session_provider()
         t = self.current_template()
-        if session is None or t is None:
+        if t is None:
             self._schedule_rebalance()
             return
-
         # Cooldown gate (monotonic). One write per move_cooldown_s.
         import time
         now = time.monotonic()
@@ -1087,11 +1085,14 @@ class FleetTemplateWindow:
         if now - self._last_write_monotonic < cooldown:
             self._schedule_rebalance()
             return
-
         max_sizes = {(w.name, s.name): s.max_size
                      for w in t.wings for s in w.squads}
 
         def worker():
+            session = self._esi_session_provider()   # blocking — off the Tk thread
+            if session is None:
+                self._post(self._schedule_rebalance)
+                return
             err = None
             action = None
             structure, members = self._live_structure, []
@@ -1102,9 +1103,9 @@ class FleetTemplateWindow:
                     members, structure, max_sizes=max_sizes)
             except fleet_esi.FleetESIError as e:
                 err = e
-            self._post(_apply_action, structure, action, err)
+            self._post(_apply_action, session, structure, action, err)
 
-        def _apply_action(structure, action, err):
+        def _apply_action(session, structure, action, err):
             self._live_structure = structure
             if err is not None:
                 if err.reason in ("boss_lost",):
