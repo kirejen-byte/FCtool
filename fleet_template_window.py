@@ -84,6 +84,7 @@ class FleetTemplateWindow:
         self._build_footer()
         self._refresh_template_selector()
         self.set_mode("template")
+        self.win.bind("<Control-z>", self._undo)
 
     # ── construction ─────────────────────────────────────────────────────────
     def _build_header(self):
@@ -226,6 +227,36 @@ class FleetTemplateWindow:
             self.store.save()
             self._status.config(text="Saved.", fg=FG_GREEN)
 
+    # ── undo (template mode) ─────────────────────────────────────────────────
+    def _push_undo(self):
+        """Snapshot the current template before a structural/rule edit
+        (template mode only). Capped at 50 levels."""
+        if self.mode != "template":
+            return
+        from fleet_template_store import template_to_dict
+        t = self.current_template()
+        if t is not None:
+            self._undo_stack.append(template_to_dict(t))
+            del self._undo_stack[:-50]
+
+    def _undo(self, _evt=None):
+        if self.mode != "template" or not self._undo_stack:
+            return
+        from fleet_template_store import template_from_dict, validate_template
+        restored = template_from_dict(self._undo_stack.pop())
+        validate_template(restored)
+        for i, t in enumerate(self.store.templates):
+            if t.id == restored.id:
+                self.store.templates[i] = restored
+                break
+        else:
+            return
+        self._current_template_id = restored.id
+        self.store.save()
+        self._reload_tree()
+        self._reload_rules()
+        self._reload_settings()
+
     # ── lifecycle ────────────────────────────────────────────────────────────
     def destroy(self):
         for after_id in (self._rebalance_after_id, self._sync_after_id):
@@ -299,6 +330,7 @@ class FleetTemplateWindow:
 
     # ── structural edits ─────────────────────────────────────────────────────
     def _add_wing(self):
+        self._push_undo()
         t = self.current_template()
         if t is None:
             return
@@ -306,12 +338,14 @@ class FleetTemplateWindow:
         self._after_structure_change()
 
     def _add_squad(self, wi):
+        self._push_undo()
         t = self.current_template()
         t.wings[wi].squads.append(
             Squad(name=f"Squad {len(t.wings[wi].squads) + 1}", max_size=None, slots=[]))
         self._after_structure_change()
 
     def _add_slot(self, wi, si):
+        self._push_undo()
         t = self.current_template()
         t.wings[wi].squads[si].slots.append(
             Slot(character=None, tag=None, role="squad_member"))
@@ -374,6 +408,7 @@ class FleetTemplateWindow:
             menu.grab_release()
 
     def _rename_selected(self):
+        self._push_undo()
         item, meta = self._selected_meta()
         if not meta:
             return
@@ -392,6 +427,7 @@ class FleetTemplateWindow:
             self._after_structure_change()
 
     def _set_max_size(self, kind, path):
+        self._push_undo()
         t = self.current_template()
         obj = t.wings[path[0]] if kind == "wing" else t.wings[path[0]].squads[path[1]]
         val = simpledialog.askinteger("Max size",
@@ -402,12 +438,14 @@ class FleetTemplateWindow:
         self._after_structure_change()
 
     def _edit_slot(self, path):
+        self._push_undo()
         wi, si, li = path
         slot = self.current_template().wings[wi].squads[si].slots[li]
         SlotEditor(self.win, slot, self.fittings, self._character_names_provider(),
                    on_ok=lambda: self._after_structure_change())
 
     def _delete_selected(self):
+        self._push_undo()
         item, meta = self._selected_meta()
         if not meta:
             return
@@ -488,6 +526,7 @@ class FleetTemplateWindow:
         return None
 
     def _drop_squad_into_wing(self, squad_path, wing_path):
+        self._push_undo()
         wi, si = squad_path
         twi = wing_path[0]
         if twi == wi:
@@ -498,6 +537,7 @@ class FleetTemplateWindow:
         self._after_structure_change()
 
     def _drop_slot_into_squad(self, slot_path, squad_path):
+        self._push_undo()
         wi, si, li = slot_path
         t = self.current_template()
         slot = t.wings[wi].squads[si].slots.pop(li)
@@ -616,6 +656,7 @@ class FleetTemplateWindow:
         return []   # ship_type / ship_class: free text
 
     def _add_rule(self):
+        self._push_undo()
         t = self.current_template()
         if t is None:
             return
@@ -626,6 +667,7 @@ class FleetTemplateWindow:
         self._renumber_and_save()
 
     def _update_rule(self, idx, *, ctype=None, cval=None, role=None, wing=None, squad=None):
+        self._push_undo()
         t = self.current_template()
         if t is None or idx >= len(t.rules):
             return
@@ -645,6 +687,7 @@ class FleetTemplateWindow:
         self._reload_rules()
 
     def _move_rule(self, idx, delta):
+        self._push_undo()
         t = self.current_template()
         j = idx + delta
         if t is None or not (0 <= j < len(t.rules)):
@@ -653,6 +696,7 @@ class FleetTemplateWindow:
         self._renumber_and_save()
 
     def _delete_rule(self, idx):
+        self._push_undo()
         t = self.current_template()
         if t is None or idx >= len(t.rules):
             return
