@@ -862,7 +862,117 @@ class FleetTemplateWindow:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _toggle_rebalance(self): pass            # Task D7
+    def _toggle_rebalance(self):
+        if self.mode != "live":
+            return
+        self._rebalance_on = not self._rebalance_on
+        self._rebalance_btn.config(
+            text=f"Rebalance: {'ON' if self._rebalance_on else 'OFF'}")
+        if self._rebalance_on:
+            self._schedule_rebalance(immediate=True)
+        elif self._rebalance_after_id:
+            try:
+                self.win.after_cancel(self._rebalance_after_id)
+            except Exception:
+                pass
+            self._rebalance_after_id = None
+
+    def _schedule_rebalance(self, *, immediate=False):
+        t = self.current_template()
+        interval_ms = (t.settings.rebalance_interval_s if t else 60) * 1000
+        delay = 100 if immediate else interval_ms
+        self._rebalance_after_id = self.win.after(delay, self._rebalance_tick)
+
+    def _rebalance_tick(self):
+        if not self._rebalance_on or self.mode != "live":
+            return
+        session = self._esi_session_provider()
+        t = self.current_template()
+        if session is None or t is None:
+            self._schedule_rebalance()
+            return
+
+        # Cooldown gate (monotonic). One write per move_cooldown_s.
+        import time
+        now = time.monotonic()
+        cooldown = t.settings.move_cooldown_s
+        if now - self._last_write_monotonic < cooldown:
+            self._schedule_rebalance()
+            return
+
+        max_sizes = {(w.name, s.name): s.max_size
+                     for w in t.wings for s in w.squads}
+
+        def worker():
+            err = None
+            action = None
+            structure, members = self._live_structure, []
+            try:
+                structure = {"wings": fleet_esi.get_wings(session, self._fleet_id)}
+                members = self._read_members(session)
+                action = fleet_composer.plan_rebalance(
+                    members, structure, max_sizes=max_sizes)
+            except fleet_esi.FleetESIError as e:
+                err = e
+            self.win.after(0, _apply_action, structure, action, err)
+
+        def _apply_action(structure, action, err):
+            self._live_structure = structure
+            if err is not None:
+                if err.reason in ("boss_lost",):
+                    self._rebalance_on = False
+                    self._rebalance_btn.config(text="Rebalance: OFF")
+                    messagebox.showerror("Rebalancer stopped",
+                                         "Lost fleet-boss role (403).", parent=self.win)
+                    return
+                self._schedule_rebalance()
+                return
+            if action is None:
+                self._status.config(text="Rebalancer: all squads within cap.",
+                                    fg=FG_DIM)
+                self._schedule_rebalance()
+                return
+            self._execute_rebalance(session, action)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _execute_rebalance(self, session, action):
+        def worker():
+            err = None
+            try:
+                name_to_wing = {w["name"]: w["id"]
+                                for w in self._live_structure.get("wings", [])}
+                wing_id = name_to_wing.get(action.target_wing_name)
+                squad_id = None
+                if action.create_squad:
+                    squad_id = fleet_esi.create_squad(session, self._fleet_id,
+                                                      wing_id, "Overflow")
+                else:
+                    for w in self._live_structure.get("wings", []):
+                        if w["name"] != action.target_wing_name:
+                            continue
+                        for s in w.get("squads", []):
+                            if s["name"] == action.target_squad_name:
+                                squad_id = s["id"]
+                fleet_esi.move_member(session, self._fleet_id, action.pilot_id,
+                                      wing_id=wing_id, squad_id=squad_id,
+                                      role="squad_member")
+            except fleet_esi.FleetESIError as e:
+                err = e
+            self.win.after(0, _done, err)
+
+        def _done(err):
+            import time
+            self._last_write_monotonic = time.monotonic()
+            if err is None:
+                self._status.config(
+                    text=f"Rebalancer: moved {action.pilot_name} → "
+                         f"{action.target_wing_name}", fg=FG_GREEN)
+            else:
+                self._status.config(text=f"Rebalancer error: {err.reason}", fg=FG_RED)
+            self._schedule_rebalance()
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 class SlotEditor:
