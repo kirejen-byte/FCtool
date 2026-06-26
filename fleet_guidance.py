@@ -19,7 +19,7 @@ DEFENDER_TAG = "Defenders"
 
 # Composition roles resolved per-fit, in priority order. "Defenders" is NOT here —
 # it is an additive fleet-wide overlay (see compute_fleet_guidance).
-COMPOSITION_ROLE_ORDER = ("DPS", "Logistics", "Links", "Support - Webs")
+COMPOSITION_ROLE_ORDER = ("DPS", "Logistics", "Links", "Support - Webs", "Tackle")
 
 # Tag -> (mode, min, max) default. "Links" has no static default (computed).
 TAG_DEFAULTS: dict[str, tuple[str, int, int | None]] = {
@@ -124,8 +124,10 @@ def resolve_composition_ideal(member, links_range) -> EffectiveIdeal | None:
 
 
 def percent_to_pilots(pct, fleet_total) -> int:
-    # round() is half-to-even (banker's rounding); that's intentional for pilot targets.
-    return int(round((pct / 100.0) * fleet_total))
+    # Ceil so a positive-percentage target never rounds down to 0 in a small fleet
+    # (e.g. 25% of 2 -> 1, not 0). A minimum should round UP to the smallest pilot
+    # count that reaches the percentage; this keeps small-fleet guidance meaningful.
+    return int(math.ceil((pct / 100.0) * fleet_total))
 
 
 def compute_delta(current, target_min, target_max):
@@ -179,11 +181,18 @@ def _targets_in_pilots(ideal: EffectiveIdeal, fleet_total):
 
 def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
                            fleet_total, command_ship_fraction=0.0) -> GuidanceReport:
-    """Compute per-fit composition guidance + a Defenders overlay rollup.
+    """Compute role-level composition guidance + a Defenders overlay rollup.
 
     ``get_fit(fit_id) -> Fit | None``. ``fleet_ship_counts`` maps hull type id ->
     live count; ``fleet_total`` is the current fleet size, or None when there is no
-    live (boss) fleet."""
+    live (boss) fleet.
+
+    Composition targets (percent/count) are ROLE-LEVEL: the role's single ideal is
+    applied once, ``current`` is the SUM of the role's hull counts, and every fit in
+    the role carries that same role-level target/current/delta. So two Logistics
+    fits (e.g. Basilisk + Scimitar) both show the same role shortfall (e.g. +4),
+    rather than each independently targeting the full percentage.
+    """
     has_live = fleet_total is not None
     members = list(getattr(doctrine, "members", []))
 
@@ -197,52 +206,59 @@ def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
     links_range = links_ideal_range(links_parsed, catalog)
     links_suppressed = command_ship_fraction > COMMAND_SHIP_SKIP_FRACTION
 
-    fits: list[FitGuidance] = []
+    # Group guided members by composition role (Defenders is a separate overlay).
+    by_role: dict[str, list] = {}
     for m in members:
+        role = _composition_role(m.tags)
+        if role is None:
+            continue
         f = get_fit(m.fit_id)
         if f is None:
             continue
-        ideal = resolve_composition_ideal(m, links_range)
+        by_role.setdefault(role, []).append((m, f))
+
+    fits: list[FitGuidance] = []
+    roles: dict = {}
+    for role, items in by_role.items():
+        if role == "Links" and links_suppressed:
+            continue
+        # One role ideal: prefer an explicit per-member override (any member in the
+        # role represents the whole role's target), else the first resolvable default.
+        ideal = None
+        for (m, _f) in items:
+            if m.ideal_mode in ("percent", "count") and m.ideal_min is not None:
+                cand = resolve_composition_ideal(m, links_range)
+                if cand is not None:
+                    ideal = cand
+                    break
+        if ideal is None:
+            for (m, _f) in items:
+                ideal = resolve_composition_ideal(m, links_range)
+                if ideal is not None:
+                    break
         if ideal is None:
             continue
-        if ideal.role == "Links" and links_suppressed:
-            continue
+
         if has_live:
             tmin, tmax = _targets_in_pilots(ideal, fleet_total)
-            current = fleet_ship_counts.get(f.hull_type_id, 0)
+            current = sum(fleet_ship_counts.get(f.hull_type_id, 0) for (_m, f) in items)
             status, delta = compute_delta(current, tmin, tmax)
         else:
             tmin, tmax = _targets_in_pilots(ideal, fleet_total or 0)
             current, status, delta = None, "unknown", 0
-        fits.append(FitGuidance(
-            fit_id=m.fit_id, hull_type_id=f.hull_type_id,
-            label=(f.hull_name or f.name or str(f.hull_type_id)),
-            role=ideal.role, mode=ideal.mode,
-            target_min=tmin, target_max=tmax,
-            current=current, status=status, delta=delta))
 
-    roles = _rollup_by_role(fits, has_live)
+        roles[role] = RoleRollup(role, tmin, tmax, current, status, delta)
+        for (m, f) in items:
+            fits.append(FitGuidance(
+                fit_id=m.fit_id, hull_type_id=f.hull_type_id,
+                label=(f.hull_name or f.name or str(f.hull_type_id)),
+                role=role, mode=ideal.mode,
+                target_min=tmin, target_max=tmax,
+                current=current, status=status, delta=delta))
+
     roles["Defenders"] = _defenders_overlay(members, get_fit, fleet_ship_counts, has_live)
     return GuidanceReport(fits=fits, roles=roles,
                           links_suppressed=links_suppressed, has_live_fleet=has_live)
-
-
-def _rollup_by_role(fits, has_live) -> dict:
-    out: dict = {}
-    grouped: dict[str, list[FitGuidance]] = {}
-    for f in fits:
-        grouped.setdefault(f.role, []).append(f)
-    for role, group in grouped.items():
-        tmin = sum(g.target_min for g in group)
-        tmax = None if any(g.target_max is None for g in group) else sum(g.target_max for g in group)
-        if has_live:
-            # g.current is guaranteed non-None inside the has_live branch, so this sum is safe.
-            current = sum(g.current for g in group)
-            status, delta = compute_delta(current, tmin, tmax)
-        else:
-            current, status, delta = None, "unknown", 0
-        out[role] = RoleRollup(role, tmin, tmax, current, status, delta)
-    return out
 
 
 def _defenders_overlay(members, get_fit, fleet_ship_counts, has_live) -> RoleRollup:

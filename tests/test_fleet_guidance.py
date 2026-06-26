@@ -98,7 +98,7 @@ def test_resolve_first_role_wins_defenders_excluded():
     assert (e.mode, e.min, e.max) == ("percent", 50, 60)
 
 def test_resolve_no_composition_tag_returns_none():
-    assert fg.resolve_composition_ideal(_mem(["Tackle"]), links_range=None) is None
+    assert fg.resolve_composition_ideal(_mem(["Special"]), links_range=None) is None
 
 def test_percent_to_pilots_rounds():
     assert fg.percent_to_pilots(50, 20) == 10
@@ -222,3 +222,96 @@ def test_compute_guidance_percent_blank_min_uses_dps_default_live():
     assert by["ret"].target_min == fg.percent_to_pilots(50, 20) == 10
     assert by["ret"].target_max == fg.percent_to_pilots(60, 20) == 12
     assert by["ret"].status == "under" and by["ret"].delta == 3
+
+
+def test_compute_guidance_multi_fit_role_shares_role_level_delta():
+    # Two Logistics fits (Basilisk + Scimitar). Logi default 25-35%. Fleet of 100.
+    # 10 Basilisk + 11 Scimitar = 21 logi total (21%). Min is 25 -> role is +4 short,
+    # and that +4 must appear on BOTH fits (not per-hull deltas).
+    cat = _Cat(groups={})
+    BASI, SCIM = 11985, 11978
+    fits = {
+        "basi": _fit("basi", BASI, _parsed(BASI, [])),
+        "scim": _fit("scim", SCIM, _parsed(SCIM, [])),
+    }
+    doc = _Doc([_mem2("basi", ["Logistics"]), _mem2("scim", ["Logistics"])])
+    counts = {BASI: 10, SCIM: 11}   # 21 logi total
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 100,
+                                    command_ship_fraction=0.0)
+    by = {f.fit_id: f for f in rep.fits}
+    # Role-level target 25-35 of 100; current = 21 (the SUM, not per-hull); +4 on each.
+    assert by["basi"].target_min == 25 and by["basi"].target_max == 35
+    assert by["scim"].target_min == 25 and by["scim"].target_max == 35
+    assert by["basi"].current == 21 and by["scim"].current == 21
+    assert by["basi"].delta == 4 and by["scim"].delta == 4
+    assert by["basi"].status == "under" and by["scim"].status == "under"
+    # Role rollup is NOT double-counted (would be 50-70 / 42 under the old summing bug).
+    rr = rep.roles["Logistics"]
+    assert (rr.target_min, rr.target_max, rr.current, rr.delta) == (25, 35, 21, 4)
+
+
+def test_compute_guidance_multi_fit_role_explicit_override_wins():
+    # An explicit override on one Logi fit represents the whole role (25-30%).
+    cat = _Cat(groups={})
+    BASI, SCIM = 11985, 11978
+    fits = {"basi": _fit("basi", BASI, _parsed(BASI, [])),
+            "scim": _fit("scim", SCIM, _parsed(SCIM, []))}
+    doc = _Doc([_mem2("basi", ["Logistics"], mode="percent", mn=25, mx=30),
+                _mem2("scim", ["Logistics"])])
+    counts = {BASI: 10, SCIM: 11}   # 21 of 100
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 100,
+                                    command_ship_fraction=0.0)
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["basi"].target_min == 25 and by["basi"].target_max == 30
+    assert by["scim"].target_min == 25 and by["scim"].target_max == 30  # role-level
+    assert by["basi"].delta == 4 and by["scim"].delta == 4
+
+
+def test_compute_guidance_small_fleet_percent_min_not_rounded_to_zero():
+    # 2-person fleet, Logistics 25-35%. Old banker's round made 25% of 2 = 0 ("in
+    # range" with 0 logi -> no feedback). Ceil -> min 1, so 0 logi shows +1.
+    cat = _Cat(groups={})
+    SCIM = 11978
+    fits = {"scim": _fit("scim", SCIM, _parsed(SCIM, []))}
+    doc = _Doc([_mem2("scim", ["Logistics"])])
+    counts = {17740: 2}   # 2 DPS-ish hulls, ZERO logistics in the fleet
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 2,
+                                    command_ship_fraction=0.0)
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["scim"].target_min == 1            # ceil(0.25*2)=1, not 0
+    assert by["scim"].current == 0
+    assert by["scim"].status == "under" and by["scim"].delta == 1   # now shows +1
+
+
+def test_percent_to_pilots_ceils_small_fractions():
+    assert fg.percent_to_pilots(25, 2) == 1     # 0.5 -> 1 (was 0 under banker's round)
+    assert fg.percent_to_pilots(50, 20) == 10   # exact, unchanged
+    assert fg.percent_to_pilots(55, 21) == 12   # 11.55 -> 12
+
+
+def test_resolve_tackle_explicit_count_ideal():
+    e = fg.resolve_composition_ideal(_mem(["Tackle"], mode="count", mn=3, mx=8),
+                                     links_range=None)
+    assert (e.mode, e.min, e.max, e.role) == ("count", 3, 8, "Tackle")
+
+
+def test_resolve_tackle_without_explicit_ideal_is_none():
+    # Tackle is a composition role but has no static default, so an unset Tackle
+    # fit yields no guidance (explicit-only).
+    assert fg.resolve_composition_ideal(_mem(["Tackle"]), links_range=None) is None
+
+
+def test_compute_guidance_tackle_role_delta_count():
+    # A Raptor (tackle frigate) tagged Tackle with explicit 3-8 count; 2 in fleet -> +1.
+    cat = _Cat(groups={})
+    RAPTOR = 11178
+    fits = {"rap": _fit("rap", RAPTOR, _parsed(RAPTOR, []))}
+    doc = _Doc([_mem2("rap", ["Tackle"], mode="count", mn=3, mx=8)])
+    counts = {RAPTOR: 2}
+    rep = fg.compute_fleet_guidance(doc, (lambda fid: fits.get(fid)), cat, counts, 50,
+                                    command_ship_fraction=0.0)
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["rap"].role == "Tackle" and by["rap"].mode == "count"
+    assert by["rap"].target_min == 3 and by["rap"].target_max == 8
+    assert by["rap"].current == 2 and by["rap"].status == "under" and by["rap"].delta == 1
+    assert "Tackle" in rep.roles and rep.roles["Tackle"].delta == 1
