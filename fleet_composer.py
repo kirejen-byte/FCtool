@@ -291,3 +291,57 @@ def plan_rebalance(live_members, live_structure, *, max_sizes) -> "RebalanceActi
                                    w["name"], w["name"], None, create_squad=True)
 
     return None
+
+
+def live_layout(live_members, live_structure):
+    """Map live members onto the actual fleet structure for Live-mode rendering.
+
+    Returns {"fc": member|None, "wings": [...], "unplaced": [member, ...]} where
+    each wing is {"id","name","wc": member|None, "squads": [...]} and each squad is
+    {"id","name","sc": member|None, "members": [member, ...]}. A member is "placed"
+    if it is the fleet_commander, a wing_commander of a known wing, a squad_commander
+    of a known squad, or sits in a known squad; everything else is "unplaced"
+    (e.g. a just-joined pilot in EVE's no-squad slot). Matching is by id, robust to
+    ESI's -1 / None "no wing/squad" sentinels (they simply aren't in the id sets).
+    """
+    valid_wings = {w["id"] for w in live_structure.get("wings", [])}
+    valid_squads = {s["id"] for w in live_structure.get("wings", [])
+                    for s in w.get("squads", [])}
+    fc = None
+    wcs: dict = {}      # wing_id -> member
+    scs: dict = {}      # squad_id -> member
+    by_squad: dict = {}  # squad_id -> [member, ...]
+    placed: set = set()
+    for m in live_members:
+        cid = m.get("character_id")
+        role = m.get("role")
+        wid = m.get("wing_id")
+        sid = m.get("squad_id")
+        if role == "fleet_commander":
+            fc = m
+            placed.add(cid)
+        if role == "wing_commander" and wid in valid_wings:
+            wcs[wid] = m
+            placed.add(cid)
+        if role == "squad_commander" and sid in valid_squads:
+            scs[sid] = m
+            placed.add(cid)
+        if sid in valid_squads:
+            by_squad.setdefault(sid, []).append(m)
+            placed.add(cid)
+    wings_out = []
+    for w in live_structure.get("wings", []):
+        squads_out = []
+        for s in w.get("squads", []):
+            squads_out.append({
+                "id": s["id"], "name": s["name"],
+                "sc": scs.get(s["id"]),
+                "members": by_squad.get(s["id"], []),
+            })
+        wings_out.append({
+            "id": w["id"], "name": w["name"],
+            "wc": wcs.get(w["id"]),
+            "squads": squads_out,
+        })
+    unplaced = [m for m in live_members if m.get("character_id") not in placed]
+    return {"fc": fc, "wings": wings_out, "unplaced": unplaced}

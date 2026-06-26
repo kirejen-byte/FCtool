@@ -322,9 +322,9 @@ class FleetTemplateWindow:
         if t is None:
             self._last_preview = None
             return
-        # Exactly one compose() per reload (live only); template mode skips it.
-        self._last_preview = self._compose_preview() if self.mode == "live" else None
-        match_map = self._slot_match_map() if self.mode == "live" else {}
+        if self.mode == "live":
+            self._reload_live_tree()
+            return
         for wi, wing in enumerate(t.wings):
             cap = f"  (max {wing.max_size})" if wing.max_size else ""
             wid = self._tree.insert("", "end", text=f"▼ {wing.name}{cap}", open=True)
@@ -334,46 +334,54 @@ class FleetTemplateWindow:
                 sid = self._tree.insert(wid, "end",
                                         text=f"▼ {squad.name}{scap}", open=True)
                 self._node_meta[sid] = ("squad", (wi, si))
-                pending = list(match_map.get((wing.name, squad.name), []))
                 for li, slot in enumerate(squad.slots):
-                    if self.mode == "live" and pending:
-                        p = pending.pop(0)
-                        text = (f"✓ {p['name']} — {p['ship_type_name']}"
-                                f"{self._role_suffix(slot.role)}")
-                        nid = self._tree.insert(
-                            sid, "end", text=text,
-                            tags=("inpos" if p["in_position"] else "moveme",))
-                    elif self.mode == "live":
-                        nid = self._tree.insert(sid, "end",
-                                                text=self._slot_label(slot),
-                                                tags=("empty",))
-                    else:
-                        nid = self._tree.insert(sid, "end", text=self._slot_label(slot))
+                    nid = self._tree.insert(sid, "end", text=self._slot_label(slot))
                     self._node_meta[nid] = ("slot", (wi, si, li))
-        if self.mode == "live":
-            self._render_unassigned()
 
-    def _role_suffix(self, role):
-        abbr = ROLE_ABBR.get(role, "")
-        return f" [{abbr}]" if abbr else ""
-
-    def _slot_match_map(self):
-        """(wing_name, squad_name) → ordered [{name, ship_type_name, in_position}]
-        for the slots in that squad, derived from the cached compose preview."""
-        res = self._last_preview
-        out: dict[tuple, list] = {}
-        if res is None:
-            return out
-        type_by_id = {m["character_id"]: m.get("ship_type_name", "")
-                      for m in self._live_members}
-        for mv in res.moves:
-            key = (mv.target_wing_name, mv.target_squad_name)
-            out.setdefault(key, []).append({
-                "name": mv.pilot_name,
-                "ship_type_name": type_by_id.get(mv.pilot_id, ""),
-                "in_position": mv.skip_reason == "already_correct",
-            })
-        return out
+    def _reload_live_tree(self):
+        # One compose() to know which currently-placed pilots the template would move.
+        self._last_preview = self._compose_preview()
+        move_ids = set()
+        if self._last_preview is not None:
+            move_ids = {mv.pilot_id for mv in self._last_preview.executable}
+        layout = fleet_composer.live_layout(self._live_members, self._live_structure)
+        fc = layout["fc"]
+        if fc is not None:
+            fid = self._tree.insert(
+                "", "end", open=True,
+                text=f"★ FC: {fc['name']} — {fc.get('ship_type_name', '')}")
+            self._node_meta[fid] = ("livepilot", fc["character_id"])
+        for w in layout["wings"]:
+            wc = w["wc"]
+            wctxt = f"   ◄ WC: {wc['name']}" if wc else ""
+            wid = self._tree.insert("", "end", open=True,
+                                    text=f"▼ {w['name']}{wctxt}")
+            self._node_meta[wid] = ("livewing", w["id"])
+            for s in w["squads"]:
+                sc = s["sc"]
+                sctxt = f"   ◄ SC: {sc['name']}" if sc else ""
+                sid = self._tree.insert(wid, "end", open=True,
+                                        text=f"▼ {s['name']}{sctxt}")
+                self._node_meta[sid] = ("livesquad", (w["id"], s["id"]))
+                for m in s["members"]:
+                    mark = ""
+                    if m.get("role") == "wing_commander":
+                        mark = " [WC]"
+                    elif m.get("role") == "squad_commander":
+                        mark = " [SC]"
+                    tag = "moveme" if m["character_id"] in move_ids else "inpos"
+                    nid = self._tree.insert(
+                        sid, "end", tags=(tag,),
+                        text=f"• {m['name']} — {m.get('ship_type_name', '')}{mark}")
+                    self._node_meta[nid] = ("livepilot", m["character_id"])
+        if layout["unplaced"]:
+            head = self._tree.insert("", "end", open=True, text="── Unassigned ──")
+            self._node_meta[head] = ("unassigned_header", ())
+            for m in layout["unplaced"]:
+                nid = self._tree.insert(
+                    head, "end",
+                    text=f"· {m['name']} — {m.get('ship_type_name', '')}")
+                self._node_meta[nid] = ("unassigned", (m["character_id"],))
 
     # ── structural edits ─────────────────────────────────────────────────────
     def _add_wing(self):
@@ -413,6 +421,8 @@ class FleetTemplateWindow:
         return sel[0], self._node_meta.get(sel[0])
 
     def _on_tree_right_click(self, event):
+        if self.mode == "live":
+            return
         item = self._tree.identify_row(event.y)
         if item:
             self._tree.selection_set(item)
@@ -553,6 +563,34 @@ class FleetTemplateWindow:
         dst_meta = self._node_meta.get(dst)
         if not dst_meta:
             return
+        if self.mode == "live":
+            if kind not in ("livepilot", "unassigned"):
+                return
+            char_ids = []
+            for i in ids:
+                meta = self._node_meta.get(i)
+                if not meta:
+                    continue
+                if meta[0] == "livepilot":
+                    char_ids.append(meta[1])
+                elif meta[0] == "unassigned":
+                    char_ids.append(meta[1][0])
+            dk, dval = dst_meta
+            wing_id = squad_id = None
+            if dk == "livesquad":
+                wing_id, squad_id = dval
+            elif dk == "livewing":
+                wing_id = dval
+            elif dk == "livepilot":
+                tgt = next((m for m in self._live_members
+                            if m["character_id"] == dval), None)
+                if tgt is not None:
+                    wing_id, squad_id = tgt.get("wing_id"), tgt.get("squad_id")
+            if wing_id is None and squad_id is None:
+                self._flash_reject(dst)
+                return
+            self._live_drop_pilots(char_ids, wing_id=wing_id, squad_id=squad_id)
+            return
         if kind == "squad":
             dst_wing = self._wing_path_of(dst_meta)
             if dst_wing is None:
@@ -581,9 +619,10 @@ class FleetTemplateWindow:
         if not metas:
             return None, []
         kind = metas[0][1][0]
-        draggable = {"slot", "unassigned"}
-        if self.mode == "template":
-            draggable.add("squad")
+        if self.mode == "live":
+            draggable = {"livepilot", "unassigned"}
+        else:
+            draggable = {"slot", "unassigned", "squad"}
         if kind not in draggable:
             return None, []
         return kind, [i for i, m in metas if m[0] == kind]
@@ -675,6 +714,33 @@ class FleetTemplateWindow:
                                      target_role="squad_member")
                  for cid in char_ids]
         self._execute_moves(session, moves)   # materialize_template=False (drag move)
+
+    def _live_drop_pilots(self, char_ids, *, wing_id, squad_id):
+        session = self._esi_session_provider()
+        if session is None:
+            self._status.config(text="No fleet-boss session.", fg=FG_RED)
+            return
+        wname = sname = None
+        for w in self._live_structure.get("wings", []):
+            if w["id"] != wing_id:
+                continue
+            wname = w["name"]
+            squads = w.get("squads", [])
+            if squad_id is not None:
+                sname = next((s["name"] for s in squads if s["id"] == squad_id), None)
+            if sname is None:
+                # Dropped on a wing (or its squad vanished): use the wing's first
+                # squad, or a new "Squad" (created by _execute_moves) if it has none.
+                sname = squads[0]["name"] if squads else "Squad"
+            break
+        if wname is None:
+            self._flash_reject(None)
+            return
+        moves = [fleet_composer.Move(pilot_id=cid, pilot_name="",
+                                     target_wing_name=wname, target_squad_name=sname,
+                                     target_role="squad_member")
+                 for cid in char_ids]
+        self._execute_moves(session, moves)   # materialize_template=False
 
     def _flash_reject(self, item):
         if not item:
@@ -1023,17 +1089,6 @@ class FleetTemplateWindow:
             doctrine=self._doctrine_provider(), fittings=self.fittings)
         return self._last_preview
 
-    def _render_unassigned(self):
-        res = self._last_preview   # set by _reload_tree's single compose() call
-        if res is None or not res.unassigned:
-            return
-        head = self._tree.insert("", "end", text="── Unassigned ──", open=True)
-        self._node_meta[head] = ("unassigned_header", ())
-        for m in res.unassigned:
-            nid = self._tree.insert(head, "end",
-                                    text=f"· {m['name']} — {m['ship_type_name']}")
-            self._node_meta[nid] = ("unassigned", (m["character_id"],))
-
     def _manual_assign(self, path):
         # path = (character_id,). Prompt for wing/squad then queue a single move.
         messagebox.showinfo("Manual move",
@@ -1181,8 +1236,10 @@ class FleetTemplateWindow:
         if now - self._last_write_monotonic < cooldown:
             self._schedule_rebalance()
             return
-        max_sizes = {(w.name, s.name): s.max_size
-                     for w in t.wings for s in w.squads}
+        # Key by clamped names — ESI/live names are clamped to 10 chars, so the
+        # cap lookup in plan_rebalance (which uses live names) must match.
+        max_sizes = {(fleet_esi.clamp_name(w.name), fleet_esi.clamp_name(s.name)):
+                     s.max_size for w in t.wings for s in w.squads}
 
         def worker():
             session = self._esi_session_provider()   # blocking — off the Tk thread
@@ -1225,20 +1282,23 @@ class FleetTemplateWindow:
         def worker():
             err = None
             try:
-                name_to_wing = {w["name"]: w["id"]
+                name_to_wing = {fleet_esi.clamp_name(w["name"]): w["id"]
                                 for w in self._live_structure.get("wings", [])}
-                wing_id = name_to_wing.get(action.target_wing_name)
+                name_to_squad = {
+                    (fleet_esi.clamp_name(w["name"]),
+                     fleet_esi.clamp_name(s["name"])): s["id"]
+                    for w in self._live_structure.get("wings", [])
+                    for s in w.get("squads", [])}
+                wing_id = name_to_wing.get(
+                    fleet_esi.clamp_name(action.target_wing_name))
                 squad_id = None
                 if action.create_squad:
                     squad_id = fleet_esi.create_squad(session, self._fleet_id,
                                                       wing_id, "Overflow")
                 else:
-                    for w in self._live_structure.get("wings", []):
-                        if w["name"] != action.target_wing_name:
-                            continue
-                        for s in w.get("squads", []):
-                            if s["name"] == action.target_squad_name:
-                                squad_id = s["id"]
+                    squad_id = name_to_squad.get(
+                        (fleet_esi.clamp_name(action.target_wing_name),
+                         fleet_esi.clamp_name(action.target_squad_name)))
                 fleet_esi.move_member(session, self._fleet_id, action.pilot_id,
                                       wing_id=wing_id, squad_id=squad_id,
                                       role="squad_member")
