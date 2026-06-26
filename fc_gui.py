@@ -1406,6 +1406,8 @@ class FCToolGUI:
                    command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(role_header, text="Expand All", style="Dark.TButton",
                    command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
+                   command=self._kick_pods_from_fleet).pack(side=tk.LEFT, padx=(16, 3))
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -12627,6 +12629,76 @@ class FCToolGUI:
         """Clear all role slot player lists."""
         for slot in self._role_slots:
             self._clear_role_slot(slot)
+
+    def _kick_pods_from_fleet(self):
+        """Kick every fleet member currently in a Capsule (pod). Boss-only, confirmed."""
+        import ship_classes
+        fleet_id = getattr(self, "_last_polled_fleet_id", None)
+        is_boss = bool(getattr(self, "_last_polled_fleet_is_boss", False))
+        if not fleet_id or not is_boss:
+            messagebox.showwarning(
+                "Kick Pods",
+                "You must be the current fleet boss to kick pods.\n"
+                "Use 'Refresh fleet' after forming or joining a fleet, then try again.")
+            return
+        auth = self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            messagebox.showwarning("Kick Pods", "No authenticated character.")
+            return
+
+        def fetch():
+            pods = []   # list of (character_id, name)
+            err = None
+            try:
+                from zkill_monitor import resolve_name
+                members = auth.get_fleet_members(fleet_id=fleet_id) or []
+                for m in members:
+                    if m.get("ship_type_id") in ship_classes.CAPSULE_TYPE_IDS:
+                        cid = m.get("character_id")
+                        if cid:
+                            pods.append((cid, resolve_name(cid, "character") or str(cid)))
+            except Exception as e:
+                err = str(e)
+            self.root.after(0, _confirm, pods, err)
+
+        def _confirm(pods, err):
+            if err:
+                messagebox.showerror("Kick Pods",
+                                     f"Could not read fleet members:\n{err}")
+                return
+            if not pods:
+                messagebox.showinfo("Kick Pods", "No one in the fleet is in a pod.")
+                return
+            names = [n for _cid, n in pods[:15]]
+            preview = ", ".join(names)
+            if len(pods) > 15:
+                preview += f", +{len(pods) - 15} more"
+            if not messagebox.askyesno(
+                    "Kick Pods",
+                    f"Kick {len(pods)} pilot(s) currently in a Capsule from the fleet?\n\n"
+                    f"{preview}\n\nThis cannot be undone."):
+                return
+            _do_kick(pods)
+
+        def _do_kick(pods):
+            def worker():
+                kicked = failed = 0
+                for cid, _name in pods:
+                    if auth.esi_delete(f"/fleets/{fleet_id}/members/{cid}/"):
+                        kicked += 1
+                    else:
+                        failed += 1
+                self.root.after(0, _done, kicked, failed)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _done(kicked, failed):
+            msg = f"Kicked {kicked} pod(s) from the fleet."
+            if failed:
+                msg += (f"\n{failed} could not be kicked (they may have left, "
+                        "swapped ship, or you lost the boss role).")
+            messagebox.showinfo("Kick Pods", msg)
+
+        threading.Thread(target=fetch, daemon=True).start()
 
     def _set_all_roles_collapsed(self, collapsed: bool):
         """Expand or collapse all role slots at once."""

@@ -185,6 +185,12 @@ BLACK_OPS = {
     44996,  # Marshal
 }
 
+# Capsules (pods) — group 29. Used by the Fleet Management "Kick Pods" action.
+CAPSULE_TYPE_IDS = {
+    670,    # Capsule
+    33328,  # Capsule - Genolution 'Auroral' 197-variant
+}
+
 # ── Convenience unions ──────────────────────────────────────────────────────
 ALL_LINKS_COMMAND = COMMAND_SHIPS | COMMAND_DESTROYERS
 ALL_LOGISTICS = (LOGISTICS_CRUISERS | LOGISTICS_FRIGATES

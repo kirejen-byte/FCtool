@@ -162,3 +162,7 @@ def test_new_cyno_groups_in_known_ship_groups():
     d-scan classification)."""
     for gid in (894, 833, 963, 834, 830):
         assert gid in ship_classes._SHIP_GROUP_IDS_KNOWN
+
+def test_capsule_type_ids():
+    import ship_classes
+    assert ship_classes.CAPSULE_TYPE_IDS == {670, 33328}
