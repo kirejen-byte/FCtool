@@ -108,3 +108,12 @@ def test_systems_within_range_filters_and_sorts(monkeypatch, tmp_path):
     assert [sid for sid, _ in everything] == [30000002, 30000004]  # sorted by distance
     assert everything[0][1] == pytest.approx(1.0, abs=1e-6)
     assert everything[1][1] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_get_kspace_name_to_id_filters_to_kspace(monkeypatch):
+    import system_coords as scd
+    monkeypatch.setattr(scd, "_loaded", True)
+    monkeypatch.setattr(scd, "_name_of",
+                        {30000142: "Jita", 30001234: "1DH-SX", 31000005: "J123456"})
+    out = scd.get_kspace_name_to_id()
+    assert out == {"Jita": 30000142, "1DH-SX": 30001234}   # J-space (31m) excluded

@@ -89,6 +89,17 @@ def resolve_name(name: str) -> int | None:
     return _id_of_name.get(name.lower())
 
 
+def get_kspace_name_to_id() -> dict[str, int]:
+    """{canonical_name: system_id} for every K-space system in the bundled table.
+
+    Seeds the autocomplete name list instantly (offline / fresh install / ESI
+    down) instead of waiting on the ESI download. K-space = ids 30000000..30999999
+    (excludes J-space wormholes, matching the ESI-download behavior)."""
+    _load()
+    return {name: sid for sid, name in _name_of.items()
+            if 30_000_000 <= sid <= 30_999_999}
+
+
 def is_legal_jump_destination(system_id: int) -> bool:
     """True iff a capital/JF/Black-Ops jump can land here: K-space, not Zarzakh,
     not Pochven/Jove, and lowsec/nullsec (true-sec < 0.45). Cyno-jammers are

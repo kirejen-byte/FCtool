@@ -380,3 +380,33 @@ def test_search_region_esi_exception_returns_none(tmp_path, monkeypatch):
 
     monkeypatch.setattr(esi_auth.ESIAuth, "resolve_region", boom)
     assert system_cache.search_region("The Forge") is None
+
+
+def test_get_system_names_uses_fresh_cache(monkeypatch):
+    import system_cache as sc
+    monkeypatch.setattr(sc, "load_cache", lambda: {"Jita": 30000142})
+    assert sc.get_system_names() == {"Jita": 30000142}
+
+
+def test_get_system_names_seeds_from_bundled_table_when_no_cache(monkeypatch):
+    import system_cache as sc
+    monkeypatch.setattr(sc, "load_cache", lambda: None)
+    monkeypatch.setattr(sc, "_seed_from_coords", lambda: {"1DH-SX": 30001234})
+    calls = {"refresh": 0, "download": 0}
+    monkeypatch.setattr(sc, "_refresh_cache_async",
+                        lambda: calls.__setitem__("refresh", calls["refresh"] + 1))
+    monkeypatch.setattr(sc, "download_system_names",
+                        lambda: (calls.__setitem__("download", calls["download"] + 1), {})[1])
+    out = sc.get_system_names()
+    assert out == {"1DH-SX": 30001234}     # served instantly from the bundled table
+    assert calls["refresh"] == 1           # background ESI refresh kicked off
+    assert calls["download"] == 0          # did NOT block on a synchronous download
+
+
+def test_get_system_names_falls_back_to_download_without_bundle(monkeypatch):
+    import system_cache as sc
+    monkeypatch.setattr(sc, "load_cache", lambda: None)
+    monkeypatch.setattr(sc, "_seed_from_coords", lambda: {})
+    monkeypatch.setattr(sc, "download_system_names", lambda: {"Amarr": 30002187})
+    monkeypatch.setattr(sc, "save_cache", lambda s: None)
+    assert sc.get_system_names() == {"Amarr": 30002187}

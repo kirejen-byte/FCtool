@@ -8,6 +8,7 @@ Excludes wormhole systems (J-space) unless they have known EVE Scout connections
 import json
 import os
 import time
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from rate_limiter import rate_limit
@@ -100,15 +101,58 @@ def load_cache() -> dict[str, int] | None:
         return None
 
 
+_refresh_lock = threading.Lock()
+_refreshing = False
+
+
+def _seed_from_coords() -> dict[str, int]:
+    """K-space {name: id} from the bundled static table (system_coords.json)."""
+    try:
+        import system_coords
+        return system_coords.get_kspace_name_to_id()
+    except Exception:
+        log.exception("Failed to seed system names from system_coords")
+        return {}
+
+
+def _refresh_cache_async() -> None:
+    """Download the latest system list from ESI in a background thread and cache
+    it, so the next launch is current. Guarded so only one refresh runs at once."""
+    global _refreshing
+    with _refresh_lock:
+        if _refreshing:
+            return
+        _refreshing = True
+
+    def _work():
+        global _refreshing
+        try:
+            systems = download_system_names()
+            if systems:
+                save_cache(systems)
+        except Exception:
+            log.exception("Background system-name refresh failed")
+        finally:
+            with _refresh_lock:
+                _refreshing = False
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
 def get_system_names() -> dict[str, int]:
-    """
-    Get all K-space system names. Uses cache if available, downloads if not.
-    Returns {name: system_id} dict.
-    """
+    """All K-space system names as {name: system_id}.
+
+    Prefers a fresh on-disk ESI cache; otherwise seeds INSTANTLY from the bundled
+    static table (so autocomplete works offline / on a fresh install / when ESI is
+    unreachable) and refreshes from ESI in the background. Only falls back to a
+    blocking ESI download if no bundled table is available."""
     cached = load_cache()
     if cached:
         return cached
-
+    seed = _seed_from_coords()
+    if seed:
+        _refresh_cache_async()
+        return seed
     systems = download_system_names()
     if systems:
         save_cache(systems)
