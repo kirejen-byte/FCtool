@@ -129,6 +129,11 @@ HULL_BURST_BONUS: dict[int, frozenset[str]] = {
     23913: frozenset({ARMOR, SKIRMISH}),     # Nyx       (Gallente)
     23917: frozenset({SHIELD, INFORMATION}), # Wyvern    (Caldari)
     22852: frozenset({SHIELD, SKIRMISH}),    # Hel       (Minmatar)
+    # Command Carriers (group 5120) — Cradle of War, fit up to 3 command bursts
+    92822: frozenset({ARMOR, INFORMATION}),   # Salvation (Amarr)
+    92823: frozenset({SHIELD, INFORMATION}),  # Simurgh   (Caldari)
+    92824: frozenset({ARMOR, SKIRMISH}),      # Gaia      (Gallente)
+    92825: frozenset({SHIELD, SKIRMISH}),     # Ymir      (Minmatar)
 }
 
 T3C_HULL_IDS: frozenset[int] = frozenset({29986, 29984, 29988, 29990})
@@ -146,6 +151,7 @@ BURST_CAPABLE_GROUP_IDS: frozenset[int] = frozenset({
     547,   # Carrier
     1538,  # Force Auxiliary
     659,   # Supercarrier
+    5120,  # Command Carrier
     30,    # Titan
 })
 

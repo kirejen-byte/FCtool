@@ -88,7 +88,7 @@ def test_evaluate_missing_data_is_unknown():
 
 
 def test_hull_table_covers_all_bonused_hulls():
-    assert len(HULL_BURST_BONUS) == 28
+    assert len(HULL_BURST_BONUS) == 32
 
 
 from command_bursts import (
@@ -201,3 +201,40 @@ def test_caldari_carrier_bonused_for_shield_and_information():
 def test_titan_fits_no_bonus_any_discipline():
     assert evaluate_discipline(ARMOR, AVATAR, group_id=GRP_TITAN) is Verdict.FITS_NO_BONUS
     assert evaluate_discipline(INFORMATION, AVATAR, group_id=GRP_TITAN) is Verdict.FITS_NO_BONUS
+
+
+# ── Command Carrier verdicts (group 5120, Cradle of War) ─────────────────────
+GRP_COMMAND_CARRIER = 5120
+
+SALVATION = 92822  # Amarr command carrier    — Armor + Information
+SIMURGH = 92823    # Caldari command carrier  — Shield + Information
+GAIA = 92824       # Gallente command carrier — Armor + Skirmish
+YMIR = 92825       # Minmatar command carrier — Shield + Skirmish
+
+
+def test_command_carrier_bonused_for_correct_disciplines():
+    assert evaluate_discipline(ARMOR, SALVATION, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, SALVATION, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+
+
+def test_command_carrier_not_bonused_for_wrong_discipline():
+    assert evaluate_discipline(SHIELD, SALVATION, group_id=GRP_COMMAND_CARRIER) is Verdict.FITS_NO_BONUS
+    assert evaluate_discipline(SKIRMISH, SALVATION, group_id=GRP_COMMAND_CARRIER) is Verdict.FITS_NO_BONUS
+
+
+def test_gallente_command_carrier_armor_skirmish():
+    assert evaluate_discipline(ARMOR, GAIA, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(SKIRMISH, GAIA, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, GAIA, group_id=GRP_COMMAND_CARRIER) is Verdict.FITS_NO_BONUS
+
+
+def test_caldari_command_carrier_shield_information():
+    assert evaluate_discipline(SHIELD, SIMURGH, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, SIMURGH, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(ARMOR, SIMURGH, group_id=GRP_COMMAND_CARRIER) is Verdict.FITS_NO_BONUS
+
+
+def test_minmatar_command_carrier_shield_skirmish():
+    assert evaluate_discipline(SHIELD, YMIR, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(SKIRMISH, YMIR, group_id=GRP_COMMAND_CARRIER) is Verdict.BONUSED
+    assert evaluate_discipline(INFORMATION, YMIR, group_id=GRP_COMMAND_CARRIER) is Verdict.FITS_NO_BONUS
