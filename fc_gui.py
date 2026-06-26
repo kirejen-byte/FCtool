@@ -12631,7 +12631,8 @@ class FCToolGUI:
             self._clear_role_slot(slot)
 
     def _themed_modal(self, title, message, *,
-                      buttons=(("OK", "Dark.TButton", None),), accent=FG_ACCENT):
+                      buttons=(("OK", "Dark.TButton", None),), accent=FG_ACCENT,
+                      detail_items=None):
         """A dark-themed modal dialog matching the app (replaces tkinter.messagebox).
 
         `buttons` is a sequence of (label, ttk_style, result); they are packed
@@ -12659,6 +12660,22 @@ class FCToolGUI:
                  fg=accent, bg=BG_DARK, anchor=tk.W).pack(fill=tk.X, pady=(0, 8))
         tk.Label(body, text=message, font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
                  justify=tk.LEFT, wraplength=440, anchor=tk.W).pack(fill=tk.X)
+        if detail_items:
+            list_wrap = tk.Frame(body, bg=BG_DARK)
+            list_wrap.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+            lb = tk.Listbox(
+                list_wrap, height=min(10, max(3, len(detail_items))),
+                bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9),
+                selectbackground=BG_PANEL, selectforeground=FG_TEXT,
+                highlightthickness=1, highlightbackground=BORDER_COLOR,
+                activestyle="none", borderwidth=0)
+            for it in detail_items:
+                lb.insert(tk.END, it)
+            if len(detail_items) > 10:
+                sb = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=lb.yview)
+                lb.configure(yscrollcommand=sb.set)
+                sb.pack(side=tk.RIGHT, fill=tk.Y)
+            lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         btn_row = tk.Frame(body, bg=BG_DARK)
         btn_row.pack(fill=tk.X, pady=(16, 0))
         for label, style, val in buttons:
@@ -12722,14 +12739,11 @@ class FCToolGUI:
                 self._themed_modal("Kick Pods", "No one in the fleet is in a pod.",
                                    buttons=[("OK", "Dark.TButton", None)], accent=FG_ACCENT)
                 return
-            names = [n for _cid, n in pods[:15]]
-            preview = ", ".join(names)
-            if len(pods) > 15:
-                preview += f", +{len(pods) - 15} more"
             confirmed = self._themed_modal(
                 "Kick Pods",
-                f"Kick {len(pods)} pilot(s) currently in a Capsule from the fleet?\n\n"
-                f"{preview}\n\nThis cannot be undone.",
+                f"Kick {len(pods)} pilot(s) currently in a Capsule from the fleet?\n"
+                f"This cannot be undone.",
+                detail_items=[n for _cid, n in pods],
                 buttons=[(f"Kick {len(pods)} Pods", "Red.TButton", True),
                          ("Cancel", "Dark.TButton", False)],
                 accent=FG_RED)
