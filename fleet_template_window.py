@@ -259,6 +259,10 @@ class FleetTemplateWindow:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def destroy(self):
+        try:
+            self._destroy_drag_ghost()
+        except Exception:
+            pass
         for after_id in (self._rebalance_after_id, self._sync_after_id):
             if after_id:
                 try:
@@ -276,7 +280,7 @@ class FleetTemplateWindow:
     def _build_tree(self):
         wrap = tk.Frame(self._tree_frame, bg=BG_PANEL)
         wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self._tree = ttk.Treeview(wrap, show="tree", selectmode="browse")
+        self._tree = ttk.Treeview(wrap, show="tree", selectmode="extended")
         vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -293,7 +297,8 @@ class FleetTemplateWindow:
         self._tree.bind("<ButtonPress-1>", self._on_drag_start)
         self._tree.bind("<B1-Motion>", self._on_drag_motion)
         self._tree.bind("<ButtonRelease-1>", self._on_drag_drop)
-        self._drag_item = None
+        self._drag_pending = None   # item ids captured at ButtonPress, dragged on motion
+        self._drag_ghost = None     # floating Toplevel that follows the cursor
 
         add = tk.Frame(self._tree_frame, bg=BG_PANEL)
         add.pack(fill=tk.X)
@@ -508,50 +513,114 @@ class FleetTemplateWindow:
         self._after_structure_change()
 
     def _on_drag_start(self, event):
+        self._destroy_drag_ghost()
+        self._drag_pending = None
+        # Ctrl/Shift clicks build the selection — don't start a drag for those.
+        if event.state & 0x0004 or event.state & 0x0001:   # Control or Shift
+            return
         item = self._tree.identify_row(event.y)
-        meta = self._node_meta.get(item)
-        # Slots and unassigned pilots are always draggable; whole squads are
-        # draggable in template mode only (live tree mirrors ESI structure).
-        draggable = {"slot", "unassigned"}
-        if self.mode == "template":
-            draggable.add("squad")
-        if meta and meta[0] in draggable:
-            self._drag_item = item
-        else:
-            self._drag_item = None
+        if not item:
+            return
+        sel = self._tree.selection()
+        if item in sel and len(sel) > 1:
+            # Pressing an already-multi-selected row → drag the whole selection,
+            # and "break" so Tk's default doesn't collapse it to one row.
+            self._drag_pending = list(sel)
+            return "break"
+        # Plain press on a single row: record it and let Tk select it normally.
+        self._drag_pending = [item]
 
     def _on_drag_motion(self, event):
-        if self._drag_item:
-            target = self._tree.identify_row(event.y)
-            self._tree.selection_set(target) if target else None
+        if not self._drag_pending:
+            return
+        kind, ids = self._draggable_drag_set(self._drag_pending)
+        if not ids:
+            return
+        if self._drag_ghost is None:
+            self._create_drag_ghost(kind, ids)
+        self._move_drag_ghost(event.x_root, event.y_root)
 
     def _on_drag_drop(self, event):
-        src = self._drag_item
-        self._drag_item = None
-        if not src:
+        pending = self._drag_pending
+        self._drag_pending = None
+        self._destroy_drag_ghost()
+        if not pending:
+            return
+        kind, ids = self._draggable_drag_set(pending)
+        if not ids:
             return
         dst = self._tree.identify_row(event.y)
-        src_meta = self._node_meta.get(src)
         dst_meta = self._node_meta.get(dst)
-        if not src_meta or not dst_meta:
+        if not dst_meta:
             return
-        # A dragged squad targets a WING (move the whole squad between wings).
-        if src_meta[0] == "squad":
+        if kind == "squad":
             dst_wing = self._wing_path_of(dst_meta)
             if dst_wing is None:
                 self._flash_reject(dst)
                 return
-            self._drop_squad_into_wing(src_meta[1], dst_wing)
+            self._drop_squads_into_wing([self._node_meta[i][1] for i in ids], dst_wing)
             return
-        # Slots / pilots target a SQUAD (squad node or a slot's parent squad).
         dst_squad = self._squad_path_of(dst_meta)
         if dst_squad is None:
             self._flash_reject(dst)
             return
-        if src_meta[0] == "slot":
-            self._drop_slot_into_squad(src_meta[1], dst_squad)
-        elif src_meta[0] == "unassigned" and self.mode == "live":
-            self._drop_pilot_into_squad(src_meta[1][0], dst_squad)
+        if kind == "slot":
+            self._drop_slots_into_squad([self._node_meta[i][1] for i in ids], dst_squad)
+        elif kind == "unassigned" and self.mode == "live":
+            char_ids = [self._node_meta[i][1][0] for i in ids]
+            self._drop_pilots_into_squad(char_ids, dst_squad)
+
+    def _draggable_drag_set(self, pending):
+        """(kind, [item_ids]) of the homogeneous draggable items in `pending`,
+        or (None, []). Kind is taken from the first item; only same-kind,
+        currently-draggable items are kept. Squads drag in template mode only."""
+        if not pending:
+            return None, []
+        metas = [(i, self._node_meta.get(i)) for i in pending]
+        metas = [(i, m) for i, m in metas if m]
+        if not metas:
+            return None, []
+        kind = metas[0][1][0]
+        draggable = {"slot", "unassigned"}
+        if self.mode == "template":
+            draggable.add("squad")
+        if kind not in draggable:
+            return None, []
+        return kind, [i for i, m in metas if m[0] == kind]
+
+    def _create_drag_ghost(self, kind, ids):
+        n = len(ids)
+        if n == 1:
+            label = self._tree.item(ids[0], "text")
+        else:
+            noun = {"slot": "slots", "unassigned": "pilots",
+                    "squad": "squads"}.get(kind, "items")
+            label = f"{n} {noun}"
+        self._drag_ghost = tk.Toplevel(self.win)
+        self._drag_ghost.overrideredirect(True)
+        try:
+            self._drag_ghost.attributes("-topmost", True)
+            self._drag_ghost.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+        tk.Label(self._drag_ghost, text=label, bg=FG_ACCENT, fg=BG_DARK,
+                 font=("Consolas", 9), padx=6, pady=2,
+                 relief=tk.SOLID, borderwidth=1).pack()
+
+    def _move_drag_ghost(self, x_root, y_root):
+        if self._drag_ghost is not None:
+            try:
+                self._drag_ghost.geometry(f"+{x_root + 12}+{y_root + 10}")
+            except tk.TclError:
+                pass
+
+    def _destroy_drag_ghost(self):
+        if getattr(self, "_drag_ghost", None) is not None:
+            try:
+                self._drag_ghost.destroy()
+            except tk.TclError:
+                pass
+            self._drag_ghost = None
 
     def _squad_path_of(self, meta):
         kind, path = meta
@@ -567,38 +636,45 @@ class FleetTemplateWindow:
             return (path[0],)
         return None
 
-    def _drop_squad_into_wing(self, squad_path, wing_path):
-        self._push_undo()
-        wi, si = squad_path
+    def _drop_squads_into_wing(self, squad_paths, wing_path):
         twi = wing_path[0]
-        if twi == wi:
-            return   # same wing → no-op
-        t = self.current_template()
-        squad = t.wings[wi].squads.pop(si)
-        t.wings[twi].squads.append(squad)
-        self._after_structure_change()
-
-    def _drop_slot_into_squad(self, slot_path, squad_path):
+        paths = [p for p in squad_paths if p[0] != twi]   # skip squads already there
+        if not paths:
+            return
         self._push_undo()
-        wi, si, li = slot_path
         t = self.current_template()
-        slot = t.wings[wi].squads[si].slots.pop(li)
-        t.wings[squad_path[0]].squads[squad_path[1]].slots.append(slot)
+        squads = [t.wings[wi].squads[si] for (wi, si) in paths]   # capture by ref first
+        for (wi, si) in sorted(paths, reverse=True):              # delete high→low
+            del t.wings[wi].squads[si]
+        t.wings[twi].squads.extend(squads)
         self._after_structure_change()
 
-    def _drop_pilot_into_squad(self, character_id, squad_path):
-        # Live: queue a single ESI move for this pilot into the target squad.
+    def _drop_slots_into_squad(self, slot_paths, squad_path):
+        if not slot_paths:
+            return
+        self._push_undo()
+        t = self.current_template()
+        slots = [t.wings[wi].squads[si].slots[li] for (wi, si, li) in slot_paths]
+        for (wi, si, li) in sorted(slot_paths, reverse=True):
+            del t.wings[wi].squads[si].slots[li]
+        tgt = t.wings[squad_path[0]].squads[squad_path[1]]
+        tgt.slots.extend(slots)
+        self._after_structure_change()
+
+    def _drop_pilots_into_squad(self, char_ids, squad_path):
         session = self._esi_session_provider()
         if session is None:
+            self._status.config(text="No fleet-boss session.", fg=FG_RED)
             return
         t = self.current_template()
         wing = t.wings[squad_path[0]]
         squad = wing.squads[squad_path[1]]
-        mv = fleet_composer.Move(pilot_id=character_id, pilot_name="",
-                                 target_wing_name=wing.name,
-                                 target_squad_name=squad.name,
-                                 target_role="squad_member")
-        self._execute_moves(session, [mv])
+        moves = [fleet_composer.Move(pilot_id=cid, pilot_name="",
+                                     target_wing_name=wing.name,
+                                     target_squad_name=squad.name,
+                                     target_role="squad_member")
+                 for cid in char_ids]
+        self._execute_moves(session, moves)   # materialize_template=False (drag move)
 
     def _flash_reject(self, item):
         if not item:
