@@ -58,3 +58,40 @@ def test_indent_respected(tmp_path):
         text = f.read()
     # A 4-space-indented quoted key should be present.
     assert '    "' in text
+
+
+def test_atomic_write_json_retries_transient_lock(tmp_path, monkeypatch):
+    import os, json
+    import app_io
+    monkeypatch.setattr(app_io.time, "sleep", lambda *_a, **_k: None)  # no real sleeping
+    path = str(tmp_path / "s.json")
+    real_replace = os.replace
+    n = {"c": 0}
+
+    def flaky(src, dst):
+        n["c"] += 1
+        if n["c"] < 3:
+            raise PermissionError(32, "locked by another process")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(app_io.os, "replace", flaky)
+    app_io.atomic_write_json(path, {"k": 1})
+    assert n["c"] == 3                              # succeeded on the 3rd try
+    assert json.load(open(path)) == {"k": 1}
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_atomic_write_json_raises_after_persistent_lock(tmp_path, monkeypatch):
+    import os
+    import pytest
+    import app_io
+    monkeypatch.setattr(app_io.time, "sleep", lambda *_a, **_k: None)
+    path = str(tmp_path / "s.json")
+
+    def always_locked(src, dst):
+        raise PermissionError(32, "locked")
+
+    monkeypatch.setattr(app_io.os, "replace", always_locked)
+    with pytest.raises(PermissionError):
+        app_io.atomic_write_json(path, {"k": 1})
+    assert not os.path.exists(path + ".tmp")        # tmp cleaned up on give-up

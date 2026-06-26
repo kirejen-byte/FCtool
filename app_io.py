@@ -4,7 +4,8 @@ Provides :func:`atomic_write_json`, a small helper used across the app to
 persist JSON config/cache files durably. The write goes to a sibling
 ``<path>.tmp`` file first, is flushed (and optionally fsync'd) while the
 handle is still open, and then atomically moved into place with
-``os.replace``. This guarantees that ``path`` is never observed in a
+``os.replace`` (retried a few times on a transient Windows file lock from
+OneDrive/antivirus). This guarantees that ``path`` is never observed in a
 partially-written state: a reader sees either the old contents or the
 fully-written new contents, never a truncated mix.
 
@@ -15,6 +16,28 @@ catch and log; the original file on disk is left untouched on failure.
 
 import json
 import os
+import time
+
+
+# os.replace can raise PermissionError (WinError 32) on Windows when the
+# destination file is momentarily held open by another process — most often
+# OneDrive or antivirus syncing/scanning it. The lock clears in milliseconds, so
+# retry a few times with a short backoff before giving up.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_S = 0.08
+
+
+def _replace_with_retry(tmp: str, path: str) -> None:
+    last = None
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            last = e
+            if attempt < _REPLACE_ATTEMPTS - 1:
+                time.sleep(_REPLACE_BACKOFF_S * (attempt + 1))
+    raise last
 
 
 def atomic_write_json(path, data, *, indent=2, ensure_ascii=True, fsync=True):
@@ -23,8 +46,9 @@ def atomic_write_json(path, data, *, indent=2, ensure_ascii=True, fsync=True):
     The data is first written to ``f"{path}.tmp"`` (in the same directory
     as ``path`` so that ``os.replace`` is an atomic rename on the same
     filesystem), flushed, optionally fsync'd to durable storage, and then
-    moved into place. The destination ``path`` is therefore never left in
-    a partially-written state.
+    moved into place. The replace is retried a few times on a transient
+    Windows file lock (e.g. OneDrive/antivirus). The destination ``path``
+    is therefore never left in a partially-written state.
 
     Args:
         path: Destination file path.
@@ -47,7 +71,7 @@ def atomic_write_json(path, data, *, indent=2, ensure_ascii=True, fsync=True):
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except Exception:
         try:
             os.remove(tmp)
