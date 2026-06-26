@@ -357,6 +357,7 @@ class JumpRangeChecker:
     SHIP_RANGES = {
         "Dreadnought": 7.0,
         "Carrier": 7.0,
+        "Command Carrier": 7.5,
         "Force Auxiliary": 7.0,
         "Supercarrier": 6.0,
         "Titan": 6.0,
