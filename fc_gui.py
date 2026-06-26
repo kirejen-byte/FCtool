@@ -7183,7 +7183,7 @@ class FCToolGUI:
                        side=tk.LEFT, padx=2)
         self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
         tk.Checkbutton(
-            act_row, text="🔗 Link", variable=self._motd_link_var,
+            act_row, text="Auto-update MOTD", variable=self._motd_link_var,
             font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
             activebackground=BG_PANEL, activeforeground=FG_YELLOW,
             command=self._motd_toggle_link).pack(side=tk.LEFT, padx=(10, 2))
