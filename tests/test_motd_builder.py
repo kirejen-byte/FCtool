@@ -286,3 +286,33 @@ def test_build_motd_leading_break_can_be_disabled():
                       fits_by_tag={"DPS": [("670::", "Pod")]}, leading_break=False)
     assert not motd.startswith("<color=0xffffffff><br>")
     assert motd.startswith("<color=0xffffffff>FC:")
+
+
+def test_build_motd_emits_delta_as_separate_colored_text():
+    import motd_builder
+    out = motd_builder.build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="Doc",
+        fits_by_tag={"Logi": [("dna1", "Guardian", 5), ("dna2", "Scimitar", -2)]},
+        text_color=None)
+    # Delta is OUTSIDE the </url> link, colored; name is unchanged inside the link.
+    assert "<url=fitting:dna1>Guardian</url> <color=0xffff4040>+5</color>" in out
+    assert "<url=fitting:dna2>Scimitar</url> <color=0xff45d945>-2</color>" in out
+    # The fit name itself must NOT contain the delta.
+    assert "Guardian (+5)" not in out and "Guardian</url>" in out
+
+
+def test_build_motd_two_tuple_fits_still_work():
+    import motd_builder
+    out = motd_builder.build_motd(
+        fc_name=None, fc_character_id=None, doctrine_name="Doc",
+        fits_by_tag={"DPS": [("dnaX", "Megathron")]}, text_color=None)
+    assert "<url=fitting:dnaX>Megathron</url>" in out
+    assert "<color=0xffff" not in out.split("Megathron</url>")[1][:30]  # no delta appended
+
+
+def test_delta_markup_signs_and_colors():
+    from motd_builder import delta_markup
+    assert delta_markup(0) == ""
+    assert delta_markup(None) == ""
+    assert delta_markup(5) == " <color=0xffff4040>+5</color>"
+    assert delta_markup(-2) == " <color=0xff45d945>-2</color>"

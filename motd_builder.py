@@ -63,6 +63,17 @@ def fitting_link(dna: str, name: str) -> str:
     return f"<url=fitting:{dna}>{name}</url>"
 
 
+# Delta colour markup for the MOTD ideal-fleet feedback. Positive delta = under
+# target (need more) -> red; negative = over target (excess) -> green. EVE colour
+# tags are <color=0xAARRGGBB>...</color>. Returns "" for a zero/None delta.
+def delta_markup(delta) -> str:
+    if not delta:
+        return ""
+    if delta > 0:
+        return f" <color=0xffff4040>+{delta}</color>"
+    return f" <color=0xff45d945>{delta}</color>"   # delta already carries the minus sign
+
+
 def char_link(character_id: int, name: str, type_id: int = CHAR_SHOWINFO_TYPE_ID) -> str:
     """Build a showinfo link to a character.
 
@@ -171,8 +182,11 @@ def build_motd(
       is supplied (see :func:`channel_text`), plain text otherwise,
     * optional ``footer`` free text.
 
-    Each fit tuple is ``(dna, name)``. Empty header/footer and empty tag lists are
-    skipped so the result has no dangling blank lines.
+    Each fit tuple is ``(dna, name)`` or ``(dna, name, delta)`` where the
+    optional ``delta`` is an integer emitted as separate colored text AFTER the
+    fitting link (not inside the link name): red when positive (under target),
+    green when negative (over target). Empty header/footer and empty tag lists
+    are skipped so the result has no dangling blank lines.
 
     Finally, when ``text_color`` is non-None (default ``"0xffffffff"``, white),
     the FULL assembled body is wrapped in ``<color={text_color}>…</color>``. The
@@ -196,7 +210,12 @@ def build_motd(
         fits = fits_by_tag.get(tag) or []
         if not fits:
             continue
-        links = " | ".join(fitting_link(dna, name) for dna, name in fits)
+        parts = []
+        for fit in fits:
+            dna, name = fit[0], fit[1]
+            delta = fit[2] if len(fit) > 2 else 0
+            parts.append(fitting_link(dna, name) + delta_markup(delta))
+        links = " | ".join(parts)
         lines.append(f"{tag}: {links}")
 
     if channel:
