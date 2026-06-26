@@ -12630,20 +12630,71 @@ class FCToolGUI:
         for slot in self._role_slots:
             self._clear_role_slot(slot)
 
+    def _themed_modal(self, title, message, *,
+                      buttons=(("OK", "Dark.TButton", None),), accent=FG_ACCENT):
+        """A dark-themed modal dialog matching the app (replaces tkinter.messagebox).
+
+        `buttons` is a sequence of (label, ttk_style, result); they are packed
+        right-to-left, so the FIRST entry is the rightmost (primary) button.
+        Returns the chosen result, or None if the dialog is closed/escaped.
+        Blocks until dismissed (modal), like messagebox."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=BG_DARK)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        def _choose(val):
+            result["value"] = val
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+        body = tk.Frame(dlg, bg=BG_DARK, padx=18, pady=16,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        body.pack(fill=tk.BOTH, expand=True)
+        tk.Label(body, text=title, font=("Consolas", 12, "bold"),
+                 fg=accent, bg=BG_DARK, anchor=tk.W).pack(fill=tk.X, pady=(0, 8))
+        tk.Label(body, text=message, font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 justify=tk.LEFT, wraplength=440, anchor=tk.W).pack(fill=tk.X)
+        btn_row = tk.Frame(body, bg=BG_DARK)
+        btn_row.pack(fill=tk.X, pady=(16, 0))
+        for label, style, val in buttons:
+            ttk.Button(btn_row, text=label, style=style,
+                       command=lambda v=val: _choose(v)).pack(side=tk.RIGHT, padx=(6, 0))
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _choose(None))
+        dlg.bind("<Escape>", lambda e: _choose(None))
+        dlg.update_idletasks()
+        try:
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            w, h = dlg.winfo_width(), dlg.winfo_height()
+            dlg.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 3)}")
+        except Exception:
+            pass
+        dlg.grab_set()
+        dlg.wait_window()
+        return result["value"]
+
     def _kick_pods_from_fleet(self):
         """Kick every fleet member currently in a Capsule (pod). Boss-only, confirmed."""
         import ship_classes
         fleet_id = getattr(self, "_last_polled_fleet_id", None)
         is_boss = bool(getattr(self, "_last_polled_fleet_is_boss", False))
         if not fleet_id or not is_boss:
-            messagebox.showwarning(
+            self._themed_modal(
                 "Kick Pods",
                 "You must be the current fleet boss to kick pods.\n"
-                "Use 'Refresh fleet' after forming or joining a fleet, then try again.")
+                "Use 'Refresh fleet' after forming or joining a fleet, then try again.",
+                buttons=[("OK", "Dark.TButton", None)], accent=FG_YELLOW)
             return
         auth = self.esi_auth
         if auth is None or not auth.is_authenticated:
-            messagebox.showwarning("Kick Pods", "No authenticated character.")
+            self._themed_modal("Kick Pods", "No authenticated character.",
+                               buttons=[("OK", "Dark.TButton", None)], accent=FG_YELLOW)
             return
 
         def fetch():
@@ -12663,20 +12714,26 @@ class FCToolGUI:
 
         def _confirm(pods, err):
             if err:
-                messagebox.showerror("Kick Pods",
-                                     f"Could not read fleet members:\n{err}")
+                self._themed_modal("Kick Pods",
+                                   f"Could not read fleet members:\n{err}",
+                                   buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
                 return
             if not pods:
-                messagebox.showinfo("Kick Pods", "No one in the fleet is in a pod.")
+                self._themed_modal("Kick Pods", "No one in the fleet is in a pod.",
+                                   buttons=[("OK", "Dark.TButton", None)], accent=FG_ACCENT)
                 return
             names = [n for _cid, n in pods[:15]]
             preview = ", ".join(names)
             if len(pods) > 15:
                 preview += f", +{len(pods) - 15} more"
-            if not messagebox.askyesno(
-                    "Kick Pods",
-                    f"Kick {len(pods)} pilot(s) currently in a Capsule from the fleet?\n\n"
-                    f"{preview}\n\nThis cannot be undone."):
+            confirmed = self._themed_modal(
+                "Kick Pods",
+                f"Kick {len(pods)} pilot(s) currently in a Capsule from the fleet?\n\n"
+                f"{preview}\n\nThis cannot be undone.",
+                buttons=[(f"Kick {len(pods)} Pods", "Red.TButton", True),
+                         ("Cancel", "Dark.TButton", False)],
+                accent=FG_RED)
+            if not confirmed:
                 return
             _do_kick(pods)
 
@@ -12693,10 +12750,13 @@ class FCToolGUI:
 
         def _done(kicked, failed):
             msg = f"Kicked {kicked} pod(s) from the fleet."
+            accent = FG_GREEN
             if failed:
                 msg += (f"\n{failed} could not be kicked (they may have left, "
                         "swapped ship, or you lost the boss role).")
-            messagebox.showinfo("Kick Pods", msg)
+                accent = FG_YELLOW
+            self._themed_modal("Kick Pods", msg,
+                               buttons=[("OK", "Dark.TButton", None)], accent=accent)
 
         threading.Thread(target=fetch, daemon=True).start()
 
