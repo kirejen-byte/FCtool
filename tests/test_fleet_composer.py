@@ -275,3 +275,17 @@ def test_rebalance_signals_create_when_no_undercap_target_exists():
     assert act.target_wing_name == "W"
     assert act.create_squad is True
     assert act.target_squad_name is None
+
+
+def test_already_correct_with_clamped_live_name_is_skipped():
+    # Live structure names are clamped to 10 chars; template uses full names.
+    struct = {"wings": [{"id": 100, "name": "Logistics ",
+                         "squads": [{"id": 200, "name": "Guardians "}]}]}
+    t = _template([Wing("Logistics Wing", None, [Squad("Guardians Squad", None, [
+        Slot(character="Kyra", tag=None, role="squad_member"),
+    ])])])
+    members = [_member(1, "Kyra", "Guardian", role="squad_member",
+                       wing_id=100, squad_id=200)]
+    res = compose(t, members, struct)
+    assert res.executable == []   # clamped names match → no redundant move
+    assert any(m.skip_reason == "already_correct" for m in res.moves)

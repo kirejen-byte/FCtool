@@ -169,3 +169,98 @@ def test_auth_session_raises_no_token_when_unauthenticated(monkeypatch):
     with pytest.raises(FleetESIError) as ei:
         sess.request("GET", "/fleets/1/wings/")
     assert ei.value.reason == "no_token"
+
+
+class StatefulFleet:
+    """In-memory fleet that models the ESI endpoints fleet_esi uses, including
+    EVE auto-creating a default 'Squad 1' when a wing is created."""
+    def __init__(self, wings=None):
+        self.wings = wings or []          # [{id,name,squads:[{id,name}]}]
+        self._next = 1000
+
+    def _new_id(self):
+        self._next += 1
+        return self._next
+
+    def request(self, method, path, json=None):
+        parts = [p for p in path.split("/") if p]   # e.g. fleets,1,wings
+        # GET /fleets/{id}/wings/
+        if method == "GET" and parts[-1] == "wings":
+            return FakeResp(200, [dict(w, squads=[dict(s) for s in w["squads"]])
+                                  for w in self.wings])
+        # POST /fleets/{id}/wings/  → new wing + AUTO squad (models EVE)
+        if method == "POST" and parts[-1] == "wings":
+            wid = self._new_id()
+            self.wings.append({"id": wid, "name": "New Wing",
+                               "squads": [{"id": self._new_id(), "name": "Squad 1"}]})
+            return FakeResp(201, {"wing_id": wid})
+        # POST /fleets/{id}/wings/{wid}/squads/  → new squad
+        if method == "POST" and parts[-1] == "squads":
+            wid = int(parts[-2])
+            w = next(w for w in self.wings if w["id"] == wid)
+            sid = self._new_id()
+            w["squads"].append({"id": sid, "name": "Squad 2"})
+            return FakeResp(201, {"squad_id": sid})
+        # PUT /fleets/{id}/wings/{wid}/  rename
+        if method == "PUT" and parts[-2] == "wings":
+            wid = int(parts[-1])
+            w = next(w for w in self.wings if w["id"] == wid)
+            w["name"] = json["name"]
+            return FakeResp(204)
+        # PUT /fleets/{id}/squads/{sid}/  rename
+        if method == "PUT" and parts[-2] == "squads":
+            sid = int(parts[-1])
+            for w in self.wings:
+                for s in w["squads"]:
+                    if s["id"] == sid:
+                        s["name"] = json["name"]
+            return FakeResp(204)
+        if method == "DELETE":
+            return FakeResp(204)
+        raise AssertionError(f"unexpected {method} {path}")
+
+
+def _squad_names(fleet):
+    return {w["name"]: [s["name"] for s in w["squads"]] for w in fleet.wings}
+
+
+def test_ensure_structure_creates_wing_and_reuses_auto_squad_no_stray():
+    # Live fleet has Alpha/[Logi]; template wants Alpha/[Logi] + Bravo/[DPS].
+    fleet = StatefulFleet([{"id": 1, "name": "Alpha",
+                            "squads": [{"id": 2, "name": "Logi"}]}])
+    wanted = [("Alpha", ["Logi"]), ("Bravo", ["DPS"])]
+    wmap, smap = fleet_esi.ensure_structure(fleet, 99, wanted, fleet.wings)
+    names = _squad_names(fleet)
+    assert set(names) == {"Alpha", "Bravo"}        # Bravo wing was created
+    assert names["Bravo"] == ["DPS"]               # auto "Squad 1" reused → no stray
+    assert names["Alpha"] == ["Logi"]
+    # returned maps are keyed by clamped name
+    assert wmap["Alpha"] == 1 and "Bravo" in wmap
+    assert ("Bravo", "DPS") in smap
+
+
+def test_ensure_structure_creates_shortfall_squads_after_reusing_auto():
+    fleet = StatefulFleet([])   # empty fleet
+    wanted = [("Wing 1", ["A", "B", "C"])]
+    fleet_esi.ensure_structure(fleet, 99, wanted, fleet.wings)
+    names = _squad_names(fleet)
+    assert names["Wing 1"] == ["A", "B", "C"]   # auto squad → A, then B and C created
+
+
+def test_ensure_structure_idempotent_when_already_matches():
+    fleet = StatefulFleet([{"id": 1, "name": "Alpha",
+                            "squads": [{"id": 2, "name": "Logi"}]}])
+    before = _squad_names(fleet)
+    fleet_esi.ensure_structure(fleet, 99, [("Alpha", ["Logi"])], fleet.wings)
+    assert _squad_names(fleet) == before   # nothing created/renamed
+
+
+def test_ensure_structure_matches_clamped_names():
+    # Live squad name is clamped to 10 chars; template uses the full name.
+    fleet = StatefulFleet([{"id": 1, "name": "Logistics ",   # 10 chars (clamped)
+                            "squads": [{"id": 2, "name": "Guardians "}]}])
+    wanted = [("Logistics Wing", ["Guardians Squad"])]   # full (>10) names
+    fleet_esi.ensure_structure(fleet, 99, wanted, fleet.wings)
+    # Must NOT create a duplicate wing/squad — clamped names already match.
+    assert len(fleet.wings) == 1
+    assert len(fleet.wings[0]["squads"]) == 1

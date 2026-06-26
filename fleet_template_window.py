@@ -977,10 +977,6 @@ class FleetTemplateWindow:
         summary = fleet_composer.summarize_moves(res)
         t = self.current_template()
         threshold = t.settings.bulk_apply_threshold
-        if summary["executable"] == 0:
-            self._status.config(text="Nothing to apply — fleet already matches.",
-                                fg=FG_GREEN)
-            return
         if summary["executable"] > threshold:
             msg = (f"{summary['executable']} moves required "
                    f"({summary['unfilled']} slots unfilled, "
@@ -989,37 +985,49 @@ class FleetTemplateWindow:
                    f"Estimated time: ~{summary['executable'] * 0.5:.0f}s\n\nApply now?")
             if not messagebox.askyesno("Confirm apply", msg, parent=self.win):
                 return
-        self._execute_moves(session, res.executable)
+        self._execute_moves(session, res.executable, materialize_template=True)
 
-    def _execute_moves(self, session, moves):
-        # Resolve target wing/squad names → live ids (creating as needed) lazily,
-        # caching within this apply run.
+    def _execute_moves(self, session, moves, *, materialize_template=False):
         fleet_id = self._fleet_id
-        name_to_wing = {w["name"]: w["id"]
-                        for w in self._live_structure.get("wings", [])}
-        name_to_squad = {(w["name"], s["name"]): s["id"]
-                         for w in self._live_structure.get("wings", [])
-                         for s in w.get("squads", [])}
+        t = self.current_template()
 
         def worker():
             done = skipped = 0
             abort = None
-            for i, mv in enumerate(moves):
+            try:
+                if materialize_template and t is not None:
+                    wanted = [(w.name, [s.name for s in w.squads]) for w in t.wings]
+                    wing_ids, squad_ids = fleet_esi.ensure_structure(
+                        session, fleet_id, wanted,
+                        self._live_structure.get("wings", []))
+                else:
+                    wing_ids = {fleet_esi.clamp_name(w["name"]): w["id"]
+                                for w in self._live_structure.get("wings", [])}
+                    squad_ids = {(fleet_esi.clamp_name(w["name"]),
+                                  fleet_esi.clamp_name(s["name"])): s["id"]
+                                 for w in self._live_structure.get("wings", [])
+                                 for s in w.get("squads", [])}
+            except fleet_esi.FleetESIError as e:
+                self._post(_finish, 0, 0, e)
+                return
+
+            for mv in moves:
                 try:
-                    wing_id = squad_id = None
-                    if mv.target_wing_name is not None:
-                        wing_id = name_to_wing.get(mv.target_wing_name)
-                        if wing_id is None:
-                            wing_id = fleet_esi.create_wing(session, fleet_id,
-                                                            mv.target_wing_name)
-                            name_to_wing[mv.target_wing_name] = wing_id
+                    wkey = (fleet_esi.clamp_name(mv.target_wing_name)
+                            if mv.target_wing_name is not None else None)
+                    wing_id = wing_ids.get(wkey) if wkey is not None else None
+                    if wkey is not None and wing_id is None:
+                        wing_id = fleet_esi.create_wing(session, fleet_id,
+                                                        mv.target_wing_name)
+                        wing_ids[wkey] = wing_id
+                    squad_id = None
                     if mv.target_squad_name is not None and wing_id is not None:
-                        key = (mv.target_wing_name, mv.target_squad_name)
-                        squad_id = name_to_squad.get(key)
+                        skey = (wkey, fleet_esi.clamp_name(mv.target_squad_name))
+                        squad_id = squad_ids.get(skey)
                         if squad_id is None:
                             squad_id = fleet_esi.create_squad(session, fleet_id,
                                                               wing_id, mv.target_squad_name)
-                            name_to_squad[key] = squad_id
+                            squad_ids[skey] = squad_id
                     fleet_esi.move_member(session, fleet_id, mv.pilot_id,
                                           wing_id=wing_id, squad_id=squad_id,
                                           role=mv.target_role)
@@ -1031,9 +1039,9 @@ class FleetTemplateWindow:
                     if e.reason == "boss_lost":
                         abort = e
                         break
-                    skipped += 1   # 404 pilot-left / other → skip, continue
+                    skipped += 1
                 import time
-                time.sleep(0.5)    # sequential pacing (spec §8)
+                time.sleep(0.5)
             self._post(_finish, done, skipped, abort)
 
         def _finish(done, skipped, abort):
@@ -1041,13 +1049,23 @@ class FleetTemplateWindow:
                 import time
                 self._last_write_monotonic = time.monotonic()
             if abort is not None:
-                messagebox.showerror("Apply aborted",
-                                     "Lost fleet-boss role (403). No further moves "
-                                     "were made.", parent=self.win)
-                self._status.config(text="Apply aborted — boss lost.", fg=FG_RED)
+                if getattr(abort, "reason", "") == "boss_lost":
+                    messagebox.showerror(
+                        "Apply aborted",
+                        "Lost fleet-boss role (403). No further moves were made.",
+                        parent=self.win)
+                    self._status.config(text="Apply aborted — boss lost.", fg=FG_RED)
+                else:
+                    messagebox.showerror(
+                        "Apply error",
+                        f"ESI error: {getattr(abort, 'reason', '?')}. "
+                        "Some changes may be partial.", parent=self.win)
+                    self._status.config(
+                        text=f"Apply error: {getattr(abort, 'reason', '?')}.",
+                        fg=FG_RED)
             else:
-                self._status.config(
-                    text=f"Applied {done} moves. {skipped} skipped.", fg=FG_GREEN)
+                self._status.config(text=f"Applied {done} moves. {skipped} skipped.",
+                                    fg=FG_GREEN)
             self._sync_live(initial=False)
 
         threading.Thread(target=worker, daemon=True).start()

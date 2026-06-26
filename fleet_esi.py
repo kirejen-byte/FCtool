@@ -111,6 +111,72 @@ def move_member(session, fleet_id: int, member_id: int, *, wing_id, squad_id,
           json=body, expect=(204,))
 
 
+def clamp_name(name) -> str:
+    """ESI wing/squad names are capped at 10 chars; this is the canonical join
+    key between full template names and the (already-clamped) live names."""
+    return (name or "")[:_NAME_MAX]
+
+
+def ensure_structure(session, fleet_id, wanted, live_wings):
+    """Materialize every wing/squad in `wanted` in the live fleet, reconciling
+    EVE's auto-created default squad (reuse/rename instead of leaving a stray).
+
+    wanted: list of (wing_name, [squad_name, ...]) in template order — FULL names.
+    live_wings: current get_wings() result (live names are already <=10 chars).
+    Returns (wing_id_by_key, squad_id_by_key): wing key = clamp_name(wing);
+    squad key = (clamp_name(wing), clamp_name(squad)).
+
+    Matching is by clamped name because ESI stores names clamped to 10 chars.
+    Re-reads get_wings once after any wing creation to capture auto-created squads.
+    """
+    def _index(wings):
+        wmap = {clamp_name(w["name"]): w["id"] for w in wings}
+        squads = {w["id"]: [dict(s) for s in w.get("squads", [])] for w in wings}
+        return wmap, squads
+
+    wmap, squads_by_wing = _index(live_wings)
+
+    created = False
+    for wing_name, _squads in wanted:
+        if clamp_name(wing_name) not in wmap:
+            wmap[clamp_name(wing_name)] = create_wing(session, fleet_id, wing_name)
+            created = True
+    if created:
+        # Re-read to capture EVE's auto-created squads + the new wing ids.
+        wmap, squads_by_wing = _index(get_wings(session, fleet_id))
+
+    squad_ids: dict = {}
+    for wing_name, squad_names in wanted:
+        wkey = clamp_name(wing_name)
+        wing_id = wmap[wkey]
+        existing = squads_by_wing.get(wing_id, [])
+        by_key = {clamp_name(s["name"]): s for s in existing}
+        wanted_keys = {clamp_name(sn) for sn in squad_names}
+        claimed: set = set()
+        for sn in squad_names:
+            skey = clamp_name(sn)
+            hit = by_key.get(skey)
+            if hit is not None and hit["id"] not in claimed:
+                squad_ids[(wkey, skey)] = hit["id"]
+                claimed.add(hit["id"])
+                continue
+            # Reuse a stray squad (exists live but isn't a wanted name) by renaming —
+            # this consumes EVE's auto-created "Squad 1" instead of duplicating.
+            stray = next((s for s in existing
+                          if s["id"] not in claimed
+                          and clamp_name(s["name"]) not in wanted_keys), None)
+            if stray is not None:
+                rename_squad(session, fleet_id, stray["id"], sn)
+                stray["name"] = clamp_name(sn)   # reflect so it isn't reused twice
+                squad_ids[(wkey, skey)] = stray["id"]
+                claimed.add(stray["id"])
+            else:
+                new_sid = create_squad(session, fleet_id, wing_id, sn)
+                squad_ids[(wkey, skey)] = new_sid
+                claimed.add(new_sid)
+    return wmap, squad_ids
+
+
 class AuthEsiSession:
     """Adapts an ESIAuth into the `session` protocol `_call` expects.
 

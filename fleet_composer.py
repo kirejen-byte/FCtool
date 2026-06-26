@@ -22,6 +22,12 @@ from fleet_template_store import AssignmentRule, RuleCondition, RuleAction
 # Lowest-priority sentinel so an implicit tag-rule never outranks a user rule.
 _IMPLICIT_PRIORITY = 1_000_000
 
+_NAME_MAX = 10
+
+
+def _clamp(name):
+    return name[:_NAME_MAX] if isinstance(name, str) else name
+
 
 @dataclass
 class Move:
@@ -175,8 +181,11 @@ def compose(template, live_members, live_structure, *, doctrine=None,
     member_by_id = {m["character_id"]: m for m in pool}
     for cid, (wname, sname, role) in assignment.items():
         m = member_by_id[cid]
-        cur = _current_placement(m, id_to_names)
-        skip = "already_correct" if cur == (wname, sname, role) else None
+        cur_w, cur_s, cur_role = _current_placement(m, id_to_names)
+        same = (cur_role == role
+                and _clamp(cur_w) == _clamp(wname)
+                and _clamp(cur_s) == _clamp(sname))
+        skip = "already_correct" if same else None
         result.moves.append(Move(
             pilot_id=cid, pilot_name=m.get("name", ""),
             target_wing_name=wname, target_squad_name=sname,
