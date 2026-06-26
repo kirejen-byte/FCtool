@@ -1406,8 +1406,6 @@ class FCToolGUI:
                    command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(role_header, text="Expand All", style="Dark.TButton",
                    command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
-                   command=self._open_fleet_templates).pack(side=tk.LEFT, padx=8)
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -1435,6 +1433,8 @@ class FCToolGUI:
         self._rebuild_preset_buttons()
         ttk.Button(role_header, text="Screenshot", style="Dark.TButton",
                    command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
+                   command=self._open_fleet_templates).pack(side=tk.RIGHT, padx=3)
         self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
                                           fg=FG_GREEN, bg=BG_DARK)
         self._screenshot_link.pack(side=tk.RIGHT, padx=5)
@@ -3188,8 +3188,8 @@ class FCToolGUI:
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
         self._ship_type_var = tk.StringVar(
             value=self.config.get("jump_range", {}).get("ship_type", "Dreadnought"))
-        ship_types = ["Dreadnought", "Carrier", "Force Auxiliary", "Supercarrier",
-                      "Titan", "Black Ops", "Jump Freighter", "Rorqual"]
+        ship_types = ["Dreadnought", "Carrier", "Command Carrier", "Force Auxiliary",
+                      "Supercarrier", "Titan", "Black Ops", "Jump Freighter", "Rorqual"]
         self._ship_menu = ttk.Combobox(row2, textvariable=self._ship_type_var,
                                         values=ship_types, state="readonly",
                                         font=("Consolas", 10), width=18)
@@ -6939,6 +6939,14 @@ class FCToolGUI:
         # doctrine-change clear. See _current_motd_markup / _capture_motd_fields.
         self._motd_loaded_fits = None
 
+        # Linked-MOTD auto-push state.
+        self._motd_link_enabled = bool(
+            self.config.get("fittings", {}).get("motd_link", False))
+        self._motd_last_push_ts = None          # time.monotonic() of last successful push
+        self._motd_last_check_ts = None         # time.monotonic() of last auto-update check
+        self._motd_last_pushed_markup = None    # for change-detection (no redundant writes)
+        self._motd_link_state = "off"           # off|waiting|ok|not_boss|overbudget|error
+
         # ── Master split: inputs (left) | preview (right) ────────────────────
         body = tk.Frame(tab, bg=BG_DARK)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -7171,6 +7179,36 @@ class FCToolGUI:
         ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
                    command=self._motd_refresh_fleet_status).pack(
                        side=tk.LEFT, padx=2)
+        self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
+        tk.Checkbutton(
+            act_row, text="🔗 Link", variable=self._motd_link_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+            activebackground=BG_PANEL, activeforeground=FG_YELLOW,
+            command=self._motd_toggle_link).pack(side=tk.LEFT, padx=(10, 2))
+        tk.Label(act_row, text="every", font=("Consolas", 8), fg=FG_DIM,
+                 bg=BG_PANEL).pack(side=tk.LEFT, padx=(6, 1))
+        self._motd_link_interval_var = tk.IntVar(value=self._motd_link_interval_s())
+        _ivl = tk.Spinbox(
+            act_row, from_=10, to=300, increment=5, width=4,
+            textvariable=self._motd_link_interval_var, font=("Consolas", 8),
+            bg=BG_ENTRY, fg=FG_TEXT, command=self._motd_link_interval_changed)
+        _ivl.pack(side=tk.LEFT)
+        _ivl.bind("<FocusOut>", lambda e: self._motd_link_interval_changed())
+        _ivl.bind("<Return>", lambda e: self._motd_link_interval_changed())
+        tk.Label(act_row, text="s", font=("Consolas", 8), fg=FG_DIM,
+                 bg=BG_PANEL).pack(side=tk.LEFT, padx=(1, 6))
+        self._motd_link_indicator = tk.Label(
+            act_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
+            bg=BG_PANEL, cursor="question_arrow")
+        self._motd_link_indicator.pack(side=tk.LEFT, padx=2)
+        _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
+                     "and re-pushes it to your fleet whenever the composition/"
+                     "deltas change. The counter is seconds since the last "
+                     "check. Requires you to be the current fleet boss; only "
+                     "re-pushes when the text actually changes.")
+        self._motd_link_indicator.bind(
+            "<Enter>", lambda e, t=_link_tip: self._show_tooltip(e, t))
+        self._motd_link_indicator.bind("<Leave>", lambda e: self._hide_tooltip())
         self._motd_fleet_status = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
@@ -7184,6 +7222,8 @@ class FCToolGUI:
         self._motd_rebuild_tag_checkboxes()
         self._motd_refresh_saved_dropdown()
         self._rebuild_motd_preview()
+        self._motd_link_tick()
+        self._motd_autopush_loop()
 
     # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
 
@@ -7255,6 +7295,25 @@ class FCToolGUI:
         self.config.setdefault("fleet", {})["active_doctrine"] = var.get()
         self._save_config()
         self._refresh_specialized_roles_from_cache()
+
+    def _auto_select_fleet_doctrine(self, doctrine_name):
+        """After a successful MOTD push, point the Fleet-Management tab's doctrine
+        selector at the MOTD's doctrine so live guidance/fleet-feedback tracks what
+        was just broadcast. No-op if the name is blank, unknown, or already active."""
+        if not doctrine_name:
+            return
+        fvar = getattr(self, "_fleet_doctrine_var", None)
+        if fvar is None:
+            return
+        if not any((d.name or "") == doctrine_name
+                   for d in self.fittings.list_doctrines()):
+            return
+        if (fvar.get() or "") == doctrine_name:
+            return
+        fvar.set(doctrine_name)
+        # Reuse the existing handler: persists active_doctrine to config + saves +
+        # refreshes the Specialized Roles / guidance sections.
+        self._on_fleet_doctrine_change()
 
     def _open_active_doctrine(self):
         """Navigate to the active doctrine in Fittings ▸ Doctrines (best-effort)."""
@@ -8258,12 +8317,10 @@ class FCToolGUI:
             try:
                 parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
             except Exception:
-                return (self._canonical_fit_dna(dna), name)
+                return (self._canonical_fit_dna(dna), name, 0)
             canon = self._canonical_fit_dna(dna, parsed)
             d = deltas.get(parsed.ship_type_id) if deltas else 0
-            if d:
-                name = f"{name} ({'+' if d > 0 else ''}{d})"
-            return (canon, name)
+            return (canon, name, d or 0)
 
         fits_by_tag = {tag: [_finalize(dna, name) for dna, name in fits]
                        for tag, fits in fits_by_tag.items()}
@@ -8578,6 +8635,11 @@ class FCToolGUI:
         fleet_id = self._motd_fleet_id
         self._motd_fleet_status.config(text="Setting MOTD...", fg=FG_ACCENT)
 
+        pushed_doctrine = ""
+        _mvar = getattr(self, "_motd_doctrine_var", None)
+        if _mvar is not None:
+            pushed_doctrine = _mvar.get() or ""
+
         def worker():
             ok = False
             err = None
@@ -8591,6 +8653,7 @@ class FCToolGUI:
             if ok:
                 self._motd_fleet_status.config(
                     text="MOTD set successfully (204).", fg=FG_GREEN)
+                self._auto_select_fleet_doctrine(pushed_doctrine)
             else:
                 detail = (f"\n\n{err}" if err else
                           "\n\nESI rejected the request (403 if you are no "
@@ -8601,6 +8664,146 @@ class FCToolGUI:
                                      f"Could not set the fleet MOTD.{detail}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _motd_toggle_link(self):
+        """Enable/disable linked auto-push of the MOTD."""
+        self._motd_link_enabled = bool(self._motd_link_var.get())
+        self.config.setdefault("fittings", {})["motd_link"] = self._motd_link_enabled
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        self._motd_link_state = "waiting" if self._motd_link_enabled else "off"
+        if self._motd_link_enabled:
+            import time
+            self._motd_last_check_ts = time.monotonic()
+            self._motd_maybe_autopush()   # push now if something changed
+        self._motd_update_link_indicator()
+
+    def _motd_maybe_autopush(self):
+        """If linked, recompute the MOTD and re-push it to the fleet when it has
+        changed since the last push. Called on the main thread each fleet poll.
+        Markup is computed here (reads Tk widgets); boss resolution + the PUT run
+        on a worker thread."""
+        if not getattr(self, "_motd_link_enabled", False):
+            return
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            return
+        try:
+            markup, _ = self._motd_output_markup()
+        except Exception:
+            return
+        if motd_builder.estimate_length(markup) >= self._motd_budget():
+            self._motd_link_state = "overbudget"
+            self._motd_update_link_indicator()
+            return
+        if markup == self._motd_last_pushed_markup:
+            return  # unchanged → no redundant ESI write
+
+        def worker():
+            ok = False
+            reason = None
+            try:
+                info = auth.get_fleet_info()
+                fid = info["fleet_id"] if info else None
+                is_boss = bool(info and auth.is_boss(info, auth.character_id))
+                if not fid or not is_boss:
+                    reason = "not_boss"
+                else:
+                    ok = auth.set_fleet_motd(fid, markup)
+                    if not ok:
+                        reason = "error"
+            except Exception as e:
+                reason = str(e) or "error"
+            self.root.after(0, _done, ok, reason, markup)
+
+        def _done(ok, reason, pushed):
+            import time
+            if ok:
+                self._motd_last_push_ts = time.monotonic()
+                self._motd_last_pushed_markup = pushed
+                self._motd_link_state = "ok"
+            elif reason == "not_boss":
+                self._motd_link_state = "not_boss"   # keep linked, just can't push
+            else:
+                # Hard failure (e.g. 403) — drop the link so we stop hammering ESI.
+                self._motd_link_enabled = False
+                if getattr(self, "_motd_link_var", None) is not None:
+                    self._motd_link_var.set(False)
+                self._motd_link_state = "error"
+            self._motd_update_link_indicator()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _motd_update_link_indicator(self):
+        ind = getattr(self, "_motd_link_indicator", None)
+        if ind is None:
+            return
+        if not getattr(self, "_motd_link_enabled", False):
+            ind.config(text="○ not linked", fg=FG_DIM)
+            return
+        state = getattr(self, "_motd_link_state", "waiting")
+        if state == "error":
+            ind.config(text="○ link dropped (push failed)", fg=FG_RED)
+            return
+        if state == "overbudget":
+            ind.config(text="🔗 over budget — not pushed", fg=FG_YELLOW)
+            return
+        if state == "not_boss":
+            ind.config(text="🔗 linked (not boss)", fg=FG_YELLOW)
+            return
+        ts = getattr(self, "_motd_last_check_ts", None)
+        if ts is None:
+            ind.config(text="🔗 linked • starting…", fg=FG_ACCENT)
+            return
+        import time
+        age = int(time.monotonic() - ts)
+        ind.config(text=f"🔗 linked • {age}s", fg=FG_GREEN)
+
+    def _motd_link_tick(self):
+        """1 s heartbeat that refreshes the 'Ns' indicator text."""
+        self._motd_update_link_indicator()
+        try:
+            self.root.after(1000, self._motd_link_tick)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _motd_link_interval_s(self) -> int:
+        """Configured auto-update interval in seconds (clamped 10..300)."""
+        try:
+            v = int(self.config.get("fittings", {}).get("motd_link_interval_s", 15))
+        except (TypeError, ValueError):
+            v = 15
+        return max(10, min(300, v))
+
+    def _motd_link_interval_changed(self):
+        try:
+            v = int(self._motd_link_interval_var.get())
+        except (tk.TclError, ValueError):
+            return
+        v = max(10, min(300, v))
+        if v != self._motd_link_interval_var.get():
+            self._motd_link_interval_var.set(v)
+        self.config.setdefault("fittings", {})["motd_link_interval_s"] = v
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _motd_autopush_loop(self):
+        """Dedicated auto-update timer (decoupled from the fleet poll). Runs every
+        configured interval; when linked, stamps the check time and re-pushes the
+        MOTD if it changed. Always re-arms at the (possibly updated) interval."""
+        if getattr(self, "_motd_link_enabled", False):
+            import time
+            self._motd_last_check_ts = time.monotonic()
+            self._motd_maybe_autopush()
+        try:
+            self._motd_autopush_after_id = self.root.after(
+                self._motd_link_interval_s() * 1000, self._motd_autopush_loop)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def _copy_motd(self):
         """Copy the raw MOTD markup to the clipboard (manual-paste fallback)."""
