@@ -3161,6 +3161,30 @@ class FCToolGUI:
                  fg=FG_MAGENTA, bg=BG_DARK).pack(side=tk.LEFT)
         ttk.Button(right_header, text="Clear", style="Dark.TButton",
                    command=self._clear_intel_log).pack(side=tk.RIGHT, padx=2)
+        # Controls sub-row: find box, pause/resume, and the "▼ N new" jump button.
+        controls = tk.Frame(self._intel_right_frame, bg=BG_DARK)
+        controls.pack(fill=tk.X, pady=(0, 2))
+        tk.Label(controls, text="Find:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_DARK).pack(side=tk.LEFT)
+        find_entry = tk.Entry(controls, textvariable=self._intel_find_var,
+                              font=("Consolas", 9), width=18, bg=BG_ENTRY,
+                              fg=FG_WHITE, insertbackground=FG_WHITE)
+        find_entry.pack(side=tk.LEFT, padx=(4, 8))
+        self._intel_find_var.trace_add(
+            "write", lambda *a: self._intel_rerender_from_buffer())
+        self._intel_pause_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            controls, text="Pause", variable=self._intel_pause_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            command=lambda: setattr(self, "_intel_autoscroll_paused",
+                                    self._intel_pause_var.get()),
+        ).pack(side=tk.LEFT)
+        self._intel_new_btn = tk.Button(
+            controls, text="▼ 0 new", font=("Consolas", 8, "bold"),
+            fg=FG_YELLOW, bg=BG_ENTRY, borderwidth=1, relief=tk.RIDGE,
+            cursor="hand2", command=self._intel_jump_to_bottom)
+        # packed on demand by _intel_update_new_button
         self._intel_log = scrolledtext.ScrolledText(
             self._intel_right_frame, height=30, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
@@ -14138,6 +14162,22 @@ $bmp.Dispose()
         for name, var in self._intel_channel_vars.items():
             if var.get():
                 self._intel_channels_enabled.add(name)
+        if hasattr(self, "_intel_buffer"):
+            self._intel_rerender_from_buffer()
+
+    def _intel_rerender_from_buffer(self):
+        """Clear the Text and re-render every buffered entry that passes the
+        current view filter. The deque is never mutated -- no data is lost."""
+        log = self._intel_log
+        log.config(state=tk.NORMAL)
+        log.delete("1.0", tk.END)
+        log.config(state=tk.DISABLED)
+        for entry in list(self._intel_buffer):
+            msg = entry[0]
+            if self._passes_view_filter(msg):
+                self._render_line(entry)
+        self._intel_new_count = 0
+        self._intel_update_new_button()
 
     _CHANNEL_PALETTE = ("#ff66ff", "#00d4ff", "#00ff88", "#ff8c00",
                         "#ffdd00", "#9b87ff", "#ff6b9d", "#5fd3bc")
@@ -14363,8 +14403,47 @@ $bmp.Dispose()
         finally:
             log.config(state=tk.DISABLED)
 
-    def _intel_system_menu(self, event, system_name):  # full impl in Task 11
-        pass
+    def _intel_system_menu(self, event, system_name: str):
+        """Right-click context menu on a system span; reuses the EXACT legacy
+        card actions. Items: Set destination (boss) / Copy name / Open in
+        Dotlan / Navigate WH route / Titan bridge. D-scan is NOT here -- the
+        legacy 'D-Scan' action (self._open_url(report.dscan_url)) is
+        per-message, so it is exposed as a clickable dscan span instead (see
+        _bind_dscan_span), not as a system-menu item."""
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
+        # Set destination — boss-gated copy/destination helper.
+        menu.add_command(
+            label="Set destination (boss)",
+            command=lambda: self._set_destination_or_copy(system_name))
+        menu.add_command(
+            label="Copy name",
+            command=lambda: (self.root.clipboard_clear(),
+                             self.root.clipboard_append(system_name)))
+        # Open in Dotlan — same URL + self._open_url as the legacy 'Dotlan' button.
+        dotlan = (f"https://evemaps.dotlan.net/system/"
+                  f"{system_name.replace(' ', '_')}")
+        menu.add_command(label="Open in Dotlan",
+                         command=lambda: self._open_url(dotlan))
+        # Navigate WH route — same call as the legacy 'Navigate' button.
+        menu.add_command(
+            label="Navigate WH route",
+            command=lambda: self._navigate_wh_route(system_name))
+        # Titan bridge — same call as the legacy 'Titan Bridge?' button.
+        menu.add_command(
+            label="Titan bridge",
+            command=lambda: self._navigate_jump_range(system_name))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _intel_jump_to_bottom(self):
+        self._intel_log.see("end")
+        self._intel_new_count = 0
+        self._intel_autoscroll_paused = False
+        if hasattr(self, "_intel_pause_var"):
+            self._intel_pause_var.set(False)
+        self._intel_update_new_button()
 
     def _check_cyno_beacon(self, system_id: int) -> bool:
         """Check if a Pharolux Cynosural Beacon exists in the given system via ESI."""
@@ -14390,182 +14469,6 @@ $bmp.Dispose()
         except Exception:
             pass
         return False
-
-    def _show_intel_report(self, report: IntelReport):
-        """Display an intel report in the intel log pane (newest at top)."""
-        ts = report.timestamp.strftime("%H:%M:%S") if report.timestamp else "??:??:??"
-        log = self._intel_log
-
-        # Track for fusion detection
-        if report.system_name:
-            self._recent_intel_systems[report.system_name] = datetime.now()
-
-        # Check for fusion with recent zkill alerts
-        is_fused = False
-        if report.system_name and report.system_name in self._recent_zkill_systems:
-            delta = datetime.now() - self._recent_zkill_systems[report.system_name]
-            if delta.total_seconds() <= 600:  # 10 minutes
-                is_fused = True
-
-        if report.report_type == "clear":
-            header_tag = "intel_clear"
-            header = f"[{ts}] INTEL — CLEAR"
-        else:
-            header_tag = "intel"
-            header = f"[{ts}] INTEL"
-            if is_fused:
-                header = f"[{ts}] [FUSED] INTEL"
-                header_tag = "fused"
-            if report.has_camp:
-                header += " [CAMP]"
-            if report.has_spike:
-                header += " [SPIKE]"
-
-        self._begin_alert_block(log)
-        self._append_zkill_log(header + "\n", header_tag)
-
-        # Determine highlight threshold
-        try:
-            min_rep = int(self._intel_min_reported_var.get())
-        except ValueError:
-            min_rep = 0
-        report_count = report.pilot_count or report.dscan_total or 0
-        is_above_threshold = min_rep > 0 and report_count >= min_rep
-
-        if report.system_name:
-            region_str = f" ({report.region_name})" if report.region_name else ""
-            # System name as clickable button (sets destination + copies)
-            self._append_zkill_log("  System:  ", "info")
-            sys_btn = tk.Button(
-                log, text=f"{report.system_name}{region_str}",
-                font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_ENTRY,
-                activebackground="#1a5a90", activeforeground=FG_WHITE,
-                borderwidth=1, relief=tk.RIDGE, cursor="hand2",
-                command=lambda s=report.system_name: self._set_destination_or_copy(s),
-            )
-            log.window_create("alert_ins", window=sys_btn)
-            self._append_zkill_log("\n")
-
-        if report.pilot_count:
-            count_tag = "fight" if is_above_threshold else "value"
-            prefix = "  *** " if is_above_threshold else "  "
-            self._append_zkill_log(
-                f"{prefix}Reported: {report.pilot_count}+ hostiles\n", count_tag
-            )
-
-        if report.dscan_summary:
-            scan_tag = "fight" if is_above_threshold else "info"
-            self._append_zkill_log(
-                f"  Scan: {report.dscan_summary}\n", scan_tag
-            )
-
-        if report.has_cyno_beacon:
-            self._append_zkill_log(
-                "  ** PHAROLUX CYNO BEACON IN SYSTEM **\n", "fused"
-            )
-
-        if report.route_from_staging:
-            self._append_zkill_log(
-                f"  Route:   {report.route_from_staging}\n", "info"
-            )
-
-        self._append_zkill_log(
-            f"  Channel: {report.channel}  |  Reporter: {report.reporter}\n",
-            "intel_meta",
-        )
-
-        # Render message with character names highlighted in red
-        self._append_zkill_log("  Message: ", "dim")
-        if report.characters:
-            char_names = {c["name"] for c in report.characters}
-            char_lookup = {c["name"]: c for c in report.characters}
-            msg_text = report.raw_message
-            # Split message around character names and render with tags
-            remaining = msg_text
-            for cname in sorted(char_names, key=len, reverse=True):
-                if cname in remaining:
-                    parts = remaining.split(cname, 1)
-                    if parts[0]:
-                        self._append_zkill_log(parts[0], "dim")
-                    # Create a unique tag for tooltip
-                    ci = char_lookup[cname]
-                    tooltip = ci.get("alliance") or ci.get("corporation") or ""
-                    hostile = ci.get("hostile", True)
-                    tag_id = f"char_{ci['character_id']}"
-                    char_color = FG_RED if hostile else FG_GREEN
-                    log.tag_config(tag_id, foreground=char_color,
-                                   font=("Consolas", 10, "bold"))
-                    self._append_zkill_log(cname, tag_id)
-                    # Bind tooltip on hover
-                    if tooltip:
-                        log.tag_bind(tag_id, "<Enter>",
-                            lambda e, t=f"[{tooltip}]": self._show_tooltip(e, t))
-                        log.tag_bind(tag_id, "<Leave>",
-                            lambda e: self._hide_tooltip())
-                    remaining = parts[1] if len(parts) > 1 else ""
-            if remaining:
-                self._append_zkill_log(remaining, "dim")
-            self._append_zkill_log("\n")
-        else:
-            self._append_zkill_log(f"{report.raw_message}\n", "dim")
-
-        # Insert action buttons
-        log.insert("alert_ins", "  ")
-
-        # Dotlan link
-        if report.system_name:
-            dotlan_url = f"https://evemaps.dotlan.net/system/{report.system_name.replace(' ', '_')}"
-            dotlan_btn = tk.Button(
-                log, text="Dotlan", font=("Consolas", 8, "bold"),
-                fg=FG_ORANGE, bg=BG_ENTRY, activebackground="#1a5a90",
-                activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
-                cursor="hand2",
-                command=lambda u=dotlan_url: self._open_url(u),
-            )
-            log.window_create("alert_ins", window=dotlan_btn)
-            log.insert("alert_ins", "  ")
-
-        # D-Scan link
-        if report.dscan_url:
-            dscan_btn = tk.Button(
-                log, text="D-Scan", font=("Consolas", 8, "bold"),
-                fg=FG_ACCENT, bg=BG_ENTRY, activebackground="#1a5a90",
-                activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
-                cursor="hand2",
-                command=lambda u=report.dscan_url: self._open_url(u),
-            )
-            log.window_create("alert_ins", window=dscan_btn)
-            log.insert("alert_ins", "  ")
-
-        # Navigate button
-        staging = self._get_staging_system()
-        if staging and report.system_name:
-            nav_btn = tk.Button(
-                log, text="Navigate", font=("Consolas", 8, "bold"),
-                fg=FG_YELLOW, bg=BG_ENTRY, activebackground="#1a5a90",
-                activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
-                cursor="hand2",
-                command=lambda s=report.system_name: self._navigate_wh_route(s),
-            )
-            log.window_create("alert_ins", window=nav_btn)
-            log.insert("alert_ins", "  ")
-
-            # Titan Bridge button — highlight if cyno beacon present
-            bridge_label = "Titan Bridge? [CYNO]" if report.has_cyno_beacon else "Titan Bridge?"
-            bridge_color = FG_YELLOW if report.has_cyno_beacon else FG_GREEN
-            bridge_btn = tk.Button(
-                log, text=bridge_label, font=("Consolas", 8, "bold"),
-                fg=bridge_color, bg=BG_ENTRY, activebackground="#1a5a90",
-                activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
-                cursor="hand2",
-                command=lambda s=report.system_name, cyno=report.has_cyno_beacon: self._navigate_jump_range(s, has_cyno=cyno),
-            )
-            log.window_create("alert_ins", window=bridge_btn)
-
-        log.insert("alert_ins", "\n\n")
-        self._end_alert_block(log)
-
-        self._notify_zkill_tab()
 
     # ── Log helpers (parameterized for split pane) ─────────────────────────
 
@@ -14594,6 +14497,10 @@ $bmp.Dispose()
         self._intel_log.config(state=tk.NORMAL)
         self._intel_log.delete("1.0", tk.END)
         self._intel_log.config(state=tk.DISABLED)
+        if hasattr(self, "_intel_buffer"):
+            self._intel_buffer.clear()
+        self._intel_new_count = 0
+        self._intel_update_new_button()
 
     def _append_zkill_log(self, text, tag=None):
         w = self._current_log or self._zkill_log

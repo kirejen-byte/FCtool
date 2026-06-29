@@ -212,3 +212,27 @@ def test_priority_ping_gated_by_intel_sound_var():
         assert pings["n"] == 1
     finally:
         root.destroy()
+
+
+# ── Task 11: find box re-render from the deque source-of-truth ───────────────
+def test_find_rerender_filters_from_deque():
+    root, host, txt = _make_host()
+    try:
+        # NOTE (test-scaffold deviation): the plan referenced
+        # fc_gui.FCToolApp._intel_rerender_from_buffer, but the real class in
+        # fc_gui.py is FCToolGUI (there is no FCToolApp). Bound from the actual
+        # class name; intent (bind the real method onto the SimpleNamespace
+        # host) is preserved.
+        setattr(host, "_intel_rerender_from_buffer",
+                types.MethodType(fc_gui.FCToolGUI._intel_rerender_from_buffer, host))
+        host._intel_buffer.append(
+            (FakeMsg("Delve.Intel", "Alice", "Amamake clear"), [], None, False))
+        host._intel_buffer.append(
+            (FakeMsg("Delve.Intel", "Bob", "Rancer camp"), [], None, False))
+        host._intel_find_var.set("rancer")
+        host._intel_rerender_from_buffer()
+        body = txt.get("1.0", "end-1c")
+        assert "Rancer camp" in body
+        assert "Amamake clear" not in body
+    finally:
+        root.destroy()
