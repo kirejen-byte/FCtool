@@ -1294,6 +1294,13 @@ class FCToolGUI:
         self._current_system_name = ""
         self._current_system_region = ""
 
+        # EVE Time (UTC) — always-visible clock (EVE servers run on UTC).
+        self._eve_clock = tk.Label(
+            title_frame, text="EVE --:--:--",
+            font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK)
+        self._eve_clock.pack(side=tk.RIGHT, padx=15)
+        self._update_eve_clock()
+
         # Status indicators on right
         self._status_frame = tk.Frame(title_frame, bg=BG_DARK)
         self._status_frame.pack(side=tk.RIGHT, padx=15)
@@ -1319,6 +1326,19 @@ class FCToolGUI:
         # Track zkill alert notifications
         self._zkill_has_unread = False
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _update_eve_clock(self):
+        """Refresh the always-visible EVE-time (UTC) clock once per second."""
+        from datetime import datetime, timezone
+        try:
+            now = datetime.now(timezone.utc)
+            self._eve_clock.config(text=now.strftime("EVE  %Y.%m.%d  %H:%M:%S"))
+        except tk.TclError:
+            return  # widget gone (app closing)
+        try:
+            self.root.after(1000, self._update_eve_clock)
+        except (tk.TclError, RuntimeError):
+            pass
 
     # ── X-Up Tab ──────────────────────────────────────────────────────────────
 
