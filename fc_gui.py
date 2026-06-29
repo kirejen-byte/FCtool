@@ -7280,26 +7280,30 @@ class FCToolGUI:
         ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
                    command=self._motd_refresh_fleet_status).pack(
                        side=tk.LEFT, padx=2)
+        # Auto-update controls on their own row so the interval ("every N s")
+        # and the link indicator are never clipped when the window is narrow.
+        link_row = tk.Frame(right, bg=BG_PANEL)
+        link_row.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
         tk.Checkbutton(
-            act_row, text="Auto-update MOTD", variable=self._motd_link_var,
+            link_row, text="Auto-update MOTD", variable=self._motd_link_var,
             font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
             activebackground=BG_PANEL, activeforeground=FG_YELLOW,
-            command=self._motd_toggle_link).pack(side=tk.LEFT, padx=(10, 2))
-        tk.Label(act_row, text="every", font=("Consolas", 8), fg=FG_DIM,
+            command=self._motd_toggle_link).pack(side=tk.LEFT, padx=(0, 2))
+        tk.Label(link_row, text="every", font=("Consolas", 8), fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(6, 1))
         self._motd_link_interval_var = tk.IntVar(value=self._motd_link_interval_s())
         _ivl = tk.Spinbox(
-            act_row, from_=10, to=300, increment=5, width=4,
+            link_row, from_=10, to=300, increment=5, width=4,
             textvariable=self._motd_link_interval_var, font=("Consolas", 8),
             bg=BG_ENTRY, fg=FG_TEXT, command=self._motd_link_interval_changed)
         _ivl.pack(side=tk.LEFT)
         _ivl.bind("<FocusOut>", lambda e: self._motd_link_interval_changed())
         _ivl.bind("<Return>", lambda e: self._motd_link_interval_changed())
-        tk.Label(act_row, text="s", font=("Consolas", 8), fg=FG_DIM,
+        tk.Label(link_row, text="s", font=("Consolas", 8), fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(1, 6))
         self._motd_link_indicator = tk.Label(
-            act_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
+            link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
             bg=BG_PANEL, cursor="question_arrow")
         self._motd_link_indicator.pack(side=tk.LEFT, padx=2)
         _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
@@ -7313,7 +7317,7 @@ class FCToolGUI:
         self._motd_fleet_status = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
-        self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
+        self._motd_fleet_status.grid(row=6, column=0, sticky="ew", padx=8,
                                      pady=(0, 8))
 
         # Populate dropdowns, then first preview. The tab opens clean (no sticky
