@@ -76,12 +76,82 @@ def _system_spans(text: str) -> list[Span]:
     return spans
 
 
+def _overlaps(start: int, end: int, taken: list[Span]) -> bool:
+    return any(not (end <= s.start or start >= s.end) for s in taken)
+
+
+def _count_spans(text: str, taken: list[Span]) -> list[Span]:
+    """count spans via the three intel_monitor tiers, non-overlapping with
+    already-taken (system) spans. payload={'count': int}."""
+    out: list[Span] = []
+    claimed: list[Span] = []
+
+    def _try_add(start: int, end: int, value: int):
+        if value < 1:
+            return
+        if _overlaps(start, end, taken) or _overlaps(start, end, claimed):
+            return
+        sp = Span(start=start, end=end, kind="count",
+                  value=text[start:end], payload={"count": value})
+        out.append(sp)
+        claimed.append(sp)
+
+    # Tier 1: keyword-adjacent ("5 reds"). group(1) is the digits.
+    for m in COUNT_PATTERN.finditer(text):
+        _try_add(m.start(1), m.end(1), int(m.group(1)))
+    # Tier 2: explicit plus ("+5"/"5+"). One of the two groups holds the digits.
+    for m in EXPLICIT_PLUS_COUNT_PATTERN.finditer(text):
+        digits = m.group(1) or m.group(2)
+        gi = 1 if m.group(1) else 2
+        _try_add(m.start(gi), m.end(gi), int(digits))
+    # Tier 3: bare digit, only when a hostile keyword is within proximity.
+    for m in BARE_COUNT_PATTERN.finditer(text):
+        ws = max(0, m.start() - BARE_COUNT_PROXIMITY)
+        we = m.end() + BARE_COUNT_PROXIMITY
+        if HOSTILE_CONTEXT_PATTERN.search(text[ws:we]):
+            _try_add(m.start(1), m.end(1), int(m.group(1)))
+    return out
+
+
+_KEYWORD_PATTERNS = (
+    ("clear", CLEAR_PATTERN),
+    ("camp", CAMP_PATTERN),
+    ("spike", SPIKE_PATTERN),
+    ("cyno", CYNO_PATTERN),
+)
+
+
+def _keyword_and_url_spans(text: str, taken: list[Span]) -> list[Span]:
+    out: list[Span] = []
+    claimed: list[Span] = []
+
+    def _add(start: int, end: int, kind: str, payload: dict):
+        if _overlaps(start, end, taken) or _overlaps(start, end, claimed):
+            return
+        sp = Span(start=start, end=end, kind=kind,
+                  value=text[start:end], payload=payload)
+        out.append(sp)
+        claimed.append(sp)
+
+    for m in DSCAN_URL_PATTERN.finditer(text):
+        _add(m.start(1), m.end(1), "dscan_url", {"url": m.group(1)})
+    for kind, pat in _KEYWORD_PATTERNS:
+        for m in pat.finditer(text):
+            _add(m.start(), m.end(), kind, {})
+    return out
+
+
 def annotate(text: str) -> list[Span]:
     """Detect important spans in a raw intel line. Pure; deterministic;
     non-overlapping (longest match wins on conflict). Total: never raises.
     'name' spans are NOT produced here."""
     if not text:
         return []
-    spans = _system_spans(text)
+    try:
+        spans = _system_spans(text)
+        spans += _keyword_and_url_spans(text, spans)
+        spans += _count_spans(text, spans)
+    except Exception:
+        return []
     spans.sort(key=lambda s: s.start)
     return spans

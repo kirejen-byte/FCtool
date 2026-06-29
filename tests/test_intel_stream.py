@@ -97,3 +97,75 @@ def test_no_system_when_nothing_resolves(monkeypatch):
     import intel_stream
     monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
     assert [s for s in annotate("random chatter here") if s.kind == "system"] == []
+
+
+def _kinds(spans):
+    return {s.kind for s in spans}
+
+
+def test_count_keyword_tier(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    spans = annotate("10 hostiles inbound")
+    cs = [s for s in spans if s.kind == "count"]
+    assert len(cs) == 1
+    assert cs[0].payload == {"count": 10}
+    assert cs[0].value == "10"
+
+
+def test_count_explicit_plus(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    spans = annotate("gang +5 coming")
+    cs = [s for s in spans if s.kind == "count"]
+    assert len(cs) == 1
+    assert cs[0].payload == {"count": 5}
+
+
+def test_bare_count_only_with_hostile_context(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    # bare digit near a hostile keyword -> count
+    assert any(s.kind == "count" and s.payload == {"count": 8}
+               for s in annotate("gang of 8 here"))
+    # bare digit with no hostile context -> NOT a count
+    assert [s for s in annotate("be there in 5 jumps") if s.kind == "count"] == []
+
+
+def test_dscan_url(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    url = "https://dscan.info/v/abc123"
+    spans = annotate(f"scan {url} fresh")
+    ds = [s for s in spans if s.kind == "dscan_url"]
+    assert len(ds) == 1
+    assert ds[0].payload == {"url": url}
+    assert ds[0].value == url
+
+
+def test_clear_camp_spike_cyno(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    assert any(s.kind == "clear" for s in annotate("clr"))
+    assert any(s.kind == "camp" for s in annotate("gate camp up"))
+    assert any(s.kind == "spike" for s in annotate("spike in local"))
+    assert any(s.kind == "cyno" for s in annotate("cyno lit"))
+
+
+def test_combined_line(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name",
+                        lambda n: 30002187 if n.lower() == "amamake" else None)
+    spans = annotate("Amamake 5 reds camp cyno")
+    kinds = _kinds(spans)
+    assert {"system", "count", "camp", "cyno"} <= kinds
+    # non-overlapping: no two spans share any offset
+    spans = sorted(spans, key=lambda s: s.start)
+    for a, b in zip(spans, spans[1:]):
+        assert a.end <= b.start
+
+
+def test_plain_chatter_no_false_positives(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    assert annotate("anyone want to run abyssals later") == []
