@@ -3,6 +3,7 @@ FCTool GUI - Fleet Commander Assistant Frontend
 Tkinter-based GUI that wraps all FCTool modules.
 """
 
+import collections
 import json
 import os
 import re
@@ -41,6 +42,7 @@ if sys.platform == "win32":
 
 import intel_filter
 import intel_monitor
+import intel_stream
 from chat_monitor import ChatMonitor, ChatMessage
 from intel_monitor import (
     IntelReport, parse_intel_message, scan_available_channels,
@@ -136,6 +138,20 @@ VERDICT_COLOR = {
 }
 
 # ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
+
+
+def high_priority(report, min_reported: int) -> bool:
+    """Priority predicate: True if the report's pilot count meets the threshold
+    OR the report has a computed route from staging (within range / reachable).
+    NOT a drop filter -- only marks inline emphasis."""
+    if report is None:
+        return False
+    count = (report.pilot_count or 0)
+    if min_reported > 0 and count >= min_reported:
+        return True
+    if getattr(report, "route_from_staging", ""):
+        return True
+    return False
 
 
 def add_filter_item(items: list, item: dict) -> tuple[list, bool]:
@@ -3079,6 +3095,13 @@ class FCToolGUI:
         self._intel_monitor: ChatMonitor | None = None
         self._intel_thread: threading.Thread | None = None
         self._intel_channels_enabled: set[str] = set()
+        self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
+        self._intel_channel_colors: dict[str, str] = {}
+        self._intel_autoscroll_paused = False
+        self._intel_new_count = 0
+        self._intel_new_btn = None
+        self._intel_resolver = None
+        self._intel_find_var = tk.StringVar(value="")
 
         # One checkbox per tracked intel channel (user-configurable, sourced
         # from config["intel_channels"]["tracked"] via self._tracked_intel_channels).
@@ -3146,11 +3169,9 @@ class FCToolGUI:
 
         # Configure text tags for intel log
         for log in (self._intel_log,):
+            # ── retained legacy tags (still referenced; do NOT drop) ──
             log.tag_config("intel", foreground=FG_MAGENTA,
                            font=("Consolas", 11, "bold"))
-            log.tag_config("intel_clear", foreground=FG_GREEN,
-                           font=("Consolas", 11, "bold"))
-            log.tag_config("intel_system", foreground=FG_ACCENT)
             log.tag_config("intel_meta", foreground=FG_DIM)
             log.tag_config("info", foreground=FG_ACCENT)
             log.tag_config("value", foreground=FG_ORANGE)
@@ -3159,6 +3180,27 @@ class FCToolGUI:
                            font=("Consolas", 11, "bold"))
             log.tag_config("hostile_char", foreground=FG_RED,
                            font=("Consolas", 10, "bold"))
+            # ── new firehose stream tags ──
+            log.tag_config("intel_system", foreground=FG_ACCENT,
+                           underline=True)
+            log.tag_config("intel_count", foreground=FG_ORANGE,
+                           font=("Consolas", 10, "bold"))
+            log.tag_config("intel_clear", foreground=FG_GREEN)
+            log.tag_config("intel_camp", foreground=FG_RED,
+                           font=("Consolas", 10, "bold"))
+            log.tag_config("intel_spike", foreground=FG_YELLOW,
+                           font=("Consolas", 10, "bold"))
+            log.tag_config("intel_cyno", foreground=FG_RED,
+                           font=("Consolas", 10, "bold"))
+            log.tag_config("intel_dscan", foreground=FG_ACCENT,
+                           underline=True)
+            log.tag_config("intel_priority", background="#3a1a1a")
+            log.tag_config("channel", foreground=FG_MAGENTA)
+            log.tag_config("name_friendly", foreground=FG_GREEN)
+            log.tag_config("name_hostile", foreground=FG_RED,
+                           font=("Consolas", 10, "bold"))
+            log.tag_config("name_neutral", foreground=FG_YELLOW)
+            log.tag_config("name_unknown", foreground=FG_DIM)
 
         # Initialize the standings age label now that the cache has been loaded.
         self._update_standings_label()
@@ -14070,100 +14112,195 @@ $bmp.Dispose()
             if var.get():
                 self._intel_channels_enabled.add(name)
 
+    _CHANNEL_PALETTE = ("#ff66ff", "#00d4ff", "#00ff88", "#ff8c00",
+                        "#ffdd00", "#9b87ff", "#ff6b9d", "#5fd3bc")
+
+    def _channel_color(self, channel: str) -> str:
+        c = self._intel_channel_colors.get(channel)
+        if c is None:
+            c = self._CHANNEL_PALETTE[len(self._intel_channel_colors)
+                                      % len(self._CHANNEL_PALETTE)]
+            self._intel_channel_colors[channel] = c
+        return c
+
     def _on_intel_message(self, msg: ChatMessage):
-        """Callback for intel channel messages."""
+        """Worker-thread callback: annotate verbatim, enrich for priority only,
+        then marshal to the main thread. Nothing is dropped."""
         if msg.channel not in self._intel_channels_enabled:
             return
-
-        report = parse_intel_message(msg, search_system)
-        if report is None:
-            return
-
-        # Skip clear reports entirely
-        if report.report_type == "clear":
-            return
-
-        # Skip pure info with no system
-        if report.report_type == "info" and not report.system_name:
-            return
-
-        # Coalesce rapid-fire posts from same reporter
-        report, is_new = coalesce_report(report)
-        if not is_new:
-            # Merged into existing — no new card needed
-            return
-
-        # Resolve region name for the system
-        if report.system_id and not report.region_name:
-            try:
-                sys_info = get_system_info(report.system_id)
-                if sys_info:
-                    if self.esi_auth and self.esi_auth.is_authenticated:
-                        report.region_name = self.esi_auth._get_region_name(sys_info)
-                    else:
-                        # Fallback: resolve via public ESI
-                        import requests as _rq
-                        cid = sys_info.get("constellation_id")
-                        if cid:
-                            rate_limit('esi')
-                            cr = _rq.get(f"{ESI_BASE}/universe/constellations/{cid}/", headers=ESI_HEADERS, timeout=5)
-                            if cr.ok:
-                                rid = cr.json().get("region_id")
-                                if rid:
-                                    rate_limit('esi')
-                                    rr = _rq.get(f"{ESI_BASE}/universe/regions/{rid}/", headers=ESI_HEADERS, timeout=5)
-                                    if rr.ok:
-                                        report.region_name = rr.json().get("name", "")
-            except Exception:
-                pass
-
-        # Calculate route from staging
-        staging = self._get_staging_system()
-        if staging and report.system_id:
-            try:
-                from jump_range import get_stargate_route as _gr
-                o = search_system(staging)
-                if o:
-                    conns = self._get_ansiblex_connections()
-                    r = _gr(o, report.system_id, connections=conns)
-                    if r:
-                        report.route_from_staging = (
-                            f"{staging} -> {report.system_name}: **{len(r)-1} jumps**"
-                        )
-            except Exception:
-                pass
-
-        # Check for Pharolux cyno beacon via ESI (non-blocking, no failure if ESI unavailable)
-        if report.system_id:
+        try:
+            spans = intel_stream.annotate(msg.message)
+        except Exception:
+            spans = []
+        report = None
+        try:
+            report = parse_intel_message(msg, search_system)
+        except Exception:
+            report = None
+        # Enrich the report for priority/route/system_id (never gates).
+        if report is not None and report.system_id:
+            staging = self._get_staging_system()
+            if staging:
+                try:
+                    from jump_range import get_stargate_route as _gr
+                    o = search_system(staging)
+                    if o:
+                        conns = self._get_ansiblex_connections()
+                        r = _gr(o, report.system_id, connections=conns)
+                        if r:
+                            report.route_from_staging = (
+                                f"{staging} -> {report.system_name}: "
+                                f"**{len(r)-1} jumps**")
+                except Exception:
+                    pass
             try:
                 report.has_cyno_beacon = self._check_cyno_beacon(report.system_id)
             except Exception:
                 pass
-
-        # Resolve character names in message (public ESI, no auth needed)
         try:
-            chars = resolve_characters(report.raw_message, report.system_name, search_system)
-            if chars:
-                report.characters = chars
-        except Exception:
-            pass
+            min_rep = int(self._intel_min_reported_var.get())
+        except (ValueError, AttributeError):
+            min_rep = 0
+        priority = high_priority(report, min_rep) if report else False
+        self.root.after(0, self._intel_stream_ingest, msg, spans, report, priority)
 
-        # Fetch dscan data if URL present (populate summary before display)
-        if report.dscan_url:
+    def _passes_view_filter(self, msg) -> bool:
+        if msg.channel not in self._intel_channels_enabled:
+            return False
+        needle = self._intel_find_var.get().strip().lower()
+        if needle:
+            hay = f"{msg.channel} {msg.sender} {msg.message}".lower()
+            if needle not in hay:
+                return False
+        return True
+
+    def _intel_stream_ingest(self, msg, spans, report, priority):
+        """Main thread: append to the ring buffer, render if visible, fire the
+        async resolver, and ping on priority lines."""
+        self._intel_buffer.append((msg, spans, report, priority))
+        if self._passes_view_filter(msg):
+            self._render_line((msg, spans, report, priority))
+        # async name resolution
+        if self._intel_resolver is not None:
             try:
-                import requests as _req
-                resp = _req.get(report.dscan_url, timeout=10)
-                if resp.ok:
-                    from intel_monitor import make_dscan_summary
-                    result = parse_dscan_text(resp.text)
-                    if result["total"] > 0:
-                        report.dscan_ships = result["ships"]
-                        report.dscan_total = result["total"]
-                        report.dscan_summary = make_dscan_summary(result["ships"], result["total"])
+                names = intel_stream.candidate_names(msg.message)
+                if names:
+                    self._intel_resolver.request(
+                        names,
+                        lambda d: self.root.after(
+                            0, self._intel_apply_resolutions, d),
+                    )
+            except Exception:
+                pass
+        if priority and getattr(self, "_sound_enabled", False):
+            try:
+                self._play_fire_alert()
             except Exception:
                 pass
 
-        self.root.after(0, self._show_intel_report, report)
+    def _render_line(self, entry):
+        """Append one verbatim line at the BOTTOM (deliberate change from the
+        old newest-at-top prepend) and apply span tags. Autoscroll only when at
+        the bottom; otherwise hold and bump the '▼ N new' counter."""
+        msg, spans, report, priority = entry
+        log = self._intel_log
+        log.config(state=tk.NORMAL)
+        ts = msg.timestamp.strftime("%H:%M:%S") if msg.timestamp else "??:??:??"
+        at_bottom = log.yview()[1] >= 0.999
+
+        start_index = log.index("end-1c")
+        prefix = f"[{ts}] "
+        log.insert("end", prefix)
+        ch_start = log.index("end-1c")
+        log.insert("end", msg.channel)
+        ch_end = log.index("end-1c")
+        ch_tag = f"chan_{abs(hash(msg.channel)) & 0xffffff}"
+        log.tag_config(ch_tag, foreground=self._channel_color(msg.channel))
+        log.tag_add(ch_tag, ch_start, ch_end)
+
+        log.insert("end", f"  {msg.sender} > ")
+        body_start = log.index("end-1c")
+        log.insert("end", msg.message)
+
+        # Apply structural span tags relative to body_start.
+        kind_to_tag = {
+            "system": "intel_system", "count": "intel_count",
+            "clear": "intel_clear", "camp": "intel_camp",
+            "spike": "intel_spike", "cyno": "intel_cyno",
+            "dscan_url": "intel_dscan",
+        }
+        for sp in spans:
+            tag = kind_to_tag.get(sp.kind)
+            if not tag:
+                continue
+            s = log.index(f"{body_start}+{sp.start}c")
+            e = log.index(f"{body_start}+{sp.end}c")
+            log.tag_add(tag, s, e)
+            if sp.kind == "system":
+                self._bind_system_span(log, tag, s, e, sp.value)
+            elif sp.kind == "dscan_url":
+                self._bind_dscan_span(log, s, e, sp.payload.get("url", ""))
+
+        log.insert("end", "\n")
+        end_index = log.index("end-1c")
+        if priority:
+            log.tag_add("intel_priority", start_index, end_index)
+
+        # Bounded trim: keep at most maxlen lines in the widget.
+        cap = self._intel_buffer.maxlen or 2000
+        line_count = int(log.index("end-1c").split(".")[0])
+        if line_count > cap:
+            log.delete("1.0", f"{line_count - cap + 1}.0")
+
+        log.config(state=tk.DISABLED)
+        if at_bottom and not self._intel_autoscroll_paused:
+            log.see("end")
+        else:
+            self._intel_new_count += 1
+            self._intel_update_new_button()
+
+    def _bind_system_span(self, log, base_tag, s, e, system_name):
+        """Per-instance click + right-click bindings for a system span."""
+        click_tag = f"sysclick_{abs(hash((system_name, s))) & 0xffffff}"
+        log.tag_add(click_tag, s, e)
+        log.tag_bind(click_tag, "<Button-1>",
+                     lambda ev, n=system_name: self._set_destination_or_copy(n))
+        log.tag_bind(click_tag, "<Button-3>",
+                     lambda ev, n=system_name: self._intel_system_menu(ev, n))
+        log.tag_bind(click_tag, "<Enter>",
+                     lambda ev: log.config(cursor="hand2"))
+        log.tag_bind(click_tag, "<Leave>",
+                     lambda ev: log.config(cursor=""))
+
+    def _bind_dscan_span(self, log, s, e, url):
+        """Per-instance click binding for a D-Scan URL span. Left-click opens
+        the URL with the SAME call the legacy 'D-Scan' card button used
+        (self._open_url(report.dscan_url), fc_gui.py:14334)."""
+        if not url:
+            return
+        click_tag = f"dscan_{abs(hash((url, s))) & 0xffffff}"
+        log.tag_add(click_tag, s, e)
+        log.tag_bind(click_tag, "<Button-1>",
+                     lambda ev, u=url: self._open_url(u))
+        log.tag_bind(click_tag, "<Enter>",
+                     lambda ev: log.config(cursor="hand2"))
+        log.tag_bind(click_tag, "<Leave>",
+                     lambda ev: log.config(cursor=""))
+
+    def _intel_update_new_button(self):
+        if self._intel_new_btn is not None:
+            try:
+                self._intel_new_btn.config(text=f"▼ {self._intel_new_count} new")
+                self._intel_new_btn.pack(side=tk.RIGHT, padx=2) \
+                    if self._intel_new_count else self._intel_new_btn.pack_forget()
+            except Exception:
+                pass
+
+    def _intel_apply_resolutions(self, resolutions):  # full impl in Task 9
+        pass
+
+    def _intel_system_menu(self, event, system_name):  # full impl in Task 11
+        pass
 
     def _check_cyno_beacon(self, system_id: int) -> bool:
         """Check if a Pharolux Cynosural Beacon exists in the given system via ESI."""
