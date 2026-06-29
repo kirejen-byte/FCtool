@@ -169,3 +169,72 @@ def test_plain_chatter_no_false_positives(monkeypatch):
     import intel_stream
     monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
     assert annotate("anyone want to run abyssals later") == []
+
+
+from intel_stream import candidate_names
+
+
+def test_candidate_names_basic(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    assert candidate_names("Bob Smith") == ["Bob Smith"]
+
+
+def test_candidate_names_drops_systems(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name",
+                        lambda n: 30000142 if n.lower() == "jita" else None)
+    assert candidate_names("Jita Bob") == ["Bob"]
+
+
+def test_candidate_names_drops_keywords_urls_numbers(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    out = candidate_names("clr 5 https://dscan.info/v/x Bob")
+    assert "Bob" in out
+    assert all("http" not in c for c in out)
+    assert "clr" not in [c.lower() for c in out]
+    assert "5" not in out
+
+
+def test_candidate_names_two_word(monkeypatch):
+    import intel_stream
+    monkeypatch.setattr(intel_stream, "resolve_name", lambda n: None)
+    # "gang" is a hostile-context word but not in the real _INTEL_KEYWORDS set,
+    # so treat it as a keyword here to keep the original test intent: two
+    # consecutive non-keyword tokens fuse into one "First Last" candidate.
+    monkeypatch.setattr(intel_stream, "_INTEL_KEYWORDS",
+                        intel_stream._INTEL_KEYWORDS | {"gang"})
+    assert candidate_names("reds John Doe gang") == ["John Doe"]
+
+
+def test_resolve_characters_uses_candidate_names(monkeypatch):
+    import intel_monitor
+    import intel_stream
+    captured = {}
+
+    def fake_candidate_names(text):
+        captured["text"] = text
+        return ["John Doe"]
+
+    # Delegation seam: resolve_characters must tokenise via candidate_names.
+    monkeypatch.setattr(intel_stream, "candidate_names", fake_candidate_names)
+    # Stub out the ESI POST so the test never hits the network and we only
+    # assert that the candidate list flowed from candidate_names into the call.
+    import requests
+    sent = {}
+
+    class _Resp:
+        ok = True
+
+        def json(self):
+            return {"characters": []}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sent["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    intel_monitor.resolve_characters("reds John Doe", "", lambda n: None)
+    assert captured["text"] == "reds John Doe"
+    assert sent["json"] == ["John Doe"]

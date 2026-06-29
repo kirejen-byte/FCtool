@@ -155,3 +155,40 @@ def annotate(text: str) -> list[Span]:
         return []
     spans.sort(key=lambda s: s.start)
     return spans
+
+
+def candidate_names(text: str) -> list[str]:
+    """Probable pilot-name candidates for the async resolver: tokens that are
+    NOT system names, intel keywords, URLs, or bare numbers. Two adjacent
+    eligible tokens fuse into a single 'First Last' candidate (one skip).
+    Pure; deterministic. Shared by intel_monitor.resolve_characters (DRY)."""
+    if not text:
+        return []
+    tokens = text.split()
+    candidates: list[str] = []
+    skip_next = 0
+    for i, token in enumerate(tokens):
+        if skip_next > 0:
+            skip_next -= 1
+            continue
+        clean = token.strip("*!?.,;:+()[]<>")
+        if not clean or len(clean) < 2:
+            continue
+        if clean.lower() in _INTEL_KEYWORDS:
+            continue
+        if clean.startswith("http"):
+            continue
+        if clean.replace("+", "").replace("-", "").isdigit():
+            continue
+        if resolve_name(clean) is not None:
+            continue
+        if i + 1 < len(tokens):
+            next_clean = tokens[i + 1].strip("*!?.,;:+()[]<>")
+            if (next_clean and len(next_clean) >= 2
+                    and next_clean.lower() not in _INTEL_KEYWORDS
+                    and resolve_name(next_clean) is None):
+                candidates.append(f"{clean} {next_clean}")
+                skip_next = 1
+                continue
+        candidates.append(clean)
+    return candidates

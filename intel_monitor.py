@@ -920,43 +920,13 @@ def resolve_characters(
     Try to identify character names in an intel message and resolve them via ESI.
     Returns list of {name, character_id, corporation, alliance} dicts.
 
-    Uses the public ESI /universe/ids/ endpoint (no auth needed).
+    Uses the public ESI /universe/ids/ endpoint (no auth needed). Tokenising is
+    shared with the firehose via intel_stream.candidate_names (DRY).
     """
     import requests as _req
+    from intel_stream import candidate_names
 
-    # Extract candidate names: tokens that are NOT system names, keywords, URLs, or numbers
-    tokens = raw_message.split()
-    candidates = []
-    skip_next = 0
-    for i, token in enumerate(tokens):
-        if skip_next > 0:
-            skip_next -= 1
-            continue
-        clean = token.strip("*!?.,;:+()[]<>")
-        if not clean or len(clean) < 2:
-            continue
-        low = clean.lower()
-        if low in _INTEL_KEYWORDS:
-            continue
-        if clean.startswith("http"):
-            continue
-        if clean.replace("+", "").replace("-", "").isdigit():
-            continue
-        if clean == system_name:
-            continue
-        if resolve_system(clean):
-            continue
-        # Multi-word names: try "First Last" (2 tokens)
-        if i + 1 < len(tokens):
-            next_clean = tokens[i + 1].strip("*!?.,;:+()[]<>")
-            if (next_clean and len(next_clean) >= 2
-                    and next_clean.lower() not in _INTEL_KEYWORDS
-                    and not resolve_system(next_clean)):
-                candidates.append(f"{clean} {next_clean}")
-                skip_next = 1
-                continue
-        candidates.append(clean)
-
+    candidates = candidate_names(raw_message)
     if not candidates:
         return []
 
