@@ -103,6 +103,9 @@ CAMP_PATTERN = re.compile(r"\bcamp\b|\bbubble[ds]?\b|\bgate\s*camp", re.IGNORECA
 # Regex for spike
 SPIKE_PATTERN = re.compile(r"\bspike\b", re.IGNORECASE)
 
+# Regex for cyno mentions (cyno / cynosural)
+CYNO_PATTERN = re.compile(r"\bcyno(?:sural)?\b", re.I)
+
 
 # ── Data Model ───────────────────────────────────────────────────────────────
 
