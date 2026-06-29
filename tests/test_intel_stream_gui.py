@@ -138,3 +138,30 @@ def test_high_priority_route_from_staging():
 
 def test_high_priority_none_report():
     assert fc_gui.high_priority(None, 5) is False
+
+
+def test_apply_resolutions_tags_names_by_standing():
+    from intel_monitor import Resolution
+    root, host, txt = _make_host()
+    try:
+        # configure name tags
+        for tag in ("name_friendly", "name_hostile", "name_neutral",
+                    "name_unknown"):
+            txt.tag_config(tag)
+        host._show_tooltip = lambda e, t: None
+        host._hide_tooltip = lambda: None
+        # class-level attr the bound method references but SimpleNamespace lacks
+        # (same scaffold pattern as _CHANNEL_PALETTE above).
+        host._STANDING_TAG = fc_gui.FCToolGUI._STANDING_TAG
+        setattr(host, "_intel_apply_resolutions",
+                types.MethodType(fc_gui.FCToolGUI._intel_apply_resolutions, host))
+        msg = FakeMsg("Delve.Intel", "Scout", "reds John Doe inbound")
+        host._render_line((msg, [], None, False))
+        res = {"John Doe": Resolution("John Doe", 1, None, "C", None, "A",
+                                      "hostile")}
+        host._intel_apply_resolutions(res)
+        ranges = txt.tag_ranges("name_hostile")
+        assert ranges
+        assert txt.get(ranges[0], ranges[1]) == "John Doe"
+    finally:
+        root.destroy()

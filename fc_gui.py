@@ -48,7 +48,9 @@ from intel_monitor import (
     IntelReport, parse_intel_message, scan_available_channels,
     discover_channels, INTEL_CHANNELS, parse_dscan_text, make_dscan_summary,
     resolve_characters, coalesce_report, load_standings_whitelist,
+    load_standings,
 )
+from intel_resolver import IntelResolver
 from intel_paste import (
     DScan, FleetComposition, FleetSummary, FleetSummaryRow, LocalScan,
     detect_and_parse,
@@ -14019,11 +14021,19 @@ $bmp.Dispose()
 
     def _start_intel_monitor(self):
         """Start the intel channel ChatMonitor."""
-        # Load standings whitelist in background (for hostile detection)
-        if self.esi_auth and self.esi_auth.is_authenticated:
-            threading.Thread(
-                target=load_standings_whitelist, args=(self.esi_auth,), daemon=True
-            ).start()
+        # Load standings (friendly/hostile) in background, then build and start
+        # the async name->standing resolver for the firehose stream.
+        def _load_and_init_resolver():
+            friendly, hostile = (set(), set())
+            if self.esi_auth and self.esi_auth.is_authenticated:
+                try:
+                    friendly, hostile = load_standings(self.esi_auth)
+                except Exception:
+                    log.exception("intel: load_standings failed")
+            self._intel_resolver = IntelResolver(
+                friendly=friendly, hostile=hostile)
+            self._intel_resolver.start()
+        threading.Thread(target=_load_and_init_resolver, daemon=True).start()
 
         logs_path = self.config.get("eve_logs_path", "")
         if not logs_path or not os.path.isdir(logs_path):
@@ -14083,6 +14093,12 @@ $bmp.Dispose()
         if self._intel_monitor:
             self._intel_monitor.stop()
             self._intel_monitor = None
+        if self._intel_resolver is not None:
+            try:
+                self._intel_resolver.stop()
+            except Exception:
+                pass
+            self._intel_resolver = None
         self._intel_channels_enabled.clear()
         # Disable all checkboxes
         for var in self._intel_channel_vars.values():
@@ -14296,8 +14312,38 @@ $bmp.Dispose()
             except Exception:
                 pass
 
-    def _intel_apply_resolutions(self, resolutions):  # full impl in Task 9
-        pass
+    _STANDING_TAG = {
+        "friendly": "name_friendly", "hostile": "name_hostile",
+        "neutral": "name_neutral", "unknown": "name_unknown",
+    }
+
+    def _intel_apply_resolutions(self, resolutions: dict):
+        """Main thread: for each resolved name found in the visible text, add a
+        standing-coloured 'name' tag + corp/alliance tooltip. No-op for names
+        that have scrolled out (search returns nothing)."""
+        log = self._intel_log
+        log.config(state=tk.NORMAL)
+        try:
+            for name, res in resolutions.items():
+                tag = self._STANDING_TAG.get(res.standing, "name_unknown")
+                tip = res.alliance or res.corporation or ""
+                idx = "1.0"
+                while True:
+                    pos = log.search(name, idx, stopindex="end", nocase=False)
+                    if not pos:
+                        break
+                    end = f"{pos}+{len(name)}c"
+                    log.tag_add(tag, pos, end)
+                    if tip:
+                        bind_tag = f"nametip_{abs(hash((name, pos))) & 0xffffff}"
+                        log.tag_add(bind_tag, pos, end)
+                        log.tag_bind(bind_tag, "<Enter>",
+                                     lambda e, t=f"[{tip}]": self._show_tooltip(e, t))
+                        log.tag_bind(bind_tag, "<Leave>",
+                                     lambda e: self._hide_tooltip())
+                    idx = end
+        finally:
+            log.config(state=tk.DISABLED)
 
     def _intel_system_menu(self, event, system_name):  # full impl in Task 11
         pass
