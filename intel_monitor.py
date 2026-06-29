@@ -155,6 +155,17 @@ class IntelReport:
         }
 
 
+@dataclass
+class Resolution:
+    name: str
+    character_id: int | None
+    corporation_id: int | None
+    corporation: str
+    alliance_id: int | None
+    alliance: str
+    standing: str  # 'friendly' | 'hostile' | 'neutral' | 'unknown'
+
+
 def coalesce_report(report: "IntelReport") -> tuple["IntelReport", bool]:
     """
     Merge rapid-fire posts from the same reporter into a single report.
@@ -928,6 +939,82 @@ _INTEL_KEYWORDS = {
 }
 
 
+def resolve_names(
+    names: list[str],
+    friendly: set[int],
+    hostile: set[int],
+) -> list[Resolution]:
+    """Resolve pilot-name candidates to Resolutions via the public ESI
+    /universe/ids/ endpoint plus corp/alliance lookups, bucketing each by
+    classify_standing(friendly, hostile). Shared by resolve_characters and the
+    async IntelResolver (DRY). Never raises; returns [] on failure."""
+    import requests as _req
+    if not names:
+        return []
+    results: list[Resolution] = []
+    try:
+        resp = _req.post(
+            f"{ESI_BASE}/universe/ids/",
+            json=list(names),
+            headers=ESI_HEADERS,
+            timeout=8,
+        )
+        if not resp.ok:
+            return []
+        data = resp.json()
+        for char in data.get("characters", [])[:5]:
+            corp_id = None
+            alliance_id = None
+            corp_name = ""
+            alliance_name = ""
+            try:
+                cresp = _req.get(
+                    f"{ESI_BASE}/characters/{char['id']}/",
+                    headers=ESI_HEADERS, timeout=5,
+                )
+                if cresp.ok:
+                    cdata = cresp.json()
+                    corp_id = cdata.get("corporation_id")
+                    alliance_id = cdata.get("alliance_id")
+                    if alliance_id:
+                        aresp = _req.get(
+                            f"{ESI_BASE}/alliances/{alliance_id}/",
+                            headers=ESI_HEADERS, timeout=5,
+                        )
+                        if aresp.ok:
+                            alliance_name = aresp.json().get("name", "")
+                    if corp_id:
+                        cresp2 = _req.get(
+                            f"{ESI_BASE}/corporations/{corp_id}/",
+                            headers=ESI_HEADERS, timeout=5,
+                        )
+                        if cresp2.ok:
+                            corp_name = cresp2.json().get("name", "")
+            except Exception:
+                log.exception(
+                    "resolve_names: failed to fetch corp/alliance detail "
+                    "for character_id=%s", char.get("id"),
+                )
+            info = {"character_id": char["id"],
+                    "corporation_id": corp_id, "alliance_id": alliance_id}
+            standing = classify_standing(info, friendly, hostile)
+            results.append(Resolution(
+                name=char["name"],
+                character_id=char["id"],
+                corporation_id=corp_id,
+                corporation=corp_name,
+                alliance_id=alliance_id,
+                alliance=alliance_name,
+                standing=standing,
+            ))
+    except Exception:
+        log.exception(
+            "resolve_names: ESI /universe/ids/ resolution failed for "
+            "%d candidate(s)", len(names),
+        )
+    return results
+
+
 def resolve_characters(
     raw_message: str,
     system_name: str,
@@ -940,65 +1027,24 @@ def resolve_characters(
     Uses the public ESI /universe/ids/ endpoint (no auth needed). Tokenising is
     shared with the firehose via intel_stream.candidate_names (DRY).
     """
-    import requests as _req
     from intel_stream import candidate_names
 
     candidates = candidate_names(raw_message)
     if not candidates:
         return []
 
-    # Resolve via ESI /universe/ids/
-    results = []
-    try:
-        resp = _req.post(
-            f"{ESI_BASE}/universe/ids/",
-            json=candidates,
-            headers=ESI_HEADERS,
-            timeout=8,
-        )
-        if not resp.ok:
-            return []
-        data = resp.json()
-        for char in data.get("characters", [])[:5]:
-            info = {"name": char["name"], "character_id": char["id"],
-                    "corporation": "", "alliance": ""}
-            try:
-                cresp = _req.get(
-                    f"{ESI_BASE}/characters/{char['id']}/",
-                    headers=ESI_HEADERS, timeout=5,
-                )
-                if cresp.ok:
-                    cdata = cresp.json()
-                    corp_id = cdata.get("corporation_id")
-                    alliance_id = cdata.get("alliance_id")
-                    if corp_id:
-                        info["corporation_id"] = corp_id
-                    if alliance_id:
-                        info["alliance_id"] = alliance_id
-                    if alliance_id:
-                        aresp = _req.get(
-                            f"{ESI_BASE}/alliances/{alliance_id}/",
-                            headers=ESI_HEADERS, timeout=5,
-                        )
-                        if aresp.ok:
-                            info["alliance"] = aresp.json().get("name", "")
-                    if corp_id:
-                        cresp2 = _req.get(
-                            f"{ESI_BASE}/corporations/{corp_id}/",
-                            headers=ESI_HEADERS, timeout=5,
-                        )
-                        if cresp2.ok:
-                            info["corporation"] = cresp2.json().get("name", "")
-            except Exception:
-                log.exception(
-                    "resolve_characters: failed to fetch corp/alliance detail "
-                    "for character_id=%s", char.get("id"),
-                )
-            info["hostile"] = is_hostile(info)
-            results.append(info)
-    except Exception:
-        log.exception(
-            "resolve_characters: ESI /universe/ids/ resolution failed for "
-            "%d candidate(s)", len(candidates),
-        )
-    return results
+    friendly = _standings_whitelist
+    hostile = _standings_hostile
+    resolutions = resolve_names(candidates, friendly, hostile)
+    out: list[dict] = []
+    for r in resolutions:
+        out.append({
+            "name": r.name,
+            "character_id": r.character_id,
+            "corporation_id": r.corporation_id,
+            "corporation": r.corporation,
+            "alliance_id": r.alliance_id,
+            "alliance": r.alliance,
+            "hostile": r.standing == "hostile",
+        })
+    return out
