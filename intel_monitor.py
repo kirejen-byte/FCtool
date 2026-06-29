@@ -812,9 +812,13 @@ def _parse_dscan_html(html: str) -> dict:
 
 from esi_constants import ESI_BASE, ESI_HEADERS
 
-# ── Standings Whitelist ──────────────────────────────────────────────────────
-# Cache of entity IDs (characters, corps, alliances) with positive standing.
-# Anyone NOT on this list is assumed hostile (including neutrals).
+# ── Standings cache ───────────────────────────────────────────────────────────
+# Entity IDs (characters, corps, alliances) split by contact standing:
+#   _standings_whitelist — positive standing (friendly)
+#   _standings_hostile   — negative standing (hostile)
+# An entity in NEITHER set is "neutral" (resolved but unlisted); see
+# classify_standing(). The legacy is_hostile() still treats not-friendly as
+# hostile for its callers.
 _standings_whitelist: set[int] = set()
 _standings_hostile: set[int] = set()
 _standings_loaded: bool = False
