@@ -52,9 +52,10 @@ HEADER_CHANNEL_PATTERN = re.compile(r"Channel Name:\s+(.+)")
 HEADER_LISTENER_PATTERN = re.compile(r"Listener:\s+(.+)")
 
 
-# Sidecar state file (relative to project root = this module's directory).
-_STATE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE_PATH = os.path.join(_STATE_DIR, "chat_monitor_state.json")
+# Sidecar state file, kept in the app's writable data dir (see app_path.app_dir).
+from app_path import app_dir
+
+STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state.json")
 
 # Dedupe TTL - drop duplicate messages (same channel/ts/sender/body) seen within this window.
 DEDUPE_TTL_SECONDS = 60.0
