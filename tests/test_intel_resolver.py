@@ -68,3 +68,84 @@ def test_resolve_names_hostile_and_neutral(monkeypatch):
 
 def test_resolve_names_empty_returns_empty(monkeypatch):
     assert resolve_names([], set(), set()) == []
+
+
+import threading
+import time
+
+from intel_monitor import Resolution
+from intel_resolver import IntelResolver
+
+
+def _mk(name, standing="neutral"):
+    return Resolution(name=name, character_id=hash(name) & 0xffff,
+                      corporation_id=None, corporation="",
+                      alliance_id=None, alliance="", standing=standing)
+
+
+def test_lookup_cached_returns_none_then_value():
+    def fake_resolve(names, friendly, hostile):
+        return [_mk(n, "hostile") for n in names]
+
+    r = IntelResolver(resolve_fn=fake_resolve, friendly=set(), hostile=set())
+    assert r.lookup_cached("Bob") is None
+    done = threading.Event()
+    results = {}
+
+    def cb(d):
+        results.update(d)
+        done.set()
+
+    r.start()
+    try:
+        r.request(["Bob"], cb)
+        assert done.wait(2.0)
+        assert results["Bob"].standing == "hostile"
+        # now cached and case-insensitive
+        assert r.lookup_cached("bob") is not None
+    finally:
+        r.stop()
+
+
+def test_cached_answered_immediately_without_worker():
+    r = IntelResolver(resolve_fn=lambda n, f, h: [],
+                      friendly=set(), hostile=set())
+    r._cache["bob"] = _mk("Bob", "friendly")
+    got = {}
+    r.request(["Bob"], lambda d: got.update(d))
+    assert got["Bob"].standing == "friendly"
+
+
+def test_in_flight_dedupe():
+    calls = []
+    gate = threading.Event()
+
+    def slow_resolve(names, friendly, hostile):
+        calls.append(list(names))
+        gate.wait(1.0)
+        return [_mk(n) for n in names]
+
+    r = IntelResolver(resolve_fn=slow_resolve, friendly=set(), hostile=set())
+    r.start()
+    try:
+        r.request(["Bob"], lambda d: None)
+        r.request(["Bob"], lambda d: None)  # already in-flight -> not re-queued
+        time.sleep(0.2)
+        gate.set()
+        time.sleep(0.3)
+        # "Bob" requested twice but only resolved once
+        flat = [n for batch in calls for n in batch]
+        assert flat.count("Bob") == 1
+    finally:
+        r.stop()
+
+
+def test_cache_evicts_oldest_over_cap():
+    r = IntelResolver(resolve_fn=lambda n, f, h: [], friendly=set(),
+                      hostile=set(), cache_cap=3)
+    for i in range(5):
+        r._cache_put(_mk(f"P{i}"))
+    assert len(r._cache) == 3
+    # oldest two evicted
+    assert "p0" not in r._cache and "p1" not in r._cache
+    assert "p4" in r._cache
