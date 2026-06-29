@@ -165,3 +165,50 @@ def test_apply_resolutions_tags_names_by_standing():
         assert txt.get(ranges[0], ranges[1]) == "John Doe"
     finally:
         root.destroy()
+
+
+# ── Task 10: opt-in sound toggle wiring ──────────────────────────────────────
+def test_on_intel_sound_toggle_persists_and_saves():
+    root, host, txt = _make_host()
+    try:
+        host.config = {}
+        saved = {"called": False}
+        host._save_config = lambda: saved.__setitem__("called", True)
+        host._intel_sound_var = tk.BooleanVar(value=True)
+        setattr(host, "_on_intel_sound_toggle",
+                types.MethodType(fc_gui.FCToolGUI._on_intel_sound_toggle, host))
+        host._on_intel_sound_toggle()
+        assert host.config["intel_sound_enabled"] is True
+        assert saved["called"] is True
+    finally:
+        root.destroy()
+
+
+def test_priority_ping_gated_by_intel_sound_var():
+    root, host, txt = _make_host()
+    try:
+        host._intel_channels_enabled = {"Delve.Intel"}
+        host._intel_buffer = collections.deque(maxlen=5)
+        pings = {"n": 0}
+        host._play_fire_alert = lambda: pings.__setitem__("n", pings["n"] + 1)
+        # global zkill mute is irrelevant to the intel stream now
+        host._sound_enabled = True
+
+        # Sound OFF -> no ping even on a priority line.
+        host._intel_sound_var = tk.BooleanVar(value=False)
+        host._intel_stream_ingest(
+            FakeMsg("Delve.Intel", "X", "a priority line"), [], None, True)
+        assert pings["n"] == 0
+
+        # Sound ON -> priority line pings.
+        host._intel_sound_var.set(True)
+        host._intel_stream_ingest(
+            FakeMsg("Delve.Intel", "X", "another priority line"), [], None, True)
+        assert pings["n"] == 1
+
+        # Sound ON but NOT priority -> no ping.
+        host._intel_stream_ingest(
+            FakeMsg("Delve.Intel", "X", "calm line"), [], None, False)
+        assert pings["n"] == 1
+    finally:
+        root.destroy()

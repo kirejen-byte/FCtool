@@ -3089,6 +3089,17 @@ class FCToolGUI:
             borderwidth=1, relief=tk.RIDGE,
         ).pack(side=tk.LEFT, padx=(4, 10))
 
+        # Opt-in audio ping for high-priority intel lines (default off; this is
+        # the intel stream's own toggle, distinct from the global zkill mute).
+        self._intel_sound_var = tk.BooleanVar(
+            value=bool(self.config.get("intel_sound_enabled", False)))
+        tk.Checkbutton(
+            intel_row, text="Sound", variable=self._intel_sound_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            command=self._on_intel_sound_toggle,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
         self._intel_channels_frame = tk.Frame(intel_row, bg=BG_PANEL)
         self._intel_channels_frame.pack(side=tk.LEFT, padx=(15, 0))
 
@@ -14139,6 +14150,13 @@ $bmp.Dispose()
             self._intel_channel_colors[channel] = c
         return c
 
+    def _on_intel_sound_toggle(self):
+        self.config["intel_sound_enabled"] = bool(self._intel_sound_var.get())
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
     def _on_intel_message(self, msg: ChatMessage):
         """Worker-thread callback: annotate verbatim, enrich for priority only,
         then marshal to the main thread. Nothing is dropped."""
@@ -14208,7 +14226,7 @@ $bmp.Dispose()
                     )
             except Exception:
                 pass
-        if priority and getattr(self, "_sound_enabled", False):
+        if priority and self._intel_sound_var.get():
             try:
                 self._play_fire_alert()
             except Exception:
