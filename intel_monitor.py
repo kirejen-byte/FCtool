@@ -805,73 +805,90 @@ from esi_constants import ESI_BASE, ESI_HEADERS
 # Cache of entity IDs (characters, corps, alliances) with positive standing.
 # Anyone NOT on this list is assumed hostile (including neutrals).
 _standings_whitelist: set[int] = set()
+_standings_hostile: set[int] = set()
 _standings_loaded: bool = False
 
 
-def load_standings_whitelist(esi_auth) -> set[int]:
-    """
-    Load positive-standing entities from ESI contacts.
-    Uses the authenticated character's contacts (personal, corp, alliance).
-    Returns a set of entity IDs with standing > 0.
-
-    Args:
-        esi_auth: An ESIAuth instance (from esi_auth.py) or None
-    """
-    global _standings_whitelist, _standings_loaded
+def load_standings(esi_auth) -> tuple[set[int], set[int]]:
+    """Load (friendly, hostile) entity-id sets from ESI contacts for the
+    authenticated character's personal, corp, and alliance contact lists.
+    friendly = standing > 0 (plus own alliance); hostile = standing < 0.
+    Caches both sets at module level (session lifetime)."""
+    global _standings_whitelist, _standings_hostile, _standings_loaded
     if _standings_loaded:
-        return _standings_whitelist
+        return _standings_whitelist, _standings_hostile
 
-    whitelist = set()
-    if not esi_auth or not hasattr(esi_auth, 'esi_get'):
+    friendly: set[int] = set()
+    hostile: set[int] = set()
+    if not esi_auth or not hasattr(esi_auth, "esi_get"):
         _standings_loaded = True
-        return whitelist
+        return friendly, hostile
 
     try:
-        char_id = getattr(esi_auth, '_character_id', None)
+        char_id = getattr(esi_auth, "_character_id", None)
         if not char_id:
             _standings_loaded = True
-            return whitelist
+            return friendly, hostile
 
-        # Personal contacts
-        contacts = esi_auth.esi_get(f"/characters/{char_id}/contacts/")
-        if contacts:
-            for c in contacts:
-                if c.get("standing", 0) > 0:
-                    whitelist.add(c["contact_id"])
+        def _bucket(rows):
+            for c in rows or []:
+                st = c.get("standing", 0)
+                cid = c.get("contact_id")
+                if cid is None:
+                    continue
+                if st > 0:
+                    friendly.add(cid)
+                elif st < 0:
+                    hostile.add(cid)
 
-        # Corporation contacts
+        _bucket(esi_auth.esi_get(f"/characters/{char_id}/contacts/"))
+
         corp_id = None
         char_info = esi_auth.esi_get(f"/characters/{char_id}/")
         if char_info:
             corp_id = char_info.get("corporation_id")
         if corp_id:
-            corp_contacts = esi_auth.esi_get(f"/corporations/{corp_id}/contacts/")
-            if corp_contacts:
-                for c in corp_contacts:
-                    if c.get("standing", 0) > 0:
-                        whitelist.add(c["contact_id"])
-
-        # Alliance contacts
-        if corp_id:
+            _bucket(esi_auth.esi_get(f"/corporations/{corp_id}/contacts/"))
             corp_info = esi_auth.esi_get(f"/corporations/{corp_id}/")
             if corp_info:
                 alliance_id = corp_info.get("alliance_id")
                 if alliance_id:
-                    # Add own alliance members implicitly
-                    whitelist.add(alliance_id)
-                    ally_contacts = esi_auth.esi_get(f"/alliances/{alliance_id}/contacts/")
-                    if ally_contacts:
-                        for c in ally_contacts:
-                            if c.get("standing", 0) > 0:
-                                whitelist.add(c["contact_id"])
-
+                    friendly.add(alliance_id)  # own alliance implicitly friendly
+                    _bucket(esi_auth.esi_get(f"/alliances/{alliance_id}/contacts/"))
     except Exception as e:
-        print(f"[Intel] Error loading standings whitelist: {e}")
+        print(f"[Intel] Error loading standings: {e}")
 
-    _standings_whitelist = whitelist
+    _standings_whitelist = friendly
+    _standings_hostile = hostile
     _standings_loaded = True
-    print(f"[Intel] Loaded standings whitelist: {len(whitelist)} entities")
-    return whitelist
+    print(f"[Intel] Loaded standings: {len(friendly)} friendly, "
+          f"{len(hostile)} hostile")
+    return friendly, hostile
+
+
+def load_standings_whitelist(esi_auth) -> set[int]:
+    """Backward-compatible wrapper: returns only the friendly set.
+    Delegates to load_standings so the friendly/hostile split is built once."""
+    friendly, _hostile = load_standings(esi_auth)
+    return friendly
+
+
+def classify_standing(info: dict, friendly: set[int], hostile: set[int]) -> str:
+    """Bucket a resolved-character info dict into one standing label.
+    'friendly' if any of char/corp/alliance id is in friendly; 'hostile' if any
+    is in hostile (friendly checked first); 'neutral' if resolved (has a
+    character_id) but in neither; 'unknown' if unresolved (no character_id)."""
+    char_id = info.get("character_id")
+    corp_id = info.get("corporation_id")
+    alliance_id = info.get("alliance_id")
+    ids = [i for i in (char_id, corp_id, alliance_id) if i]
+    if any(i in friendly for i in ids):
+        return "friendly"
+    if any(i in hostile for i in ids):
+        return "hostile"
+    if char_id:
+        return "neutral"
+    return "unknown"
 
 
 def is_hostile(character_info: dict, whitelist: set[int] | None = None) -> bool:
