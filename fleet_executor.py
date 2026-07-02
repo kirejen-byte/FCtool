@@ -74,7 +74,13 @@ import queue as _queue
 import threading as _threading
 from dataclasses import dataclass
 
+import fleet_esi
+
 MOVE_SOURCES = ("drag", "menu", "apply", "autosort")
+
+AUTOSORT_FLOOR = 360
+HARD_FLOOR = 180
+CONSECUTIVE_4XX_ABORT = 3
 
 
 @dataclass
@@ -105,7 +111,8 @@ class FleetExecutor:
     def __init__(self, *, session, on_move, post, sleep, ledger,
                  move_spacing_ms=400, burst_cap=25, settle_s=3,
                  on_log=lambda line: None, on_repoll=None,
-                 remaining_needed=lambda job: True, now=None, autostart=True):
+                 remaining_needed=lambda job: True, on_boss_lost=lambda: None,
+                 now=None, autostart=True):
         self.session = session
         self._on_move = on_move
         self._post = post
@@ -117,6 +124,9 @@ class FleetExecutor:
         self._on_log = on_log
         self._on_repoll = on_repoll
         self._remaining_needed = remaining_needed
+        self._on_boss_lost = on_boss_lost
+        self._consecutive_4xx = 0
+        self._aborted = False
         self._now = now or _time.monotonic
         self._q: _queue.Queue = _queue.Queue()
         self._worker: _threading.Thread | None = None
@@ -177,16 +187,54 @@ class FleetExecutor:
         self._burst = 0
 
     def _process_one(self, job: MoveJob):
-        """One iteration of the shared loop body (pacing + write + burst/settle).
-
-        Task 4 adds the gate + abort/freeze branches around this."""
+        if self._aborted:
+            self._drain_remaining()
+            return
+        if not self._gate(job):
+            return   # gated jobs are skipped (logged), no spacing consumed
         if self._wrote_any:
             self._sleep(self._spacing_s)   # spacing BETWEEN consecutive writes only
         self._log(self._perform(job))
         self._wrote_any = True
+        if self._aborted:               # boss_lost / 3rd-4xx set this in _perform
+            self._drain_remaining()
+            return
+        if self._frozen_until:          # 429/420 froze ops mid-run
+            self._drain_remaining()
+            return
         self._burst += 1
         if self._burst >= self._burst_cap and not self._q.empty():
             self._settle_and_repoll()
+
+    def _drain_remaining(self):
+        """Discard every remaining queued job (abort/freeze). A pending stop
+        sentinel is preserved so stop() still ends the persistent worker."""
+        while True:
+            try:
+                item = self._q.get_nowait()
+            except _queue.Empty:
+                return
+            if item is self._STOP:
+                self._q.put(item)
+                return
+
+    def _gate(self, job: MoveJob) -> bool:
+        rem = self.ledger.remaining()
+        manual = job.source in ("drag", "menu", "apply")
+        if rem < HARD_FLOOR:
+            if manual:
+                self._post(self._on_log,
+                           f"[{job.source}] {job.pilot_name}: LOW BUDGET "
+                           f"({rem}) — running anyway")
+                return True
+            self._post(self._on_log,
+                       f"[{job.source}] {job.pilot_name}: blocked, budget {rem} < {HARD_FLOOR}")
+            return False
+        if job.source == "autosort" and rem < AUTOSORT_FLOOR:
+            self._post(self._on_log,
+                       f"[autosort] {job.pilot_name}: skipped, budget {rem} < {AUTOSORT_FLOOR}")
+            return False
+        return True
 
     def _settle_and_repoll(self):
         self._sleep(self._settle_s)
@@ -209,12 +257,49 @@ class FleetExecutor:
                 self._q.put(job)
 
     def _perform(self, job: MoveJob):
-        """Execute one write, spend tokens, reconcile from headers. Returns a
-        (job, status, error) tuple for logging. Error paths land in Task 4."""
-        status = self._on_move(job)
+        try:
+            status = self._on_move(job)
+        except fleet_esi.FleetESIError as e:
+            if e.reason == "boss_lost":
+                self._aborted = True
+                self._post(self._on_boss_lost)
+                return (job, 403, "boss lost (403) — queue aborted")
+            self._consecutive_4xx = 0
+            return (job, e.status or 0, e.reason)
+        # Non-exception statuses.
+        if status == 429:
+            retry = self._retry_after()
+            self._sleep(retry)
+            self._frozen_until = self._now() + retry
+            return (job, 429, f"429 rate-limited — froze fleet ops {retry:.0f}s")
+        if status == 420:
+            reset = self._error_reset()
+            self._frozen_until = self._now() + reset
+            return (job, 420, f"420 error-limited — froze ESI {reset:.0f}s")
         self.ledger.spend(cost_for_status(status))
         self.ledger.reconcile(self._header_remaining())
+        if 400 <= status < 500:
+            self._consecutive_4xx += 1
+            if self._consecutive_4xx >= CONSECUTIVE_4XX_ABORT:
+                self._aborted = True
+                return (job, status, f"{status} — 3rd consecutive 4xx, aborting queue")
+            return (job, status, f"{status} error")
+        self._consecutive_4xx = 0
         return (job, status, None)
+
+    def _retry_after(self) -> float:
+        h = getattr(self.session, "last_headers", {}) or {}
+        try:
+            return float(h.get("Retry-After"))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def _error_reset(self) -> float:
+        h = getattr(self.session, "last_headers", {}) or {}
+        try:
+            return float(h.get("X-ESI-Error-Limit-Reset"))
+        except (TypeError, ValueError):
+            return 60.0
 
     def _header_remaining(self):
         h = getattr(self.session, "last_headers", {}) or {}

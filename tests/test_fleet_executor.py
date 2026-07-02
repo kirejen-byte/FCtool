@@ -167,3 +167,80 @@ def test_repoll_drops_already_correct_remaining_jobs():
     ex.submit(_job(99))
     ex.drain()
     assert written == [1]           # 99 dropped at the post-burst re-verify
+
+
+# append — FleetExecutor gates + error paths
+import fleet_esi
+
+
+def test_autosort_gate_blocks_below_360_but_manual_runs():
+    written = []
+    ex = _make_executor(lambda job: (written.append(job.pilot_id), 204)[1])
+    ex.ledger.reconcile(300)                 # remaining 300 (< 360, >= 180)
+    ex.submit(_job(1, source="autosort"))    # blocked
+    ex.submit(_job(2, source="drag"))        # manual → runs
+    ex.drain()
+    assert written == [2]
+    assert any("skipped" in l.lower() or "blocked" in l.lower() for l in ex._logs)
+
+
+def test_hard_gate_below_180_blocks_all_but_manual_warns_and_runs():
+    written = []
+    ex = _make_executor(lambda job: (written.append(job.pilot_id), 204)[1])
+    ex.ledger.reconcile(150)                 # remaining 150 (< 180)
+    ex.submit(_job(1, source="autosort"))    # blocked
+    ex.submit(_job(2, source="apply"))       # manual → warn + run
+    ex.drain()
+    assert written == [2]
+
+
+def test_429_sleeps_retry_after_and_freezes(monkeypatch):
+    calls = {"n": 0}
+
+    def on_move(job):
+        calls["n"] += 1
+        return 429
+
+    ex = _make_executor(on_move)
+    ex.session.last_headers = {"Retry-After": "7"}   # SimpleNamespace attr
+    ex.submit(_job(1))
+    ex.submit(_job(2))
+    ex.drain()
+    # 429 froze fleet ops: only the first job attempted, Retry-After slept
+    assert calls["n"] == 1
+    assert 7.0 in ex._sleeps
+    assert any("429" in l for l in ex._logs)
+
+
+def test_three_consecutive_4xx_aborts_queue_with_names():
+    attempted = []
+
+    def on_move(job):
+        attempted.append(job.pilot_name)
+        return 400
+
+    ex = _make_executor(on_move)
+    for i in (1, 2, 3, 4):
+        ex.submit(_job(i, name=f"Pilot{i}"))
+    ex.drain()
+    assert attempted == ["Pilot1", "Pilot2", "Pilot3"]   # 4th never attempted
+    assert any("Pilot3" in l for l in ex._logs)
+    assert any("abort" in l.lower() for l in ex._logs)
+
+
+def test_boss_lost_aborts_and_notifies():
+    notified = []
+
+    def on_move(job):
+        raise fleet_esi.FleetESIError("boss_lost", status=403)
+
+    ledger = FleetTokenLedger(now=_Clock())
+    ex = FleetExecutor(
+        session=types.SimpleNamespace(last_headers={}), on_move=on_move,
+        post=lambda fn, *a: fn(*a), sleep=lambda s: None, ledger=ledger,
+        on_log=lambda l: None, on_boss_lost=lambda: notified.append(1),
+        autostart=False)
+    ex.submit(_job(1))
+    ex.submit(_job(2))
+    ex.drain()
+    assert notified == [1]
