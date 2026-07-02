@@ -4462,7 +4462,20 @@ class FCToolGUI:
             )
 
     def _rebuild_esi_char_list(self):
-        """Rebuild the ESI character list in Settings."""
+        """Rebuild the ESI character list in Settings.
+
+        Everything grids directly into ``_esi_chars_frame`` on shared columns so
+        the action buttons line up in stable columns no matter how long each
+        character's name is:
+
+          col 0  primary chip ("PRIMARY" on the primary account, blank
+                 fixed-width placeholder otherwise) — keeps col 1 aligned
+          col 1  character name (absorbs slack via columnconfigure weight=1)
+          col 2  scope-warning flag (⚠ when the token predates esi-fittings)
+          col 3  "Set Primary" — present on every row (disabled on primary)
+          col 4  "Disconnect" — present on every row
+          col 5  "Re-authorize" — only on missing-scope rows
+        """
         for w in self._esi_chars_frame.winfo_children():
             w.destroy()
         if not self.esi_accounts:
@@ -4470,43 +4483,77 @@ class FCToolGUI:
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK
                      ).pack(anchor=tk.W)
             return
-        for acct in self.esi_accounts:
-            row = tk.Frame(self._esi_chars_frame, bg=BG_DARK)
-            row.pack(fill=tk.X, pady=1)
+        # Column 1 (the name) absorbs all extra width so every widget to its
+        # right stays column-aligned across rows regardless of name length.
+        self._esi_chars_frame.columnconfigure(1, weight=1)
+        for r, acct in enumerate(self.esi_accounts):
             is_primary = (acct is self.esi_auth)
-            name = acct.character_name or "Unknown"
-            prefix = "[PRIMARY] " if is_primary else ""
-            fg = FG_GREEN if acct.is_authenticated else FG_DIM
-            lbl = tk.Label(row, text=f"{prefix}{name}",
-                           font=("Consolas", 10), fg=fg, bg=BG_DARK, anchor=tk.W)
-            lbl.pack(side=tk.LEFT, padx=(0, 10))
-            if not is_primary:
-                ttk.Button(row, text="Set Primary", style="Dark.TButton",
-                           command=lambda a=acct: self._esi_set_primary(a)
-                           ).pack(side=tk.LEFT, padx=2)
-            ttk.Button(row, text="Disconnect", style="Dark.TButton",
-                       command=lambda a=acct: self._esi_disconnect(a)
-                       ).pack(side=tk.LEFT, padx=2)
+            # Alternate row shading applied to the tk.Label cells (chip / name /
+            # flag). ttk buttons keep their own themed style.
+            row_bg = BG_DARK if (r % 2 == 0) else BG_PANEL
 
-            # If this character's token predates the esi-fittings scopes, it
-            # cannot import/push fits until re-authorized. Show a one-line
-            # notice + a Re-authorize button that reuses the SSO login flow
-            # (re-logging in as the same character refreshes its tokens with
-            # the full current SCOPES via _esi_login_complete's dup handling).
-            if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
-                notice = tk.Frame(self._esi_chars_frame, bg=BG_DARK)
-                notice.pack(fill=tk.X, padx=(20, 0), pady=(0, 2))
-                tk.Label(
-                    notice,
-                    text="⚠ Re-authorize to enable in-game fittings "
-                         "import/push.",
-                    font=("Consolas", 9), fg=FG_ORANGE, bg=BG_DARK,
-                    anchor=tk.W,
-                ).pack(side=tk.LEFT, padx=(0, 8))
-                ttk.Button(
-                    notice, text="Re-authorize", style="Dark.TButton",
-                    command=self._esi_login,
-                ).pack(side=tk.LEFT, padx=2)
+            # col 0 — primary chip (constant width=8 so col 1 aligns on all rows)
+            if is_primary:
+                chip = tk.Label(self._esi_chars_frame, text="PRIMARY",
+                                font=("Consolas", 8, "bold"),
+                                fg=BG_DARK, bg=FG_ACCENT, width=8)
+            else:
+                chip = tk.Label(self._esi_chars_frame, text="",
+                                width=8, bg=row_bg)
+            chip.grid(row=r, column=0, sticky="w", padx=(0, 8), pady=1)
+
+            # col 1 — character name (stretches; everything right of it aligns)
+            name = acct.character_name or "Unknown"
+            fg = FG_GREEN if acct.is_authenticated else FG_DIM
+            tk.Label(self._esi_chars_frame, text=name,
+                     font=("Consolas", 10), fg=fg, bg=row_bg, anchor="w"
+                     ).grid(row=r, column=1, sticky="we", padx=(0, 8), pady=1)
+
+            # col 2 — scope-warning flag. If this character's token predates the
+            # esi-fittings scopes it cannot import/push fits until re-authorized;
+            # the ⚠ (with tooltip) plus the col-5 Re-authorize button replace the
+            # old full-width notice row. Re-logging in as the same character
+            # refreshes its tokens with the full current SCOPES.
+            needs_reauth = (acct.is_authenticated
+                            and not acct.has_scope(SCOPE_FITTINGS_READ))
+            if needs_reauth:
+                flag = tk.Label(self._esi_chars_frame, text="⚠",
+                                font=("Consolas", 10), fg=FG_ORANGE, bg=row_bg)
+                flag.bind(
+                    "<Enter>",
+                    lambda e: self._show_tooltip(
+                        e, "Missing fittings scopes — Re-authorize to enable "
+                           "in-game fittings import/push."))
+                flag.bind("<Leave>", lambda e: self._hide_tooltip())
+            else:
+                flag = tk.Label(self._esi_chars_frame, text="",
+                                width=2, bg=row_bg)
+            flag.grid(row=r, column=2, sticky="w", padx=(0, 8), pady=1)
+
+            # col 3 — "Set Primary" on every row (disabled, identical geometry,
+            # on the primary account so the column stays constant).
+            if is_primary:
+                sp_btn = ttk.Button(self._esi_chars_frame, text="Set Primary",
+                                    style="Dark.TButton", state=tk.DISABLED)
+            else:
+                sp_btn = ttk.Button(
+                    self._esi_chars_frame, text="Set Primary",
+                    style="Dark.TButton",
+                    command=lambda a=acct: self._esi_set_primary(a))
+            sp_btn.grid(row=r, column=3, sticky="w", padx=(0, 8), pady=1)
+
+            # col 4 — "Disconnect" on every row
+            ttk.Button(self._esi_chars_frame, text="Disconnect",
+                       style="Dark.TButton",
+                       command=lambda a=acct: self._esi_disconnect(a)
+                       ).grid(row=r, column=4, sticky="w", padx=(0, 8), pady=1)
+
+            # col 5 — "Re-authorize" only on missing-scope rows
+            if needs_reauth:
+                ttk.Button(self._esi_chars_frame, text="Re-authorize",
+                           style="Dark.TButton", command=self._esi_login
+                           ).grid(row=r, column=5, sticky="w",
+                                  padx=(0, 8), pady=1)
 
     def _esi_set_primary(self, acct: ESIAuth):
         """Set a character as the primary ESI account."""
