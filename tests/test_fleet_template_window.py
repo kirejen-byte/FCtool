@@ -848,3 +848,59 @@ def test_inline_rename_counter_text():
     assert inline_rename_counter("squad", "TooLongName") == "11/10 ⚠"
     # slots aren't ESI-clamped → no counter.
     assert inline_rename_counter("slot", "Kyra Dawnfall") == ""
+
+
+def test_mode_banner_text_updates(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        # Template mode banner is the dim sandbox line.
+        win.set_mode("template")
+        assert "TEMPLATE" in str(win._banner["text"])
+        assert "sandbox" in str(win._banner["text"]).lower()
+        # Live mode banner warns.
+        win.set_mode("live")
+        assert "LIVE" in str(win._banner["text"])
+        assert "real fleet" in str(win._banner["text"]).lower()
+    finally:
+        win.destroy()
+
+
+def test_banner_text_helper():
+    from fleet_template_window import mode_banner_text
+    assert "TEMPLATE" in mode_banner_text("template")
+    assert "LIVE" in mode_banner_text("live")
+
+
+def test_settings_spinbox_saves_on_focusout(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        var, lo, hi = win._settings_vars["burst_cap"]
+        var.set(17)
+        # Simulate the FocusOut/Return path (not an arrow click).
+        win._on_settings_changed()
+        assert win.current_template().settings.burst_cap == 17
+        # The Spinbox must carry FocusOut + Return bindings (save-on-type).
+        binds = win._settings_spinboxes["burst_cap"].bind()
+        assert "<FocusOut>" in binds or "FocusOut" in " ".join(binds)
+    finally:
+        win.destroy()
+
+
+def test_geometry_persisted_on_destroy_and_restored(root, tmp_path):
+    from fleet_template_window import FleetTemplateWindow
+    store = _store(tmp_path)
+    win = FleetTemplateWindow(
+        root, store=store, fittings=_FakeFittings(), config={},
+        esi_session_provider=lambda: None, fleet_info_provider=lambda: None,
+        doctrine_provider=lambda: None, character_names_provider=lambda: [])
+    win.win.geometry("1001x611+30+30")
+    win.win.update_idletasks()
+    win.destroy()
+    assert "geometry" in store.ui
+    # Reopen: a fresh window restores from store.ui without raising.
+    win2 = FleetTemplateWindow(
+        root, store=store, fittings=_FakeFittings(), config={},
+        esi_session_provider=lambda: None, fleet_info_provider=lambda: None,
+        doctrine_provider=lambda: None, character_names_provider=lambda: [])
+    assert store.ui["geometry"].startswith("1001x611")
+    win2.destroy()

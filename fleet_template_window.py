@@ -88,6 +88,12 @@ def inline_rename_counter(kind: str, text: str) -> str:
     return f"{n}/10 ⚠" if n > 10 else f"{n}/10"
 
 
+def mode_banner_text(mode: str) -> str:
+    if mode == "live":
+        return "LIVE — changes affect the real fleet"
+    return "TEMPLATE — sandbox (changes saved to the template only)"
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -120,7 +126,9 @@ class FleetTemplateWindow:
         self.win = tk.Toplevel(root)
         self.win.title("Fleet Templates")
         self.win.configure(bg=BG_DARK)
-        self.win.geometry("980x640")
+        geom = self.store.ui.get("geometry") if hasattr(self.store, "ui") else None
+        self.win.geometry(geom if isinstance(geom, str) and geom else "980x640")
+        self.win.minsize(900, 560)
         self.win.protocol("WM_DELETE_WINDOW", self.destroy)
 
         self._build_header()
@@ -163,6 +171,10 @@ class FleetTemplateWindow:
                    command=self._delete_template).pack(side=tk.LEFT, padx=2)
         ttk.Button(sel, text="Duplicate", style="Dark.TButton",
                    command=self._duplicate_template).pack(side=tk.LEFT, padx=2)
+
+        self._banner = tk.Label(self.win, text="", font=("Consolas", 9, "bold"),
+                                anchor="w", padx=10, pady=3)
+        self._banner.pack(fill=tk.X, side=tk.TOP)
 
     def _build_body(self):
         body = tk.Frame(self.win, bg=BG_DARK)
@@ -276,6 +288,10 @@ class FleetTemplateWindow:
 
     def set_mode(self, mode: str):
         self.mode = mode
+        self._banner.config(
+            text=mode_banner_text(mode),
+            fg=(FG_YELLOW if mode == "live" else FG_DIM),
+            bg=(BG_DARK if mode == "live" else BG_PANEL))
         self._mode_btn.config(text=f"Mode: {mode.capitalize()}")
         live = (mode == "live")
         self._apply_btn.config(state="normal" if live else "disabled")
@@ -330,6 +346,12 @@ class FleetTemplateWindow:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def destroy(self):
+        try:
+            if hasattr(self.store, "ui"):
+                self.store.ui["geometry"] = self.win.geometry()
+                self.store.save()
+        except Exception:
+            pass
         try:
             self._destroy_drag_ghost()
         except Exception:
@@ -1322,6 +1344,7 @@ class FleetTemplateWindow:
 
     def _build_settings_tab(self):
         self._settings_vars = {}
+        self._settings_spinboxes = {}
         fields = [
             ("sync_active_s", "Active sync interval (s)", 5, 120),
             ("sync_idle_s", "Idle sync interval (s)", 5, 300),
@@ -1336,10 +1359,13 @@ class FleetTemplateWindow:
                                                 padx=8, pady=6)
             var = tk.IntVar()
             self._settings_vars[key] = (var, lo, hi)
-            tk.Spinbox(self._settings_tab, from_=lo, to=hi, textvariable=var,
-                       width=8, bg=BG_ENTRY, fg=FG_TEXT,
-                       command=self._on_settings_changed).grid(row=i, column=1,
-                                                               padx=8, pady=6)
+            sb = tk.Spinbox(self._settings_tab, from_=lo, to=hi, textvariable=var,
+                            width=8, bg=BG_ENTRY, fg=FG_TEXT,
+                            command=self._on_settings_changed)
+            sb.grid(row=i, column=1, padx=8, pady=6)
+            sb.bind("<FocusOut>", lambda e: self._on_settings_changed())
+            sb.bind("<Return>", lambda e: self._on_settings_changed())
+            self._settings_spinboxes[key] = sb
         tk.Label(self._settings_tab,
                  text="Fast bursts are ESI-verified: after each burst the tool "
                       "pauses and re-checks the fleet before continuing.",
