@@ -72,10 +72,14 @@ class FleetTemplateWindow:
         self.mode = "template"
         self._current_template_id = (store.templates[0].id if store.templates else None)
         self._rebalance_on = False
+        self._auto_sort_on = False      # Task 6 (rename of _rebalance_on; Task 7 removes _rebalance_on)
         self._rebalance_after_id = None
         self._sync_after_id = None
         self._executor = None
         self._last_write_wall = 0.0
+        self._pins: dict[int, int] = {}          # pilot_id -> ship_type_id at pin time
+        self._prev_members: list[dict] = []      # previous sync snapshot (for diffing)
+        self._sync_generation = 0                # bumped per sync; guards stale worker results
         self._live_members: list[dict] = []      # enriched dicts (Task D5)
         self._live_structure: dict = {"wings": []}
         self._last_preview = None                 # cached ComposeResult (Tasks D5/D10)
@@ -152,6 +156,9 @@ class FleetTemplateWindow:
         self._status = tk.Label(bar, text="", font=("Consolas", 9),
                                 fg=FG_DIM, bg=BG_PANEL)
         self._status.pack(side=tk.LEFT, padx=10)
+        self._clear_pins_btn = ttk.Button(bar, text="Clear pins (0)",
+                                          style="Dark.TButton", command=self._clear_pins)
+        # packed/unpacked by _refresh_pins_button (hidden when 0)
         self._apply_btn = ttk.Button(bar, text="Apply Template",
                                      style="Dark.TButton", command=self._apply)
         self._apply_btn.pack(side=tk.RIGHT, padx=8)
@@ -378,9 +385,10 @@ class FleetTemplateWindow:
                     elif m.get("role") == "squad_commander":
                         mark = " [SC]"
                     tag = "moveme" if m["character_id"] in move_ids else "inpos"
+                    pin = "📌 " if m["character_id"] in self._pins else ""
                     nid = self._tree.insert(
                         sid, "end", tags=(tag,),
-                        text=f"• {m['name']} — {m.get('ship_type_name', '')}{mark}")
+                        text=f"{pin}• {m['name']} — {m.get('ship_type_name', '')}{mark}")
                     self._node_meta[nid] = ("livepilot", m["character_id"])
         if layout["unplaced"]:
             head = self._tree.insert("", "end", open=True, text="── Unassigned ──")
@@ -390,6 +398,41 @@ class FleetTemplateWindow:
                     head, "end",
                     text=f"· {m['name']} — {m.get('ship_type_name', '')}")
                 self._node_meta[nid] = ("unassigned", (m["character_id"],))
+
+    # ── pins ─────────────────────────────────────────────────────────────────
+    def _refresh_pins_button(self):
+        n = len(self._pins)
+        if n:
+            self._clear_pins_btn.config(text=f"Clear pins ({n})")
+            if not self._clear_pins_btn.winfo_ismapped():
+                self._clear_pins_btn.pack(side=tk.LEFT, padx=6)
+        else:
+            self._clear_pins_btn.pack_forget()
+
+    def _clear_pins(self):
+        self._pins.clear()
+        self._refresh_pins_button()
+        if self.mode == "live":
+            self._reload_tree()
+
+    # ── sync member diff ───────────────────────────────────────────────────────
+    def _diff_members(self, prev, new):
+        prev_by = {m["character_id"]: m for m in prev}
+        new_by = {m["character_id"]: m for m in new}
+        joined = [cid for cid in new_by if cid not in prev_by]
+        left = [cid for cid in prev_by if cid not in new_by]
+        ship_changed = [cid for cid in new_by
+                        if cid in prev_by
+                        and new_by[cid].get("ship_type_id")
+                        != prev_by[cid].get("ship_type_id")]
+        return {"joined": joined, "left": left, "ship_changed": ship_changed}
+
+    def _apply_member_diff(self, events):
+        for cid in events["ship_changed"]:
+            self._pins.pop(cid, None)
+        for cid in events["left"]:
+            self._pins.pop(cid, None)
+        self._refresh_pins_button()
 
     # ── structural edits ─────────────────────────────────────────────────────
     def _add_wing(self):
@@ -726,6 +769,7 @@ class FleetTemplateWindow:
                                      target_squad_name=squad.name,
                                      target_role=self._current_role_of(cid))
                  for cid in char_ids]
+        self._pin_dragged(char_ids)
         self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
 
     def _name_of(self, cid):
@@ -753,7 +797,18 @@ class FleetTemplateWindow:
                                      target_squad_name=sname,
                                      target_role=self._current_role_of(cid))
                  for cid in char_ids]
+        self._pin_dragged(char_ids)
         self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
+
+    def _pin_dragged(self, char_ids):
+        """Record each dragged pilot's current ship as a pin (pilot -> ship_type_id)
+        so sync-time ship changes / leaves can clear it. Spec §5 pins."""
+        for cid in char_ids:
+            m = next((x for x in self._live_members
+                      if x["character_id"] == cid), None)
+            if m is not None and m.get("ship_type_id"):
+                self._pins[cid] = m["ship_type_id"]
+        self._refresh_pins_button()
 
     def _flash_reject(self, item):
         if not item:
@@ -1104,9 +1159,18 @@ class FleetTemplateWindow:
             self._sync_after_id = None
         self._reload_tree()   # revert to stored template
 
+    def _sync_delay_ms(self):
+        import time
+        t = self.current_template()
+        active = t.settings.sync_active_s if t else 10
+        idle = t.settings.sync_idle_s if t else 30
+        recent = (time.time() - self._last_write_wall) < 60
+        return (active if (self._auto_sort_on or recent) else idle) * 1000
+
     def _schedule_sync(self):
-        # UI sync read every ~30 s (spec §9 budget).
-        self._sync_after_id = self.win.after(30_000, self._sync_tick)
+        # Active cadence (sync_active_s) when auto-sort is on or a write is
+        # recent (<60s); otherwise the idle cadence (sync_idle_s). Spec §5.
+        self._sync_after_id = self.win.after(self._sync_delay_ms(), self._sync_tick)
 
     def _post(self, fn, *args):
         """Schedule fn on the Tk thread from a worker; ignore the teardown race
@@ -1125,6 +1189,9 @@ class FleetTemplateWindow:
         self._schedule_sync()
 
     def _sync_live(self, *, initial):
+        self._sync_generation += 1
+        generation = self._sync_generation
+
         def worker():
             session = self._esi_session_provider()   # blocking get_fleet_info — off the Tk thread
             if session is None:
@@ -1140,18 +1207,30 @@ class FleetTemplateWindow:
                 members = self._enrich_members(self._read_members(session))
             except fleet_esi.FleetESIError as e:
                 err = e
-            self._post(_done, structure, members, err)
-
-        def _done(structure, members, err):
-            if err is not None:
-                self._status.config(text=f"Sync failed: {err.reason}", fg=FG_RED)
-                return
-            self._live_structure = structure
-            self._live_members = members          # already enriched on the worker
-            self._status.config(text="● Synced", fg=FG_GREEN)
-            self._reload_tree()
+            self._post(self._apply_sync_result, generation, structure, members, err)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_sync_result(self, generation, structure, members, err):
+        """Tk-thread-only snapshot swap, guarded by the generation counter.
+        Returns True if applied, False if a newer sync superseded this one."""
+        if generation != self._sync_generation:
+            return False
+        if err is not None:
+            self._status.config(text=f"Sync failed: {err.reason}", fg=FG_RED)
+            return False
+        events = self._diff_members(self._prev_members, members)
+        self._apply_member_diff(events)
+        self._live_structure = structure
+        self._live_members = members          # already enriched on the worker
+        self._prev_members = members
+        self._status.config(text="● Synced", fg=FG_GREEN)
+        self._reload_tree()
+        self._on_sync_complete(events)   # Task 7: auto-sort tick hook
+        return True
+
+    def _on_sync_complete(self, events):
+        pass   # Task 7 wires the Auto-sort tick here
 
     def _read_members(self, session):
         """GET /fleets/{id}/members/ via the session adapter."""

@@ -390,3 +390,62 @@ def test_no_hard_sleep_or_cooldown_attr(root, tmp_path):
     src += inspect.getsource(FleetTemplateWindow.__init__)
     assert "time.sleep(0.5)" not in src
     assert "_last_write_monotonic" not in src
+
+
+# append — Phase B: sync diff + pins
+def test_sync_diff_clears_pin_on_ship_change_and_leave(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    win.mode = "live"
+    # Pilot 1 pinned in a Rifter (id 587); pilot 2 pinned; pilot 3 present.
+    win._pins = {1: 587, 2: 111}
+    win._prev_members = [
+        {"character_id": 1, "ship_type_id": 587},
+        {"character_id": 2, "ship_type_id": 111},
+        {"character_id": 3, "ship_type_id": 222},
+    ]
+    new = [
+        {"character_id": 1, "ship_type_id": 999},   # ship change → clear pin 1
+        {"character_id": 3, "ship_type_id": 222},   # pilot 2 left → drop pin 2
+    ]
+    events = win._diff_members(win._prev_members, new)
+    assert 1 in events["ship_changed"]
+    assert 2 in events["left"]
+    assert 3 in events["joined"] or 3 not in events["joined"]  # 3 stayed
+    win._apply_member_diff(events)
+    assert 1 not in win._pins        # cleared on ship change
+    assert 2 not in win._pins        # dropped on leave
+    win.destroy()
+
+
+def test_clear_pins_button_label_and_action(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    win._pins = {1: 10, 2: 20}
+    win._refresh_pins_button()
+    assert "2" in str(win._clear_pins_btn["text"])
+    win._clear_pins()
+    assert win._pins == {}
+    win.destroy()
+
+
+def test_sync_generation_discards_stale_worker_result(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    win.mode = "live"
+    win._sync_generation = 5
+    # A worker that started at generation 4 must not overwrite state.
+    applied = win._apply_sync_result(4, {"wings": [{"id": 9, "name": "X",
+                                                    "squads": []}]}, [], None)
+    assert applied is False
+    assert win._live_structure.get("wings") == []   # unchanged
+    win.destroy()
+
+
+def test_active_cadence_when_recent_write(root, tmp_path):
+    import time
+    win = _live_win(root, tmp_path)
+    t = win.current_template()
+    win._auto_sort_on = False
+    win._last_write_wall = time.time()      # a write just happened
+    assert win._sync_delay_ms() == t.settings.sync_active_s * 1000
+    win._last_write_wall = time.time() - 120  # long ago, auto-sort off
+    assert win._sync_delay_ms() == t.settings.sync_idle_s * 1000
+    win.destroy()
