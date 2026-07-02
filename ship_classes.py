@@ -410,3 +410,83 @@ def is_ship_type(type_id: int) -> bool:
     if gid is None:
         return False
     return gid in _SHIP_GROUP_IDS_KNOWN
+
+
+# ── Capital / subcap classification ──────────────────────────────────────────
+
+# Group ids treated as "capital" for fleet routing (verified against ESI
+# /universe/groups/{gid}/ at implementation time):
+#   30   Titan
+#   485  Dreadnought
+#   547  Carrier
+#   659  Supercarrier
+#   883  Capital Industrial Ship (Rorqual)
+#   902  Jump Freighter
+#   513  Freighter
+#   1538 Force Auxiliary (FAX)
+#   4594 Lancer Dreadnought
+CAPITAL_GROUP_IDS: set[int] = {30, 485, 547, 659, 883, 902, 513, 1538, 4594}
+
+# group_id -> group name cache (separate namespace from the type->group caches).
+_group_name_cache: dict[int, str | None] = {}
+_group_name_lock = threading.Lock()
+
+
+def _fetch_group_name(group_id: int) -> str | None:
+    """Resolve a group_id to its display name via ESI, thread-safe + cached.
+
+    ESI /universe/groups/{gid}/ carries a "name" field. Any failure caches and
+    returns None so we never hammer a bad id."""
+    if not group_id:
+        return None
+    with _group_name_lock:
+        if group_id in _group_name_cache:
+            return _group_name_cache[group_id]
+    name: str | None = None
+    try:
+        from rate_limiter import rate_limit
+        rate_limit("esi")
+        resp = requests.get(
+            f"{ESI_BASE}/universe/groups/{group_id}/",
+            timeout=5, headers=HEADERS,
+        )
+        if resp.ok:
+            got = resp.json().get("name")
+            if isinstance(got, str) and got:
+                name = got
+    except Exception:
+        pass
+    with _group_name_lock:
+        _group_name_cache[group_id] = name
+    return name
+
+
+def is_capital(type_id: int) -> bool:
+    """True iff type_id is a ship hull whose group is in CAPITAL_GROUP_IDS."""
+    if not type_id:
+        return False
+    if not is_ship_type(type_id):
+        return False
+    return get_group_id(type_id) in CAPITAL_GROUP_IDS
+
+
+def is_subcap(type_id: int) -> bool:
+    """True iff type_id is a ship hull that is NOT a capital."""
+    if not type_id:
+        return False
+    if not is_ship_type(type_id):
+        return False
+    return get_group_id(type_id) not in CAPITAL_GROUP_IDS
+
+
+def get_group_name(type_id: int) -> str | None:
+    """Human group name for a hull (e.g. 'Heavy Assault Cruiser'), or None.
+
+    Two cached hops: type_id -> group_id (get_group_id) -> group name
+    (_fetch_group_name). Network-free once both are cached."""
+    if not type_id:
+        return None
+    gid = get_group_id(type_id)
+    if gid is None:
+        return None
+    return _fetch_group_name(gid)
