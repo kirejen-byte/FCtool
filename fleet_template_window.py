@@ -79,6 +79,15 @@ def parse_pilot_lines(text: str) -> list[str]:
     return out
 
 
+def inline_rename_counter(kind: str, text: str) -> str:
+    """Live counter for the inline rename Entry. Wing/squad names are clamped to
+    10 chars on ESI, so show 'N/10' (with ⚠ when over). Slots aren't clamped."""
+    if kind not in ("wing", "squad"):
+        return ""
+    n = len(text or "")
+    return f"{n}/10 ⚠" if n > 10 else f"{n}/10"
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -354,7 +363,8 @@ class FleetTemplateWindow:
         # node-id → ("wing"|"squad"|"slot"|"unassigned", path tuple)
         self._node_meta: dict[str, tuple] = {}
         self._tree.bind("<Button-3>", self._on_tree_right_click)
-        self._tree.bind("<F2>", lambda e: self._rename_selected())
+        self._tree.bind("<F2>", lambda e: self._begin_inline_rename())
+        self._tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self._tree.bind("<Delete>", lambda e: self._delete_selected())
         # Drag-drop bindings (Task D8).
         self._tree.bind("<ButtonPress-1>", self._on_drag_start)
@@ -561,6 +571,18 @@ class FleetTemplateWindow:
             return None, None
         return sel[0], self._node_meta.get(sel[0])
 
+    def _on_tree_double_click(self, event):
+        if self.mode != "template":
+            return
+        item = self._tree.identify_row(event.y)
+        if not item:
+            return
+        meta = self._node_meta.get(item)
+        if meta and meta[0] in ("wing", "squad", "slot"):
+            self._tree.selection_set(item)
+            self._begin_inline_rename(item)
+            return "break"
+
     def _on_tree_right_click(self, event):
         if self.mode == "live":
             return
@@ -608,23 +630,99 @@ class FleetTemplateWindow:
             menu.grab_release()
 
     def _rename_selected(self):
-        self._push_undo()
-        item, meta = self._selected_meta()
-        if not meta:
-            return
-        kind, path = meta
+        self._begin_inline_rename()
+
+    def _commit_inline_rename(self, kind, path, new_name):
+        """Model write for an inline rename. Wing/squad: set .name; slot: set the
+        named character (blank clears to generic). Blank wing/squad names are
+        ignored. Pure of Tk overlay concerns so it is unit-testable."""
+        name = (new_name or "").strip()
         t = self.current_template()
+        if t is None:
+            return
         if kind == "wing":
-            obj = t.wings[path[0]]
+            if not name:
+                return
+            self._push_undo()
+            t.wings[path[0]].name = name
         elif kind == "squad":
-            obj = t.wings[path[0]].squads[path[1]]
+            if not name:
+                return
+            self._push_undo()
+            t.wings[path[0]].squads[path[1]].name = name
+        elif kind == "slot":
+            self._push_undo()
+            slot = t.wings[path[0]].squads[path[1]].slots[path[2]]
+            slot.character = name or None
+            if not name:
+                slot.character_id = None
+            else:
+                slot.character_id = self.store.cached_id(name)
         else:
             return
-        new = simpledialog.askstring("Rename", "Name (max 10 chars on ESI):",
-                                     initialvalue=obj.name, parent=self.win)
-        if new:
-            obj.name = new
-            self._after_structure_change()
+        self._after_structure_change()
+
+    def _begin_inline_rename(self, item=None):
+        """Overlay a tk.Entry on the selected (or given) tree row for in-place
+        rename. Return/FocusOut commits, Escape cancels. Template mode only;
+        live rows are not renameable."""
+        if self.mode != "template":
+            return
+        if item is None:
+            item, meta = self._selected_meta()
+        else:
+            meta = self._node_meta.get(item)
+        if not item or not meta:
+            return
+        kind, path = meta
+        if kind not in ("wing", "squad", "slot"):
+            return
+        bbox = self._tree.bbox(item)
+        if not bbox:                 # row not visible
+            return
+        x, y, w, h = bbox
+        t = self.current_template()
+        if kind == "wing":
+            initial = t.wings[path[0]].name
+        elif kind == "squad":
+            initial = t.wings[path[0]].squads[path[1]].name
+        else:
+            slot = t.wings[path[0]].squads[path[1]].slots[path[2]]
+            initial = slot.character or ""
+
+        overlay = tk.Frame(self._tree, bg=BG_PANEL)
+        entry = tk.Entry(overlay, bg=BG_ENTRY, fg=FG_TEXT,
+                         insertbackground=FG_TEXT, font=("Consolas", 9),
+                         relief=tk.SOLID, borderwidth=1)
+        entry.insert(0, initial)
+        entry.select_range(0, tk.END)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        counter = tk.Label(overlay, text=inline_rename_counter(kind, initial),
+                           bg=BG_PANEL, fg=FG_DIM, font=("Consolas", 8))
+        counter.pack(side=tk.LEFT, padx=2)
+        overlay.place(x=x, y=y, width=max(w, 160), height=h)
+
+        state = {"done": False}
+
+        def finish(commit):
+            if state["done"]:
+                return
+            state["done"] = True
+            value = entry.get()
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+            if commit:
+                self._commit_inline_rename(kind, path, value)
+
+        entry.bind("<KeyRelease>",
+                   lambda e: counter.config(
+                       text=inline_rename_counter(kind, entry.get())))
+        entry.bind("<Return>", lambda e: finish(True))
+        entry.bind("<FocusOut>", lambda e: finish(True))
+        entry.bind("<Escape>", lambda e: finish(False))
+        entry.focus_set()
 
     def _set_max_size(self, kind, path):
         self._push_undo()

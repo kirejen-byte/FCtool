@@ -793,3 +793,58 @@ def test_wing_menu_has_no_set_max_size(root, tmp_path):
         assert "Set max size" in slabels
     finally:
         win.destroy()
+
+
+def test_commit_inline_rename_wing_and_squad(root, tmp_path):
+    win = _win(root, tmp_path)   # seeded Wing 1 / Squad 1
+    try:
+        wid = win._tree.get_children()[0]
+        sid = win._tree.get_children(wid)[0]
+        # Capture the model paths up front — the first commit reloads the tree and
+        # regenerates the Tk item ids in _node_meta, so re-indexing sid afterwards
+        # would KeyError. Paths (wi,) / (wi, si) are stable across reloads.
+        wing_path = win._node_meta[wid][1]
+        squad_path = win._node_meta[sid][1]
+        win._commit_inline_rename("wing", wing_path, "Assault")
+        win._commit_inline_rename("squad", squad_path, "DPS")
+        t = win.current_template()
+        assert t.wings[0].name == "Assault"
+        assert t.wings[0].squads[0].name == "DPS"
+    finally:
+        win.destroy()
+
+
+def test_commit_inline_rename_slot_sets_character(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        # add a slot to Squad 1
+        t = win.current_template()
+        from fleet_template_store import Slot
+        t.wings[0].squads[0].slots.append(Slot(None, None, "squad_member"))
+        win._reload_tree()
+        wid = win._tree.get_children()[0]
+        sid = win._tree.get_children(wid)[0]
+        lid = win._tree.get_children(sid)[0]
+        win._commit_inline_rename("slot", win._node_meta[lid][1], "Kyra Dawnfall")
+        assert t.wings[0].squads[0].slots[0].character == "Kyra Dawnfall"
+    finally:
+        win.destroy()
+
+
+def test_commit_inline_rename_ignores_blank(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        wid = win._tree.get_children()[0]
+        win._commit_inline_rename("wing", win._node_meta[wid][1], "   ")
+        assert win.current_template().wings[0].name == "Wing 1"   # unchanged
+    finally:
+        win.destroy()
+
+
+def test_inline_rename_counter_text():
+    from fleet_template_window import inline_rename_counter
+    # wing/squad names clamp to 10 on ESI → show over/under.
+    assert inline_rename_counter("wing", "Assault") == "7/10"
+    assert inline_rename_counter("squad", "TooLongName") == "11/10 ⚠"
+    # slots aren't ESI-clamped → no counter.
+    assert inline_rename_counter("slot", "Kyra Dawnfall") == ""
