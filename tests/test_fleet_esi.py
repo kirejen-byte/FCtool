@@ -264,3 +264,95 @@ def test_ensure_structure_matches_clamped_names():
     # Must NOT create a duplicate wing/squad — clamped names already match.
     assert len(fleet.wings) == 1
     assert len(fleet.wings[0]["squads"]) == 1
+
+
+# append to tests/test_fleet_esi.py — Phase B: AuthEsiSession headers + ETag
+import fleet_esi
+
+
+class _Resp:
+    def __init__(self, status, *, headers=None, body=None, etag=None, text=""):
+        self.status_code = status
+        self.ok = 200 <= status < 300
+        self.headers = dict(headers or {})
+        if etag is not None:
+            self.headers["ETag"] = etag
+        self._body = body
+        self.text = text
+
+    def json(self):
+        return self._body
+
+
+class _FakeHttp:
+    """Stand-in for auth._session; records outgoing headers, replays queued responses."""
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.sent = []   # list of (method, url, headers)
+
+    def request(self, method, url, headers=None, json=None, timeout=None):
+        self.sent.append((method, url, dict(headers or {})))
+        return self._responses.pop(0)
+
+
+class _FakeAuthB:
+    def __init__(self, http):
+        self.access_token = "tok"
+        self._session = http
+
+
+def _sess(responses):
+    return fleet_esi.AuthEsiSession(_FakeAuthB(_FakeHttp(responses)))
+
+
+def test_session_captures_rate_limit_headers():
+    resp = _Resp(200, headers={
+        "X-Ratelimit-Remaining": "1750",
+        "X-ESI-Error-Limit-Remain": "99",
+        "X-ESI-Error-Limit-Reset": "42",
+        "Retry-After": "5",
+    }, body=[])
+    s = _sess([resp])
+    s.request("GET", "/fleets/1/members/")
+    assert s.last_headers["X-Ratelimit-Remaining"] == "1750"
+    assert s.last_headers["X-ESI-Error-Limit-Remain"] == "99"
+    assert s.last_headers["X-ESI-Error-Limit-Reset"] == "42"
+    assert s.last_headers["Retry-After"] == "5"
+
+
+def test_members_get_sends_if_none_match_after_first_200_and_304_returns_cached_body():
+    body = [{"character_id": 1}]
+    first = _Resp(200, body=body, etag='"abc"')
+    second = _Resp(304, etag='"abc"')
+    http = _FakeHttp([first, second])
+    s = fleet_esi.AuthEsiSession(_FakeAuthB(http))
+    r1 = s.request("GET", "/fleets/1/members/")
+    assert r1.status_code == 200 and r1.json() == body
+    # First call carried no If-None-Match.
+    assert "If-None-Match" not in http.sent[0][2]
+    r2 = s.request("GET", "/fleets/1/members/")
+    # Second call sent the stored ETag …
+    assert http.sent[1][2].get("If-None-Match") == '"abc"'
+    # … and the 304 was rewritten into a 200-shaped response carrying the cached body.
+    assert r2.status_code == 200
+    assert r2.json() == body
+
+
+def test_etag_cache_is_keyed_per_url():
+    mbody, wbody = [{"m": 1}], [{"w": 1}]
+    http = _FakeHttp([_Resp(200, body=mbody, etag='"m1"'),
+                      _Resp(200, body=wbody, etag='"w1"'),
+                      _Resp(304, etag='"m1"')])
+    s = fleet_esi.AuthEsiSession(_FakeAuthB(http))
+    s.request("GET", "/fleets/1/members/")
+    s.request("GET", "/fleets/1/wings/")
+    r = s.request("GET", "/fleets/1/members/")
+    assert http.sent[2][2].get("If-None-Match") == '"m1"'   # members etag, not wings
+    assert r.json() == mbody
+
+
+def test_non_etag_paths_are_not_cached():
+    http = _FakeHttp([_Resp(204, body=None)])
+    s = fleet_esi.AuthEsiSession(_FakeAuthB(http))
+    s.request("PUT", "/fleets/1/members/9/", json={"role": "squad_member"})
+    assert "If-None-Match" not in http.sent[0][2]

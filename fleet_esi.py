@@ -177,15 +177,51 @@ def ensure_structure(session, fleet_id, wanted, live_wings):
     return wmap, squad_ids
 
 
+# ETag-cacheable hot GETs (spec §4: members + wings only, 5s cache).
+_ETAG_CACHEABLE = ("/members/", "/wings/")
+
+_CAPTURED_HEADERS = (
+    "X-Ratelimit-Remaining", "X-ESI-Error-Limit-Remain",
+    "X-ESI-Error-Limit-Reset", "Retry-After",
+)
+
+
+class _CachedBody:
+    """A 200-shaped response replayed from the ETag cache on a 304."""
+    def __init__(self, body, headers):
+        self.status_code = 200
+        self.ok = True
+        self.headers = dict(headers)
+        self._body = body
+        self.text = ""
+
+    def json(self):
+        return self._body
+
+
 class AuthEsiSession:
     """Adapts an ESIAuth into the `session` protocol `_call` expects.
 
     Each request applies the ESI rate limiter, attaches the bearer token, and
     calls through the auth's live requests.Session. Raises FleetESIError
-    ("no_token") if the auth has no valid token (e.g. not the fleet boss yet)."""
+    ("no_token") if the auth has no valid token (e.g. not the fleet boss yet).
+
+    Phase B additions:
+      * `last_headers` — the rate-limit / error-limit / Retry-After headers off
+        the most recent response, for the executor's ledger + freeze logic.
+      * ETag cache for the two hot GETs (members, wings): the first 200 stores
+        (etag, body); subsequent GETs send `If-None-Match`; a 304 is rewritten
+        into a 200-shaped response carrying the cached body (costs 1 token).
+    """
 
     def __init__(self, auth):
         self._auth = auth
+        self.last_headers: dict = {}
+        self._etags: dict[str, tuple] = {}   # path -> (etag, body)
+
+    @staticmethod
+    def _etag_cacheable(method, path):
+        return method.upper() == "GET" and path.endswith(_ETAG_CACHEABLE)
 
     def request(self, method, path, json=None):
         from rate_limiter import rate_limit
@@ -193,8 +229,21 @@ class AuthEsiSession:
         token = self._auth.access_token
         if not token:
             raise FleetESIError("no_token")
+        headers = {"Authorization": f"Bearer {token}"}
+        cacheable = self._etag_cacheable(method, path)
+        cached = self._etags.get(path) if cacheable else None
+        if cached is not None:
+            headers["If-None-Match"] = cached[0]
         rate_limit("esi")
-        return self._auth._session.request(
-            method, f"{ESI_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            json=json, timeout=10)
+        resp = self._auth._session.request(
+            method, f"{ESI_BASE}{path}", headers=headers, json=json, timeout=10)
+        rh = getattr(resp, "headers", {}) or {}
+        self.last_headers = {k: rh[k] for k in _CAPTURED_HEADERS if k in rh}
+        if cacheable:
+            if resp.status_code == 304 and cached is not None:
+                return _CachedBody(cached[1], self.last_headers)
+            if resp.status_code == 200:
+                etag = rh.get("ETag")
+                if etag:
+                    self._etags[path] = (etag, resp.json())
+        return resp
