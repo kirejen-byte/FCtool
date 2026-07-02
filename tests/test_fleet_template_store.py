@@ -417,3 +417,58 @@ def test_build_template_from_live_empty_fleet():
                                  now=datetime(2026, 1, 1, 0, 0), new_id="x")
     assert t.wings == []
     assert t.name == "Import 2026-01-01 00:00"
+
+
+def test_add_template_seeds_one_wing_one_squad():
+    from fleet_template_store import FleetTemplateStore
+    store = FleetTemplateStore("unused.json")
+    t = store.add_template("Fresh")
+    assert [w.name for w in t.wings] == ["Wing 1"]
+    assert [s.name for s in t.wings[0].squads] == ["Squad 1"]
+    assert t.wings[0].squads[0].slots == []
+
+
+def test_duplicate_template_deep_copies_with_copy_suffix(tmp_path):
+    from fleet_template_store import (FleetTemplateStore, Wing, Squad, Slot,
+                                      AssignmentRule, RuleCondition, RuleAction)
+    store = FleetTemplateStore(str(tmp_path / "f.json"))
+    src = store.add_template("Doctrine A")
+    src.wings = [Wing("W", None, [Squad("S", 5, [Slot("Kyra", None,
+                                                      "squad_member", 95)])])]
+    src.rules = [AssignmentRule(0, RuleCondition("capital", ""),
+                               RuleAction("squad_member", "W", "S"))]
+    dup = store.duplicate_template(src.id)
+    assert dup is not None
+    assert dup.id != src.id
+    assert dup.name == "Doctrine A (copy)"
+    assert store.templates[-1] is dup
+    # Deep copy: mutating the copy must not touch the source.
+    dup.wings[0].squads[0].slots[0].character = "Someone Else"
+    dup.rules[0].condition.type = "subcap"
+    assert src.wings[0].squads[0].slots[0].character == "Kyra"
+    assert src.rules[0].condition.type == "capital"
+
+
+def test_duplicate_missing_template_returns_none(tmp_path):
+    from fleet_template_store import FleetTemplateStore
+    store = FleetTemplateStore(str(tmp_path / "f.json"))
+    assert store.duplicate_template("nope") is None
+
+
+def test_ui_dict_round_trips(tmp_path):
+    from fleet_template_store import FleetTemplateStore
+    path = str(tmp_path / "f.json")
+    store = FleetTemplateStore(path)
+    store.load()
+    store.ui["geometry"] = "1024x700+40+40"
+    store.save()
+    reloaded = FleetTemplateStore(path)
+    reloaded.load()
+    assert reloaded.ui.get("geometry") == "1024x700+40+40"
+
+
+def test_ui_defaults_empty_when_absent(tmp_path):
+    from fleet_template_store import FleetTemplateStore
+    store = FleetTemplateStore(str(tmp_path / "missing.json"))
+    store.load()
+    assert store.ui == {}

@@ -225,6 +225,8 @@ class FleetTemplateStore:
         self.templates: list[FleetTemplate] = []
         # v2: list of {"name": str, "character_id": int | None}
         self.cached_characters: list[dict] = []
+        # v2-additive UI state (window geometry etc.); optional, defaults {}.
+        self.ui: dict = {}
 
     # ── persistence ──────────────────────────────────────────────────────────
     def load(self) -> None:
@@ -236,6 +238,7 @@ class FleetTemplateStore:
         corrupted."""
         self.templates = []
         self.cached_characters = []
+        self.ui = {}
         if not os.path.exists(self.path):
             return
         try:
@@ -264,6 +267,8 @@ class FleetTemplateStore:
                 log.exception("[fleet-templates] skipping malformed template in %s",
                               self.path)
         self.cached_characters = self._normalize_cached(data.get("cached_characters", []))
+        raw_ui = data.get("ui")
+        self.ui = dict(raw_ui) if isinstance(raw_ui, dict) else {}
 
     @staticmethod
     def _normalize_cached(raw) -> list[dict]:
@@ -290,6 +295,7 @@ class FleetTemplateStore:
             "version": SCHEMA_VERSION,
             "templates": [template_to_dict(t) for t in self.templates],
             "cached_characters": self.cached_characters,
+            "ui": self.ui,
         }
         atomic_write_json(self.path, data)
 
@@ -299,9 +305,25 @@ class FleetTemplateStore:
 
     def add_template(self, name: str, doctrine_id: str | None = None) -> FleetTemplate:
         t = FleetTemplate(id=uuid4().hex, name=name or "Untitled",
-                          doctrine_id=doctrine_id)
+                          doctrine_id=doctrine_id,
+                          wings=[Wing(name="Wing 1", max_size=None,
+                                      squads=[Squad(name="Squad 1", max_size=None,
+                                                    slots=[])])])
         self.templates.append(t)
         return t
+
+    def duplicate_template(self, template_id: str, *,
+                           new_id: str | None = None) -> FleetTemplate | None:
+        """Deep-copy an existing template (new id, ' (copy)' name suffix) and
+        append it. Returns the copy, or None if the source id is unknown."""
+        src = self.get_template(template_id)
+        if src is None:
+            return None
+        copy = template_from_dict(template_to_dict(src))
+        copy.id = new_id or uuid4().hex
+        copy.name = f"{src.name} (copy)"
+        self.templates.append(copy)
+        return copy
 
     def rename_template(self, template_id: str, new_name: str) -> None:
         t = self.get_template(template_id)

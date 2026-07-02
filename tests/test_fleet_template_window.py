@@ -214,7 +214,7 @@ def _win_with_structure(root, tmp_path):
     win = _win(root, tmp_path)
     t = win.current_template()
     from fleet_template_store import Wing, Squad
-    t.wings.append(Wing("Cap Wing", None, [Squad("Dreads", None, [])]))
+    t.wings = [Wing("Cap Wing", None, [Squad("Dreads", None, [])])]
     win.store.save()
     return win
 
@@ -532,8 +532,8 @@ def test_bulk_add_creates_pinned_named_slots_and_caches(root, tmp_path, monkeypa
     # give the template a wing+squad to add into
     t = store.templates[0]
     from fleet_template_store import Wing, Squad
-    t.wings.append(Wing(name="W1", max_size=None,
-                        squads=[Squad(name="S1", max_size=None, slots=[])]))
+    t.wings = [Wing(name="W1", max_size=None,
+                    squads=[Squad(name="S1", max_size=None, slots=[])])]
 
     def fake_resolver(names):
         return {"kyra dawnfall": 95}   # only Kyra resolves; "Ghost Name" does not
@@ -638,8 +638,8 @@ def test_add_my_characters_creates_slots(root, tmp_path, monkeypatch):
     from fleet_template_store import Wing, Squad
     store = _store(tmp_path)
     t = store.templates[0]
-    t.wings.append(Wing(name="W1", max_size=None,
-                        squads=[Squad(name="S1", max_size=None, slots=[])]))
+    t.wings = [Wing(name="W1", max_size=None,
+                    squads=[Squad(name="S1", max_size=None, slots=[])])]
     win = _win(root, tmp_path if False else tmp_path,  # keep same store below
                character_names_provider=lambda: ["Alpha", "Bravo"],
                resolve_names_provider=lambda names: {"alpha": 1, "bravo": 2})
@@ -683,3 +683,17 @@ def test_import_live_as_template_builds_pins_and_selects(root, tmp_path, monkeyp
     assert slot.character == "Placed" and slot.character_id == 5
     assert 5 in win._pins                    # every imported member pinned
     win.destroy()
+
+
+def test_duplicate_template_button_creates_copy_and_selects(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        src = win.current_template()
+        before = len(win.store.templates)
+        win._duplicate_template()
+        assert len(win.store.templates) == before + 1
+        cur = win.current_template()
+        assert cur.id != src.id
+        assert cur.name == "Test Fleet (copy)"
+    finally:
+        win.destroy()

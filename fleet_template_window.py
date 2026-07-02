@@ -152,6 +152,8 @@ class FleetTemplateWindow:
                    command=self._rename_template).pack(side=tk.LEFT, padx=2)
         ttk.Button(sel, text="Delete", style="Red.TButton",
                    command=self._delete_template).pack(side=tk.LEFT, padx=2)
+        ttk.Button(sel, text="Duplicate", style="Dark.TButton",
+                   command=self._duplicate_template).pack(side=tk.LEFT, padx=2)
 
     def _build_body(self):
         body = tk.Frame(self.win, bg=BG_DARK)
@@ -218,6 +220,18 @@ class FleetTemplateWindow:
             return
         t = self.store.add_template(name)
         self._current_template_id = t.id
+        self.store.save()
+        self._refresh_template_selector()
+        self._on_template_selected()
+
+    def _duplicate_template(self):
+        t = self.current_template()
+        if t is None:
+            return
+        copy = self.store.duplicate_template(t.id)
+        if copy is None:
+            return
+        self._current_template_id = copy.id
         self.store.save()
         self._refresh_template_selector()
         self._on_template_selected()
