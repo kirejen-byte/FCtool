@@ -7489,7 +7489,7 @@ class FCToolGUI:
             nm = getattr(acct, "character_name", None)
             if nm:
                 names.append(nm)
-        names += list(self.fleet_templates.cached_characters)
+        names += self.fleet_templates.cached_character_names()
         return sorted(set(names))
 
     def _open_fleet_templates(self):

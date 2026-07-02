@@ -24,15 +24,16 @@ from app_log import get_logger
 
 log = get_logger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 @dataclass
 class Slot:
-    character: str | None  # named slot (exact, case-insensitive match); None = role/generic
-    tag: str | None        # doctrine-tag role slot; None = generic
-    role: str              # ESI role string
+    character: str | None       # named slot (exact, case-insensitive match); None = generic
+    tag: str | None             # DEPRECATED in v2 (migrated to rules); kept for round-trip
+    role: str                   # ESI role string
+    character_id: int | None = None   # resolved id for a named slot (v2)
 
 
 @dataclass
@@ -51,7 +52,9 @@ class Wing:
 
 @dataclass
 class RuleCondition:
-    type: str   # "doctrine_tag" | "ship_type" | "ship_class" | "character"
+    # "doctrine_tag" | "ship_type" | "ship_class" | "character"
+    #   | "capital" | "subcap" | "default"  (last three: value ignored, stored "")
+    type: str
     value: str
 
 
@@ -72,10 +75,16 @@ class AssignmentRule:
 
 @dataclass
 class RebalanceSettings:
+    # v2 pacing (used by the Phase-B executor/auto-sort loop):
+    sync_active_s: int = 10
+    sync_idle_s: int = 30
+    move_spacing_ms: int = 400
+    burst_cap: int = 25
+    settle_s: int = 3
+    bulk_apply_threshold: int = 5
+    # Kept for the Phase-A size-cap rebalancer loop (removed in Phase B):
     rebalance_interval_s: int = 60
     move_cooldown_s: int = 45
-    bulk_apply_threshold: int = 5
-    overflow_strategy: str = "least_populated"
 
 
 @dataclass
@@ -90,12 +99,15 @@ class FleetTemplate:
 
 # ── (de)serialization ────────────────────────────────────────────────────────
 def _slot_to_dict(s: Slot) -> dict:
-    return {"character": s.character, "tag": s.tag, "role": s.role}
+    return {"character": s.character, "tag": s.tag, "role": s.role,
+            "character_id": s.character_id}
 
 
 def _slot_from_dict(d: dict) -> Slot:
+    cid = d.get("character_id")
     return Slot(character=d.get("character"), tag=d.get("tag"),
-                role=d.get("role", "squad_member"))
+                role=d.get("role", "squad_member"),
+                character_id=cid if isinstance(cid, int) else None)
 
 
 def _squad_to_dict(sq: Squad) -> dict:
@@ -109,12 +121,11 @@ def _squad_from_dict(d: dict) -> Squad:
 
 
 def _wing_to_dict(w: Wing) -> dict:
-    return {"name": w.name, "max_size": w.max_size,
-            "squads": [_squad_to_dict(s) for s in w.squads]}
+    return {"name": w.name, "squads": [_squad_to_dict(s) for s in w.squads]}
 
 
 def _wing_from_dict(d: dict) -> Wing:
-    return Wing(name=d.get("name", ""), max_size=d.get("max_size"),
+    return Wing(name=d.get("name", ""), max_size=None,
                 squads=[_squad_from_dict(s) for s in d.get("squads", [])])
 
 
@@ -140,19 +151,24 @@ def _rule_from_dict(d: dict) -> AssignmentRule:
 
 
 def _settings_to_dict(s: RebalanceSettings) -> dict:
-    return {"rebalance_interval_s": s.rebalance_interval_s,
-            "move_cooldown_s": s.move_cooldown_s,
-            "bulk_apply_threshold": s.bulk_apply_threshold,
-            "overflow_strategy": s.overflow_strategy}
+    return {"sync_active_s": s.sync_active_s, "sync_idle_s": s.sync_idle_s,
+            "move_spacing_ms": s.move_spacing_ms, "burst_cap": s.burst_cap,
+            "settle_s": s.settle_s, "bulk_apply_threshold": s.bulk_apply_threshold,
+            "rebalance_interval_s": s.rebalance_interval_s,
+            "move_cooldown_s": s.move_cooldown_s}
 
 
 def _settings_from_dict(d: dict) -> RebalanceSettings:
     base = RebalanceSettings()
     return RebalanceSettings(
+        sync_active_s=d.get("sync_active_s", base.sync_active_s),
+        sync_idle_s=d.get("sync_idle_s", base.sync_idle_s),
+        move_spacing_ms=d.get("move_spacing_ms", base.move_spacing_ms),
+        burst_cap=d.get("burst_cap", base.burst_cap),
+        settle_s=d.get("settle_s", base.settle_s),
+        bulk_apply_threshold=d.get("bulk_apply_threshold", base.bulk_apply_threshold),
         rebalance_interval_s=d.get("rebalance_interval_s", base.rebalance_interval_s),
         move_cooldown_s=d.get("move_cooldown_s", base.move_cooldown_s),
-        bulk_apply_threshold=d.get("bulk_apply_threshold", base.bulk_apply_threshold),
-        overflow_strategy=d.get("overflow_strategy", base.overflow_strategy),
     )
 
 
@@ -178,6 +194,32 @@ def template_from_dict(d: dict) -> FleetTemplate:
     )
 
 
+def _migrate_template_v1(t: FleetTemplate) -> None:
+    """In-place v1→v2 template migration.
+
+    Each distinct doctrine tag T among a squad's slots becomes one routing rule
+    `doctrine_tag=T → (that wing, that squad, role of the first slot bearing T)`,
+    appended after existing rules with sequential priorities. Every slot's `tag`
+    is then cleared (slots become generic). Named slots are untouched.
+    """
+    next_priority = (max((r.priority for r in t.rules), default=-1) + 1)
+    for w in t.wings:
+        for sq in w.squads:
+            seen: dict[str, str] = {}   # tag -> role of its first slot (first-seen order)
+            for slot in sq.slots:
+                tag = (slot.tag or "").strip()
+                if tag and tag not in seen:
+                    seen[tag] = slot.role or "squad_member"
+            for tag, role in seen.items():
+                t.rules.append(AssignmentRule(
+                    priority=next_priority,
+                    condition=RuleCondition("doctrine_tag", tag),
+                    action=RuleAction(role, w.name, sq.name)))
+                next_priority += 1
+            for slot in sq.slots:
+                slot.tag = None
+
+
 # append to fleet_template_store.py
 import json
 
@@ -188,11 +230,17 @@ class FleetTemplateStore:
     def __init__(self, path: str):
         self.path = path
         self.templates: list[FleetTemplate] = []
-        self.cached_characters: list[str] = []
+        # v2: list of {"name": str, "character_id": int | None}
+        self.cached_characters: list[dict] = []
 
     # ── persistence ──────────────────────────────────────────────────────────
     def load(self) -> None:
-        """Load from disk. Missing or corrupt file → empty store (never raises)."""
+        """Load from disk. Missing/corrupt → empty store (never raises).
+
+        Reads `version`: v1 (or missing) is migrated in memory (written back on
+        the next natural save); a future version (>SCHEMA_VERSION) is refused —
+        the store opens empty and the file is left untouched so nothing is
+        corrupted."""
         self.templates = []
         self.cached_characters = []
         if not os.path.exists(self.path):
@@ -204,16 +252,44 @@ class FleetTemplateStore:
             log.exception("[fleet-templates] could not read %s; starting empty",
                           self.path)
             return
+        version = data.get("version", 1)
+        if not isinstance(version, int):
+            version = 1
+        if version > SCHEMA_VERSION:
+            log.warning("[fleet-templates] file version %s is newer than supported "
+                        "%s; opening empty and leaving the file untouched.",
+                        version, SCHEMA_VERSION)
+            return
         for raw in data.get("templates", []):
             try:
                 t = template_from_dict(raw)
+                if version < 2:
+                    _migrate_template_v1(t)
                 validate_template(t)
                 self.templates.append(t)
             except Exception:
                 log.exception("[fleet-templates] skipping malformed template in %s",
                               self.path)
-        self.cached_characters = [c for c in data.get("cached_characters", [])
-                                  if isinstance(c, str) and c.strip()]
+        self.cached_characters = self._normalize_cached(data.get("cached_characters", []))
+
+    @staticmethod
+    def _normalize_cached(raw) -> list[dict]:
+        out: list[dict] = []
+        seen: set[str] = set()
+        for entry in raw or []:
+            if isinstance(entry, str):
+                name, cid = entry.strip(), None
+            elif isinstance(entry, dict):
+                name = (entry.get("name") or "").strip()
+                cid = entry.get("character_id")
+                cid = cid if isinstance(cid, int) else None
+            else:
+                continue
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append({"name": name, "character_id": cid})
+        return out
 
     def save(self) -> None:
         """Atomically persist the store. Raises on serialization/IO error."""
@@ -242,27 +318,46 @@ class FleetTemplateStore:
     def delete_template(self, template_id: str) -> None:
         self.templates = [t for t in self.templates if t.id != template_id]
 
-    def cache_character(self, name: str) -> bool:
-        """Add a free-typed character name to the roster cache.
+    def cache_character(self, name: str, character_id: int | None = None) -> bool:
+        """Upsert a character into the roster cache.
 
-        Trims whitespace; de-dupes case-insensitively, preserving the first-seen
-        casing. Returns True if a new name was added, False otherwise."""
+        De-dupes case-insensitively on name, preserving first-seen casing. If the
+        name already exists and a non-None `character_id` is supplied, the id is
+        filled in (upgrading a previously-unresolved entry). Returns True only
+        when a NEW name row was added."""
         cleaned = (name or "").strip()
         if not cleaned:
             return False
         lowered = cleaned.lower()
-        if any(c.lower() == lowered for c in self.cached_characters):
-            return False
-        self.cached_characters.append(cleaned)
+        for row in self.cached_characters:
+            if row["name"].lower() == lowered:
+                if character_id is not None and row.get("character_id") is None:
+                    row["character_id"] = character_id
+                return False
+        self.cached_characters.append({"name": cleaned, "character_id": character_id})
         return True
+
+    def cached_id(self, name: str) -> int | None:
+        """Resolved character_id for a cached name (case-insensitive), or None."""
+        lowered = (name or "").strip().lower()
+        for row in self.cached_characters:
+            if row["name"].lower() == lowered:
+                return row.get("character_id")
+        return None
+
+    def cached_character_names(self) -> list[str]:
+        """Flat list of cached names (for autocomplete providers)."""
+        return [row["name"] for row in self.cached_characters]
 
 
 # fleet_template_store.py — replace the placeholder validate_template
 def validate_template(template: FleetTemplate) -> None:
-    """Mark rules whose wing/squad reference no longer exists with broken=True.
+    """Mark rules whose wing/squad reference no longer exists with broken=True,
+    and mark every `default` rule after the first as broken (at most one default
+    per template; it evaluates last regardless of priority — see the composer).
 
     Rule semantics:
-      - wing_name None & squad_name None  → "anywhere", never broken.
+      - wing_name None & squad_name None  → "anywhere", never broken (ref-wise).
       - wing_name set, squad_name None    → broken iff that wing is missing.
       - wing_name set, squad_name set     → broken iff that (wing, squad) is missing.
       - wing_name None, squad_name set    → broken (a squad ref needs a wing).
@@ -270,14 +365,20 @@ def validate_template(template: FleetTemplate) -> None:
     """
     wing_names = {w.name for w in template.wings}
     squad_pairs = {(w.name, s.name) for w in template.wings for s in w.squads}
+    seen_default = False
     for rule in template.rules:
         wn = rule.action.wing_name
         sn = rule.action.squad_name
         if wn is None and sn is None:
-            rule.broken = False
+            broken = False
         elif wn is None and sn is not None:
-            rule.broken = True
+            broken = True
         elif sn is None:
-            rule.broken = wn not in wing_names
+            broken = wn not in wing_names
         else:
-            rule.broken = (wn, sn) not in squad_pairs
+            broken = (wn, sn) not in squad_pairs
+        if rule.condition.type == "default":
+            if seen_default:
+                broken = True
+            seen_default = True
+        rule.broken = broken
