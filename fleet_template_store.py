@@ -375,3 +375,47 @@ def validate_template(template: FleetTemplate) -> None:
                 broken = True
             seen_default = True
         rule.broken = broken
+
+
+def build_template_from_live(live_members, live_structure, *, now,
+                             new_id=None) -> FleetTemplate:
+    """Build a NEW template from a live fleet snapshot (spec ask 4).
+
+    Wings/squads are recreated by their (unclamped display) name in order.
+    Every member sitting in a known squad becomes a named slot
+    (character=name, character_id=id, role=member role) — squad commanders keep
+    their squad_commander role. Members with no known squad (FC, wing
+    commanders in EVE's boss/wing slot, just-joined pilots in the no-squad slot)
+    do NOT produce squad slots. The caller pins these slots after import.
+
+    `now` is a datetime (injected/frozen by tests); the template is named
+    'Import YYYY-MM-DD HH:MM'. `new_id` overrides the generated uuid (tests).
+    Pure: no Tk, no ESI, no network.
+    """
+    name = f"Import {now.strftime('%Y-%m-%d %H:%M')}"
+    t = FleetTemplate(id=new_id or uuid4().hex, name=name, doctrine_id=None)
+
+    # squad_id -> list of members (in roster order) that sit in a known squad.
+    valid_squads = {s["id"] for w in live_structure.get("wings", [])
+                    for s in w.get("squads", [])}
+    by_squad: dict = {}
+    for m in live_members:
+        sid = m.get("squad_id")
+        if sid in valid_squads:
+            by_squad.setdefault(sid, []).append(m)
+
+    for w in live_structure.get("wings", []):
+        wing = Wing(name=w.get("name", ""), max_size=None, squads=[])
+        for s in w.get("squads", []):
+            squad = Squad(name=s.get("name", ""), max_size=None, slots=[])
+            for m in by_squad.get(s.get("id"), []):
+                squad.slots.append(Slot(
+                    character=m.get("name") or None,
+                    tag=None,
+                    role=m.get("role") or "squad_member",
+                    character_id=(m.get("character_id")
+                                 if isinstance(m.get("character_id"), int)
+                                 else None)))
+            wing.squads.append(squad)
+        t.wings.append(wing)
+    return t

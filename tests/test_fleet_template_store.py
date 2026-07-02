@@ -348,3 +348,72 @@ def test_old_v2_file_with_dropped_keys_still_loads(tmp_path):
     s = FleetTemplateStore(str(p))
     s.load()   # unknown keys ignored, known keys honored
     assert s.templates[0].settings.sync_active_s == 12
+
+
+def test_build_template_from_live_full():
+    from datetime import datetime
+    from fleet_template_store import build_template_from_live
+
+    live_structure = {"wings": [
+        {"id": 1, "name": "Assault Wing", "squads": [
+            {"id": 10, "name": "DPS Squad"},
+            {"id": 11, "name": "Logi Squad"},
+        ]},
+        {"id": 2, "name": "Tackle Wing", "squads": [
+            {"id": 20, "name": "Fast Tackle"},
+        ]},
+    ]}
+    live_members = [
+        # FC (no wing/squad in EVE's boss slot)
+        {"character_id": 100, "name": "Boss", "role": "fleet_commander",
+         "wing_id": -1, "squad_id": -1},
+        # WC of wing 1
+        {"character_id": 101, "name": "WingLead", "role": "wing_commander",
+         "wing_id": 1, "squad_id": -1},
+        # SC of squad 10
+        {"character_id": 102, "name": "SquadLead", "role": "squad_commander",
+         "wing_id": 1, "squad_id": 10},
+        # plain member of squad 10
+        {"character_id": 103, "name": "Grunt", "role": "squad_member",
+         "wing_id": 1, "squad_id": 10},
+        # member of squad 20
+        {"character_id": 104, "name": "Scout", "role": "squad_member",
+         "wing_id": 2, "squad_id": 20},
+        # an unplaced pilot (no known wing/squad) — must NOT create a slot
+        {"character_id": 105, "name": "Floater", "role": "squad_member",
+         "wing_id": -1, "squad_id": -1},
+    ]
+    now = datetime(2026, 7, 2, 20, 30)
+    t = build_template_from_live(live_members, live_structure,
+                                 now=now, new_id="abc123")
+
+    assert t.id == "abc123"
+    assert t.name == "Import 2026-07-02 20:30"
+    # Structure preserved by display name, in order.
+    assert [w.name for w in t.wings] == ["Assault Wing", "Tackle Wing"]
+    assert [s.name for s in t.wings[0].squads] == ["DPS Squad", "Logi Squad"]
+    # Squad 10 has SC + grunt as named slots; SC keeps its role.
+    dps = t.wings[0].squads[0]
+    by_char = {s.character: s for s in dps.slots}
+    assert by_char["SquadLead"].role == "squad_commander"
+    assert by_char["SquadLead"].character_id == 102
+    assert by_char["Grunt"].role == "squad_member"
+    assert by_char["Grunt"].character_id == 103
+    # Logi squad is empty (no members) but still exists.
+    assert t.wings[0].squads[1].slots == []
+    # Floater (unplaced) produced no slot anywhere.
+    all_chars = {s.character for w in t.wings for sq in w.squads for s in sq.slots}
+    assert "Floater" not in all_chars
+    # FC/WC are commanders but not squad-members: they should NOT appear as
+    # squad slots (they have no squad). No slot carries character_id 100 or 101.
+    all_ids = {s.character_id for w in t.wings for sq in w.squads for s in sq.slots}
+    assert 100 not in all_ids and 101 not in all_ids
+
+
+def test_build_template_from_live_empty_fleet():
+    from datetime import datetime
+    from fleet_template_store import build_template_from_live
+    t = build_template_from_live([], {"wings": []},
+                                 now=datetime(2026, 1, 1, 0, 0), new_id="x")
+    assert t.wings == []
+    assert t.name == "Import 2026-01-01 00:00"
