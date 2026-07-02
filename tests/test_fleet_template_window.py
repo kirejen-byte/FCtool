@@ -565,3 +565,92 @@ def test_bulk_add_creates_pinned_named_slots_and_caches(root, tmp_path, monkeypa
     # unresolved surfaced for the Add anyway / Skip decision
     assert captured["unres"] == ["Ghost Name"]
     win.destroy()
+
+
+def test_named_slot_without_id_renders_unvalidated(root, tmp_path):
+    from fleet_template_window import FleetTemplateWindow
+    from fleet_template_store import Slot
+    win = _win(root, tmp_path)
+    validated = Slot(character="Known", tag=None, role="squad_member",
+                     character_id=42)
+    unvalidated = Slot(character="Typed", tag=None, role="squad_member",
+                       character_id=None)
+    assert "⚠" not in win._slot_label(validated)
+    assert "⚠" in win._slot_label(unvalidated)
+    win.destroy()
+
+
+def test_slot_editor_resolves_and_caches_on_ok(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    from fleet_template_window import SlotEditor
+    from fleet_template_store import Slot
+
+    store = _store(tmp_path)
+    slot = Slot(character=None, tag=None, role="squad_member")
+    done = {"ok": False}
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+
+    ed = SlotEditor(
+        root, slot, _FakeFittings(), ["Kyra Dawnfall"],
+        resolve_names=lambda names: {"kyra dawnfall": 95},
+        store=store, post=lambda fn, *a: fn(*a),
+        on_ok=lambda: done.__setitem__("ok", True))
+    ed._char.set("Kyra Dawnfall")
+    ed._ok()
+    root.update()
+    assert slot.character == "Kyra Dawnfall"
+    assert slot.character_id == 95
+    assert store.cached_id("Kyra Dawnfall") == 95
+    assert done["ok"] is True
+
+
+def test_slot_editor_not_found_shows_warning_then_save_anyway(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    from fleet_template_window import SlotEditor
+    from fleet_template_store import Slot
+
+    store = _store(tmp_path)
+    slot = Slot(character=None, tag=None, role="squad_member")
+    saved = {"ok": False}
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+
+    ed = SlotEditor(
+        root, slot, _FakeFittings(), [],
+        resolve_names=lambda names: {},          # not found
+        store=store, post=lambda fn, *a: fn(*a),
+        on_ok=lambda: saved.__setitem__("ok", True))
+    ed._char.set("Ghost Name")
+    ed._ok()
+    root.update()
+    # OK did NOT commit yet — a warning is shown and the editor stays open.
+    assert saved["ok"] is False
+    assert ed._warning_shown is True
+    # Save anyway commits the slot unvalidated (character_id stays None), caches name.
+    ed._save_anyway()
+    assert slot.character == "Ghost Name"
+    assert slot.character_id is None
+    assert store.cached_id("Ghost Name") is None   # cached name, no id
+    assert saved["ok"] is True
+
+
+def test_add_my_characters_creates_slots(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    from fleet_template_store import Wing, Squad
+    store = _store(tmp_path)
+    t = store.templates[0]
+    t.wings.append(Wing(name="W1", max_size=None,
+                        squads=[Squad(name="S1", max_size=None, slots=[])]))
+    win = _win(root, tmp_path if False else tmp_path,  # keep same store below
+               character_names_provider=lambda: ["Alpha", "Bravo"],
+               resolve_names_provider=lambda names: {"alpha": 1, "bravo": 2})
+    # rebind to the store that already has W1/S1
+    win.store = store
+    win._current_template_id = t.id
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+    win._add_my_chars_names(0, 0, ["Alpha"])   # only Alpha checked
+    root.update()
+    squad = win.current_template().wings[0].squads[0]
+    named = {s.character: s for s in squad.slots}
+    assert "Alpha" in named and named["Alpha"].character_id == 1
+    assert "Bravo" not in named
+    win.destroy()

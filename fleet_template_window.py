@@ -351,7 +351,8 @@ class FleetTemplateWindow:
         abbr = ROLE_ABBR.get(slot.role, "")
         suffix = f" [{abbr}]" if abbr else ""
         if slot.character:
-            return f"● {slot.character}{suffix}"
+            mark = "" if slot.character_id else " ⚠"
+            return f"● {slot.character}{mark}{suffix}"
         if slot.tag:
             return f"◈ {slot.tag}{suffix}"
         return f"○ (empty){suffix}"
@@ -376,7 +377,10 @@ class FleetTemplateWindow:
                                         text=f"▼ {squad.name}{scap}", open=True)
                 self._node_meta[sid] = ("squad", (wi, si))
                 for li, slot in enumerate(squad.slots):
-                    nid = self._tree.insert(sid, "end", text=self._slot_label(slot))
+                    tags = () if (slot.character is None or slot.character_id
+                                  or slot.tag) else ("empty",)
+                    nid = self._tree.insert(sid, "end",
+                                            text=self._slot_label(slot), tags=tags)
                     self._node_meta[nid] = ("slot", (wi, si, li))
 
     def _reload_live_tree(self):
@@ -580,7 +584,9 @@ class FleetTemplateWindow:
         wi, si, li = path
         slot = self.current_template().wings[wi].squads[si].slots[li]
         SlotEditor(self.win, slot, self.fittings, self._character_names_provider(),
-                   on_ok=lambda: self._after_structure_change())
+                   on_ok=lambda: self._after_structure_change(),
+                   resolve_names=self._resolve_names_provider,
+                   store=self.store, post=self._post)
 
     def _open_bulk_add(self, wi, si):
         _BulkAddDialog(self.win, on_ok=lambda text: self._bulk_add_pilots_names(
@@ -640,6 +646,19 @@ class FleetTemplateWindow:
                 wi, si, [(n, None) for n in unresolved]),
             on_skip=lambda: self._status.config(
                 text=f"Skipped {len(unresolved)} unresolved name(s).", fg=FG_YELLOW))
+
+    def _open_add_my_chars(self, wi, si):
+        names = sorted(self._character_names_provider() or [])
+        if not names:
+            self._status.config(text="No authed characters to add.", fg=FG_YELLOW)
+            return
+        _AddMyCharsDialog(self.win, names,
+                          on_ok=lambda chosen: self._add_my_chars_names(wi, si, chosen))
+
+    def _add_my_chars_names(self, wi, si, chosen):
+        """Resolve the checked SSO names (should resolve trivially) and pin them
+        as named slots. Reuses the bulk resolution path."""
+        self._bulk_add_pilots_names(wi, si, list(chosen))
 
     def _delete_selected(self):
         self._push_undo()
@@ -1552,9 +1571,15 @@ class FleetTemplateWindow:
 
 class SlotEditor:
     """Modal: edit a slot's type (named/role/generic), tag, and role."""
-    def __init__(self, parent, slot, fittings, character_names, *, on_ok):
+    def __init__(self, parent, slot, fittings, character_names, *, on_ok,
+                 resolve_names=None, store=None, post=None):
         self.slot = slot
         self.on_ok = on_ok
+        self._resolve_names = resolve_names
+        self._store = store
+        self._post = post or (lambda fn, *a: fn(*a))
+        self._warning_shown = False
+        self._pending_char = None
         self.win = tk.Toplevel(parent)
         self.win.title("Edit Slot")
         self.win.configure(bg=BG_PANEL)
@@ -1583,22 +1608,117 @@ class SlotEditor:
         self._role.set(slot.role)
         self._role.grid(row=2, column=1, padx=6, pady=4)
 
+        self._warning = tk.Label(self.win, text="", bg=BG_PANEL, fg=FG_YELLOW,
+                                 font=("Consolas", 8))
+        self._warning.grid(row=4, column=0, columnspan=2, sticky="w", padx=6)
+
         btns = tk.Frame(self.win, bg=BG_PANEL)
-        btns.grid(row=3, column=0, columnspan=2, pady=8)
+        btns.grid(row=5, column=0, columnspan=2, pady=8)
         ttk.Button(btns, text="OK", style="Dark.TButton",
                    command=self._ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Save anyway", style="Dark.TButton",
+                   command=self._save_anyway).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=self.win.destroy).pack(side=tk.LEFT, padx=4)
 
     def _ok(self):
         char = self._char.get().strip()
         tag = self._tag.get().strip()
-        # Named takes precedence; a named slot ignores tag. Generic = both blank.
-        self.slot.character = char or None
         self.slot.tag = (tag or None) if not char else None
         self.slot.role = self._role.get() or "squad_member"
-        self.win.destroy()
+        # Generic slot or a name that already carries an id → commit immediately.
+        if not char:
+            self.slot.character = None
+            self.slot.character_id = None
+            self._commit()
+            return
+        if self.slot.character and self.slot.character.strip().lower() == char.lower() \
+                and self.slot.character_id:
+            self.slot.character = char
+            self._commit()
+            return
+        # Already-cached id?
+        cached = self._store.cached_id(char) if self._store is not None else None
+        if isinstance(cached, int):
+            self.slot.character = char
+            self.slot.character_id = cached
+            self._commit()
+            return
+        # Otherwise resolve in the background; do NOT block saving.
+        if self._resolve_names is None:
+            self.slot.character = char
+            self.slot.character_id = None
+            self._commit()
+            return
+        self._pending_char = char
+        self._warning.config(text="Resolving…", fg=FG_DIM)
+
+        def worker():
+            found = (self._resolve_names([char]) or {}).get(char.lower())
+            self._post(self._after_resolve, char, found)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_resolve(self, char, cid):
+        if isinstance(cid, int):
+            self.slot.character = char
+            self.slot.character_id = cid
+            if self._store is not None:
+                self._store.cache_character(char, cid)
+            self._commit()
+            return
+        # Not found — inline warning; the FC decides Save anyway / Cancel.
+        self._warning_shown = True
+        self._warning.config(text="Name not found on ESI.", fg=FG_YELLOW)
+
+    def _save_anyway(self):
+        char = (self._pending_char or self._char.get().strip())
+        self.slot.character = char or None
+        self.slot.character_id = None
+        if char and self._store is not None:
+            self._store.cache_character(char, None)   # cache name for autocomplete
+        self._commit()
+
+    def _commit(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
         self.on_ok()
+
+
+class _AddMyCharsDialog:
+    """Themed checkbox list of authed character names -> on_ok([checked names])."""
+    def __init__(self, parent, names, *, on_ok):
+        self.on_ok = on_ok
+        self.win = tk.Toplevel(parent)
+        self.win.title("Add my characters")
+        self.win.configure(bg=BG_PANEL)
+        self.win.transient(parent)
+        self.win.grab_set()
+        tk.Label(self.win, text="Select characters to add:", bg=BG_PANEL,
+                 fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", padx=8, pady=(8, 2))
+        self._vars = {}
+        body = tk.Frame(self.win, bg=BG_PANEL)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
+        for name in names:
+            v = tk.BooleanVar(value=False)
+            self._vars[name] = v
+            tk.Checkbutton(body, text=name, variable=v, bg=BG_PANEL, fg=FG_TEXT,
+                           selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+                           activeforeground=FG_TEXT, font=("Consolas", 9),
+                           anchor="w").pack(fill=tk.X, anchor="w")
+        btns = tk.Frame(self.win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Add", style="Dark.TButton",
+                   command=self._ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=self.win.destroy).pack(side=tk.LEFT, padx=2)
+
+    def _ok(self):
+        chosen = [n for n, v in self._vars.items() if v.get()]
+        self.win.destroy()
+        self.on_ok(chosen)
 
 
 class _BulkAddDialog:
