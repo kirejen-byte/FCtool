@@ -61,7 +61,8 @@ COMMON_SHIP_CLASSES = [
 
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
-                 fleet_info_provider, doctrine_provider, character_names_provider):
+                 fleet_info_provider, doctrine_provider, character_names_provider,
+                 resolve_names_provider=None):
         self.store = store
         self.fittings = fittings
         self.config = config
@@ -69,6 +70,8 @@ class FleetTemplateWindow:
         self._fleet_info_provider = fleet_info_provider
         self._doctrine_provider = doctrine_provider
         self._character_names_provider = character_names_provider
+        # names -> {name_lower: character_id}; None/absent = no-auth (returns {}).
+        self._resolve_names_provider = resolve_names_provider or (lambda names: {})
 
         self.mode = "template"
         self._current_template_id = (store.templates[0].id if store.templates else None)

@@ -472,3 +472,46 @@ def test_settings_tab_exposes_v2_fields(root, tmp_path):
     assert "rebalance_interval_s" not in win._settings_vars
     assert "move_cooldown_s" not in win._settings_vars
     win.destroy()
+
+
+def test_resolve_names_provider_is_stored_and_called(root, tmp_path):
+    from fleet_template_window import FleetTemplateWindow
+    seen = {}
+
+    def fake_resolver(names):
+        seen["names"] = list(names)
+        return {"kyra dawnfall": 95, "someone else": 96}
+
+    win = FleetTemplateWindow(
+        root, store=_store(tmp_path), fittings=_FakeFittings(), config={},
+        esi_session_provider=lambda: None,
+        fleet_info_provider=lambda: None,
+        doctrine_provider=lambda: None,
+        character_names_provider=lambda: [],
+        resolve_names_provider=fake_resolver,
+    )
+    out = win._resolve_names_provider(["Kyra Dawnfall", "Someone Else"])
+    assert out == {"kyra dawnfall": 95, "someone else": 96}
+    assert seen["names"] == ["Kyra Dawnfall", "Someone Else"]
+    win.destroy()
+
+
+def test_fc_gui_resolve_names_lowercases_keys_and_survives_no_auth():
+    import types
+    import fc_gui
+
+    # No esi_auth → provider returns {} (graceful no-auth).
+    gui = types.SimpleNamespace(esi_auth=None)
+    provider = fc_gui.FCToolGUI._resolve_names.__get__(gui, fc_gui.FCToolGUI)
+    assert provider(["Kyra Dawnfall"]) == {}
+
+    # With an auth whose resolve_names_to_ids returns proper-cased names,
+    # the provider lowercases the keys for case-insensitive matching.
+    class _Auth:
+        is_authenticated = True
+        def resolve_names_to_ids(self, names):
+            return {"Kyra Dawnfall": 95}
+    gui2 = types.SimpleNamespace(esi_auth=_Auth())
+    provider2 = fc_gui.FCToolGUI._resolve_names.__get__(gui2, fc_gui.FCToolGUI)
+    assert provider2(["Kyra Dawnfall"]) == {"kyra dawnfall": 95}
+    assert provider2([]) == {}

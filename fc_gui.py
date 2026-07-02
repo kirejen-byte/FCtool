@@ -7492,6 +7492,31 @@ class FCToolGUI:
         names += self.fleet_templates.cached_character_names()
         return sorted(set(names))
 
+    def _resolve_names(self, names):
+        """Resolve a list of typed pilot names to {name_lower: character_id}.
+
+        Backed by esi_auth.resolve_names_to_ids (public POST /universe/ids/,
+        batched <=500/request with a split-on-failure fallback — see
+        esi_auth._resolve_chunk_recursive). Safe on a worker thread. Keys are
+        lower-cased so callers can match case-insensitively against typed input.
+        Returns {} when there is no authenticated character (graceful no-auth) or
+        on any error, so names simply stay unvalidated."""
+        auth = getattr(self, "esi_auth", None)
+        if auth is None or not getattr(auth, "is_authenticated", False):
+            return {}
+        cleaned = [n for n in (names or []) if isinstance(n, str) and n.strip()]
+        if not cleaned:
+            return {}
+        try:
+            raw = auth.resolve_names_to_ids(cleaned)   # {proper_name: id}, <=500/batch
+        except Exception:
+            return {}
+        out = {}
+        for name, cid in (raw or {}).items():
+            if isinstance(name, str) and isinstance(cid, int):
+                out[name.strip().lower()] = cid
+        return out
+
     def _open_fleet_templates(self):
         from fleet_template_window import FleetTemplateWindow
         existing = self._fleet_template_window
@@ -7511,6 +7536,7 @@ class FCToolGUI:
             fleet_info_provider=self._fleet_boss_info,
             doctrine_provider=self._active_doctrine_obj,
             character_names_provider=self._authed_character_names,
+            resolve_names_provider=self._resolve_names,
         )
         # Clear the handle when the window closes so re-open works.
         win = self._fleet_template_window
