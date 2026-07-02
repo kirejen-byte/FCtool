@@ -7,9 +7,6 @@ slots, then generic slots, then Unassigned — diffs each assignment against the
 pilot's current ESI placement, and returns a `ComposeResult` whose executable
 moves (`skip_reason is None`) are exactly the ESI writes the apply step issues.
 
-`plan_rebalance(...)` returns a single overflow move for the size-cap rebalancer
-(at most one per tick, by design).
-
 All targets are expressed by wing/squad NAME; the caller resolves names to live
 ESI ids (creating wings/squads as needed) at apply time.
 """
@@ -268,96 +265,13 @@ def summarize_moves(result: ComposeResult) -> dict:
     """Counts for the apply confirm dialog. `esi_calls` is the move count;
     the apply layer adds wing/squad creates on top, so this is a lower bound."""
     executable = len(result.executable)
-    unfilled = sum(1 for w in result.warnings if "unfilled" in w)
+    unfilled = sum(1 for w in result.warnings if "no matching pilots" in w)
     return {
         "executable": executable,
         "unfilled": unfilled,
         "unassigned": len(result.unassigned),
         "esi_calls": executable,
     }
-
-
-# append to fleet_composer.py
-@dataclass
-class RebalanceAction:
-    pilot_id: int
-    pilot_name: str
-    source_wing_name: str
-    target_wing_name: str
-    target_squad_name: str | None   # None + create_squad=True → make a new squad here
-    create_squad: bool = False
-
-
-def plan_rebalance(live_members, live_structure, *, max_sizes) -> "RebalanceAction | None":
-    """Return at most ONE overflow move, or None if every squad is within cap.
-
-    Order of preference for the target (spec §9): an under-cap squad in the SAME
-    wing → the least-populated squad across all wings → signal create_squad in
-    the same wing. The overflow pilot is the last-joined in the over-cap squad.
-    `max_sizes`: {(wing_name, squad_name): cap or None}. None means uncapped.
-
-    NOTE: `RebalanceSettings.overflow_strategy` is reserved for v1. The only
-    documented/default value is "least_populated", which is exactly this
-    target-selection order, so the field is persisted (round-tripped) but not
-    branched on yet and is intentionally not exposed in the Settings tab. A
-    future strategy (e.g. "fill_first") would add a branch here.
-    """
-    # Index structure.
-    wings = live_structure.get("wings", [])
-    sid_to_names: dict[int, tuple] = {}
-    wname_by_id: dict[int, str] = {}
-    squads_by_wing: dict[str, list] = {}
-    for w in wings:
-        wname_by_id[w["id"]] = w["name"]
-        squads_by_wing[w["name"]] = []
-        for s in w.get("squads", []):
-            sid_to_names[s["id"]] = (w["name"], s["name"])
-            squads_by_wing[w["name"]].append(s["name"])
-
-    # Population per (wing_name, squad_name).
-    pop: dict[tuple, list] = {}
-    for m in live_members:
-        names = sid_to_names.get(m.get("squad_id"))
-        if names:
-            pop.setdefault(names, []).append(m)
-
-    # First over-cap squad in tree order.
-    for w in wings:
-        for s in w.get("squads", []):
-            key = (w["name"], s["name"])
-            cap = max_sizes.get(key)
-            members = pop.get(key, [])
-            if cap is None or len(members) <= cap:
-                continue
-            overflow = max(members, key=lambda m: m.get("join_time") or "")
-
-            # (i) under-cap squad in the same wing
-            same_wing = [(w["name"], sn) for sn in squads_by_wing[w["name"]]
-                         if sn != s["name"]]
-            under = [k for k in same_wing
-                     if max_sizes.get(k) is None or len(pop.get(k, [])) < max_sizes[k]]
-            if under:
-                target = min(under, key=lambda k: len(pop.get(k, [])))
-                return RebalanceAction(overflow["character_id"],
-                                       overflow.get("name", ""), w["name"],
-                                       target[0], target[1], create_squad=False)
-
-            # (ii) least-populated under-cap squad across all wings
-            all_other = [k for k in pop.keys() | set(max_sizes.keys())
-                         if k != key]
-            under_any = [k for k in all_other
-                         if max_sizes.get(k) is None or len(pop.get(k, [])) < max_sizes[k]]
-            if under_any:
-                target = min(under_any, key=lambda k: len(pop.get(k, [])))
-                return RebalanceAction(overflow["character_id"],
-                                       overflow.get("name", ""), w["name"],
-                                       target[0], target[1], create_squad=False)
-
-            # (iii) no under-cap squad anywhere → create one in the same wing
-            return RebalanceAction(overflow["character_id"], overflow.get("name", ""),
-                                   w["name"], w["name"], None, create_squad=True)
-
-    return None
 
 
 def live_layout(live_members, live_structure):

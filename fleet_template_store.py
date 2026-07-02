@@ -82,9 +82,6 @@ class RebalanceSettings:
     burst_cap: int = 25
     settle_s: int = 3
     bulk_apply_threshold: int = 5
-    # Kept for the Phase-A size-cap rebalancer loop (removed in Phase B):
-    rebalance_interval_s: int = 60
-    move_cooldown_s: int = 45
 
 
 @dataclass
@@ -153,9 +150,7 @@ def _rule_from_dict(d: dict) -> AssignmentRule:
 def _settings_to_dict(s: RebalanceSettings) -> dict:
     return {"sync_active_s": s.sync_active_s, "sync_idle_s": s.sync_idle_s,
             "move_spacing_ms": s.move_spacing_ms, "burst_cap": s.burst_cap,
-            "settle_s": s.settle_s, "bulk_apply_threshold": s.bulk_apply_threshold,
-            "rebalance_interval_s": s.rebalance_interval_s,
-            "move_cooldown_s": s.move_cooldown_s}
+            "settle_s": s.settle_s, "bulk_apply_threshold": s.bulk_apply_threshold}
 
 
 def _settings_from_dict(d: dict) -> RebalanceSettings:
@@ -167,8 +162,6 @@ def _settings_from_dict(d: dict) -> RebalanceSettings:
         burst_cap=d.get("burst_cap", base.burst_cap),
         settle_s=d.get("settle_s", base.settle_s),
         bulk_apply_threshold=d.get("bulk_apply_threshold", base.bulk_apply_threshold),
-        rebalance_interval_s=d.get("rebalance_interval_s", base.rebalance_interval_s),
-        move_cooldown_s=d.get("move_cooldown_s", base.move_cooldown_s),
     )
 
 

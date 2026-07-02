@@ -71,51 +71,6 @@ def test_mode_toggle_to_live_enables_apply(root, tmp_path):
     win.destroy()
 
 
-def test_rebalance_reuses_clamped_live_squad_no_duplicate(root, tmp_path, monkeypatch):
-    import fleet_esi
-    import fleet_composer
-    import fleet_template_window as ftw
-    from fleet_template_window import FleetTemplateWindow
-
-    calls = {"create_wing": 0, "create_squad": 0, "move": []}
-    monkeypatch.setattr(fleet_esi, "create_wing",
-                        lambda *a, **k: (calls.__setitem__("create_wing", calls["create_wing"] + 1), 9001)[1])
-    monkeypatch.setattr(fleet_esi, "create_squad",
-                        lambda *a, **k: (calls.__setitem__("create_squad", calls["create_squad"] + 1), 9002)[1])
-    monkeypatch.setattr(fleet_esi, "move_member",
-                        lambda session, fleet_id, pid, *, wing_id, squad_id, role:
-                            calls["move"].append((pid, wing_id, squad_id, role)))
-
-    class _SyncThread:
-        def __init__(self, target=None, daemon=None):
-            self._t = target
-        def start(self):
-            self._t()
-    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
-
-    win = FleetTemplateWindow(
-        root, store=_store(tmp_path), fittings=_FakeFittings(), config={},
-        esi_session_provider=lambda: object(),
-        fleet_info_provider=lambda: {"fleet_id": 1, "is_boss": True},
-        doctrine_provider=lambda: None,
-        character_names_provider=lambda: [])
-    win._fleet_id = 1
-    # Live names are clamped to 10 chars; the action targets the full names.
-    win._live_structure = {"wings": [{"id": 100, "name": "Logistics ",
-                                      "squads": [{"id": 200, "name": "Guardians "}]}]}
-    action = fleet_composer.RebalanceAction(
-        pilot_id=42, pilot_name="Pilot", source_wing_name="Logistics Wing",
-        target_wing_name="Logistics Wing", target_squad_name="Guardians Squad",
-        create_squad=False)
-
-    win._execute_rebalance(object(), action)
-    win.destroy()
-
-    assert calls["create_wing"] == 0
-    assert calls["create_squad"] == 0          # reused existing squad — no duplicate
-    assert calls["move"] == [(42, 100, 200, "squad_member")]
-
-
 def test_live_tree_mirrors_real_fleet(root, tmp_path):
     from fleet_template_window import FleetTemplateWindow
     win = FleetTemplateWindow(
@@ -448,4 +403,72 @@ def test_active_cadence_when_recent_write(root, tmp_path):
     assert win._sync_delay_ms() == t.settings.sync_active_s * 1000
     win._last_write_wall = time.time() - 120  # long ago, auto-sort off
     assert win._sync_delay_ms() == t.settings.sync_idle_s * 1000
+    win.destroy()
+
+
+# append — Phase B: auto-sort toggle + tick
+def test_auto_sort_button_label(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    win.set_mode("live")
+    assert "Auto-sort" in str(win._auto_sort_btn["text"])
+    win._toggle_auto_sort()
+    assert win._auto_sort_on is True
+    assert "ON" in str(win._auto_sort_btn["text"])
+    win.destroy()
+
+
+def test_auto_sort_tick_enqueues_only_unpinned_needed(root, tmp_path):
+    import fleet_composer
+    win = _live_win(root, tmp_path)
+    win.mode = "live"
+    win._auto_sort_on = True
+    win._ensure_executor()
+    submitted = []
+    win._executor.submit = lambda job: submitted.append(job)
+    win._pins = {1: 587}          # pilot 1 pinned → skip
+    win._live_structure = {"wings": [{"id": 100, "name": "Alpha",
+                                      "squads": [{"id": 200, "name": "S1"}]}]}
+    win._live_members = [
+        {"character_id": 1, "name": "Pinned", "ship_type_id": 587,
+         "is_capital": False, "ship_class": "Frigate", "wing_id": 100,
+         "squad_id": 999, "role": "squad_member", "join_time": "1"},
+        {"character_id": 2, "name": "Free", "ship_type_id": 588,
+         "is_capital": False, "ship_class": "Frigate", "wing_id": 100,
+         "squad_id": 999, "role": "squad_member", "join_time": "2"},
+    ]
+    # A template with a default rule → routes everyone to Alpha/S1.
+    t = win.current_template()
+    from fleet_template_store import (AssignmentRule, RuleCondition, RuleAction,
+                                      Wing, Squad)
+    t.wings = [Wing("Alpha", None, [Squad("S1", None, [])])]
+    t.rules = [AssignmentRule(0, RuleCondition("default", ""),
+                              RuleAction("squad_member", "Alpha", "S1"))]
+    win._auto_sort_tick()
+    ids = [j.pilot_id for j in submitted]
+    assert 1 not in ids            # pinned skipped
+    assert 2 in ids                # free pilot enqueued
+    assert all(j.source == "autosort" for j in submitted)
+    win.destroy()
+
+
+def test_apply_clears_pins(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    win.mode = "live"
+    win._pins = {1: 10, 2: 20}
+    win._live_members = []
+    win._live_structure = {"wings": []}
+    # Stub the enqueue path so _apply just runs the clear-pins side effect.
+    win._execute_moves = lambda *a, **k: None
+    win._apply()
+    assert win._pins == {}
+    win.destroy()
+
+
+def test_settings_tab_exposes_v2_fields(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    for key in ("sync_active_s", "sync_idle_s", "move_spacing_ms",
+                "burst_cap", "settle_s", "bulk_apply_threshold"):
+        assert key in win._settings_vars
+    assert "rebalance_interval_s" not in win._settings_vars
+    assert "move_cooldown_s" not in win._settings_vars
     win.destroy()

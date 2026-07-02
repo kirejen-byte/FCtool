@@ -222,60 +222,13 @@ def test_summarize_counts_repositions_role_changes_and_unfilled():
             Move(3, "C", "W", "S1", "squad_member", skip_reason="already_correct"),
         ],
         unassigned=[{"character_id": 9}],
-        warnings=["1 slot unfilled (no match): W/S2 [Logistics]"],
+        warnings=["Rule Logistics: no matching pilots"],
     )
     s = summarize_moves(res)
     assert s["executable"] == 2
     assert s["unfilled"] == 1
     assert s["unassigned"] == 1
     assert s["esi_calls"] == 2
-
-
-# append to tests/test_fleet_composer.py
-from fleet_composer import plan_rebalance, RebalanceAction
-
-
-def _struct(wings):
-    return {"wings": wings}
-
-
-def test_rebalance_moves_last_joined_overflow_to_undercap_squad_same_wing():
-    # Wing W: S1 cap 2 has 3 members; S2 cap 5 has 0 → move newest from S1 to S2.
-    struct = _struct([{"id": 1, "name": "W", "squads": [
-        {"id": 10, "name": "S1"}, {"id": 11, "name": "S2"}]}])
-    members = [
-        {"character_id": 1, "name": "A", "wing_id": 1, "squad_id": 10,
-         "join_time": "2026-01-01T00:00:00Z"},
-        {"character_id": 2, "name": "B", "wing_id": 1, "squad_id": 10,
-         "join_time": "2026-01-02T00:00:00Z"},
-        {"character_id": 3, "name": "C", "wing_id": 1, "squad_id": 10,
-         "join_time": "2026-01-03T00:00:00Z"},   # newest → overflow
-    ]
-    max_sizes = {("W", "S1"): 2, ("W", "S2"): 5}
-    act = plan_rebalance(members, struct, max_sizes=max_sizes)
-    assert isinstance(act, RebalanceAction)
-    assert act.pilot_id == 3
-    assert act.target_wing_name == "W"
-    assert act.target_squad_name == "S2"
-    assert act.create_squad is False
-
-
-def test_rebalance_returns_none_when_all_within_cap():
-    struct = _struct([{"id": 1, "name": "W", "squads": [{"id": 10, "name": "S1"}]}])
-    members = [{"character_id": 1, "name": "A", "wing_id": 1, "squad_id": 10,
-                "join_time": "2026-01-01T00:00:00Z"}]
-    assert plan_rebalance(members, struct, max_sizes={("W", "S1"): 5}) is None
-
-
-def test_rebalance_signals_create_when_no_undercap_target_exists():
-    struct = _struct([{"id": 1, "name": "W", "squads": [{"id": 10, "name": "S1"}]}])
-    members = [{"character_id": i, "name": str(i), "wing_id": 1, "squad_id": 10,
-                "join_time": f"2026-01-0{i}T00:00:00Z"} for i in (1, 2, 3)]
-    act = plan_rebalance(members, struct, max_sizes={("W", "S1"): 2})
-    assert act.pilot_id == 3
-    assert act.target_wing_name == "W"
-    assert act.create_squad is True
-    assert act.target_squad_name is None
 
 
 def test_already_correct_with_clamped_live_name_is_skipped():
@@ -290,18 +243,6 @@ def test_already_correct_with_clamped_live_name_is_skipped():
     res = compose(t, members, struct)
     assert res.executable == []   # clamped names match → no redundant move
     assert any(m.skip_reason == "already_correct" for m in res.moves)
-
-
-def test_plan_rebalance_caps_match_clamped_live_names():
-    # Live squad name is clamped to 10 chars; max_sizes keyed by that clamped name.
-    struct = {"wings": [{"id": 1, "name": "Logistics ",
-                         "squads": [{"id": 10, "name": "Guardians "}]}]}
-    members = [{"character_id": i, "name": str(i), "wing_id": 1, "squad_id": 10,
-                "join_time": f"2026-01-0{i}T00:00:00Z"} for i in (1, 2, 3)]
-    max_sizes = {("Logistics ", "Guardians "): 2}   # clamped key, cap 2, 3 members
-    act = plan_rebalance(members, struct, max_sizes=max_sizes)
-    assert act is not None
-    assert act.pilot_id == 3        # last-joined overflow pilot
 
 
 def test_live_layout_groups_members_commanders_and_unplaced():
@@ -472,3 +413,13 @@ def test_named_slot_prefers_character_id_over_name():
     res = compose(t, members, _EMPTY_STRUCT)
     assert res.executable[0].pilot_id == 42
     assert res.executable[0].target_role == "squad_commander"
+
+
+# append — summarize counts the v2 "no matching pilots" rule warnings
+def test_summarize_counts_no_matching_pilots_as_unfilled():
+    from fleet_composer import ComposeResult, summarize_moves
+    res = ComposeResult()
+    res.warnings = ["Rule Capitals: no matching pilots",
+                    "Rule DPS: no matching pilots"]
+    s = summarize_moves(res)
+    assert s["unfilled"] == 2

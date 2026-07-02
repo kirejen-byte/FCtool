@@ -43,11 +43,10 @@ def test_defaults_on_rebalance_settings():
     assert s.burst_cap == 25
     assert s.settle_s == 3
     assert s.bulk_apply_threshold == 5
-    # kept for the Phase-A rebalancer loop (deleted in Phase B):
-    assert s.rebalance_interval_s == 60
-    assert s.move_cooldown_s == 45
     # dropped in v2:
     assert not hasattr(s, "overflow_strategy")
+    assert not hasattr(s, "rebalance_interval_s")
+    assert not hasattr(s, "move_cooldown_s")
 
 
 # append to tests/test_fleet_template_store.py
@@ -173,8 +172,6 @@ def test_rebalance_settings_v2_fields():
     assert s.burst_cap == 25
     assert s.settle_s == 3
     assert s.bulk_apply_threshold == 5
-    # kept for the Phase-A rebalancer loop (deleted in Phase B):
-    assert s.move_cooldown_s == 45
     # dropped in v2:
     assert not hasattr(s, "overflow_strategy")
 
@@ -325,3 +322,29 @@ def test_validate_default_rule_still_checks_dangling_ref():
                                             RuleAction("squad_member", "Ghost", "Nope"))])
     validate_template(t)
     assert t.rules[0].broken is True      # dangling wing/squad
+
+
+# append — Phase B: dropped rebalance settings fields
+def test_settings_dict_has_no_dropped_fields():
+    from fleet_template_store import RebalanceSettings, _settings_to_dict
+    d = _settings_to_dict(RebalanceSettings())
+    assert "rebalance_interval_s" not in d
+    assert "move_cooldown_s" not in d
+    assert not hasattr(RebalanceSettings(), "rebalance_interval_s")
+
+
+def test_old_v2_file_with_dropped_keys_still_loads(tmp_path):
+    import json
+    from fleet_template_store import FleetTemplateStore
+    p = tmp_path / "fleet_templates.json"
+    p.write_text(json.dumps({
+        "version": 2,
+        "templates": [{"id": "x", "name": "T", "doctrine_id": None, "wings": [],
+                       "rules": [], "settings": {"rebalance_interval_s": 60,
+                                                 "move_cooldown_s": 45,
+                                                 "sync_active_s": 12}}],
+        "cached_characters": [],
+    }), encoding="utf-8")
+    s = FleetTemplateStore(str(p))
+    s.load()   # unknown keys ignored, known keys honored
+    assert s.templates[0].settings.sync_active_s == 12

@@ -2,8 +2,8 @@
 """Fleet Templates window — Tkinter view over the pure fleet_* modules.
 
 Owns a Toplevel with a Template/Live mode toggle, a wing/squad/slot tree, a
-right-hand Members/Rules/Settings notebook, a hybrid apply flow, and a pausable
-size-cap rebalancer. All matching/persistence/ESI logic lives in
+right-hand Members/Rules/Settings notebook, a hybrid apply flow, and a
+compose-driven Auto-sort loop. All matching/persistence/ESI logic lives in
 fleet_template_store / fleet_composer / fleet_esi; this module is widgets + glue.
 
 Constructed by fc_gui with provider callables so it never reaches back into the
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, messagebox, simpledialog
 
 import fleet_composer
@@ -71,9 +72,7 @@ class FleetTemplateWindow:
 
         self.mode = "template"
         self._current_template_id = (store.templates[0].id if store.templates else None)
-        self._rebalance_on = False
-        self._auto_sort_on = False      # Task 6 (rename of _rebalance_on; Task 7 removes _rebalance_on)
-        self._rebalance_after_id = None
+        self._auto_sort_on = False
         self._sync_after_id = None
         self._executor = None
         self._last_write_wall = 0.0
@@ -84,6 +83,7 @@ class FleetTemplateWindow:
         self._live_structure: dict = {"wings": []}
         self._last_preview = None                 # cached ComposeResult (Tasks D5/D10)
         self._undo_stack: list[dict] = []         # template-mode undo (Task D9)
+        self._log_buffer: deque = deque(maxlen=500)   # internal executor/sort log
 
         self.win = tk.Toplevel(root)
         self.win.title("Fleet Templates")
@@ -149,10 +149,10 @@ class FleetTemplateWindow:
         self._save_btn = ttk.Button(bar, text="Save Template",
                                     style="Dark.TButton", command=self._save)
         self._save_btn.pack(side=tk.LEFT, padx=8, pady=6)
-        self._rebalance_btn = ttk.Button(bar, text="Rebalance: OFF",
+        self._auto_sort_btn = ttk.Button(bar, text="Auto-sort: OFF",
                                          style="Dark.TButton",
-                                         command=self._toggle_rebalance)
-        self._rebalance_btn.pack(side=tk.LEFT, padx=8)
+                                         command=self._toggle_auto_sort)
+        self._auto_sort_btn.pack(side=tk.LEFT, padx=8)
         self._status = tk.Label(bar, text="", font=("Consolas", 9),
                                 fg=FG_DIM, bg=BG_PANEL)
         self._status.pack(side=tk.LEFT, padx=10)
@@ -228,8 +228,11 @@ class FleetTemplateWindow:
         self._mode_btn.config(text=f"Mode: {mode.capitalize()}")
         live = (mode == "live")
         self._apply_btn.config(state="normal" if live else "disabled")
-        self._rebalance_btn.config(state="normal" if live else "disabled")
+        self._auto_sort_btn.config(state="normal" if live else "disabled")
         self._save_btn.config(state="disabled" if live else "normal")
+        if not live:
+            self._auto_sort_on = False
+            self._auto_sort_btn.config(text="Auto-sort: OFF")
         if live:
             self._enter_live_mode()    # Task D5
         else:
@@ -278,12 +281,13 @@ class FleetTemplateWindow:
             self._destroy_drag_ghost()
         except Exception:
             pass
-        for after_id in (self._rebalance_after_id, self._sync_after_id):
-            if after_id:
-                try:
-                    self.win.after_cancel(after_id)
-                except Exception:
-                    pass
+        if self._sync_after_id:
+            try:
+                self.win.after_cancel(self._sync_after_id)
+            except Exception:
+                pass
+        if getattr(self, "_executor", None) is not None:
+            self._executor.stop()   # ends the persistent worker (None sentinel)
         try:
             self.win.destroy()
         except Exception:
@@ -1059,9 +1063,12 @@ class FleetTemplateWindow:
     def _build_settings_tab(self):
         self._settings_vars = {}
         fields = [
-            ("rebalance_interval_s", "Rebalance interval (s)", 10, 600),
-            ("move_cooldown_s", "Move cooldown (s)", 30, 600),
-            ("bulk_apply_threshold", "Bulk apply threshold (moves)", 1, 100),
+            ("sync_active_s", "Active sync interval (s)", 5, 120),
+            ("sync_idle_s", "Idle sync interval (s)", 5, 300),
+            ("move_spacing_ms", "Spacing between moves (ms)", 100, 5000),
+            ("burst_cap", "Moves per burst", 1, 100),
+            ("settle_s", "Settle pause after a burst (s)", 1, 30),
+            ("bulk_apply_threshold", "Bulk apply warning threshold", 1, 100),
         ]
         for i, (key, label, lo, hi) in enumerate(fields):
             tk.Label(self._settings_tab, text=label, bg=BG_PANEL, fg=FG_TEXT,
@@ -1074,11 +1081,12 @@ class FleetTemplateWindow:
                        command=self._on_settings_changed).grid(row=i, column=1,
                                                                padx=8, pady=6)
         tk.Label(self._settings_tab,
-                 text="Each pilot move triggers a ~30 s EVE session timer.\n"
-                      "Cooldown ≥ 45 s keeps the rebalancer under that limit.",
+                 text="Fast bursts are ESI-verified: after each burst the tool "
+                      "pauses and re-checks the fleet before continuing.",
                  bg=BG_PANEL, fg=FG_DIM, font=("Consolas", 8),
-                 justify=tk.LEFT).grid(row=len(fields), column=0, columnspan=2,
-                                       sticky="w", padx=8, pady=8)
+                 justify=tk.LEFT, wraplength=320).grid(
+                     row=len(fields), column=0, columnspan=2,
+                     sticky="w", padx=8, pady=8)
         self._reload_settings()
 
     def _reload_settings(self):
@@ -1086,9 +1094,8 @@ class FleetTemplateWindow:
         if t is None:
             return
         s = t.settings
-        self._settings_vars["rebalance_interval_s"][0].set(s.rebalance_interval_s)
-        self._settings_vars["move_cooldown_s"][0].set(s.move_cooldown_s)
-        self._settings_vars["bulk_apply_threshold"][0].set(s.bulk_apply_threshold)
+        for key, (var, _lo, _hi) in self._settings_vars.items():
+            var.set(getattr(s, key))
 
     def _on_settings_changed(self):
         t = self.current_template()
@@ -1230,7 +1237,53 @@ class FleetTemplateWindow:
         return True
 
     def _on_sync_complete(self, events):
-        pass   # Task 7 wires the Auto-sort tick here
+        if self._auto_sort_on and self.mode == "live":
+            self._auto_sort_tick()
+
+    def _toggle_auto_sort(self):
+        if self.mode != "live":
+            return
+        self._auto_sort_on = not self._auto_sort_on
+        self._auto_sort_btn.config(
+            text=f"Auto-sort: {'ON' if self._auto_sort_on else 'OFF'}")
+        if self._auto_sort_on:
+            # Re-cadence to active immediately.
+            self._sync_tick_now()
+
+    def _auto_sort_tick(self):
+        t = self.current_template()
+        if t is None:
+            return
+        res = fleet_composer.compose(
+            t, self._live_members, self._live_structure,
+            doctrine=self._doctrine_provider(), fittings=self.fittings,
+            passes=(1, 2))
+        self._ensure_executor()
+        # id -> (wing, squad) live-name lookup for concrete ids.
+        wing_ids = {fleet_esi.clamp_name(w["name"]): w["id"]
+                    for w in self._live_structure.get("wings", [])}
+        squad_ids = {(fleet_esi.clamp_name(w["name"]),
+                      fleet_esi.clamp_name(s["name"])): s["id"]
+                     for w in self._live_structure.get("wings", [])
+                     for s in w.get("squads", [])}
+        import time
+        enqueued = 0
+        for mv in res.executable:              # already-correct already filtered
+            if mv.pilot_id in self._pins:      # never move a pinned pilot
+                continue
+            wkey = (fleet_esi.clamp_name(mv.target_wing_name)
+                    if mv.target_wing_name else None)
+            wid = wing_ids.get(wkey) if wkey else None
+            sid = squad_ids.get((wkey, fleet_esi.clamp_name(mv.target_squad_name))) \
+                if mv.target_squad_name and wid is not None else None
+            self._executor.submit(MoveJob(
+                pilot_id=mv.pilot_id, pilot_name=mv.pilot_name,
+                wing_id=wid, squad_id=sid, role=mv.target_role, source="autosort"))
+            self._log_line(f"[autosort] queue {mv.pilot_name} → "
+                           f"{mv.target_wing_name}/{mv.target_squad_name}")
+            enqueued += 1
+        if enqueued:
+            self._last_write_wall = time.time()
 
     def _read_members(self, session):
         """GET /fleets/{id}/members/ via the session adapter."""
@@ -1280,6 +1333,8 @@ class FleetTemplateWindow:
             if not messagebox.askyesno("Confirm apply", msg, parent=self.win):
                 return
         self._execute_moves(session, res.executable, materialize_template=True)
+        self._pins.clear()
+        self._refresh_pins_button()
 
     def _ensure_executor(self):
         if self._executor is not None:
@@ -1335,8 +1390,13 @@ class FleetTemplateWindow:
         self._status.config(text="Boss lost — fleet ops aborted.", fg=FG_RED)
 
     def _log_line(self, line):
-        # Task 7 replaces this with the deque buffer; for now just surface it.
-        self._status.config(text=line, fg=FG_DIM)
+        import time
+        stamped = f"{time.strftime('%H:%M:%S')} {line}"
+        self._log_buffer.append(stamped)
+        try:
+            self._status.config(text=line, fg=FG_DIM)
+        except tk.TclError:
+            pass
 
     def _current_role_of(self, cid):
         m = next((x for x in self._live_members if x["character_id"] == cid), None)
@@ -1404,125 +1464,6 @@ class FleetTemplateWindow:
             self.win.after(delay_ms, self._sync_tick_now)
         except tk.TclError:
             pass
-
-    def _toggle_rebalance(self):
-        if self.mode != "live":
-            return
-        self._rebalance_on = not self._rebalance_on
-        self._rebalance_btn.config(
-            text=f"Rebalance: {'ON' if self._rebalance_on else 'OFF'}")
-        if self._rebalance_on:
-            self._schedule_rebalance(immediate=True)
-        elif self._rebalance_after_id:
-            try:
-                self.win.after_cancel(self._rebalance_after_id)
-            except Exception:
-                pass
-            self._rebalance_after_id = None
-
-    def _schedule_rebalance(self, *, immediate=False):
-        t = self.current_template()
-        interval_ms = (t.settings.rebalance_interval_s if t else 60) * 1000
-        delay = 100 if immediate else interval_ms
-        self._rebalance_after_id = self.win.after(delay, self._rebalance_tick)
-
-    def _rebalance_tick(self):
-        if not self._rebalance_on or self.mode != "live":
-            return
-        t = self.current_template()
-        if t is None:
-            self._schedule_rebalance()
-            return
-        # Cooldown gate (monotonic). One write per move_cooldown_s.
-        import time
-        now = time.monotonic()
-        cooldown = t.settings.move_cooldown_s
-        if now - self._last_write_monotonic < cooldown:
-            self._schedule_rebalance()
-            return
-        # Key by clamped names — ESI/live names are clamped to 10 chars, so the
-        # cap lookup in plan_rebalance (which uses live names) must match.
-        max_sizes = {(fleet_esi.clamp_name(w.name), fleet_esi.clamp_name(s.name)):
-                     s.max_size for w in t.wings for s in w.squads}
-
-        def worker():
-            session = self._esi_session_provider()   # blocking — off the Tk thread
-            if session is None:
-                self._post(self._schedule_rebalance)
-                return
-            err = None
-            action = None
-            structure, members = self._live_structure, []
-            try:
-                structure = {"wings": fleet_esi.get_wings(session, self._fleet_id)}
-                members = self._read_members(session)
-                action = fleet_composer.plan_rebalance(
-                    members, structure, max_sizes=max_sizes)
-            except fleet_esi.FleetESIError as e:
-                err = e
-            self._post(_apply_action, session, structure, action, err)
-
-        def _apply_action(session, structure, action, err):
-            self._live_structure = structure
-            if err is not None:
-                if err.reason in ("boss_lost",):
-                    self._rebalance_on = False
-                    self._rebalance_btn.config(text="Rebalance: OFF")
-                    messagebox.showerror("Rebalancer stopped",
-                                         "Lost fleet-boss role (403).", parent=self.win)
-                    return
-                self._schedule_rebalance()
-                return
-            if action is None:
-                self._status.config(text="Rebalancer: all squads within cap.",
-                                    fg=FG_DIM)
-                self._schedule_rebalance()
-                return
-            self._execute_rebalance(session, action)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _execute_rebalance(self, session, action):
-        def worker():
-            err = None
-            try:
-                name_to_wing = {fleet_esi.clamp_name(w["name"]): w["id"]
-                                for w in self._live_structure.get("wings", [])}
-                name_to_squad = {
-                    (fleet_esi.clamp_name(w["name"]),
-                     fleet_esi.clamp_name(s["name"])): s["id"]
-                    for w in self._live_structure.get("wings", [])
-                    for s in w.get("squads", [])}
-                wing_id = name_to_wing.get(
-                    fleet_esi.clamp_name(action.target_wing_name))
-                squad_id = None
-                if action.create_squad:
-                    squad_id = fleet_esi.create_squad(session, self._fleet_id,
-                                                      wing_id, "Overflow")
-                else:
-                    squad_id = name_to_squad.get(
-                        (fleet_esi.clamp_name(action.target_wing_name),
-                         fleet_esi.clamp_name(action.target_squad_name)))
-                fleet_esi.move_member(session, self._fleet_id, action.pilot_id,
-                                      wing_id=wing_id, squad_id=squad_id,
-                                      role="squad_member")
-            except fleet_esi.FleetESIError as e:
-                err = e
-            self._post(_done, err)
-
-        def _done(err):
-            import time
-            self._last_write_monotonic = time.monotonic()
-            if err is None:
-                self._status.config(
-                    text=f"Rebalancer: moved {action.pilot_name} → "
-                         f"{action.target_wing_name}", fg=FG_GREEN)
-            else:
-                self._status.config(text=f"Rebalancer error: {err.reason}", fg=FG_RED)
-            self._schedule_rebalance()
-
-        threading.Thread(target=worker, daemon=True).start()
-
 
 class SlotEditor:
     """Modal: edit a slot's type (named/role/generic), tag, and role."""
