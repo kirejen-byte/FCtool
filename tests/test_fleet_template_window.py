@@ -1024,3 +1024,68 @@ def test_apply_big_warning_line_over_threshold(root, tmp_path, monkeypatch):
         assert captured["big"]        # non-empty warning string when 3 > 1
     finally:
         win.destroy()
+
+
+def test_member_matches_filter_substring():
+    from fleet_template_window import member_matches_filter
+    m = {"name": "Kyra Dawnfall", "ship_type_name": "Revelation",
+         "ship_class": "Dreadnought"}
+    assert member_matches_filter(m, "") is True
+    assert member_matches_filter(m, "kyra") is True
+    assert member_matches_filter(m, "revel") is True     # ship
+    assert member_matches_filter(m, "dread") is True     # class
+    assert member_matches_filter(m, "zzz") is False
+
+
+def test_members_tab_populates_and_filters(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._live_members = [
+            {"character_id": 1, "name": "Kyra", "ship_type_name": "Revelation",
+             "ship_class": "Dreadnought", "wing_id": 1, "squad_id": 10},
+            {"character_id": 2, "name": "Bob", "ship_type_name": "Rifter",
+             "ship_class": "Frigate", "wing_id": 1, "squad_id": 10},
+        ]
+        win._live_structure = {"wings": [{"id": 1, "name": "A",
+                                          "squads": [{"id": 10, "name": "S1"}]}]}
+        win._refresh_members_tab()
+        rows = win._members_tree.get_children()
+        assert len(rows) == 2
+        win._members_filter_var.set("kyra")
+        win._refresh_members_tab()
+        rows = win._members_tree.get_children()
+        assert len(rows) == 1
+    finally:
+        win.destroy()
+
+
+def test_members_tab_marks_pinned(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._pins = {1: 587}
+        win._live_members = [
+            {"character_id": 1, "name": "Kyra", "ship_type_name": "Rev",
+             "ship_class": "Dread", "wing_id": 1, "squad_id": 10}]
+        win._live_structure = {"wings": [{"id": 1, "name": "A",
+                                          "squads": [{"id": 10, "name": "S1"}]}]}
+        win._refresh_members_tab()
+        iid = win._members_tree.get_children()[0]
+        vals = win._members_tree.item(iid, "values")
+        assert "📌" in " ".join(str(v) for v in vals)
+    finally:
+        win.destroy()
+
+
+def test_log_tab_receives_lines_and_clears(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        win._log_line("[drag] moved Kyra")
+        win._log_line("[autosort] moved Bob")
+        content = win._log_text.get("1.0", "end")
+        assert "moved Kyra" in content and "moved Bob" in content
+        win._clear_log()
+        assert win._log_text.get("1.0", "end").strip() == ""
+    finally:
+        win.destroy()

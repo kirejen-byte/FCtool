@@ -135,6 +135,17 @@ def build_apply_preview_rows(res, members) -> dict:
             "warnings": list(getattr(res, "warnings", []) or [])}
 
 
+def member_matches_filter(member: dict, query: str) -> bool:
+    """Substring match (case-insensitive) of `query` against a member's name,
+    ship type, and ship class. Empty query matches all. Pure — no Tk."""
+    q = (query or "").strip().lower()
+    if not q:
+        return True
+    hay = " ".join(str(member.get(k, "") or "") for k in
+                   ("name", "ship_type_name", "ship_class")).lower()
+    return q in hay
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -228,12 +239,16 @@ class FleetTemplateWindow:
         self._members_tab = tk.Frame(self._panel, bg=BG_PANEL)
         self._rules_tab = tk.Frame(self._panel, bg=BG_PANEL)
         self._settings_tab = tk.Frame(self._panel, bg=BG_PANEL)
+        self._log_tab = tk.Frame(self._panel, bg=BG_PANEL)
         self._panel.add(self._members_tab, text="Members")
         self._panel.add(self._rules_tab, text="Rules")
         self._panel.add(self._settings_tab, text="Settings")
+        self._panel.add(self._log_tab, text="Log")
         self._build_tree()         # Task D2
         self._build_rules_tab()    # Task D3
         self._build_settings_tab() # Task D4
+        self._build_members_tab()  # Task D6
+        self._build_log_tab()      # Task D6
 
     def _build_footer(self):
         bar = tk.Frame(self.win, bg=BG_PANEL)
@@ -1416,6 +1431,107 @@ class FleetTemplateWindow:
                      sticky="w", padx=8, pady=8)
         self._reload_settings()
 
+    def _build_members_tab(self):
+        top = tk.Frame(self._members_tab, bg=BG_PANEL)
+        top.pack(fill=tk.X)
+        tk.Label(top, text="Filter:", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Consolas", 9)).pack(side=tk.LEFT, padx=(6, 2), pady=4)
+        self._members_filter_var = tk.StringVar()
+        ent = tk.Entry(top, textvariable=self._members_filter_var, width=22,
+                       bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+                       font=("Consolas", 9), relief=tk.FLAT)
+        ent.pack(side=tk.LEFT, padx=2)
+        ent.bind("<KeyRelease>", lambda e: self._refresh_members_tab())
+
+        legend = tk.Frame(self._members_tab, bg=BG_PANEL)
+        legend.pack(fill=tk.X, padx=6)
+        tk.Label(legend, text="● in position", bg=BG_PANEL, fg=FG_GREEN,
+                 font=("Consolas", 8)).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(legend, text="● needs moving", bg=BG_PANEL, fg=FG_YELLOW,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+
+        wrap = tk.Frame(self._members_tab, bg=BG_PANEL)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        cols = ("pin", "name", "ship", "class", "squad")
+        self._members_tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                          selectmode="browse")
+        for col, head, w in (("pin", "📌", 28), ("name", "Name", 130),
+                             ("ship", "Ship", 120), ("class", "Class", 110),
+                             ("squad", "Squad", 90)):
+            self._members_tree.heading(col, text=head)
+            self._members_tree.column(col, width=w,
+                                      anchor="center" if col == "pin" else "w")
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL,
+                            command=self._members_tree.yview)
+        self._members_tree.configure(yscrollcommand=vsb.set)
+        self._members_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._members_tree.tag_configure("inpos", foreground=FG_GREEN)
+        self._members_tree.tag_configure("moveme", foreground=FG_YELLOW)
+        # character_id -> iid so a double-click can select in the left tree.
+        self._members_row_cid: dict = {}
+        self._members_tree.bind("<Double-Button-1>",
+                                self._on_members_double_click)
+
+    def _refresh_members_tab(self):
+        tree = getattr(self, "_members_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        self._members_row_cid.clear()
+        query = self._members_filter_var.get()
+        move_ids = set()
+        if self._last_preview is not None:
+            move_ids = {mv.pilot_id for mv in self._last_preview.executable}
+        # squad_id -> "Wing/Squad" label for the Squad column.
+        squad_label = {}
+        for w in self._live_structure.get("wings", []):
+            for s in w.get("squads", []):
+                squad_label[s.get("id")] = f"{w.get('name', '')}/{s.get('name', '')}"
+        for m in self._live_members:
+            if not member_matches_filter(m, query):
+                continue
+            cid = m.get("character_id")
+            pin = "📌" if cid in self._pins else ""
+            tag = "moveme" if cid in move_ids else "inpos"
+            iid = tree.insert(
+                "", "end", tags=(tag,),
+                values=(pin, m.get("name", ""), m.get("ship_type_name", ""),
+                        m.get("ship_class") or "",
+                        squad_label.get(m.get("squad_id"), "")))
+            self._members_row_cid[iid] = cid
+
+    def _on_members_double_click(self, event):
+        iid = self._members_tree.identify_row(event.y)
+        cid = self._members_row_cid.get(iid)
+        if cid is None:
+            return
+        for node, meta in self._node_meta.items():
+            if meta[0] == "livepilot" and meta[1] == cid:
+                self._tree.selection_set(node)
+                self._tree.see(node)
+                break
+
+    def _build_log_tab(self):
+        wrap = tk.Frame(self._log_tab, bg=BG_PANEL)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+        self._log_text = tk.Text(wrap, bg=BG_ENTRY, fg=FG_TEXT,
+                                 font=("Consolas", 9), relief=tk.FLAT,
+                                 wrap="word", state="disabled")
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self._log_text.yview)
+        self._log_text.configure(yscrollcommand=vsb.set)
+        self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        btns = tk.Frame(self._log_tab, bg=BG_PANEL)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Clear", style="Dark.TButton",
+                   command=self._clear_log).pack(side=tk.LEFT, padx=6, pady=4)
+
+    def _clear_log(self):
+        self._log_text.configure(state="normal")
+        self._log_text.delete("1.0", tk.END)
+        self._log_text.configure(state="disabled")
+
     def _reload_settings(self):
         t = self.current_template()
         if t is None:
@@ -1560,6 +1676,7 @@ class FleetTemplateWindow:
         self._prev_members = members
         self._status.config(text="● Synced", fg=FG_GREEN)
         self._reload_tree()
+        self._refresh_members_tab()
         self._on_sync_complete(events)   # Task 7: auto-sort tick hook
         return True
 
@@ -1753,6 +1870,20 @@ class FleetTemplateWindow:
             self._status.config(text=line, fg=FG_DIM)
         except tk.TclError:
             pass
+        log_text = getattr(self, "_log_text", None)
+        if log_text is not None:
+            try:
+                log_text.configure(state="normal")
+                log_text.insert(tk.END, stamped + "\n")
+                # Bound to the deque size (drop oldest visible lines).
+                excess = int(log_text.index("end-1c").split(".")[0]) - \
+                    self._log_buffer.maxlen
+                if excess > 0:
+                    log_text.delete("1.0", f"{excess + 1}.0")
+                log_text.see(tk.END)
+                log_text.configure(state="disabled")
+            except tk.TclError:
+                pass
 
     def _current_role_of(self, cid):
         m = next((x for x in self._live_members if x["character_id"] == cid), None)
