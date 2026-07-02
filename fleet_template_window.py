@@ -424,9 +424,6 @@ class FleetTemplateWindow:
         except Exception:
             pass
 
-    # fleet_template_window.py — temporary stubs (each replaced in Tasks D2–D10;
-    # the drag handlers + _manual_assign are introduced as stubs in Task D2's
-    # append and fleshed out in Tasks D5/D8)
     def _build_tree(self):
         wrap = tk.Frame(self._tree_frame, bg=BG_PANEL)
         wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -662,12 +659,13 @@ class FleetTemplateWindow:
             return "break"
 
     def _on_tree_right_click(self, event):
-        if self.mode == "live":
-            return
         item = self._tree.identify_row(event.y)
         if item:
             self._tree.selection_set(item)
         meta = self._node_meta.get(item)
+        if self.mode == "live":
+            self._live_right_click_menu(event, item, meta)
+            return
         menu = tk.Menu(self.win, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
         if meta is None:
             menu.add_command(label="Add Wing", command=self._add_wing)
@@ -699,13 +697,43 @@ class FleetTemplateWindow:
                                  command=lambda: self._edit_slot(path))
                 menu.add_command(label="Delete Slot",
                                  command=lambda: self._delete_selected())
-            elif kind == "unassigned" and self.mode == "live":
-                menu.add_command(label="Move to squad…",
-                                 command=lambda: self._manual_assign(path))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _live_right_click_menu(self, event, item, meta):
+        if not meta:
+            return
+        kind, val = meta
+        char_id = None
+        if kind == "livepilot":
+            char_id = val
+        elif kind == "unassigned":
+            char_id = val[0]
+        if char_id is None:
+            return
+        menu = tk.Menu(self.win, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
+        self._add_move_to_squad_cascade(menu, char_id)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _add_move_to_squad_cascade(self, menu, char_id):
+        """Attach a 'Move to squad…' cascade (wing → squad) that routes the
+        pilot through _menu_move_pilot."""
+        cascade = tk.Menu(menu, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
+        for w in self._live_structure.get("wings", []):
+            wsub = tk.Menu(cascade, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
+            for s in w.get("squads", []):
+                wid, sid = w["id"], s["id"]
+                wsub.add_command(
+                    label=s.get("name", ""),
+                    command=lambda cid=char_id, wi=wid, si=sid:
+                    self._menu_move_pilot(cid, wi, si))
+            cascade.add_cascade(label=w.get("name", ""), menu=wsub)
+        menu.add_cascade(label="Move to squad…", menu=cascade)
 
     def _rename_selected(self):
         self._begin_inline_rename()
@@ -1749,11 +1777,20 @@ class FleetTemplateWindow:
             doctrine=self._doctrine_provider(), fittings=self.fittings)
         return self._last_preview
 
-    def _manual_assign(self, path):
-        # path = (character_id,). Prompt for wing/squad then queue a single move.
-        messagebox.showinfo("Manual move",
-                            "Use drag-and-drop onto a squad to move this pilot.",
-                            parent=self.win)
+    def _menu_move_pilot(self, char_id, wing_id, squad_id):
+        """Live-mode right-click move: enqueue a source='menu' job and pin the
+        pilot (drag-wins). Ids are already concrete (from the fleet snapshot)."""
+        import time
+        self._ensure_executor()
+        role = self._current_role_of(char_id)
+        self._executor.submit(MoveJob(
+            pilot_id=char_id, pilot_name=self._name_of(char_id),
+            wing_id=wing_id, squad_id=squad_id, role=role, source="menu"))
+        self._pin_dragged([char_id])
+        self._log_line(f"[menu] queue {self._name_of(char_id)} → "
+                       f"wing {wing_id}/squad {squad_id}")
+        self._last_write_wall = time.time()
+        self._schedule_reconcile_poll()
 
     def _apply(self):
         if self.mode != "live":

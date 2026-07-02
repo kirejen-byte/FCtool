@@ -1089,3 +1089,47 @@ def test_log_tab_receives_lines_and_clears(root, tmp_path):
         assert win._log_text.get("1.0", "end").strip() == ""
     finally:
         win.destroy()
+
+
+def test_menu_move_pilot_enqueues_and_pins(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._live_structure = {"wings": [{"id": 100, "name": "Alpha",
+                                          "squads": [{"id": 200, "name": "S1"}]}]}
+        win._live_members = [{"character_id": 42, "name": "Zed",
+                              "role": "squad_member", "ship_type_id": 587,
+                              "wing_id": 100, "squad_id": 999}]
+        submitted = []
+        win._ensure_executor()
+        win._executor.submit = lambda job: submitted.append(job)
+        win._menu_move_pilot(42, 100, 200)
+        assert len(submitted) == 1
+        job = submitted[0]
+        assert job.pilot_id == 42 and job.wing_id == 100 and job.squad_id == 200
+        assert job.source == "menu"
+        assert win._pins.get(42) == 587      # pinned (drag-wins)
+    finally:
+        win.destroy()
+
+
+def test_live_pilot_menu_has_move_to_squad_cascade(root, tmp_path):
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._live_structure = {"wings": [{"id": 1, "name": "Alpha",
+                                          "squads": [{"id": 10, "name": "S1"}]}]}
+        win._live_members = [{"character_id": 5, "name": "P", "role": "squad_member",
+                              "ship_type_id": 1, "wing_id": 1, "squad_id": 10}]
+        win._reload_live_tree()
+        # find the livepilot node
+        node = next(n for n, m in win._node_meta.items() if m[0] == "livepilot")
+        labels = _menu_labels_for(win, node)
+        assert "Move to squad…" in labels
+    finally:
+        win.destroy()
+
+
+def test_manual_assign_is_gone():
+    from fleet_template_window import FleetTemplateWindow
+    assert not hasattr(FleetTemplateWindow, "_manual_assign")
