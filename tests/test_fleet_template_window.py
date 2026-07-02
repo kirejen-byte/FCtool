@@ -17,6 +17,41 @@ def root():
     r.destroy()
 
 
+def _menu_labels_for(win, item):
+    """Capture the labels the right-click menu would build for `item` without
+    popping it up (tk_popup is patched to a no-op)."""
+    import tkinter as tk
+    import types
+    captured = []
+    real_menu_cls = tk.Menu
+
+    class _CapMenu(real_menu_cls):
+        def add_command(self, *a, label=None, **k):
+            if label is not None:
+                captured.append(label)
+            return super().add_command(*a, label=label, **k)
+
+        def add_cascade(self, *a, label=None, **k):
+            if label is not None:
+                captured.append(label)
+            return super().add_cascade(*a, label=label, **k)
+
+        def tk_popup(self, *a, **k):
+            pass
+
+        def grab_release(self):
+            pass
+
+    tk.Menu = _CapMenu
+    try:
+        evt = types.SimpleNamespace(x=0, y=0, x_root=0, y_root=0)
+        win._tree.identify_row = lambda _y: item
+        win._on_tree_right_click(evt)
+    finally:
+        tk.Menu = real_menu_cls
+    return captured
+
+
 def _store(tmp_path):
     from fleet_template_store import FleetTemplateStore
     s = FleetTemplateStore(str(tmp_path / "fleet_templates.json"))
@@ -695,5 +730,66 @@ def test_duplicate_template_button_creates_copy_and_selects(root, tmp_path):
         cur = win.current_template()
         assert cur.id != src.id
         assert cur.name == "Test Fleet (copy)"
+    finally:
+        win.destroy()
+
+
+def test_add_squad_slot_buttons_enable_by_selection(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        t = win.current_template()
+        t.wings = []                       # start empty for a clean count
+        win.store.save()
+        win._reload_tree()
+        # Nothing selected: both disabled.
+        win._refresh_add_buttons()
+        assert str(win._add_squad_btn["state"]) == "disabled"
+        assert str(win._add_slot_btn["state"]) == "disabled"
+        # Add a wing, select it → + Squad enabled, + Slot still disabled.
+        win._add_wing()
+        wid = win._tree.get_children()[0]
+        win._tree.selection_set(wid)
+        win._refresh_add_buttons()
+        assert str(win._add_squad_btn["state"]) == "normal"
+        assert str(win._add_slot_btn["state"]) == "disabled"
+        # Add a squad under it, select the squad → + Slot enabled.
+        win._add_squad_from_selection()
+        # _add_squad rebuilds the tree, so re-fetch the wing node id.
+        wid = win._tree.get_children()[0]
+        sid = win._tree.get_children(wid)[0]
+        win._tree.selection_set(sid)
+        win._refresh_add_buttons()
+        assert str(win._add_slot_btn["state"]) == "normal"
+    finally:
+        win.destroy()
+
+
+def test_add_slot_from_selection_appends_slot(root, tmp_path):
+    win = _win(root, tmp_path)   # seeded Wing 1 / Squad 1
+    try:
+        wid = win._tree.get_children()[0]
+        sid = win._tree.get_children(wid)[0]
+        win._tree.selection_set(sid)
+        win._add_slot_from_selection()
+        t = win.current_template()
+        assert len(t.wings[0].squads[0].slots) == 1
+    finally:
+        win.destroy()
+
+
+def test_wing_menu_has_no_set_max_size(root, tmp_path):
+    # Build the wing context menu and assert 'Set max size' is absent (squads keep it).
+    win = _win(root, tmp_path)
+    try:
+        wid = win._tree.get_children()[0]
+        win._tree.selection_set(wid)
+        labels = _menu_labels_for(win, wid)
+        assert "Add Squad" in labels
+        assert "Set max size" not in labels
+        # Squad still has it.
+        sid = win._tree.get_children(wid)[0]
+        win._tree.selection_set(sid)
+        slabels = _menu_labels_for(win, sid)
+        assert "Set max size" in slabels
     finally:
         win.destroy()

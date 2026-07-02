@@ -280,6 +280,7 @@ class FleetTemplateWindow:
             self._enter_live_mode()    # Task D5
         else:
             self._exit_live_mode()     # Task D5
+        self._refresh_add_buttons()
 
     def _save(self):
         t = self.current_template()
@@ -366,6 +367,13 @@ class FleetTemplateWindow:
         add.pack(fill=tk.X)
         ttk.Button(add, text="+ Add Wing", style="Dark.TButton",
                    command=self._add_wing).pack(side=tk.LEFT, padx=4, pady=2)
+        self._add_squad_btn = ttk.Button(add, text="+ Squad", style="Dark.TButton",
+                                         command=self._add_squad_from_selection)
+        self._add_squad_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._add_slot_btn = ttk.Button(add, text="+ Slot", style="Dark.TButton",
+                                        command=self._add_slot_from_selection)
+        self._add_slot_btn.pack(side=tk.LEFT, padx=4, pady=2)
+        self._tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_add_buttons())
         self._reload_tree()
 
     def _slot_label(self, slot: Slot) -> str:
@@ -403,6 +411,7 @@ class FleetTemplateWindow:
                     nid = self._tree.insert(sid, "end",
                                             text=self._slot_label(slot), tags=tags)
                     self._node_meta[nid] = ("slot", (wi, si, li))
+        self._refresh_add_buttons()
 
     def _reload_live_tree(self):
         # One compose() to know which currently-placed pilots the template would move.
@@ -449,6 +458,7 @@ class FleetTemplateWindow:
                     head, "end",
                     text=f"· {m['name']} — {m.get('ship_type_name', '')}")
                 self._node_meta[nid] = ("unassigned", (m["character_id"],))
+        self._refresh_add_buttons()
 
     # ── pins ─────────────────────────────────────────────────────────────────
     def _refresh_pins_button(self):
@@ -508,6 +518,35 @@ class FleetTemplateWindow:
             Slot(character=None, tag=None, role="squad_member"))
         self._after_structure_change()
 
+    def _refresh_add_buttons(self):
+        """+ Squad enabled when a wing/squad/slot is selected; + Slot enabled
+        when a squad or slot is selected. Template mode only (live tree has no
+        editable structure)."""
+        squad_ok = slot_ok = False
+        if self.mode == "template":
+            _item, meta = self._selected_meta()
+            if meta is not None:
+                kind = meta[0]
+                squad_ok = kind in ("wing", "squad", "slot")
+                slot_ok = kind in ("squad", "slot")
+        self._add_squad_btn.config(state="normal" if squad_ok else "disabled")
+        self._add_slot_btn.config(state="normal" if slot_ok else "disabled")
+
+    def _add_squad_from_selection(self):
+        _item, meta = self._selected_meta()
+        if not meta:
+            return
+        wi = meta[1][0]            # wing/squad/slot paths all start with wi
+        self._add_squad(wi)
+
+    def _add_slot_from_selection(self):
+        _item, meta = self._selected_meta()
+        if not meta:
+            return
+        kind, path = meta
+        if kind in ("squad", "slot"):
+            self._add_slot(path[0], path[1])
+
     def _after_structure_change(self):
         t = self.current_template()
         if t is not None:
@@ -538,8 +577,6 @@ class FleetTemplateWindow:
                 wi = path[0]
                 menu.add_command(label="Rename", command=lambda: self._rename_selected())
                 menu.add_command(label="Add Squad", command=lambda: self._add_squad(wi))
-                menu.add_command(label="Set max size",
-                                 command=lambda: self._set_max_size("wing", path))
                 menu.add_separator()
                 menu.add_command(label="Delete Wing",
                                  command=lambda: self._delete_selected())
