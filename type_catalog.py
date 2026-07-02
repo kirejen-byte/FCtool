@@ -124,6 +124,23 @@ class TypeCatalog:
             return None
         return self._by_name.get(name.strip().lower())
 
+    def search_prefix(self, prefix: str, limit: int = 20) -> list[str]:
+        """Display names whose lowercased name starts with `prefix` (case-
+        insensitive), sorted, capped at `limit`. Prefixes shorter than 2 chars
+        return [] so a keystroke never dumps the whole catalog."""
+        p = (prefix or "").strip().lower()
+        if len(p) < 2:
+            return []
+        out: list[str] = []
+        for low, tid in self._by_name.items():
+            if low.startswith(p):
+                entry = self._by_id.get(tid)
+                name = entry.get("n") if isinstance(entry, dict) else None
+                if isinstance(name, str) and name:
+                    out.append(name)
+        out.sort()
+        return out[:limit]
+
     def category_of(self, type_id: int) -> str | None:
         """Return one of ship/module/charge/drone/fighter/subsystem/other, or
         ``None`` if the type cannot be resolved at all."""

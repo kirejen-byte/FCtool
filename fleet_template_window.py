@@ -40,7 +40,21 @@ BORDER_COLOR = "#3a3a3a"
 ROLE_VALUES = ["squad_member", "squad_commander", "wing_commander", "fleet_commander"]
 ROLE_ABBR = {"squad_member": "", "squad_commander": "SC",
              "wing_commander": "WC", "fleet_commander": "FC"}
-CONDITION_TYPES = ["ship_type", "ship_class", "character", "doctrine_tag"]
+CONDITION_TYPES = ["ship_type", "ship_class", "character", "doctrine_tag",
+                   "capital", "subcap", "default"]
+
+# Condition types whose value is meaningless (the value widget is hidden).
+VALUELESS_CONDITIONS = {"capital", "subcap", "default"}
+
+# Static common ship-class labels for the ship_class dropdown (augmented at
+# runtime by classes present in the live fleet).
+COMMON_SHIP_CLASSES = [
+    "Titan", "Supercarrier", "Carrier", "Dreadnought", "Force Auxiliary",
+    "Command Ship", "Command Destroyer", "Logistics Cruiser",
+    "Logistics Frigate", "Strategic Cruiser", "Heavy Assault Cruiser",
+    "Interdictor", "Heavy Interdiction Cruiser", "Interceptor", "Battleship",
+    "Battlecruiser", "Cruiser", "Frigate", "Destroyer",
+]
 
 
 class FleetTemplateWindow:
@@ -795,12 +809,30 @@ class FleetTemplateWindow:
         ctype = ttk.Combobox(row, values=CONDITION_TYPES, width=11, state="readonly")
         ctype.set(rule.condition.type)
         ctype.pack(side=tk.LEFT, padx=1)
-        ctype.bind("<<ComboboxSelected>>",
-                   lambda e: self._update_rule(idx, ctype=ctype.get()))
 
-        cval = ttk.Combobox(row, width=16, values=self._condition_values(rule.condition.type))
+        cval = ttk.Combobox(row, width=16,
+                            values=self._condition_values(rule.condition.type))
         cval.set(rule.condition.value)
         cval.pack(side=tk.LEFT, padx=1)
+
+        def _apply_value_state():
+            if ctype.get() in VALUELESS_CONDITIONS:
+                cval.set("")
+                cval.configure(state="disabled")
+            else:
+                cval.configure(state="normal")
+        _apply_value_state()
+
+        def _on_ctype(_e):
+            self._update_rule(idx, ctype=ctype.get())
+            cval.configure(values=self._condition_values(ctype.get()))
+            _apply_value_state()
+        ctype.bind("<<ComboboxSelected>>", _on_ctype)
+
+        def _on_cval_key(_e):
+            if ctype.get() == "ship_type":
+                cval.configure(values=self._ship_type_suggestions(cval.get()))
+        cval.bind("<KeyRelease>", _on_cval_key)
         cval.bind("<FocusOut>", lambda e: self._update_rule(idx, cval=cval.get()))
         cval.bind("<<ComboboxSelected>>", lambda e: self._update_rule(idx, cval=cval.get()))
 
@@ -829,7 +861,25 @@ class FleetTemplateWindow:
             return list(getattr(self.fittings, "tags", []))
         if ctype == "character":
             return sorted(self._character_names_provider())
-        return []   # ship_type / ship_class: free text
+        if ctype == "ship_class":
+            present = sorted({c for c in self._live_ship_classes() if c})
+            merged = list(dict.fromkeys(present + COMMON_SHIP_CLASSES))
+            return merged
+        return []   # ship_type (autocomplete via <KeyRelease>); valueless types
+
+    def _live_ship_classes(self):
+        """Ship-class labels present among the last-synced live members."""
+        members = getattr(self, "_live_members", None) or []
+        return [m.get("ship_class") for m in members]
+
+    def _ship_type_suggestions(self, prefix):
+        catalog = getattr(self.fittings, "catalog", None)
+        if catalog is None:
+            return []
+        try:
+            return catalog.search_prefix(prefix, limit=20)
+        except Exception:
+            return []
 
     def _add_rule(self):
         self._push_undo()
@@ -850,7 +900,9 @@ class FleetTemplateWindow:
         r = t.rules[idx]
         if ctype is not None:
             r.condition.type = ctype
-        if cval is not None:
+            if ctype in VALUELESS_CONDITIONS:
+                r.condition.value = ""      # value meaningless for these types
+        if cval is not None and r.condition.type not in VALUELESS_CONDITIONS:
             r.condition.value = cval
         if role is not None:
             r.action.role = role
@@ -860,7 +912,8 @@ class FleetTemplateWindow:
             r.action.squad_name = squad or None
         validate_template(t)
         self.store.save()
-        self._reload_rules()
+        # NOTE: no _reload_rules() here — that rebuilt every row and stole focus.
+        # add/delete/reorder still call _reload_rules via their own paths.
 
     def _move_rule(self, idx, delta):
         self._push_undo()

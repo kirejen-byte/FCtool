@@ -195,3 +195,61 @@ def test_enrich_members_stamps_is_capital(root, tmp_path, monkeypatch):
         assert by_id[2]["is_capital"] is False
     finally:
         win.destroy()
+
+
+def test_condition_types_include_capital_subcap_default():
+    import fleet_template_window as ftw
+    assert ftw.CONDITION_TYPES == [
+        "ship_type", "ship_class", "character", "doctrine_tag",
+        "capital", "subcap", "default"]
+
+
+def test_update_rule_does_not_reload_all_rows(root, tmp_path, monkeypatch):
+    win = _win(root, tmp_path)
+    try:
+        win._add_rule()   # one rule exists
+        calls = {"n": 0}
+        monkeypatch.setattr(win, "_reload_rules", lambda: calls.__setitem__("n", calls["n"] + 1))
+        win._update_rule(0, cval="Revelation")
+        assert calls["n"] == 0                      # in-place, no full rebuild
+        t = win.current_template()
+        assert t.rules[0].condition.value == "Revelation"
+    finally:
+        win.destroy()
+
+
+def test_update_rule_capital_forces_empty_value(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        win._add_rule()
+        win._update_rule(0, cval="junk")
+        win._update_rule(0, ctype="capital")
+        t = win.current_template()
+        assert t.rules[0].condition.type == "capital"
+        assert t.rules[0].condition.value == ""       # value cleared for value-less type
+    finally:
+        win.destroy()
+
+
+def test_condition_values_ship_class_includes_common(root, tmp_path):
+    win = _win(root, tmp_path)
+    try:
+        vals = win._condition_values("ship_class")
+        assert "Dreadnought" in vals and "Force Auxiliary" in vals
+    finally:
+        win.destroy()
+
+
+def test_ship_type_suggestions_uses_catalog(root, tmp_path):
+    class _CatFittings:
+        tags = ["DPS"]
+        class catalog:
+            @staticmethod
+            def search_prefix(prefix, limit=20):
+                return ["Revelation", "Reaper"] if prefix.lower().startswith("re") else []
+    win = _win(root, tmp_path, fittings=_CatFittings())
+    try:
+        assert win._ship_type_suggestions("rev") == ["Revelation", "Reaper"]
+        assert win._ship_type_suggestions("z") == []   # short/no match
+    finally:
+        win.destroy()

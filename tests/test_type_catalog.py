@@ -147,3 +147,46 @@ def test_cache_write_roundtrips_via_atomic_writer(tmp_path):
     # Fresh catalog (no esi) still resolves from the persisted cache.
     cat2 = TypeCatalog(bundled_path=_fixture(tmp_path), cache_path=str(cache))
     assert cat2.resolve_name(424242) == "Atomic Module"
+
+
+def test_search_prefix_returns_matching_names(tmp_path):
+    import json
+    from type_catalog import TypeCatalog
+    bundled = tmp_path / "fit_types.json"
+    bundled.write_text(json.dumps({
+        "19720": {"n": "Revelation", "c": 6, "g": 485, "s": None},
+        "19724": {"n": "Moros", "c": 6, "g": 485, "s": None},
+        "587":   {"n": "Rifter", "c": 6, "g": 25, "s": None},
+        "17738": {"n": "Rev Fleet Nope", "c": 6, "g": 485, "s": None},
+    }), encoding="utf-8")
+    cat = TypeCatalog(bundled_path=str(bundled),
+                      cache_path=str(tmp_path / "cache.json"), esi=None)
+    got = cat.search_prefix("rev")
+    assert "Revelation" in got
+    assert "Rev Fleet Nope" in got
+    assert "Moros" not in got
+    assert "Rifter" not in got
+
+
+def test_search_prefix_short_prefix_is_empty(tmp_path):
+    import json
+    from type_catalog import TypeCatalog
+    bundled = tmp_path / "fit_types.json"
+    bundled.write_text(json.dumps({"587": {"n": "Rifter", "c": 6, "g": 25, "s": None}}),
+                       encoding="utf-8")
+    cat = TypeCatalog(bundled_path=str(bundled),
+                      cache_path=str(tmp_path / "c.json"), esi=None)
+    assert cat.search_prefix("r") == []
+    assert cat.search_prefix("") == []
+
+
+def test_search_prefix_caps_at_limit(tmp_path):
+    import json
+    from type_catalog import TypeCatalog
+    bundled = tmp_path / "fit_types.json"
+    bundled.write_text(json.dumps(
+        {str(1000 + i): {"n": f"Shipxx{i:02d}", "c": 6, "g": 25, "s": None}
+         for i in range(30)}), encoding="utf-8")
+    cat = TypeCatalog(bundled_path=str(bundled),
+                      cache_path=str(tmp_path / "c.json"), esi=None)
+    assert len(cat.search_prefix("shipxx", limit=5)) == 5
