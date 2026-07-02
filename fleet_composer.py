@@ -43,6 +43,7 @@ class Move:
 class ComposeResult:
     moves: list[Move] = field(default_factory=list)        # all (incl. already-correct)
     unassigned: list[dict] = field(default_factory=list)   # enriched member dicts
+    unassigned_reasons: dict = field(default_factory=dict)  # character_id -> reason
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -78,6 +79,12 @@ def _pilot_matches(condition, member, tag_index) -> bool:
         return (member.get("ship_class") or "").lower() == v.lower()
     if t == "doctrine_tag":
         return v in tag_index.get(member.get("ship_type_id"), set())
+    if t == "capital":
+        return member.get("is_capital") is True
+    if t == "subcap":
+        return member.get("is_capital") is False and bool(member.get("ship_class"))
+    if t == "default":
+        return True
     return False
 
 
@@ -90,7 +97,7 @@ def _current_placement(member, id_to_names):
 
 
 def compose(template, live_members, live_structure, *, doctrine=None,
-            fittings=None) -> ComposeResult:
+            fittings=None, passes=(1, 2, 3)) -> ComposeResult:
     """Assign pilots to template slots and diff against current placement.
 
     See module docstring for the member/structure dict shapes. Ship-class rule
@@ -121,61 +128,114 @@ def compose(template, live_members, live_structure, *, doctrine=None,
     for m in pool:
         by_name.setdefault((m.get("name") or "").lower(), []).append(m)
 
-    # Pass 1 — named slots.
-    for wname, sname, slot in flat:
-        if not slot.character:
-            continue
-        cand = next((c for c in by_name.get(slot.character.lower(), [])
-                     if c["character_id"] not in claimed), None)
-        if cand is not None:
-            assignment[cand["character_id"]] = (wname, sname, slot.role)
-            claimed.add(cand["character_id"])
+    # id → member, for id-preferred named matching.
+    by_id = {m["character_id"]: m for m in pool}
 
-    # Pass 2 — rule-driven role slots (slot.tag set, slot.character None).
-    user_rules = sorted((r for r in template.rules if not r.broken),
-                        key=lambda r: r.priority)
-    for wname, sname, slot in flat:
-        if slot.character or slot.tag is None:
-            continue
-        candidate_rules = [
-            r for r in user_rules
-            if r.action.role == slot.role
-            and r.action.wing_name in (None, wname)
-            and r.action.squad_name in (None, sname)
-        ]
-        # Implicit lowest-priority rule from the slot's own doctrine tag.
-        candidate_rules.append(AssignmentRule(
-            _IMPLICIT_PRIORITY,
-            RuleCondition("doctrine_tag", slot.tag),
-            RuleAction(slot.role, wname, sname)))
-        for rule in candidate_rules:
-            pilot = next((m for m in pool if m["character_id"] not in claimed
-                          and _pilot_matches(rule.condition, m, tag_index)), None)
+    # Per-(wing, squad) count of pilots THIS compose assigns into that squad, in
+    # ANY pass. Seeded by Pass 1 so Pass 2's cap-respect counts named pins too.
+    assigned_here: dict[tuple, int] = {}
+
+    # Pass 1 — named slots (prefer character_id, fall back to name).
+    if 1 in passes:
+        for wname, sname, slot in flat:
+            if not slot.character and getattr(slot, "character_id", None) is None:
+                continue
+            cand = None
+            sid = getattr(slot, "character_id", None)
+            if sid is not None:
+                m = by_id.get(sid)
+                if m is not None and m["character_id"] not in claimed:
+                    cand = m
+            if cand is None and slot.character:
+                cand = next((c for c in by_name.get(slot.character.lower(), [])
+                             if c["character_id"] not in claimed), None)
+            if cand is not None:
+                assignment[cand["character_id"]] = (wname, sname, slot.role)
+                claimed.add(cand["character_id"])
+                assigned_here[(wname, sname)] = assigned_here.get((wname, sname), 0) + 1
+
+    # Pass 2 — routing rules assign DIRECTLY to a single wing+squad+role, in
+    # priority order (default-type rules forced last). No tagged slots.
+    if 2 in passes:
+        # Squad max_size lookup by (wing, squad) name.
+        squad_caps: dict[tuple, int | None] = {}
+        for w in template.wings:
+            for sq in w.squads:
+                squad_caps[(w.name, sq.name)] = sq.max_size
+
+        # Occupants who count against a squad's cap = pool pilots PHYSICALLY in
+        # that squad right now who are NOT being reassigned somewhere else this
+        # compose (they "stay"). A pilot pinned INTO this squad by Pass 1 is NOT
+        # counted here (they may not be physically in it yet) — instead Pass 1
+        # already recorded them in `assigned_here[key]`, and the cap check below
+        # adds `assigned_here[key]` on top of this base. That split keeps every
+        # occupant counted exactly once: physical-and-staying via base, and
+        # assigned-this-compose (Pass 1 pins + Pass 2 routes) via assigned_here.
+        def _staying_count(wname, sname):
+            n = 0
+            for m in pool:
+                cur_w, cur_s, _ = _current_placement(m, id_to_names)
+                if (cur_w, cur_s) == (wname, sname) \
+                        and m["character_id"] not in assignment:
+                    n += 1
+            return n
+
+        ordered = sorted(
+            (r for r in template.rules if not r.broken),
+            key=lambda r: (r.condition.type == "default", r.priority))
+        for rule in ordered:
+            wname = rule.action.wing_name
+            sname = rule.action.squad_name
+            if wname is None or sname is None:
+                continue   # single-squad targets only
+            key = (wname, sname)
+            cap = squad_caps.get(key)
+            base = _staying_count(wname, sname) if cap is not None else 0
+            for m in pool:
+                if m["character_id"] in claimed:
+                    continue
+                if not _pilot_matches(rule.condition, m, tag_index):
+                    continue
+                if cap is not None:
+                    # base (physical stayers) + every pilot this compose has
+                    # already assigned into the squad (Pass 1 pins + earlier
+                    # Pass 2 routes) — so a named pin cannot be overfilled past.
+                    used = base + assigned_here.get(key, 0)
+                    if used >= cap:
+                        result.unassigned_reasons[m["character_id"]] = "target full"
+                        continue
+                assignment[m["character_id"]] = (wname, sname, rule.action.role)
+                claimed.add(m["character_id"])
+                assigned_here[key] = assigned_here.get(key, 0) + 1
+
+        # Pass-2 tail — warn about routing rules that matched NO pilot at all, so
+        # a rule pointing at an absent ship class/tag surfaces in the preview
+        # (replaces the old tagged-slot "unfilled" warnings). "target full"
+        # blocks don't count as a match here, so an all-full rule still warns
+        # only if it placed nobody. Uses the rule's condition value (or, for the
+        # valueless capital/subcap/default types, the condition type).
+        for rule in ordered:
+            key = (rule.action.wing_name, rule.action.squad_name)
+            if key[0] is None or key[1] is None:
+                continue
+            placed_any = any(
+                _pilot_matches(rule.condition, m, tag_index)
+                and assignment.get(m["character_id"]) == (key[0], key[1], rule.action.role)
+                for m in pool)
+            if not placed_any:
+                label = rule.condition.value or rule.condition.type
+                result.warnings.append(f"Rule {label}: no matching pilots")
+
+    # Pass 3 — generic slots (character None, tag None), tree order.
+    if 3 in passes:
+        for wname, sname, slot in flat:
+            if slot.character or slot.tag is not None \
+                    or getattr(slot, "character_id", None) is not None:
+                continue
+            pilot = next((m for m in pool if m["character_id"] not in claimed), None)
             if pilot is not None:
                 assignment[pilot["character_id"]] = (wname, sname, slot.role)
                 claimed.add(pilot["character_id"])
-                break
-        else:
-            result.warnings.append(
-                f"1 slot unfilled (no match): {wname}/{sname} [{slot.tag}]")
-
-    # Pass 2b — warn about pilots a user rule matched but had no open slot for.
-    for rule in user_rules:
-        leftover = [m for m in pool if m["character_id"] not in claimed
-                    and _pilot_matches(rule.condition, m, tag_index)]
-        if leftover:
-            result.warnings.append(
-                f"{len(leftover)} {rule.condition.value} unplaced by "
-                f"{rule.action.role} rule (no open slot).")
-
-    # Pass 3 — generic slots (character None, tag None), tree order.
-    for wname, sname, slot in flat:
-        if slot.character or slot.tag is not None:
-            continue
-        pilot = next((m for m in pool if m["character_id"] not in claimed), None)
-        if pilot is not None:
-            assignment[pilot["character_id"]] = (wname, sname, slot.role)
-            claimed.add(pilot["character_id"])
 
     # Build moves (diff each assignment vs current placement).
     member_by_id = {m["character_id"]: m for m in pool}
@@ -191,8 +251,15 @@ def compose(template, live_members, live_structure, *, doctrine=None,
             target_wing_name=wname, target_squad_name=sname,
             target_role=role, skip_reason=skip))
 
-    # Pass 5 — leftover pool → Unassigned.
-    result.unassigned = [m for m in pool if m["character_id"] not in claimed]
+    # Leftover pool + cap-overflow → Unassigned (de-duped; overflow keeps its reason).
+    seen_unassigned: set = set()
+    result.unassigned = []
+    for m in pool:
+        cid = m["character_id"]
+        if cid in claimed or cid in seen_unassigned:
+            continue
+        seen_unassigned.add(cid)
+        result.unassigned.append(m)
     return result
 
 
