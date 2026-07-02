@@ -145,3 +145,53 @@ def test_live_tree_mirrors_real_fleet(root, tmp_path):
     unassigned = [v[1][0] for v in win._node_meta.values() if v[0] == "unassigned"]
     assert 5 in livepilots and 6 in unassigned and 5 not in unassigned
     win.destroy()
+
+
+def _win(root, tmp_path, fittings=None, **providers):
+    from fleet_template_window import FleetTemplateWindow
+    defaults = dict(
+        esi_session_provider=lambda: None,
+        fleet_info_provider=lambda: None,
+        doctrine_provider=lambda: None,
+        character_names_provider=lambda: [],
+    )
+    defaults.update(providers)
+    return FleetTemplateWindow(root, store=_store(tmp_path),
+                               fittings=fittings or _FakeFittings(),
+                               config={}, **defaults)
+
+
+def test_ship_class_label_uses_get_group_name(root, tmp_path, monkeypatch):
+    import ship_classes
+    monkeypatch.setattr(ship_classes, "get_group_name",
+                        lambda tid: "Heavy Assault Cruiser" if tid == 12345 else None)
+    win = _win(root, tmp_path)
+    try:
+        assert win.ship_class_label(12345) == "Heavy Assault Cruiser"
+        assert win.ship_class_label(0) is None
+    finally:
+        win.destroy()
+
+
+def test_enrich_members_stamps_is_capital(root, tmp_path, monkeypatch):
+    import ship_classes
+    import fleet_template_window as ftw
+    monkeypatch.setattr(ship_classes, "is_capital", lambda tid: tid == 19720)
+    monkeypatch.setattr(ftw, "resolve_name", lambda cid, kind: "X", raising=False)
+    # zkill_monitor.resolve_name is imported inside _enrich_members; patch there too.
+    import zkill_monitor
+    monkeypatch.setattr(zkill_monitor, "resolve_name", lambda cid, kind: "X")
+    monkeypatch.setattr(ship_classes, "get_group_name", lambda tid: "Dreadnought")
+    win = _win(root, tmp_path)
+    try:
+        out = win._enrich_members([
+            {"character_id": 1, "ship_type_id": 19720, "role": "squad_member",
+             "wing_id": None, "squad_id": None, "join_time": ""},
+            {"character_id": 2, "ship_type_id": 587, "role": "squad_member",
+             "wing_id": None, "squad_id": None, "join_time": ""},
+        ])
+        by_id = {m["character_id"]: m for m in out}
+        assert by_id[1]["is_capital"] is True
+        assert by_id[2]["is_capital"] is False
+    finally:
+        win.destroy()

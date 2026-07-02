@@ -42,14 +42,6 @@ ROLE_ABBR = {"squad_member": "", "squad_commander": "SC",
              "wing_commander": "WC", "fleet_commander": "FC"}
 CONDITION_TYPES = ["ship_type", "ship_class", "character", "doctrine_tag"]
 
-# group_id → ship_class rule label (covers the doctrine-relevant hull groups).
-_GROUP_LABELS = {
-    540: "Command Ship", 1534: "Command Destroyer", 832: "Logistics Cruiser",
-    1527: "Logistics Frigate", 963: "Strategic Cruiser", 547: "Carrier",
-    1538: "Force Auxiliary", 485: "Dreadnought", 30: "Titan", 659: "Supercarrier",
-    1201: "Combat Battlecruiser", 419: "Combat Battlecruiser",
-}
-
 
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
@@ -966,21 +958,21 @@ class FleetTemplateWindow:
         self.store.save()
 
     def ship_class_label(self, type_id):
-        """Human label for a hull's group (for ship_class rule conditions)."""
+        """Human group name for a hull (for ship_class rule conditions)."""
         if not type_id:
             return None
         try:
             import ship_classes
-            gid = ship_classes.get_group_id(type_id)
+            return ship_classes.get_group_name(type_id)
         except Exception:
             return None
-        return _GROUP_LABELS.get(gid)
 
     def _enrich_members(self, raw_members):
         """ESI member dicts → composer-shaped dicts. Runs on the background sync
         worker (see _sync_live), so the name/ship-class resolution here may hit
         ESI without blocking the UI thread."""
         from zkill_monitor import resolve_name
+        import ship_classes
         out = []
         for m in raw_members:
             cid = m.get("character_id")
@@ -991,6 +983,7 @@ class FleetTemplateWindow:
                 "ship_type_id": tid,
                 "ship_type_name": resolve_name(tid, "type") if tid else "",
                 "ship_class": self.ship_class_label(tid),   # pre-resolve off the Tk thread
+                "is_capital": ship_classes.is_capital(tid) if tid else False,
                 "role": m.get("role", "squad_member"),
                 "wing_id": m.get("wing_id"),
                 "squad_id": m.get("squad_id"),
