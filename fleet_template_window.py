@@ -59,6 +59,25 @@ COMMON_SHIP_CLASSES = [
 ]
 
 
+def parse_pilot_lines(text: str) -> list[str]:
+    """Parse a multiline bulk-add blob into a clean ordered name list.
+
+    One name per line: strip surrounding whitespace, drop empty lines, and
+    de-dupe case-insensitively (first-seen casing wins). Pure — no Tk."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (text or "").splitlines():
+        name = raw.strip()
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(name)
+    return out
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -504,6 +523,10 @@ class FleetTemplateWindow:
                 menu.add_command(label="Rename", command=lambda: self._rename_selected())
                 menu.add_command(label="Add Slot",
                                  command=lambda: self._add_slot(wi, si))
+                menu.add_command(label="Add pilots from list…",
+                                 command=lambda: self._open_bulk_add(wi, si))
+                menu.add_command(label="Add my characters…",
+                                 command=lambda: self._open_add_my_chars(wi, si))
                 menu.add_command(label="Set max size",
                                  command=lambda: self._set_max_size("squad", path))
                 menu.add_separator()
@@ -558,6 +581,65 @@ class FleetTemplateWindow:
         slot = self.current_template().wings[wi].squads[si].slots[li]
         SlotEditor(self.win, slot, self.fittings, self._character_names_provider(),
                    on_ok=lambda: self._after_structure_change())
+
+    def _open_bulk_add(self, wi, si):
+        _BulkAddDialog(self.win, on_ok=lambda text: self._bulk_add_pilots_names(
+            wi, si, parse_pilot_lines(text)))
+
+    def _bulk_add_pilots_names(self, wi, si, names):
+        """Resolve `names` on a worker, then create pinned named slots on the Tk
+        thread. Unresolved names are routed to the Add-anyway/Skip dialog."""
+        if not names:
+            return
+        self._status.config(text=f"Resolving {len(names)} name(s)…", fg=FG_DIM)
+
+        def worker():
+            resolved = self._resolve_names_provider(names) or {}
+            self._post(self._apply_bulk_resolution, wi, si, names, resolved)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_bulk_resolution(self, wi, si, names, resolved):
+        """Tk thread: add a pinned named slot per resolved name; cache the pair;
+        collect unresolved names for the decision dialog."""
+        found_pairs = []      # (display_name, character_id)
+        unresolved = []
+        for name in names:
+            cid = resolved.get(name.strip().lower())
+            if isinstance(cid, int):
+                found_pairs.append((name, cid))
+            else:
+                unresolved.append(name)
+        if found_pairs:
+            self._add_named_slots(wi, si, found_pairs)
+        if unresolved:
+            self._show_unresolved_dialog(wi, si, unresolved)
+        else:
+            self._status.config(text=f"Added {len(found_pairs)} pilot(s).",
+                                fg=FG_GREEN)
+
+    def _add_named_slots(self, wi, si, pairs):
+        """Append one pinned named slot per (name, character_id) pair, cache the
+        pairs, and persist via the standard structure-change path."""
+        self._push_undo()
+        t = self.current_template()
+        if t is None:
+            return
+        squad = t.wings[wi].squads[si]
+        for name, cid in pairs:
+            squad.slots.append(Slot(character=name, tag=None,
+                                    role="squad_member",
+                                    character_id=cid if isinstance(cid, int) else None))
+            self.store.cache_character(name, cid if isinstance(cid, int) else None)
+        self._after_structure_change()
+
+    def _show_unresolved_dialog(self, wi, si, unresolved):
+        _UnresolvedDialog(
+            self.win, unresolved,
+            on_add_anyway=lambda: self._add_named_slots(
+                wi, si, [(n, None) for n in unresolved]),
+            on_skip=lambda: self._status.config(
+                text=f"Skipped {len(unresolved)} unresolved name(s).", fg=FG_YELLOW))
 
     def _delete_selected(self):
         self._push_undo()
@@ -1517,6 +1599,71 @@ class SlotEditor:
         self.slot.role = self._role.get() or "squad_member"
         self.win.destroy()
         self.on_ok()
+
+
+class _BulkAddDialog:
+    """Themed multiline dialog: paste one pilot name per line, OK -> on_ok(text)."""
+    def __init__(self, parent, *, on_ok):
+        self.on_ok = on_ok
+        self.win = tk.Toplevel(parent)
+        self.win.title("Add pilots from list")
+        self.win.configure(bg=BG_PANEL)
+        self.win.transient(parent)
+        self.win.grab_set()
+        tk.Label(self.win, text="One pilot name per line:", bg=BG_PANEL,
+                 fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", padx=8, pady=(8, 2))
+        self._text = tk.Text(self.win, width=36, height=12, bg=BG_ENTRY,
+                             fg=FG_TEXT, insertbackground=FG_TEXT,
+                             font=("Consolas", 9), relief=tk.FLAT)
+        self._text.pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
+        btns = tk.Frame(self.win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=self._ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=self.win.destroy).pack(side=tk.LEFT, padx=2)
+        self._text.focus_set()
+
+    def _ok(self):
+        text = self._text.get("1.0", tk.END)
+        self.win.destroy()
+        self.on_ok(text)
+
+
+class _UnresolvedDialog:
+    """Themed result dialog listing names ESI could not resolve, with
+    [Add anyway] (create unvalidated slots) / [Skip]."""
+    def __init__(self, parent, unresolved, *, on_add_anyway, on_skip):
+        self.on_add_anyway = on_add_anyway
+        self.on_skip = on_skip
+        self.win = tk.Toplevel(parent)
+        self.win.title("Unresolved names")
+        self.win.configure(bg=BG_PANEL)
+        self.win.transient(parent)
+        self.win.grab_set()
+        tk.Label(self.win,
+                 text=f"{len(unresolved)} name(s) not found on ESI:",
+                 bg=BG_PANEL, fg=FG_YELLOW, font=("Consolas", 9)).pack(
+                     anchor="w", padx=8, pady=(8, 2))
+        box = tk.Text(self.win, width=32, height=min(10, max(3, len(unresolved))),
+                     bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9), relief=tk.FLAT)
+        box.pack(fill=tk.BOTH, expand=True, padx=8, pady=2)
+        box.insert("1.0", "\n".join(unresolved))
+        box.configure(state="disabled")
+        btns = tk.Frame(self.win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Add anyway", style="Dark.TButton",
+                   command=self._add).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Skip", style="Dark.TButton",
+                   command=self._skip).pack(side=tk.LEFT, padx=2)
+
+    def _add(self):
+        self.win.destroy()
+        self.on_add_anyway()
+
+    def _skip(self):
+        self.win.destroy()
+        self.on_skip()
 
 
 class _QuickAddPicker:

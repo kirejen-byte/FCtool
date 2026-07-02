@@ -515,3 +515,53 @@ def test_fc_gui_resolve_names_lowercases_keys_and_survives_no_auth():
     provider2 = fc_gui.FCToolGUI._resolve_names.__get__(gui2, fc_gui.FCToolGUI)
     assert provider2(["Kyra Dawnfall"]) == {"kyra dawnfall": 95}
     assert provider2([]) == {}
+
+
+def test_parse_pilot_lines_strips_dedupes_dropsblanks():
+    from fleet_template_window import parse_pilot_lines
+    text = "  Kyra Dawnfall \n\nkyra dawnfall\nBob McTest\n   \nBob McTest\n"
+    assert parse_pilot_lines(text) == ["Kyra Dawnfall", "Bob McTest"]
+
+
+def test_bulk_add_creates_pinned_named_slots_and_caches(root, tmp_path, monkeypatch):
+    import types
+    import fleet_template_window as ftw
+    from fleet_template_window import FleetTemplateWindow
+
+    store = _store(tmp_path)
+    # give the template a wing+squad to add into
+    t = store.templates[0]
+    from fleet_template_store import Wing, Squad
+    t.wings.append(Wing(name="W1", max_size=None,
+                        squads=[Squad(name="S1", max_size=None, slots=[])]))
+
+    def fake_resolver(names):
+        return {"kyra dawnfall": 95}   # only Kyra resolves; "Ghost Name" does not
+
+    win = FleetTemplateWindow(
+        root, store=store, fittings=_FakeFittings(), config={},
+        esi_session_provider=lambda: None,
+        fleet_info_provider=lambda: None,
+        doctrine_provider=lambda: None,
+        character_names_provider=lambda: [],
+        resolve_names_provider=fake_resolver,
+    )
+    # Run the resolver worker synchronously and capture the unresolved-dialog call.
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+    captured = {}
+    monkeypatch.setattr(win, "_show_unresolved_dialog",
+                        lambda wi, si, unresolved: captured.setdefault("unres", unresolved))
+
+    win._bulk_add_pilots_names(0, 0, ["Kyra Dawnfall", "Ghost Name"])
+    root.update()   # pump the _post-marshaled result back onto the Tk thread
+
+    squad = win.current_template().wings[0].squads[0]
+    named = {s.character: s for s in squad.slots}
+    assert "Kyra Dawnfall" in named
+    assert named["Kyra Dawnfall"].character_id == 95
+    assert named["Kyra Dawnfall"].role == "squad_member"
+    # resolved pair cached for autocomplete
+    assert win.store.cached_id("Kyra Dawnfall") == 95
+    # unresolved surfaced for the Add anyway / Skip decision
+    assert captured["unres"] == ["Ghost Name"]
+    win.destroy()
