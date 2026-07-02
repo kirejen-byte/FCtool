@@ -253,3 +253,70 @@ def test_ship_type_suggestions_uses_catalog(root, tmp_path):
         assert win._ship_type_suggestions("z") == []   # short/no match
     finally:
         win.destroy()
+
+
+def _win_with_structure(root, tmp_path):
+    win = _win(root, tmp_path)
+    t = win.current_template()
+    from fleet_template_store import Wing, Squad
+    t.wings.append(Wing("Cap Wing", None, [Squad("Dreads", None, [])]))
+    win.store.save()
+    return win
+
+
+def test_quick_add_capitals_rule(root, tmp_path):
+    win = _win_with_structure(root, tmp_path)
+    try:
+        win._quick_add_rule("capital", "", "Cap Wing", "Dreads", "squad_member")
+        t = win.current_template()
+        r = t.rules[-1]
+        assert r.condition.type == "capital"
+        assert r.condition.value == ""
+        assert (r.action.wing_name, r.action.squad_name, r.action.role) \
+            == ("Cap Wing", "Dreads", "squad_member")
+        assert r.broken is False
+    finally:
+        win.destroy()
+
+
+def test_quick_add_class_rule_sets_value(root, tmp_path):
+    win = _win_with_structure(root, tmp_path)
+    try:
+        win._quick_add_rule("ship_class", "Dreadnought", "Cap Wing", "Dreads",
+                            "squad_commander")
+        r = win.current_template().rules[-1]
+        assert (r.condition.type, r.condition.value) == ("ship_class", "Dreadnought")
+        assert r.action.role == "squad_commander"
+    finally:
+        win.destroy()
+
+
+def test_quick_add_priorities_increment(root, tmp_path):
+    win = _win_with_structure(root, tmp_path)
+    try:
+        win._quick_add_rule("capital", "", "Cap Wing", "Dreads", "squad_member")
+        win._quick_add_rule("subcap", "", "Cap Wing", "Dreads", "squad_member")
+        pri = [r.priority for r in win.current_template().rules]
+        assert pri == sorted(pri) and len(set(pri)) == len(pri)   # unique, ordered
+    finally:
+        win.destroy()
+
+
+def test_rules_tab_has_quick_add_buttons(root, tmp_path):
+    # The buttons exist as children of the rules tab's top bar.
+    win = _win(root, tmp_path)
+    try:
+        texts = []
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    texts.append(str(c.cget("text")))
+                except tk.TclError:
+                    pass
+                walk(c)
+        walk(win._rules_tab)
+        joined = " ".join(texts)
+        assert "Capitals" in joined and "Subcaps" in joined
+        assert "Class" in joined and "Tag" in joined
+    finally:
+        win.destroy()

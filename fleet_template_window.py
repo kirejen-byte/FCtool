@@ -760,6 +760,14 @@ class FleetTemplateWindow:
                    command=self._add_rule).pack(side=tk.LEFT, padx=6, pady=4)
         ttk.Button(top, text="Test Rules", style="Dark.TButton",
                    command=self._test_rules).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Capitals →", style="Dark.TButton",
+                   command=lambda: self._open_quick_add("capital")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Subcaps →", style="Dark.TButton",
+                   command=lambda: self._open_quick_add("subcap")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Class… →", style="Dark.TButton",
+                   command=lambda: self._open_quick_add("ship_class")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Tag… →", style="Dark.TButton",
+                   command=lambda: self._open_quick_add("doctrine_tag")).pack(side=tk.LEFT, padx=2)
         self._rules_hint = tk.Label(top, text="", font=("Consolas", 8),
                                     fg=FG_YELLOW, bg=BG_PANEL)
         self._rules_hint.pack(side=tk.LEFT, padx=6)
@@ -891,6 +899,28 @@ class FleetTemplateWindow:
             condition=RuleCondition("ship_type", ""),
             action=RuleAction("squad_member", None, None)))
         self._renumber_and_save()
+
+    def _quick_add_rule(self, cond_type, cond_value, wing, squad, role):
+        """Append a single-squad routing rule and reload. Pure enough to unit-test
+        without driving the picker widgets."""
+        self._push_undo()
+        t = self.current_template()
+        if t is None:
+            return
+        value = "" if cond_type in VALUELESS_CONDITIONS else (cond_value or "")
+        t.rules.append(AssignmentRule(
+            priority=len(t.rules),
+            condition=RuleCondition(cond_type, value),
+            action=RuleAction(role or "squad_member", wing or None, squad or None)))
+        self._renumber_and_save()
+
+    def _open_quick_add(self, mode):
+        """Open the compact routing picker for one of capital/subcap/ship_class/
+        doctrine_tag. Class/Tag modes show a value picker; capital/subcap don't."""
+        t = self.current_template()
+        if t is None:
+            return
+        _QuickAddPicker(self.win, mode=mode, window=self)
 
     def _update_rule(self, idx, *, ctype=None, cval=None, role=None, wing=None, squad=None):
         self._push_undo()
@@ -1415,3 +1445,87 @@ class SlotEditor:
         self.slot.role = self._role.get() or "squad_member"
         self.win.destroy()
         self.on_ok()
+
+
+class _QuickAddPicker:
+    """Compact modal: choose destination wing+squad+role (and, for class/tag
+    modes, the class or tag), then create one routing rule via the window's
+    _quick_add_rule."""
+
+    _MODE_LABEL = {"capital": "Route Capitals", "subcap": "Route Subcaps",
+                   "ship_class": "Route Ship Class", "doctrine_tag": "Route Tag"}
+
+    def __init__(self, parent, *, mode, window):
+        self.mode = mode
+        self.window = window
+        self.win = tk.Toplevel(parent)
+        self.win.title(self._MODE_LABEL.get(mode, "Route"))
+        self.win.configure(bg=BG_PANEL)
+        self.win.transient(parent)
+        self.win.grab_set()
+
+        row = 0
+        self._value = None
+        if mode in ("ship_class", "doctrine_tag"):
+            label = "Ship class:" if mode == "ship_class" else "Doctrine tag:"
+            tk.Label(self.win, text=label, bg=BG_PANEL, fg=FG_TEXT,
+                     font=("Consolas", 9)).grid(row=row, column=0, sticky="w",
+                                                padx=6, pady=4)
+            values = (window._condition_values("ship_class") if mode == "ship_class"
+                      else list(getattr(window.fittings, "tags", [])))
+            self._value = ttk.Combobox(self.win, values=values, width=24)
+            self._value.grid(row=row, column=1, padx=6, pady=4)
+            row += 1
+
+        tk.Label(self.win, text="Wing:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).grid(row=row, column=0, sticky="w", padx=6, pady=4)
+        self._wing = ttk.Combobox(self.win, values=window._wing_names(), width=24,
+                                  state="readonly")
+        self._wing.grid(row=row, column=1, padx=6, pady=4)
+        self._wing.bind("<<ComboboxSelected>>", lambda e: self._sync_squads())
+        row += 1
+
+        tk.Label(self.win, text="Squad:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).grid(row=row, column=0, sticky="w", padx=6, pady=4)
+        self._squad = ttk.Combobox(self.win, values=window._squad_names(), width=24,
+                                   state="readonly")
+        self._squad.grid(row=row, column=1, padx=6, pady=4)
+        row += 1
+
+        tk.Label(self.win, text="Role:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).grid(row=row, column=0, sticky="w", padx=6, pady=4)
+        self._role = ttk.Combobox(self.win, values=ROLE_VALUES, width=24,
+                                  state="readonly")
+        self._role.set("squad_member")
+        self._role.grid(row=row, column=1, padx=6, pady=4)
+        row += 1
+
+        btns = tk.Frame(self.win, bg=BG_PANEL)
+        btns.grid(row=row, column=0, columnspan=2, pady=8)
+        ttk.Button(btns, text="Create rule", style="Dark.TButton",
+                   command=self._ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=self.win.destroy).pack(side=tk.LEFT, padx=4)
+
+    def _sync_squads(self):
+        # Restrict the squad list to the chosen wing's squads.
+        t = self.window.current_template()
+        wname = self._wing.get()
+        squads = [""]
+        for w in (t.wings if t else []):
+            if w.name == wname:
+                squads += [s.name for s in w.squads]
+        self._squad.configure(values=squads)
+
+    def _ok(self):
+        value = self._value.get().strip() if self._value is not None else ""
+        wing = self._wing.get().strip()
+        squad = self._squad.get().strip()
+        role = self._role.get() or "squad_member"
+        if not wing or not squad:
+            messagebox.showwarning("Route", "Pick a wing and a squad.",
+                                   parent=self.win)
+            return
+        cond_type = self.mode
+        self.window._quick_add_rule(cond_type, value, wing, squad, role)
+        self.win.destroy()
