@@ -654,3 +654,32 @@ def test_add_my_characters_creates_slots(root, tmp_path, monkeypatch):
     assert "Alpha" in named and named["Alpha"].character_id == 1
     assert "Bravo" not in named
     win.destroy()
+
+
+def test_import_live_as_template_builds_pins_and_selects(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    from datetime import datetime
+    win = _live_win(root, tmp_path) if "_live_win" in dir() else _win(
+        root, tmp_path, fleet_info_provider=lambda: {"fleet_id": 1, "is_boss": True})
+    win.mode = "live"
+    win._fleet_id = 1
+    win._live_structure = {"wings": [
+        {"id": 1, "name": "Alpha", "squads": [{"id": 10, "name": "S1"}]}]}
+    win._live_members = [
+        {"character_id": 5, "name": "Placed", "ship_type_id": 1,
+         "ship_type_name": "Megathron", "ship_class": None, "role": "squad_member",
+         "wing_id": 1, "squad_id": 10, "join_time": ""},
+    ]
+    # Freeze time deterministically.
+    monkeypatch.setattr(ftw, "datetime", type("D", (), {
+        "now": staticmethod(lambda: datetime(2026, 7, 2, 21, 15))}))
+    before = len(win.store.templates)
+    win._import_live_as_template()
+    assert len(win.store.templates) == before + 1
+    t = win.current_template()
+    assert t.name == "Import 2026-07-02 21:15"
+    assert win.mode == "template"           # switched to template mode
+    slot = t.wings[0].squads[0].slots[0]
+    assert slot.character == "Placed" and slot.character_id == 5
+    assert 5 in win._pins                    # every imported member pinned
+    win.destroy()

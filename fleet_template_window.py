@@ -18,6 +18,7 @@ from __future__ import annotations
 import threading
 import tkinter as tk
 from collections import deque
+from datetime import datetime
 from tkinter import ttk, messagebox, simpledialog
 
 import fleet_composer
@@ -130,6 +131,11 @@ class FleetTemplateWindow:
         self._mode_btn = ttk.Button(bar, text="Mode: Template",
                                     style="Dark.TButton", command=self._toggle_mode)
         self._mode_btn.pack(side=tk.RIGHT, padx=10)
+
+        self._import_btn = ttk.Button(bar, text="Import live fleet",
+                                      style="Dark.TButton",
+                                      command=self._import_live_as_template)
+        self._import_btn.pack(side=tk.RIGHT, padx=4)
 
         sel = tk.Frame(self.win, bg=BG_DARK)
         sel.pack(fill=tk.X, side=tk.TOP)
@@ -250,6 +256,7 @@ class FleetTemplateWindow:
         self._mode_btn.config(text=f"Mode: {mode.capitalize()}")
         live = (mode == "live")
         self._apply_btn.config(state="normal" if live else "disabled")
+        self._import_btn.config(state="normal" if live else "disabled")
         self._auto_sort_btn.config(state="normal" if live else "disabled")
         self._save_btn.config(state="disabled" if live else "normal")
         if not live:
@@ -1439,6 +1446,31 @@ class FleetTemplateWindow:
         self._execute_moves(session, res.executable, materialize_template=True)
         self._pins.clear()
         self._refresh_pins_button()
+
+    def _import_live_as_template(self):
+        """Build a NEW template from the current live fleet, pin every member,
+        select it, and switch to template mode (spec ask 4). Requires a live
+        snapshot (live mode with members synced)."""
+        if self.mode != "live" or not self._live_structure.get("wings"):
+            self._status.config(text="Import needs a synced live fleet.",
+                                fg=FG_YELLOW)
+            return
+        from fleet_template_store import build_template_from_live
+        t = build_template_from_live(self._live_members, self._live_structure,
+                                     now=datetime.now())
+        self.store.templates.append(t)
+        # Pin every member that became a slot (id -> current ship_type_id).
+        for m in self._live_members:
+            cid = m.get("character_id")
+            tid = m.get("ship_type_id")
+            if isinstance(cid, int) and tid:
+                self._pins[cid] = tid
+        self.store.save()
+        self._current_template_id = t.id
+        self._refresh_template_selector()
+        self.set_mode("template")            # exits live, reloads the stored tree
+        self._refresh_pins_button()
+        self._status.config(text=f"Imported '{t.name}'.", fg=FG_GREEN)
 
     def _ensure_executor(self):
         if self._executor is not None:
