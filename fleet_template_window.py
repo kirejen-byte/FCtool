@@ -94,6 +94,47 @@ def mode_banner_text(mode: str) -> str:
     return "TEMPLATE — sandbox (changes saved to the template only)"
 
 
+def build_apply_preview_rows(res, members) -> dict:
+    """Turn a ComposeResult + the live member dicts into display rows for the
+    Apply preview dialog.
+
+    moves      -> 'Pilot — Ship → Wing/Squad [role]'.  Move has no ship name, so
+                  the ship is looked up in `members` by character_id (== pilot_id);
+                  a missing pilot/ship drops the ship segment (segments are
+                  ' — '.joined so there is no doubled ' — ' artifact).
+    unassigned -> 'Name — reason'.  res.unassigned are enriched member dicts;
+                  the reason is joined from res.unassigned_reasons by
+                  character_id, falling back to 'no matching rule' only when the
+                  id has no entry.
+    warnings   -> passed through.
+    Pure — no Tk."""
+    members_by_id = {m.get("character_id"): m for m in (members or [])}
+    moves = []
+    for mv in res.executable:
+        role = getattr(mv, "target_role", None) or "squad_member"
+        wing = getattr(mv, "target_wing_name", "") or ""
+        squad = getattr(mv, "target_squad_name", "") or ""
+        member = members_by_id.get(getattr(mv, "pilot_id", None))
+        ship = (member.get("ship_type_name") or "") if member else ""
+        # Build the leading segments and join the non-empty ones so a missing
+        # ship yields 'Pilot → ...' rather than 'Pilot —  → ...'.
+        lead = [seg for seg in (mv.pilot_name, ship) if seg]
+        moves.append(f"{' — '.join(lead)} → {wing}/{squad} [{role}]")
+    reasons = getattr(res, "unassigned_reasons", None) or {}
+    unassigned = []
+    for u in getattr(res, "unassigned", []) or []:
+        if isinstance(u, dict):
+            cid = u.get("character_id")
+            name = u.get("name") or u.get("pilot_name") or "?"
+        else:
+            cid = getattr(u, "character_id", None)
+            name = getattr(u, "name", None) or getattr(u, "pilot_name", "?")
+        reason = reasons.get(cid) or "no matching rule"
+        unassigned.append(f"{name} — {reason}")
+    return {"moves": moves, "unassigned": unassigned,
+            "warnings": list(getattr(res, "warnings", []) or [])}
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -1602,25 +1643,29 @@ class FleetTemplateWindow:
             return
         session = self._esi_session_provider()
         if session is None:
-            messagebox.showwarning("Apply", "No fleet-boss session — you must be the current fleet boss with the fleet-write scope (re-authenticate if your token is old).", parent=self.win)
+            messagebox.showwarning(
+                "Apply", "No fleet-boss session — you must be the current fleet "
+                "boss with the fleet-write scope (re-authenticate if your token "
+                "is old).", parent=self.win)
             return
         res = self._compose_preview()
         if res is None:
             return
-        summary = fleet_composer.summarize_moves(res)
+        rows = build_apply_preview_rows(res, self._live_members)
         t = self.current_template()
         threshold = t.settings.bulk_apply_threshold
-        if summary["executable"] > threshold:
-            msg = (f"{summary['executable']} moves required "
-                   f"({summary['unfilled']} slots unfilled, "
-                   f"{summary['unassigned']} unassigned).\n"
-                   f"ESI calls: ~{summary['esi_calls']} (+ wing/squad creates)\n"
-                   f"Estimated time: ~{summary['executable'] * 0.5:.0f}s\n\nApply now?")
-            if not messagebox.askyesno("Confirm apply", msg, parent=self.win):
-                return
-        self._execute_moves(session, res.executable, materialize_template=True)
-        self._pins.clear()
-        self._refresh_pins_button()
+        big_warning = ""
+        if len(rows["moves"]) > threshold:
+            big_warning = (f"Large apply: {len(rows['moves'])} moves "
+                           f"(> {threshold}). This will take "
+                           f"~{len(rows['moves']) * 0.5:.0f}s.")
+
+        def _confirm():
+            self._execute_moves(session, res.executable, materialize_template=True)
+            self._pins.clear()
+            self._refresh_pins_button()
+
+        _ApplyPreviewDialog(self.win, rows, big_warning, on_confirm=_confirm)
 
     def _import_live_as_template(self):
         """Build a NEW template from the current live fleet, pin every member,
@@ -2075,3 +2120,63 @@ class _QuickAddPicker:
         cond_type = self.mode
         self.window._quick_add_rule(cond_type, value, wing, squad, role)
         self.win.destroy()
+
+
+class _ApplyPreviewDialog:
+    """Themed modal listing every move + unassigned + warnings; Confirm/Cancel.
+    Confirm runs on_confirm(); the itemized list is bounded and scrollable."""
+
+    def __init__(self, parent, rows, big_warning, *, on_confirm):
+        self.on_confirm = on_confirm
+        self.win = tk.Toplevel(parent)
+        self.win.title("Apply preview")
+        self.win.configure(bg=BG_PANEL)
+        self.win.transient(parent)
+        self.win.grab_set()
+
+        moves = rows.get("moves", [])
+        tk.Label(self.win, text=f"{len(moves)} move(s):", bg=BG_PANEL,
+                 fg=FG_TEXT, font=("Consolas", 9, "bold")).pack(
+                     anchor="w", padx=8, pady=(8, 2))
+
+        wrap = tk.Frame(self.win, bg=BG_PANEL)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=8)
+        box = tk.Text(wrap, width=54, height=min(14, max(3, len(moves) or 3)),
+                      bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9), relief=tk.FLAT,
+                      wrap="none")
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=box.yview)
+        box.configure(yscrollcommand=vsb.set)
+        box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        box.insert("1.0", "\n".join(moves) if moves else "(no moves needed)")
+        box.configure(state="disabled")
+
+        for label, items, colour in (
+                ("Unassigned / unrouted:", rows.get("unassigned", []), FG_YELLOW),
+                ("Warnings:", rows.get("warnings", []), FG_YELLOW)):
+            if items:
+                tk.Label(self.win, text=label, bg=BG_PANEL, fg=colour,
+                         font=("Consolas", 8, "bold")).pack(anchor="w", padx=8,
+                                                            pady=(6, 0))
+                tk.Label(self.win, text="\n".join(items), bg=BG_PANEL, fg=colour,
+                         font=("Consolas", 8), justify=tk.LEFT).pack(
+                             anchor="w", padx=12)
+
+        if big_warning:
+            tk.Label(self.win, text=big_warning, bg=BG_PANEL, fg=FG_RED,
+                     font=("Consolas", 8, "bold"), justify=tk.LEFT,
+                     wraplength=380).pack(anchor="w", padx=8, pady=(6, 0))
+
+        btns = tk.Frame(self.win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Confirm", style="Dark.TButton",
+                   command=self._confirm).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=self.win.destroy).pack(side=tk.LEFT, padx=2)
+
+    def _confirm(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.on_confirm()

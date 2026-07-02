@@ -486,7 +486,7 @@ def test_auto_sort_tick_enqueues_only_unpinned_needed(root, tmp_path):
     win.destroy()
 
 
-def test_apply_clears_pins(root, tmp_path):
+def test_apply_clears_pins(root, tmp_path, monkeypatch):
     win = _live_win(root, tmp_path)
     win.mode = "live"
     win._pins = {1: 10, 2: 20}
@@ -494,7 +494,13 @@ def test_apply_clears_pins(root, tmp_path):
     win._live_structure = {"wings": []}
     # Stub the enqueue path so _apply just runs the clear-pins side effect.
     win._execute_moves = lambda *a, **k: None
+    import fleet_template_window as ftw
+    captured = {}
+    monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
+                        lambda parent, rows, big_warning, on_confirm:
+                        captured.setdefault("confirm", on_confirm))
     win._apply()
+    captured["confirm"]()
     assert win._pins == {}
     win.destroy()
 
@@ -904,3 +910,117 @@ def test_geometry_persisted_on_destroy_and_restored(root, tmp_path):
         doctrine_provider=lambda: None, character_names_provider=lambda: [])
     assert store.ui["geometry"].startswith("1001x611")
     win2.destroy()
+
+
+def _fake_compose_result(moves, unassigned=None, unassigned_reasons=None,
+                         warnings=None):
+    """ComposeResult-shaped fake. `moves` are Move-shaped (no ship name);
+    `unassigned` are enriched member dicts; `unassigned_reasons` is
+    {character_id: reason}."""
+    import types
+    return types.SimpleNamespace(
+        executable=moves,
+        unassigned=(unassigned or []),
+        unassigned_reasons=(unassigned_reasons or {}),
+        warnings=(warnings or []))
+
+
+def test_build_apply_preview_rows_formats_moves():
+    import types
+    from fleet_template_window import build_apply_preview_rows
+    # Move carries NO ship name — the ship comes from the live member dicts.
+    mv = types.SimpleNamespace(pilot_id=42, pilot_name="Kyra",
+                               target_wing_name="Cap", target_squad_name="Dreads",
+                               target_role="squad_commander")
+    members = [{"character_id": 42, "name": "Kyra",
+                "ship_type_name": "Revelation"}]
+    res = _fake_compose_result(
+        [mv],
+        unassigned=[{"character_id": 7, "name": "Bob"}],
+        unassigned_reasons={7: "target full"},
+        warnings=["heads up"])
+    rows = build_apply_preview_rows(res, members)
+    assert rows["moves"] == ["Kyra — Revelation → Cap/Dreads [squad_commander]"]
+    assert rows["unassigned"] == ["Bob — target full"]   # joined by character_id
+    assert rows["warnings"] == ["heads up"]
+
+
+def test_build_apply_preview_rows_missing_ship_stays_well_formed():
+    import types
+    from fleet_template_window import build_apply_preview_rows
+    # Pilot not in members (or no ship) -> ship segment omitted, no doubled ' — '.
+    mv = types.SimpleNamespace(pilot_id=99, pilot_name="Ghost",
+                               target_wing_name="A", target_squad_name="S",
+                               target_role="squad_member")
+    rows = build_apply_preview_rows(_fake_compose_result([mv]), members=[])
+    assert rows["moves"] == ["Ghost → A/S [squad_member]"]
+    assert " —  → " not in rows["moves"][0]     # no empty-ship artifact
+
+
+def test_build_apply_preview_rows_unassigned_reason_fallback():
+    from fleet_template_window import build_apply_preview_rows
+    # One id has a reason, one has none -> the second falls back cleanly.
+    res = _fake_compose_result(
+        [],
+        unassigned=[{"character_id": 1, "name": "Has"},
+                    {"character_id": 2, "name": "None"}],
+        unassigned_reasons={1: "target full"})
+    rows = build_apply_preview_rows(res, members=[])
+    assert rows["unassigned"] == ["Has — target full", "None — no matching rule"]
+
+
+def test_apply_opens_preview_and_confirm_executes(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._live_members = [{"character_id": 1, "name": "Kyra",
+                              "ship_type_name": "Rifter"}]
+        win._live_structure = {"wings": []}
+        executed = {"n": 0}
+        win._execute_moves = lambda *a, **k: executed.__setitem__("n", executed["n"] + 1)
+        import types
+        mv = types.SimpleNamespace(pilot_id=1, pilot_name="Kyra",
+                                   target_wing_name="A", target_squad_name="S",
+                                   target_role="squad_member")
+        monkeypatch.setattr(win, "_compose_preview",
+                            lambda: _fake_compose_result([mv]))
+        # Auto-confirm the dialog by capturing it and invoking its confirm.
+        captured = {}
+        monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
+                            lambda parent, rows, big_warning, on_confirm:
+                            captured.setdefault("confirm", on_confirm))
+        win._apply()
+        assert "confirm" in captured
+        captured["confirm"]()
+        assert executed["n"] == 1
+        assert win._pins == {}      # Apply clears pins on confirm
+    finally:
+        win.destroy()
+
+
+def test_apply_big_warning_line_over_threshold(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
+    win = _live_win(root, tmp_path)
+    try:
+        win.mode = "live"
+        win._live_members = []
+        win._live_structure = {"wings": []}
+        win._execute_moves = lambda *a, **k: None
+        t = win.current_template()
+        t.settings.bulk_apply_threshold = 1
+        import types
+        moves = [types.SimpleNamespace(pilot_id=i, pilot_name=f"P{i}",
+                                       target_wing_name="A", target_squad_name="S",
+                                       target_role="squad_member")
+                 for i in range(3)]
+        monkeypatch.setattr(win, "_compose_preview",
+                            lambda: _fake_compose_result(moves))
+        captured = {}
+        monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
+                            lambda parent, rows, big_warning, on_confirm:
+                            captured.update(big=big_warning))
+        win._apply()
+        assert captured["big"]        # non-empty warning string when 3 > 1
+    finally:
+        win.destroy()
