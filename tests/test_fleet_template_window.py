@@ -320,3 +320,73 @@ def test_rules_tab_has_quick_add_buttons(root, tmp_path):
         assert "Class" in joined and "Tag" in joined
     finally:
         win.destroy()
+
+
+# append — Phase B: write path enqueues onto the executor
+import types
+
+
+def _live_win(root, tmp_path, **providers):
+    from fleet_template_window import FleetTemplateWindow
+    base = dict(
+        store=_store(tmp_path), fittings=_FakeFittings(), config={},
+        esi_session_provider=lambda: object(),
+        fleet_info_provider=lambda: {"fleet_id": 1, "is_boss": True},
+        doctrine_provider=lambda: None, character_names_provider=lambda: [])
+    base.update(providers)
+    win = FleetTemplateWindow(root, **base)
+    win._fleet_id = 1
+    return win
+
+
+class _SyncThread:
+    """Synchronous stand-in for threading.Thread (runs target() on .start()).
+
+    Copied from the Apply-path scaffold in the (now-deleted)
+    test_rebalance_reuses_clamped_live_squad_no_duplicate. Monkeypatch
+    fleet_template_window.threading.Thread with this for ANY test that drives the
+    Apply path (which preps structure on a worker thread); pump root.update() so
+    the _post()-marshaled _enqueue callback runs on the Tk thread. The DRAG path
+    needs none of this — it enqueues synchronously (test below)."""
+    def __init__(self, target=None, daemon=None):
+        self._t = target
+
+    def start(self):
+        if self._t is not None:
+            self._t()
+
+
+def test_drag_drop_enqueues_moves_not_sleeps(root, tmp_path):
+    # DRAG path is fully synchronous: no thread, no _post. Stubbing submit and
+    # calling _live_drop_pilots directly captures the job with no pumping.
+    win = _live_win(root, tmp_path)
+    win.mode = "live"
+    win._live_structure = {"wings": [{"id": 100, "name": "Alpha",
+                                      "squads": [{"id": 200, "name": "S1"}]}]}
+    win._live_members = [{"character_id": 42, "name": "Zed",
+                          "role": "squad_commander", "wing_id": 100,
+                          "squad_id": 999}]
+    submitted = []
+    win._ensure_executor()
+    win._executor.submit = lambda job: submitted.append(job)
+    win._live_drop_pilots([42], wing_id=100, squad_id=200)
+    assert len(submitted) == 1
+    job = submitted[0]
+    assert job.pilot_id == 42
+    assert job.wing_id == 100 and job.squad_id == 200
+    assert job.role == "squad_commander"     # current role preserved, not flattened
+    assert job.source == "drag"
+    win.destroy()
+
+
+def test_no_hard_sleep_or_cooldown_attr(root, tmp_path):
+    # Scoped to the refactored write path only. A whole-file grep would still
+    # hit the legacy rebalancer methods, which are deleted in Task 7 — this
+    # Task-5 commit must be green while they still exist. The whole-file audit
+    # lives in Task 7 / Task 8.
+    import inspect
+    from fleet_template_window import FleetTemplateWindow
+    src = inspect.getsource(FleetTemplateWindow._execute_moves)
+    src += inspect.getsource(FleetTemplateWindow.__init__)
+    assert "time.sleep(0.5)" not in src
+    assert "_last_write_monotonic" not in src

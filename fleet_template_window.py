@@ -21,6 +21,7 @@ from tkinter import ttk, messagebox, simpledialog
 
 import fleet_composer
 import fleet_esi
+from fleet_executor import MoveJob
 from fleet_template_store import (
     Wing, Squad, Slot, RuleCondition, RuleAction, AssignmentRule, validate_template,
 )
@@ -73,7 +74,8 @@ class FleetTemplateWindow:
         self._rebalance_on = False
         self._rebalance_after_id = None
         self._sync_after_id = None
-        self._last_write_monotonic = 0.0
+        self._executor = None
+        self._last_write_wall = 0.0
         self._live_members: list[dict] = []      # enriched dicts (Task D5)
         self._live_structure: dict = {"wings": []}
         self._last_preview = None                 # cached ComposeResult (Tasks D5/D10)
@@ -707,46 +709,51 @@ class FleetTemplateWindow:
         self._after_structure_change()
 
     def _drop_pilots_into_squad(self, char_ids, squad_path):
-        session = self._esi_session_provider()
-        if session is None:
-            self._status.config(text="No fleet-boss session.", fg=FG_RED)
-            return
+        self._ensure_executor()
         t = self.current_template()
         wing = t.wings[squad_path[0]]
         squad = wing.squads[squad_path[1]]
-        moves = [fleet_composer.Move(pilot_id=cid, pilot_name="",
+        # Build live id maps (drag targets concrete existing wings/squads).
+        wing_ids = {fleet_esi.clamp_name(w["name"]): w["id"]
+                    for w in self._live_structure.get("wings", [])}
+        squad_ids = {(fleet_esi.clamp_name(w["name"]),
+                      fleet_esi.clamp_name(s["name"])): s["id"]
+                     for w in self._live_structure.get("wings", [])
+                     for s in w.get("squads", [])}
+        moves = [fleet_composer.Move(pilot_id=cid,
+                                     pilot_name=self._name_of(cid),
                                      target_wing_name=wing.name,
                                      target_squad_name=squad.name,
-                                     target_role="squad_member")
+                                     target_role=self._current_role_of(cid))
                  for cid in char_ids]
-        self._execute_moves(session, moves)   # materialize_template=False (drag move)
+        self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
+
+    def _name_of(self, cid):
+        return next((m["name"] for m in self._live_members
+                     if m["character_id"] == cid), str(cid))
 
     def _live_drop_pilots(self, char_ids, *, wing_id, squad_id):
-        session = self._esi_session_provider()
-        if session is None:
-            self._status.config(text="No fleet-boss session.", fg=FG_RED)
-            return
-        wname = sname = None
-        for w in self._live_structure.get("wings", []):
-            if w["id"] != wing_id:
-                continue
-            wname = w["name"]
-            squads = w.get("squads", [])
-            if squad_id is not None:
-                sname = next((s["name"] for s in squads if s["id"] == squad_id), None)
-            if sname is None:
-                # Dropped on a wing (or its squad vanished): use the wing's first
-                # squad, or a new "Squad" (created by _execute_moves) if it has none.
-                sname = squads[0]["name"] if squads else "Squad"
-            break
-        if wname is None:
-            self._flash_reject(None)
-            return
-        moves = [fleet_composer.Move(pilot_id=cid, pilot_name="",
-                                     target_wing_name=wname, target_squad_name=sname,
-                                     target_role="squad_member")
+        self._ensure_executor()
+        # The drop target ids are already concrete; build a trivial id map so
+        # _enqueue_moves_sync resolves them by the live wing/squad names.
+        wname = next((w["name"] for w in self._live_structure.get("wings", [])
+                      if w["id"] == wing_id), None)
+        sname = next((s["name"]
+                      for w in self._live_structure.get("wings", [])
+                      if w["id"] == wing_id
+                      for s in w.get("squads", [])
+                      if s["id"] == squad_id), None)
+        wkey = fleet_esi.clamp_name(wname) if wname is not None else None
+        skey = fleet_esi.clamp_name(sname) if sname is not None else None
+        wing_ids = {wkey: wing_id} if wkey is not None else {}
+        squad_ids = {(wkey, skey): squad_id} if skey is not None else {}
+        moves = [fleet_composer.Move(pilot_id=cid,
+                                     pilot_name=self._name_of(cid),
+                                     target_wing_name=wname,
+                                     target_squad_name=sname,
+                                     target_role=self._current_role_of(cid))
                  for cid in char_ids]
-        self._execute_moves(session, moves)   # materialize_template=False
+        self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
 
     def _flash_reject(self, item):
         if not item:
@@ -1084,6 +1091,7 @@ class FleetTemplateWindow:
             self.set_mode("template")
             return
         self._fleet_id = info["fleet_id"]
+        self._ensure_executor()
         self._sync_live(initial=True)
         self._schedule_sync()
 
@@ -1194,13 +1202,79 @@ class FleetTemplateWindow:
                 return
         self._execute_moves(session, res.executable, materialize_template=True)
 
-    def _execute_moves(self, session, moves, *, materialize_template=False):
+    def _ensure_executor(self):
+        if self._executor is not None:
+            return
+        import time
+        from fleet_executor import FleetExecutor, FleetTokenLedger
+        t = self.current_template()
+        s = t.settings if t is not None else None
+        self._ledger = FleetTokenLedger()
+        # autostart defaults True → the single persistent worker thread is
+        # launched here (parks on a blocking queue.get until submit()/stop()).
+        self._executor = FleetExecutor(
+            session=self._esi_session_provider(),
+            on_move=self._executor_on_move,
+            post=self._post,
+            sleep=time.sleep,
+            ledger=self._ledger,
+            move_spacing_ms=(s.move_spacing_ms if s else 400),
+            burst_cap=(s.burst_cap if s else 25),
+            settle_s=(s.settle_s if s else 3),
+            on_log=self._log_line,
+            on_repoll=lambda: self._post(self._sync_tick_now),
+            remaining_needed=self._job_still_needed,
+            on_boss_lost=lambda: self._post(self._on_boss_lost))
+
+    def _executor_on_move(self, job):
+        session = self._esi_session_provider()
+        if session is None:
+            import fleet_esi
+            raise fleet_esi.FleetESIError("no_token")
+        # Point the executor at the freshest session each write.
+        self._executor.session = session
+        fleet_esi.move_member(session, self._fleet_id, job.pilot_id,
+                              wing_id=job.wing_id, squad_id=job.squad_id,
+                              role=job.role)
+        return 204
+
+    def _job_still_needed(self, job):
+        """After a burst re-poll, is this pilot still not where the job wants?"""
+        m = next((x for x in self._live_members
+                  if x["character_id"] == job.pilot_id), None)
+        if m is None:
+            return False
+        return not (m.get("wing_id") == job.wing_id
+                    and m.get("squad_id") == job.squad_id
+                    and m.get("role") == job.role)
+
+    def _sync_tick_now(self):
+        if self.mode == "live":
+            self._sync_live(initial=False)
+
+    def _on_boss_lost(self):
+        self._status.config(text="Boss lost — fleet ops aborted.", fg=FG_RED)
+
+    def _log_line(self, line):
+        # Task 7 replaces this with the deque buffer; for now just surface it.
+        self._status.config(text=line, fg=FG_DIM)
+
+    def _current_role_of(self, cid):
+        m = next((x for x in self._live_members if x["character_id"] == cid), None)
+        return (m.get("role") if m else None) or "squad_member"
+
+    def _execute_moves(self, session, moves, *, materialize_template=True):
+        """Apply path: create structure on a worker, then enqueue MoveJobs.
+
+        (Drag/drop does NOT use this — it enqueues synchronously, see
+        _enqueue_moves_sync — because its target ids are already known.)"""
+        self._ensure_executor()
         fleet_id = self._fleet_id
         t = self.current_template()
 
-        def worker():
-            done = skipped = 0
-            abort = None
+        # Structure creation (Apply only) still happens up front on a worker so
+        # the executor jobs carry concrete wing/squad ids.
+        def prep():
             try:
                 if materialize_template and t is not None:
                     wanted = [(w.name, [s.name for s in w.squads]) for w in t.wings]
@@ -1215,67 +1289,42 @@ class FleetTemplateWindow:
                                  for w in self._live_structure.get("wings", [])
                                  for s in w.get("squads", [])}
             except fleet_esi.FleetESIError as e:
-                self._post(_finish, 0, 0, e)
+                self._post(lambda: self._status.config(
+                    text=f"Apply error: {e.reason}", fg=FG_RED))
                 return
+            self._post(self._enqueue_moves_sync, moves, wing_ids, squad_ids, "apply")
 
-            for mv in moves:
-                try:
-                    wkey = (fleet_esi.clamp_name(mv.target_wing_name)
-                            if mv.target_wing_name is not None else None)
-                    wing_id = wing_ids.get(wkey) if wkey is not None else None
-                    if wkey is not None and wing_id is None:
-                        wing_id = fleet_esi.create_wing(session, fleet_id,
-                                                        mv.target_wing_name)
-                        wing_ids[wkey] = wing_id
-                    squad_id = None
-                    if mv.target_squad_name is not None and wing_id is not None:
-                        skey = (wkey, fleet_esi.clamp_name(mv.target_squad_name))
-                        squad_id = squad_ids.get(skey)
-                        if squad_id is None:
-                            squad_id = fleet_esi.create_squad(session, fleet_id,
-                                                              wing_id, mv.target_squad_name)
-                            squad_ids[skey] = squad_id
-                    fleet_esi.move_member(session, fleet_id, mv.pilot_id,
-                                          wing_id=wing_id, squad_id=squad_id,
-                                          role=mv.target_role)
-                    done += 1
-                    self._post(lambda d=done, n=len(moves):
-                               self._status.config(text=f"Moving pilots… {d}/{n}",
-                                                   fg=FG_ACCENT))
-                except fleet_esi.FleetESIError as e:
-                    if e.reason == "boss_lost":
-                        abort = e
-                        break
-                    skipped += 1
-                import time
-                time.sleep(0.5)
-            self._post(_finish, done, skipped, abort)
+        threading.Thread(target=prep, daemon=True).start()
 
-        def _finish(done, skipped, abort):
-            if done:
-                import time
-                self._last_write_monotonic = time.monotonic()
-            if abort is not None:
-                if getattr(abort, "reason", "") == "boss_lost":
-                    messagebox.showerror(
-                        "Apply aborted",
-                        "Lost fleet-boss role (403). No further moves were made.",
-                        parent=self.win)
-                    self._status.config(text="Apply aborted — boss lost.", fg=FG_RED)
-                else:
-                    messagebox.showerror(
-                        "Apply error",
-                        f"ESI error: {getattr(abort, 'reason', '?')}. "
-                        "Some changes may be partial.", parent=self.win)
-                    self._status.config(
-                        text=f"Apply error: {getattr(abort, 'reason', '?')}.",
-                        fg=FG_RED)
-            else:
-                self._status.config(text=f"Applied {done} moves. {skipped} skipped.",
-                                    fg=FG_GREEN)
-            self._sync_live(initial=False)
+    def _enqueue_moves_sync(self, moves, wing_ids, squad_ids, source):
+        """Build + submit MoveJobs on the Tk thread. Used directly by drag/drop
+        (ids known up front) and by the Apply worker's _post callback."""
+        import time
+        for mv in moves:
+            wkey = (fleet_esi.clamp_name(mv.target_wing_name)
+                    if mv.target_wing_name is not None else None)
+            wing_id = wing_ids.get(wkey) if wkey is not None else None
+            squad_id = None
+            if mv.target_squad_name is not None and wing_id is not None:
+                squad_id = squad_ids.get(
+                    (wkey, fleet_esi.clamp_name(mv.target_squad_name)))
+            self._executor.submit(MoveJob(
+                pilot_id=mv.pilot_id, pilot_name=mv.pilot_name,
+                wing_id=wing_id, squad_id=squad_id, role=mv.target_role,
+                source=source))
+        self._last_write_wall = time.time()   # go active-cadence after a write
+        self._schedule_reconcile_poll()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _schedule_reconcile_poll(self):
+        """Fire one sync ~(settle_s + 3)s after enqueue so the tree reflects the
+        drained queue (replaces the old 45s move cooldown)."""
+        t = self.current_template()
+        settle = t.settings.settle_s if t is not None else 3
+        delay_ms = (settle + 3) * 1000
+        try:
+            self.win.after(delay_ms, self._sync_tick_now)
+        except tk.TclError:
+            pass
 
     def _toggle_rebalance(self):
         if self.mode != "live":
