@@ -10923,6 +10923,10 @@ class FCToolGUI:
         )
         self._esi_status_label.pack(side=tk.LEFT, padx=10)
 
+        # ── Eve-O Preview Overlay ─────────────────────────────────────────
+        self._add_section(scroll_frame, "Eve-O Preview Overlay")
+        self._build_overlay_section(scroll_frame)
+
         # ── Autostart ────────────────────────────────────────────────────
         self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
         auto_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -11202,6 +11206,239 @@ class FCToolGUI:
 
     def _overlay_stop_poller(self):
         pass
+
+    _OVERLAY_COLOR_CYCLE = [
+        ("Accent", FG_ACCENT), ("Green", FG_GREEN), ("Yellow", FG_YELLOW),
+        ("Orange", FG_ORANGE), ("White", FG_WHITE),
+    ]
+    _OVERLAY_ANCHORS = ["Top-left", "Top-right", "Bottom-left", "Bottom-right"]
+    _OVERLAY_ANCHOR_TO_CFG = {
+        "Top-left": "top-left", "Top-right": "top-right",
+        "Bottom-left": "bottom-left", "Bottom-right": "bottom-right",
+    }
+    _OVERLAY_CFG_TO_ANCHOR = {v: k for k, v in _OVERLAY_ANCHOR_TO_CFG.items()}
+
+    def _build_overlay_section(self, parent):
+        cfg = self._overlay_cfg()
+
+        # Row 1: master toggle + live status label
+        row1 = tk.Frame(parent, bg=BG_DARK)
+        row1.pack(fill=tk.X, padx=20, pady=2)
+        self._overlay_enabled_var = tk.BooleanVar(value=cfg.get("enabled", False))
+        cb = tk.Checkbutton(
+            row1, text="Activity overlay on Eve-O Preview thumbnails",
+            variable=self._overlay_enabled_var, command=self._overlay_toggle_changed,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK, activeforeground=FG_TEXT,
+            anchor=tk.W)
+        cb.pack(side=tk.LEFT)
+        self._overlay_status_label = tk.Label(
+            row1, text=self._overlay_status_text(0, 0), font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_DARK, anchor=tk.W)
+        self._overlay_status_label.pack(side=tk.LEFT, padx=12)
+
+        # Row 2: size / color / anchor, grid-aligned, applied live
+        row2 = tk.Frame(parent, bg=BG_DARK)
+        row2.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row2, text="Size", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        self._overlay_size_var = tk.IntVar(value=int(cfg.get("font_size", 11)))
+        size_spin = tk.Spinbox(
+            row2, from_=8, to=24, width=4, textvariable=self._overlay_size_var,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, command=self._overlay_apply_style)
+        # save-on-type + arrow (house rule)
+        size_spin.bind("<KeyRelease>", lambda e: self._overlay_apply_style())
+        size_spin.grid(row=0, column=1, padx=(0, 16))
+
+        tk.Label(row2, text="Color", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+        self._overlay_color_val = cfg.get("color", FG_ACCENT)
+        self._overlay_color_btn = tk.Button(
+            row2, text="●", font=("Consolas", 12), width=3,
+            fg=self._overlay_color_val, bg=BG_ENTRY, activebackground=BG_ENTRY,
+            relief=tk.RIDGE, command=self._overlay_cycle_color)
+        self._overlay_color_btn.grid(row=0, column=3, padx=(0, 16))
+
+        tk.Label(row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+        self._overlay_anchor_var = tk.StringVar(
+            value=self._OVERLAY_CFG_TO_ANCHOR.get(cfg.get("anchor", "top-left"),
+                                                  "Top-left"))
+        anchor_combo = ttk.Combobox(
+            row2, textvariable=self._overlay_anchor_var, values=self._OVERLAY_ANCHORS,
+            state="readonly", width=12, font=("Consolas", 10))
+        anchor_combo.grid(row=0, column=5)
+        anchor_combo.bind("<<ComboboxSelected>>",
+                          lambda e: self._overlay_apply_style())
+
+        # Row 3: Label rules… button
+        row3 = tk.Frame(parent, bg=BG_DARK)
+        row3.pack(fill=tk.X, padx=20, pady=2)
+        ttk.Button(row3, text="Label rules…", style="Dark.TButton",
+                   command=self._open_overlay_rules_dialog).pack(side=tk.LEFT)
+
+        # Row 4: fine print
+        row4 = tk.Frame(parent, bg=BG_DARK)
+        row4.pack(fill=tk.X, padx=20, pady=(2, 6))
+        tk.Label(
+            row4,
+            text=("Labels are drawn from your own ESI data and your text only. "
+                  "Placeholders: {ship} {group} {system}."),
+            font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
+            wraplength=760).pack(side=tk.LEFT)
+
+    def _overlay_toggle_changed(self):
+        want = self._overlay_enabled_var.get()
+        if want:
+            self._overlay_enable()
+        else:
+            self._overlay_disable()
+        self._save_config()
+
+    def _overlay_cycle_color(self):
+        colors = [c for _, c in self._OVERLAY_COLOR_CYCLE]
+        try:
+            idx = colors.index(self._overlay_color_val)
+        except ValueError:
+            idx = -1
+        self._overlay_color_val = colors[(idx + 1) % len(colors)]
+        self._overlay_color_btn.config(fg=self._overlay_color_val)
+        self._overlay_apply_style()
+
+    def _overlay_apply_style(self):
+        cfg = self._overlay_cfg()
+        try:
+            cfg["font_size"] = int(self._overlay_size_var.get())
+        except (tk.TclError, ValueError):
+            pass
+        cfg["color"] = self._overlay_color_val
+        cfg["anchor"] = self._OVERLAY_ANCHOR_TO_CFG.get(
+            self._overlay_anchor_var.get(), "top-left")
+        if self._overlay is not None:
+            try:
+                self._overlay.set_font_size(cfg["font_size"])
+                self._overlay.set_color(cfg["color"])
+                self._overlay.set_anchor(cfg["anchor"])
+            except Exception:
+                pass
+        self._save_config()
+
+    def _open_overlay_rules_dialog(self):
+        cfg = self._overlay_cfg()
+        win = tk.Toplevel(self.root)
+        win.title("Overlay label rules")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Rules (first match wins):", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        rules_frame = tk.Frame(win, bg=BG_PANEL)
+        rules_frame.pack(fill=tk.X, padx=10)
+
+        when_values = ["ship_group", "ship_type", "system", "docked",
+                       "offline", "capital", "subcap"]
+        rule_rows = []   # list of dicts: {when, value, label} Tk vars
+
+        def _add_rule_row(when="ship_group", value="", label=""):
+            r = len(rule_rows)
+            wv = tk.StringVar(value=when)
+            vv = tk.StringVar(value=value)
+            lv = tk.StringVar(value=label)
+            ttk.Combobox(rules_frame, textvariable=wv, values=when_values,
+                         state="readonly", width=11,
+                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
+            # value: autocomplete for systems/ship-groups (free text otherwise)
+            ve = AutocompleteEntry(
+                rules_frame, self._system_names, font=("Consolas", 9),
+                bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+            ve.grid(row=r, column=1, padx=2)
+            if value:
+                ve.insert(0, value)
+            le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+            le.grid(row=r, column=2, padx=2)
+            rule_rows.append({"when": wv, "value_entry": ve, "label": lv})
+
+        for r in cfg.get("rules", []) or []:
+            _add_rule_row(r.get("when", "ship_group"), r.get("value", ""),
+                          r.get("label", ""))
+        if not rule_rows:
+            _add_rule_row()
+
+        ttk.Button(win, text="+ Add rule", style="Dark.TButton",
+                   command=lambda: _add_rule_row()).pack(anchor="w", padx=10, pady=(2, 8))
+
+        tk.Label(win, text="Overrides (beat rules; empty label hides that char):",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(4, 2))
+        ov_frame = tk.Frame(win, bg=BG_PANEL)
+        ov_frame.pack(fill=tk.X, padx=10)
+        char_names = [a.character_name for a in self.esi_accounts
+                      if getattr(a, "character_name", None)]
+        override_rows = []
+
+        def _add_override_row(name="", label=""):
+            r = len(override_rows)
+            nv = tk.StringVar(value=name)
+            lv = tk.StringVar(value=label)
+            ttk.Combobox(ov_frame, textvariable=nv, values=char_names, width=20,
+                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
+            tk.Entry(ov_frame, textvariable=lv, font=("Consolas", 9), bg=BG_ENTRY,
+                     fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
+                         row=r, column=1, padx=2)
+            override_rows.append({"name": nv, "label": lv})
+
+        for name, label in (cfg.get("overrides", {}) or {}).items():
+            _add_override_row(name, label)
+        if not override_rows:
+            _add_override_row()
+
+        ttk.Button(win, text="+ Add override", style="Dark.TButton",
+                   command=lambda: _add_override_row()).pack(anchor="w", padx=10, pady=(2, 8))
+
+        def _ok():
+            rules_out = []
+            for row in rule_rows:
+                when = row["when"].get().strip()
+                value = row["value_entry"].get().strip()
+                label = row["label"].get().strip()
+                if not when:
+                    continue
+                # docked/offline/capital/subcap need no value; the rest need one
+                if when in ("ship_group", "ship_type", "system") and not value:
+                    continue
+                if not label and when not in ("ship_group",):
+                    # allow empty label only where a placeholder-only rule is
+                    # meaningless; simplest: require a label
+                    if not label:
+                        continue
+                rules_out.append({"when": when, "value": value, "label": label})
+            overrides_out = {}
+            for row in override_rows:
+                name = row["name"].get().strip()
+                if not name:
+                    continue
+                overrides_out[name] = row["label"].get()   # '' allowed = hide
+            cfg["rules"] = rules_out
+            cfg["overrides"] = overrides_out
+            self._save_config()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=_ok).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=2)
+        self.root.wait_window(win)
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",

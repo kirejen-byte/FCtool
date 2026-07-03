@@ -133,6 +133,88 @@ def test_tick_sets_labels_and_retops_when_enabled():
         root.destroy()
 
 
+def _ui_host(overlay_cfg=None):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display available")
+    root.withdraw()
+    host = types.SimpleNamespace()
+    host.root = root
+    host.config = {"overlay": overlay_cfg} if overlay_cfg is not None else {}
+    host.esi_accounts = []
+    host._overlay = FakeOverlay()
+    host._overlay_states = {}
+    host._overlay_after_id = None
+    host._overlay_poller = None
+    host._overlay_status_label = None
+    host._overlay_thumbs_fn = lambda: []
+    host._system_names = ["Jita", "Amarr"]
+    saved = {"n": 0}
+    host._save_config = lambda: saved.__setitem__("n", saved["n"] + 1)
+    host._saved = saved
+    host._show_tooltip = lambda e, t: None
+    host._hide_tooltip = lambda: None
+    for name in ("_overlay_cfg", "_OVERLAY_DEFAULTS", "_build_overlay_section",
+                 "_overlay_toggle_changed", "_overlay_apply_style",
+                 "_overlay_status_text", "_overlay_compose_items",
+                 "_overlay_rules", "_overlay_state_for", "_overlay_enable",
+                 "_overlay_disable", "_overlay_teardown", "_overlay_ensure_window",
+                 "_overlay_start_poller", "_overlay_stop_poller",
+                 "_overlay_disable_session", "_overlay_tick",
+                 "_overlay_cycle_color", "_open_overlay_rules_dialog",
+                 "_OVERLAY_COLOR_CYCLE", "_OVERLAY_ANCHORS",
+                 "_OVERLAY_ANCHOR_TO_CFG", "_OVERLAY_CFG_TO_ANCHOR"):
+        attr = getattr(fc_gui.FCToolGUI, name)
+        setattr(host, name, types.MethodType(attr, host) if callable(attr) else attr)
+    return root, host
+
+
+def test_build_section_creates_toggle_and_status():
+    root, host = _ui_host(overlay_cfg={"enabled": False})
+    try:
+        frame = tk.Frame(root)
+        host._build_overlay_section(frame)
+        assert host._overlay_enabled_var.get() is False
+        assert host._overlay_status_label is not None
+    finally:
+        root.destroy()
+
+
+def test_toggle_persists_and_enables():
+    root, host = _ui_host(overlay_cfg={"enabled": False})
+    try:
+        frame = tk.Frame(root)
+        host._build_overlay_section(frame)
+        host._overlay_enabled_var.set(True)
+        host._overlay_toggle_changed()
+        assert host.config["overlay"]["enabled"] is True
+        assert host._saved["n"] >= 1
+        # seed rules got created on first enable
+        assert len(host.config["overlay"]["rules"]) >= 1
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
+def test_style_change_persists_live():
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        frame = tk.Frame(root)
+        host._build_overlay_section(frame)
+        host._overlay_size_var.set(16)
+        host._overlay_apply_style()
+        assert host.config["overlay"]["font_size"] == 16
+        assert host._saved["n"] >= 1
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
 def test_teardown_safe_when_never_enabled():
     # App-close teardown must be safe/idempotent even if the overlay was never
     # enabled: no after-loop, no poller, overlay may be a bare fake. Mirrors the
