@@ -1133,3 +1133,44 @@ def test_live_pilot_menu_has_move_to_squad_cascade(root, tmp_path):
 def test_manual_assign_is_gone():
     from fleet_template_window import FleetTemplateWindow
     assert not hasattr(FleetTemplateWindow, "_manual_assign")
+
+
+def test_executor_on_move_uses_module_fleet_esi(monkeypatch):
+    """Regression: _executor_on_move must resolve `fleet_esi` from the module-level
+    import (line 25), NOT a function-local `import fleet_esi` that shadowed it and
+    made the normal (session-present) path raise UnboundLocalError at move_member —
+    which killed the persistent executor worker so no move ever ran.
+
+    Bind the REAL unbound method onto a bare host so no Tk window is needed.
+    """
+    import types
+    import fleet_template_window
+    from fleet_template_window import FleetTemplateWindow
+
+    calls = []
+
+    def _fake_move_member(session, fleet_id, pilot_id, *, wing_id, squad_id, role):
+        calls.append((session, fleet_id, pilot_id, wing_id, squad_id, role))
+        return None
+
+    monkeypatch.setattr(fleet_template_window.fleet_esi, "move_member",
+                        _fake_move_member)
+
+    fake_session = object()   # non-None → normal write path
+    host = types.SimpleNamespace(
+        _esi_session_provider=lambda: fake_session,
+        _executor=types.SimpleNamespace(session=None),
+        _fleet_id=1,
+    )
+    job = types.SimpleNamespace(pilot_id=1, wing_id=2, squad_id=3,
+                                role="squad_member")
+
+    # Call the real method with our host as `self`. On the UNFIXED code this
+    # raises UnboundLocalError: cannot access local variable 'fleet_esi'.
+    result = FleetTemplateWindow._executor_on_move(host, job)
+
+    assert result == 204
+    assert len(calls) == 1
+    assert calls[0] == (fake_session, 1, 1, 2, 3, "squad_member")
+    # freshest session was pushed onto the executor before the write
+    assert host._executor.session is fake_session

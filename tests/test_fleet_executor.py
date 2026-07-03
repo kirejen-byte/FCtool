@@ -244,3 +244,58 @@ def test_boss_lost_aborts_and_notifies():
     ex.submit(_job(2))
     ex.drain()
     assert notified == [1]
+
+
+# append — hardening: an unexpected on_move error must not kill the worker/queue
+def test_worker_survives_unexpected_on_move_error():
+    """A non-FleetESIError raised by on_move for one job is downgraded to a
+    non-fatal per-job failure: the run continues, the next job executes normally,
+    an 'unexpected error' line is logged, and nothing escapes drain().
+
+    Regression for the shadowing-import bug: an UnboundLocalError in the real
+    _executor_on_move escaped _perform → killed the persistent worker → every
+    later queued job was stranded forever."""
+    attempted = []
+
+    def on_move(job):
+        attempted.append(job.pilot_id)
+        if job.pilot_id == 1:
+            raise RuntimeError("boom in the ESI writer")
+        return 204
+
+    ex = _make_executor(on_move)
+    ex.submit(_job(1))
+    ex.submit(_job(2))
+    # Must NOT raise — the unexpected error is contained inside _perform.
+    ex.drain()
+
+    assert attempted == [1, 2]                       # both jobs were attempted
+    assert any("unexpected error" in l for l in ex._logs)
+    assert any("RuntimeError" in l for l in ex._logs)
+    # The first job's failure was non-fatal: no abort, counter untouched, and the
+    # second job spent its normal 2-token 204 cost (the failed job spent nothing).
+    assert ex._aborted is False
+    assert ex._consecutive_4xx == 0
+    assert ex.ledger.remaining() == 1800 - 2         # only job 2's 204 charged
+
+
+def test_submit_restarts_dead_worker(monkeypatch):
+    """Self-healing submit(): if the worker was started but its thread has died,
+    submit() restarts it before enqueueing (start() no-ops when alive)."""
+    ex = _make_executor(lambda job: 204)   # drain-only, _worker is None
+
+    started = []
+    monkeypatch.setattr(ex, "start", lambda: started.append(1))
+
+    # Simulate a previously-started-but-now-dead worker (thread-free).
+    ex._worker = types.SimpleNamespace(is_alive=lambda: False)
+    ex.submit(_job(1))
+    assert started == [1]                   # dead worker → start() called
+    assert ex._q.qsize() == 1               # job still enqueued
+
+    # A live worker must NOT trigger a restart.
+    started.clear()
+    ex._worker = types.SimpleNamespace(is_alive=lambda: True)
+    ex.submit(_job(2))
+    assert started == []
+    assert ex._q.qsize() == 2

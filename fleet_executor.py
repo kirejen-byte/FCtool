@@ -151,6 +151,14 @@ class FleetExecutor:
         self._q.put(self._STOP)
 
     def submit(self, job: MoveJob) -> None:
+        # Self-healing: if the persistent worker was ever started but its thread
+        # has since died (should not happen now that the loop is guarded, but a
+        # last line of defence against stranded queues), restart it before
+        # enqueueing. start() no-ops when the worker is already alive, so this is
+        # a cheap check on the normal path and a no-op for drain()-only executors
+        # that never started a worker (self._worker is None).
+        if self._worker is not None and not self._worker.is_alive():
+            self.start()
         self._q.put(job)
 
     def drain(self) -> None:
@@ -168,7 +176,14 @@ class FleetExecutor:
             if job is self._STOP:
                 self._on_idle()
                 return
-            self._process_one(job)
+            try:
+                self._process_one(job)
+            except Exception as e:
+                # Belt-and-braces: an unexpected error must never abort the drain
+                # loop. _perform already downgrades on_move errors to non-fatal
+                # results; this catches anything else in the pipeline.
+                self._post(self._on_log,
+                           f"executor error on {job.pilot_name}: {e!r}")
 
     # ── worker ───────────────────────────────────────────────────────────────
     def _run(self):
@@ -177,7 +192,14 @@ class FleetExecutor:
             job = self._q.get()          # blocks until a job (or stop() sentinel)
             if job is self._STOP:
                 return
-            self._process_one(job)
+            try:
+                self._process_one(job)
+            except Exception as e:
+                # Belt-and-braces: an unexpected error must never kill the
+                # persistent worker thread (which would strand every later job in
+                # the queue forever). Log it and keep serving the next job.
+                self._post(self._on_log,
+                           f"executor error on {job.pilot_name}: {e!r}")
             if self._q.empty():
                 self._on_idle()
 
@@ -266,6 +288,12 @@ class FleetExecutor:
                 return (job, 403, "boss lost (403) — queue aborted")
             self._consecutive_4xx = 0
             return (job, e.status or 0, e.reason)
+        except Exception as e:
+            # Any unexpected error in on_move (e.g. a bug in the ESI writer) is a
+            # NON-FATAL per-job failure: no ledger spend, do not touch the
+            # consecutive-4xx counter, do not abort the queue. This keeps one bad
+            # job from taking down the whole run (and, in the worker, the thread).
+            return (job, 0, f"unexpected error: {e!r}")
         # Non-exception statuses.
         if status == 429:
             retry = self._retry_after()

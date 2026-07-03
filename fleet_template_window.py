@@ -1873,7 +1873,6 @@ class FleetTemplateWindow:
     def _executor_on_move(self, job):
         session = self._esi_session_provider()
         if session is None:
-            import fleet_esi
             raise fleet_esi.FleetESIError("no_token")
         # Point the executor at the freshest session each write.
         self._executor.session = session
