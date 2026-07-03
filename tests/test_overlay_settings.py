@@ -70,7 +70,7 @@ def test_overlay_cfg_defaults():
         cfg = host._overlay_cfg()
         assert cfg["enabled"] is False
         assert cfg["font_size"] == 11
-        assert cfg["color"] == "#00d4ff"
+        assert cfg["color"] == "#ffffff"    # Fix 3: readable white default
         assert cfg["anchor"] == "top-left"
         assert cfg["dpi_awareness"] == "auto"
         assert cfg["rules"] == [] or isinstance(cfg["rules"], list)

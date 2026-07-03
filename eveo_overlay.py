@@ -25,8 +25,23 @@ import tkinter as tk
 # Toplevel bg is set to this and registered as -transparentcolor, so every
 # pixel except the label text is fully click-through/invisible.
 TRANSPARENT_KEY = "#010203"
-SHADOW_COLOR = "#000000"
-SHADOW_OFFSET = 1
+
+# Default label color: high-legibility white (was the low-contrast teal
+# #00d4ff). Existing users keep their saved overlay.color; only the default
+# changes. The fill is drawn on top of a black 1px outline (see OUTLINE_OFFSETS)
+# so it reads on both bright and dark thumbnails.
+DEFAULT_COLOR = "#ffffff"
+OUTLINE_COLOR = "#000000"
+OUTLINE_OFFSET = 1
+# The 8 surrounding 1px positions (N, S, E, W + 4 diagonals). Drawing the text
+# once in black at each offset forms a clean, crisp outline halo around the
+# fill — replacing the old single-direction drop shadow, which looked like a
+# smear rather than an outline.
+OUTLINE_OFFSETS = [
+    (-OUTLINE_OFFSET, -OUTLINE_OFFSET), (0, -OUTLINE_OFFSET), (OUTLINE_OFFSET, -OUTLINE_OFFSET),
+    (-OUTLINE_OFFSET, 0),                                     (OUTLINE_OFFSET, 0),
+    (-OUTLINE_OFFSET, OUTLINE_OFFSET),  (0, OUTLINE_OFFSET),  (OUTLINE_OFFSET, OUTLINE_OFFSET),
+]
 
 
 class _RealOverlayWin32:
@@ -102,7 +117,7 @@ class OverlayWindow:
     def __init__(self, root, palette: dict, win32=None):
         self._root = root
         self._font_size = int(palette.get("font_size", 11))
-        self._color = palette.get("color", "#00d4ff")
+        self._color = palette.get("color", DEFAULT_COLOR)
         self._anchor = palette.get("anchor", "top-left")
         self._transparent_key = palette.get("transparent_key", TRANSPARENT_KEY)
         self._win32 = win32
@@ -239,6 +254,19 @@ class OverlayWindow:
             return r - pad, b - pad, "se"
         return l + pad, t + pad, "nw"
 
+    def _draw_label(self, x, y, text, anchor, font):
+        """Draw one label as a black 1px outline (8 surrounding offsets) with the
+        fill color on top. Returns the number of canvas items created
+        (len(OUTLINE_OFFSETS) outline items + 1 fill) so callers/tests can
+        reason about the layered draw."""
+        for dx, dy in OUTLINE_OFFSETS:
+            self._canvas.create_text(
+                x + dx, y + dy, text=text, anchor=anchor,
+                fill=OUTLINE_COLOR, font=font)
+        self._canvas.create_text(
+            x, y, text=text, anchor=anchor, fill=self._color, font=font)
+        return len(OUTLINE_OFFSETS) + 1
+
     def set_labels(self, items):
         """Redraw all labels. `items` = list of (rect, text). Empty text is
         skipped. When nothing is drawn, the window is withdrawn entirely."""
@@ -249,12 +277,9 @@ class OverlayWindow:
             if not text:
                 continue
             x, y, anchor = self._anchor_xy(rect)
-            # dark offset shadow, then foreground (no boxy background)
-            self._canvas.create_text(
-                x + SHADOW_OFFSET, y + SHADOW_OFFSET, text=text, anchor=anchor,
-                fill=SHADOW_COLOR, font=font)
-            self._canvas.create_text(
-                x, y, text=text, anchor=anchor, fill=self._color, font=font)
+            # crisp black outline (halo), then the fill color on top — no boxy
+            # background; reads on both bright and dark thumbnails
+            self._draw_label(x, y, text, anchor, font)
             drawn += 1
         if drawn:
             self._place_fullspan()

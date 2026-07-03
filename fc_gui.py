@@ -11166,7 +11166,11 @@ class FCToolGUI:
         return due
 
     _OVERLAY_DEFAULTS = {
-        "enabled": False, "font_size": 11, "color": "#00d4ff",
+        # Default label color is high-legibility white (#ffffff), not the old
+        # low-contrast teal — existing users keep their saved overlay.color;
+        # only this default changes. Text is drawn as a crisp black outline +
+        # white fill (see eveo_overlay), readable on any thumbnail.
+        "enabled": False, "font_size": 11, "color": "#ffffff",
         "anchor": "top-left", "dpi_awareness": "auto", "rules": [],
         "overrides": {},
     }
@@ -11323,7 +11327,7 @@ class FCToolGUI:
             cfg = self._overlay_cfg()
             self._overlay = OverlayWindow(self.root, {
                 "font_size": cfg.get("font_size", 11),
-                "color": cfg.get("color", "#00d4ff"),
+                "color": cfg.get("color", "#ffffff"),
                 "anchor": cfg.get("anchor", "top-left"),
             })
         return self._overlay
@@ -11535,7 +11539,7 @@ class FCToolGUI:
 
         tk.Label(row2, text="Color", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
-        self._overlay_color_val = cfg.get("color", FG_ACCENT)
+        self._overlay_color_val = cfg.get("color", "#ffffff")
         self._overlay_color_btn = tk.Button(
             row2, text="●", font=("Consolas", 12), width=3,
             fg=self._overlay_color_val, bg=BG_ENTRY, activebackground=BG_ENTRY,

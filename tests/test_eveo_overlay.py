@@ -11,7 +11,7 @@ from eveo_overlay import OverlayWindow
 
 
 PALETTE = {
-    "font_size": 11, "color": "#00d4ff", "anchor": "top-left",
+    "font_size": 11, "color": "#ffffff", "anchor": "top-left",
     "transparent_key": "#010203",
 }
 
@@ -73,10 +73,60 @@ def _canvas_texts(ov):
 def test_set_labels_draws_text_items():
     root, ov, _ = _make()
     try:
+        from eveo_overlay import OUTLINE_OFFSETS
         ov.set_labels([((10, 10, 210, 130), "Cyno")])
         texts = _canvas_texts(ov)
-        # shadow + foreground => the label text appears twice
-        assert texts.count("Cyno") == 2
+        # crisp outline (N black offsets) + 1 fill => text appears N+1 times
+        assert texts.count("Cyno") == len(OUTLINE_OFFSETS) + 1
+    finally:
+        root.destroy()
+
+
+def test_label_outline_layers_black_around_colored_fill():
+    # Fix 3: N black outline items (the halo) sit UNDER a single fill item drawn
+    # in the configured color. The fill is created last (topmost) and is the
+    # only non-black item.
+    root, ov, _ = _make()
+    try:
+        from eveo_overlay import OUTLINE_OFFSETS, OUTLINE_COLOR
+        ov.set_color("#ffffff")
+        ov.set_labels([((0, 0, 100, 60), "Cyno")])
+        c = ov._canvas
+        text_items = [i for i in c.find_all() if c.type(i) == "text"]
+        assert len(text_items) == len(OUTLINE_OFFSETS) + 1
+        fills = [c.itemcget(i, "fill") for i in text_items]
+        # exactly one item is the colored fill; the rest are the black outline
+        assert fills.count("#ffffff") == 1
+        assert fills.count(OUTLINE_COLOR) == len(OUTLINE_OFFSETS)
+        # the fill is the LAST (topmost) item — drawn on top of the outline
+        assert c.itemcget(text_items[-1], "fill") == "#ffffff"
+    finally:
+        root.destroy()
+
+
+def test_outline_offsets_are_eight_surrounding_1px():
+    from eveo_overlay import OUTLINE_OFFSETS
+    # 8 distinct surrounding positions, none at the center, all within 1px.
+    assert len(OUTLINE_OFFSETS) == 8
+    assert (0, 0) not in OUTLINE_OFFSETS
+    assert len(set(OUTLINE_OFFSETS)) == 8
+    for dx, dy in OUTLINE_OFFSETS:
+        assert abs(dx) <= 1 and abs(dy) <= 1
+
+
+def test_default_color_is_readable_white():
+    # Fix 3: the OverlayWindow default color (no palette color) is white, not
+    # the old low-contrast teal.
+    from eveo_overlay import OverlayWindow, DEFAULT_COLOR
+    assert DEFAULT_COLOR == "#ffffff"
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display available")
+    root.withdraw()
+    try:
+        ov = OverlayWindow(root, {"transparent_key": "#010203"})  # no "color"
+        assert ov._color == "#ffffff"
     finally:
         root.destroy()
 
