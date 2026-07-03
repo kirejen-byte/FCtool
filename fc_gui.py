@@ -11819,15 +11819,24 @@ class FCToolGUI:
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
                     # B3: flash the border red while the pilot's system carries a
-                    # fresh hostile intel note; clear it (None) otherwise so the
-                    # flash expires on its own once the note ages out or clears.
+                    # fresh hostile intel note; otherwise fall through to the
+                    # next border source so the flash expires on its own once the
+                    # note ages out or clears. Border precedence is deterministic
+                    # (plan §B6): damage flash > intel flash > active highlight >
+                    # none. Damage flash (B6) will wrap this call; the
+                    # active-highlight border (P12/C4) is not wired yet, so the
+                    # non-flash branch resolves to None today — but it MUST stay a
+                    # single resolved value, never an unconditional None, so that
+                    # whoever wires the highlight can slot it in here without the
+                    # intel branch clobbering a live highlight every tick.
                     state = (None if client.is_login
                              else self._preview_state_for(client.key))
+                    highlight = None                      # C4/P12: active-client highlight (not yet wired)
                     if self._preview_should_flash(self._preview_intel, state, cfg,
                                                   time.monotonic()):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
                     else:
-                        tile.set_border(None)
+                        tile.set_border(highlight)
                 except OSError:
                     # Per-tile DWM failure (client died mid-tick, or DWM restarted
                     # and invalidated every handle). Retire THIS tile only — the

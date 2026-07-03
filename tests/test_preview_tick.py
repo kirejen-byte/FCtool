@@ -768,6 +768,7 @@ def test_video_labels_no_matches_pushes_empty_list(monkeypatch):
     host._preview_compose_video_labels({1: _cw(1, "Kirejen")})
     # option is on → overlay created, but pushed list is empty (no matches)
     assert host._overlay is not None
+    assert host._overlay.label_pushes[-1] == []
 
 
 # ── (B3) intel flash: own-log system index + tile-border alerts ──────────────
