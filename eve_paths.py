@@ -23,6 +23,30 @@ import sys
 
 # Relative path of the EVE chat-logs folder beneath a "Documents" root.
 _EVE_LOGS_SUBPATH = ("EVE", "logs", "Chatlogs")
+# Sibling folder holding auto-written combat Gamelogs (UTF-8).
+_EVE_GAMELOGS_SUBPATH = ("EVE", "logs", "Gamelogs")
+
+
+def gamelogs_dir_for(chatlogs_path):
+    """Return the Gamelogs dir that sits beside a resolved Chatlogs path.
+
+    EVE writes combat Gamelogs to ``<Documents>/EVE/logs/Gamelogs`` — the
+    sibling of ``Chatlogs``. The app already has the resolved chat-logs folder in
+    ``config["eve_logs_path"]``, so the cheapest resolution is to swap the
+    trailing ``Chatlogs`` leaf for ``Gamelogs`` rather than re-run the whole
+    candidate-probing ladder.
+
+    Trailing-slash safe. Any input whose final path component is not ``Chatlogs``
+    (case-insensitively) is returned unchanged, as are falsy inputs.
+    """
+    if not chatlogs_path:
+        return chatlogs_path
+    # Drop a trailing separator so os.path.basename sees the real leaf.
+    normalized = chatlogs_path.rstrip("/\\")
+    parent, leaf = os.path.split(normalized)
+    if leaf.lower() != "Chatlogs".lower():
+        return chatlogs_path
+    return os.path.join(parent, "Gamelogs")
 
 
 def _looks_like_placeholder(value: str) -> bool:
