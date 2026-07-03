@@ -88,6 +88,9 @@ import pyfa_import
 import motd_builder
 import motd_markup
 from markup_editor import MarkupEditor
+from eveo_tracker import find_thumbs, preview_running
+from eveo_overlay import OverlayWindow
+import overlay_rules
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -97,6 +100,41 @@ log = get_logger(__name__)
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
+
+
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo-handle value -4.
+_DPI_PER_MONITOR_AWARE_V2 = -4
+
+
+def _read_overlay_dpi_pref() -> str:
+    """Best-effort read of config['overlay']['dpi_awareness'] BEFORE the Tk root
+    (and self.config) exist. Returns 'auto' when the file/key is absent."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        return (cfg.get("overlay", {}) or {}).get("dpi_awareness", "auto")
+    except Exception:
+        return "auto"
+
+
+def _apply_dpi_awareness(pref: str, user32=None) -> None:
+    """Attempt Per-Monitor-V2 DPI awareness before Tk root creation. Gated by
+    pref != 'off'; wrapped so older Windows / any failure is non-fatal. The
+    user32 arg is injectable for tests; in production it's ctypes.windll.user32."""
+    if pref == "off":
+        return
+    try:
+        if user32 is None:
+            if sys.platform != "win32":
+                return
+            import ctypes
+            user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext(_DPI_PER_MONITOR_AWARE_V2)
+    except Exception:
+        # Older Windows lacks this API, or the process is already aware — the
+        # overlay still works on uniform-DPI setups. One quiet line, no crash.
+        log.debug("[overlay] Per-Monitor-V2 DPI awareness not applied")
+
 
 # ── Color Scheme ──────────────────────────────────────────────────────────────
 BG_DARK = "#1a1a2e"
@@ -492,6 +530,7 @@ def _filter_cap_entries(entries, only_region: str) -> list:
 
 class FCToolGUI:
     def __init__(self):
+        _apply_dpi_awareness(_read_overlay_dpi_pref())
         self.root = tk.Tk()
         self.root.title("FCTool - Fleet Commander Assistant")
         self.root.geometry("1200x900")
@@ -620,6 +659,24 @@ class FCToolGUI:
                     break
         if not self.esi_auth and self.esi_accounts:
             self.esi_auth = self.esi_accounts[0]
+
+        # ── Eve-O Preview overlay state ─────────────────────────────────────
+        self._overlay = None
+        self._overlay_states: dict = {}        # name_lower -> CharState (poller)
+        self._overlay_state_ts: dict = {}      # name_lower -> monotonic fetch ts
+        self._overlay_after_id = None
+        self._overlay_poller = None            # Phase 2 daemon thread
+        self._overlay_poller_stop = None       # threading.Event while running
+        self._overlay_status_label = None
+        self._overlay_thumbs_fn = find_thumbs  # injectable for tests
+        # Seed rules created once, the first time the feature is enabled.
+        if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
+            self._overlay_cfg()["rules"] = [
+                {"when": r.when, "value": r.value, "label": r.label}
+                for r in overlay_rules.seed_rules()
+            ]
+        # Auto-start the controller if the user left it enabled last session.
+        self.root.after(1200, self._overlay_boot_if_enabled)
 
         # Fitting / doctrine services (Fittings tab). Built AFTER esi_auth so the
         # type catalog's id->name fallback can reach the public ESI endpoint via
@@ -10959,6 +11016,10 @@ class FCToolGUI:
         )
         self._esi_status_label.pack(side=tk.LEFT, padx=10)
 
+        # ── Eve-O Preview Overlay ─────────────────────────────────────────
+        self._add_section(scroll_frame, "Eve-O Preview Overlay")
+        self._build_overlay_section(scroll_frame)
+
         # ── Autostart ────────────────────────────────────────────────────
         self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
         auto_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -11071,6 +11132,537 @@ class FCToolGUI:
                 return "break"
             w = getattr(w, "master", None)
         return None
+
+    # Eve-O overlay controller cadences (ms)
+    _OVERLAY_TICK_MS = 250          # when Eve-O detected + enabled
+    _OVERLAY_PROBE_MS = 2000        # when enabled but Eve-O not detected
+    _OVERLAY_STALE_SECS = 300       # drop a CharState label after 5 min stale
+
+    _OVERLAY_LOCSHIP_EVERY = 10.0    # seconds between location+ship polls / char
+    _OVERLAY_ONLINE_EVERY = 60.0     # seconds between online polls / char
+
+    @staticmethod
+    def _overlay_poll_plan(names, last, now, online_ok):
+        """Return the list of (name_lower, kind) fetches due, where kind is
+        'locship' or 'online'. Pure: given names to poll, a {(name,kind): ts}
+        last-poll map, the current time, and an {name: has_online_scope} map.
+
+        location+ship every _OVERLAY_LOCSHIP_EVERY s; online every
+        _OVERLAY_ONLINE_EVERY s and only when online_ok[name] is truthy."""
+        loc_every = FCToolGUI._OVERLAY_LOCSHIP_EVERY
+        online_every = FCToolGUI._OVERLAY_ONLINE_EVERY
+        due = []
+        for name in names:
+            key = (name, "locship")
+            if now - last.get(key, float("-inf")) >= loc_every:
+                due.append(key)
+            if online_ok.get(name):
+                okey = (name, "online")
+                if now - last.get(okey, float("-inf")) >= online_every:
+                    due.append(okey)
+        return due
+
+    _OVERLAY_DEFAULTS = {
+        "enabled": False, "font_size": 11, "color": "#00d4ff",
+        "anchor": "top-left", "dpi_awareness": "auto", "rules": [],
+        "overrides": {},
+    }
+
+    def _overlay_cfg(self) -> dict:
+        """The config['overlay'] dict with spec defaults filled in (config is
+        NOT deep-merged from DEFAULT_CONFIG, so every key is .get-defaulted)."""
+        cfg = self.config.setdefault("overlay", {})
+        for k, v in self._OVERLAY_DEFAULTS.items():
+            if k not in cfg:
+                cfg[k] = ([] if isinstance(v, list) else
+                          {} if isinstance(v, dict) else v)
+        return cfg
+
+    def _overlay_rules(self) -> list:
+        raw = self._overlay_cfg().get("rules", []) or []
+        out = []
+        for r in raw:
+            try:
+                out.append(overlay_rules.OverlayRule(
+                    when=r["when"], value=r.get("value", ""), label=r.get("label", "")))
+            except Exception:
+                continue
+        return out
+
+    def _overlay_state_for(self, thumb):
+        """CharState for a thumb — the poller snapshot if present AND fresh
+        (within _OVERLAY_STALE_SECS), else a name-only CharState. A stale state
+        is dropped rather than shown, so we never label wrong/old info."""
+        key = thumb.char_name.strip().lower()
+        st = self._overlay_states.get(key)
+        if st is not None:
+            ts = self._overlay_state_ts.get(key)
+            if ts is not None and (time.monotonic() - ts) <= self._OVERLAY_STALE_SECS:
+                return st
+        return overlay_rules.CharState(character_id=0, name=thumb.char_name)
+
+    def _overlay_compose_items(self):
+        """Join current thumbs with CharState + rules/overrides → list of
+        (rect, label). Empty labels are kept out by OverlayWindow.set_labels."""
+        rules = self._overlay_rules()
+        overrides = self._overlay_cfg().get("overrides", {}) or {}
+        items = []
+        for thumb in self._overlay_thumbs_fn():
+            state = self._overlay_state_for(thumb)
+            label = overlay_rules.label_for(state, rules, overrides)
+            items.append((thumb.rect, label))
+        return items
+
+    def _overlay_status_text(self, thumb_count: int, matched: int) -> str:
+        if not self._overlay_cfg().get("enabled", False):
+            return "⏸ off"
+        if thumb_count <= 0:
+            return "○ Eve-O Preview not detected"
+        return f"● {thumb_count} thumbnails · {matched} matched"
+
+    def _overlay_tick(self):
+        """One controller tick. Reschedules itself while enabled. Enumerates
+        thumbs (sub-ms, inline on the Tk thread), composes labels, redraws +
+        re-asserts topmost. Cadence drops to a slow probe when Eve-O is absent."""
+        cfg = self._overlay_cfg()
+        if not cfg.get("enabled", False):
+            self._overlay_after_id = None
+            return
+        try:
+            items = self._overlay_compose_items()
+        except Exception:
+            log.exception("[overlay] compose failed; disabling for session")
+            self._overlay_disable_session()
+            return
+        thumb_count = len(items)
+        matched = sum(1 for _, t in items if t)
+        try:
+            # set_labels owns the topmost re-assert: on a non-empty draw it calls
+            # retop() itself, so the controller does NOT call retop() again here
+            # (single owner — avoids a double SetWindowPos per tick).
+            self._overlay.set_labels(items)
+        except Exception:
+            log.exception("[overlay] draw failed; disabling for session")
+            self._overlay_disable_session()
+            return
+        # live status label (if the Settings section is built)
+        if getattr(self, "_overlay_status_label", None) is not None:
+            try:
+                self._overlay_status_label.config(
+                    text=self._overlay_status_text(thumb_count, matched))
+            except tk.TclError:
+                pass
+        # getattr-with-default so the tick works both on the real class (class
+        # constants below) and on the test's SimpleNamespace host, whose bind
+        # loop does not copy these two cadence constants across.
+        tick_ms = getattr(self, "_OVERLAY_TICK_MS", 250)
+        probe_ms = getattr(self, "_OVERLAY_PROBE_MS", 2000)
+        delay = tick_ms if thumb_count else probe_ms
+        self._overlay_after_id = self.root.after(delay, self._overlay_tick)
+
+    def _overlay_ensure_window(self):
+        if self._overlay is None:
+            cfg = self._overlay_cfg()
+            self._overlay = OverlayWindow(self.root, {
+                "font_size": cfg.get("font_size", 11),
+                "color": cfg.get("color", "#00d4ff"),
+                "anchor": cfg.get("anchor", "top-left"),
+            })
+        return self._overlay
+
+    def _overlay_boot_if_enabled(self):
+        if self._overlay_cfg().get("enabled", False):
+            self._overlay_enable()
+
+    def _overlay_enable(self):
+        cfg = self._overlay_cfg()
+        cfg["enabled"] = True
+        if not cfg.get("rules"):
+            cfg["rules"] = [
+                {"when": r.when, "value": r.value, "label": r.label}
+                for r in overlay_rules.seed_rules()
+            ]
+        try:
+            self._overlay_ensure_window()
+        except Exception:
+            log.exception("[overlay] could not create overlay window; disabling")
+            self._overlay_disable_session()
+            return
+        self._overlay_start_poller()       # daemon ESI poller (Phase 2)
+        if self._overlay_after_id is None:
+            self._overlay_tick()
+
+    def _overlay_disable(self):
+        self._overlay_cfg()["enabled"] = False
+        self._overlay_teardown()
+
+    def _overlay_disable_session(self):
+        """A Win32/draw failure disables the overlay for THIS session only (the
+        config toggle is untouched) with a single log line already emitted."""
+        self._overlay_teardown()
+
+    def _overlay_teardown(self):
+        if self._overlay_after_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_after_id)
+            except Exception:
+                pass
+            self._overlay_after_id = None
+        self._overlay_stop_poller()
+        self._overlay_states = {}
+        self._overlay_state_ts = {}
+        if self._overlay is not None:
+            try:
+                self._overlay.set_labels([])
+            except Exception:
+                pass
+        if getattr(self, "_overlay_status_label", None) is not None:
+            try:
+                self._overlay_status_label.config(text=self._overlay_status_text(0, 0))
+            except tk.TclError:
+                pass
+
+    def _overlay_build_state(self, auth, do_online: bool):
+        """Fetch this ONE character's ESI location/ship (+ online when do_online)
+        with its OWN auth, returning a CharState. Merges onto any prior state so
+        a partial pass doesn't clobber the other field. Never raises."""
+        name = getattr(auth, "character_name", "") or ""
+        key = name.strip().lower()
+        prior = self._overlay_states.get(key)
+
+        ship_type_id = prior.ship_type_id if prior else None
+        ship_type_name = prior.ship_type_name if prior else ""
+        ship_group = prior.ship_group if prior else ""
+        is_cap = prior.is_capital if prior else None
+        sys_id = prior.solar_system_id if prior else None
+        sys_name = prior.system_name if prior else ""
+        docked = prior.docked if prior else False
+        online = prior.online if prior else None
+
+        try:
+            ship = auth.get_ship_type() or {}
+            if ship.get("ship_type_id"):
+                ship_type_id = ship.get("ship_type_id")
+                ship_type_name = ship.get("ship_name", "") or ship_type_name
+                ship_group = ship_classes.get_group_name(ship_type_id) or ""
+                is_cap = bool(ship_classes.is_capital(ship_type_id))
+        except Exception:
+            pass
+        try:
+            loc = auth.get_location() or {}
+            if loc:
+                sys_id = loc.get("solar_system_id")
+                docked = bool(loc.get("station_id") or loc.get("structure_id"))
+                if sys_id:
+                    info = get_system_info(sys_id)
+                    if info and info.get("name"):
+                        sys_name = info["name"]
+        except Exception:
+            pass
+        if do_online:
+            try:
+                res = auth.esi_get(f"/characters/{auth.character_id}/online/")
+                if isinstance(res, dict) and "online" in res:
+                    online = bool(res["online"])
+            except Exception:
+                pass
+
+        return overlay_rules.CharState(
+            character_id=getattr(auth, "character_id", 0) or 0, name=name,
+            online=online, ship_type_id=ship_type_id,
+            ship_type_name=ship_type_name,
+            ship_group=ship_group, is_capital=is_cap, solar_system_id=sys_id,
+            system_name=sys_name, docked=docked)
+
+    def _overlay_start_poller(self):
+        """Start the daemon poller if not already running."""
+        if self._overlay_poller is not None and self._overlay_poller.is_alive():
+            return
+        self._overlay_poller_stop = threading.Event()
+        self._overlay_poller = threading.Thread(
+            target=self._overlay_poll_loop, name="eveo-overlay-poller", daemon=True)
+        self._overlay_poller.start()
+
+    def _overlay_stop_poller(self):
+        ev = getattr(self, "_overlay_poller_stop", None)
+        if ev is not None:
+            ev.set()
+        self._overlay_poller = None
+
+    def _overlay_poll_loop(self):
+        """Daemon: round-robin ESI polling for the currently-matched characters.
+        Uses each character's own ESIAuth. Writes into self._overlay_states
+        (with a fetch timestamp) consumed by the controller tick. Sleeps in
+        short slices so a disable is responsive."""
+        stop = self._overlay_poller_stop
+        last: dict = {}          # (name_lower, kind) -> ts
+        auth_by_name = {}
+        online_ok = {}
+        while not stop.is_set():
+            try:
+                # who is on screen right now?
+                thumbs = self._overlay_thumbs_fn()
+                names = [t.char_name.strip().lower() for t in thumbs]
+                if not names:
+                    stop.wait(1.0)
+                    continue
+                # refresh the name->auth + scope maps cheaply
+                for a in self.esi_accounts:
+                    nm = (getattr(a, "character_name", "") or "").strip().lower()
+                    if nm:
+                        auth_by_name[nm] = a
+                        online_ok[nm] = bool(
+                            a.has_scope("esi-location.read_online.v1"))
+                now = time.monotonic()
+                due = self._overlay_poll_plan(
+                    [n for n in names if n in auth_by_name], last, now, online_ok)
+                for name, kind in due:
+                    if stop.is_set():
+                        break
+                    auth = auth_by_name.get(name)
+                    if auth is None:
+                        continue
+                    st = self._overlay_build_state(auth, do_online=(kind == "online"))
+                    self._overlay_states[name] = st
+                    self._overlay_state_ts[name] = time.monotonic()
+                    last[(name, kind)] = time.monotonic()
+                    stop.wait(0.2)         # stagger ESI requests
+            except Exception:
+                log.exception("[overlay] poller pass failed; continuing")
+            stop.wait(1.0)
+
+    _OVERLAY_COLOR_CYCLE = [
+        ("Accent", FG_ACCENT), ("Green", FG_GREEN), ("Yellow", FG_YELLOW),
+        ("Orange", FG_ORANGE), ("White", FG_WHITE),
+    ]
+    _OVERLAY_ANCHORS = ["Top-left", "Top-right", "Bottom-left", "Bottom-right"]
+    _OVERLAY_ANCHOR_TO_CFG = {
+        "Top-left": "top-left", "Top-right": "top-right",
+        "Bottom-left": "bottom-left", "Bottom-right": "bottom-right",
+    }
+    _OVERLAY_CFG_TO_ANCHOR = {v: k for k, v in _OVERLAY_ANCHOR_TO_CFG.items()}
+
+    def _build_overlay_section(self, parent):
+        cfg = self._overlay_cfg()
+
+        # Row 1: master toggle + live status label
+        row1 = tk.Frame(parent, bg=BG_DARK)
+        row1.pack(fill=tk.X, padx=20, pady=2)
+        self._overlay_enabled_var = tk.BooleanVar(value=cfg.get("enabled", False))
+        cb = tk.Checkbutton(
+            row1, text="Activity overlay on Eve-O Preview thumbnails",
+            variable=self._overlay_enabled_var, command=self._overlay_toggle_changed,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK, activeforeground=FG_TEXT,
+            anchor=tk.W)
+        cb.pack(side=tk.LEFT)
+        self._overlay_status_label = tk.Label(
+            row1, text=self._overlay_status_text(0, 0), font=("Consolas", 9),
+            fg=FG_DIM, bg=BG_DARK, anchor=tk.W)
+        self._overlay_status_label.pack(side=tk.LEFT, padx=12)
+
+        # Row 2: size / color / anchor, grid-aligned, applied live
+        row2 = tk.Frame(parent, bg=BG_DARK)
+        row2.pack(fill=tk.X, padx=20, pady=2)
+        tk.Label(row2, text="Size", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        self._overlay_size_var = tk.IntVar(value=int(cfg.get("font_size", 11)))
+        size_spin = tk.Spinbox(
+            row2, from_=8, to=24, width=4, textvariable=self._overlay_size_var,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, command=self._overlay_apply_style)
+        # save-on-type + arrow (house rule)
+        size_spin.bind("<KeyRelease>", lambda e: self._overlay_apply_style())
+        size_spin.grid(row=0, column=1, padx=(0, 16))
+
+        tk.Label(row2, text="Color", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+        self._overlay_color_val = cfg.get("color", FG_ACCENT)
+        self._overlay_color_btn = tk.Button(
+            row2, text="●", font=("Consolas", 12), width=3,
+            fg=self._overlay_color_val, bg=BG_ENTRY, activebackground=BG_ENTRY,
+            relief=tk.RIDGE, command=self._overlay_cycle_color)
+        self._overlay_color_btn.grid(row=0, column=3, padx=(0, 16))
+
+        tk.Label(row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+        self._overlay_anchor_var = tk.StringVar(
+            value=self._OVERLAY_CFG_TO_ANCHOR.get(cfg.get("anchor", "top-left"),
+                                                  "Top-left"))
+        anchor_combo = ttk.Combobox(
+            row2, textvariable=self._overlay_anchor_var, values=self._OVERLAY_ANCHORS,
+            state="readonly", width=12, font=("Consolas", 10))
+        anchor_combo.grid(row=0, column=5)
+        anchor_combo.bind("<<ComboboxSelected>>",
+                          lambda e: self._overlay_apply_style())
+
+        # Row 3: Label rules… button
+        row3 = tk.Frame(parent, bg=BG_DARK)
+        row3.pack(fill=tk.X, padx=20, pady=2)
+        ttk.Button(row3, text="Label rules…", style="Dark.TButton",
+                   command=self._open_overlay_rules_dialog).pack(side=tk.LEFT)
+
+        # Row 4: fine print
+        row4 = tk.Frame(parent, bg=BG_DARK)
+        row4.pack(fill=tk.X, padx=20, pady=(2, 6))
+        tk.Label(
+            row4,
+            text=("Labels are drawn from your own ESI data and your text only. "
+                  "Placeholders: {ship} {group} {system}."),
+            font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
+            wraplength=760).pack(side=tk.LEFT)
+
+    def _overlay_toggle_changed(self):
+        want = self._overlay_enabled_var.get()
+        if want:
+            self._overlay_enable()
+        else:
+            self._overlay_disable()
+        self._save_config()
+
+    def _overlay_cycle_color(self):
+        colors = [c for _, c in self._OVERLAY_COLOR_CYCLE]
+        try:
+            idx = colors.index(self._overlay_color_val)
+        except ValueError:
+            idx = -1
+        self._overlay_color_val = colors[(idx + 1) % len(colors)]
+        self._overlay_color_btn.config(fg=self._overlay_color_val)
+        self._overlay_apply_style()
+
+    def _overlay_apply_style(self):
+        cfg = self._overlay_cfg()
+        try:
+            cfg["font_size"] = int(self._overlay_size_var.get())
+        except (tk.TclError, ValueError):
+            pass
+        cfg["color"] = self._overlay_color_val
+        cfg["anchor"] = self._OVERLAY_ANCHOR_TO_CFG.get(
+            self._overlay_anchor_var.get(), "top-left")
+        if self._overlay is not None:
+            try:
+                self._overlay.set_font_size(cfg["font_size"])
+                self._overlay.set_color(cfg["color"])
+                self._overlay.set_anchor(cfg["anchor"])
+            except Exception:
+                pass
+        self._save_config()
+
+    def _open_overlay_rules_dialog(self):
+        cfg = self._overlay_cfg()
+        win = tk.Toplevel(self.root)
+        win.title("Overlay label rules")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Rules (first match wins):", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        rules_frame = tk.Frame(win, bg=BG_PANEL)
+        rules_frame.pack(fill=tk.X, padx=10)
+
+        when_values = ["ship_group", "ship_type", "system", "docked",
+                       "offline", "capital", "subcap"]
+        rule_rows = []   # list of dicts: {when, value, label} Tk vars
+
+        def _add_rule_row(when="ship_group", value="", label=""):
+            r = len(rule_rows)
+            wv = tk.StringVar(value=when)
+            vv = tk.StringVar(value=value)
+            lv = tk.StringVar(value=label)
+            ttk.Combobox(rules_frame, textvariable=wv, values=when_values,
+                         state="readonly", width=11,
+                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
+            # value: autocomplete for systems/ship-groups (free text otherwise)
+            ve = AutocompleteEntry(
+                rules_frame, self._system_names, font=("Consolas", 9),
+                bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+            ve.grid(row=r, column=1, padx=2)
+            if value:
+                ve.insert(0, value)
+            le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+            le.grid(row=r, column=2, padx=2)
+            rule_rows.append({"when": wv, "value_entry": ve, "label": lv})
+
+        for r in cfg.get("rules", []) or []:
+            _add_rule_row(r.get("when", "ship_group"), r.get("value", ""),
+                          r.get("label", ""))
+        if not rule_rows:
+            _add_rule_row()
+
+        ttk.Button(win, text="+ Add rule", style="Dark.TButton",
+                   command=lambda: _add_rule_row()).pack(anchor="w", padx=10, pady=(2, 8))
+
+        tk.Label(win, text="Overrides (beat rules; empty label hides that char):",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(4, 2))
+        ov_frame = tk.Frame(win, bg=BG_PANEL)
+        ov_frame.pack(fill=tk.X, padx=10)
+        char_names = [a.character_name for a in self.esi_accounts
+                      if getattr(a, "character_name", None)]
+        override_rows = []
+
+        def _add_override_row(name="", label=""):
+            r = len(override_rows)
+            nv = tk.StringVar(value=name)
+            lv = tk.StringVar(value=label)
+            ttk.Combobox(ov_frame, textvariable=nv, values=char_names, width=20,
+                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
+            tk.Entry(ov_frame, textvariable=lv, font=("Consolas", 9), bg=BG_ENTRY,
+                     fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
+                         row=r, column=1, padx=2)
+            override_rows.append({"name": nv, "label": lv})
+
+        for name, label in (cfg.get("overrides", {}) or {}).items():
+            _add_override_row(name, label)
+        if not override_rows:
+            _add_override_row()
+
+        ttk.Button(win, text="+ Add override", style="Dark.TButton",
+                   command=lambda: _add_override_row()).pack(anchor="w", padx=10, pady=(2, 8))
+
+        def _ok():
+            rules_out = []
+            for row in rule_rows:
+                when = row["when"].get().strip()
+                value = row["value_entry"].get().strip()
+                label = row["label"].get().strip()
+                if not when:
+                    continue
+                # docked/offline/capital/subcap need no value; the rest need one
+                if when in ("ship_group", "ship_type", "system") and not value:
+                    continue
+                if not label and when not in ("ship_group",):
+                    # allow empty label only where a placeholder-only rule is
+                    # meaningless; simplest: require a label
+                    if not label:
+                        continue
+                rules_out.append({"when": when, "value": value, "label": label})
+            overrides_out = {}
+            for row in override_rows:
+                name = row["name"].get().strip()
+                if not name:
+                    continue
+                overrides_out[name] = row["label"].get()   # '' allowed = hide
+            cfg["rules"] = rules_out
+            cfg["overrides"] = overrides_out
+            self._save_config()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=_ok).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=2)
+        self.root.wait_window(win)
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",
@@ -15043,6 +15635,15 @@ $bmp.Dispose()
         try:
             from jump_range import save_route_cache
             save_route_cache()
+        except Exception:
+            pass
+        # Tear down the Eve-O overlay (cancel its after-loop, stop the poller,
+        # withdraw the window) before destroying root. Guarded: the attribute /
+        # method may be absent if overlay init never ran.
+        try:
+            teardown = getattr(self, "_overlay_teardown", None)
+            if callable(teardown):
+                teardown()
         except Exception:
             pass
         self.root.destroy()
