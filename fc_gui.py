@@ -473,6 +473,23 @@ def _motd_link_initial_state(config) -> bool:
     return False
 
 
+def _filter_cap_entries(entries, only_region: str) -> list:
+    """Filter capability asset entries down to a single region.
+
+    Entries are dicts shaped ``{"ship", "location", "region"}``. When
+    ``only_region`` is falsy the list is returned unchanged (no filtering).
+    When set, only dict entries whose ``region`` matches survive; non-dict
+    entries are dropped. Pure function so the role+region item predicate is
+    unit-testable without Tk.
+    """
+    if not only_region:
+        return list(entries)
+    return [
+        e for e in entries
+        if isinstance(e, dict) and e.get("region") == only_region
+    ]
+
+
 class FCToolGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -5761,9 +5778,14 @@ class FCToolGUI:
             15000, lambda: self._update_refresh_status(had_errors=had_errors),
         )
 
-    def _render_capabilities(self, panel, info: dict, only_cap: str = ""):
+    def _render_capabilities(self, panel, info: dict, only_cap: str = "",
+                             only_region: str = ""):
         """Render capability rows in a panel's cap_frame.
-        If only_cap is set (e.g. 'fax'), only show that capability."""
+        If only_cap is set (e.g. 'fax'), only show that capability.
+        If only_region is set, asset-cap items are filtered to that region
+        (a cap whose items are all elsewhere is skipped entirely), and the
+        cyno/dictor rows only render when the character's current-location
+        region matches."""
         for w in panel._cap_frame.winfo_children():
             w.destroy()
 
@@ -5791,6 +5813,11 @@ class FCToolGUI:
                 continue
             if only_cap and key != only_cap:
                 continue
+            # Filter items to the selected region (if any); a cap whose
+            # entries are all in other regions is skipped entirely.
+            items = _filter_cap_entries(items, only_region)
+            if not items:
+                continue
             has_caps = True
             row = tk.Frame(panel._cap_frame, bg=BG_PANEL)
             row.pack(fill=tk.X, pady=1)
@@ -5807,7 +5834,8 @@ class FCToolGUI:
                      ).pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
 
         # Cyno capability (current ship is Force Recon with cyno fitted + ozone)
-        if info.get("cyno") and (not only_cap or only_cap == "cyno"):
+        if (info.get("cyno") and (not only_cap or only_cap == "cyno")
+                and (not only_region or info.get("region") == only_region)):
             has_caps = True
             row = tk.Frame(panel._cap_frame, bg=BG_PANEL)
             row.pack(fill=tk.X, pady=1)
@@ -5828,7 +5856,8 @@ class FCToolGUI:
                          anchor=tk.W).pack(side=tk.LEFT)
 
         # Dictor/HIC capability (current ship is interdictor or heavy interdictor)
-        if info.get("dictor") and (not only_cap or only_cap == "hic/dictor"):
+        if (info.get("dictor") and (not only_cap or only_cap == "hic/dictor")
+                and (not only_region or info.get("region") == only_region)):
             has_caps = True
             row = tk.Frame(panel._cap_frame, bg=BG_PANEL)
             row.pack(fill=tk.X, pady=1)
@@ -6036,7 +6065,7 @@ class FCToolGUI:
         # Render capability content for every visible panel first
         for panel in active_panels + passive_panels:
             self._render_capabilities(panel, getattr(panel, '_info', {}),
-                                       only_cap=cap_key)
+                                       only_cap=cap_key, only_region=region)
 
         # Lay out active first, then passive; active ones get the highlight
         visible = active_panels + passive_panels
