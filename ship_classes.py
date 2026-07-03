@@ -233,6 +233,40 @@ def get_group_id(type_id: int) -> int | None:
     return None
 
 
+# ── Base layer HP (dogma attrs 263/265/9) ────────────────────────────────────
+# dogma attribute ids for base layer HP (verified): 263 shield, 265 armor, 9 hull
+_LAYER_HP_ATTRS = {"shield": 263, "armor": 265, "hull": 9}
+_layer_hp_cache: dict[int, dict | None] = {}
+_layer_hp_lock = threading.Lock()
+
+
+def get_layer_hp(type_id: int) -> dict | None:
+    """Base dogma layer HP {'shield','armor','hull'} for a hull type_id (values
+    may be None if an attribute is absent), or None on total failure. Cached.
+    These are BASE hull values — fitted ships have more (the UI says so)."""
+    if not type_id:
+        return None
+    with _layer_hp_lock:
+        if type_id in _layer_hp_cache:
+            return _layer_hp_cache[type_id]
+    result = None
+    try:
+        from rate_limiter import rate_limit
+        rate_limit("esi")
+        resp = requests.get(f"{ESI_BASE}/universe/types/{type_id}/",
+                            timeout=5, headers=HEADERS)
+        if resp.ok:
+            attrs = {a.get("attribute_id"): a.get("value")
+                     for a in resp.json().get("dogma_attributes", [])}
+            result = {layer: attrs.get(attr_id)
+                      for layer, attr_id in _LAYER_HP_ATTRS.items()}
+    except Exception:
+        result = None
+    with _layer_hp_lock:
+        _layer_hp_cache[type_id] = result
+    return result
+
+
 def classify_ship(type_id: int) -> str | None:
     """Return the role category string for a ship type_id, or None."""
     if type_id in COMMAND_SHIPS:

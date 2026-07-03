@@ -132,6 +132,12 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     host._preview_last_key = ""
     host._preview_find_clients = lambda: []
     host._preview_status = ""
+    # B6 damage-flash state (mirror __init__ block)
+    import damage_flash as _df
+    host._preview_damage = _df.DamageFlashTracker()
+    host._preview_gamelog = None
+    host._preview_layer_hp = {}
+    host._preview_damage_until = {}
 
     # Caption-composition boundaries (the tick body now calls the real
     # _preview_compose_captions — Task B1). Stub the ESI/doctrine/rules edges so
@@ -158,6 +164,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_drain_hotkeys", "_preview_compose_captions",
                  "_preview_compose_video_labels",
                  "_preview_caption_parts", "_preview_should_flash",
+                 "_preview_on_damage",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
         if fn is not None:
@@ -932,4 +939,117 @@ def test_tick_no_flash_border_when_intel_flash_disabled(monkeypatch):
     tick(host)
     tile = host._preview_tiles[1]
     # border is only ever set to the "clear" value (None); never the flash color
+    assert "#ff3b30" not in tile.borders
+
+
+# ── (B6) damage flash: gamelog ingest + tick border precedence + hold ─────────
+def test_on_damage_ingests_lowercased_into_tracker(monkeypatch):
+    host = make_host(mode="native")
+    host._preview_on_damage = types.MethodType(
+        fc_gui.FCToolGUI._preview_on_damage, host)
+    monkeypatch.setattr(fc_gui.time, "monotonic", lambda: 100.0)
+    from gamelog_monitor import DamageEvent
+    host._preview_on_damage(DamageEvent(timestamp="", character_name="Kirejen",
+                                        amount=250, attacker=""))
+    # 10% of weakest layer 2000 = 200; 250 >= 200 → the tracker would flash
+    cfg = {"damage_flash_pct": 10, "damage_flash_window_s": 5,
+           "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest"}
+    hp = {"shield": 4000.0, "armor": 3000.0, "hull": 2000.0}
+    assert host._preview_damage.should_flash("kirejen", hp, cfg, 100.1)
+
+
+def test_on_damage_ignores_blank_character(monkeypatch):
+    host = make_host(mode="native")
+    host._preview_on_damage = types.MethodType(
+        fc_gui.FCToolGUI._preview_on_damage, host)
+    monkeypatch.setattr(fc_gui.time, "monotonic", lambda: 100.0)
+    from gamelog_monitor import DamageEvent
+    host._preview_on_damage(DamageEvent(timestamp="", character_name="   ",
+                                        amount=999, attacker=""))
+    cfg = {"damage_flash_pct": 10, "damage_flash_window_s": 5,
+           "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest"}
+    hp = {"shield": 4000.0, "armor": 3000.0, "hull": 2000.0}
+    # nothing was ingested under any key → no flash
+    assert not host._preview_damage.should_flash("", hp, cfg, 100.1)
+
+
+def _damage_tick_host(monkeypatch, now):
+    """A tick-ready host with one live client, damage_flash on, known base HP,
+    and a controlled monotonic clock."""
+    host = make_host(mode="native", layouts={"kirejen": [10, 20, 384, 216]})
+    cfg = host._preview_cfg()
+    cfg["damage_flash"] = True
+    cfg["damage_flash_pct"] = 10
+    cfg["damage_flash_window_s"] = 5
+    cfg["damage_flash_cooldown_s"] = 3
+    cfg["damage_flash_reference"] = "weakest"
+    cfg["damage_flash_color"] = "#ff3b30"
+    host._preview_find_clients = lambda: [_cw(1, "Kirejen")]
+    host._preview_layer_hp = {"kirejen": {"shield": 4000.0, "armor": 3000.0,
+                                          "hull": 2000.0}}
+    host._preview_state_for = lambda key: None
+    monkeypatch.setattr(fc_gui.time, "monotonic", lambda: now[0])
+    return host
+
+
+def test_tick_sets_damage_border_when_windowed_damage_crosses_threshold(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    # 250 dmg >= 10% of weakest (2000)=200 → flash
+    host._preview_damage.add("kirejen", 250, now[0])
+    tick(host)
+    tile = host._preview_tiles[1]
+    assert tile.borders and tile.borders[-1] == "#ff3b30"
+
+
+def test_tick_holds_damage_border_across_frames_then_clears(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    host._preview_damage.add("kirejen", 250, now[0])
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"
+    # 1 s later: no new damage, but the ~1.5 s hold keeps the red border
+    now[0] = 101.0
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"
+    # past the hold (seeded at 100.0 + 1.5 = 101.5): border clears to None
+    now[0] = 102.0
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] is None
+
+
+def test_tick_damage_flash_beats_intel_flash(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    # ALSO in a hostile system with intel flash on — damage must win precedence
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    cfg["intel_flash_secs"] = 10
+    cfg["intel_flash_color"] = "#0000ff"
+    st = CS(character_id=1, name="Kirejen", online=True, solar_system_id=30000142)
+    host._preview_state_for = lambda key: st
+    host._preview_intel = {30000142: (100.0, "hostile")}
+    host._preview_damage.add("kirejen", 250, now[0])
+    tick(host)
+    tile = host._preview_tiles[1]
+    assert tile.borders[-1] == "#ff3b30"     # damage color, not intel's blue
+
+
+def test_tick_no_damage_border_when_hp_unknown(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    host._preview_layer_hp = {}              # no base HP known for this pilot
+    host._preview_damage.add("kirejen", 99999, now[0])
+    tick(host)
+    tile = host._preview_tiles[1]
+    assert "#ff3b30" not in tile.borders
+
+
+def test_tick_no_damage_border_when_damage_flash_disabled(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    host._preview_cfg()["damage_flash"] = False
+    host._preview_damage.add("kirejen", 99999, now[0])
+    tick(host)
+    tile = host._preview_tiles[1]
     assert "#ff3b30" not in tile.borders

@@ -72,7 +72,7 @@ from system_cache import get_sorted_names, get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker
 from cyno_check import analyze_character as cyno_analyze_character
-from eve_paths import resolve_eve_logs_path
+from eve_paths import resolve_eve_logs_path, gamelogs_dir_for
 from default_config import DEFAULT_CONFIG
 import tts_helper
 from app_path import app_dir
@@ -97,6 +97,8 @@ import eve_client_tracker
 import window_activator
 import preview_layout
 import hotkey_service
+import damage_flash
+from gamelog_monitor import GamelogMonitor
 from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -690,6 +692,12 @@ class FCToolGUI:
         self._preview_last_key = ""            # last-activated char key (cycle anchor)
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
+        # ── Damage flash (Task B6) ──────────────────────────────────────────
+        self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
+        self._preview_gamelog = None           # GamelogMonitor (lazy, native only)
+        self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
+        self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
+        self._preview_gamelog_factory = GamelogMonitor  # injectable
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11812,6 +11820,22 @@ class FCToolGUI:
         secs = cfg.get("intel_flash_secs", 10)
         return (now - ts) <= secs
 
+    def _preview_on_damage(self, ev):
+        """Tk-thread ingest of a GamelogMonitor DamageEvent (Task B6).
+
+        The monitor polls on its own daemon thread and marshals here via
+        root.after(0, ...), so this runs on the Tk thread — safe to touch the
+        damage tracker (single Tk-thread writer). Keyed by lowercased char name,
+        the same join key used for layouts/ESI states/tiles."""
+        try:
+            key = (getattr(ev, "character_name", "") or "").strip().lower()
+            if not key:
+                return
+            self._preview_damage.add(key, getattr(ev, "amount", 0),
+                                     time.monotonic())
+        except Exception:
+            log.exception("[preview] damage ingest failed")
+
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
         if preview_running():                      # EVE-O still open → refuse to fight it
@@ -11855,8 +11879,30 @@ class FCToolGUI:
                     state = (None if client.is_login
                              else self._preview_state_for(client.key))
                     highlight = None                      # C4/P12: active-client highlight (not yet wired)
-                    if self._preview_should_flash(self._preview_intel, state, cfg,
-                                                  time.monotonic()):
+                    # Border precedence is fixed + deterministic (plan §B6):
+                    #   damage flash > intel flash > active highlight > none.
+                    # Damage flash (B6): a fresh should_flash arms a ~1.5 s red
+                    # hold (seeded in _preview_damage_until) so a single True
+                    # tick doesn't blink for one 250 ms frame; the tile counts
+                    # as flashing until the hold expires. Damage wins even if the
+                    # highlight would otherwise claim the border this same tick.
+                    now = time.monotonic()
+                    key = client.key
+                    damaging = False
+                    if cfg.get("damage_flash", True) and not client.is_login:
+                        hp = self._preview_layer_hp.get(key)
+                        if self._preview_damage.should_flash(key, hp, cfg, now):
+                            self._preview_damage_until[key] = now + 1.5
+                        until = self._preview_damage_until.get(key)
+                        if until is not None:
+                            if now < until:
+                                damaging = True
+                            else:
+                                self._preview_damage_until.pop(key, None)
+                    if damaging:
+                        tile.set_border(cfg.get("damage_flash_color", "#ff3b30"))
+                    elif self._preview_should_flash(self._preview_intel, state, cfg,
+                                                    time.monotonic()):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
                     else:
                         tile.set_border(highlight)
@@ -11886,12 +11932,43 @@ class FCToolGUI:
             self._preview_disable_session()
             return "⚠ native previews disabled (error) — see log"
 
+    def _preview_start_gamelog(self):
+        """Lazily create + start the UTF-8 Gamelog monitor feeding damage flash
+        (Task B6). Resolves the Gamelogs dir beside the configured Chatlogs path
+        (eve_paths.gamelogs_dir_for). The monitor polls on its own daemon thread
+        and marshals each DamageEvent to the Tk thread via root.after(0, ...) —
+        never touching Tk widgets or _preview_* dicts off-thread. Fail-soft: any
+        error disables the monitor for the session without killing previews."""
+        try:
+            if self._preview_gamelog is not None:
+                return
+            chat_path = resolve_eve_logs_path(self.config.get("eve_logs_path", ""))
+            logs_dir = gamelogs_dir_for(chat_path)
+            mon = self._preview_gamelog_factory(
+                on_event=lambda ev: self.root.after(0, self._preview_on_damage, ev),
+                logs_dir=logs_dir)
+            mon.start()
+            self._preview_gamelog = mon
+        except Exception:
+            log.exception("[preview] gamelog monitor failed to start")
+            self._preview_gamelog = None
+
+    def _preview_stop_gamelog(self):
+        mon = self._preview_gamelog
+        if mon is not None:
+            try:
+                mon.stop()
+            except Exception:
+                pass
+            self._preview_gamelog = None
+
     def _preview_enable_native(self):
         self._preview_disabled_session = False
         try:
             self._preview_restart_hotkeys()   # lazy service create + register
         except Exception:
             log.exception("[preview] hotkey registration failed on enable")
+        self._preview_start_gamelog()         # B6: damage-flash source
         if self._preview_after_id is None:
             self._preview_tick()
 
@@ -11913,6 +11990,7 @@ class FCToolGUI:
             self._preview_after_id = None
         self._preview_retire_all_tiles()
         self._preview_clients = {}
+        self._preview_stop_gamelog()          # B6: stop the damage-flash source
         svc = self._preview_hotkeys
         if svc is not None:
             try:
@@ -11980,6 +12058,7 @@ class FCToolGUI:
         key = name.strip().lower()
         prior = self._overlay_states.get(key)
 
+        prior_ship_type_id = prior.ship_type_id if prior else None
         ship_type_id = prior.ship_type_id if prior else None
         ship_type_name = prior.ship_type_name if prior else ""
         ship_group = prior.ship_group if prior else ""
@@ -11996,6 +12075,17 @@ class FCToolGUI:
                 ship_type_name = ship.get("ship_name", "") or ship_type_name
                 ship_group = ship_classes.get_group_name(ship_type_id) or ""
                 is_cap = bool(ship_classes.is_capital(ship_type_id))
+        except Exception:
+            pass
+        # B6: base layer HP for the damage-flash reference pool. Cached in
+        # ship_classes; only (re)fetched when the hull changes (or never seen)
+        # to avoid an ESI call every poll. Poller-thread write into the
+        # _preview_layer_hp dict — the tick only reads it (single-writer, same
+        # discipline as _overlay_states).
+        try:
+            if ship_type_id and (ship_type_id != prior_ship_type_id
+                                 or key not in self._preview_layer_hp):
+                self._preview_layer_hp[key] = ship_classes.get_layer_hp(ship_type_id)
         except Exception:
             pass
         try:
@@ -12256,30 +12346,102 @@ class FCToolGUI:
         cbi.grid(row=0, column=2, padx=(0, 16))
         w.append(cbi)
 
-        bg = ttk.Button(rowN2, text="Arrange in grid", style="Dark.TButton",
+        # B6: damage flash — tile border pulses red when windowed incoming
+        # damage from your OWN combat Gamelogs crosses a % of base hull HP.
+        # Default ON. Native-mode only (eveo_labels has no tiles to flash).
+        self._preview_damage_flash_var = tk.BooleanVar(
+            value=bool(pcfg.get("damage_flash", True)))
+        cbdf = tk.Checkbutton(
+            rowN2, text="Damage flash", variable=self._preview_damage_flash_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbdf.grid(row=0, column=3, padx=(0, 16))
+        w.append(cbdf)
+
+        # Row 6 (native): damage-flash tuning (threshold % / window / cooldown /
+        # reference) — all live-applied like the other native rows (Task B6).
+        rowN3 = tk.Frame(parent, bg=BG_DARK)
+        rowN3.pack(fill=tk.X, padx=20, pady=2)
+
+        tk.Label(rowN3, text="Flash %", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        self._preview_dmg_pct_var = tk.IntVar(value=int(pcfg.get("damage_flash_pct", 10)))
+        spct = tk.Spinbox(rowN3, from_=1, to=100, width=4,
+                          textvariable=self._preview_dmg_pct_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          command=self._preview_apply_native_state)
+        spct.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        spct.grid(row=0, column=1, padx=(0, 12))
+        w.append(spct)
+
+        tk.Label(rowN3, text="Window s", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+        self._preview_dmg_window_var = tk.IntVar(
+            value=int(pcfg.get("damage_flash_window_s", 5)))
+        swin = tk.Spinbox(rowN3, from_=1, to=60, width=4,
+                          textvariable=self._preview_dmg_window_var, font=("Consolas", 10),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          command=self._preview_apply_native_state)
+        swin.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        swin.grid(row=0, column=3, padx=(0, 12))
+        w.append(swin)
+
+        tk.Label(rowN3, text="Cooldown s", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+        self._preview_dmg_cooldown_var = tk.IntVar(
+            value=int(pcfg.get("damage_flash_cooldown_s", 3)))
+        scd = tk.Spinbox(rowN3, from_=0, to=60, width=4,
+                         textvariable=self._preview_dmg_cooldown_var, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         command=self._preview_apply_native_state)
+        scd.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        scd.grid(row=0, column=5, padx=(0, 12))
+        w.append(scd)
+
+        tk.Label(rowN3, text="Reference", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=6, padx=(0, 4), sticky=tk.W)
+        self._preview_dmg_ref_var = tk.StringVar(
+            value=str(pcfg.get("damage_flash_reference", "weakest")))
+        ref_combo = ttk.Combobox(
+            rowN3, textvariable=self._preview_dmg_ref_var,
+            values=["weakest", "shield", "armor", "hull", "total"],
+            state="readonly", width=8, font=("Consolas", 10))
+        ref_combo.grid(row=0, column=7)
+        ref_combo.bind("<<ComboboxSelected>>",
+                       lambda e: self._preview_apply_native_state())
+        w.append(ref_combo)
+
+        # Row 7 (native): arrange / hotkey buttons.
+        rowN4 = tk.Frame(parent, bg=BG_DARK)
+        rowN4.pack(fill=tk.X, padx=20, pady=2)
+        bg = ttk.Button(rowN4, text="Arrange in grid", style="Dark.TButton",
                         command=self._preview_arrange_grid)
-        bg.grid(row=0, column=3, padx=(0, 6))
+        bg.grid(row=0, column=0, padx=(0, 6))
         w.append(bg)
 
-        bgf = ttk.Button(rowN2, text="Arrange by fleet", style="Dark.TButton",
+        bgf = ttk.Button(rowN4, text="Arrange by fleet", style="Dark.TButton",
                          command=self._preview_arrange_by_fleet)
-        bgf.grid(row=0, column=4, padx=(0, 6))
+        bgf.grid(row=0, column=1, padx=(0, 6))
         w.append(bgf)
 
-        bhk = ttk.Button(rowN2, text="Hotkeys…", style="Dark.TButton",
+        bhk = ttk.Button(rowN4, text="Hotkeys…", style="Dark.TButton",
                          command=self._open_preview_hotkeys_dialog)
-        bhk.grid(row=0, column=5, padx=(0, 6))
+        bhk.grid(row=0, column=2, padx=(0, 6))
         w.append(bhk)
 
-        # Fine print (updated disclaimer — spec §9).
+        # Fine print (updated disclaimer — spec §9). Damage-flash fine print
+        # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
         row4 = tk.Frame(parent, bg=BG_DARK)
         row4.pack(fill=tk.X, padx=20, pady=(2, 6))
         tk.Label(
             row4,
             text=("Labels come from your own ESI data and your text only; intel "
-                  "flash reads only your own chat logs. Previews are view-only — "
-                  "clicks and hotkeys only change window focus; no input is ever "
-                  "sent to EVE clients."),
+                  "flash reads only your own chat logs. Damage flash is based on "
+                  "base hull HP — fitted ships have more; English client only; it "
+                  "reads only your own combat logs. Previews are view-only — clicks "
+                  "and hotkeys only change window focus; no input is ever sent to "
+                  "EVE clients."),
             font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
             wraplength=760).pack(side=tk.LEFT)
 
@@ -12347,6 +12509,11 @@ class FCToolGUI:
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
+            ("_preview_damage_flash_var", "damage_flash", bool),
+            ("_preview_dmg_pct_var", "damage_flash_pct", int),
+            ("_preview_dmg_window_var", "damage_flash_window_s", int),
+            ("_preview_dmg_cooldown_var", "damage_flash_cooldown_s", int),
+            ("_preview_dmg_ref_var", "damage_flash_reference", str),
         ):
             v = getattr(self, var, None)
             if v is None:
