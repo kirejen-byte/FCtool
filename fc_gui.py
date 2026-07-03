@@ -1462,8 +1462,6 @@ class FCToolGUI:
                    command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
         ttk.Button(role_header, text="Expand All", style="Dark.TButton",
                    command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
-                   command=self._kick_pods_from_fleet).pack(side=tk.LEFT, padx=(16, 3))
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -1493,6 +1491,11 @@ class FCToolGUI:
                    command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
         ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
                    command=self._open_fleet_templates).pack(side=tk.RIGHT, padx=3)
+        # Kick Pods lives with the right-hand group. Right-packing lays out
+        # right-to-left, so packing it last places it left of Fleet Templates:
+        #   … [Kick Pods] [Fleet Templates] [Screenshot]
+        ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
+                   command=self._kick_pods_from_fleet).pack(side=tk.RIGHT, padx=3)
         self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
                                           fg=FG_GREEN, bg=BG_DARK)
         self._screenshot_link.pack(side=tk.RIGHT, padx=5)
