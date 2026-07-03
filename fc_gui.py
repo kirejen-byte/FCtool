@@ -92,6 +92,7 @@ from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running
 from eveo_overlay import OverlayWindow
 import overlay_rules
+import fleet_composer
 import eve_client_tracker
 import window_activator
 import preview_layout
@@ -11602,10 +11603,91 @@ class FCToolGUI:
             svc.restart(bindings)
         return svc
 
+    def _preview_state_for(self, key):
+        """Staleness-checked CharState for a client key (lowercased char name),
+        or None. Native parallel of _overlay_state_for: the poller snapshot if
+        present AND fresh (within _OVERLAY_STALE_SECS), else None so the caption
+        falls back to a dim/unknown dot rather than showing stale info."""
+        st = self._overlay_states.get(key)
+        if st is not None:
+            ts = self._overlay_state_ts.get(key)
+            stale = getattr(self, "_OVERLAY_STALE_SECS",
+                            FCToolGUI._OVERLAY_STALE_SECS)
+            if ts is not None and (time.monotonic() - ts) <= stale:
+                return st
+        return None
+
+    def _preview_caption_parts(self, client, state, rules, overrides,
+                               role_chip, tag_index, doctrine_tag_captions):
+        """Compose (name, dot_color, chip, tag_text) for one tile's caption.
+
+        - Login clients render "login screen" with no status dot.
+        - dot: green online, red offline, dim grey when unknown/stale (None state
+          or None online).
+        - name gains the ⚓ anchor glyph when the pilot is docked.
+        - tag_text precedence (caveat #4): manual override > rule label >
+          doctrine tag (first, sorted) > "". An empty-string override means
+          "hide" and still wins.
+        """
+        if client.is_login:
+            return ("login screen", None, "", "")
+        name = client.char_name
+        if state is None or state.online is None:
+            dot = FG_DIM
+        elif state.online:
+            dot = FG_GREEN
+        else:
+            dot = FG_RED
+        if state is not None and state.docked:
+            name = f"{name} ⚓"
+        # tag precedence (caveat #4): manual override > rule label >
+        # doctrine tag (first, sorted) > "". An empty-string override = "hide".
+        key = client.key
+        norm = {k.strip().lower(): v for k, v in (overrides or {}).items()}
+        rule_label = overlay_rules.label_for(state, rules, {}) if state else ""
+        hull_tags = (tag_index.get(state.ship_type_id)
+                     if (state is not None and tag_index) else None)
+        if key and key in norm:                       # 1: manual override wins
+            tag = norm[key] or ""
+        elif rule_label:                              # 2: rule label
+            tag = rule_label
+        elif doctrine_tag_captions and hull_tags:     # 3: doctrine tag (sorted)
+            tag = sorted(hull_tags)[0]
+        else:                                         # 4: nothing
+            tag = ""
+        return (name, dot, role_chip or "", tag)
+
     def _preview_compose_captions(self, cur):
-        """Caption composition is filled in by Task B1 (ESI states + rules +
-        doctrine tag). A8 leaves it a safe no-op so the tick body is complete."""
-        return
+        """Set each live tile's caption from its staleness-checked ESI state +
+        rules/overrides + (optionally) the active doctrine's tag for its hull.
+        Built once per tick: one doctrine tag index shared across all tiles."""
+        cfg = self._preview_cfg()
+        if not cfg.get("captions", True):
+            return
+        rules = self._overlay_rules()
+        overrides = self._overlay_cfg().get("overrides", {}) or {}
+        doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
+        show_chip = bool(cfg.get("show_role_chip", True))
+        doctrine = self._active_doctrine_obj()
+        tag_index = fleet_composer.build_tag_index(doctrine, self.fittings)
+        for hwnd, client in cur.items():
+            tile = self._preview_tiles.get(hwnd)
+            if tile is None:
+                continue
+            state = None if client.is_login else self._preview_state_for(client.key)
+            role_chip = self._preview_role_chip(client) if show_chip else ""
+            parts = self._preview_caption_parts(
+                client, state, rules, overrides, role_chip, tag_index,
+                doctrine_tag_captions)
+            try:
+                tile.set_caption(*parts)
+            except tk.TclError:
+                pass
+
+    def _preview_role_chip(self, client):
+        """Fleet-role chip text for a client (B4 fills this in with the fleet
+        store lookup). B1 leaves it empty so the chip column stays blank."""
+        return ""
 
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
@@ -11814,6 +11896,18 @@ class FCToolGUI:
             ev.set()
         self._overlay_poller = None
 
+    def _preview_tracked_names(self):
+        """Lowercased character names the ESI poller should refresh, routed by
+        preview mode so the same poll loop serves both label modes:
+          - eveo_labels: the currently-enumerated EVE-O thumbnails;
+          - native: the live native-preview clients (login screens excluded).
+        Both write into the single self._overlay_states dict — single-writer
+        invariant preserved (only the poller thread writes it)."""
+        if self._preview_cfg().get("mode") == "native":
+            return [c.char_name.strip().lower()
+                    for c in self._preview_clients.values() if not c.is_login]
+        return [t.char_name.strip().lower() for t in self._overlay_thumbs_fn()]
+
     def _overlay_poll_loop(self):
         """Daemon: round-robin ESI polling for the currently-matched characters.
         Uses each character's own ESIAuth. Writes into self._overlay_states
@@ -11825,9 +11919,9 @@ class FCToolGUI:
         online_ok = {}
         while not stop.is_set():
             try:
-                # who is on screen right now?
-                thumbs = self._overlay_thumbs_fn()
-                names = [t.char_name.strip().lower() for t in thumbs]
+                # who is on screen right now? (mode-routed: eveo thumbs vs native
+                # client tiles — either way it feeds the SAME _overlay_states dict)
+                names = self._preview_tracked_names()
                 if not names:
                     stop.wait(1.0)
                     continue

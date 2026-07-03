@@ -125,6 +125,18 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     host._preview_find_clients = lambda: []
     host._preview_status = ""
 
+    # Caption-composition boundaries (the tick body now calls the real
+    # _preview_compose_captions — Task B1). Stub the ESI/doctrine/rules edges so
+    # the default tick exercises compose without error; the B1 compose tests
+    # override these with richer fakes.
+    host.fittings = None
+    host._overlay_rules = lambda: []
+    host._overlay_cfg = lambda: host.config.setdefault(
+        "overlay", {"rules": [], "overrides": {}})
+    host._active_doctrine_obj = lambda: None
+    host._preview_state_for = lambda key: None
+    host._preview_role_chip = lambda client: ""
+
     # recording buffers used by test assertions
     host.tiles_created = []
     host.tiles_destroyed = []
@@ -136,6 +148,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_spawn_tile", "_preview_rekey_tile",
                  "_preview_retire_tile", "_preview_retire_all_tiles",
                  "_preview_drain_hotkeys", "_preview_compose_captions",
+                 "_preview_caption_parts",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
         if fn is not None:
@@ -438,3 +451,229 @@ def test_restart_hotkeys_reuses_existing_service():
     assert host._preview_hotkeys is first         # not re-created
     assert len(created) == 1
     assert len(first.started_with) == 2           # restarted with fresh bindings
+
+
+# ── (B1) captions: tracked-names provider, caption parts precedence, compose ──
+import overlay_rules
+import fleet_composer
+
+
+def _bind_caption_methods(host):
+    for name in ("_preview_caption_parts", "_preview_tracked_names",
+                 "_preview_state_for", "_active_doctrine_obj",
+                 "_preview_compose_captions"):
+        fn = getattr(fc_gui.FCToolGUI, name, None)
+        if fn is not None:
+            setattr(host, name, types.MethodType(fn, host))
+
+
+CS = overlay_rules.CharState
+
+
+# --- (a) provider: native mode names come from _preview_clients, feeding the
+#     SAME _overlay_states dict the poller writes (single-writer invariant) ---
+def test_tracked_names_native_mode_from_preview_clients():
+    host = make_host(mode="native")
+    _bind_caption_methods(host)
+    host._preview_clients = {1: _cw(1, "Kirejen"), 2: _cw(2, ""),  # login excluded
+                             3: _cw(3, "Alt Two")}
+    names = host._preview_tracked_names()
+    assert set(names) == {"kirejen", "alt two"}    # lowercased, login dropped
+
+
+def test_tracked_names_eveo_mode_from_thumbs():
+    host = make_host(mode="eveo_labels")
+    _bind_caption_methods(host)
+    host._overlay_thumbs_fn = lambda: [
+        SimpleNamespace(char_name="Bob"), SimpleNamespace(char_name="Carol")]
+    names = host._preview_tracked_names()
+    assert set(names) == {"bob", "carol"}
+
+
+# --- (b) _preview_caption_parts precedence: manual > rule > doctrine tag > "" ---
+def _caption_host():
+    host = make_host(mode="native")
+    _bind_caption_methods(host)
+    return host
+
+
+def test_caption_login_client_has_no_dot():
+    host = _caption_host()
+    login = _cw(2, "", title="EVE")
+    name, dot, chip, tag = host._preview_caption_parts(
+        login, None, [], {}, "", {}, True)
+    assert name == "login screen"
+    assert dot is None
+    assert tag == ""
+
+
+def test_caption_dot_color_reflects_online_state():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    online = CS(character_id=1, name="Kirejen", online=True)
+    offline = CS(character_id=1, name="Kirejen", online=False)
+    unknown = CS(character_id=1, name="Kirejen", online=None)
+    assert host._preview_caption_parts(c, online, [], {}, "", {}, True)[1] == fc_gui.FG_GREEN
+    assert host._preview_caption_parts(c, offline, [], {}, "", {}, True)[1] == fc_gui.FG_RED
+    assert host._preview_caption_parts(c, unknown, [], {}, "", {}, True)[1] == fc_gui.FG_DIM
+    # no state at all (stale/dropped) → dim grey
+    assert host._preview_caption_parts(c, None, [], {}, "", {}, True)[1] == fc_gui.FG_DIM
+
+
+def test_caption_docked_appends_anchor_glyph():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    docked = CS(character_id=1, name="Kirejen", online=True, docked=True)
+    name, dot, chip, tag = host._preview_caption_parts(
+        c, docked, [], {}, "", {}, True)
+    assert name.startswith("Kirejen")
+    assert "⚓" in name
+
+
+def test_caption_role_chip_passed_through():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True)
+    parts = host._preview_caption_parts(c, st, [], {}, "FC", {}, True)
+    assert parts[2] == "FC"
+
+
+def test_caption_manual_override_beats_rule_and_doctrine_tag():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999,
+            ship_group="Force Recon Ship")
+    rules = [overlay_rules.OverlayRule("ship_group", "Force Recon Ship", "Cyno")]
+    overrides = {"kirejen": "MyTag"}
+    tag_index = {999: {"Logi", "Anchor"}}
+    _, _, _, tag = host._preview_caption_parts(
+        c, st, rules, overrides, "", tag_index, True)
+    assert tag == "MyTag"
+
+
+def test_caption_rule_label_beats_doctrine_tag():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999,
+            ship_group="Force Recon Ship")
+    rules = [overlay_rules.OverlayRule("ship_group", "Force Recon Ship", "Cyno")]
+    tag_index = {999: {"Logi", "Anchor"}}
+    _, _, _, tag = host._preview_caption_parts(
+        c, st, rules, {}, "", tag_index, True)
+    assert tag == "Cyno"
+
+
+def test_caption_doctrine_tag_shows_when_no_override_no_rule():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999)
+    tag_index = {999: {"Logi", "Anchor"}}
+    _, _, _, tag = host._preview_caption_parts(
+        c, st, [], {}, "", tag_index, True)
+    assert tag == "Anchor"          # sorted(...)[0], deterministic multi-tag pick
+
+
+def test_caption_doctrine_tag_suppressed_when_toggle_off():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999)
+    tag_index = {999: {"Anchor"}}
+    _, _, _, tag = host._preview_caption_parts(
+        c, st, [], {}, "", tag_index, False)      # doctrine_tag_captions=False
+    assert tag == ""
+
+
+def test_caption_doctrine_tag_inert_without_hull_or_index():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    # unknown ship_type_id
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=None)
+    assert host._preview_caption_parts(c, st, [], {}, "", {999: {"X"}}, True)[3] == ""
+    # empty tag index (no doctrine active — build_tag_index returns {})
+    st2 = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999)
+    assert host._preview_caption_parts(c, st2, [], {}, "", {}, True)[3] == ""
+
+
+def test_caption_empty_override_hides_tag():
+    host = _caption_host()
+    c = _cw(1, "Kirejen")
+    st = CS(character_id=1, name="Kirejen", online=True, ship_type_id=999)
+    tag_index = {999: {"Anchor"}}
+    # empty-string override means "hide", beating the doctrine tag
+    _, _, _, tag = host._preview_caption_parts(
+        c, st, [], {"kirejen": ""}, "", tag_index, True)
+    assert tag == ""
+
+
+# --- (c) _preview_compose_captions integration: builds one tag index, looks up
+#     staleness-checked state, calls tile.set_caption(*parts) for each tile ---
+def _compose_host(**kw):
+    host = make_host(mode="native", **kw)
+    _bind_caption_methods(host)
+    # doctrine/fittings/rules/overrides needed by compose
+    host.fittings = None
+    host.config["preview"]["captions"] = True
+    host.config["preview"]["show_role_chip"] = False
+    host.config["preview"]["doctrine_tag_captions"] = True
+    # _overlay_cfg / _overlay_rules read class-level _OVERLAY_DEFAULTS which a
+    # bare SimpleNamespace host lacks; stub them at the boundary (empty rules +
+    # overrides is the "no rule / no manual tag" caption case these tests want).
+    host.config.setdefault("overlay", {"rules": [], "overrides": {}})
+    host._overlay_cfg = lambda: host.config["overlay"]
+    host._overlay_rules = lambda: []
+    for name in ("_preview_state_for", "_preview_role_chip"):
+        fn = getattr(fc_gui.FCToolGUI, name, None)
+        if fn is not None:
+            setattr(host, name, types.MethodType(fn, host))
+    return host
+
+
+def test_compose_captions_sets_caption_on_each_live_tile(monkeypatch):
+    host = _compose_host()
+    # no doctrine → tag_index {}
+    monkeypatch.setattr(fc_gui.FCToolGUI, "_active_doctrine_obj",
+                        lambda self: None, raising=False)
+    c = _cw(1, "Kirejen")
+    tile = FakeTile(host, "kirejen")
+    host._preview_tiles = {1: tile}
+    host._overlay_states = {"kirejen": CS(character_id=1, name="Kirejen", online=True)}
+    host._overlay_state_ts = {"kirejen": 10 ** 12}   # fresh (far-future ts vs monotonic)
+    import time as _t
+    monkeypatch.setattr(_t, "monotonic", lambda: 0.0)
+    host._preview_compose_captions({1: c})
+    assert tile.captions, "set_caption should have been called"
+    name, dot, chip, tag = tile.captions[-1]
+    assert name == "Kirejen"
+    assert dot == fc_gui.FG_GREEN
+
+
+def test_compose_captions_uses_doctrine_tag_when_active(monkeypatch):
+    host = _compose_host()
+    doctrine = object()
+    monkeypatch.setattr(fc_gui.FCToolGUI, "_active_doctrine_obj",
+                        lambda self: doctrine, raising=False)
+    monkeypatch.setattr(fleet_composer, "build_tag_index",
+                        lambda d, f: {999: {"Anchor", "Logi"}})
+    c = _cw(1, "Kirejen")
+    tile = FakeTile(host, "kirejen")
+    host._preview_tiles = {1: tile}
+    host._overlay_states = {"kirejen": CS(character_id=1, name="Kirejen",
+                                          online=True, ship_type_id=999)}
+    host._overlay_state_ts = {"kirejen": 10 ** 12}
+    import time as _t
+    monkeypatch.setattr(_t, "monotonic", lambda: 0.0)
+    host._preview_compose_captions({1: c})
+    name, dot, chip, tag = tile.captions[-1]
+    assert tag == "Anchor"          # deterministic first tag
+
+
+def test_compose_captions_disabled_when_captions_off(monkeypatch):
+    host = _compose_host()
+    host.config["preview"]["captions"] = False
+    monkeypatch.setattr(fc_gui.FCToolGUI, "_active_doctrine_obj",
+                        lambda self: None, raising=False)
+    c = _cw(1, "Kirejen")
+    tile = FakeTile(host, "kirejen")
+    host._preview_tiles = {1: tile}
+    host._preview_compose_captions({1: c})
+    assert tile.captions == []      # captions off → no set_caption calls
