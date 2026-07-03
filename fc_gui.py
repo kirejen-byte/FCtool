@@ -11045,6 +11045,30 @@ class FCToolGUI:
     _OVERLAY_PROBE_MS = 2000        # when enabled but Eve-O not detected
     _OVERLAY_STALE_SECS = 300       # drop a CharState label after 5 min stale
 
+    _OVERLAY_LOCSHIP_EVERY = 10.0    # seconds between location+ship polls / char
+    _OVERLAY_ONLINE_EVERY = 60.0     # seconds between online polls / char
+
+    @staticmethod
+    def _overlay_poll_plan(names, last, now, online_ok):
+        """Return the list of (name_lower, kind) fetches due, where kind is
+        'locship' or 'online'. Pure: given names to poll, a {(name,kind): ts}
+        last-poll map, the current time, and an {name: has_online_scope} map.
+
+        location+ship every _OVERLAY_LOCSHIP_EVERY s; online every
+        _OVERLAY_ONLINE_EVERY s and only when online_ok[name] is truthy."""
+        loc_every = FCToolGUI._OVERLAY_LOCSHIP_EVERY
+        online_every = FCToolGUI._OVERLAY_ONLINE_EVERY
+        due = []
+        for name in names:
+            key = (name, "locship")
+            if now - last.get(key, float("-inf")) >= loc_every:
+                due.append(key)
+            if online_ok.get(name):
+                okey = (name, "online")
+                if now - last.get(okey, float("-inf")) >= online_every:
+                    due.append(okey)
+        return due
+
     _OVERLAY_DEFAULTS = {
         "enabled": False, "font_size": 11, "color": "#00d4ff",
         "anchor": "top-left", "dpi_awareness": "auto", "rules": [],
