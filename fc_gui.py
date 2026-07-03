@@ -7372,7 +7372,9 @@ class FCToolGUI:
                      "and re-pushes it to your fleet whenever the composition/"
                      "deltas change. The counter is seconds since the last "
                      "check. Requires you to be the current fleet boss; only "
-                     "re-pushes when the text actually changes.")
+                     "re-pushes when the text actually changes. Switches on "
+                     "automatically after you 'Set as fleet MOTD' once this "
+                     "session (startup stays off); toggle it off any time.")
         self._motd_link_indicator.bind(
             "<Enter>", lambda e, t=_link_tip: self._show_tooltip(e, t))
         self._motd_link_indicator.bind("<Leave>", lambda e: self._hide_tooltip())
@@ -8847,6 +8849,9 @@ class FCToolGUI:
                 self._motd_fleet_status.config(
                     text="MOTD set successfully (204).", fg=FG_GREEN)
                 self._auto_select_fleet_doctrine(pushed_doctrine)
+                # First successful manual push this session arms the auto-update
+                # link (startup stays OFF; see _motd_link_initial_state).
+                self._motd_arm_link(markup)
             else:
                 detail = (f"\n\n{err}" if err else
                           "\n\nESI rejected the request (403 if you are no "
@@ -8857,6 +8862,28 @@ class FCToolGUI:
                                      f"Could not set the fleet MOTD.{detail}")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _motd_arm_link(self, markup):
+        """Arm the auto-update link after a successful manual "Set as fleet
+        MOTD" push. Main-thread only.
+
+        The link is session-scoped (never persisted, always OFF at startup — see
+        _motd_link_initial_state). But once the FC has deliberately pushed a MOTD
+        this session, keeping it in sync no longer risks clobbering the fleet's
+        real MOTD with a default, so a successful first manual push switches
+        auto-update ON without an extra click. Records the just-pushed markup and
+        timestamp so the autopush loop treats it as already-synced and does not
+        immediately re-push the identical text. The user can still toggle it off.
+        """
+        self._motd_link_enabled = True
+        var = getattr(self, "_motd_link_var", None)
+        if var is not None:
+            var.set(True)
+        self._motd_link_state = "ok"
+        self._motd_last_pushed_markup = markup
+        self._motd_last_push_ts = time.monotonic()
+        self._motd_last_check_ts = time.monotonic()
+        self._motd_update_link_indicator()
 
     def _motd_toggle_link(self):
         """Enable/disable linked auto-push of the MOTD.
