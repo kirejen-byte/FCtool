@@ -190,3 +190,112 @@ def test_zoom_suppressed_while_dragging():
         tile.destroy()
     finally:
         root.destroy()
+
+
+# ── (C4) mouse-model modifier ladder: exclude / switch-external / highlight ────
+class _Evt:
+    """Minimal <ButtonRelease-1> event stand-in (no real Tk event needed)."""
+
+    def __init__(self, state=0, x_root=0, y_root=0):
+        self.state = state
+        self.x_root = x_root
+        self.y_root = y_root
+
+
+def _tile_with_all_callbacks(root, w32=None):
+    calls = {"activate": [], "minimize": [], "exclude": [], "external": []}
+    tile = pt.TileWindow(
+        root, "kirejen", PALETTE, win32=w32 or FakeTileWin32(), dwm=FakeDwm(),
+        on_activate=lambda k: calls["activate"].append(k),
+        on_minimize=lambda k: calls["minimize"].append(k),
+        on_move_end=lambda k, x, y: None,
+        on_resize_end=lambda k, w, h: None,
+        on_exclude=lambda k: calls["exclude"].append(k),
+        on_switch_external=lambda: calls["external"].append(1),
+    )
+    return tile, calls
+
+
+def test_plain_left_release_activates():
+    root = _root()
+    try:
+        tile, calls = _tile_with_all_callbacks(root)
+        tile._on_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_b1_release(_Evt(state=0x0000, x_root=10, y_root=10))
+        assert calls["activate"] == ["kirejen"]
+        assert calls["minimize"] == [] and calls["exclude"] == []
+        assert calls["external"] == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_ctrl_left_release_minimizes():
+    root = _root()
+    try:
+        tile, calls = _tile_with_all_callbacks(root)
+        tile._on_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_b1_release(_Evt(state=0x0004, x_root=10, y_root=10))   # Ctrl
+        assert calls["minimize"] == ["kirejen"]
+        assert calls["activate"] == [] and calls["exclude"] == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_shift_left_release_toggles_cycle_exclusion():
+    root = _root()
+    try:
+        tile, calls = _tile_with_all_callbacks(root)
+        tile._on_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_b1_release(_Evt(state=0x0001, x_root=10, y_root=10))   # Shift only
+        assert calls["exclude"] == ["kirejen"]
+        assert calls["activate"] == [] and calls["minimize"] == []
+        assert calls["external"] == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_ctrl_shift_left_release_switches_external():
+    root = _root()
+    try:
+        tile, calls = _tile_with_all_callbacks(root)
+        tile._on_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_b1_release(_Evt(state=0x0005, x_root=10, y_root=10))   # Ctrl+Shift
+        assert calls["external"] == [1]
+        assert calls["activate"] == [] and calls["minimize"] == []
+        assert calls["exclude"] == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_modifier_click_still_suppressed_after_a_drag():
+    root = _root()
+    try:
+        tile, calls = _tile_with_all_callbacks(root)
+        tile._on_b1_press(_Evt(x_root=10, y_root=10))
+        # released far from press → treated as a drag, not a click: no callback
+        tile._on_b1_release(_Evt(state=0x0001, x_root=200, y_root=200))
+        assert calls == {"activate": [], "minimize": [], "exclude": [],
+                         "external": []}
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_set_excluded_shows_badge_dot_and_clears():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.set_excluded(True)
+        assert tile.is_excluded() is True
+        # a visible marker is present on the strip after exclusion
+        assert tile._excl_lbl.cget("text") != ""
+        tile.set_excluded(False)
+        assert tile.is_excluded() is False
+        assert tile._excl_lbl.cget("text") == ""
+        tile.destroy()
+    finally:
+        root.destroy()

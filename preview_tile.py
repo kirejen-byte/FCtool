@@ -114,7 +114,7 @@ class TileWindow:
 
     def __init__(self, root, char_key, palette, win32=None, dwm=None,
                  on_activate=None, on_minimize=None, on_move_end=None,
-                 on_resize_end=None):
+                 on_resize_end=None, on_exclude=None, on_switch_external=None):
         self._win32 = win32 or _real_tile_win32()
         self._dwm_backend = dwm
         self._key = char_key
@@ -123,6 +123,9 @@ class TileWindow:
         self._on_minimize = on_minimize or (lambda k: None)
         self._on_move_end = on_move_end or (lambda k, x, y: None)
         self._on_resize_end = on_resize_end or (lambda k, w, h: None)
+        self._on_exclude = on_exclude or (lambda k: None)          # Shift+Left
+        self._on_switch_external = on_switch_external or (lambda: None)  # Ctrl+Shift+Left
+        self._excluded = False        # session-only cycle-exclusion flag (C4)
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -179,6 +182,12 @@ class TileWindow:
                                    font=("Consolas", 9, "bold"))
         self._name_lbl.pack(side="left")
 
+        # cycle-exclusion marker (C4): shown only while the tile is excluded from
+        # hotkey cycling (Shift+Left toggles it). A dim dot glyph beside the name.
+        self._excl_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_dim,
+                                  font=("Consolas", 9, "bold"))
+        self._excl_lbl.pack(side="left", padx=(2, 0))
+
         self._tag_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_dim,
                                  font=("Consolas", 8))
         self._tag_lbl.pack(side="right", padx=(0, 4))
@@ -228,9 +237,17 @@ class TileWindow:
         dy = abs(event.y_root - press[1])
         if dx > _MOVE_JITTER or dy > _MOVE_JITTER:
             return  # was a drag, not a click
-        if event.state & 0x0004:            # Ctrl held → minimize
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        # Modifier ladder (EVE-O parity + FCTool C4 extras). Check the two-modifier
+        # combo first so Ctrl+Shift never falls through to a single-modifier branch.
+        if ctrl and shift:                  # Ctrl+Shift+Left → switch to last non-EVE window
+            self._on_switch_external()
+        elif shift:                         # Shift+Left → toggle cycle-exclusion
+            self._on_exclude(self._key)
+        elif ctrl:                          # Ctrl+Left → minimize
             self._on_minimize(self._key)
-        else:
+        else:                               # plain Left → activate
             self._on_activate(self._key)
 
     def _on_b3_press(self, event):
@@ -457,6 +474,18 @@ class TileWindow:
         and logging."""
         parts = [p for p in (self._badge or self._name, self._chip, self._tag) if p]
         return " ".join(parts)
+
+    def set_excluded(self, flag):
+        """Mark this tile as excluded from hotkey cycling (session-only, C4). Shows
+        a dim dot on the strip while excluded; clears it when re-included."""
+        self._excluded = bool(flag)
+        try:
+            self._excl_lbl.configure(text="●" if self._excluded else "")
+        except tk.TclError:
+            pass
+
+    def is_excluded(self) -> bool:
+        return self._excluded
 
     def set_border(self, color):
         """Highlight/flash border via strip+body highlightbackground (None clears)."""

@@ -701,6 +701,9 @@ class FCToolGUI:
         # ── Hide rules / per-char selection (Task C2) ───────────────────────
         self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
         self._preview_win32 = None             # foreground backend; None → lazy real singleton
+        # ── Active highlight / cycle exclusion / switch-external (Task C4) ────
+        self._preview_excluded = set()         # session-only cycle-exclusion char keys
+        self._preview_last_external_hwnd = None  # last non-EVE, non-ours foreground hwnd
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11391,6 +11394,8 @@ class FCToolGUI:
             on_minimize=self._preview_on_tile_minimize,
             on_move_end=self._preview_on_tile_move_end,
             on_resize_end=self._preview_on_tile_resize_end,
+            on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
+            on_switch_external=self._preview_on_tile_switch_external,  # C4: Ctrl+Shift+Left
         )
         tile.place(x, y, w, body_h)
         return tile
@@ -11429,6 +11434,10 @@ class FCToolGUI:
         set_active = getattr(tile, "set_active", None)
         if set_active is not None:
             set_active(bool(key) and key == self._preview_last_key)
+        # C4: keep the cycle-exclusion badge in sync (survives retire/respawn).
+        set_excluded = getattr(tile, "set_excluded", None)
+        if set_excluded is not None:
+            set_excluded(bool(key) and key in self._preview_excluded)
 
     def _preview_spawn_tile(self, client):
         cfg = self._preview_cfg()
@@ -11521,6 +11530,34 @@ class FCToolGUI:
                 window_activator.minimize(c.hwnd)
                 return
 
+    def _preview_on_tile_exclude(self, key):
+        """Shift+Left on a tile: toggle that character's session-only exclusion
+        from hotkey cycling (C4). Excluded keys are skipped by cycle_next (the
+        drain passes live_keys - excluded). Purely in-memory: nothing is written
+        to config, so it resets each session. Pushes the strip badge to the tile."""
+        if not key:
+            return
+        if key in self._preview_excluded:
+            self._preview_excluded.discard(key)
+        else:
+            self._preview_excluded.add(key)
+        excluded = key in self._preview_excluded
+        for c in self._preview_clients.values():
+            if c.key == key:
+                tile = self._preview_tiles.get(c.hwnd)
+                if tile is not None and hasattr(tile, "set_excluded"):
+                    tile.set_excluded(excluded)
+                break
+
+    def _preview_on_tile_switch_external(self):
+        """Ctrl+Shift+Left on a tile: focus the last non-EVE, non-ours window the
+        tick observed in the foreground (captured in _preview_last_external_hwnd).
+        A no-op when nothing has been captured yet. Activation goes through
+        window_activator (the compliance choke-point) — focus APIs only (spec §4)."""
+        hwnd = self._preview_last_external_hwnd
+        if hwnd:
+            window_activator.activate(hwnd)
+
     def _preview_on_tile_move_end(self, key, x, y):
         if not key:
             return
@@ -11583,7 +11620,8 @@ class FCToolGUI:
                 cfg = self._preview_cfg()
                 groups = cfg.get("hotkeys", {}).get("groups", [])
                 order = groups[group].get("order", []) if group < len(groups) else []
-                live_keys = set(by_key)
+                # C4: skip session-excluded characters (Shift+Left toggles them).
+                live_keys = set(by_key) - self._preview_excluded
                 nxt = preview_layout.cycle_next(
                     order, self._preview_last_key, live_keys, direction)
                 c = by_key.get(nxt)
@@ -11953,12 +11991,15 @@ class FCToolGUI:
 
     def _preview_foreground_info(self, cur):
         """Snapshot the foreground window for the hide-on-lost-focus / hide-active
-        rules. `.active_hwnd` = the foreground hwnd when it is one of our tracked
-        EVE clients (else None); `.focused` = True when the foreground window is
-        an EVE client OR one of our own windows (tiles / the main FCTool window).
+        rules AND the C4 active-highlight / switch-external features.
+        `.active_hwnd` = the foreground hwnd when it is one of our tracked EVE
+        clients (else None); `.focused` = True when the foreground window is an EVE
+        client OR one of our own windows (tiles / the main FCTool window);
+        `.external_hwnd` = the foreground hwnd when it is NEITHER an EVE client NOR
+        one of ours (else None) — the Ctrl+Shift+Left "switch back" target (C4).
         Fails soft to focused=True (never hide on an errored probe)."""
         from types import SimpleNamespace
-        info = SimpleNamespace(active_hwnd=None, focused=True)
+        info = SimpleNamespace(active_hwnd=None, focused=True, external_hwnd=None)
         w = getattr(self, "_preview_win32", None)
         if w is None:
             return info
@@ -11984,6 +12025,8 @@ class FCToolGUI:
         except Exception:
             pass
         info.focused = fg in our
+        if not info.focused:
+            info.external_hwnd = fg      # neither an EVE client nor ours → switch target
         return info
 
     def _preview_native_tick_body(self):
@@ -12008,6 +12051,19 @@ class FCToolGUI:
             # DWM registrations survive; the tile is just unmapped, so re-showing
             # is instant and no data is ever wiped.
             fg_info = self._preview_foreground_info(cur)
+            # C4: remember the last non-EVE, non-ours foreground window so
+            # Ctrl+Shift+Left on a tile can switch back to it. Only overwrite when
+            # the probe actually saw an external window (never clobber to None).
+            if getattr(fg_info, "external_hwnd", None):
+                self._preview_last_external_hwnd = fg_info.external_hwnd
+            # C4: which live EVE client counts as "active" for the highlight border.
+            # Prefer the polled foreground client this tick; fall back to the last
+            # activation anchor so a highlight persists between foreground probes.
+            active_key = None
+            if getattr(fg_info, "active_hwnd", None) in cur:
+                active_key = cur[fg_info.active_hwnd].key
+            elif self._preview_last_key:
+                active_key = self._preview_last_key
             hidden, self._preview_lost_focus_since = self._preview_visibility(
                 cur, fg_info, cfg, self._preview_tick_count,
                 self._preview_lost_focus_since)
@@ -12038,15 +12094,18 @@ class FCToolGUI:
                     # next border source so the flash expires on its own once the
                     # note ages out or clears. Border precedence is deterministic
                     # (plan §B6): damage flash > intel flash > active highlight >
-                    # none. Damage flash (B6) will wrap this call; the
-                    # active-highlight border (P12/C4) is not wired yet, so the
-                    # non-flash branch resolves to None today — but it MUST stay a
-                    # single resolved value, never an unconditional None, so that
-                    # whoever wires the highlight can slot it in here without the
-                    # intel branch clobbering a live highlight every tick.
+                    # none. The active-highlight border (P12/C4) is the lowest
+                    # non-empty source: the active EVE client's tile gets a steady
+                    # highlight-colour frame, but a live damage/intel flash always
+                    # overrides it this tick.
                     state = (None if client.is_login
                              else self._preview_state_for(client.key))
-                    highlight = None                      # C4/P12: active-client highlight (not yet wired)
+                    # C4/P12: highlight the active client's tile (steady frame).
+                    highlight = (cfg.get("highlight_color", "#00d4ff")
+                                 if (cfg.get("highlight_active", True)
+                                     and not client.is_login
+                                     and client.key == active_key)
+                                 else None)
                     # Border precedence is fixed + deterministic (plan §B6):
                     #   damage flash > intel flash > active highlight > none.
                     # Damage flash (B6): a fresh should_flash arms a ~1.5 s red

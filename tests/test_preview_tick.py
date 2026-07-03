@@ -52,6 +52,7 @@ class FakeTile:
         self.hidden = False
         self.hide_calls = 0
         self.show_calls = 0
+        self.excluded = False
 
     def hide(self):
         self.hidden = True
@@ -81,6 +82,9 @@ class FakeTile:
 
     def set_border(self, color):
         self.borders.append(color)
+
+    def set_excluded(self, flag):
+        self.excluded = bool(flag)
 
     def retop(self):
         self.retops += 1
@@ -153,6 +157,9 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     # C2 hide-rules / shown-chars state (mirror __init__ block)
     host._preview_lost_focus_since = None
     host._preview_win32 = None            # foreground backend; None → treat as focused
+    # C4 active-highlight / cycle-exclusion / switch-external state
+    host._preview_excluded = set()        # session-only cycle-exclusion keys
+    host._preview_last_external_hwnd = None
 
     # Caption-composition boundaries (the tick body now calls the real
     # _preview_compose_captions — Task B1). Stub the ESI/doctrine/rules edges so
@@ -1358,4 +1365,142 @@ def test_minall_hotkey_skips_never_minimize(monkeypatch):
     host._preview_hotkey_map = {300: ("minall",)}
     host._preview_drain_hotkeys()
     assert set(minimized) == {2}                        # b minimized, a exempt
+    assert activated == []
+
+
+# ── (C4) active highlight border: highlight > none, damage/intel still win ─────
+def test_tick_highlights_active_client_tile_by_last_key(monkeypatch):
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216],
+                                             "b": [1, 1, 384, 216]})
+    host._preview_cfg().update(highlight_active=True, highlight_color="#00d4ff")
+    host._preview_last_key = "a"                        # A is the active client
+    host._preview_find_clients = lambda: [_cw(1, "A"), _cw(2, "B")]
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#00d4ff"   # active → highlight
+    assert host._preview_tiles[2].borders[-1] is None        # inactive → no border
+
+
+def test_tick_highlights_active_client_tile_by_foreground(monkeypatch):
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216],
+                                             "b": [1, 1, 384, 216]})
+    host._preview_cfg().update(highlight_active=True, highlight_color="#00d4ff")
+    host._preview_last_key = ""                         # no activation yet
+    host._preview_win32 = _FgWin32(2)                  # B is foreground
+    host._preview_find_clients = lambda: [_cw(1, "A"), _cw(2, "B")]
+    tick(host)
+    assert host._preview_tiles[2].borders[-1] == "#00d4ff"   # foreground → highlight
+    assert host._preview_tiles[1].borders[-1] is None
+
+
+def test_tick_no_highlight_when_disabled(monkeypatch):
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216]})
+    host._preview_cfg().update(highlight_active=False, highlight_color="#00d4ff")
+    host._preview_last_key = "a"
+    host._preview_find_clients = lambda: [_cw(1, "A")]
+    tick(host)
+    assert "#00d4ff" not in host._preview_tiles[1].borders
+
+
+def test_tick_damage_flash_beats_active_highlight(monkeypatch):
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    host._preview_cfg().update(highlight_active=True, highlight_color="#00d4ff")
+    host._preview_last_key = "kirejen"                  # would otherwise highlight
+    host._preview_damage.add("kirejen", 250, now[0])
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"   # damage wins
+
+
+def test_tick_intel_flash_beats_active_highlight(monkeypatch):
+    now = [100.0]
+    host = _flash_tick_host(monkeypatch, now)
+    host._preview_cfg().update(highlight_active=True, highlight_color="#00d4ff",
+                               intel_flash_color="#ff3b30")
+    host._preview_last_key = "kirejen"                  # would otherwise highlight
+    host._preview_intel = {30000142: (100.0, "hostile")}
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"   # intel wins over highlight
+
+
+# ── (C4) cycle exclusion: Shift+Left toggles, excluded keys skipped by cycle ───
+def test_tile_exclude_toggles_session_exclusion_set_and_badge():
+    host = make_host(mode="native")
+    host._preview_on_tile_exclude = types.MethodType(
+        fc_gui.FCToolGUI._preview_on_tile_exclude, host)
+    ta = FakeTile(host, "a")
+    host._preview_clients = {1: _cw(1, "A")}
+    host._preview_tiles = {1: ta}
+    host._preview_on_tile_exclude("a")
+    assert "a" in host._preview_excluded
+    assert ta.excluded is True                         # badge dot pushed to the tile
+    host._preview_on_tile_exclude("a")                 # toggle back
+    assert "a" not in host._preview_excluded
+    assert ta.excluded is False
+
+
+def test_cycle_skips_excluded_keys(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    host._preview_clients = {1: _cw(1, "A"), 2: _cw(2, "B"), 3: _cw(3, "C")}
+    host._preview_excluded = {"b"}                      # B excluded from cycling
+    svc = FakeHotkeys()
+    svc.events.put(200)
+    host._preview_hotkeys = svc
+    host._preview_hotkey_map = {200: ("cycle", 0, +1)}
+    host._preview_cfg()["hotkeys"] = {
+        "focus": {}, "groups": [{"next": [], "prev": [],
+                                 "order": ["a", "b", "c"]}],
+        "minimize_all": []}
+    host._preview_drain_hotkeys()
+    assert activated == [3]                             # a -> c (b skipped)
+    assert host._preview_last_key == "c"
+
+
+# ── (C4) switch-to-non-EVE: external hwnd captured in tick, activated on demand ─
+class _FgWin32Ext:
+    """Foreground fake reporting an hwnd that is neither an EVE client nor ours."""
+
+    def __init__(self, fg_hwnd):
+        self._fg = fg_hwnd
+
+    def get_foreground(self):
+        return self._fg
+
+
+def test_tick_captures_external_foreground_hwnd(monkeypatch):
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216]})
+    host._preview_find_clients = lambda: [_cw(1, "A")]
+    host._preview_win32 = _FgWin32Ext(9999)            # a non-EVE, non-ours window
+    tick(host)
+    assert host._preview_last_external_hwnd == 9999
+
+
+def test_tick_does_not_capture_eve_client_as_external(monkeypatch):
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216]})
+    host._preview_find_clients = lambda: [_cw(1, "A")]
+    host._preview_win32 = _FgWin32(1)                  # foreground IS an EVE client
+    tick(host)
+    assert host._preview_last_external_hwnd is None
+
+
+def test_switch_external_activates_captured_hwnd(monkeypatch):
+    activated = []
+    monkeypatch.setattr(window_activator, "activate",
+                        lambda hwnd, **k: activated.append(hwnd) or True)
+    host = make_host(mode="native")
+    host._preview_on_tile_switch_external = types.MethodType(
+        fc_gui.FCToolGUI._preview_on_tile_switch_external, host)
+    host._preview_last_external_hwnd = 4242
+    host._preview_on_tile_switch_external()
+    assert activated == [4242]
+
+
+def test_switch_external_noop_when_nothing_captured(monkeypatch):
+    activated = []
+    monkeypatch.setattr(window_activator, "activate",
+                        lambda hwnd, **k: activated.append(hwnd) or True)
+    host = make_host(mode="native")
+    host._preview_on_tile_switch_external = types.MethodType(
+        fc_gui.FCToolGUI._preview_on_tile_switch_external, host)
+    host._preview_last_external_hwnd = None
+    host._preview_on_tile_switch_external()
     assert activated == []
