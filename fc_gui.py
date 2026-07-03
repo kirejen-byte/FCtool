@@ -12903,14 +12903,21 @@ class FCToolGUI:
         cfg = self._preview_cfg()
         tile_w = int(cfg.get("tile_w", 384))
         body_h = int(cfg.get("tile_body_h", 216))
+        # C5: arrange across the full virtual desktop (all monitors), not just
+        # the primary screen. _virtual_screen_bounds() wraps the SM_*VIRTUALSCREEN
+        # GetSystemMetrics (read-only) and falls back to Tk's primary screen.
         try:
-            bw = int(self.root.winfo_screenwidth())
-            bh = int(self.root.winfo_screenheight())
+            x0, y0, x1, y1 = self._virtual_screen_bounds()
+            bx, by = int(x0), int(y0)
+            bw, bh = int(x1) - bx, int(y1) - by
         except Exception:
-            bw, bh = 1920, 1080
-        rects = preview_layout.grid_arrange(
-            len(ordered_live), tile_w, body_h, (0, 0, bw, bh),
-            origin=(10, 10), gap=8)
+            bx, by, bw, bh = 0, 0, 1920, 1080
+        # Lay out in a bounds-local (0,0,bw,bh) space so per-row math is correct,
+        # then shift every rect onto the virtual desktop by the origin (bx, by).
+        rects = [(bx + gx, by + gy, gw, gh) for gx, gy, gw, gh
+                 in preview_layout.grid_arrange(
+                     len(ordered_live), tile_w, body_h, (0, 0, bw, bh),
+                     origin=(10, 10), gap=8)]
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):
             layouts[client.key] = [int(x), int(y), tile_w, body_h]

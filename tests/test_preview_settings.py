@@ -78,6 +78,8 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
     host._preview_last_key = ""
     host._preview_status = ""
     host._preview_status_label = None
+    # Deterministic virtual-desktop bounds for arrange-grid (see _pure_host).
+    host._virtual_screen_bounds = lambda: (0, 0, 1920, 1080)
     saved = {"n": 0}
     host._save_config = lambda: saved.__setitem__("n", saved["n"] + 1)
     host._saved = saved
@@ -148,6 +150,9 @@ def _pure_host(preview_cfg=None):
         "overlay_disable", calls["overlay_disable"] + 1)
     host.root = SimpleNamespace(
         winfo_screenwidth=lambda: 1920, winfo_screenheight=lambda: 1080)
+    # Deterministic virtual-desktop bounds so arrange-grid math is stable across
+    # dev boxes (the real _virtual_screen_bounds calls GetSystemMetrics on win32).
+    host._virtual_screen_bounds = lambda: (0, 0, 1920, 1080)
     host._preview_status_label = None
     host._preview_native_widgets = []
     host._preview_disabled_session = False
@@ -327,6 +332,34 @@ def test_arrange_grid_noop_when_no_live_clients():
     host = _pure_host(preview_cfg={"mode": "native", "layouts": {}})
     host._preview_arrange_grid()      # must not raise
     assert host.config["preview"]["layouts"] == {}
+
+
+def test_arrange_grid_uses_virtual_desktop_bounds_and_origin():
+    """C5 finalization: arrange spans the full virtual desktop, so a secondary
+    monitor with a negative/offset origin shifts every tile onto that space
+    (GetSystemMetrics SM_*VIRTUALSCREEN, wrapped by _virtual_screen_bounds)."""
+    host = _pure_host(preview_cfg={"mode": "native", "layouts": {}})
+    # A left-hand secondary monitor: virtual desktop starts at x=-1920.
+    host._virtual_screen_bounds = lambda: (-1920, 0, 1920, 1080)
+    host._preview_clients = {1: _cw(1, "Alpha"), 2: _cw(2, "Bravo")}
+
+    class T:
+        def __init__(self, key):
+            self.key = key
+        def place(self, *a):
+            pass
+    host._preview_tiles = {1: T("alpha"), 2: T("bravo")}
+
+    host._preview_arrange_grid()
+
+    layouts = host.config["preview"]["layouts"]
+    # bw = 1920 - (-1920) = 3840; local grid then shifted by origin (-1920, 0).
+    local = preview_layout.grid_arrange(
+        2, 384, 216, (0, 0, 3840, 1080), origin=(10, 10), gap=8)
+    assert layouts["alpha"] == [-1920 + local[0][0], 0 + local[0][1], 384, 216]
+    assert layouts["bravo"] == [-1920 + local[1][0], 0 + local[1][1], 384, 216]
+    # first tile lands on the secondary (negative-x) monitor
+    assert layouts["alpha"][0] < 0
 
 
 # ── (A10) hotkey binding builder — pure, no Tk/ctypes ────────────────────────
