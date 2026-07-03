@@ -190,3 +190,76 @@ def test_search_prefix_caps_at_limit(tmp_path):
     cat = TypeCatalog(bundled_path=str(bundled),
                       cache_path=str(tmp_path / "c.json"), esi=None)
     assert len(cat.search_prefix("shipxx", limit=5)) == 5
+
+
+# ── ship_type_names / ship_group_names (overlay rule-value scoping) ───────────
+
+def _ship_fixture(tmp_path):
+    import json
+    data = {
+        # ships (category 6) across several groups, incl. a shuttle (group 31)
+        # and a Force Recon Ship (group 833) that also lives in the name map.
+        "11134": {"n": "Amarr Shuttle", "c": 6, "g": 31, "s": None},
+        "672":   {"n": "Caldari Shuttle", "c": 6, "g": 31, "s": None},
+        "11957": {"n": "Falcon", "c": 6, "g": 833, "s": None},
+        "12015": {"n": "Muninn", "c": 6, "g": 358, "s": None},
+        # a non-ship (module) that must NEVER show up in ship_* results
+        "2048":  {"n": "Damage Control II", "c": 7, "g": 60, "s": "low"},
+        # a ship whose group id is absent from SHIP_GROUP_NAMES: its TYPE name
+        # is still offered, but it contributes no GROUP name.
+        "99001": {"n": "Mystery Hull", "c": 6, "g": 999999, "s": None},
+    }
+    p = tmp_path / "fit_types.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return str(p)
+
+
+def test_ship_type_names_ship_only_incl_shuttles(tmp_path):
+    cat = TypeCatalog(bundled_path=_ship_fixture(tmp_path),
+                      cache_path=str(tmp_path / "c.json"))
+    all_ships = cat.ship_type_names()
+    assert "Amarr Shuttle" in all_ships          # the reported-missing case
+    assert "Falcon" in all_ships
+    assert "Muninn" in all_ships
+    assert "Mystery Hull" in all_ships           # unknown-group ship still listed
+    assert "Damage Control II" not in all_ships  # module excluded
+    # sorted output
+    assert all_ships == sorted(all_ships)
+
+
+def test_ship_type_names_prefix_is_substring(tmp_path):
+    cat = TypeCatalog(bundled_path=_ship_fixture(tmp_path),
+                      cache_path=str(tmp_path / "c.json"))
+    shuttles = cat.ship_type_names("shuttle")     # substring, not just prefix
+    assert set(shuttles) == {"Amarr Shuttle", "Caldari Shuttle"}
+    assert "Falcon" not in shuttles
+
+
+def test_ship_group_names_catalog_aligned_incl_shuttle(tmp_path):
+    cat = TypeCatalog(bundled_path=_ship_fixture(tmp_path),
+                      cache_path=str(tmp_path / "c.json"))
+    groups = cat.ship_group_names()
+    # groups present among the fixture's ships, resolved to authoritative names
+    assert "Shuttle" in groups                    # group 31
+    assert "Force Recon Ship" in groups           # group 833
+    assert "Heavy Assault Cruiser" in groups      # group 358
+    # a ship group id not in SHIP_GROUP_NAMES contributes no bare-number entry
+    assert "999999" not in groups
+    # no module/system contamination
+    assert "Damage Control II" not in groups
+    assert groups == sorted(groups)
+
+
+def test_ship_group_names_fallback_when_no_ships(tmp_path):
+    import json
+    from type_catalog import SHIP_GROUP_NAMES
+    # catalog with zero ships -> falls back to the full name map (never empty)
+    bundled = tmp_path / "fit_types.json"
+    bundled.write_text(json.dumps(
+        {"2048": {"n": "Damage Control II", "c": 7, "g": 60, "s": "low"}}),
+        encoding="utf-8")
+    cat = TypeCatalog(bundled_path=str(bundled),
+                      cache_path=str(tmp_path / "c.json"))
+    groups = cat.ship_group_names()
+    assert set(groups) == set(SHIP_GROUP_NAMES.values())
+    assert "Shuttle" in groups

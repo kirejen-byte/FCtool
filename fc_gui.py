@@ -11181,6 +11181,36 @@ class FCToolGUI:
                           {} if isinstance(v, dict) else v)
         return cfg
 
+    # `when` kinds whose rule needs no match value (the value field is hidden /
+    # disabled and no suggestions apply).
+    _OVERLAY_VALUELESS_WHENS = ("docked", "offline", "capital", "subcap")
+
+    def _overlay_rule_value_suggestions(self, when: str) -> list[str]:
+        """Autocomplete suggestions for a rule's value, SCOPED to the rule
+        category so systems never bleed into ship_group etc.:
+
+          ship_group -> distinct ship GROUP names (incl. "Shuttle")
+          ship_type  -> ship TYPE names (incl. "Amarr Shuttle" and other
+                        shuttles — sourced from ship-only catalog names)
+          system     -> system names (self._system_names)
+          docked/offline/capital/subcap -> [] (valueless)
+
+        Pure w.r.t. the chosen `when`: given the kind it reads the correct
+        source and cross-contaminates none of the others. Never raises; returns
+        [] on any failure so the dialog degrades to free-text entry."""
+        w = (when or "").strip()
+        try:
+            if w == "system":
+                return list(getattr(self, "_system_names", []) or [])
+            tc = getattr(self, "type_catalog", None)
+            if w == "ship_group":
+                return tc.ship_group_names() if tc is not None else []
+            if w == "ship_type":
+                return tc.ship_type_names() if tc is not None else []
+        except Exception:
+            return []
+        return []
+
     def _overlay_rules(self) -> list:
         raw = self._overlay_cfg().get("rules", []) or []
         out = []
@@ -11599,22 +11629,51 @@ class FCToolGUI:
         def _add_rule_row(when="ship_group", value="", label=""):
             r = len(rule_rows)
             wv = tk.StringVar(value=when)
-            vv = tk.StringVar(value=value)
             lv = tk.StringVar(value=label)
-            ttk.Combobox(rules_frame, textvariable=wv, values=when_values,
-                         state="readonly", width=11,
-                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
-            # value: autocomplete for systems/ship-groups (free text otherwise)
+            when_combo = ttk.Combobox(rules_frame, textvariable=wv,
+                                      values=when_values, state="readonly",
+                                      width=11, font=("Consolas", 9))
+            when_combo.grid(row=r, column=0, padx=2, pady=1)
+            # value: autocomplete SCOPED to the chosen `when` kind (ship_group ->
+            # group names, ship_type -> ship type names incl. shuttles, system ->
+            # system names). Valueless kinds disable the field entirely.
             ve = AutocompleteEntry(
-                rules_frame, self._system_names, font=("Consolas", 9),
-                bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+                rules_frame, self._overlay_rule_value_suggestions(when),
+                font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                insertbackground=FG_WHITE, width=18)
             ve.grid(row=r, column=1, padx=2)
             if value:
                 ve.insert(0, value)
+
+            def _sync_value_source(*_a, _wv=wv, _ve=ve):
+                kind = _wv.get().strip()
+                # repopulate suggestions from the correct source for this kind
+                try:
+                    _ve.update_completions(
+                        self._overlay_rule_value_suggestions(kind))
+                except Exception:
+                    pass
+                # disable + clear the value field for valueless kinds; the OK
+                # handler also ignores any value for these, so this is purely UX
+                if kind in self._OVERLAY_VALUELESS_WHENS:
+                    try:
+                        _ve.delete(0, tk.END)
+                        _ve.configure(state="disabled")
+                    except tk.TclError:
+                        pass
+                else:
+                    try:
+                        _ve.configure(state="normal")
+                    except tk.TclError:
+                        pass
+
+            when_combo.bind("<<ComboboxSelected>>", _sync_value_source)
             le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
             le.grid(row=r, column=2, padx=2)
             rule_rows.append({"when": wv, "value_entry": ve, "label": lv})
+            # apply the initial enabled/disabled state for the seeded `when`
+            _sync_value_source()
 
         for r in cfg.get("rules", []) or []:
             _add_rule_row(r.get("when", "ship_group"), r.get("value", ""),
