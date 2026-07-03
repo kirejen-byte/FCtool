@@ -11099,12 +11099,15 @@ class FCToolGUI:
         return out
 
     def _overlay_state_for(self, thumb):
-        """Return the CharState for a thumb — the poller's snapshot if present
-        and fresh, else a name-only CharState so overrides still fire (Phase 1
-        has no poller at all)."""
-        st = self._overlay_states.get(thumb.char_name.strip().lower())
+        """CharState for a thumb — the poller snapshot if present AND fresh
+        (within _OVERLAY_STALE_SECS), else a name-only CharState. A stale state
+        is dropped rather than shown, so we never label wrong/old info."""
+        key = thumb.char_name.strip().lower()
+        st = self._overlay_states.get(key)
         if st is not None:
-            return st
+            ts = self._overlay_state_ts.get(key)
+            if ts is not None and (time.monotonic() - ts) <= self._OVERLAY_STALE_SECS:
+                return st
         return overlay_rules.CharState(character_id=0, name=thumb.char_name)
 
     def _overlay_compose_items(self):
@@ -11215,6 +11218,8 @@ class FCToolGUI:
                 pass
             self._overlay_after_id = None
         self._overlay_stop_poller()
+        self._overlay_states = {}
+        self._overlay_state_ts = {}
         if self._overlay is not None:
             try:
                 self._overlay.set_labels([])

@@ -221,6 +221,32 @@ def test_style_change_persists_live():
         root.destroy()
 
 
+import time as _time
+from overlay_rules import OverlayRule
+
+
+def test_stale_state_dropped_to_name_only():
+    thumbs = [Thumb(1, "Alpha", (0, 0, 100, 100))]
+    fresh = CharState(character_id=1, name="Alpha", ship_group="Force Recon Ship")
+    root, host = _host(
+        overlay_cfg={"enabled": True,
+                     "rules": [{"when": "ship_group", "value": "Force Recon Ship",
+                                "label": "Cyno"}],
+                     "overrides": {}},
+        thumbs=thumbs, states={"alpha": fresh})
+    host._overlay_state_ts = {"alpha": _time.monotonic()}
+    # bind the staleness-aware accessor + cap constant
+    host._OVERLAY_STALE_SECS = fc_gui.FCToolGUI._OVERLAY_STALE_SECS
+    try:
+        # fresh: rule matches → "Cyno"
+        assert host._overlay_compose_items() == [((0, 0, 100, 100), "Cyno")]
+        # now make it stale (older than the cap) → state ignored → no rule match
+        host._overlay_state_ts["alpha"] = _time.monotonic() - (host._OVERLAY_STALE_SECS + 1)
+        assert host._overlay_compose_items() == [((0, 0, 100, 100), "")]
+    finally:
+        root.destroy()
+
+
 def test_teardown_safe_when_never_enabled():
     # App-close teardown must be safe/idempotent even if the overlay was never
     # enabled: no after-loop, no poller, overlay may be a bare fake. Mirrors the
