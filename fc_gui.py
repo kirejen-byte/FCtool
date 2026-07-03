@@ -492,6 +492,11 @@ class FCToolGUI:
         # one thread cannot interleave with a write on another and corrupt or
         # clobber settings. Created before any save path can run.
         self._config_lock = threading.Lock()
+        # Short TTL cache for get_fleet_info() shared by _fleet_boss_session and
+        # _fleet_boss_info. The Fleet Templates window calls both back-to-back on
+        # entering live mode; without this each does its own ESI round-trip.
+        # (ts_monotonic, info_dict_or_None); see _cached_fleet_info.
+        self._fleet_info_cache = None
         self.config = self._load_config()
         # One-time migration of the config-driven intel filter + coalition seed
         # (synchronous part; the Triumvirate. id is resolved off-thread later,
@@ -7524,6 +7529,24 @@ class FCToolGUI:
                 return d
         return None
 
+    _FLEET_INFO_TTL_S = 4.0   # get_fleet_info() cache lifetime (see _cached_fleet_info)
+
+    def _cached_fleet_info(self, auth):
+        """auth.get_fleet_info() behind a short monotonic TTL, keyed by the
+        character so switching the selected FC never returns a stale hit. Lets
+        _fleet_boss_session and _fleet_boss_info share one ESI round-trip when
+        the Fleet Templates window calls both on entering live mode."""
+        cid = getattr(auth, "character_id", None)
+        now = time.monotonic()
+        cached = self._fleet_info_cache
+        if cached is not None:
+            ts, ckey, info = cached
+            if ckey == cid and (now - ts) < self._FLEET_INFO_TTL_S:
+                return info
+        info = auth.get_fleet_info()
+        self._fleet_info_cache = (now, cid, info)
+        return info
+
     def _fleet_boss_session(self):
         """Current fleet-boss AuthEsiSession, or None if no authed boss."""
         import fleet_esi
@@ -7532,7 +7555,7 @@ class FCToolGUI:
             return None
         if not auth.has_scope("esi-fleets.write_fleet.v1"):
             return None
-        info = auth.get_fleet_info()
+        info = self._cached_fleet_info(auth)
         if not info or not auth.is_boss(info, auth.character_id):
             return None
         return fleet_esi.AuthEsiSession(auth)
@@ -7541,7 +7564,7 @@ class FCToolGUI:
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             return None
-        info = auth.get_fleet_info()
+        info = self._cached_fleet_info(auth)
         if not info:
             return None
         return {"fleet_id": info["fleet_id"],

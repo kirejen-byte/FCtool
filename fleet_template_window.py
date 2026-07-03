@@ -165,6 +165,9 @@ class FleetTemplateWindow:
         self._auto_sort_on = False
         self._sync_after_id = None
         self._executor = None
+        # True while an async fleet-boss check is in flight (set_mode → live).
+        # Guards against stacking workers on rapid double-clicks of the toggle.
+        self._entering_live = False
         self._last_write_wall = 0.0
         self._pins: dict[int, int] = {}          # pilot_id -> ship_type_id at pin time
         self._prev_members: list[dict] = []      # previous sync snapshot (for diffing)
@@ -343,6 +346,22 @@ class FleetTemplateWindow:
         self.set_mode("live" if self.mode == "template" else "template")
 
     def set_mode(self, mode: str):
+        if mode == "live":
+            # Entering live requires a fleet-boss check, which is a SYNCHRONOUS
+            # ESI round-trip. Do it off the Tk thread and only flip the UI to
+            # live once it succeeds — keep mode='template' until confirmed so a
+            # failed check needs no visible revert. See _enter_live_mode.
+            self._enter_live_mode()
+            return
+        # Template mode is local-only → apply immediately.
+        self._apply_mode_ui("template")
+        self._exit_live_mode()         # Task D5
+        self._refresh_add_buttons()
+
+    def _apply_mode_ui(self, mode: str):
+        """Apply all mode-dependent widget state (banner, button enablement).
+        Shared by the synchronous template path and the async live-entry
+        completion so both leave the window in a consistent state."""
         self.mode = mode
         self._banner.config(
             text=mode_banner_text(mode),
@@ -357,11 +376,6 @@ class FleetTemplateWindow:
         if not live:
             self._auto_sort_on = False
             self._auto_sort_btn.config(text="Auto-sort: OFF")
-        if live:
-            self._enter_live_mode()    # Task D5
-        else:
-            self._exit_live_mode()     # Task D5
-        self._refresh_add_buttons()
 
     def _save(self):
         t = self.current_template()
@@ -1615,18 +1629,45 @@ class FleetTemplateWindow:
         return out
 
     def _enter_live_mode(self):
-        info = self._fleet_info_provider()
+        """Begin the switch to live mode. The fleet-boss check
+        (_fleet_info_provider) is a SYNCHRONOUS ESI round-trip, so run it on a
+        daemon worker and finish the switch from the _post()'d continuation.
+        Mode stays 'template' until the check confirms boss status, so a failed
+        check requires no visible revert. Re-entrancy-guarded so rapid
+        double-clicks of the toggle don't stack workers."""
+        if self._entering_live:
+            return
+        self._entering_live = True
+        self._status.config(text="Checking fleet…", fg=FG_DIM)
+
+        def worker():
+            info = self._fleet_info_provider()
+            self._post(self._finish_enter_live, info)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_enter_live(self, info):
+        """Tk-thread continuation of _enter_live_mode once fleet info is known."""
+        self._entering_live = False
+        if self.mode != "template":
+            # Something else changed the mode while the check was in flight;
+            # abandon this (stale) entry attempt.
+            return
         if not info or not info.get("is_boss"):
             messagebox.showwarning(
                 "Live mode unavailable",
                 "The selected FC character must be the current fleet boss to "
                 "read and manage fleet structure.", parent=self.win)
-            self.set_mode("template")
+            # Mode was never flipped, so just restore the resting template UI.
+            self._apply_mode_ui("template")
+            self._refresh_add_buttons()
             return
+        self._apply_mode_ui("live")
         self._fleet_id = info["fleet_id"]
         self._ensure_executor()
         self._sync_live(initial=True)
         self._schedule_sync()
+        self._refresh_add_buttons()
 
     def _exit_live_mode(self):
         if self._sync_after_id:
@@ -1795,12 +1836,28 @@ class FleetTemplateWindow:
     def _apply(self):
         if self.mode != "live":
             return
-        session = self._esi_session_provider()
+        # _esi_session_provider() does a SYNCHRONOUS ESI round-trip (get_fleet_info
+        # + a possible token refresh), so fetch it off the Tk thread and open the
+        # preview from the _post()'d continuation. Keeps the UI responsive.
+        self._status.config(text="Checking fleet…", fg=FG_DIM)
+
+        def worker():
+            session = self._esi_session_provider()
+            self._post(self._apply_with_session, session)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_with_session(self, session):
+        """Tk-thread continuation of _apply once the boss session is known.
+        Identical to the old inline post-fetch logic."""
+        if self.mode != "live":
+            return
         if session is None:
             messagebox.showwarning(
                 "Apply", "No fleet-boss session — you must be the current fleet "
                 "boss with the fleet-write scope (re-authenticate if your token "
                 "is old).", parent=self.win)
+            self._status.config(text="No fleet-boss session.", fg=FG_RED)
             return
         res = self._compose_preview()
         if res is None:
@@ -1856,8 +1913,14 @@ class FleetTemplateWindow:
         self._ledger = FleetTokenLedger()
         # autostart defaults True → the single persistent worker thread is
         # launched here (parks on a blocking queue.get until submit()/stop()).
+        # session=None on purpose: _esi_session_provider() does a SYNCHRONOUS
+        # ESI round-trip and _ensure_executor runs on the Tk thread. The
+        # executor never needs a session before the first move — _executor_on_move
+        # fetches a fresh one on the worker and re-points self._executor.session
+        # for every write, and FleetExecutor's header reads use
+        # `getattr(self.session, "last_headers", {}) or {}`, which is None-safe.
         self._executor = FleetExecutor(
-            session=self._esi_session_provider(),
+            session=None,
             on_move=self._executor_on_move,
             post=self._post,
             sleep=time.sleep,

@@ -91,7 +91,8 @@ def test_window_builds_and_defaults_to_template_mode(root, tmp_path):
     win.destroy()
 
 
-def test_mode_toggle_to_live_enables_apply(root, tmp_path):
+def test_mode_toggle_to_live_enables_apply(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
     from fleet_template_window import FleetTemplateWindow
     win = FleetTemplateWindow(
         root, store=_store(tmp_path), fittings=_FakeFittings(), config={},
@@ -100,7 +101,15 @@ def test_mode_toggle_to_live_enables_apply(root, tmp_path):
         doctrine_provider=lambda: None,
         character_names_provider=lambda: [],
     )
+    # The boss check is now async (off the Tk thread); run it inline and pump
+    # the _post-marshaled continuation. Stub the live-sync side effects so the
+    # test stays focused on the mode/button transition.
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(win, "_sync_live", lambda **k: None)
+    monkeypatch.setattr(win, "_schedule_sync", lambda: None)
+    _stub_executor(win, monkeypatch)
     win.set_mode("live")
+    root.update()
     assert win.mode == "live"
     assert str(win._apply_btn["state"]) == "normal"
     win.destroy()
@@ -346,6 +355,18 @@ class _SyncThread:
             self._t()
 
 
+def _stub_executor(win, monkeypatch):
+    """Neutralize _ensure_executor for tests that patch threading.Thread with
+    _SyncThread. threading.Thread is a shared-module attribute, so patching it
+    also makes FleetExecutor.start() run its persistent worker inline — which
+    blocks forever on queue.get(). Stub the build to set a sentinel with a
+    no-op stop() (destroy() calls _executor.stop())."""
+    monkeypatch.setattr(
+        win, "_ensure_executor",
+        lambda: setattr(win, "_executor",
+                        types.SimpleNamespace(stop=lambda: None)))
+
+
 def test_drag_drop_enqueues_moves_not_sleeps(root, tmp_path):
     # DRAG path is fully synchronous: no thread, no _post. Stubbing submit and
     # calling _live_drop_pilots directly captures the job with no pumping.
@@ -442,9 +463,17 @@ def test_active_cadence_when_recent_write(root, tmp_path):
 
 
 # append — Phase B: auto-sort toggle + tick
-def test_auto_sort_button_label(root, tmp_path):
+def test_auto_sort_button_label(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
     win = _live_win(root, tmp_path)
+    # set_mode('live') now runs an async boss check; run it inline + pump, and
+    # stub the sync side effects (fake session can't hit ESI).
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(win, "_sync_live", lambda **k: None)
+    monkeypatch.setattr(win, "_schedule_sync", lambda: None)
+    _stub_executor(win, monkeypatch)
     win.set_mode("live")
+    root.update()
     assert "Auto-sort" in str(win._auto_sort_btn["text"])
     win._toggle_auto_sort()
     assert win._auto_sort_on is True
@@ -495,11 +524,14 @@ def test_apply_clears_pins(root, tmp_path, monkeypatch):
     # Stub the enqueue path so _apply just runs the clear-pins side effect.
     win._execute_moves = lambda *a, **k: None
     import fleet_template_window as ftw
+    # _apply fetches the boss session off-thread now; run it inline + pump.
+    monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
     captured = {}
     monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
                         lambda parent, rows, big_warning, on_confirm:
                         captured.setdefault("confirm", on_confirm))
     win._apply()
+    root.update()
     captured["confirm"]()
     assert win._pins == {}
     win.destroy()
@@ -856,15 +888,22 @@ def test_inline_rename_counter_text():
     assert inline_rename_counter("slot", "Kyra Dawnfall") == ""
 
 
-def test_mode_banner_text_updates(root, tmp_path):
+def test_mode_banner_text_updates(root, tmp_path, monkeypatch):
+    import fleet_template_window as ftw
     win = _live_win(root, tmp_path)
     try:
         # Template mode banner is the dim sandbox line.
         win.set_mode("template")
         assert "TEMPLATE" in str(win._banner["text"])
         assert "sandbox" in str(win._banner["text"]).lower()
-        # Live mode banner warns.
+        # Live mode banner warns. The boss check is async now — run inline + pump
+        # and stub the sync side effects (fake session can't hit ESI).
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        monkeypatch.setattr(win, "_sync_live", lambda **k: None)
+        monkeypatch.setattr(win, "_schedule_sync", lambda: None)
+        _stub_executor(win, monkeypatch)
         win.set_mode("live")
+        root.update()
         assert "LIVE" in str(win._banner["text"])
         assert "real fleet" in str(win._banner["text"]).lower()
     finally:
@@ -985,12 +1024,15 @@ def test_apply_opens_preview_and_confirm_executes(root, tmp_path, monkeypatch):
                                    target_role="squad_member")
         monkeypatch.setattr(win, "_compose_preview",
                             lambda: _fake_compose_result([mv]))
+        # _apply fetches the boss session off-thread now; run it inline + pump.
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
         # Auto-confirm the dialog by capturing it and invoking its confirm.
         captured = {}
         monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
                             lambda parent, rows, big_warning, on_confirm:
                             captured.setdefault("confirm", on_confirm))
         win._apply()
+        root.update()
         assert "confirm" in captured
         captured["confirm"]()
         assert executed["n"] == 1
@@ -1016,11 +1058,14 @@ def test_apply_big_warning_line_over_threshold(root, tmp_path, monkeypatch):
                  for i in range(3)]
         monkeypatch.setattr(win, "_compose_preview",
                             lambda: _fake_compose_result(moves))
+        # _apply fetches the boss session off-thread now; run it inline + pump.
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
         captured = {}
         monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
                             lambda parent, rows, big_warning, on_confirm:
                             captured.update(big=big_warning))
         win._apply()
+        root.update()
         assert captured["big"]        # non-empty warning string when 3 > 1
     finally:
         win.destroy()
@@ -1174,3 +1219,179 @@ def test_executor_on_move_uses_module_fleet_esi(monkeypatch):
     assert calls[0] == (fake_session, 1, 1, 2, 3, "squad_member")
     # freshest session was pushed onto the executor before the write
     assert host._executor.session is fake_session
+
+
+# append — v2.3.2 freeze fix: never call ESI on the Tk thread
+def test_ensure_executor_does_not_call_session_provider(root, tmp_path):
+    """_ensure_executor must NOT call the (synchronous, ESI-hitting) session
+    provider on the Tk thread. It builds the executor with session=None;
+    _executor_on_move fetches a fresh session per move on the worker."""
+    def _tripwire():
+        pytest.fail("_ensure_executor called the ESI session provider on the "
+                    "Tk thread")
+    win = _live_win(root, tmp_path, esi_session_provider=_tripwire)
+    try:
+        win._ensure_executor()
+        assert win._executor is not None
+        assert win._executor.session is None      # lazy — no provider call
+    finally:
+        win.destroy()
+
+
+def test_apply_fetches_session_off_thread(root, tmp_path, monkeypatch):
+    """_apply defers the session fetch to a worker thread and opens the preview
+    from the _post-marshaled continuation. With _SyncThread the worker runs
+    inline; the provider is called exactly once and the dialog opens."""
+    import fleet_template_window as ftw
+    calls = {"n": 0}
+
+    def _recording_provider():
+        calls["n"] += 1
+        return object()      # non-None session → proceed to preview
+
+    win = _live_win(root, tmp_path, esi_session_provider=_recording_provider)
+    try:
+        win.mode = "live"
+        win._live_members = []
+        win._live_structure = {"wings": []}
+        win._execute_moves = lambda *a, **k: None
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        captured = {}
+        monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
+                            lambda parent, rows, big_warning, on_confirm:
+                            captured.setdefault("opened", True))
+        win._apply()
+        root.update()      # pump the _post-marshaled continuation
+        assert calls["n"] == 1          # provider called once (inside the worker)
+        assert captured.get("opened") is True
+    finally:
+        win.destroy()
+
+
+def test_enter_live_boss_ok_completes_switch(root, tmp_path, monkeypatch):
+    """When the async boss check confirms boss status, the switch to live
+    completes: mode='live', fleet_id set, executor built."""
+    import fleet_template_window as ftw
+    win = _live_win(
+        root, tmp_path,
+        fleet_info_provider=lambda: {"fleet_id": 77, "is_boss": True})
+    try:
+        # Start from a clean template resting state.
+        win.mode = "template"
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        # Stub the live-sync side effects (fake session can't hit ESI).
+        monkeypatch.setattr(win, "_sync_live", lambda **k: None)
+        monkeypatch.setattr(win, "_schedule_sync", lambda: None)
+        _stub_executor(win, monkeypatch)   # _ensure_executor is exercised here
+        win.set_mode("live")
+        root.update()      # pump the _post-marshaled continuation
+        assert win.mode == "live"
+        assert win._fleet_id == 77
+        assert win._executor is not None   # _ensure_executor ran (sentinel set)
+        assert win._entering_live is False
+    finally:
+        win.destroy()
+
+
+def test_enter_live_not_boss_reverts(root, tmp_path, monkeypatch):
+    """When the async boss check says not-boss, the window stays in template
+    mode and warns — no visible flip to live."""
+    import fleet_template_window as ftw
+    win = _live_win(
+        root, tmp_path,
+        fleet_info_provider=lambda: {"fleet_id": 1, "is_boss": False})
+    try:
+        win.mode = "template"
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        warned = {"n": 0}
+        monkeypatch.setattr(ftw.messagebox, "showwarning",
+                            lambda *a, **k: warned.__setitem__("n", warned["n"] + 1))
+        win.set_mode("live")
+        root.update()      # pump the _post-marshaled continuation
+        assert win.mode == "template"       # never flipped to live
+        assert warned["n"] == 1             # user was warned
+        assert win._entering_live is False  # guard cleared for a retry
+        assert str(win._apply_btn["state"]) == "disabled"   # template UI
+    finally:
+        win.destroy()
+
+
+def test_enter_live_reentrancy_guard_blocks_second_worker(root, tmp_path,
+                                                           monkeypatch):
+    """A second set_mode('live') while a boss check is in flight must not stack
+    a second worker (guarded by _entering_live)."""
+    import fleet_template_window as ftw
+    spawned = {"n": 0}
+
+    class _CountingThread:
+        def __init__(self, target=None, daemon=None):
+            spawned["n"] += 1
+            self._t = target      # do NOT run — leave the check "in flight"
+
+        def start(self):
+            pass
+
+    win = _live_win(
+        root, tmp_path,
+        fleet_info_provider=lambda: {"fleet_id": 1, "is_boss": True})
+    try:
+        win.mode = "template"
+        monkeypatch.setattr(ftw.threading, "Thread", _CountingThread)
+        win.set_mode("live")      # first: sets _entering_live, spawns 1 worker
+        win.set_mode("live")      # second: guard blocks it
+        assert spawned["n"] == 1
+        assert win._entering_live is True
+    finally:
+        win.destroy()
+
+
+def test_fleet_info_ttl_cache_shares_one_fetch(monkeypatch):
+    """fc_gui._fleet_boss_session and _fleet_boss_info share one get_fleet_info()
+    round-trip within the TTL, and re-fetch after it expires."""
+    import types
+    import fc_gui
+
+    fetches = {"n": 0}
+
+    class _FakeAuth:
+        is_authenticated = True
+        character_id = 123
+
+        def has_scope(self, _scope):
+            return True
+
+        def get_fleet_info(self):
+            fetches["n"] += 1
+            return {"fleet_id": 42, "fleet_boss_id": 123, "role": "fleet_commander"}
+
+        @staticmethod
+        def is_boss(info, cid):
+            return bool(info and info.get("fleet_boss_id") == cid)
+
+    auth = _FakeAuth()
+    host = types.SimpleNamespace(
+        _fleet_info_cache=None,
+        _FLEET_INFO_TTL_S=4.0,
+        esi_auth=auth,
+        _motd_selected_fc_auth=lambda: None,      # falls back to esi_auth
+    )
+    # Bind the real (unbound) methods onto our bare host.
+    cached = fc_gui.FCToolGUI._cached_fleet_info.__get__(host, fc_gui.FCToolGUI)
+    host._cached_fleet_info = cached
+    boss_session = fc_gui.FCToolGUI._fleet_boss_session.__get__(host, fc_gui.FCToolGUI)
+    boss_info = fc_gui.FCToolGUI._fleet_boss_info.__get__(host, fc_gui.FCToolGUI)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(fc_gui.time, "monotonic", lambda: clock["t"])
+
+    # Two calls within the TTL → a single ESI fetch feeds both providers.
+    sess = boss_session()
+    inf = boss_info()
+    assert sess is not None
+    assert inf == {"fleet_id": 42, "is_boss": True}
+    assert fetches["n"] == 1
+
+    # Advance past the TTL → the next call re-fetches.
+    clock["t"] += 5.0
+    boss_info()
+    assert fetches["n"] == 2
