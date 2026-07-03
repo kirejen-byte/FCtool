@@ -101,6 +101,41 @@ log = get_logger(__name__)
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
 
+
+# DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo-handle value -4.
+_DPI_PER_MONITOR_AWARE_V2 = -4
+
+
+def _read_overlay_dpi_pref() -> str:
+    """Best-effort read of config['overlay']['dpi_awareness'] BEFORE the Tk root
+    (and self.config) exist. Returns 'auto' when the file/key is absent."""
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        return (cfg.get("overlay", {}) or {}).get("dpi_awareness", "auto")
+    except Exception:
+        return "auto"
+
+
+def _apply_dpi_awareness(pref: str, user32=None) -> None:
+    """Attempt Per-Monitor-V2 DPI awareness before Tk root creation. Gated by
+    pref != 'off'; wrapped so older Windows / any failure is non-fatal. The
+    user32 arg is injectable for tests; in production it's ctypes.windll.user32."""
+    if pref == "off":
+        return
+    try:
+        if user32 is None:
+            if sys.platform != "win32":
+                return
+            import ctypes
+            user32 = ctypes.windll.user32
+        user32.SetProcessDpiAwarenessContext(_DPI_PER_MONITOR_AWARE_V2)
+    except Exception:
+        # Older Windows lacks this API, or the process is already aware — the
+        # overlay still works on uniform-DPI setups. One quiet line, no crash.
+        log.debug("[overlay] Per-Monitor-V2 DPI awareness not applied")
+
+
 # ── Color Scheme ──────────────────────────────────────────────────────────────
 BG_DARK = "#1a1a2e"
 BG_PANEL = "#16213e"
@@ -478,6 +513,7 @@ def _motd_link_initial_state(config) -> bool:
 
 class FCToolGUI:
     def __init__(self):
+        _apply_dpi_awareness(_read_overlay_dpi_pref())
         self.root = tk.Tk()
         self.root.title("FCTool - Fleet Commander Assistant")
         self.root.geometry("1200x900")

@@ -213,3 +213,41 @@ def test_real_window_styles_land_on_true_toplevel():
             f"WS_EX_LAYERED not set on resolved hwnd (exstyle=0x{exstyle:08x})")
     finally:
         root.destroy()
+
+
+def test_dpi_helper_calls_when_not_off():
+    import fc_gui
+    calls = []
+
+    class FakeUser32:
+        def SetProcessDpiAwarenessContext(self, handle):
+            calls.append(handle)
+            return 1
+
+    fc_gui._apply_dpi_awareness("auto", user32=FakeUser32())
+    # -4 == DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    assert calls == [-4]
+
+
+def test_dpi_helper_skips_when_off():
+    import fc_gui
+    calls = []
+
+    class FakeUser32:
+        def SetProcessDpiAwarenessContext(self, handle):
+            calls.append(handle)
+            return 1
+
+    fc_gui._apply_dpi_awareness("off", user32=FakeUser32())
+    assert calls == []
+
+
+def test_dpi_helper_never_raises():
+    import fc_gui
+
+    class Boom:
+        def SetProcessDpiAwarenessContext(self, handle):
+            raise OSError("nope")
+
+    # must swallow and return without raising
+    fc_gui._apply_dpi_awareness("auto", user32=Boom())
