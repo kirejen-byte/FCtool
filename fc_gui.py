@@ -11738,10 +11738,33 @@ class FCToolGUI:
         except Exception:
             log.exception("[preview] on-video label draw failed")
 
+    #: Fleet-role -> caption chip glyph. squad_member (and any unknown role)
+    #: renders no chip so the common case stays clean.
+    _PREVIEW_ROLE_CHIP = {
+        "fleet_commander": "FC",
+        "wing_commander": "WC",
+        "squad_commander": "SC",
+        "squad_member": "",
+    }
+
     def _preview_role_chip(self, client):
-        """Fleet-role chip text for a client (B4 fills this in with the fleet
-        store lookup). B1 leaves it empty so the chip column stays blank."""
-        return ""
+        """Fleet-role chip text for a client (B4): look the pilot up in the
+        fleet-template store by name and map its role to a short chip glyph.
+
+        Login screens and pilots with no named slot (or the squad_member role)
+        get an empty chip. Fails soft — any store error yields no chip."""
+        if client.is_login or not client.char_name:
+            return ""
+        try:
+            from fleet_template_store import find_character_role
+            match = find_character_role(self.fleet_templates, client.char_name)
+        except Exception:
+            log.exception("[preview] role-chip lookup failed")
+            return ""
+        if match is None:
+            return ""
+        role, _wing, _squad = match
+        return self._PREVIEW_ROLE_CHIP.get(role, "")
 
     # ── B3: intel flash — own-log system index + tile-border alerts ──────────
     def _preview_intel_note(self, index, report, now):
@@ -12238,9 +12261,14 @@ class FCToolGUI:
         bg.grid(row=0, column=3, padx=(0, 6))
         w.append(bg)
 
+        bgf = ttk.Button(rowN2, text="Arrange by fleet", style="Dark.TButton",
+                         command=self._preview_arrange_by_fleet)
+        bgf.grid(row=0, column=4, padx=(0, 6))
+        w.append(bgf)
+
         bhk = ttk.Button(rowN2, text="Hotkeys…", style="Dark.TButton",
                          command=self._open_preview_hotkeys_dialog)
-        bhk.grid(row=0, column=4, padx=(0, 6))
+        bhk.grid(row=0, column=5, padx=(0, 6))
         w.append(bhk)
 
         # Fine print (updated disclaimer — spec §9).
@@ -12333,11 +12361,45 @@ class FCToolGUI:
         """Lay out every live non-login tile in a row-major grid, persist each
         char's rect (keyed by char name), and re-place its tile. Login screens
         keep their stacked positions and are never persisted."""
-        cfg = self._preview_cfg()
         live = [c for c in self._preview_clients.values() if not c.is_login]
-        if not live:
-            return
         live.sort(key=lambda c: c.key)
+        self._preview_arrange_ordered(live)
+
+    def _preview_fleet_order_key(self):
+        """Map lowercased char name -> (wing_idx, squad_idx, slot_idx) position
+        in the fleet-template store (B4). First occurrence wins. Characters with
+        no named slot are absent; callers sort them to the end."""
+        order: dict[str, tuple] = {}
+        try:
+            wi = 0
+            for t in self.fleet_templates.templates:
+                for w in t.wings:
+                    for si, sq in enumerate(w.squads):
+                        for li, slot in enumerate(sq.slots):
+                            name = (slot.character or "").strip().lower()
+                            if name and name not in order:
+                                order[name] = (wi, si, li)
+                    wi += 1
+        except Exception:
+            log.exception("[preview] fleet order build failed")
+        return order
+
+    def _preview_arrange_by_fleet(self):
+        """Arrange live non-login tiles ordered by their fleet-template position
+        (wing → squad → slot), then the same grid + persist as 'Arrange in grid'.
+        Pilots not in any template fall to the end, sorted by name (B4)."""
+        order = self._preview_fleet_order_key()
+        live = [c for c in self._preview_clients.values() if not c.is_login]
+        live.sort(key=lambda c: (order.get(c.key, (1 << 30, 0, 0)), c.key))
+        self._preview_arrange_ordered(live)
+
+    def _preview_arrange_ordered(self, ordered_live):
+        """Grid-place an already-ordered list of live clients, persist each rect
+        (keyed by char name), and re-place its tile. Shared by the grid and
+        by-fleet arrange buttons. No-op on an empty list."""
+        if not ordered_live:
+            return
+        cfg = self._preview_cfg()
         tile_w = int(cfg.get("tile_w", 384))
         body_h = int(cfg.get("tile_body_h", 216))
         try:
@@ -12346,9 +12408,10 @@ class FCToolGUI:
         except Exception:
             bw, bh = 1920, 1080
         rects = preview_layout.grid_arrange(
-            len(live), tile_w, body_h, (0, 0, bw, bh), origin=(10, 10), gap=8)
+            len(ordered_live), tile_w, body_h, (0, 0, bw, bh),
+            origin=(10, 10), gap=8)
         layouts = cfg.setdefault("layouts", {})
-        for client, (x, y, _w, _h) in zip(live, rects):
+        for client, (x, y, _w, _h) in zip(ordered_live, rects):
             layouts[client.key] = [int(x), int(y), tile_w, body_h]
             for tile in self._preview_tiles.values():
                 if getattr(tile, "key", None) == client.key:

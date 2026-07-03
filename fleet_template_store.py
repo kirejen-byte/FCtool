@@ -399,6 +399,40 @@ def validate_template(template: FleetTemplate) -> None:
         rule.broken = broken
 
 
+def find_character_role(store, name_or_id):
+    """Resolve a character's fleet role from the store's named slots.
+
+    Walks every template → wing → squad → slot in order and returns
+    ``(role, wing_name, squad_name)`` for the first NAMED slot whose
+    ``character`` matches ``name_or_id`` — by case-insensitive name (str) or by
+    resolved ``character_id`` (int). Generic slots (``character is None``) never
+    match. Returns None when nothing matches or the query is empty/None.
+
+    Pure: no Tk, no ESI, no network. Uses attribute access (never positional
+    unpacking) so the deprecated 2nd-positional ``tag`` field can't be confused
+    with ``role``.
+    """
+    if name_or_id is None:
+        return None
+    want_id = name_or_id if isinstance(name_or_id, int) else None
+    want_name = (name_or_id.strip().lower()
+                 if isinstance(name_or_id, str) and name_or_id.strip() else None)
+    if want_id is None and want_name is None:
+        return None
+    for t in store.templates:
+        for w in t.wings:
+            for sq in w.squads:
+                for slot in sq.slots:
+                    if slot.character is None:
+                        continue
+                    if want_id is not None and slot.character_id == want_id:
+                        return (slot.role, w.name, sq.name)
+                    if (want_name is not None
+                            and slot.character.strip().lower() == want_name):
+                        return (slot.role, w.name, sq.name)
+    return None
+
+
 def build_template_from_live(live_members, live_structure, *, now,
                              new_id=None) -> FleetTemplate:
     """Build a NEW template from a live fleet snapshot (spec ask 4).

@@ -96,7 +96,9 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
     for name in ("_preview_cfg", "_PREVIEW_DEFAULTS", "_overlay_cfg",
                  "_OVERLAY_DEFAULTS", "_build_preview_section",
                  "_preview_set_mode", "_preview_status_text",
-                 "_preview_arrange_grid", "_preview_apply_native_state",
+                 "_preview_arrange_grid", "_preview_arrange_by_fleet",
+                 "_preview_arrange_ordered", "_preview_fleet_order_key",
+                 "_preview_apply_native_state",
                  "_preview_sync_native_widgets",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
                  "_preview_restart_hotkeys",
@@ -144,6 +146,8 @@ def _pure_host(preview_cfg=None):
     host._preview_status = ""
     for name in ("_preview_cfg", "_PREVIEW_DEFAULTS", "_preview_set_mode",
                  "_preview_status_text", "_preview_arrange_grid",
+                 "_preview_arrange_by_fleet", "_preview_arrange_ordered",
+                 "_preview_fleet_order_key",
                  "_preview_sync_native_widgets"):
         attr = getattr(fc_gui.FCToolGUI, name, None)
         if attr is None:
