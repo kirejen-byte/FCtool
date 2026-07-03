@@ -1706,17 +1706,38 @@ class FCToolGUI:
         self._fleet_locations_cache: dict[str, tuple[str, str, str]] = {}
 
         # ── X-Up Log ─────────────────────────────────────────────────────────
-        log_label = tk.Label(tab, text="X-Up Log", font=("Consolas", 10, "bold"),
-                              fg=FG_ACCENT, bg=BG_DARK)
-        log_label.pack(anchor=tk.W, padx=15, pady=(4, 2))
+        # Collapsible drawer (mirrors the Cyno Check drawer). Starts CLOSED;
+        # the log widget is built into an unpacked body so writers keep working
+        # while it is hidden. New x-up events do NOT auto-expand the drawer.
+        self._xup_log_expanded = False
+
+        self._xup_log_drawer_frame = tk.Frame(
+            tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+            highlightbackground=BORDER_COLOR, highlightthickness=1)
+        self._xup_log_drawer_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        xup_log_header = tk.Frame(self._xup_log_drawer_frame, bg=BG_PANEL)
+        xup_log_header.pack(fill=tk.X, padx=10, pady=4)
+
+        self._xup_log_toggle_btn = tk.Label(
+            xup_log_header, text="▶ X-Up Log",
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2",
+        )
+        self._xup_log_toggle_btn.pack(side=tk.LEFT)
+        self._xup_log_toggle_btn.bind(
+            "<Button-1>", lambda e: self._toggle_xup_log())
+
+        # Body (hidden by default)
+        self._xup_log_body = tk.Frame(self._xup_log_drawer_frame, bg=BG_PANEL)
 
         self._xup_log = scrolledtext.ScrolledText(
-            tab, height=4, font=("Consolas", 9),
+            self._xup_log_body, height=4, font=("Consolas", 9),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
             selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
-        self._xup_log.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self._xup_log.pack(fill=tk.X, padx=10, pady=(0, 6))
         self._theme_scrolledtext_bar(self._xup_log)
         self._xup_log.tag_config("xup", foreground=FG_GREEN)
         self._xup_log.tag_config("fire", foreground=FG_RED, font=("Consolas", 10, "bold"))
@@ -13562,6 +13583,15 @@ $bmp.Dispose()
         else:
             self._cyno_toggle_btn.config(text="▶ Cyno Check")
             self._cyno_body.pack_forget()
+
+    def _toggle_xup_log(self):
+        self._xup_log_expanded = not self._xup_log_expanded
+        if self._xup_log_expanded:
+            self._xup_log_toggle_btn.config(text="▼ X-Up Log")
+            self._xup_log_body.pack(fill=tk.X, padx=6, pady=(0, 6))
+        else:
+            self._xup_log_toggle_btn.config(text="▶ X-Up Log")
+            self._xup_log_body.pack_forget()
 
     def _cyno_on_typeahead(self, event=None):
         """Best-effort debounced ESI character type-ahead.
