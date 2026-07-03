@@ -88,6 +88,9 @@ import pyfa_import
 import motd_builder
 import motd_markup
 from markup_editor import MarkupEditor
+from eveo_tracker import find_thumbs, preview_running
+from eveo_overlay import OverlayWindow
+import overlay_rules
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -603,6 +606,22 @@ class FCToolGUI:
                     break
         if not self.esi_auth and self.esi_accounts:
             self.esi_auth = self.esi_accounts[0]
+
+        # ── Eve-O Preview overlay state ─────────────────────────────────────
+        self._overlay = None
+        self._overlay_states: dict = {}        # name_lower -> CharState (poller)
+        self._overlay_after_id = None
+        self._overlay_poller = None            # Phase 2 daemon thread
+        self._overlay_status_label = None
+        self._overlay_thumbs_fn = find_thumbs  # injectable for tests
+        # Seed rules created once, the first time the feature is enabled.
+        if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
+            self._overlay_cfg()["rules"] = [
+                {"when": r.when, "value": r.value, "label": r.label}
+                for r in overlay_rules.seed_rules()
+            ]
+        # Auto-start the controller if the user left it enabled last session.
+        self.root.after(1200, self._overlay_boot_if_enabled)
 
         # Fitting / doctrine services (Fittings tab). Built AFTER esi_auth so the
         # type catalog's id->name fallback can reach the public ESI endpoint via
@@ -11017,6 +11036,173 @@ class FCToolGUI:
             w = getattr(w, "master", None)
         return None
 
+    # Eve-O overlay controller cadences (ms)
+    _OVERLAY_TICK_MS = 250          # when Eve-O detected + enabled
+    _OVERLAY_PROBE_MS = 2000        # when enabled but Eve-O not detected
+    _OVERLAY_STALE_SECS = 300       # drop a CharState label after 5 min stale
+
+    _OVERLAY_DEFAULTS = {
+        "enabled": False, "font_size": 11, "color": "#00d4ff",
+        "anchor": "top-left", "dpi_awareness": "auto", "rules": [],
+        "overrides": {},
+    }
+
+    def _overlay_cfg(self) -> dict:
+        """The config['overlay'] dict with spec defaults filled in (config is
+        NOT deep-merged from DEFAULT_CONFIG, so every key is .get-defaulted)."""
+        cfg = self.config.setdefault("overlay", {})
+        for k, v in self._OVERLAY_DEFAULTS.items():
+            if k not in cfg:
+                cfg[k] = ([] if isinstance(v, list) else
+                          {} if isinstance(v, dict) else v)
+        return cfg
+
+    def _overlay_rules(self) -> list:
+        raw = self._overlay_cfg().get("rules", []) or []
+        out = []
+        for r in raw:
+            try:
+                out.append(overlay_rules.OverlayRule(
+                    when=r["when"], value=r.get("value", ""), label=r.get("label", "")))
+            except Exception:
+                continue
+        return out
+
+    def _overlay_state_for(self, thumb):
+        """Return the CharState for a thumb — the poller's snapshot if present
+        and fresh, else a name-only CharState so overrides still fire (Phase 1
+        has no poller at all)."""
+        st = self._overlay_states.get(thumb.char_name.strip().lower())
+        if st is not None:
+            return st
+        return overlay_rules.CharState(character_id=0, name=thumb.char_name)
+
+    def _overlay_compose_items(self):
+        """Join current thumbs with CharState + rules/overrides → list of
+        (rect, label). Empty labels are kept out by OverlayWindow.set_labels."""
+        rules = self._overlay_rules()
+        overrides = self._overlay_cfg().get("overrides", {}) or {}
+        items = []
+        for thumb in self._overlay_thumbs_fn():
+            state = self._overlay_state_for(thumb)
+            label = overlay_rules.label_for(state, rules, overrides)
+            items.append((thumb.rect, label))
+        return items
+
+    def _overlay_status_text(self, thumb_count: int, matched: int) -> str:
+        if not self._overlay_cfg().get("enabled", False):
+            return "⏸ off"
+        if thumb_count <= 0:
+            return "○ Eve-O Preview not detected"
+        return f"● {thumb_count} thumbnails · {matched} matched"
+
+    def _overlay_tick(self):
+        """One controller tick. Reschedules itself while enabled. Enumerates
+        thumbs (sub-ms, inline on the Tk thread), composes labels, redraws +
+        re-asserts topmost. Cadence drops to a slow probe when Eve-O is absent."""
+        cfg = self._overlay_cfg()
+        if not cfg.get("enabled", False):
+            self._overlay_after_id = None
+            return
+        try:
+            items = self._overlay_compose_items()
+        except Exception:
+            log.exception("[overlay] compose failed; disabling for session")
+            self._overlay_disable_session()
+            return
+        thumb_count = len(items)
+        matched = sum(1 for _, t in items if t)
+        try:
+            # set_labels owns the topmost re-assert: on a non-empty draw it calls
+            # retop() itself, so the controller does NOT call retop() again here
+            # (single owner — avoids a double SetWindowPos per tick).
+            self._overlay.set_labels(items)
+        except Exception:
+            log.exception("[overlay] draw failed; disabling for session")
+            self._overlay_disable_session()
+            return
+        # live status label (if the Settings section is built)
+        if getattr(self, "_overlay_status_label", None) is not None:
+            try:
+                self._overlay_status_label.config(
+                    text=self._overlay_status_text(thumb_count, matched))
+            except tk.TclError:
+                pass
+        # getattr-with-default so the tick works both on the real class (class
+        # constants below) and on the test's SimpleNamespace host, whose bind
+        # loop does not copy these two cadence constants across.
+        tick_ms = getattr(self, "_OVERLAY_TICK_MS", 250)
+        probe_ms = getattr(self, "_OVERLAY_PROBE_MS", 2000)
+        delay = tick_ms if thumb_count else probe_ms
+        self._overlay_after_id = self.root.after(delay, self._overlay_tick)
+
+    def _overlay_ensure_window(self):
+        if self._overlay is None:
+            cfg = self._overlay_cfg()
+            self._overlay = OverlayWindow(self.root, {
+                "font_size": cfg.get("font_size", 11),
+                "color": cfg.get("color", "#00d4ff"),
+                "anchor": cfg.get("anchor", "top-left"),
+            })
+        return self._overlay
+
+    def _overlay_boot_if_enabled(self):
+        if self._overlay_cfg().get("enabled", False):
+            self._overlay_enable()
+
+    def _overlay_enable(self):
+        cfg = self._overlay_cfg()
+        cfg["enabled"] = True
+        if not cfg.get("rules"):
+            cfg["rules"] = [
+                {"when": r.when, "value": r.value, "label": r.label}
+                for r in overlay_rules.seed_rules()
+            ]
+        try:
+            self._overlay_ensure_window()
+        except Exception:
+            log.exception("[overlay] could not create overlay window; disabling")
+            self._overlay_disable_session()
+            return
+        self._overlay_start_poller()       # no-op stub in Phase 1
+        if self._overlay_after_id is None:
+            self._overlay_tick()
+
+    def _overlay_disable(self):
+        self._overlay_cfg()["enabled"] = False
+        self._overlay_teardown()
+
+    def _overlay_disable_session(self):
+        """A Win32/draw failure disables the overlay for THIS session only (the
+        config toggle is untouched) with a single log line already emitted."""
+        self._overlay_teardown()
+
+    def _overlay_teardown(self):
+        if self._overlay_after_id is not None:
+            try:
+                self.root.after_cancel(self._overlay_after_id)
+            except Exception:
+                pass
+            self._overlay_after_id = None
+        self._overlay_stop_poller()
+        if self._overlay is not None:
+            try:
+                self._overlay.set_labels([])
+            except Exception:
+                pass
+        if getattr(self, "_overlay_status_label", None) is not None:
+            try:
+                self._overlay_status_label.config(text=self._overlay_status_text(0, 0))
+            except tk.TclError:
+                pass
+
+    # Phase 1 stubs; replaced by the real daemon poller in Phase 2 (Task 8).
+    def _overlay_start_poller(self):
+        pass
+
+    def _overlay_stop_poller(self):
+        pass
+
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",
                  font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK
@@ -14979,6 +15165,15 @@ $bmp.Dispose()
         try:
             from jump_range import save_route_cache
             save_route_cache()
+        except Exception:
+            pass
+        # Tear down the Eve-O overlay (cancel its after-loop, stop the poller,
+        # withdraw the window) before destroying root. Guarded: the attribute /
+        # method may be absent if overlay init never ran.
+        try:
+            teardown = getattr(self, "_overlay_teardown", None)
+            if callable(teardown):
+                teardown()
         except Exception:
             pass
         self.root.destroy()

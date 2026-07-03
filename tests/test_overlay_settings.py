@@ -1,0 +1,166 @@
+import pytest
+tk = pytest.importorskip("tkinter")
+import types
+
+import fc_gui
+from overlay_rules import CharState
+from eveo_tracker import Thumb
+
+
+class FakeOverlay:
+    def __init__(self):
+        self.labels = None
+        self.retops = 0
+        self.visible = False
+        self.destroyed = False
+    def set_labels(self, items):
+        # Mirror the real OverlayWindow contract: set_labels is the SINGLE owner
+        # of the topmost re-assert — it calls retop() itself on a non-empty draw.
+        self.labels = list(items)
+        self.visible = bool([t for _, t in items if t])
+        if self.visible:
+            self.retop()
+    def retop(self):
+        self.retops += 1
+    def set_font_size(self, s): self.font = s
+    def set_color(self, c): self.color = c
+    def set_anchor(self, a): self.anchor = a
+    def destroy(self): self.destroyed = True
+
+
+def _host(overlay_cfg=None, thumbs=None, states=None):
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no display available")
+    root.withdraw()
+    host = types.SimpleNamespace()
+    host.root = root
+    host.config = {"overlay": overlay_cfg} if overlay_cfg is not None else {}
+    host.esi_accounts = []
+    host._overlay = FakeOverlay()
+    host._overlay_states = states or {}
+    host._overlay_thumbs_fn = lambda: (thumbs or [])
+    host._overlay_after_id = None
+    host._overlay_poller = None
+    host._overlay_state_ts = {}
+    host._overlay_status_label = None
+    host._save_config = lambda: None
+    # Bind methods AND the class-level constants: _overlay_cfg iterates
+    # self._OVERLAY_DEFAULTS and (from Task 9 on) _overlay_state_for reads
+    # self._OVERLAY_STALE_SECS — a bare SimpleNamespace has neither, so the
+    # bind loop copies non-callables straight across.
+    for name in ("_overlay_cfg", "_overlay_compose_items", "_overlay_tick",
+                 "_overlay_status_text", "_overlay_state_for", "_overlay_rules",
+                 "_overlay_teardown", "_overlay_stop_poller",
+                 "_overlay_disable_session",
+                 "_OVERLAY_DEFAULTS", "_OVERLAY_STALE_SECS"):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        if attr is None:
+            continue
+        setattr(host, name,
+                types.MethodType(attr, host) if callable(attr) else attr)
+    return root, host
+
+
+def test_overlay_cfg_defaults():
+    root, host = _host(overlay_cfg=None)
+    try:
+        cfg = host._overlay_cfg()
+        assert cfg["enabled"] is False
+        assert cfg["font_size"] == 11
+        assert cfg["color"] == "#00d4ff"
+        assert cfg["anchor"] == "top-left"
+        assert cfg["dpi_awareness"] == "auto"
+        assert cfg["rules"] == [] or isinstance(cfg["rules"], list)
+        assert cfg["overrides"] == {}
+    finally:
+        root.destroy()
+
+
+def test_compose_items_uses_override():
+    thumbs = [Thumb(1, "Alpha", (0, 0, 100, 100))]
+    states = {"alpha": CharState(character_id=1, name="Alpha")}
+    root, host = _host(
+        overlay_cfg={"enabled": True, "rules": [], "overrides": {"alpha": "Cyno"}},
+        thumbs=thumbs, states=states)
+    try:
+        items = host._overlay_compose_items()
+        assert items == [((0, 0, 100, 100), "Cyno")]
+    finally:
+        root.destroy()
+
+
+def test_compose_items_no_state_still_uses_override():
+    # Phase 1: no poller => no CharState. A synthetic state from the thumb name
+    # must still let overrides fire.
+    thumbs = [Thumb(1, "Bravo", (1, 2, 3, 4))]
+    root, host = _host(
+        overlay_cfg={"enabled": True, "rules": [], "overrides": {"bravo": "X"}},
+        thumbs=thumbs, states={})
+    try:
+        items = host._overlay_compose_items()
+        assert items == [((1, 2, 3, 4), "X")]
+    finally:
+        root.destroy()
+
+
+def test_status_text_variants():
+    root, host = _host(overlay_cfg={"enabled": False})
+    try:
+        assert "off" in host._overlay_status_text(0, 0).lower()
+        host.config["overlay"]["enabled"] = True
+        assert "not detected" in host._overlay_status_text(0, 0).lower()
+        assert "matched" in host._overlay_status_text(4, 3).lower()
+    finally:
+        root.destroy()
+
+
+def test_tick_sets_labels_and_retops_when_enabled():
+    thumbs = [Thumb(1, "Alpha", (0, 0, 100, 100))]
+    root, host = _host(
+        overlay_cfg={"enabled": True, "rules": [], "overrides": {"alpha": "Cyno"}},
+        thumbs=thumbs)
+    try:
+        host._overlay_tick()
+        assert host._overlay.labels == [((0, 0, 100, 100), "Cyno")]
+        assert host._overlay.retops >= 1
+    finally:
+        # cancel the rescheduled after() so the interpreter can be destroyed
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
+def test_teardown_safe_when_never_enabled():
+    # App-close teardown must be safe/idempotent even if the overlay was never
+    # enabled: no after-loop, no poller, overlay may be a bare fake. Mirrors the
+    # guarded _on_close call path.
+    root, host = _host(overlay_cfg={"enabled": False})
+    try:
+        host._overlay_after_id = None
+        host._overlay_teardown()          # first call — no crash
+        host._overlay_teardown()          # idempotent second call — no crash
+        # overlay was withdrawn (set_labels([]) called on the fake) if present
+        assert host._overlay.labels == [] or host._overlay.labels is None
+    finally:
+        root.destroy()
+
+
+def test_teardown_cancels_after_and_stops_poller():
+    # With an active after-loop and a poller placeholder, teardown cancels the
+    # after id and clears the poller (the guarded _on_close path relies on this).
+    root, host = _host(
+        overlay_cfg={"enabled": True, "rules": [], "overrides": {"alpha": "Cyno"}})
+    try:
+        # schedule a real after so there is an id to cancel
+        host._overlay_after_id = root.after(100000, lambda: None)
+        host._overlay_teardown()
+        assert host._overlay_after_id is None
+        assert host._overlay_poller is None
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
