@@ -6,15 +6,66 @@ import pytest
 tk = pytest.importorskip("tkinter")
 
 
-@pytest.fixture
-def root():
+def _drain_root(r):
+    """Cancel pending after-jobs, destroy child Toplevels, and flush the event
+    queue on interpreter `r`. Shared by the module-root teardown and the per-test
+    cleanup so no test's leftover callbacks/windows/marshaled _post()s run against
+    a later test's state."""
+    try:
+        for aid in r.tk.call("after", "info"):
+            try:
+                r.after_cancel(aid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    for child in list(r.children.values()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
+    try:
+        r.update_idletasks()
+        r.update()
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="module")
+def _module_root():
+    """One Tk interpreter for the whole module.
+
+    Creating and destroying a fresh tk.Tk() per test is fragile on Windows: a
+    daemon executor/sync worker or a pending after() callback from one test can
+    still be touching the Tcl interpreter when the NEXT tk.Tk() is created, which
+    intermittently raises TclError. The old per-test fixture then misreported that
+    as pytest.skip("no display available") — an order/timing-fragile skip that
+    floated between tests run-to-run. A single long-lived root removes the
+    repeated create/destroy race entirely; each test still gets a clean slate via
+    the per-test `root` fixture below."""
     try:
         r = tk.Tk()
     except tk.TclError:
         pytest.skip("no display available")
     r.withdraw()
     yield r
-    r.destroy()
+    _drain_root(r)
+    try:
+        r.destroy()
+    except Exception:
+        pass
+
+
+@pytest.fixture
+def root(_module_root):
+    r = _module_root
+    # Pre-clean: drop anything a previous test left behind so this test starts
+    # from a quiescent interpreter (no stray after-jobs or un-destroyed windows).
+    _drain_root(r)
+    yield r
+    # Post-clean: the test's own window may still hold pending after()/worker
+    # continuations; drain them now so they never race the next test.
+    _drain_root(r)
 
 
 def _menu_labels_for(win, item):
@@ -1312,6 +1363,77 @@ def test_enter_live_not_boss_reverts(root, tmp_path, monkeypatch):
         assert warned["n"] == 1             # user was warned
         assert win._entering_live is False  # guard cleared for a retry
         assert str(win._apply_btn["state"]) == "disabled"   # template UI
+    finally:
+        win.destroy()
+
+
+def test_enter_live_provider_exception_clears_guard_and_reverts(
+        root, tmp_path, monkeypatch):
+    """If the async fleet-boss check RAISES (real ESI I/O — network errors are
+    the normal environment), the re-entrancy guard must be cleared, the window
+    must stay in template mode, the failure must be surfaced, and a SECOND
+    attempt with a now-working provider must succeed (proves no permanent
+    lockout)."""
+    import fleet_template_window as ftw
+
+    state = {"raise": True}
+
+    def _flaky_provider():
+        if state["raise"]:
+            raise ConnectionError("ESI unreachable")
+        return {"fleet_id": 88, "is_boss": True}
+
+    win = _live_win(root, tmp_path, fleet_info_provider=_flaky_provider)
+    try:
+        win.mode = "template"
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        # Stub the live-sync side effects for the eventual success path.
+        monkeypatch.setattr(win, "_sync_live", lambda **k: None)
+        monkeypatch.setattr(win, "_schedule_sync", lambda: None)
+        _stub_executor(win, monkeypatch)
+
+        # First attempt: provider raises.
+        win.set_mode("live")
+        root.update()      # pump the _post-marshaled failure continuation
+        assert win._entering_live is False          # guard cleared, not leaked
+        assert win.mode == "template"               # never flipped to live
+        assert "failed" in str(win._status["text"]).lower()   # error surfaced
+        assert str(win._status["fg"]) == ftw.FG_RED
+
+        # Second attempt with a now-working provider: must succeed (no lockout).
+        state["raise"] = False
+        win.set_mode("live")
+        root.update()
+        assert win.mode == "live"
+        assert win._fleet_id == 88
+        assert win._entering_live is False
+    finally:
+        win.destroy()
+
+
+def test_apply_provider_exception_surfaces_error(root, tmp_path, monkeypatch):
+    """If _apply's async session fetch RAISES, the error must be surfaced in the
+    status line and NO preview dialog may open (the failure must not be
+    swallowed, leaving the status stuck on 'Checking fleet…')."""
+    import fleet_template_window as ftw
+
+    def _raising_provider():
+        raise ConnectionError("ESI unreachable")
+
+    win = _live_win(root, tmp_path, esi_session_provider=_raising_provider)
+    try:
+        win.mode = "live"
+        win._live_members = []
+        win._live_structure = {"wings": []}
+        monkeypatch.setattr(ftw.threading, "Thread", _SyncThread)
+        opened = {"n": 0}
+        monkeypatch.setattr(ftw, "_ApplyPreviewDialog",
+                            lambda *a, **k: opened.__setitem__("n", opened["n"] + 1))
+        win._apply()
+        root.update()      # pump the _post-marshaled failure continuation
+        assert opened["n"] == 0                       # no dialog opened
+        assert "failed" in str(win._status["text"]).lower()
+        assert str(win._status["fg"]) == ftw.FG_RED
     finally:
         win.destroy()
 

@@ -1641,13 +1641,24 @@ class FleetTemplateWindow:
         self._status.config(text="Checking fleet…", fg=FG_DIM)
 
         def worker():
-            info = self._fleet_info_provider()
+            # _fleet_info_provider() does real ESI I/O and can raise (network
+            # errors are the normal environment here). If it does, marshal the
+            # failure back so the guard is always cleared and the UI reverts —
+            # otherwise _entering_live would leak True forever and lock out every
+            # future live-mode entry.
+            try:
+                info = self._fleet_info_provider()
+            except Exception as e:
+                self._post(self._enter_live_failed, e)
+                return
             self._post(self._finish_enter_live, info)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish_enter_live(self, info):
         """Tk-thread continuation of _enter_live_mode once fleet info is known."""
+        # Clear the re-entrancy guard FIRST so that even if the continuation below
+        # raises, a leaked guard can never permanently block live-mode entry.
         self._entering_live = False
         if self.mode != "template":
             # Something else changed the mode while the check was in flight;
@@ -1668,6 +1679,32 @@ class FleetTemplateWindow:
         self._sync_live(initial=True)
         self._schedule_sync()
         self._refresh_add_buttons()
+
+    def _enter_live_failed(self, exc):
+        """Tk-thread continuation when the async fleet-boss check RAISED (real ESI
+        I/O — network errors are the normal environment). Clears the re-entrancy
+        guard so live mode can be retried, reverts to the resting template UI (the
+        same path the not-boss branch uses), and surfaces the failure instead of
+        leaving the status stuck on 'Checking fleet…'."""
+        self._entering_live = False
+        # Log first, then set the red status — _log_line writes a FG_DIM status as
+        # a side effect, so setting the red status afterward keeps it visible.
+        msg = f"Fleet check failed: {exc}"
+        if len(msg) > 120:
+            msg = msg[:117] + "…"
+        try:
+            self._log_line(msg)
+        except Exception:
+            pass
+        if self.mode == "template":
+            # Never flipped to live; restore the resting template UI (same revert
+            # the not-boss branch performs).
+            self._apply_mode_ui("template")
+            self._refresh_add_buttons()
+        try:
+            self._status.config(text=msg, fg=FG_RED)
+        except tk.TclError:
+            pass
 
     def _exit_live_mode(self):
         if self._sync_after_id:
@@ -1842,10 +1879,32 @@ class FleetTemplateWindow:
         self._status.config(text="Checking fleet…", fg=FG_DIM)
 
         def worker():
-            session = self._esi_session_provider()
+            # _esi_session_provider() does real ESI I/O and can raise; surface the
+            # failure rather than swallowing it and leaving the status stuck on
+            # "Checking fleet…" with no preview and no error.
+            try:
+                session = self._esi_session_provider()
+            except Exception as e:
+                self._post(self._apply_failed, e)
+                return
             self._post(self._apply_with_session, session)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_failed(self, exc):
+        """Tk-thread continuation when _apply's async session fetch RAISED.
+        Surfaces the error in the status line (no dialog, no state to unwind)."""
+        msg = f"Fleet check failed: {exc}"
+        if len(msg) > 120:
+            msg = msg[:117] + "…"
+        try:
+            self._log_line(msg)
+        except Exception:
+            pass
+        try:
+            self._status.config(text=msg, fg=FG_RED)
+        except tk.TclError:
+            pass
 
     def _apply_with_session(self, session):
         """Tk-thread continuation of _apply once the boss session is known.
