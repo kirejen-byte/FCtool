@@ -106,6 +106,8 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_update_shown_summary", "_preview_all_known_chars",
                  "_preview_shown_chars", "_open_preview_previews_dialog",
                  "_preview_apply_shown_chars", "_preview_sync_gamelog_scope",
+                 "_open_preview_never_minimize_dialog",
+                 "_preview_apply_never_minimize",
                  "_add_section", "_overlay_apply_style",
                  "_open_overlay_rules_dialog", "_overlay_cycle_color",
                  "_overlay_status_text", "_overlay_rules",
@@ -512,5 +514,65 @@ def test_previews_modal_apply_writes_disabled_chars_show_oriented():
         host._preview_apply_shown_chars()
         assert host.config["preview"]["disabled_chars"] == ["kirejen"]
         win.destroy()
+    finally:
+        root.destroy()
+
+
+# ── (C3) Never-minimize modal: exempt-oriented checklist over known chars ─────
+def _never_ui_host(preview_cfg, esi_names=(), live_names=()):
+    root, host = _ui_host(preview_cfg=preview_cfg)
+    host.esi_accounts = [SimpleNamespace(character_name=n) for n in esi_names]
+    host._preview_clients = {
+        i + 1: _cw(i + 1, nm) for i, nm in enumerate(live_names)}
+    for name in ("_open_preview_never_minimize_dialog",
+                 "_preview_apply_never_minimize", "_preview_all_known_chars"):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        if attr is None:
+            continue
+        setattr(host, name,
+                _bind_attr(name, attr, host) if callable(attr) else attr)
+    return root, host
+
+
+def test_never_minimize_modal_builds_and_checks_current_members():
+    root, host = _never_ui_host(
+        preview_cfg={"mode": "native", "never_minimize": ["boss"],
+                     "layouts": {"ghost": [0, 0, 384, 216]}},
+        esi_names=("Kirejen", "Boss"), live_names=("Alt Two",))
+    try:
+        win = host._open_preview_never_minimize_dialog(_test_no_wait=True)
+        assert set(host._preview_never_vars) == {
+            "kirejen", "boss", "ghost", "alt two"}
+        # exempt-oriented: only the saved member is checked
+        assert host._preview_never_vars["boss"].get() is True
+        assert host._preview_never_vars["kirejen"].get() is False
+        win.destroy()
+    finally:
+        root.destroy()
+
+
+def test_never_minimize_modal_apply_writes_checked_keys():
+    root, host = _never_ui_host(
+        preview_cfg={"mode": "native", "never_minimize": []},
+        esi_names=("Kirejen", "Boss"))
+    try:
+        win = host._open_preview_never_minimize_dialog(_test_no_wait=True)
+        host._preview_never_vars["boss"].set(True)
+        host._preview_apply_never_minimize()
+        assert host.config["preview"]["never_minimize"] == ["boss"]
+        win.destroy()
+    finally:
+        root.destroy()
+
+
+def test_minimize_inactive_toggle_persists_live():
+    root, host = _ui_host(preview_cfg={"mode": "native",
+                                       "minimize_inactive": False})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        host._preview_minimize_inactive_var.set(True)
+        host._preview_apply_native_state()
+        assert host.config["preview"]["minimize_inactive"] is True
     finally:
         root.destroy()

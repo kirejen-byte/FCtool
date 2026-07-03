@@ -182,6 +182,8 @@ def _ui_host(overlay_cfg=None):
                  "_preview_update_shown_summary", "_preview_all_known_chars",
                  "_preview_shown_chars", "_open_preview_previews_dialog",
                  "_preview_apply_shown_chars", "_preview_sync_gamelog_scope",
+                 "_open_preview_never_minimize_dialog",
+                 "_preview_apply_never_minimize",
                  "_add_section",
                  "_overlay_apply_style",
                  "_overlay_status_text", "_overlay_compose_items",

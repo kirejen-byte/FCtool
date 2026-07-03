@@ -176,7 +176,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     for name in ("_preview_cfg", "_preview_native_tick_body",
                  "_preview_spawn_tile", "_preview_rekey_tile",
                  "_preview_retire_tile", "_preview_retire_all_tiles",
-                 "_preview_style_tile",
+                 "_preview_style_tile", "_preview_switch_to",
                  "_preview_drain_hotkeys", "_preview_compose_captions",
                  "_preview_compose_video_labels",
                  "_preview_caption_parts", "_preview_should_flash",
@@ -1219,3 +1219,143 @@ def test_tick_no_damage_border_when_damage_flash_disabled(monkeypatch):
     tick(host)
     tile = host._preview_tiles[1]
     assert "#ff3b30" not in tile.borders
+
+
+# ── (C3) minimize-inactive on activation switch + never-minimize list ─────────
+def _bind_switch_methods(host):
+    """Bind the C3 activation/minimize surface onto a bare host.
+
+    NON-DISRUPTIVE: the activation + minimize primitives (window_activator.*) are
+    monkeypatched by every test below — nothing here touches a real window,
+    changes real focus, or minimizes a live client.
+    """
+    for name in ("_preview_switch_to", "_preview_on_tile_activate",
+                 "_preview_on_tile_minimize", "_preview_drain_hotkeys"):
+        fn = getattr(fc_gui.FCToolGUI, name)
+        setattr(host, name, types.MethodType(fn, host))
+
+
+def _minmax_host(monkeypatch, minimize_inactive=True, never=None, last_key=""):
+    """Host with two live clients (a=hwnd1, b=hwnd2), recording activate/minimize."""
+    activated, minimized = [], []
+    monkeypatch.setattr(window_activator, "activate",
+                        lambda hwnd, **k: activated.append(hwnd) or True)
+    monkeypatch.setattr(window_activator, "minimize",
+                        lambda hwnd, **k: minimized.append(hwnd))
+    host = make_host(mode="native")
+    _bind_switch_methods(host)
+    cfg = host._preview_cfg()
+    cfg["minimize_inactive"] = minimize_inactive
+    cfg["never_minimize"] = list(never or [])
+    host._preview_clients = {1: _cw(1, "A"), 2: _cw(2, "B")}
+    host._preview_last_key = last_key
+    return host, activated, minimized
+
+
+# --- _preview_switch_to: the shared activation choke-point -------------------
+def test_switch_to_minimizes_previous_active_when_enabled(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    host._preview_switch_to(host._preview_clients[2])   # switch a -> b
+    assert activated == [2]                              # new client foregrounded
+    assert minimized == [1]                             # previous (a) minimized
+    assert host._preview_last_key == "b"                # anchor updated
+
+
+def test_switch_to_does_not_minimize_when_disabled(monkeypatch):
+    host, activated, minimized = _minmax_host(
+        monkeypatch, minimize_inactive=False, last_key="a")
+    host._preview_switch_to(host._preview_clients[2])
+    assert activated == [2]
+    assert minimized == []                              # feature off → no minimize
+    assert host._preview_last_key == "b"
+
+
+def test_switch_to_respects_never_minimize_list(monkeypatch):
+    host, activated, minimized = _minmax_host(
+        monkeypatch, never=["a"], last_key="a")
+    host._preview_switch_to(host._preview_clients[2])
+    assert activated == [2]
+    assert minimized == []                              # a is exempt → not minimized
+    assert host._preview_last_key == "b"
+
+
+def test_switch_to_never_minimizes_the_client_being_activated(monkeypatch):
+    # Re-activating the already-active client must not minimize it (prev == new).
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    host._preview_switch_to(host._preview_clients[1])   # switch a -> a
+    assert activated == [1]
+    assert minimized == []                              # never minimize self
+    assert host._preview_last_key == "a"
+
+
+def test_switch_to_no_previous_key_minimizes_nothing(monkeypatch):
+    # First activation of the session (no prior anchor) → nothing to minimize.
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="")
+    host._preview_switch_to(host._preview_clients[1])
+    assert activated == [1]
+    assert minimized == []
+    assert host._preview_last_key == "a"
+
+
+def test_switch_to_ignores_previous_key_with_no_live_client(monkeypatch):
+    # The prior active client is gone (closed/undocked); only the new one is live.
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="ghost")
+    host._preview_switch_to(host._preview_clients[2])
+    assert activated == [2]
+    assert minimized == []                              # ghost has no live hwnd
+    assert host._preview_last_key == "b"
+
+
+# --- the three activation entry points all route through _preview_switch_to ---
+def test_tile_activate_minimizes_previous_active(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    host._preview_on_tile_activate("b")                 # click B's tile
+    assert activated == [2] and minimized == [1]
+    assert host._preview_last_key == "b"
+
+
+def test_hotkey_focus_minimizes_previous_active(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    svc = FakeHotkeys()
+    svc.events.put(101)
+    host._preview_hotkeys = svc
+    host._preview_hotkey_map = {101: ("focus", "b")}
+    host._preview_drain_hotkeys()
+    assert activated == [2] and minimized == [1]
+    assert host._preview_last_key == "b"
+
+
+def test_hotkey_cycle_minimizes_previous_active(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    svc = FakeHotkeys()
+    svc.events.put(200)
+    host._preview_hotkeys = svc
+    host._preview_hotkey_map = {200: ("cycle", 0, +1)}
+    # cycle order a -> b over live {a, b}
+    host._preview_cfg()["hotkeys"] = {
+        "focus": {}, "groups": [{"next": [], "prev": [], "order": ["a", "b"]}],
+        "minimize_all": []}
+    host._preview_drain_hotkeys()
+    assert activated == [2] and minimized == [1]
+    assert host._preview_last_key == "b"
+
+
+# --- Ctrl+Left on a tile still minimizes THAT client (A5 wiring preserved) ----
+def test_tile_minimize_minimizes_that_client(monkeypatch):
+    host, activated, minimized = _minmax_host(monkeypatch, last_key="a")
+    host._preview_on_tile_minimize("b")
+    assert minimized == [2]                             # the named tile's client
+    assert activated == []                             # minimize is not an activate
+
+
+# --- minimize_all hotkey skips the never-minimize list ------------------------
+def test_minall_hotkey_skips_never_minimize(monkeypatch):
+    host, activated, minimized = _minmax_host(
+        monkeypatch, never=["a"], last_key="")
+    svc = FakeHotkeys()
+    svc.events.put(300)
+    host._preview_hotkeys = svc
+    host._preview_hotkey_map = {300: ("minall",)}
+    host._preview_drain_hotkeys()
+    assert set(minimized) == {2}                        # b minimized, a exempt
+    assert activated == []

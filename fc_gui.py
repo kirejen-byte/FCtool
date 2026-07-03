@@ -11486,11 +11486,33 @@ class FCToolGUI:
         for hwnd in list(self._preview_tiles):
             self._preview_retire_tile(hwnd)
 
+    def _preview_switch_to(self, client):
+        """Foreground `client`, and (C3) minimize the PREVIOUS active client when
+        `minimize_inactive` is on and that client isn't exempt. The single
+        activation choke-point every switch path routes through (tile click,
+        focus hotkey, cycle hotkey) so minimize-inactive is honored uniformly.
+
+        The previous active client is the one at `_preview_last_key`; we minimize
+        it only if it is a DIFFERENT, still-live client whose key is not in
+        `never_minimize` (EVE-O PriorityClients parity). Activation itself is
+        always via window_activator (the compliance choke-point) — focus APIs
+        only, nothing injected into any EVE client (spec §4)."""
+        cfg = self._preview_cfg()
+        prev_key = self._preview_last_key
+        if (cfg.get("minimize_inactive", False)
+                and prev_key and prev_key != client.key
+                and prev_key not in set(cfg.get("never_minimize", []))):
+            for other in self._preview_clients.values():
+                if other.key == prev_key:
+                    window_activator.minimize(other.hwnd)
+                    break
+        self._preview_last_key = client.key
+        window_activator.activate(client.hwnd)
+
     def _preview_on_tile_activate(self, key):
         for c in self._preview_clients.values():
             if c.key == key:
-                self._preview_last_key = key
-                window_activator.activate(c.hwnd)
+                self._preview_switch_to(c)
                 return
 
     def _preview_on_tile_minimize(self, key):
@@ -11555,8 +11577,7 @@ class FCToolGUI:
             if kind == "focus":
                 c = by_key.get(action[1])
                 if c is not None:
-                    self._preview_last_key = c.key
-                    window_activator.activate(c.hwnd)
+                    self._preview_switch_to(c)          # C3: minimize-inactive aware
             elif kind == "cycle":
                 _, group, direction = action
                 cfg = self._preview_cfg()
@@ -11567,8 +11588,7 @@ class FCToolGUI:
                     order, self._preview_last_key, live_keys, direction)
                 c = by_key.get(nxt)
                 if c is not None:
-                    self._preview_last_key = c.key
-                    window_activator.activate(c.hwnd)
+                    self._preview_switch_to(c)          # C3: minimize-inactive aware
             elif kind == "minall":
                 cfg = self._preview_cfg()
                 never = set(cfg.get("never_minimize", []))
@@ -12535,6 +12555,24 @@ class FCToolGUI:
         cbdf.grid(row=0, column=3, padx=(0, 16))
         w.append(cbdf)
 
+        # C3: minimize-inactive — on a switch, the previously-active client is
+        # minimized (unless it's in the never-minimize list). EVE-O parity.
+        self._preview_minimize_inactive_var = tk.BooleanVar(
+            value=bool(pcfg.get("minimize_inactive", False)))
+        cbmi = tk.Checkbutton(
+            rowN2, text="Minimize inactive",
+            variable=self._preview_minimize_inactive_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbmi.grid(row=0, column=4, padx=(0, 8))
+        w.append(cbmi)
+
+        bnm = ttk.Button(rowN2, text="Never minimize…", style="Dark.TButton",
+                         command=self._open_preview_never_minimize_dialog)
+        bnm.grid(row=0, column=5, padx=(0, 6))
+        w.append(bnm)
+
         # Row 5b (native, Task C2): hide rules + the per-character "which previews
         # to show" entry point. Hiding a rule/character never wipes saved data.
         rowHide = tk.Frame(parent, bg=BG_DARK)
@@ -12730,6 +12768,7 @@ class FCToolGUI:
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
+            ("_preview_minimize_inactive_var", "minimize_inactive", bool),
             ("_preview_hide_active_var", "hide_active", bool),
             ("_preview_hide_login_var", "hide_login", bool),
             ("_preview_hide_lost_focus_var", "hide_on_lost_focus", bool),
@@ -13288,6 +13327,87 @@ class FCToolGUI:
         if not _test_no_wait:
             self.root.wait_window(win)
         return win
+
+    def _open_preview_never_minimize_dialog(self, _test_no_wait=False):
+        """C3 'never minimize' modal (EVE-O PriorityClients parity). Lists every
+        known character with a checkbox = 'exempt from minimize-inactive'. Checked
+        keys are stored in `never_minimize` (exact lowercased-key match); they are
+        never auto-minimized when you switch away. Editing this list never touches
+        layouts, hotkeys, or the shown-characters set.
+
+        Returns the Toplevel (tests pass _test_no_wait=True to skip wait_window)."""
+        known = sorted(self._preview_all_known_chars())
+        never = {str(k).strip().lower()
+                 for k in (self._preview_cfg().get("never_minimize", []) or [])}
+
+        win = tk.Toplevel(self.root)
+        win.title("Never minimize")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Check a character to keep it OPEN when you switch "
+                 "away (exempt from Minimize inactive).",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10),
+                 justify=tk.LEFT, wraplength=420).pack(
+                     anchor="w", padx=10, pady=(10, 6))
+
+        self._preview_never_vars = {}
+        list_frame = tk.Frame(win, bg=BG_PANEL)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        if not known:
+            tk.Label(list_frame, text="(no characters seen yet)", bg=BG_PANEL,
+                     fg=FG_DIM, font=("Consolas", 9)).pack(anchor="w")
+        for key in known:
+            var = tk.BooleanVar(value=(key in never))
+            self._preview_never_vars[key] = var
+            tk.Checkbutton(
+                list_frame, text=key, variable=var, font=("Consolas", 10),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                anchor="w").pack(anchor="w", fill=tk.X)
+
+        def _ok():
+            self._preview_apply_never_minimize()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=_ok).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=2)
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
+
+    def _preview_apply_never_minimize(self):
+        """Persist the checked exemptions into `never_minimize`. Keys are the same
+        lowercased char keys used everywhere in the preview subsystem; characters
+        not shown in the dialog keep their existing membership untouched."""
+        vars_ = getattr(self, "_preview_never_vars", None)
+        if vars_ is None:
+            return
+        cfg = self._preview_cfg()
+        existing = {str(k).strip().lower()
+                    for k in (cfg.get("never_minimize", []) or [])}
+        shown = set(vars_)
+        checked = set()
+        for key, v in vars_.items():
+            try:
+                if v.get():
+                    checked.add(key)
+            except tk.TclError:
+                checked.add(key)          # widget gone → keep it exempt (fail safe)
+        # Preserve keys not shown in this dialog; replace membership for shown keys.
+        cfg["never_minimize"] = sorted((existing - shown) | checked)
+        self._save_config()
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",
