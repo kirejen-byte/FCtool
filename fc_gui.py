@@ -11743,6 +11743,52 @@ class FCToolGUI:
         store lookup). B1 leaves it empty so the chip column stays blank."""
         return ""
 
+    # ── B3: intel flash — own-log system index + tile-border alerts ──────────
+    def _preview_intel_note(self, index, report, now):
+        """Update the per-system intel index from one IntelReport (Task B3).
+
+        `index` maps solar_system_id -> (monotonic_ts, report_type). A report
+        whose type is in `intel_report_types` (default just "hostile") stamps
+        its system with `now`; a "clear" report for that system deletes the
+        entry so a tile stops flashing once the field is called clear. Reports
+        for unselected types or without a resolved system_id are ignored.
+
+        Pure (no Tk / no I/O): the intel pipeline already marshals to the Tk
+        thread before this runs (called from _intel_stream_ingest), so this is a
+        plain-dict write on the Tk thread — no second writer to a shared map.
+        """
+        sid = getattr(report, "system_id", None)
+        if not sid:
+            return
+        rtype = getattr(report, "report_type", "") or ""
+        if rtype == "clear":
+            index.pop(sid, None)
+            return
+        cfg = self._preview_cfg()
+        selected = cfg.get("intel_report_types") or ["hostile"]
+        if rtype in selected:
+            index[sid] = (now, rtype)
+
+    def _preview_should_flash(self, index, state, cfg, now):
+        """True iff the pilot's system has a fresh intel note and flashing is on.
+
+        Fresh = the stamped note is at most `intel_flash_secs` old. Requires
+        `cfg["intel_flash"]`, a non-None state with a known solar_system_id that
+        is present in `index`. Pure/side-effect-free."""
+        if not cfg.get("intel_flash", False):
+            return False
+        if state is None:
+            return False
+        sid = getattr(state, "solar_system_id", None)
+        if not sid:
+            return False
+        entry = index.get(sid)
+        if not entry:
+            return False
+        ts, _kind = entry
+        secs = cfg.get("intel_flash_secs", 10)
+        return (now - ts) <= secs
+
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
         if preview_running():                      # EVE-O still open → refuse to fight it
@@ -11772,6 +11818,16 @@ class FCToolGUI:
                                    else ("login screen" if client.is_login else None))
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
+                    # B3: flash the border red while the pilot's system carries a
+                    # fresh hostile intel note; clear it (None) otherwise so the
+                    # flash expires on its own once the note ages out or clears.
+                    state = (None if client.is_login
+                             else self._preview_state_for(client.key))
+                    if self._preview_should_flash(self._preview_intel, state, cfg,
+                                                  time.monotonic()):
+                        tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
+                    else:
+                        tile.set_border(None)
                 except OSError:
                     # Per-tile DWM failure (client died mid-tick, or DWM restarted
                     # and invalidated every handle). Retire THIS tile only — the
@@ -12156,14 +12212,26 @@ class FCToolGUI:
         cbl.grid(row=0, column=1, padx=(0, 16))
         w.append(cbl)
 
+        # B3: intel flash — tile border flashes red while the pilot's system has
+        # a fresh hostile intel note from your own chat logs. Default OFF.
+        self._preview_intel_flash_var = tk.BooleanVar(
+            value=bool(pcfg.get("intel_flash", False)))
+        cbi = tk.Checkbutton(
+            rowN2, text="Intel flash", variable=self._preview_intel_flash_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbi.grid(row=0, column=2, padx=(0, 16))
+        w.append(cbi)
+
         bg = ttk.Button(rowN2, text="Arrange in grid", style="Dark.TButton",
                         command=self._preview_arrange_grid)
-        bg.grid(row=0, column=2, padx=(0, 6))
+        bg.grid(row=0, column=3, padx=(0, 6))
         w.append(bg)
 
         bhk = ttk.Button(rowN2, text="Hotkeys…", style="Dark.TButton",
                          command=self._open_preview_hotkeys_dialog)
-        bhk.grid(row=0, column=3, padx=(0, 6))
+        bhk.grid(row=0, column=4, padx=(0, 6))
         w.append(bhk)
 
         # Fine print (updated disclaimer — spec §9).
@@ -12171,9 +12239,10 @@ class FCToolGUI:
         row4.pack(fill=tk.X, padx=20, pady=(2, 6))
         tk.Label(
             row4,
-            text=("Labels come from your own ESI data and your text only. "
-                  "Previews are view-only — clicks and hotkeys only change window "
-                  "focus; no input is ever sent to EVE clients."),
+            text=("Labels come from your own ESI data and your text only; intel "
+                  "flash reads only your own chat logs. Previews are view-only — "
+                  "clicks and hotkeys only change window focus; no input is ever "
+                  "sent to EVE clients."),
             font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
             wraplength=760).pack(side=tk.LEFT)
 
@@ -12240,6 +12309,7 @@ class FCToolGUI:
             ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
+            ("_preview_intel_flash_var", "intel_flash", bool),
         ):
             v = getattr(self, var, None)
             if v is None:
@@ -16017,6 +16087,15 @@ $bmp.Dispose()
         """Main thread: append to the ring buffer, render if visible, fire the
         async resolver, and ping on priority lines."""
         self._intel_buffer.append((msg, spans, report, priority))
+        # B3: feed the native-preview intel index (own chat logs only — spec §4).
+        # This runs on the Tk thread (root.after-marshalled), so it is a plain
+        # write to the single-owner _preview_intel dict.
+        if report is not None:
+            try:
+                self._preview_intel_note(self._preview_intel, report,
+                                         time.monotonic())
+            except Exception:
+                pass
         if self._passes_view_filter(msg):
             self._render_line((msg, spans, report, priority))
         # async name resolution

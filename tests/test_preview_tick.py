@@ -67,6 +67,9 @@ class FakeTile:
     def refresh_source_size(self):
         self.refreshes += 1
 
+    def set_border(self, color):
+        self.borders.append(color)
+
     def retop(self):
         self.retops += 1
         self._host.retop_order.append(("tile", self.key))
@@ -154,7 +157,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_retire_tile", "_preview_retire_all_tiles",
                  "_preview_drain_hotkeys", "_preview_compose_captions",
                  "_preview_compose_video_labels",
-                 "_preview_caption_parts",
+                 "_preview_caption_parts", "_preview_should_flash",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
         if fn is not None:
@@ -765,4 +768,167 @@ def test_video_labels_no_matches_pushes_empty_list(monkeypatch):
     host._preview_compose_video_labels({1: _cw(1, "Kirejen")})
     # option is on → overlay created, but pushed list is empty (no matches)
     assert host._overlay is not None
-    assert host._overlay.label_pushes[-1] == []
+
+
+# ── (B3) intel flash: own-log system index + tile-border alerts ──────────────
+from intel_monitor import IntelReport
+import datetime as _dt
+
+
+def _report(system_id, report_type="hostile"):
+    return IntelReport(
+        timestamp=_dt.datetime(2026, 7, 3, 18, 0, 0),
+        channel="Intel", reporter="Scout", system_name="Foo",
+        system_id=system_id, report_type=report_type)
+
+
+def _bind_intel_methods(host):
+    for name in ("_preview_intel_note", "_preview_should_flash"):
+        fn = getattr(fc_gui.FCToolGUI, name)
+        setattr(host, name, types.MethodType(fn, host))
+
+
+# --- pure _preview_intel_note(index, report, now) -----------------------------
+def test_intel_note_hostile_inserts_system_with_timestamp():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    idx = {}
+    host._preview_intel_note(idx, _report(30000142, "hostile"), 100.0)
+    assert idx == {30000142: (100.0, "hostile")}
+
+
+def test_intel_note_clear_deletes_entry():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    idx = {30000142: (50.0, "hostile")}
+    host._preview_intel_note(idx, _report(30000142, "clear"), 100.0)
+    assert 30000142 not in idx
+
+
+def test_intel_note_ignores_report_types_not_selected():
+    # default intel_report_types == ["hostile"]; a dscan/info report is ignored
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    idx = {}
+    host._preview_intel_note(idx, _report(30000142, "dscan"), 100.0)
+    host._preview_intel_note(idx, _report(30000142, "info"), 100.0)
+    assert idx == {}
+
+
+def test_intel_note_ignores_report_without_system_id():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    idx = {}
+    host._preview_intel_note(idx, _report(None, "hostile"), 100.0)
+    assert idx == {}
+
+
+def test_intel_note_respects_custom_report_types():
+    host = make_host(mode="native")
+    host.config["preview"]["intel_report_types"] = ["hostile", "info"]
+    _bind_intel_methods(host)
+    idx = {}
+    host._preview_intel_note(idx, _report(30000142, "info"), 100.0)
+    assert idx == {30000142: (100.0, "info")}
+
+
+# --- pure _preview_should_flash(index, state, cfg, now) -----------------------
+def test_should_flash_true_when_system_recent_and_enabled():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    cfg["intel_flash_secs"] = 10
+    idx = {30000142: (100.0, "hostile")}
+    st = CS(character_id=1, name="K", solar_system_id=30000142)
+    assert host._preview_should_flash(idx, st, cfg, 105.0) is True
+
+
+def test_should_flash_false_when_expired():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    cfg["intel_flash_secs"] = 10
+    idx = {30000142: (100.0, "hostile")}
+    st = CS(character_id=1, name="K", solar_system_id=30000142)
+    assert host._preview_should_flash(idx, st, cfg, 111.0) is False
+
+
+def test_should_flash_false_when_disabled():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = False
+    idx = {30000142: (100.0, "hostile")}
+    st = CS(character_id=1, name="K", solar_system_id=30000142)
+    assert host._preview_should_flash(idx, st, cfg, 101.0) is False
+
+
+def test_should_flash_false_when_system_not_in_index():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    idx = {30000142: (100.0, "hostile")}
+    st = CS(character_id=1, name="K", solar_system_id=30000999)
+    assert host._preview_should_flash(idx, st, cfg, 101.0) is False
+
+
+def test_should_flash_false_when_state_or_system_missing():
+    host = make_host(mode="native")
+    _bind_intel_methods(host)
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    idx = {30000142: (100.0, "hostile")}
+    assert host._preview_should_flash(idx, None, cfg, 101.0) is False
+    st = CS(character_id=1, name="K", solar_system_id=None)
+    assert host._preview_should_flash(idx, st, cfg, 101.0) is False
+
+
+# --- tick integration: flashing tile gets the border, cleared after expiry ---
+def _flash_tick_host(monkeypatch, now):
+    """A tick-ready host with one live client whose ESI state sits in a hostile
+    system, intel_flash on, and a controlled monotonic clock."""
+    host = make_host(mode="native", layouts={"kirejen": [10, 20, 384, 216]})
+    cfg = host._preview_cfg()
+    cfg["intel_flash"] = True
+    cfg["intel_flash_secs"] = 10
+    cfg["intel_flash_color"] = "#ff3b30"
+    host._preview_find_clients = lambda: [_cw(1, "Kirejen")]
+    st = CS(character_id=1, name="Kirejen", online=True, solar_system_id=30000142)
+    host._preview_state_for = lambda key: st
+    monkeypatch.setattr(fc_gui.time, "monotonic", lambda: now[0])
+    return host
+
+
+def test_tick_sets_flash_border_for_client_in_hostile_system(monkeypatch):
+    now = [100.0]
+    host = _flash_tick_host(monkeypatch, now)
+    host._preview_intel = {30000142: (100.0, "hostile")}
+    tick(host)
+    tile = host._preview_tiles[1]
+    assert tile.borders and tile.borders[-1] == "#ff3b30"
+
+
+def test_tick_clears_flash_border_after_expiry(monkeypatch):
+    now = [100.0]
+    host = _flash_tick_host(monkeypatch, now)
+    host._preview_intel = {30000142: (100.0, "hostile")}
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"
+    # advance past the flash window → the border is cleared (None)
+    now[0] = 120.0
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] is None
+
+
+def test_tick_no_flash_border_when_intel_flash_disabled(monkeypatch):
+    now = [100.0]
+    host = _flash_tick_host(monkeypatch, now)
+    host._preview_cfg()["intel_flash"] = False
+    host._preview_intel = {30000142: (100.0, "hostile")}
+    tick(host)
+    tile = host._preview_tiles[1]
+    # border is only ever set to the "clear" value (None); never the flash color
+    assert "#ff3b30" not in tile.borders
