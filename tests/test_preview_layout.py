@@ -42,3 +42,45 @@ def test_cycle_next_and_prev_wrap_and_skip_missing():
     assert pl.cycle_next(order, "a", live, -1) == "d"
     assert pl.cycle_next([], "x", {"y"}, +1) == "y"     # empty order → live sorted
     assert pl.cycle_next(order, "zz", live, +1) == "a"  # unknown current → first live
+
+
+def test_zoom_rect_nw_holds_top_left():
+    # nw anchor: top-left corner is fixed; grows right + down only.
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "nw") == (100, 200, 600, 400)
+
+
+def test_zoom_rect_center_holds_center():
+    # c anchor: center fixed; grows symmetrically. 300->600 (+300), 200->400 (+200).
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "c") == (-50, 100, 600, 400)
+
+
+def test_zoom_rect_se_holds_bottom_right():
+    # se anchor: bottom-right fixed; grows left + up.
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "se") == (-200, 0, 600, 400)
+
+
+def test_zoom_rect_ne_holds_top_right():
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "ne") == (-200, 200, 600, 400)
+
+
+def test_zoom_rect_sw_holds_bottom_left():
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "sw") == (100, 0, 600, 400)
+
+
+def test_zoom_rect_edge_anchors_center_the_free_axis():
+    # n: top fixed, x centered.  s: bottom fixed, x centered.
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "n") == (-50, 200, 600, 400)
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "s") == (-50, 0, 600, 400)
+    # w: left fixed, y centered.  e: right fixed, y centered.
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "w") == (100, 100, 600, 400)
+    assert pl.zoom_rect((100, 200, 300, 200), 2.0, "e") == (-200, 100, 600, 400)
+
+
+def test_zoom_rect_rounds_and_defaults_unknown_anchor_to_nw():
+    # factor 1.5 → 300*1.5=450, 200*1.5=300 (both exact).
+    assert pl.zoom_rect((0, 0, 300, 200), 1.5, "nw") == (0, 0, 450, 300)
+    # unknown anchor falls back to nw (never crashes).
+    assert pl.zoom_rect((10, 20, 100, 100), 2.0, "??") == (10, 20, 200, 200)
+    # factor <= 1 is a no-op (nothing to zoom).
+    assert pl.zoom_rect((10, 20, 100, 100), 1.0, "c") == (10, 20, 100, 100)
+    assert pl.zoom_rect((10, 20, 100, 100), 0.5, "c") == (10, 20, 100, 100)

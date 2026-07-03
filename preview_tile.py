@@ -23,6 +23,7 @@ import sys
 
 import tkinter as tk
 
+import preview_layout
 from dwm_thumbs import Thumbnail, aspect_fit
 
 STRIP_H = 20
@@ -127,7 +128,20 @@ class TileWindow:
         self._src_size = (0, 0)
         self._w = 0
         self._body_h = 0
+        self._pos = (0, 0)            # last-placed top-left (physical px)
         self._badge = None
+
+        # hover / opacity / zoom state (Task C1)
+        self._alpha = 1.0             # last requested window alpha (mirror for tests)
+        self._opacity_inactive = 1.0
+        self._opacity_hover = 1.0
+        self._active = False          # last-activated / foreground EVE client tile
+        self._hovering = False
+        self._zoom_enabled = False
+        self._zoom_factor = 2.0
+        self._zoom_anchor = "nw"
+        self._zoomed = False          # currently displaying a zoomed rect
+        self._prezoom_rect = None     # (x, y, w, body_h) to restore on <Leave>
 
         # drag state
         self._press_root = None       # (x_root, y_root) at button-3 press
@@ -186,6 +200,10 @@ class TileWindow:
         self._win32.make_tool_noactivate(self._hwnd)   # BEFORE first map
 
         self._bind_mouse()
+        # Enter/Leave on the toplevel — child widgets fire their own Enter/Leave,
+        # so bind on self.top and rely on Tk's toplevel-level crossing events.
+        self.top.bind("<Enter>", self._on_enter)
+        self.top.bind("<Leave>", self._on_leave)
 
     # ── mouse model (EVE-O parity) ──────────────────────────────────────────
     def _bind_mouse(self):
@@ -237,6 +255,7 @@ class TileWindow:
         else:  # move
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
+            self._pos = (x, y)
             self._win32.set_window_pos(self._hwnd, x, y, self._w,
                                        self._body_h + STRIP_H)
 
@@ -265,6 +284,7 @@ class TileWindow:
     # ── placement / DWM ─────────────────────────────────────────────────────
     def place(self, x, y, w, body_h):
         self._w, self._body_h = w, body_h
+        self._pos = (x, y)
         self.top.deiconify()
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
@@ -299,10 +319,78 @@ class TileWindow:
         self._win32.retop(self._hwnd)
 
     def set_alpha(self, a):
+        self._alpha = a
         try:
             self.top.attributes("-alpha", a)
         except tk.TclError:
             pass
+
+    def current_alpha(self):
+        """Last requested window alpha (mirror for tests / logging)."""
+        return self._alpha
+
+    # ── opacity / hover / zoom (Task C1) ────────────────────────────────────
+    def configure_hover(self, inactive, hover):
+        """Set the inactive/hover opacities and apply the resting opacity now."""
+        self._opacity_inactive = inactive
+        self._opacity_hover = hover
+        self._apply_resting_alpha()
+
+    def configure_zoom(self, enabled, factor, anchor):
+        """Set hover-zoom parameters. Does not zoom until the next <Enter>."""
+        self._zoom_enabled = bool(enabled)
+        self._zoom_factor = factor
+        self._zoom_anchor = anchor
+
+    def set_active(self, active):
+        """Mark this tile as the active client's (last-activated / foreground).
+        An active tile rests at hover opacity even when not hovered."""
+        self._active = bool(active)
+        self._apply_resting_alpha()
+
+    def _apply_resting_alpha(self):
+        """Alpha when not mid-hover: hover if hovering-or-active, else inactive."""
+        if self._hovering or self._active:
+            self.set_alpha(self._opacity_hover)
+        else:
+            self.set_alpha(self._opacity_inactive)
+
+    def _dragging(self):
+        return self._press_root is not None or self._mode is not None
+
+    def _on_enter(self, _event):
+        self._hovering = True
+        self.set_alpha(self._opacity_hover)
+        self._apply_zoom()
+
+    def _on_leave(self, _event):
+        self._hovering = False
+        self._restore_zoom()
+        self._apply_resting_alpha()
+
+    def _apply_zoom(self):
+        if not self._zoom_enabled or self._zoomed or self._dragging():
+            return
+        rect = (self._pos[0], self._pos[1], self._w, self._body_h)
+        self._prezoom_rect = rect
+        zx, zy, zw, zbody = preview_layout.zoom_rect(
+            rect, self._zoom_factor, self._zoom_anchor)
+        self._zoomed = True
+        self._w, self._body_h = zw, zbody
+        self._win32.set_window_pos(self._hwnd, zx, zy, zw, zbody + STRIP_H)
+        self._push_thumb_rect()
+        self._win32.retop(self._hwnd)
+
+    def _restore_zoom(self):
+        if not self._zoomed or self._prezoom_rect is None:
+            return
+        x, y, w, body_h = self._prezoom_rect
+        self._zoomed = False
+        self._prezoom_rect = None
+        self._w, self._body_h = w, body_h
+        self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
+        self._push_thumb_rect()
+        self._win32.retop(self._hwnd)
 
     def detach(self):
         if self._thumb:

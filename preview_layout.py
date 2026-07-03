@@ -55,6 +55,32 @@ def login_stack_pos(index, base):
     return (base[0] + index * LOGIN_STACK_STEP, base[1] + index * LOGIN_STACK_STEP)
 
 
+_ZOOM_ANCHORS = {
+    # anchor -> (fx, fy) fraction of the size DELTA to subtract from x / y.
+    # 0.0 keeps that edge fixed, 1.0 keeps the opposite edge fixed, 0.5 centers.
+    "nw": (0.0, 0.0), "n": (0.5, 0.0), "ne": (1.0, 0.0),
+    "w":  (0.0, 0.5), "c": (0.5, 0.5), "e":  (1.0, 0.5),
+    "sw": (0.0, 1.0), "s": (0.5, 1.0), "se": (1.0, 1.0),
+}
+
+
+def zoom_rect(rect, factor, anchor):
+    """Scale (x, y, w, h) by factor around one of 9 anchors (nw n ne w c e sw s se).
+
+    The anchor point stays fixed; the rect grows away from it. factor <= 1 is a
+    no-op. Unknown anchors fall back to 'nw'. Returns integer-rounded (x, y, w, h).
+    """
+    x, y, w, h = rect
+    if factor <= 1:
+        return (x, y, w, h)
+    nw = max(1, round(w * factor))
+    nh = max(1, round(h * factor))
+    fx, fy = _ZOOM_ANCHORS.get(anchor, _ZOOM_ANCHORS["nw"])
+    nx = round(x - (nw - w) * fx)
+    ny = round(y - (nh - h) * fy)
+    return (nx, ny, nw, nh)
+
+
 def cycle_next(order, current, live, direction):
     """Next live char key in the ordered ring. Empty order → sorted(live)."""
     ring = [k for k in order if k in live] if order else sorted(live)

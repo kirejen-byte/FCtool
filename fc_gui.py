@@ -11411,6 +11411,22 @@ class FCToolGUI:
         idx = len(self._preview_tiles)
         return (10 + idx * 24, 10 + idx * 24, w, body_h)
 
+    def _preview_style_tile(self, tile, key, cfg):
+        """Apply opacity + hover-zoom config and the active flag to one tile
+        (Task C1). Guarded so recording fakes without these hooks stay no-ops."""
+        conf_hover = getattr(tile, "configure_hover", None)
+        if conf_hover is not None:
+            conf_hover(inactive=float(cfg.get("opacity_inactive", 0.85)),
+                       hover=float(cfg.get("opacity_hover", 1.0)))
+        conf_zoom = getattr(tile, "configure_zoom", None)
+        if conf_zoom is not None:
+            conf_zoom(enabled=bool(cfg.get("zoom_enabled", False)),
+                      factor=float(cfg.get("zoom_factor", 2.0)),
+                      anchor=str(cfg.get("zoom_anchor", "nw")))
+        set_active = getattr(tile, "set_active", None)
+        if set_active is not None:
+            set_active(bool(key) and key == self._preview_last_key)
+
     def _preview_spawn_tile(self, client):
         cfg = self._preview_cfg()
         x, y, w, body_h = self._preview_tile_rect(client, cfg)
@@ -11427,6 +11443,7 @@ class FCToolGUI:
             return
         self._preview_tiles[client.hwnd] = tile
         self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
+        self._preview_style_tile(tile, client.key, cfg)
 
     def _preview_rekey_tile(self, old, new):
         """Same hwnd, changed title (login<->char or char rename). Re-key the tile
@@ -11863,6 +11880,9 @@ class FCToolGUI:
                 try:
                     tile.set_badge("MINIMIZED" if client.is_iconic
                                    else ("login screen" if client.is_login else None))
+                    # C1: keep opacity/zoom config + active flag current. The
+                    # active tile (last-activated client) rests at hover opacity.
+                    self._preview_style_tile(tile, client.key, cfg)
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
                     # B3: flash the border red while the pilot's system carries a

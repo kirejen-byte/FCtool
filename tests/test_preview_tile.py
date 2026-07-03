@@ -104,3 +104,89 @@ def test_caption_and_badge_render_text():
         tile.destroy()
     finally:
         root.destroy()
+
+
+def _make_tile(root, w32=None, dwm=None):
+    return pt.TileWindow(root, "kirejen", PALETTE, win32=w32 or FakeTileWin32(),
+                         dwm=dwm or FakeDwm(), on_activate=lambda k: None,
+                         on_minimize=lambda k: None,
+                         on_move_end=lambda k, x, y: None,
+                         on_resize_end=lambda k, w, h: None)
+
+
+def test_hover_opacity_enter_leave_and_active_stays_hover():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.configure_hover(inactive=0.85, hover=1.0)
+        assert tile.current_alpha() == 0.85          # inactive applied on configure
+        tile._on_enter(None)
+        assert tile.current_alpha() == 1.0           # hover on enter
+        tile._on_leave(None)
+        assert tile.current_alpha() == 0.85          # back to inactive on leave
+        tile.set_active(True)                        # active tile stays at hover
+        assert tile.current_alpha() == 1.0
+        tile._on_leave(None)                         # leaving an active tile keeps hover
+        assert tile.current_alpha() == 1.0
+        tile.set_active(False)
+        assert tile.current_alpha() == 0.85
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_zoom_on_enter_replaces_rect_and_restores_on_leave():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile = _make_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.configure_zoom(enabled=True, factor=2.0, anchor="nw")
+        placed_before = len(w32.placed)
+        tile._on_enter(None)
+        # zoomed rect re-placed via win32 (body_h doubled, +STRIP_H on window height)
+        assert w32.placed[-1] == (w32.get_root_hwnd(tile.top.winfo_id()),
+                                  100, 200, 768, 432 + pt.STRIP_H)
+        assert w32.retops                             # retop after zoom
+        assert len(w32.placed) > placed_before
+        tile._on_leave(None)
+        # restored to the original rect
+        assert w32.placed[-1] == (w32.get_root_hwnd(tile.top.winfo_id()),
+                                  100, 200, 384, 216 + pt.STRIP_H)
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_zoom_disabled_does_not_move_tile_on_hover():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile = _make_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.configure_zoom(enabled=False, factor=2.0, anchor="nw")
+        n = len(w32.placed)
+        tile._on_enter(None)
+        tile._on_leave(None)
+        assert len(w32.placed) == n                   # no re-placement when zoom off
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_zoom_suppressed_while_dragging():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile = _make_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.configure_zoom(enabled=True, factor=2.0, anchor="nw")
+        # simulate an in-progress drag (right-button move mode active)
+        tile._mode = "move"
+        tile._press_root = (0, 0)
+        n = len(w32.placed)
+        tile._on_enter(None)
+        assert len(w32.placed) == n                   # no zoom while dragging
+        tile.destroy()
+    finally:
+        root.destroy()
