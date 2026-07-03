@@ -116,6 +116,42 @@ def test_status_text_variants():
         root.destroy()
 
 
+def test_status_text_hidden_thumbnails_middle_state():
+    # Fix 1: process running but 0 thumbnails => the "hidden" middle state,
+    # distinct from both "not detected" and the thumbnail-count state.
+    root, host = _host(overlay_cfg={"enabled": True})
+    try:
+        hidden = host._overlay_status_text(0, 0, preview_running=True).lower()
+        assert "hidden" in hidden
+        assert "running" in hidden
+        assert "not detected" not in hidden
+        # process running is irrelevant once thumbnails ARE visible
+        shown = host._overlay_status_text(2, 1, preview_running=True).lower()
+        assert "matched" in shown and "hidden" not in shown
+        # no process, no thumbnails => plain not-detected
+        assert "not detected" in host._overlay_status_text(
+            0, 0, preview_running=False).lower()
+    finally:
+        root.destroy()
+
+
+def test_tick_picks_hidden_state_from_preview_running_fn():
+    # Fix 1: the controller tick probes _overlay_preview_running_fn when there
+    # are 0 thumbnails and shows the "hidden" state on the live status label.
+    root, host = _host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}},
+                       thumbs=[])
+    try:
+        host._overlay_preview_running_fn = lambda: True
+        host._overlay_status_label = tk.Label(root)
+        host._overlay_tick()
+        assert "hidden" in host._overlay_status_label.cget("text").lower()
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
 def test_tick_sets_labels_and_retops_when_enabled():
     thumbs = [Thumb(1, "Alpha", (0, 0, 100, 100))]
     root, host = _host(

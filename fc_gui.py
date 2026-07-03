@@ -669,6 +669,9 @@ class FCToolGUI:
         self._overlay_poller_stop = None       # threading.Event while running
         self._overlay_status_label = None
         self._overlay_thumbs_fn = find_thumbs  # injectable for tests
+        # Process-based Eve-O detection for the "thumbnails hidden" status state
+        # (Eve-O can be running with every thumbnail window hidden). Injectable.
+        self._overlay_preview_running_fn = preview_running
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11213,10 +11216,23 @@ class FCToolGUI:
             items.append((thumb.rect, label))
         return items
 
-    def _overlay_status_text(self, thumb_count: int, matched: int) -> str:
+    def _overlay_status_text(self, thumb_count: int, matched: int,
+                             preview_running: bool = False) -> str:
+        """Status line for the overlay Settings row. Three live states:
+          ● N thumbnails · M matched        — thumbnails are visible
+          ◐ Eve-O running · thumbnails …    — the process is up but Eve-O has
+                                              hidden its thumbnails (its config
+                                              only shows them when an EVE client
+                                              is focused; select an EVE client)
+          ○ Eve-O Preview not detected      — no thumbnails and no process
+        The middle state relies on process-based detection (preview_running),
+        so it fires even when every Eve-O window is hidden/minimised."""
         if not self._overlay_cfg().get("enabled", False):
             return "⏸ off"
         if thumb_count <= 0:
+            if preview_running:
+                return ("◐ Eve-O running · thumbnails hidden "
+                        "(select an EVE client)")
             return "○ Eve-O Preview not detected"
         return f"● {thumb_count} thumbnails · {matched} matched"
 
@@ -11247,9 +11263,21 @@ class FCToolGUI:
             return
         # live status label (if the Settings section is built)
         if getattr(self, "_overlay_status_label", None) is not None:
+            # Only probe the process list when NO thumbnails are visible — that
+            # is the sole case where the "hidden thumbnails" middle state can
+            # apply, and it keeps the sub-ms hot path free of the snapshot when
+            # thumbnails are up.
+            running = False
+            if thumb_count <= 0:
+                prfn = getattr(self, "_overlay_preview_running_fn", None)
+                if prfn is not None:
+                    try:
+                        running = bool(prfn())
+                    except Exception:
+                        running = False
             try:
                 self._overlay_status_label.config(
-                    text=self._overlay_status_text(thumb_count, matched))
+                    text=self._overlay_status_text(thumb_count, matched, running))
             except tk.TclError:
                 pass
         # getattr-with-default so the tick works both on the real class (class
