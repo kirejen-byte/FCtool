@@ -11,6 +11,7 @@ host (no real Tk / Win32 / DWM). Every boundary is a fake:
 NON-DISRUPTIVE: nothing here touches a real window, registers a hotkey, or
 grabs focus — the activation path is exercised only through the fake.
 """
+import inspect
 import queue
 import types
 from types import SimpleNamespace
@@ -48,6 +49,17 @@ class FakeTile:
         self.destroyed = False
         self.refreshes = 0
         self.borders = []
+        self.hidden = False
+        self.hide_calls = 0
+        self.show_calls = 0
+
+    def hide(self):
+        self.hidden = True
+        self.hide_calls += 1
+
+    def show(self):
+        self.hidden = False
+        self.show_calls += 1
 
     def set_key(self, char_key):
         self.key = char_key
@@ -138,6 +150,9 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     host._preview_gamelog = None
     host._preview_layer_hp = {}
     host._preview_damage_until = {}
+    # C2 hide-rules / shown-chars state (mirror __init__ block)
+    host._preview_lost_focus_since = None
+    host._preview_win32 = None            # foreground backend; None → treat as focused
 
     # Caption-composition boundaries (the tick body now calls the real
     # _preview_compose_captions — Task B1). Stub the ESI/doctrine/rules edges so
@@ -166,9 +181,18 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_compose_video_labels",
                  "_preview_caption_parts", "_preview_should_flash",
                  "_preview_on_damage",
+                 "_preview_visibility", "_preview_shown_chars",
+                 "_preview_all_known_chars", "_preview_foreground_info",
+                 "_preview_sync_gamelog_scope",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
-        if fn is not None:
+        if fn is None:
+            continue
+        # Staticmethods must NOT receive `host` as an implicit first arg.
+        raw = inspect.getattr_static(fc_gui.FCToolGUI, name, None)
+        if isinstance(raw, staticmethod):
+            setattr(host, name, fn)
+        else:
             setattr(host, name, types.MethodType(fn, host))
 
     # recording tile factory (replaces real TileWindow construction)
@@ -1017,6 +1041,147 @@ def test_tick_holds_damage_border_across_frames_then_clears(monkeypatch):
     now[0] = 102.0
     tick(host)
     assert host._preview_tiles[1].borders[-1] is None
+
+
+# ── (C2) shown-chars set: all_known - disabled (pure, show-oriented) ──────────
+def test_shown_chars_subtracts_disabled_case_insensitively():
+    fn = fc_gui.FCToolGUI._preview_shown_chars
+    all_known = {"kirejen", "alt two", "boss"}
+    assert fn(all_known, ["Boss", "KIREJEN"]) == {"alt two"}
+    assert fn(all_known, []) == {"kirejen", "alt two", "boss"}
+    assert fn(all_known, ["kirejen", "alt two", "boss"]) == set()
+
+
+def test_all_known_chars_unions_esi_live_and_saved_layouts():
+    host = make_host(mode="native", layouts={"ghost": [0, 0, 384, 216],
+                                             "kirejen": [1, 1, 384, 216]})
+    host.esi_accounts = [SimpleNamespace(character_name="Kirejen"),
+                         SimpleNamespace(character_name="Bob")]
+    host._preview_clients = {1: _cw(1, "Alt Two"), 2: _cw(2, "")}  # login excluded
+    known = host._preview_all_known_chars()
+    # union, lowercased, login screens contribute nothing
+    assert known == {"kirejen", "bob", "alt two", "ghost"}
+
+
+# ── (C2) _preview_visibility pure hide rules ─────────────────────────────────
+def _vis(cur, fg_info, cfg, tick_count=0, lost_since=None):
+    return fc_gui.FCToolGUI._preview_visibility(
+        cur, fg_info, cfg, tick_count, lost_since)
+
+
+def _fg(active_hwnd=None, focused=True):
+    return SimpleNamespace(active_hwnd=active_hwnd, focused=focused)
+
+
+def test_visibility_all_rules_off_hides_nothing():
+    cur = {1: _cw(1, "A"), 2: _cw(2, "")}
+    cfg = {"hide_active": False, "hide_login": False,
+           "hide_on_lost_focus": False, "hide_delay_ticks": 4}
+    hidden, lost = _vis(cur, _fg(active_hwnd=1, focused=True), cfg)
+    assert hidden == set()
+    assert lost is None
+
+
+def test_visibility_hide_active_hides_foreground_client_only():
+    cur = {1: _cw(1, "A"), 2: _cw(2, "B")}
+    cfg = {"hide_active": True, "hide_login": False,
+           "hide_on_lost_focus": False, "hide_delay_ticks": 4}
+    hidden, _ = _vis(cur, _fg(active_hwnd=2, focused=True), cfg)
+    assert hidden == {2}
+    # nothing foregrounded → nothing hidden by this rule
+    hidden, _ = _vis(cur, _fg(active_hwnd=None, focused=True), cfg)
+    assert hidden == set()
+
+
+def test_visibility_hide_login_hides_login_tiles():
+    cur = {1: _cw(1, "A"), 2: _cw(2, ""), 3: _cw(3, "")}
+    cfg = {"hide_active": False, "hide_login": True,
+           "hide_on_lost_focus": False, "hide_delay_ticks": 4}
+    hidden, _ = _vis(cur, _fg(active_hwnd=1, focused=True), cfg)
+    assert hidden == {2, 3}
+
+
+def test_visibility_lost_focus_delays_then_hides_all_then_resets():
+    cur = {1: _cw(1, "A"), 2: _cw(2, "B")}
+    cfg = {"hide_active": False, "hide_login": False,
+           "hide_on_lost_focus": True, "hide_delay_ticks": 3}
+    # tick 10: focus just lost → countdown seeded, nothing hidden yet
+    hidden, lost = _vis(cur, _fg(focused=False), cfg, tick_count=10, lost_since=None)
+    assert hidden == set() and lost == 10
+    # tick 12: still < delay ticks elapsed (12-10=2 < 3) → not yet
+    hidden, lost = _vis(cur, _fg(focused=False), cfg, tick_count=12, lost_since=10)
+    assert hidden == set() and lost == 10
+    # tick 13: 3 ticks elapsed → hide every tile
+    hidden, lost = _vis(cur, _fg(focused=False), cfg, tick_count=13, lost_since=10)
+    assert hidden == {1, 2} and lost == 10
+    # focus returns → countdown cleared, nothing hidden
+    hidden, lost = _vis(cur, _fg(focused=True), cfg, tick_count=14, lost_since=10)
+    assert hidden == set() and lost is None
+
+
+def test_visibility_lost_focus_zero_delay_hides_immediately():
+    cur = {1: _cw(1, "A")}
+    cfg = {"hide_active": False, "hide_login": False,
+           "hide_on_lost_focus": True, "hide_delay_ticks": 0}
+    hidden, lost = _vis(cur, _fg(focused=False), cfg, tick_count=5, lost_since=None)
+    assert hidden == {1} and lost == 5
+
+
+# ── (C2) tick integration: hidden tiles withdrawn (not destroyed), skip retop ─
+class _FgWin32:
+    """Foreground-only fake: get_foreground() returns a scripted hwnd."""
+
+    def __init__(self, fg_hwnd):
+        self._fg = fg_hwnd
+
+    def get_foreground(self):
+        return self._fg
+
+
+def test_tick_hide_active_withdraws_foreground_tile_keeps_layout():
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216],
+                                             "b": [1, 1, 384, 216]})
+    host._preview_cfg().update(hide_active=True)
+    ca, cb = _cw(1, "A"), _cw(2, "B")
+    host._preview_find_clients = lambda: [ca, cb]
+    host._preview_win32 = _FgWin32(1)          # client A is foreground
+    tick(host)
+    ta, tb = host._preview_tiles[1], host._preview_tiles[2]
+    assert ta.hidden is True and ta.hide_calls == 1
+    assert tb.hidden is False
+    # hidden tile is NOT retopped this tick
+    assert ("tile", "a") not in host.retop_order
+    assert ("tile", "b") in host.retop_order
+    # layout preserved (never wiped)
+    assert host.config["preview"]["layouts"]["a"] == [0, 0, 384, 216]
+    # foreground moves to B → A re-shown, B hidden
+    host._preview_win32 = _FgWin32(2)
+    tick(host)
+    assert ta.hidden is False and ta.show_calls == 1
+    assert tb.hidden is True
+
+
+def test_tick_disabled_char_never_spawns_tile_and_keeps_layout():
+    host = make_host(mode="native", layouts={"alt": [3, 4, 384, 216]},
+                     disabled_chars=["alt"])
+    host._preview_find_clients = lambda: [_cw(1, "Alt")]
+    tick(host)
+    assert host._preview_tiles == {}          # disabled → no tile
+    assert host.config["preview"]["layouts"]["alt"] == [3, 4, 384, 216]
+
+
+def test_tick_pushes_shown_chars_to_gamelog_monitor():
+    host = make_host(mode="native", disabled_chars=["boss"])
+    host.esi_accounts = [SimpleNamespace(character_name="Kirejen"),
+                         SimpleNamespace(character_name="Boss")]
+    tracked = {}
+    host._preview_gamelog = SimpleNamespace(
+        set_tracked_characters=lambda names: tracked.__setitem__(
+            "names", set(names)))
+    host._preview_find_clients = lambda: [_cw(1, "Alt Two")]
+    tick(host)
+    # shown = all_known(kirejen, boss, alt two) - disabled(boss)
+    assert tracked["names"] == {"kirejen", "alt two"}
 
 
 def test_tick_damage_flash_beats_intel_flash(monkeypatch):

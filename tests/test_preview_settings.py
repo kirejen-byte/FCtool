@@ -57,6 +57,7 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
     if overlay_cfg is not None:
         host.config["overlay"] = overlay_cfg
     host.esi_accounts = []
+    host._preview_gamelog = None
     host._overlay = None
     host._overlay_states = {}
     host._overlay_state_ts = {}
@@ -102,6 +103,9 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_sync_native_widgets",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
                  "_preview_restart_hotkeys",
+                 "_preview_update_shown_summary", "_preview_all_known_chars",
+                 "_preview_shown_chars", "_open_preview_previews_dialog",
+                 "_preview_apply_shown_chars", "_preview_sync_gamelog_scope",
                  "_add_section", "_overlay_apply_style",
                  "_open_overlay_rules_dialog", "_overlay_cycle_color",
                  "_overlay_status_text", "_overlay_rules",
@@ -436,5 +440,77 @@ def test_hotkey_preset_fills_group0_next_prev_without_touching_focus():
         assert hk["groups"][0]["prev"] == ["F13"]
         # focus keys untouched (EVE-O parity: preset only sets cycle group 0)
         assert hk["focus"] == {"kirejen": "F5"}
+    finally:
+        root.destroy()
+
+
+# ── (C2) hide-rule checkboxes persist via _preview_apply_native_state ─────────
+def test_hide_rule_checkboxes_persist_live():
+    root, host = _ui_host(preview_cfg={"mode": "native"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        host._preview_hide_active_var.set(True)
+        host._preview_hide_login_var.set(True)
+        host._preview_hide_lost_focus_var.set(True)
+        host._preview_apply_native_state()
+        pcfg = host.config["preview"]
+        assert pcfg["hide_active"] is True
+        assert pcfg["hide_login"] is True
+        assert pcfg["hide_on_lost_focus"] is True
+        # a saved layout is never touched by toggling a comfort option
+        assert "layouts" in pcfg
+    finally:
+        root.destroy()
+
+
+# ── (C2) Previews… modal: show-oriented checklist over the known-char union ──
+def _previews_ui_host(preview_cfg, esi_names=(), live_names=()):
+    root, host = _ui_host(preview_cfg=preview_cfg)
+    host.esi_accounts = [SimpleNamespace(character_name=n) for n in esi_names]
+    host._preview_clients = {
+        i + 1: _cw(i + 1, nm) for i, nm in enumerate(live_names)}
+    host._preview_gamelog = None
+    for name in ("_open_preview_previews_dialog", "_preview_shown_chars",
+                 "_preview_all_known_chars", "_preview_sync_gamelog_scope",
+                 "_preview_apply_shown_chars", "_preview_update_shown_summary"):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        if attr is None:
+            continue
+        setattr(host, name,
+                _bind_attr(name, attr, host) if callable(attr) else attr)
+    return root, host
+
+
+def test_previews_modal_builds_headless_and_lists_known_chars():
+    root, host = _previews_ui_host(
+        preview_cfg={"mode": "native", "disabled_chars": ["bob"],
+                     "layouts": {"ghost": [0, 0, 384, 216]}},
+        esi_names=("Kirejen", "Bob"), live_names=("Alt Two",))
+    try:
+        win = host._open_preview_previews_dialog(_test_no_wait=True)
+        assert win is not None
+        # one checkbox var per known char (union, lowercased)
+        assert set(host._preview_show_vars) == {
+            "kirejen", "bob", "ghost", "alt two"}
+        # show-oriented: disabled char is UNchecked, everyone else checked
+        assert host._preview_show_vars["bob"].get() is False
+        assert host._preview_show_vars["kirejen"].get() is True
+        win.destroy()
+    finally:
+        root.destroy()
+
+
+def test_previews_modal_apply_writes_disabled_chars_show_oriented():
+    root, host = _previews_ui_host(
+        preview_cfg={"mode": "native", "disabled_chars": []},
+        esi_names=("Kirejen", "Bob"))
+    try:
+        win = host._open_preview_previews_dialog(_test_no_wait=True)
+        # uncheck Kirejen (= hide/disable it); Bob stays shown
+        host._preview_show_vars["kirejen"].set(False)
+        host._preview_apply_shown_chars()
+        assert host.config["preview"]["disabled_chars"] == ["kirejen"]
+        win.destroy()
     finally:
         root.destroy()

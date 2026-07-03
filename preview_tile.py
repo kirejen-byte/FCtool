@@ -130,6 +130,7 @@ class TileWindow:
         self._body_h = 0
         self._pos = (0, 0)            # last-placed top-left (physical px)
         self._badge = None
+        self._hidden = False          # withdrawn by a C2 hide rule (layout kept)
 
         # hover / opacity / zoom state (Task C1)
         self._alpha = 1.0             # last requested window alpha (mirror for tests)
@@ -288,6 +289,33 @@ class TileWindow:
         self.top.deiconify()
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
+
+    def hide(self):
+        """Withdraw the tile without destroying it (Task C2 hide rules). The DWM
+        thumbnail registration and the saved layout are untouched; show() re-maps
+        it instantly. Idempotent."""
+        if getattr(self, "_hidden", False):
+            return
+        self._hidden = True
+        try:
+            self.top.withdraw()
+        except tk.TclError:
+            pass
+
+    def show(self):
+        """Re-map a tile hidden by hide(). Idempotent; re-pushes the thumbnail rect
+        so the live image resumes exactly where it left off."""
+        if not getattr(self, "_hidden", False):
+            return
+        self._hidden = False
+        try:
+            self.top.deiconify()
+            self.top.update_idletasks()
+            self._win32.set_window_pos(self._hwnd, self._pos[0], self._pos[1],
+                                       self._w, self._body_h + STRIP_H)
+            self._push_thumb_rect()
+        except tk.TclError:
+            pass
 
     def attach_source(self, src_hwnd):
         self.detach()

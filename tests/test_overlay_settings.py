@@ -1,5 +1,6 @@
 import pytest
 tk = pytest.importorskip("tkinter")
+import inspect
 import types
 
 import fc_gui
@@ -163,6 +164,7 @@ def _ui_host(overlay_cfg=None):
     host._preview_clients = {}
     host._preview_disabled_session = False
     host._preview_status = ""
+    host._preview_gamelog = None
     # Native-mode boot/teardown are recorded (never fired at a real window).
     calls = {"enable_native": 0, "disable_native": 0}
     host._calls = calls
@@ -177,6 +179,9 @@ def _ui_host(overlay_cfg=None):
                  "_preview_fleet_order_key",
                  "_preview_apply_native_state", "_preview_sync_native_widgets",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
+                 "_preview_update_shown_summary", "_preview_all_known_chars",
+                 "_preview_shown_chars", "_open_preview_previews_dialog",
+                 "_preview_apply_shown_chars", "_preview_sync_gamelog_scope",
                  "_add_section",
                  "_overlay_apply_style",
                  "_overlay_status_text", "_overlay_compose_items",
@@ -191,7 +196,12 @@ def _ui_host(overlay_cfg=None):
                  "_OVERLAY_COLOR_CYCLE", "_OVERLAY_ANCHORS",
                  "_OVERLAY_ANCHOR_TO_CFG", "_OVERLAY_CFG_TO_ANCHOR"):
         attr = getattr(fc_gui.FCToolGUI, name)
-        setattr(host, name, types.MethodType(attr, host) if callable(attr) else attr)
+        raw = inspect.getattr_static(fc_gui.FCToolGUI, name, None)
+        if isinstance(raw, staticmethod):
+            setattr(host, name, attr)                 # no implicit host arg
+        else:
+            setattr(host, name,
+                    types.MethodType(attr, host) if callable(attr) else attr)
     return root, host
 
 

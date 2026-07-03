@@ -123,6 +123,13 @@ class _RealWin32:
         self._user32.GetWindowThreadProcessId.argtypes = [
             wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         self._user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        self._user32.GetForegroundWindow.argtypes = []
+        self._user32.GetForegroundWindow.restype = wintypes.HWND
+
+    def get_foreground(self) -> int:
+        """HWND of the window the user is currently working in (0 if none).
+        Drives the C2 hide-active / hide-on-lost-focus rules — read-only."""
+        return int(self._user32.GetForegroundWindow() or 0)
 
     def enum_windows(self) -> list[int]:
         out: list[int] = []

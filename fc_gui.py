@@ -698,6 +698,9 @@ class FCToolGUI:
         self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
         self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
         self._preview_gamelog_factory = GamelogMonitor  # injectable
+        # ── Hide rules / per-char selection (Task C2) ───────────────────────
+        self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
+        self._preview_win32 = None             # foreground backend; None → lazy real singleton
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11853,6 +11856,116 @@ class FCToolGUI:
         except Exception:
             log.exception("[preview] damage ingest failed")
 
+    # ── C2: hide rules + per-character preview selection ────────────────────
+    @staticmethod
+    def _preview_shown_chars(all_known, disabled):
+        """Set of char keys to show = every known char minus the disabled set.
+
+        UX is show-oriented (a checked box = visible) but storage is
+        `disabled_chars` (an unchecked box), so a brand-new character seen for
+        the first time is shown by default. Both sides are lowercased so the
+        subtraction is case-insensitive. Pure."""
+        known = {str(k).strip().lower() for k in all_known if str(k).strip()}
+        off = {str(k).strip().lower() for k in (disabled or []) if str(k).strip()}
+        return known - off
+
+    def _preview_all_known_chars(self):
+        """Every character ever seen (lowercased): ESI account names ∪ live
+        native client names ∪ any name with a saved layout. Drives the
+        Previews… checklist and the GamelogMonitor tracked-set. Login screens
+        contribute nothing (no char name). Fails soft to an empty set."""
+        known = set()
+        try:
+            for a in getattr(self, "esi_accounts", []) or []:
+                nm = (getattr(a, "character_name", "") or "").strip().lower()
+                if nm:
+                    known.add(nm)
+            for c in self._preview_clients.values():
+                if not c.is_login and c.char_name:
+                    known.add(c.char_name.strip().lower())
+            cfg = self._preview_cfg()
+            for key in (cfg.get("layouts", {}) or {}):
+                k = str(key).strip().lower()
+                if k:
+                    known.add(k)
+        except Exception:
+            log.exception("[preview] known-char union failed")
+        return known
+
+    @staticmethod
+    def _preview_visibility(cur, fg_info, cfg, tick_count, lost_since):
+        """Pure hide-rule resolver. Returns (hidden_hwnds:set, new_lost_since).
+
+        Rules (spec §7/P11), combined by union:
+          - hide_active: the foreground EVE client's own tile is withdrawn
+            (its window already fills the screen, so its tile is redundant).
+          - hide_login: login-screen tiles are withdrawn.
+          - hide_on_lost_focus: when focus leaves both every EVE client AND our
+            own windows for `hide_delay_ticks` consecutive ticks, every tile is
+            withdrawn; the countdown resets the instant focus returns.
+
+        `fg_info.active_hwnd` is the foreground EVE client's hwnd (or None) and
+        `fg_info.focused` is True when the foreground window is an EVE client or
+        one of ours. `lost_since` is the tick_count at which focus was first
+        lost (or None while focused). No Tk / no ctypes — fully unit-tested."""
+        hidden = set()
+        if cfg.get("hide_active", False):
+            ah = getattr(fg_info, "active_hwnd", None)
+            if ah is not None and ah in cur:
+                hidden.add(ah)
+        if cfg.get("hide_login", False):
+            for hwnd, client in cur.items():
+                if client.is_login:
+                    hidden.add(hwnd)
+        new_lost = lost_since
+        if cfg.get("hide_on_lost_focus", False):
+            if getattr(fg_info, "focused", True):
+                new_lost = None                     # focus back → reset countdown
+            else:
+                if new_lost is None:
+                    new_lost = tick_count           # seed the countdown
+                delay = int(cfg.get("hide_delay_ticks", 4))
+                if tick_count - new_lost >= delay:
+                    hidden.update(cur)              # hide every tile
+        else:
+            new_lost = None
+        return hidden, new_lost
+
+    def _preview_foreground_info(self, cur):
+        """Snapshot the foreground window for the hide-on-lost-focus / hide-active
+        rules. `.active_hwnd` = the foreground hwnd when it is one of our tracked
+        EVE clients (else None); `.focused` = True when the foreground window is
+        an EVE client OR one of our own windows (tiles / the main FCTool window).
+        Fails soft to focused=True (never hide on an errored probe)."""
+        from types import SimpleNamespace
+        info = SimpleNamespace(active_hwnd=None, focused=True)
+        w = getattr(self, "_preview_win32", None)
+        if w is None:
+            return info
+        try:
+            fg = w.get_foreground()
+        except Exception:
+            return info
+        if not fg:
+            return info
+        if fg in cur:
+            info.active_hwnd = fg
+            info.focused = True
+            return info
+        our = set()
+        for tile in self._preview_tiles.values():
+            h = getattr(tile, "_hwnd", None)
+            if h:
+                our.add(h)
+        try:
+            root_hwnd = self.root.winfo_id()
+            if root_hwnd:
+                our.add(int(root_hwnd))
+        except Exception:
+            pass
+        info.focused = fg in our
+        return info
+
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
         if preview_running():                      # EVE-O still open → refuse to fight it
@@ -11870,6 +11983,14 @@ class FCToolGUI:
                 self._preview_rekey_tile(old, new)                  # login→char and back
             for client in added:
                 self._preview_spawn_tile(client)                    # saved | login stack | spawn
+            # C2 hide rules: withdraw (never destroy) tiles the rules hide this
+            # tick — hide-active / hide-login / hide-on-lost-focus. Layouts and
+            # DWM registrations survive; the tile is just unmapped, so re-showing
+            # is instant and no data is ever wiped.
+            fg_info = self._preview_foreground_info(cur)
+            hidden, self._preview_lost_focus_since = self._preview_visibility(
+                cur, fg_info, cfg, self._preview_tick_count,
+                self._preview_lost_focus_since)
             for hwnd, client in cur.items():
                 tile = self._preview_tiles.get(hwnd)
                 if not tile:
@@ -11877,7 +11998,14 @@ class FCToolGUI:
                 if not eve_client_tracker.still_same_client(client):
                     self._preview_retire_tile(hwnd)                 # HWND reuse guard
                     continue
+                if hwnd in hidden:
+                    try:
+                        tile.hide()                                 # withdraw; keep layout+DWM
+                    except Exception:
+                        pass
+                    continue                                        # no style/border/retop
                 try:
+                    tile.show()                                     # idempotent re-map
                     tile.set_badge("MINIMIZED" if client.is_iconic
                                    else ("login screen" if client.is_login else None))
                     # C1: keep opacity/zoom config + active flag current. The
@@ -11933,7 +12061,9 @@ class FCToolGUI:
                     # fresh registration. Only tracker-level/unexpected exceptions
                     # disable the session.
                     self._preview_retire_tile(hwnd)
-            for tile in self._preview_tiles.values():
+            for hwnd, tile in self._preview_tiles.items():
+                if hwnd in hidden:
+                    continue                                        # withdrawn — nothing to retop
                 tile.retop()
             if self._overlay is not None:
                 self._overlay.retop()                               # labels above tiles
@@ -11944,6 +12074,9 @@ class FCToolGUI:
             self._preview_drain_hotkeys()
             self._preview_compose_captions(cur)                     # Task B1 fills this in
             self._preview_compose_video_labels(cur)                 # Task B2 on-video labels
+            # C2: the shown (checked) character set drives damage scanning too, so
+            # the GamelogMonitor tails only pilots the user chose to preview.
+            self._preview_sync_gamelog_scope()
             self._preview_tick_count += 1
             n = len(cur)
             return f"● {n} client{'s' if n != 1 else ''} · {len(self._preview_tiles)} tiles"
@@ -11973,6 +12106,21 @@ class FCToolGUI:
             log.exception("[preview] gamelog monitor failed to start")
             self._preview_gamelog = None
 
+    def _preview_sync_gamelog_scope(self):
+        """Restrict the GamelogMonitor to the shown (checked) character set so
+        damage scanning follows the same pilots the user chose to preview
+        (Task C2). No-op when the monitor isn't running. Fails soft."""
+        mon = getattr(self, "_preview_gamelog", None)
+        if mon is None:
+            return
+        try:
+            shown = self._preview_shown_chars(
+                self._preview_all_known_chars(),
+                self._preview_cfg().get("disabled_chars", []))
+            mon.set_tracked_characters(shown)
+        except Exception:
+            log.exception("[preview] gamelog scope sync failed")
+
     def _preview_stop_gamelog(self):
         mon = self._preview_gamelog
         if mon is not None:
@@ -11984,6 +12132,14 @@ class FCToolGUI:
 
     def _preview_enable_native(self):
         self._preview_disabled_session = False
+        # C2: resolve the real foreground/win32 backend for the hide-on-lost-focus
+        # and hide-active rules (lazy real singleton; tests inject their own fake
+        # or leave it None to mean "no foreground info → always focused").
+        if self._preview_win32 is None:
+            try:
+                self._preview_win32 = eve_client_tracker._real_win32()
+            except Exception:
+                self._preview_win32 = None
         try:
             self._preview_restart_hotkeys()   # lazy service create + register
         except Exception:
@@ -12379,6 +12535,51 @@ class FCToolGUI:
         cbdf.grid(row=0, column=3, padx=(0, 16))
         w.append(cbdf)
 
+        # Row 5b (native, Task C2): hide rules + the per-character "which previews
+        # to show" entry point. Hiding a rule/character never wipes saved data.
+        rowHide = tk.Frame(parent, bg=BG_DARK)
+        rowHide.pack(fill=tk.X, padx=20, pady=2)
+        self._preview_hide_active_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_active", False)))
+        cbha = tk.Checkbutton(
+            rowHide, text="Hide active", variable=self._preview_hide_active_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbha.grid(row=0, column=0, padx=(0, 8))
+        w.append(cbha)
+
+        self._preview_hide_login_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_login", False)))
+        cbhl = tk.Checkbutton(
+            rowHide, text="Hide login", variable=self._preview_hide_login_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbhl.grid(row=0, column=1, padx=(0, 8))
+        w.append(cbhl)
+
+        self._preview_hide_lost_focus_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_on_lost_focus", False)))
+        cbhf = tk.Checkbutton(
+            rowHide, text="Hide all on lost focus",
+            variable=self._preview_hide_lost_focus_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbhf.grid(row=0, column=2, padx=(0, 16))
+        w.append(cbhf)
+
+        bpv = ttk.Button(rowHide, text="Previews…", style="Dark.TButton",
+                         command=self._open_preview_previews_dialog)
+        bpv.grid(row=0, column=3, padx=(0, 6))
+        w.append(bpv)
+        self._preview_shown_summary_lbl = tk.Label(
+            rowHide, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
+        self._preview_shown_summary_lbl.grid(row=0, column=4, padx=(4, 0),
+                                             sticky=tk.W)
+        self._preview_update_shown_summary()
+
         # Row 6 (native): damage-flash tuning (threshold % / window / cooldown /
         # reference) — all live-applied like the other native rows (Task B6).
         rowN3 = tk.Frame(parent, bg=BG_DARK)
@@ -12529,6 +12730,9 @@ class FCToolGUI:
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
+            ("_preview_hide_active_var", "hide_active", bool),
+            ("_preview_hide_login_var", "hide_login", bool),
+            ("_preview_hide_lost_focus_var", "hide_on_lost_focus", bool),
             ("_preview_damage_flash_var", "damage_flash", bool),
             ("_preview_dmg_pct_var", "damage_flash_pct", int),
             ("_preview_dmg_window_var", "damage_flash_window_s", int),
@@ -12950,6 +13154,130 @@ class FCToolGUI:
             if act[0] == "minall":
                 return "minimize all"
             return "hotkey"
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=_ok).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=2)
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
+
+    def _preview_update_shown_summary(self):
+        """Refresh the '(N of M shown)' label next to the Previews… button."""
+        lbl = getattr(self, "_preview_shown_summary_lbl", None)
+        if lbl is None:
+            return
+        try:
+            known = self._preview_all_known_chars()
+            shown = self._preview_shown_chars(
+                known, self._preview_cfg().get("disabled_chars", []))
+            lbl.config(text=f"({len(shown)} of {len(known)} shown)")
+        except tk.TclError:
+            pass
+
+    def _preview_apply_shown_chars(self):
+        """Persist the Previews… checklist to `disabled_chars` (show-oriented:
+        an UNchecked box disables that character). Never deletes a layout / size
+        / hotkey — hiding a preview only stops it from being shown. Pushes the
+        new shown set to the settings summary and the GamelogMonitor scope."""
+        cfg = self._preview_cfg()
+        disabled = []
+        for key, var in getattr(self, "_preview_show_vars", {}).items():
+            try:
+                shown = bool(var.get())
+            except tk.TclError:
+                shown = True
+            if not shown:
+                disabled.append(key)
+        cfg["disabled_chars"] = sorted(disabled)   # deterministic order
+        self._save_config()
+        self._preview_update_shown_summary()
+        self._preview_sync_gamelog_scope()
+
+    def _open_preview_previews_dialog(self, _test_no_wait=False):
+        """First-class 'which previews to show' modal (Task C2). Lists every
+        character ever seen (ESI accounts ∪ live clients ∪ saved layouts) with a
+        checkbox = 'show this preview' (checked = visible). Unchecking hides +
+        withdraws that tile on the next tick and NEVER deletes its layout / size /
+        hotkey. Includes Show-all / Hide-all and a live '(N of M shown)' count.
+
+        Returns the Toplevel (tests pass _test_no_wait=True to skip wait_window)."""
+        known = sorted(self._preview_all_known_chars())
+        disabled = {str(k).strip().lower()
+                    for k in (self._preview_cfg().get("disabled_chars", []) or [])}
+
+        win = tk.Toplevel(self.root)
+        win.title("Which previews to show")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Check a character to show its live preview. "
+                 "Unchecking only hides it — layouts and hotkeys are kept.",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10),
+                 justify=tk.LEFT, wraplength=420).pack(
+                     anchor="w", padx=10, pady=(10, 6))
+
+        count_lbl = tk.Label(win, text="", bg=BG_PANEL, fg=FG_DIM,
+                             font=("Consolas", 9))
+        count_lbl.pack(anchor="w", padx=10)
+
+        self._preview_show_vars = {}
+
+        def _refresh_count():
+            shown = sum(1 for v in self._preview_show_vars.values()
+                        if _safe_get(v))
+            count_lbl.config(text=f"({shown} of {len(self._preview_show_vars)} shown)")
+
+        def _safe_get(v):
+            try:
+                return bool(v.get())
+            except tk.TclError:
+                return True
+
+        list_frame = tk.Frame(win, bg=BG_PANEL)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        if not known:
+            tk.Label(list_frame, text="(no characters seen yet)", bg=BG_PANEL,
+                     fg=FG_DIM, font=("Consolas", 9)).pack(anchor="w")
+        for key in known:
+            var = tk.BooleanVar(value=(key not in disabled))
+            self._preview_show_vars[key] = var
+            tk.Checkbutton(
+                list_frame, text=key, variable=var,
+                command=_refresh_count, font=("Consolas", 10),
+                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+                activebackground=BG_PANEL, activeforeground=FG_TEXT,
+                anchor="w").pack(anchor="w", fill=tk.X)
+        _refresh_count()
+
+        def _set_all(value):
+            for v in self._preview_show_vars.values():
+                try:
+                    v.set(value)
+                except tk.TclError:
+                    pass
+            _refresh_count()
+
+        tools = tk.Frame(win, bg=BG_PANEL)
+        tools.pack(fill=tk.X, padx=10, pady=(2, 4))
+        ttk.Button(tools, text="Show all", style="Dark.TButton",
+                   command=lambda: _set_all(True)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(tools, text="Hide all", style="Dark.TButton",
+                   command=lambda: _set_all(False)).pack(side=tk.LEFT)
+
+        def _ok():
+            self._preview_apply_shown_chars()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
 
         btns = tk.Frame(win, bg=BG_PANEL)
         btns.pack(fill=tk.X, pady=8)
