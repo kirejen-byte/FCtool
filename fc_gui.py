@@ -460,6 +460,19 @@ def build_linux_screenshot_cmds(wayland, available, x, y, w, h, out_path):
     return capture_cmd, clipboard_cmd, None
 
 
+def _motd_link_initial_state(config) -> bool:
+    """Initial state of the MOTD auto-update link at tab build.
+
+    Always False, by design. The link is session-scoped: it must be turned on
+    deliberately each session. Persisting it and restoring it on startup caused
+    the app to push a freshly-opened (default) MOTD over the fleet's real one
+    before the FC had set anything up, so any persisted ``motd_link`` value is
+    intentionally ignored. ``config`` is accepted (and unused) to document that
+    the decision does not depend on it and to pin this behavior in tests.
+    """
+    return False
+
+
 class FCToolGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -7087,9 +7100,11 @@ class FCToolGUI:
         # doctrine-change clear. See _current_motd_markup / _capture_motd_fields.
         self._motd_loaded_fits = None
 
-        # Linked-MOTD auto-push state.
-        self._motd_link_enabled = bool(
-            self.config.get("fittings", {}).get("motd_link", False))
+        # Linked-MOTD auto-push state. The link is deliberately session-scoped:
+        # restoring it across restarts caused the app to push a freshly-opened
+        # (default) MOTD over the fleet's real one at startup, so it always
+        # starts OFF regardless of any persisted "motd_link" value.
+        self._motd_link_enabled = _motd_link_initial_state(self.config)
         self._motd_last_push_ts = None          # time.monotonic() of last successful push
         self._motd_last_check_ts = None         # time.monotonic() of last auto-update check
         self._motd_last_pushed_markup = None    # for change-detection (no redundant writes)
@@ -8844,13 +8859,12 @@ class FCToolGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _motd_toggle_link(self):
-        """Enable/disable linked auto-push of the MOTD."""
+        """Enable/disable linked auto-push of the MOTD.
+
+        The link is session-scoped and intentionally NOT persisted: on the next
+        launch it must start OFF so a freshly-opened (default) MOTD is never
+        pushed over the fleet's real one. See _motd_link_initial_state."""
         self._motd_link_enabled = bool(self._motd_link_var.get())
-        self.config.setdefault("fittings", {})["motd_link"] = self._motd_link_enabled
-        try:
-            self._save_config()
-        except Exception:
-            pass
         self._motd_link_state = "waiting" if self._motd_link_enabled else "off"
         if self._motd_link_enabled:
             import time
