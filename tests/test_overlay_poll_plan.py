@@ -44,3 +44,74 @@ def test_no_scope_never_schedules_online():
 
 def test_empty_names():
     assert plan([], last={}, now=1.0, online_ok={}) == []
+
+
+import types as _types
+import fc_gui as _fcg
+
+
+class FakeAuth:
+    def __init__(self, name, cid, *, online=True, has_online=True,
+                 loc=None, ship=None):
+        self.character_name = name
+        self.character_id = cid
+        self._online = online
+        self._has_online = has_online
+        self._loc = loc or {"solar_system_id": 30000142}
+        self._ship = ship or {"ship_type_id": 11957, "ship_name": "cyno alt"}
+    def has_scope(self, scope):
+        return self._has_online
+    def get_location(self):
+        return dict(self._loc)
+    def get_ship_type(self):
+        return dict(self._ship)
+    def esi_get(self, path):
+        if path.endswith("/online/"):
+            return {"online": self._online}
+        return None
+
+
+def _state_host(monkeypatch):
+    host = _types.SimpleNamespace()
+    host._overlay_states = {}
+    # stub ship_classes lookups so the test is network-free + deterministic
+    monkeypatch.setattr(_fcg.ship_classes, "get_group_name",
+                        lambda tid: "Force Recon Ship" if tid == 11957 else "Shuttle")
+    monkeypatch.setattr(_fcg.ship_classes, "is_capital", lambda tid: False)
+    host._overlay_build_state = _types.MethodType(
+        _fcg.FCToolGUI._overlay_build_state, host)
+    return host
+
+
+def test_build_state_locship(monkeypatch):
+    host = _state_host(monkeypatch)
+    auth = FakeAuth("Alpha", 1)
+    # monkeypatch system name resolution used by the builder
+    monkeypatch.setattr(_fcg, "get_system_info",
+                        lambda sid: {"name": "Jita"}, raising=False)
+    st = host._overlay_build_state(auth, do_online=False)
+    assert st.name == "Alpha"
+    assert st.ship_type_id == 11957
+    assert st.ship_group == "Force Recon Ship"
+    assert st.system_name == "Jita"
+    assert st.docked is False
+    assert st.online is None      # online not fetched this pass
+
+
+def test_build_state_docked(monkeypatch):
+    host = _state_host(monkeypatch)
+    auth = FakeAuth("Beta", 2, loc={"solar_system_id": 30000142,
+                                     "station_id": 60003760})
+    monkeypatch.setattr(_fcg, "get_system_info",
+                        lambda sid: {"name": "Jita"}, raising=False)
+    st = host._overlay_build_state(auth, do_online=False)
+    assert st.docked is True
+
+
+def test_build_state_online(monkeypatch):
+    host = _state_host(monkeypatch)
+    auth = FakeAuth("Gamma", 3, online=False)
+    monkeypatch.setattr(_fcg, "get_system_info",
+                        lambda sid: {"name": "Jita"}, raising=False)
+    st = host._overlay_build_state(auth, do_online=True)
+    assert st.online is False

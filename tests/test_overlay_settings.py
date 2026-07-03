@@ -145,8 +145,10 @@ def _ui_host(overlay_cfg=None):
     host.esi_accounts = []
     host._overlay = FakeOverlay()
     host._overlay_states = {}
+    host._overlay_state_ts = {}
     host._overlay_after_id = None
     host._overlay_poller = None
+    host._overlay_poller_stop = None
     host._overlay_status_label = None
     host._overlay_thumbs_fn = lambda: []
     host._system_names = ["Jita", "Amarr"]
@@ -161,6 +163,9 @@ def _ui_host(overlay_cfg=None):
                  "_overlay_rules", "_overlay_state_for", "_overlay_enable",
                  "_overlay_disable", "_overlay_teardown", "_overlay_ensure_window",
                  "_overlay_start_poller", "_overlay_stop_poller",
+                 "_overlay_poll_loop", "_overlay_poll_plan",
+                 "_overlay_build_state", "_OVERLAY_LOCSHIP_EVERY",
+                 "_OVERLAY_ONLINE_EVERY",
                  "_overlay_disable_session", "_overlay_tick",
                  "_overlay_cycle_color", "_open_overlay_rules_dialog",
                  "_OVERLAY_COLOR_CYCLE", "_OVERLAY_ANCHORS",
@@ -193,6 +198,7 @@ def test_toggle_persists_and_enables():
         # seed rules got created on first enable
         assert len(host.config["overlay"]["rules"]) >= 1
     finally:
+        host._overlay_stop_poller()       # stop the daemon poller thread
         if host._overlay_after_id:
             try: root.after_cancel(host._overlay_after_id)
             except Exception: pass

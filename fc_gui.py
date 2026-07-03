@@ -610,8 +610,10 @@ class FCToolGUI:
         # ── Eve-O Preview overlay state ─────────────────────────────────────
         self._overlay = None
         self._overlay_states: dict = {}        # name_lower -> CharState (poller)
+        self._overlay_state_ts: dict = {}      # name_lower -> monotonic fetch ts
         self._overlay_after_id = None
         self._overlay_poller = None            # Phase 2 daemon thread
+        self._overlay_poller_stop = None       # threading.Event while running
         self._overlay_status_label = None
         self._overlay_thumbs_fn = find_thumbs  # injectable for tests
         # Seed rules created once, the first time the feature is enabled.
@@ -11192,7 +11194,7 @@ class FCToolGUI:
             log.exception("[overlay] could not create overlay window; disabling")
             self._overlay_disable_session()
             return
-        self._overlay_start_poller()       # no-op stub in Phase 1
+        self._overlay_start_poller()       # daemon ESI poller (Phase 2)
         if self._overlay_after_id is None:
             self._overlay_tick()
 
@@ -11224,12 +11226,114 @@ class FCToolGUI:
             except tk.TclError:
                 pass
 
-    # Phase 1 stubs; replaced by the real daemon poller in Phase 2 (Task 8).
+    def _overlay_build_state(self, auth, do_online: bool):
+        """Fetch this ONE character's ESI location/ship (+ online when do_online)
+        with its OWN auth, returning a CharState. Merges onto any prior state so
+        a partial pass doesn't clobber the other field. Never raises."""
+        name = getattr(auth, "character_name", "") or ""
+        key = name.strip().lower()
+        prior = self._overlay_states.get(key)
+
+        ship_type_id = prior.ship_type_id if prior else None
+        ship_type_name = prior.ship_type_name if prior else ""
+        ship_group = prior.ship_group if prior else ""
+        is_cap = prior.is_capital if prior else None
+        sys_id = prior.solar_system_id if prior else None
+        sys_name = prior.system_name if prior else ""
+        docked = prior.docked if prior else False
+        online = prior.online if prior else None
+
+        try:
+            ship = auth.get_ship_type() or {}
+            if ship.get("ship_type_id"):
+                ship_type_id = ship.get("ship_type_id")
+                ship_type_name = ship.get("ship_name", "") or ship_type_name
+                ship_group = ship_classes.get_group_name(ship_type_id) or ""
+                is_cap = bool(ship_classes.is_capital(ship_type_id))
+        except Exception:
+            pass
+        try:
+            loc = auth.get_location() or {}
+            if loc:
+                sys_id = loc.get("solar_system_id")
+                docked = bool(loc.get("station_id") or loc.get("structure_id"))
+                if sys_id:
+                    info = get_system_info(sys_id)
+                    if info and info.get("name"):
+                        sys_name = info["name"]
+        except Exception:
+            pass
+        if do_online:
+            try:
+                res = auth.esi_get(f"/characters/{auth.character_id}/online/")
+                if isinstance(res, dict) and "online" in res:
+                    online = bool(res["online"])
+            except Exception:
+                pass
+
+        return overlay_rules.CharState(
+            character_id=getattr(auth, "character_id", 0) or 0, name=name,
+            online=online, ship_type_id=ship_type_id,
+            ship_type_name=ship_type_name,
+            ship_group=ship_group, is_capital=is_cap, solar_system_id=sys_id,
+            system_name=sys_name, docked=docked)
+
     def _overlay_start_poller(self):
-        pass
+        """Start the daemon poller if not already running."""
+        if self._overlay_poller is not None and self._overlay_poller.is_alive():
+            return
+        self._overlay_poller_stop = threading.Event()
+        self._overlay_poller = threading.Thread(
+            target=self._overlay_poll_loop, name="eveo-overlay-poller", daemon=True)
+        self._overlay_poller.start()
 
     def _overlay_stop_poller(self):
-        pass
+        ev = getattr(self, "_overlay_poller_stop", None)
+        if ev is not None:
+            ev.set()
+        self._overlay_poller = None
+
+    def _overlay_poll_loop(self):
+        """Daemon: round-robin ESI polling for the currently-matched characters.
+        Uses each character's own ESIAuth. Writes into self._overlay_states
+        (with a fetch timestamp) consumed by the controller tick. Sleeps in
+        short slices so a disable is responsive."""
+        stop = self._overlay_poller_stop
+        last: dict = {}          # (name_lower, kind) -> ts
+        auth_by_name = {}
+        online_ok = {}
+        while not stop.is_set():
+            try:
+                # who is on screen right now?
+                thumbs = self._overlay_thumbs_fn()
+                names = [t.char_name.strip().lower() for t in thumbs]
+                if not names:
+                    stop.wait(1.0)
+                    continue
+                # refresh the name->auth + scope maps cheaply
+                for a in self.esi_accounts:
+                    nm = (getattr(a, "character_name", "") or "").strip().lower()
+                    if nm:
+                        auth_by_name[nm] = a
+                        online_ok[nm] = bool(
+                            a.has_scope("esi-location.read_online.v1"))
+                now = time.monotonic()
+                due = self._overlay_poll_plan(
+                    [n for n in names if n in auth_by_name], last, now, online_ok)
+                for name, kind in due:
+                    if stop.is_set():
+                        break
+                    auth = auth_by_name.get(name)
+                    if auth is None:
+                        continue
+                    st = self._overlay_build_state(auth, do_online=(kind == "online"))
+                    self._overlay_states[name] = st
+                    self._overlay_state_ts[name] = time.monotonic()
+                    last[(name, kind)] = time.monotonic()
+                    stop.wait(0.2)         # stagger ESI requests
+            except Exception:
+                log.exception("[overlay] poller pass failed; continuing")
+            stop.wait(1.0)
 
     _OVERLAY_COLOR_CYCLE = [
         ("Accent", FG_ACCENT), ("Green", FG_GREEN), ("Yellow", FG_YELLOW),
