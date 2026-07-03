@@ -91,6 +91,7 @@ from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running
 from eveo_overlay import OverlayWindow
 import overlay_rules
+import eve_client_tracker
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -669,6 +670,16 @@ class FCToolGUI:
         self._overlay_poller_stop = None       # threading.Event while running
         self._overlay_status_label = None
         self._overlay_thumbs_fn = find_thumbs  # injectable for tests
+
+        # ── Native preview controller state ─────────────────────────────────
+        self._preview_tiles = {}               # hwnd -> TileWindow
+        self._preview_clients = {}             # hwnd -> ClientWindow
+        self._preview_hotkeys = None           # HotkeyService (lazy, native only)
+        self._preview_hotkey_map = {}          # hk_id -> action tuple
+        self._preview_after_id = None
+        self._preview_intel = {}               # system_id -> (ts, kind)
+        self._preview_disabled_session = False
+        self._preview_find_clients = eve_client_tracker.find_clients  # injectable
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11141,6 +11152,47 @@ class FCToolGUI:
     _OVERLAY_LOCSHIP_EVERY = 10.0    # seconds between location+ship polls / char
     _OVERLAY_ONLINE_EVERY = 60.0     # seconds between online polls / char
 
+    # ── Native preview controller config ───────────────────────────────────
+    _PREVIEW_DEFAULTS = {
+        "mode": "off",              # "off" | "eveo_labels" | "native"
+        "tile_w": 384, "tile_body_h": 216,
+        "opacity_inactive": 0.85, "opacity_hover": 1.0,
+        "layouts": {}, "sizes": {},
+        "login_position": [5, 5],
+        "lock_layout": False,
+        "snap": True, "grid": False, "grid_w": 100, "grid_h": 50,
+        "hotkeys": {"focus": {}, "groups": [{"next": [], "prev": [], "order": []}],
+                    "minimize_all": []},
+        "hide_active": False, "hide_login": False,
+        "hide_on_lost_focus": False, "hide_delay_ticks": 4,
+        "disabled_chars": [],
+        "minimize_inactive": False, "never_minimize": [],
+        "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
+        "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
+        "captions": True, "labels_on_video": False, "show_role_chip": True,
+        "intel_flash": False, "intel_flash_color": "#ff3b30",
+        "intel_flash_secs": 10, "intel_report_types": ["hostile"],
+        "doctrine_tag_captions": True,       # caveat #4 (Task B1)
+        "damage_flash": True,                # caveat #3 / P1 (Task B6)
+        "damage_flash_pct": 10, "damage_flash_window_s": 5,
+        "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest",
+        "damage_flash_color": "#ff3b30",
+    }
+
+    def _preview_cfg(self):
+        # Config is not deep-merged (house rule) — fill defaults per key.
+        # NOTE: reference the defaults via the CLASS, not self — the unit tests bind
+        # this method onto a bare SimpleNamespace host (house pattern; same reason
+        # _overlay_poll_plan reads FCToolGUI._OVERLAY_LOCSHIP_EVERY at fc_gui.py:11152,
+        # a class constant defined at :11141).
+        cfg = self.config.setdefault("preview", {})
+        migrated = "mode" in cfg
+        for key, default in FCToolGUI._PREVIEW_DEFAULTS.items():
+            cfg.setdefault(key, json.loads(json.dumps(default)))
+        if not migrated and self.config.get("overlay", {}).get("enabled"):
+            cfg["mode"] = "eveo_labels"   # one-time legacy migration; sticky thereafter
+        return cfg
+
     @staticmethod
     def _overlay_poll_plan(names, last, now, online_ok):
         """Return the list of (name_lower, kind) fetches due, where kind is
@@ -11271,7 +11323,16 @@ class FCToolGUI:
         return self._overlay
 
     def _overlay_boot_if_enabled(self):
-        if self._overlay_cfg().get("enabled", False):
+        # Single boot slot for both the legacy overlay and the native preview
+        # controller. _preview_cfg() applies the one-time overlay.enabled ->
+        # eveo_labels migration, so route on preview.mode here.
+        mode = self._preview_cfg().get("mode", "off")
+        if mode == "native":
+            enable_native = getattr(self, "_preview_enable_native", None)
+            if enable_native is not None:      # A8 wires the native controller
+                enable_native()
+            return
+        if mode == "eveo_labels" or self._overlay_cfg().get("enabled", False):
             self._overlay_enable()
 
     def _overlay_enable(self):
