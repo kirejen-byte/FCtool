@@ -1668,10 +1668,12 @@ class FCToolGUI:
                    ).pack(side=tk.RIGHT, padx=(0, 6))
 
         # Create collapsible sections (order matters for display)
+        # Links / Command Ships sits ABOVE DPS and is expanded by default.
+        self._links_container, self._links_content, self._links_count = \
+            self._create_collapsible_section(
+                self._spec_roles_frame, "Links / Command Ships", collapsed=False)
         self._dps_container, self._dps_content, self._dps_count = \
             self._create_collapsible_section(self._spec_roles_frame, "DPS")
-        self._links_container, self._links_content, self._links_count = \
-            self._create_collapsible_section(self._spec_roles_frame, "Links / Command Ships")
         # Non-boss banner. Created on _spec_roles_frame (NOT _links_container) so
         # it stays visible even when the Links section is collapsed. Packed /
         # forgotten dynamically by _render_boss_banner (just before the Links
