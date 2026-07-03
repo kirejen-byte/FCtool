@@ -157,8 +157,25 @@ def _ui_host(overlay_cfg=None):
     host._saved = saved
     host._show_tooltip = lambda e, t: None
     host._hide_tooltip = lambda: None
-    for name in ("_overlay_cfg", "_OVERLAY_DEFAULTS", "_build_overlay_section",
-                 "_overlay_toggle_changed", "_overlay_apply_style",
+    host._preview_status_label = None
+    host._preview_native_widgets = []
+    host._preview_tiles = {}
+    host._preview_clients = {}
+    host._preview_disabled_session = False
+    host._preview_status = ""
+    # Native-mode boot/teardown are recorded (never fired at a real window).
+    calls = {"enable_native": 0, "disable_native": 0}
+    host._calls = calls
+    host._preview_enable_native = lambda: calls.__setitem__(
+        "enable_native", calls["enable_native"] + 1)
+    host._preview_disable_native = lambda: calls.__setitem__(
+        "disable_native", calls["disable_native"] + 1)
+    for name in ("_overlay_cfg", "_OVERLAY_DEFAULTS", "_build_preview_section",
+                 "_preview_cfg", "_PREVIEW_DEFAULTS", "_preview_set_mode",
+                 "_preview_status_text", "_preview_arrange_grid",
+                 "_preview_apply_native_state", "_preview_sync_native_widgets",
+                 "_add_section",
+                 "_overlay_apply_style",
                  "_overlay_status_text", "_overlay_compose_items",
                  "_overlay_rules", "_overlay_state_for", "_overlay_enable",
                  "_overlay_disable", "_overlay_teardown", "_overlay_ensure_window",
@@ -175,25 +192,27 @@ def _ui_host(overlay_cfg=None):
     return root, host
 
 
-def test_build_section_creates_toggle_and_status():
+def test_build_section_creates_mode_radio_and_status():
     root, host = _ui_host(overlay_cfg={"enabled": False})
+    host.config["preview"] = {"mode": "off"}
     try:
         frame = tk.Frame(root)
-        host._build_overlay_section(frame)
-        assert host._overlay_enabled_var.get() is False
-        assert host._overlay_status_label is not None
+        host._build_preview_section(frame)
+        assert host._preview_mode_var.get() == "off"
+        assert host._preview_status_label is not None
     finally:
         root.destroy()
 
 
-def test_toggle_persists_and_enables():
+def test_mode_radio_persists_and_enables():
     root, host = _ui_host(overlay_cfg={"enabled": False})
+    host.config["preview"] = {"mode": "off"}
     try:
         frame = tk.Frame(root)
-        host._build_overlay_section(frame)
-        host._overlay_enabled_var.set(True)
-        host._overlay_toggle_changed()
-        assert host.config["overlay"]["enabled"] is True
+        host._build_preview_section(frame)
+        host._preview_mode_var.set("eveo_labels")
+        host._preview_set_mode("eveo_labels")
+        assert host.config["preview"]["mode"] == "eveo_labels"
         assert host._saved["n"] >= 1
         # seed rules got created on first enable
         assert len(host.config["overlay"]["rules"]) >= 1
@@ -207,9 +226,10 @@ def test_toggle_persists_and_enables():
 
 def test_style_change_persists_live():
     root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    host.config["preview"] = {"mode": "eveo_labels"}
     try:
         frame = tk.Frame(root)
-        host._build_overlay_section(frame)
+        host._build_preview_section(frame)
         host._overlay_size_var.set(16)
         host._overlay_apply_style()
         assert host.config["overlay"]["font_size"] == 16

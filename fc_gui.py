@@ -11033,9 +11033,9 @@ class FCToolGUI:
         )
         self._esi_status_label.pack(side=tk.LEFT, padx=10)
 
-        # ── Eve-O Preview Overlay ─────────────────────────────────────────
-        self._add_section(scroll_frame, "Eve-O Preview Overlay")
-        self._build_overlay_section(scroll_frame)
+        # ── Client previews & labels ──────────────────────────────────────
+        self._add_section(scroll_frame, "Client previews & labels")
+        self._build_preview_section(scroll_frame)
 
         # ── Autostart ────────────────────────────────────────────────────
         self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
@@ -11793,24 +11793,32 @@ class FCToolGUI:
     }
     _OVERLAY_CFG_TO_ANCHOR = {v: k for k, v in _OVERLAY_ANCHOR_TO_CFG.items()}
 
-    def _build_overlay_section(self, parent):
+    def _build_preview_section(self, parent):
         cfg = self._overlay_cfg()
+        pcfg = self._preview_cfg()
 
-        # Row 1: master toggle + live status label
+        # Native rows collected here so the mode radio can enable/disable them
+        # as a group (native controls are inert unless mode == "native").
+        self._preview_native_widgets = []
+
+        # Row 1: mode radio (Off / Label EVE-O thumbnails / Native previews) +
+        # live status label. Toggling mode never touches saved layouts/hotkeys.
         row1 = tk.Frame(parent, bg=BG_DARK)
         row1.pack(fill=tk.X, padx=20, pady=2)
-        self._overlay_enabled_var = tk.BooleanVar(value=cfg.get("enabled", False))
-        cb = tk.Checkbutton(
-            row1, text="Activity overlay on Eve-O Preview thumbnails",
-            variable=self._overlay_enabled_var, command=self._overlay_toggle_changed,
-            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-            selectcolor=BG_ENTRY, activebackground=BG_DARK, activeforeground=FG_TEXT,
-            anchor=tk.W)
-        cb.pack(side=tk.LEFT)
-        self._overlay_status_label = tk.Label(
-            row1, text=self._overlay_status_text(0, 0), font=("Consolas", 9),
+        self._preview_mode_var = tk.StringVar(value=pcfg.get("mode", "off"))
+        for value, text in (("off", "Off"),
+                            ("eveo_labels", "Label EVE-O thumbnails"),
+                            ("native", "Native previews (beta)")):
+            tk.Radiobutton(
+                row1, text=text, value=value, variable=self._preview_mode_var,
+                command=lambda: self._preview_set_mode(self._preview_mode_var.get()),
+                font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                selectcolor=BG_ENTRY, activebackground=BG_DARK,
+                activeforeground=FG_TEXT, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 8))
+        self._preview_status_label = tk.Label(
+            row1, text=self._preview_status_text(), font=("Consolas", 9),
             fg=FG_DIM, bg=BG_DARK, anchor=tk.W)
-        self._overlay_status_label.pack(side=tk.LEFT, padx=12)
+        self._preview_status_label.pack(side=tk.LEFT, padx=12)
 
         # Row 2: size / color / anchor, grid-aligned, applied live
         row2 = tk.Frame(parent, bg=BG_DARK)
@@ -11847,21 +11855,202 @@ class FCToolGUI:
         anchor_combo.bind("<<ComboboxSelected>>",
                           lambda e: self._overlay_apply_style())
 
-        # Row 3: Label rules… button
+        # Row 3 (shared): Label rules… button (rules + manual tags modal)
         row3 = tk.Frame(parent, bg=BG_DARK)
         row3.pack(fill=tk.X, padx=20, pady=2)
         ttk.Button(row3, text="Label rules…", style="Dark.TButton",
                    command=self._open_overlay_rules_dialog).pack(side=tk.LEFT)
 
-        # Row 4: fine print
+        # Row 4 (native): tile size / inactive opacity / captions / doctrine tag /
+        # highlight / lock layout, all live-applied. Comfort & parity (zoom,
+        # hide-*, minimize-inactive) and damage-flash (Task B6) extend this row.
+        rowN = tk.Frame(parent, bg=BG_DARK)
+        rowN.pack(fill=tk.X, padx=20, pady=2)
+        w = self._preview_native_widgets
+
+        tk.Label(rowN, text="Tile w", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        self._preview_tilew_var = tk.IntVar(value=int(pcfg.get("tile_w", 384)))
+        sw = tk.Spinbox(rowN, from_=160, to=960, increment=16, width=5,
+                        textvariable=self._preview_tilew_var, font=("Consolas", 10),
+                        bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                        command=self._preview_apply_native_state)
+        sw.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        sw.grid(row=0, column=1, padx=(0, 16))
+        w.append(sw)
+
+        tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+        self._preview_opacity_var = tk.DoubleVar(
+            value=float(pcfg.get("opacity_inactive", 0.85)))
+        so = tk.Spinbox(rowN, from_=0.2, to=1.0, increment=0.05, width=5,
+                        textvariable=self._preview_opacity_var, font=("Consolas", 10),
+                        bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                        command=self._preview_apply_native_state)
+        so.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        so.grid(row=0, column=3, padx=(0, 16))
+        w.append(so)
+
+        self._preview_captions_var = tk.BooleanVar(value=bool(pcfg.get("captions", True)))
+        cbc = tk.Checkbutton(
+            rowN, text="Captions", variable=self._preview_captions_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbc.grid(row=0, column=4, padx=(0, 8))
+        w.append(cbc)
+
+        self._preview_doctrine_tag_var = tk.BooleanVar(
+            value=bool(pcfg.get("doctrine_tag_captions", True)))
+        cbd = tk.Checkbutton(
+            rowN, text="Default caption = doctrine tag",
+            variable=self._preview_doctrine_tag_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbd.grid(row=0, column=5, padx=(0, 8))
+        w.append(cbd)
+
+        # Row 5 (native): highlight active / lock layout / arrange buttons.
+        rowN2 = tk.Frame(parent, bg=BG_DARK)
+        rowN2.pack(fill=tk.X, padx=20, pady=2)
+        self._preview_highlight_var = tk.BooleanVar(
+            value=bool(pcfg.get("highlight_active", True)))
+        cbh = tk.Checkbutton(
+            rowN2, text="Highlight active", variable=self._preview_highlight_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbh.grid(row=0, column=0, padx=(0, 8))
+        w.append(cbh)
+
+        self._preview_lock_var = tk.BooleanVar(value=bool(pcfg.get("lock_layout", False)))
+        cbl = tk.Checkbutton(
+            rowN2, text="Lock layout", variable=self._preview_lock_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbl.grid(row=0, column=1, padx=(0, 16))
+        w.append(cbl)
+
+        bg = ttk.Button(rowN2, text="Arrange in grid", style="Dark.TButton",
+                        command=self._preview_arrange_grid)
+        bg.grid(row=0, column=2, padx=(0, 6))
+        w.append(bg)
+
+        # Fine print (updated disclaimer — spec §9).
         row4 = tk.Frame(parent, bg=BG_DARK)
         row4.pack(fill=tk.X, padx=20, pady=(2, 6))
         tk.Label(
             row4,
-            text=("Labels are drawn from your own ESI data and your text only. "
-                  "Placeholders: {ship} {group} {system}."),
+            text=("Labels come from your own ESI data and your text only. "
+                  "Previews are view-only — clicks and hotkeys only change window "
+                  "focus; no input is ever sent to EVE clients."),
             font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
             wraplength=760).pack(side=tk.LEFT)
+
+        self._preview_sync_native_widgets()
+
+    def _preview_sync_native_widgets(self):
+        """Enable native-only controls iff mode == native (spec §9 row gating)."""
+        state = "normal" if self._preview_cfg().get("mode") == "native" else "disabled"
+        for widget in getattr(self, "_preview_native_widgets", []):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _preview_status_text(self) -> str:
+        """Live status for the settings label. `off`/`labels` are static; native
+        surfaces the blocked-by-EVE-O notice or the controller's own tick status."""
+        mode = self._preview_cfg().get("mode", "off")
+        if mode == "off":
+            return "⏸ off"
+        if mode == "eveo_labels":
+            return "◐ labelling EVE-O thumbnails"
+        if preview_running():
+            return "○ EVE-O Preview detected — close it to enable native tiles"
+        return getattr(self, "_preview_status", "") or "● native previews"
+
+    def _preview_set_mode(self, new_mode: str):
+        """Switch preview mode: tear down the old mode, persist, boot the new one.
+        NEVER clears saved layouts/hotkeys (the EVE-O config-wipe foot-gun we fix).
+        The three modes are mutually exclusive controllers sharing one config dict."""
+        cfg = self._preview_cfg()
+        old = cfg.get("mode", "off")
+        if old == new_mode:
+            # Re-assert the requested mode's controller anyway (idempotent boot).
+            pass
+        # Tear down whatever is currently running.
+        if old == "native":
+            self._preview_disable_native()
+        elif old == "eveo_labels":
+            self._overlay_disable()
+        cfg["mode"] = new_mode          # layouts/hotkeys untouched by design
+        self._save_config()
+        # Boot the newly-selected mode.
+        if new_mode == "native":
+            self._preview_disabled_session = False
+            self._preview_enable_native()
+        elif new_mode == "eveo_labels":
+            self._overlay_enable()
+        # keep the settings label + native-row gating in sync if the UI is built
+        if getattr(self, "_preview_status_label", None) is not None:
+            try:
+                self._preview_status_label.config(text=self._preview_status_text())
+            except tk.TclError:
+                pass
+        self._preview_sync_native_widgets()
+
+    def _preview_apply_native_state(self):
+        """Persist the native-row control values live. No path clears saved data."""
+        cfg = self._preview_cfg()
+        for var, key, cast in (
+            ("_preview_tilew_var", "tile_w", int),
+            ("_preview_opacity_var", "opacity_inactive", float),
+            ("_preview_captions_var", "captions", bool),
+            ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
+            ("_preview_highlight_var", "highlight_active", bool),
+            ("_preview_lock_var", "lock_layout", bool),
+        ):
+            v = getattr(self, var, None)
+            if v is None:
+                continue
+            try:
+                cfg[key] = cast(v.get())
+            except (tk.TclError, ValueError):
+                pass
+        self._save_config()
+
+    def _preview_arrange_grid(self):
+        """Lay out every live non-login tile in a row-major grid, persist each
+        char's rect (keyed by char name), and re-place its tile. Login screens
+        keep their stacked positions and are never persisted."""
+        cfg = self._preview_cfg()
+        live = [c for c in self._preview_clients.values() if not c.is_login]
+        if not live:
+            return
+        live.sort(key=lambda c: c.key)
+        tile_w = int(cfg.get("tile_w", 384))
+        body_h = int(cfg.get("tile_body_h", 216))
+        try:
+            bw = int(self.root.winfo_screenwidth())
+            bh = int(self.root.winfo_screenheight())
+        except Exception:
+            bw, bh = 1920, 1080
+        rects = preview_layout.grid_arrange(
+            len(live), tile_w, body_h, (0, 0, bw, bh), origin=(10, 10), gap=8)
+        layouts = cfg.setdefault("layouts", {})
+        for client, (x, y, _w, _h) in zip(live, rects):
+            layouts[client.key] = [int(x), int(y), tile_w, body_h]
+            for tile in self._preview_tiles.values():
+                if getattr(tile, "key", None) == client.key:
+                    try:
+                        tile.place(int(x), int(y), tile_w, body_h)
+                    except Exception:
+                        pass
+                    break
+        self._save_config()
 
     def _overlay_toggle_changed(self):
         want = self._overlay_enabled_var.get()
