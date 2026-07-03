@@ -178,6 +178,8 @@ def _ui_host(overlay_cfg=None):
                  "_preview_arrange_by_fleet", "_preview_arrange_ordered",
                  "_preview_fleet_order_key",
                  "_preview_apply_native_state", "_preview_sync_native_widgets",
+                 "parse_eveo_config", "_preview_import_eveo",
+                 "_preview_merge_eveo",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
                  "_preview_update_shown_summary", "_preview_all_known_chars",
                  "_preview_shown_chars", "_open_preview_previews_dialog",

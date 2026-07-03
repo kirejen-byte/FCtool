@@ -101,6 +101,8 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_arrange_ordered", "_preview_fleet_order_key",
                  "_preview_apply_native_state",
                  "_preview_sync_native_widgets",
+                 "parse_eveo_config", "_preview_import_eveo",
+                 "_preview_merge_eveo",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
                  "_preview_restart_hotkeys",
                  "_preview_update_shown_summary", "_preview_all_known_chars",
@@ -576,3 +578,132 @@ def test_minimize_inactive_toggle_persists_live():
         assert host.config["preview"]["minimize_inactive"] is True
     finally:
         root.destroy()
+
+
+# ── (C5) EVE-O config import — pure parser + fill-only merge ──────────────────
+# A captured real-shape EVE-O-Preview.json sample (Proopai fork). FlatLayout maps
+# window titles → "x, y" point strings; ClientHotkey maps titles → hotkey strings;
+# CycleGroup1ClientsOrder maps titles → an integer position (cycle order = sort by
+# value). Prefixes "EVE - " / "EVE Frontier - " strip to the char key (lowercased).
+_EVEO_SAMPLE = """{
+  "FlatLayout": {
+    "EVE - Kirejen": "100, 200",
+    "EVE Frontier - Alt Two": "640, 200",
+    "EVE": "5, 5",
+    "EVE - Broken": "not-a-point"
+  },
+  "ClientHotkey": {
+    "EVE - Kirejen": "Control+F1",
+    "EVE Frontier - Alt Two": "F13",
+    "EVE - Kirejen Bad": "Win+F2"
+  },
+  "CycleGroup1ClientsOrder": {
+    "EVE - Kirejen": 1,
+    "EVE Frontier - Alt Two": 0
+  }
+}"""
+
+
+def _parse_eveo(text):
+    return fc_gui.FCToolGUI.parse_eveo_config(text)
+
+
+def test_parse_eveo_strips_prefixes_and_parses_points():
+    parsed = _parse_eveo(_EVEO_SAMPLE)
+    layouts = parsed["layouts"]
+    assert layouts["kirejen"] == (100, 200)
+    assert layouts["alt two"] == (640, 200)
+    # bare "EVE" (login) has no char name → excluded; bad point → excluded
+    assert "" not in layouts
+    assert "broken" not in layouts
+
+
+def test_parse_eveo_validates_hotkeys_and_reports_invalid():
+    parsed = _parse_eveo(_EVEO_SAMPLE)
+    fh = parsed["focus_hotkeys"]
+    assert fh["kirejen"] == "Control+F1"
+    assert fh["alt two"] == "F13"
+    # Win-modified hotkey is rejected by parse_hotkey → skipped, not raised
+    assert "kirejen bad" not in fh
+    assert any("Win" in e or "kirejen bad" in e.lower() for e in parsed["errors"])
+
+
+def test_parse_eveo_cycle_order_sorted_by_value():
+    parsed = _parse_eveo(_EVEO_SAMPLE)
+    # value 0 (alt two) comes before value 1 (kirejen)
+    assert parsed["cycle_order"] == ["alt two", "kirejen"]
+
+
+def test_parse_eveo_tolerates_empty_or_missing_sections():
+    parsed = _parse_eveo("{}")
+    assert parsed["layouts"] == {}
+    assert parsed["focus_hotkeys"] == {}
+    assert parsed["cycle_order"] == []
+    assert parsed["errors"] == []
+
+
+def test_parse_eveo_bad_json_returns_error_not_raise():
+    parsed = _parse_eveo("{not json")
+    assert parsed["layouts"] == {} and parsed["focus_hotkeys"] == {}
+    assert parsed["cycle_order"] == []
+    assert parsed["errors"]  # at least one error explaining the parse failure
+
+
+def _import_host(preview_cfg):
+    """Pure host with the import method + a fixed tile size for layout merge."""
+    host = _pure_host(preview_cfg=preview_cfg)
+    for name in ("parse_eveo_config", "_preview_import_eveo",
+                 "_preview_merge_eveo"):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        if attr is None:
+            continue
+        setattr(host, name, _bind_attr(name, attr, host))
+    return host
+
+
+def test_import_eveo_merge_is_fill_only_and_never_overwrites(monkeypatch):
+    # existing FCTool data must survive; only NEW keys are filled.
+    host = _import_host(preview_cfg={
+        "mode": "native",
+        "tile_w": 300, "tile_body_h": 180,
+        "layouts": {"kirejen": [999, 999, 300, 180]},   # pre-existing → kept
+        "hotkeys": {"focus": {"kirejen": "F9"},
+                    "groups": [{"next": [], "prev": [], "order": ["kirejen"]}],
+                    "minimize_all": []},
+    })
+    infos = []
+    monkeypatch.setattr(fc_gui.filedialog, "askopenfilename",
+                        lambda **k: "EVE-O-Preview.json")
+    monkeypatch.setattr(fc_gui, "_read_text_file_for_import",
+                        lambda p: _EVEO_SAMPLE, raising=False)
+    monkeypatch.setattr(fc_gui.messagebox, "showinfo",
+                        lambda *a, **k: infos.append((a, k)))
+    monkeypatch.setattr(fc_gui.messagebox, "showerror",
+                        lambda *a, **k: infos.append(("err", a, k)))
+
+    host._preview_import_eveo()
+
+    cfg = host.config["preview"]
+    # existing kirejen layout + hotkey untouched
+    assert cfg["layouts"]["kirejen"] == [999, 999, 300, 180]
+    assert cfg["hotkeys"]["focus"]["kirejen"] == "F9"
+    # new alt two filled in with the configured tile size
+    assert cfg["layouts"]["alt two"] == [640, 200, 300, 180]
+    assert cfg["hotkeys"]["focus"]["alt two"] == "F13"
+    # cycle order fill-only: kirejen already present → keep; alt two appended
+    assert cfg["hotkeys"]["groups"][0]["order"] == ["kirejen", "alt two"]
+    assert host._saved["n"] >= 1
+    assert infos  # a summary messagebox was shown
+
+
+def test_import_eveo_cancel_dialog_is_noop(monkeypatch):
+    host = _import_host(preview_cfg={"mode": "native", "layouts": {}})
+    monkeypatch.setattr(fc_gui.filedialog, "askopenfilename", lambda **k: "")
+    called = {"read": 0}
+    monkeypatch.setattr(fc_gui, "_read_text_file_for_import",
+                        lambda p: called.__setitem__("read", 1) or "{}",
+                        raising=False)
+    host._preview_import_eveo()   # cancelled dialog → no read, no save
+    assert called["read"] == 0
+    assert host.config["preview"]["layouts"] == {}
+    assert host._saved["n"] == 0

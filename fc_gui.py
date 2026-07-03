@@ -537,6 +537,13 @@ def _filter_cap_entries(entries, only_region: str) -> list:
     ]
 
 
+def _read_text_file_for_import(path: str) -> str:
+    """Read a text file for one-time import (EVE-O config). Split out so tests
+    can stub it without touching the real filesystem. EVE-O writes UTF-8."""
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        return fh.read()
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -12748,6 +12755,11 @@ class FCToolGUI:
         bhk.grid(row=0, column=2, padx=(0, 6))
         w.append(bhk)
 
+        bimp = ttk.Button(rowN4, text="Import EVE-O layout…", style="Dark.TButton",
+                          command=self._preview_import_eveo)
+        bimp.grid(row=0, column=3, padx=(0, 6))
+        w.append(bimp)
+
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
         row4 = tk.Frame(parent, bg=BG_DARK)
@@ -12910,6 +12922,147 @@ class FCToolGUI:
                         pass
                     break
         self._save_config()
+
+    @staticmethod
+    def parse_eveo_config(json_text: str) -> dict:
+        """Pure parser for an EVE-O-Preview.json (Proopai fork). Returns
+        {"layouts": {char_key: (x, y)}, "focus_hotkeys": {char_key: str},
+         "cycle_order": [char_key, ...], "errors": [str, ...]}.
+
+        - FlatLayout: {title: "x, y"} — title prefix stripped to lowercased char
+          key; bare "EVE" login windows and unparseable points are skipped.
+        - ClientHotkey: {title: hotkey} — validated through parse_hotkey; invalid
+          entries (Win modifier, unknown key, …) are skipped and reported.
+        - CycleGroup1ClientsOrder: {title: int} — cycle order = keys sorted by
+          value ascending.
+        Never raises: a bad JSON body returns empty maps + one error string."""
+        errors: list = []
+        try:
+            data = json.loads(json_text)
+            if not isinstance(data, dict):
+                raise ValueError("top-level JSON is not an object")
+        except Exception as e:
+            return {"layouts": {}, "focus_hotkeys": {}, "cycle_order": [],
+                    "errors": [f"could not parse EVE-O config: {e}"]}
+
+        def _char_key(title: str):
+            # Reuse the tracker's own title parser for exact prefix parity.
+            char = eve_client_tracker._char_from_title(
+                eve_client_tracker._normalize(str(title)))
+            if char is None or char == "":   # non-EVE title or login screen
+                return None
+            return char.strip().lower()
+
+        layouts: dict = {}
+        for title, point in (data.get("FlatLayout") or {}).items():
+            key = _char_key(title)
+            if key is None:
+                continue
+            try:
+                sx, sy = str(point).split(",")
+                layouts[key] = (int(sx.strip()), int(sy.strip()))
+            except (ValueError, AttributeError):
+                errors.append(f"bad layout point for {title!r}: {point!r}")
+
+        focus_hotkeys: dict = {}
+        for title, hk in (data.get("ClientHotkey") or {}).items():
+            key = _char_key(title)
+            if key is None:
+                continue
+            text = str(hk).strip()
+            if not text:
+                continue
+            try:
+                hotkey_service.parse_hotkey(text)
+            except ValueError as e:
+                errors.append(f"invalid hotkey for {title!r}: {e}")
+                continue
+            focus_hotkeys[key] = text
+
+        order_pairs = []
+        for title, idx in (data.get("CycleGroup1ClientsOrder") or {}).items():
+            key = _char_key(title)
+            if key is None:
+                continue
+            try:
+                order_pairs.append((int(idx), key))
+            except (ValueError, TypeError):
+                continue
+        cycle_order = [k for _, k in sorted(order_pairs, key=lambda p: p[0])]
+
+        return {"layouts": layouts, "focus_hotkeys": focus_hotkeys,
+                "cycle_order": cycle_order, "errors": errors}
+
+    def _preview_merge_eveo(self, parsed: dict) -> dict:
+        """Fill-only merge of a parsed EVE-O config into the preview cfg. NEVER
+        overwrites an existing FCTool layout/hotkey/cycle entry (the whole point
+        of a one-time import). Returns a small {added_*: n} summary."""
+        cfg = self._preview_cfg()
+        tile_w = int(cfg.get("tile_w", 384))
+        body_h = int(cfg.get("tile_body_h", 216))
+        layouts = cfg.setdefault("layouts", {})
+        added_layouts = 0
+        for key, (x, y) in parsed["layouts"].items():
+            if key not in layouts:
+                layouts[key] = [int(x), int(y), tile_w, body_h]
+                added_layouts += 1
+
+        hk = cfg.setdefault("hotkeys", {})
+        focus = hk.setdefault("focus", {})
+        added_hotkeys = 0
+        for key, text in parsed["focus_hotkeys"].items():
+            if key not in focus:
+                focus[key] = text
+                added_hotkeys += 1
+
+        groups = hk.setdefault("groups", [])
+        if not groups:
+            groups.append({"next": [], "prev": [], "order": []})
+        order = groups[0].setdefault("order", [])
+        added_order = 0
+        for key in parsed["cycle_order"]:
+            if key not in order:
+                order.append(key)
+                added_order += 1
+
+        self._save_config()
+        return {"added_layouts": added_layouts, "added_hotkeys": added_hotkeys,
+                "added_order": added_order}
+
+    def _preview_import_eveo(self):
+        """Settings button: pick an EVE-O-Preview.json, parse it, fill-only merge
+        into the preview cfg, and show an import summary. One-time convenience;
+        it only reads the file — EVE-O's own config is never modified."""
+        path = filedialog.askopenfilename(
+            title="Import EVE-O Preview layout",
+            initialfile="EVE-O-Preview.json",
+            filetypes=[("EVE-O Preview config", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            text = _read_text_file_for_import(path)
+        except Exception as e:
+            log.exception("[preview] EVE-O import read failed")
+            messagebox.showerror("Import EVE-O layout",
+                                 f"Could not read the file:\n{e}")
+            return
+        parsed = self.parse_eveo_config(text)
+        summary = self._preview_merge_eveo(parsed)
+        lines = [
+            f"Imported from:\n{path}\n",
+            f"Layouts added: {summary['added_layouts']}",
+            f"Focus hotkeys added: {summary['added_hotkeys']}",
+            f"Cycle-order entries added: {summary['added_order']}",
+            "\nExisting FCTool entries were kept (fill-only merge).",
+        ]
+        if parsed["errors"]:
+            shown = parsed["errors"][:8]
+            more = len(parsed["errors"]) - len(shown)
+            lines.append("\nSkipped entries:")
+            lines.extend(f"  • {e}" for e in shown)
+            if more > 0:
+                lines.append(f"  • …and {more} more")
+        messagebox.showinfo("Import EVE-O layout", "\n".join(lines))
 
     def _overlay_toggle_changed(self):
         want = self._overlay_enabled_var.get()
