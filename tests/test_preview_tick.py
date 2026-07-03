@@ -361,3 +361,80 @@ def test_per_tile_oserror_retires_only_that_tile(monkeypatch):
     tick(host)
     assert host.disabled_session_called == 0
     assert host._preview_tiles == {}
+
+
+# ── (A10) hotkey service lifecycle wiring ────────────────────────────────────
+class FakeService:
+    """Records start/restart/stop + bindings; exposes .events + .failures."""
+
+    def __init__(self):
+        self.events = queue.Queue()
+        self.failures = {}
+        self.started_with = []
+        self.stopped = 0
+
+    def start(self, bindings):
+        self.started_with.append(dict(bindings))
+
+    def restart(self, bindings):
+        self.started_with.append(dict(bindings))
+
+    def stop(self):
+        self.stopped += 1
+
+
+def _wire_hotkey_methods(host):
+    import inspect
+    for name in ("_preview_restart_hotkeys", "_preview_hotkey_bindings"):
+        fn = getattr(fc_gui.FCToolGUI, name, None)
+        if fn is None:
+            continue
+        raw = inspect.getattr_static(fc_gui.FCToolGUI, name, None)
+        if isinstance(raw, staticmethod):
+            setattr(host, name, fn)          # static: no self
+        else:
+            setattr(host, name, types.MethodType(fn, host))
+
+
+def test_restart_hotkeys_lazily_creates_service_and_starts_with_bindings():
+    host = make_host(
+        hotkeys={"focus": {"kirejen": "F13"},
+                 "groups": [{"next": ["F14"], "prev": [], "order": []}],
+                 "minimize_all": []})
+    _wire_hotkey_methods(host)
+    created = []
+
+    def factory():
+        svc = FakeService()
+        created.append(svc)
+        return svc
+    host._preview_hotkey_factory = factory
+    host._preview_clients = {1: _cw(1, "Kirejen")}
+
+    host._preview_restart_hotkeys()
+
+    assert len(created) == 1                      # lazy: created once
+    svc = created[0]
+    assert host._preview_hotkeys is svc
+    assert len(svc.started_with) == 1
+    bindings = svc.started_with[0]
+    assert len(bindings) == 2                     # F13 focus + F14 next
+    # action map rebuilt in lockstep with the bindings
+    assert set(host._preview_hotkey_map) == set(bindings)
+    assert ("focus", "kirejen") in set(host._preview_hotkey_map.values())
+    assert ("cycle", 0, +1) in set(host._preview_hotkey_map.values())
+
+
+def test_restart_hotkeys_reuses_existing_service():
+    host = make_host(
+        hotkeys={"focus": {}, "groups": [{"next": ["F14"], "prev": [], "order": []}],
+                 "minimize_all": []})
+    _wire_hotkey_methods(host)
+    created = []
+    host._preview_hotkey_factory = lambda: created.append(FakeService()) or created[-1]
+    host._preview_restart_hotkeys()
+    first = host._preview_hotkeys
+    host._preview_restart_hotkeys()
+    assert host._preview_hotkeys is first         # not re-created
+    assert len(created) == 1
+    assert len(first.started_with) == 2           # restarted with fresh bindings

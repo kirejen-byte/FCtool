@@ -95,6 +95,7 @@ import overlay_rules
 import eve_client_tracker
 import window_activator
 import preview_layout
+import hotkey_service
 from preview_tile import TileWindow
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -686,6 +687,7 @@ class FCToolGUI:
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
         self._preview_last_key = ""            # last-activated char key (cycle anchor)
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
+        self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
             self._overlay_cfg()["rules"] = [
@@ -11532,6 +11534,74 @@ class FCToolGUI:
                     if c.key not in never:
                         window_activator.minimize(c.hwnd)
 
+    @staticmethod
+    def _preview_hotkey_bindings(hotkeys, live_keys):
+        """Pure builder: turn the saved `hotkeys` config sub-dict into
+        (bindings {id:(mods,vk)}, actions {id:action_tuple}, errors [str]).
+
+        Each hotkey STRING (e.g. "F13", "Control+F9") is parsed via
+        hotkey_service.parse_hotkey; a distinct sequential id (starting at 1,
+        RegisterHotKey ids must be positive) is minted per binding. Invalid
+        strings are collected into `errors` (never raised) and skipped, so one
+        bad key never blocks the rest. `live_keys` is accepted for signature
+        symmetry with the tick (focus rows are keyed by char, already lowercased
+        in config); no filtering is done here — an unbound-but-saved focus key
+        stays registered so it works the moment that client appears.
+
+        Actions match the drain in _preview_drain_hotkeys:
+          focus       -> ("focus", char_key)
+          group next  -> ("cycle", group_index, +1)
+          group prev  -> ("cycle", group_index, -1)
+          minimize_all-> ("minall",)
+        """
+        hotkeys = hotkeys or {}
+        bindings, actions, errors = {}, {}, []
+        next_id = 1
+
+        def _bind(text, action):
+            nonlocal next_id
+            if not text or not str(text).strip():
+                errors.append("empty hotkey")
+                return
+            try:
+                mv = hotkey_service.parse_hotkey(str(text))
+            except ValueError as exc:
+                errors.append(str(exc))
+                return
+            bindings[next_id] = mv
+            actions[next_id] = action
+            next_id += 1
+
+        for char_key, text in (hotkeys.get("focus", {}) or {}).items():
+            _bind(text, ("focus", char_key))
+        for gi, group in enumerate(hotkeys.get("groups", []) or []):
+            for text in (group.get("next", []) or []):
+                _bind(text, ("cycle", gi, +1))
+            for text in (group.get("prev", []) or []):
+                _bind(text, ("cycle", gi, -1))
+        for text in (hotkeys.get("minimize_all", []) or []):
+            _bind(text, ("minall",))
+        return bindings, actions, errors
+
+    def _preview_restart_hotkeys(self):
+        """(Re)register the global hotkeys from current config. Lazily creates
+        the HotkeyService (native-only, one worker thread) and rebuilds the
+        id->action map in lockstep with the (re)started bindings. Returns the
+        service so the settings modal can read .failures for conflict display."""
+        cfg = self._preview_cfg()
+        live_keys = {c.key for c in self._preview_clients.values() if not c.is_login}
+        bindings, actions, _errors = self._preview_hotkey_bindings(
+            cfg.get("hotkeys", {}), live_keys)
+        self._preview_hotkey_map = actions
+        svc = self._preview_hotkeys
+        if svc is None:
+            svc = self._preview_hotkey_factory()
+            self._preview_hotkeys = svc
+            svc.start(bindings)
+        else:
+            svc.restart(bindings)
+        return svc
+
     def _preview_compose_captions(self, cur):
         """Caption composition is filled in by Task B1 (ESI states + rules +
         doctrine tag). A8 leaves it a safe no-op so the tick body is complete."""
@@ -11593,6 +11663,10 @@ class FCToolGUI:
 
     def _preview_enable_native(self):
         self._preview_disabled_session = False
+        try:
+            self._preview_restart_hotkeys()   # lazy service create + register
+        except Exception:
+            log.exception("[preview] hotkey registration failed on enable")
         if self._preview_after_id is None:
             self._preview_tick()
 
@@ -11938,6 +12012,11 @@ class FCToolGUI:
         bg.grid(row=0, column=2, padx=(0, 6))
         w.append(bg)
 
+        bhk = ttk.Button(rowN2, text="Hotkeys…", style="Dark.TButton",
+                         command=self._open_preview_hotkeys_dialog)
+        bhk.grid(row=0, column=3, padx=(0, 6))
+        w.append(bhk)
+
         # Fine print (updated disclaimer — spec §9).
         row4 = tk.Frame(parent, bg=BG_DARK)
         row4.pack(fill=tk.X, padx=20, pady=(2, 6))
@@ -12203,6 +12282,206 @@ class FCToolGUI:
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.LEFT, padx=2)
         self.root.wait_window(win)
+
+    def _preview_hotkey_preset(self):
+        """One-click EVE-O parity: set cycle group 0 to next=F14 / prev=F13,
+        WITHOUT touching per-character focus keys (parity with EVE-O's default
+        cycle bindings). Persists + re-registers if native is live."""
+        cfg = self._preview_cfg()
+        hk = cfg.setdefault("hotkeys", {})
+        groups = hk.setdefault("groups", [])
+        if not groups:
+            groups.append({"next": [], "prev": [], "order": []})
+        groups[0]["next"] = ["F14"]
+        groups[0]["prev"] = ["F13"]
+        self._save_config()
+        if self._preview_hotkeys is not None:
+            try:
+                self._preview_restart_hotkeys()
+            except Exception:
+                log.exception("[preview] hotkey preset re-register failed")
+
+    def _open_preview_hotkeys_dialog(self, _test_no_wait=False):
+        """Modal to edit native-preview hotkeys: per-known-character focus keys,
+        cycle group 0 next/prev + order, and minimize-all. Mirrors the overlay
+        rules dialog conventions (themed Toplevel + transient + grab_set). On OK
+        it rebuilds bindings, restarts the service, and surfaces any per-binding
+        conflicts (RegisterHotKey error 1409) via hotkey_service.format_error.
+
+        Returns the Toplevel (tests pass _test_no_wait=True to skip wait_window).
+        """
+        cfg = self._preview_cfg()
+        hk = cfg.setdefault("hotkeys", {})
+        hk.setdefault("focus", {})
+        groups = hk.setdefault("groups", [])
+        if not groups:
+            groups.append({"next": [], "prev": [], "order": []})
+        hk.setdefault("minimize_all", [])
+
+        win = tk.Toplevel(self.root)
+        win.title("Preview hotkeys")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win, text="Per-character focus keys "
+                 "(e.g. Control+F9 — brings that client to the front):",
+                 bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(10, 2))
+        focus_frame = tk.Frame(win, bg=BG_PANEL)
+        focus_frame.pack(fill=tk.X, padx=10)
+
+        # Seed the char Combobox from ESI accounts + currently-live client names.
+        known = []
+        for a in getattr(self, "esi_accounts", []) or []:
+            nm = getattr(a, "character_name", None)
+            if nm:
+                known.append(nm)
+        for c in self._preview_clients.values():
+            if not c.is_login and c.char_name and c.char_name not in known:
+                known.append(c.char_name)
+
+        focus_rows = []   # {name: StringVar, key: StringVar, status: Label}
+
+        def _add_focus_row(name="", key=""):
+            r = len(focus_rows)
+            nv = tk.StringVar(value=name)
+            kv = tk.StringVar(value=key)
+            ttk.Combobox(focus_frame, textvariable=nv, values=known, width=20,
+                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
+            tk.Entry(focus_frame, textvariable=kv, font=("Consolas", 9), bg=BG_ENTRY,
+                     fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
+                         row=r, column=1, padx=2)
+            st = tk.Label(focus_frame, text="", bg=BG_PANEL, fg=FG_DIM,
+                          font=("Consolas", 9), width=26, anchor="w")
+            st.grid(row=r, column=2, padx=2)
+            focus_rows.append({"name": nv, "key": kv, "status": st})
+
+        for name, key in (hk.get("focus", {}) or {}).items():
+            _add_focus_row(name, key)
+        if not focus_rows:
+            _add_focus_row()
+
+        ttk.Button(win, text="+ Add character", style="Dark.TButton",
+                   command=lambda: _add_focus_row()).pack(
+                       anchor="w", padx=10, pady=(2, 8))
+
+        # Cycle group 0: next / prev (comma-separated keys) + preset button.
+        tk.Label(win, text="Cycle group (next / previous client):", bg=BG_PANEL,
+                 fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(4, 2))
+        cyc = tk.Frame(win, bg=BG_PANEL)
+        cyc.pack(fill=tk.X, padx=10)
+        tk.Label(cyc, text="Next", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).grid(row=0, column=0, padx=2, sticky="w")
+        next_var = tk.StringVar(value=", ".join(groups[0].get("next", []) or []))
+        tk.Entry(cyc, textvariable=next_var, font=("Consolas", 9), bg=BG_ENTRY,
+                 fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
+                     row=0, column=1, padx=2)
+        tk.Label(cyc, text="Prev", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).grid(row=0, column=2, padx=2, sticky="w")
+        prev_var = tk.StringVar(value=", ".join(groups[0].get("prev", []) or []))
+        tk.Entry(cyc, textvariable=prev_var, font=("Consolas", 9), bg=BG_ENTRY,
+                 fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
+                     row=0, column=3, padx=2)
+
+        def _apply_preset():
+            self._preview_hotkey_preset()
+            g0 = self._preview_cfg().get("hotkeys", {}).get("groups", [{}])[0]
+            next_var.set(", ".join(g0.get("next", []) or []))
+            prev_var.set(", ".join(g0.get("prev", []) or []))
+
+        ttk.Button(win, text="Use EVE-O preset (F14 / F13)", style="Dark.TButton",
+                   command=_apply_preset).pack(anchor="w", padx=10, pady=(2, 8))
+
+        # Cycle order (one char key per line; blank = live sorted order).
+        tk.Label(win, text="Cycle order (one character per line; blank = "
+                 "all live, alphabetical):", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(0, 2))
+        order_txt = tk.Text(win, height=4, width=40, font=("Consolas", 9),
+                            bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE)
+        order_txt.pack(anchor="w", padx=10, pady=(0, 8))
+        order_txt.insert("1.0", "\n".join(groups[0].get("order", []) or []))
+
+        # Minimize-all.
+        tk.Label(win, text="Minimize all clients:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(4, 2))
+        minall_var = tk.StringVar(value=", ".join(hk.get("minimize_all", []) or []))
+        tk.Entry(win, textvariable=minall_var, font=("Consolas", 9), bg=BG_ENTRY,
+                 fg=FG_WHITE, insertbackground=FG_WHITE, width=18).pack(
+                     anchor="w", padx=10, pady=(0, 4))
+
+        status_lbl = tk.Label(win, text="", bg=BG_PANEL, fg=FG_DIM,
+                              font=("Consolas", 9), justify=tk.LEFT, wraplength=420)
+        status_lbl.pack(anchor="w", padx=10, pady=(2, 4))
+
+        def _split(text):
+            return [p.strip() for p in str(text).replace("\n", ",").split(",")
+                    if p.strip()]
+
+        def _ok():
+            focus_out = {}
+            for row in focus_rows:
+                name = row["name"].get().strip().lower()
+                key = row["key"].get().strip()
+                if name and key:
+                    focus_out[name] = key
+            hk["focus"] = focus_out
+            groups[0]["next"] = _split(next_var.get())
+            groups[0]["prev"] = _split(prev_var.get())
+            groups[0]["order"] = [
+                ln.strip().lower()
+                for ln in order_txt.get("1.0", "end").splitlines() if ln.strip()]
+            hk["minimize_all"] = _split(minall_var.get())
+            self._save_config()
+            # Re-register + surface conflicts. Restart even if native isn't live
+            # yet only when a service already exists; otherwise enable path does it.
+            failures = {}
+            if self._preview_hotkeys is not None:
+                try:
+                    svc = self._preview_restart_hotkeys()
+                    failures = dict(getattr(svc, "failures", {}) or {})
+                except Exception:
+                    log.exception("[preview] hotkey re-register failed")
+            # Report any conflicts inline; the dialog stays open so the user can fix.
+            _bindings, actions, errors = self._preview_hotkey_bindings(
+                hk, {c.key for c in self._preview_clients.values()})
+            msgs = list(errors)
+            for hk_id, code in failures.items():
+                act = actions.get(hk_id)
+                label = _describe_action(act)
+                msgs.append(f"{label}: {hotkey_service.format_error(code)}")
+            if msgs:
+                status_lbl.config(text="  •  ".join(msgs), fg="#ff9500")
+            else:
+                try:
+                    win.destroy()
+                except tk.TclError:
+                    pass
+
+        def _describe_action(act):
+            if not act:
+                return "hotkey"
+            if act[0] == "focus":
+                return f"focus {act[1]}"
+            if act[0] == "cycle":
+                return "cycle " + ("next" if act[2] > 0 else "prev")
+            if act[0] == "minall":
+                return "minimize all"
+            return "hotkey"
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="OK", style="Dark.TButton",
+                   command=_ok).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=2)
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
 
     def _add_section(self, parent, title):
         tk.Label(parent, text=f"── {title} ──",

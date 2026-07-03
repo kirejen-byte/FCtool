@@ -174,6 +174,7 @@ def _ui_host(overlay_cfg=None):
                  "_preview_cfg", "_PREVIEW_DEFAULTS", "_preview_set_mode",
                  "_preview_status_text", "_preview_arrange_grid",
                  "_preview_apply_native_state", "_preview_sync_native_widgets",
+                 "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
                  "_add_section",
                  "_overlay_apply_style",
                  "_overlay_status_text", "_overlay_compose_items",

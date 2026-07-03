@@ -10,6 +10,7 @@ Two host flavors, both house-standard:
 NON-DISRUPTIVE: no real EVE window, hotkey, or focus grab is ever touched —
 mode boot/teardown are recorded on the host; grid math is pure.
 """
+import inspect
 import types
 from types import SimpleNamespace
 
@@ -23,6 +24,16 @@ import eve_client_tracker
 
 
 CW = eve_client_tracker.ClientWindow
+
+
+def _bind_attr(name, attr, host):
+    """Bind a class attribute onto a bare host. Staticmethods must NOT receive
+    `self` (accessed via the class they are already unwrapped), so leave them as
+    plain functions; everything else is an instance method → MethodType-bind."""
+    raw = inspect.getattr_static(fc_gui.FCToolGUI, name, None)
+    if isinstance(raw, staticmethod):
+        return attr
+    return types.MethodType(attr, host)
 
 
 def _cw(hwnd, char_name, rect=(0, 0, 800, 600), is_iconic=False):
@@ -87,6 +98,8 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_set_mode", "_preview_status_text",
                  "_preview_arrange_grid", "_preview_apply_native_state",
                  "_preview_sync_native_widgets",
+                 "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
+                 "_preview_restart_hotkeys",
                  "_add_section", "_overlay_apply_style",
                  "_open_overlay_rules_dialog", "_overlay_cycle_color",
                  "_overlay_status_text", "_overlay_rules",
@@ -96,7 +109,7 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
         if attr is None:
             continue
         setattr(host, name,
-                types.MethodType(attr, host) if callable(attr) else attr)
+                _bind_attr(name, attr, host) if callable(attr) else attr)
     return root, host
 
 
@@ -302,3 +315,122 @@ def test_arrange_grid_noop_when_no_live_clients():
     host = _pure_host(preview_cfg={"mode": "native", "layouts": {}})
     host._preview_arrange_grid()      # must not raise
     assert host.config["preview"]["layouts"] == {}
+
+
+# ── (A10) hotkey binding builder — pure, no Tk/ctypes ────────────────────────
+import hotkey_service
+
+
+def _build(hk, live_keys=()):
+    return fc_gui.FCToolGUI._preview_hotkey_bindings(hk, set(live_keys))
+
+
+def test_hotkey_builder_focus_group_and_minall_get_distinct_ids_and_actions():
+    hk = {
+        "focus": {"kirejen": "F13", "alt one": "Control+F9"},
+        "groups": [{"next": ["F14"], "prev": ["F15"], "order": []}],
+        "minimize_all": ["Alt+M"],
+    }
+    bindings, actions, errors = _build(hk)
+    assert errors == []
+    # every binding id is distinct and appears in both maps
+    assert set(bindings) == set(actions)
+    assert len(bindings) == 5
+    assert len(set(bindings)) == 5
+    # every binding parses to a (mods, vk) pair
+    for hk_id, mv in bindings.items():
+        assert isinstance(mv, tuple) and len(mv) == 2
+    action_set = set(actions.values())
+    assert ("focus", "kirejen") in action_set
+    assert ("focus", "alt one") in action_set
+    assert ("cycle", 0, +1) in action_set        # next
+    assert ("cycle", 0, -1) in action_set        # prev
+    assert ("minall",) in action_set
+    # the parsed values match hotkey_service.parse_hotkey
+    inv = {v: k for k, v in actions.items()}
+    assert bindings[inv[("focus", "kirejen")]] == hotkey_service.parse_hotkey("F13")
+    assert bindings[inv[("cycle", 0, +1)]] == hotkey_service.parse_hotkey("F14")
+
+
+def test_hotkey_builder_collects_invalid_strings_into_errors_not_raise():
+    hk = {
+        "focus": {"kirejen": "NotAKey", "alt": "F13"},
+        "groups": [{"next": ["F14", "Win+F1"], "prev": [], "order": []}],
+        "minimize_all": [""],
+    }
+    bindings, actions, errors = _build(hk)
+    # valid ones still bound
+    assert ("focus", "alt") in set(actions.values())
+    assert ("cycle", 0, +1) in set(actions.values())
+    # three invalid strings collected, nothing raised
+    assert len(errors) == 3
+    joined = " ".join(errors).lower()
+    assert "notakey" in joined
+    # invalid entries produced no binding
+    assert ("focus", "kirejen") not in set(actions.values())
+
+
+def test_hotkey_builder_multiple_next_keys_each_get_a_binding():
+    hk = {"focus": {}, "minimize_all": [],
+          "groups": [{"next": ["F14", "F16"], "prev": [], "order": []}]}
+    bindings, actions, errors = _build(hk)
+    assert errors == []
+    # both next keys map to the same cycle action but distinct ids
+    ids = [i for i, a in actions.items() if a == ("cycle", 0, +1)]
+    assert len(ids) == 2 and len(set(ids)) == 2
+
+
+def test_hotkey_builder_empty_config_is_empty():
+    bindings, actions, errors = _build(
+        {"focus": {}, "groups": [{"next": [], "prev": [], "order": []}],
+         "minimize_all": []})
+    assert bindings == {} and actions == {} and errors == []
+
+
+def test_hotkey_builder_tolerates_missing_keys():
+    # a sparse/legacy hotkeys dict must not KeyError
+    bindings, actions, errors = _build({})
+    assert bindings == {} and actions == {} and errors == []
+
+
+# ── (A10) modal builds headless + preset button fills group 0 ────────────────
+def _hotkey_ui_host(preview_cfg):
+    root, host = _ui_host(preview_cfg=preview_cfg)
+    for name in ("_open_preview_hotkeys_dialog", "_preview_hotkey_bindings",
+                 "_preview_restart_hotkeys", "_preview_hotkey_preset"):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        if attr is None:
+            continue
+        setattr(host, name,
+                _bind_attr(name, attr, host) if callable(attr) else attr)
+    return root, host
+
+
+def test_hotkey_modal_builds_headless_and_closes():
+    root, host = _hotkey_ui_host(preview_cfg={
+        "mode": "native",
+        "hotkeys": {"focus": {}, "groups": [{"next": [], "prev": [], "order": []}],
+                    "minimize_all": []}})
+    try:
+        win = host._open_preview_hotkeys_dialog(_test_no_wait=True)
+        assert win is not None
+        win.destroy()
+    finally:
+        root.destroy()
+
+
+def test_hotkey_preset_fills_group0_next_prev_without_touching_focus():
+    root, host = _hotkey_ui_host(preview_cfg={
+        "mode": "native",
+        "hotkeys": {"focus": {"kirejen": "F5"},
+                    "groups": [{"next": [], "prev": [], "order": []}],
+                    "minimize_all": []}})
+    try:
+        host._preview_hotkey_preset()
+        hk = host.config["preview"]["hotkeys"]
+        assert hk["groups"][0]["next"] == ["F14"]
+        assert hk["groups"][0]["prev"] == ["F13"]
+        # focus keys untouched (EVE-O parity: preset only sets cycle group 0)
+        assert hk["focus"] == {"kirejen": "F5"}
+    finally:
+        root.destroy()
