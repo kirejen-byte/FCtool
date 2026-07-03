@@ -97,7 +97,7 @@ import eve_client_tracker
 import window_activator
 import preview_layout
 import hotkey_service
-from preview_tile import TileWindow
+from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -679,6 +679,7 @@ class FCToolGUI:
 
         # ── Native preview controller state ─────────────────────────────────
         self._preview_tiles = {}               # hwnd -> TileWindow
+        self._preview_tile_rects = {}          # hwnd -> (x, y, w, body_h) screen px
         self._preview_clients = {}             # hwnd -> ClientWindow
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
         self._preview_hotkey_map = {}          # hk_id -> action tuple
@@ -11417,6 +11418,7 @@ class FCToolGUI:
                 pass
             return
         self._preview_tiles[client.hwnd] = tile
+        self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
 
     def _preview_rekey_tile(self, old, new):
         """Same hwnd, changed title (login<->char or char rename). Re-key the tile
@@ -11431,13 +11433,15 @@ class FCToolGUI:
             cfg = self._preview_cfg()
             saved = (cfg.get("layouts", {}) or {}).get(new.key)
             if saved and len(saved) >= 4:
-                tile.place(int(saved[0]), int(saved[1]),
-                           int(saved[2]), int(saved[3]))
+                r = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
+                tile.place(*r)
+                self._preview_tile_rects[new.hwnd] = r
         except OSError:
             self._preview_retire_tile(new.hwnd)
 
     def _preview_retire_tile(self, hwnd):
         """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
+        self._preview_tile_rects.pop(hwnd, None)
         tile = self._preview_tiles.pop(hwnd, None)
         if tile is None:
             return
@@ -11473,15 +11477,19 @@ class FCToolGUI:
         cfg = self._preview_cfg()
         w = cfg.get("tile_w", 384)
         body_h = cfg.get("tile_body_h", 216)
+        hwnd = None
         tile = None
         for c in self._preview_clients.values():
             if c.key == key:
+                hwnd = c.hwnd
                 tile = self._preview_tiles.get(c.hwnd)
                 break
         if tile is not None:
             w = getattr(tile, "_w", w) or w
             body_h = getattr(tile, "_body_h", body_h) or body_h
         cfg.setdefault("layouts", {})[key] = [int(x), int(y), int(w), int(body_h)]
+        if hwnd is not None:
+            self._preview_tile_rects[hwnd] = (int(x), int(y), int(w), int(body_h))
         self._save_config()
 
     def _preview_on_tile_resize_end(self, key, w, body_h):
@@ -11491,6 +11499,11 @@ class FCToolGUI:
         layouts = cfg.setdefault("layouts", {})
         prev = layouts.get(key) or [10, 10, w, body_h]
         layouts[key] = [int(prev[0]), int(prev[1]), int(w), int(body_h)]
+        for c in self._preview_clients.values():
+            if c.key == key:
+                self._preview_tile_rects[c.hwnd] = (
+                    int(prev[0]), int(prev[1]), int(w), int(body_h))
+                break
         self._save_config()
 
     def _preview_drain_hotkeys(self):
@@ -11684,6 +11697,47 @@ class FCToolGUI:
             except tk.TclError:
                 pass
 
+    def _preview_compose_video_labels(self, cur):
+        """Task B2: optional on-video rule labels drawn by the shared OverlayWindow.
+
+        When `labels_on_video` is on, draw the (same) overlay_rules label used by
+        the caption strip ON TOP of each tile's video body — but ONLY for tiles
+        whose rule label is non-empty (login screens / rule-less pilots stay
+        clean). Rects are the controller's own tracked screen rects (physical px),
+        offset down by the caption-strip height so the label sits over the video,
+        not the strip. The OverlayWindow is created lazily and only when the
+        option is on. With the option off, an already-existing overlay is cleared
+        with [] (the strip carries the label instead); no overlay is created."""
+        cfg = self._preview_cfg()
+        on = bool(cfg.get("labels_on_video", False))
+        if not on:
+            if self._overlay is not None:
+                try:
+                    self._overlay.set_labels([])   # strips own the labels now
+                except Exception:
+                    pass
+            return
+        rules = self._overlay_rules()
+        overrides = self._overlay_cfg().get("overrides", {}) or {}
+        items = []
+        for hwnd, client in cur.items():
+            if hwnd not in self._preview_tiles or client.is_login:
+                continue
+            rect = self._preview_tile_rects.get(hwnd)
+            if not rect:
+                continue
+            state = self._preview_state_for(client.key)
+            label = overlay_rules.label_for(state, rules, overrides) if state else ""
+            if not label:
+                continue
+            x, y, w, body_h = rect
+            body = (x, y + _TILE_STRIP_H, x + w, y + _TILE_STRIP_H + body_h)
+            items.append((body, label))
+        try:
+            self._overlay_ensure_window().set_labels(items)
+        except Exception:
+            log.exception("[preview] on-video label draw failed")
+
     def _preview_role_chip(self, client):
         """Fleet-role chip text for a client (B4 fills this in with the fleet
         store lookup). B1 leaves it empty so the chip column stays blank."""
@@ -11735,6 +11789,7 @@ class FCToolGUI:
             self._preview_clients = cur
             self._preview_drain_hotkeys()
             self._preview_compose_captions(cur)                     # Task B1 fills this in
+            self._preview_compose_video_labels(cur)                 # Task B2 on-video labels
             self._preview_tick_count += 1
             n = len(cur)
             return f"● {n} client{'s' if n != 1 else ''} · {len(self._preview_tiles)} tiles"

@@ -83,10 +83,14 @@ class FakeOverlay:
     def __init__(self, host):
         self._host = host
         self.retops = 0
+        self.label_pushes = []
 
     def retop(self):
         self.retops += 1
         self._host.retop_order.append(("overlay",))
+
+    def set_labels(self, items):
+        self.label_pushes.append(list(items))
 
 
 class FakeHotkeys:
@@ -114,6 +118,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     )
     # controller state (mirror __init__ block)
     host._preview_tiles = {}
+    host._preview_tile_rects = {}
     host._preview_clients = {}
     host._preview_hotkeys = None
     host._preview_hotkey_map = {}
@@ -148,6 +153,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_spawn_tile", "_preview_rekey_tile",
                  "_preview_retire_tile", "_preview_retire_all_tiles",
                  "_preview_drain_hotkeys", "_preview_compose_captions",
+                 "_preview_compose_video_labels",
                  "_preview_caption_parts",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
@@ -677,3 +683,86 @@ def test_compose_captions_disabled_when_captions_off(monkeypatch):
     host._preview_tiles = {1: tile}
     host._preview_compose_captions({1: c})
     assert tile.captions == []      # captions off → no set_caption calls
+
+
+# ── (B2) on-video rule labels via the existing OverlayWindow ──────────────────
+from preview_tile import STRIP_H
+
+
+def _labels_host(labels_on_video, overlay=None):
+    host = make_host(mode="native")
+    host.config["preview"]["labels_on_video"] = labels_on_video
+    host._overlay = overlay
+    host.config.setdefault("overlay", {"rules": [], "overrides": {}})
+    host._overlay_cfg = lambda: host.config["overlay"]
+    host._overlay_rules = lambda: []
+    host._preview_state_for = lambda key: None
+    # lazy-overlay creator: hand back a FakeOverlay and remember it
+    def _ensure():
+        if host._overlay is None:
+            host._overlay = FakeOverlay(host)
+        return host._overlay
+    host._overlay_ensure_window = _ensure
+    for name in ("_preview_compose_video_labels",):
+        fn = getattr(fc_gui.FCToolGUI, name, None)
+        if fn is not None:
+            setattr(host, name, types.MethodType(fn, host))
+    return host
+
+
+def test_video_labels_pushed_for_tiles_with_rule_label(monkeypatch):
+    host = _labels_host(labels_on_video=True)
+    # two live clients; only Kirejen matches a rule → only it gets a label
+    st = CS(character_id=1, name="Kirejen", online=True, ship_group="Force Recon Ship")
+    host._overlay_rules = lambda: [
+        overlay_rules.OverlayRule("ship_group", "Force Recon Ship", "Cyno")]
+    host._preview_state_for = lambda key: st if key == "kirejen" else None
+    ck = _cw(1, "Kirejen")
+    ca = _cw(2, "Alt")
+    host._preview_tiles = {1: FakeTile(host, "kirejen"), 2: FakeTile(host, "alt")}
+    # controller-known screen rects (x, y, w, body_h)
+    host._preview_tile_rects = {1: (100, 200, 384, 216), 2: (600, 200, 384, 216)}
+    host._preview_compose_video_labels({1: ck, 2: ca})
+    ov = host._overlay
+    assert ov is not None and ov.label_pushes, "overlay should have been created + drawn"
+    items = ov.label_pushes[-1]
+    # body rect = (x, y+STRIP_H, x+w, y+STRIP_H+body_h); only the matched tile
+    assert items == [((100, 200 + STRIP_H, 100 + 384, 200 + STRIP_H + 216), "Cyno")]
+
+
+def test_video_labels_empty_when_disabled():
+    ov = FakeOverlay(None)
+    host = _labels_host(labels_on_video=False, overlay=ov)
+    host._overlay_rules = lambda: [
+        overlay_rules.OverlayRule("ship_group", "Force Recon Ship", "Cyno")]
+    st = CS(character_id=1, name="Kirejen", online=True, ship_group="Force Recon Ship")
+    host._preview_state_for = lambda key: st
+    host._preview_tiles = {1: FakeTile(host, "kirejen")}
+    host._preview_tile_rects = {1: (0, 0, 384, 216)}
+    host._preview_compose_video_labels({1: _cw(1, "Kirejen")})
+    # existing overlay is cleared with [] (labels carried by the strips instead)
+    assert ov.label_pushes[-1] == []
+
+
+def test_video_labels_disabled_does_not_create_overlay():
+    host = _labels_host(labels_on_video=False, overlay=None)
+    host._preview_tiles = {1: FakeTile(host, "kirejen")}
+    host._preview_tile_rects = {1: (0, 0, 384, 216)}
+    host._preview_compose_video_labels({1: _cw(1, "Kirejen")})
+    # no overlay existed and the option is off → none is lazily created
+    assert host._overlay is None
+
+
+def test_video_labels_no_matches_pushes_empty_list(monkeypatch):
+    host = _labels_host(labels_on_video=True)
+    # rules present but no client matches → drawn set is empty
+    host._overlay_rules = lambda: [
+        overlay_rules.OverlayRule("ship_group", "Force Recon Ship", "Cyno")]
+    host._preview_state_for = lambda key: CS(character_id=1, name="Kirejen",
+                                             online=True, ship_group="Battleship")
+    host._preview_tiles = {1: FakeTile(host, "kirejen")}
+    host._preview_tile_rects = {1: (0, 0, 384, 216)}
+    host._preview_compose_video_labels({1: _cw(1, "Kirejen")})
+    # option is on → overlay created, but pushed list is empty (no matches)
+    assert host._overlay is not None
+    assert host._overlay.label_pushes[-1] == []
