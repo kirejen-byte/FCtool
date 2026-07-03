@@ -6,6 +6,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 import collections
 import json
 import os
+import queue
 import re
 import sys
 import shutil
@@ -92,6 +93,9 @@ from eveo_tracker import find_thumbs, preview_running
 from eveo_overlay import OverlayWindow
 import overlay_rules
 import eve_client_tracker
+import window_activator
+import preview_layout
+from preview_tile import TileWindow
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -679,6 +683,8 @@ class FCToolGUI:
         self._preview_after_id = None
         self._preview_intel = {}               # system_id -> (ts, kind)
         self._preview_disabled_session = False
+        self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
+        self._preview_last_key = ""            # last-activated char key (cycle anchor)
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
         # Seed rules created once, the first time the feature is enabled.
         if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
@@ -11353,6 +11359,290 @@ class FCToolGUI:
         if self._overlay_after_id is None:
             self._overlay_tick()
 
+    # ── Native preview controller (Task A8) ──────────────────────────────────
+    def _preview_palette(self) -> dict:
+        """Palette dict handed to each TileWindow (module color constants)."""
+        return {
+            "BG_PANEL": BG_PANEL, "BG_DARK": BG_DARK, "FG_TEXT": FG_TEXT,
+            "FG_ACCENT": FG_ACCENT, "FG_DIM": FG_DIM,
+        }
+
+    def _preview_make_tile(self, char_key, x, y, w, body_h):
+        """Construct + place a real TileWindow. Injectable: the unit tests bind a
+        recording factory over this name so no Tk/DWM window is ever created."""
+        tile = TileWindow(
+            self.root, char_key, self._preview_palette(),
+            on_activate=self._preview_on_tile_activate,
+            on_minimize=self._preview_on_tile_minimize,
+            on_move_end=self._preview_on_tile_move_end,
+            on_resize_end=self._preview_on_tile_resize_end,
+        )
+        tile.place(x, y, w, body_h)
+        return tile
+
+    def _preview_tile_rect(self, client, cfg):
+        """Resolve (x, y, w, body_h) for a NEW tile: saved layout for the char,
+        else login-stack position for a login screen, else a default grid spawn.
+        Never mutates saved layouts."""
+        w = cfg.get("tile_w", 384)
+        body_h = cfg.get("tile_body_h", 216)
+        layouts = cfg.get("layouts", {}) or {}
+        saved = layouts.get(client.key)
+        if saved and len(saved) >= 4:
+            return (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
+        if client.is_login:
+            n = sum(1 for c in self._preview_clients.values() if c.is_login)
+            base = tuple(cfg.get("login_position", [5, 5]))
+            x, y = preview_layout.login_stack_pos(n, base)
+            return (x, y, w, body_h)
+        # default spawn: cascade by current tile count so new clients don't stack
+        idx = len(self._preview_tiles)
+        return (10 + idx * 24, 10 + idx * 24, w, body_h)
+
+    def _preview_spawn_tile(self, client):
+        cfg = self._preview_cfg()
+        x, y, w, body_h = self._preview_tile_rect(client, cfg)
+        tile = self._preview_make_tile(client.key, x, y, w, body_h)
+        try:
+            tile.attach_source(client.hwnd)
+        except OSError:
+            # source vanished between enumerate and attach — drop the tile;
+            # the next tick respawns it if the client is still around.
+            try:
+                tile.destroy()
+            except Exception:
+                pass
+            return
+        self._preview_tiles[client.hwnd] = tile
+
+    def _preview_rekey_tile(self, old, new):
+        """Same hwnd, changed title (login<->char or char rename). Re-key the tile
+        and move it to the new key's saved layout if one exists. Saved layouts of
+        the OLD key are left untouched (foot-gun fix)."""
+        tile = self._preview_tiles.get(new.hwnd)
+        if tile is None:
+            self._preview_spawn_tile(new)
+            return
+        try:
+            tile.set_key(new.key)
+            cfg = self._preview_cfg()
+            saved = (cfg.get("layouts", {}) or {}).get(new.key)
+            if saved and len(saved) >= 4:
+                tile.place(int(saved[0]), int(saved[1]),
+                           int(saved[2]), int(saved[3]))
+        except OSError:
+            self._preview_retire_tile(new.hwnd)
+
+    def _preview_retire_tile(self, hwnd):
+        """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
+        tile = self._preview_tiles.pop(hwnd, None)
+        if tile is None:
+            return
+        try:
+            tile.detach()
+        except Exception:
+            pass
+        try:
+            tile.destroy()
+        except Exception:
+            pass
+
+    def _preview_retire_all_tiles(self):
+        for hwnd in list(self._preview_tiles):
+            self._preview_retire_tile(hwnd)
+
+    def _preview_on_tile_activate(self, key):
+        for c in self._preview_clients.values():
+            if c.key == key:
+                self._preview_last_key = key
+                window_activator.activate(c.hwnd)
+                return
+
+    def _preview_on_tile_minimize(self, key):
+        for c in self._preview_clients.values():
+            if c.key == key:
+                window_activator.minimize(c.hwnd)
+                return
+
+    def _preview_on_tile_move_end(self, key, x, y):
+        if not key:
+            return
+        cfg = self._preview_cfg()
+        w = cfg.get("tile_w", 384)
+        body_h = cfg.get("tile_body_h", 216)
+        tile = None
+        for c in self._preview_clients.values():
+            if c.key == key:
+                tile = self._preview_tiles.get(c.hwnd)
+                break
+        if tile is not None:
+            w = getattr(tile, "_w", w) or w
+            body_h = getattr(tile, "_body_h", body_h) or body_h
+        cfg.setdefault("layouts", {})[key] = [int(x), int(y), int(w), int(body_h)]
+        self._save_config()
+
+    def _preview_on_tile_resize_end(self, key, w, body_h):
+        if not key:
+            return
+        cfg = self._preview_cfg()
+        layouts = cfg.setdefault("layouts", {})
+        prev = layouts.get(key) or [10, 10, w, body_h]
+        layouts[key] = [int(prev[0]), int(prev[1]), int(w), int(body_h)]
+        self._save_config()
+
+    def _preview_drain_hotkeys(self):
+        """Drain the hotkey worker queue and act on each event. Focus APIs only —
+        the compliance choke-point is window_activator; nothing is injected into
+        any EVE client (spec §4)."""
+        svc = self._preview_hotkeys
+        if svc is None:
+            return
+        live = list(self._preview_clients.values())
+        by_key = {c.key: c for c in live if not c.is_login}
+        while True:
+            try:
+                hk_id = svc.events.get_nowait()
+            except queue.Empty:
+                break
+            action = self._preview_hotkey_map.get(hk_id)
+            if not action:
+                continue
+            kind = action[0]
+            if kind == "focus":
+                c = by_key.get(action[1])
+                if c is not None:
+                    self._preview_last_key = c.key
+                    window_activator.activate(c.hwnd)
+            elif kind == "cycle":
+                _, group, direction = action
+                cfg = self._preview_cfg()
+                groups = cfg.get("hotkeys", {}).get("groups", [])
+                order = groups[group].get("order", []) if group < len(groups) else []
+                live_keys = set(by_key)
+                nxt = preview_layout.cycle_next(
+                    order, self._preview_last_key, live_keys, direction)
+                c = by_key.get(nxt)
+                if c is not None:
+                    self._preview_last_key = c.key
+                    window_activator.activate(c.hwnd)
+            elif kind == "minall":
+                cfg = self._preview_cfg()
+                never = set(cfg.get("never_minimize", []))
+                for c in by_key.values():
+                    if c.key not in never:
+                        window_activator.minimize(c.hwnd)
+
+    def _preview_compose_captions(self, cur):
+        """Caption composition is filled in by Task B1 (ESI states + rules +
+        doctrine tag). A8 leaves it a safe no-op so the tick body is complete."""
+        return
+
+    def _preview_native_tick_body(self):
+        cfg = self._preview_cfg()
+        if preview_running():                      # EVE-O still open → refuse to fight it
+            self._preview_retire_all_tiles()
+            return "○ EVE-O Preview detected — close it to enable native previews"
+        try:
+            disabled = set(cfg.get("disabled_chars", []))
+            cur = {c.hwnd: c for c in self._preview_find_clients()
+                   if c.key not in disabled}
+            added, retitled, removed = eve_client_tracker.diff_clients(
+                self._preview_clients, cur)
+            for old in removed:
+                self._preview_retire_tile(old.hwnd)                 # layouts untouched
+            for old, new in retitled:
+                self._preview_rekey_tile(old, new)                  # login→char and back
+            for client in added:
+                self._preview_spawn_tile(client)                    # saved | login stack | spawn
+            for hwnd, client in cur.items():
+                tile = self._preview_tiles.get(hwnd)
+                if not tile:
+                    continue
+                if not eve_client_tracker.still_same_client(client):
+                    self._preview_retire_tile(hwnd)                 # HWND reuse guard
+                    continue
+                try:
+                    tile.set_badge("MINIMIZED" if client.is_iconic
+                                   else ("login screen" if client.is_login else None))
+                    if self._preview_tick_count % 8 == 0:
+                        tile.refresh_source_size()                  # cheap re-letterbox
+                except OSError:
+                    # Per-tile DWM failure (client died mid-tick, or DWM restarted
+                    # and invalidated every handle). Retire THIS tile only — the
+                    # client is still in `cur`, so the next tick respawns it with a
+                    # fresh registration. Only tracker-level/unexpected exceptions
+                    # disable the session.
+                    self._preview_retire_tile(hwnd)
+            for tile in self._preview_tiles.values():
+                tile.retop()
+            if self._overlay is not None:
+                self._overlay.retop()                               # labels above tiles
+            # Publish the current client set BEFORE draining hotkeys / composing
+            # captions: both resolve char keys against the live set (activation
+            # by key needs the just-diffed `cur`, not the previous tick's set).
+            self._preview_clients = cur
+            self._preview_drain_hotkeys()
+            self._preview_compose_captions(cur)                     # Task B1 fills this in
+            self._preview_tick_count += 1
+            n = len(cur)
+            return f"● {n} client{'s' if n != 1 else ''} · {len(self._preview_tiles)} tiles"
+        except Exception:
+            log.exception("[preview] native tick failed; disabling for session")
+            self._preview_disable_session()
+            return "⚠ native previews disabled (error) — see log"
+
+    def _preview_enable_native(self):
+        self._preview_disabled_session = False
+        if self._preview_after_id is None:
+            self._preview_tick()
+
+    def _preview_disable_native(self):
+        self._preview_teardown()
+
+    def _preview_disable_session(self):
+        """A tracker/Win32 failure disables native previews for THIS session only
+        (the config mode is untouched); a single log line was already emitted."""
+        self._preview_disabled_session = True
+        self._preview_teardown()
+
+    def _preview_teardown(self):
+        if self._preview_after_id is not None:
+            try:
+                self.root.after_cancel(self._preview_after_id)
+            except Exception:
+                pass
+            self._preview_after_id = None
+        self._preview_retire_all_tiles()
+        self._preview_clients = {}
+        svc = self._preview_hotkeys
+        if svc is not None:
+            try:
+                svc.stop()
+            except Exception:
+                pass
+            self._preview_hotkeys = None
+
+    def _preview_tick(self):
+        """Reschedule the native controller while native mode is active (mirrors
+        _overlay_tick's cadence tail). 250 ms with tiles, 2 s slow probe idle."""
+        if self._preview_cfg().get("mode") != "native" or self._preview_disabled_session:
+            self._preview_after_id = None
+            return
+        status = self._preview_native_tick_body()
+        self._preview_status = status
+        if getattr(self, "_preview_status_label", None) is not None:
+            try:
+                self._preview_status_label.config(text=status)
+            except tk.TclError:
+                pass
+        if self._preview_disabled_session:
+            self._preview_after_id = None
+            return
+        tick_ms = getattr(self, "_OVERLAY_TICK_MS", 250)
+        probe_ms = getattr(self, "_OVERLAY_PROBE_MS", 2000)
+        delay = tick_ms if self._preview_tiles else probe_ms
+        self._preview_after_id = self.root.after(delay, self._preview_tick)
+
     def _overlay_disable(self):
         self._overlay_cfg()["enabled"] = False
         self._overlay_teardown()
@@ -15705,6 +15995,14 @@ $bmp.Dispose()
             teardown = getattr(self, "_overlay_teardown", None)
             if callable(teardown):
                 teardown()
+        except Exception:
+            pass
+        # Tear down the native-preview controller too (cancel its after-loop,
+        # retire tiles, stop the hotkey worker thread). Guarded like the overlay.
+        try:
+            preview_teardown = getattr(self, "_preview_teardown", None)
+            if callable(preview_teardown):
+                preview_teardown()
         except Exception:
             pass
         self.root.destroy()

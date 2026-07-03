@@ -289,6 +289,12 @@ class TileWindow:
                 self._src_size = size
                 self._push_thumb_rect()
 
+    def set_key(self, char_key):
+        """Re-key an existing tile (login screen -> character, and back). The
+        mouse callbacks read self._key at call time, so updating it here is
+        enough for move/resize persistence to target the new layout key."""
+        self._key = char_key
+
     def retop(self):
         self._win32.retop(self._hwnd)
 
