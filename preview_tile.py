@@ -36,6 +36,100 @@ _MIN_BODY_H = 68          # min body height (physical px); strip height is const
 _CORNER_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
                   "ne": "size_ne_sw", "sw": "size_ne_sw"}
 
+# ── on-video activity label (caption-onvideo) ────────────────────────────────
+# The activity label ("<label> - <ShipType>") is drawn directly on the tile BODY
+# (over the DWM thumbnail) at a configurable corner, as a black 8-direction
+# outline with a coloured fill on top — the same legibility trick eveo_overlay
+# uses, so the text reads on both bright and dark video.
+_LABEL_OUTLINE = "#000000"
+_LABEL_OUTLINE_OFFSET = 1
+# The 8 surrounding 1px positions (N/S/E/W + 4 diagonals) forming the halo.
+_LABEL_OUTLINE_OFFSETS = [
+    (-1, -1), (0, -1), (1, -1),
+    (-1, 0),          (1, 0),
+    (-1, 1), (0, 1), (1, 1),
+]
+_LABEL_PAD = 4            # px inset from the chosen body corner
+_LABEL_MIN_SIZE = 8      # sane font floor
+_LABEL_MAX_SIZE = 28     # sane font ceiling (before the body-fraction cap)
+_LABEL_MAX_CHARS = 40    # hard character cap before the width-based ellipsis
+# Rough monospace char-advance as a fraction of font point size. Consolas at N pt
+# advances ~0.6*N px per glyph; used to estimate rendered width Tk-free so the
+# clamp/ellipsis helpers stay pure (no font metrics / no Tk).
+_CHAR_W_RATIO = 0.62
+
+
+def format_tile_label(activity_label, ship_type_name) -> str:
+    """Join the activity label and ship TYPE name as '<label> - <ShipType>',
+    omitting empty/whitespace-only parts.
+
+    label only -> 'Cyno'; ship only -> 'Onyx'; both -> 'Cyno - Onyx';
+    neither -> '' (caller hides the label entirely). Pure/Tk-free."""
+    parts = [p.strip() for p in (activity_label, ship_type_name)
+             if p and str(p).strip()]
+    return " - ".join(parts)
+
+
+def _ellipsize(text: str, max_chars: int) -> str:
+    """Truncate `text` to at most `max_chars` glyphs, appending '…' when cut.
+    max_chars <= 0 yields '' (nothing fits)."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars == 1:
+        return "…"
+    return text[:max_chars - 1] + "…"
+
+
+def clamp_label(text, font_size, tile_w, tile_body_h):
+    """Bound an on-video label so it can never overflow or fill the tile.
+
+    Returns (clamped_text, clamped_size):
+      - size is clamped to [_LABEL_MIN_SIZE, _LABEL_MAX_SIZE] AND to at most
+        ~tile_body_h/5 so a huge font can't dominate the body;
+      - text is ellipsized to _LABEL_MAX_CHARS AND to the body width (estimated
+        from the clamped size), truncating with '…'.
+
+    Pure/Tk-free: width is estimated via _CHAR_W_RATIO, not real font metrics
+    (live rendering is re-tested on-video). Deterministic for unit tests."""
+    text = text or ""
+    try:
+        size = int(font_size)
+    except (TypeError, ValueError):
+        size = _LABEL_MIN_SIZE
+    # cap by the sane range first, then by the body fraction (never below floor).
+    size = max(_LABEL_MIN_SIZE, min(size, _LABEL_MAX_SIZE))
+    if tile_body_h and tile_body_h > 0:
+        body_cap = max(_LABEL_MIN_SIZE, int(tile_body_h // 5))
+        size = min(size, body_cap)
+    # hard character cap first (cheap, independent of width).
+    text = _ellipsize(text, _LABEL_MAX_CHARS)
+    # then the width cap: how many glyphs fit inside (tile_w - 2*pad)?
+    if tile_w and tile_w > 0:
+        usable = max(0, tile_w - 2 * _LABEL_PAD)
+        per_char = max(1.0, size * _CHAR_W_RATIO)
+        max_chars_w = int(usable // per_char)
+        if max_chars_w < len(text):
+            text = _ellipsize(text, max_chars_w)
+    return text, size
+
+
+def label_anchor_placement(anchor, pad_frac=0.0):
+    """Map an overlay anchor name to (relx, rely, tk_anchor) for place()-ing the
+    on-video label canvas at a BODY corner. `relx`/`rely` are relative positions
+    in [0,1]; `tk_anchor` is the Tk anchor that pins the widget's own corner to
+    that point. Unknown anchors fall back to top-left. Pure/Tk-free."""
+    a = (anchor or "").strip().lower()
+    lo, hi = pad_frac, 1.0 - pad_frac
+    table = {
+        "top-left": (lo, lo, "nw"),
+        "top-right": (hi, lo, "ne"),
+        "bottom-left": (lo, hi, "sw"),
+        "bottom-right": (hi, hi, "se"),
+    }
+    return table.get(a, (lo, lo, "nw"))
+
 
 class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRANSPARENT
     """Real ctypes wrapper for the tile window's tool/no-activate styling and
@@ -140,6 +234,14 @@ class TileWindow:
         self._src_size = (0, 0)
         self._w = 0
         self._body_h = 0
+
+        # on-video activity label style (caption-onvideo). Fed live from
+        # config['overlay'] color/font_size/anchor via set_label_style; the strip
+        # no longer carries the activity label (bug (i)/(ii) fix).
+        self._label_color = "#ffffff"
+        self._label_size = 11
+        self._label_anchor = "top-left"
+        self._label_text = ""
         self._pos = (0, 0)            # last-placed top-left (physical px)
         self._badge = None
         self._hidden = False          # withdrawn by a C2 hide rule (layout kept)
@@ -224,6 +326,19 @@ class TileWindow:
         # ── body (DWM composites the live thumbnail over this) ──────────────
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
+
+        # On-video activity label (caption-onvideo): a small Canvas placed over
+        # the BODY at the configured corner. Child Tk widgets composite ABOVE the
+        # DWM thumbnail client area (the caption strip already proves this), so
+        # the label reads on top of the live video. Its bg matches the body so
+        # only the outlined+filled text is visible; it's placed lazily on the
+        # first non-empty set_video_label so an empty label leaves the body clean.
+        # FLAG: on-video compositing above the thumbnail + legibility need a live
+        # re-test on a real DWM-composited tile.
+        self._label_canvas = tk.Canvas(
+            self._body, bg="#000000", highlightthickness=0, bd=0,
+            width=1, height=1)
+        self._label_placed = False
 
         # caption text mirror for tests / logging (badge overrides name display)
         self._name = ""
@@ -577,6 +692,9 @@ class TileWindow:
         self._push_thumb_rect()
 
     def _push_thumb_rect(self):
+        # Re-clamp the on-video label to the (possibly new) body size on every
+        # placement/resize so a shrunken tile ellipsizes and a grown one relaxes.
+        self._draw_video_label()
         if not self._thumb:
             return
         fx, fy, fw, fh = aspect_fit(self._w, self._body_h, *self._src_size)
@@ -691,13 +809,33 @@ class TileWindow:
                 pass
 
     def _render_caption(self):
+        # The strip carries only name + status dot + role chip now; the activity
+        # label ('tag') has moved onto the video body (caption-onvideo). Ellipsize
+        # the NAME so a long name can't push the chip off the fixed-width row.
         shown = self._badge or self._name
+        shown = self._ellipsize_name(shown)
         try:
             self._name_lbl.configure(text=shown)
             self._chip_lbl.configure(text=self._chip)
-            self._tag_lbl.configure(text=self._tag)
+            self._tag_lbl.configure(text="")     # activity moved on-video
         except tk.TclError:
             pass
+
+    def _ellipsize_name(self, name):
+        """Truncate the strip name to fit the fixed-width row. Budget = the tile
+        width minus the dot/chip/exclusion glyphs and padding, estimated Tk-free
+        via the strip's 9pt name font. Never returns more chars than fit."""
+        name = name or ""
+        w = self._w if self._w > 0 else 0
+        if w <= 0:
+            return name
+        # reserve space for the dot (~17px), chip (~len*7px + pad), excl (~14px)
+        chip_px = (len(self._chip) + 1) * 8 if self._chip else 0
+        reserved = 17 + 14 + chip_px + 8
+        usable = max(0, w - reserved)
+        per_char = 9 * _CHAR_W_RATIO       # 9pt bold Consolas ≈ this px/glyph
+        budget = int(usable // max(1.0, per_char))
+        return _ellipsize(name, budget)
 
     def set_badge(self, text):
         """Overlay a status word in place of the name (MINIMIZED / login screen /
@@ -736,6 +874,89 @@ class TileWindow:
             else:
                 self._strip.configure(highlightthickness=0)
                 self._body.configure(highlightthickness=0)
+        except tk.TclError:
+            pass
+
+    # ── on-video activity label (caption-onvideo) ───────────────────────────
+    def set_label_style(self, color=None, size=None, anchor=None):
+        """Push the on-video label style from config['overlay'] (color=fill,
+        size=font_size, anchor=corner). Editing these in settings and calling
+        this on every existing tile makes style edits update live (fixes bug
+        (ii)). Re-draws the current label with the new style immediately."""
+        if color is not None:
+            self._label_color = color
+        if size is not None:
+            try:
+                self._label_size = int(size)
+            except (TypeError, ValueError):
+                pass
+        if anchor is not None:
+            self._label_anchor = anchor
+        self._draw_video_label()
+
+    def set_video_label(self, text):
+        """Set the on-video activity label text ('<label> - <ShipType>', already
+        composed by the caller). Empty text hides the label entirely (canvas
+        cleared, not placed). Clamped to never overflow/fill the tile."""
+        self._label_text = text or ""
+        self._draw_video_label()
+
+    def video_label_text(self) -> str:
+        """The last-drawn (post-clamp is not applied here) on-video label text —
+        for tests/logging."""
+        return self._label_text
+
+    def _draw_video_label(self):
+        """Render the on-video label: clamp text+size to the current body, then
+        draw a black 8-direction outline with the coloured fill on top. Empty
+        text withdraws (place_forget) the canvas so the body stays clean."""
+        cv = getattr(self, "_label_canvas", None)
+        if cv is None:
+            return
+        try:
+            cv.delete("all")
+        except tk.TclError:
+            return
+        text = self._label_text
+        if not text:
+            if self._label_placed:
+                try:
+                    cv.place_forget()
+                except tk.TclError:
+                    pass
+                self._label_placed = False
+            return
+        body_w = self._w if self._w > 0 else 0
+        body_h = self._body_h if self._body_h > 0 else 0
+        shown, size = clamp_label(text, self._label_size, body_w, body_h)
+        font = ("Consolas", size, "bold")
+        relx, rely, tk_anchor = label_anchor_placement(self._label_anchor)
+        # Place the canvas to fill the body; it draws the text at the matching
+        # corner itself, so a single full-body canvas covers all four anchors.
+        try:
+            cv.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
+            self._label_placed = True
+            cv.update_idletasks()
+        except tk.TclError:
+            pass
+        # Text position inside the canvas: pad in from the chosen corner.
+        pad = _LABEL_PAD
+        if "left" in (self._label_anchor or ""):
+            tx = pad
+        elif "right" in (self._label_anchor or ""):
+            tx = max(pad, body_w - pad) if body_w else pad
+        else:
+            tx = pad
+        if (self._label_anchor or "").startswith("bottom"):
+            ty = max(pad, body_h - pad) if body_h else pad
+        else:
+            ty = pad
+        try:
+            for dx, dy in _LABEL_OUTLINE_OFFSETS:
+                cv.create_text(tx + dx, ty + dy, text=shown, anchor=tk_anchor,
+                               fill=_LABEL_OUTLINE, font=font)
+            cv.create_text(tx, ty, text=shown, anchor=tk_anchor,
+                           fill=self._label_color, font=font)
         except tk.TclError:
             pass
 

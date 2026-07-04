@@ -115,3 +115,15 @@ def test_build_state_online(monkeypatch):
                         lambda sid: {"name": "Jita"}, raising=False)
     st = host._overlay_build_state(auth, do_online=True)
     assert st.online is False
+
+
+def test_build_state_populates_ship_type_name(monkeypatch):
+    # The on-video caption uses CharState.ship_type_name, so the poller MUST
+    # populate it from the ESI ship payload's ship_name (caption-onvideo).
+    host = _state_host(monkeypatch)
+    auth = FakeAuth("Delta", 4,
+                    ship={"ship_type_id": 11957, "ship_name": "Onyx"})
+    monkeypatch.setattr(_fcg, "get_system_info",
+                        lambda sid: {"name": "Jita"}, raising=False)
+    st = host._overlay_build_state(auth, do_online=False)
+    assert st.ship_type_name == "Onyx"

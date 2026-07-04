@@ -99,6 +99,7 @@ import preview_layout
 import hotkey_service
 import damage_flash
 from gamelog_monitor import GamelogMonitor
+import preview_tile
 from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -11847,6 +11848,15 @@ class FCToolGUI:
         set_active = getattr(tile, "set_active", None)
         if set_active is not None:
             set_active(bool(key) and key == self._preview_last_key)
+        # caption-onvideo: push the on-video label style from config['overlay']
+        # (color/font_size/anchor) so a freshly-spawned tile already matches the
+        # saved settings; live edits go through _overlay_apply_style → all tiles.
+        set_style = getattr(tile, "set_label_style", None)
+        if set_style is not None:
+            ocfg = self._overlay_cfg()
+            set_style(color=ocfg.get("color", "#ffffff"),
+                      size=int(ocfg.get("font_size", 11)),
+                      anchor=ocfg.get("anchor", "top-left"))
         # BUG B: keep the tile's lock_layout flag in lockstep with config so a
         # live toggle gates drag-moves without respawning the tile.
         set_lock = getattr(tile, "set_lock_layout", None)
@@ -12245,10 +12255,18 @@ class FCToolGUI:
     def _preview_compose_captions(self, cur):
         """Set each live tile's caption from its staleness-checked ESI state +
         rules/overrides + (optionally) the active doctrine's tag for its hull.
-        Built once per tick: one doctrine tag index shared across all tiles."""
+        Built once per tick: one doctrine tag index shared across all tiles.
+
+        Two channels (caption-onvideo):
+          - the STRIP (name + status dot + role chip) is gated by `captions`;
+          - the ON-VIDEO activity label ('<label> - <ShipType>') is drawn on the
+            tile body at the configured corner, gated by `labels_on_video`. The
+            activity label reuses the same rule/override/doctrine precedence
+            (_preview_caption_parts' `tag`) and is joined with the pilot's ship
+            TYPE name via preview_tile.format_tile_label."""
         cfg = self._preview_cfg()
-        if not cfg.get("captions", True):
-            return
+        do_strip = bool(cfg.get("captions", True))
+        do_video = bool(cfg.get("labels_on_video", False))
         rules = self._overlay_rules()
         overrides = self._overlay_cfg().get("overrides", {}) or {}
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
@@ -12261,54 +12279,41 @@ class FCToolGUI:
                 continue
             state = None if client.is_login else self._preview_state_for(client.key)
             role_chip = self._preview_role_chip(client) if show_chip else ""
-            parts = self._preview_caption_parts(
+            name, dot, chip, activity = self._preview_caption_parts(
                 client, state, rules, overrides, role_chip, tag_index,
                 doctrine_tag_captions)
             try:
-                tile.set_caption(*parts)
+                if do_strip:
+                    tile.set_caption(name, dot, chip, activity)
+                # On-video activity label: '<label> - <ShipType>'. Login screens
+                # and rule-less pilots with no ship resolve to '' → hidden.
+                if do_video:
+                    ship_name = "" if (client.is_login or state is None) \
+                        else (state.ship_type_name or "")
+                    tile.set_video_label(
+                        preview_tile.format_tile_label(activity, ship_name))
+                else:
+                    tile.set_video_label("")
             except tk.TclError:
                 pass
 
     def _preview_compose_video_labels(self, cur):
-        """Task B2: optional on-video rule labels drawn by the shared OverlayWindow.
+        """caption-onvideo: native on-video labels are now drawn DIRECTLY on each
+        tile body (see _preview_compose_captions → tile.set_video_label), styled
+        live from config['overlay'] color/size/anchor. The separate desktop-span
+        OverlayWindow is no longer used for NATIVE mode — this method only clears
+        any legacy OverlayWindow that a prior eveo_labels session left behind, so
+        stale click-through label forms never linger over the native tiles.
 
-        When `labels_on_video` is on, draw the (same) overlay_rules label used by
-        the caption strip ON TOP of each tile's video body — but ONLY for tiles
-        whose rule label is non-empty (login screens / rule-less pilots stay
-        clean). Rects are the controller's own tracked screen rects (physical px),
-        offset down by the caption-strip height so the label sits over the video,
-        not the strip. The OverlayWindow is created lazily and only when the
-        option is on. With the option off, an already-existing overlay is cleared
-        with [] (the strip carries the label instead); no overlay is created."""
-        cfg = self._preview_cfg()
-        on = bool(cfg.get("labels_on_video", False))
-        if not on:
-            if self._overlay is not None:
-                try:
-                    self._overlay.set_labels([])   # strips own the labels now
-                except Exception:
-                    pass
-            return
-        rules = self._overlay_rules()
-        overrides = self._overlay_cfg().get("overrides", {}) or {}
-        items = []
-        for hwnd, client in cur.items():
-            if hwnd not in self._preview_tiles or client.is_login:
-                continue
-            rect = self._preview_tile_rects.get(hwnd)
-            if not rect:
-                continue
-            state = self._preview_state_for(client.key)
-            label = overlay_rules.label_for(state, rules, overrides) if state else ""
-            if not label:
-                continue
-            x, y, w, body_h = rect
-            body = (x, y + _TILE_STRIP_H, x + w, y + _TILE_STRIP_H + body_h)
-            items.append((body, label))
-        try:
-            self._overlay_ensure_window().set_labels(items)
-        except Exception:
-            log.exception("[preview] on-video label draw failed")
+        The OverlayWindow routing is retained solely for `eveo_labels` mode (that
+        path draws over Eve-O Preview thumbnails, which are not FCTool tiles and
+        so have no place to host a child label)."""
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.set_labels([])   # tiles own the on-video labels now
+            except Exception:
+                pass
 
     #: Fleet-role -> caption chip glyph. squad_member (and any unknown role)
     #: renders no chip so the common case stays clean.
@@ -13750,6 +13755,19 @@ class FCToolGUI:
                 self._overlay.set_font_size(cfg["font_size"])
                 self._overlay.set_color(cfg["color"])
                 self._overlay.set_anchor(cfg["anchor"])
+            except Exception:
+                pass
+        # caption-onvideo (Change 2): push the same color/size/anchor to every
+        # EXISTING native tile so editing settings updates the on-video label
+        # live — this is what fixes bug (ii) (the native strip/label was styled
+        # from FIXED Tk styling before; now it follows config['overlay']).
+        for tile in getattr(self, "_preview_tiles", {}).values():
+            set_style = getattr(tile, "set_label_style", None)
+            if set_style is None:
+                continue
+            try:
+                set_style(color=cfg["color"], size=cfg["font_size"],
+                          anchor=cfg["anchor"])
             except Exception:
                 pass
         self._save_config()

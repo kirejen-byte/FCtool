@@ -192,6 +192,70 @@ def test_zoom_suppressed_while_dragging():
         root.destroy()
 
 
+# ── (caption-onvideo) on-video anchored label + live style + name ellipsize ───
+def test_set_label_style_stores_color_size_anchor():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.set_label_style(color="#ff8800", size=16, anchor="bottom-right")
+        assert tile._label_color == "#ff8800"
+        assert tile._label_size == 16
+        assert tile._label_anchor == "bottom-right"
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_set_video_label_draws_and_empty_hides():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.place(0, 0, 384, 216)
+        tile.set_label_style(color="#00d4ff", size=12, anchor="top-left")
+        tile.set_video_label("Cyno - Onyx")
+        # the on-video canvas has drawn outline + fill items for the text
+        items = tile._label_canvas.find_all()
+        assert len(items) >= 2                    # >=1 outline + 1 fill
+        assert tile.video_label_text() == "Cyno - Onyx"
+        # empty text clears the canvas (nothing drawn)
+        tile.set_video_label("")
+        assert tile._label_canvas.find_all() == ()
+        assert tile.video_label_text() == ""
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_set_video_label_uses_configured_fill_color():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.place(0, 0, 384, 216)
+        tile.set_label_style(color="#ff0000", size=12, anchor="top-left")
+        tile.set_video_label("Cyno")
+        fills = {tile._label_canvas.itemcget(i, "fill")
+                 for i in tile._label_canvas.find_all()}
+        assert "#ff0000" in fills                 # configured fill present
+        assert "#000000" in fills                 # black outline present
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_caption_name_ellipsized_on_narrow_tile():
+    root = _root()
+    try:
+        tile = _make_tile(root)
+        tile.place(0, 0, 120, 216)                # narrow tile
+        tile.set_caption("A" * 60, dot="#3fbf5f", chip="", tag="")
+        shown = tile._name_lbl.cget("text")
+        assert shown.endswith("…")                # name truncated to fit the row
+        assert len(shown) < 60
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
 # ── (C4) mouse-model modifier ladder: exclude / switch-external / highlight ────
 class _Evt:
     """Minimal <ButtonRelease-1> event stand-in (no real Tk event needed)."""

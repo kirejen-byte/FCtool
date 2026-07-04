@@ -403,6 +403,42 @@ def test_style_change_persists_live():
         root.destroy()
 
 
+class _StyleTile:
+    """Records set_label_style pushes (caption-onvideo live-style test)."""
+    def __init__(self):
+        self.styles = []
+    def set_label_style(self, color=None, size=None, anchor=None):
+        self.styles.append((color, size, anchor))
+
+
+def test_apply_style_pushes_to_native_tiles_live():
+    # Change 2: editing color/size/anchor in settings pushes the new on-video
+    # label style to EVERY existing native tile (this is what fixes bug (ii)).
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    host.config["preview"] = {"mode": "native"}
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        t1, t2 = _StyleTile(), _StyleTile()
+        host._preview_tiles = {1: t1, 2: t2}
+        host._overlay_size_var.set(18)
+        host._overlay_color_val = "#ff8800"
+        host._overlay_anchor_var.set("Bottom-right")
+        host._overlay_apply_style()
+        # both tiles received the new style with the persisted cfg values
+        for t in (t1, t2):
+            assert t.styles, "tile should have received a style push"
+            color, size, anchor = t.styles[-1]
+            assert color == "#ff8800"
+            assert size == 18
+            assert anchor == "bottom-right"
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
 import time as _time
 from overlay_rules import OverlayRule
 
