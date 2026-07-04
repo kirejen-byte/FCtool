@@ -114,8 +114,10 @@ class TileWindow:
 
     def __init__(self, root, char_key, palette, win32=None, dwm=None,
                  on_activate=None, on_minimize=None, on_move_end=None,
-                 on_resize_end=None, on_exclude=None, on_switch_external=None):
+                 on_resize_end=None, on_exclude=None, on_switch_external=None,
+                 lock_layout=False):
         self._win32 = win32 or _real_tile_win32()
+        self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
         self._key = char_key
         self._palette = palette
@@ -152,6 +154,12 @@ class TileWindow:
         self._press_pos = None        # (x, y) tile position at press
         self._press_size = None       # (w, body_h) at press
         self._mode = None             # None | "move" | "resize"
+
+        # LEFT-drag-on-strip (title-bar) move state (BUG B). Separate from the
+        # body left-click (activate) path and from the right-drag move path.
+        self._strip_press_root = None  # (x_root, y_root) at strip button-1 press
+        self._strip_press_pos = None   # (x, y) tile position at strip press
+        self._strip_moving = False     # True once a strip left-drag passed jitter
 
         bg_panel = palette.get("BG_PANEL", "#16213e")
         bg_dark = palette.get("BG_DARK", "#1a1a2e")
@@ -217,13 +225,24 @@ class TileWindow:
 
     # ── mouse model (EVE-O parity) ──────────────────────────────────────────
     def _bind_mouse(self):
+        # RIGHT-drag move/resize + LEFT click-activate are bound on every widget.
         for w in (self.top, self._strip, self._body, self._name_lbl,
                   self._chip_lbl, self._tag_lbl, self._dot):
-            w.bind("<Button-1>", self._on_b1_press)
-            w.bind("<ButtonRelease-1>", self._on_b1_release)
             w.bind("<Button-3>", self._on_b3_press)
             w.bind("<B3-Motion>", self._on_b3_motion)
             w.bind("<ButtonRelease-3>", self._on_b3_release)
+        # LEFT on the BODY (and toplevel) = activate/minimize/etc (click semantics).
+        for w in (self.top, self._body):
+            w.bind("<Button-1>", self._on_b1_press)
+            w.bind("<ButtonRelease-1>", self._on_b1_release)
+        # LEFT on the CAPTION STRIP = title-bar drag-to-move; a plain click there
+        # still activates (BUG B). The strip cluster (strip + its child labels)
+        # gets the strip handlers so a left-drag anywhere on the caption moves.
+        for w in (self._strip, self._name_lbl, self._excl_lbl, self._chip_lbl,
+                  self._tag_lbl, self._dot):
+            w.bind("<ButtonPress-1>", self._on_strip_b1_press)
+            w.bind("<B1-Motion>", self._on_strip_b1_motion)
+            w.bind("<ButtonRelease-1>", self._on_strip_b1_release)
 
     def _on_b1_press(self, event):
         self._b1_press_root = (event.x_root, event.y_root)
@@ -250,9 +269,68 @@ class TileWindow:
         else:                               # plain Left → activate
             self._on_activate(self._key)
 
+    # ── LEFT-drag-to-move on the caption strip (title-bar semantics, BUG B) ──
+    def set_lock_layout(self, flag):
+        """When True, BOTH left-drag (strip) and right-drag moves are no-ops. The
+        controller pushes this from the `lock_layout` config so a locked layout
+        can't be nudged by an instinctive drag."""
+        self._lock_layout = bool(flag)
+
+    def _on_strip_b1_press(self, event):
+        # Record the press so a left-drag on the caption can move the tile. A plain
+        # click (release within jitter) falls through to the activate ladder. Anchor
+        # on self._pos (the authoritative last-placed PHYSICAL top-left) rather than
+        # Tk winfo_root* — Tk geometry is logical px under PMv2 and would misplace.
+        self._strip_press_root = (event.x_root, event.y_root)
+        self._strip_press_pos = self._pos
+        self._strip_moving = False
+
+    def _on_strip_b1_motion(self, event):
+        press = self._strip_press_root
+        if press is None or self._lock_layout:
+            return  # not tracking, or layout locked → no move
+        dx = event.x_root - press[0]
+        dy = event.y_root - press[1]
+        if not self._strip_moving:
+            if abs(dx) <= _MOVE_JITTER and abs(dy) <= _MOVE_JITTER:
+                return  # still within jitter → treat as a click, not a drag yet
+            self._strip_moving = True
+        x = self._strip_press_pos[0] + dx
+        y = self._strip_press_pos[1] + dy
+        self._pos = (x, y)
+        # SAME Win32 physical-px placement _on_b3_motion uses (GA_ROOT hwnd).
+        self._win32.set_window_pos(self._hwnd, x, y, self._w,
+                                   self._body_h + STRIP_H)
+
+    def _on_strip_b1_release(self, event):
+        press = self._strip_press_root
+        self._strip_press_root = None
+        if press is None:
+            return
+        if self._strip_moving:
+            self._strip_moving = False
+            if self._lock_layout:
+                return
+            dx = event.x_root - press[0]
+            dy = event.y_root - press[1]
+            x = self._strip_press_pos[0] + dx
+            y = self._strip_press_pos[1] + dy
+            self._pos = (x, y)
+            self._on_move_end(self._key, x, y)
+            return
+        # No drag → a plain caption click: run the same activate/modifier ladder
+        # as a body left-click (reuse the _on_b1_release semantics). Seed the
+        # press anchor from the strip press so the jitter check inside sees a
+        # click, then dispatch the release (which reads modifiers off `event`).
+        self._b1_press_root = press
+        self._on_b1_release(event)
+
     def _on_b3_press(self, event):
         self._press_root = (event.x_root, event.y_root)
-        self._press_pos = self._cur_pos()
+        # Anchor on self._pos (authoritative last-placed PHYSICAL top-left), not
+        # Tk winfo_root* (logical px under PMv2 → misplaces). Matches the strip
+        # left-drag path so both move gestures share one coordinate basis.
+        self._press_pos = self._pos
         self._press_size = (self._w, self._body_h)
         # resize if Ctrl (0x0004) or left button (0x0100) is also held
         self._mode = "resize" if (event.state & 0x0004 or
@@ -271,6 +349,8 @@ class TileWindow:
                                        self._press_pos[1], w, body_h + STRIP_H)
             self._push_thumb_rect()
         else:  # move
+            if self._lock_layout:
+                return  # locked layout → right-drag move is a no-op (BUG B)
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
             self._pos = (x, y)
@@ -287,7 +367,7 @@ class TileWindow:
         self._mode = None
         if mode == "resize":
             self._on_resize_end(self._key, self._w, self._body_h)
-        else:
+        elif not self._lock_layout:
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
             self._on_move_end(self._key, x, y)

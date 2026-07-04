@@ -299,3 +299,129 @@ def test_set_excluded_shows_badge_dot_and_clears():
         tile.destroy()
     finally:
         root.destroy()
+
+
+# ── (BUG B) LEFT-drag-to-move on the caption strip (title-bar semantics) ──────
+def _move_tile(root, w32=None):
+    """Tile with a recording on_move_end callback for left/right drag tests."""
+    moves = []
+    tile = pt.TileWindow(
+        root, "kirejen", PALETTE, win32=w32 or FakeTileWin32(), dwm=FakeDwm(),
+        on_activate=lambda k: None, on_minimize=lambda k: None,
+        on_move_end=lambda k, x, y: moves.append((k, x, y)),
+        on_resize_end=lambda k, w, h: None)
+    return tile, moves
+
+
+def test_left_drag_on_strip_past_jitter_moves_via_win32():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, moves = _move_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        hwnd = w32.get_root_hwnd(tile.top.winfo_id())
+        n = len(w32.placed)
+        # press on the strip, drag +50,+30 (past _MOVE_JITTER), release
+        tile._on_strip_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_strip_b1_motion(_Evt(x_root=60, y_root=40))
+        # a set_window_pos with the GA_ROOT hwnd and the right delta was issued
+        assert w32.placed[-1] == (hwnd, 150, 230, 384, 216 + pt.STRIP_H)
+        assert len(w32.placed) > n
+        tile._on_strip_b1_release(_Evt(x_root=60, y_root=40))
+        # move committed via on_move_end with the final position
+        assert moves[-1] == ("kirejen", 150, 230)
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_left_click_within_jitter_on_strip_still_activates():
+    root = _root()
+    try:
+        activated = []
+        tile = pt.TileWindow(
+            root, "kirejen", PALETTE, win32=FakeTileWin32(), dwm=FakeDwm(),
+            on_activate=lambda k: activated.append(k),
+            on_minimize=lambda k: None,
+            on_move_end=lambda k, x, y: None,
+            on_resize_end=lambda k, w, h: None)
+        tile.place(100, 200, 384, 216)
+        # a plain left press+release within jitter on the strip = activate, no move
+        tile._on_strip_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_strip_b1_release(_Evt(x_root=12, y_root=11))
+        assert activated == ["kirejen"]
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_lock_layout_makes_left_drag_noop():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, moves = _move_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.set_lock_layout(True)
+        n = len(w32.placed)
+        tile._on_strip_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_strip_b1_motion(_Evt(x_root=200, y_root=200))   # far drag
+        tile._on_strip_b1_release(_Evt(x_root=200, y_root=200))
+        assert len(w32.placed) == n        # no placement while locked
+        assert moves == []                 # no move committed
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_lock_layout_makes_right_drag_noop():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, moves = _move_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.set_lock_layout(True)
+        n = len(w32.placed)
+        tile._on_b3_press(_Evt(state=0, x_root=10, y_root=10))
+        tile._on_b3_motion(_Evt(state=0, x_root=200, y_root=200))
+        tile._on_b3_release(_Evt(state=0, x_root=200, y_root=200))
+        assert len(w32.placed) == n        # right-drag move suppressed while locked
+        assert moves == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_lock_layout_via_constructor_param():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile = pt.TileWindow(
+            root, "kirejen", PALETTE, win32=w32, dwm=FakeDwm(),
+            on_activate=lambda k: None, on_minimize=lambda k: None,
+            on_move_end=lambda k, x, y: None,
+            on_resize_end=lambda k, w, h: None, lock_layout=True)
+        tile.place(100, 200, 384, 216)
+        n = len(w32.placed)
+        tile._on_strip_b1_press(_Evt(x_root=10, y_root=10))
+        tile._on_strip_b1_motion(_Evt(x_root=200, y_root=200))
+        assert len(w32.placed) == n        # locked from construction → no move
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_right_drag_still_moves_when_unlocked():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, moves = _move_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        hwnd = w32.get_root_hwnd(tile.top.winfo_id())
+        tile._on_b3_press(_Evt(state=0, x_root=10, y_root=10))
+        tile._on_b3_motion(_Evt(state=0, x_root=70, y_root=50))
+        assert w32.placed[-1] == (hwnd, 160, 240, 384, 216 + pt.STRIP_H)
+        tile._on_b3_release(_Evt(state=0, x_root=70, y_root=50))
+        assert moves[-1] == ("kirejen", 160, 240)
+        tile.destroy()
+    finally:
+        root.destroy()

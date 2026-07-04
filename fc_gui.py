@@ -699,6 +699,7 @@ class FCToolGUI:
         self._preview_intel = {}               # system_id -> (ts, kind)
         self._preview_disabled_session = False
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
+        self._preview_tick_fails = 0           # consecutive failed ticks (BUG A guard)
         self._preview_last_key = ""            # last-activated char key (cycle anchor)
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
@@ -11465,6 +11466,7 @@ class FCToolGUI:
             on_resize_end=self._preview_on_tile_resize_end,
             on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
             on_switch_external=self._preview_on_tile_switch_external,  # C4: Ctrl+Shift+Left
+            lock_layout=bool(self._preview_cfg().get("lock_layout", False)),
         )
         tile.place(x, y, w, body_h)
         return tile
@@ -11503,6 +11505,11 @@ class FCToolGUI:
         set_active = getattr(tile, "set_active", None)
         if set_active is not None:
             set_active(bool(key) and key == self._preview_last_key)
+        # BUG B: keep the tile's lock_layout flag in lockstep with config so a
+        # live toggle gates drag-moves without respawning the tile.
+        set_lock = getattr(tile, "set_lock_layout", None)
+        if set_lock is not None:
+            set_lock(bool(cfg.get("lock_layout", False)))
         # C4: keep the cycle-exclusion badge in sync (survives retire/respawn).
         set_excluded = getattr(tile, "set_excluded", None)
         if set_excluded is not None:
@@ -11586,6 +11593,23 @@ class FCToolGUI:
                     break
         self._preview_last_key = client.key
         window_activator.activate(client.hwnd)
+        # BUG A (occlusion): the just-activated EVE client jumps to the top of the
+        # z-order. Without an immediate re-assert the tiles vanish behind it for up
+        # to one tick (~250 ms). Re-top every tile (and the overlay) ONCE right now
+        # so they ride above the activated client instantly. retop() is pure
+        # z-order (HWND_TOPMOST, SWP_NOACTIVATE|NOMOVE|NOSIZE) — no focus change,
+        # so it never steals focus back from the client we just activated.
+        for tile in list(self._preview_tiles.values()):
+            try:
+                tile.retop()
+            except Exception:
+                pass
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.retop()
+            except Exception:
+                pass
 
     def _preview_on_tile_activate(self, key):
         for c in self._preview_clients.values():
@@ -12202,12 +12226,15 @@ class FCToolGUI:
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
                     else:
                         tile.set_border(highlight)
-                except OSError:
-                    # Per-tile DWM failure (client died mid-tick, or DWM restarted
-                    # and invalidated every handle). Retire THIS tile only — the
-                    # client is still in `cur`, so the next tick respawns it with a
-                    # fresh registration. Only tracker-level/unexpected exceptions
-                    # disable the session.
+                except Exception:
+                    # Per-tile failure of ANY kind (DWM handle invalidated, a Tk
+                    # op after a foreground change, a client that died mid-tick).
+                    # Retire THIS tile ONLY and keep iterating the remaining
+                    # clients — a single tile throwing must never nuke every tile
+                    # or cancel the loop (BUG A). The client is still in `cur`, so
+                    # the next tick respawns it with a fresh registration.
+                    log.exception("[preview] tile %r failed this tick; retiring it",
+                                  hwnd)
                     self._preview_retire_tile(hwnd)
             for hwnd, tile in self._preview_tiles.items():
                 if hwnd in hidden:
@@ -12226,12 +12253,23 @@ class FCToolGUI:
             # the GamelogMonitor tails only pilots the user chose to preview.
             self._preview_sync_gamelog_scope()
             self._preview_tick_count += 1
+            # A fully-successful tick clears the consecutive-failure counter so a
+            # transient blip never accumulates toward the disable threshold.
+            self._preview_tick_fails = 0
             n = len(cur)
             return f"● {n} client{'s' if n != 1 else ''} · {len(self._preview_tiles)} tiles"
         except Exception:
-            log.exception("[preview] native tick failed; disabling for session")
-            self._preview_disable_session()
-            return "⚠ native previews disabled (error) — see log"
+            # BUG A: a single failed tick must NOT tear down the whole session.
+            # Log, count the consecutive failure, and SKIP this tick (the caller
+            # reschedules the after as normal). Only give up after >=5 ticks fail
+            # back-to-back — a genuinely broken environment, not a transient throw.
+            self._preview_tick_fails = getattr(self, "_preview_tick_fails", 0) + 1
+            log.exception("[preview] native tick failed (%d in a row)",
+                          self._preview_tick_fails)
+            if self._preview_tick_fails >= 5:
+                self._preview_disable_session()
+                return "⚠ native previews disabled (repeated errors) — see log"
+            return "⚠ native preview tick skipped (error) — see log"
 
     def _preview_start_gamelog(self):
         """Lazily create + start the UTF-8 Gamelog monitor feeding damage flash

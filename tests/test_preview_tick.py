@@ -145,6 +145,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     host._preview_intel = {}
     host._preview_disabled_session = False
     host._preview_tick_count = 0
+    host._preview_tick_fails = 0
     host._preview_last_key = ""
     host._preview_find_clients = lambda: []
     host._preview_status = ""
@@ -355,16 +356,60 @@ def test_hotkey_cycle_activates_next_live_client(monkeypatch):
     assert activated == [3]
 
 
-# ── (g) tracker exception → disable-for-session, no crash ─────────────────────
-def test_tracker_exception_disables_session_without_crashing():
+# ── (g) tracker exception → skip tick, disable only after >=5 in a row ────────
+def test_tracker_exception_skips_tick_without_crashing_or_disabling():
     host = make_host()
 
     def boom():
         raise RuntimeError("enum blew up")
     host._preview_find_clients = boom
-    # must not raise
+    # a single failed tick must NOT disable the session (log-and-continue)
     host._preview_native_tick_body()
+    assert host.disabled_session_called == 0
+    assert host._preview_tick_fails == 1
+
+
+def test_five_consecutive_failed_ticks_disable_session():
+    host = make_host()
+
+    def boom():
+        raise RuntimeError("enum blew up")
+    host._preview_find_clients = boom
+    for _ in range(4):
+        host._preview_native_tick_body()
+    assert host.disabled_session_called == 0        # 4 in a row: still alive
+    assert host._preview_tick_fails == 4
+    host._preview_native_tick_body()                # 5th consecutive failure
     assert host.disabled_session_called == 1
+    assert host._preview_disabled_session is True
+
+
+def test_four_failures_then_success_does_not_disable():
+    host = make_host(layouts={"kirejen": [0, 0, 384, 216]})
+
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise RuntimeError("enum blew up")
+        return [_cw(1, "Kirejen")]
+    host._preview_find_clients = flaky
+    for _ in range(4):
+        host._preview_native_tick_body()
+    assert host._preview_tick_fails == 4
+    host._preview_native_tick_body()                # 5th tick succeeds
+    assert host.disabled_session_called == 0
+    assert host._preview_tick_fails == 0            # counter reset on success
+    # a subsequent failure starts the count fresh (not immediately fatal)
+    host._preview_find_clients = flaky              # calls["n"] now >4 → returns client
+    # force a failure again to confirm the counter restarts from 0
+    def boom():
+        raise RuntimeError("boom")
+    host._preview_find_clients = boom
+    host._preview_native_tick_body()
+    assert host._preview_tick_fails == 1
+    assert host.disabled_session_called == 0
 
 
 # ── (h) EVE-O running in native mode → tiles NOT started, status mentions EVE-O
@@ -422,6 +467,82 @@ def test_per_tile_oserror_retires_only_that_tile(monkeypatch):
     tick(host)
     assert host.disabled_session_called == 0
     assert host._preview_tiles == {}
+
+
+# ── per-tile NON-OSError → retire ONLY that tile, session + loop survive ──────
+def test_per_tile_arbitrary_exception_retires_only_that_tile_session_survives(
+        monkeypatch):
+    # Two live clients; one tile's per-tile work throws a plain Exception. Only
+    # the offending tile is retired; the other tile survives and the loop stays
+    # scheduled (session NOT disabled). This is the core BUG-A regression guard.
+    host = make_host(layouts={"a": [0, 0, 384, 216], "b": [1, 1, 384, 216]})
+    ca, cb = _cw(1, "A"), _cw(2, "B")
+    host._preview_find_clients = lambda: [ca, cb]
+    tick(host)
+    assert set(host._preview_tiles) == {1, 2}
+    bad = host._preview_tiles[1]
+    good = host._preview_tiles[2]
+
+    def boom(*a, **k):
+        raise RuntimeError("per-tile blew up after foreground change")
+    bad.set_badge = boom
+    status = tick(host)
+    # session survived: not disabled, counter reset (a successful tick overall)
+    assert host.disabled_session_called == 0
+    assert host._preview_disabled_session is False
+    assert host._preview_tick_fails == 0
+    # ONLY the offending tile retired; the other still populated
+    assert 1 not in host._preview_tiles
+    assert host._preview_tiles.get(2) is good
+    # the tick returned a normal status (loop still schedules)
+    assert isinstance(status, str) and status.startswith("●")
+
+
+# ── (BUG A part 2) activation immediately re-asserts tile+overlay z-order ─────
+def test_switch_to_retops_tiles_and_overlay_immediately_after_activate(monkeypatch):
+    order = []
+    monkeypatch.setattr(window_activator, "activate",
+                        lambda hwnd, **k: order.append(("activate", hwnd)) or True)
+    host = make_host(mode="native", layouts={"a": [0, 0, 384, 216],
+                                             "b": [1, 1, 384, 216]})
+    for name in ("_preview_switch_to",):
+        setattr(host, name, types.MethodType(getattr(fc_gui.FCToolGUI, name), host))
+    ca, cb = _cw(1, "A"), _cw(2, "B")
+    host._preview_clients = {1: ca, 2: cb}
+    ta = FakeTile(host, "a")
+    tb = FakeTile(host, "b")
+    host._preview_tiles = {1: ta, 2: tb}
+    host._overlay = FakeOverlay(host)
+    # patch tile.retop to also record ordering relative to activate
+    orig_ta_retop, orig_tb_retop = ta.retop, tb.retop
+    ta.retop = lambda: (order.append(("tile", "a")), orig_ta_retop())
+    tb.retop = lambda: (order.append(("tile", "b")), orig_tb_retop())
+    host._overlay.retop = lambda: order.append(("overlay",))
+
+    host._preview_switch_to(cb)                          # activate B
+
+    # activate happened, then tiles retopped, then overlay retopped
+    assert order[0] == ("activate", 2)
+    assert ("tile", "a") in order and ("tile", "b") in order
+    assert order[-1] == ("overlay",)
+    # retops happen AFTER activate (immediate z-order re-assert)
+    assert order.index(("activate", 2)) < order.index(("tile", "a"))
+    assert order.index(("activate", 2)) < order.index(("overlay",))
+
+
+def test_switch_to_retop_survives_no_overlay(monkeypatch):
+    # Overlay absent (None) → activation still retops tiles, no crash.
+    monkeypatch.setattr(window_activator, "activate", lambda hwnd, **k: True)
+    host = make_host(mode="native")
+    setattr(host, "_preview_switch_to",
+            types.MethodType(fc_gui.FCToolGUI._preview_switch_to, host))
+    cb = _cw(2, "B")
+    host._preview_clients = {2: cb}
+    tb = FakeTile(host, "b")
+    host._preview_tiles = {2: tb}
+    host._overlay = None
+    host._preview_switch_to(cb)
+    assert tb.retops == 1                                # tile retopped once
 
 
 # ── (A10) hotkey service lifecycle wiring ────────────────────────────────────
