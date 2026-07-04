@@ -334,6 +334,7 @@ def _ui_host(overlay_cfg=None):
                  "_overlay_apply_style",
                  "_overlay_status_text", "_overlay_compose_items",
                  "_overlay_rules", "_overlay_state_for", "_overlay_enable",
+                 "_overlay_seed_rules_if_empty",
                  "_overlay_disable", "_overlay_teardown", "_overlay_ensure_window",
                  "_overlay_start_poller", "_overlay_stop_poller",
                  "_overlay_poll_loop", "_overlay_poll_plan",

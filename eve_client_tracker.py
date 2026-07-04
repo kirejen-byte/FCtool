@@ -27,8 +27,9 @@ class ClientWindow:
 
     @property
     def key(self) -> str:
-        """Layout/ESI join key: lowercased char name."""
-        return self.char_name.lower()
+        """Layout/ESI join key: stripped + lowercased char name (exact match
+        with the ESI poller's `.strip().lower()` state keys)."""
+        return self.char_name.strip().lower()
 
 
 def _normalize(title: str) -> str:

@@ -995,3 +995,146 @@ def test_import_eveo_cancel_dialog_is_noop(monkeypatch):
     assert called["read"] == 0
     assert host.config["preview"]["layouts"] == {}
     assert host._saved["n"] == 0
+
+
+# ── mode switches drive the REAL ESI-poller lifecycle (net exactly one) ───────
+# Regression guard for the native-mode bug: the poller (single writer of
+# _overlay_states/_preview_layer_hp) must start with native mode, survive as
+# exactly ONE thread across native↔eveo_labels switches, and stop on "off".
+# _preview_set_mode + both enable/teardown paths + poller start/stop are REAL;
+# only the poller THREAD BODY is a probe and the heavy edges (Tk overlay window,
+# hotkeys, gamelog, Win32, tick loops) are stubs. NON-DISRUPTIVE throughout.
+import threading
+import time as _time
+
+
+class _PollerProbe:
+    """Thread BODY for the poller (start/stop machinery stays real): records
+    (thread, captured stop Event) per run — the same first read the real loop
+    does — then parks on that Event until it is fired."""
+
+    def __init__(self, host):
+        self.host = host
+        self.runs = []                    # [(threading.Thread, threading.Event)]
+
+    def __call__(self):
+        stop = self.host._overlay_poller_stop
+        self.runs.append((threading.current_thread(), stop))
+        stop.wait(10.0)
+
+
+def _wait_until(cond, timeout=2.0):
+    deadline = _time.monotonic() + timeout
+    while not cond():
+        if _time.monotonic() > deadline:
+            raise AssertionError("condition not reached within %ss" % timeout)
+        _time.sleep(0.01)
+
+
+def _poller_mode_host(mode):
+    """A _pure_host whose mode boot/teardown paths are the REAL methods (not
+    the recording lambdas), with the poller thread body replaced by a probe."""
+    host = _pure_host(preview_cfg={"mode": mode})
+    for name in ("_preview_enable_native", "_preview_disable_native",
+                 "_preview_teardown",
+                 "_overlay_enable", "_overlay_disable", "_overlay_teardown",
+                 "_overlay_seed_rules_if_empty", "_overlay_cfg",
+                 "_overlay_start_poller", "_overlay_stop_poller"):
+        setattr(host, name,
+                types.MethodType(getattr(fc_gui.FCToolGUI, name), host))
+    host._OVERLAY_DEFAULTS = fc_gui.FCToolGUI._OVERLAY_DEFAULTS
+    probe = _PollerProbe(host)
+    host._overlay_poll_loop = probe       # Thread target resolves this attribute
+    host._overlay_poller_stop = None
+    # overlay edges: no Tk window, no after-loop
+    host._overlay_ensure_window = lambda: None
+    host._overlay_tick = lambda: None
+    host._overlay_states = {}
+    host._overlay_state_ts = {}
+    host._overlay_status_label = None
+    # native edges: no hotkeys/gamelog/Win32/tiles/tick loop
+    host._preview_restart_hotkeys = lambda: None
+    host._preview_start_gamelog = lambda: None
+    host._preview_stop_gamelog = lambda: None
+    host._preview_retire_all_tiles = lambda: None
+    host._preview_tick = lambda: None
+    host._preview_after_id = None
+    host._preview_hotkeys = None
+    host._preview_win32 = object()        # already resolved → no real Win32 lookup
+    host._preview_layer_hp = {}
+    return host, probe
+
+
+def _stop_all_pollers(host, probe):
+    try:
+        host._overlay_stop_poller()
+    except Exception:
+        pass
+    for _t, ev in probe.runs:
+        ev.set()
+
+
+def test_set_mode_off_to_native_starts_the_esi_poller():
+    host, probe = _poller_mode_host("off")
+    try:
+        host._preview_set_mode("native")
+        t = host._overlay_poller
+        assert t is not None and t.is_alive()
+        _wait_until(lambda: probe.runs)
+        # fresh, not-yet-fired stop Event owned by this run
+        assert probe.runs[0][1] is host._overlay_poller_stop
+        assert not probe.runs[0][1].is_set()
+        # native boot seeds the shared label rules for a fresh user
+        assert host.config["overlay"]["rules"]
+    finally:
+        _stop_all_pollers(host, probe)
+
+
+def test_set_mode_native_to_off_stops_the_poller():
+    host, probe = _poller_mode_host("off")
+    try:
+        host._preview_set_mode("native")
+        _wait_until(lambda: len(probe.runs) == 1)
+        t1, ev1 = probe.runs[0]
+        host._preview_set_mode("off")
+        assert host._overlay_poller is None
+        assert ev1.is_set()
+        t1.join(2.0)
+        assert not t1.is_alive()          # zero pollers left
+        assert len(probe.runs) == 1       # and none was started for "off"
+    finally:
+        _stop_all_pollers(host, probe)
+
+
+def test_mode_switch_native_to_eveo_nets_exactly_one_poller_then_off_zero():
+    host, probe = _poller_mode_host("off")
+    try:
+        # off → native: poller #1 up
+        host._preview_set_mode("native")
+        _wait_until(lambda: len(probe.runs) == 1)
+        t1, ev1 = probe.runs[0]
+        assert t1.is_alive()
+        host._overlay_states = {"kirejen": object()}   # simulate a poll pass
+        host._preview_layer_hp = {"kirejen": {"shield": 1.0}}
+
+        # native → eveo_labels: preview teardown stops #1 (and clears its
+        # state), overlay enable starts #2 with a FRESH Event — net exactly one
+        host._preview_set_mode("eveo_labels")
+        _wait_until(lambda: len(probe.runs) == 2)
+        t2, ev2 = probe.runs[1]
+        assert ev1.is_set() and ev2 is not ev1
+        t1.join(2.0)
+        assert not t1.is_alive()          # old poller gone…
+        assert t2.is_alive()              # …new poller running
+        assert host._overlay_poller is t2
+        assert host._overlay_states == {} and host._preview_layer_hp == {}
+
+        # eveo_labels → off: overlay teardown stops #2 — zero pollers left
+        host._preview_set_mode("off")
+        assert host._overlay_poller is None
+        assert ev2.is_set()
+        t2.join(2.0)
+        assert not t2.is_alive()
+        assert len(probe.runs) == 2       # no stray third start
+    finally:
+        _stop_all_pollers(host, probe)

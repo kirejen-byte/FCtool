@@ -749,11 +749,8 @@ class FCToolGUI:
         self._preview_excluded = set()         # session-only cycle-exclusion char keys
         self._preview_last_external_hwnd = None  # last non-EVE, non-ours foreground hwnd
         # Seed rules created once, the first time the feature is enabled.
-        if self._overlay_cfg().get("enabled", False) and not self._overlay_cfg().get("rules"):
-            self._overlay_cfg()["rules"] = [
-                {"when": r.when, "value": r.value, "label": r.label}
-                for r in overlay_rules.seed_rules()
-            ]
+        if self._overlay_cfg().get("enabled", False):
+            self._overlay_seed_rules_if_empty()
         # Auto-start the controller if the user left it enabled last session.
         self.root.after(1200, self._overlay_boot_if_enabled)
 
@@ -11766,14 +11763,21 @@ class FCToolGUI:
         if mode == "eveo_labels" or self._overlay_cfg().get("enabled", False):
             self._overlay_enable()
 
-    def _overlay_enable(self):
+    def _overlay_seed_rules_if_empty(self):
+        """Plant the starter label rules once, the first time either consumer
+        of the shared rules is enabled (Eve-O overlay labels OR native tile
+        captions — both read the same overlay.rules list)."""
         cfg = self._overlay_cfg()
-        cfg["enabled"] = True
         if not cfg.get("rules"):
             cfg["rules"] = [
                 {"when": r.when, "value": r.value, "label": r.label}
                 for r in overlay_rules.seed_rules()
             ]
+
+    def _overlay_enable(self):
+        cfg = self._overlay_cfg()
+        cfg["enabled"] = True
+        self._overlay_seed_rules_if_empty()
         try:
             self._overlay_ensure_window()
         except Exception:
@@ -12712,6 +12716,10 @@ class FCToolGUI:
 
     def _preview_enable_native(self):
         self._preview_disabled_session = False
+        # Native captions consume the SAME overlay.rules list as the Eve-O label
+        # overlay — a native-only fresh user must get the seed rules too (same
+        # condition _overlay_enable uses).
+        self._overlay_seed_rules_if_empty()
         # C2: resolve the real foreground/win32 backend for the hide-on-lost-focus
         # and hide-active rules (lazy real singleton; tests inject their own fake
         # or leave it None to mean "no foreground info → always focused").
@@ -12725,6 +12733,12 @@ class FCToolGUI:
         except Exception:
             log.exception("[preview] hotkey registration failed on enable")
         self._preview_start_gamelog()         # B6: damage-flash source
+        # ESI poller: the single writer of _overlay_states / _overlay_state_ts /
+        # _preview_layer_hp. In native mode _preview_tracked_names routes it to
+        # the live client tiles, feeding captions (rule labels + doctrine tags),
+        # status dots and the damage-flash base-HP pool. Idempotent (no-op while
+        # a poller is already alive).
+        self._overlay_start_poller()
         if self._preview_after_id is None:
             self._preview_tick()
 
@@ -12747,6 +12761,14 @@ class FCToolGUI:
         self._preview_retire_all_tiles()
         self._preview_clients = {}
         self._preview_stop_gamelog()          # B6: stop the damage-flash source
+        # Stop the ESI poller and clear its outputs (symmetry with
+        # _overlay_teardown; also covers _preview_disable_session). A mode
+        # switch then leaves exactly ONE poller: the follow-up enable creates a
+        # fresh stop Event + thread, and "off" leaves zero.
+        self._overlay_stop_poller()
+        self._overlay_states = {}
+        self._overlay_state_ts = {}
+        self._preview_layer_hp = {}
         svc = self._preview_hotkeys
         if svc is not None:
             try:

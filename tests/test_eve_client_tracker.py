@@ -75,3 +75,14 @@ def test_identity_check_rejects_reused_hwnd():
     old = ect.ClientWindow(hwnd=1, char_name="Kirejen", title="EVE - Kirejen",
                            rect=(0, 0, 1, 1), is_iconic=False, pid=5)
     assert not ect.still_same_client(old, win32=w)
+
+
+def test_key_strips_and_lowercases():
+    # .key must match the ESI poller's `.strip().lower()` state keys exactly,
+    # even if a client title carried stray padding around the char name.
+    padded = ect.ClientWindow(hwnd=1, char_name=" Kirejen ", title="EVE -  Kirejen ",
+                              rect=(0, 0, 1, 1), is_iconic=False, pid=5)
+    assert padded.key == "kirejen"
+    plain = ect.ClientWindow(hwnd=2, char_name="Alt Two", title="EVE - Alt Two",
+                             rect=(0, 0, 1, 1), is_iconic=False, pid=6)
+    assert plain.key == "alt two"

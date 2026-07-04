@@ -1653,3 +1653,172 @@ def test_switch_external_noop_when_nothing_captured(monkeypatch):
     host._preview_last_external_hwnd = None
     host._preview_on_tile_switch_external()
     assert activated == []
+
+
+# ── native enable/teardown lifecycle: ESI poller + seed rules + state clears ──
+# The bug fixed here: native mode never started the ESI poller (the ONLY writer
+# of _overlay_states/_preview_layer_hp), so captions never showed rule labels or
+# doctrine tags, status dots stayed dim, and damage flash could never fire.
+# These tests run the REAL _preview_enable_native/_preview_teardown with the
+# REAL _overlay_start_poller/_overlay_stop_poller; only the poller THREAD BODY
+# is a probe (no ESI), and the heavy native edges (hotkeys/gamelog/win32/tick)
+# are stubs. NON-DISRUPTIVE: no window, hotkey, focus grab, or network call.
+import threading
+import time as _time
+
+
+class _PollerProbe:
+    """Replaces the _overlay_poll_loop BODY only (start/stop stay real): each
+    run records (thread, captured stop Event) — the same first read the real
+    daemon loop does — then parks on that Event until it is fired."""
+
+    def __init__(self, host):
+        self.host = host
+        self.runs = []                    # [(threading.Thread, threading.Event)]
+
+    def __call__(self):
+        stop = self.host._overlay_poller_stop
+        self.runs.append((threading.current_thread(), stop))
+        stop.wait(10.0)
+
+
+def _wait_until(cond, timeout=2.0):
+    deadline = _time.monotonic() + timeout
+    while not cond():
+        if _time.monotonic() > deadline:
+            raise AssertionError("condition not reached within %ss" % timeout)
+        _time.sleep(0.01)
+
+
+def _lifecycle_host():
+    host = make_host(mode="native")
+    for name in ("_preview_enable_native", "_preview_teardown",
+                 "_preview_disable_native",
+                 "_overlay_seed_rules_if_empty",
+                 "_overlay_start_poller", "_overlay_stop_poller"):
+        setattr(host, name,
+                types.MethodType(getattr(fc_gui.FCToolGUI, name), host))
+    host._overlay_poller = None
+    host._overlay_poller_stop = None
+    probe = _PollerProbe(host)
+    host._overlay_poll_loop = probe       # Thread target resolves this attribute
+    # heavy native edges stubbed (recorded where an assertion wants them)
+    host.lifecycle_calls = []
+    host._preview_restart_hotkeys = (
+        lambda: host.lifecycle_calls.append("hotkeys"))
+    host._preview_start_gamelog = (
+        lambda: host.lifecycle_calls.append("gamelog"))
+    host._preview_stop_gamelog = (
+        lambda: host.lifecycle_calls.append("gamelog_stop"))
+    host._preview_tick = lambda: host.lifecycle_calls.append("tick")
+    host._preview_win32 = object()        # already resolved → no real Win32 lookup
+    return host, probe
+
+
+def _stop_probe(host, probe):
+    """Belt-and-braces cleanup: fire every recorded stop Event + the current."""
+    try:
+        host._overlay_stop_poller()
+    except Exception:
+        pass
+    for _t, ev in probe.runs:
+        ev.set()
+
+
+def test_enable_native_starts_the_esi_poller():
+    host, probe = _lifecycle_host()
+    try:
+        host._preview_enable_native()
+        t = host._overlay_poller
+        assert t is not None and t.is_alive()
+        _wait_until(lambda: probe.runs)
+        # the body captured the freshly-created (not yet fired) stop Event
+        assert probe.runs[0][1] is host._overlay_poller_stop
+        assert not probe.runs[0][1].is_set()
+        # poller starts after the damage-flash source (gamelog) is up
+        assert "gamelog" in host.lifecycle_calls
+    finally:
+        _stop_probe(host, probe)
+
+
+def test_enable_native_twice_reuses_the_one_alive_poller():
+    host, probe = _lifecycle_host()
+    try:
+        host._preview_enable_native()
+        _wait_until(lambda: len(probe.runs) == 1)
+        t1 = host._overlay_poller
+        host._preview_enable_native()     # idempotent re-boot (set_mode re-assert)
+        assert host._overlay_poller is t1
+        assert len(probe.runs) == 1       # no second thread body ever ran
+    finally:
+        _stop_probe(host, probe)
+
+
+def test_enable_native_seeds_label_rules_when_empty():
+    host, probe = _lifecycle_host()
+    try:
+        assert not host.config.get("overlay", {}).get("rules")
+        host._preview_enable_native()
+        rules = host.config["overlay"]["rules"]
+        # same seed set + dict shape _overlay_enable plants
+        expected = [{"when": r.when, "value": r.value, "label": r.label}
+                    for r in overlay_rules.seed_rules()]
+        assert rules == expected
+        assert {"when": "ship_group", "value": "Force Recon Ship",
+                "label": "Cyno"} in rules
+    finally:
+        _stop_probe(host, probe)
+
+
+def test_enable_native_keeps_existing_label_rules():
+    host, probe = _lifecycle_host()
+    mine = [{"when": "ship_group", "value": "Logistics Cruiser", "label": "Logi"}]
+    host.config["overlay"] = {"rules": list(mine), "overrides": {}}
+    try:
+        host._preview_enable_native()
+        assert host.config["overlay"]["rules"] == mine   # never overwritten
+    finally:
+        _stop_probe(host, probe)
+
+
+def test_preview_teardown_stops_poller_and_clears_state_dicts():
+    host, probe = _lifecycle_host()
+    try:
+        host._preview_enable_native()
+        _wait_until(lambda: probe.runs)
+        t1, ev1 = probe.runs[0]
+        # poller-fed state present from a "previous poll pass"
+        host._overlay_states = {"kirejen": object()}
+        host._overlay_state_ts = {"kirejen": 1.0}
+        host._preview_layer_hp = {"kirejen": {"shield": 4000.0}}
+
+        host._preview_teardown()
+
+        assert host._overlay_poller is None
+        assert ev1.is_set()               # its own stop Event was fired
+        t1.join(2.0)
+        assert not t1.is_alive()
+        # the three poller-fed dicts are cleared (no stale captions/dots/HP)
+        assert host._overlay_states == {}
+        assert host._overlay_state_ts == {}
+        assert host._preview_layer_hp == {}
+    finally:
+        _stop_probe(host, probe)
+
+
+def test_disable_session_stops_the_poller_via_teardown():
+    host, probe = _lifecycle_host()
+    # the REAL session-disable (make_host installs a recorder by default)
+    host._preview_disable_session = types.MethodType(
+        fc_gui.FCToolGUI._preview_disable_session, host)
+    try:
+        host._preview_enable_native()
+        _wait_until(lambda: probe.runs)
+        t1, ev1 = probe.runs[0]
+        host._preview_disable_session()
+        assert host._preview_disabled_session is True
+        assert host._overlay_poller is None and ev1.is_set()
+        t1.join(2.0)
+        assert not t1.is_alive()
+    finally:
+        _stop_probe(host, probe)
