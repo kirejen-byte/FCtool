@@ -537,6 +537,39 @@ def _filter_cap_entries(entries, only_region: str) -> list:
     ]
 
 
+def _exemption_entry_key(entry: dict):
+    """Canonical de-dupe key for a doctrine ideal-% exemption entry.
+
+    A "capital" meta entry de-dupes on kind alone (there is only ever one);
+    "group"/"type" entries de-dupe on (kind, id). Pure so the editor's add
+    helper is unit-testable without Tk."""
+    kind = entry.get("kind")
+    if kind == "capital":
+        return ("capital",)
+    return (kind, entry.get("id"))
+
+
+def _add_exemption_entry(entries: list[dict], new: dict) -> list[dict]:
+    """Return a NEW exemption list with ``new`` appended unless an entry with the
+    same canonical key is already present (a no-op then). Copies entries so the
+    caller's list is never mutated in place."""
+    out = [dict(e) for e in (entries or [])]
+    key = _exemption_entry_key(new)
+    if any(_exemption_entry_key(e) == key for e in out):
+        return out
+    out.append(dict(new))
+    return out
+
+
+def _remove_exemption_entry(entries: list[dict], index: int) -> list[dict]:
+    """Return a NEW exemption list with the entry at ``index`` removed. An
+    out-of-range index is a safe no-op (returns a copy)."""
+    out = [dict(e) for e in (entries or [])]
+    if 0 <= index < len(out):
+        del out[index]
+    return out
+
+
 def _read_text_file_for_import(path: str) -> str:
     """Read a text file for one-time import (EVE-O config). Split out so tests
     can stub it without touching the real filesystem. EVE-O writes UTF-8."""
@@ -3977,9 +4010,12 @@ class FCToolGUI:
                       if tid in ALL_LINKS_COMMAND)
             frac = (cmd / total) if total else 0.0
             try:
+                exempt_ids, hull_ids = self._resolve_exemptions_for_counts(
+                    doc, ship_counts)
                 self._fleet_guidance = fleet_guidance.compute_fleet_guidance(
                     doc, self.fittings.get_fit, self.type_catalog,
-                    ship_counts, total, command_ship_fraction=frac)
+                    ship_counts, total, command_ship_fraction=frac,
+                    exempt_type_ids=exempt_ids, doctrine_hull_ids=hull_ids)
             except Exception as exc:
                 print(f"[Fleet] guidance compute failed: {exc}")
                 self._fleet_guidance = None
@@ -4139,6 +4175,14 @@ class FCToolGUI:
             tk.Label(self._dps_content, text="  Doctrine DPS hulls in fleet",
                      font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
+            # Adjusted-denominator note: some present pilots (caps/recon) were
+            # dropped from the ideal-% denominator so the targets track the
+            # composition, not the raw fleet size.
+            note = self._exclusion_note_text(getattr(self, "_fleet_guidance", None))
+            if note:
+                tk.Label(self._dps_content, text=f"  {note}",
+                         font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                         ).pack(anchor=tk.W)
         else:
             self._dps_count.config(text="—", fg=FG_DIM)
             tk.Label(self._dps_content, text="  No doctrine",
@@ -6494,6 +6538,9 @@ class FCToolGUI:
         ttk.Button(add_row, text="Add tag…", style="Dark.TButton",
                    command=lambda: self._add_custom_tag(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
+        ttk.Button(add_row, text="Exemptions…", style="Dark.TButton",
+                   command=lambda: self._edit_doctrine_exemptions(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
 
         if not doctrine.members:
             tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
@@ -7074,6 +7121,177 @@ class FCToolGUI:
         self.root.wait_window(win)
         return result["value"]
 
+    def _edit_doctrine_exemptions(self, doctrine_id, _test_no_wait=False):
+        """Modal editor for a doctrine's ideal-% exemptions.
+
+        Shows the doctrine's effective_exemptions as removable rows (the STANDARD
+        seed is shown when the doctrine has never been customized). 'Add…' offers
+        a ship GROUP, a ship TYPE, or the 'Capitals (all)' meta; 'Reset to
+        standard' clears the customization (stores None). Save routes through
+        :meth:`_commit_doctrine_exemptions` (store mutator + save + refresh).
+
+        Returns the Toplevel (tests pass ``_test_no_wait=True`` to skip
+        wait_window). Mirrors the themed-Toplevel + transient + grab_set pattern
+        of the tag dialogs; the add/remove/reset list logic lives in the pure
+        module helpers (_add_exemption_entry/_remove_exemption_entry) so it is
+        unit-testable without Tk."""
+        from type_catalog import SHIP_GROUP_NAMES
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return None
+
+        # Working copy of the effective list; None sentinel tracks "reset to
+        # standard" so Save can persist None (fall back to the seed).
+        eff = fleet_guidance.effective_exemptions(doctrine)
+        state = {"entries": [dict(e) for e in eff], "reset": False}
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Exemptions — {doctrine.name}")
+        win.configure(bg=BG_DARK)
+        win.geometry("420x460")
+        win.minsize(380, 360)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        tk.Label(win,
+                 text="Ships exempted from the ideal-% denominator (they inflate "
+                      "fleet size without being part of the composition target). "
+                      "Doctrine hulls are never excluded.",
+                 font=("Consolas", 9), fg=FG_TEXT, bg=BG_DARK,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=390).pack(
+                     anchor=tk.W, padx=12, pady=(12, 4))
+
+        seed_lbl = tk.Label(win, text="", font=("Consolas", 8, "italic"),
+                            fg=FG_DIM, bg=BG_DARK, anchor=tk.W, justify=tk.LEFT,
+                            wraplength=390)
+        seed_lbl.pack(anchor=tk.W, padx=12, pady=(0, 2))
+
+        list_wrap = tk.Frame(win, bg=BG_PANEL, bd=1, relief=tk.RIDGE)
+        canvas = tk.Canvas(list_wrap, bg=BG_PANEL, highlightthickness=0)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=BG_PANEL)
+        _win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(_win, width=e.width))
+
+        def _entry_label(e):
+            kind = e.get("kind")
+            if kind == "capital":
+                return "Capitals (all)"
+            if kind == "group":
+                return f"Group · {e.get('name') or e.get('id')}"
+            if kind == "type":
+                return f"Ship · {e.get('name') or e.get('id')}"
+            return str(e)
+
+        def _rebuild_rows():
+            for w in inner.winfo_children():
+                w.destroy()
+            is_seed = (not state["reset"]
+                       and getattr(doctrine, "exemptions", None) is None)
+            seed_lbl.config(
+                text="Showing the standard exemption set (not yet customized "
+                     "for this doctrine)." if is_seed else "")
+            if not state["entries"]:
+                tk.Label(inner, text="  No exemptions — every present pilot "
+                                     "counts toward the %.",
+                         font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+                         anchor=tk.W).pack(fill=tk.X, anchor=tk.W, padx=4, pady=2)
+                return
+            for idx, e in enumerate(state["entries"]):
+                row = tk.Frame(inner, bg=BG_PANEL)
+                row.pack(fill=tk.X, anchor=tk.W, padx=4, pady=1)
+                tk.Label(row, text=_entry_label(e), font=("Consolas", 9),
+                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W).pack(
+                             side=tk.LEFT, fill=tk.X, expand=True)
+                ttk.Button(row, text="✕", style="Red.TButton", width=2,
+                           command=lambda i=idx: _remove(i)).pack(side=tk.RIGHT)
+
+        def _remove(idx):
+            state["entries"] = _remove_exemption_entry(state["entries"], idx)
+            state["reset"] = False
+            _rebuild_rows()
+
+        def _add_entry(entry):
+            state["entries"] = _add_exemption_entry(state["entries"], entry)
+            state["reset"] = False
+            _rebuild_rows()
+
+        def _add_capital():
+            _add_entry({"kind": "capital"})
+
+        def _add_group():
+            name_to_id = {v: k for k, v in SHIP_GROUP_NAMES.items()}
+            names = self.type_catalog.ship_group_names()
+            picked = self._prompt_pick_from_list(
+                "Add ship group", "Exempt which ship group?", names)
+            if not picked:
+                return
+            gid = name_to_id.get(picked)
+            if gid is None:
+                return
+            _add_entry({"kind": "group", "id": gid, "name": picked})
+
+        def _add_type():
+            picked = self._prompt_pick_from_list(
+                "Add ship type", "Exempt which ship type?",
+                self.type_catalog.ship_type_names())
+            if not picked:
+                return
+            tid = self.type_catalog.resolve_id(picked)
+            if tid is None:
+                return
+            _add_entry({"kind": "type", "id": tid, "name": picked})
+
+        def _reset():
+            state["entries"] = []
+            state["reset"] = True
+            seed_lbl.config(text="Will reset to the standard exemption set on Save.")
+            _rebuild_rows()
+
+        add_row = tk.Frame(win, bg=BG_DARK)
+        ttk.Button(add_row, text="Add group…", style="Dark.TButton",
+                   command=_add_group).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(add_row, text="Add ship…", style="Dark.TButton",
+                   command=_add_type).pack(side=tk.LEFT, padx=4)
+        ttk.Button(add_row, text="Add capitals", style="Dark.TButton",
+                   command=_add_capital).pack(side=tk.LEFT, padx=4)
+        ttk.Button(add_row, text="Reset to standard", style="Dark.TButton",
+                   command=_reset).pack(side=tk.LEFT, padx=4)
+
+        def _save():
+            entries = None if state["reset"] else state["entries"]
+            self._commit_doctrine_exemptions(doctrine, entries)
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        ttk.Button(btns, text="Save", style="Green.TButton",
+                   command=_save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        # Pin the action rows to the bottom first so they never clip.
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        add_row.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 0))
+        list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
+
+        _rebuild_rows()
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
+
     def _manage_tags_dialog(self):
         """Modal manager for the library tag vocabulary: add custom tags and
         delete them (built-in DEFAULT_TAGS are protected). Deleting a tag also
@@ -7606,6 +7824,52 @@ class FCToolGUI:
             if (d.name or "") == name:
                 return d
         return None
+
+    # ── Ideal-% exemptions (Fleet-guidance denominator) ─────────────────────
+    def _resolve_exemptions_for_counts(self, doc, ship_counts):
+        """Resolve (exempt_type_ids, doctrine_hull_ids) for a doctrine + the
+        PRESENT fleet ship_counts.
+
+        ``exempt_type_ids`` is the subset of the ``ship_counts`` keys that match
+        the doctrine's effective exemptions (STANDARD_EXEMPTIONS when never
+        customized). Only ids actually present are classified — the group/capital
+        resolvers (ship_classes.get_group_id / is_capital, cached) are only hit
+        for present hulls, keeping the per-poll cost cheap. ``doctrine_hull_ids``
+        is the set of hull type ids the doctrine uses; the engine treats a hull in
+        that set as an exact-hull override (never excluded even if it matches an
+        exemption). Both are passed straight into compute_fleet_guidance."""
+        doctrine_hull_ids = set(
+            fleet_composer.build_tag_index(doc, self.fittings).keys())
+        exemptions = fleet_guidance.effective_exemptions(doc)
+        exempt_type_ids: set[int] = set()
+        if exemptions:
+            for tid in ship_counts:
+                if fleet_guidance.is_exempt_type(
+                        tid, exemptions,
+                        ship_classes.get_group_id, ship_classes.is_capital):
+                    exempt_type_ids.add(tid)
+        return exempt_type_ids, doctrine_hull_ids
+
+    def _exclusion_note_text(self, rep):
+        """One-line dim note for the guidance panel when pilots were removed from
+        the ideal-% denominator, or None when nothing was excluded. ``rep`` is a
+        GuidanceReport (or None)."""
+        n = getattr(rep, "excluded_from_pct", 0) if rep is not None else 0
+        if not n:
+            return None
+        return f"{n} excluded from % (caps/recon)"
+
+    def _commit_doctrine_exemptions(self, doc, entries):
+        """Persist a doctrine's ideal-% exemptions and refresh the affected views.
+
+        ``entries`` is the explicit exemption list, or None for
+        "reset to standard" (fall back to STANDARD_EXEMPTIONS). Routes through the
+        store mutator + save, then re-renders the doctrine detail pane and the
+        MOTD preview so the adjusted denominator/annotations reflect the change."""
+        self.fittings.set_doctrine_exemptions(doc.id, entries)
+        self.fittings.save()
+        self._show_doctrine_detail(doc.id)
+        self._rebuild_motd_preview()
 
     def _refresh_fleet_doctrine_combo(self):
         """Keep the Fleet-tab doctrine dropdown's values in sync with the library.
@@ -8645,9 +8909,12 @@ class FCToolGUI:
                   if tid in ship_classes.ALL_LINKS_COMMAND)
         frac = (cmd / total) if total else 0.0
         try:
+            exempt_ids, hull_ids = self._resolve_exemptions_for_counts(
+                doc, counts)
             rep = fleet_guidance.compute_fleet_guidance(
                 doc, self.fittings.get_fit, self.type_catalog,
-                counts, total, command_ship_fraction=frac)
+                counts, total, command_ship_fraction=frac,
+                exempt_type_ids=exempt_ids, doctrine_hull_ids=hull_ids)
         except Exception as exc:
             print(f"[MOTD] fit-delta compute failed: {exc}")
             return {}
@@ -10050,6 +10317,74 @@ class FCToolGUI:
                    command=_cancel).pack(side=tk.RIGHT)
         entry.bind("<Return>", lambda e: _ok())
         win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _prompt_pick_from_list(self, title, label, options):
+        """A modal single-choice picker over ``options`` (a list of strings) with
+        a type-to-filter box. Returns the chosen string, or None if cancelled or
+        the list is empty. Used by the exemptions editor's group/type add flows."""
+        options = list(options or [])
+        if not options:
+            messagebox.showinfo(title, "Nothing to choose from.")
+            return None
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=BG_DARK)
+        win.geometry("380x440")
+        win.minsize(340, 320)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        tk.Label(win, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                 bg=BG_DARK, anchor=tk.W, justify=tk.LEFT, wraplength=350).pack(
+                     anchor=tk.W, padx=12, pady=(12, 2))
+        filt = tk.StringVar()
+        entry = tk.Entry(win, textvariable=filt, font=("Consolas", 10),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         borderwidth=1, relief=tk.RIDGE)
+        entry.pack(fill=tk.X, padx=12, pady=(0, 4))
+        entry.focus_set()
+
+        lb = tk.Listbox(win, font=("Consolas", 9), bg=BG_PANEL, fg=FG_TEXT,
+                        selectbackground=FG_ACCENT, selectforeground=BG_DARK,
+                        highlightthickness=0, activestyle="none")
+
+        def _repopulate(*_a):
+            needle = (filt.get() or "").strip().lower()
+            lb.delete(0, tk.END)
+            for opt in options:
+                if not needle or needle in opt.lower():
+                    lb.insert(tk.END, opt)
+            if lb.size():
+                lb.selection_set(0)
+        filt.trace_add("write", _repopulate)
+
+        def _ok(*_a):
+            sel = lb.curselection()
+            if sel:
+                result["value"] = lb.get(sel[0])
+            win.destroy()
+
+        def _cancel(*_a):
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=12)
+        lb.pack(fill=tk.BOTH, expand=True, padx=12)
+        _repopulate()
+        lb.bind("<Double-Button-1>", _ok)
+        entry.bind("<Return>", _ok)
+        win.bind("<Escape>", _cancel)
         win.protocol("WM_DELETE_WINDOW", _cancel)
         self.root.wait_window(win)
         return result["value"]
