@@ -396,6 +396,19 @@ class TileWindow:
         self._bottom_visible = False   # True while the strip is packed/shown
         self._bottom_strip_h = STRIP_H  # last chosen (clamped) bottom-strip height
 
+        # ── location caption strip (its OWN thin line, LOWEST of all) ────────
+        # The pilot's current system/location gets its own strip packed BELOW the
+        # activity-label strip so neither existing line is crowded. Same look as
+        # the label strip; carved from the body via _push_thumb_rect just like it.
+        self._strip_location = tk.Frame(self.top, bg=bg_panel, height=STRIP_H)
+        self._strip_location.pack_propagate(False)
+        self._location_lbl = tk.Label(self._strip_location, text="", bg=bg_panel,
+                                      fg=fg_text, anchor="w",
+                                      font=("Consolas", 9, "bold"))
+        self._location_lbl.pack(side="left", fill="x", padx=(4, 4))
+        self._location_visible = False   # True while the strip is packed/shown
+        self._location_strip_h = STRIP_H  # last chosen (clamped) location-strip height
+
         # ── body (DWM composites the live thumbnail over this) ──────────────
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
@@ -432,7 +445,8 @@ class TileWindow:
         # RIGHT-drag move/resize + LEFT click-activate are bound on every widget.
         for w in (self.top, self._strip, self._body, self._name_lbl,
                   self._chip_lbl, self._tag_lbl, self._dot,
-                  self._strip_bottom, self._bottom_lbl):
+                  self._strip_bottom, self._bottom_lbl,
+                  self._strip_location, self._location_lbl):
             w.bind("<Button-3>", self._on_b3_press)
             w.bind("<B3-Motion>", self._on_b3_motion)
             w.bind("<ButtonRelease-3>", self._on_b3_release)
@@ -446,7 +460,8 @@ class TileWindow:
         # either caption bar moves the tile (bottom strip = same, no dead zone).
         for w in (self._strip, self._name_lbl, self._excl_lbl, self._chip_lbl,
                   self._tag_lbl, self._dot,
-                  self._strip_bottom, self._bottom_lbl):
+                  self._strip_bottom, self._bottom_lbl,
+                  self._strip_location, self._location_lbl):
             w.bind("<ButtonPress-1>", self._on_strip_b1_press)
             w.bind("<B1-Motion>", self._on_strip_b1_motion)
             w.bind("<ButtonRelease-1>", self._on_strip_b1_release)
@@ -455,7 +470,8 @@ class TileWindow:
         # diagonal-resize glyph. The armed corner + a left press start a resize.
         for w in (self.top, self._strip, self._body, self._name_lbl,
                   self._excl_lbl, self._chip_lbl, self._tag_lbl, self._dot,
-                  self._strip_bottom, self._bottom_lbl):
+                  self._strip_bottom, self._bottom_lbl,
+                  self._strip_location, self._location_lbl):
             w.bind("<Motion>", self._on_corner_motion, add="+")
         # A corner drag that begins on the BODY (or toplevel) needs its own
         # B1-Motion/Release routing — the body has no strip-move handlers, and
@@ -779,16 +795,25 @@ class TileWindow:
         self._push_thumb_rect()
 
     def _bottom_h(self) -> int:
-        """Current bottom-strip height in px when the strip is visible, else 0.
-        The strip is carved out of the body area (the window total height stays
-        body_h + STRIP_H), so the letterboxed video shrinks by exactly this."""
-        return self._bottom_strip_h if self._bottom_visible else 0
+        """Total height in px of ALL bottom strips currently visible (activity
+        label + location line), else 0. Each strip is carved out of the body area
+        (the window total height stays body_h + STRIP_H), so the letterboxed video
+        shrinks by exactly this sum.
+
+        The combined height is capped at ~60% of the body as a safety net so the
+        two bottom lines can never swallow the whole video, even if both request
+        their per-strip 40% cap on a squat tile."""
+        total = (self._bottom_strip_h if self._bottom_visible else 0)
+        total += (self._location_strip_h if self._location_visible else 0)
+        if self._body_h and self._body_h > 0:
+            total = min(total, int(self._body_h * 0.60))
+        return total
 
     def _push_thumb_rect(self):
         if not self._thumb:
             return
-        # Letterbox the video into the body MINUS the bottom strip, so the strip
-        # never overlaps the live thumbnail (the strip sits below it).
+        # Letterbox the video into the body MINUS both bottom strips, so neither
+        # strip ever overlaps the live thumbnail (both sit below it).
         avail_h = max(1, self._body_h - self._bottom_h())
         fx, fy, fw, fh = aspect_fit(self._w, avail_h, *self._src_size)
         self._thumb.show((fx, STRIP_H + fy, fx + fw, STRIP_H + fy + fh))
@@ -1027,20 +1052,22 @@ class TileWindow:
         except (TypeError, ValueError):
             fsize = 9
         fsize = max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
-        # Strip height tracks the font so a bigger font stays legible, but is
-        # CLAMPED to ~40% of the body so a huge font can't swallow the video.
-        strip_h = max(STRIP_H, fsize + 8)
+        # Auto-fit: keep the chosen font size when the text fits the tile width,
+        # shrink it only as needed (measured with real font metrics), and ellipsize
+        # only as a last resort at the floor. Replaces the old char-count estimate.
+        shown, drawn_size = self._fit_label_text(text, fsize)
+        # Strip height tracks the DRAWN (possibly downscaled) font so a bigger font
+        # stays legible, but is CLAMPED to ~40% of the body so it can't swallow the
+        # video.
+        strip_h = max(STRIP_H, drawn_size + 8)
         if self._body_h and self._body_h > 0:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)
         self._bottom_strip_h = strip_h
-        # Ellipsize to the tile width the same way the top-strip name does, using
-        # the chosen font size for the per-glyph estimate.
-        shown = self._ellipsize_bottom(text, fsize)
         try:
             self._strip_bottom.configure(height=strip_h)
             self._bottom_lbl.configure(text=shown, fg=fill,
-                                       font=("Consolas", fsize, "bold"))
+                                       font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
             pass
         if not self._bottom_visible:
@@ -1049,6 +1076,11 @@ class TileWindow:
             except tk.TclError:
                 pass
             self._bottom_visible = True
+            # If the location line is already shown, re-pin it BELOW this label
+            # strip so the location always stays the lowest line (Tk order depends
+            # on pack sequence; re-packing location `before` the label fixes it).
+            if self._location_visible:
+                self._pack_location_lowest()
         self._push_thumb_rect()           # shrink the video above the strip
 
     def _ellipsize_bottom(self, text, font_size):
@@ -1064,6 +1096,128 @@ class TileWindow:
         per_char = max(1.0, font_size * _CHAR_W_RATIO)
         budget = int(usable // per_char)
         return _ellipsize(text, budget)
+
+    def _fit_label_text(self, text, base_size):
+        """Auto-fit a bottom-line label to the tile width. Returns
+        (shown_text, drawn_size):
+
+          - Keeps `base_size` when `text` fits inside the available width, measured
+            with REAL font metrics (Consolas, bold, at each candidate size).
+          - Otherwise decrements the size from `base_size` down to _LABEL_MIN_SIZE,
+            picking the largest size whose measured width fits.
+          - If it still doesn't fit at the floor, ellipsizes (via _ellipsize_bottom)
+            at that floor size as a last resort so it can never overflow.
+
+        `avail_w` = the tile width minus the label's L/R pad (4+4). When the width
+        is unknown (unplaced) the base size + full text are returned unchanged.
+        Font-metric creation is guarded against tk.TclError (headless) — on failure
+        it falls back to the Tk-free char-count estimate (_ellipsize_bottom)."""
+        text = text or ""
+        try:
+            base = int(base_size)
+        except (TypeError, ValueError):
+            base = _LABEL_MIN_SIZE
+        base = max(_LABEL_MIN_SIZE, min(base, _LABEL_MAX_SIZE))
+        w = self._w if self._w > 0 else 0
+        if w <= 0 or not text:
+            return text, base
+        avail_w = max(0, w - 2 * _LABEL_PAD)
+        try:
+            import tkinter.font as tkfont
+            root = getattr(self, "top", None)
+            best = None
+            for size in range(base, _LABEL_MIN_SIZE - 1, -1):
+                f = tkfont.Font(root=root, family="Consolas", size=size,
+                                weight="bold")
+                if f.measure(text) <= avail_w:
+                    best = size
+                    break
+            if best is not None:
+                return text, best
+            # Still too wide at the floor → ellipsize to fit at the floor size.
+            floor = _LABEL_MIN_SIZE
+            f = tkfont.Font(root=root, family="Consolas", size=floor,
+                            weight="bold")
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                cand = _ellipsize(text, mid)
+                if f.measure(cand) <= avail_w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return _ellipsize(text, lo), floor
+        except tk.TclError:
+            # Headless / no font support: fall back to the char-count estimate at
+            # the base size (never raises, keeps the label bounded).
+            return self._ellipsize_bottom(text, base), base
+
+    # ── location caption strip (its own thin line, below the label strip) ─────
+    def set_location_label(self, text, color=None, size=None):
+        """Show the pilot's current system/location on its OWN thin strip BELOW
+        the activity-label strip (the lowest line of the tile). Mirrors
+        set_bottom_label.
+
+        Empty/falsy text hides the strip and lets the video reclaim the space.
+        A non-empty text applies the given fill colour + font size (from
+        config['overlay'] color/font_size), AUTO-FITS the font down so it never
+        overflows (keeping the chosen size when it fits), sizes the strip to the
+        drawn font (clamped so it can never exceed ~40% of the body, with the
+        combined bottom-strips height capped at ~60% of the body via _bottom_h),
+        packs it below the label strip, and re-letterboxes the thumbnail."""
+        text = "" if not text else str(text)
+        if not text:
+            if self._location_visible:
+                try:
+                    self._strip_location.pack_forget()
+                except tk.TclError:
+                    pass
+                self._location_visible = False
+                self._push_thumb_rect()   # video reclaims the freed space
+            return
+        fill = color if color else self._fg_text
+        try:
+            fsize = int(size) if size is not None else 9
+        except (TypeError, ValueError):
+            fsize = 9
+        fsize = max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
+        # Auto-fit: keep the chosen size when the location fits, shrink to fit
+        # otherwise (measured), ellipsize only at the floor.
+        shown, drawn_size = self._fit_label_text(text, fsize)
+        strip_h = max(STRIP_H, drawn_size + 8)
+        if self._body_h and self._body_h > 0:
+            cap = max(STRIP_H, int(self._body_h * 0.40))
+            strip_h = min(strip_h, cap)
+        self._location_strip_h = strip_h
+        try:
+            self._strip_location.configure(height=strip_h)
+            self._location_lbl.configure(text=shown, fg=fill,
+                                         font=("Consolas", drawn_size, "bold"))
+        except tk.TclError:
+            pass
+        if not self._location_visible:
+            self._pack_location_lowest()
+            self._location_visible = True
+        self._push_thumb_rect()           # shrink the video above both strips
+
+    def _pack_location_lowest(self):
+        """Pack the location strip so it is the LOWEST bottom-side widget. When
+        the activity-label strip is already packed, pack `before` it (Tk places an
+        earlier-packed `side=bottom` widget nearer the edge), so the location line
+        always sits under the label line regardless of call order."""
+        try:
+            if self._bottom_visible:
+                self._strip_location.pack(side="bottom", fill="x",
+                                          before=self._strip_bottom)
+            else:
+                self._strip_location.pack(side="bottom", fill="x")
+        except tk.TclError:
+            pass
+
+    def location_label_text(self) -> str:
+        """The text currently shown in the location strip ('' when hidden) — for
+        tests/logging."""
+        return self._location_lbl.cget("text") if self._location_visible else ""
 
     def bottom_label_text(self) -> str:
         """The text currently shown in the bottom strip ('' when hidden) — for

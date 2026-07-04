@@ -11614,7 +11614,8 @@ class FCToolGUI:
         "minimize_inactive": False, "never_minimize": [],
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
-        "captions": True, "labels_on_video": True, "show_role_chip": True,
+        "captions": True, "labels_on_video": True, "show_location": True,
+        "show_role_chip": True,
         "intel_flash": False, "intel_flash_color": "#ff3b30",
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
         "doctrine_tag_captions": True,       # caveat #4 (Task B1)
@@ -12346,6 +12347,7 @@ class FCToolGUI:
         cfg = self._preview_cfg()
         do_strip = bool(cfg.get("captions", True))
         do_video = bool(cfg.get("labels_on_video", False))
+        do_location = bool(cfg.get("show_location", True))
         rules = self._overlay_rules()
         overrides = self._overlay_cfg().get("overrides", {}) or {}
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
@@ -12387,6 +12389,16 @@ class FCToolGUI:
                     tile.set_bottom_label(text, bottom_color, bottom_size)
                 else:
                     tile.set_bottom_label("")   # flag off → hide the strip
+                # Location line (its own thin strip UNDER the label strip): the
+                # pilot's current system, gated by show_location. Login screens /
+                # no-state pilots have no system → '' hides the line. Same colour
+                # + font-size source as the label bar; the tile auto-fits the font.
+                system = "" if (client.is_login or state is None) \
+                    else (state.system_name or "")
+                if do_location and system:
+                    tile.set_location_label(system, bottom_color, bottom_size)
+                else:
+                    tile.set_location_label("")
             except tk.TclError:
                 pass
 
@@ -13309,6 +13321,20 @@ class FCToolGUI:
                    "strip at the BOTTOM of each preview tile — below the video, "
                    "never over it — using the colour and font size set above.")
 
+        self._preview_show_location_var = tk.BooleanVar(
+            value=bool(pcfg.get("show_location", True)))
+        cbloc = tk.Checkbutton(
+            rowN, text="Show location",
+            variable=self._preview_show_location_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbloc.grid(row=1, column=4, columnspan=2, padx=(0, 8), pady=(4, 0),
+                   sticky=tk.W)
+        w.append(cbloc)
+        _tip(cbloc, "Shows each pilot's current system on its own line under the "
+                    "ship label.")
+
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
         rowN2.pack(fill=tk.X, pady=2)
@@ -13739,6 +13765,7 @@ class FCToolGUI:
             ("_preview_captions_var", "captions", bool),
             ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
             ("_preview_labels_on_video_var", "labels_on_video", bool),
+            ("_preview_show_location_var", "show_location", bool),
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
