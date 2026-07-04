@@ -45,7 +45,7 @@ Turn it on in **Settings → the previews section**: pick **FCPreview**. (The ot
 
 ### FCTool-exclusive extras
 
-- **Activity label bar** — each tile shows the character name in the top strip and, in a **bottom strip**, an activity label plus the ship's **hull type** (e.g. `Logi - Onyx`, `Cyno - Force Recon`) — rendered below the video (never over it) in your chosen colour/size, and shown once when the two would be identical. The label comes from your label rules or your active doctrine's fit tag; override any caption with a **Manual tag** in the label rules.
+- **Activity label + location bars** — each tile shows the character name in the top strip and, in a **bottom strip**, an activity label plus the ship's **hull type** (e.g. `Logi - Onyx`, `Cyno - Force Recon`), then a **separate line** below it with the pilot's current **system**. All of it renders below the video (never over it) in your chosen colour/size and **auto-shrinks to fit** (keeping your size when it can), so nothing gets clipped. The label comes from your label rules or your active doctrine's fit tag; override any caption with a **Manual tag** in the label rules. (Both bottom lines have their own on/off toggles.)
 - **Damage flash** — native tiles **pulse red on incoming combat damage**. This is **native-mode only and default ON** (the separate intel tile-flash is default OFF). Fine print, verbatim: it reads **only your own EVE combat Gamelogs** (the same own-logs-only compliance class as the intel firehose and the EVE-APM precedent); the threshold is **based on base hull HP — fitted ships have more, so it is an approximation**; and it assumes the **English client** (localized clients are out of scope for this version).
 
 ### Compliance
