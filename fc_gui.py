@@ -12966,7 +12966,12 @@ class FCToolGUI:
             ship = auth.get_ship_type() or {}
             if ship.get("ship_type_id"):
                 ship_type_id = ship.get("ship_type_id")
-                ship_type_name = ship.get("ship_name", "") or ship_type_name
+                # HULL TYPE (Thrasher, Onyx, …) from the local bundled SDE — NOT
+                # ship.get("ship_name"), which is the pilot's CUSTOM ship name.
+                # type_catalog.resolve_name is a pure in-memory SDE lookup (all
+                # hulls are bundled → no network, thread-safe in the poller).
+                ship_type_name = (self.type_catalog.resolve_name(ship_type_id)
+                                  or ship_type_name)
                 ship_group = ship_classes.get_group_name(ship_type_id) or ""
                 is_cap = bool(ship_classes.is_capital(ship_type_id))
         except Exception:

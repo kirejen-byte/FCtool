@@ -116,9 +116,13 @@ def format_tile_label(activity_label, ship_type_name) -> str:
     omitting empty/whitespace-only parts.
 
     label only -> 'Cyno'; ship only -> 'Onyx'; both -> 'Cyno - Onyx';
-    neither -> '' (caller hides the label entirely). Pure/Tk-free."""
+    neither -> '' (caller hides the label entirely). When both parts are present
+    and equal case-insensitively (e.g. a rule labels an Onyx hull "Onyx"), the
+    value is shown ONCE -> 'Onyx' rather than 'Onyx - Onyx'. Pure/Tk-free."""
     parts = [p.strip() for p in (activity_label, ship_type_name)
              if p and str(p).strip()]
+    if len(parts) == 2 and parts[0].casefold() == parts[1].casefold():
+        return parts[0]
     return " - ".join(parts)
 
 
