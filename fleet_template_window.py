@@ -259,10 +259,16 @@ class FleetTemplateWindow:
         self._save_btn = ttk.Button(bar, text="Save Template",
                                     style="Dark.TButton", command=self._save)
         self._save_btn.pack(side=tk.LEFT, padx=8, pady=6)
-        self._auto_sort_btn = ttk.Button(bar, text="Auto-sort: OFF",
+        self._auto_sort_btn = ttk.Button(bar, text="Auto-move: OFF",
                                          style="Dark.TButton",
                                          command=self._toggle_auto_sort)
         self._auto_sort_btn.pack(side=tk.LEFT, padx=8)
+        self._attach_tooltip(self._auto_sort_btn,
+                             "When ON, continuously moves fleet members into the "
+                             "positions your template's rules dictate as the fleet "
+                             "changes (joins, ship swaps). Manually dragged pilots "
+                             "stay where you put them. OFF by default; only active "
+                             "in live-fleet mode.")
         self._status = tk.Label(bar, text="", font=("Consolas", 9),
                                 fg=FG_DIM, bg=BG_PANEL)
         self._status.pack(side=tk.LEFT, padx=10)
@@ -375,7 +381,7 @@ class FleetTemplateWindow:
         self._save_btn.config(state="disabled" if live else "normal")
         if not live:
             self._auto_sort_on = False
-            self._auto_sort_btn.config(text="Auto-sort: OFF")
+            self._auto_sort_btn.config(text="Auto-move: OFF")
 
     def _save(self):
         t = self.current_template()
@@ -1790,12 +1796,43 @@ class FleetTemplateWindow:
         if self._auto_sort_on and self.mode == "live":
             self._auto_sort_tick()
 
+    def _attach_tooltip(self, widget, text):
+        """Lightweight hover tooltip: a borderless Toplevel shown on <Enter>,
+        destroyed on <Leave>/<ButtonPress>. Self-contained (no external deps)."""
+        tip = {"win": None}
+
+        def show(_e=None):
+            if tip["win"] is not None:
+                return
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tw = tk.Toplevel(widget)
+            tw.overrideredirect(True)
+            tw.attributes("-topmost", True)
+            tw.geometry(f"+{x}+{y}")
+            tk.Label(tw, text=text, bg=BG_PANEL, fg=FG_TEXT,
+                     font=("Consolas", 8), relief=tk.SOLID, borderwidth=1,
+                     padx=6, pady=2, justify=tk.LEFT, wraplength=280).pack()
+            tip["win"] = tw
+
+        def hide(_e=None):
+            if tip["win"] is not None:
+                try:
+                    tip["win"].destroy()
+                except tk.TclError:
+                    pass
+                tip["win"] = None
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Leave>", hide)
+        widget.bind("<ButtonPress>", hide)
+
     def _toggle_auto_sort(self):
         if self.mode != "live":
             return
         self._auto_sort_on = not self._auto_sort_on
         self._auto_sort_btn.config(
-            text=f"Auto-sort: {'ON' if self._auto_sort_on else 'OFF'}")
+            text=f"Auto-move: {'ON' if self._auto_sort_on else 'OFF'}")
         if self._auto_sort_on:
             # Re-cadence to active immediately.
             self._sync_tick_now()
