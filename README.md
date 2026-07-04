@@ -14,14 +14,14 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 - **Standings-based capital alerts** — flags hostile capitals using **your own** corp/alliance + ESI standings (nothing hard-coded to any group), with toggles to alert on hostile caps and to bypass the filter for them.
 - **Intelligence Fusion** — tails your tracked in-game intel channels (from EVE's chat logs), parses each report (system, pilot count, d-scan link, cyno/camp flags), and cross-references it with live zKillboard activity. Includes a **suggested-channels** picker that scans your logs across all characters.
 - **Jump-range checker** — Dread / Carrier / FAX / Super / Titan / Black Ops / Jump Freighter / Rorqual ranges, Ansiblex-aware routing, and editable friendly/hostile staging lists.
-- **Fittings, doctrines & MOTD writer** — import fits from **pyfa** or **in-game** (ESI), organize them into **doctrines** with role tags, and compose a clickable fleet **MOTD** (FC link, staging system, role-grouped fit links, logi channel) with a WYSIWYG markup editor and a live raw/rendered preview. **Doctrine-driven fleet guidance** sets an ideal composition (% or # per fit), shows live *in / under / over* status in **Fleet Management**, and annotates the MOTD with `+X / -Y` pilot deltas for the current fleet. Command-burst (links) coverage is tracked from fleet chat.
+- **Fittings, doctrines & MOTD writer** — import fits from **pyfa** or **in-game** (ESI), organize them into **doctrines** with role tags, and compose a clickable fleet **MOTD** (FC link, staging system, role-grouped fit links, logi channel) with a WYSIWYG markup editor and a live raw/rendered preview. **Doctrine-driven fleet guidance** sets an ideal composition (% or # per fit), shows live *in / under / over* status in **Fleet Management**, and annotates the MOTD with `+X / -Y` pilot deltas for the current fleet. Command-burst (links) coverage is tracked from fleet chat. **Fleet Templates** define your wing/squad structure with assignment rules and one-click **Auto-move** pilots into position as the fleet changes; a ready-made **Default** template (Subcaps/Caps) ships built-in and editable, and templates are only applied when you choose.
 - **Wormhole routing**, an **X-up fleet counter** (configurable trigger / clear words + threshold), **character & asset tracking**, and **text-to-speech audio alerts**.
 
 ## Client Previews (native)
 
 FCTool can show **live previews of your own EVE clients** right inside the tool — a small always-on-top tile per client with the live game video and a caption strip — so you no longer need EVE-O Preview running. Left-click a tile to bring that client to the front; assign a global focus **hotkey** per character or cycle hotkeys across a group; drag tiles to arrange them (positions snap and persist per character). It multiboxes cleanly with per-monitor DPI.
 
-Turn it on in **Settings → the previews section**: pick **Native previews (beta)**. (The other modes are **Off** and **Label EVE-O thumbnails**, which keeps the old activity-label overlay on EVE-O Preview's own thumbnails.)
+Turn it on in **Settings → the previews section**: pick **FCPreview**. (The other modes are **Off** and **Eve-O Preview Enhancement**, which keeps the activity-label overlay on EVE-O Preview's own thumbnails.)
 
 **EVE-O Preview parity (condensed):**
 
@@ -45,7 +45,7 @@ Turn it on in **Settings → the previews section**: pick **Native previews (bet
 
 ### FCTool-exclusive extras
 
-- **Doctrine-tag captions** — by default each tile's caption is the pilot's **doctrine-fit tag** from your own active doctrine (e.g. the fit's role tag), so you can see at a glance who is flying what. Override any caption with a **Manual tag** in the label rules.
+- **Activity label bar** — each tile shows the character name in the top strip and, in a **bottom strip**, an activity label plus the ship's **hull type** (e.g. `Logi - Onyx`, `Cyno - Force Recon`) — rendered below the video (never over it) in your chosen colour/size, and shown once when the two would be identical. The label comes from your label rules or your active doctrine's fit tag; override any caption with a **Manual tag** in the label rules.
 - **Damage flash** — native tiles **pulse red on incoming combat damage**. This is **native-mode only and default ON** (the separate intel tile-flash is default OFF). Fine print, verbatim: it reads **only your own EVE combat Gamelogs** (the same own-logs-only compliance class as the intel firehose and the EVE-APM precedent); the threshold is **based on base hull HP — fitted ships have more, so it is an approximation**; and it assumes the **English client** (localized clients are out of scope for this version).
 
 ### Compliance
