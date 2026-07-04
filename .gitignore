@@ -57,3 +57,6 @@ CLAUDE.md
 docs/superpowers/
 docs/eve_reference/
 gamelog_monitor_state.json
+
+# Test suite: kept on disk for local TDD, not committed/published (owner preference)
+tests/
