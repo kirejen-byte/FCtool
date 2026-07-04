@@ -578,3 +578,104 @@ def test_rules_dialog_delete_removes_override_and_keeps_order():
         assert overrides == {"Bravo": "B"}
     finally:
         root.destroy()
+
+
+# ── Labels button rename + tooltip + dialog column headers ──────────────────
+
+def _find_labels_button(root):
+    """Walk the widget tree for the ttk.Button whose text is 'Labels'."""
+    from tkinter import ttk as _ttk
+    found = []
+    def _walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, _ttk.Button) and str(c.cget("text")) == "Labels":
+                found.append(c)
+            _walk(c)
+    _walk(root)
+    return found
+
+
+def test_labels_button_renamed_and_has_tooltip():
+    # The shared overlay-label button reads 'Labels' (not 'Label rules…') and
+    # has an <Enter> tooltip binding via the app's tooltip helper.
+    root, host = _ui_host(overlay_cfg={"enabled": False})
+    host.config["preview"] = {"mode": "off"}
+    tips = []
+    host._show_tooltip = lambda e, t: tips.append(t)
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        btns = _find_labels_button(frame)
+        assert btns, "expected a button labelled 'Labels'"
+        btn = btns[0]
+        # An <Enter> handler is bound (the tooltip trigger).
+        assert str(btn.bind("<Enter>")).strip() != ""
+        # Firing it surfaces the intended tooltip copy.
+        btn.event_generate("<Enter>", x=1, y=1)
+        assert tips, "expected the tooltip helper to be invoked on <Enter>"
+        assert "labelled" in tips[-1]
+        assert "Eve-O Enhancement" in tips[-1]
+        assert "FCPreview" in tips[-1]
+    finally:
+        root.destroy()
+
+
+def _all_label_texts(win):
+    """Collect the text of every tk.Label / ttk.Label under win."""
+    from tkinter import ttk as _ttk
+    texts = []
+    def _walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, (tk.Label, _ttk.Label)):
+                try:
+                    texts.append(str(c.cget("text")))
+                except tk.TclError:
+                    pass
+            _walk(c)
+    _walk(win)
+    return texts
+
+
+def test_rules_dialog_has_column_headers():
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        from type_catalog import TypeCatalog
+        host.type_catalog = TypeCatalog()
+        host._overlay_rule_value_suggestions = types.MethodType(
+            fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+        host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+        host.config["overlay"]["rules"] = [
+            {"when": "system", "value": "Jita", "label": "R0"},
+        ]
+        win = _open_rules_dialog(host)
+        assert win is not None
+        texts = _all_label_texts(win)
+        for header in ("When", "Value", "Label", "Character"):
+            assert header in texts, f"expected column header {header!r}"
+    finally:
+        root.destroy()
+
+
+def test_rules_dialog_headers_persist_through_add_and_delete():
+    # Headers live above the dynamic row frames, so adding/deleting rows must
+    # not destroy them.
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        from type_catalog import TypeCatalog
+        host.type_catalog = TypeCatalog()
+        host._overlay_rule_value_suggestions = types.MethodType(
+            fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+        host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+        host.config["overlay"]["rules"] = [
+            {"when": "system", "value": "Jita", "label": "R0"},
+            {"when": "system", "value": "Amarr", "label": "R1"},
+        ]
+        win = _open_rules_dialog(host)
+        assert win is not None
+        # Delete a rule row; headers must survive the re-render.
+        win._rule_delete_buttons()[0].invoke()
+        texts = _all_label_texts(win)
+        for header in ("When", "Value", "Label", "Character"):
+            assert header in texts, f"header {header!r} vanished after delete"
+    finally:
+        root.destroy()

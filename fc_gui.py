@@ -13077,8 +13077,17 @@ class FCToolGUI:
         # captions reuse these same rules, so it lives in the shared frame too.
         row3 = tk.Frame(shared, bg=BG_DARK)
         row3.pack(fill=tk.X, pady=2)
-        ttk.Button(row3, text="Label rules…", style="Dark.TButton",
-                   command=self._open_overlay_rules_dialog).pack(side=tk.LEFT)
+        labels_btn = ttk.Button(row3, text="Labels", style="Dark.TButton",
+                                command=self._open_overlay_rules_dialog)
+        labels_btn.pack(side=tk.LEFT)
+        self._overlay_labels_button = labels_btn
+        _labels_tip = (
+            "Define how thumbnails/tiles are labelled from your own ESI data "
+            "(ship group, type, system…). Overrides pin custom text per "
+            "character. Shared by Eve-O Enhancement and FCPreview.")
+        labels_btn.bind(
+            "<Enter>", lambda e, t=_labels_tip: self._show_tooltip(e, t))
+        labels_btn.bind("<Leave>", lambda e: self._hide_tooltip())
 
         # Row 4 (native): tile size / inactive opacity / captions / doctrine tag /
         # highlight / lock layout, all live-applied. Comfort & parity (zoom,
@@ -13862,9 +13871,24 @@ class FCToolGUI:
             pass
 
         tk.Label(win, text="Rules (first match wins):", bg=BG_PANEL, fg=FG_TEXT,
-                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+                 font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
+        tk.Label(win,
+                 text="— first matching rule wins; a character override beats "
+                      "all rules",
+                 bg=BG_PANEL, fg=FG_DIM,
+                 font=("Consolas", 8)).pack(anchor="w", padx=10, pady=(0, 2))
         rules_frame = tk.Frame(win, bg=BG_PANEL)
         rules_frame.pack(fill=tk.X, padx=10)
+        # Static column headers gridded ABOVE the dynamic rows frame so they
+        # persist across add/delete re-renders (the row renderer only ever
+        # touches its own inner frame). The '✕' delete column has no header.
+        _rh = lambda c, t: tk.Label(
+            rules_frame, text=t, bg=BG_PANEL, fg=FG_DIM,
+            font=("Consolas", 8, "bold")).grid(row=0, column=c, sticky="w",
+                                               padx=2, pady=(0, 1))
+        _rh(0, "When"); _rh(1, "Value"); _rh(2, "Label")
+        rule_rows_frame = tk.Frame(rules_frame, bg=BG_PANEL)
+        rule_rows_frame.grid(row=1, column=0, columnspan=4, sticky="we")
 
         when_values = ["ship_group", "ship_type", "system", "docked",
                        "offline", "capital", "subcap"]
@@ -13875,7 +13899,7 @@ class FCToolGUI:
         rule_rows = []   # list of dicts: {when, value_entry, label, del_btn}
 
         def _render_rule_rows():
-            for w in rules_frame.winfo_children():
+            for w in rule_rows_frame.winfo_children():
                 w.grid_forget()
             for r, row in enumerate(rule_rows):
                 row["when_combo"].grid(row=r, column=0, padx=2, pady=1)
@@ -13899,14 +13923,14 @@ class FCToolGUI:
         def _add_rule_row(when="ship_group", value="", label=""):
             wv = tk.StringVar(value=when)
             lv = tk.StringVar(value=label)
-            when_combo = ttk.Combobox(rules_frame, textvariable=wv,
+            when_combo = ttk.Combobox(rule_rows_frame, textvariable=wv,
                                       values=when_values, state="readonly",
                                       width=11, font=("Consolas", 9))
             # value: autocomplete SCOPED to the chosen `when` kind (ship_group ->
             # group names, ship_type -> ship type names incl. shuttles, system ->
             # system names). Valueless kinds disable the field entirely.
             ve = AutocompleteEntry(
-                rules_frame, self._overlay_rule_value_suggestions(when),
+                rule_rows_frame, self._overlay_rule_value_suggestions(when),
                 font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
                 insertbackground=FG_WHITE, width=18)
             if value:
@@ -13935,12 +13959,12 @@ class FCToolGUI:
                         pass
 
             when_combo.bind("<<ComboboxSelected>>", _sync_value_source)
-            le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
+            le = tk.Entry(rule_rows_frame, textvariable=lv, font=("Consolas", 9),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
             row = {"when": wv, "value_entry": ve, "label": lv,
                    "when_combo": when_combo, "label_entry": le}
             row["del_btn"] = ttk.Button(
-                rules_frame, text="✕", width=2, style="Dark.TButton",
+                rule_rows_frame, text="✕", width=2, style="Dark.TButton",
                 command=lambda _row=row: _delete_rule_row(_row))
             rule_rows.append(row)
             # apply the initial enabled/disabled state for the seeded `when`
@@ -13958,15 +13982,29 @@ class FCToolGUI:
 
         tk.Label(win, text="Overrides (beat rules; empty label hides that char):",
                  bg=BG_PANEL, fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
-                     anchor="w", padx=10, pady=(4, 2))
+                     anchor="w", padx=10, pady=(4, 0))
+        tk.Label(win,
+                 text="— pin exact text for one character; empty label hides "
+                      "that character",
+                 bg=BG_PANEL, fg=FG_DIM,
+                 font=("Consolas", 8)).pack(anchor="w", padx=10, pady=(0, 2))
         ov_frame = tk.Frame(win, bg=BG_PANEL)
         ov_frame.pack(fill=tk.X, padx=10)
+        # Static headers gridded above the dynamic override rows frame (persist
+        # across add/delete). The '✕' delete column has no header.
+        _oh = lambda c, t: tk.Label(
+            ov_frame, text=t, bg=BG_PANEL, fg=FG_DIM,
+            font=("Consolas", 8, "bold")).grid(row=0, column=c, sticky="w",
+                                               padx=2, pady=(0, 1))
+        _oh(0, "Character"); _oh(1, "Label")
+        override_rows_frame = tk.Frame(ov_frame, bg=BG_PANEL)
+        override_rows_frame.grid(row=1, column=0, columnspan=3, sticky="we")
         char_names = [a.character_name for a in self.esi_accounts
                       if getattr(a, "character_name", None)]
         override_rows = []   # list of dicts: {name, label, combo, label_entry, del_btn}
 
         def _render_override_rows():
-            for w in ov_frame.winfo_children():
+            for w in override_rows_frame.winfo_children():
                 w.grid_forget()
             for r, row in enumerate(override_rows):
                 row["combo"].grid(row=r, column=0, padx=2, pady=1)
@@ -13988,14 +14026,14 @@ class FCToolGUI:
         def _add_override_row(name="", label=""):
             nv = tk.StringVar(value=name)
             lv = tk.StringVar(value=label)
-            combo = ttk.Combobox(ov_frame, textvariable=nv, values=char_names,
-                                 width=20, font=("Consolas", 9))
-            le = tk.Entry(ov_frame, textvariable=lv, font=("Consolas", 9),
-                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
-                          width=18)
+            combo = ttk.Combobox(override_rows_frame, textvariable=nv,
+                                 values=char_names, width=20, font=("Consolas", 9))
+            le = tk.Entry(override_rows_frame, textvariable=lv,
+                          font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                          insertbackground=FG_WHITE, width=18)
             row = {"name": nv, "label": lv, "combo": combo, "label_entry": le}
             row["del_btn"] = ttk.Button(
-                ov_frame, text="✕", width=2, style="Dark.TButton",
+                override_rows_frame, text="✕", width=2, style="Dark.TButton",
                 command=lambda _row=row: _delete_override_row(_row))
             override_rows.append(row)
             _render_override_rows()
