@@ -12352,6 +12352,15 @@ class FCToolGUI:
         show_chip = bool(cfg.get("show_role_chip", True))
         doctrine = self._active_doctrine_obj()
         tag_index = fleet_composer.build_tag_index(doctrine, self.fittings)
+        # Bottom-strip label style (shared with the eveo overlay): config['overlay']
+        # color + font_size. The label now shows in a strip BELOW each tile's video
+        # (set_bottom_label) — never over it — so no topmost overlay is driven.
+        ocfg = self._overlay_cfg()
+        bottom_color = ocfg.get("color", "#ffffff")
+        try:
+            bottom_size = int(ocfg.get("font_size", 11))
+        except (TypeError, ValueError):
+            bottom_size = 11
         for hwnd, client in cur.items():
             tile = self._preview_tiles.get(hwnd)
             if tile is None:
@@ -12364,75 +12373,36 @@ class FCToolGUI:
             try:
                 if do_strip:
                     tile.set_caption(name, dot, chip, activity)
-                # On-video activity label: '<label> - <ShipType>'. Login screens
-                # and rule-less pilots with no ship resolve to '' → hidden.
-                # Composed ONCE here (rule/override/doctrine precedence evaluated
-                # once) and stashed by hwnd; _preview_compose_video_labels consumes
-                # the stash to draw via the topmost OverlayWindow. The child Canvas
-                # is DWM-occluded, so we clear it and never draw the visible label
-                # on the tile body.
+                # Bottom-strip activity label: '<label> - <ShipType>'. Login
+                # screens and rule-less pilots with no ship resolve to '' → the
+                # strip hides and the video reclaims the space. Composed here
+                # (rule/override/doctrine precedence) and pushed straight to the
+                # tile's bottom strip; the retired on-video path (DWM-occluded +
+                # laggy topmost overlay) is no longer used.
                 ship_name = "" if (client.is_login or state is None) \
                     else (state.ship_type_name or "")
-                self._preview_video_labels[hwnd] = \
-                    preview_tile.format_tile_label(activity, ship_name)
-                tile.set_video_label("")
+                text = preview_tile.format_tile_label(activity, ship_name)
+                self._preview_video_labels[hwnd] = text  # kept for tests/logging
+                if do_video:
+                    tile.set_bottom_label(text, bottom_color, bottom_size)
+                else:
+                    tile.set_bottom_label("")   # flag off → hide the strip
             except tk.TclError:
                 pass
 
     def _preview_compose_video_labels(self, cur):
-        """caption-onvideo: draw each live tile's on-video label ('<label> - <ShipType>')
-        via the separate topmost, click-through OverlayWindow — NOT a child widget of
-        the tile. The DWM compositor draws each tile's live thumbnail ON TOP of any
-        child widget inside the thumbnail rect, so a child Canvas is occluded; the
-        overlay is a distinct always-on-top window that composites above the tiles.
+        """RETIRED (lag fix). The native activity label used to be drawn by a
+        separate topmost, click-through OverlayWindow re-topped on every tick,
+        which caused massive in-game FPS drops. The label now renders in each
+        tile's BOTTOM STRIP (see _preview_compose_captions → tile.set_bottom_label),
+        below the video, so NO overlay is created or re-topped in native mode.
 
-        Gated by config['preview']['labels_on_video']. The label TEXT is composed once
-        in _preview_compose_captions and stashed in self._preview_video_labels (keyed by
-        hwnd); this method only positions it. Empty-text items are skipped by the overlay
-        (set_labels), and the overlay withdraws itself when nothing is drawn.
-
-        native and eveo_labels are mutually exclusive and share the single self._overlay;
-        this path never starts the eveo ESI poller (the native poller runs separately)."""
-        do_video = bool(self._preview_cfg().get("labels_on_video", False))
-        overlay = getattr(self, "_overlay", None)
-        if not do_video:
-            if overlay is not None:
-                try:
-                    overlay.set_labels([])   # clear any stale native labels
-                except Exception:
-                    pass
-            return
-        # Ensure the shared overlay Toplevel exists (idempotent). Do NOT call
-        # _overlay_enable() / start the eveo poller — native mode owns its own ESI
-        # poller; we only borrow the overlay's draw surface.
-        overlay = self._overlay_ensure_window()
-        # Push the current overlay style (size/color/anchor) from config['overlay']
-        # straight to the overlay, mirroring _overlay_ensure_window's seeding. This
-        # keeps the native labels styled by the same settings the eveo labels use,
-        # without depending on the eveo settings UI vars existing.
-        ocfg = self._overlay_cfg()
-        try:
-            overlay.set_font_size(int(ocfg.get("font_size", 11)))
-            overlay.set_color(ocfg.get("color", "#ffffff"))
-            overlay.set_anchor(ocfg.get("anchor", "top-left"))
-        except Exception:
-            pass
-        items = []
-        for hwnd in cur:
-            tile = self._preview_tiles.get(hwnd)
-            if tile is None:
-                continue
-            text = self._preview_video_labels.get(hwnd, "")
-            if not text:
-                continue
-            rect = tile.body_screen_rect()
-            if rect is None:
-                continue
-            items.append((rect, text))
-        try:
-            overlay.set_labels(items)
-        except Exception:
-            pass
+        This is a no-op kept so the native tick's call site never breaks. It must
+        NEVER call _overlay_ensure_window() or overlay.set_labels() with native
+        labels — the eveo_labels mode still owns the overlay legitimately, and any
+        stale overlay from a prior eveo session is cleared by _preview_teardown /
+        the mode switch (which pushes set_labels([]))."""
+        return
 
     #: Fleet-role -> caption chip glyph. squad_member (and any unknown role)
     #: renders no chip so the common case stays clean.
@@ -12773,15 +12743,17 @@ class FCToolGUI:
                 if hwnd in hidden:
                     continue                                        # withdrawn — nothing to retop
                 tile.retop()
-            if self._overlay is not None:
-                self._overlay.retop()                               # labels above tiles
+            # NOTE: native mode NEVER re-tops the OverlayWindow. The activity label
+            # now lives in each tile's bottom strip (set_bottom_label); driving a
+            # topmost overlay per tick was the in-game lag source and is retired.
+            # A lingering overlay from a prior eveo session is already withdrawn by
+            # _preview_teardown's set_labels([]) on the mode switch.
             # Publish the current client set BEFORE draining hotkeys / composing
             # captions: both resolve char keys against the live set (activation
             # by key needs the just-diffed `cur`, not the previous tick's set).
             self._preview_clients = cur
             self._preview_drain_hotkeys()
-            self._preview_compose_captions(cur)                     # Task B1 fills this in
-            self._preview_compose_video_labels(cur)                 # Task B2 on-video labels
+            self._preview_compose_captions(cur)   # strip + bottom-strip activity label
             # C2: the shown (checked) character set drives damage scanning too, so
             # the GamelogMonitor tails only pilots the user chose to preview.
             self._preview_sync_gamelog_scope()
@@ -13321,16 +13293,16 @@ class FCToolGUI:
         self._preview_labels_on_video_var = tk.BooleanVar(
             value=bool(pcfg.get("labels_on_video", True)))
         cblv = tk.Checkbutton(
-            rowN, text="Label over video (Label - ShipType)",
+            rowN, text="Label bar (bottom)",
             variable=self._preview_labels_on_video_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
         cblv.grid(row=1, column=0, columnspan=4, padx=(0, 8), pady=(4, 0), sticky=tk.W)
         w.append(cblv)
-        _tip(cblv, "Draw the label and ship type over each preview's video "
-                   "(e.g. 'Logi - Onyx') via a topmost overlay, in the corner and "
-                   "colour set above.")
+        _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') in a small "
+                   "strip at the BOTTOM of each preview tile — below the video, "
+                   "never over it — using the colour and font size set above.")
 
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)

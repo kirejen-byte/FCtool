@@ -375,18 +375,34 @@ class TileWindow:
                                   font=("Consolas", 8, "bold"))
         self._chip_lbl.pack(side="right", padx=(0, 4))
 
+        # ── bottom caption strip (mirror of the top strip) ──────────────────
+        # The activity label ('<label> - <ShipType>') lives in a small strip
+        # BELOW the video, never over it. The old on-video child-canvas is
+        # DWM-occluded and the topmost-overlay workaround caused in-game lag, so
+        # the label now draws here. Packed side="bottom" BEFORE the body so the
+        # body expands into the middle, between the top strip and this one; the
+        # window total height (body_h + STRIP_H) is unchanged — the strip is
+        # carved out of the body area via _push_thumb_rect's avail_h.
+        self._strip_bottom = tk.Frame(self.top, bg=bg_panel, height=STRIP_H)
+        self._strip_bottom.pack_propagate(False)
+        self._bottom_lbl = tk.Label(self._strip_bottom, text="", bg=bg_panel,
+                                    fg=fg_text, anchor="w",
+                                    font=("Consolas", 9, "bold"))
+        self._bottom_lbl.pack(side="left", fill="x", padx=(4, 4))
+        self._bottom_visible = False   # True while the strip is packed/shown
+        self._bottom_strip_h = STRIP_H  # last chosen (clamped) bottom-strip height
+
         # ── body (DWM composites the live thumbnail over this) ──────────────
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
 
-        # On-video activity label (caption-onvideo): a small Canvas placed over
-        # the BODY at the configured corner. Child Tk widgets composite ABOVE the
-        # DWM thumbnail client area (the caption strip already proves this), so
-        # the label reads on top of the live video. Its bg matches the body so
-        # only the outlined+filled text is visible; it's placed lazily on the
-        # first non-empty set_video_label so an empty label leaves the body clean.
-        # FLAG: on-video compositing above the thumbnail + legibility need a live
-        # re-test on a real DWM-composited tile.
+        # On-video activity label (RETIRED): the DWM compositor draws each tile's
+        # live thumbnail OVER any child widget inside the thumbnail rect, so this
+        # child Canvas was occluded, and routing the label through a separate
+        # topmost overlay caused massive in-game FPS drops. The activity label now
+        # renders in the bottom strip (see set_bottom_label). This canvas + the
+        # _draw_video_label path are kept as dead code so references never break;
+        # set_video_label is now a no-op.
         self._label_canvas = tk.Canvas(
             self._body, bg="#000000", highlightthickness=0, bd=0,
             width=1, height=1)
@@ -411,7 +427,8 @@ class TileWindow:
     def _bind_mouse(self):
         # RIGHT-drag move/resize + LEFT click-activate are bound on every widget.
         for w in (self.top, self._strip, self._body, self._name_lbl,
-                  self._chip_lbl, self._tag_lbl, self._dot):
+                  self._chip_lbl, self._tag_lbl, self._dot,
+                  self._strip_bottom, self._bottom_lbl):
             w.bind("<Button-3>", self._on_b3_press)
             w.bind("<B3-Motion>", self._on_b3_motion)
             w.bind("<ButtonRelease-3>", self._on_b3_release)
@@ -420,10 +437,12 @@ class TileWindow:
             w.bind("<Button-1>", self._on_b1_press)
             w.bind("<ButtonRelease-1>", self._on_b1_release)
         # LEFT on the CAPTION STRIP = title-bar drag-to-move; a plain click there
-        # still activates (BUG B). The strip cluster (strip + its child labels)
-        # gets the strip handlers so a left-drag anywhere on the caption moves.
+        # still activates (BUG B). The strip cluster (top strip + bottom strip +
+        # their child labels) gets the strip handlers so a left-drag anywhere on
+        # either caption bar moves the tile (bottom strip = same, no dead zone).
         for w in (self._strip, self._name_lbl, self._excl_lbl, self._chip_lbl,
-                  self._tag_lbl, self._dot):
+                  self._tag_lbl, self._dot,
+                  self._strip_bottom, self._bottom_lbl):
             w.bind("<ButtonPress-1>", self._on_strip_b1_press)
             w.bind("<B1-Motion>", self._on_strip_b1_motion)
             w.bind("<ButtonRelease-1>", self._on_strip_b1_release)
@@ -431,7 +450,8 @@ class TileWindow:
         # the nearest corner (12 px zone) and swaps the cursor to the matching
         # diagonal-resize glyph. The armed corner + a left press start a resize.
         for w in (self.top, self._strip, self._body, self._name_lbl,
-                  self._excl_lbl, self._chip_lbl, self._tag_lbl, self._dot):
+                  self._excl_lbl, self._chip_lbl, self._tag_lbl, self._dot,
+                  self._strip_bottom, self._bottom_lbl):
             w.bind("<Motion>", self._on_corner_motion, add="+")
         # A corner drag that begins on the BODY (or toplevel) needs its own
         # B1-Motion/Release routing — the body has no strip-move handlers, and
@@ -754,13 +774,19 @@ class TileWindow:
         self._src_size = self._thumb.source_size()
         self._push_thumb_rect()
 
+    def _bottom_h(self) -> int:
+        """Current bottom-strip height in px when the strip is visible, else 0.
+        The strip is carved out of the body area (the window total height stays
+        body_h + STRIP_H), so the letterboxed video shrinks by exactly this."""
+        return self._bottom_strip_h if self._bottom_visible else 0
+
     def _push_thumb_rect(self):
-        # Re-clamp the on-video label to the (possibly new) body size on every
-        # placement/resize so a shrunken tile ellipsizes and a grown one relaxes.
-        self._draw_video_label()
         if not self._thumb:
             return
-        fx, fy, fw, fh = aspect_fit(self._w, self._body_h, *self._src_size)
+        # Letterbox the video into the body MINUS the bottom strip, so the strip
+        # never overlaps the live thumbnail (the strip sits below it).
+        avail_h = max(1, self._body_h - self._bottom_h())
+        fx, fy, fw, fh = aspect_fit(self._w, avail_h, *self._src_size)
         self._thumb.show((fx, STRIP_H + fy, fx + fw, STRIP_H + fy + fh))
 
     def refresh_source_size(self):
@@ -958,70 +984,104 @@ class TileWindow:
         self._draw_video_label()
 
     def set_video_label(self, text):
-        """Set the on-video activity label text ('<label> - <ShipType>', already
-        composed by the caller). Empty text hides the label entirely (canvas
-        cleared, not placed). Clamped to never overflow/fill the tile."""
+        """RETIRED no-op. The on-video label drew over the DWM thumbnail (which
+        occludes it) and the topmost-overlay workaround caused in-game lag, so the
+        activity label now renders in the bottom strip (set_bottom_label). The
+        method + signature are kept so callers never break; it does NOT draw."""
         self._label_text = text or ""
-        self._draw_video_label()
 
     def video_label_text(self) -> str:
-        """The last-drawn (post-clamp is not applied here) on-video label text —
-        for tests/logging."""
+        """The last text handed to the retired set_video_label — for tests/logging.
+        (The visible activity label now lives in the bottom strip.)"""
         return self._label_text
 
+    # ── bottom caption strip label ('<label> - <ShipType>', below the video) ──
+    def set_bottom_label(self, text, color=None, size=None):
+        """Show the activity label ('<label> - <ShipType>') in the bottom strip,
+        BELOW the video (never over it). This replaces the retired on-video label.
+
+        Empty/falsy text hides the strip and lets the video reclaim the space.
+        A non-empty text ellipsizes to the tile width, applies the given fill
+        colour + font size (from config['overlay'] color/font_size), sizes the
+        strip to the font (clamped so it can never exceed ~40% of the body), packs
+        it if hidden, and re-letterboxes the thumbnail into the smaller area."""
+        text = "" if not text else str(text)
+        if not text:
+            if self._bottom_visible:
+                try:
+                    self._strip_bottom.pack_forget()
+                except tk.TclError:
+                    pass
+                self._bottom_visible = False
+                self._push_thumb_rect()   # video reclaims the freed space
+            return
+        # Resolve style. Fall back to the strip's default fg / the top-strip name
+        # font size (9) when the caller passes nothing.
+        fill = color if color else self._fg_text
+        try:
+            fsize = int(size) if size is not None else 9
+        except (TypeError, ValueError):
+            fsize = 9
+        fsize = max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
+        # Strip height tracks the font so a bigger font stays legible, but is
+        # CLAMPED to ~40% of the body so a huge font can't swallow the video.
+        strip_h = max(STRIP_H, fsize + 8)
+        if self._body_h and self._body_h > 0:
+            cap = max(STRIP_H, int(self._body_h * 0.40))
+            strip_h = min(strip_h, cap)
+        self._bottom_strip_h = strip_h
+        # Ellipsize to the tile width the same way the top-strip name does, using
+        # the chosen font size for the per-glyph estimate.
+        shown = self._ellipsize_bottom(text, fsize)
+        try:
+            self._strip_bottom.configure(height=strip_h)
+            self._bottom_lbl.configure(text=shown, fg=fill,
+                                       font=("Consolas", fsize, "bold"))
+        except tk.TclError:
+            pass
+        if not self._bottom_visible:
+            try:
+                self._strip_bottom.pack(side="bottom", fill="x")
+            except tk.TclError:
+                pass
+            self._bottom_visible = True
+        self._push_thumb_rect()           # shrink the video above the strip
+
+    def _ellipsize_bottom(self, text, font_size):
+        """Truncate the bottom-strip label to fit the tile width, estimated
+        Tk-free from the font size (mirrors _ellipsize_name's width budget). The
+        bottom label spans nearly the full width, so only the L/R strip pad (4+4)
+        is reserved."""
+        text = text or ""
+        w = self._w if self._w > 0 else 0
+        if w <= 0:
+            return text
+        usable = max(0, w - 2 * _LABEL_PAD)
+        per_char = max(1.0, font_size * _CHAR_W_RATIO)
+        budget = int(usable // per_char)
+        return _ellipsize(text, budget)
+
+    def bottom_label_text(self) -> str:
+        """The text currently shown in the bottom strip ('' when hidden) — for
+        tests/logging. Pre-ellipsis (the raw text handed to set_bottom_label)."""
+        return self._bottom_lbl.cget("text") if self._bottom_visible else ""
+
     def _draw_video_label(self):
-        """Render the on-video label: clamp text+size to the current body, then
-        draw a black 8-direction outline with the coloured fill on top. Empty
-        text withdraws (place_forget) the canvas so the body stays clean."""
+        """RETIRED. The on-video label is gone (DWM-occluded + the topmost-overlay
+        workaround lagged the game); the activity label now renders in the bottom
+        strip. This is kept as a defensive no-op that only ever ensures the dead
+        _label_canvas stays unplaced — it must NEVER draw over the video again.
+        (set_label_style still calls it; that call is harmless.)"""
         cv = getattr(self, "_label_canvas", None)
         if cv is None:
             return
         try:
             cv.delete("all")
-        except tk.TclError:
-            return
-        text = self._label_text
-        if not text:
-            if self._label_placed:
-                try:
-                    cv.place_forget()
-                except tk.TclError:
-                    pass
-                self._label_placed = False
-            return
-        body_w = self._w if self._w > 0 else 0
-        body_h = self._body_h if self._body_h > 0 else 0
-        shown, size = clamp_label(text, self._label_size, body_w, body_h)
-        font = ("Consolas", size, "bold")
-        relx, rely, tk_anchor = label_anchor_placement(self._label_anchor)
-        # Place the canvas to fill the body; it draws the text at the matching
-        # corner itself, so a single full-body canvas covers all four anchors.
-        try:
-            cv.place(relx=0, rely=0, relwidth=1.0, relheight=1.0)
-            self._label_placed = True
-            cv.update_idletasks()
+            if getattr(self, "_label_placed", False):
+                cv.place_forget()
         except tk.TclError:
             pass
-        # Text position inside the canvas: pad in from the chosen corner.
-        pad = _LABEL_PAD
-        if "left" in (self._label_anchor or ""):
-            tx = pad
-        elif "right" in (self._label_anchor or ""):
-            tx = max(pad, body_w - pad) if body_w else pad
-        else:
-            tx = pad
-        if (self._label_anchor or "").startswith("bottom"):
-            ty = max(pad, body_h - pad) if body_h else pad
-        else:
-            ty = pad
-        try:
-            for dx, dy in _LABEL_OUTLINE_OFFSETS:
-                cv.create_text(tx + dx, ty + dy, text=shown, anchor=tk_anchor,
-                               fill=_LABEL_OUTLINE, font=font)
-            cv.create_text(tx, ty, text=shown, anchor=tk_anchor,
-                           fill=self._label_color, font=font)
-        except tk.TclError:
-            pass
+        self._label_placed = False
 
     def destroy(self):
         self.detach()
