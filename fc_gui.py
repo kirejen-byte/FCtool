@@ -13201,19 +13201,25 @@ class FCToolGUI:
         _tip(self._overlay_color_btn,
              "Click to cycle the colour of the on-video label text.")
 
-        tk.Label(row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+        self._overlay_anchor_label = tk.Label(
+            row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
+            bg=BG_DARK)
+        self._overlay_anchor_label.grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
         self._overlay_anchor_var = tk.StringVar(
             value=self._OVERLAY_CFG_TO_ANCHOR.get(cfg.get("anchor", "top-left"),
                                                   "Top-left"))
-        anchor_combo = ttk.Combobox(
+        self._overlay_anchor_combo = ttk.Combobox(
             row2, textvariable=self._overlay_anchor_var, values=self._OVERLAY_ANCHORS,
             state="readonly", width=12, font=("Consolas", 10))
-        anchor_combo.grid(row=0, column=5)
-        anchor_combo.bind("<<ComboboxSelected>>",
-                          lambda e: self._overlay_apply_style())
-        _tip(anchor_combo,
-             "Which corner of the preview the on-video label sits in.")
+        self._overlay_anchor_combo.grid(row=0, column=5)
+        self._overlay_anchor_combo.bind("<<ComboboxSelected>>",
+                                        lambda e: self._overlay_apply_style())
+        _tip(self._overlay_anchor_combo,
+             "Which corner the label sits in — applies to Eve-O Preview "
+             "Enhancement mode only (FCPreview uses fixed bottom strips).")
+        # Anchor only affects EVE-O-Enhancement thumbnails; native tiles draw the
+        # label/location in fixed bottom strips. Grey it out when mode == native.
+        self._preview_sync_anchor_enabled()
 
         # Row 3 (shared): Label rules… button (rules + manual tags modal). Native
         # captions reuse these same rules, so it lives in the shared frame too.
@@ -13614,6 +13620,7 @@ class FCToolGUI:
         self._preview_show_mode_panel()
         self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
+        self._preview_sync_anchor_enabled()
 
     # Button layout: (internal mode key, exact label). Labels are user-facing and
     # must stay verbatim; keys are the persisted mode values (no migration).
@@ -13709,6 +13716,25 @@ class FCToolGUI:
             except tk.TclError:
                 pass
 
+    def _preview_sync_anchor_enabled(self):
+        """Grey out the shared Position (anchor) control in native mode.
+
+        The anchor corner only affects Eve-O Preview Enhancement mode (labels drawn
+        on EVE-O's own thumbnails). Native FCPreview tiles render label + location in
+        fixed bottom strips, so the anchor does nothing there — disable it to signal
+        that. Size/Color still apply to native and stay enabled."""
+        combo = getattr(self, "_overlay_anchor_combo", None)
+        if combo is None:
+            return
+        native = (self._preview_mode_var.get() == "native")
+        try:
+            combo.configure(state=("disabled" if native else "readonly"))
+            lbl = getattr(self, "_overlay_anchor_label", None)
+            if lbl is not None:
+                lbl.configure(fg=(FG_DIM if native else FG_TEXT))
+        except tk.TclError:
+            pass
+
     def _preview_status_text(self) -> str:
         """Live status for the settings label. `off`/`labels` are static; native
         surfaces the blocked-by-EVE-O notice or the controller's own tick status."""
@@ -13754,6 +13780,7 @@ class FCToolGUI:
         self._preview_show_mode_panel()
         self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
+        self._preview_sync_anchor_enabled()
 
     def _preview_apply_native_state(self):
         """Persist the native-row control values live. No path clears saved data."""
