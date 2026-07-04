@@ -26,6 +26,14 @@ log = get_logger(__name__)
 
 SCHEMA_VERSION = 2
 
+# Load-time renames for legacy doctrine-tag rule VALUES (old -> new). The
+# "Logistics" role tag was shortened to "Logi"; a seeded Default template from
+# v2.5.0 carries a ``doctrine_tag = "Logistics"`` rule that would no longer match
+# "Logi"-tagged fits, so it is rewritten on load. Applies ONLY to rules whose
+# condition.type is "doctrine_tag" — never to ship_class/ship_type values (which
+# use EVE names like "Logistics Cruiser").
+_DOCTRINE_TAG_RENAMES: dict[str, str] = {"Logistics": "Logi"}
+
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 @dataclass
@@ -213,6 +221,21 @@ def _migrate_template_v1(t: FleetTemplate) -> None:
                 slot.tag = None
 
 
+def _migrate_template_tags(t: FleetTemplate) -> None:
+    """In-place rename of legacy doctrine-tag rule values (``_DOCTRINE_TAG_RENAMES``).
+
+    Runs on every load, independent of schema version, so a v2 template seeded by
+    an older build (whose Logi rule value is still "Logistics") starts matching
+    "Logi"-tagged fits. Idempotent: a value already renamed ("Logi") maps to
+    itself. Only ``doctrine_tag`` conditions are touched — ``ship_class`` /
+    ``ship_type`` values (EVE names such as "Logistics Cruiser") are left intact.
+    """
+    for rule in t.rules:
+        cond = rule.condition
+        if cond.type == "doctrine_tag":
+            cond.value = _DOCTRINE_TAG_RENAMES.get(cond.value, cond.value)
+
+
 # append to fleet_template_store.py
 import json
 
@@ -261,6 +284,7 @@ class FleetTemplateStore:
                 t = template_from_dict(raw)
                 if version < 2:
                     _migrate_template_v1(t)
+                _migrate_template_tags(t)
                 validate_template(t)
                 self.templates.append(t)
             except Exception:

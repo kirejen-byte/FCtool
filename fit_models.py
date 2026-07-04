@@ -26,7 +26,7 @@ SLOT_SERVICE = "service"
 DEFAULT_TAGS = [
     "DPS",
     "Links",
-    "Logistics",
+    "Logi",
     "Support - EWAR",
     "Support - Webs",
     "Defenders",

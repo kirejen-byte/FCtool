@@ -47,10 +47,36 @@ log = get_logger(__name__)
 
 SCHEMA_VERSION = 1
 
+# Load-time tag renames applied to legacy libraries (old tag -> new tag). The
+# "Logistics" role tag was shortened to "Logi" so preview labels read
+# "Logi - Onyx" instead of "Logistics - Onyx"; existing data tagged the old way
+# is rewritten on every load (idempotent + de-duping). This does NOT touch EVE
+# ship-group/class names (e.g. type_catalog's group 832 "Logistics") — only the
+# doctrine role tag vocabulary and the per-membership tags that carry it.
+_TAG_RENAMES: dict[str, str] = {"Logistics": "Logi"}
+
 # ESI character-fittings field limits (see esi_auth.create_fitting). The body is
 # pre-trimmed here so the GUI never hands ESI an over-length name/description.
 _FITTING_NAME_MAX = 50
 _FITTING_DESC_MAX = 500
+
+
+def _migrate_tag_list(tags: list[str]) -> list[str]:
+    """Apply ``_TAG_RENAMES`` to a tag list, de-duping while preserving order.
+
+    Idempotent: an already-renamed tag maps to itself and is kept once. If both a
+    legacy tag and its target are present, they collapse to a single entry at the
+    legacy tag's original position (the target's later duplicate is dropped).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tags:
+        new_t = _TAG_RENAMES.get(t, t)
+        if new_t in seen:
+            continue
+        seen.add(new_t)
+        out.append(new_t)
+    return out
 
 
 class ImportSummary(NamedTuple):
@@ -129,6 +155,24 @@ class FittingsStore:
         }
         tags = data.get("tags")
         self._tags = list(tags) if tags else list(DEFAULT_TAGS)
+        self._migrate_tags()
+
+    def _migrate_tags(self) -> None:
+        """Rewrite legacy role tags (``_TAG_RENAMES``) across the loaded library.
+
+        Applies to the custom tag vocabulary and to every doctrine membership's
+        ``tags`` list (which is where per-fit doctrine tags AND composition/ideal
+        role resolution live — see ``fleet_guidance._composition_role``). Purely
+        in-memory: the rename persists on the next natural ``save()``. Idempotent
+        and de-duping via ``_migrate_tag_list`` so running it every load is safe
+        and never creates duplicate ``"Logi"`` entries.
+        """
+        self._tags = _migrate_tag_list(self._tags)
+        for doctrine in self._doctrines.values():
+            for member in doctrine.members:
+                new_tags = _migrate_tag_list(member.tags)
+                if new_tags != member.tags:
+                    member.tags = new_tags
 
     def save(self) -> None:
         """Atomically persist the library (temp file + fsync + os.replace)."""
@@ -492,7 +536,9 @@ class FittingsStore:
                 remapped.append(
                     DoctrineMember(
                         fit_id=local_fit_id,
-                        tags=list(member.tags),
+                        # Rename legacy tags on import too, so a .fctdoc exported
+                        # by an older build lands with the current tag vocabulary.
+                        tags=_migrate_tag_list(member.tags),
                         order=len(remapped),
                         ideal_mode=member.ideal_mode,
                         ideal_min=member.ideal_min,

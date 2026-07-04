@@ -607,7 +607,7 @@ def build_default_fleet_template(primary_name, primary_id, *, new_id=None):
             condition=fts.RuleCondition("capital", ""),
             action=fts.RuleAction("squad_member", "Caps", "Caps")),
         fts.AssignmentRule(priority=1,
-            condition=fts.RuleCondition("doctrine_tag", "Logistics"),
+            condition=fts.RuleCondition("doctrine_tag", "Logi"),
             action=fts.RuleAction("squad_member", "Subcaps", "Logi")),
         fts.AssignmentRule(priority=2,
             condition=fts.RuleCondition("doctrine_tag", "DPS"),
@@ -1912,7 +1912,7 @@ class FCToolGUI:
             self._spec_roles_frame, bg=BG_PANEL, fg=FG_YELLOW,
             font=("Consolas", 8), anchor=tk.W, justify=tk.LEFT, wraplength=320)
         self._logi_container, self._logi_content, self._logi_count = \
-            self._create_collapsible_section(self._spec_roles_frame, "Logistics")
+            self._create_collapsible_section(self._spec_roles_frame, "Logi")
         self._defenders_container, self._defenders_content, self._defenders_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Defenders")
         self._cyno_container, self._cyno_content, self._cyno_count = \
@@ -4267,7 +4267,7 @@ class FCToolGUI:
             self._schedule_motd_preview()
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
-    _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logistics",
+    _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
                         "defenders": "Defenders", "webs": "Support - Webs"}
 
     def _format_rollup(self, rr) -> tuple[str, str]:
@@ -6358,7 +6358,7 @@ class FCToolGUI:
     # Canonical tag display order for the role-grouped doctrine detail. Members
     # carrying a tag outside this list are grouped last under "Other".
     _DOCTRINE_TAG_ORDER = (
-        "DPS", "Logistics", "Links",
+        "DPS", "Logi", "Links",
         "Support - EWAR", "Support - Webs", "Defenders", "Tackle", "Special",
     )
 
@@ -7520,7 +7520,7 @@ class FCToolGUI:
     # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
 
     # Tags pre-checked by default on a fresh MOTD (the common doctrine roles).
-    _MOTD_DEFAULT_TAGS = ("DPS", "Logistics", "Links")
+    _MOTD_DEFAULT_TAGS = ("DPS", "Logi", "Links")
     # Debounce window (ms) for live preview rebuilds while typing/toggling.
     _MOTD_PREVIEW_DEBOUNCE_MS = 250
     # Per-attribute soft limit for a single <url=fitting:...> link (spec §3.5,
@@ -8207,7 +8207,7 @@ class FCToolGUI:
         """Rebuild the include-tag checkboxes from the selected doctrine's tags.
 
         Tags present on the doctrine's members (in canonical order, then any
-        extras) each get a checkbox; DPS/Logistics/Links default checked. Prior
+        extras) each get a checkbox; DPS/Logi/Links default checked. Prior
         check states are preserved across rebuilds for tags that persist."""
         frame = getattr(self, "_motd_tag_frame", None)
         if frame is None:

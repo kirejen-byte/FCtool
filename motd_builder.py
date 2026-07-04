@@ -46,9 +46,9 @@ LINE_BREAK = "<br>"
 CHANNEL_LINK_COMPOUND = True
 
 # Tags are emitted in this stable priority; any tag not listed follows in the
-# caller's iteration order. Keeps DPS/Logistics/Links at the top regardless of
+# caller's iteration order. Keeps DPS/Logi/Links at the top regardless of
 # how ``fits_by_tag`` happens to be ordered.
-TAG_PRIORITY = ("DPS", "Logistics", "Links")
+TAG_PRIORITY = ("DPS", "Logi", "Links")
 
 
 def fitting_link(dna: str, name: str) -> str:

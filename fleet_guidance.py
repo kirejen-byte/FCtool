@@ -19,7 +19,7 @@ DEFENDER_TAG = "Defenders"
 
 # Composition roles resolved per-fit, in priority order. "Defenders" is NOT here —
 # it is an additive fleet-wide overlay (see compute_fleet_guidance).
-COMPOSITION_ROLE_ORDER = ("DPS", "Logistics", "Links", "Support - Webs", "Tackle")
+COMPOSITION_ROLE_ORDER = ("DPS", "Logi", "Links", "Support - Webs", "Tackle")
 
 # ── Ideal-% exemptions ───────────────────────────────────────────────────────
 # Ships exempted by default from the fleet-% denominator (they inflate the fleet
@@ -83,7 +83,7 @@ def is_exempt_type(ship_type_id, exemptions, group_of, is_capital_of) -> bool:
 # Tag -> (mode, min, max) default. "Links" has no static default (computed).
 TAG_DEFAULTS: dict[str, tuple[str, int, int | None]] = {
     "DPS": ("percent", 50, 60),
-    "Logistics": ("percent", 25, 35),
+    "Logi": ("percent", 25, 35),
     "Support - Webs": ("count", 2, 6),
 }
 DEFENDER_TARGET_MIN = 8
@@ -260,7 +260,7 @@ def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
 
     Composition targets (percent/count) are ROLE-LEVEL: the role's single ideal is
     applied once, ``current`` is the SUM of the role's hull counts, and every fit in
-    the role carries that same role-level target/current/delta. So two Logistics
+    the role carries that same role-level target/current/delta. So two Logi
     fits (e.g. Basilisk + Scimitar) both show the same role shortfall (e.g. +4),
     rather than each independently targeting the full percentage.
     """
