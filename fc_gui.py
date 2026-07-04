@@ -12899,28 +12899,46 @@ class FCToolGUI:
         # as a group (native controls are inert unless mode == "native").
         self._preview_native_widgets = []
 
-        # Row 1: mode radio (Off / Label EVE-O thumbnails / Native previews) +
-        # live status label. Toggling mode never touches saved layouts/hotkeys.
+        # Row 1: three mode BUTTONS (Off / Eve-O Preview Enhancement / FCPreview)
+        # + live status label. The active mode's button turns green with a leading
+        # checkmark; the others keep the dark style. Toggling mode never touches
+        # saved layouts/hotkeys. Internal mode keys are unchanged (off / eveo_labels
+        # / native) so no config migration is needed.
         row1 = tk.Frame(parent, bg=BG_DARK)
         row1.pack(fill=tk.X, padx=20, pady=2)
+        # _preview_mode_var is retained (StringVar mirror of the current mode) so
+        # existing callers/tests that read it keep working; the buttons drive it.
         self._preview_mode_var = tk.StringVar(value=pcfg.get("mode", "off"))
-        for value, text in (("off", "Off"),
-                            ("eveo_labels", "Label EVE-O thumbnails"),
-                            ("native", "Native previews (beta)")):
-            tk.Radiobutton(
-                row1, text=text, value=value, variable=self._preview_mode_var,
-                command=lambda: self._preview_set_mode(self._preview_mode_var.get()),
-                font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-                selectcolor=BG_ENTRY, activebackground=BG_DARK,
-                activeforeground=FG_TEXT, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 8))
+        self._preview_mode_buttons = {}
+        for value, text in self._PREVIEW_MODE_BUTTONS:
+            btn = tk.Button(
+                row1, text=text, font=("Consolas", 10),
+                relief=tk.RIDGE, bd=1, padx=8, pady=1, cursor="hand2",
+                command=lambda v=value: self._preview_set_mode(v))
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            self._preview_mode_buttons[value] = btn
         self._preview_status_label = tk.Label(
             row1, text=self._preview_status_text(), font=("Consolas", 9),
             fg=FG_DIM, bg=BG_DARK, anchor=tk.W)
         self._preview_status_label.pack(side=tk.LEFT, padx=12)
 
+        # Per-mode option panels. Only the active mode's panel is packed (below the
+        # buttons row, above the fine print) so the settings window never shows
+        # controls for a mode you aren't using. 'off' has no panel.
+        self._preview_panel_off = None
+        self._preview_panel_labels = tk.Frame(parent, bg=BG_DARK)
+        self._preview_panel_native = tk.Frame(parent, bg=BG_DARK)
+
+        # Shared overlay-label controls (size / color / anchor + Label rules…). The
+        # same overlay cfg keys drive labels in BOTH Eve-O-Enhancement and FCPreview
+        # (native captions reuse the same label rules), so this single frame is
+        # re-homed into whichever active panel needs it (see _preview_show_mode_panel).
+        self._preview_shared_overlay_frame = tk.Frame(parent, bg=BG_DARK)
+        shared = self._preview_shared_overlay_frame
+
         # Row 2: size / color / anchor, grid-aligned, applied live
-        row2 = tk.Frame(parent, bg=BG_DARK)
-        row2.pack(fill=tk.X, padx=20, pady=2)
+        row2 = tk.Frame(shared, bg=BG_DARK)
+        row2.pack(fill=tk.X, pady=2)
         tk.Label(row2, text="Size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
         self._overlay_size_var = tk.IntVar(value=int(cfg.get("font_size", 11)))
@@ -12953,17 +12971,21 @@ class FCToolGUI:
         anchor_combo.bind("<<ComboboxSelected>>",
                           lambda e: self._overlay_apply_style())
 
-        # Row 3 (shared): Label rules… button (rules + manual tags modal)
-        row3 = tk.Frame(parent, bg=BG_DARK)
-        row3.pack(fill=tk.X, padx=20, pady=2)
+        # Row 3 (shared): Label rules… button (rules + manual tags modal). Native
+        # captions reuse these same rules, so it lives in the shared frame too.
+        row3 = tk.Frame(shared, bg=BG_DARK)
+        row3.pack(fill=tk.X, pady=2)
         ttk.Button(row3, text="Label rules…", style="Dark.TButton",
                    command=self._open_overlay_rules_dialog).pack(side=tk.LEFT)
 
         # Row 4 (native): tile size / inactive opacity / captions / doctrine tag /
         # highlight / lock layout, all live-applied. Comfort & parity (zoom,
         # hide-*, minimize-inactive) and damage-flash (Task B6) extend this row.
-        rowN = tk.Frame(parent, bg=BG_DARK)
-        rowN.pack(fill=tk.X, padx=20, pady=2)
+        rowN = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowN.pack(fill=tk.X, pady=2)
+        # First native row — the shared overlay-label row is packed *before* it so
+        # the label controls sit at the top of the FCPreview panel.
+        self._preview_native_first_row = rowN
         w = self._preview_native_widgets
 
         tk.Label(rowN, text="Tile w", font=("Consolas", 10), fg=FG_TEXT,
@@ -13010,8 +13032,8 @@ class FCToolGUI:
         w.append(cbd)
 
         # Row 5 (native): highlight active / lock layout / arrange buttons.
-        rowN2 = tk.Frame(parent, bg=BG_DARK)
-        rowN2.pack(fill=tk.X, padx=20, pady=2)
+        rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowN2.pack(fill=tk.X, pady=2)
         self._preview_highlight_var = tk.BooleanVar(
             value=bool(pcfg.get("highlight_active", True)))
         cbh = tk.Checkbutton(
@@ -13076,8 +13098,8 @@ class FCToolGUI:
 
         # Row 5b (native, Task C2): hide rules + the per-character "which previews
         # to show" entry point. Hiding a rule/character never wipes saved data.
-        rowHide = tk.Frame(parent, bg=BG_DARK)
-        rowHide.pack(fill=tk.X, padx=20, pady=2)
+        rowHide = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowHide.pack(fill=tk.X, pady=2)
         self._preview_hide_active_var = tk.BooleanVar(
             value=bool(pcfg.get("hide_active", False)))
         cbha = tk.Checkbutton(
@@ -13121,8 +13143,8 @@ class FCToolGUI:
 
         # Row 6 (native): damage-flash tuning (threshold % / window / cooldown /
         # reference) — all live-applied like the other native rows (Task B6).
-        rowN3 = tk.Frame(parent, bg=BG_DARK)
-        rowN3.pack(fill=tk.X, padx=20, pady=2)
+        rowN3 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowN3.pack(fill=tk.X, pady=2)
 
         tk.Label(rowN3, text="Flash %", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
@@ -13173,8 +13195,8 @@ class FCToolGUI:
         w.append(ref_combo)
 
         # Row 7 (native): arrange / hotkey buttons.
-        rowN4 = tk.Frame(parent, bg=BG_DARK)
-        rowN4.pack(fill=tk.X, padx=20, pady=2)
+        rowN4 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowN4.pack(fill=tk.X, pady=2)
         bg = ttk.Button(rowN4, text="Arrange in grid", style="Dark.TButton",
                         command=self._preview_arrange_grid)
         bg.grid(row=0, column=0, padx=(0, 6))
@@ -13197,8 +13219,11 @@ class FCToolGUI:
 
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
+        # Stored so the active mode's panel packs *before* it (see
+        # _preview_show_mode_panel) and the disclaimer stays at the bottom.
         row4 = tk.Frame(parent, bg=BG_DARK)
         row4.pack(fill=tk.X, padx=20, pady=(2, 6))
+        self._preview_fineprint_row = row4
         tk.Label(
             row4,
             text=("Labels come from your own ESI data and your text only; intel "
@@ -13210,7 +13235,95 @@ class FCToolGUI:
             font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT,
             wraplength=760).pack(side=tk.LEFT)
 
+        # Show the active mode's panel and paint the buttons for the first time.
+        self._preview_show_mode_panel()
+        self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
+
+    # Button layout: (internal mode key, exact label). Labels are user-facing and
+    # must stay verbatim; keys are the persisted mode values (no migration).
+    _PREVIEW_MODE_BUTTONS = (
+        ("off", "Off"),
+        ("eveo_labels", "Eve-O Preview Enhancement"),
+        ("native", "FCPreview"),
+    )
+
+    def _preview_refresh_mode_buttons(self):
+        """Paint the three mode buttons: the active mode gets a leading checkmark
+        + green bg / dark fg; the others keep the house dark-button style."""
+        btns = getattr(self, "_preview_mode_buttons", None)
+        if not btns:
+            return
+        active = self._preview_cfg().get("mode", "off")
+        # keep the retained StringVar mirror in sync with the persisted mode
+        try:
+            if getattr(self, "_preview_mode_var", None) is not None:
+                self._preview_mode_var.set(active)
+        except tk.TclError:
+            pass
+        for mode, label in self._PREVIEW_MODE_BUTTONS:
+            btn = btns.get(mode)
+            if btn is None:
+                continue
+            try:
+                if mode == active:
+                    btn.configure(
+                        text=f"✓ {label}", bg=FG_GREEN, fg=BG_DARK,
+                        activebackground=FG_GREEN, activeforeground=BG_DARK)
+                else:
+                    btn.configure(
+                        text=label, bg=BG_ENTRY, fg=FG_TEXT,
+                        activebackground=BG_ENTRY, activeforeground=FG_TEXT)
+            except tk.TclError:
+                pass
+
+    def _preview_show_mode_panel(self):
+        """Pack exactly the active mode's option panel (labels/native), re-homing
+        the shared overlay-label controls into it, and hide the others. 'off' shows
+        no panel — just the buttons row + status line + fine print."""
+        active = self._preview_cfg().get("mode", "off")
+        panels = {
+            "off": getattr(self, "_preview_panel_off", None),
+            "eveo_labels": getattr(self, "_preview_panel_labels", None),
+            "native": getattr(self, "_preview_panel_native", None),
+        }
+        before = getattr(self, "_preview_fineprint_row", None)
+        shared = getattr(self, "_preview_shared_overlay_frame", None)
+        # First detach every panel + the shared row so re-homing is clean.
+        for p in panels.values():
+            if p is not None:
+                try:
+                    p.pack_forget()
+                except tk.TclError:
+                    pass
+        if shared is not None:
+            try:
+                shared.pack_forget()
+            except tk.TclError:
+                pass
+        panel = panels.get(active)
+        if panel is None:
+            return
+        # The labels + native panels both host the shared overlay-label row at
+        # their top; re-parent it into the active panel before packing. In the
+        # native panel the row-order already exists, so pack before the first
+        # native row to keep the label controls on top.
+        if shared is not None and active in ("eveo_labels", "native"):
+            first = getattr(self, "_preview_native_first_row", None)
+            try:
+                if active == "native" and first is not None:
+                    shared.pack(in_=panel, fill=tk.X, pady=(0, 2), before=first)
+                else:
+                    shared.pack(in_=panel, fill=tk.X, pady=(0, 2))
+            except tk.TclError:
+                pass
+        try:
+            if before is not None:
+                panel.pack(fill=tk.X, padx=20, pady=2, before=before)
+            else:
+                panel.pack(fill=tk.X, padx=20, pady=2)
+        except tk.TclError:
+            pass
 
     def _preview_sync_native_widgets(self):
         """Enable native-only controls iff mode == native (spec §9 row gating)."""
@@ -13261,6 +13374,10 @@ class FCToolGUI:
                 self._preview_status_label.config(text=self._preview_status_text())
             except tk.TclError:
                 pass
+        # swap the visible option panel + repaint the mode buttons (no-ops before
+        # the settings UI is built — both guard on their widgets existing).
+        self._preview_show_mode_panel()
+        self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
 
     def _preview_apply_native_state(self):

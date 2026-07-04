@@ -103,6 +103,8 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_arrange_ordered", "_preview_fleet_order_key",
                  "_preview_apply_native_state",
                  "_preview_sync_native_widgets",
+                 "_PREVIEW_MODE_BUTTONS", "_preview_refresh_mode_buttons",
+                 "_preview_show_mode_panel",
                  "parse_eveo_config", "_preview_import_eveo",
                  "_preview_merge_eveo",
                  "_open_preview_hotkeys_dialog", "_preview_hotkey_preset",
@@ -161,7 +163,9 @@ def _pure_host(preview_cfg=None):
                  "_preview_status_text", "_preview_arrange_grid",
                  "_preview_arrange_by_fleet", "_preview_arrange_ordered",
                  "_preview_fleet_order_key",
-                 "_preview_sync_native_widgets"):
+                 "_preview_sync_native_widgets",
+                 "_PREVIEW_MODE_BUTTONS", "_preview_refresh_mode_buttons",
+                 "_preview_show_mode_panel"):
         attr = getattr(fc_gui.FCToolGUI, name, None)
         if attr is None:
             continue
@@ -188,6 +192,181 @@ def test_build_section_reflects_native_mode():
         frame = tk.Frame(root)
         host._build_preview_section(frame)
         assert host._preview_mode_var.get() == "native"
+    finally:
+        root.destroy()
+
+
+# ── mode buttons: three labeled buttons + active checkmark/green bg ───────────
+_BTN_OFF = "Off"
+_BTN_LABELS = "Eve-O Preview Enhancement"
+_BTN_NATIVE = "FCPreview"
+_CHECK = "✓"
+
+
+def _panels(host):
+    """Return {mode: panel frame or None}."""
+    return {
+        "off": getattr(host, "_preview_panel_off", None),
+        "eveo_labels": getattr(host, "_preview_panel_labels", None),
+        "native": getattr(host, "_preview_panel_native", None),
+    }
+
+
+def _is_packed(w):
+    if w is None:
+        return False
+    try:
+        return w.winfo_manager() == "pack"
+    except tk.TclError:
+        return False
+
+
+def test_build_creates_three_mode_buttons_with_exact_labels():
+    root, host = _ui_host(preview_cfg={"mode": "off"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        btns = host._preview_mode_buttons
+        assert set(btns) == {"off", "eveo_labels", "native"}
+        # inactive buttons carry the plain base label; the active one is prefixed
+        # with the checkmark. In "off" mode only "off" is active.
+        assert btns["eveo_labels"].cget("text") == _BTN_LABELS
+        assert btns["native"].cget("text") == _BTN_NATIVE
+        assert btns["off"].cget("text") == f"{_CHECK} {_BTN_OFF}"
+    finally:
+        root.destroy()
+
+
+def test_active_button_is_green_with_checkmark_others_dark():
+    root, host = _ui_host(preview_cfg={"mode": "eveo_labels"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        btns = host._preview_mode_buttons
+        # active (eveo_labels): checkmark + green bg + dark fg
+        active = btns["eveo_labels"]
+        assert active.cget("text").startswith(_CHECK)
+        assert str(active.cget("bg")) == fc_gui.FG_GREEN
+        assert str(active.cget("fg")) == fc_gui.BG_DARK
+        # inactive: no checkmark, not green
+        for m in ("off", "native"):
+            assert not btns[m].cget("text").startswith(_CHECK)
+            assert str(btns[m].cget("bg")) != fc_gui.FG_GREEN
+    finally:
+        root.destroy()
+
+
+def test_exactly_one_panel_visible_per_mode_off():
+    root, host = _ui_host(preview_cfg={"mode": "off"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        panels = _panels(host)
+        # off → no panel packed
+        assert panels["off"] is None
+        assert not _is_packed(panels["eveo_labels"])
+        assert not _is_packed(panels["native"])
+    finally:
+        root.destroy()
+
+
+def test_exactly_one_panel_visible_per_mode_labels():
+    root, host = _ui_host(preview_cfg={"mode": "eveo_labels"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        panels = _panels(host)
+        assert _is_packed(panels["eveo_labels"])
+        assert not _is_packed(panels["native"])
+    finally:
+        root.destroy()
+
+
+def test_exactly_one_panel_visible_per_mode_native():
+    root, host = _ui_host(preview_cfg={"mode": "native"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        panels = _panels(host)
+        assert _is_packed(panels["native"])
+        assert not _is_packed(panels["eveo_labels"])
+    finally:
+        root.destroy()
+
+
+def test_switching_modes_swaps_panels_and_button_visuals():
+    root, host = _ui_host(preview_cfg={"mode": "off"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        panels = _panels(host)
+        btns = host._preview_mode_buttons
+
+        # off → labels
+        host._preview_set_mode("eveo_labels")
+        assert _is_packed(panels["eveo_labels"])
+        assert not _is_packed(panels["native"])
+        assert btns["eveo_labels"].cget("text").startswith(_CHECK)
+        assert str(btns["eveo_labels"].cget("bg")) == fc_gui.FG_GREEN
+        assert not btns["off"].cget("text").startswith(_CHECK)
+
+        # labels → native
+        host._preview_set_mode("native")
+        assert _is_packed(panels["native"])
+        assert not _is_packed(panels["eveo_labels"])
+        assert btns["native"].cget("text").startswith(_CHECK)
+        assert not btns["eveo_labels"].cget("text").startswith(_CHECK)
+
+        # native → off (no panel)
+        host._preview_set_mode("off")
+        assert not _is_packed(panels["native"])
+        assert not _is_packed(panels["eveo_labels"])
+        assert btns["off"].cget("text").startswith(_CHECK)
+        assert not btns["native"].cget("text").startswith(_CHECK)
+    finally:
+        root.destroy()
+
+
+def test_clicking_button_invokes_set_mode_with_internal_key():
+    root, host = _ui_host(preview_cfg={"mode": "off"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        seen = []
+        real = host._preview_set_mode
+
+        def _spy(mode):
+            seen.append(mode)
+            return real(mode)
+        host._preview_set_mode = _spy
+        # invoke() fires the button command → _preview_set_mode(<key>)
+        host._preview_mode_buttons["native"].invoke()
+        host._preview_mode_buttons["eveo_labels"].invoke()
+        host._preview_mode_buttons["off"].invoke()
+        assert seen == ["native", "eveo_labels", "off"]
+    finally:
+        root.destroy()
+
+
+def test_shared_overlay_row_present_in_active_labels_and_native_panels():
+    # The overlay label controls (size/color/anchor + Label rules) are shared:
+    # they must live under the active panel in BOTH labels and native modes.
+    root, host = _ui_host(preview_cfg={"mode": "eveo_labels"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        shared = host._preview_shared_overlay_frame
+        # in labels mode the shared row is packed INTO the labels panel (via
+        # pack(in_=panel) — the widget's master stays `parent`, so membership is
+        # verified through the panel's pack_slaves, not the widget hierarchy).
+        assert _is_packed(shared)
+        assert shared in host._preview_panel_labels.pack_slaves()
+        assert shared not in host._preview_panel_native.pack_slaves()
+        # switch to native → shared row re-homes into the native panel
+        host._preview_set_mode("native")
+        assert _is_packed(shared)
+        assert shared in host._preview_panel_native.pack_slaves()
+        assert shared not in host._preview_panel_labels.pack_slaves()
     finally:
         root.destroy()
 
