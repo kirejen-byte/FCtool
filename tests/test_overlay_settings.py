@@ -457,3 +457,83 @@ def test_teardown_cancels_after_and_stops_poller():
             try: root.after_cancel(host._overlay_after_id)
             except Exception: pass
         root.destroy()
+
+
+# ── Bug C: per-row delete on the label-rules dialog ─────────────────────────
+
+def _open_rules_dialog(host):
+    """Build the overlay rules dialog without blocking on wait_window.
+    Returns the created Toplevel."""
+    created = {}
+    orig_wait = host.root.wait_window
+    host.root.wait_window = lambda w: created.__setitem__("win", w)
+    try:
+        host._open_overlay_rules_dialog()
+    finally:
+        host.root.wait_window = orig_wait
+    return created.get("win")
+
+
+def _find_ok(win):
+    from tkinter import ttk as _ttk
+    found = []
+    def _walk(w):
+        for c in w.winfo_children():
+            if isinstance(c, _ttk.Button) and str(c.cget("text")) == "OK":
+                found.append(c)
+            _walk(c)
+    _walk(win)
+    assert found, "expected an OK button in the dialog"
+    return found[0]
+
+
+def test_rules_dialog_delete_removes_rule_and_keeps_order():
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        from type_catalog import TypeCatalog
+        host.type_catalog = TypeCatalog()
+        host._overlay_rule_value_suggestions = types.MethodType(
+            fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+        host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+        host.config["overlay"]["rules"] = [
+            {"when": "system", "value": "Jita", "label": "R0"},
+            {"when": "system", "value": "Amarr", "label": "R1"},
+        ]
+        win = _open_rules_dialog(host)
+        assert win is not None
+        # Delete the FIRST rule row via its ✕ button.
+        del_btns = win._rule_delete_buttons()
+        assert len(del_btns) == 2
+        del_btns[0].invoke()
+        # Drive OK -> cfg rebuilt from surviving rows.
+        _find_ok(win).invoke()
+        rules = host.config["overlay"]["rules"]
+        assert [r["label"] for r in rules] == ["R1"]
+        assert rules[0]["value"] == "Amarr"
+    finally:
+        root.destroy()
+
+
+def test_rules_dialog_delete_removes_override_and_keeps_order():
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        from type_catalog import TypeCatalog
+        host.type_catalog = TypeCatalog()
+        host._overlay_rule_value_suggestions = types.MethodType(
+            fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+        host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+        host.esi_accounts = [
+            types.SimpleNamespace(character_name="Alpha"),
+            types.SimpleNamespace(character_name="Bravo"),
+        ]
+        host.config["overlay"]["overrides"] = {"Alpha": "A", "Bravo": "B"}
+        win = _open_rules_dialog(host)
+        assert win is not None
+        del_btns = win._override_delete_buttons()
+        assert len(del_btns) == 2
+        del_btns[0].invoke()          # remove "Alpha"
+        _find_ok(win).invoke()
+        overrides = host.config["overlay"]["overrides"]
+        assert overrides == {"Bravo": "B"}
+    finally:
+        root.destroy()

@@ -13225,16 +13225,40 @@ class FCToolGUI:
 
         when_values = ["ship_group", "ship_type", "system", "docked",
                        "offline", "capital", "subcap"]
-        rule_rows = []   # list of dicts: {when, value, label} Tk vars
+        # rule_rows is the backing data list; each entry is a dict carrying the
+        # row's live Tk vars/widgets plus its own '✕' delete button. Deletes
+        # remove the entry from this list and re-render the whole frame from it,
+        # so mid-list removals never leave stale grid indices / var mismatches.
+        rule_rows = []   # list of dicts: {when, value_entry, label, del_btn}
+
+        def _render_rule_rows():
+            for w in rules_frame.winfo_children():
+                w.grid_forget()
+            for r, row in enumerate(rule_rows):
+                row["when_combo"].grid(row=r, column=0, padx=2, pady=1)
+                row["value_entry"].grid(row=r, column=1, padx=2)
+                row["label_entry"].grid(row=r, column=2, padx=2)
+                row["del_btn"].grid(row=r, column=3, padx=(2, 0))
+
+        def _delete_rule_row(row):
+            try:
+                rule_rows.remove(row)
+            except ValueError:
+                return
+            for w in (row["when_combo"], row["value_entry"],
+                      row["label_entry"], row["del_btn"]):
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            _render_rule_rows()
 
         def _add_rule_row(when="ship_group", value="", label=""):
-            r = len(rule_rows)
             wv = tk.StringVar(value=when)
             lv = tk.StringVar(value=label)
             when_combo = ttk.Combobox(rules_frame, textvariable=wv,
                                       values=when_values, state="readonly",
                                       width=11, font=("Consolas", 9))
-            when_combo.grid(row=r, column=0, padx=2, pady=1)
             # value: autocomplete SCOPED to the chosen `when` kind (ship_group ->
             # group names, ship_type -> ship type names incl. shuttles, system ->
             # system names). Valueless kinds disable the field entirely.
@@ -13242,7 +13266,6 @@ class FCToolGUI:
                 rules_frame, self._overlay_rule_value_suggestions(when),
                 font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
                 insertbackground=FG_WHITE, width=18)
-            ve.grid(row=r, column=1, padx=2)
             if value:
                 ve.insert(0, value)
 
@@ -13271,10 +13294,15 @@ class FCToolGUI:
             when_combo.bind("<<ComboboxSelected>>", _sync_value_source)
             le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
-            le.grid(row=r, column=2, padx=2)
-            rule_rows.append({"when": wv, "value_entry": ve, "label": lv})
+            row = {"when": wv, "value_entry": ve, "label": lv,
+                   "when_combo": when_combo, "label_entry": le}
+            row["del_btn"] = ttk.Button(
+                rules_frame, text="✕", width=2, style="Dark.TButton",
+                command=lambda _row=row: _delete_rule_row(_row))
+            rule_rows.append(row)
             # apply the initial enabled/disabled state for the seeded `when`
             _sync_value_source()
+            _render_rule_rows()
 
         for r in cfg.get("rules", []) or []:
             _add_rule_row(r.get("when", "ship_group"), r.get("value", ""),
@@ -13292,18 +13320,42 @@ class FCToolGUI:
         ov_frame.pack(fill=tk.X, padx=10)
         char_names = [a.character_name for a in self.esi_accounts
                       if getattr(a, "character_name", None)]
-        override_rows = []
+        override_rows = []   # list of dicts: {name, label, combo, label_entry, del_btn}
+
+        def _render_override_rows():
+            for w in ov_frame.winfo_children():
+                w.grid_forget()
+            for r, row in enumerate(override_rows):
+                row["combo"].grid(row=r, column=0, padx=2, pady=1)
+                row["label_entry"].grid(row=r, column=1, padx=2)
+                row["del_btn"].grid(row=r, column=2, padx=(2, 0))
+
+        def _delete_override_row(row):
+            try:
+                override_rows.remove(row)
+            except ValueError:
+                return
+            for w in (row["combo"], row["label_entry"], row["del_btn"]):
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            _render_override_rows()
 
         def _add_override_row(name="", label=""):
-            r = len(override_rows)
             nv = tk.StringVar(value=name)
             lv = tk.StringVar(value=label)
-            ttk.Combobox(ov_frame, textvariable=nv, values=char_names, width=20,
-                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
-            tk.Entry(ov_frame, textvariable=lv, font=("Consolas", 9), bg=BG_ENTRY,
-                     fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
-                         row=r, column=1, padx=2)
-            override_rows.append({"name": nv, "label": lv})
+            combo = ttk.Combobox(ov_frame, textvariable=nv, values=char_names,
+                                 width=20, font=("Consolas", 9))
+            le = tk.Entry(ov_frame, textvariable=lv, font=("Consolas", 9),
+                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                          width=18)
+            row = {"name": nv, "label": lv, "combo": combo, "label_entry": le}
+            row["del_btn"] = ttk.Button(
+                ov_frame, text="✕", width=2, style="Dark.TButton",
+                command=lambda _row=row: _delete_override_row(_row))
+            override_rows.append(row)
+            _render_override_rows()
 
         for name, label in (cfg.get("overrides", {}) or {}).items():
             _add_override_row(name, label)
@@ -13350,6 +13402,10 @@ class FCToolGUI:
                    command=_ok).pack(side=tk.LEFT, padx=8)
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.LEFT, padx=2)
+        # Test hooks: expose the per-row delete buttons so headless tests can
+        # drive deletion without pixel-hunting inside the frames.
+        win._rule_delete_buttons = lambda: [r["del_btn"] for r in rule_rows]
+        win._override_delete_buttons = lambda: [r["del_btn"] for r in override_rows]
         self.root.wait_window(win)
 
     def _preview_hotkey_preset(self):
