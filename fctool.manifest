@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- Per-Monitor-V2 DPI awareness for FCTool native client previews.
+       Belt-and-suspenders: the runtime SetProcessDpiAwarenessContext(-4) call in
+       fc_gui._apply_dpi_awareness stays as a fallback (double-set is harmless;
+       "already set" errors are swallowed). Manifest wins when both are present,
+       and it applies before any Python runs — closing the pre-Tk gap on frozen
+       builds. Values verified against MS Learn "Setting the default DPI awareness
+       for a process" (SMI/2005 dpiAware + SMI/2016 dpiAwareness). -->
+  <asmv3:application xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+    <asmv3:windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

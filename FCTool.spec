@@ -49,4 +49,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='NONE',
+    manifest='fctool.manifest',
 )
