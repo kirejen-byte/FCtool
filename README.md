@@ -17,6 +17,41 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 - **Fittings, doctrines & MOTD writer** — import fits from **pyfa** or **in-game** (ESI), organize them into **doctrines** with role tags, and compose a clickable fleet **MOTD** (FC link, staging system, role-grouped fit links, logi channel) with a WYSIWYG markup editor and a live raw/rendered preview. **Doctrine-driven fleet guidance** sets an ideal composition (% or # per fit), shows live *in / under / over* status in **Fleet Management**, and annotates the MOTD with `+X / -Y` pilot deltas for the current fleet. Command-burst (links) coverage is tracked from fleet chat.
 - **Wormhole routing**, an **X-up fleet counter** (configurable trigger / clear words + threshold), **character & asset tracking**, and **text-to-speech audio alerts**.
 
+## Client Previews (native)
+
+FCTool can show **live previews of your own EVE clients** right inside the tool — a small always-on-top tile per client with the live game video and a caption strip — so you no longer need EVE-O Preview running. Left-click a tile to bring that client to the front; assign a global focus **hotkey** per character or cycle hotkeys across a group; drag tiles to arrange them (positions snap and persist per character). It multiboxes cleanly with per-monitor DPI.
+
+Turn it on in **Settings → the previews section**: pick **Native previews (beta)**. (The other modes are **Off** and **Label EVE-O thumbnails**, which keeps the old activity-label overlay on EVE-O Preview's own thumbnails.)
+
+**EVE-O Preview parity (condensed):**
+
+| Capability | FCTool native |
+|---|---|
+| Live per-client thumbnails | ✓ |
+| Click-to-activate | ✓ |
+| Per-character focus hotkeys + cycle-next/prev groups | ✓ |
+| Drag to arrange, snap-to-grid / snap-to-edges, per-character saved layout & size | ✓ |
+| Login-screen stacking | ✓ |
+| Hover opacity + hover zoom (9 anchors) | ✓ |
+| Hide active / hide login / hide-on-lost-focus rules | ✓ |
+| Minimize-inactive + never-minimize (priority) list + minimize-all | ✓ |
+| Active-client highlight, per-tile cycle exclusion, switch-to-non-EVE | ✓ |
+| Arrange-in-grid, one-time **Import EVE-O layout** | ✓ |
+
+**Requirements & notes:**
+- Clients must run **windowed** (borderless-window or windowed-fullscreen). True exclusive fullscreen has no thumbnail for Windows to mirror.
+- Focus hotkeys are **swallowed** by Windows while registered — they will not also reach the game or other apps, so pick keys you don't otherwise use in EVE.
+- **Import EVE-O layout…** reads an existing `EVE-O-Preview.json` and fills in matching per-character positions, focus hotkeys, and cycle order (fill-only — it never overwrites layouts you've already set in FCTool).
+
+### FCTool-exclusive extras
+
+- **Doctrine-tag captions** — by default each tile's caption is the pilot's **doctrine-fit tag** from your own active doctrine (e.g. the fit's role tag), so you can see at a glance who is flying what. Override any caption with a **Manual tag** in the label rules.
+- **Damage flash** — native tiles **pulse red on incoming combat damage**. This is **native-mode only and default ON** (the separate intel tile-flash is default OFF). Fine print, verbatim: it reads **only your own EVE combat Gamelogs** (the same own-logs-only compliance class as the intel firehose and the EVE-APM precedent); the threshold is **based on base hull HP — fitted ships have more, so it is an approximation**; and it assumes the **English client** (localized clients are out of scope for this version).
+
+### Compliance
+
+Previews are **view-only**: they mirror the full client area of **your own** running clients (no cropped sub-regions, no overlays that read another client's screen, overview, or local). Clicking a tile or pressing a focus hotkey performs **exactly one OS window-focus change** and **nothing else** — no input of any kind is ever sent into an EVE client. All caption/label/flash data comes **only from your own SSO-authorized characters' ESI and your own chat/combat log files** — never another player's data, no scraping, no injection, no telemetry, everything stays local. This matches CCP's stated position that view-only full-client previews (as EVE-O Preview does them) are fine, and that switching clients must bring the client to the front.
+
 ## Download & run (end users)
 
 1. Open **[releases/latest](https://github.com/kirejen-byte/FCtool/releases/latest)** and download the `.zip`.
