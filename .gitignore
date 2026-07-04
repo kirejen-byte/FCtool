@@ -56,3 +56,4 @@ CLAUDE.md
 # AI-agent dev artifacts (local only)
 docs/superpowers/
 docs/eve_reference/
+gamelog_monitor_state.json
