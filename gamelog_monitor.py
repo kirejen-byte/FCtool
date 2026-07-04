@@ -52,9 +52,16 @@ _GAMELOG_HEADER_TOKEN = "Gamelog"
 _GAMELOG_TS = r"\[\s*(?P<ts>\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})\s*\]"
 DAMAGE_IN_RE = re.compile(
     _GAMELOG_TS
-    + r"\s*\(combat\)\s*<[^>]*><b>(?P<dmg>\d+)</b>.*?>\s*from\b.*?<b>(?P<attacker>[^<]+)</b>",
+    + r"\s*\(combat\)\s*<[^>]*><b>(?P<dmg>\d+)</b>.*?>\s*from\b.*?"
+      r"<b>(?:<[^>]*>)*(?P<attacker>[^<]+)</b>",
     re.IGNORECASE,
 )
+# NOTE (2026 fix): the attacker clause allows zero-or-more nested tags between
+# the opening <b> and the name — the 2026 client wraps the attacker name in a
+# nested <color=..> tag INSIDE the <b>…</b>, e.g.
+#   … from</font> <b><color=0xffffffff>Corpum Dark Priest</b> …
+# The pre-fix `<b>([^<]+)</b>` could not span that nested tag, so it matched 0%
+# of real incoming-combat lines and the damage flash was silently suppressed.
 # Simpler PELD fallback if a client variant slips past the full pattern; still
 # gated on `from` (never `to`) so outgoing damage is never matched.
 DAMAGE_IN_FALLBACK_RE = re.compile(

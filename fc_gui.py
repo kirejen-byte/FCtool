@@ -742,6 +742,7 @@ class FCToolGUI:
         self._preview_gamelog = None           # GamelogMonitor (lazy, native only)
         self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
         self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
+        self._preview_damage_since = {}        # char key -> monotonic ts the pulse started
         self._preview_gamelog_factory = GamelogMonitor  # injectable
         # ── Hide rules / per-char selection (Task C2) ───────────────────────
         self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
@@ -11544,6 +11545,10 @@ class FCToolGUI:
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
         "doctrine_tag_captions": True,       # caveat #4 (Task B1)
         "damage_flash": True,                # caveat #3 / P1 (Task B6)
+        # Default mode is 'any' (log-only, no HP/ESI gate): flash on ANY windowed
+        # incoming damage. 'threshold' keeps the pct-of-reference behaviour but
+        # degrades to any-damage when HP is unknown (never a silent no-flash).
+        "damage_flash_mode": "any",
         "damage_flash_pct": 10, "damage_flash_window_s": 5,
         "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest",
         "damage_flash_color": "#ff3b30",
@@ -12604,26 +12609,37 @@ class FCToolGUI:
                                  else None)
                     # Border precedence is fixed + deterministic (plan §B6):
                     #   damage flash > intel flash > active highlight > none.
-                    # Damage flash (B6): a fresh should_flash arms a ~1.5 s red
-                    # hold (seeded in _preview_damage_until) so a single True
-                    # tick doesn't blink for one 250 ms frame; the tile counts
-                    # as flashing until the hold expires. Damage wins even if the
-                    # highlight would otherwise claim the border this same tick.
+                    # Damage flash: a fresh should_flash (re)arms a hold that runs
+                    # `window_s` past the last hit (seeded in _preview_damage_until)
+                    # so the pulse holds while damage keeps landing and fades once
+                    # it stops. While the hold is live the border PULSES between a
+                    # soft red and the peak colour (~2 Hz) via preview_tile.pulse_color,
+                    # stepped by elapsed = now - pulse_start (seeded in
+                    # _preview_damage_since). Damage wins even if the highlight would
+                    # otherwise claim the border this same tick.
                     now = time.monotonic()
                     key = client.key
                     damaging = False
                     if cfg.get("damage_flash", True) and not client.is_login:
                         hp = self._preview_layer_hp.get(key)
+                        hold_s = float(cfg.get("damage_flash_window_s", 5) or 5)
                         if self._preview_damage.should_flash(key, hp, cfg, now):
-                            self._preview_damage_until[key] = now + 1.5
+                            self._preview_damage_until[key] = now + hold_s
+                            # Start (or keep) the pulse clock; don't reset it on a
+                            # re-arm so the pulse phase stays continuous.
+                            self._preview_damage_since.setdefault(key, now)
                         until = self._preview_damage_until.get(key)
                         if until is not None:
                             if now < until:
                                 damaging = True
                             else:
                                 self._preview_damage_until.pop(key, None)
+                                self._preview_damage_since.pop(key, None)
                     if damaging:
-                        tile.set_border(cfg.get("damage_flash_color", "#ff3b30"))
+                        peak = cfg.get("damage_flash_color", "#ff3b30")
+                        started = self._preview_damage_since.get(key, now)
+                        tile.set_border(preview_tile.pulse_color(
+                            peak, now - started, 0.5))     # ~2 Hz soft pulse
                     elif self._preview_should_flash(self._preview_intel, state, cfg,
                                                     time.monotonic()):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
@@ -13240,24 +13256,50 @@ class FCToolGUI:
                                              sticky=tk.W)
         self._preview_update_shown_summary()
 
-        # Row 6 (native): damage-flash tuning (threshold % / window / cooldown /
-        # reference) — all live-applied like the other native rows (Task B6).
+        # Row 6 (native): damage-flash tuning. Mode picks 'Any damage' (log-only
+        # default; no HP/ESI gate) or 'Threshold' (pct-of-reference). The pct +
+        # reference controls are shown ONLY in threshold mode; window/cooldown
+        # apply to both (window is also the pulse hold). All live-applied.
         rowN3 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
         rowN3.pack(fill=tk.X, pady=2)
 
-        tk.Label(rowN3, text="Flash %", font=("Consolas", 10), fg=FG_TEXT,
+        tk.Label(rowN3, text="Flash on", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        # Human labels ↔ stored mode values.
+        self._preview_dmg_mode_labels = {"any": "Any damage",
+                                         "threshold": "Threshold"}
+        self._preview_dmg_mode_from_label = {
+            v: k for k, v in self._preview_dmg_mode_labels.items()}
+        _mode0 = str(pcfg.get("damage_flash_mode", "any"))
+        self._preview_dmg_mode_var = tk.StringVar(
+            value=self._preview_dmg_mode_labels.get(_mode0, "Any damage"))
+        mode_combo = ttk.Combobox(
+            rowN3, textvariable=self._preview_dmg_mode_var,
+            values=["Any damage", "Threshold"],
+            state="readonly", width=11, font=("Consolas", 10))
+        mode_combo.grid(row=0, column=1, padx=(0, 12))
+        mode_combo.bind("<<ComboboxSelected>>",
+                        lambda e: (self._preview_apply_dmg_mode_visibility(),
+                                   self._preview_apply_native_state()))
+        w.append(mode_combo)
+
+        # pct label+spin (threshold-only; grid_remove'd in any mode below).
+        self._preview_dmg_pct_lbl = tk.Label(rowN3, text="Flash %",
+                                             font=("Consolas", 10), fg=FG_TEXT,
+                                             bg=BG_DARK)
+        self._preview_dmg_pct_lbl.grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
         self._preview_dmg_pct_var = tk.IntVar(value=int(pcfg.get("damage_flash_pct", 10)))
         spct = tk.Spinbox(rowN3, from_=1, to=100, width=4,
                           textvariable=self._preview_dmg_pct_var, font=("Consolas", 10),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                           command=self._preview_apply_native_state)
         spct.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        spct.grid(row=0, column=1, padx=(0, 12))
+        spct.grid(row=0, column=3, padx=(0, 12))
+        self._preview_dmg_pct_spin = spct
         w.append(spct)
 
         tk.Label(rowN3, text="Window s", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
         self._preview_dmg_window_var = tk.IntVar(
             value=int(pcfg.get("damage_flash_window_s", 5)))
         swin = tk.Spinbox(rowN3, from_=1, to=60, width=4,
@@ -13265,11 +13307,11 @@ class FCToolGUI:
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                           command=self._preview_apply_native_state)
         swin.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        swin.grid(row=0, column=3, padx=(0, 12))
+        swin.grid(row=0, column=5, padx=(0, 12))
         w.append(swin)
 
         tk.Label(rowN3, text="Cooldown s", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+                 bg=BG_DARK).grid(row=0, column=6, padx=(0, 4), sticky=tk.W)
         self._preview_dmg_cooldown_var = tk.IntVar(
             value=int(pcfg.get("damage_flash_cooldown_s", 3)))
         scd = tk.Spinbox(rowN3, from_=0, to=60, width=4,
@@ -13277,21 +13319,27 @@ class FCToolGUI:
                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                          command=self._preview_apply_native_state)
         scd.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        scd.grid(row=0, column=5, padx=(0, 12))
+        scd.grid(row=0, column=7, padx=(0, 12))
         w.append(scd)
 
-        tk.Label(rowN3, text="Reference", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=6, padx=(0, 4), sticky=tk.W)
+        # reference label+combo (threshold-only).
+        self._preview_dmg_ref_lbl = tk.Label(rowN3, text="Reference",
+                                            font=("Consolas", 10), fg=FG_TEXT,
+                                            bg=BG_DARK)
+        self._preview_dmg_ref_lbl.grid(row=0, column=8, padx=(0, 4), sticky=tk.W)
         self._preview_dmg_ref_var = tk.StringVar(
             value=str(pcfg.get("damage_flash_reference", "weakest")))
         ref_combo = ttk.Combobox(
             rowN3, textvariable=self._preview_dmg_ref_var,
             values=["weakest", "shield", "armor", "hull", "total"],
             state="readonly", width=8, font=("Consolas", 10))
-        ref_combo.grid(row=0, column=7)
+        ref_combo.grid(row=0, column=9)
         ref_combo.bind("<<ComboboxSelected>>",
                        lambda e: self._preview_apply_native_state())
+        self._preview_dmg_ref_combo = ref_combo
         w.append(ref_combo)
+        # Apply initial threshold-only visibility from the loaded mode.
+        self._preview_apply_dmg_mode_visibility()
 
         # Row 7 (native): arrange / hotkey buttons.
         rowN4 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
@@ -13508,7 +13556,37 @@ class FCToolGUI:
                 cfg[key] = cast(v.get())
             except (tk.TclError, ValueError):
                 pass
+        # damage_flash_mode: the StringVar holds a human label; map it back to the
+        # stored value ('any' | 'threshold'). Absent/unknown label → 'any'.
+        mode_var = getattr(self, "_preview_dmg_mode_var", None)
+        if mode_var is not None:
+            try:
+                label = mode_var.get()
+                cfg["damage_flash_mode"] = getattr(
+                    self, "_preview_dmg_mode_from_label", {}).get(label, "any")
+            except tk.TclError:
+                pass
         self._save_config()
+
+    def _preview_apply_dmg_mode_visibility(self):
+        """Show the pct + reference controls only in 'threshold' mode; hide them in
+        'any' mode. Window/cooldown apply to both modes and stay visible. Idempotent
+        and Tk-safe (grid_remove keeps the grid slot so re-showing restores it)."""
+        try:
+            label = self._preview_dmg_mode_var.get()
+        except (AttributeError, tk.TclError):
+            return
+        threshold = (getattr(self, "_preview_dmg_mode_from_label", {})
+                     .get(label, "any") == "threshold")
+        for attr in ("_preview_dmg_pct_lbl", "_preview_dmg_pct_spin",
+                     "_preview_dmg_ref_lbl", "_preview_dmg_ref_combo"):
+            wdg = getattr(self, attr, None)
+            if wdg is None:
+                continue
+            try:
+                wdg.grid() if threshold else wdg.grid_remove()
+            except tk.TclError:
+                pass
 
     def _preview_arrange_grid(self):
         """Lay out every live non-login tile in a row-major grid, persist each

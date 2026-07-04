@@ -102,6 +102,7 @@ def _ui_host(preview_cfg=None, overlay_cfg=None):
                  "_preview_arrange_grid", "_preview_arrange_by_fleet",
                  "_preview_arrange_ordered", "_preview_fleet_order_key",
                  "_preview_apply_native_state",
+                 "_preview_apply_dmg_mode_visibility",
                  "_preview_sync_native_widgets",
                  "_PREVIEW_MODE_BUTTONS", "_preview_refresh_mode_buttons",
                  "_preview_show_mode_panel",
@@ -676,6 +677,42 @@ def test_uniform_size_checkbox_persists_live():
         assert host.config["preview"]["uniform_size"] is True
         # never touches saved layouts/sizes
         assert "layouts" in host.config["preview"]
+    finally:
+        root.destroy()
+
+
+# ── damage-flash mode selector: persistence + threshold-only visibility ──────
+def test_damage_flash_mode_defaults_to_any_and_hides_threshold_controls():
+    # No damage_flash_mode in cfg → defaults to 'any'; pct + reference controls
+    # are hidden (grid_remove'd) in any mode, window/cooldown stay visible.
+    root, host = _ui_host(preview_cfg={"mode": "native"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        assert host._preview_dmg_mode_var.get() == "Any damage"
+        # grid_remove leaves no grid info → empty mapping.
+        assert host._preview_dmg_pct_spin.grid_info() == {}
+        assert host._preview_dmg_ref_combo.grid_info() == {}
+    finally:
+        root.destroy()
+
+
+def test_damage_flash_mode_threshold_shows_controls_and_persists():
+    root, host = _ui_host(preview_cfg={"mode": "native",
+                                       "damage_flash_mode": "threshold"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        assert host._preview_dmg_mode_var.get() == "Threshold"
+        # threshold mode → pct + reference are gridded (visible).
+        assert host._preview_dmg_pct_spin.grid_info() != {}
+        assert host._preview_dmg_ref_combo.grid_info() != {}
+        # switching to Any persists 'any' and hides the threshold controls live.
+        host._preview_dmg_mode_var.set("Any damage")
+        host._preview_apply_dmg_mode_visibility()
+        host._preview_apply_native_state()
+        assert host.config["preview"]["damage_flash_mode"] == "any"
+        assert host._preview_dmg_pct_spin.grid_info() == {}
     finally:
         root.destroy()
 

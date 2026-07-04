@@ -1,10 +1,17 @@
-"""Per-character damage-flash decision engine (pure). Proposal P1:
-flash when windowed incoming damage >= pct% of a reference base-HP pool,
-with a cooldown between flashes. All time is caller-supplied (`now`) so tests
-inject a clock; no wall-clock reads here.
+"""Per-character damage-flash decision engine (pure). All time is caller-supplied
+(`now`) so tests inject a clock; no wall-clock reads here.
 
-HP values are BASE dogma hull HP (fitted ships have more) — the UI labels this
-as an approximation. Unknown HP → never flash (fail safe, never spurious)."""
+Two modes (cfg['damage_flash_mode']):
+  - 'any' (DEFAULT, and the default when the key is ABSENT): flash whenever any
+    windowed incoming damage > 0 within the window. NO HP, NO ESI — this is the
+    log-only path that can never be silently suppressed. Cooldown still applies.
+  - 'threshold': flash when windowed incoming damage >= pct% of a reference
+    base-HP pool. BUT if HP is None/unknown it DEGRADES to any-damage rather
+    than returning a silent False (the root cause of the missed death flash:
+    the ESI-HP gate suppressed the flash whenever HP was unavailable).
+
+HP values (threshold mode) are BASE dogma hull HP (fitted ships have more) — the
+UI labels this as an approximation."""
 from __future__ import annotations
 
 from collections import defaultdict, deque
@@ -41,17 +48,30 @@ class DamageFlashTracker:
             dq.popleft()
         return sum(d for _, d in dq)
 
-    def should_flash(self, char_key, hp, cfg, now: float) -> bool:
-        pool = _reference_pool(hp, cfg.get("damage_flash_reference", "weakest"))
-        if pool is None:
-            return False
-        window_s = cfg.get("damage_flash_window_s", 5)
-        threshold = pool * (cfg.get("damage_flash_pct", 10) / 100.0)
-        if self._windowed_sum(char_key, now, window_s) < threshold:
-            return False
+    def _cooldown_ok(self, char_key, cfg, now: float) -> bool:
+        """True if the per-char cooldown has elapsed; arms it on True."""
         last = self._last_flash.get(char_key)
         cooldown = cfg.get("damage_flash_cooldown_s", 3)
         if last is not None and (now - last) < cooldown:
             return False
         self._last_flash[char_key] = now      # arm cooldown on a real flash
         return True
+
+    def should_flash(self, char_key, hp, cfg, now: float) -> bool:
+        window_s = cfg.get("damage_flash_window_s", 5)
+        windowed = self._windowed_sum(char_key, now, window_s)
+        # Absent mode key => 'any' (the new default). 'threshold' with unknown HP
+        # DEGRADES to any-damage — it must never silently return False.
+        mode = cfg.get("damage_flash_mode", "any")
+        pool = None
+        if mode == "threshold":
+            pool = _reference_pool(hp, cfg.get("damage_flash_reference", "weakest"))
+        if mode == "threshold" and pool is not None:
+            threshold = pool * (cfg.get("damage_flash_pct", 10) / 100.0)
+            if windowed < threshold:
+                return False
+        else:
+            # 'any' mode, or 'threshold' degraded (HP unknown): flash on any dmg.
+            if windowed <= 0:
+                return False
+        return self._cooldown_ok(char_key, cfg, now)

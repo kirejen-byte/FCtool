@@ -59,6 +59,58 @@ _LABEL_MAX_CHARS = 40    # hard character cap before the width-based ellipsis
 _CHAR_W_RATIO = 0.62
 
 
+# ── damage-flash soft pulse ──────────────────────────────────────────────────
+# The damage flash PULSES: the border eases between a soft red and the peak
+# colour at ~2 Hz (period ~0.5 s) while active. pulse_color is pure/Tk-free so it
+# is unit-testable; the tick steps `elapsed_s` and pushes the result via
+# tile.set_border. On-video render + the pulse *feel* need a live re-test (FLAG).
+_PULSE_SOFT_FLOOR = 0.45     # softest channel scale at the trough (never black)
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def pulse_color(peak_hex, elapsed_s, period_s) -> str:
+    """Ease a border colour between the peak (`peak_hex`) and a softer version of
+    it, as a cosine pulse of period `period_s`. At elapsed 0 (and every whole
+    period) the colour sits at the PEAK; at the half-period it sits at the
+    softest point (each channel scaled by _PULSE_SOFT_FLOOR). Pure/Tk-free.
+
+    Robust to bad input: a non-#rrggbb `peak_hex` falls back to a default red; a
+    zero/negative period holds at peak; elapsed is treated by its phase only.
+    Always returns a valid '#rrggbb' string."""
+    h = (peak_hex or "").strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    try:
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+    except (ValueError, IndexError):
+        r, g, b = 0xff, 0x3b, 0x30       # default soft red peak
+    try:
+        period = float(period_s)
+    except (TypeError, ValueError):
+        period = 0.0
+    if period <= 0.0:
+        scale = 1.0                      # no pulse → hold at peak
+    else:
+        import math
+        try:
+            phase = float(elapsed_s) / period
+        except (TypeError, ValueError):
+            phase = 0.0
+        # cosine pulse: 1.0 at phase 0/1/2…, dips to the soft floor at 0.5.
+        wave = (1.0 + math.cos(2.0 * math.pi * phase)) / 2.0   # 1→0→1
+        scale = _PULSE_SOFT_FLOOR + (1.0 - _PULSE_SOFT_FLOOR) * wave
+    scale = _clamp01(scale)
+    r = int(round(_clamp01(r / 255.0 * scale) * 255))
+    g = int(round(_clamp01(g / 255.0 * scale) * 255))
+    b = int(round(_clamp01(b / 255.0 * scale) * 255))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def format_tile_label(activity_label, ship_type_name) -> str:
     """Join the activity label and ship TYPE name as '<label> - <ShipType>',
     omitting empty/whitespace-only parts.

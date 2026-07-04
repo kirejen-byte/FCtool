@@ -21,6 +21,42 @@ NOTIFY = ("[ 2026.07.03 18:22:15 ] (notify) <color=0xffaa00aa>"
           "<font size=12>You are now cloaked</font>")
 MALFORMED = "[ garbage ] (combat) <b>not a number</b> from <b>x</b>"
 
+# --- REAL 2026 client lines (verbatim shapes from the user's death log) ---
+# The 2026 client wraps the attacker name in a nested <color=..> tag INSIDE the
+# <b>…</b>, which the pre-fix DAMAGE_IN_RE attacker clause (`<b>([^<]+)</b>`)
+# could not span — it matched 0% of real lines and silently suppressed the flash.
+REAL_2026_NPC = ("[ 2026.07.03 18:22:11 ] (combat) <color=0xffcc0000><b>62</b> "
+                 "<color=0x77ffffff><font size=10>from</font> "
+                 "<b><color=0xffffffff>Corpum Dark Priest</b> - Wrecks")
+REAL_2026_PLAYER = ("[ 2026.07.03 18:22:11 ] (combat) <color=0xffcc0000><b>333</b> "
+                    "<color=0x77ffffff><font size=10>from</font> "
+                    "<b><color=0xffffffff>Enemy Pilot[CORP](Ishtar)</b> - Warden II - Hits")
+REAL_2026_OUT = ("[ 2026.07.03 18:22:13 ] (combat) <color=0xff00ff00><b>612</b> "
+                 "<color=0x77ffffff><font size=10>to</font> "
+                 "<b><color=0xffffffff>Victim[RED](Drake)</b> - Occult L - Penetrates")
+REAL_2026_MISS = ("[ 2026.07.03 18:22:20 ] (combat) <color=0xffcc0000>"
+                  "Corpum Dark Priest misses you completely")
+
+
+def test_real_2026_npc_line_extracts_amount_and_nested_attacker():
+    # dmg from the leading <b>N</b>; attacker spans the nested <color=..> tag.
+    assert gm.parse_damage_line(REAL_2026_NPC) == (62, "Corpum Dark Priest")
+
+
+def test_real_2026_player_line_extracts_nested_attacker():
+    assert gm.parse_damage_line(REAL_2026_PLAYER) == (
+        333, "Enemy Pilot[CORP](Ishtar)")
+
+
+def test_real_2026_outgoing_is_rejected():
+    # 'to' must never match — this is our outgoing damage, not incoming.
+    assert gm.parse_damage_line(REAL_2026_OUT) is None
+
+
+def test_real_2026_miss_is_not_a_damage_event():
+    # 'X misses you completely' carries no <b>N</b> amount → not a damage event.
+    assert gm.parse_damage_line(REAL_2026_MISS) is None
+
 
 def test_parse_incoming_damage_extracts_amount_and_attacker():
     got = gm.parse_damage_line(INCOMING)

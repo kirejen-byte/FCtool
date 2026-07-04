@@ -166,6 +166,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
     host._preview_gamelog = None
     host._preview_layer_hp = {}
     host._preview_damage_until = {}
+    host._preview_damage_since = {}
     # C2 hide-rules / shown-chars state (mirror __init__ block)
     host._preview_lost_focus_since = None
     host._preview_win32 = None            # foreground backend; None → treat as focused
@@ -1174,6 +1175,7 @@ def _damage_tick_host(monkeypatch, now):
     host = make_host(mode="native", layouts={"kirejen": [10, 20, 384, 216]})
     cfg = host._preview_cfg()
     cfg["damage_flash"] = True
+    cfg["damage_flash_mode"] = "threshold"     # exercise the pct-of-HP path here
     cfg["damage_flash_pct"] = 10
     cfg["damage_flash_window_s"] = 5
     cfg["damage_flash_cooldown_s"] = 3
@@ -1202,13 +1204,16 @@ def test_tick_holds_damage_border_across_frames_then_clears(monkeypatch):
     host = _damage_tick_host(monkeypatch, now)
     host._preview_damage.add("kirejen", 250, now[0])
     tick(host)
+    # At the arming frame the pulse is at its peak (elapsed 0) → the peak colour.
     assert host._preview_tiles[1].borders[-1] == "#ff3b30"
-    # 1 s later: no new damage, but the ~1.5 s hold keeps the red border
+    # 1 s later: no new damage, but the hold (window_s=5) keeps a non-empty
+    # pulsing border (a valid #rrggbb, never None).
     now[0] = 101.0
     tick(host)
-    assert host._preview_tiles[1].borders[-1] == "#ff3b30"
-    # past the hold (seeded at 100.0 + 1.5 = 101.5): border clears to None
-    now[0] = 102.0
+    mid = host._preview_tiles[1].borders[-1]
+    assert mid is not None and mid.startswith("#") and len(mid) == 7
+    # past the hold (seeded at 100.0 + window_s 5 = 105.0): border clears to None.
+    now[0] = 106.0
     tick(host)
     assert host._preview_tiles[1].borders[-1] is None
 
@@ -1371,14 +1376,27 @@ def test_tick_damage_flash_beats_intel_flash(monkeypatch):
     assert tile.borders[-1] == "#ff3b30"     # damage color, not intel's blue
 
 
-def test_tick_no_damage_border_when_hp_unknown(monkeypatch):
+def test_tick_threshold_mode_degrades_to_flash_when_hp_unknown(monkeypatch):
+    # THE ROOT-CAUSE FIX: in threshold mode with UNKNOWN base HP the flash must
+    # NOT be silently suppressed — it degrades to any-damage and still fires.
     now = [100.0]
-    host = _damage_tick_host(monkeypatch, now)
-    host._preview_layer_hp = {}              # no base HP known for this pilot
-    host._preview_damage.add("kirejen", 99999, now[0])
+    host = _damage_tick_host(monkeypatch, now)        # mode == 'threshold'
+    host._preview_layer_hp = {}                        # no base HP known
+    host._preview_damage.add("kirejen", 62, now[0])    # a real death-log hit
     tick(host)
     tile = host._preview_tiles[1]
-    assert "#ff3b30" not in tile.borders
+    assert tile.borders[-1] == "#ff3b30"               # flashed (elapsed 0 → peak)
+
+
+def test_tick_any_mode_default_flashes_on_any_damage_without_hp(monkeypatch):
+    # The DEFAULT mode ('any'): no HP, no threshold — any incoming damage flashes.
+    now = [100.0]
+    host = _damage_tick_host(monkeypatch, now)
+    host._preview_cfg()["damage_flash_mode"] = "any"
+    host._preview_layer_hp = {}
+    host._preview_damage.add("kirejen", 1, now[0])     # one point of damage
+    tick(host)
+    assert host._preview_tiles[1].borders[-1] == "#ff3b30"
 
 
 def test_tick_no_damage_border_when_damage_flash_disabled(monkeypatch):

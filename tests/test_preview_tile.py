@@ -52,6 +52,35 @@ PALETTE = dict(BG_PANEL="#16213e", BG_DARK="#1a1a2e", FG_TEXT="#e0e0e0",
                FG_ACCENT="#00d4ff", FG_DIM="#808090")
 
 
+# ── pulse_color: pure soft-pulse interpolation (no Tk, no window) ────────────
+
+def test_pulse_color_is_peak_at_phase_zero():
+    # At elapsed 0 the pulse sits at its peak colour.
+    assert pt.pulse_color("#ff0000", 0.0, 2.0).lower() == "#ff0000"
+
+
+def test_pulse_color_softens_away_from_peak_mid_period():
+    # Half a period in, the eased value is a softer red — never brighter than
+    # the peak channel, always a valid #rrggbb.
+    c = pt.pulse_color("#ff0000", 1.0, 2.0)
+    assert c.startswith("#") and len(c) == 7
+    assert int(c[1:3], 16) < 0xff        # softened away from full-red peak
+
+
+def test_pulse_color_is_periodic():
+    a = pt.pulse_color("#ff3b30", 0.25, 2.0)
+    b = pt.pulse_color("#ff3b30", 0.25 + 2.0, 2.0)   # one full period later
+    assert a == b
+
+
+def test_pulse_color_clamps_and_survives_bad_input():
+    # Bad hex / zero or negative period / negative elapsed must not raise.
+    for out in (pt.pulse_color("nothex", 0.5, 2.0),
+                pt.pulse_color("#ff0000", 0.5, 0.0),
+                pt.pulse_color("#ff0000", -3.0, 2.0)):
+        assert isinstance(out, str) and out.startswith("#") and len(out) == 7
+
+
 def test_tile_applies_styles_and_places_via_win32_not_tk():
     root = _root()
     try:
