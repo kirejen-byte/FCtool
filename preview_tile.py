@@ -710,6 +710,17 @@ class TileWindow:
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
 
+    def body_screen_rect(self):
+        """(left, top, right, bottom) of the BODY region (below the caption strip)
+        in PHYSICAL screen px, or None if unplaced/hidden. Uses self._pos + STRIP_H
+        (the authoritative physical geometry), NOT winfo_root* (logical under PMv2)."""
+        if getattr(self, "_hidden", False):
+            return None
+        if self._w <= 0 or self._body_h <= 0:
+            return None
+        x, y = self._pos
+        return (x, y + STRIP_H, x + self._w, y + STRIP_H + self._body_h)
+
     def hide(self):
         """Withdraw the tile without destroying it (Task C2 hide rules). The DWM
         thumbnail registration and the saved layout are untouched; show() re-maps

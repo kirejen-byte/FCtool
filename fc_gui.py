@@ -725,6 +725,7 @@ class FCToolGUI:
 
         # ── Native preview controller state ─────────────────────────────────
         self._preview_tiles = {}               # hwnd -> TileWindow
+        self._preview_video_labels = {}        # hwnd -> composed on-video label text
         self._preview_tile_rects = {}          # hwnd -> (x, y, w, body_h) screen px
         self._preview_clients = {}             # hwnd -> ClientWindow
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
@@ -11540,7 +11541,7 @@ class FCToolGUI:
         "minimize_inactive": False, "never_minimize": [],
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
-        "captions": True, "labels_on_video": False, "show_role_chip": True,
+        "captions": True, "labels_on_video": True, "show_role_chip": True,
         "intel_flash": False, "intel_flash_color": "#ff3b30",
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
         "doctrine_tag_captions": True,       # caveat #4 (Task B1)
@@ -12292,33 +12293,73 @@ class FCToolGUI:
                     tile.set_caption(name, dot, chip, activity)
                 # On-video activity label: '<label> - <ShipType>'. Login screens
                 # and rule-less pilots with no ship resolve to '' → hidden.
-                if do_video:
-                    ship_name = "" if (client.is_login or state is None) \
-                        else (state.ship_type_name or "")
-                    tile.set_video_label(
-                        preview_tile.format_tile_label(activity, ship_name))
-                else:
-                    tile.set_video_label("")
+                # Composed ONCE here (rule/override/doctrine precedence evaluated
+                # once) and stashed by hwnd; _preview_compose_video_labels consumes
+                # the stash to draw via the topmost OverlayWindow. The child Canvas
+                # is DWM-occluded, so we clear it and never draw the visible label
+                # on the tile body.
+                ship_name = "" if (client.is_login or state is None) \
+                    else (state.ship_type_name or "")
+                self._preview_video_labels[hwnd] = \
+                    preview_tile.format_tile_label(activity, ship_name)
+                tile.set_video_label("")
             except tk.TclError:
                 pass
 
     def _preview_compose_video_labels(self, cur):
-        """caption-onvideo: native on-video labels are now drawn DIRECTLY on each
-        tile body (see _preview_compose_captions → tile.set_video_label), styled
-        live from config['overlay'] color/size/anchor. The separate desktop-span
-        OverlayWindow is no longer used for NATIVE mode — this method only clears
-        any legacy OverlayWindow that a prior eveo_labels session left behind, so
-        stale click-through label forms never linger over the native tiles.
+        """caption-onvideo: draw each live tile's on-video label ('<label> - <ShipType>')
+        via the separate topmost, click-through OverlayWindow — NOT a child widget of
+        the tile. The DWM compositor draws each tile's live thumbnail ON TOP of any
+        child widget inside the thumbnail rect, so a child Canvas is occluded; the
+        overlay is a distinct always-on-top window that composites above the tiles.
 
-        The OverlayWindow routing is retained solely for `eveo_labels` mode (that
-        path draws over Eve-O Preview thumbnails, which are not FCTool tiles and
-        so have no place to host a child label)."""
+        Gated by config['preview']['labels_on_video']. The label TEXT is composed once
+        in _preview_compose_captions and stashed in self._preview_video_labels (keyed by
+        hwnd); this method only positions it. Empty-text items are skipped by the overlay
+        (set_labels), and the overlay withdraws itself when nothing is drawn.
+
+        native and eveo_labels are mutually exclusive and share the single self._overlay;
+        this path never starts the eveo ESI poller (the native poller runs separately)."""
+        do_video = bool(self._preview_cfg().get("labels_on_video", False))
         overlay = getattr(self, "_overlay", None)
-        if overlay is not None:
-            try:
-                overlay.set_labels([])   # tiles own the on-video labels now
-            except Exception:
-                pass
+        if not do_video:
+            if overlay is not None:
+                try:
+                    overlay.set_labels([])   # clear any stale native labels
+                except Exception:
+                    pass
+            return
+        # Ensure the shared overlay Toplevel exists (idempotent). Do NOT call
+        # _overlay_enable() / start the eveo poller — native mode owns its own ESI
+        # poller; we only borrow the overlay's draw surface.
+        overlay = self._overlay_ensure_window()
+        # Push the current overlay style (size/color/anchor) from config['overlay']
+        # straight to the overlay, mirroring _overlay_ensure_window's seeding. This
+        # keeps the native labels styled by the same settings the eveo labels use,
+        # without depending on the eveo settings UI vars existing.
+        ocfg = self._overlay_cfg()
+        try:
+            overlay.set_font_size(int(ocfg.get("font_size", 11)))
+            overlay.set_color(ocfg.get("color", "#ffffff"))
+            overlay.set_anchor(ocfg.get("anchor", "top-left"))
+        except Exception:
+            pass
+        items = []
+        for hwnd in cur:
+            tile = self._preview_tiles.get(hwnd)
+            if tile is None:
+                continue
+            text = self._preview_video_labels.get(hwnd, "")
+            if not text:
+                continue
+            rect = tile.body_screen_rect()
+            if rect is None:
+                continue
+            items.append((rect, text))
+        try:
+            overlay.set_labels(items)
+        except Exception:
+            pass
 
     #: Fleet-role -> caption chip glyph. squad_member (and any unknown role)
     #: renders no chip so the common case stays clean.
@@ -12790,6 +12831,15 @@ class FCToolGUI:
         self._overlay_states = {}
         self._overlay_state_ts = {}
         self._preview_layer_hp = {}
+        self._preview_video_labels = {}
+        # Clear any native on-video labels off the shared overlay so a mode switch
+        # (native → off / eveo_labels) never leaves stale native labels lingering.
+        # eveo_labels repaints its own labels on its next tick.
+        if self._overlay is not None:
+            try:
+                self._overlay.set_labels([])
+            except Exception:
+                pass
         svc = self._preview_hotkeys
         if svc is not None:
             try:
@@ -13194,6 +13244,20 @@ class FCToolGUI:
         w.append(cbd)
         _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
                   "rule or override already labels it.")
+
+        self._preview_labels_on_video_var = tk.BooleanVar(
+            value=bool(pcfg.get("labels_on_video", True)))
+        cblv = tk.Checkbutton(
+            rowN, text="Label over video (Label - ShipType)",
+            variable=self._preview_labels_on_video_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cblv.grid(row=1, column=0, columnspan=4, padx=(0, 8), pady=(4, 0), sticky=tk.W)
+        w.append(cblv)
+        _tip(cblv, "Draw the label and ship type over each preview's video "
+                   "(e.g. 'Logi - Onyx') via a topmost overlay, in the corner and "
+                   "colour set above.")
 
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
@@ -13624,6 +13688,7 @@ class FCToolGUI:
             ("_preview_opacity_var", "opacity_inactive", float),
             ("_preview_captions_var", "captions", bool),
             ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
+            ("_preview_labels_on_video_var", "labels_on_video", bool),
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
