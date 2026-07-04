@@ -660,6 +660,82 @@ def test_hotkey_preset_fills_group0_next_prev_without_touching_focus():
         root.destroy()
 
 
+# ── uniform-size checkbox persists + resize-end routing (corner-resize task) ──
+def test_uniform_size_checkbox_persists_live():
+    root, host = _ui_host(preview_cfg={"mode": "native"})
+    try:
+        frame = tk.Frame(root)
+        host._build_preview_section(frame)
+        # default True per _PREVIEW_DEFAULTS
+        assert host._preview_uniform_var.get() is True
+        host._preview_uniform_var.set(False)
+        host._preview_apply_native_state()
+        assert host.config["preview"]["uniform_size"] is False
+        host._preview_uniform_var.set(True)
+        host._preview_apply_native_state()
+        assert host.config["preview"]["uniform_size"] is True
+        # never touches saved layouts/sizes
+        assert "layouts" in host.config["preview"]
+    finally:
+        root.destroy()
+
+
+def _resize_host(preview_cfg):
+    """Pure host with the resize-end handler + client/tile state for routing."""
+    host = _pure_host(preview_cfg=preview_cfg)
+    host._preview_tiles = {}
+    host._preview_clients = {}
+    host._preview_tile_rects = {}
+    for name in ("_preview_on_tile_resize_end",):
+        attr = getattr(fc_gui.FCToolGUI, name, None)
+        setattr(host, name, types.MethodType(attr, host))
+    return host
+
+
+class _RClient:
+    def __init__(self, hwnd, key):
+        self.hwnd = hwnd
+        self.key = key
+
+
+def test_resize_end_uniform_true_updates_global_cfg_size():
+    host = _resize_host(preview_cfg={
+        "mode": "native", "uniform_size": True,
+        "tile_w": 384, "tile_body_h": 216, "layouts": {}, "sizes": {}})
+    host._preview_clients = {1: _RClient(1, "kirejen")}
+    host._preview_on_tile_resize_end("kirejen", 500, 300)
+    cfg = host.config["preview"]
+    # global size updated; per-char sizes NOT written
+    assert cfg["tile_w"] == 500 and cfg["tile_body_h"] == 300
+    assert cfg.get("sizes", {}).get("kirejen") is None
+    assert host._saved["n"] >= 1
+
+
+def test_resize_end_uniform_false_writes_per_char_sizes_only():
+    host = _resize_host(preview_cfg={
+        "mode": "native", "uniform_size": False,
+        "tile_w": 384, "tile_body_h": 216, "layouts": {}, "sizes": {}})
+    host._preview_clients = {1: _RClient(1, "kirejen")}
+    host._preview_on_tile_resize_end("kirejen", 500, 300)
+    cfg = host.config["preview"]
+    # per-char override written; global size untouched
+    assert cfg["sizes"]["kirejen"] == [500, 300]
+    assert cfg["tile_w"] == 384 and cfg["tile_body_h"] == 216
+
+
+def test_resize_end_never_deletes_saved_sizes_on_uniform_true():
+    # house rule: uniform_size True must NOT wipe an existing per-char override.
+    host = _resize_host(preview_cfg={
+        "mode": "native", "uniform_size": True,
+        "tile_w": 384, "tile_body_h": 216, "layouts": {},
+        "sizes": {"kirejen": [222, 111]}})
+    host._preview_clients = {1: _RClient(1, "kirejen")}
+    host._preview_on_tile_resize_end("kirejen", 500, 300)
+    cfg = host.config["preview"]
+    assert cfg["tile_w"] == 500 and cfg["tile_body_h"] == 300
+    assert cfg["sizes"]["kirejen"] == [222, 111]      # preserved, never deleted
+
+
 # ── (C2) hide-rule checkboxes persist via _preview_apply_native_state ─────────
 def test_hide_rule_checkboxes_persist_live():
     root, host = _ui_host(preview_cfg={"mode": "native"})

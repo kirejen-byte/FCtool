@@ -425,3 +425,181 @@ def test_right_drag_still_moves_when_unlocked():
         tile.destroy()
     finally:
         root.destroy()
+
+
+# ── corner-hover resize (SE/NW/NE/SW) + cursor feedback ───────────────────────
+def _resize_tile(root, w32=None):
+    """Tile with a recording on_resize_end callback for corner-resize tests."""
+    resizes = []
+    tile = pt.TileWindow(
+        root, "kirejen", PALETTE, win32=w32 or FakeTileWin32(), dwm=FakeDwm(),
+        on_activate=lambda k: None, on_minimize=lambda k: None,
+        on_move_end=lambda k, x, y: None,
+        on_resize_end=lambda k, w, h: resizes.append((k, w, h)))
+    return tile, resizes
+
+
+def test_corner_hover_arms_se_and_sets_nwse_cursor():
+    root = _root()
+    try:
+        tile, _ = _resize_tile(root)
+        tile.place(100, 200, 384, 216)
+        # pointer near the bottom-right (SE) corner of the tile window
+        # window spans x:100..484, y:200..200+216+STRIP_H
+        h = 216 + pt.STRIP_H
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        assert tile._corner == "se"
+        assert str(tile.top.cget("cursor")) == "size_nw_se"
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_corner_hover_arms_ne_and_sets_nesw_cursor():
+    root = _root()
+    try:
+        tile, _ = _resize_tile(root)
+        tile.place(100, 200, 384, 216)
+        # top-right corner (NE) → size_ne_sw
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 2, y_root=200 + 2))
+        assert tile._corner == "ne"
+        assert str(tile.top.cget("cursor")) == "size_ne_sw"
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_moving_off_corner_restores_normal_cursor():
+    root = _root()
+    try:
+        tile, _ = _resize_tile(root)
+        tile.place(100, 200, 384, 216)
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + 3))  # NE
+        assert tile._corner == "ne"
+        # move into the middle → no corner armed, cursor back to normal
+        tile._on_corner_motion(_Evt(x_root=100 + 190, y_root=200 + 100))
+        assert tile._corner is None
+        assert str(tile.top.cget("cursor")) in ("", "arrow")
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_se_drag_grows_wh_with_nw_anchored():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, resizes = _resize_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        hwnd = w32.get_root_hwnd(tile.top.winfo_id())
+        h = 216 + pt.STRIP_H
+        # arm SE, press there, drag +40,+30, release
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._corner_press(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._corner_motion(_Evt(x_root=100 + 384 - 3 + 40, y_root=200 + h - 3 + 30))
+        # NW corner anchored → x,y unchanged; w/h grown by the drag delta
+        last = w32.placed[-1]
+        assert last[0] == hwnd
+        assert last[1:3] == (100, 200)               # NW anchor fixed
+        assert last[3] == 384 + 40                   # width grew
+        assert last[4] == (216 + 30) + pt.STRIP_H    # body_h grew, +STRIP_H window
+        tile._corner_release(_Evt(x_root=100 + 384 - 3 + 40, y_root=200 + h - 3 + 30))
+        assert resizes[-1] == ("kirejen", 384 + 40, 216 + 30)
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_nw_drag_keeps_se_anchored_and_shrinks():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, resizes = _resize_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        hwnd = w32.get_root_hwnd(tile.top.winfo_id())
+        # arm NW at the top-left corner, drag +20,+10 (inward → shrink)
+        tile._on_corner_motion(_Evt(x_root=100 + 2, y_root=200 + 2))
+        assert tile._corner == "nw"
+        tile._corner_press(_Evt(x_root=100 + 2, y_root=200 + 2))
+        tile._corner_motion(_Evt(x_root=100 + 22, y_root=200 + 12))
+        last = w32.placed[-1]
+        assert last[0] == hwnd
+        # SE corner fixed at (100+384, 200+216+STRIP_H); dragging NW in by (20,10)
+        # → x,y shift by +20,+10 and w/h shrink by the same.
+        assert last[1:3] == (120, 210)
+        assert last[3] == 384 - 20
+        assert last[4] == (216 - 10) + pt.STRIP_H
+        tile._corner_release(_Evt(x_root=100 + 22, y_root=200 + 12))
+        assert resizes[-1] == ("kirejen", 384 - 20, 216 - 10)
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_corner_resize_clamps_to_min_size():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, resizes = _resize_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        h = 216 + pt.STRIP_H
+        # SE drag far to the top-left → would go negative; clamps at min
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._corner_press(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._corner_motion(_Evt(x_root=100 - 500, y_root=200 - 500))
+        last = w32.placed[-1]
+        assert last[3] == 120                         # min width
+        assert last[4] == 68 + pt.STRIP_H             # min body height
+        tile._corner_release(_Evt(x_root=100 - 500, y_root=200 - 500))
+        assert resizes[-1] == ("kirejen", 120, 68)
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_lock_layout_blocks_corner_resize_and_cursor_stays_normal():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        tile, resizes = _resize_tile(root, w32=w32)
+        tile.place(100, 200, 384, 216)
+        tile.set_lock_layout(True)
+        n = len(w32.placed)
+        h = 216 + pt.STRIP_H
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        assert tile._corner is None                   # never arms while locked
+        assert str(tile.top.cget("cursor")) in ("", "arrow")
+        tile._corner_press(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._corner_motion(_Evt(x_root=100 + 500, y_root=200 + 500))
+        tile._corner_release(_Evt(x_root=100 + 500, y_root=200 + 500))
+        assert len(w32.placed) == n                   # no resize while locked
+        assert resizes == []
+        tile.destroy()
+    finally:
+        root.destroy()
+
+
+def test_corner_resize_suppresses_strip_move_and_activate():
+    root = _root()
+    try:
+        w32 = FakeTileWin32()
+        moved, activated = [], []
+        tile = pt.TileWindow(
+            root, "kirejen", PALETTE, win32=w32, dwm=FakeDwm(),
+            on_activate=lambda k: activated.append(k),
+            on_minimize=lambda k: None,
+            on_move_end=lambda k, x, y: moved.append((x, y)),
+            on_resize_end=lambda k, w, h: None)
+        tile.place(100, 200, 384, 216)
+        h = 216 + pt.STRIP_H
+        # arm SE, then run the strip press/motion/release path — a corner gesture
+        # must NOT move the tile nor activate on release.
+        tile._on_corner_motion(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._on_strip_b1_press(_Evt(x_root=100 + 384 - 3, y_root=200 + h - 3))
+        tile._on_strip_b1_motion(_Evt(x_root=100 + 384 - 3 + 40, y_root=200 + h - 3 + 30))
+        tile._on_strip_b1_release(_Evt(x_root=100 + 384 - 3 + 40, y_root=200 + h - 3 + 30))
+        assert moved == []
+        assert activated == []
+        tile.destroy()
+    finally:
+        root.destroy()

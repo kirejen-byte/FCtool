@@ -192,6 +192,7 @@ def make_host(layouts=None, mode="native", disabled_chars=None,
                  "_preview_visibility", "_preview_shown_chars",
                  "_preview_all_known_chars", "_preview_foreground_info",
                  "_preview_sync_gamelog_scope",
+                 "_preview_resolve_size", "_preview_apply_tile_size",
                  "_preview_tile_rect", "_preview_tracked_names"):
         fn = getattr(fc_gui.FCToolGUI, name, None)
         if fn is None:
@@ -258,6 +259,33 @@ def test_new_login_client_uses_login_stack_when_no_saved_layout():
     key, x, y, w, h = host.tiles_created[0]
     assert (x, y) == preview_layout.login_stack_pos(0, base)
     assert w == 384 and h == 216
+
+
+# ── uniform_size: a global cfg size change re-places every live tile ─────────
+def test_uniform_size_change_replaces_all_tiles_at_new_global_size():
+    host = make_host(layouts={"kirejen": [10, 20, 384, 216]})
+    host.config["preview"]["uniform_size"] = True
+    client = _cw(1, "Kirejen", rect=(0, 0, 800, 600))
+    host._preview_find_clients = lambda: [client]
+    tick(host)                                      # spawn at 384x216
+    tile = host._preview_tiles[1]
+    # user bumped the global size (e.g. via the tile-w spin or another tile's resize)
+    host.config["preview"]["tile_w"] = 500
+    host.config["preview"]["tile_body_h"] = 300
+    tick(host)                                      # tick must re-place at new size
+    assert tile.placed == (10, 20, 500, 300)        # x,y kept; w/body_h updated
+
+
+def test_uniform_false_applies_per_char_size_override_on_tick():
+    host = make_host(layouts={"kirejen": [10, 20, 384, 216]})
+    host.config["preview"]["uniform_size"] = False
+    host.config["preview"]["sizes"] = {"kirejen": [260, 150]}
+    client = _cw(1, "Kirejen", rect=(0, 0, 800, 600))
+    host._preview_find_clients = lambda: [client]
+    tick(host)
+    tile = host._preview_tiles[1]
+    # per-char override wins over the (default) global size
+    assert tile.placed == (10, 20, 260, 150)
 
 
 # ── (b) retitle login→char → re-key + move to char layout ────────────────────

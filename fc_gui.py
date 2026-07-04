@@ -11526,6 +11526,8 @@ class FCToolGUI:
     _PREVIEW_DEFAULTS = {
         "mode": "off",              # "off" | "eveo_labels" | "native"
         "tile_w": 384, "tile_body_h": 216,
+        "uniform_size": True,       # one resize applies to all tiles (EVE-O parity);
+                                    # False → per-char cfg['sizes'] overrides apply
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
         "login_position": [5, 5],
@@ -11810,11 +11812,12 @@ class FCToolGUI:
         """Resolve (x, y, w, body_h) for a NEW tile: saved layout for the char,
         else login-stack position for a login screen, else a default grid spawn.
         Never mutates saved layouts."""
-        w = cfg.get("tile_w", 384)
-        body_h = cfg.get("tile_body_h", 216)
+        w, body_h = self._preview_resolve_size(cfg, client.key)
         layouts = cfg.get("layouts", {}) or {}
         saved = layouts.get(client.key)
         if saved and len(saved) >= 4:
+            # Saved rect carries its own w/body_h; under uniform_size the tick's
+            # _preview_apply_tile_size re-places it at the global size next cycle.
             return (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
         if client.is_login:
             n = sum(1 for c in self._preview_clients.values() if c.is_login)
@@ -12007,17 +12010,68 @@ class FCToolGUI:
             self._preview_tile_rects[hwnd] = (int(x), int(y), int(w), int(body_h))
         self._save_config()
 
+    def _preview_apply_tile_size(self, hwnd, tile, key, cfg):
+        """If the tile's resolved (w, body_h) differs from what it currently shows,
+        re-place it at its saved top-left with the new size. Called each tick so a
+        global (uniform) size change or a per-char override reaches every live
+        tile. Skips a tile mid-corner-resize so the drag isn't fought."""
+        if getattr(tile, "_corner_resizing", False):
+            return
+        w, body_h = self._preview_resolve_size(cfg, key)
+        rect = self._preview_tile_rects.get(hwnd)
+        if rect is not None and len(rect) >= 4:
+            x, y, cur_w, cur_body = int(rect[0]), int(rect[1]), rect[2], rect[3]
+        else:
+            x, y, cur_w, cur_body = 10, 10, None, None
+        if cur_w == w and cur_body == body_h:
+            return                                   # already the target size
+        try:
+            tile.place(x, y, w, body_h)
+        except Exception:
+            return
+        self._preview_tile_rects[hwnd] = (x, y, w, body_h)
+
+    def _preview_resolve_size(self, cfg, key):
+        """Resolve (w, body_h) for a char's tile. When uniform_size is True (EVE-O
+        parity) every tile uses the GLOBAL tile_w/tile_body_h; when False, a
+        per-char cfg['sizes'][key] override wins if present, else the global size.
+        Never mutates cfg."""
+        gw = int(cfg.get("tile_w", 384))
+        gh = int(cfg.get("tile_body_h", 216))
+        if cfg.get("uniform_size", True):
+            return gw, gh
+        override = (cfg.get("sizes", {}) or {}).get(key)
+        if override and len(override) >= 2:
+            return int(override[0]), int(override[1])
+        return gw, gh
+
     def _preview_on_tile_resize_end(self, key, w, body_h):
+        """Persist a finished tile resize (corner-hover OR the legacy Ctrl/L+R
+        drag — both land here). Branches on uniform_size:
+          - True  (EVE-O parity): update the GLOBAL tile_w/tile_body_h so the next
+            tick re-places every tile at the new size. Per-char 'sizes' overrides
+            are LEFT INTACT (house rule: never delete saved data) — they simply
+            don't apply while uniform_size is on.
+          - False: write ONLY cfg['sizes'][key] = [w, body_h]; the global size and
+            every other tile are untouched.
+        The char's saved layout rect (x,y,w,body_h) is updated in both cases so a
+        respawn restores at the resized dimensions."""
         if not key:
             return
         cfg = self._preview_cfg()
+        w, body_h = int(w), int(body_h)
+        if cfg.get("uniform_size", True):
+            cfg["tile_w"] = w
+            cfg["tile_body_h"] = body_h
+        else:
+            cfg.setdefault("sizes", {})[key] = [w, body_h]
         layouts = cfg.setdefault("layouts", {})
         prev = layouts.get(key) or [10, 10, w, body_h]
-        layouts[key] = [int(prev[0]), int(prev[1]), int(w), int(body_h)]
+        layouts[key] = [int(prev[0]), int(prev[1]), w, body_h]
         for c in self._preview_clients.values():
             if c.key == key:
                 self._preview_tile_rects[c.hwnd] = (
-                    int(prev[0]), int(prev[1]), int(w), int(body_h))
+                    int(prev[0]), int(prev[1]), w, body_h)
                 break
         self._save_config()
 
@@ -12515,6 +12569,11 @@ class FCToolGUI:
                     # C1: keep opacity/zoom config + active flag current. The
                     # active tile (last-activated client) rests at hover opacity.
                     self._preview_style_tile(tile, client.key, cfg)
+                    # Uniform/individual sizing: re-place the tile if its resolved
+                    # target size drifted from what it currently shows (e.g. a
+                    # uniform_size resize on another tile bumped the global size, or
+                    # the tile-w spin changed it). Keep x,y; only w/body_h move.
+                    self._preview_apply_tile_size(hwnd, tile, client.key, cfg)
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
                     # B3: flash the border red while the pilot's system carries a
@@ -12999,6 +13058,19 @@ class FCToolGUI:
         sw.grid(row=0, column=1, padx=(0, 16))
         w.append(sw)
 
+        # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
+        # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
+        # a per-character override. Lives beside the tile-size spin.
+        self._preview_uniform_var = tk.BooleanVar(
+            value=bool(pcfg.get("uniform_size", True)))
+        cbu = tk.Checkbutton(
+            rowN, text="Uniform tile size", variable=self._preview_uniform_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbu.grid(row=0, column=6, padx=(0, 8))
+        w.append(cbu)
+
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
         self._preview_opacity_var = tk.DoubleVar(
@@ -13385,6 +13457,7 @@ class FCToolGUI:
         cfg = self._preview_cfg()
         for var, key, cast in (
             ("_preview_tilew_var", "tile_w", int),
+            ("_preview_uniform_var", "uniform_size", bool),
             ("_preview_opacity_var", "opacity_inactive", float),
             ("_preview_captions_var", "captions", bool),
             ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),

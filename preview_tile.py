@@ -28,6 +28,13 @@ from dwm_thumbs import Thumbnail, aspect_fit
 
 STRIP_H = 20
 _MOVE_JITTER = 4          # left-release within this many px still counts as a click
+_CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
+_MIN_W = 120              # min tile width (physical px)
+_MIN_BODY_H = 68          # min body height (physical px); strip height is constant
+
+# Tk diagonal-resize cursor names (Windows): NW/SE share one, NE/SW the other.
+_CORNER_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
+                  "ne": "size_ne_sw", "sw": "size_ne_sw"}
 
 
 class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRANSPARENT
@@ -161,6 +168,16 @@ class TileWindow:
         self._strip_press_pos = None   # (x, y) tile position at strip press
         self._strip_moving = False     # True once a strip left-drag passed jitter
 
+        # corner-hover resize state (this task). `_corner` is the currently-armed
+        # corner under the cursor ('nw'/'ne'/'sw'/'se'/None); once a left-press
+        # lands on an armed corner, `_corner_resizing` gates the strip-move and
+        # body-activate paths so a corner drag never doubles as a move/click.
+        self._corner = None            # armed corner under the pointer, or None
+        self._corner_resizing = False  # True while a corner drag is in progress
+        self._corner_anchor = None     # (ax, ay) opposite corner, fixed (physical)
+        self._corner_press_root = None # (x_root, y_root) at the corner press
+        self._corner_press_size = None # (w, body_h) at the corner press
+
         bg_panel = palette.get("BG_PANEL", "#16213e")
         bg_dark = palette.get("BG_DARK", "#1a1a2e")
         fg_text = palette.get("FG_TEXT", "#e0e0e0")
@@ -243,8 +260,26 @@ class TileWindow:
             w.bind("<ButtonPress-1>", self._on_strip_b1_press)
             w.bind("<B1-Motion>", self._on_strip_b1_motion)
             w.bind("<ButtonRelease-1>", self._on_strip_b1_release)
+        # Corner-hover resize: a plain <Motion> over any strip/body widget arms
+        # the nearest corner (12 px zone) and swaps the cursor to the matching
+        # diagonal-resize glyph. The armed corner + a left press start a resize.
+        for w in (self.top, self._strip, self._body, self._name_lbl,
+                  self._excl_lbl, self._chip_lbl, self._tag_lbl, self._dot):
+            w.bind("<Motion>", self._on_corner_motion, add="+")
+        # A corner drag that begins on the BODY (or toplevel) needs its own
+        # B1-Motion/Release routing — the body has no strip-move handlers, and
+        # the strip cluster's B1 handlers already defer to _corner_resizing.
+        for w in (self.top, self._body):
+            w.bind("<B1-Motion>", self._corner_motion, add="+")
+            w.bind("<ButtonRelease-1>", self._corner_release, add="+")
 
     def _on_b1_press(self, event):
+        # A press that lands on an armed corner starts a resize instead of the
+        # click-activate path; consume it so no activate fires on release.
+        if self._corner is not None and not self._lock_layout:
+            self._corner_press(event)
+            self._b1_press_root = None
+            return
         self._b1_press_root = (event.x_root, event.y_root)
 
     def _on_b1_release(self, event):
@@ -277,6 +312,12 @@ class TileWindow:
         self._lock_layout = bool(flag)
 
     def _on_strip_b1_press(self, event):
+        # A press on an armed corner starts a resize, not a strip-move. Consume it
+        # so neither the move nor the click-activate path runs for this gesture.
+        if self._corner is not None and not self._lock_layout:
+            self._corner_press(event)
+            self._strip_press_root = None
+            return
         # Record the press so a left-drag on the caption can move the tile. A plain
         # click (release within jitter) falls through to the activate ladder. Anchor
         # on self._pos (the authoritative last-placed PHYSICAL top-left) rather than
@@ -286,6 +327,9 @@ class TileWindow:
         self._strip_moving = False
 
     def _on_strip_b1_motion(self, event):
+        if self._corner_resizing:
+            self._corner_motion(event)
+            return
         press = self._strip_press_root
         if press is None or self._lock_layout:
             return  # not tracking, or layout locked → no move
@@ -303,6 +347,9 @@ class TileWindow:
                                    self._body_h + STRIP_H)
 
     def _on_strip_b1_release(self, event):
+        if self._corner_resizing:
+            self._corner_release(event)
+            return
         press = self._strip_press_root
         self._strip_press_root = None
         if press is None:
@@ -325,6 +372,115 @@ class TileWindow:
         self._b1_press_root = press
         self._on_b1_release(event)
 
+    # ── corner-hover resize (any of the 4 corners; opposite corner anchored) ──
+    def _detect_corner(self, event):
+        """Which corner (if any) the pointer is over, as an inset zone. Uses the
+        pointer position relative to the tile's PHYSICAL top-left (self._pos) vs
+        the tile's known w / (body_h + STRIP_H). This matches the move/resize
+        gestures which also delta event.x_root against the physical self._pos —
+        under PMv2 the tile's monitor makes Tk root coords 1:1 with physical px,
+        so no scale factor is needed (FLAG: re-verify on mixed-DPI monitors)."""
+        w = self._w
+        h = self._body_h + STRIP_H
+        if w <= 0 or h <= 0:
+            return None
+        lx = event.x_root - self._pos[0]
+        ly = event.y_root - self._pos[1]
+        if lx < 0 or ly < 0 or lx > w or ly > h:
+            return None
+        left = lx <= _CORNER_ZONE
+        right = lx >= w - _CORNER_ZONE
+        top = ly <= _CORNER_ZONE
+        bottom = ly >= h - _CORNER_ZONE
+        if top and left:
+            return "nw"
+        if top and right:
+            return "ne"
+        if bottom and left:
+            return "sw"
+        if bottom and right:
+            return "se"
+        return None
+
+    def _set_cursor(self, cursor):
+        try:
+            self.top.configure(cursor=cursor)
+        except tk.TclError:
+            pass
+
+    def _on_corner_motion(self, event):
+        """Plain hover: arm the corner under the pointer (unless locked or already
+        mid-resize) and swap the cursor to the matching diagonal-resize glyph.
+        Moving off every corner disarms and restores the normal cursor."""
+        if self._corner_resizing:
+            return
+        if self._lock_layout:
+            if self._corner is not None:
+                self._corner = None
+                self._set_cursor("")
+            return
+        corner = self._detect_corner(event)
+        if corner == self._corner:
+            return
+        self._corner = corner
+        self._set_cursor(_CORNER_CURSOR.get(corner, "") if corner else "")
+
+    def _corner_press(self, event):
+        """Begin a corner resize: capture the OPPOSITE corner as a fixed anchor
+        (physical px, from self._pos + current w/h) and enter resize mode. The
+        strip-move and activate paths are already gated on _corner_resizing."""
+        if self._lock_layout or self._corner is None:
+            return
+        x, y = self._pos
+        w, h = self._w, self._body_h + STRIP_H
+        # anchor = the corner OPPOSITE the grabbed one; it stays put through drag.
+        ax = x if self._corner in ("ne", "se") else x + w
+        ay = y if self._corner in ("sw", "se") else y + h
+        self._corner_anchor = (ax, ay)
+        self._corner_press_root = (event.x_root, event.y_root)
+        self._corner_press_size = (self._w, self._body_h)
+        self._corner_resizing = True
+
+    def _corner_motion(self, event):
+        if not self._corner_resizing or self._lock_layout:
+            return
+        dx = event.x_root - self._corner_press_root[0]
+        dy = event.y_root - self._corner_press_root[1]
+        w0, body0 = self._corner_press_size
+        # Grabbed edge moves with the pointer; the OTHER edge is the fixed anchor.
+        # West/North corners invert the delta (drag right/down shrinks them).
+        if self._corner in ("nw", "sw"):
+            w = w0 - dx
+        else:
+            w = w0 + dx
+        if self._corner in ("nw", "ne"):
+            body_h = body0 - dy
+        else:
+            body_h = body0 + dy
+        w = max(_MIN_W, int(w))
+        body_h = max(_MIN_BODY_H, int(body_h))
+        ax, ay = self._corner_anchor
+        # Left edge = anchor_x for E-anchored (ne/se) grabs; else anchor_x - w.
+        x = ax if self._corner in ("ne", "se") else ax - w
+        y = ay if self._corner in ("sw", "se") else ay - (body_h + STRIP_H)
+        self._w, self._body_h = w, body_h
+        self._pos = (x, y)
+        self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
+        self._push_thumb_rect()
+
+    def _corner_release(self, event):
+        if not self._corner_resizing:
+            return
+        self._corner_resizing = False
+        self._corner_anchor = None
+        self._corner_press_root = None
+        self._corner_press_size = None
+        if self._lock_layout:
+            return
+        # Persist through the SAME resize-end path the legacy Ctrl/L+R resize uses;
+        # the controller branches on uniform_size to route the new size.
+        self._on_resize_end(self._key, self._w, self._body_h)
+
     def _on_b3_press(self, event):
         self._press_root = (event.x_root, event.y_root)
         # Anchor on self._pos (authoritative last-placed PHYSICAL top-left), not
@@ -342,8 +498,8 @@ class TileWindow:
         dx = event.x_root - self._press_root[0]
         dy = event.y_root - self._press_root[1]
         if self._mode == "resize":
-            w = max(120, self._press_size[0] + dx)
-            body_h = max(80, self._press_size[1] + dy)
+            w = max(_MIN_W, self._press_size[0] + dx)
+            body_h = max(_MIN_BODY_H, self._press_size[1] + dy)
             self._w, self._body_h = w, body_h
             self._win32.set_window_pos(self._hwnd, self._press_pos[0],
                                        self._press_pos[1], w, body_h + STRIP_H)
