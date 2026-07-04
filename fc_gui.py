@@ -685,6 +685,9 @@ class FCToolGUI:
         self._overlay_poller_stop = None       # threading.Event while running
         self._overlay_status_label = None
         self._overlay_thumbs_fn = find_thumbs  # injectable for tests
+        # Process-based Eve-O detection for the "thumbnails hidden" status state
+        # (Eve-O can be running with every thumbnail window hidden). Injectable.
+        self._overlay_preview_running_fn = preview_running
 
         # ── Native preview controller state ─────────────────────────────────
         self._preview_tiles = {}               # hwnd -> TileWindow
@@ -11246,7 +11249,11 @@ class FCToolGUI:
         return due
 
     _OVERLAY_DEFAULTS = {
-        "enabled": False, "font_size": 11, "color": "#00d4ff",
+        # Default label color is high-legibility white (#ffffff), not the old
+        # low-contrast teal — existing users keep their saved overlay.color;
+        # only this default changes. Text is drawn as a crisp black outline +
+        # white fill (see eveo_overlay), readable on any thumbnail.
+        "enabled": False, "font_size": 11, "color": "#ffffff",
         "anchor": "top-left", "dpi_awareness": "auto", "rules": [],
         "overrides": {},
     }
@@ -11260,6 +11267,36 @@ class FCToolGUI:
                 cfg[k] = ([] if isinstance(v, list) else
                           {} if isinstance(v, dict) else v)
         return cfg
+
+    # `when` kinds whose rule needs no match value (the value field is hidden /
+    # disabled and no suggestions apply).
+    _OVERLAY_VALUELESS_WHENS = ("docked", "offline", "capital", "subcap")
+
+    def _overlay_rule_value_suggestions(self, when: str) -> list[str]:
+        """Autocomplete suggestions for a rule's value, SCOPED to the rule
+        category so systems never bleed into ship_group etc.:
+
+          ship_group -> distinct ship GROUP names (incl. "Shuttle")
+          ship_type  -> ship TYPE names (incl. "Amarr Shuttle" and other
+                        shuttles — sourced from ship-only catalog names)
+          system     -> system names (self._system_names)
+          docked/offline/capital/subcap -> [] (valueless)
+
+        Pure w.r.t. the chosen `when`: given the kind it reads the correct
+        source and cross-contaminates none of the others. Never raises; returns
+        [] on any failure so the dialog degrades to free-text entry."""
+        w = (when or "").strip()
+        try:
+            if w == "system":
+                return list(getattr(self, "_system_names", []) or [])
+            tc = getattr(self, "type_catalog", None)
+            if w == "ship_group":
+                return tc.ship_group_names() if tc is not None else []
+            if w == "ship_type":
+                return tc.ship_type_names() if tc is not None else []
+        except Exception:
+            return []
+        return []
 
     def _overlay_rules(self) -> list:
         raw = self._overlay_cfg().get("rules", []) or []
@@ -11296,10 +11333,23 @@ class FCToolGUI:
             items.append((thumb.rect, label))
         return items
 
-    def _overlay_status_text(self, thumb_count: int, matched: int) -> str:
+    def _overlay_status_text(self, thumb_count: int, matched: int,
+                             preview_running: bool = False) -> str:
+        """Status line for the overlay Settings row. Three live states:
+          ● N thumbnails · M matched        — thumbnails are visible
+          ◐ Eve-O running · thumbnails …    — the process is up but Eve-O has
+                                              hidden its thumbnails (its config
+                                              only shows them when an EVE client
+                                              is focused; select an EVE client)
+          ○ Eve-O Preview not detected      — no thumbnails and no process
+        The middle state relies on process-based detection (preview_running),
+        so it fires even when every Eve-O window is hidden/minimised."""
         if not self._overlay_cfg().get("enabled", False):
             return "⏸ off"
         if thumb_count <= 0:
+            if preview_running:
+                return ("◐ Eve-O running · thumbnails hidden "
+                        "(select an EVE client)")
             return "○ Eve-O Preview not detected"
         return f"● {thumb_count} thumbnails · {matched} matched"
 
@@ -11330,9 +11380,21 @@ class FCToolGUI:
             return
         # live status label (if the Settings section is built)
         if getattr(self, "_overlay_status_label", None) is not None:
+            # Only probe the process list when NO thumbnails are visible — that
+            # is the sole case where the "hidden thumbnails" middle state can
+            # apply, and it keeps the sub-ms hot path free of the snapshot when
+            # thumbnails are up.
+            running = False
+            if thumb_count <= 0:
+                prfn = getattr(self, "_overlay_preview_running_fn", None)
+                if prfn is not None:
+                    try:
+                        running = bool(prfn())
+                    except Exception:
+                        running = False
             try:
                 self._overlay_status_label.config(
-                    text=self._overlay_status_text(thumb_count, matched))
+                    text=self._overlay_status_text(thumb_count, matched, running))
             except tk.TclError:
                 pass
         # getattr-with-default so the tick works both on the real class (class
@@ -11348,7 +11410,7 @@ class FCToolGUI:
             cfg = self._overlay_cfg()
             self._overlay = OverlayWindow(self.root, {
                 "font_size": cfg.get("font_size", 11),
-                "color": cfg.get("color", "#00d4ff"),
+                "color": cfg.get("color", "#ffffff"),
                 "anchor": cfg.get("anchor", "top-left"),
             })
         return self._overlay
@@ -12499,7 +12561,7 @@ class FCToolGUI:
 
         tk.Label(row2, text="Color", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
-        self._overlay_color_val = cfg.get("color", FG_ACCENT)
+        self._overlay_color_val = cfg.get("color", "#ffffff")
         self._overlay_color_btn = tk.Button(
             row2, text="●", font=("Consolas", 12), width=3,
             fg=self._overlay_color_val, bg=BG_ENTRY, activebackground=BG_ENTRY,
@@ -13130,22 +13192,51 @@ class FCToolGUI:
         def _add_rule_row(when="ship_group", value="", label=""):
             r = len(rule_rows)
             wv = tk.StringVar(value=when)
-            vv = tk.StringVar(value=value)
             lv = tk.StringVar(value=label)
-            ttk.Combobox(rules_frame, textvariable=wv, values=when_values,
-                         state="readonly", width=11,
-                         font=("Consolas", 9)).grid(row=r, column=0, padx=2, pady=1)
-            # value: autocomplete for systems/ship-groups (free text otherwise)
+            when_combo = ttk.Combobox(rules_frame, textvariable=wv,
+                                      values=when_values, state="readonly",
+                                      width=11, font=("Consolas", 9))
+            when_combo.grid(row=r, column=0, padx=2, pady=1)
+            # value: autocomplete SCOPED to the chosen `when` kind (ship_group ->
+            # group names, ship_type -> ship type names incl. shuttles, system ->
+            # system names). Valueless kinds disable the field entirely.
             ve = AutocompleteEntry(
-                rules_frame, self._system_names, font=("Consolas", 9),
-                bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
+                rules_frame, self._overlay_rule_value_suggestions(when),
+                font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                insertbackground=FG_WHITE, width=18)
             ve.grid(row=r, column=1, padx=2)
             if value:
                 ve.insert(0, value)
+
+            def _sync_value_source(*_a, _wv=wv, _ve=ve):
+                kind = _wv.get().strip()
+                # repopulate suggestions from the correct source for this kind
+                try:
+                    _ve.update_completions(
+                        self._overlay_rule_value_suggestions(kind))
+                except Exception:
+                    pass
+                # disable + clear the value field for valueless kinds; the OK
+                # handler also ignores any value for these, so this is purely UX
+                if kind in self._OVERLAY_VALUELESS_WHENS:
+                    try:
+                        _ve.delete(0, tk.END)
+                        _ve.configure(state="disabled")
+                    except tk.TclError:
+                        pass
+                else:
+                    try:
+                        _ve.configure(state="normal")
+                    except tk.TclError:
+                        pass
+
+            when_combo.bind("<<ComboboxSelected>>", _sync_value_source)
             le = tk.Entry(rules_frame, textvariable=lv, font=("Consolas", 9),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, width=18)
             le.grid(row=r, column=2, padx=2)
             rule_rows.append({"when": wv, "value_entry": ve, "label": lv})
+            # apply the initial enabled/disabled state for the seeded `when`
+            _sync_value_source()
 
         for r in cfg.get("rules", []) or []:
             _add_rule_row(r.get("when", "ship_group"), r.get("value", ""),

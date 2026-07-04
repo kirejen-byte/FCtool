@@ -1,6 +1,7 @@
 import pytest
 tk = pytest.importorskip("tkinter")
 import inspect
+from tkinter import ttk
 import types
 
 import fc_gui
@@ -70,7 +71,7 @@ def test_overlay_cfg_defaults():
         cfg = host._overlay_cfg()
         assert cfg["enabled"] is False
         assert cfg["font_size"] == 11
-        assert cfg["color"] == "#00d4ff"
+        assert cfg["color"] == "#ffffff"    # Fix 3: readable white default
         assert cfg["anchor"] == "top-left"
         assert cfg["dpi_awareness"] == "auto"
         assert cfg["rules"] == [] or isinstance(cfg["rules"], list)
@@ -114,6 +115,147 @@ def test_status_text_variants():
         assert "not detected" in host._overlay_status_text(0, 0).lower()
         assert "matched" in host._overlay_status_text(4, 3).lower()
     finally:
+        root.destroy()
+
+
+def test_status_text_hidden_thumbnails_middle_state():
+    # Fix 1: process running but 0 thumbnails => the "hidden" middle state,
+    # distinct from both "not detected" and the thumbnail-count state.
+    root, host = _host(overlay_cfg={"enabled": True})
+    try:
+        hidden = host._overlay_status_text(0, 0, preview_running=True).lower()
+        assert "hidden" in hidden
+        assert "running" in hidden
+        assert "not detected" not in hidden
+        # process running is irrelevant once thumbnails ARE visible
+        shown = host._overlay_status_text(2, 1, preview_running=True).lower()
+        assert "matched" in shown and "hidden" not in shown
+        # no process, no thumbnails => plain not-detected
+        assert "not detected" in host._overlay_status_text(
+            0, 0, preview_running=False).lower()
+    finally:
+        root.destroy()
+
+
+def test_tick_picks_hidden_state_from_preview_running_fn():
+    # Fix 1: the controller tick probes _overlay_preview_running_fn when there
+    # are 0 thumbnails and shows the "hidden" state on the live status label.
+    root, host = _host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}},
+                       thumbs=[])
+    try:
+        host._overlay_preview_running_fn = lambda: True
+        host._overlay_status_label = tk.Label(root)
+        host._overlay_tick()
+        assert "hidden" in host._overlay_status_label.cget("text").lower()
+    finally:
+        if host._overlay_after_id:
+            try: root.after_cancel(host._overlay_after_id)
+            except Exception: pass
+        root.destroy()
+
+
+# ── Fix 2: rule-value autocomplete scoped per `when` kind ────────────────────
+
+def _suggestion_host():
+    host = types.SimpleNamespace()
+    host._system_names = ["Jita", "Amarr", "Hek"]
+    from type_catalog import TypeCatalog
+    host.type_catalog = TypeCatalog()   # real bundled catalog
+    host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+    host._overlay_rule_value_suggestions = types.MethodType(
+        fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+    return host
+
+
+def test_rule_value_suggestions_scoped_per_kind():
+    host = _suggestion_host()
+    groups = host._overlay_rule_value_suggestions("ship_group")
+    types_ = host._overlay_rule_value_suggestions("ship_type")
+    systems = host._overlay_rule_value_suggestions("system")
+
+    # ship_group -> group names incl. Shuttle; NO system names
+    assert "Shuttle" in groups
+    assert "Force Recon Ship" in groups
+    assert "Jita" not in groups            # system must not leak into groups
+    assert "Amarr Shuttle" not in groups   # a TYPE name must not appear here
+
+    # ship_type -> type names incl. a shuttle (the reported-missing case)
+    assert "Amarr Shuttle" in types_
+    assert "Jita" not in types_
+    assert "Shuttle" not in types_         # a GROUP name is not a type name
+
+    # system -> system names only
+    assert systems == ["Jita", "Amarr", "Hek"]
+
+    # valueless kinds -> no suggestions
+    for kind in ("docked", "offline", "capital", "subcap"):
+        assert host._overlay_rule_value_suggestions(kind) == []
+
+
+def test_rule_value_suggestions_degrade_without_catalog():
+    host = types.SimpleNamespace()
+    host._system_names = ["Jita"]
+    host.type_catalog = None
+    fn = types.MethodType(fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+    assert fn("ship_group") == []
+    assert fn("ship_type") == []
+    assert fn("system") == ["Jita"]
+
+
+def test_rules_dialog_value_field_scopes_and_disables():
+    # End-to-end on the modal: after switching a rule's `when` to a valueless
+    # kind the value entry is cleared+disabled; switching to ship_group offers
+    # group names; ship_type offers ship type names.
+    root, host = _ui_host(overlay_cfg={"enabled": True, "rules": [], "overrides": {}})
+    try:
+        from type_catalog import TypeCatalog
+        host.type_catalog = TypeCatalog()
+        host._overlay_rule_value_suggestions = types.MethodType(
+            fc_gui.FCToolGUI._overlay_rule_value_suggestions, host)
+        host._OVERLAY_VALUELESS_WHENS = fc_gui.FCToolGUI._OVERLAY_VALUELESS_WHENS
+        # open the dialog in a non-blocking way: build it, then close before
+        # wait_window would block by scheduling a destroy.
+        host.config["overlay"]["rules"] = [
+            {"when": "ship_group", "value": "Shuttle", "label": "shuttle!"}]
+        # Drive the modal builder but avoid the terminal wait_window block by
+        # patching it to a no-op via the root's after/return; simplest: call the
+        # builder and immediately destroy any created Toplevel.
+        created = {}
+        orig_wait = host.root.wait_window
+        host.root.wait_window = lambda w: created.__setitem__("win", w)
+        host._open_overlay_rules_dialog()
+        win = created.get("win")
+        assert win is not None
+        # find the AutocompleteEntry (value field) and its when combobox
+        from autocomplete import AutocompleteEntry
+        entries = [w for w in win.winfo_children()]
+        # walk the rules_frame for the value entry + combobox
+        acs, combos = [], []
+        def _walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, AutocompleteEntry):
+                    acs.append(c)
+                elif isinstance(c, ttk.Combobox):
+                    combos.append(c)
+                _walk(c)
+        _walk(win)
+        assert acs, "expected a value AutocompleteEntry in the dialog"
+        ve = acs[0]
+        # seeded ship_group -> completions include group names
+        assert "Shuttle" in ve._completions
+        # switch the row's when to 'capital' (valueless) -> disabled + cleared
+        rule_combo = combos[0]
+        rule_combo.set("capital")
+        rule_combo.event_generate("<<ComboboxSelected>>")
+        assert str(ve.cget("state")) == "disabled"
+        # switch to ship_type -> re-enabled and completions are ship type names
+        rule_combo.set("ship_type")
+        rule_combo.event_generate("<<ComboboxSelected>>")
+        assert str(ve.cget("state")) == "normal"
+        assert "Amarr Shuttle" in ve._completions
+        win.destroy()
+    finally:
+        host.root.wait_window = orig_wait
         root.destroy()
 
 

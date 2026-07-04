@@ -8,6 +8,14 @@ A thumbnail qualifies when ALL hold:
   * ex-style has WS_EX_TOOLWINDOW
   * owning process basename is NOT 'ExeFile.exe' (the real game client, whose
     titles match too but is not a tool window and belongs to ExeFile.exe)
+
+Detection (preview_running) is process-based so it survives Eve-O configs that
+hide the thumbnail windows unless an EVE client is focused AND minimise the
+Eve-O main window to the tray — in that state neither a thumbnail nor the main
+window is visible, yet the process is still running. list_process_names()
+enumerates running-process basenames via CreateToolhelp32Snapshot (stdlib
+ctypes, no psutil) so we can detect "EVE-O Preview.exe" regardless of window
+visibility.
 """
 from __future__ import annotations
 
@@ -16,6 +24,7 @@ from dataclasses import dataclass
 
 TITLE_PREFIX = "EVE - "
 GAME_CLIENT_EXE = "exefile.exe"   # compared case-insensitively
+PREVIEW_EXE = "eve-o preview.exe"   # compared case-insensitively
 WS_EX_TOOLWINDOW = 0x00000080
 GWL_EXSTYLE = -20
 
@@ -62,6 +71,14 @@ class _RealWin32:
         self._user32.GetWindowThreadProcessId.argtypes = [
             wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         self._user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        # Toolhelp process-snapshot entry points (kernel32). Used by
+        # list_process_names() for window-visibility-independent detection.
+        self._kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        self._kernel32.CreateToolhelp32Snapshot.argtypes = [
+            wintypes.DWORD, wintypes.DWORD]
+        self._kernel32.Process32FirstW.restype = wintypes.BOOL
+        self._kernel32.Process32NextW.restype = wintypes.BOOL
 
     def enum_windows(self) -> list[int]:
         ctypes = self._ctypes
@@ -125,6 +142,47 @@ class _RealWin32:
         finally:
             self._kernel32.CloseHandle(h)
 
+    def list_process_names(self) -> list[str]:
+        """Return the basenames of all running processes (e.g. 'EVE-O
+        Preview.exe') via CreateToolhelp32Snapshot / Process32FirstW / NextW.
+        No psutil. Never raises; returns [] on any Win32 failure."""
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * MAX_PATH),
+            ]
+
+        snap = self._kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID_HANDLE_VALUE:
+            return []
+        out: list[str] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = self._kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                name = entry.szExeFile
+                if name:
+                    out.append(name)
+                ok = self._kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            self._kernel32.CloseHandle(snap)
+        return out
+
 
 # Lazily-created singleton so importing the module on non-Windows / headless
 # never touches ctypes.windll. Tests always pass their own fake.
@@ -181,22 +239,71 @@ def find_thumbs(win32=None) -> list[Thumb]:
 PREVIEW_MAIN_TITLE = "EVE-O Preview"   # the app's own main window title
 
 
+def _preview_process_running(win32) -> bool:
+    """True iff a process named 'EVE-O Preview.exe' (case-insensitive) is
+    running, OR a renamed Eve-O fork that owns a thumbnail-style window is
+    running. Window-visibility-independent: works even when Eve-O has hidden
+    every thumbnail AND minimised its main window to the tray.
+
+    The renamed-fork case is derived from live windows: any visible tool window
+    titled 'EVE - <name>' whose owner exe is neither the game client nor
+    already matched contributes its basename as an "Eve-O fork" candidate, and
+    if that basename is in the process list we count it. This mirrors
+    find_thumbs' renamed-exe tolerance without hard-coding fork names.
+    Never raises; returns False on any failure (e.g. no list_process_names on
+    an older fake)."""
+    lister = getattr(win32, "list_process_names", None)
+    if lister is None:
+        return False
+    try:
+        names = lister() or []
+    except Exception:
+        return False
+    lowered = {(n or "").rsplit("\\", 1)[-1].lower() for n in names}
+    if PREVIEW_EXE in lowered:
+        return True
+    # Renamed-fork tolerance: match the owner exe of any live thumbnail-style
+    # tool window against the running-process list.
+    try:
+        for hwnd in win32.enum_windows():
+            try:
+                if not win32.is_visible(hwnd):
+                    continue
+                if not (win32.get_title(hwnd) or "").startswith(TITLE_PREFIX):
+                    continue
+                if not (win32.get_ex_style(hwnd) & WS_EX_TOOLWINDOW):
+                    continue
+                exe = (win32.get_owner_exe(hwnd) or "").lower()
+                if exe and exe != GAME_CLIENT_EXE and exe in lowered:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
 def preview_running(win32=None) -> bool:
-    """True iff Eve-O Preview appears to be running: at least one thumbnail is
-    present OR its main window (a visible top-level titled exactly
-    'EVE-O Preview') is open even with no clients previewed yet. Uses the same
-    EnumWindows pass — no psutil. Never raises; returns False on any failure."""
+    """True iff Eve-O Preview appears to be running via ANY of three signals:
+      1. at least one thumbnail window is present, OR
+      2. its main window (a visible top-level titled exactly 'EVE-O Preview')
+         is open (no clients previewed yet), OR
+      3. an 'EVE-O Preview.exe' process is running even with every thumbnail
+         hidden and the main window minimised to the tray.
+
+    Signals 1-2 use the EnumWindows pass; signal 3 uses a process snapshot
+    (no psutil). Never raises; returns False on any failure."""
     if win32 is None:
         if sys.platform != "win32":
             return False
         win32 = _real_win32()
     if find_thumbs(win32=win32):
         return True
-    # Fallback: the Eve-O Preview main window itself (no thumbnails yet).
+    # Fallback A: the Eve-O Preview main window itself (no thumbnails yet).
     try:
         hwnds = win32.enum_windows()
     except Exception:
-        return False
+        hwnds = []
     for hwnd in hwnds:
         try:
             if not win32.is_visible(hwnd):
@@ -205,4 +312,5 @@ def preview_running(win32=None) -> bool:
                 return True
         except Exception:
             continue
-    return False
+    # Fallback B: the process is running even though every window is hidden.
+    return _preview_process_running(win32)

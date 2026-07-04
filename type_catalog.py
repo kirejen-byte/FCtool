@@ -44,6 +44,67 @@ CATEGORY_NAMES: dict[int, str] = {
     32: "subsystem",
 }
 
+SHIP_CATEGORY_ID = 6
+
+# SDE ship groupID -> display name, for every ship group present in the bundled
+# fit_types.json. The names are the authoritative ESI /universe/groups/{id}/
+# names, so a rule value chosen from ship_group_names() matches exactly what
+# ship_classes.get_group_name() (same ESI endpoint) reports for a live hull.
+# Used to populate the overlay Label-rules "ship_group" value autocomplete
+# (which otherwise had no source of group names — the bundle carries group ids
+# but no group names). "Shuttle" (group 31) is included so shuttles are
+# reachable by group as well as by type.
+SHIP_GROUP_NAMES: dict[int, str] = {
+    25: "Frigate",
+    26: "Cruiser",
+    27: "Battleship",
+    28: "Hauler",
+    29: "Capsule",
+    30: "Titan",
+    31: "Shuttle",
+    237: "Corvette",
+    324: "Assault Frigate",
+    358: "Heavy Assault Cruiser",
+    380: "Deep Space Transport",
+    419: "Combat Battlecruiser",
+    420: "Destroyer",
+    463: "Mining Barge",
+    485: "Dreadnought",
+    513: "Freighter",
+    540: "Command Ship",
+    541: "Interdictor",
+    543: "Exhumer",
+    547: "Carrier",
+    659: "Supercarrier",
+    830: "Covert Ops",
+    831: "Interceptor",
+    832: "Logistics",
+    833: "Force Recon Ship",
+    834: "Stealth Bomber",
+    883: "Capital Industrial Ship",
+    893: "Electronic Attack Ship",
+    894: "Heavy Interdiction Cruiser",
+    898: "Black Ops",
+    900: "Marauder",
+    902: "Jump Freighter",
+    906: "Combat Recon Ship",
+    941: "Industrial Command Ship",
+    963: "Strategic Cruiser",
+    1022: "Prototype Exploration Ship",
+    1201: "Attack Battlecruiser",
+    1202: "Blockade Runner",
+    1283: "Expedition Frigate",
+    1305: "Tactical Destroyer",
+    1527: "Logistics Frigate",
+    1534: "Command Destroyer",
+    1538: "Force Auxiliary",
+    1972: "Flag Cruiser",
+    4594: "Lancer Dreadnought",
+    4902: "Expedition Command Ship",
+    5087: "Special Edition Yachts",
+    5120: "Command Carrier",
+}
+
 
 class TypeCatalog:
     """Resolve type IDs to names/categories/slots from bundled SDE + ESI fallback."""
@@ -140,6 +201,53 @@ class TypeCatalog:
                     out.append(name)
         out.sort()
         return out[:limit]
+
+    def ship_type_names(self, prefix: str = "", limit: int = 1000) -> list[str]:
+        """Ship (categoryID 6) type names only, sorted, capped at ``limit``.
+
+        With no prefix, returns the whole ship roster (used to seed the overlay
+        rule "ship_type" value autocomplete, which filters client-side as the
+        user types). With a prefix, returns ship names whose lowercased name
+        contains it (substring, so "shuttle" finds "Amarr Shuttle"). Modules,
+        charges, drones etc. are excluded — this is the source that guarantees
+        shuttles are reachable under ship_type.
+        """
+        p = (prefix or "").strip().lower()
+        out: list[str] = []
+        for tid, entry in self._by_id.items():
+            if not isinstance(entry, dict) or entry.get("c") != SHIP_CATEGORY_ID:
+                continue
+            name = entry.get("n")
+            if not isinstance(name, str) or not name:
+                continue
+            if p and p not in name.lower():
+                continue
+            out.append(name)
+        out.sort()
+        return out[:limit]
+
+    def ship_group_names(self) -> list[str]:
+        """Distinct ship group NAMES for the overlay rule "ship_group" value
+        autocomplete, sorted.
+
+        Catalog-aligned: only groups that actually appear among the bundled
+        ship types are offered (so the list tracks the shipped SDE), resolved
+        to authoritative ESI names via SHIP_GROUP_NAMES. Any ship group id
+        missing from the map is skipped rather than shown as a bare number. If
+        no ship types are loaded at all (corrupt/missing bundle), falls back to
+        the full SHIP_GROUP_NAMES value set so the field is never empty.
+        """
+        present: set[int] = set()
+        for entry in self._by_id.values():
+            if isinstance(entry, dict) and entry.get("c") == SHIP_CATEGORY_ID:
+                gid = entry.get("g")
+                if isinstance(gid, int):
+                    present.add(gid)
+        if present:
+            names = {SHIP_GROUP_NAMES[g] for g in present if g in SHIP_GROUP_NAMES}
+        else:
+            names = set(SHIP_GROUP_NAMES.values())
+        return sorted(names)
 
     def category_of(self, type_id: int) -> str | None:
         """Return one of ship/module/charge/drone/fighter/subsystem/other, or
