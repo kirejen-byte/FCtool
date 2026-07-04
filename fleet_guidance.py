@@ -19,7 +19,7 @@ DEFENDER_TAG = "Defenders"
 
 # Composition roles resolved per-fit, in priority order. "Defenders" is NOT here —
 # it is an additive fleet-wide overlay (see compute_fleet_guidance).
-COMPOSITION_ROLE_ORDER = ("DPS", "Logi", "Links", "Support - Webs", "Tackle")
+COMPOSITION_ROLE_ORDER = ("DPS", "Logi", "Links", "Webs", "Tackle")
 
 # ── Ideal-% exemptions ───────────────────────────────────────────────────────
 # Ships exempted by default from the fleet-% denominator (they inflate the fleet
@@ -84,7 +84,7 @@ def is_exempt_type(ship_type_id, exemptions, group_of, is_capital_of) -> bool:
 TAG_DEFAULTS: dict[str, tuple[str, int, int | None]] = {
     "DPS": ("percent", 50, 60),
     "Logi": ("percent", 25, 35),
-    "Support - Webs": ("count", 2, 6),
+    "Webs": ("count", 2, 6),
 }
 DEFENDER_TARGET_MIN = 8
 

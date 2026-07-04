@@ -26,13 +26,18 @@ log = get_logger(__name__)
 
 SCHEMA_VERSION = 2
 
-# Load-time renames for legacy doctrine-tag rule VALUES (old -> new). The
-# "Logistics" role tag was shortened to "Logi"; a seeded Default template from
-# v2.5.0 carries a ``doctrine_tag = "Logistics"`` rule that would no longer match
-# "Logi"-tagged fits, so it is rewritten on load. Applies ONLY to rules whose
-# condition.type is "doctrine_tag" — never to ship_class/ship_type values (which
-# use EVE names like "Logistics Cruiser").
-_DOCTRINE_TAG_RENAMES: dict[str, str] = {"Logistics": "Logi"}
+# Load-time renames for legacy doctrine-tag rule VALUES (old -> new). Three
+# default role tags were shortened: "Logistics" -> "Logi", "Support - Webs" ->
+# "Webs", and "Support - EWAR" -> "EWAR". A seeded Default template from v2.5.0
+# carries e.g. a ``doctrine_tag = "Logistics"`` rule that would no longer match
+# "Logi"-tagged fits, so such values are rewritten on load. Applies ONLY to rules
+# whose condition.type is "doctrine_tag" — never to ship_class/ship_type values
+# (which use EVE names like "Logistics Cruiser").
+_DOCTRINE_TAG_RENAMES: dict[str, str] = {
+    "Logistics": "Logi",
+    "Support - Webs": "Webs",
+    "Support - EWAR": "EWAR",
+}
 
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────

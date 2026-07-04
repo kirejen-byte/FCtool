@@ -4268,7 +4268,7 @@ class FCToolGUI:
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
-                        "defenders": "Defenders", "webs": "Support - Webs"}
+                        "defenders": "Defenders", "webs": "Webs"}
 
     def _format_rollup(self, rr) -> tuple[str, str]:
         """Format a role rollup's live current/target into (text, colour).
@@ -6359,7 +6359,7 @@ class FCToolGUI:
     # carrying a tag outside this list are grouped last under "Other".
     _DOCTRINE_TAG_ORDER = (
         "DPS", "Logi", "Links",
-        "Support - EWAR", "Support - Webs", "Defenders", "Tackle", "Special",
+        "EWAR", "Webs", "Defenders", "Tackle", "Special",
     )
 
     def _build_doctrines_subtab(self):
@@ -7366,9 +7366,10 @@ class FCToolGUI:
         return win
 
     def _manage_tags_dialog(self):
-        """Modal manager for the library tag vocabulary: add custom tags and
-        delete them (built-in DEFAULT_TAGS are protected). Deleting a tag also
-        strips it from every doctrine member that carries it."""
+        """Modal manager for the library tag vocabulary: add, rename, and delete
+        any tag (built-in default tags are editable exactly like custom ones).
+        Deleting a tag also strips it from every doctrine member that carries
+        it."""
         win = tk.Toplevel(self.root)
         win.title("Manage Tags")
         win.configure(bg=BG_DARK)
@@ -7381,8 +7382,8 @@ class FCToolGUI:
             pass
 
         tk.Label(win,
-                 text="Add, rename, or remove custom tags. Built-in tags "
-                      "cannot be changed.",
+                 text="Add, rename, or remove any tag. Deleting a tag also "
+                      "strips it from every fit that carries it.",
                  font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
                  anchor=tk.W, justify=tk.LEFT, wraplength=350).pack(
                      anchor=tk.W, padx=12, pady=(12, 4))
@@ -7412,13 +7413,13 @@ class FCToolGUI:
                 tk.Label(row, text=tag, font=("Consolas", 9), fg=FG_TEXT,
                          bg=BG_PANEL, anchor=tk.W).pack(
                              side=tk.LEFT, fill=tk.X, expand=True)
-                if tag not in fit_models.DEFAULT_TAGS:
-                    ttk.Button(row, text="Delete", style="Red.TButton",
-                               command=lambda t=tag: _delete(t)).pack(
-                                   side=tk.RIGHT)
-                    ttk.Button(row, text="Rename", style="Dark.TButton",
-                               command=lambda t=tag: _rename(t)).pack(
-                                   side=tk.RIGHT, padx=(0, 4))
+                # Every tag row (including built-in defaults) gets Delete/Rename.
+                ttk.Button(row, text="Delete", style="Red.TButton",
+                           command=lambda t=tag: _delete(t)).pack(
+                               side=tk.RIGHT)
+                ttk.Button(row, text="Rename", style="Dark.TButton",
+                           command=lambda t=tag: _rename(t)).pack(
+                               side=tk.RIGHT, padx=(0, 4))
 
         def _refresh_after_tag_change():
             """Refresh every UI surface a tag add/delete/rename can affect.

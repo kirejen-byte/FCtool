@@ -47,13 +47,18 @@ log = get_logger(__name__)
 
 SCHEMA_VERSION = 1
 
-# Load-time tag renames applied to legacy libraries (old tag -> new tag). The
-# "Logistics" role tag was shortened to "Logi" so preview labels read
-# "Logi - Onyx" instead of "Logistics - Onyx"; existing data tagged the old way
-# is rewritten on every load (idempotent + de-duping). This does NOT touch EVE
-# ship-group/class names (e.g. type_catalog's group 832 "Logistics") — only the
-# doctrine role tag vocabulary and the per-membership tags that carry it.
-_TAG_RENAMES: dict[str, str] = {"Logistics": "Logi"}
+# Load-time tag renames applied to legacy libraries (old tag -> new tag). Three
+# default role tags were shortened: "Logistics" -> "Logi" (so preview labels read
+# "Logi - Onyx" instead of "Logistics - Onyx"), "Support - Webs" -> "Webs", and
+# "Support - EWAR" -> "EWAR". Existing data tagged the old way is rewritten on
+# every load (idempotent + de-duping). This does NOT touch EVE ship-group/class
+# names (e.g. type_catalog's group 832 "Logistics") — only the doctrine role tag
+# vocabulary and the per-membership tags that carry it.
+_TAG_RENAMES: dict[str, str] = {
+    "Logistics": "Logi",
+    "Support - Webs": "Webs",
+    "Support - EWAR": "EWAR",
+}
 
 # ESI character-fittings field limits (see esi_auth.create_fitting). The body is
 # pre-trimmed here so the GUI never hands ESI an over-length name/description.
