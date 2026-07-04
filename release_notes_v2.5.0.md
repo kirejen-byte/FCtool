@@ -1,26 +1,30 @@
 ## FCTool v2.5.0
 
-### New — Native client previews (beta)
+### Native EVE-client previews — **FCPreview**
+Show **live previews of your own EVE clients** right inside FCTool — no more EVE-O Preview needed. Enable it under **Settings → previews → FCPreview**.
 
-FCTool can now show **live previews of your own EVE clients right inside the tool** — one small always-on-top tile per client with the live game video and a caption strip — so you no longer need **EVE-O Preview** running.
+- **Live per-client tiles** with the real game video, **click-to-activate**, and per-character **focus hotkeys** (plus cycle-next/prev across a group).
+- **Drag to arrange** with snap-to-grid / snap-to-edges; per-character layout & size persist. **Corner-hover resize**, and a choice of **uniform or individual** tile sizing.
+- Hover opacity + hover zoom, hide/minimize rules, active-client highlight, and a one-time **Import EVE-O layout**.
+- **Bottom label bar** on each tile — an activity label + the ship's **hull type** (e.g. `Logi - Onyx`, `Cyno - Force Recon`), rendered below the video in your chosen colour/size (and collapsed to one value when the two are identical).
+- **Damage flash** — tiles pulse red on incoming combat damage, read only from your own EVE Gamelogs (own-logs-only, the same compliance class as the intel firehose).
+- **Three modes:** _Off_ · **Eve-O Preview Enhancement** (activity labels drawn on EVE-O Preview's own thumbnails) · **FCPreview** (native tiles).
+- View-only and compliant: mirrors your own full client, performs exactly one OS focus-change per click, and uses only your own-account ESI + your own log files — no input is ever sent into a client.
 
-- **Settings → the previews section**: choose **Native previews (beta)**. (The other modes stay available: **Off**, and **Label EVE-O thumbnails** — the existing activity-label overlay on EVE-O Preview's own thumbnails.)
-- **Click a tile** to bring that client to the front. Assign a global **focus hotkey** per character, or **cycle** next/prev across a group.
-- **Drag to arrange**; positions snap (grid + edges) and are **saved per character**, along with each tile's size. Login screens stack neatly.
-- **EVE-O parity**: hover opacity + hover zoom (9 anchors), hide rules (active / login / lost-focus), minimize-inactive with a never-minimize priority list and minimize-all, active-client highlight, per-tile cycle exclusion, switch-to-non-EVE, arrange-in-grid, and a one-time **Import EVE-O layout…** that fills in matching positions, focus hotkeys, and cycle order (fill-only — it never overwrites what you've already set in FCTool).
-- Multiboxes cleanly with **per-monitor DPI**.
+> Native previews need clients running **windowed** or **windowed-fullscreen** (true exclusive fullscreen has no thumbnail for Windows to mirror).
 
-**Requirements:** clients must run **windowed** (borderless-window or windowed-fullscreen — exclusive fullscreen has no thumbnail to mirror). Focus hotkeys are **swallowed** by Windows while registered, so pick keys you don't otherwise use in EVE.
+### Fleet Templates
+- A ready-made **"Default"** template (Wing _Subcaps_ with DPS / Logi / Special squads, Wing _Caps_ for capitals) now ships **built-in and fully editable**. Nothing is auto-applied — templates apply only when you choose.
+- **Auto-Sort → Auto-move:** the continuous-move toggle was renamed and given a tooltip. It stays **off** by default and respects pilots you've dragged into place.
 
-### New — FCTool-exclusive extras
+### Doctrine & overlay
+- **Per-doctrine ideal-% exemptions** — exclude specific hulls (e.g. Force Recon, capitals) from the composition denominator, with an editor; the Fleet Management panel and MOTD `+X / -Y` deltas use the adjusted percentage.
+- Label-rules dialog renamed **Labels** (with field labels and delete buttons for rules/overrides), and informative tooltips added across every preview setting.
 
-- **Doctrine-tag captions** (default ON): each tile's caption defaults to the pilot's **doctrine-fit tag** from your own active doctrine, so you can see at a glance who's flying what. Override any caption with a **Manual tag**.
-- **Damage flash** (native-mode only, **default ON**): native tiles **pulse red on incoming combat damage**. It reads **only your own EVE combat Gamelogs** (same own-logs-only compliance class as the intel firehose and the EVE-APM precedent). The threshold is **based on base hull HP — fitted ships have more, so it's an approximation** — and it assumes the **English client** (localized clients are out of scope for this version). The separate intel tile-flash remains **default OFF**.
-
-### Compliance
-
-Native previews are **view-only** — they mirror the full client area of **your own** running clients (no cropped sub-regions; no reading another client's screen, overview, or local). Clicking a tile or pressing a focus hotkey performs **exactly one OS window-focus change** and nothing else — **no input is ever sent into an EVE client**. All caption, label, and flash data comes **only from your own SSO-authorized characters' ESI and your own chat/combat log files** — never another player's data, no scraping, no injection, no telemetry; everything stays local. This matches CCP's stated position that view-only full-client previews (as EVE-O Preview does them) are fine, and that switching clients must bring the client to the front.
+### Fixes
+- The preview label now shows the **hull type** (Thrasher, Archon…) instead of the pilot's custom ship name.
+- Damage flash rebuilt to pulse on **any** incoming damage by default (higher thresholds optional), with a fix for the 2026 client's combat-log format.
 
 ---
 
-**Install:** unzip `FCTool.exe` and `config.json` into the same folder and run the exe. Updating? Replace only `FCTool.exe` and keep your existing `*.json` files.
+_Windows: unzip, run `FCTool.exe`, and sign in with the in-app ESI SSO button — as your own character. This is the first release with native previews; feedback and issue reports are welcome._
