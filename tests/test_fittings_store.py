@@ -174,6 +174,49 @@ def test_set_member_ideal_persists(tmp_path):
     assert (mem.ideal_mode, mem.ideal_min, mem.ideal_max) == ("percent", 45, 55)
 
 
+def test_doctrine_exemptions_none_omitted_from_json(tmp_path):
+    import json
+    from fit_models import doctrine_to_dict
+    store, fid = _store_with_fit(tmp_path, 17740, [])
+    did = store.add_doctrine("D")
+    doc = store.get_doctrine(did)
+    assert doc.exemptions is None
+    # None must NOT be serialized (omitted key).
+    assert "exemptions" not in doctrine_to_dict(doc)
+
+
+def test_set_doctrine_exemptions_list_persists(tmp_path):
+    store, fid = _store_with_fit(tmp_path, 17740, [])
+    did = store.add_doctrine("D")
+    entries = [{"kind": "type", "id": 671, "name": "Erebus"},
+               {"kind": "group", "id": 833, "name": "Force Recon Ship"}]
+    store.set_doctrine_exemptions(did, entries)
+    store.save()
+    store2 = FittingsStore(str(tmp_path / "lib.json")); store2.load()
+    assert store2.get_doctrine(did).exemptions == entries
+
+
+def test_set_doctrine_exemptions_empty_list_persists(tmp_path):
+    # [] means "explicitly no exemptions" and must round-trip as [], not None.
+    store, fid = _store_with_fit(tmp_path, 17740, [])
+    did = store.add_doctrine("D")
+    store.set_doctrine_exemptions(did, [])
+    store.save()
+    store2 = FittingsStore(str(tmp_path / "lib.json")); store2.load()
+    assert store2.get_doctrine(did).exemptions == []
+
+
+def test_set_doctrine_exemptions_none_resets(tmp_path):
+    # Setting back to None means "use STANDARD_EXEMPTIONS" and is omitted from JSON.
+    store, fid = _store_with_fit(tmp_path, 17740, [])
+    did = store.add_doctrine("D")
+    store.set_doctrine_exemptions(did, [{"kind": "capital"}])
+    store.set_doctrine_exemptions(did, None)
+    store.save()
+    store2 = FittingsStore(str(tmp_path / "lib.json")); store2.load()
+    assert store2.get_doctrine(did).exemptions is None
+
+
 def test_share_import_preserves_per_fit_ideals(tmp_path):
     src = FittingsStore(str(tmp_path / "a.json")); src.load()
     fid = src.add_fit(_fit("Arty Muninn")); did = src.add_doctrine("Shield HACs")

@@ -21,6 +21,65 @@ DEFENDER_TAG = "Defenders"
 # it is an additive fleet-wide overlay (see compute_fleet_guidance).
 COMPOSITION_ROLE_ORDER = ("DPS", "Logistics", "Links", "Support - Webs", "Tackle")
 
+# ── Ideal-% exemptions ───────────────────────────────────────────────────────
+# Ships exempted by default from the fleet-% denominator (they inflate the fleet
+# size without being part of the composition target). Each entry is a tagged-union
+# dict; see fit_models.Doctrine.exemptions for the format. Force Recon (group 833)
+# plus every capital group (granular, matching ship_classes.CAPITAL_GROUP_IDS's
+# ship-class groups): Titan, Supercarrier, Carrier, Dreadnought, Force Auxiliary,
+# Lancer Dreadnought.
+STANDARD_EXEMPTIONS: list[dict] = [
+    {"kind": "group", "id": 833, "name": "Force Recon Ship"},
+    {"kind": "group", "id": 30, "name": "Titan"},
+    {"kind": "group", "id": 659, "name": "Supercarrier"},
+    {"kind": "group", "id": 547, "name": "Carrier"},
+    {"kind": "group", "id": 485, "name": "Dreadnought"},
+    {"kind": "group", "id": 1538, "name": "Force Auxiliary"},
+    {"kind": "group", "id": 4594, "name": "Lancer Dreadnought"},
+]
+
+
+def effective_exemptions(doctrine) -> list[dict]:
+    """Resolve a doctrine's exemption list.
+
+    None (or missing) means "never customized" -> STANDARD_EXEMPTIONS. An explicit
+    empty list means "no exemptions". An explicit list is returned as-is.
+    """
+    exemptions = getattr(doctrine, "exemptions", None)
+    if exemptions is None:
+        return STANDARD_EXEMPTIONS
+    return exemptions
+
+
+def is_exempt_type(ship_type_id, exemptions, group_of, is_capital_of) -> bool:
+    """True if ``ship_type_id`` matches any exemption entry.
+
+    Pure and network-free: ``group_of(tid) -> int | None`` and
+    ``is_capital_of(tid) -> bool`` are injected resolvers (the caller wires them to
+    ship_classes.get_group_id / is_capital off-thread). A "capital" entry matches
+    when ``is_capital_of`` is true; a "group" entry matches the resolved group id; a
+    "type" entry matches the exact type id.
+    """
+    if not exemptions:
+        return False
+    gid = None
+    gid_resolved = False
+    for e in exemptions:
+        kind = e.get("kind")
+        if kind == "type":
+            if e.get("id") == ship_type_id:
+                return True
+        elif kind == "group":
+            if not gid_resolved:
+                gid = group_of(ship_type_id)
+                gid_resolved = True
+            if gid is not None and e.get("id") == gid:
+                return True
+        elif kind == "capital":
+            if is_capital_of(ship_type_id):
+                return True
+    return False
+
 # Tag -> (mode, min, max) default. "Links" has no static default (computed).
 TAG_DEFAULTS: dict[str, tuple[str, int, int | None]] = {
     "DPS": ("percent", 50, 60),
@@ -169,6 +228,7 @@ class GuidanceReport:
     roles: dict
     links_suppressed: bool
     has_live_fleet: bool
+    excluded_from_pct: int = 0   # # of present pilots removed from the %-denominator
 
 
 def _targets_in_pilots(ideal: EffectiveIdeal, fleet_total):
@@ -180,12 +240,23 @@ def _targets_in_pilots(ideal: EffectiveIdeal, fleet_total):
 
 
 def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
-                           fleet_total, command_ship_fraction=0.0) -> GuidanceReport:
+                           fleet_total, command_ship_fraction=0.0,
+                           exempt_type_ids: set[int] | None = None,
+                           doctrine_hull_ids: set[int] | None = None) -> GuidanceReport:
     """Compute role-level composition guidance + a Defenders overlay rollup.
 
     ``get_fit(fit_id) -> Fit | None``. ``fleet_ship_counts`` maps hull type id ->
     live count; ``fleet_total`` is the current fleet size, or None when there is no
     live (boss) fleet.
+
+    ``exempt_type_ids`` is the caller-preresolved set of PRESENT ship type ids that
+    are exempt from the fleet-% denominator (resolved off-thread to keep this fn
+    pure/network-free). ``doctrine_hull_ids`` is the set of hull type ids used by the
+    doctrine — a hull in this set is NEVER excluded even if it matches an exemption
+    (exact-hull override). Exempt present pilots are subtracted from the denominator
+    (``adj_total``, clamped to >=1 when fleet_total>0); percentage targets use
+    ``adj_total``, while ``current``/numerator role sums are UNCHANGED. The count of
+    excluded present pilots is returned as ``excluded_from_pct``.
 
     Composition targets (percent/count) are ROLE-LEVEL: the role's single ideal is
     applied once, ``current`` is the SUM of the role's hull counts, and every fit in
@@ -195,6 +266,21 @@ def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
     """
     has_live = fleet_total is not None
     members = list(getattr(doctrine, "members", []))
+
+    # Adjusted %-denominator: subtract PRESENT exempt pilots, but never a doctrine
+    # hull (exact-hull override). Exemptions only affect the denominator, not the
+    # numerator role sums. Clamp to >=1 whenever there is a live fleet so the target
+    # math never divides toward 0 / goes negative.
+    hull_ids = doctrine_hull_ids or set()
+    excluded = 0
+    for tid in (exempt_type_ids or ()):
+        if tid in hull_ids:
+            continue
+        excluded += fleet_ship_counts.get(tid, 0)
+    if has_live and fleet_total > 0:
+        adj_total = max(fleet_total - excluded, 1)
+    else:
+        adj_total = fleet_total  # None (no live fleet) or 0 -> leave untouched
 
     # Precompute the links range from the doctrine's links fits.
     links_parsed = []
@@ -240,11 +326,11 @@ def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
             continue
 
         if has_live:
-            tmin, tmax = _targets_in_pilots(ideal, fleet_total)
+            tmin, tmax = _targets_in_pilots(ideal, adj_total)
             current = sum(fleet_ship_counts.get(f.hull_type_id, 0) for (_m, f) in items)
             status, delta = compute_delta(current, tmin, tmax)
         else:
-            tmin, tmax = _targets_in_pilots(ideal, fleet_total or 0)
+            tmin, tmax = _targets_in_pilots(ideal, adj_total or 0)
             current, status, delta = None, "unknown", 0
 
         roles[role] = RoleRollup(role, tmin, tmax, current, status, delta)
@@ -258,7 +344,8 @@ def compute_fleet_guidance(doctrine, get_fit, catalog, fleet_ship_counts,
 
     roles["Defenders"] = _defenders_overlay(members, get_fit, fleet_ship_counts, has_live)
     return GuidanceReport(fits=fits, roles=roles,
-                          links_suppressed=links_suppressed, has_live_fleet=has_live)
+                          links_suppressed=links_suppressed, has_live_fleet=has_live,
+                          excluded_from_pct=excluded)
 
 
 def _defenders_overlay(members, get_fit, fleet_ship_counts, has_live) -> RoleRollup:

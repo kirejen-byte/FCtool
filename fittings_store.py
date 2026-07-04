@@ -327,6 +327,21 @@ class FittingsStore:
                 member.ideal_max = ideal_max
         doctrine.modified = _now()
 
+    def set_doctrine_exemptions(
+        self, doctrine_id: str, entries: list[dict] | None
+    ) -> None:
+        """Set the per-doctrine ideal-% exemption list.
+
+        None = "use STANDARD_EXEMPTIONS" (omitted from JSON); [] = explicitly none;
+        [...] = that explicit list. Copies the entries so external mutation cannot
+        leak in. Round-trips via doctrine_to_dict/_from_dict.
+        """
+        doctrine = self._doctrines.get(doctrine_id)
+        if doctrine is None:
+            return
+        doctrine.exemptions = None if entries is None else [dict(e) for e in entries]
+        doctrine.modified = _now()
+
     def remove_fit_from_doctrine(self, doctrine_id: str, fit_id: str) -> None:
         """Remove a fit from a doctrine's member list."""
         doctrine = self._doctrines.get(doctrine_id)

@@ -224,6 +224,146 @@ def test_compute_guidance_percent_blank_min_uses_dps_default_live():
     assert by["ret"].status == "under" and by["ret"].delta == 3
 
 
+# ── Doctrine exemptions (ideal-% denominator) ────────────────────────────────
+
+def test_standard_exemptions_seed_contents():
+    ids = {e["id"] for e in fg.STANDARD_EXEMPTIONS}
+    # Force Recon (833) + granular capital groups.
+    assert ids == {833, 30, 659, 547, 485, 1538, 4594}
+    assert all(e["kind"] == "group" for e in fg.STANDARD_EXEMPTIONS)
+    assert all(isinstance(e["name"], str) and e["name"] for e in fg.STANDARD_EXEMPTIONS)
+
+
+def test_effective_exemptions_none_uses_standard():
+    doc = _Doc([])
+    doc.exemptions = None
+    assert fg.effective_exemptions(doc) is fg.STANDARD_EXEMPTIONS
+
+
+def test_effective_exemptions_empty_list_is_explicit_none():
+    doc = _Doc([])
+    doc.exemptions = []
+    assert fg.effective_exemptions(doc) == []
+
+
+def test_effective_exemptions_explicit_list_passthrough():
+    doc = _Doc([])
+    custom = [{"kind": "type", "id": 123, "name": "Widget"}]
+    doc.exemptions = custom
+    assert fg.effective_exemptions(doc) is custom
+
+
+def test_effective_exemptions_missing_attr_treated_as_none():
+    doc = _Doc([])  # no exemptions attr at all
+    assert fg.effective_exemptions(doc) is fg.STANDARD_EXEMPTIONS
+
+
+def test_is_exempt_type_capital_kind():
+    exemptions = [{"kind": "capital"}]
+    is_cap = lambda tid: tid == 999
+    group_of = lambda tid: None
+    assert fg.is_exempt_type(999, exemptions, group_of, is_cap) is True
+    assert fg.is_exempt_type(111, exemptions, group_of, is_cap) is False
+
+
+def test_is_exempt_type_group_kind():
+    exemptions = [{"kind": "group", "id": 833, "name": "Force Recon Ship"}]
+    group_of = lambda tid: 833 if tid == 11957 else 500
+    is_cap = lambda tid: False
+    assert fg.is_exempt_type(11957, exemptions, group_of, is_cap) is True
+    assert fg.is_exempt_type(22222, exemptions, group_of, is_cap) is False
+
+
+def test_is_exempt_type_type_kind():
+    exemptions = [{"kind": "type", "id": 671, "name": "Erebus"}]
+    group_of = lambda tid: None
+    is_cap = lambda tid: False
+    assert fg.is_exempt_type(671, exemptions, group_of, is_cap) is True
+    assert fg.is_exempt_type(672, exemptions, group_of, is_cap) is False
+
+
+def test_is_exempt_type_empty_exemptions_never_matches():
+    assert fg.is_exempt_type(671, [], (lambda t: 1), (lambda t: True)) is False
+
+
+def test_is_exempt_type_multiple_kinds_any_match():
+    exemptions = [
+        {"kind": "capital"},
+        {"kind": "group", "id": 833, "name": "Force Recon Ship"},
+        {"kind": "type", "id": 671, "name": "Erebus"},
+    ]
+    group_of = lambda tid: 833 if tid == 11957 else None
+    is_cap = lambda tid: tid == 23773
+    assert fg.is_exempt_type(23773, exemptions, group_of, is_cap) is True   # capital
+    assert fg.is_exempt_type(11957, exemptions, group_of, is_cap) is True   # group
+    assert fg.is_exempt_type(671, exemptions, group_of, is_cap) is True     # type
+    assert fg.is_exempt_type(555, exemptions, group_of, is_cap) is False
+
+
+def test_compute_guidance_exempt_present_ship_reduces_denominator():
+    # Fleet of 20 but 4 are exempt (present in fleet, NOT a doctrine hull) -> adj 16.
+    doc, get_fit, cat = _build()
+    counts = {17740: 7, 33816: 6, 22468: 2, 11957: 4}  # 4 Force Recons (exempt)
+    rep = fg.compute_fleet_guidance(
+        doc, get_fit, cat, counts, 20, command_ship_fraction=0.1,
+        exempt_type_ids={11957}, doctrine_hull_ids={17740, 33816, 22468})
+    by = {f.fit_id: f for f in rep.fits}
+    # DPS 50-60% of adjusted 16 = 8-10 (was 10-12 at 20). current 7 -> under +1.
+    assert by["ret"].target_min == 8 and by["ret"].target_max == 10
+    assert by["ret"].current == 7  # numerator unchanged (role sum)
+    assert by["ret"].status == "under" and by["ret"].delta == 1
+    assert rep.excluded_from_pct == 4
+
+
+def test_compute_guidance_exempt_doctrine_hull_still_counted():
+    # A doctrine hull that is also exempt-by-group must STILL count in the denominator
+    # (exact-hull-id override): it is a doctrine ship, so not excluded.
+    doc, get_fit, cat = _build()
+    # Say the DPS hull (17740) is exempt by type-id resolution, but it's a doctrine hull.
+    counts = {17740: 7, 33816: 6, 22468: 2}
+    rep = fg.compute_fleet_guidance(
+        doc, get_fit, cat, counts, 20, command_ship_fraction=0.1,
+        exempt_type_ids={17740}, doctrine_hull_ids={17740, 33816, 22468})
+    by = {f.fit_id: f for f in rep.fits}
+    # Denominator stays 20 (17740 excluded from the exemption because it's a doctrine hull).
+    assert by["ret"].target_min == 10 and by["ret"].target_max == 12
+    assert rep.excluded_from_pct == 0
+
+
+def test_compute_guidance_adj_total_clamps_at_one():
+    # If exemptions would zero out the denominator, it clamps to 1 (never 0/negative).
+    doc, get_fit, cat = _build()
+    counts = {17740: 7, 33816: 6, 22468: 2, 11957: 20}
+    rep = fg.compute_fleet_guidance(
+        doc, get_fit, cat, counts, 20, command_ship_fraction=0.1,
+        exempt_type_ids={11957}, doctrine_hull_ids={17740, 33816, 22468})
+    # All 20 excluded -> adj clamps to 1. 50% of 1 = 1 (ceil), etc.
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["ret"].target_min == fg.percent_to_pilots(50, 1) == 1
+    assert rep.excluded_from_pct == 20
+
+
+def test_compute_guidance_no_exemptions_denominator_unchanged():
+    doc, get_fit, cat = _build()
+    counts = {17740: 7, 33816: 6, 22468: 2}
+    rep = fg.compute_fleet_guidance(doc, get_fit, cat, counts, 20, command_ship_fraction=0.1)
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["ret"].target_min == 10 and by["ret"].target_max == 12
+    assert rep.excluded_from_pct == 0
+
+
+def test_compute_guidance_excluded_count_only_counts_present_ships():
+    # An exempt type id that is NOT present in the fleet contributes 0 to excluded.
+    doc, get_fit, cat = _build()
+    counts = {17740: 7, 33816: 6, 22468: 2}  # no 11957 present
+    rep = fg.compute_fleet_guidance(
+        doc, get_fit, cat, counts, 20, command_ship_fraction=0.1,
+        exempt_type_ids={11957}, doctrine_hull_ids={17740, 33816, 22468})
+    assert rep.excluded_from_pct == 0
+    by = {f.fit_id: f for f in rep.fits}
+    assert by["ret"].target_min == 10 and by["ret"].target_max == 12
+
+
 def test_compute_guidance_multi_fit_role_shares_role_level_delta():
     # Two Logistics fits (Basilisk + Scimitar). Logi default 25-35%. Fleet of 100.
     # 10 Basilisk + 11 Scimitar = 21 logi total (21%). Min is 25 -> role is +4 short,

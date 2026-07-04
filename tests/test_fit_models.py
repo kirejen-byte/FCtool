@@ -22,6 +22,60 @@ def test_default_tags_are_the_seven():
                             "Support - EWAR", "Support - Webs", "Defenders", "Tackle", "Special"]
 
 
+def _doctrine(exemptions="__unset__"):
+    from fit_models import Doctrine
+    kwargs = {}
+    if exemptions != "__unset__":
+        kwargs["exemptions"] = exemptions
+    return Doctrine(id="d1", name="D", description="", members=[],
+                    created="c", modified="m", **kwargs)
+
+
+def test_doctrine_exemptions_defaults_none():
+    assert _doctrine().exemptions is None
+
+
+def test_doctrine_to_dict_omits_none_exemptions():
+    from fit_models import doctrine_to_dict
+    d = doctrine_to_dict(_doctrine(None))
+    assert "exemptions" not in d
+
+
+def test_doctrine_to_dict_serializes_list_exemptions():
+    from fit_models import doctrine_to_dict
+    entries = [{"kind": "capital"},
+               {"kind": "group", "id": 833, "name": "Force Recon Ship"},
+               {"kind": "type", "id": 671, "name": "Erebus"}]
+    d = doctrine_to_dict(_doctrine(entries))
+    assert d["exemptions"] == entries
+
+
+def test_doctrine_to_dict_serializes_empty_list_exemptions():
+    from fit_models import doctrine_to_dict
+    d = doctrine_to_dict(_doctrine([]))
+    assert d["exemptions"] == []
+
+
+def test_doctrine_from_dict_reads_exemptions():
+    from fit_models import doctrine_from_dict
+    entries = [{"kind": "type", "id": 671, "name": "Erebus"}]
+    doc = doctrine_from_dict({"id": "d1", "name": "D", "exemptions": entries})
+    assert doc.exemptions == entries
+
+
+def test_doctrine_from_dict_missing_exemptions_is_none():
+    from fit_models import doctrine_from_dict
+    doc = doctrine_from_dict({"id": "d1", "name": "D"})
+    assert doc.exemptions is None
+
+
+def test_doctrine_roundtrip_preserves_exemptions():
+    from fit_models import doctrine_to_dict, doctrine_from_dict
+    entries = [{"kind": "group", "id": 30, "name": "Titan"}]
+    doc = doctrine_from_dict(doctrine_to_dict(_doctrine(entries)))
+    assert doc.exemptions == entries
+
+
 def test_content_hash_is_order_independent_and_stable():
     a = _fit()
     b = _fit()

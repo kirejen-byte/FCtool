@@ -107,6 +107,12 @@ class Doctrine:
     members: list[DoctrineMember]
     created: str
     modified: str
+    # Per-doctrine ideal-% exemptions. Tagged-union entry dicts:
+    #   {"kind": "capital"} | {"kind": "group", "id": int, "name": str}
+    #   | {"kind": "type", "id": int, "name": str}
+    # Semantics: None = "use STANDARD_EXEMPTIONS" (never customized); [] = explicitly
+    # none; [...] = that explicit list. See fleet_guidance.effective_exemptions.
+    exemptions: list[dict] | None = None
 
 
 # ── Content hashing (order-independent, for de-dupe) ──────────────────────────
@@ -253,7 +259,7 @@ def doctrine_member_from_dict(d: dict) -> DoctrineMember:
 
 
 def doctrine_to_dict(doctrine: Doctrine) -> dict:
-    return {
+    d = {
         "id": doctrine.id,
         "name": doctrine.name,
         "description": doctrine.description,
@@ -261,6 +267,11 @@ def doctrine_to_dict(doctrine: Doctrine) -> dict:
         "created": doctrine.created,
         "modified": doctrine.modified,
     }
+    # Serialize exemptions ONLY when customized (None omitted so absence == "use
+    # STANDARD_EXEMPTIONS"; an explicit [] is preserved to mean "no exemptions").
+    if doctrine.exemptions is not None:
+        d["exemptions"] = [dict(e) for e in doctrine.exemptions]
+    return d
 
 
 def doctrine_from_dict(data: dict) -> Doctrine:
@@ -271,4 +282,5 @@ def doctrine_from_dict(data: dict) -> Doctrine:
         members=[doctrine_member_from_dict(m) for m in data.get("members", [])],
         created=data.get("created", ""),
         modified=data.get("modified", ""),
+        exemptions=data.get("exemptions"),
     )
