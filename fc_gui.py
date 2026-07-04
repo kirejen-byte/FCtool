@@ -12997,6 +12997,20 @@ class FCToolGUI:
         cfg = self._overlay_cfg()
         pcfg = self._preview_cfg()
 
+        # DRY tooltip binder — reuses the app-wide tooltip helper
+        # (_show_tooltip/_hide_tooltip) so every preview control gets one concise
+        # plain-English hint on hover. `t=text` captures per-widget copy.
+        def _tip(widget, text):
+            widget.bind("<Enter>", lambda e, t=text: self._show_tooltip(e, t))
+            widget.bind("<Leave>", lambda e: self._hide_tooltip())
+            # Record the copy on the widget too. Harmless at runtime, and it lets
+            # headless tests assert tooltip content without relying on synthetic
+            # <Enter> delivery (unreliable for classic tk widgets when unmapped).
+            try:
+                widget._fctool_tooltip = text
+            except Exception:
+                pass
+
         # Native rows collected here so the mode radio can enable/disable them
         # as a group (native controls are inert unless mode == "native").
         self._preview_native_widgets = []
@@ -13019,6 +13033,16 @@ class FCToolGUI:
                 command=lambda v=value: self._preview_set_mode(v))
             btn.pack(side=tk.LEFT, padx=(0, 6))
             self._preview_mode_buttons[value] = btn
+        _tip(self._preview_mode_buttons["off"],
+             "Off: no previews. 'Eve-O Preview Enhancement' labels your Eve-O "
+             "thumbnails; 'FCPreview' shows native live previews inside FCTool.")
+        _tip(self._preview_mode_buttons["eveo_labels"],
+             "Eve-O Preview Enhancement: label the Eve-O Preview thumbnails you "
+             "already run — FCTool draws captions on them, it doesn't make the "
+             "thumbnails itself.")
+        _tip(self._preview_mode_buttons["native"],
+             "FCPreview: FCTool renders its own native live preview tiles of each "
+             "EVE client inside the app (no Eve-O Preview needed).")
         self._preview_status_label = tk.Label(
             row1, text=self._preview_status_text(), font=("Consolas", 9),
             fg=FG_DIM, bg=BG_DARK, anchor=tk.W)
@@ -13051,6 +13075,8 @@ class FCToolGUI:
         # save-on-type + arrow (house rule)
         size_spin.bind("<KeyRelease>", lambda e: self._overlay_apply_style())
         size_spin.grid(row=0, column=1, padx=(0, 16))
+        _tip(size_spin, "Font size of the on-video label text drawn over each "
+                        "preview / thumbnail.")
 
         tk.Label(row2, text="Color", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
@@ -13060,6 +13086,8 @@ class FCToolGUI:
             fg=self._overlay_color_val, bg=BG_ENTRY, activebackground=BG_ENTRY,
             relief=tk.RIDGE, command=self._overlay_cycle_color)
         self._overlay_color_btn.grid(row=0, column=3, padx=(0, 16))
+        _tip(self._overlay_color_btn,
+             "Click to cycle the colour of the on-video label text.")
 
         tk.Label(row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
@@ -13072,6 +13100,8 @@ class FCToolGUI:
         anchor_combo.grid(row=0, column=5)
         anchor_combo.bind("<<ComboboxSelected>>",
                           lambda e: self._overlay_apply_style())
+        _tip(anchor_combo,
+             "Which corner of the preview the on-video label sits in.")
 
         # Row 3 (shared): Label rules… button (rules + manual tags modal). Native
         # captions reuse these same rules, so it lives in the shared frame too.
@@ -13109,6 +13139,8 @@ class FCToolGUI:
         sw.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
         sw.grid(row=0, column=1, padx=(0, 16))
         w.append(sw)
+        _tip(sw, "Width in pixels of each native preview tile (height follows the "
+                 "client's aspect ratio).")
 
         # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
         # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
@@ -13122,6 +13154,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbu.grid(row=0, column=6, padx=(0, 8))
         w.append(cbu)
+        _tip(cbu, "On: resizing one preview resizes them all; Off: each preview "
+                  "keeps its own size.")
 
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
@@ -13134,6 +13168,8 @@ class FCToolGUI:
         so.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
         so.grid(row=0, column=3, padx=(0, 16))
         w.append(so)
+        _tip(so, "Opacity of preview tiles for clients that are NOT the active "
+                 "one (1.0 = fully opaque).")
 
         self._preview_captions_var = tk.BooleanVar(value=bool(pcfg.get("captions", True)))
         cbc = tk.Checkbutton(
@@ -13143,6 +13179,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbc.grid(row=0, column=4, padx=(0, 8))
         w.append(cbc)
+        _tip(cbc, "Show a text caption on each preview tile (character name or its "
+                  "label rule).")
 
         self._preview_doctrine_tag_var = tk.BooleanVar(
             value=bool(pcfg.get("doctrine_tag_captions", True)))
@@ -13154,6 +13192,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbd.grid(row=0, column=5, padx=(0, 8))
         w.append(cbd)
+        _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
+                  "rule or override already labels it.")
 
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
@@ -13167,6 +13207,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbh.grid(row=0, column=0, padx=(0, 8))
         w.append(cbh)
+        _tip(cbh, "Draw a highlight border around the preview of the currently "
+                  "active EVE client.")
 
         self._preview_lock_var = tk.BooleanVar(value=bool(pcfg.get("lock_layout", False)))
         cbl = tk.Checkbutton(
@@ -13176,6 +13218,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbl.grid(row=0, column=1, padx=(0, 16))
         w.append(cbl)
+        _tip(cbl, "Lock preview positions and sizes so they can't be dragged or "
+                  "resized by accident.")
 
         # B3: intel flash — tile border flashes red while the pilot's system has
         # a fresh hostile intel note from your own chat logs. Default OFF.
@@ -13188,6 +13232,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbi.grid(row=0, column=2, padx=(0, 16))
         w.append(cbi)
+        _tip(cbi, "Flash a preview's border red when that pilot's system gets a "
+                  "fresh hostile intel note from your own chat logs.")
 
         # B6: damage flash — tile border pulses red when windowed incoming
         # damage from your OWN combat Gamelogs crosses a % of base hull HP.
@@ -13201,6 +13247,9 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbdf.grid(row=0, column=3, padx=(0, 16))
         w.append(cbdf)
+        _tip(cbdf, "Pulse a preview's border red when that character takes "
+                   "incoming damage in your own combat logs (tune it in the row "
+                   "below).")
 
         # C3: minimize-inactive — on a switch, the previously-active client is
         # minimized (unless it's in the never-minimize list). EVE-O parity.
@@ -13214,11 +13263,15 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbmi.grid(row=0, column=4, padx=(0, 8))
         w.append(cbmi)
+        _tip(cbmi, "When you switch clients, minimize the one you just left "
+                   "(except characters on the never-minimize list).")
 
         bnm = ttk.Button(rowN2, text="Never minimize…", style="Dark.TButton",
                          command=self._open_preview_never_minimize_dialog)
         bnm.grid(row=0, column=5, padx=(0, 6))
         w.append(bnm)
+        _tip(bnm, "Pick characters that should stay open and never be minimized "
+                  "by 'Minimize inactive'.")
 
         # Row 5b (native, Task C2): hide rules + the per-character "which previews
         # to show" entry point. Hiding a rule/character never wipes saved data.
@@ -13233,6 +13286,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbha.grid(row=0, column=0, padx=(0, 8))
         w.append(cbha)
+        _tip(cbha, "Hide the preview of whichever client is currently active "
+                   "(you're already looking at that window).")
 
         self._preview_hide_login_var = tk.BooleanVar(
             value=bool(pcfg.get("hide_login", False)))
@@ -13243,6 +13298,8 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbhl.grid(row=0, column=1, padx=(0, 8))
         w.append(cbhl)
+        _tip(cbhl, "Hide previews of clients still sitting on the character-select "
+                   "/ login screen.")
 
         self._preview_hide_lost_focus_var = tk.BooleanVar(
             value=bool(pcfg.get("hide_on_lost_focus", False)))
@@ -13254,11 +13311,14 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbhf.grid(row=0, column=2, padx=(0, 16))
         w.append(cbhf)
+        _tip(cbhf, "Hide every preview whenever no EVE client has focus (e.g. "
+                   "you've alt-tabbed away from the game).")
 
         bpv = ttk.Button(rowHide, text="Previews…", style="Dark.TButton",
                          command=self._open_preview_previews_dialog)
         bpv.grid(row=0, column=3, padx=(0, 6))
         w.append(bpv)
+        _tip(bpv, "Choose which characters get a preview window.")
         self._preview_shown_summary_lbl = tk.Label(
             rowHide, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
         self._preview_shown_summary_lbl.grid(row=0, column=4, padx=(4, 0),
@@ -13291,6 +13351,9 @@ class FCToolGUI:
                         lambda e: (self._preview_apply_dmg_mode_visibility(),
                                    self._preview_apply_native_state()))
         w.append(mode_combo)
+        _tip(mode_combo,
+             "Any damage: pulse on any incoming hit from your combat logs. "
+             "Threshold: pulse only once damage passes a % of the ship's HP.")
 
         # pct label+spin (threshold-only; grid_remove'd in any mode below).
         self._preview_dmg_pct_lbl = tk.Label(rowN3, text="Flash %",
@@ -13306,6 +13369,8 @@ class FCToolGUI:
         spct.grid(row=0, column=3, padx=(0, 12))
         self._preview_dmg_pct_spin = spct
         w.append(spct)
+        _tip(spct, "Threshold mode only: how much damage (as a % of the reference "
+                   "HP) within the window triggers a pulse.")
 
         tk.Label(rowN3, text="Window s", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
@@ -13318,6 +13383,8 @@ class FCToolGUI:
         swin.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
         swin.grid(row=0, column=5, padx=(0, 12))
         w.append(swin)
+        _tip(swin, "How many seconds of incoming damage are summed together, and "
+                   "how long the pulse is held.")
 
         tk.Label(rowN3, text="Cooldown s", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=6, padx=(0, 4), sticky=tk.W)
@@ -13330,6 +13397,8 @@ class FCToolGUI:
         scd.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
         scd.grid(row=0, column=7, padx=(0, 12))
         w.append(scd)
+        _tip(scd, "Minimum seconds between pulses on the same preview, so a steady "
+                  "beating doesn't strobe.")
 
         # reference label+combo (threshold-only).
         self._preview_dmg_ref_lbl = tk.Label(rowN3, text="Reference",
@@ -13347,6 +13416,9 @@ class FCToolGUI:
                        lambda e: self._preview_apply_native_state())
         self._preview_dmg_ref_combo = ref_combo
         w.append(ref_combo)
+        _tip(ref_combo,
+             "Threshold mode only: which base-hull HP pool the Flash % is measured "
+             "against (weakest layer, a specific layer, or total).")
         # Apply initial threshold-only visibility from the loaded mode.
         self._preview_apply_dmg_mode_visibility()
 
@@ -13357,21 +13429,28 @@ class FCToolGUI:
                         command=self._preview_arrange_grid)
         bg.grid(row=0, column=0, padx=(0, 6))
         w.append(bg)
+        _tip(bg, "Auto-place every preview tile into a tidy grid on your screen.")
 
         bgf = ttk.Button(rowN4, text="Arrange by fleet", style="Dark.TButton",
                          command=self._preview_arrange_by_fleet)
         bgf.grid(row=0, column=1, padx=(0, 6))
         w.append(bgf)
+        _tip(bgf, "Arrange the preview tiles grouped by their fleet wing/squad "
+                  "order.")
 
         bhk = ttk.Button(rowN4, text="Hotkeys…", style="Dark.TButton",
                          command=self._open_preview_hotkeys_dialog)
         bhk.grid(row=0, column=2, padx=(0, 6))
         w.append(bhk)
+        _tip(bhk, "Set global hotkeys to switch/cycle EVE clients (focus only — no "
+                  "input is ever sent to the game).")
 
         bimp = ttk.Button(rowN4, text="Import EVE-O layout…", style="Dark.TButton",
                           command=self._preview_import_eveo)
         bimp.grid(row=0, column=3, padx=(0, 6))
         w.append(bimp)
+        _tip(bimp, "Import tile positions/sizes from your existing Eve-O Preview "
+                   "configuration.")
 
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
