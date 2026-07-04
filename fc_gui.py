@@ -578,6 +578,51 @@ def _read_text_file_for_import(path: str) -> str:
         return fh.read()
 
 
+def build_default_fleet_template(primary_name, primary_id, *, new_id=None):
+    """Construct the seeded 'Default' fleet template (Subcaps/Caps wings).
+
+    Pure: no self, no Tk, no ESI, no I/O. ``primary_name``/``primary_id`` pin the
+    Subcaps wing commander (a wing_commander-role slot physically inside the
+    Subcaps->DPS squad, per the established idiom); when ``primary_name`` is
+    falsy the WC slot is left empty. ``doctrine_id`` is None so the doctrine_tag
+    rules stay dormant until a doctrine is active, while the capital + default
+    rules always route. Returns a validated FleetTemplate (validate_template has
+    been run, so ``.broken`` flags are set).
+    """
+    import fleet_template_store as fts
+    from uuid import uuid4
+    wc_slot = fts.Slot(character=(primary_name or None), tag=None,
+                       role="wing_commander",
+                       character_id=(primary_id if primary_name else None))
+    subcaps = fts.Wing(name="Subcaps", max_size=None, squads=[
+        fts.Squad(name="DPS", max_size=None, slots=[wc_slot]),
+        fts.Squad(name="Logi", max_size=None, slots=[]),
+        fts.Squad(name="Special", max_size=None, slots=[]),
+    ])
+    caps = fts.Wing(name="Caps", max_size=None, squads=[
+        fts.Squad(name="Caps", max_size=None, slots=[]),
+    ])
+    rules = [
+        fts.AssignmentRule(priority=0,
+            condition=fts.RuleCondition("capital", ""),
+            action=fts.RuleAction("squad_member", "Caps", "Caps")),
+        fts.AssignmentRule(priority=1,
+            condition=fts.RuleCondition("doctrine_tag", "Logistics"),
+            action=fts.RuleAction("squad_member", "Subcaps", "Logi")),
+        fts.AssignmentRule(priority=2,
+            condition=fts.RuleCondition("doctrine_tag", "DPS"),
+            action=fts.RuleAction("squad_member", "Subcaps", "DPS")),
+        fts.AssignmentRule(priority=3,
+            condition=fts.RuleCondition("default", ""),
+            action=fts.RuleAction("squad_member", "Subcaps", "DPS")),
+    ]
+    t = fts.FleetTemplate(id=new_id or uuid4().hex, name="Default",
+                          doctrine_id=None, wings=[subcaps, caps],
+                          rules=rules, settings=fts.RebalanceSettings())
+    fts.validate_template(t)
+    return t
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -775,6 +820,9 @@ class FCToolGUI:
         self.fleet_templates = _fleet_template_store.FleetTemplateStore(
             os.path.join(app_dir(), "fleet_templates.json"))
         self.fleet_templates.load()
+        # Seed the editable "Default" template once (survives user deletion via
+        # the fleet_default_seeded config flag; never auto-applied).
+        self._seed_default_fleet_template()
         self._fleet_template_window = None
         # Per-dialog/sub-tab state placeholders (populated as the tab is built).
         self._fit_selected_id: str | None = None
@@ -1085,6 +1133,31 @@ class FCToolGUI:
                 atomic_write_json(CONFIG_PATH, self.config, indent=4)
         except Exception:
             log.exception("Failed to save config.json")
+
+    def _seed_default_fleet_template(self):
+        """Seed the editable 'Default' fleet template once, on first run.
+
+        Idempotent via the ``fleet_default_seeded`` config flag (NOT
+        store-emptiness) so a user who deletes 'Default' is not re-seeded.
+        Data-only: appends to the store, saves, and sets the flag; it never
+        auto-applies, never opens the Fleet Templates window, and never touches
+        ESI. Any failure is logged and swallowed so a bad seed cannot crash
+        startup.
+        """
+        try:
+            if self.config.get("fleet_default_seeded", False):
+                return
+            name = getattr(self.esi_auth, "character_name", None) if self.esi_auth else None
+            cid = getattr(self.esi_auth, "character_id", None) if self.esi_auth else None
+            t = build_default_fleet_template(name, cid)
+            self.fleet_templates.templates.append(t)
+            self.fleet_templates.save()
+            if name:
+                self.fleet_templates.cache_character(name, cid)
+            self.config["fleet_default_seeded"] = True
+            self._save_config()
+        except Exception:
+            log.exception("[fleet-templates] failed to seed the Default template")
 
     def _save_staging_systems(self):
         """Persist the friendly/hostile staging lists into config["jump_range"]

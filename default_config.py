@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     "tracked_character": "",
     "sound_on_ready": True,
     "ansiblex_connections": [],
+    "fleet_default_seeded": False,
     "xup": {
         "trigger_word": "x",
         "fire_word": "FIRE",
