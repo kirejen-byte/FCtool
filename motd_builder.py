@@ -51,6 +51,19 @@ CHANNEL_LINK_COMPOUND = True
 TAG_PRIORITY = ("DPS", "Logi", "Links")
 
 
+def _escape(text: str) -> str:
+    """Escape ``&``, ``<`` and ``>`` so user free-text is safe in MOTD markup.
+
+    EVE's markup is not XML but it still parses ``<...>`` as tags: an unescaped
+    ``<`` in user text (e.g. a doctrine named ``Shield <HACs>``) makes the client
+    strip the unknown pseudo-tag (silent text loss) and an unbalanced ``<`` can
+    swallow following markup, including fit links. ``&`` is escaped FIRST so an
+    already-inserted ``&`` is not double-escaped. :func:`parse_motd` runs
+    ``html.unescape`` on read-back, so these round-trip cleanly.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def fitting_link(dna: str, name: str) -> str:
     """Build a self-contained in-game fitting link from a fit's DNA.
 
@@ -204,7 +217,7 @@ def build_motd(
     if staging_name is not None and staging_system_id is not None:
         lines.append(f"Staging: {system_link(staging_system_id, staging_name)}")
 
-    lines.append(f"Doctrine: {doctrine_name}")
+    lines.append(f"Doctrine: {_escape(doctrine_name)}")
 
     for tag in _ordered_tags(list(fits_by_tag.keys())):
         fits = fits_by_tag.get(tag) or []
@@ -216,7 +229,7 @@ def build_motd(
             delta = fit[2] if len(fit) > 2 else 0
             parts.append(fitting_link(dna, name) + delta_markup(delta))
         links = " | ".join(parts)
-        lines.append(f"{tag}: {links}")
+        lines.append(f"{_escape(tag)}: {links}")
 
     if channel:
         lines.append(f"Logi: {channel_text(channel, channel_id)}")

@@ -245,6 +245,19 @@ def parse_intel_message(
     if len(text) <= 1:
         return None
 
+    # Per-message resolver memo: _extract_system_name and _strip_system_refs
+    # each probe overlapping tokens, so the same token can be resolved several
+    # times within one message. Cache token->result (including None) for the
+    # lifetime of this call so each distinct token hits the injected resolver
+    # at most once. No cross-message state lives here — jump_range's own
+    # positive/negative caches handle persistence across messages.
+    _resolve_memo: dict[str, int | None] = {}
+
+    def resolve(token: str) -> int | None:
+        if token not in _resolve_memo:
+            _resolve_memo[token] = resolve_system(token)
+        return _resolve_memo[token]
+
     report = IntelReport(
         timestamp=msg.timestamp,
         channel=msg.channel,
@@ -272,11 +285,11 @@ def parse_intel_message(
     # Try to extract system name from the beginning of the message
     # EVE system names: letters, numbers, dashes (e.g., "C-N4OD", "1DQ1-A", "NOL-M9")
     # Also multi-word names like "Korasen" or "Old Man Star"
-    system_name, remaining = _extract_system_name(text, resolve_system)
+    system_name, remaining = _extract_system_name(text, resolve)
 
     if system_name:
         report.system_name = system_name
-        report.system_id = resolve_system(system_name)
+        report.system_id = resolve(system_name)
 
         # Classify the remaining text
         remaining = remaining.strip()
@@ -299,7 +312,7 @@ def parse_intel_message(
         #      digit and the licensing keyword in the same clause.
         # Strip system-name-like tokens first (e.g. "in XY-503") so their
         # digits aren't mistaken for pilot counts.
-        cleaned = _strip_system_refs(remaining, resolve_system)
+        cleaned = _strip_system_refs(remaining, resolve)
 
         count_match = COUNT_PATTERN.search(remaining)
         if count_match:
@@ -966,7 +979,7 @@ def resolve_names(
         if not resp.ok:
             return []
         data = resp.json()
-        for char in data.get("characters", [])[:5]:
+        for char in data.get("characters", []):
             corp_id = None
             alliance_id = None
             corp_name = ""

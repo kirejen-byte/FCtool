@@ -1858,6 +1858,16 @@ class FleetTemplateWindow:
         for mv in res.executable:              # already-correct already filtered
             if mv.pilot_id in self._pins:      # never move a pinned pilot
                 continue
+            # C3-04 dedup (auto-sort only): a pilot whose previous auto-sort job
+            # is still queued or in flight must NOT be re-enqueued this tick — the
+            # burst-boundary re-verify used to be the only dedup, so a still-queued
+            # pilot got a fresh duplicate ESI write billed against the token budget
+            # on every ~10s sync tick. Manual drag/menu/apply moves bypass this
+            # entirely (they call submit() directly); a re-drag to a NEW squad must
+            # still supersede. Self-healing: once the pending job clears, a
+            # still-misplaced pilot is re-enqueued on the next tick — no starvation.
+            if self._executor.has_pending(mv.pilot_id):
+                continue
             wkey = (fleet_esi.clamp_name(mv.target_wing_name)
                     if mv.target_wing_name else None)
             wid = wing_ids.get(wkey) if wkey else None

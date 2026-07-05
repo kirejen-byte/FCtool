@@ -890,7 +890,8 @@ class FCToolGUI:
             try:
                 names = get_sorted_names()
                 self._system_names = names
-                self.root.after(0, self._update_autocomplete_lists)
+                wh_names = self._fetch_wh_names()
+                self.root.after(0, self._update_autocomplete_lists, wh_names)
             except Exception as e:
                 print(f"[FCTool] Error loading system names: {e}")
 
@@ -905,31 +906,48 @@ class FCToolGUI:
                     if region:
                         labels[name] = f"{name} ({region})"
                 self._system_labels = labels
-                self.root.after(0, self._update_autocomplete_lists)
+                wh_names = self._fetch_wh_names()
+                self.root.after(0, self._update_autocomplete_lists, wh_names)
             except Exception as e:
                 print(f"[FCTool] Error loading region map: {e}")
 
         threading.Thread(target=load, daemon=True).start()
         threading.Thread(target=load_regions, daemon=True).start()
 
-    def _update_autocomplete_lists(self):
-        """Push loaded system names + region labels into all autocomplete widgets."""
+    def _fetch_wh_names(self):
+        """Fetch EVE Scout WH (system_name, region_name) pairs off the Tk thread.
+
+        MUST be called from a worker thread — ``fetch_connections()`` does a
+        blocking HTTP GET. A failed fetch is swallowed and yields an empty list
+        (i.e. no WH names get merged), matching prior behaviour.
+        """
+        try:
+            return [(c.dest_system_name, c.dest_region_name)
+                    for c in fetch_connections()]
+        except Exception:
+            return []
+
+    def _update_autocomplete_lists(self, wh_names=None):
+        """Push loaded system names + region labels into all autocomplete widgets.
+
+        Runs on the Tk main thread, so it must never do network I/O. WH system
+        names are pre-fetched off-thread by the caller and passed in via
+        ``wh_names`` as an iterable of ``(dest_system_name, dest_region_name)``
+        tuples. ``wh_names=None`` means "skip WH names" (no fetch here).
+        """
         all_names = list(self._system_names)
         labels = dict(self._system_labels)
         print(f"[Autocomplete] Updating: {len(all_names)} names, {len(labels)} labels")
 
-        # Merge EVE Scout WH system names
-        try:
-            conns = fetch_connections()
-            for c in conns:
-                if c.dest_system_name and c.dest_system_name not in all_names:
-                    all_names.append(c.dest_system_name)
+        # Merge pre-fetched EVE Scout WH system names (fetched off the Tk thread).
+        if wh_names:
+            for dest_name, dest_region in wh_names:
+                if dest_name and dest_name not in all_names:
+                    all_names.append(dest_name)
                 # Add region label for WH-connected systems
-                if c.dest_system_name and c.dest_region_name:
-                    labels[c.dest_system_name] = f"{c.dest_system_name} ({c.dest_region_name})"
+                if dest_name and dest_region:
+                    labels[dest_name] = f"{dest_name} ({dest_region})"
             all_names.sort()
-        except Exception:
-            pass
 
         for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_motd_staging_entry']:
             widget = getattr(self, attr, None)
@@ -3384,6 +3402,11 @@ class FCToolGUI:
         self._intel_new_count = 0
         self._intel_new_btn = None
         self._intel_resolver = None
+        # Cyno-beacon TTL memo (system_id -> (has_beacon, monotonic_expiry)).
+        # Touched only from the intel poll thread via _check_cyno_beacon, so no
+        # lock is needed. Spares the per-line ESI search + structure GETs when
+        # the same system is named repeatedly during a spike.
+        self._cyno_beacon_cache: dict[int, tuple[bool, float]] = {}
         self._intel_find_var = tk.StringVar(value="")
 
         # One checkbox per tracked intel channel (user-configurable, sourced
@@ -4567,20 +4590,40 @@ class FCToolGUI:
                     )
             return
 
-        saved = result.jumps_saved
-        self._wh_result_label.config(
-            text=f"BEST ROUTE: {via_wh} jumps via {result.hub_name} (saves {saved}!)", fg=FG_GREEN
-        )
-        self._wh_detail_label.config(
-            text=f"Direct: {direct} jumps  |  Via {result.hub_name}: {via_wh} jumps  |  Saves {saved} jumps",
-            fg=FG_GREEN,
-        )
+        # No direct gate route exists — the WH route is the ONLY way there.
+        # Present it honestly rather than claiming it "saves" jumps.
+        if direct is None:
+            self._wh_result_label.config(
+                text=f"BEST ROUTE: {via_wh} jumps via {result.hub_name} (no direct route!)",
+                fg=FG_GREEN,
+            )
+            self._wh_detail_label.config(
+                text=f"No direct gate route  |  Via {result.hub_name}: {via_wh} jumps",
+                fg=FG_GREEN,
+            )
 
-        # Build clickable waypoint buttons
-        self._build_waypoint_buttons(result)
+            # Build clickable waypoint buttons
+            self._build_waypoint_buttons(result)
 
-        self._append_wh_log(f"\nWH Route via {result.hub_name}: {via_wh} jumps ", "saved")
-        self._append_wh_log(f"(saves {saved} jumps!)\n\n", "saved")
+            self._append_wh_log(
+                f"\nNo direct gate route exists — wormhole is the only path.\n", "warn"
+            )
+            self._append_wh_log(f"WH Route via {result.hub_name}: {via_wh} jumps\n\n", "saved")
+        else:
+            saved = result.jumps_saved
+            self._wh_result_label.config(
+                text=f"BEST ROUTE: {via_wh} jumps via {result.hub_name} (saves {saved}!)", fg=FG_GREEN
+            )
+            self._wh_detail_label.config(
+                text=f"Direct: {direct} jumps  |  Via {result.hub_name}: {via_wh} jumps  |  Saves {saved} jumps",
+                fg=FG_GREEN,
+            )
+
+            # Build clickable waypoint buttons
+            self._build_waypoint_buttons(result)
+
+            self._append_wh_log(f"\nWH Route via {result.hub_name}: {via_wh} jumps ", "saved")
+            self._append_wh_log(f"(saves {saved} jumps!)\n\n", "saved")
 
         # Show route breakdown with clear leg demarcation
         self._append_wh_log("Route Breakdown:\n", "header")
@@ -4655,8 +4698,10 @@ class FCToolGUI:
                              "fg": FG_GREEN})
             # Show in log
             self.root.after(0, self._show_connections_summary, conns)
-            # Update autocomplete with WH system names
-            self.root.after(0, self._update_autocomplete_lists)
+            # Update autocomplete with WH system names (reuse the conns we
+            # already fetched here on the worker thread — never fetch on Tk).
+            wh_names = [(c.dest_system_name, c.dest_region_name) for c in conns]
+            self.root.after(0, self._update_autocomplete_lists, wh_names)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -16974,6 +17019,12 @@ $bmp.Dispose()
             self._tooltip.destroy()
             self._tooltip = None
 
+    # Cap the zKill alert log so a multi-hour watch_all op cannot grow the
+    # widget (and its embedded live Button widgets / HWNDs) without bound.
+    # Alerts are prepended (newest at "1.0"), so the oldest blocks sit at the
+    # tail and get trimmed there. ~8 lines/alert → ~250 alerts retained.
+    _ZKILL_LOG_MAX_LINES = 2000
+
     def _show_zkill_alert(self, alert: KillAlert):
         # ── GUI-only filters (applied at display time only) ──
         # These read the panel vars, which mirror config["intel_filter"]; the
@@ -17157,6 +17208,18 @@ $bmp.Dispose()
 
         self._zkill_log.insert("alert_ins", "\n\n")
         self._end_alert_block()
+
+        # Bounded trim: keep at most _ZKILL_LOG_MAX_LINES in the widget. Newest
+        # is at the top, so drop the oldest blocks from the tail. Deleting the
+        # range destroys the live Button widgets embedded in those old blocks
+        # (they are children of self._zkill_log), reclaiming their HWNDs. The
+        # "alert_ins" mark sits at "1.0" and is untouched by tail deletion.
+        cap = self._ZKILL_LOG_MAX_LINES
+        line_count = int(self._zkill_log.index("end-1c").split(".")[0])
+        if line_count > cap:
+            self._zkill_log.config(state=tk.NORMAL)
+            self._zkill_log.delete(f"{cap + 1}.0", tk.END)
+            self._zkill_log.config(state=tk.DISABLED)
 
         if not self._intel_mute_var.get():
             self.root.bell()
@@ -18330,10 +18393,26 @@ $bmp.Dispose()
             self._intel_pause_var.set(False)
         self._intel_update_new_button()
 
+    # How long a *successful* cyno-beacon verdict stays memoised. Beacons are
+    # durable structures, so a 10-minute lag is acceptable (per audit C9-02).
+    _CYNO_BEACON_TTL = 600.0
+
     def _check_cyno_beacon(self, system_id: int) -> bool:
-        """Check if a Pharolux Cynosural Beacon exists in the given system via ESI."""
+        """Check if a Pharolux Cynosural Beacon exists in the given system via ESI.
+
+        Results are memoised per system_id for _CYNO_BEACON_TTL seconds so a
+        spike that names the same system on many intel lines does not re-run the
+        ESI search + up to 20 structure GETs each time. Only definitive
+        determinations (ESI answered) are cached; transient failures fall
+        through uncached so the next line re-attempts. The memo is touched only
+        from the single intel poll thread, so no lock is required."""
+        cached = self._cyno_beacon_cache.get(system_id)
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
         if not self.esi_auth or not self.esi_auth.is_authenticated:
             return False
+        determined = False  # True only once ESI has actually answered.
+        result = False
         try:
             # Search for structures with "Pharolux" in name in the system
             # ESI: /characters/{character_id}/search/?categories=structure&search=Pharolux
@@ -18346,14 +18425,22 @@ $bmp.Dispose()
             )
             if not data or "structure" not in data:
                 return False
+            # The search resolved -> this is a real determination worth caching.
+            determined = True
             # Check each structure to see if it's in our target system
             for struct_id in data["structure"][:20]:  # Check up to 20 results
                 info = self.esi_auth.esi_get(f"/universe/structures/{struct_id}/")
                 if info and info.get("solar_system_id") == system_id:
-                    return True
+                    result = True
+                    break
         except Exception:
-            pass
-        return False
+            # Transient/ESI error: preserve legacy behaviour (return False) but
+            # do NOT cache, so a blip cannot pin a wrong verdict for the TTL.
+            return False
+        if determined:
+            self._cyno_beacon_cache[system_id] = (
+                result, time.monotonic() + self._CYNO_BEACON_TTL)
+        return result
 
     # ── Log helpers (parameterized for split pane) ─────────────────────────
 

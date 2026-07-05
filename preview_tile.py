@@ -746,6 +746,7 @@ class TileWindow:
     def place(self, x, y, w, body_h):
         self._w, self._body_h = w, body_h
         self._pos = (x, y)
+        self._hidden = False   # deiconify() below un-hides the tile; keep the flag honest
         self.top.deiconify()
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
@@ -825,6 +826,13 @@ class TileWindow:
             if size != self._src_size:
                 self._src_size = size
                 self._push_thumb_rect()
+
+    @property
+    def key(self):
+        """Read-only layout key for this tile. fc_gui's arrange/visibility code
+        matches tiles via getattr(tile, "key", None) == client.key, so this must
+        stay public and mirror self._key (updated live by set_key)."""
+        return self._key
 
     def set_key(self, char_key):
         """Re-key an existing tile (login screen -> character, and back). The

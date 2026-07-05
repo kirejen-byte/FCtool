@@ -46,6 +46,14 @@ def _char_from_title(title: str) -> str | None:
     return None
 
 
+# Escalating buffer sizes (in WCHARs) for QueryFullProcessImageNameW. The
+# first (260) covers virtually every install; the larger tiers rescue process
+# paths >259 chars (realistic under deep OneDrive-redirected installs) instead
+# of silently returning "" and dropping a genuine EVE client. 32768 is the
+# Win32 extended-path (\\?\) ceiling — no point retrying past it.
+_IMAGE_NAME_BUFFER_SIZES: tuple[int, ...] = (260, 1024, 32768)
+
+
 def find_clients(win32=None) -> list[ClientWindow]:
     w = win32 or _real_win32()
     out = []
@@ -127,6 +135,19 @@ class _RealWin32:
         self._user32.GetForegroundWindow.argtypes = []
         self._user32.GetForegroundWindow.restype = wintypes.HWND
 
+        # kernel32: declare argtypes/restype so the OpenProcess HANDLE is not
+        # truncated to a signed 32-bit int on Win64 (classic ctypes pitfall),
+        # then passed (mangled) to QueryFullProcessImageNameW/CloseHandle.
+        self._kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self._kernel32.OpenProcess.restype = wintypes.HANDLE
+        self._kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        self._kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+
     def get_foreground(self) -> int:
         """HWND of the window the user is currently working in (0 if none).
         Drives the C2 hide-active / hide-on-lost-focus rules — read-only."""
@@ -189,14 +210,19 @@ class _RealWin32:
         if not h:
             return ""
         try:
-            size = wintypes.DWORD(260)
-            buf = ctypes.create_unicode_buffer(size.value)
-            ok = self._kernel32.QueryFullProcessImageNameW(
-                h, 0, buf, ctypes.byref(size))
-            if not ok:
-                return ""
-            full = buf.value
-            return full.replace("/", "\\").rsplit("\\", 1)[-1]
+            # Retry with a larger buffer on failure: QueryFullProcessImageNameW
+            # returns falsy (ERROR_INSUFFICIENT_BUFFER) when the path exceeds
+            # the buffer, so escalate through _IMAGE_NAME_BUFFER_SIZES before
+            # giving up. Preserves the "return '' on any failure" contract.
+            for cap in _IMAGE_NAME_BUFFER_SIZES:
+                size = wintypes.DWORD(cap)
+                buf = ctypes.create_unicode_buffer(cap)
+                ok = self._kernel32.QueryFullProcessImageNameW(
+                    h, 0, buf, ctypes.byref(size))
+                if ok:
+                    full = buf.value
+                    return full.replace("/", "\\").rsplit("\\", 1)[-1]
+            return ""
         finally:
             self._kernel32.CloseHandle(h)
 

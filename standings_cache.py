@@ -99,26 +99,57 @@ class StandingsCache:
             getattr(auth, "character_id", None)
             or getattr(auth, "_character_id", None)
         )
+        own_corp_id = None
+        own_alliance_id = None
+        info_ok = False
         if own_char_id:
             try:
                 info = auth.esi_get(f"/characters/{own_char_id}/")
             except Exception:
                 info = None
             if isinstance(info, dict):
-                corp_id = info.get("corporation_id")
-                alliance_id = info.get("alliance_id")
-                if corp_id:
-                    friendly.add(int(corp_id))
-                if alliance_id:
-                    friendly.add(int(alliance_id))
+                info_ok = True
+                own_corp_id = info.get("corporation_id")
+                own_alliance_id = info.get("alliance_id")
+                if own_corp_id:
+                    friendly.add(int(own_corp_id))
+                if own_alliance_id:
+                    friendly.add(int(own_alliance_id))
 
-        for getter in (auth.get_personal_contacts,
-                       auth.get_corp_contacts,
-                       auth.get_alliance_contacts):
+        # Build the contact getters. When the character sheet fetched above
+        # succeeded we already know the corp/alliance ids, so pass them through
+        # to skip the redundant /characters/{id}/ GETs that get_corp_contacts /
+        # get_alliance_contacts would otherwise perform to rediscover the same
+        # ids -- one /characters/{id}/ GET per refresh instead of three. A
+        # character with no alliance simply omits the alliance getter (today's
+        # get_alliance_contacts returns an empty list for that case, so the
+        # contribution is identical). When the character sheet fetch failed
+        # (info_ok False) we fall back to the no-arg self-resolving calls,
+        # byte-identical to the pre-optimization behaviour.
+        getters: list = [("get_personal_contacts", auth.get_personal_contacts)]
+        if info_ok:
+            if own_corp_id:
+                getters.append(
+                    ("get_corp_contacts",
+                     lambda cid=own_corp_id: auth.get_corp_contacts(cid))
+                )
+            else:
+                getters.append(("get_corp_contacts", auth.get_corp_contacts))
+            if own_alliance_id:
+                getters.append(
+                    ("get_alliance_contacts",
+                     lambda aid=own_alliance_id: auth.get_alliance_contacts(aid))
+                )
+            # else: character has no alliance -> skip the call entirely.
+        else:
+            getters.append(("get_corp_contacts", auth.get_corp_contacts))
+            getters.append(("get_alliance_contacts", auth.get_alliance_contacts))
+
+        for name, getter in getters:
             try:
                 rows = getter() or []
             except (OSError, ValueError, RuntimeError) as exc:
-                print(f"[standings_cache] {getter.__name__} failed: {exc}", file=sys.stderr)
+                print(f"[standings_cache] {name} failed: {exc}", file=sys.stderr)
                 rows = []
             for row in rows:
                 cid = row.get("contact_id")

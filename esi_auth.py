@@ -10,6 +10,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlencode, urlparse, parse_qs
@@ -138,6 +139,19 @@ class ESIAuth:
         # Re-entrant because _do_refresh() (which acquires) may be called from
         # within the access_token property (which also acquires).
         self._refresh_lock = threading.RLock()
+
+        # Cache for the sibling ESIAuth delegate resolved by
+        # _any_authenticated_auth() when *this* instance is unauthenticated.
+        # Constructing a sibling ESIAuth fires a live SSO refresh that rotates
+        # that character's refresh token, so we must not rebuild one per call
+        # (search_entities is driven by debounced type-ahead keystrokes on
+        # worker threads). Guarded by _refresh_lock. _delegate_last_fail_ts is a
+        # monotonic timestamp used to throttle re-resolution when no sibling
+        # authenticated, so a keystroke burst can't trigger a glob+construct
+        # storm; a later attempt (after the cooldown) can still pick up a
+        # character the user logs in.
+        self._delegate_auth: "ESIAuth | None" = None
+        self._delegate_last_fail_ts: float = 0.0
 
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
@@ -1017,6 +1031,12 @@ class ESIAuth:
         if not isinstance(data, dict):
             data = self.esi_post("/universe/ids/", chunk)
 
+        # A True sentinel is a successful 2xx with an empty body (esi_post's
+        # empty-body signal) — the batch resolved to nothing, so stop here
+        # instead of treating it as a failure and needlessly splitting.
+        if data is True:
+            return
+
         if isinstance(data, dict):
             for entry in data.get("characters", []) or []:
                 n = entry.get("name")
@@ -1099,6 +1119,12 @@ class ESIAuth:
         if not isinstance(data, dict):
             data = self.esi_post("/universe/ids/", chunk)
 
+        # A True sentinel is a successful 2xx with an empty body (esi_post's
+        # empty-body signal) — the batch resolved to nothing, so stop here
+        # instead of treating it as a failure and needlessly splitting.
+        if data is True:
+            return
+
         if isinstance(data, dict):
             for cat in self._ID_CATEGORIES:
                 for entry in data.get(cat, []) or []:
@@ -1166,30 +1192,81 @@ class ESIAuth:
 
     # ── Live type-ahead search (/characters/{id}/search/) ────────────────────
 
+    # Minimum seconds between failed sibling-delegate resolutions. A resolution
+    # that finds no authenticated sibling globs the token dir and constructs an
+    # ESIAuth per file (each a live SSO refresh), so we throttle retries to keep
+    # a keystroke burst from re-running that scan; the cooldown is short enough
+    # that a character logged in mid-session is picked up on the next attempt.
+    _DELEGATE_FAIL_COOLDOWN = 7.0
+
     def _any_authenticated_auth(self) -> "ESIAuth | None":
         """Return an authenticated ESIAuth usable for endpoints that require a
         character context (e.g. /search/). Prefers self; otherwise loads any
-        other stored per-character token file. Returns None if none authenticate.
+        other stored per-character token file and caches it on the instance so
+        subsequent calls reuse it instead of reconstructing (which would fire a
+        live SSO refresh and rotate that sibling's token every keystroke).
+        Returns None if none authenticate.
 
         We reuse self.client_id/secret/callback so no extra credentials are
         needed. Errors loading sibling tokens are swallowed (best-effort)."""
+        # Fast path: this instance is authenticated -> always prefer self, and
+        # drop any stale sibling delegate so it can't shadow us. No lock needed
+        # (is_authenticated/access_token are internally synchronized).
         if self.is_authenticated and self.access_token:
+            if self._delegate_auth is not None:
+                self._delegate_auth = None
             return self
-        import glob
-        pattern = os.path.join(TOKEN_DIR, "esi_tokens_*.json")
-        for token_file in glob.glob(pattern):
-            try:
-                other = ESIAuth(
-                    client_id=self.client_id,
-                    client_secret=self.client_secret,
-                    callback_url=self.callback_url,
-                    token_file=token_file,
-                )
-                if other.is_authenticated and other.access_token:
-                    return other
-            except Exception:
-                continue
-        return None
+
+        # Fast path: reuse a still-authenticated cached delegate without taking
+        # the lock (mirrors the access_token double-checked-locking idiom).
+        cached = self._delegate_auth
+        if cached is not None and cached.is_authenticated and cached.access_token:
+            return cached
+
+        # Slow path: (re)resolve under the lock so two concurrent worker-thread
+        # callers can't each glob + construct the same sibling (double SSO
+        # refresh -> possible invalid_grant race).
+        with self._refresh_lock:
+            # Re-check self: another thread may have authenticated us.
+            if self.is_authenticated and self.access_token:
+                self._delegate_auth = None
+                return self
+            # Re-check the cache: another thread may have resolved it while we
+            # waited on the lock.
+            cached = self._delegate_auth
+            if cached is not None and cached.is_authenticated and cached.access_token:
+                return cached
+            # Stale (or never set): clear before re-resolving.
+            self._delegate_auth = None
+
+            # Throttle repeated failed resolutions so a keystroke burst doesn't
+            # re-glob + reconstruct siblings every call. A prior failure within
+            # the cooldown short-circuits; the window is short enough that a
+            # newly logged-in character is still picked up soon after.
+            now = time.monotonic()
+            if (self._delegate_last_fail_ts
+                    and now - self._delegate_last_fail_ts < self._DELEGATE_FAIL_COOLDOWN):
+                return None
+
+            import glob
+            pattern = os.path.join(TOKEN_DIR, "esi_tokens_*.json")
+            for token_file in glob.glob(pattern):
+                try:
+                    other = ESIAuth(
+                        client_id=self.client_id,
+                        client_secret=self.client_secret,
+                        callback_url=self.callback_url,
+                        token_file=token_file,
+                    )
+                    if other.is_authenticated and other.access_token:
+                        self._delegate_auth = other
+                        self._delegate_last_fail_ts = 0.0
+                        return other
+                except Exception:
+                    continue
+            # No sibling authenticated: record the failure time for the cooldown.
+            self._delegate_last_fail_ts = now
+            return None
 
     def search_entities(
         self, query: str,
@@ -1312,6 +1389,12 @@ class ESIAuth:
         if not isinstance(data, list):
             data = self.esi_post("/characters/affiliation/", chunk)
 
+        # A True sentinel is a successful 2xx with an empty body (esi_post's
+        # empty-body signal) — the batch resolved to nothing, so stop here
+        # instead of treating it as a failure and needlessly splitting.
+        if data is True:
+            return
+
         if isinstance(data, list):
             out.extend(data)
             return
@@ -1331,27 +1414,44 @@ class ESIAuth:
         data = self.esi_get(f"/characters/{self._character_id}/contacts/")
         return data if isinstance(data, list) else []
 
-    def get_corp_contacts(self) -> list[dict]:
-        """Get the authenticated character's corporation contacts."""
+    def get_corp_contacts(self, corp_id: int | None = None) -> list[dict]:
+        """Get the authenticated character's corporation contacts.
+
+        When ``corp_id`` is supplied, the internal ``/characters/{id}/`` lookup
+        used to rediscover the corp id is skipped -- callers that already know
+        the id (e.g. StandingsCache.refresh) can pass it to avoid a redundant
+        GET. When ``corp_id`` is None the behaviour is unchanged: the corp id is
+        self-resolved from the character sheet.
+        """
         if not self._character_id:
             return []
-        info = self.esi_get(f"/characters/{self._character_id}/")
-        if not isinstance(info, dict):
-            return []
-        corp_id = info.get("corporation_id")
+        if corp_id is None:
+            info = self.esi_get(f"/characters/{self._character_id}/")
+            if not isinstance(info, dict):
+                return []
+            corp_id = info.get("corporation_id")
         if not corp_id:
             return []
         data = self.esi_get(f"/corporations/{corp_id}/contacts/")
         return data if isinstance(data, list) else []
 
-    def get_alliance_contacts(self) -> list[dict]:
-        """Get the authenticated character's alliance contacts."""
+    def get_alliance_contacts(self, alliance_id: int | None = None) -> list[dict]:
+        """Get the authenticated character's alliance contacts.
+
+        When ``alliance_id`` is supplied, the internal ``/characters/{id}/``
+        lookup used to rediscover the alliance id is skipped -- callers that
+        already know the id (e.g. StandingsCache.refresh) can pass it to avoid a
+        redundant GET. When ``alliance_id`` is None the behaviour is unchanged:
+        the alliance id is self-resolved from the character sheet, and a
+        character with no alliance yields an empty list.
+        """
         if not self._character_id:
             return []
-        info = self.esi_get(f"/characters/{self._character_id}/")
-        if not isinstance(info, dict):
-            return []
-        alliance_id = info.get("alliance_id")
+        if alliance_id is None:
+            info = self.esi_get(f"/characters/{self._character_id}/")
+            if not isinstance(info, dict):
+                return []
+            alliance_id = info.get("alliance_id")
         if not alliance_id:
             return []
         data = self.esi_get(f"/alliances/{alliance_id}/contacts/")

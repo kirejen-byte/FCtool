@@ -45,14 +45,37 @@ def classify_capital(type_id: int) -> str | None:
             return cls_name
     return None
 
-# Cache for ESI lookups
-_name_cache: dict[int, str] = {}
+# Cache for ESI lookups.
+# _name_cache is keyed by (category, entity_id) so different entity kinds that
+# happen to share an id (e.g. a character and a system) never collide. It holds
+# PERMANENT entries only: a resolved name, or a str(id) fallback for a
+# definitive 404 (an identity that returned 404 will not start resolving later).
+_name_cache: dict[tuple[str, int], str] = {}
+# Negative cache for TRANSIENT failures (network/timeout errors and non-404
+# HTTP failures such as an ESI 420 error-limit or a 5xx blip), keyed the same
+# way. Maps key -> (fallback_str, expiry_monotonic); entries heal after the TTL
+# so a temporary outage does not mute a name forever.
+_name_neg_cache: dict[tuple[str, int], tuple[str, float]] = {}
+_NAME_NEG_TTL = 300  # seconds a transient-failure fallback is trusted
+# system_id -> region_id. The system->region mapping is static, so a successful
+# hit is permanently valid; failures are never cached (they stay retryable).
+_region_cache: dict[int, int] = {}
 
 
 def resolve_name(entity_id: int, category: str = "solar_system") -> str:
     """Resolve an EVE entity ID to a name via ESI."""
-    if entity_id in _name_cache:
-        return _name_cache[entity_id]
+    key = (category, entity_id)
+    # Permanent cache (resolved name or definitive-404 fallback) wins outright.
+    if key in _name_cache:
+        return _name_cache[key]
+    # Transient-failure fallback, honoured only until its TTL expires.
+    neg = _name_neg_cache.get(key)
+    if neg is not None:
+        fallback, expiry = neg
+        if time.monotonic() < expiry:
+            return fallback
+        # Expired — drop it and fall through to retry the HTTP request.
+        del _name_neg_cache[key]
     try:
         endpoints = {
             "solar_system": f"{ESI_BASE}/universe/systems/{entity_id}/",
@@ -67,15 +90,34 @@ def resolve_name(entity_id: int, category: str = "solar_system") -> str:
         resp = requests.get(url, timeout=5, headers=HEADERS)
         if resp.ok:
             name = resp.json().get("name", str(entity_id))
-            _name_cache[entity_id] = name
+            _name_cache[key] = name
             return name
+        fallback = str(entity_id)
+        if resp.status_code == 404:
+            # Definitive 404: the id conclusively doesn't resolve (and won't
+            # start to later), so cache the fallback PERMANENTLY — zero further
+            # requests for this entity, and never a stale neg-cache entry.
+            _name_cache[key] = fallback
+        else:
+            # Non-definitive HTTP failure (ESI 420 error-limit, 5xx blip):
+            # trust the fallback only for the TTL so the name heals once the
+            # server recovers instead of staying muted until restart.
+            _name_neg_cache[key] = (fallback, time.monotonic() + _NAME_NEG_TTL)
+        return fallback
     except Exception:
-        pass
-    return str(entity_id)
+        # Network/timeout failure: cache the fallback with a TTL so it heals.
+        fallback = str(entity_id)
+        _name_neg_cache[key] = (fallback, time.monotonic() + _NAME_NEG_TTL)
+        return fallback
 
 
 def get_region_for_system(system_id: int) -> int | None:
     """Get the region ID for a solar system via ESI."""
+    # The system->region mapping is static; a cached hit is permanently valid
+    # and lets us skip both ESI round-trips entirely.
+    cached = _region_cache.get(system_id)
+    if cached is not None:
+        return cached
     try:
         rate_limit("esi")
         resp = requests.get(
@@ -91,7 +133,11 @@ def get_region_for_system(system_id: int) -> int | None:
                     timeout=5, headers=HEADERS
                 )
                 if resp2.ok:
-                    return resp2.json().get("region_id")
+                    region_id = resp2.json().get("region_id")
+                    if region_id is not None:
+                        # Cache ONLY a successful, non-None region id.
+                        _region_cache[system_id] = region_id
+                    return region_id
     except Exception:
         pass
     return None
@@ -149,6 +195,23 @@ class EngagementTracker:
         system_id = km.get("solar_system_id", 0)
         if not system_id:
             return None
+
+        # Cheap, ESI-free staleness gate FIRST — mirrors the 30-minute cutoff in
+        # ZKillMonitor._matches_filters. A stale kill does zero aggregation and
+        # zero name/region resolution (the only calls that touch ESI). This is
+        # behaviour-preserving in production because _process_kill already ran
+        # _matches_filters (which rejects >30-minute-old kills) before reaching
+        # here. If killmail_time is absent or unparseable we treat the kill as
+        # NOT stale and proceed (test killmails carry no killmail_time).
+        kill_time_str = km.get("killmail_time", "")
+        if kill_time_str:
+            try:
+                kill_time = datetime.fromisoformat(
+                    kill_time_str.replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) - kill_time > timedelta(minutes=30):
+                    return None
+            except Exception:
+                pass  # Unparseable time -> treat as fresh, let it through.
 
         now = datetime.now(timezone.utc)
 
@@ -318,6 +381,10 @@ class ZKillMonitor:
         # Maps system_id -> {"time": datetime, "pilots": int}
         self._alerted_systems: dict[int, dict] = {}
         self._pilot_growth_threshold = 100  # Re-ping Discord if fight grows by this many
+        # How long a fired alert keeps muting the same system. A later fight past
+        # this horizon counts as new and re-alerts. Scales with a custom window
+        # (~3x the engagement window, i.e. ~900s by default).
+        self._alert_expiry_seconds = alert_window_seconds * 3
 
     def set_friendly_ids(self, ids):
         """Update the friendly (blue/own) corp/alliance id set without rebuilding
@@ -410,9 +477,21 @@ class ZKillMonitor:
 
         alert = self._tracker.add_kill(kill_data)
         if alert and self.on_alert:
+            # Opportunistically prune stale entries (no background timer). Use
+            # the alert timestamp as the clock so expiry is deterministic and
+            # test-drivable. Anything older than the expiry horizon is a fight
+            # that has since ended and should no longer mute its system.
+            expiry = timedelta(seconds=self._alert_expiry_seconds)
+            self._alerted_systems = {
+                sid: rec for sid, rec in self._alerted_systems.items()
+                if alert.timestamp - rec["time"] <= expiry
+            }
+
             prev = self._alerted_systems.get(alert.system_id)
+            # An expired entry was already dropped above, so a surviving `prev`
+            # is a genuinely active fight; its absence means "new fight".
             if not prev:
-                # New fight — first alert
+                # New (or newly re-armed) fight — first alert.
                 self._alerted_systems[alert.system_id] = {
                     "time": alert.timestamp,
                     "pilots": alert.pilots_on_field,
@@ -474,13 +553,19 @@ class ZKillMonitor:
         """Main polling loop using R2Z2 API."""
         print("[zKill] Starting R2Z2 poll loop...")
 
-        # Get current sequence to start from
-        seq = self._get_current_sequence()
-        if seq is None:
+        # Get current sequence to start from. Retry iteratively (not by
+        # recursing into _poll_loop) so a prolonged outage cannot grow the
+        # stack until it hits Python's recursion limit and silently kills the
+        # daemon thread.
+        seq = None
+        while self._running:
+            seq = self._get_current_sequence()
+            if seq is not None:
+                break
             print("[zKill] ERROR: Could not fetch initial sequence. Retrying in 10s...")
             time.sleep(10)
-            if self._running:
-                self._poll_loop()
+        if seq is None:
+            # Only reached when we were asked to stop before acquiring a sequence.
             return
 
         # Look back to catch recent kills we may have missed (e.g. during restart)

@@ -101,17 +101,36 @@ class IntelResolver:
                 break
             try:
                 resolutions = self._resolve_fn(batch, self.friendly, self.hostile)
+                resolve_ok = True
             except Exception:
                 log.exception("IntelResolver: resolve_fn failed for %d names",
                               len(batch))
                 resolutions = []
-            by_name = {r.name: r for r in resolutions}
+                resolve_ok = False
+            # Match case-insensitively: ESI returns canonical casing, but batch
+            # tokens carry whatever the chat line typed. Key by lower() so a
+            # typed "bob smith" pairs with the canonical "Bob Smith".
+            by_name = {r.name.lower(): r for r in resolutions}
             out: dict[str, Resolution] = {}
             for n in batch:
-                r = by_name.get(n)
+                r = by_name.get(n.lower())
                 if r is not None:
                     self._cache_put(r)
-                    out[n] = r
+                    out[n] = r  # deliver under the requested-name key
+                elif resolve_ok:
+                    # resolve_fn succeeded (returned a list, possibly empty) but
+                    # did not name this pilot — negative-cache it so the same
+                    # line's tokens don't re-POST to ESI on every future line.
+                    # The 'unknown' shape mirrors classify_standing's own
+                    # unresolved output; it is cached but NOT delivered (an
+                    # 'unknown' delivered to the GUI would apply the dim tag,
+                    # whereas an unresolved name renders with no tag today).
+                    self._cache_put(Resolution(
+                        name=n, character_id=None,
+                        corporation_id=None, corporation="",
+                        alliance_id=None, alliance="", standing="unknown",
+                    ))
+                # else: resolve_fn RAISED — keep discard-and-retry (no cache).
             with self._lock:
                 for n in batch:
                     self._inflight.discard(n.lower())

@@ -12,7 +12,7 @@ X-Ratelimit-Remaining is authoritative when present (reconcile()).
 from __future__ import annotations
 
 import time as _time
-from collections import deque
+from collections import Counter, deque
 
 DEFAULT_BUDGET = 1800
 DEFAULT_WINDOW_S = 900
@@ -130,6 +130,16 @@ class FleetExecutor:
         self._now = now or _time.monotonic
         self._q: _queue.Queue = _queue.Queue()
         self._worker: _threading.Thread | None = None
+        # Pending-pilot ledger (C3-04): pilot_id -> count of queued-or-in-flight
+        # MoveJobs. A Counter (multiset), not a set, so a manual + auto-sort job
+        # for the same pilot don't clear each other prematurely. Incremented in
+        # submit(); decremented on EVERY disposal path (complete / gate-drop /
+        # abort-drain / freeze-drain / repoll-drop). `submit` runs on the Tk
+        # thread while disposal runs on the worker thread, so the counter is
+        # guarded by _pending_lock. Queried by has_pending()/pending_pilot_ids()
+        # so the auto-sort tick can skip pilots that already have a job in flight.
+        self._pending: Counter = Counter()
+        self._pending_lock = _threading.Lock()
         # Persistent run-state — survives across submits so sequential writes are
         # paced as one continuous run. Reset only when the queue goes idle.
         self._wrote_any = False
@@ -159,7 +169,36 @@ class FleetExecutor:
         # that never started a worker (self._worker is None).
         if self._worker is not None and not self._worker.is_alive():
             self.start()
+        # Track the pilot BEFORE enqueueing so a query racing the enqueue never
+        # sees the job land untracked. Exactly one increment per submitted job;
+        # _process_one's finally-clause / drain paths decrement it exactly once.
+        self._track(job.pilot_id)
         self._q.put(job)
+
+    def _track(self, pilot_id) -> None:
+        with self._pending_lock:
+            self._pending[pilot_id] += 1
+
+    def _untrack(self, pilot_id) -> None:
+        """Drop one pending reference for a pilot. Idempotent-safe at zero (a
+        stray/duplicate untrack for an already-cleared pilot is a no-op rather
+        than driving the count negative)."""
+        with self._pending_lock:
+            n = self._pending.get(pilot_id, 0)
+            if n <= 1:
+                self._pending.pop(pilot_id, None)
+            else:
+                self._pending[pilot_id] = n - 1
+
+    def has_pending(self, pilot_id) -> bool:
+        """True if this pilot has a queued-or-in-flight MoveJob (C3-04 dedup)."""
+        with self._pending_lock:
+            return pilot_id in self._pending
+
+    def pending_pilot_ids(self) -> set:
+        """Snapshot of all pilot ids with a queued-or-in-flight MoveJob."""
+        with self._pending_lock:
+            return set(self._pending)
 
     def drain(self) -> None:
         """Run the exact worker loop body inline until the queue is empty.
@@ -209,28 +248,38 @@ class FleetExecutor:
         self._burst = 0
 
     def _process_one(self, job: MoveJob):
-        if self._aborted:
-            self._drain_remaining()
-            return
-        if not self._gate(job):
-            return   # gated jobs are skipped (logged), no spacing consumed
-        if self._wrote_any:
-            self._sleep(self._spacing_s)   # spacing BETWEEN consecutive writes only
-        self._log(self._perform(job))
-        self._wrote_any = True
-        if self._aborted:               # boss_lost / 3rd-4xx set this in _perform
-            self._drain_remaining()
-            return
-        if self._frozen_until:          # 429/420 froze ops mid-run
-            self._drain_remaining()
-            return
-        self._burst += 1
-        if self._burst >= self._burst_cap and not self._q.empty():
-            self._settle_and_repoll()
+        # The current job leaves the pipeline down EXACTLY one of these branches
+        # (completed, gate-dropped, or discarded because the queue is
+        # aborted/frozen). The finally untracks its pilot once, regardless of
+        # which branch (or an unexpected raise) exits — so C3-04's pending ledger
+        # never leaks a reference. _drain_remaining / _settle_and_repoll untrack
+        # the OTHER jobs they discard; they never touch this job (already popped).
+        try:
+            if self._aborted:
+                self._drain_remaining()
+                return
+            if not self._gate(job):
+                return   # gated jobs are skipped (logged), no spacing consumed
+            if self._wrote_any:
+                self._sleep(self._spacing_s)   # spacing BETWEEN consecutive writes only
+            self._log(self._perform(job))
+            self._wrote_any = True
+            if self._aborted:               # boss_lost / 3rd-4xx set this in _perform
+                self._drain_remaining()
+                return
+            if self._frozen_until:          # 429/420 froze ops mid-run
+                self._drain_remaining()
+                return
+            self._burst += 1
+            if self._burst >= self._burst_cap and not self._q.empty():
+                self._settle_and_repoll()
+        finally:
+            self._untrack(job.pilot_id)
 
     def _drain_remaining(self):
         """Discard every remaining queued job (abort/freeze). A pending stop
-        sentinel is preserved so stop() still ends the persistent worker."""
+        sentinel is preserved so stop() still ends the persistent worker.
+        Each discarded MoveJob is untracked from the pending ledger (C3-04)."""
         while True:
             try:
                 item = self._q.get_nowait()
@@ -239,8 +288,20 @@ class FleetExecutor:
             if item is self._STOP:
                 self._q.put(item)
                 return
+            self._untrack(item.pilot_id)
 
     def _gate(self, job: MoveJob) -> bool:
+        if self._frozen_until:
+            remaining = self._frozen_until - self._now()
+            if remaining > 0:
+                # Server asked us to back off (429/420). Drop NEW work for the
+                # whole freeze window — auto-sort re-submits on a later tick, so
+                # dropping is safe and matches the mid-run freeze-drain semantics.
+                self._post(self._on_log,
+                           f"[{job.source}] {job.pilot_name}: frozen "
+                           f"{remaining:.0f}s — dropping job")
+                return False
+            self._frozen_until = 0.0   # freeze elapsed → resume normal operation
         rem = self.ledger.remaining()
         manual = job.source in ("drag", "menu", "apply")
         if rem < HARD_FLOOR:
@@ -276,7 +337,9 @@ class FleetExecutor:
             kept.append(item)
         for job in kept:
             if self._remaining_needed(job):
-                self._q.put(job)
+                self._q.put(job)   # still queued → stays tracked
+            else:
+                self._untrack(job.pilot_id)   # dropped → release its reference
 
     def _perform(self, job: MoveJob):
         try:

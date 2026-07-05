@@ -34,6 +34,13 @@ _SYSTEM_CACHE_FILE = os.path.join(_CACHE_DIR, "esi_cache.json")
 _route_disk_cache: dict[str, list[int]] = {}
 _system_disk_cache: dict[str, dict] = {}  # system_id -> {position, name, ...}
 _system_name_cache: dict[str, int] = {}   # lowered name -> system_id
+# In-memory only (never persisted): lowered names ESI has definitively
+# reported are NOT systems. Guards search_system against re-POSTing every
+# non-system token during an intel spike. Transient errors are excluded so
+# they stay retryable; not written to disk so a "not a system" verdict can't
+# outlive an ESI hiccup or a newly-added system.
+_system_name_negative: set[str] = set()
+_NEGATIVE_CACHE_MAX = 50_000
 _cache_lock = threading.Lock()
 _cache_dirty = False
 
@@ -242,6 +249,8 @@ def search_system(name: str) -> int | None:
     with _cache_lock:
         if lower in _system_name_cache:
             return _system_name_cache[lower]
+        if lower in _system_name_negative:
+            return None
     try:
         rate_limit("esi")
         resp = requests.post(
@@ -265,8 +274,17 @@ def search_system(name: str) -> int | None:
                     _system_name_cache[lower] = result_id
                     _cache_dirty = True
                 return result_id
+            # resp.ok + no matching system == definitive "not a system".
+            # Negative-cache in memory only (do NOT set _cache_dirty) so we
+            # stop re-POSTing this token, without pinning the verdict to disk.
+            with _cache_lock:
+                if len(_system_name_negative) >= _NEGATIVE_CACHE_MAX:
+                    _system_name_negative.clear()
+                _system_name_negative.add(lower)
+            return None
     except Exception:
         # ESI unreachable/error — distinct from a valid "no such system".
+        # Stays retryable: not negative-cached.
         log.exception("search_system: ESI request failed for name %r", name)
     return None
 
@@ -370,8 +388,13 @@ class JumpRangeChecker:
                  custom_ranges: dict | None = None):
         self.ship_type = ship_type
         self.jdc_level = jdc_level
+        # Own a per-instance copy so custom_ranges never mutates the shared
+        # class dict (which would bleed user-edited ranges into every later
+        # checker, including the no-custom threshold checkers).
         if custom_ranges:
-            self.SHIP_RANGES.update(custom_ranges)
+            self.SHIP_RANGES = {**JumpRangeChecker.SHIP_RANGES, **custom_ranges}
+        else:
+            self.SHIP_RANGES = dict(JumpRangeChecker.SHIP_RANGES)
 
     @property
     def jump_range(self) -> float:
