@@ -69,6 +69,26 @@ DAMAGE_IN_FALLBACK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── Decloak notify line (English client) ─────────────────────────────────────
+# EVE writes a (notify) line to the character's OWN Gamelog the instant their
+# cloak drops. TWO templates share one prefix — the cause object varies widely
+# (stargates, Ansiblex, Keepstar/Fortizar/Astrahus/POS, ships, ESS "Invisible
+# Cloud - Disallow Cloaking", a Mobile Observatory pulse, …):
+#   … (notify) Your cloak deactivates due to proximity to a nearby Stargate (…).
+#   … (notify) Your cloak deactivates due to a pulse from a Mobile Observatory …
+# Capture whatever follows "deactivates due to " up to the trailing period, so
+# BOTH templates match and the cause is reported for logging.
+#
+# NEAR-MISS lines that appear in real logs and must NOT match (they are not
+# decloaks): "Your cloaking systems are unable to activate due to …",
+# "You cannot cloak your ship as you are being targeted…", and "Your targeting
+# attempt fails because your ship is cloaked." — none contain the exact
+# "cloak deactivates due to" phrase this pattern anchors on.
+DECLOAK_RE = re.compile(
+    r"\(notify\)\s+Your cloak deactivates due to\s+(?P<cause>.+?)\.?\s*$",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class DamageEvent:
@@ -76,6 +96,13 @@ class DamageEvent:
     character_name: str     # from the file's "Listener:" header
     amount: int
     attacker: str           # raw "Name[CORP](Ship)" blob, may be "" via fallback
+
+
+@dataclass(frozen=True)
+class DecloakEvent:
+    timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
+    character_name: str     # from the file's "Listener:" header
+    cause: str              # e.g. "proximity to a nearby Stargate (Caldari System)"
 
 
 def parse_damage_line(line: str):
@@ -100,6 +127,23 @@ def parse_damage_line(line: str):
     return None
 
 
+def parse_decloak_line(line: str):
+    """Return the decloak CAUSE (str) for a "(notify) Your cloak deactivates …"
+    line, else None.
+
+    Matches BOTH the proximity template and the Mobile Observatory template
+    (they share the "cloak deactivates due to" prefix); rejects the near-miss
+    "unable to activate" / "cannot cloak" / "targeting attempt fails" notify
+    lines. Short-circuits on the cheap "cloak deactivates" substring so the
+    tailer only runs the regex on candidate lines."""
+    if not line or "cloak deactivates" not in line:
+        return None
+    m = DECLOAK_RE.search(line)
+    if m:
+        return (m.group("cause") or "").strip()
+    return None
+
+
 def _ts_of(line: str) -> str:
     m = re.search(_GAMELOG_TS, line)
     return m.group("ts") if m else ""
@@ -107,7 +151,11 @@ def _ts_of(line: str) -> str:
 
 class GamelogMonitor:
     """UTF-8 Gamelog tailer. on_event(DamageEvent) is called on the polling
-    thread; the fc_gui wiring (Task B6) marshals to the Tk thread.
+    thread; the fc_gui wiring (Task B6) marshals to the Tk thread. An optional
+    on_decloak(DecloakEvent) callback rides the SAME tailing pass — each complete
+    line is checked for a decloak notify alongside the incoming-damage parse — so
+    covering decloaks costs one extra (short-circuited) regex per line and no
+    second file read.
 
     Structure mirrors chat_monitor.ChatMonitor: a discovery loop over the
     Gamelogs dir + per-file tailer with rotation/truncation detection. The
@@ -116,8 +164,9 @@ class GamelogMonitor:
     """
 
     def __init__(self, on_event, logs_dir=None, state_path=STATE_FILE_PATH,
-                 poll_interval=1.0):
+                 poll_interval=1.0, on_decloak=None):
         self._on_event = on_event
+        self._on_decloak = on_decloak        # optional DecloakEvent sink (parallel of on_event)
         self._logs_dir = logs_dir            # resolved lazily (see B6 wiring)
         self._state_path = state_path
         self._poll_interval = poll_interval
@@ -252,7 +301,9 @@ class GamelogMonitor:
           - decode raw bytes as UTF-8
           - new position = read_start + len(consumed raw bytes)
         For each COMPLETE line, parse_damage_line(); on a hit, emit a
-        DamageEvent(timestamp=_ts_of(line), character_name=listener, ...).
+        DamageEvent(timestamp=_ts_of(line), character_name=listener, ...). The
+        SAME line is also run through parse_decloak_line() (short-circuited on a
+        cheap substring); on a hit a DecloakEvent is emitted via on_decloak.
         """
         listener = self._listeners.get(path) or self._read_listener(path)
         self._listeners.setdefault(path, listener)
@@ -308,6 +359,14 @@ class GamelogMonitor:
                 self._on_event(DamageEvent(timestamp=_ts_of(ln),
                                            character_name=listener,
                                            amount=dmg, attacker=attacker))
+            # Decloak notify (same pass; short-circuited inside parse_decloak_line
+            # so it's ~free on the overwhelming majority of lines).
+            if self._on_decloak is not None:
+                cause = parse_decloak_line(ln)
+                if cause is not None:
+                    self._on_decloak(DecloakEvent(timestamp=_ts_of(ln),
+                                                  character_name=listener,
+                                                  cause=cause))
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos

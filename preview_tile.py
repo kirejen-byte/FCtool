@@ -66,6 +66,15 @@ _CHAR_W_RATIO = 0.62
 # tile.set_border. On-video render + the pulse *feel* need a live re-test (FLAG).
 _PULSE_SOFT_FLOOR = 0.45     # softest channel scale at the trough (never black)
 
+# ── decloak hazard banner ────────────────────────────────────────────────────
+# When a tracked character is decloaked, the bottom label strip is REPLACED for
+# the alert window by a classic hazard banner: black bold text on a yellow strip,
+# the DECLOAKED word flanked by hazard-bar glyphs. The measure-based auto-fit
+# (_fit_label_text) still applies so it never overflows a narrow tile.
+_ALERT_BG = "#ffcc00"        # hazard yellow strip background
+_ALERT_FG = "#000000"        # black text (classic hazard look)
+DECLOAK_BANNER_TEXT = "▞▞▞ DECLOAKED ▞▞▞"
+
 
 def _clamp01(x: float) -> float:
     return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
@@ -344,6 +353,9 @@ class TileWindow:
         self._fg_text = fg_text
         self._fg_dim = fg_dim
         self._fg_accent = fg_accent
+        # Normal bottom-strip background, restored when a decloak alert clears
+        # (set_bottom_alert paints it hazard-yellow; set_bottom_label restores it).
+        self._bg_panel = bg_panel
 
         self.top = tk.Toplevel(root)
         self.top.overrideredirect(True)
@@ -395,6 +407,7 @@ class TileWindow:
         self._bottom_lbl.pack(side="left", fill="x", padx=(4, 4))
         self._bottom_visible = False   # True while the strip is packed/shown
         self._bottom_strip_h = STRIP_H  # last chosen (clamped) bottom-strip height
+        self._bottom_alert = False     # True while the strip shows the decloak banner
 
         # ── location caption strip (its OWN thin line, LOWEST of all) ────────
         # The pilot's current system/location gets its own strip packed BELOW the
@@ -1041,7 +1054,13 @@ class TileWindow:
         A non-empty text ellipsizes to the tile width, applies the given fill
         colour + font size (from config['overlay'] color/font_size), sizes the
         strip to the font (clamped so it can never exceed ~40% of the body), packs
-        it if hidden, and re-letterboxes the thumbnail into the smaller area."""
+        it if hidden, and re-letterboxes the thumbnail into the smaller area.
+
+        RESTORE PATH: this always repaints the strip/label to the normal panel
+        background + given fg and clears the decloak-alert flag, so after a
+        decloak banner's window expires the next compose-tick call here brings the
+        normal 'Label - ShipType' text and panel bg back automatically — a yellow
+        strip is never left behind."""
         text = "" if not text else str(text)
         if not text:
             if self._bottom_visible:
@@ -1051,6 +1070,7 @@ class TileWindow:
                     pass
                 self._bottom_visible = False
                 self._push_thumb_rect()   # video reclaims the freed space
+            self._bottom_alert = False    # strip is gone → no alert lingering
             return
         # Resolve style. Fall back to the strip's default fg / the top-strip name
         # font size (9) when the caller passes nothing.
@@ -1072,9 +1092,12 @@ class TileWindow:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)
         self._bottom_strip_h = strip_h
+        # Repaint back to the NORMAL panel bg (undo any prior hazard-yellow) and
+        # clear the alert flag — this is the explicit banner->normal restore.
+        self._bottom_alert = False
         try:
-            self._strip_bottom.configure(height=strip_h)
-            self._bottom_lbl.configure(text=shown, fg=fill,
+            self._strip_bottom.configure(height=strip_h, bg=self._bg_panel)
+            self._bottom_lbl.configure(text=shown, fg=fill, bg=self._bg_panel,
                                        font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
             pass
@@ -1087,6 +1110,47 @@ class TileWindow:
             # If the location line is already shown, re-pin it BELOW this label
             # strip so the location always stays the lowest line (Tk order depends
             # on pack sequence; re-packing location `before` the label fixes it).
+            if self._location_visible:
+                self._pack_location_lowest()
+        self._push_thumb_rect()           # shrink the video above the strip
+
+    def set_bottom_alert(self, text=DECLOAK_BANNER_TEXT, size=None):
+        """Show the decloak HAZARD BANNER in the bottom strip IN PLACE OF the
+        normal activity label: black bold text on a yellow strip (the classic
+        hazard look). Mirrors set_bottom_label's packing / height-clamp /
+        measure-based auto-fit so the banner never overflows a narrow tile, but
+        forces the hazard fg/bg and marks the strip as an alert.
+
+        The compose pass calls this every tick while the decloak window is live;
+        once the window expires it calls set_bottom_label (or set_bottom_label(''))
+        instead, which repaints the normal panel bg and clears the alert flag."""
+        text = DECLOAK_BANNER_TEXT if not text else str(text)
+        try:
+            fsize = int(size) if size is not None else 9
+        except (TypeError, ValueError):
+            fsize = 9
+        fsize = max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
+        # Same auto-fit as the normal label so the banner shrinks/ellipsizes to
+        # fit rather than overflowing.
+        shown, drawn_size = self._fit_label_text(text, fsize)
+        strip_h = max(STRIP_H, drawn_size + 8)
+        if self._body_h and self._body_h > 0:
+            cap = max(STRIP_H, int(self._body_h * 0.40))
+            strip_h = min(strip_h, cap)
+        self._bottom_strip_h = strip_h
+        self._bottom_alert = True
+        try:
+            self._strip_bottom.configure(height=strip_h, bg=_ALERT_BG)
+            self._bottom_lbl.configure(text=shown, fg=_ALERT_FG, bg=_ALERT_BG,
+                                       font=("Consolas", drawn_size, "bold"))
+        except tk.TclError:
+            pass
+        if not self._bottom_visible:
+            try:
+                self._strip_bottom.pack(side="bottom", fill="x")
+            except tk.TclError:
+                pass
+            self._bottom_visible = True
             if self._location_visible:
                 self._pack_location_lowest()
         self._push_thumb_rect()           # shrink the video above the strip
@@ -1231,6 +1295,12 @@ class TileWindow:
         """The text currently shown in the bottom strip ('' when hidden) — for
         tests/logging. Pre-ellipsis (the raw text handed to set_bottom_label)."""
         return self._bottom_lbl.cget("text") if self._bottom_visible else ""
+
+    def is_bottom_alert(self) -> bool:
+        """True while the bottom strip shows the decloak hazard banner (yellow
+        strip / black text), False once a normal label or hide restores it — for
+        tests/logging."""
+        return bool(self._bottom_visible and self._bottom_alert)
 
     def _draw_video_label(self):
         """RETIRED. The on-video label is gone (DWM-occluded + the topmost-overlay

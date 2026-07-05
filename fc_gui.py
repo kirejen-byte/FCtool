@@ -789,6 +789,10 @@ class FCToolGUI:
         self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
         self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
         self._preview_damage_since = {}        # char key -> monotonic ts the pulse started
+        # ── Decloak alert (mirror of the damage-flash state) ────────────────
+        self._preview_decloak_until = {}       # char key -> monotonic ts the yellow hold ends
+        self._preview_decloak_since = {}       # char key -> monotonic ts the pulse started
+        self._preview_decloak_audio_at = 0.0   # last monotonic ts the "Decloaked" cue played
         self._preview_gamelog_factory = GamelogMonitor  # injectable
         # ── Hide rules / per-char selection (Task C2) ───────────────────────
         self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
@@ -873,6 +877,7 @@ class FCToolGUI:
             "Ten percent of fleet lost",
             "Twenty five percent of fleet lost",
             "Fifty percent of fleet lost",
+            "Decloaked",                       # native-preview decloak alert cue
         ])
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -11673,6 +11678,15 @@ class FCToolGUI:
         "damage_flash_pct": 10, "damage_flash_window_s": 5,
         "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest",
         "damage_flash_color": "#ff3b30",
+        # ── Decloak alert (native only) ─────────────────────────────────────
+        # When one of the user's own chars is decloaked (proximity or Mobile
+        # Observatory), read from that char's OWN Gamelog, the tile flashes
+        # yellow + shows a DECLOAKED hazard banner for decloak_flash_secs. The
+        # spoken "Decloaked" cue is OFF by default (decloak_audio).
+        "decloak_flash": True,               # visuals (yellow flash + banner)
+        "decloak_audio": False,              # spoken "Decloaked" cue (off by default)
+        "decloak_flash_secs": 10,            # how long the flash + banner hold
+        "decloak_flash_color": "#ffcc00",    # hazard-yellow pulse peak
     }
 
     def _preview_cfg(self):
@@ -12409,6 +12423,11 @@ class FCToolGUI:
             bottom_size = int(ocfg.get("font_size", 11))
         except (TypeError, ValueError):
             bottom_size = 11
+        # Decloak hazard banner: while a char's decloak window (edge-armed in
+        # _preview_on_decloak) is live, its label strip shows the DECLOAKED banner
+        # INSTEAD of the normal '<label> - <ShipType>' text. Gated by decloak_flash.
+        decloak_on = bool(cfg.get("decloak_flash", True))
+        now_mono = time.monotonic()
         for hwnd, client in cur.items():
             tile = self._preview_tiles.get(hwnd)
             if tile is None:
@@ -12431,7 +12450,19 @@ class FCToolGUI:
                     else (state.ship_type_name or "")
                 text = preview_tile.format_tile_label(activity, ship_name)
                 self._preview_video_labels[hwnd] = text  # kept for tests/logging
-                if do_video:
+                # DECLOAK banner overrides the label strip while the window is
+                # live (login screens never alert). Once it expires, the normal
+                # branch below runs again and set_bottom_label repaints the panel
+                # bg + label text (explicit restore in preview_tile) — no yellow
+                # strip is left behind.
+                dkey = client.key
+                d_until = self._preview_decloak_until.get(dkey)
+                decloak_live = (decloak_on and not client.is_login
+                                and d_until is not None and now_mono < d_until)
+                if decloak_live:
+                    tile.set_bottom_alert(preview_tile.DECLOAK_BANNER_TEXT,
+                                          bottom_size)
+                elif do_video:
                     tile.set_bottom_label(text, bottom_color, bottom_size)
                 else:
                     tile.set_bottom_label("")   # flag off → hide the strip
@@ -12551,6 +12582,58 @@ class FCToolGUI:
                                      time.monotonic())
         except Exception:
             log.exception("[preview] damage ingest failed")
+
+    # Global cooldown (s) so a burst of simultaneous decloaks / repeated pulses
+    # never stacks the "Decloaked" audio cue.
+    _PREVIEW_DECLOAK_AUDIO_COOLDOWN_S = 2.0
+
+    def _preview_on_decloak(self, ev):
+        """Tk-thread ingest of a GamelogMonitor DecloakEvent (decloak alert).
+
+        Mirrors _preview_on_damage: the monitor marshals here via root.after(0,…)
+        so this runs on the Tk thread. This is the EDGE trigger — it fires once
+        per decloak line, NOT every tick the window is live:
+          - visuals (gated by cfg['decloak_flash']): (re)arm the yellow-flash /
+            hazard-banner hold for cfg['decloak_flash_secs'] and seed a continuous
+            pulse clock (don't reset it on a re-arm, matching the damage flash);
+          - audio (gated additionally by cfg['decloak_audio']): speak "Decloaked"
+            once, subject to a ~2 s global cooldown so multiple simultaneous
+            decloaks don't stack the cue.
+        Keyed by lowercased char name (same join key as layouts/ESI/tiles)."""
+        try:
+            key = (getattr(ev, "character_name", "") or "").strip().lower()
+            if not key:
+                return
+            cfg = self._preview_cfg()
+            if not cfg.get("decloak_flash", True):
+                # Visuals off → no flash/banner. Audio still allowed to fire so a
+                # user can run an audio-only alert; it has its own gate below.
+                pass
+            now = time.monotonic()
+            if cfg.get("decloak_flash", True):
+                try:
+                    secs = float(cfg.get("decloak_flash_secs", 10) or 10)
+                except (TypeError, ValueError):
+                    secs = 10.0
+                self._preview_decloak_until[key] = now + secs
+                # Keep a continuous pulse phase across rapid re-arms.
+                self._preview_decloak_since.setdefault(key, now)
+            # Audio cue: edge-triggered here (not per-tick), gated by decloak_audio,
+            # rate-limited by the global cooldown.
+            if cfg.get("decloak_audio", False):
+                last = getattr(self, "_preview_decloak_audio_at", 0.0)
+                # Reference the class constant via FCToolGUI (not self) — the unit
+                # tests bind this method onto a bare SimpleNamespace host (same
+                # reason _preview_cfg reads FCToolGUI._PREVIEW_DEFAULTS, see the
+                # note at _preview_cfg).
+                if (now - last) >= FCToolGUI._PREVIEW_DECLOAK_AUDIO_COOLDOWN_S:
+                    self._preview_decloak_audio_at = now
+                    try:
+                        tts_helper.speak("Decloaked")
+                    except Exception:
+                        log.exception("[preview] decloak audio cue failed")
+        except Exception:
+            log.exception("[preview] decloak ingest failed")
 
     # ── C2: hide rules + per-character preview selection ────────────────────
     @staticmethod
@@ -12749,8 +12832,8 @@ class FCToolGUI:
                                      and not client.is_login
                                      and client.key == active_key)
                                  else None)
-                    # Border precedence is fixed + deterministic (plan §B6):
-                    #   damage flash > intel flash > active highlight > none.
+                    # Border precedence is fixed + deterministic:
+                    #   damage flash > DECLOAK flash > intel flash > highlight > none.
                     # Damage flash: a fresh should_flash (re)arms a hold that runs
                     # `window_s` past the last hit (seeded in _preview_damage_until)
                     # so the pulse holds while damage keeps landing and fades once
@@ -12777,11 +12860,30 @@ class FCToolGUI:
                             else:
                                 self._preview_damage_until.pop(key, None)
                                 self._preview_damage_since.pop(key, None)
+                    # DECLOAK flash: the window is edge-armed in _preview_on_decloak
+                    # (until = now + decloak_flash_secs, pulse start seeded then).
+                    # Here we only read the live window, expire it, and — while
+                    # live — pulse the border YELLOW. Sits JUST BELOW damage red:
+                    # if both are active this tick, damage wins (checked first).
+                    decloaking = False
+                    if cfg.get("decloak_flash", True) and not client.is_login:
+                        d_until = self._preview_decloak_until.get(key)
+                        if d_until is not None:
+                            if now < d_until:
+                                decloaking = True
+                            else:
+                                self._preview_decloak_until.pop(key, None)
+                                self._preview_decloak_since.pop(key, None)
                     if damaging:
                         peak = cfg.get("damage_flash_color", "#ff3b30")
                         started = self._preview_damage_since.get(key, now)
                         tile.set_border(preview_tile.pulse_color(
                             peak, now - started, 0.5))     # ~2 Hz soft pulse
+                    elif decloaking:
+                        peak = cfg.get("decloak_flash_color", "#ffcc00")
+                        started = self._preview_decloak_since.get(key, now)
+                        tile.set_border(preview_tile.pulse_color(
+                            peak, now - started, 0.5))     # ~2 Hz soft yellow pulse
                     elif self._preview_should_flash(self._preview_intel, state, cfg,
                                                     time.monotonic()):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
@@ -12848,6 +12950,7 @@ class FCToolGUI:
             logs_dir = gamelogs_dir_for(chat_path)
             mon = self._preview_gamelog_factory(
                 on_event=lambda ev: self.root.after(0, self._preview_on_damage, ev),
+                on_decloak=lambda ev: self.root.after(0, self._preview_on_decloak, ev),
                 logs_dir=logs_dir)
             mon.start()
             self._preview_gamelog = mon
@@ -13465,6 +13568,39 @@ class FCToolGUI:
         _tip(bnm, "Pick characters that should stay open and never be minimized "
                   "by 'Minimize inactive'.")
 
+        # Decloak alert — when one of YOUR chars is decloaked (proximity or a
+        # Mobile Observatory), read from your own combat logs, its tile flashes
+        # yellow + shows a DECLOAKED banner for 10s. Optional spoken cue (OFF by
+        # default). Native-mode only. Mirrors the label-bar / show-location vars.
+        rowDecloak = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowDecloak.pack(fill=tk.X, pady=2)
+        self._preview_decloak_flash_var = tk.BooleanVar(
+            value=bool(pcfg.get("decloak_flash", True)))
+        cbdk = tk.Checkbutton(
+            rowDecloak, text="Decloak alert",
+            variable=self._preview_decloak_flash_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbdk.grid(row=0, column=0, padx=(0, 16))
+        w.append(cbdk)
+        _tip(cbdk, "Flashes the tile yellow and shows a DECLOAKED banner for 10s "
+                   "when that character is decloaked (proximity or Mobile "
+                   "Observatory), read from your own combat logs.")
+
+        self._preview_decloak_audio_var = tk.BooleanVar(
+            value=bool(pcfg.get("decloak_audio", False)))
+        cbdka = tk.Checkbutton(
+            rowDecloak, text="Decloak audio cue",
+            variable=self._preview_decloak_audio_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbdka.grid(row=0, column=1, padx=(0, 8))
+        w.append(cbdka)
+        _tip(cbdka, "Plays a spoken \"Decloaked\" alert when it happens. "
+                    "Off by default.")
+
         # Row 5b (native, Task C2): hide rules + the per-character "which previews
         # to show" entry point. Hiding a rule/character never wipes saved data.
         rowHide = tk.Frame(self._preview_panel_native, bg=BG_DARK)
@@ -13851,6 +13987,8 @@ class FCToolGUI:
             ("_preview_dmg_window_var", "damage_flash_window_s", int),
             ("_preview_dmg_cooldown_var", "damage_flash_cooldown_s", int),
             ("_preview_dmg_ref_var", "damage_flash_reference", str),
+            ("_preview_decloak_flash_var", "decloak_flash", bool),
+            ("_preview_decloak_audio_var", "decloak_audio", bool),
         ):
             v = getattr(self, var, None)
             if v is None:
