@@ -12593,6 +12593,11 @@ class FCToolGUI:
         Mirrors _preview_on_damage: the monitor marshals here via root.after(0,…)
         so this runs on the Tk thread. This is the EDGE trigger — it fires once
         per decloak line, NOT every tick the window is live:
+          - suppression: if the decloaked character's OWN client is the
+            currently-focused (foreground) window, the user is already looking
+            at it — skip visuals AND audio entirely (no state writes at all).
+            Fail-open: any errored/unavailable probe fires the alert anyway,
+            since a redundant alert beats a missed one.
           - visuals (gated by cfg['decloak_flash']): (re)arm the yellow-flash /
             hazard-banner hold for cfg['decloak_flash_secs'] and seed a continuous
             pulse clock (don't reset it on a re-arm, matching the damage flash);
@@ -12604,6 +12609,11 @@ class FCToolGUI:
             key = (getattr(ev, "character_name", "") or "").strip().lower()
             if not key:
                 return
+            try:
+                if self._preview_is_client_focused(key):
+                    return                    # focused → fully suppress, no state writes
+            except Exception:
+                log.exception("[preview] decloak focus probe failed — firing anyway")
             cfg = self._preview_cfg()
             if not cfg.get("decloak_flash", True):
                 # Visuals off → no flash/banner. Audio still allowed to fire so a
@@ -12709,6 +12719,42 @@ class FCToolGUI:
         else:
             new_lost = None
         return hidden, new_lost
+
+    def _preview_foreground_hwnd(self):
+        """Raw foreground hwnd right now, via the SAME backend the C2/C4 tick
+        uses (`self._preview_win32.get_foreground()` — see _preview_foreground_info).
+        Injectable seam (mirrors `_preview_find_clients`) so tests can fake it
+        without touching win32. Returns None if the backend isn't resolved yet
+        or the probe fails; callers must treat None as "unknown" and fail open
+        (never suppress an alert on an errored/unavailable probe)."""
+        w = getattr(self, "_preview_win32", None)
+        if w is None:
+            return None
+        return w.get_foreground()
+
+    def _preview_is_client_focused(self, key):
+        """True only on a POSITIVE determination that the client whose key is
+        `key` (lowercased char name) IS the current foreground window — the
+        decloak-alert suppression check (see _preview_on_decloak).
+
+        Uses the same hwnd-equality semantics as _preview_foreground_info's
+        `fg in cur` check (no GA_ROOT/ancestor walk anywhere in this codebase's
+        win32 layer — see eve_client_tracker._RealWin32.get_foreground). Reads
+        `self._preview_clients` (hwnd -> ClientWindow, populated by the last
+        tick) rather than re-enumerating windows, since this fires off the
+        GamelogMonitor edge, not the tick.
+
+        Any ambiguity resolves to False (fail open, caller fires the alert):
+        no matching client hwnd for `key`, foreground hwnd unknown/0, or the
+        probe raising are all treated as "not (confirmed) focused"."""
+        hwnds = [h for h, c in (self._preview_clients or {}).items()
+                 if c.key == key]
+        if not hwnds:
+            return False
+        fg = self._preview_foreground_hwnd()
+        if not fg:
+            return False
+        return fg in hwnds
 
     def _preview_foreground_info(self, cur):
         """Snapshot the foreground window for the hide-on-lost-focus / hide-active
@@ -13586,7 +13632,8 @@ class FCToolGUI:
         w.append(cbdk)
         _tip(cbdk, "Flashes the tile yellow and shows a DECLOAKED banner for 10s "
                    "when that character is decloaked (proximity or Mobile "
-                   "Observatory), read from your own combat logs.")
+                   "Observatory), read from your own combat logs. Suppressed "
+                   "while that client is the focused window.")
 
         self._preview_decloak_audio_var = tk.BooleanVar(
             value=bool(pcfg.get("decloak_audio", False)))
