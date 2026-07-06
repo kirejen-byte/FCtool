@@ -11510,8 +11510,13 @@ class FCToolGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._register_scroll_canvas(canvas)
 
+        # Collect section anchors for the floating table-of-contents (built at
+        # the end of this method, once every section header exists). While this
+        # list is present, _add_section records each header into it.
+        self._settings_toc_anchors = []
+
         # ── EVE Logs Path ────────────────────────────────────────────────────
-        self._add_section(scroll_frame, "EVE Chat Logs")
+        self._add_section(scroll_frame, "EVE Chat Logs", toc_title="Chat Logs")
         path_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         path_frame.pack(fill=tk.X, padx=20, pady=2)
         self._logs_path_var = tk.StringVar(
@@ -11526,6 +11531,9 @@ class FCToolGUI:
         # ── Character / Fleet Selection ───────────────────────────────────
         char_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         char_frame.pack(fill=tk.X, padx=20, pady=2)
+        # This Track-character + Staging block has no section header; anchor the
+        # TOC's "Tracking" entry on the block's first widget so it's reachable.
+        self._settings_toc_anchors.append(("Tracking", char_frame))
         tk.Label(char_frame, text="Track character:", font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK, width=28, anchor=tk.W).pack(side=tk.LEFT)
         self._char_var = tk.StringVar(value=self.config.get("tracked_character", ""))
@@ -11567,7 +11575,8 @@ class FCToolGUI:
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=5)
 
         # ── ESI SSO Characters ──────────────────────────────────────────
-        self._add_section(scroll_frame, "EVE SSO Characters")
+        self._add_section(scroll_frame, "EVE SSO Characters",
+                          toc_title="SSO Characters")
 
         # Character list frame
         self._esi_chars_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -11597,13 +11606,16 @@ class FCToolGUI:
         self._esi_status_label.pack(side=tk.LEFT, padx=10)
 
         # ── Client previews & labels ──────────────────────────────────────
-        self._add_section(scroll_frame, "Client previews & labels")
+        self._add_section(scroll_frame, "Client previews & labels",
+                          toc_title="Previews")
         self._build_preview_section(scroll_frame)
 
         # ── Autostart ────────────────────────────────────────────────────
         self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
         auto_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         auto_frame.pack(fill=tk.X, padx=20, pady=2)
+        # Autostart + Sound share one un-headered block; anchor "Autostart & Sound".
+        self._settings_toc_anchors.append(("Autostart & Sound", auto_frame))
         tk.Checkbutton(auto_frame, text="Start FCTool on Windows startup",
                        variable=self._autostart_var,
                        font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
@@ -11622,7 +11634,8 @@ class FCToolGUI:
                        command=self._on_sound_toggle).pack(anchor=tk.W)
 
         # ── Ansiblex Jump Gates ──────────────────────────────────────────
-        self._add_section(scroll_frame, "Ansiblex Jump Gates")
+        self._add_section(scroll_frame, "Ansiblex Jump Gates",
+                          toc_title="Ansiblex")
         tk.Label(scroll_frame, text="One pair per line: SystemA, SystemB",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK).pack(anchor=tk.W, padx=20)
         ansiblex_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -11642,7 +11655,7 @@ class FCToolGUI:
         self._build_intel_channels_settings(scroll_frame)
 
         # ── X-Up Settings ────────────────────────────────────────────────────
-        self._add_section(scroll_frame, "Fleet Management")
+        self._add_section(scroll_frame, "Fleet Management", toc_title="Fleet Mgmt")
         xup = self.config.get("xup", {})
 
         self._setting_entries = {}
@@ -11660,7 +11673,7 @@ class FCToolGUI:
                           xup.get("channel_name", "Fleet"))
 
         # ── zKillboard Settings ──────────────────────────────────────────────
-        self._add_section(scroll_frame, "zKillboard")
+        self._add_section(scroll_frame, "zKillboard", toc_title="zKillboard")
         zk = self.config.get("zkillboard", {})
 
         self._zkill_enabled_var = tk.BooleanVar(value=zk.get("enabled", True))
@@ -11677,6 +11690,13 @@ class FCToolGUI:
         # Region/alliance filters are now on the zKill tab inline filter panel
 
         # (Save button is at the top of the settings tab)
+
+        # ── Floating section index (right margin) ─────────────────────────
+        # Built last so every section header is already recorded. Packed
+        # side=RIGHT AFTER the scrollbar (also RIGHT) → it sits just left of the
+        # scrollbar; the LEFT-packed canvas keeps expanding into the middle, so
+        # the final order is [canvas | TOC | scrollbar].
+        self._build_settings_toc(tab, canvas, scroll_frame)
 
     def _register_scroll_canvas(self, canvas):
         """Register a scrollable canvas so the global mouse-wheel router can
@@ -11709,6 +11729,11 @@ class FCToolGUI:
         while w is not None:
             if w in scroll_canvases:
                 w.yview_scroll(amount, "units")
+                # Keep the Settings-tab TOC's active-section highlight in sync
+                # as the content scrolls under it (cheap; fully guarded no-op
+                # when this isn't the Settings canvas or the TOC isn't built).
+                if w is getattr(self, "_settings_toc_canvas", None):
+                    self._settings_toc_update_active()
                 return "break"
             w = getattr(w, "master", None)
         return None
@@ -15048,10 +15073,146 @@ class FCToolGUI:
         cfg["never_minimize"] = sorted((existing - shown) | checked)
         self._save_config()
 
-    def _add_section(self, parent, title):
-        tk.Label(parent, text=f"── {title} ──",
-                 font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK
-                 ).pack(anchor=tk.W, padx=10, pady=(15, 5))
+    def _add_section(self, parent, title, toc_title=None):
+        """Create a section header label. If a Settings-tab TOC is currently
+        collecting anchors (``self._settings_toc_anchors`` is a list), record
+        this header under ``toc_title`` (falling back to ``title``) so the
+        floating table-of-contents can jump straight to it. Returns the label
+        so callers can register their own anchor if they wish."""
+        lbl = tk.Label(parent, text=f"── {title} ──",
+                       font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK)
+        lbl.pack(anchor=tk.W, padx=10, pady=(15, 5))
+        anchors = getattr(self, "_settings_toc_anchors", None)
+        if isinstance(anchors, list):
+            anchors.append((toc_title or title, lbl))
+        return lbl
+
+    # ── Settings-tab floating table-of-contents ────────────────────────────
+    @staticmethod
+    def _toc_jump_fraction(y, total):
+        """Return the yview_moveto fraction that scrolls a section anchor at
+        offset ``y`` (pixels, inside scroll_frame) to the top with a little
+        headroom. Pure + clamped to [0.0, 1.0]; div-by-zero safe.
+
+        y < 8 (or a non-positive total) collapses to 0.0 so the first section
+        pins to the very top."""
+        total = max(1, int(total))
+        frac = (y - 8) / total
+        if frac < 0.0:
+            return 0.0
+        if frac > 1.0:
+            return 1.0
+        return frac
+
+    def _build_settings_toc(self, tab, canvas, scroll_frame):
+        """Build the slim, always-visible section index pinned to the right
+        margin of the Settings tab.
+
+        Layout: it is packed side=RIGHT *before* the content canvas expands, so
+        the tab reads [canvas (expands) | TOC | scrollbar (already RIGHT-most)].
+        Being a sibling of the canvas (not a child of scroll_frame) it does NOT
+        scroll with the content — that gives the floating-on-the-margin effect.
+
+        ``self._settings_toc_anchors`` must already be populated (ordered list of
+        (title, header_widget)). Clicking a row scrolls ``canvas`` so the anchor
+        sits near the top."""
+        anchors = getattr(self, "_settings_toc_anchors", None) or []
+        panel = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        # Pack on the right, filling height, BEFORE the canvas expands so the
+        # order becomes [canvas | toc | scrollbar]. (The scrollbar was packed
+        # side=RIGHT first, so it stays right-most; the canvas packs LEFT and
+        # expands to fill the gap.)
+        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=10)
+
+        tk.Label(panel, text="Sections", font=("Consolas", 8, "bold"),
+                 fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                 ).pack(anchor=tk.W, padx=8, pady=(6, 4))
+
+        self._settings_toc_rows = []   # list of (row_label, anchor_widget)
+        for title, widget in anchors:
+            row = tk.Label(panel, text=title, font=("Consolas", 8),
+                           fg=FG_DIM, bg=BG_PANEL, anchor=tk.W,
+                           cursor="hand2", padx=8)
+            row.pack(anchor=tk.W, fill=tk.X, pady=1)
+            self._settings_toc_rows.append((row, widget))
+
+            def _enter(_e, r=row):
+                # Don't fight the active-section highlight (accent); only lift
+                # dim rows to the brighter text colour on hover.
+                if r.cget("fg") != FG_ACCENT:
+                    r.configure(fg=FG_TEXT)
+
+            def _leave(_e, r=row):
+                if r.cget("fg") != FG_ACCENT:
+                    r.configure(fg=FG_DIM)
+
+            def _click(_e, w=widget):
+                self._settings_toc_jump(canvas, scroll_frame, w)
+
+            row.bind("<Enter>", _enter)
+            row.bind("<Leave>", _leave)
+            row.bind("<Button-1>", _click)
+
+        self._settings_toc_canvas = canvas
+        self._settings_toc_scroll_frame = scroll_frame
+        # Prime the active-section highlight once geometry settles (widget sizes
+        # aren't realized until the tab is mapped). Guarded: an absent/dead root
+        # `after` (e.g. a SimpleNamespace test host) is simply skipped.
+        try:
+            self.root.after(200, self._settings_toc_update_active)
+        except (AttributeError, tk.TclError):
+            pass
+        return panel
+
+    def _settings_toc_jump(self, canvas, scroll_frame, anchor):
+        """Scroll ``canvas`` so ``anchor`` (a header widget inside scroll_frame)
+        sits near the top. Uses rooty deltas so nested widgets resolve correctly
+        (winfo_y only reports position within the *direct* parent). Guards
+        TclError from dead/unmapped widgets."""
+        try:
+            canvas.update_idletasks()
+            y = anchor.winfo_rooty() - scroll_frame.winfo_rooty()
+            total = scroll_frame.winfo_height()
+            canvas.yview_moveto(self._toc_jump_fraction(y, total))
+        except tk.TclError:
+            return
+        self._settings_toc_update_active()
+
+    def _settings_toc_update_active(self):
+        """Highlight the TOC row whose section is currently topmost-visible.
+
+        Cheap: reads the canvas's current top edge (via yview fraction × content
+        height) and picks the last anchor at or above it. Called after a jump and
+        from the wheel router when it scrolls the Settings canvas. Fully guarded —
+        any TclError just leaves the highlight as-is (never crashes scrolling)."""
+        rows = getattr(self, "_settings_toc_rows", None)
+        canvas = getattr(self, "_settings_toc_canvas", None)
+        scroll_frame = getattr(self, "_settings_toc_scroll_frame", None)
+        if not rows or canvas is None or scroll_frame is None:
+            return
+        try:
+            total = scroll_frame.winfo_height()
+            top_frac = canvas.yview()[0]
+            # Small tolerance (headroom mirror + a few px for Tk's fractional
+            # yview rounding) so the section pinned at the top counts as active.
+            # NOTE: for sections near the very bottom, yview clamps (content
+            # bottom aligns to viewport bottom) so they physically can't reach
+            # the top — the highlight then correctly shows the topmost-VISIBLE
+            # header, which may be the one above. That's honest, not a bug.
+            top_y = top_frac * total + 12
+            sf_root = scroll_frame.winfo_rooty()
+            active_idx = 0
+            for i, (_row, widget) in enumerate(rows):
+                wy = widget.winfo_rooty() - sf_root
+                if wy <= top_y:
+                    active_idx = i
+                else:
+                    break
+            for i, (row, _widget) in enumerate(rows):
+                row.configure(fg=FG_ACCENT if i == active_idx else FG_DIM)
+        except (tk.TclError, IndexError, ZeroDivisionError):
+            return
 
     def _add_setting(self, parent, label, key, default="", tooltip=None):
         frame = tk.Frame(parent, bg=BG_DARK)
@@ -15187,7 +15348,7 @@ class FCToolGUI:
         free-type any name. 'Scan Channels' discovers channels from the logs dir
         and caches them into config["intel_channels"]["cached_discovered"].
         """
-        self._add_section(parent, "Intel Channels")
+        self._add_section(parent, "Intel Channels", toc_title="Intel Channels")
         tk.Label(parent,
                  text="Channels tracked for Intelligence Fusion "
                       "(shared with the web UI).",
