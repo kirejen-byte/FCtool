@@ -6765,6 +6765,11 @@ class FCToolGUI:
         self._market_doc_status_label.pack(side=tk.LEFT, padx=(4, 0))
         self._refresh_market_status_labels()
 
+        # Per-doctrine seed-target editor (override for the market availability
+        # bar; blank = the global Settings default). Sits with the doctrine-level
+        # controls, on its own line so it never crowds the button row.
+        self._build_doctrine_seed_target_row(parent, doctrine)
+
         if not doctrine.members:
             tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
                                   "to this doctrine.",
@@ -6776,8 +6781,9 @@ class FCToolGUI:
         # Per-fit market availability (empty dict when no snapshot → rows show
         # nothing, no clutter). Computed once for the whole doctrine.
         avail_map = self._market_doctrine_avail_map(doctrine)
-        seed_target = int((self.config.get("market", {}) or {}).get(
-            "seed_target", 20) or 20)
+        # Per-doctrine seed target (override wins; else the global default). Drives
+        # the availability colour thresholds for THIS doctrine's rows.
+        seed_target = self._market_seed_target(doctrine)
         # Legend for the availability line (only shown when marks are present).
         if avail_map:
             legend = tk.Label(
@@ -6874,6 +6880,62 @@ class FCToolGUI:
         ttk.Button(ctrls, text="Remove", style="Red.TButton",
                    command=lambda: self._remove_doctrine_member(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    def _build_doctrine_seed_target_row(self, parent, doctrine):
+        """Compact per-doctrine seed-target editor.
+
+        A small int Entry showing the doctrine's override (blank when unset), a
+        dim "default N" hint making the global fallback visible, and a tooltip
+        explaining override-vs-Settings-default. Commits on <Return>/<FocusOut>:
+        blank/invalid/<=0 → None (revert to default), a positive int overrides.
+        Persists via ``set_doctrine_seed_target`` + save and re-renders the
+        detail so the availability colours re-evaluate against the new bar.
+        """
+        row = tk.Frame(parent, bg=BG_PANEL)
+        row.pack(fill=tk.X, padx=12, pady=(4, 0))
+        lbl = tk.Label(row, text="Seed target:", font=("Consolas", 9),
+                       fg=FG_TEXT, bg=BG_PANEL)
+        lbl.pack(side=tk.LEFT)
+        cur = getattr(doctrine, "seed_target", None)
+        var = tk.StringVar(value=("" if cur is None else str(cur)))
+        self._doctrine_seed_target_var = var
+        entry = tk.Entry(row, textvariable=var, width=6, font=("Consolas", 9),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         borderwidth=1, relief=tk.RIDGE)
+        entry.pack(side=tk.LEFT, padx=(4, 6))
+        hint = tk.Label(row, text=f"(default {self._global_seed_target()})",
+                        font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
+        hint.pack(side=tk.LEFT)
+        tip = ("How many of each fit counts as 'fully seeded' for THIS doctrine "
+               "(colours the availability line). Blank = use the global default "
+               "from Settings ▸ Market. Set a number to override — e.g. fewer "
+               "battleships than throwaway frigates.")
+        self._tip_widget(lbl, tip)
+        self._tip_widget(entry, tip)
+
+        def _commit(_evt=None, _did=doctrine.id):
+            self._commit_doctrine_seed_target(_did, var.get())
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<FocusOut>", _commit)
+
+    def _commit_doctrine_seed_target(self, doctrine_id, text):
+        """Parse + persist a per-doctrine seed-target edit, then refresh.
+
+        Routes the raw entry text through ``_parse_seed_target_input`` (blank/
+        invalid/<=0 → None = revert to default), persists via the store setter +
+        save, and re-renders the doctrine detail so the availability colours
+        re-evaluate immediately. No-op'd early if the value is unchanged so a
+        bare focus-out doesn't churn the pane (and lose focus mid-edit)."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        new_val = self._parse_seed_target_input(text)
+        if new_val == getattr(doctrine, "seed_target", None):
+            return  # unchanged — don't re-render (avoids focus thrash)
+        self.fittings.set_doctrine_seed_target(doctrine_id, new_val)
+        self.fittings.save()
+        self._show_doctrine_detail(doctrine_id)
 
     def _doctrine_links_range(self, doctrine):
         """Computed ideal links-ship count range for this doctrine (or None)."""
@@ -19879,6 +19941,54 @@ $bmp.Dispose()
                    f" · best {cls._market_price_short(best_price)} ISK")
             return ("✓", FG_GREEN, tip)
         return ("✗", FG_DIM, "not on the staging market")
+
+    @staticmethod
+    def _parse_seed_target_input(text):
+        """Parse a per-doctrine seed-target entry. Returns an int > 0, or None.
+
+        None means "revert to the global default" and is what a blank field, a
+        non-integer, or a zero/negative value all resolve to (so a fat-fingered
+        or cleared entry safely falls back to the Settings default rather than
+        wedging a bad target). A leading/trailing-whitespace integer is accepted.
+        """
+        s = (text or "").strip()
+        if not s:
+            return None
+        try:
+            val = int(s)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
+
+    def _global_seed_target(self):
+        """The global fallback seed target from config (floored at 1).
+
+        Reads ``config["market"]["seed_target"]`` defensively; a missing/garbage/
+        non-positive value falls back to 20 (the documented default), matching
+        _collect_market_settings' own floor."""
+        raw = (self.config.get("market", {}) or {}).get("seed_target", 20)
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return 20
+        return val if val > 0 else 20
+
+    def _market_seed_target(self, doctrine):
+        """Resolve the effective market seed target for ``doctrine``.
+
+        The per-doctrine override (``Doctrine.seed_target``) wins when set to a
+        positive int; otherwise the global ``config["market"]["seed_target"]``
+        default applies. Always >= 1 so availability colour thresholds have a
+        sane bar. A None/0/negative doctrine value falls through to the global.
+        """
+        override = getattr(doctrine, "seed_target", None) if doctrine is not None else None
+        try:
+            override = int(override) if override is not None else None
+        except (TypeError, ValueError):
+            override = None
+        if override is not None and override > 0:
+            return override
+        return self._global_seed_target()
 
     @staticmethod
     def _market_row_text(avail, seed_target):

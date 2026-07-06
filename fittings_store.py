@@ -391,6 +391,23 @@ class FittingsStore:
         doctrine.exemptions = None if entries is None else [dict(e) for e in entries]
         doctrine.modified = _now()
 
+    def set_doctrine_seed_target(
+        self, doctrine_id: str, seed_target: int | None
+    ) -> None:
+        """Set the per-doctrine market seed target (units of each fit to consider
+        "fully seeded").
+
+        None = "use the global config["market"]["seed_target"] default" (omitted
+        from JSON); a positive int overrides it for this doctrine. Mirrors
+        ``set_doctrine_exemptions``: mutates in memory + stamps ``modified``; the
+        caller persists via ``save()`` like the sibling doctrine setters.
+        """
+        doctrine = self._doctrines.get(doctrine_id)
+        if doctrine is None:
+            return
+        doctrine.seed_target = seed_target
+        doctrine.modified = _now()
+
     def remove_fit_from_doctrine(self, doctrine_id: str, fit_id: str) -> None:
         """Remove a fit from a doctrine's member list."""
         doctrine = self._doctrines.get(doctrine_id)

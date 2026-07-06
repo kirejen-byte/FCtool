@@ -113,6 +113,11 @@ class Doctrine:
     # Semantics: None = "use STANDARD_EXEMPTIONS" (never customized); [] = explicitly
     # none; [...] = that explicit list. See fleet_guidance.effective_exemptions.
     exemptions: list[dict] | None = None
+    # Per-doctrine market seed target (how many of each fit counts as "fully
+    # seeded"). None = "use the global config["market"]["seed_target"] default"
+    # — a throwaway-frigate doctrine and a battleship doctrine can want very
+    # different targets. Resolved via fc_gui._market_seed_target.
+    seed_target: int | None = None
 
 
 # ── Content hashing (order-independent, for de-dupe) ──────────────────────────
@@ -271,6 +276,11 @@ def doctrine_to_dict(doctrine: Doctrine) -> dict:
     # STANDARD_EXEMPTIONS"; an explicit [] is preserved to mean "no exemptions").
     if doctrine.exemptions is not None:
         d["exemptions"] = [dict(e) for e in doctrine.exemptions]
+    # Serialize seed_target ONLY when overridden (None omitted so absence == "use
+    # the global market seed_target default"; older libraries without the key load
+    # back as None, unaffected).
+    if doctrine.seed_target is not None:
+        d["seed_target"] = doctrine.seed_target
     return d
 
 
@@ -283,4 +293,5 @@ def doctrine_from_dict(data: dict) -> Doctrine:
         created=data.get("created", ""),
         modified=data.get("modified", ""),
         exemptions=data.get("exemptions"),
+        seed_target=data.get("seed_target"),
     )
