@@ -635,15 +635,23 @@ class MarketScanner:
                 continue
 
             loc_id = contract.get("start_location_id", 0) or 0
-            csys = self._resolve_system_cached(loc_id)
-            if system_id is not None and not region_wide:
-                # Strict system filter: drop known-other-system contracts.
-                if csys is not None and csys != system_id:
-                    continue
-                # Unknown-location contracts are dropped in strict mode too
-                # (they can't be confirmed in-system).
-                if csys is None:
-                    continue
+            # Only resolve the contract's system when it is actually needed: a
+            # system filter is active (system_id given). With no filter the
+            # match is region-wide and csys is never used for filtering, and the
+            # stamped value would be informational only — skip the per-contract
+            # location resolve entirely (it's a network/cache hit each time).
+            if system_id is not None:
+                csys = self._resolve_system_cached(loc_id)
+                if not region_wide:
+                    # Strict system filter: drop known-other-system contracts.
+                    if csys is not None and csys != system_id:
+                        continue
+                    # Unknown-location contracts are dropped in strict mode too
+                    # (they can't be confirmed in-system).
+                    if csys is None:
+                        continue
+            else:
+                csys = None
 
             items, was_cached = self._fetch_contract_items(cid, is_alliance, corp_id)
             scanned += 1
@@ -919,6 +927,14 @@ def fit_bom(parsed, catalog=None) -> list[Component]:
     agree on the fit's contents. (Unlike ``to_dna``, module identity here is
     ``type_id`` only — online/offline copies of the same module are one BoM line,
     because for buying purposes they are the same item.)
+
+    Cargo note: this intentionally DIVERGES from ``to_dna``'s cargo-safety drop.
+    ``to_dna`` omits/limits cargo (a DNA link shouldn't force-load a hold); the
+    BoM keeps every cargo + loaded-charge line (role ``"cargo"``/``"charge"``) so
+    a full component table is available, but the two scored numbers
+    (``completable_fits`` / >=95% similarity) and the default gap list exclude
+    cargo/charges (see ``_SCORING_MODULE_ROLES``), so keeping them here is
+    harmless to seeding math while still surfacing them for display.
     """
 
     def _name(type_id: int, fallback: str = "") -> str:

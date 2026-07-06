@@ -835,6 +835,21 @@ class FCToolGUI:
         self._fit_sort_column: str = "name"
         self._fit_sort_reverse: bool = False
 
+        # ── Market scanner (Phase B) state ──────────────────────────────────
+        # Lazily-built scanner (needs the type catalog above). The snapshot +
+        # contract scan are populated on the manual "Scan market" button only —
+        # NO polling. On startup we load the last cached snapshot so availability
+        # shows stale-but-useful data with a "cached HH:MM" status before any
+        # live scan. All UI refreshes marshal back via root.after.
+        self._market_scanner = None            # MarketScanner (lazy)
+        self._market_snapshot = None           # last MarketSnapshot
+        self._market_contracts = None          # last ContractScan
+        self._market_scan_ts = None            # datetime of the last scan / cache load
+        self._market_scanning = False          # in-flight guard (no concurrent scans)
+        self._market_from_cache = False        # True while showing a disk-cached snapshot
+        self._market_corp_id_cache = {}        # character_id -> corp id (1 GET per char)
+        self._load_market_cache()              # populate snapshot from disk if present
+
         # Discover ansiblex from ESI if authenticated, else fall back to config
         self._refresh_ansiblex_from_esi()
         self._prewarm_cache_async()
@@ -6739,6 +6754,16 @@ class FCToolGUI:
         ttk.Button(add_row, text="Exemptions…", style="Dark.TButton",
                    command=lambda: self._edit_doctrine_exemptions(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
+        # Market availability refresh + status. Scans the local staging market
+        # (and, per Settings, contracts for this doctrine's fits) then re-renders
+        # the rows with per-fit availability. Manual only — no polling.
+        ttk.Button(add_row, text="⟳ Market", style="Dark.TButton",
+                   command=self._market_scan_now).pack(side=tk.LEFT, padx=(10, 2))
+        self._market_doc_status_label = tk.Label(
+            add_row, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+            anchor=tk.W)
+        self._market_doc_status_label.pack(side=tk.LEFT, padx=(4, 0))
+        self._refresh_market_status_labels()
 
         if not doctrine.members:
             tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
@@ -6748,6 +6773,26 @@ class FCToolGUI:
                          anchor=tk.W, padx=12, pady=(8, 10))
             return
 
+        # Per-fit market availability (empty dict when no snapshot → rows show
+        # nothing, no clutter). Computed once for the whole doctrine.
+        avail_map = self._market_doctrine_avail_map(doctrine)
+        seed_target = int((self.config.get("market", {}) or {}).get(
+            "seed_target", 20) or 20)
+        # Legend for the availability line (only shown when marks are present).
+        if avail_map:
+            legend = tk.Label(
+                parent,
+                text="Market: ✓/✗ breadth% · N fits (M on market / C in "
+                     "contracts) — green ≥ seed target, yellow > 0, red 0",
+                font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
+                anchor=tk.W, justify=tk.LEFT, wraplength=420)
+            legend.pack(anchor=tk.W, padx=12, pady=(6, 0))
+            self._tip_widget(
+                legend,
+                "breadth% = share of hull+modules+subsystems on the local "
+                "market. N = fits you could source: M complete fits from market "
+                "stock + C matching contracts. Click ⟳ Market to refresh.")
+
         # Members grouped by tag (canonical order).
         links_range = self._doctrine_links_range(doctrine)
         for tag_label, members in self._group_members_by_tag(doctrine):
@@ -6755,11 +6800,16 @@ class FCToolGUI:
                      fg=FG_GREEN, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=12, pady=(8, 2))
             for mem in members:
-                self._render_doctrine_member_row(parent, doctrine, mem, links_range)
+                self._render_doctrine_member_row(
+                    parent, doctrine, mem, links_range,
+                    avail_map=avail_map, seed_target=seed_target)
 
-    def _render_doctrine_member_row(self, parent, doctrine, mem, links_range):
+    def _render_doctrine_member_row(self, parent, doctrine, mem, links_range,
+                                    avail_map=None, seed_target=20):
         """One member row: fit name + its tag-chip cluster within this doctrine
-        + Tags/Remove controls."""
+        + Tags/Remove controls. When ``avail_map`` (fit_id -> DoctrineAvailability)
+        carries an entry for this member, a compact market-availability line is
+        appended below the tag chips."""
         fit = self.fittings.get_fit(mem.fit_id)
         name = fit.name if fit is not None else f"(missing fit {mem.fit_id})"
         hull = f"  ·  {fit.hull_name}" if fit is not None and fit.hull_name \
@@ -6784,6 +6834,21 @@ class FCToolGUI:
         else:
             tk.Label(info, text="(no tags)", font=("Consolas", 8),
                      fg=FG_DIM, bg=BG_PANEL).pack(anchor=tk.W, pady=(1, 0))
+
+        # Market availability line (only when a snapshot produced an entry).
+        avail = (avail_map or {}).get(mem.fit_id) if fit is not None else None
+        if avail is not None:
+            text, colour = self._market_row_text(avail, seed_target)
+            avail_lbl = tk.Label(info, text=text, font=("Consolas", 8),
+                                 fg=colour, bg=BG_PANEL, anchor=tk.W)
+            avail_lbl.pack(anchor=tk.W, pady=(1, 0))
+            binding = getattr(avail, "binding_name", None)
+            if binding and getattr(avail, "completable_fits", 0) >= 0:
+                self._tip_widget(
+                    avail_lbl,
+                    f"bottleneck for market seeding: {binding}"
+                    f" (limits you to {avail.completable_fits} complete fits "
+                    f"from local stock)")
 
         ctrls = tk.Frame(row, bg=BG_PANEL)
         ctrls.pack(side=tk.RIGHT)
@@ -10229,9 +10294,16 @@ class FCToolGUI:
         tk.Label(parent, text=fit.name, font=("Consolas", 13, "bold"),
                  fg=FG_ACCENT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
                  wraplength=380).pack(anchor=tk.W, padx=10, pady=(10, 0))
-        tk.Label(parent, text=f"{fit.hull_name}  ·  source: {fit.source}",
+        hull_line = tk.Frame(parent, bg=BG_PANEL)
+        hull_line.pack(anchor=tk.W, fill=tk.X, padx=10, pady=(0, 6))
+        # Per-component market availability marks (Phase B). Empty dict when no
+        # snapshot → no marks (graceful). Computed once for the whole fit.
+        comp_map = self._market_fit_component_map(fit)
+        # Hull availability mark sits before the hull/source line.
+        self._market_mark_label(hull_line, fit.hull_type_id, comp_map)
+        tk.Label(hull_line, text=f"{fit.hull_name}  ·  source: {fit.source}",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
-                     anchor=tk.W, padx=10, pady=(0, 6))
+                     side=tk.LEFT)
 
         # Slot-grouped module list.
         parsed = fit.parsed
@@ -10254,13 +10326,10 @@ class FCToolGUI:
                     line += f", {m.charge_name}"
                 if m.offline:
                     line += " /offline"
-                tk.Label(parent, text=f"  {line}", font=("Consolas", 9),
-                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
-                         wraplength=380).pack(anchor=tk.W, padx=14)
-            for nm in extra:
-                tk.Label(parent, text=f"  {nm}", font=("Consolas", 9),
-                         fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
-                         wraplength=380).pack(anchor=tk.W, padx=14)
+                self._market_marked_line(parent, m.type_id, line, comp_map)
+            for sub_tid, nm in zip((parsed.subsystems or []) if extra else [],
+                                   extra):
+                self._market_marked_line(parent, sub_tid, nm, comp_map)
         # Any modules with an unrecognized slot bucket.
         other_mods = [m for s, ms in by_slot.items()
                       if s not in self._FIT_SLOT_ORDER for m in ms]
@@ -10268,24 +10337,23 @@ class FCToolGUI:
             tk.Label(parent, text="Other", font=("Consolas", 9, "bold"),
                      fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
             for m in other_mods:
-                tk.Label(parent, text=f"  {m.name or m.type_id}",
-                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
-                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+                self._market_marked_line(
+                    parent, m.type_id, m.name or str(m.type_id), comp_map)
 
         if parsed.drones:
             tk.Label(parent, text="Drones", font=("Consolas", 9, "bold"),
                      fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
             for d in parsed.drones:
-                tk.Label(parent, text=f"  {d.name or d.type_id} x{d.quantity}",
-                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
-                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+                self._market_marked_line(
+                    parent, d.type_id,
+                    f"{d.name or d.type_id} x{d.quantity}", comp_map)
         if parsed.cargo:
             tk.Label(parent, text="Cargo", font=("Consolas", 9, "bold"),
                      fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(6, 0))
             for c in parsed.cargo:
-                tk.Label(parent, text=f"  {c.name or c.type_id} x{c.quantity}",
-                         font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
-                         anchor=tk.W).pack(anchor=tk.W, padx=14)
+                self._market_marked_line(
+                    parent, c.type_id,
+                    f"{c.name or c.type_id} x{c.quantity}", comp_map)
 
         # Notes.
         if (fit.notes or "").strip():
@@ -11688,6 +11756,9 @@ class FCToolGUI:
         # Min-pilots gate lives on the Intelligence tab's filter panel
         # (config["intel_filter"]["min_pilots"]) — the single source of truth.
         # Region/alliance filters are now on the zKill tab inline filter panel
+
+        # ── Market Scanner Settings ──────────────────────────────────────────
+        self._build_market_settings_section(scroll_frame)
 
         # (Save button is at the top of the settings tab)
 
@@ -15232,6 +15303,89 @@ class FCToolGUI:
                         lambda e, t=tooltip: self._show_tooltip(e, t))
                 _w.bind("<Leave>", lambda e: self._hide_tooltip())
 
+    def _build_market_settings_section(self, parent):
+        """Build the Settings-tab 'Market Scanner' section (Phase B).
+
+        Int-entry fields for the staging structure/station/region/system ids +
+        the fixed seed target, two contract checkboxes, and a 'Scan market'
+        button with a last-scan status label. All fields persist into
+        config["market"] on Save Settings (see _save_settings). The section
+        header is registered with the floating TOC via _add_section (toc_title
+        'Market')."""
+        self._add_section(parent, "Market Scanner", toc_title="Market")
+        mkt = self.config.get("market", {}) or {}
+
+        # Field vars kept on self so _save_settings can collect them. Ints are
+        # rendered as their str value (0 shows as "0").
+        self._market_setting_vars = {
+            "staging_structure_id": tk.StringVar(
+                value=str(mkt.get("staging_structure_id", 0) or 0)),
+            "staging_station_id": tk.StringVar(
+                value=str(mkt.get("staging_station_id", 0) or 0)),
+            "staging_region_id": tk.StringVar(
+                value=str(mkt.get("staging_region_id", 0) or 0)),
+            "staging_system_id": tk.StringVar(
+                value=str(mkt.get("staging_system_id", 0) or 0)),
+            "seed_target": tk.StringVar(
+                value=str(mkt.get("seed_target", 20) or 20)),
+        }
+        self._market_scan_contracts_var = tk.BooleanVar(
+            value=bool(mkt.get("scan_contracts", True)))
+        self._market_alliance_contracts_var = tk.BooleanVar(
+            value=bool(mkt.get("include_alliance_contracts", True)))
+
+        def _int_row(label, key, hint):
+            frame = tk.Frame(parent, bg=BG_DARK)
+            frame.pack(fill=tk.X, padx=20, pady=2)
+            lbl = tk.Label(frame, text=f"{label}:", font=("Consolas", 10),
+                           fg=FG_TEXT, bg=BG_DARK, width=28, anchor=tk.W)
+            lbl.pack(side=tk.LEFT)
+            entry = tk.Entry(frame, textvariable=self._market_setting_vars[key],
+                             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                             insertbackground=FG_WHITE, width=20,
+                             borderwidth=1, relief=tk.RIDGE)
+            entry.pack(side=tk.LEFT, padx=5)
+            if hint:
+                tk.Label(frame, text=hint, font=("Consolas", 9),
+                         fg=FG_DIM, bg=BG_DARK, anchor=tk.W).pack(
+                             side=tk.LEFT, padx=6)
+
+        _int_row("Staging structure ID", "staging_structure_id",
+                 "citadel (primary) — right-click your staging citadel market → "
+                 "Copy ID, or leave 0 and set station/region")
+        _int_row("Staging station ID", "staging_station_id",
+                 "NPC station fallback")
+        _int_row("Staging region ID", "staging_region_id",
+                 "region for orders + contracts")
+        _int_row("Staging system ID", "staging_system_id",
+                 "contract filter (0 = whole region)")
+        _int_row("Seed target per fit", "seed_target",
+                 "how many of each fit counts as 'fully seeded' (default 20)")
+
+        cb_frame = tk.Frame(parent, bg=BG_DARK)
+        cb_frame.pack(fill=tk.X, padx=20, pady=2)
+        tk.Checkbutton(cb_frame, text="Scan contracts",
+                       variable=self._market_scan_contracts_var,
+                       font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                       selectcolor=BG_ENTRY, activebackground=BG_DARK,
+                       activeforeground=FG_TEXT).pack(side=tk.LEFT)
+        tk.Checkbutton(cb_frame, text="Include corp/alliance contracts",
+                       variable=self._market_alliance_contracts_var,
+                       font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                       selectcolor=BG_ENTRY, activebackground=BG_DARK,
+                       activeforeground=FG_TEXT).pack(side=tk.LEFT, padx=(16, 0))
+
+        scan_row = tk.Frame(parent, bg=BG_DARK)
+        scan_row.pack(fill=tk.X, padx=20, pady=(4, 2))
+        ttk.Button(scan_row, text="Scan market", style="Dark.TButton",
+                   command=self._market_scan_now).pack(side=tk.LEFT)
+        self._market_status_label = tk.Label(
+            scan_row, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+            anchor=tk.W)
+        self._market_status_label.pack(side=tk.LEFT, padx=10)
+        # Prime the status text from current config/cache state.
+        self._refresh_market_status_labels()
+
     def _browse_logs(self):
         path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
         if path:
@@ -15742,6 +15896,10 @@ class FCToolGUI:
         # truth. The key is preserved as-is so the one-time migration seed and
         # any existing readers keep working.
 
+        # Market Scanner fields (guarded — the section may not be built if the
+        # Settings tab was never opened; then there is nothing to collect).
+        self._collect_market_settings()
+
         self._save_config()
         self._save_status.config(text="Saved!", fg=FG_GREEN)
 
@@ -15774,6 +15932,41 @@ class FCToolGUI:
         val = self._staging_entry.get().strip()
         self.config.setdefault("zkillboard", {})["staging_system"] = val
         self._save_config()
+
+    def _collect_market_settings(self):
+        """Collect the Market Scanner Settings fields into config["market"].
+
+        Extracted from _save_settings so it is independently testable. The int
+        entries are parsed defensively: a blank/garbage value falls back to the
+        current config value (or 0), so a fat-fingered field never wipes a good
+        id. No-op when the section was never built (vars absent)."""
+        vars_ = getattr(self, "_market_setting_vars", None)
+        if not vars_:
+            return
+        mkt = self.config.setdefault("market", {})
+
+        def _as_int(key):
+            raw = (vars_[key].get() or "").strip()
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return int(mkt.get(key, 0) or 0)
+
+        for key in ("staging_structure_id", "staging_station_id",
+                    "staging_region_id", "staging_system_id", "seed_target"):
+            mkt[key] = _as_int(key)
+        # seed_target must stay positive; fall back to 20 on a 0/negative entry.
+        if mkt.get("seed_target", 0) <= 0:
+            mkt["seed_target"] = 20
+        cb = getattr(self, "_market_scan_contracts_var", None)
+        if cb is not None:
+            mkt["scan_contracts"] = bool(cb.get())
+        ally = getattr(self, "_market_alliance_contracts_var", None)
+        if ally is not None:
+            mkt["include_alliance_contracts"] = bool(ally.get())
+        # Preserve contracts_scope; the section doesn't expose it as a control,
+        # but keep the key present (default "system") so readers are safe.
+        mkt.setdefault("contracts_scope", "system")
 
     # ── Module Setup ──────────────────────────────────────────────────────────
 
@@ -17506,6 +17699,18 @@ $bmp.Dispose()
             highlightthickness=0, borderwidth=0, relief="flat",
             elementborderwidth=0,
         )
+
+    def _tip_widget(self, widget, text):
+        """Bind the app-wide hover tooltip (``_show_tooltip``/``_hide_tooltip``)
+        to ``widget`` and record the copy on the widget so headless tests can
+        assert tooltip content without synthetic <Enter> delivery. DRY helper
+        mirroring the preview section's local ``_tip`` closure."""
+        widget.bind("<Enter>", lambda e, t=text: self._show_tooltip(e, t))
+        widget.bind("<Leave>", lambda e: self._hide_tooltip())
+        try:
+            widget._fctool_tooltip = text
+        except Exception:
+            pass
 
     def _show_tooltip(self, event, text):
         """Show a tooltip near the mouse cursor. Long text wraps to multiple
@@ -19333,6 +19538,397 @@ $bmp.Dispose()
                      width=10, anchor=tk.W
                      ).grid(row=i, column=col)
 
+
+    # ── Market scanner (Phase B) ──────────────────────────────────────────────
+    #
+    # Wires market_scanner.py / market_esi.py into the app. The scanner is
+    # MANUAL-trigger only (a "Scan market" button + a Doctrine-tab "⟳ Market"
+    # button) — there is no poller (the design's budget stance). A scan runs on a
+    # daemon thread and marshals the UI refresh back via root.after(0, ...). All
+    # degraded paths (no scopes, structure configured but not consented, market
+    # unconfigured) are handled without exceptions: they surface as status text.
+
+    def _market_source(self):
+        """Build a MarketSource from config["market"], or None if unconfigured.
+
+        Thin wrapper over MarketScanner's from_config so the resolution rules
+        live in one place (structure > station+region > None)."""
+        try:
+            import market_scanner
+            return market_scanner.MarketSource.from_config(
+                self.config.get("market", {}) or {})
+        except Exception:
+            log.exception("[market] failed to build MarketSource")
+            return None
+
+    def _get_market_scanner(self):
+        """Lazily construct the MarketScanner (over a live AuthMarketAdapter on
+        the primary character). Degraded/public paths work when scopes are
+        missing — the adapter/scanner already handle that. Returns None only if
+        construction itself fails (missing module, no catalog)."""
+        if self._market_scanner is not None:
+            return self._market_scanner
+        try:
+            import market_scanner
+            import market_esi
+        except Exception:
+            log.exception("[market] scanner modules unavailable")
+            return None
+        try:
+            adapter = market_esi.AuthMarketAdapter(self.esi_auth)
+            self._market_scanner = market_scanner.MarketScanner(
+                adapter, self.type_catalog)
+        except Exception:
+            log.exception("[market] failed to construct MarketScanner")
+            return None
+        return self._market_scanner
+
+    def _load_market_cache(self):
+        """Startup: load the last-cached snapshot (if any) so availability marks
+        show stale-but-useful data before any live scan. Never touches the
+        network; silent no-op when nothing is configured/cached."""
+        source = self._market_source()
+        if source is None:
+            return
+        scanner = self._get_market_scanner()
+        if scanner is None:
+            return
+        try:
+            snap = scanner.load_snapshot(source.source_id)
+        except Exception:
+            log.exception("[market] cache load failed")
+            snap = None
+        if snap is None:
+            return
+        self._market_snapshot = snap
+        self._market_from_cache = True
+        # Stamp the cache time from the snapshot's taken_at for the status label.
+        try:
+            self._market_scan_ts = datetime.fromisoformat(snap.taken_at)
+        except (ValueError, TypeError):
+            self._market_scan_ts = None
+
+    def _market_active_doctrine(self):
+        """The doctrine whose fits the contract scan targets: the one currently
+        selected on the Doctrine tab, else None. (Contracts are scanned per the
+        active doctrine's fits; the market depth pull is doctrine-independent.)"""
+        did = getattr(self, "_doctrine_selected_id", None)
+        if not did:
+            return None
+        try:
+            return self.fittings.get_doctrine(did)
+        except Exception:
+            return None
+
+    def _market_status_text(self):
+        """The last-scan status string for the Market status labels.
+
+        Reflects config state (unconfigured / needs re-auth), in-flight scans,
+        and the freshness of the current snapshot ("cached HH:MM" for a
+        disk-loaded snapshot, "scanned HH:MM" after a live scan)."""
+        if self._market_scanning:
+            return ("scanning…", FG_ACCENT)
+        source = self._market_source()
+        if source is None:
+            return ("market not configured — set a staging structure or "
+                    "station+region below", FG_DIM)
+        # Structure configured but the primary char lacks the citadel scope →
+        # a clear re-auth hint, not an exception (public/station paths still run).
+        if source.kind == "structure":
+            auth = self.esi_auth
+            has_scope = bool(auth and getattr(
+                auth, "has_market_structure_scope", lambda: False)())
+            if not has_scope:
+                return ("structure market needs re-auth (⚠ in the SSO list) — "
+                        "using public data only", FG_ORANGE)
+        if self._market_scan_ts is not None:
+            hhmm = self._market_scan_ts.strftime("%H:%M")
+            when = "cached" if self._market_from_cache else "scanned"
+            n = len(self._market_snapshot.depth) if self._market_snapshot else 0
+            return (f"{when} {hhmm} · {n} types on market", FG_DIM)
+        return ("not scanned yet — click Scan market", FG_DIM)
+
+    def _refresh_market_status_labels(self):
+        """Push _market_status_text onto every Market status label that exists
+        (Settings + Doctrine tab). Guarded for missing/dead widgets."""
+        text, colour = self._market_status_text()
+        for attr in ("_market_status_label", "_market_doc_status_label"):
+            lbl = getattr(self, attr, None)
+            if lbl is None:
+                continue
+            try:
+                lbl.config(text=text, fg=colour)
+            except tk.TclError:
+                pass
+
+    def _market_scan_now(self):
+        """Manual market scan: depth pull + (optional) contract scan on a daemon
+        thread, results marshalled back to the Tk thread. In-flight guarded (a
+        second click while a scan runs is ignored). Every error is swallowed to a
+        status update — never a crash or dialog spam.
+
+        Both the Settings "Scan market" button and the Doctrine-tab "⟳ Market"
+        button call this."""
+        if self._market_scanning:
+            return
+        source = self._market_source()
+        if source is None:
+            self._refresh_market_status_labels()
+            return
+        scanner = self._get_market_scanner()
+        if scanner is None:
+            self._refresh_market_status_labels()
+            return
+
+        self._market_scanning = True
+        self._refresh_market_status_labels()
+
+        market_cfg = self.config.get("market", {}) or {}
+        scan_contracts = bool(market_cfg.get("scan_contracts", True))
+        contracts_scope = str(market_cfg.get("contracts_scope", "system"))
+        want_corp = bool(market_cfg.get("include_alliance_contracts", True))
+        auth = self.esi_auth  # snapshot for the worker (stable across the scan)
+        doctrine = self._market_active_doctrine()
+        # Collect the active doctrine's fits for the contract scan (region from
+        # config; system filter unless contracts_scope == "region").
+        fits = []
+        if doctrine is not None:
+            for mem in getattr(doctrine, "members", []):
+                fit = None
+                try:
+                    fit = self.fittings.get_fit(mem.fit_id)
+                except Exception:
+                    fit = None
+                if fit is not None:
+                    fits.append(fit)
+
+        def worker():
+            snap = None
+            contracts = None
+            try:
+                try:
+                    snap = scanner.scan_market(source)
+                except Exception:
+                    log.exception("[market] scan_market failed")
+                if scan_contracts and fits and source.region_id:
+                    # Corp-id resolution is a live ESI GET
+                    # (ESIAuth._get_character_corp_id) → it runs HERE on the
+                    # worker thread, never the Tk thread, and only when the
+                    # alliance-contracts toggle is on. _market_corp_id also
+                    # gates on the contract scope + caches per character.
+                    corp_id = self._market_corp_id(auth) if want_corp else None
+                    sys_filter = (source.system_id
+                                  if contracts_scope == "system" else None)
+                    try:
+                        contracts = scanner.scan_contracts(
+                            source.region_id, fits,
+                            system_id=sys_filter, corp_id=corp_id)
+                    except Exception:
+                        log.exception("[market] scan_contracts failed")
+            finally:
+                # The apply step clears the in-flight flag on the Tk thread. If
+                # marshalling fails for ANY reason (root destroyed at shutdown,
+                # interpreter teardown), clear the flag directly so no exception
+                # type can ever leave the guard stuck.
+                try:
+                    self.root.after(0, self._market_apply_scan, snap, contracts)
+                except Exception:
+                    self._market_scanning = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _market_corp_id(self, auth):
+        """Resolve the character's corporation id for the corp/alliance contract
+        pull. WORKER-THREAD ONLY — it can hit ESI via
+        ``ESIAuth._get_character_corp_id()`` (a live ``/characters/{id}/`` GET).
+
+        Guards, in order:
+
+        * no auth → None;
+        * missing contract scope (``has_market_contract_scope``) → None — the
+          corp contracts pull would 403 anyway, so skip the pointless GET;
+        * per-character cache on ``self._market_corp_id_cache`` (one successful
+          GET ever per character, not one per scan);
+        * resolution raising or returning falsy → None (public-only degrade),
+          never an exception. Failures are NOT cached so a transient error can
+          retry on the next manual scan.
+        """
+        if auth is None:
+            return None
+        checker = getattr(auth, "has_market_contract_scope", None)
+        try:
+            if not callable(checker) or not checker():
+                return None
+        except Exception:
+            return None
+        char_id = getattr(auth, "character_id", None)
+        cache = getattr(self, "_market_corp_id_cache", None)
+        if cache is None:
+            cache = self._market_corp_id_cache = {}
+        if char_id and char_id in cache:
+            return cache[char_id]
+        try:
+            corp_id = auth._get_character_corp_id()
+        except Exception:
+            log.exception("[market] corp id resolve failed")
+            return None
+        corp_id = int(corp_id) if corp_id else None
+        if char_id and corp_id:
+            cache[char_id] = corp_id
+        return corp_id
+
+    def _market_apply_scan(self, snap, contracts):
+        """Apply scan results on the Tk main thread: store the snapshot/contracts
+        + timestamp, clear the in-flight guard, and refresh the dependent views
+        (Doctrine detail + Fittings detail) so availability marks appear."""
+        self._market_scanning = False
+        if snap is not None:
+            self._market_snapshot = snap
+            self._market_from_cache = False
+            self._market_scan_ts = datetime.now()
+        if contracts is not None:
+            self._market_contracts = contracts
+        self._refresh_market_status_labels()
+        # Re-render the currently open detail panes so the new marks show.
+        try:
+            if getattr(self, "_doctrine_selected_id", None):
+                self._show_doctrine_detail(self._doctrine_selected_id)
+        except Exception:
+            log.exception("[market] doctrine refresh after scan failed")
+        try:
+            if getattr(self, "_fit_selected_id", None):
+                self._show_fit_detail(self._fit_selected_id)
+        except Exception:
+            log.exception("[market] fit refresh after scan failed")
+
+    def _market_fit_component_map(self, fit):
+        """type_id -> (on_market, market_qty, best_price) for one fit, from the
+        current snapshot. Pure data lookup over fit_bom + snapshot.get — no
+        scoring logic duplicated. Empty dict when no snapshot / on any error."""
+        snap = self._market_snapshot
+        if snap is None or fit is None:
+            return {}
+        try:
+            import market_scanner
+            bom = market_scanner.fit_bom(fit.parsed, self.type_catalog)
+        except Exception:
+            log.exception("[market] fit_bom failed for fit detail marks")
+            return {}
+        out: dict[int, tuple] = {}
+        for c in bom:
+            td = snap.get(c.type_id)
+            qty = td.sell_qty if td else 0
+            best = td.best_sell if td else None
+            out[c.type_id] = (qty > 0, qty, best)
+        return out
+
+    def _market_mark_label(self, parent, type_id, comp_map):
+        """Pack a leading ✓/✗ availability mark for ``type_id`` into ``parent``
+        (a horizontal line frame), or nothing when there is no snapshot entry.
+        Returns the mark label (or None). Used by the fit-detail line renderer."""
+        if not comp_map or type_id not in comp_map:
+            return None
+        on_market, qty, best = comp_map[type_id]
+        mark, colour, tip = self._market_component_mark(on_market, qty, best)
+        lbl = tk.Label(parent, text=mark, font=("Consolas", 9, "bold"),
+                       fg=colour, bg=BG_PANEL, width=2, anchor=tk.W)
+        lbl.pack(side=tk.LEFT)
+        self._tip_widget(lbl, tip)
+        return lbl
+
+    def _market_marked_line(self, parent, type_id, text, comp_map):
+        """Render one fit-detail component line with an optional leading market
+        mark. When ``comp_map`` is empty (no snapshot) this degrades to the exact
+        original plain-label look (indented text, no mark)."""
+        if not comp_map:
+            tk.Label(parent, text=f"  {text}", font=("Consolas", 9),
+                     fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=380).pack(anchor=tk.W, padx=14)
+            return
+        line = tk.Frame(parent, bg=BG_PANEL)
+        line.pack(anchor=tk.W, fill=tk.X, padx=14)
+        self._market_mark_label(line, type_id, comp_map)
+        tk.Label(line, text=text, font=("Consolas", 9), fg=FG_TEXT,
+                 bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=360).pack(side=tk.LEFT)
+
+    @staticmethod
+    def _market_price_short(price):
+        """Compact ISK price for tooltips: 12.3M / 4.5K / 900. None → '?'."""
+        if price is None:
+            return "?"
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return "?"
+        if p >= 1_000_000_000:
+            return f"{p / 1_000_000_000:.1f}B"
+        if p >= 1_000_000:
+            return f"{p / 1_000_000:.1f}M"
+        if p >= 1_000:
+            return f"{p / 1_000:.1f}K"
+        return f"{p:.0f}"
+
+    @classmethod
+    def _market_component_mark(cls, on_market, market_qty, best_price):
+        """Pure formatter for a fit-detail component mark. Returns
+        (mark, colour, tooltip): a green ✓ when the item is on the local market,
+        a dim ✗ when absent. Tooltip carries qty + best price."""
+        if on_market:
+            tip = (f"on market: {market_qty} available"
+                   f" · best {cls._market_price_short(best_price)} ISK")
+            return ("✓", FG_GREEN, tip)
+        return ("✗", FG_DIM, "not on the staging market")
+
+    @staticmethod
+    def _market_row_text(avail, seed_target):
+        """Pure formatter for a Doctrine-tab per-fit availability row. Returns
+        (text, colour).
+
+        ``avail`` is a market_scanner.DoctrineAvailability. The line is::
+
+            ✓/✗ breadth% · N fits (M mkt / C ctr)
+
+        where breadth% is the % of scored components on the market, N is the
+        TOTAL available (market-completable fits + matching contracts), M is the
+        market-completable fits, C is the contract-match count. Colour:
+        green when N >= seed_target, yellow when N > 0, red/dim when 0."""
+        breadth = getattr(avail, "breadth_pct", 0.0) or 0.0
+        market_fits = getattr(avail, "completable_fits", 0) or 0
+        ctr = getattr(avail, "contract_matches", 0) or 0
+        total = market_fits + ctr
+        glyph = "✓" if total > 0 else "✗"
+        text = (f"{glyph} {breadth:.0f}% · {total} fits "
+                f"({market_fits} mkt / {ctr} ctr)")
+        try:
+            target = int(seed_target)
+        except (TypeError, ValueError):
+            target = 0
+        if total <= 0:
+            colour = FG_RED
+        elif target > 0 and total >= target:
+            colour = FG_GREEN
+        else:
+            colour = FG_YELLOW
+        return (text, colour)
+
+    def _market_doctrine_avail_map(self, doctrine):
+        """fit_id -> DoctrineAvailability for a doctrine, from the current
+        snapshot + contracts. Empty dict when no snapshot. Errors are swallowed
+        (availability marks are best-effort decoration)."""
+        snap = self._market_snapshot
+        if snap is None or doctrine is None:
+            return {}
+        scanner = self._get_market_scanner()
+        if scanner is None:
+            return {}
+        try:
+            avails = scanner.doctrine_availability(
+                doctrine, self.fittings, snap, self._market_contracts)
+        except Exception:
+            log.exception("[market] doctrine_availability failed")
+            return {}
+        return {a.fit_id: a for a in avails}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
