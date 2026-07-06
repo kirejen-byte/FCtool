@@ -872,6 +872,16 @@ class FCToolGUI:
         # already seeded synchronously above). No-ops if the logs path is unset.
         self.root.after(2500, self._motd_scan_channels)
 
+        # First-run auto-setup: self-populate the scans a new user would
+        # otherwise click manually. Each is a silent no-op unless the logs path
+        # is valid AND the corresponding cache is still empty (the empty cache is
+        # the first-run signal — a scan that found results won't re-fire). Staged
+        # a beat after the other timed tasks so they don't pile onto the same
+        # tick. Both read the config logs path (not a Settings field) and guard
+        # UI-widget access, so they are safe even before Settings is opened.
+        self.root.after(3500, self._auto_scan_characters_if_needed)
+        self.root.after(4000, self._auto_scan_intel_channels_if_needed)
+
         # Pre-generate loss threshold TTS audio in the background
         tts_helper.pregenerate([
             "Ten percent of fleet lost",
@@ -1001,6 +1011,62 @@ class FCToolGUI:
             self._resolve_ansiblex_sync()
 
         threading.Thread(target=do_refresh, daemon=True).start()
+
+    def _auto_discover_ansiblex_after_login(self):
+        """Auto-discover Ansiblex gates after a character is added/re-authed via
+        SSO, so a fresh install self-populates gate routes without the user
+        clicking "Discover Ansiblex Gates".
+
+        Fires unconditionally on each SSO success (discovery dedupes cheaply),
+        but is debounced by an in-flight flag: adding 5 characters back-to-back
+        starts ONE scan, not five — subsequent calls while a scan is running are
+        dropped. Fully headless: it only mutates config + resolves connections
+        (no Settings-tab widget access), mirroring
+        :meth:`_refresh_ansiblex_from_esi`, so it is safe before Settings is
+        opened. A no-op when ESI is not authenticated.
+
+        The flag is cleared on the Tk thread via ``root.after`` so the
+        clear/read never races the set on the Tk thread."""
+        if not (self.esi_auth and self.esi_auth.is_authenticated):
+            return
+        if getattr(self, "_ansiblex_autodiscover_inflight", False):
+            # A discovery is already running — its results will reflect this
+            # newly-added character too (config is shared), so drop this call.
+            return
+        self._ansiblex_autodiscover_inflight = True
+
+        def do_discover():
+            try:
+                try:
+                    gates = self.esi_auth.discover_ansiblex_gates()
+                except Exception as e:
+                    print(f"[Ansiblex] SSO auto-discover failed: {e}")
+                    gates = None
+                if gates:
+                    # Same locked mutate-then-write as _refresh_ansiblex_from_esi
+                    # (inline write because the config lock is non-reentrant).
+                    with self._config_lock:
+                        self.config["ansiblex_connections"] = gates
+                        try:
+                            atomic_write_json(
+                                CONFIG_PATH, self.config, indent=4)
+                        except Exception:
+                            log.exception(
+                                "Failed to save config.json "
+                                "(ansiblex SSO auto-discover)")
+                    print(f"[Ansiblex] SSO auto-discover: {len(gates)} gate(s)")
+                    self._resolve_ansiblex_sync()
+            finally:
+                # Clear the in-flight flag back on the Tk thread so the next SSO
+                # add can start a fresh scan.
+                try:
+                    self.root.after(
+                        0, lambda: setattr(
+                            self, "_ansiblex_autodiscover_inflight", False))
+                except Exception:
+                    self._ansiblex_autodiscover_inflight = False
+
+        threading.Thread(target=do_discover, daemon=True).start()
 
     def _resolve_ansiblex_sync(self):
         """Resolve all ansiblex pairs from config into ID strings."""
@@ -5081,6 +5147,10 @@ class FCToolGUI:
                     # next program restart.
                     if hasattr(self, "_char_tab_content"):
                         self._populate_character_panels()
+                    # Re-auth may have (re)granted the ESI location/gate scopes,
+                    # so auto-discover Ansiblex gates (debounced) as on a fresh
+                    # add — cheap and dedupes.
+                    self._auto_discover_ansiblex_after_login()
                     return
 
             # New character — add to accounts list
@@ -5097,6 +5167,11 @@ class FCToolGUI:
             # Refresh only the new character's panel
             if hasattr(self, '_char_tab_content'):
                 self._refresh_single_character(new_auth)
+            # A new character can make ESI newly usable, so auto-discover
+            # Ansiblex gates so a first-time user's gate routes self-populate
+            # without clicking "Discover Ansiblex Gates". Debounced (in-flight
+            # flag) so adding several characters back-to-back runs one scan.
+            self._auto_discover_ansiblex_after_login()
         else:
             self._esi_status_label.config(
                 text=f"Login failed: {info}", fg=FG_RED
@@ -15031,20 +15106,75 @@ class FCToolGUI:
     def _scan_characters(self):
         """Scan log files to find all character names that have fleet channels.
         Results are cached in config.json so the dropdown stays populated
-        across app restarts without requiring another scan."""
+        across app restarts without requiring another scan.
+
+        The header I/O runs on a worker thread (``get_available_listeners()``
+        globs + reads chat-log headers); results are applied back on the Tk main
+        thread via :meth:`_apply_scanned_characters`. Manual button entry point —
+        reads the Settings-tab path field (which always exists here)."""
         logs_path = self._logs_path_var.get()
+        self._scan_characters_worker(logs_path)
+
+    def _scan_characters_worker(self, logs_path):
+        """Shared character-scan worker used by the manual button and the
+        startup/logs-path auto-trigger.
+
+        ``logs_path`` is resolved by the caller (Settings field for the button,
+        config for the auto-trigger) so this stays UI-agnostic. Silent no-op when
+        the path is missing/not a directory. Never touches Tk from the worker
+        thread — the apply step is marshalled back via ``root.after``."""
         if not logs_path or not os.path.isdir(logs_path):
             return
         channel = self.config.get("xup", {}).get("channel_name", "Fleet")
-        temp_monitor = ChatMonitor(logs_path, channel_filter=channel)
-        listeners = temp_monitor.get_available_listeners()
+
+        def worker():
+            try:
+                temp_monitor = ChatMonitor(logs_path, channel_filter=channel)
+                listeners = temp_monitor.get_available_listeners()
+            except Exception:
+                listeners = []
+            self.root.after(0, self._apply_scanned_characters, listeners)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_scanned_characters(self, listeners):
+        """Apply character-scan results on the Tk main thread: cache the found
+        names and repopulate the Track-character combobox.
+
+        Guards the combobox with ``getattr`` because the auto-trigger can fire
+        before the Settings tab is built (``self._char_combo`` absent). The cache
+        is always written when names were found so a later Settings open shows
+        them even though the combo wasn't updatable at scan time."""
+        combo = getattr(self, "_char_combo", None)
         if listeners:
-            self._char_combo["values"] = [""] + listeners
-            # Cache for next startup
+            if combo is not None:
+                combo["values"] = [""] + listeners
+            # Cache for next startup (and for a Settings tab opened later).
             self.config["cached_tracked_characters"] = listeners
             self._save_config()
         else:
-            self._char_combo["values"] = [""]
+            if combo is not None:
+                combo["values"] = [""]
+
+    def _auto_scan_characters_if_needed(self):
+        """First-run auto character-scan: if the logs path resolves to a real
+        directory AND no characters are cached yet, run the scan in the
+        background so a fresh install self-populates the Track-character combo.
+
+        Silent no-op when the logs path is unset/invalid or the cache is already
+        populated (a prior scan that found results won't re-fire; an empty result
+        simply retries next launch, which is cheap). The empty-cache condition IS
+        the first-run detection — no separate config flag needed."""
+        if self.config.get("cached_tracked_characters"):
+            return
+        try:
+            logs_path = resolve_eve_logs_path(
+                self.config.get("eve_logs_path", ""))
+        except Exception:
+            logs_path = self.config.get("eve_logs_path", "")
+        if not logs_path or not os.path.isdir(logs_path):
+            return
+        self._scan_characters_worker(logs_path)
 
     # ── Intel Channels settings (curation UI) ──────────────────────────────
 
@@ -15247,25 +15377,46 @@ class FCToolGUI:
         self._refresh_intel_channel_suggestions()
         self._intel_channels_status.config(text=f"Removed {name}", fg=FG_DIM)
 
+    def _set_intel_channels_status(self, text, fg):
+        """Set the Intel-Channels status label if it exists.
+
+        The scan can be driven from the startup auto-trigger before the Settings
+        tab (and thus ``self._intel_channels_status``) is built, so every status
+        write goes through this guard rather than touching the label directly."""
+        label = getattr(self, "_intel_channels_status", None)
+        if label is not None:
+            try:
+                label.config(text=text, fg=fg)
+            except Exception:
+                pass
+
     def _scan_intel_channels(self):
         """Discover channels from the logs dir (off the Tk main thread) to
         populate the picker's suggestion pool, the Suggested panel, and the
-        cache.
+        cache. Manual button entry point — reads the Settings-tab path field."""
+        self._scan_intel_channels_worker(self._logs_path_var.get())
+
+    def _scan_intel_channels_worker(self, logs_path):
+        """Shared intel-channel discovery worker used by the manual button and
+        the startup/logs-path auto-trigger.
 
         discover_channels() does directory + header I/O, so it runs on a worker
         thread; results are applied back on the Tk main thread via root.after.
+        ``logs_path`` is resolved by the caller (Settings field for the button,
+        config for the auto-trigger) so this stays UI-agnostic, and all status
+        writes go through :meth:`_set_intel_channels_status` so it is safe to
+        call before the Settings tab exists.
 
         The scan deliberately passes ``tracked_character=None`` (every character)
         rather than the currently-selected character: intel channels are often
         logged under an alt, so narrowing to the selected character would miss
         them. The Suggested panel then surfaces any intel-named channel found in
         the logs regardless of which alt opened it."""
-        logs_path = self._logs_path_var.get()
         if not logs_path or not os.path.isdir(logs_path):
-            self._intel_channels_status.config(
-                text="Set a valid EVE Chat Logs path first", fg=FG_ORANGE)
+            self._set_intel_channels_status(
+                "Set a valid EVE Chat Logs path first", FG_ORANGE)
             return
-        self._intel_channels_status.config(text="Scanning...", fg=FG_ACCENT)
+        self._set_intel_channels_status("Scanning...", FG_ACCENT)
 
         def worker():
             try:
@@ -15280,10 +15431,37 @@ class FCToolGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _auto_scan_intel_channels_if_needed(self):
+        """First-run auto intel-channel scan: if the logs path resolves to a
+        real directory AND nothing is cached in
+        ``config["intel_channels"]["cached_discovered"]`` yet, run the same
+        discovery worker the button uses so the Suggested panel self-populates.
+
+        Silent no-op when the logs path is unset/invalid or the cache is already
+        populated. The empty-cache condition IS the first-run detection — no
+        separate flag — and an empty result simply retries next launch."""
+        ic = self.config.get("intel_channels", {})
+        if ic.get("cached_discovered"):
+            return
+        try:
+            logs_path = resolve_eve_logs_path(
+                self.config.get("eve_logs_path", ""))
+        except Exception:
+            logs_path = self.config.get("eve_logs_path", "")
+        if not logs_path or not os.path.isdir(logs_path):
+            return
+        self._scan_intel_channels_worker(logs_path)
+
     def _apply_scanned_intel_channels(self, discovered_names):
         """Apply discovery results on the Tk main thread: cache ALL discovered
         names, refresh the (noise-filtered) autocomplete pool, and refresh the
-        Suggested panel from the fresh discovered set."""
+        Suggested panel from the fresh discovered set.
+
+        Safe to run headless (before the Settings tab is built): the autocomplete
+        entry and status label are guarded, and
+        :meth:`_refresh_intel_channel_suggestions` is a no-op when its panel is
+        absent — so an auto-trigger still lands the cache + in-memory pools for a
+        later Settings open."""
         # Cache the full discovery set (unfiltered — anything can be added).
         ic = self.config.setdefault("intel_channels", {})
         ic["cached_discovered"] = list(discovered_names)
@@ -15297,10 +15475,10 @@ class FCToolGUI:
         # Suggested panel uses the intel/intelligence predicate (not the
         # autocomplete denylist) against the fresh discovered set, minus tracked.
         self._refresh_intel_channel_suggestions(discovered=discovered_names)
-        self._intel_channels_status.config(
-            text=f"Found {len(self._intel_channel_suggestions)} channel(s), "
-                 f"{len(self._intel_suggested_channels)} suggested",
-            fg=FG_GREEN)
+        self._set_intel_channels_status(
+            f"Found {len(self._intel_channel_suggestions)} channel(s), "
+            f"{len(self._intel_suggested_channels)} suggested",
+            FG_GREEN)
 
     def _set_autostart(self, enabled: bool):
         """Add or remove FCTool from Windows startup via Start Menu shortcut."""
@@ -15421,6 +15599,15 @@ class FCToolGUI:
         self._setup_modules()
         self._start_monitoring()
         self._save_status.config(text="Saved!", fg=FG_GREEN)
+
+        # First-run auto-setup on a newly-set/browsed logs path: if the user just
+        # pointed FCTool at a valid Chatlogs folder and the caches are still
+        # empty, self-populate the character + intel-channel scans (same workers
+        # the manual buttons use). Both no-op when the cache is already populated
+        # or the path is invalid, so re-saving Settings with characters already
+        # cached never re-scans.
+        self._auto_scan_characters_if_needed()
+        self._auto_scan_intel_channels_if_needed()
 
     def _autosave_staging_system(self, *args):
         val = self._staging_entry.get().strip()
