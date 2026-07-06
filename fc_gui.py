@@ -6759,6 +6759,21 @@ class FCToolGUI:
         # the rows with per-fit availability. Manual only — no polling.
         ttk.Button(add_row, text="⟳ Market", style="Dark.TButton",
                    command=self._market_scan_now).pack(side=tk.LEFT, padx=(10, 2))
+        # Gaps shopping-list export — only meaningful once a snapshot exists (the
+        # same snapshot the availability marks gate on). Shown disabled with an
+        # explanatory tip until then so the affordance is discoverable.
+        gaps_state = tk.NORMAL if self._market_snapshot is not None else tk.DISABLED
+        gaps_btn = ttk.Button(
+            add_row, text="Gaps…", style="Dark.TButton", state=gaps_state,
+            command=lambda: self._open_market_gaps_dialog(doctrine))
+        gaps_btn.pack(side=tk.LEFT, padx=2)
+        self._tip_widget(
+            gaps_btn,
+            "Shopping list of items short of this doctrine's seed target — "
+            "copy for Janice or in-game Multibuy. Click ⟳ Market first to load "
+            "market stock." if self._market_snapshot is None else
+            "Shopping list of items short of this doctrine's seed target — "
+            "copy for Janice or in-game Multibuy.")
         self._market_doc_status_label = tk.Label(
             add_row, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W)
@@ -20039,6 +20054,197 @@ $bmp.Dispose()
             log.exception("[market] doctrine_availability failed")
             return {}
         return {a.fit_id: a for a in avails}
+
+    # ── Gap list (shopping list) dialog + exports ─────────────────────────────
+
+    @staticmethod
+    def _market_gap_rows(gap):
+        """Pure formatter: a market_scanner.GapList → aligned monospace table
+        lines ``Item | needed | available | short`` (a header + one row per short
+        item). ``gap.items`` only carries shortfalls (short > 0), so every row is
+        a real gap. Column widths adapt to the longest item name so the table
+        stays readable in the fixed-width dialog. Returns ``[]`` for no items (the
+        caller shows the 'no gaps' message instead of an empty grid)."""
+        items = list(getattr(gap, "items", []) or [])
+        if not items:
+            return []
+        name_w = max(4, max(len(it.name) for it in items))
+        need_w = max(len("needed"), max(len(f"{it.needed:,}") for it in items))
+        avail_w = max(len("available"), max(len(f"{it.available:,}") for it in items))
+        short_w = max(len("short"), max(len(f"{it.short:,}") for it in items))
+        rows = [
+            f"{'Item':<{name_w}}  {'needed':>{need_w}}  "
+            f"{'available':>{avail_w}}  {'short':>{short_w}}"
+        ]
+        for it in items:
+            rows.append(
+                f"{it.name:<{name_w}}  {it.needed:>{need_w},}  "
+                f"{it.available:>{avail_w},}  {it.short:>{short_w},}"
+            )
+        return rows
+
+    @staticmethod
+    def _market_gap_summary(gap):
+        """Pure formatter: the one-line summary above the gap table.
+
+        ``N item(s) short for <target basis>`` where the basis is the GapList's
+        own ``target_desc`` (e.g. "20x Onyx"). Empty items → a 'covered' line
+        naming the same basis so the dialog reads sensibly when nothing is
+        short."""
+        items = list(getattr(gap, "items", []) or [])
+        target = str(getattr(gap, "target_desc", "") or "the seed target")
+        n = len(items)
+        if n == 0:
+            return f"No gaps — the market covers {target} ✓"
+        noun = "item" if n == 1 else "items"
+        return f"{n} {noun} short for {target}"
+
+    def _market_build_gap_list(self, doctrine):
+        """Lazily build the GapList for ``doctrine`` off the current snapshot.
+
+        Returns ``(gap, error)``: ``gap`` is a market_scanner.GapList (or None on
+        failure), ``error`` a short user-facing string (or None on success). No
+        snapshot → a clear "scan first" error, never a crash. The per-doctrine
+        seed target (override wins, else the global default) flows in as
+        ``target_fits`` so the shopping list matches the availability bar's bar."""
+        snap = self._market_snapshot
+        if snap is None:
+            return None, "No market snapshot yet — click ⟳ Market first."
+        scanner = self._get_market_scanner()
+        if scanner is None:
+            return None, "Market scanner unavailable."
+        try:
+            gap = scanner.gap_list(
+                doctrine, self.fittings, snap,
+                target_fits=self._market_seed_target(doctrine))
+        except Exception:
+            log.exception("[market] gap_list failed")
+            return None, "Could not build the gap list (see log)."
+        return gap, None
+
+    def _market_copy_text(self, text):
+        """Put ``text`` on the system clipboard (app idiom). Swallows Tk errors
+        so a copy on a torn-down root never raises. Returns True on success."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            return True
+        except Exception:
+            log.exception("[market] clipboard copy failed")
+            return False
+
+    def _open_market_gaps_dialog(self, doctrine):
+        """Open the market-gaps shopping-list dialog for ``doctrine``.
+
+        Builds the GapList lazily (per-doctrine seed target), renders the short
+        items in a monospace table with a summary line, and offers two
+        clipboard exports: "Copy for Janice" (``gap.janice()``) and "Copy for
+        Multibuy" (``gap.multibuy()``). Everything-stocked → a 'no gaps' message
+        instead of an empty grid. Build/scan errors surface as dialog status
+        text, never a crash."""
+        gap, error = self._market_build_gap_list(doctrine)
+        dname = getattr(doctrine, "name", "") or "doctrine"
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Market gaps — {dname}")
+        dlg.configure(bg=BG_DARK)
+        dlg.transient(self.root)
+
+        body = tk.Frame(dlg, bg=BG_DARK, padx=18, pady=16,
+                        highlightbackground=BORDER_COLOR, highlightthickness=1)
+        body.pack(fill=tk.BOTH, expand=True)
+        tk.Label(body, text=f"Market gaps — {dname}",
+                 font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK,
+                 anchor=tk.W).pack(fill=tk.X, pady=(0, 8))
+
+        if error is not None:
+            tk.Label(body, text=error, font=("Consolas", 10), fg=FG_ORANGE,
+                     bg=BG_DARK, justify=tk.LEFT, wraplength=440,
+                     anchor=tk.W).pack(fill=tk.X)
+            btn_row = tk.Frame(body, bg=BG_DARK)
+            btn_row.pack(fill=tk.X, pady=(16, 0))
+            ttk.Button(btn_row, text="Close", style="Dark.TButton",
+                       command=dlg.destroy).pack(side=tk.RIGHT)
+            self._finalize_modal_dialog(dlg)
+            return
+
+        rows = self._market_gap_rows(gap)
+        tk.Label(body, text=self._market_gap_summary(gap),
+                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                 justify=tk.LEFT, wraplength=520, anchor=tk.W).pack(fill=tk.X)
+
+        if not rows:
+            # Everything stocked — no table, just the covered message + Close.
+            btn_row = tk.Frame(body, bg=BG_DARK)
+            btn_row.pack(fill=tk.X, pady=(16, 0))
+            ttk.Button(btn_row, text="Close", style="Dark.TButton",
+                       command=dlg.destroy).pack(side=tk.RIGHT)
+            self._finalize_modal_dialog(dlg)
+            return
+
+        # Monospace gap table (header + rows) in a bordered, scrollable listbox.
+        list_wrap = tk.Frame(body, bg=BG_DARK)
+        list_wrap.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        lb = tk.Listbox(
+            list_wrap, height=min(14, max(3, len(rows))),
+            width=max(28, max(len(r) for r in rows)),
+            bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9),
+            selectbackground=BG_PANEL, selectforeground=FG_TEXT,
+            highlightthickness=1, highlightbackground=BORDER_COLOR,
+            activestyle="none", borderwidth=0)
+        for r in rows:
+            lb.insert(tk.END, r)
+        if len(rows) > 14:
+            sb = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=lb.yview)
+            lb.configure(yscrollcommand=sb.set)
+            sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        status = tk.Label(body, text="", font=("Consolas", 9), fg=FG_GREEN,
+                          bg=BG_DARK, anchor=tk.W)
+        status.pack(fill=tk.X, pady=(8, 0))
+
+        def _copy(kind):
+            text = gap.janice() if kind == "janice" else gap.multibuy()
+            ok = self._market_copy_text(text)
+            label = "Janice" if kind == "janice" else "Multibuy"
+            try:
+                if ok:
+                    status.config(text=f"Copied {label} list ✓", fg=FG_GREEN)
+                else:
+                    status.config(text="Copy failed — clipboard unavailable.",
+                                  fg=FG_RED)
+            except tk.TclError:
+                pass
+
+        btn_row = tk.Frame(body, bg=BG_DARK)
+        btn_row.pack(fill=tk.X, pady=(16, 0))
+        # Packed right-to-left: Close rightmost, then the two copy buttons.
+        ttk.Button(btn_row, text="Close", style="Dark.TButton",
+                   command=dlg.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Copy for Multibuy", style="Dark.TButton",
+                   command=lambda: _copy("multibuy")).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text="Copy for Janice", style="Green.TButton",
+                   command=lambda: _copy("janice")).pack(side=tk.RIGHT, padx=(6, 0))
+
+        self._finalize_modal_dialog(dlg)
+
+    def _finalize_modal_dialog(self, dlg):
+        """Center a Toplevel over the app and give it a close/escape binding.
+
+        Shared tail for the app's custom (non-``_themed_modal``) dialogs. Guarded
+        against a headless root (winfo_* raising) so tests that new up a dialog
+        don't blow up on geometry."""
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        try:
+            dlg.update_idletasks()
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            w, h = dlg.winfo_width(), dlg.winfo_height()
+            dlg.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 3)}")
+        except Exception:
+            pass
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
