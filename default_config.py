@@ -54,4 +54,18 @@ DEFAULT_CONFIG = {
             "Rorqual": 5.0,
         },
     },
+    # Market Scanner (design 2026-07-06-market-scanner-design.md §6.1). All ids
+    # default to 0 = "not set" → the scanner returns an empty snapshot with a
+    # "configure staging market" status and touches no network. Phase B adds the
+    # structure-picker UI that populates these; nothing reads this block yet.
+    "market": {
+        "staging_structure_id": 0,  # citadel market (0 = not set); authed pull, primary
+        "staging_station_id": 0,    # NPC station id (0 = not set); filters the region pull
+        "staging_region_id": 0,     # region for orders + contracts pull
+        "staging_system_id": 0,     # resolved staging system (0 = unknown); contract filter
+        "scan_contracts": True,     # allow the (expensive) contract scan
+        "include_alliance_contracts": True,  # also pull corp/alliance contracts (needs scope)
+        "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)
+        "seed_target": 20,          # FIXED target quantity of each fit for gap math
+    },
 }

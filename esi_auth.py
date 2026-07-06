@@ -64,7 +64,25 @@ SCOPES = [
     "esi-assets.read_assets.v1",
     "esi-fittings.read_fittings.v1",
     "esi-fittings.write_fittings.v1",
+    # Market Scanner (design 2026-07-06-market-scanner-design.md §6.3). Adding
+    # these forces a RE-AUTH: SSO grants scopes only at login, so every existing
+    # character token was minted without them and must be re-consented per
+    # character before the citadel-market / corp-contract pulls work. The
+    # existing ⚠ missing-scope indicator communicates this (has_scope gating);
+    # public region orders + public contracts need NO scope, so the degraded
+    # mode works without re-auth.
+    "esi-markets.structure_markets.v1",  # citadel market pull
+    "esi-contracts.read_character_contracts.v1",  # personal/alliance contract visibility
+    "esi-contracts.read_corporation_contracts.v1",  # corp/alliance contracts
 ]
+
+# Market Scanner scope groups, for has_scope gating helpers (design §6.3). Kept
+# as module constants so the GUI and any worker gate features on the same names.
+MARKET_STRUCTURE_SCOPE = "esi-markets.structure_markets.v1"
+MARKET_CONTRACT_SCOPES = (
+    "esi-contracts.read_character_contracts.v1",
+    "esi-contracts.read_corporation_contracts.v1",
+)
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -553,6 +571,21 @@ class ESIAuth:
         """True iff this character's token was granted `scope`. Defensive:
         returns False on any decode error or missing token."""
         return scope in self.granted_scopes()
+
+    def has_market_structure_scope(self) -> bool:
+        """True iff this token can pull a citadel/structure market (design §6.3).
+
+        Gates the authed structure-market path. When False the Market Scanner
+        falls back to public region orders / public contracts (degraded mode) and
+        the UI shows the existing ⚠ re-auth indicator for this character."""
+        return self.has_scope(MARKET_STRUCTURE_SCOPE)
+
+    def has_market_contract_scope(self) -> bool:
+        """True iff this token can read corp/alliance contracts (design §6.3).
+
+        Gates the corp-contract path only; public region contracts need no scope,
+        so the contract scan still runs (public-only) when this is False."""
+        return any(self.has_scope(s) for s in MARKET_CONTRACT_SCOPES)
 
     def logout(self):
         """Clear stored tokens."""
