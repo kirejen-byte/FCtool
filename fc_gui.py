@@ -923,6 +923,10 @@ class FCToolGUI:
         # UI-widget access, so they are safe even before Settings is opened.
         self.root.after(3500, self._auto_scan_characters_if_needed)
         self.root.after(4000, self._auto_scan_intel_channels_if_needed)
+        # Market re-scan rides the same stagger, a further half-second later.
+        # Silent no-op unless a market is configured, enabled in Settings,
+        # and not already fresh — see _auto_market_rescan_if_needed's gates.
+        self.root.after(4500, self._auto_market_rescan_if_needed)
 
         # Pre-generate loss threshold TTS audio in the background
         tts_helper.pregenerate([
@@ -15955,6 +15959,8 @@ class FCToolGUI:
             value=bool(mkt.get("scan_contracts", True)))
         self._market_alliance_contracts_var = tk.BooleanVar(
             value=bool(mkt.get("include_alliance_contracts", True)))
+        self._market_scan_on_startup_var = tk.BooleanVar(
+            value=bool(mkt.get("scan_on_startup", True)))
 
         def _hint(text):
             tk.Label(parent, text=text, font=("Consolas", 8), fg=FG_DIM,
@@ -16079,6 +16085,18 @@ class FCToolGUI:
                        font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
                        selectcolor=BG_ENTRY, activebackground=BG_DARK,
                        activeforeground=FG_TEXT).pack(side=tk.LEFT, padx=(16, 0))
+        market_startup_cb = tk.Checkbutton(
+            cb_frame, text="Re-scan market on startup",
+            variable=self._market_scan_on_startup_var,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        market_startup_cb.pack(side=tk.LEFT, padx=(16, 0))
+        self._tip_widget(
+            market_startup_cb,
+            "Re-runs the market scan in the background at launch. Skipped "
+            "if the last scan is under 5 minutes old or the market isn't "
+            "configured.")
 
         scan_row = tk.Frame(parent, bg=BG_DARK)
         scan_row.pack(fill=tk.X, padx=20, pady=(4, 2))
@@ -16988,6 +17006,49 @@ class FCToolGUI:
             f"{len(self._intel_suggested_channels)} suggested",
             FG_GREEN)
 
+    def _auto_market_rescan_if_needed(self):
+        """Startup market re-scan: silently re-run the market scan in the
+        background so depth/breadth/contract data is fresh again without a
+        manual click.
+
+        Silent no-op unless ALL of:
+          1. ``config["market"]["scan_on_startup"]`` is truthy (default True,
+             the Settings checkbox) — an explicit opt-out short-circuits
+             everything else.
+          2. ``_market_source()`` resolves — an unconfigured market (fresh
+             install, or one that never picked a staging system) no-ops
+             rather than scanning nothing.
+          3. No scan is already in flight (``self._market_scanning``, the
+             same guard the manual scan button and post-re-auth auto-heal
+             share).
+          4. The cached snapshot is stale: ``self._market_scan_ts`` —
+             stamped from the on-disk cache by ``_load_market_cache`` during
+             __init__, well before this trigger fires — is either ``None``
+             (no cache, or one that failed to parse: always scan) or older
+             than ``market_scanner.CACHE_TTL_ORDERS`` seconds.
+
+        Delegates to the existing bare ``self._market_scan_now()`` entry
+        point (doctrine-targeted when a doctrine is selected, else the
+        full-scan fallback), so progress display, degraded/re-auth banners,
+        and completion refresh all ride the proven, widget-absent-safe
+        plumbing — no new scan machinery lives here. ``getattr``-guarded so a
+        bare host built before __init__'s market block has run (or a
+        headless test host) never raises."""
+        mkt_cfg = self.config.get("market", {}) or {}
+        if not bool(mkt_cfg.get("scan_on_startup", True)):
+            return
+        if self._market_source() is None:
+            return
+        if getattr(self, "_market_scanning", False):
+            return
+        scan_ts = getattr(self, "_market_scan_ts", None)
+        if scan_ts is not None:
+            import market_scanner
+            age = (datetime.now() - scan_ts).total_seconds()
+            if age < market_scanner.CACHE_TTL_ORDERS:
+                return
+        self._market_scan_now()
+
     def _set_autostart(self, enabled: bool):
         """Add or remove FCTool from Windows startup via Start Menu shortcut."""
         try:
@@ -17163,6 +17224,9 @@ class FCToolGUI:
         ally = getattr(self, "_market_alliance_contracts_var", None)
         if ally is not None:
             mkt["include_alliance_contracts"] = bool(ally.get())
+        startup = getattr(self, "_market_scan_on_startup_var", None)
+        if startup is not None:
+            mkt["scan_on_startup"] = bool(startup.get())
         # Preserve contracts_scope; the section doesn't expose it as a control,
         # but keep the key present (default "system") so readers are safe.
         mkt.setdefault("contracts_scope", "system")
