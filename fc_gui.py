@@ -6628,6 +6628,10 @@ class FCToolGUI:
         except tk.TclError:
             return
         if "MOTD" in text:
+            # Re-sync the staging field to the current global staging default
+            # (unless the user/template owns it) so a staging system set in
+            # Settings after this tab was built shows up here.
+            self._motd_sync_staging_default()
             self._motd_refresh_doctrines()
             self._motd_refresh_fc_choices()
             # Rebuild the include-tag checkboxes and preview from the selected
@@ -6960,11 +6964,6 @@ class FCToolGUI:
         self._market_doc_status_label.pack(side=tk.LEFT, padx=(4, 0))
         self._refresh_market_status_labels()
 
-        # Per-doctrine seed-target editor (override for the market availability
-        # bar; blank = the global Settings default). Sits with the doctrine-level
-        # controls, on its own line so it never crowds the button row.
-        self._build_doctrine_seed_target_row(parent, doctrine)
-
         # Structure market blocked → prominent orange re-auth banner ABOVE the
         # member rows (with an inline Re-authenticate button); the availability
         # rows are suppressed so an empty forbidden book can't read as bare.
@@ -7104,72 +7103,17 @@ class FCToolGUI:
                    command=lambda: self._remove_doctrine_member(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
 
-    def _build_doctrine_seed_target_row(self, parent, doctrine):
-        """Compact per-doctrine seed-target editor.
-
-        A small int Entry showing the doctrine's override (blank when unset), a
-        dim "default N" hint making the global fallback visible, and a tooltip
-        explaining override-vs-Settings-default. Commits on <Return>/<FocusOut>:
-        blank/invalid/<=0 → None (revert to default), a positive int overrides.
-        Persists via ``set_doctrine_seed_target`` + save and re-renders the
-        detail so the availability colours re-evaluate against the new bar.
-        """
-        row = tk.Frame(parent, bg=BG_PANEL)
-        row.pack(fill=tk.X, padx=12, pady=(4, 0))
-        lbl = tk.Label(row, text="Seed target:", font=("Consolas", 9),
-                       fg=FG_TEXT, bg=BG_PANEL)
-        lbl.pack(side=tk.LEFT)
-        cur = getattr(doctrine, "seed_target", None)
-        var = tk.StringVar(value=("" if cur is None else str(cur)))
-        self._doctrine_seed_target_var = var
-        entry = tk.Entry(row, textvariable=var, width=6, font=("Consolas", 9),
-                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
-                         borderwidth=1, relief=tk.RIDGE)
-        entry.pack(side=tk.LEFT, padx=(4, 6))
-        hint = tk.Label(row, text=f"(default {self._global_seed_target()})",
-                        font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
-        hint.pack(side=tk.LEFT)
-        tip = ("How many of each fit counts as 'fully seeded' for THIS doctrine "
-               "(colours the availability line). Blank = use the global default "
-               "from Settings ▸ Market. Set a number to override — e.g. fewer "
-               "battleships than throwaway frigates.")
-        self._tip_widget(lbl, tip)
-        self._tip_widget(entry, tip)
-
-        def _commit(_evt=None, _did=doctrine.id):
-            self._commit_doctrine_seed_target(_did, var.get())
-
-        entry.bind("<Return>", _commit)
-        entry.bind("<FocusOut>", _commit)
-
-    def _commit_doctrine_seed_target(self, doctrine_id, text):
-        """Parse + persist a per-doctrine seed-target edit, then refresh.
-
-        Routes the raw entry text through ``_parse_seed_target_input`` (blank/
-        invalid/<=0 → None = revert to default), persists via the store setter +
-        save, and re-renders the doctrine detail so the availability colours
-        re-evaluate immediately. No-op'd early if the value is unchanged so a
-        bare focus-out doesn't churn the pane (and lose focus mid-edit)."""
-        doctrine = self.fittings.get_doctrine(doctrine_id)
-        if doctrine is None:
-            return
-        new_val = self._parse_seed_target_input(text)
-        if new_val == getattr(doctrine, "seed_target", None):
-            return  # unchanged — don't re-render (avoids focus thrash)
-        self.fittings.set_doctrine_seed_target(doctrine_id, new_val)
-        self.fittings.save()
-        self._show_doctrine_detail(doctrine_id)
-
     def _build_member_seed_target_row(self, parent, doctrine, mem):
         """Compact per-fit seed-target editor for one doctrine member row.
 
-        Mirrors ``_build_doctrine_seed_target_row`` one level down: a small int
-        Entry showing the fit's own override (blank when inheriting), a dim
-        "(inherit N)" hint making the RESOLVED fallback visible (the doctrine
-        override, else the global default), and a tooltip. Commits on <Return>/
-        <FocusOut>: blank/invalid/<=0 → None (inherit), a positive int overrides
-        just this fit. The StringVar + commit closure capture the fit id by value
-        (default args) so they survive the detail re-render each commit triggers.
+        A small int Entry showing the fit's own value (blank when inheriting),
+        a dim state hint, and a tooltip. Commits on <Return>/<FocusOut>:
+        blank/invalid/negative → None (inherit), an explicit ``0`` = "don't seed
+        this fit", a positive int = seed that many. The hint reflects the field:
+        blank shows the RESOLVED fallback "(inherit N)"; an explicit 0 shows
+        "(not seeded)"; an explicit positive value speaks for itself (no hint).
+        The StringVar + commit closure capture the fit id by value (default args)
+        so they survive the detail re-render each commit triggers.
         """
         row = tk.Frame(parent, bg=BG_PANEL)
         row.pack(anchor=tk.W, pady=(1, 0))
@@ -7182,16 +7126,23 @@ class FCToolGUI:
                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                          borderwidth=1, relief=tk.RIDGE)
         entry.pack(side=tk.LEFT, padx=(3, 4))
-        # The value this fit falls back to when the field is blank = the doctrine/
-        # global resolution (member excluded).
-        inherited = self._market_seed_target(doctrine)
-        hint = tk.Label(row, text=f"(inherit {inherited})", font=("Consolas", 8),
+        # State hint: blank → the resolved fallback "(inherit N)"; explicit 0 →
+        # "(not seeded)"; an explicit positive value needs no hint (and must NOT
+        # show "(inherit N)", which would contradict the shown number).
+        if cur is None:
+            hint_text = f"(inherit {self._market_seed_target(doctrine)})"
+        elif cur == 0:
+            hint_text = "(not seeded)"
+        else:
+            hint_text = ""
+        hint = tk.Label(row, text=hint_text, font=("Consolas", 8),
                         fg=FG_DIM, bg=BG_PANEL)
         hint.pack(side=tk.LEFT)
         tip = ("How many of THIS fit counts as 'fully seeded' (colours the "
                "availability line + drives the Gaps shopping list). Blank = "
                "inherit the doctrine's seed target. Set a number to override just "
-               "this fit — e.g. 50 stabbers, 20 scythes, 10 bifrosts.")
+               "this fit — e.g. 50 stabbers, 20 scythes, 10 bifrosts. Set 0 to "
+               "skip seeding this fit entirely (kept out of the Gaps list).")
         self._tip_widget(lbl, tip)
         self._tip_widget(entry, tip)
 
@@ -7205,11 +7156,12 @@ class FCToolGUI:
         """Parse + persist a per-fit seed-target edit, then refresh.
 
         Routes the raw entry text through ``_parse_seed_target_input`` (blank/
-        invalid/<=0 → None = inherit the doctrine target), persists via the store
-        setter + save, and re-renders the doctrine detail so the availability
-        colours re-evaluate immediately against the new per-fit bar. No-op'd early
-        when the value is unchanged so a bare focus-out doesn't churn the pane
-        (and steal focus mid-edit)."""
+        invalid/negative → None = inherit the doctrine target; an explicit ``0``
+        = "don't seed this fit"; a positive int overrides), persists via the
+        store setter + save, and re-renders the doctrine detail so the
+        availability colours re-evaluate immediately against the new per-fit bar.
+        No-op'd early when the value is unchanged so a bare focus-out doesn't
+        churn the pane (and steal focus mid-edit)."""
         doctrine = self.fittings.get_doctrine(doctrine_id)
         if doctrine is None:
             return
@@ -8185,6 +8137,11 @@ class FCToolGUI:
         self._motd_staging_enabled = tk.BooleanVar(
             value=bool(_default_staging.strip()))
         self._motd_staging_var = tk.StringVar(value=_default_staging)
+        # Remember the last value we AUTO-applied from the global staging default
+        # so a later refresh can tell "field still holds the default" (safe to
+        # re-sync) from "user typed / a template set it" (never clobber). See
+        # _motd_sync_staging_default. Kept stripped to match its comparison.
+        self._motd_staging_autofilled_value = _default_staging.strip()
         st_chk = tk.Checkbutton(
             inputs, text="Include staging system",
             variable=self._motd_staging_enabled,
@@ -8741,7 +8698,57 @@ class FCToolGUI:
                               .get("staging_system", "") or "").strip()
                 if designated:
                     self._motd_staging_var.set(designated)
+                    # This auto-fill IS the global default → track it so a later
+                    # global change still re-syncs (and so it isn't mistaken for
+                    # a manual entry).
+                    self._motd_staging_autofilled_value = designated
         self._schedule_motd_preview()
+
+    def _motd_sync_staging_default(self):
+        """Re-sync the MOTD staging field to the global default (config
+        ``zkillboard.staging_system``) when the field still holds the last
+        auto-applied default — i.e. the user hasn't typed their own value and no
+        template/import has set one. Called on MOTD-tab show so a staging system
+        configured (or changed) in Settings AFTER this tab was built is reflected
+        without an app restart.
+
+        Priority is preserved: a manual entry or a template-defined staging (any
+        value other than the remembered auto value) is never clobbered — only a
+        still-default field is refreshed, and only when the global value actually
+        changed (a no-op otherwise). The include-checkbox is nudged to match only
+        when it, too, is still in its auto state (so a deliberate user toggle is
+        respected)."""
+        var = getattr(self, "_motd_staging_var", None)
+        if var is None:
+            return
+        new_default = (self.config.get("zkillboard", {})
+                       .get("staging_system", "") or "").strip()
+        last_auto = getattr(self, "_motd_staging_autofilled_value", "")
+        try:
+            cur = (var.get() or "").strip()
+        except tk.TclError:
+            return
+        if cur != last_auto:
+            return  # user- or template-owned — never clobber
+        if new_default == cur:
+            return  # already current — no-op
+        enabled = getattr(self, "_motd_staging_enabled", None)
+        checkbox_auto = False
+        if enabled is not None:
+            try:
+                checkbox_auto = (bool(enabled.get()) == bool(last_auto))
+            except tk.TclError:
+                checkbox_auto = False
+        self._motd_staging_autofilled_value = new_default
+        try:
+            var.set(new_default)
+        except tk.TclError:
+            return
+        if enabled is not None and checkbox_auto:
+            try:
+                enabled.set(bool(new_default))
+            except tk.TclError:
+                pass
 
     def _motd_rebuild_tag_checkboxes(self):
         """Rebuild the include-tag checkboxes from the selected doctrine's tags.
@@ -10625,7 +10632,7 @@ class FCToolGUI:
         action_specs = [
             ("Rename", "Dark.TButton", lambda: self._rename_fit(fit.id)),
             ("Edit notes", "Dark.TButton", lambda: self._edit_fit_notes(fit.id)),
-            ("Replace fit text", "Dark.TButton",
+            ("Edit fitting", "Dark.TButton",
              lambda: self._replace_fit_text(fit.id)),
             ("Copy EFT", "Dark.TButton", lambda: self._copy_fit_eft(fit.id)),
             ("Copy DNA", "Dark.TButton", lambda: self._copy_fit_dna(fit.id)),
@@ -10791,7 +10798,7 @@ class FCToolGUI:
                     + "\n".join(warnings[:12]))
 
         self._open_paste_dialog(
-            title="Replace Fit Text",
+            title="Edit Fitting",
             instruction="Paste the new EFT or DNA for this fit:",
             on_success=_on_parsed)
 
@@ -16035,15 +16042,27 @@ class FCToolGUI:
                  "(default 20)", font=("Consolas", 8), fg=FG_DIM,
                  bg=BG_DARK, anchor=tk.W).pack(side=tk.LEFT, padx=6)
 
-        # ── Advanced (auto-filled) id entries ─────────────────────────────────
-        tk.Label(parent, text="Advanced ids — auto-filled by the pickers above; "
-                 "paste to override:", font=("Consolas", 8, "italic"),
-                 fg=FG_DIM, bg=BG_DARK, anchor=tk.W, justify=tk.LEFT,
-                 wraplength=360).pack(anchor=tk.W, padx=22, pady=(8, 1))
+        # ── Advanced (auto-filled) id entries — collapsed by default ──────────
+        # The raw structure/station/region/system ids are clutter for the common
+        # name-first flow, so they live behind a disclosure toggle that starts
+        # COLLAPSED. Crucially, the StringVars are ALWAYS built (above, in
+        # _market_setting_vars) whether or not the rows are shown — the pickers
+        # still auto-fill them and _collect_market_settings/Save still round-trip
+        # them. Only the Entry widgets are hidden. Expanding reveals them as the
+        # manual-paste override escape hatch.
+        self._market_advanced_open = tk.BooleanVar(value=False)
+        adv_header = tk.Label(
+            parent, text="▶ Advanced ids (manual paste)",
+            font=("Consolas", 8, "italic"), fg=FG_DIM, bg=BG_DARK,
+            anchor=tk.W, cursor="hand2")
+        adv_header.pack(anchor=tk.W, padx=22, pady=(8, 1))
+        # Built but deliberately NOT packed → hidden until the header is clicked.
+        adv_frame = tk.Frame(parent, bg=BG_DARK)
+        self._market_advanced_frame = adv_frame
 
         def _int_row(label, key):
-            frame = tk.Frame(parent, bg=BG_DARK)
-            frame.pack(fill=tk.X, padx=22, pady=1)
+            frame = tk.Frame(adv_frame, bg=BG_DARK)
+            frame.pack(fill=tk.X, pady=1)
             tk.Label(frame, text=f"{label}:", font=("Consolas", 9),
                      fg=FG_DIM, bg=BG_DARK, width=15, anchor=tk.W).pack(
                          side=tk.LEFT)
@@ -16058,6 +16077,20 @@ class FCToolGUI:
         _int_row("Station ID", "staging_station_id")
         _int_row("Region ID", "staging_region_id")
         _int_row("System ID", "staging_system_id")
+
+        def _toggle_advanced(_evt=None):
+            if self._market_advanced_open.get():
+                adv_frame.pack_forget()
+                adv_header.config(text="▶ Advanced ids (manual paste)")
+                self._market_advanced_open.set(False)
+            else:
+                # Slot the rows in directly under the header regardless of the
+                # widgets packed after it (pickers, checkboxes, scan row).
+                adv_frame.pack(fill=tk.X, padx=22, pady=(0, 2), after=adv_header)
+                adv_header.config(text="▼ Advanced ids (manual paste)")
+                self._market_advanced_open.set(True)
+
+        adv_header.bind("<Button-1>", _toggle_advanced)
 
         # Prime the station picker from the currently-configured system (if any)
         # so a saved staging system shows its stations without a re-type.
@@ -16436,7 +16469,12 @@ class FCToolGUI:
 
     def _market_on_station_pick(self):
         """Station combobox selection → write staging_station_id (0 for the
-        '(none)'/placeholder rows)."""
+        '(none)'/placeholder rows).
+
+        Citadel-XOR-station: choosing a REAL NPC station clears any staging
+        structure (id + name + combobox display) so ``MarketSource.from_config``
+        never sees both set. Picking the '(none)' row only clears the station —
+        it leaves any structure alone."""
         var = getattr(self, "_market_station_var", None)
         if var is None:
             return
@@ -16452,9 +16490,17 @@ class FCToolGUI:
         self._market_set_id_var("staging_station_id", chosen)
         # Instant-persist the id + display name (name cleared for the (none)/
         # placeholder rows where chosen == 0) so the station survives a restart.
-        self._market_persist_keys(
-            staging_station_id=int(chosen),
-            staging_station_name=(label if chosen else ""))
+        _persist = {
+            "staging_station_id": int(chosen),
+            "staging_station_name": (label if chosen else ""),
+        }
+        if chosen:
+            # XOR: a real station replaces any structure — clear it + persist the
+            # cleared keys in the same save.
+            self._market_clear_structure_selection()
+            _persist["staging_structure_id"] = 0
+            _persist["staging_structure_name"] = ""
+        self._market_persist_keys(**_persist)
 
     def _market_find_structures(self):
         """'Find structures…' → authed structure search for the chosen staging
@@ -16555,7 +16601,12 @@ class FCToolGUI:
     def _market_on_structure_pick(self):
         """Structure combobox selection → write staging_structure_id (0 for the
         '(none)' placeholder). Structure takes precedence over station in
-        MarketSource, so this is the primary staging source when set."""
+        MarketSource, so this is the primary staging source when set.
+
+        Citadel-XOR-station: choosing a structure clears any NPC station (id +
+        name + combobox display) so ``MarketSource.from_config`` never sees both
+        set. Picking the '(none)' row only clears the structure — it leaves any
+        station alone."""
         var = getattr(self, "_market_structure_var", None)
         if var is None:
             return
@@ -16576,8 +16627,51 @@ class FCToolGUI:
         if chosen:
             _tail = f" ({chosen})"
             _name = label[:-len(_tail)] if label.endswith(_tail) else label
-        self._market_persist_keys(
-            staging_structure_id=int(chosen), staging_structure_name=_name)
+        _persist = {
+            "staging_structure_id": int(chosen),
+            "staging_structure_name": _name,
+        }
+        if chosen:
+            # XOR: a structure replaces any NPC station — clear it + persist the
+            # cleared keys in the same save.
+            self._market_clear_station_selection()
+            _persist["staging_station_id"] = 0
+            _persist["staging_station_name"] = ""
+        self._market_persist_keys(**_persist)
+
+    def _market_clear_structure_selection(self):
+        """Reset the structure picker to its '(none)' placeholder and zero its id
+        var — the XOR partner of a station pick. Persistence is left to the
+        caller (it batches the cleared keys into the same save). Guarded for the
+        headless test host and a Tk teardown."""
+        self._market_set_id_var("staging_structure_id", 0)
+        var = getattr(self, "_market_structure_var", None)
+        if var is not None:
+            try:
+                var.set(self._MARKET_STRUCT_NONE)
+            except tk.TclError:
+                pass
+
+    def _market_clear_station_selection(self):
+        """Reset the station picker to its placeholder and zero its id var — the
+        XOR partner of a structure pick. Keeps the '(no NPC stations)' text when
+        that's what's shown (a station-less system), else resets to '(none)'.
+        Persistence is left to the caller. Guarded for headless."""
+        self._market_set_id_var("staging_station_id", 0)
+        var = getattr(self, "_market_station_var", None)
+        if var is None:
+            return
+        try:
+            cur = var.get()
+        except tk.TclError:
+            return
+        target = (self._MARKET_STATION_EMPTY
+                  if cur == self._MARKET_STATION_EMPTY
+                  else self._MARKET_STATION_NONE)
+        try:
+            var.set(target)
+        except tk.TclError:
+            pass
 
     def _browse_logs(self):
         path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
@@ -21640,12 +21734,17 @@ $bmp.Dispose()
 
     @staticmethod
     def _parse_seed_target_input(text):
-        """Parse a per-doctrine seed-target entry. Returns an int > 0, or None.
+        """Parse a per-fit / per-doctrine seed-target entry. Returns an int >= 0,
+        or None.
 
-        None means "revert to the global default" and is what a blank field, a
-        non-integer, or a zero/negative value all resolve to (so a fat-fingered
-        or cleared entry safely falls back to the Settings default rather than
-        wedging a bad target). A leading/trailing-whitespace integer is accepted.
+        * blank / empty            → None  ("inherit the default")
+        * an explicit ``0``        → ``0`` ("don't seed this fit at all")
+        * a positive int           → that int
+        * negative or non-numeric  → None  (invalid ⇒ inherit)
+
+        So 0 is the ONLY non-positive value that is NOT None — it is a real,
+        explicit "don't seed" target rather than a fall-back-to-default. A
+        leading/trailing-whitespace integer is accepted.
         """
         s = (text or "").strip()
         if not s:
@@ -21654,7 +21753,7 @@ $bmp.Dispose()
             val = int(s)
         except (TypeError, ValueError):
             return None
-        return val if val > 0 else None
+        return val if val >= 0 else None
 
     def _global_seed_target(self):
         """The global fallback seed target from config (floored at 1).
@@ -21674,33 +21773,40 @@ $bmp.Dispose()
 
         Three-level resolution chain, most-specific wins:
 
-        1. the per-fit override (``member.seed_target``) when a positive int,
-        2. else the per-doctrine override (``Doctrine.seed_target``) when a
-           positive int,
+        1. the per-fit value (``member.seed_target``) when explicitly set — a
+           positive int OR an explicit ``0`` ("don't seed this fit at all"),
+        2. else the per-doctrine value (``Doctrine.seed_target``) when explicitly
+           set (positive or an explicit 0 — vestigial UI-wise, but ``.fctdoc``
+           round-trips it),
         3. else the global ``config["market"]["seed_target"]`` default.
 
-        Always >= 1 so availability colour thresholds have a sane bar. A None/0/
-        negative value at any level falls through to the next. ``member`` is
-        optional so the existing doctrine-level call sites are unaffected
-        (``_market_seed_target(doctrine)`` behaves exactly as before).
+        An explicit **0 is a real target** and is returned as 0 — it is NEVER
+        floored upward. Only the GLOBAL default source is floored to a sane
+        positive bar (>= 1 / 20) so a missing/garbage global still yields 20. A
+        None value (blank/inherit) or a negative/garbage value at levels 1-2
+        falls through to the next. ``member`` is optional so the doctrine-level
+        call sites are unaffected (``_market_seed_target(doctrine)``).
         """
-        # 1. Per-fit override (most specific).
-        m_override = getattr(member, "seed_target", None) if member is not None else None
-        try:
-            m_override = int(m_override) if m_override is not None else None
-        except (TypeError, ValueError):
-            m_override = None
-        if m_override is not None and m_override > 0:
-            return m_override
-        # 2. Per-doctrine override.
-        override = getattr(doctrine, "seed_target", None) if doctrine is not None else None
-        try:
-            override = int(override) if override is not None else None
-        except (TypeError, ValueError):
-            override = None
-        if override is not None and override > 0:
-            return override
-        # 3. Global default.
+        # 1. Per-fit value (most specific). Honour an explicit 0 ("don't seed");
+        #    only None / negative / garbage falls through.
+        m_raw = getattr(member, "seed_target", None) if member is not None else None
+        if m_raw is not None:
+            try:
+                m_val = int(m_raw)
+            except (TypeError, ValueError):
+                m_val = None
+            if m_val is not None and m_val >= 0:
+                return m_val
+        # 2. Per-doctrine value.
+        d_raw = getattr(doctrine, "seed_target", None) if doctrine is not None else None
+        if d_raw is not None:
+            try:
+                d_val = int(d_raw)
+            except (TypeError, ValueError):
+                d_val = None
+            if d_val is not None and d_val >= 0:
+                return d_val
+        # 3. Global default (the ONLY floored source).
         return self._global_seed_target()
 
     @staticmethod
@@ -21714,22 +21820,31 @@ $bmp.Dispose()
 
         where breadth% is the % of scored components on the market, N is the
         TOTAL available (market-completable fits + matching contracts), M is the
-        market-completable fits, C is the contract-match count. Colour:
-        green when N >= seed_target, yellow when N > 0, red/dim when 0."""
+        market-completable fits, C is the contract-match count. Colour: an
+        explicit ``seed_target`` of **0** ("don't seed this fit") renders a
+        neutral dim "— not seeded" marker (never green/red — the owner opted
+        out); otherwise green when N >= target, yellow when N > 0 (or the target
+        is unknown), red when N is 0."""
         breadth = getattr(avail, "breadth_pct", 0.0) or 0.0
         market_fits = getattr(avail, "completable_fits", 0) or 0
         ctr = getattr(avail, "contract_matches", 0) or 0
         total = market_fits + ctr
-        glyph = "✓" if total > 0 else "✗"
-        text = (f"{glyph} {breadth:.0f}% · {total} fits "
-                f"({market_fits} mkt / {ctr} ctr)")
         try:
             target = int(seed_target)
         except (TypeError, ValueError):
-            target = 0
+            target = None   # unknown/garbage — never "not seeded", never green
+        # Explicit "don't seed" target → a neutral marker, never the stocked
+        # (green) / short (red) colours which imply an active seeding goal.
+        if target == 0:
+            text = (f"— not seeded · {breadth:.0f}% · {total} fits "
+                    f"({market_fits} mkt / {ctr} ctr)")
+            return (text, FG_DIM)
+        glyph = "✓" if total > 0 else "✗"
+        text = (f"{glyph} {breadth:.0f}% · {total} fits "
+                f"({market_fits} mkt / {ctr} ctr)")
         if total <= 0:
             colour = FG_RED
-        elif target > 0 and total >= target:
+        elif target is not None and target > 0 and total >= target:
             colour = FG_GREEN
         else:
             colour = FG_YELLOW

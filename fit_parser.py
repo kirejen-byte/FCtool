@@ -5,7 +5,10 @@ Turns pasted EVE fit text into a `ParsedFit`. Two input formats:
 - **EFT** — `[Hull, Fit Name]` header followed by blank-line-delimited racks of
   module lines (`Module Name[, Charge Name][ /offline]`), then drones/cargo as
   `Item Name xN`. Drones and cargo are syntactically identical, so they are
-  disambiguated by the catalog's category lookup, not by syntax.
+  disambiguated by the catalog's category lookup, not by syntax. A bare line
+  (no ` xN`) is likewise routed by category — combat boosters, loose charges,
+  drones and fighters are emitted without a quantity but are not fitting
+  modules, so they go to cargo/drones rather than into a slot.
 - **DNA** — a flat `shipID:typeID[_];qty:…::` bag of items; slot position is not
   encoded, so items route to slots via the catalog.
 
@@ -182,7 +185,29 @@ def parse_eft(text: str, catalog) -> ParseResult:
             if warning is not None:
                 warnings.append(warning)
                 continue
-            if module is not None:
+            if module is None:
+                continue
+
+            # Route the resolved line by catalog category, mirroring the ESI
+            # import path (`fit_dna.esi_items_to_parsed`) and `parse_dna`. A bare
+            # line (no ` xN`) is not necessarily a fitting module: EFT/pyfa emit
+            # combat boosters (SDE category "Implant" -> "other"), and loose
+            # charges/drones/fighters, as bare lines too. Classifying by category
+            # keeps a booster in cargo instead of forcing it into a fitting slot
+            # (or, when it fails to resolve, surfacing a misleading "Unknown
+            # module"). Only genuine modules/subsystems occupy a rack.
+            category = catalog.category_of(module.type_id)
+            if category == "subsystem":
+                subsystems.append(module.type_id)
+                produced_module = True
+            elif category == "drone":
+                drones.append(DroneStack(module.type_id, module.name, 1))
+            elif category in ("charge", "fighter", "other"):
+                cargo.append(CargoStack(module.type_id, module.name, 1))
+            else:
+                # A genuine fitting module (or an unclassifiable type kept as a
+                # module for back-compat). Slot-less modules fall back to the
+                # EFT rack order.
                 if not module.slot:
                     fallback = (
                         _RACK_ORDER[rack_index]
@@ -190,10 +215,7 @@ def parse_eft(text: str, catalog) -> ParseResult:
                         else SLOT_LOW
                     )
                     module.slot = fallback
-                if catalog.category_of(module.type_id) == "subsystem":
-                    subsystems.append(module.type_id)
-                else:
-                    modules.append(module)
+                modules.append(module)
                 produced_module = True
         if produced_module:
             rack_index += 1
