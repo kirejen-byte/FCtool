@@ -46,11 +46,16 @@ _FLAG_PREFIX_TO_SLOT: list[tuple[str, str]] = sorted(
 # The order modules are emitted in (DNA sections and ESI flag assignment).
 _SLOT_EMIT_ORDER = [SLOT_HIGH, SLOT_MED, SLOT_LOW, SLOT_RIG, SLOT_SUBSYSTEM]
 
-# Cargo whose category is one of these is "safe" to emit in fitting-DNA: the EVE
-# client routes it to cargo/bays, not into a slot. Anything else (module/ship/
-# subsystem/unknown) would re-fit into a slot when the DNA link is clicked
-# ("ghost slots"), so it is dropped from DNA when a catalog can classify it.
-_CARGO_SAFE_CATEGORIES = frozenset({"charge", "other", "drone", "fighter"})
+# Cargo classification for fitting-DNA emission. The official EVE fitting-DNA
+# grammar (developers.eveonline.com/docs/guides/fitting) has no cargo section:
+# the client routes each item to slot-or-cargo by CATEGORY, but a trailing "_"
+# on a module id marks it UNFITTED so it lands in cargo instead of re-fitting
+# into a slot. Items whose category is one of these route to cargo/bays anyway,
+# so they are emitted BARE ("typeID;qty") — the historical form, which also
+# keeps the loaded-charge merge shape. Everything else (module/subsystem) is
+# emitted UNFITTED ("typeID_;qty"); a ship in cargo is excluded outright, as the
+# grammar defines no sanctioned cargo-ship token.
+_CARGO_BARE_CATEGORIES = frozenset({"charge", "other", "drone", "fighter"})
 
 # ── Tech III subsystem slot ordering ─────────────────────────────────────────
 #
@@ -139,63 +144,92 @@ def to_dna(parsed: ParsedFit, catalog=None) -> str:
 
     by_slot = _modules_by_slot(parsed)
 
-    # Modules, grouped by slot section then stacked by (type id, offline).
+    # Modules, grouped by slot section then stacked by type id.
     #
-    # NOTE: a module's `offline` state IS representable in DNA via a trailing `_`
-    # on the id (`typeID_;qty`), which `parse_dna` reads back as `offline=True`,
-    # so offline state round-trips through DNA. Online and offline instances of
-    # the same type are emitted as SEPARATE tokens (never merged into one stack),
-    # because they differ in identity. `to_esi_items` still drops offline: the
-    # ESI items[] format has no offline field, and it is intentionally left
-    # unchanged. `fit_content_hash` (fit_models.py) folds `offline` into a fit's
-    # identity, consistent with DNA now preserving it.
+    # NOTE: a FITTED module NEVER carries a trailing `_`. In the official
+    # fitting-DNA grammar the `_` means UNFITTED (the item belongs in cargo), so
+    # tagging a fitted module with it would send it to cargo in the client. DNA
+    # therefore cannot encode a module's `offline` state — re-encoding an offline
+    # module yields a plain online token. Offline state still lives on the
+    # `ParsedFit` (persisted by fittings_store and folded into `fit_content_hash`
+    # in fit_models.py); it simply does not survive a DNA round-trip. `to_esi_items`
+    # likewise has no offline field. Online and offline instances of the same type
+    # therefore stack into ONE `typeID;count` token.
     charge_counts: dict[int, int] = {}
     for slot in _SLOT_EMIT_ORDER:
-        # Key on (type_id, offline) so online/offline of the same id each get
-        # their own token; dict insertion order keeps first-seen token order.
-        counts: dict[tuple[int, bool], int] = {}
+        # dict insertion order keeps first-seen token order within the section.
+        counts: dict[int, int] = {}
         for module in by_slot.get(slot, []):
-            key = (module.type_id, bool(module.offline))
-            counts[key] = counts.get(key, 0) + 1
+            counts[module.type_id] = counts.get(module.type_id, 0) + 1
             if module.charge_type_id is not None:
                 charge_counts[module.charge_type_id] = (
                     charge_counts.get(module.charge_type_id, 0) + 1
                 )
-        for (type_id, offline), count in counts.items():
-            parts.append(f"{type_id}_;{count}" if offline else f"{type_id};{count}")
+        for type_id, count in counts.items():
+            parts.append(f"{type_id};{count}")
 
     # Drones are emitted before cargo, each as typeID;qty, and are NOT merged
-    # with cargo/charges.
+    # with cargo/charges. A non-positive quantity never emits a token.
     for drone in parsed.drones:
-        parts.append(f"{drone.type_id};{drone.quantity}")
+        if drone.quantity > 0:
+            parts.append(f"{drone.type_id};{drone.quantity}")
 
     # Cargo + loaded charges, merged by type id so the SAME id carried in cargo
     # and loaded in guns yields ONE token with the summed quantity (mirrors
     # `to_esi_items`). First-seen order is preserved: cargo first, then
-    # charge-only ids. Module-category cargo is dropped when a catalog can
-    # classify it — EVE fitting-DNA has no cargo section, so a module carried as
-    # cargo would otherwise re-fit into a slot ("ghost slots"). Without a catalog
-    # (or one that cannot classify), all cargo is kept for back-compat.
-    def _cargo_is_safe(type_id: int) -> bool:
+    # charge-only ids. Each cargo type is emitted BARE ("typeID;qty") or UNFITTED
+    # ("typeID_;qty") by category (see `_CARGO_BARE_CATEGORIES`) so a spare module
+    # or subsystem carried as cargo lands in cargo instead of re-fitting into a
+    # slot ("ghost slots"); a ship in cargo is excluded (no sanctioned cargo-ship
+    # token in the grammar). Loaded charges are always charges, so they merge into
+    # the BARE form of the same id. Without a catalog (or one that cannot classify)
+    # every item is kept BARE, unchanged, for back-compat. A merged quantity <= 0
+    # never emits a token (guards the malformed "typeID;0" a zero-quantity cargo
+    # stack used to leak).
+    def _cargo_disposition(type_id: int) -> str:
+        """Classify a cargo type for DNA emission: 'bare', 'unfitted', or 'skip'.
+
+        Without a catalog nothing can be classified, so everything is kept 'bare'
+        (historical back-compat). 'ship' is skipped (no sanctioned cargo-ship
+        token); charge/other/drone/fighter stay 'bare'; module/subsystem and
+        anything unclassifiable become 'unfitted' so they never ghost-fit."""
         if catalog is None:
-            return True
+            return "bare"
         category_of = getattr(catalog, "category_of", None)
         if not callable(category_of):
-            return True  # no way to classify -> keep (back-compat)
+            return "bare"  # no way to classify -> keep bare (back-compat)
         try:
-            return category_of(type_id) in _CARGO_SAFE_CATEGORIES
+            category = category_of(type_id)
         except Exception:
-            return False  # cannot classify confidently -> drop (avoid ghost-fit)
+            return "unfitted"  # unclassifiable -> unfitted so it still reaches cargo
+        if category in _CARGO_BARE_CATEGORIES:
+            return "bare"
+        if category == "ship":
+            return "skip"
+        return "unfitted"  # module / subsystem / any other non-cargo-safe category
 
-    cargo_to_emit: dict[int, int] = {}
+    # type_id -> [quantity, unfitted?]. A type's category is deterministic, so an
+    # id is consistently bare OR unfitted (never both); first-seen order is kept.
+    cargo_to_emit: dict[int, list] = {}
     for cargo in parsed.cargo:
-        if not _cargo_is_safe(cargo.type_id):
+        disposition = _cargo_disposition(cargo.type_id)
+        if disposition == "skip":
             continue
-        cargo_to_emit[cargo.type_id] = cargo_to_emit.get(cargo.type_id, 0) + cargo.quantity
+        entry = cargo_to_emit.get(cargo.type_id)
+        if entry is None:
+            cargo_to_emit[cargo.type_id] = [cargo.quantity, disposition == "unfitted"]
+        else:
+            entry[0] += cargo.quantity
     for type_id, count in charge_counts.items():
-        cargo_to_emit[type_id] = cargo_to_emit.get(type_id, 0) + count
-    for type_id, quantity in cargo_to_emit.items():
-        parts.append(f"{type_id};{quantity}")
+        entry = cargo_to_emit.get(type_id)
+        if entry is None:
+            cargo_to_emit[type_id] = [count, False]  # loaded charges are bare
+        else:
+            entry[0] += count
+    for type_id, (quantity, unfitted) in cargo_to_emit.items():
+        if quantity <= 0:
+            continue
+        parts.append(f"{type_id}_;{quantity}" if unfitted else f"{type_id};{quantity}")
 
     return ":".join(parts) + "::"
 

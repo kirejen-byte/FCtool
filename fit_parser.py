@@ -238,8 +238,11 @@ def parse_dna(text: str, catalog) -> ParseResult:
     DNA is a flat ``shipID[:subsystemID×5]:typeID[_];qty:…::`` bag of items;
     slot position is not encoded, so each item is routed to a slot/drone/cargo
     bucket via the catalog. Stacked (``typeID;N``) and per-instance forms are
-    both accepted; a trailing ``_`` on a module marks it offline. DNA does not
-    bind charges to modules, so charges land in cargo.
+    both accepted. A trailing ``_`` on an id marks the item UNFITTED (per the
+    official grammar) and routes it straight to cargo regardless of category —
+    this is how a spare module/subsystem carried as cargo is preserved without
+    re-fitting into a slot. DNA does not bind charges to modules, so charges land
+    in cargo too.
     """
     cleaned = text.lstrip("﻿").strip()
     cleaned = cleaned.rstrip(":")  # drop the terminating "::"
@@ -259,7 +262,7 @@ def parse_dna(text: str, catalog) -> ParseResult:
     warnings: list[str] = []
 
     for token in tokens[1:]:
-        offline = False
+        unfitted = False
         if ";" in token:
             id_part, qty_part = token.split(";", 1)
             try:
@@ -272,7 +275,12 @@ def parse_dna(text: str, catalog) -> ParseResult:
             id_part = token
             qty = 1
         if id_part.endswith("_"):
-            offline = True
+            # The official fitting-DNA grammar uses a trailing "_" to mark an item
+            # UNFITTED: it belongs in cargo, not a slot. Route it to cargo
+            # regardless of category (a spare module/subsystem carried as cargo),
+            # after stripping the "_" to resolve the id. Inverse of to_dna, which
+            # emits module/subsystem cargo as "typeID_;qty".
+            unfitted = True
             id_part = id_part[:-1]
         try:
             type_id = int(id_part)
@@ -280,8 +288,13 @@ def parse_dna(text: str, catalog) -> ParseResult:
             warnings.append(f"Invalid DNA type id: {token!r}")
             continue
 
-        category = catalog.category_of(type_id)
         name = catalog.resolve_name(type_id) or str(type_id)
+
+        if unfitted:
+            cargo.append(CargoStack(type_id, name, qty))
+            continue
+
+        category = catalog.category_of(type_id)
 
         if category == "subsystem":
             subsystems.append(type_id)
@@ -292,16 +305,11 @@ def parse_dna(text: str, catalog) -> ParseResult:
         elif category in ("charge", "other"):
             cargo.append(CargoStack(type_id, name, qty))
         else:
-            # A module — expand the stack into individual instances.
+            # A fitted module — expand the stack into individual instances.
             slot = catalog.slot_of(type_id) or ""
             for _ in range(qty):
                 modules.append(
-                    ParsedModule(
-                        type_id=type_id,
-                        name=name,
-                        slot=slot,
-                        offline=offline,
-                    )
+                    ParsedModule(type_id=type_id, name=name, slot=slot)
                 )
 
     ship_name = catalog.resolve_name(ship_type_id) or str(ship_type_id)
