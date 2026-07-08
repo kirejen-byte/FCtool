@@ -49,6 +49,7 @@ safe to hand to the Tk thread via the app's ``after()`` marshalling.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import statistics
 import threading
@@ -72,6 +73,32 @@ log = get_logger(__name__)
 CACHE_TTL_ORDERS = 300
 CACHE_TTL_CONTRACTS = 1800
 CACHE_TTL_CONTRACT_ITEMS = 3600
+
+# An "ok but genuinely EMPTY" contract-items result (a 2xx with a bare body — a
+# want-to-buy request, a courier, or a since-emptied stock contract) is cached on
+# a much longer timer than a populated one. WHY: on a busy staging book the large
+# majority of surviving contracts fetch back empty, and with the 1h items TTL they
+# ALL re-fetched live every hour — a recurring serial-latency storm of pointless
+# GETs against contracts that were empty last hour and are still empty. They gain
+# nothing from hourly freshness, so an empty result rides a 12h TTL instead. A
+# populated contract keeps the tight 1h TTL (its stock can sell out fast). Stored
+# with an explicit ``"empty": True`` flag inside the SAME cache-entry shape; an
+# older entry that lacks the flag simply falls back to the 1h timer (old
+# behaviour), so existing cache files load unchanged.
+CACHE_TTL_CONTRACT_ITEMS_EMPTY = 12 * 3600
+
+# Pass 2 of the contract scan fetches each surviving contract's items over ESI.
+# Each fetch is one blocking ~0.4-1.0s round-trip, so fetching 300+ survivors
+# SERIALLY took minutes (the user-reported "stuck at 309/316" plateau — the
+# newest + corp contracts, uncached, cluster at the tail). We fetch survivors
+# CONCURRENTLY on this small pool to overlap that latency. The pool size is NOT
+# the request-rate control: the shared global ``rate_limit("esi")`` token bucket
+# (15/s, burst 30) inside every adapter GET remains the real cadence gate, and a
+# serial loop used only ~1/s of it — 15x of headroom. Six workers overlap the
+# per-request latency (turning 316x~1s ≈ 5min into roughly a sixth of that, then
+# bounded by the 15/s limiter) without ever exceeding the budget the fleet /
+# overlay / zkill pollers also share.
+CONTRACT_FETCH_WORKERS = 6
 
 # During a contract scan the item cache is held in memory (one disk read at pass
 # start) and flushed back to disk every N *fetched* contracts (plus a final flush
@@ -383,6 +410,12 @@ class ContractScan:
     matches: dict[str, list[ContractMatch]]  # fit_id -> matches (sorted by price asc)
     scanned_contracts: int  # how many contracts we fetched items for this pass
     from_cache: int  # how many were served from the item cache (unchanged)
+    # Reasons the pass is degraded (mirrors ``MarketSnapshot.degraded``): e.g.
+    # ``"contract_error_limit"`` when the ESI error budget forced an early abort
+    # so the returned matches are PARTIAL (the contracts fetched before the floor
+    # was hit are kept). Empty ``[]`` => a clean, complete pass. Defaulted so
+    # every existing construction (and any older caller) stays valid.
+    degraded: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -485,6 +518,24 @@ class MarketEsiAdapter(Protocol):
 
     def corp_contract_items(self, corporation_id: int, contract_id: int) -> list[dict]:
         ...
+
+
+@dataclass
+class _FetchResult:
+    """One survivor's Pass-2 outcome, produced by a POOL WORKER and consumed by
+    the coordinating (scan) thread. Workers are pure w.r.t. shared scanner state:
+    they do the network item fetch + the (pure) match and hand back this record;
+    the coordinating thread then does all the shared-state work (cache write,
+    counters, ``matches`` accumulation, progress) as the future completes, so no
+    lock is needed anywhere. ``match_list`` is ``[(fit_id, ContractMatch), ...]``.
+    """
+    idx: int  # position in ``to_fetch`` — matches are applied in this order (det.)
+    contract_id: int
+    items: list  # the fetched item rows ([] when empty/dead/transient/raised)
+    status: str  # adapter disposition: "ok" / "dead" / "transient" / "raise"
+    error_limited: bool  # the adapter reported error-budget floor after this call
+    raised: bool  # the adapter call raised (→ transient, do not cache)
+    match_list: list  # [(fit_id, ContractMatch), ...] for this contract
 
 
 # ── The scanner (§4.2) ───────────────────────────────────────────────────────
@@ -866,6 +917,7 @@ class MarketScanner:
         corp_id: int | None = None,
         region_wide: bool = False,
         progress=None,
+        cancel=None,
     ) -> ContractScan:
         """Scan public (+ optional corp) item-exchange contracts in ``region_id``
         for ones that match any of ``fits`` (same hull, >=95% over modules +
@@ -887,7 +939,15 @@ class MarketScanner:
           via the *cached* resolver and drop out-of-staging contracts. Location
           resolves are memoised per ``location_id``, so the hundreds of contracts
           that overwhelmingly sit at the ONE staging citadel cost a single resolve.
-        * **Pass 2 — fetch items ONLY for the survivors, then match.**
+        * **Pass 2 — fetch items ONLY for the survivors, then match.** Cache hits
+          replay inline (instant, no network); the remaining live fetches run
+          CONCURRENTLY on a ``CONTRACT_FETCH_WORKERS``-wide pool to overlap the
+          per-request latency (the global 15/s ESI limiter is still the true
+          cadence gate). Pool WORKERS are pure — they fetch + match and return a
+          result; THIS thread does every shared-state mutation (cache write,
+          counters, ``matches``, progress) as each future completes, so results
+          are deterministic (matches applied in ``to_fetch`` order, then sorted by
+          price, exactly as the old serial loop) and no lock is needed.
 
         The persistent contract-items cache (immutable per contract_id) is held in
         memory for the pass and flushed back to disk every ``_ITEM_FLUSH_EVERY``
@@ -895,6 +955,18 @@ class MarketScanner:
         with no network AND an interrupted first scan resumes from what it already
         fetched. Every adapter failure is swallowed per contract (a bad item pull
         just skips that contract) so a firehose region never crashes the pass.
+
+        **Error-limit + cancel.** Before submitting each fetch AND on each
+        completion the loop checks the adapter's ``error_limited`` flag; once the
+        ESI error budget drops below the floor it STOPS submitting, drains the
+        in-flight fetches, records ``"contract_error_limit"`` in the returned
+        scan's ``degraded`` list, and keeps the matches gathered so far (partial,
+        never a crash). ``cancel`` (optional) is a zero-arg predicate polled the
+        same way: a truthy return stops new submissions, drains what is running,
+        and returns the partial result promptly (bounded by the in-flight fetches'
+        own timeouts) — the executor is always shut down cleanly, so a cancel can
+        never hang the caller. ``cancel=None`` (the default) never cancels, so the
+        existing GUI call site is unchanged.
 
         ``progress`` (optional) is a cheap, exception-swallowed callback fed:
 
@@ -912,6 +984,7 @@ class MarketScanner:
         matches: dict[str, list[ContractMatch]] = {f.id: [] for f in fits}
         scanned = 0
         from_cache = 0
+        degraded: list[str] = []
 
         if not fits:
             return ContractScan(
@@ -1012,36 +1085,129 @@ class MarketScanner:
                  "kept": len(to_fetch)},
             )
 
-            # ── PASS 2 — fetch items ONLY for survivors, then match. ────────────
+            # ── PASS 2 — fetch survivors' items (parallel), then match. ─────────
+            # Cache reads + writes, the counters, the ``matches`` accumulator, the
+            # ``degraded`` list and progress emission are ALL confined to THIS (the
+            # coordinating) thread; the pool workers only fetch + match and RETURN a
+            # _FetchResult. That confinement is why nothing here needs a lock even
+            # though the fetches overlap, and it preserves the cache session's
+            # batched-flush cadence — ``put_items`` still runs only here, one call
+            # per completed future, exactly as the old serial loop did.
             total_fetch = len(to_fetch)
-            for contract, is_alliance, csys, loc_id in to_fetch:
-                cid = contract.get("contract_id")
-                items, was_cached = self._fetch_contract_items(cid, is_alliance, corp_id)
-                scanned += 1
-                if was_cached:
-                    from_cache += 1
-                _emit_progress(
-                    progress,
-                    {"stage": "contracts", "done": scanned, "total": total_fetch,
-                     "from_cache": from_cache},
-                )
-                if not items:
-                    continue
+            # Per-survivor matches keyed by to_fetch index so they are APPLIED in
+            # to_fetch order regardless of which future finishes first → the result
+            # is byte-identical to the serial pass (then a final per-fit price sort,
+            # as before).
+            match_by_idx: dict[int, list] = {}
+            aborted = False       # ESI error-limit floor forced an early stop
+            cancelled = False     # the caller's cancel predicate fired
 
-                included = _included_for_match(items, self._catalog)
-                for fit, spec in fit_specs:
-                    m = _match_contract(
-                        contract=contract,
-                        included=included,
-                        fit=fit,
-                        spec=spec,
-                        catalog=self._catalog,
-                        is_alliance=is_alliance,
-                        location_id=int(loc_id),
-                        system_id=csys,
+            def _stop_requested() -> bool:
+                if not callable(cancel):
+                    return False
+                try:
+                    return bool(cancel())
+                except Exception:
+                    return False
+
+            # 2a. Cache reads (instant, no network): a hit replays and counts as
+            #     from_cache exactly as before; misses queue for the parallel fetch.
+            misses: list[tuple[int, dict, bool, "int | None", int]] = []
+            for idx, (contract, is_alliance, csys, loc_id) in enumerate(to_fetch):
+                cid = contract.get("contract_id")
+                cached = self._read_contract_items_cache(int(cid))
+                if cached is not None:
+                    scanned += 1
+                    from_cache += 1
+                    match_by_idx[idx] = self._match_contract_items(
+                        cached, contract, is_alliance, loc_id, csys, fit_specs)
+                    _emit_progress(
+                        progress,
+                        {"stage": "contracts", "done": scanned, "total": total_fetch,
+                         "from_cache": from_cache},
                     )
-                    if m is not None:
-                        matches[fit.id].append(m)
+                else:
+                    misses.append((idx, contract, is_alliance, csys, loc_id))
+
+            # 2b. Live fetches in parallel with a BOUNDED in-flight window, so the
+            #     pass can stop submitting the instant an error-limit or a cancel is
+            #     observed and merely drain what is already running.
+            if misses and not _stop_requested():
+                workers = min(CONTRACT_FETCH_WORKERS, len(misses))
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+                miss_iter = iter(misses)
+                inflight: set = set()
+
+                def _submit_next() -> bool:
+                    nxt = next(miss_iter, None)
+                    if nxt is None:
+                        return False
+                    m_idx, m_contract, m_ally, m_csys, m_loc = nxt
+                    inflight.add(ex.submit(
+                        self._fetch_and_match_contract, m_idx, m_contract,
+                        m_ally, m_csys, m_loc, corp_id, fit_specs))
+                    return True
+
+                try:
+                    # Poll the error-limit floor BEFORE the first submissions (4a):
+                    # an earlier phase may already have driven the budget down.
+                    if bool(getattr(self._adapter, "error_limited", False)):
+                        aborted = True
+                    else:
+                        for _ in range(workers):
+                            if not _submit_next():
+                                break
+                    while inflight:
+                        done = concurrent.futures.wait(
+                            inflight,
+                            return_when=concurrent.futures.FIRST_COMPLETED).done
+                        for fut in done:
+                            inflight.discard(fut)
+                            res = fut.result()  # worker catches all → never raises
+                            scanned += 1
+                            self._cache_live_result(res)
+                            match_by_idx[res.idx] = res.match_list
+                            _emit_progress(
+                                progress,
+                                {"stage": "contracts", "done": scanned,
+                                 "total": total_fetch, "from_cache": from_cache},
+                            )
+                            if res.error_limited:
+                                aborted = True
+                        # Poll cancel + the live error-limit flag on EACH completion
+                        # (4b); once either fires, stop feeding and let the in-flight
+                        # fetches drain (the while loop keeps consuming them).
+                        if _stop_requested():
+                            cancelled = True
+                        if not aborted and not cancelled and bool(
+                                getattr(self._adapter, "error_limited", False)):
+                            aborted = True
+                        if aborted or cancelled:
+                            continue
+                        for _ in range(len(done)):
+                            if not _submit_next():
+                                break
+                finally:
+                    # Drain in-flight fetches + release the pool. wait=True is
+                    # bounded — at most ``workers`` requests, each capped by the
+                    # adapter's own GET timeout — so a cancel can never hang here.
+                    ex.shutdown(wait=True)
+            elif misses:
+                cancelled = True  # cancelled before any live fetch started
+
+            if aborted and "contract_error_limit" not in degraded:
+                degraded.append("contract_error_limit")
+                log.warning(
+                    "[market] contract scan hit the ESI error-limit floor after "
+                    "%d/%d fetched — stopped early, partial matches kept",
+                    scanned, total_fetch,
+                )
+
+            # Apply per-survivor matches in to_fetch order (deterministic); the
+            # final per-fit price sort below then reproduces the serial output.
+            for idx in range(total_fetch):
+                for fid, m in match_by_idx.get(idx, ()):
+                    matches[fid].append(m)
         finally:
             # Final flush of anything not yet persisted (even on an unexpected
             # error mid-pass) so an interrupted scan keeps its fetched items, then
@@ -1077,6 +1243,7 @@ class MarketScanner:
             matches=matches,
             scanned_contracts=scanned,
             from_cache=from_cache,
+            degraded=degraded,
         )
 
     def _contract_list(self, fn, arg, progress) -> list[dict]:
@@ -1089,63 +1256,106 @@ class MarketScanner:
             return fn(arg, progress=progress)
         return fn(arg)
 
-    def _fetch_contract_items(
-        self, contract_id, is_alliance: bool, corp_id: int | None
-    ) -> tuple[list[dict], bool]:
-        """Return (items, served_from_cache) for a contract.
+    def _fetch_and_match_contract(
+        self, idx: int, contract: dict, is_alliance: bool,
+        csys: "int | None", loc_id: int, corp_id: int | None, fit_specs: list,
+    ) -> "_FetchResult":
+        """POOL-WORKER unit for one survivor: fetch its items over ESI and match
+        them against every fit, returning a ``_FetchResult``. PURE with respect to
+        shared scanner state — it touches NO cache, NO counter, NO ``matches``
+        accumulator; the coordinating thread applies all of that as the future
+        completes (see ``scan_contracts`` Pass 2 / ``_cache_live_result``). Never
+        raises: an adapter failure is captured as ``status="raise"`` /
+        ``raised=True`` so the coordinator simply skips + does not cache it (the
+        same transient treatment the old serial path gave a raising fetch).
 
-        Reads the persistent contract-items cache first; a cache hit — including a
-        permanent DEAD tombstone (see below) — replays with no network. Otherwise
-        fetches via the adapter (public route, or the corp route for an alliance
-        contract) and stores the result.
+        The adapter's per-call disposition (``last_contract_items_status``) and
+        error-budget flag (``error_limited``) are read immediately after the call
+        and ride back on the result, so the coordinator classifies the cache write
+        from the worker's own captured values rather than re-reading the shared
+        adapter attributes on a later thread."""
+        cid = int(contract.get("contract_id") or 0)
+        try:
+            if is_alliance and corp_id and hasattr(self._adapter, "corp_contract_items"):
+                items = self._adapter.corp_contract_items(corp_id, cid)
+            else:
+                items = self._adapter.contract_items(cid)
+        except Exception:
+            log.exception("[market] contract items pull failed for %s", cid)
+            return _FetchResult(idx, cid, [], "raise", False, True, [])
+        # Capture the adapter's disposition + error-limit flag for THIS call.
+        status = getattr(self._adapter, "last_contract_items_status", "ok")
+        err = bool(getattr(self._adapter, "error_limited", False))
+        items = items or []
+        match_list = (
+            self._match_contract_items(items, contract, is_alliance, loc_id, csys, fit_specs)
+            if items else []
+        )
+        return _FetchResult(idx, cid, items, status, err, False, match_list)
 
-        **Negative caching (the every-refresh dead-contract crawl fix).** When the
-        fetch comes back empty, the adapter's ``last_contract_items_status``
-        (duck-typed; "ok" when the adapter doesn't report one) classifies it:
+    def _match_contract_items(
+        self, items: list, contract: dict, is_alliance: bool,
+        loc_id: int, csys: "int | None", fit_specs: list,
+    ) -> list:
+        """Pure per-contract match: reduce ``items`` to the included multiset and
+        score it against every fit, returning ``[(fit_id, ContractMatch), ...]``
+        (empty when nothing matches). No shared state — safe to run on a worker OR
+        inline on the coordinating thread (a cache hit)."""
+        if not items:
+            return []
+        included = _included_for_match(items, self._catalog)
+        out: list = []
+        for fit, spec in fit_specs:
+            m = _match_contract(
+                contract=contract,
+                included=included,
+                fit=fit,
+                spec=spec,
+                catalog=self._catalog,
+                is_alliance=is_alliance,
+                location_id=int(loc_id),
+                system_id=csys,
+            )
+            if m is not None:
+                out.append((fit.id, m))
+        return out
+
+    def _cache_live_result(self, res: "_FetchResult") -> None:
+        """COORDINATING-THREAD cache write for one live fetch, mirroring the old
+        ``_fetch_contract_items`` tail's negative-caching (the every-refresh
+        dead-contract crawl fix). Runs only on the scan thread, so the in-memory
+        cache session stays single-writer and its batched-flush cadence is intact.
+
+        Classifies an EMPTY result by the worker-captured disposition:
 
         * ``"dead"`` — a definitively gone contract (404/410, or a 403 on the
           PUBLIC route = permanently restricted). Written as an immutable-forever
           TOMBSTONE (``dead=True``, no TTL) so it is NEVER re-fetched — it counts
           as ``from_cache`` on every later scan.
-        * ``"transient"`` — a timeout / 5xx / error-limit / corp-route scope 403.
-          NOT cached, so the next scan re-fetches (a live contract must never be
-          hidden behind a transient blip).
-        * ``"ok"`` — a real (possibly genuinely empty) 2xx response. Cached with
-          the normal 1h TTL, exactly as before.
+        * ``"transient"``/``"raise"`` — a timeout / 5xx / error-limit / corp-route
+          scope 403 / raising adapter. NOT cached, so the next scan re-fetches (a
+          live contract must never be hidden behind a transient blip).
+        * ``"ok"`` — a genuinely empty 2xx. Cached as an ok-empty entry on the
+          LONGER ``CACHE_TTL_CONTRACT_ITEMS_EMPTY`` timer (the empties-storm fix).
 
-        A raising adapter is treated as transient (skipped, uncached).
-        """
-        cached = self._read_contract_items_cache(int(contract_id))
-        if cached is not None:
-            return cached, True
-
-        try:
-            if is_alliance and corp_id and hasattr(self._adapter, "corp_contract_items"):
-                items = self._adapter.corp_contract_items(corp_id, int(contract_id))
-            else:
-                items = self._adapter.contract_items(int(contract_id))
-        except Exception:
-            log.exception("[market] contract items pull failed for %s", contract_id)
-            return [], False  # adapter raised → transient, do not cache
-
-        items = items or []
-        if items:
+        A populated result is cached on the normal 1h TTL (disposition
+        irrelevant)."""
+        if res.raised:
+            return  # adapter raised → transient, do not cache
+        if res.items:
             # Live contract with items → normal-TTL cache (disposition irrelevant).
-            self._write_contract_items_cache(int(contract_id), items)
-            return items, False
-
-        # Empty result — classify to decide tombstone vs transient-skip.
-        status = getattr(self._adapter, "last_contract_items_status", "ok")
-        if status == "dead":
+            self._write_contract_items_cache(res.contract_id, res.items)
+            return
+        if res.status == "dead":
             # Immutable-forever tombstone: a gone contract stays gone.
-            self._write_contract_items_cache(int(contract_id), [], dead=True)
-        elif status == "transient":
+            self._write_contract_items_cache(res.contract_id, [], dead=True)
+        elif res.status == "transient":
             # Timeout / 5xx / error-limit — do NOT cache; retry next scan.
-            return [], False
+            return
         else:
-            # "ok" (a genuinely empty 2xx) — normal-TTL empty entry, as before.
-            self._write_contract_items_cache(int(contract_id), [])
-        return [], False
+            # "ok" (a genuinely empty 2xx) — longer-TTL empty entry so the many
+            # empties on a staging book stop re-fetching hourly.
+            self._write_contract_items_cache(res.contract_id, [], empty=True)
 
     def _resolve_system_cached(self, location_id: int) -> int | None:
         """Resolve a contract ``location_id`` to a system id, memoized in the
@@ -1331,8 +1541,11 @@ class MarketScanner:
             return None
 
     def _read_contract_items_cache(self, contract_id: int) -> list[dict] | None:
-        """Return cached items for a contract if present and within the 1h TTL,
-        else None. Uses ``fetched_at`` age against ``CACHE_TTL_CONTRACT_ITEMS``.
+        """Return cached items for a contract if present and still within its TTL,
+        else None. A populated (or older, un-flagged) entry uses the 1h
+        ``CACHE_TTL_CONTRACT_ITEMS``; an ok-EMPTY entry (``"empty": True``) uses
+        the longer ``CACHE_TTL_CONTRACT_ITEMS_EMPTY`` so genuinely-empty contracts
+        stop re-fetching hourly. A DEAD tombstone is served forever (no TTL).
 
         During a scan (``self._session`` set) this reads the in-memory session
         view — one disk read served the whole pass — instead of re-reading and
@@ -1348,22 +1561,26 @@ class MarketScanner:
         if entry.get("dead"):
             items = entry.get("items")
             return items if isinstance(items, list) else []
-        fetched_at = entry.get("fetched_at")
-        if _age_seconds(fetched_at) > CACHE_TTL_CONTRACT_ITEMS:
+        # An ok-empty entry rides the longer empty TTL; a missing/absent "empty"
+        # flag (older cache files, populated entries) falls back to the 1h timer.
+        ttl = CACHE_TTL_CONTRACT_ITEMS_EMPTY if entry.get("empty") else CACHE_TTL_CONTRACT_ITEMS
+        if _age_seconds(entry.get("fetched_at")) > ttl:
             return None
         items = entry.get("items")
         return items if isinstance(items, list) else None
 
     def _write_contract_items_cache(
         self, contract_id: int, items: list[dict], etag: str | None = None,
-        *, dead: bool = False,
+        *, dead: bool = False, empty: bool = False,
     ) -> None:
         # During a scan the write lands in the in-memory session (flushed to disk
         # in merged batches) instead of a full read-modify-write per contract.
         # ``dead`` marks a permanent tombstone (a gone contract): stored with no
-        # TTL so it is served forever and never re-fetched.
+        # TTL so it is served forever and never re-fetched. ``empty`` marks an
+        # ok-empty result so the read path uses the longer empty TTL; it is an
+        # OPTIONAL field — an entry without it reads exactly as before.
         if self._session is not None:
-            self._session.put_items(int(contract_id), items, etag, dead=dead)
+            self._session.put_items(int(contract_id), items, etag, dead=dead, empty=empty)
             return
 
         def _mut(data: dict) -> None:
@@ -1372,6 +1589,7 @@ class MarketScanner:
                 "etag": etag,
                 "fetched_at": _now_iso(),
                 "dead": dead,
+                "empty": empty,
             }
 
         self._write_cache(_mut)
@@ -1437,25 +1655,32 @@ class _ContractCacheSession:
     # ── contract items ────────────────────────────────────────────────────────
 
     def get_items(self, contract_id: int) -> list[dict] | None:
-        """Cached items for a contract within the 1h TTL, else None (same rule as
-        the direct disk path). A permanent DEAD tombstone bypasses the TTL — a gone
-        contract stays gone, served forever so it is never re-fetched."""
+        """Cached items for a contract within its TTL, else None — the SAME rule as
+        the direct disk path: a populated (or older, un-flagged) entry uses the 1h
+        ``CACHE_TTL_CONTRACT_ITEMS``, an ok-EMPTY entry (``"empty": True``) uses the
+        longer ``CACHE_TTL_CONTRACT_ITEMS_EMPTY``, and a permanent DEAD tombstone
+        bypasses the TTL — a gone contract stays gone, served forever so it is never
+        re-fetched."""
         entry = self._items.get(str(contract_id))
         if not isinstance(entry, dict):
             return None
         if entry.get("dead"):
             items = entry.get("items")
             return items if isinstance(items, list) else []
-        if _age_seconds(entry.get("fetched_at")) > CACHE_TTL_CONTRACT_ITEMS:
+        ttl = CACHE_TTL_CONTRACT_ITEMS_EMPTY if entry.get("empty") else CACHE_TTL_CONTRACT_ITEMS
+        if _age_seconds(entry.get("fetched_at")) > ttl:
             return None
         items = entry.get("items")
         return items if isinstance(items, list) else None
 
     def put_items(
         self, contract_id: int, items: list[dict], etag: str | None = None,
-        *, dead: bool = False,
+        *, dead: bool = False, empty: bool = False,
     ) -> None:
-        entry = {"items": items, "etag": etag, "fetched_at": _now_iso(), "dead": dead}
+        entry = {
+            "items": items, "etag": etag, "fetched_at": _now_iso(),
+            "dead": dead, "empty": empty,
+        }
         key = str(contract_id)
         self._items[key] = entry
         self._pending_items[key] = entry
@@ -1538,10 +1763,13 @@ def fit_bom(parsed, catalog=None) -> list[Component]:
     ship carried in cargo is still skipped (no sanctioned cargo-ship token in the
     grammar), which ``fit_bom`` keeps — hence "superset". ``fit_bom`` likewise
     carries every cargo + loaded-charge line (role ``"cargo"``/``"charge"``) so a
-    full component table is available. The two scored numbers
-    (``completable_fits`` / >=95% similarity) and the default gap list still
-    exclude cargo/charges (see ``_SCORING_MODULE_ROLES``), so carrying them here
-    is harmless to the seeding math while still surfacing them for display.
+    full component table is available. Only the two scored numbers
+    (``completable_fits`` / >=95% similarity) still exclude cargo/charges (see
+    ``_SCORING_MODULE_ROLES``). The default gap list, by contrast, INCLUDES them:
+    since commit 2ca9f42 ``gap_list(components=None)`` shops the full BoM — cargo,
+    charges and drones included — because a seeding list is not complete without
+    the ammo/boosters/drones the fits carry (narrow it with an explicit
+    ``components`` set for the flyable-only subset).
     """
 
     def _name(type_id: int, fallback: str = "") -> str:
