@@ -17025,7 +17025,11 @@ class FCToolGUI:
              stamped from the on-disk cache by ``_load_market_cache`` during
              __init__, well before this trigger fires — is either ``None``
              (no cache, or one that failed to parse: always scan) or older
-             than ``market_scanner.CACHE_TTL_ORDERS`` seconds.
+             than ``market_scanner.CACHE_TTL_ORDERS`` seconds. ``scan_ts`` may
+             be offset-aware UTC (disk-cache shape, from
+             ``market_scanner._now_iso()``) or naive local time (the
+             post-scan write site's ``datetime.now()``) — the age comparison
+             below matches its "now" to whichever shape it finds.
 
         Delegates to the existing bare ``self._market_scan_now()`` entry
         point (doctrine-targeted when a doctrine is selected, else the
@@ -17044,7 +17048,14 @@ class FCToolGUI:
         scan_ts = getattr(self, "_market_scan_ts", None)
         if scan_ts is not None:
             import market_scanner
-            age = (datetime.now() - scan_ts).total_seconds()
+            # scan_ts is offset-aware UTC when stamped from the disk cache
+            # (_load_market_cache -> market_scanner._now_iso()) but naive
+            # local time when stamped fresh after a scan (_market_apply_scan
+            # -> datetime.now()). Match "now"'s shape to scan_ts's so the
+            # subtraction never raises TypeError on a mixed aware/naive pair.
+            now = (datetime.now(timezone.utc) if scan_ts.tzinfo is not None
+                   else datetime.now())
+            age = (now - scan_ts).total_seconds()
             if age < market_scanner.CACHE_TTL_ORDERS:
                 return
         self._market_scan_now()
