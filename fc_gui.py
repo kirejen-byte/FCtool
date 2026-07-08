@@ -14382,9 +14382,16 @@ class FCToolGUI:
         _tip(bhk, "Set global hotkeys to switch/cycle EVE clients (focus only — no "
                   "input is ever sent to the game).")
 
+        bcg = ttk.Button(rowN4, text="Cycle groups…", style="Dark.TButton",
+                         command=self._open_preview_cycle_groups_dialog)
+        bcg.grid(row=0, column=3, padx=(0, 6))
+        w.append(bcg)
+        _tip(bcg, "Define groups of clients and cycle each with its own hotkey. "
+                  "Cycle keys are swallowed system-wide while FCPreview runs.")
+
         bimp = ttk.Button(rowN4, text="Import EVE-O layout…", style="Dark.TButton",
                           command=self._preview_import_eveo)
-        bimp.grid(row=0, column=3, padx=(0, 6))
+        bimp.grid(row=0, column=4, padx=(0, 6))
         w.append(bimp)
         _tip(bimp, "Import tile positions/sizes from your existing Eve-O Preview "
                    "configuration.")
@@ -15138,7 +15145,12 @@ class FCToolGUI:
         hk = cfg.setdefault("hotkeys", {})
         groups = hk.setdefault("groups", [])
         if not groups:
-            groups.append({"next": [], "prev": [], "order": []})
+            groups.append({"name": "All clients", "members": [],
+                           "next": [], "prev": [], "order": []})
+        # Seed name/members on a legacy/nameless group 0 (spec §2 in-place idiom)
+        # so the preset never leaves an un-labelled group behind.
+        groups[0].setdefault("name", "All clients")
+        groups[0].setdefault("members", [])
         groups[0]["next"] = ["F14"]
         groups[0]["prev"] = ["F13"]
         self._save_config()
@@ -15148,9 +15160,467 @@ class FCToolGUI:
             except Exception:
                 log.exception("[preview] hotkey preset re-register failed")
 
+    def _open_preview_cycle_groups_dialog(self, _test_no_wait=False):
+        """Modal CRUD manager for named cycle groups (spec §4). Left pane lists
+        groups; right pane edits the selected group's name, next/prev cycle
+        hotkeys (typed comma-lists or captured via the ⌨ buttons), and its
+        ordered member list (roster picker + ↑/↓/remove). Empty members means
+        "cycle ALL clients" (legacy Proopai convention). Edits happen on a DEEP
+        COPY of the groups list and are written back only on OK, which then
+        restarts the hotkey service and surfaces RegisterHotKey conflicts inline.
+
+        Returns the Toplevel (tests pass _test_no_wait=True to skip wait_window).
+        """
+        cfg = self._preview_cfg()
+        hk = cfg.setdefault("hotkeys", {})
+        src_groups = hk.setdefault("groups", [])
+        # Deep copy — edits touch only the copy until OK. Seed name/members/etc.
+        # on every (possibly legacy/nameless) group so they render + edit safely
+        # (spec §2 in-place seeding idiom).
+        working = json.loads(json.dumps(src_groups))
+        for i, g in enumerate(working):
+            g.setdefault("name", "All clients" if i == 0 else f"Group {i + 1}")
+            g.setdefault("members", [])
+            g.setdefault("next", [])
+            g.setdefault("prev", [])
+            g.setdefault("order", [])
+        # Which member keys are actually running right now → dim "(not running)"
+        # suffix. Computed once at open (spec §4).
+        live_keys = {c.key for c in self._preview_clients.values()
+                     if not c.is_login and c.key}
+        sel = [0 if working else None]        # selected group index (or None)
+
+        win = tk.Toplevel(self.root)
+        win.title("Cycle groups")
+        win.configure(bg=BG_PANEL)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+
+        def _tip(widget, text):
+            widget.bind("<Enter>", lambda e, t=text: self._show_tooltip(e, t))
+            widget.bind("<Leave>", lambda e: self._hide_tooltip())
+            try:
+                widget._fctool_tooltip = text
+            except Exception:
+                pass
+
+        tk.Label(win, text="Groups of clients, each cycled by its own hotkey. "
+                 "No members = cycles ALL clients. Cycle keys are swallowed "
+                 "system-wide while FCPreview runs.",
+                 bg=BG_PANEL, fg=FG_DIM, font=("Consolas", 8),
+                 justify=tk.LEFT, wraplength=520).pack(
+                     anchor="w", padx=10, pady=(10, 6))
+
+        body = tk.Frame(win, bg=BG_PANEL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        # ── Left pane: group list + new/delete + preset ──────────────────────
+        left = tk.Frame(body, bg=BG_PANEL)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        tk.Label(left, text="Groups", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9, "bold")).pack(anchor="w")
+        groups_listbox = tk.Listbox(left, width=30, height=10, exportselection=0,
+                                    bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9),
+                                    selectbackground=FG_ACCENT,
+                                    selectforeground=BG_DARK, activestyle="none")
+        groups_listbox.pack(fill=tk.Y, expand=True)
+        win._groups_listbox = groups_listbox
+        lbtns = tk.Frame(left, bg=BG_PANEL)
+        lbtns.pack(fill=tk.X, pady=(4, 0))
+        win._btn_new_group = ttk.Button(lbtns, text="+ New group",
+                                        style="Dark.TButton",
+                                        command=lambda: _new_group())
+        win._btn_new_group.pack(side=tk.LEFT, padx=(0, 4))
+        win._btn_del_group = ttk.Button(lbtns, text="✕ Delete",
+                                        style="Dark.TButton",
+                                        command=lambda: _del_group())
+        win._btn_del_group.pack(side=tk.LEFT)
+        win._btn_preset = ttk.Button(left, text="EVE-O preset (F14 / F13)",
+                                     style="Dark.TButton",
+                                     command=lambda: _preset())
+        win._btn_preset.pack(anchor="w", pady=(6, 0))
+        _tip(win._btn_preset, "Set the first group's cycle keys to F14 (next) / "
+             "F13 (prev), matching Eve-O Preview's defaults.")
+
+        # ── Right pane: selected-group editor ────────────────────────────────
+        right = tk.Frame(body, bg=BG_PANEL)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        namer = tk.Frame(right, bg=BG_PANEL)
+        namer.pack(fill=tk.X)
+        tk.Label(namer, text="Name", bg=BG_PANEL, fg=FG_TEXT, width=6,
+                 anchor="w", font=("Consolas", 9)).grid(row=0, column=0, sticky="w")
+        name_var = tk.StringVar()
+        win._name_entry = tk.Entry(namer, textvariable=name_var,
+                                   font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                                   insertbackground=FG_WHITE, width=24)
+        win._name_entry.grid(row=0, column=1, columnspan=2, sticky="w",
+                             padx=2, pady=1)
+
+        tk.Label(namer, text="Next", bg=BG_PANEL, fg=FG_TEXT, width=6,
+                 anchor="w", font=("Consolas", 9)).grid(row=1, column=0, sticky="w")
+        next_var = tk.StringVar()
+        win._next_entry = tk.Entry(namer, textvariable=next_var,
+                                   font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                                   insertbackground=FG_WHITE, width=24)
+        win._next_entry.grid(row=1, column=1, sticky="w", padx=2, pady=1)
+        win._btn_capture_next = ttk.Button(namer, text="⌨", width=3,
+                                           style="Dark.TButton",
+                                           command=lambda: _arm_capture("next"))
+        win._btn_capture_next.grid(row=1, column=2, padx=(2, 0))
+        _tip(win._btn_capture_next, "Click, then press a key combo to capture it.")
+
+        tk.Label(namer, text="Prev", bg=BG_PANEL, fg=FG_TEXT, width=6,
+                 anchor="w", font=("Consolas", 9)).grid(row=2, column=0, sticky="w")
+        prev_var = tk.StringVar()
+        win._prev_entry = tk.Entry(namer, textvariable=prev_var,
+                                   font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                                   insertbackground=FG_WHITE, width=24)
+        win._prev_entry.grid(row=2, column=1, sticky="w", padx=2, pady=1)
+        win._btn_capture_prev = ttk.Button(namer, text="⌨", width=3,
+                                           style="Dark.TButton",
+                                           command=lambda: _arm_capture("prev"))
+        win._btn_capture_prev.grid(row=2, column=2, padx=(2, 0))
+        _tip(win._btn_capture_prev, "Click, then press a key combo to capture it.")
+
+        tk.Label(right, text="Members (cycle order, top → bottom):", bg=BG_PANEL,
+                 fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", pady=(6, 0))
+        win._member_listbox = tk.Listbox(right, width=34, height=6,
+                                         exportselection=0, bg=BG_ENTRY,
+                                         fg=FG_TEXT, font=("Consolas", 9),
+                                         selectbackground=FG_ACCENT,
+                                         selectforeground=BG_DARK,
+                                         activestyle="none")
+        win._member_listbox.pack(fill=tk.X)
+        mbtns = tk.Frame(right, bg=BG_PANEL)
+        mbtns.pack(fill=tk.X, pady=(2, 0))
+        win._btn_member_up = ttk.Button(mbtns, text="↑ Up", style="Dark.TButton",
+                                        command=lambda: _member_move(-1))
+        win._btn_member_up.pack(side=tk.LEFT, padx=(0, 4))
+        win._btn_member_down = ttk.Button(mbtns, text="↓ Down",
+                                          style="Dark.TButton",
+                                          command=lambda: _member_move(+1))
+        win._btn_member_down.pack(side=tk.LEFT, padx=(0, 4))
+        win._btn_member_remove = ttk.Button(mbtns, text="✕ Remove",
+                                            style="Dark.TButton",
+                                            command=lambda: _member_remove())
+        win._btn_member_remove.pack(side=tk.LEFT)
+
+        addrow = tk.Frame(right, bg=BG_PANEL)
+        addrow.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(addrow, text="Add member:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        win._member_combo = ttk.Combobox(addrow, values=[], width=20,
+                                         font=("Consolas", 9))
+        win._member_combo.pack(side=tk.LEFT, padx=4)
+        win._btn_member_add = ttk.Button(addrow, text="Add", style="Dark.TButton",
+                                         command=lambda: _member_add())
+        win._btn_member_add.pack(side=tk.LEFT)
+
+        tk.Label(right, text="(no members = cycles ALL clients)", bg=BG_PANEL,
+                 fg=FG_DIM, font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
+
+        win._error_lbl = tk.Label(win, text="", bg=BG_PANEL, fg=FG_ORANGE,
+                                  font=("Consolas", 9), justify=tk.LEFT,
+                                  wraplength=520)
+        win._error_lbl.pack(anchor="w", padx=10, pady=(4, 0))
+
+        # ── helpers ──────────────────────────────────────────────────────────
+        def _split(text):
+            return [p.strip() for p in str(text).replace("\n", ",").split(",")
+                    if p.strip()]
+
+        def _fmt_group_row(g):
+            name = (g.get("name") or "").strip() or "(unnamed)"
+            members = g.get("members") or []
+            if members:
+                nxt = g.get("next") or []
+                return f"{name}   {len(members)} · {nxt[0] if nxt else '—'}"
+            return f"{name}   (all clients)"
+
+        def _render_left(keep_sel=True):
+            groups_listbox.delete(0, tk.END)
+            for g in working:
+                groups_listbox.insert(tk.END, _fmt_group_row(g))
+            if keep_sel and sel[0] is not None and 0 <= sel[0] < len(working):
+                groups_listbox.selection_clear(0, tk.END)
+                groups_listbox.selection_set(sel[0])
+                groups_listbox.activate(sel[0])
+
+        def _render_members():
+            win._member_listbox.delete(0, tk.END)
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            for key in working[i].get("members", []):
+                suffix = "" if key in live_keys else "   (not running)"
+                win._member_listbox.insert(tk.END, f"{key}{suffix}")
+
+        def _refresh_combo():
+            i = sel[0]
+            current = set(working[i].get("members", [])) if (
+                i is not None and 0 <= i < len(working)) else set()
+            try:
+                known = self._preview_all_known_chars()
+            except Exception:
+                known = set()
+            win._member_combo["values"] = sorted(known - current)
+
+        def _set_right_enabled(on):
+            for wdg in (win._name_entry, win._next_entry, win._prev_entry,
+                        win._btn_capture_next, win._btn_capture_prev,
+                        win._btn_member_up, win._btn_member_down,
+                        win._btn_member_remove, win._btn_member_add,
+                        win._member_combo, win._member_listbox):
+                try:
+                    wdg.configure(state=("normal" if on else "disabled"))
+                except tk.TclError:
+                    pass
+
+        def _load_right():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                _set_right_enabled(False)
+                name_var.set(""); next_var.set(""); prev_var.set("")
+                win._member_listbox.delete(0, tk.END)
+                win._member_combo["values"] = []
+                return
+            _set_right_enabled(True)
+            g = working[i]
+            name_var.set(g.get("name") or "")
+            next_var.set(", ".join(g.get("next") or []))
+            prev_var.set(", ".join(g.get("prev") or []))
+            _render_members()
+            _refresh_combo()
+
+        def _flush_right():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            g = working[i]
+            g["name"] = name_var.get().strip()
+            g["next"] = _split(next_var.get())
+            g["prev"] = _split(prev_var.get())
+
+        # ── selection / group CRUD ───────────────────────────────────────────
+        def _on_select(_evt=None):
+            _flush_right()                    # persist edits of the OLD selection
+            cur = groups_listbox.curselection()
+            sel[0] = cur[0] if cur else None
+            _load_right()
+
+        groups_listbox.bind("<<ListboxSelect>>", _on_select)
+
+        def _on_name_key(_evt=None):
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            working[i]["name"] = name_var.get().strip()
+            _render_left(keep_sel=True)       # live-update the left row
+
+        win._name_entry.bind("<KeyRelease>", _on_name_key)
+
+        def _new_group():
+            _flush_right()
+            working.append({"name": f"Group {len(working) + 1}", "members": [],
+                            "next": [], "prev": [], "order": []})
+            sel[0] = len(working) - 1
+            _render_left(keep_sel=True)
+            _load_right()
+
+        def _del_group():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            del working[i]
+            sel[0] = None if not working else min(i, len(working) - 1)
+            _render_left(keep_sel=True)
+            _load_right()
+
+        # ── member CRUD ──────────────────────────────────────────────────────
+        def _member_add():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            raw = win._member_combo.get().strip().lower()
+            if not raw:
+                return
+            members = working[i].setdefault("members", [])
+            if raw not in members:            # duplicate-in-group → silent no-op
+                members.append(raw)
+            win._member_combo.set("")
+            _render_members()
+            _refresh_combo()
+            _render_left(keep_sel=True)       # member count changed → left row
+
+        def _member_remove():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            cur = win._member_listbox.curselection()
+            if not cur:
+                return
+            members = working[i].get("members", [])
+            if 0 <= cur[0] < len(members):
+                del members[cur[0]]
+            _render_members()
+            _refresh_combo()
+            _render_left(keep_sel=True)
+
+        def _member_move(delta):
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            cur = win._member_listbox.curselection()
+            if not cur:
+                return
+            j = cur[0]
+            members = working[i].get("members", [])
+            k = j + delta
+            if not (0 <= k < len(members)):
+                return
+            members[j], members[k] = members[k], members[j]
+            _render_members()
+            win._member_listbox.selection_clear(0, tk.END)
+            win._member_listbox.selection_set(k)   # keep the moved item selected
+            win._member_listbox.activate(k)
+
+        # ── key capture ──────────────────────────────────────────────────────
+        capturing = [None]      # "next" | "prev" | None
+
+        def _disarm_capture():
+            capturing[0] = None
+            try:
+                win.unbind("<KeyPress>")
+            except tk.TclError:
+                pass
+
+        def _arm_capture(which):
+            if sel[0] is None:
+                return
+            capturing[0] = which
+            win._error_lbl.config(
+                text=f"Press a key combo for '{which}'… (Esc cancels)", fg=FG_DIM)
+            win.bind("<KeyPress>", _on_capture_key)
+
+        def _on_capture_key(event):
+            if capturing[0] is None:
+                return
+            if event.keysym == "Escape":
+                _disarm_capture()
+                win._error_lbl.config(text="")
+                return "break"
+            if event.keysym in hotkey_service._EVENT_MODIFIER_KEYSYMS:
+                return "break"                # bare modifier → keep waiting
+            combo = hotkey_service.event_to_hotkey(event.keysym, event.state)
+            if combo is None:
+                win._error_lbl.config(
+                    text=f"'{event.keysym}' is not a usable hotkey — try again.",
+                    fg=FG_ORANGE)
+                return "break"
+            entry = win._next_entry if capturing[0] == "next" else win._prev_entry
+            entry.delete(0, tk.END)
+            entry.insert(0, combo)            # capture REPLACES the field
+            win._error_lbl.config(text="")
+            _disarm_capture()
+            return "break"
+
+        # ── EVE-O preset (immediate, EVE-O parity) ───────────────────────────
+        def _preset():
+            self._preview_hotkey_preset()     # persists cfg groups[0] = F14/F13
+            if not working:
+                working.append({"name": "All clients", "members": [],
+                                "next": [], "prev": [], "order": []})
+                sel[0] = 0
+            working[0].setdefault("name", "All clients")
+            working[0].setdefault("members", [])
+            working[0]["next"] = ["F14"]      # mirror into the working copy so OK
+            working[0]["prev"] = ["F13"]      # never reverts the preset
+            _render_left(keep_sel=True)
+            if sel[0] == 0:
+                _load_right()
+
+        # ── describe / OK ────────────────────────────────────────────────────
+        def _describe_action(act):
+            if not act:
+                return "hotkey"
+            if act[0] == "cycle":
+                gi = act[1]
+                nm = working[gi].get("name") if 0 <= gi < len(working) else None
+                nm = (nm or "").strip() or f"Group {gi + 1}"
+                return f"cycle {'next' if act[2] > 0 else 'prev'} — {nm}"
+            if act[0] == "focus":
+                return f"focus {act[1]}"
+            if act[0] == "minall":
+                return "minimize all"
+            return "hotkey"
+
+        win._describe_action = _describe_action
+
+        def _ok():
+            _flush_right()
+            # Validate names + every hotkey string BEFORE touching config.
+            msgs = []
+            for i, g in enumerate(working):
+                nm = (g.get("name") or "").strip() or f"Group {i + 1}"
+                g["name"] = nm
+                for key in list(g.get("next") or []) + list(g.get("prev") or []):
+                    try:
+                        hotkey_service.parse_hotkey(key)
+                    except ValueError as exc:
+                        msgs.append(f"{nm}: {exc}")
+            if msgs:
+                win._error_lbl.config(text="  •  ".join(msgs), fg=FG_ORANGE)
+                return
+            hk["groups"] = working
+            self._save_config()
+            # Re-register + surface conflicts (only if a service already exists;
+            # the enable path registers otherwise). Dialog stays open on failures.
+            failures = {}
+            if self._preview_hotkeys is not None:
+                try:
+                    svc = self._preview_restart_hotkeys()
+                    failures = dict(getattr(svc, "failures", {}) or {})
+                except Exception:
+                    log.exception("[preview] cycle-groups re-register failed")
+            if failures:
+                amap = getattr(self, "_preview_hotkey_map", {}) or {}
+                fmsgs = [f"{_describe_action(amap.get(hk_id))}: "
+                         f"{hotkey_service.format_error(code)}"
+                         for hk_id, code in failures.items()]
+                win._error_lbl.config(text="  •  ".join(fmsgs), fg=FG_ORANGE)
+                return
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        win._btn_ok = ttk.Button(btns, text="OK", style="Dark.TButton",
+                                 command=_ok)
+        win._btn_ok.pack(side=tk.LEFT, padx=8)
+        win._btn_cancel = ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                                     command=win.destroy)
+        win._btn_cancel.pack(side=tk.LEFT, padx=2)
+
+        _render_left(keep_sel=False)
+        if working:
+            groups_listbox.selection_set(0)
+            groups_listbox.activate(0)
+        _load_right()
+
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
+
     def _open_preview_hotkeys_dialog(self, _test_no_wait=False):
-        """Modal to edit native-preview hotkeys: per-known-character focus keys,
-        cycle group 0 next/prev + order, and minimize-all. Mirrors the overlay
+        """Modal to edit native-preview hotkeys: per-known-character focus keys
+        and minimize-all (cycle hotkeys moved to _open_preview_cycle_groups_dialog).
+        Mirrors the overlay
         rules dialog conventions (themed Toplevel + transient + grab_set). On OK
         it rebuilds bindings, restarts the service, and surfaces any per-binding
         conflicts (RegisterHotKey error 1409) via hotkey_service.format_error.
@@ -15162,7 +15632,8 @@ class FCToolGUI:
         hk.setdefault("focus", {})
         groups = hk.setdefault("groups", [])
         if not groups:
-            groups.append({"next": [], "prev": [], "order": []})
+            groups.append({"name": "All clients", "members": [],
+                           "next": [], "prev": [], "order": []})
         hk.setdefault("minimize_all", [])
 
         win = tk.Toplevel(self.root)
@@ -15216,42 +15687,16 @@ class FCToolGUI:
                    command=lambda: _add_focus_row()).pack(
                        anchor="w", padx=10, pady=(2, 8))
 
-        # Cycle group 0: next / prev (comma-separated keys) + preset button.
-        tk.Label(win, text="Cycle group (next / previous client):", bg=BG_PANEL,
+        # Cycle hotkeys are managed per-group in their own dialog now (Task 2);
+        # this dialog keeps only per-character focus keys + minimize-all. The old
+        # inline group-0 next/prev/order editor is replaced by a pointer button.
+        tk.Label(win, text="Cycle hotkeys are per-group now:", bg=BG_PANEL,
                  fg=FG_TEXT, font=("Consolas", 10, "bold")).pack(
                      anchor="w", padx=10, pady=(4, 2))
-        cyc = tk.Frame(win, bg=BG_PANEL)
-        cyc.pack(fill=tk.X, padx=10)
-        tk.Label(cyc, text="Next", bg=BG_PANEL, fg=FG_TEXT,
-                 font=("Consolas", 9)).grid(row=0, column=0, padx=2, sticky="w")
-        next_var = tk.StringVar(value=", ".join(groups[0].get("next", []) or []))
-        tk.Entry(cyc, textvariable=next_var, font=("Consolas", 9), bg=BG_ENTRY,
-                 fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
-                     row=0, column=1, padx=2)
-        tk.Label(cyc, text="Prev", bg=BG_PANEL, fg=FG_TEXT,
-                 font=("Consolas", 9)).grid(row=0, column=2, padx=2, sticky="w")
-        prev_var = tk.StringVar(value=", ".join(groups[0].get("prev", []) or []))
-        tk.Entry(cyc, textvariable=prev_var, font=("Consolas", 9), bg=BG_ENTRY,
-                 fg=FG_WHITE, insertbackground=FG_WHITE, width=18).grid(
-                     row=0, column=3, padx=2)
-
-        def _apply_preset():
-            self._preview_hotkey_preset()
-            g0 = self._preview_cfg().get("hotkeys", {}).get("groups", [{}])[0]
-            next_var.set(", ".join(g0.get("next", []) or []))
-            prev_var.set(", ".join(g0.get("prev", []) or []))
-
-        ttk.Button(win, text="Use EVE-O preset (F14 / F13)", style="Dark.TButton",
-                   command=_apply_preset).pack(anchor="w", padx=10, pady=(2, 8))
-
-        # Cycle order (one char key per line; blank = live sorted order).
-        tk.Label(win, text="Cycle order (one character per line; blank = "
-                 "all live, alphabetical):", bg=BG_PANEL, fg=FG_TEXT,
-                 font=("Consolas", 9)).pack(anchor="w", padx=10, pady=(0, 2))
-        order_txt = tk.Text(win, height=4, width=40, font=("Consolas", 9),
-                            bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE)
-        order_txt.pack(anchor="w", padx=10, pady=(0, 8))
-        order_txt.insert("1.0", "\n".join(groups[0].get("order", []) or []))
+        win._btn_open_cycle_groups = ttk.Button(
+            win, text="Cycle groups…", style="Dark.TButton",
+            command=self._open_preview_cycle_groups_dialog)
+        win._btn_open_cycle_groups.pack(anchor="w", padx=10, pady=(0, 8))
 
         # Minimize-all.
         tk.Label(win, text="Minimize all clients:", bg=BG_PANEL, fg=FG_TEXT,
@@ -15277,11 +15722,6 @@ class FCToolGUI:
                 if name and key:
                     focus_out[name] = key
             hk["focus"] = focus_out
-            groups[0]["next"] = _split(next_var.get())
-            groups[0]["prev"] = _split(prev_var.get())
-            groups[0]["order"] = [
-                ln.strip().lower()
-                for ln in order_txt.get("1.0", "end").splitlines() if ln.strip()]
             hk["minimize_all"] = _split(minall_var.get())
             self._save_config()
             # Re-register + surface conflicts. Restart even if native isn't live
