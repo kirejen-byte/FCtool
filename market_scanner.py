@@ -931,6 +931,7 @@ class MarketScanner:
 
         n_listed = len(contract_source)
         n_item_exchange = 0
+        n_status_dropped = 0
 
         # Hold the cache in memory for the whole pass (one disk read up front) and
         # flush it back periodically + at the end (see the finally). This kills the
@@ -948,6 +949,23 @@ class MarketScanner:
                 if contract.get("contract_id") is None:
                     continue
                 n_item_exchange += 1
+
+                # ── Status guard (the corp-history firehose fix). ──────────────
+                # The corp/character contracts endpoint returns up to ~30 days of
+                # contract HISTORY of ALL statuses (finished / finished_issuer /
+                # finished_contractor / cancelled / rejected / failed / deleted /
+                # reversed / in_progress), so a busy staging corp lists a
+                # thousand-plus DEAD contracts. Only "outstanding" contracts are
+                # still acceptable — seedable — stock. Drop any row whose status is
+                # present AND not "outstanding" BEFORE the (cached) location resolve
+                # and the expensive per-contract item fetch. The PUBLIC region
+                # endpoint omits the status field and already lists only
+                # outstanding contracts, so a MISSING status is kept — which also
+                # defensively guards the public path if it ever grows the field.
+                status = contract.get("status")
+                if status is not None and str(status) != "outstanding":
+                    n_status_dropped += 1
+                    continue
 
                 loc_id = int(contract.get("start_location_id", 0) or 0)
                 # Only resolve the contract's system when it is actually needed: a
@@ -1029,8 +1047,10 @@ class MarketScanner:
         )
         log.info(
             "[market] contract scan: region=%s listed=%d (corp=%d) item_exchange=%d "
-            "fetched=%d (live=%d cache=%d) matches=%d elapsed=%.1fs",
-            region_id, n_listed, n_corp, n_item_exchange, scanned,
+            "status_dropped=%d outstanding=%d fetched=%d (live=%d cache=%d) "
+            "matches=%d elapsed=%.1fs",
+            region_id, n_listed, n_corp, n_item_exchange, n_status_dropped,
+            n_item_exchange - n_status_dropped, scanned,
             scanned - from_cache, from_cache, total_matches, time.monotonic() - t0,
         )
 
@@ -1057,10 +1077,26 @@ class MarketScanner:
     ) -> tuple[list[dict], bool]:
         """Return (items, served_from_cache) for a contract.
 
-        Reads the persistent contract-items cache first; a cache hit within the
-        1h TTL replays from disk (no network). Otherwise fetches via the adapter
-        (public route, or the corp route for an alliance contract) and stores the
-        result. Any adapter error yields ``([], False)`` — the caller skips it.
+        Reads the persistent contract-items cache first; a cache hit — including a
+        permanent DEAD tombstone (see below) — replays with no network. Otherwise
+        fetches via the adapter (public route, or the corp route for an alliance
+        contract) and stores the result.
+
+        **Negative caching (the every-refresh dead-contract crawl fix).** When the
+        fetch comes back empty, the adapter's ``last_contract_items_status``
+        (duck-typed; "ok" when the adapter doesn't report one) classifies it:
+
+        * ``"dead"`` — a definitively gone contract (404/410, or a 403 on the
+          PUBLIC route = permanently restricted). Written as an immutable-forever
+          TOMBSTONE (``dead=True``, no TTL) so it is NEVER re-fetched — it counts
+          as ``from_cache`` on every later scan.
+        * ``"transient"`` — a timeout / 5xx / error-limit / corp-route scope 403.
+          NOT cached, so the next scan re-fetches (a live contract must never be
+          hidden behind a transient blip).
+        * ``"ok"`` — a real (possibly genuinely empty) 2xx response. Cached with
+          the normal 1h TTL, exactly as before.
+
+        A raising adapter is treated as transient (skipped, uncached).
         """
         cached = self._read_contract_items_cache(int(contract_id))
         if cached is not None:
@@ -1073,11 +1109,26 @@ class MarketScanner:
                 items = self._adapter.contract_items(int(contract_id))
         except Exception:
             log.exception("[market] contract items pull failed for %s", contract_id)
-            return [], False
+            return [], False  # adapter raised → transient, do not cache
 
         items = items or []
-        self._write_contract_items_cache(int(contract_id), items)
-        return items, False
+        if items:
+            # Live contract with items → normal-TTL cache (disposition irrelevant).
+            self._write_contract_items_cache(int(contract_id), items)
+            return items, False
+
+        # Empty result — classify to decide tombstone vs transient-skip.
+        status = getattr(self._adapter, "last_contract_items_status", "ok")
+        if status == "dead":
+            # Immutable-forever tombstone: a gone contract stays gone.
+            self._write_contract_items_cache(int(contract_id), [], dead=True)
+        elif status == "transient":
+            # Timeout / 5xx / error-limit — do NOT cache; retry next scan.
+            return [], False
+        else:
+            # "ok" (a genuinely empty 2xx) — normal-TTL empty entry, as before.
+            self._write_contract_items_cache(int(contract_id), [])
+        return [], False
 
     def _resolve_system_cached(self, location_id: int) -> int | None:
         """Resolve a contract ``location_id`` to a system id, memoized in the
@@ -1270,6 +1321,11 @@ class MarketScanner:
         entry = (data.get("contract_items") or {}).get(str(contract_id))
         if not isinstance(entry, dict):
             return None
+        # A permanent DEAD tombstone is served forever (no TTL) — a gone contract
+        # stays gone, so we never re-fetch it.
+        if entry.get("dead"):
+            items = entry.get("items")
+            return items if isinstance(items, list) else []
         fetched_at = entry.get("fetched_at")
         if _age_seconds(fetched_at) > CACHE_TTL_CONTRACT_ITEMS:
             return None
@@ -1277,12 +1333,15 @@ class MarketScanner:
         return items if isinstance(items, list) else None
 
     def _write_contract_items_cache(
-        self, contract_id: int, items: list[dict], etag: str | None = None
+        self, contract_id: int, items: list[dict], etag: str | None = None,
+        *, dead: bool = False,
     ) -> None:
         # During a scan the write lands in the in-memory session (flushed to disk
         # in merged batches) instead of a full read-modify-write per contract.
+        # ``dead`` marks a permanent tombstone (a gone contract): stored with no
+        # TTL so it is served forever and never re-fetched.
         if self._session is not None:
-            self._session.put_items(int(contract_id), items, etag)
+            self._session.put_items(int(contract_id), items, etag, dead=dead)
             return
 
         def _mut(data: dict) -> None:
@@ -1290,6 +1349,7 @@ class MarketScanner:
                 "items": items,
                 "etag": etag,
                 "fetched_at": _now_iso(),
+                "dead": dead,
             }
 
         self._write_cache(_mut)
@@ -1356,17 +1416,24 @@ class _ContractCacheSession:
 
     def get_items(self, contract_id: int) -> list[dict] | None:
         """Cached items for a contract within the 1h TTL, else None (same rule as
-        the direct disk path)."""
+        the direct disk path). A permanent DEAD tombstone bypasses the TTL — a gone
+        contract stays gone, served forever so it is never re-fetched."""
         entry = self._items.get(str(contract_id))
         if not isinstance(entry, dict):
             return None
+        if entry.get("dead"):
+            items = entry.get("items")
+            return items if isinstance(items, list) else []
         if _age_seconds(entry.get("fetched_at")) > CACHE_TTL_CONTRACT_ITEMS:
             return None
         items = entry.get("items")
         return items if isinstance(items, list) else None
 
-    def put_items(self, contract_id: int, items: list[dict], etag: str | None = None) -> None:
-        entry = {"items": items, "etag": etag, "fetched_at": _now_iso()}
+    def put_items(
+        self, contract_id: int, items: list[dict], etag: str | None = None,
+        *, dead: bool = False,
+    ) -> None:
+        entry = {"items": items, "etag": etag, "fetched_at": _now_iso(), "dead": dead}
         key = str(contract_id)
         self._items[key] = entry
         self._pending_items[key] = entry

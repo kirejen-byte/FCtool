@@ -63,6 +63,12 @@ DEFAULT_CONFIG = {
         "staging_station_id": 0,    # NPC station id (0 = not set); filters the region pull
         "staging_region_id": 0,     # region for orders + contracts pull
         "staging_system_id": 0,     # resolved staging system (0 = unknown); contract filter
+        # Picker display names, persisted alongside the ids so the Settings
+        # pickers restore on rebuild without reverse lookups (0-id rows keep "").
+        # Written instantly on each pick — see FCToolGUI._market_persist_keys.
+        "staging_system_name": "",     # staging system name (autocomplete entry text)
+        "staging_station_name": "",    # chosen NPC station display name
+        "staging_structure_name": "",  # chosen structure name (no "(id)" suffix)
         "scan_contracts": True,     # allow the (expensive) contract scan
         "include_alliance_contracts": True,  # also pull corp/alliance contracts (needs scope)
         "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)

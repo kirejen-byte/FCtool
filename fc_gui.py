@@ -16062,6 +16062,10 @@ class FCToolGUI:
         # Prime the station picker from the currently-configured system (if any)
         # so a saved staging system shows its stations without a re-type.
         self._market_prime_pickers()
+        # Restore the name-carrying pickers (system entry text, station selection,
+        # structure display) from the saved config name keys — network-free, so a
+        # previously-chosen system/station/structure shows on rebuild.
+        self._market_restore_saved_pickers()
 
         cb_frame = tk.Frame(parent, bg=BG_DARK)
         cb_frame.pack(fill=tk.X, padx=20, pady=2)
@@ -16155,15 +16159,118 @@ class FCToolGUI:
     def _market_prime_pickers(self):
         """Populate the station picker from the currently-configured staging
         system, using ONLY the on-disk resolution cache (network-free). No-op
-        when nothing is configured or the system was never resolved."""
+        when nothing is configured or the system was never resolved; a resolved
+        but station-less system yields the '(no NPC stations)' placeholder."""
         try:
             import market_staging
             sid = self._market_current_id("staging_system_id")
-            resolution = market_staging.get_cached(sid) if sid else None
+            stations = market_staging.get_cached_stations(sid) if sid else None
         except Exception:
-            resolution = None
-        if resolution:
-            self._market_set_station_options(resolution.get("stations") or [])
+            stations = None
+        if stations is not None:
+            self._market_set_station_options(stations)
+
+    def _market_persist_keys(self, **updates):
+        """Instant-save one or more ``config["market"]`` keys, mirroring the
+        app's proven autosave idioms (``_on_tracked_character_change``,
+        ``_autosave_staging_system``): mutate ``self.config`` then
+        ``_save_config()`` (which takes the config lock for the atomic write).
+
+        A NO-OP when every value already equals what is stored, so a redundant
+        re-pick causes no write churn. Fully guarded — a bare test host without
+        ``config``/``_save_config``, a missing key, or a save failure never
+        crashes the picker callbacks."""
+        try:
+            mkt = self.config.setdefault("market", {})
+        except (AttributeError, TypeError):
+            return
+        changed = False
+        for key, value in updates.items():
+            if mkt.get(key) != value:
+                mkt[key] = value
+                changed = True
+        if not changed:
+            return
+        save = getattr(self, "_save_config", None)
+        if callable(save):
+            save()
+
+    def _market_restore_saved_pickers(self):
+        """Rebuild-time restore of the staging pickers from the saved display-name
+        config keys (network-free), complementing ``_market_prime_pickers``
+        (which fills the station LIST from the warm cache):
+
+        * SYSTEM — set the autocomplete entry text to the saved system name.
+        * STATION — select the saved station name in the (warm) cached list;
+          when the cache was cold so prime left no list, show the saved station
+          name as a standalone current selection.
+        * STRUCTURE — show ``'name (id)'`` from the saved keys, so the last-picked
+          structure survives a restart without re-running 'Find structures…'.
+
+        Setting the entry/combobox vars never fires a resolve (``on_select`` only
+        fires on a real dropdown pick). Fully guarded: a missing config or a dead
+        widget never raises."""
+        try:
+            mkt = self.config.get("market", {}) or {}
+        except (AttributeError, TypeError):
+            return
+
+        def _as_int(v):
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        # ── System-name entry ─────────────────────────────────────────────────
+        sys_name = str(mkt.get("staging_system_name", "") or "").strip()
+        sv = getattr(self, "_market_staging_var", None)
+        if sys_name and sv is not None:
+            try:
+                sv.set(sys_name)
+            except tk.TclError:
+                pass
+
+        # ── Station selection (warm list from prime, else cold-name fallback) ──
+        st_name = str(mkt.get("staging_station_name", "") or "").strip()
+        st_id = _as_int(mkt.get("staging_station_id", 0))
+        combo = getattr(self, "_market_station_combo", None)
+        var = getattr(self, "_market_station_var", None)
+        if st_name and combo is not None and var is not None:
+            opts = getattr(self, "_market_station_options", []) or []
+            if len(opts) > 1:
+                # Warm: prime populated the cached list — select the saved name
+                # when it's present (an id-preselect already ran otherwise).
+                if any(lbl == st_name for (lbl, _i) in opts):
+                    try:
+                        var.set(st_name)
+                    except tk.TclError:
+                        pass
+            elif st_id:
+                # Cold cache: no station list — show the saved station as the
+                # standalone current selection (a re-resolve refills the full
+                # list on demand).
+                self._market_station_options = [
+                    (self._MARKET_STATION_NONE, 0), (st_name, st_id)]
+                try:
+                    combo.config(values=[self._MARKET_STATION_NONE, st_name])
+                    var.set(st_name)
+                except tk.TclError:
+                    pass
+
+        # ── Structure display ─────────────────────────────────────────────────
+        sc_name = str(mkt.get("staging_structure_name", "") or "").strip()
+        sc_id = _as_int(mkt.get("staging_structure_id", 0))
+        sc_combo = getattr(self, "_market_structure_combo", None)
+        sc_var = getattr(self, "_market_structure_var", None)
+        if sc_name and sc_id and sc_combo is not None and sc_var is not None:
+            label = f"{sc_name} ({sc_id})"
+            self._market_structure_options = [
+                (self._MARKET_STRUCT_NONE, 0), (label, sc_id)]
+            try:
+                sc_combo.config(values=[self._MARKET_STRUCT_NONE, label])
+                sc_var.set(label)
+            except tk.TclError:
+                pass
 
     def _market_on_staging_select(self):
         """A staging system was chosen (typed + selected from the dropdown).
@@ -16188,6 +16295,16 @@ class FCToolGUI:
             self._market_set_id_var("staging_system_id", sid)
         if rid:
             self._market_set_id_var("staging_region_id", rid)
+        # Instant-persist the chosen system NAME + whatever local ids we have now,
+        # so a pick survives a restart even if the background resolve never lands
+        # (offline). The resolution-apply step re-persists the canonical name +
+        # resolved ids once it completes (both no-op when unchanged).
+        _persist = {"staging_system_name": name}
+        if sid:
+            _persist["staging_system_id"] = int(sid)
+        if rid:
+            _persist["staging_region_id"] = int(rid)
+        self._market_persist_keys(**_persist)
         self._market_set_status("_market_staging_status",
                                 f"resolving {name}…", FG_ACCENT)
         if getattr(self, "_market_staging_resolving", False):
@@ -16264,6 +16381,15 @@ class FCToolGUI:
             self._market_set_id_var("staging_region_id", rid)
         stations = resolution.get("stations") or []
         self._market_set_station_options(stations)
+        # Persist the resolved system — reached only AFTER the latest-selection
+        # guard above, so a STALE resolve never lands here. Canonical name +
+        # resolved ids; no-op when unchanged from the on_select pre-fill.
+        _persist = {"staging_system_name": resolution.get("name") or name}
+        if sid:
+            _persist["staging_system_id"] = int(sid)
+        if rid:
+            _persist["staging_region_id"] = int(rid)
+        self._market_persist_keys(**_persist)
         n = len(stations)
         region_txt = f"region {rid}" if rid else "region unknown"
         tail = "  — pick a station below" if n else ""
@@ -16324,6 +16450,11 @@ class FCToolGUI:
                 chosen = sid
                 break
         self._market_set_id_var("staging_station_id", chosen)
+        # Instant-persist the id + display name (name cleared for the (none)/
+        # placeholder rows where chosen == 0) so the station survives a restart.
+        self._market_persist_keys(
+            staging_station_id=int(chosen),
+            staging_station_name=(label if chosen else ""))
 
     def _market_find_structures(self):
         """'Find structures…' → authed structure search for the chosen staging
@@ -16438,6 +16569,15 @@ class FCToolGUI:
                 chosen = rid
                 break
         self._market_set_id_var("staging_structure_id", chosen)
+        # Instant-persist the id + the BARE structure name (strip the " (id)" the
+        # option label carries) so restore can redisplay "name (id)" without a
+        # re-search. Name cleared for the (none) row.
+        _name = ""
+        if chosen:
+            _tail = f" ({chosen})"
+            _name = label[:-len(_tail)] if label.endswith(_tail) else label
+        self._market_persist_keys(
+            staging_structure_id=int(chosen), staging_structure_name=_name)
 
     def _browse_logs(self):
         path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
@@ -17011,6 +17151,12 @@ class FCToolGUI:
         # seed_target must stay positive; fall back to 20 on a 0/negative entry.
         if mkt.get("seed_target", 0) <= 0:
             mkt["seed_target"] = 20
+        # Preserve the picker display-name keys (written instantly on each pick by
+        # _market_persist_keys). _collect only knows the id/seed vars, so ensure a
+        # Save Settings never drops the names — keep them present (default "").
+        for nk in ("staging_system_name", "staging_station_name",
+                   "staging_structure_name"):
+            mkt.setdefault(nk, "")
         cb = getattr(self, "_market_scan_contracts_var", None)
         if cb is not None:
             mkt["scan_contracts"] = bool(cb.get())

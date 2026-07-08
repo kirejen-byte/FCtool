@@ -175,6 +175,20 @@ def get_cached(system_id) -> dict | None:
     return hit if isinstance(hit, dict) else None
 
 
+def get_cached_stations(system_id) -> list | None:
+    """Station list ``[{"id","name"}, ...]`` for a previously-resolved system,
+    read from the on-disk cache (network-free). Returns ``None`` when the system
+    was never resolved (cache MISS) and ``[]`` for a resolved but station-less
+    system — so a caller can tell 'unknown' apart from 'known to have no
+    stations'. For priming/restoring the station picker from a saved staging
+    system without a re-fetch."""
+    hit = get_cached(system_id)
+    if not isinstance(hit, dict):
+        return None
+    stations = hit.get("stations")
+    return stations if isinstance(stations, list) else []
+
+
 def _save_cache(systems: dict) -> None:
     """Persist the resolution map (best-effort; a write failure is logged, not
     raised — a missing cache just means the next resolve re-fetches)."""
