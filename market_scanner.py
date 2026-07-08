@@ -1175,12 +1175,17 @@ class MarketScanner:
         (honest summary) instead of ``"Nx <doctrine>"``. Omitting the mapping
         (``None``) reproduces the prior single-target behaviour exactly.
 
-        By owner decision #4 the gap builder accepts whichever component subset
-        it is handed: the ``components`` predicate/iterable selects roles to
-        include. Default (``None``) = the scored set — hull + modules +
-        subsystems (charges/drones/cargo excluded), matching the completable-fits
-        math. Pass ``components="full"`` to include the whole BoM
-        (charges/drones too).
+        The gap builder accepts whichever component subset it is handed: the
+        ``components`` predicate/iterable selects roles to include. Default
+        (``None``) = the FULL BoM — hull + modules + subsystems + charges + cargo
+        + drones — so the seeding shopping list covers modules, implants,
+        boosters, ammo, drones and everything else the doctrine's fits carry
+        (owner requirement). This is intentionally WIDER than the completable-fits
+        / breadth scoring (which stays modules + subsystems + the hull gate): a
+        fit is flyable without its cargo, but a seeding list is not complete
+        without it. Pass an explicit ``components`` iterable to narrow — e.g.
+        ``{"module", "subsystem"}`` for the flyable-only subset, or ``["hull"]``
+        for hulls alone. ``components="full"`` is a synonym for the default.
         """
         # needed[type_id] -> (name, total needed units)
         needed: dict[int, list] = {}  # type_id -> [name, needed]
@@ -1810,16 +1815,21 @@ def _resolve_gap_role_filter(components):
     """Return a predicate ``role -> bool`` selecting which BoM roles the gap list
     includes.
 
-    * ``None`` (default) → hull + modules + subsystems (the scored subset;
-      charges/drones/cargo excluded).
-    * ``"full"`` → every role (hull, module, subsystem, charge, cargo, drone).
-    * an iterable of role strings → exactly those roles.
+    * ``None`` (default) → the FULL bill-of-materials: hull + modules +
+      subsystems + charges + cargo + drones. The seeding export must cover
+      modules, implants, boosters, ammo, drones, and anything else a doctrine's
+      shopping-list fit carries in cargo — so the default is the whole BoM, not
+      the flyable-only scored subset. (This is deliberately wider than the
+      completable-fits / breadth scoring, which stays modules + subsystems + the
+      hull gate — a fit is flyable without its cargo, but a seeding list is not
+      complete without it.)
+    * ``"full"`` → identical to the default (every role); kept as an explicit
+      keyword for call sites that want to state the intent.
+    * an iterable of role strings → exactly those roles (e.g. ``["hull"]`` or
+      ``{"module", "subsystem"}`` to reproduce the old flyable-only export).
     * a callable → used directly.
     """
-    if components is None:
-        allowed = {"hull"} | set(_SCORING_MODULE_ROLES)
-        return lambda role: role in allowed
-    if components == "full":
+    if components is None or components == "full":
         return lambda role: True
     if callable(components):
         return components
