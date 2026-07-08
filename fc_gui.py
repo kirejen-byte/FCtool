@@ -859,6 +859,7 @@ class FCToolGUI:
         self._market_scan_ts = None            # datetime of the last scan / cache load
         self._market_scanning = False          # in-flight guard (no concurrent scans)
         self._market_from_cache = False        # True while showing a disk-cached snapshot
+        self._market_degraded_reasons = []     # snapshot degradation tags (e.g. structure_market)
         self._market_corp_id_cache = {}        # character_id -> corp id (1 GET per char)
         self._market_staging_resolving = False  # in-flight guard: staging resolve
         self._market_staging_pending = None     # selection queued behind an in-flight resolve
@@ -4888,6 +4889,34 @@ class FCToolGUI:
                 text=f"{count} character(s) connected", fg=FG_GREEN
             )
 
+    def _acct_missing_scopes(self, acct):
+        """Set of required scopes an account's token is missing.
+
+        Prefers ``ESIAuth.missing_scopes()`` (checks the full current SCOPES —
+        fittings AND market scanner scopes). Falls back to the legacy single
+        fittings-scope check for stand-ins that only implement ``has_scope`` so
+        the ⚠ still appears for a fittings-only shortfall. Never raises."""
+        fn = getattr(acct, "missing_scopes", None)
+        if callable(fn):
+            try:
+                return set(fn())
+            except Exception:
+                return set()
+        try:
+            return (set() if acct.has_scope(SCOPE_FITTINGS_READ)
+                    else {SCOPE_FITTINGS_READ})
+        except Exception:
+            return set()
+
+    @staticmethod
+    def _missing_scopes_tooltip(missing):
+        """Tooltip listing the missing scopes for the ⚠ flag / Re-authorize
+        button. Empty input → empty string."""
+        if not missing:
+            return ""
+        listed = "\n".join(f"  • {s}" for s in sorted(missing))
+        return "Missing ESI scopes — Re-authorize to grant:\n" + listed
+
     def _rebuild_esi_char_list(self):
         """Rebuild the ESI character list in Settings.
 
@@ -4936,21 +4965,22 @@ class FCToolGUI:
                      font=("Consolas", 10), fg=fg, bg=row_bg, anchor="w"
                      ).grid(row=r, column=1, sticky="we", padx=(0, 8), pady=1)
 
-            # col 2 — scope-warning flag. If this character's token predates the
-            # esi-fittings scopes it cannot import/push fits until re-authorized;
-            # the ⚠ (with tooltip) plus the col-5 Re-authorize button replace the
-            # old full-width notice row. Re-logging in as the same character
-            # refreshes its tokens with the full current SCOPES.
-            needs_reauth = (acct.is_authenticated
-                            and not acct.has_scope(SCOPE_FITTINGS_READ))
+            # col 2 — scope-warning flag. If this character's token is missing
+            # ANY scope in the current esi_auth.SCOPES (e.g. it predates the
+            # esi-fittings OR the market scanner scopes) it cannot use the
+            # dependent features until re-authorized; the ⚠ (with a tooltip that
+            # lists the missing scopes) plus the col-5 Re-authorize button
+            # replace the old full-width notice row. Re-logging in as the same
+            # character refreshes its tokens with the full current SCOPES.
+            missing = self._acct_missing_scopes(acct) if acct.is_authenticated else set()
+            needs_reauth = bool(missing)
             if needs_reauth:
                 flag = tk.Label(self._esi_chars_frame, text="⚠",
                                 font=("Consolas", 10), fg=FG_ORANGE, bg=row_bg)
+                tip = self._missing_scopes_tooltip(missing)
                 flag.bind(
                     "<Enter>",
-                    lambda e: self._show_tooltip(
-                        e, "Missing fittings scopes — Re-authorize to enable "
-                           "in-game fittings import/push."))
+                    lambda e, t=tip: self._show_tooltip(e, t))
                 flag.bind("<Leave>", lambda e: self._hide_tooltip())
             else:
                 flag = tk.Label(self._esi_chars_frame, text="",
@@ -5181,6 +5211,11 @@ class FCToolGUI:
                     # so auto-discover Ansiblex gates (debounced) as on a fresh
                     # add — cheap and dedupes.
                     self._auto_discover_ansiblex_after_login()
+                    # Re-auth may have just granted the citadel-market scope
+                    # while a cached forbidden-empty snapshot still latches the
+                    # degraded banner — auto-rescan to clear it honestly (and
+                    # refresh the market status/button either way).
+                    self._market_after_reauth()
                     return
 
             # New character — add to accounts list
@@ -5202,6 +5237,9 @@ class FCToolGUI:
             # without clicking "Discover Ansiblex Gates". Debounced (in-flight
             # flag) so adding several characters back-to-back runs one scan.
             self._auto_discover_ansiblex_after_login()
+            # A new (or newly-primary) character can also unlatch a cached
+            # structure-degraded market snapshot — same auto-heal as re-auth.
+            self._market_after_reauth()
         else:
             self._esi_status_label.config(
                 text=f"Login failed: {info}", fg=FG_RED
@@ -6732,6 +6770,11 @@ class FCToolGUI:
                          anchor=tk.W, padx=10, pady=10)
             return
 
+        # Structure market blocked (missing scope / degraded snapshot) → a
+        # re-auth banner replaces the misleading availability rows below, and the
+        # Gaps… button is gated off (a forbidden-empty book would say "buy all").
+        blocked = self._market_structure_blocked()
+
         # Header: name + rename/delete.
         head = tk.Frame(parent, bg=BG_PANEL)
         head.pack(fill=tk.X, padx=10, pady=(10, 0))
@@ -6777,18 +6820,24 @@ class FCToolGUI:
         # Gaps shopping-list export — only meaningful once a snapshot exists (the
         # same snapshot the availability marks gate on). Shown disabled with an
         # explanatory tip until then so the affordance is discoverable.
-        gaps_state = tk.NORMAL if self._market_snapshot is not None else tk.DISABLED
+        gaps_state = (tk.NORMAL if (self._market_snapshot is not None
+                                    and not blocked) else tk.DISABLED)
         gaps_btn = ttk.Button(
             add_row, text="Gaps…", style="Dark.TButton", state=gaps_state,
             command=lambda: self._open_market_gaps_dialog(doctrine))
         gaps_btn.pack(side=tk.LEFT, padx=2)
-        self._tip_widget(
-            gaps_btn,
-            "Shopping list of items short of this doctrine's seed target — "
-            "copy for Janice or in-game Multibuy. Click ⟳ Market first to load "
-            "market stock." if self._market_snapshot is None else
-            "Shopping list of items short of this doctrine's seed target — "
-            "copy for Janice or in-game Multibuy.")
+        if blocked:
+            gaps_tip = self._market_structure_reauth_message()
+        elif self._market_snapshot is None:
+            gaps_tip = (
+                "Shopping list of items short of this doctrine's seed target — "
+                "copy for Janice or in-game Multibuy. Click ⟳ Market first to "
+                "load market stock.")
+        else:
+            gaps_tip = (
+                "Shopping list of items short of this doctrine's seed target — "
+                "copy for Janice or in-game Multibuy.")
+        self._tip_widget(gaps_btn, gaps_tip)
         self._market_doc_status_label = tk.Label(
             add_row, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W)
@@ -6800,6 +6849,12 @@ class FCToolGUI:
         # controls, on its own line so it never crowds the button row.
         self._build_doctrine_seed_target_row(parent, doctrine)
 
+        # Structure market blocked → prominent orange re-auth banner ABOVE the
+        # member rows (with an inline Re-authenticate button); the availability
+        # rows are suppressed so an empty forbidden book can't read as bare.
+        if blocked:
+            self._market_render_reauth_banner(parent)
+
         if not doctrine.members:
             tk.Label(parent, text="No fits yet — use 'Add fit…' to add ships "
                                   "to this doctrine.",
@@ -6808,9 +6863,9 @@ class FCToolGUI:
                          anchor=tk.W, padx=12, pady=(8, 10))
             return
 
-        # Per-fit market availability (empty dict when no snapshot → rows show
-        # nothing, no clutter). Computed once for the whole doctrine.
-        avail_map = self._market_doctrine_avail_map(doctrine)
+        # Per-fit market availability (empty dict when no snapshot OR blocked →
+        # rows show nothing, no clutter). Computed once for the whole doctrine.
+        avail_map = {} if blocked else self._market_doctrine_avail_map(doctrine)
         # Per-doctrine seed target (override wins; else the global default). Drives
         # the availability colour thresholds for THIS doctrine's rows.
         seed_target = self._market_seed_target(doctrine)
@@ -15827,7 +15882,18 @@ class FCToolGUI:
             scan_row, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
             anchor=tk.W)
         self._market_status_label.pack(side=tk.LEFT, padx=10)
-        # Prime the status text from current config/cache state.
+        # Re-authenticate button — appears (packed) only when the structure
+        # market is blocked (missing scope / degraded). Managed by
+        # _refresh_market_status_labels; reuses the char-list SSO flow so it
+        # re-logs in the primary character with the full current SCOPES.
+        self._market_reauth_btn = ttk.Button(
+            scan_row, text="Re-authenticate", style="Dark.TButton",
+            command=self._esi_login)
+        self._tip_widget(
+            self._market_reauth_btn,
+            "Your primary character's token predates the citadel-market scope. "
+            "Re-authenticate to read the structure market and its contracts.")
+        # Prime the status text + reauth-button visibility from current state.
         self._refresh_market_status_labels()
 
     # ── Market Scanner: name-first staging pickers ────────────────────────────
@@ -20374,6 +20440,7 @@ $bmp.Dispose()
             return
         self._market_snapshot = snap
         self._market_from_cache = True
+        self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
         # Stamp the cache time from the snapshot's taken_at for the status label.
         try:
             self._market_scan_ts = datetime.fromisoformat(snap.taken_at)
@@ -20391,6 +20458,111 @@ $bmp.Dispose()
             return self.fittings.get_doctrine(did)
         except Exception:
             return None
+
+    def _market_scope_reauth_needed(self):
+        """True when a STRUCTURE market is configured but the primary character's
+        token lacks the citadel-market scope (proactive — known without a scan).
+
+        Drives the Settings ▸ Market Re-authenticate button and the Doctrine-tab
+        banner even before/without a scan. Defensive/duck-typed so headless test
+        hosts (no real ESIAuth) don't blow up."""
+        source = self._market_source()
+        if source is None or source.kind != "structure":
+            return False
+        auth = getattr(self, "esi_auth", None)
+        checker = getattr(auth, "has_market_structure_scope", None) if auth else None
+        if not callable(checker):
+            return False
+        try:
+            return not checker()
+        except Exception:
+            return False
+
+    def _market_structure_blocked(self):
+        """True when the structure market can't be trusted for lack of scope /
+        docking access — either the active snapshot came back degraded for the
+        structure market (reactive 403), OR a structure is configured and the
+        primary char lacks the scope (proactive belt).
+
+        The single gate for: the Doctrine-tab re-auth banner, suppression of the
+        misleading "✗ 0" availability rows / per-module ✗ marks (a forbidden-
+        empty book must not read as a bare market), and the Gaps… button."""
+        reasons = getattr(self, "_market_degraded_reasons", None) or []
+        if "structure_market" in reasons:
+            return True
+        return self._market_scope_reauth_needed()
+
+    def _market_reauth_char_name(self):
+        """The primary character's name for the re-auth prompts (or a fallback)."""
+        auth = getattr(self, "esi_auth", None)
+        name = getattr(auth, "character_name", None) if auth else None
+        return name or "your primary character"
+
+    def _market_structure_reauth_message(self):
+        """The one-line orange banner / tooltip message for the blocked state.
+
+        Names the rescan step explicitly: a CACHED degraded snapshot latches the
+        blocked state until a fresh scan proves the book readable, so the manual
+        ⟳ is the honest fallback whenever the post-re-auth auto-rescan
+        (``_market_after_reauth``) can't run or the 403 was docking-access."""
+        return ("⚠ Citadel market data unavailable — re-authenticate "
+                f"{self._market_reauth_char_name()} to grant the market scope, "
+                "then click ⟳ Market to refresh.")
+
+    def _market_render_reauth_banner(self, parent):
+        """Render a prominent orange banner with an inline Re-authenticate button
+        into ``parent`` (used above the Doctrine-tab availability rows while the
+        structure market is blocked). The button reuses the SAME SSO flow as the
+        Settings character list (``_esi_login``), which re-logs in the primary
+        character with the full current SCOPES. Returns the banner frame."""
+        banner = tk.Frame(parent, bg=BG_PANEL,
+                          highlightbackground=FG_ORANGE, highlightthickness=1)
+        banner.pack(fill=tk.X, padx=12, pady=(6, 2))
+        ttk.Button(banner, text="Re-authenticate", style="Dark.TButton",
+                   command=self._esi_login).pack(side=tk.RIGHT, padx=6, pady=4)
+        tk.Label(banner, text=self._market_structure_reauth_message(),
+                 font=("Consolas", 9, "bold"), fg=FG_ORANGE, bg=BG_PANEL,
+                 anchor=tk.W, justify=tk.LEFT, wraplength=330).pack(
+                     side=tk.LEFT, padx=(6, 8), pady=4)
+        return banner
+
+    def _market_after_reauth(self):
+        """Market auto-heal after a successful SSO (re-)login — called from both
+        success branches of ``_esi_login_complete``.
+
+        A re-auth that just granted the citadel-market scope would otherwise
+        leave a CACHED structure-degraded snapshot latched (banner up, rows
+        suppressed, message now misleadingly saying "re-authenticate") until a
+        manual ⟳ Market. When the scope is now present AND the active degraded
+        state came from the structure market, kick a fresh scan automatically —
+        ``_market_scan_now`` has its own in-flight guard, and its apply step
+        re-renders the detail panes + status labels once the clean snapshot
+        lands. The degraded reasons are deliberately NOT cleared here: a 403 can
+        also mean docking-access denial (which re-auth does not fix), so only a
+        fresh scan proving readability may reset them.
+
+        When no rescan is warranted (scope still missing, or nothing degraded),
+        just refresh the status labels so the Settings Re-authenticate button
+        tracks the new scope state immediately. Guarded throughout — a login can
+        complete with the Settings Market section never built, or mid-teardown.
+        """
+        heal = False
+        try:
+            reasons = getattr(self, "_market_degraded_reasons", None) or []
+            heal = ("structure_market" in reasons
+                    and not self._market_scope_reauth_needed())
+        except Exception:
+            log.exception("[market] post-reauth heal check failed")
+        if heal:
+            try:
+                self._market_scan_now()  # refreshes labels; apply re-renders
+                return
+            except Exception:
+                log.exception("[market] post-reauth rescan failed")
+        try:
+            self._refresh_market_status_labels()
+        except Exception:
+            log.exception("[market] post-reauth status refresh failed")
 
     def _market_status_text(self):
         """The last-scan status string for the Market status labels.
@@ -20430,6 +20602,20 @@ $bmp.Dispose()
                 continue
             try:
                 lbl.config(text=text, fg=colour)
+            except tk.TclError:
+                pass
+        # Settings ▸ Market Re-authenticate button: shown+enabled only when the
+        # structure market is blocked (scope missing / degraded), hidden
+        # otherwise. Reuses the char-list SSO flow (self._esi_login).
+        btn = getattr(self, "_market_reauth_btn", None)
+        if btn is not None:
+            try:
+                if self._market_structure_blocked():
+                    if not btn.winfo_ismapped():
+                        btn.pack(side=tk.LEFT, padx=(10, 0))
+                    btn.config(state=tk.NORMAL)
+                else:
+                    btn.pack_forget()
             except tk.TclError:
                 pass
 
@@ -20482,6 +20668,18 @@ $bmp.Dispose()
                     snap = scanner.scan_market(source)
                 except Exception:
                     log.exception("[market] scan_market failed")
+                # Pre-check belt: a structure source whose primary character
+                # lacks the citadel scope is degraded even if the pull never
+                # recorded a 403 (e.g. no token attached). Mark the snapshot so
+                # the UI shows the re-auth banner instead of a bare-market read.
+                if snap is not None and source.kind == "structure":
+                    try:
+                        checker = getattr(auth, "has_market_structure_scope", None)
+                        marker = getattr(snap, "mark_degraded", None)
+                        if callable(checker) and callable(marker) and not checker():
+                            marker("structure_market")
+                    except Exception:
+                        pass
                 if scan_contracts and fits and source.region_id:
                     # Corp-id resolution is a live ESI GET
                     # (ESIAuth._get_character_corp_id) → it runs HERE on the
@@ -20558,6 +20756,7 @@ $bmp.Dispose()
             self._market_snapshot = snap
             self._market_from_cache = False
             self._market_scan_ts = datetime.now()
+            self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
         if contracts is not None:
             self._market_contracts = contracts
         self._refresh_market_status_labels()
@@ -20579,6 +20778,11 @@ $bmp.Dispose()
         scoring logic duplicated. Empty dict when no snapshot / on any error."""
         snap = self._market_snapshot
         if snap is None or fit is None:
+            return {}
+        # Degraded/blocked structure market → suppress marks entirely (a
+        # forbidden-empty book would paint every component a misleading ✗).
+        # Byte-identical to the no-snapshot path below (empty dict → plain lines).
+        if self._market_structure_blocked():
             return {}
         try:
             import market_scanner
@@ -20739,6 +20943,10 @@ $bmp.Dispose()
         snap = self._market_snapshot
         if snap is None or doctrine is None:
             return {}
+        # Degraded/blocked structure market → no rows (the banner explains why);
+        # an empty forbidden book must not render as "✗ 0% · 0 fits" everywhere.
+        if self._market_structure_blocked():
+            return {}
         scanner = self._get_market_scanner()
         if scanner is None:
             return {}
@@ -20802,6 +21010,10 @@ $bmp.Dispose()
         snapshot → a clear "scan first" error, never a crash. The per-doctrine
         seed target (override wins, else the global default) flows in as
         ``target_fits`` so the shopping list matches the availability bar's bar."""
+        # A gap list built from a forbidden-empty structure book would tell the
+        # owner to buy EVERYTHING — suppress it with the re-auth message instead.
+        if self._market_structure_blocked():
+            return None, self._market_structure_reauth_message()
         snap = self._market_snapshot
         if snap is None:
             return None, "No market snapshot yet — click ⟳ Market first."

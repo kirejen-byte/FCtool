@@ -572,6 +572,18 @@ class ESIAuth:
         returns False on any decode error or missing token."""
         return scope in self.granted_scopes()
 
+    def missing_scopes(self) -> set[str]:
+        """The scopes in the current ``SCOPES`` list this token was NOT granted.
+
+        Empty set = fully scoped for every feature. A token minted before scopes
+        were added (e.g. the Market Scanner's structure-market + contract scopes,
+        or the fittings scopes) reports those as missing so the UI can flag ⚠ +
+        offer Re-authorize for ANY missing scope — not just fittings. Defensive:
+        an unreadable/expired token (no granted scopes) reports every scope
+        missing, routing the user to re-auth rather than silently degrading."""
+        granted = self.granted_scopes()
+        return {s for s in SCOPES if s not in granted}
+
     def has_market_structure_scope(self) -> bool:
         """True iff this token can pull a citadel/structure market (design §6.3).
 

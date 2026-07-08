@@ -77,6 +77,13 @@ class AuthMarketAdapter:
         self._public = public_session or getattr(auth, "_session", None)
         self.last_headers: dict = {}
         self._etags: dict[str, tuple] = {}  # path -> (etag, list-of-pages-body)
+        # Scope/access degradation record. A 403 on an AUTHED route adds a tag
+        # here (e.g. "structure_market" / "corp_contracts") IN ADDITION to the
+        # degrade-by-design empty return, so the scanner can mark the resulting
+        # snapshot degraded (forbidden != empty) instead of it looking like a
+        # genuinely bare market. The scanner clears this at the start of every
+        # ``scan_market`` pass (duck-typed) so it only reflects the current scan.
+        self.last_forbidden: set[str] = set()
 
     # ── Error-limit awareness (§8.2) ──────────────────────────────────────────
 
@@ -129,11 +136,17 @@ class AuthMarketAdapter:
         self._capture(resp)
         return resp
 
-    def _paginate(self, path, *, authed: bool, params=None) -> list[dict]:
+    def _paginate(
+        self, path, *, authed: bool, params=None, forbidden_tag: str | None = None
+    ) -> list[dict]:
         """Auto-paginate a list endpoint on ``X-Pages``. Returns the concatenated
         items. A 403 (missing scope / no access) → ``[]``. Stops on the first
         non-OK page or transport error. Honours the error-limit floor between
-        pages (aborts early, returning what it has)."""
+        pages (aborts early, returning what it has).
+
+        ``forbidden_tag`` (when given) is recorded in ``last_forbidden`` on a 403
+        so the caller can distinguish "forbidden" (scope/access) from "genuinely
+        empty" — the 403 is still degraded to ``[]`` (no raise)."""
         url = f"{ESI_BASE}{path}"
         out: list[dict] = []
         page = 1
@@ -145,6 +158,8 @@ class AuthMarketAdapter:
                 break
             if resp.status_code == 403:
                 log.info("[market-esi] 403 (scope/access) for %s", path)
+                if forbidden_tag:
+                    self.last_forbidden.add(forbidden_tag)
                 return []
             if not getattr(resp, "ok", False):
                 break
@@ -231,9 +246,11 @@ class AuthMarketAdapter:
 
     def structure_orders(self, structure_id: int) -> list[dict]:
         """Authed structure market — the whole order book, no filter (scope
-        ``esi-markets.structure_markets.v1`` + docking access). 403 → []."""
+        ``esi-markets.structure_markets.v1`` + docking access). 403 → [] and a
+        ``"structure_market"`` entry in ``last_forbidden`` (forbidden != empty)."""
         return self._paginate(
-            f"/markets/structures/{structure_id}/", authed=True
+            f"/markets/structures/{structure_id}/", authed=True,
+            forbidden_tag="structure_market",
         )
 
     def public_contracts(self, region_id: int) -> list[dict]:
@@ -251,16 +268,18 @@ class AuthMarketAdapter:
     def corp_contracts(self, corporation_id: int) -> list[dict]:
         """Corp/alliance contracts (scope
         ``esi-contracts.read_corporation_contracts.v1`` + a rolled character).
-        403 → []."""
+        403 → [] and a ``"corp_contracts"`` entry in ``last_forbidden``."""
         return self._paginate(
-            f"/corporations/{corporation_id}/contracts/", authed=True
+            f"/corporations/{corporation_id}/contracts/", authed=True,
+            forbidden_tag="corp_contracts",
         )
 
     def corp_contract_items(self, corporation_id: int, contract_id: int) -> list[dict]:
-        """Items for a corp/alliance contract (authed)."""
+        """Items for a corp/alliance contract (authed). 403 → [] and a
+        ``"corp_contracts"`` entry in ``last_forbidden``."""
         return self._paginate(
             f"/corporations/{corporation_id}/contracts/{contract_id}/items/",
-            authed=True,
+            authed=True, forbidden_tag="corp_contracts",
         )
 
     def resolve_location_system(self, location_id: int) -> int | None:

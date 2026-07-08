@@ -52,7 +52,7 @@ from __future__ import annotations
 import os
 import statistics
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -186,9 +186,22 @@ class MarketSnapshot:
     taken_at: str  # ISO-8601 UTC
     depth: dict[int, TypeDepth]  # type_id -> depth (only types with any order)
     etag: str | None = None  # last ETag for the orders pull (region path)
+    # Degradation tags for THIS snapshot (forbidden != empty). A structure pull
+    # that 403s for a missing scope / no docking access records
+    # ``"structure_market"`` here so the UI can show a "re-authenticate" banner
+    # instead of rendering an empty (forbidden) order book as a bare market.
+    # JSON round-tripped through the cache so a stale cached load remembers it.
+    degraded: list[str] = field(default_factory=list)
 
     def get(self, type_id: int) -> TypeDepth | None:
         return self.depth.get(type_id)
+
+    def mark_degraded(self, reason: str) -> None:
+        """Record a degradation reason (deduped, order-preserving). Used by the
+        GUI worker's pre-check belt when a structure source's auth lacks the
+        market scope even before the pull records a 403."""
+        if reason and reason not in self.degraded:
+            self.degraded.append(reason)
 
     def to_dict(self) -> dict:
         return {
@@ -198,6 +211,7 @@ class MarketSnapshot:
             "system_id": self.system_id,
             "taken_at": self.taken_at,
             "etag": self.etag,
+            "degraded": list(self.degraded),
             # type_id keys become strings in JSON, ints in memory.
             "depth": {str(tid): d.to_dict() for tid, d in self.depth.items()},
         }
@@ -211,6 +225,10 @@ class MarketSnapshot:
             except (TypeError, ValueError):
                 continue
             depth[tid] = TypeDepth.from_dict(raw)
+        raw_degraded = d.get("degraded")
+        degraded = (
+            [str(x) for x in raw_degraded] if isinstance(raw_degraded, list) else []
+        )
         return MarketSnapshot(
             source_id=int(d.get("source_id", 0)),
             source_kind=str(d.get("source_kind", "")),
@@ -219,6 +237,7 @@ class MarketSnapshot:
             taken_at=str(d.get("taken_at", "")),
             depth=depth,
             etag=d.get("etag"),
+            degraded=degraded,
         )
 
 
@@ -424,6 +443,13 @@ class MarketScanner:
                 depth={},
             )
 
+        # Clear the adapter's per-pass forbidden record so a stale 403 from an
+        # earlier scan can't leak into this snapshot (duck-typed: fake adapters
+        # without ``last_forbidden`` are unaffected).
+        fb = getattr(self._adapter, "last_forbidden", None)
+        if isinstance(fb, set):
+            fb.clear()
+
         try:
             if source.kind == "structure":
                 raw = self._adapter.structure_orders(source.source_id)
@@ -441,9 +467,38 @@ class MarketScanner:
             system_id=source.system_id,
             taken_at=_now_iso(),
             depth=depth,
+            degraded=self._degraded_reasons(source),
         )
         self._store_snapshot(snap)
         return snap
+
+    def _degraded_reasons(self, source: "MarketSource") -> list[str]:
+        """Reasons the just-pulled snapshot is degraded (forbidden != empty).
+
+        Combines two duck-typed signals so a fake adapter without either is
+        simply treated as healthy:
+
+        * REACTIVE — the adapter's ``last_forbidden`` set (a 403 the structure /
+          corp route recorded during this pass, e.g. ``"structure_market"``).
+        * PROACTIVE pre-check belt — a structure source whose auth already
+          reports ``has_market_structure_scope() == False`` is degraded even
+          before/without a network 403 (missing scope means the pull can only
+          come back forbidden-empty). Reached via the adapter's ``_auth``.
+        """
+        reasons: set[str] = set()
+        fb = getattr(self._adapter, "last_forbidden", None)
+        if isinstance(fb, (set, frozenset, list, tuple)):
+            reasons.update(str(x) for x in fb)
+        if source is not None and source.kind == "structure":
+            auth = getattr(self._adapter, "_auth", None)
+            checker = getattr(auth, "has_market_structure_scope", None)
+            if callable(checker):
+                try:
+                    if not checker():
+                        reasons.add("structure_market")
+                except Exception:
+                    pass
+        return sorted(reasons)
 
     def _build_depth(
         self, orders: list[dict], source: MarketSource
