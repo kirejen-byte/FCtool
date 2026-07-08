@@ -14,6 +14,8 @@ regions_cache.json
 systems_cache.json
 char_cache.json
 standings_cache.json
+market_scanner_cache.json
+market_staging_cache.json
 cyno_cache.json
 tts_cache/
 chat_monitor_state.json
