@@ -162,6 +162,18 @@ FG_MAGENTA = "#ff66ff"
 FG_UNDER = "#ff6666"
 BORDER_COLOR = "#2a2a4a"
 
+# ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
+# The full TOC panel yields to content when the tab gets too narrow: it collapses
+# to a slim ribbon and the content reclaims the panel's width, so the SSO
+# character-row action buttons (Disconnect/Re-authorize) can never be clipped
+# (there is no horizontal scrollbar). All widths are in pixels.
+_SETTINGS_TOC_FIT_MARGIN = 12       # breathing room beyond content+TOC+scrollbar
+_SETTINGS_TOC_HYSTERESIS = 24       # extra room to RE-expand → dead-band vs flapping
+_SETTINGS_TOC_RIBBON_W = 20         # slim collapsed ribbon width
+_SETTINGS_TOC_FULL_W_FALLBACK = 108  # assumed TOC width before geometry is realized
+_SETTINGS_TOC_SB_W_FALLBACK = 16    # assumed vertical scrollbar width (pre-realization)
+_SETTINGS_TOC_PADY = 10             # panel/ribbon vertical padding (matches pack pady)
+
 # ── Notebook tab indices ────────────────────────────────────────────────────────
 # Order of self.notebook.add() calls in _build_ui:
 #   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
@@ -11653,6 +11665,8 @@ class FCToolGUI:
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Kept so the responsive-TOC fit check can measure the scrollbar width.
+        self._settings_toc_scrollbar = scrollbar
         self._register_scroll_canvas(canvas)
 
         # Collect section anchors for the floating table-of-contents (built at
@@ -15253,17 +15267,26 @@ class FCToolGUI:
         return frac
 
     def _build_settings_toc(self, tab, canvas, scroll_frame):
-        """Build the slim, always-visible section index pinned to the right
-        margin of the Settings tab.
+        """Build the section index pinned to the right margin of the Settings
+        tab, plus its responsive-collapse machinery.
 
-        Layout: it is packed side=RIGHT *before* the content canvas expands, so
-        the tab reads [canvas (expands) | TOC | scrollbar (already RIGHT-most)].
-        Being a sibling of the canvas (not a child of scroll_frame) it does NOT
-        scroll with the content — that gives the floating-on-the-margin effect.
+        Layout (wide window): the panel is packed side=RIGHT *before* the content
+        canvas expands, so the tab reads [canvas (expands) | TOC | scrollbar
+        (already RIGHT-most)]. Being a sibling of the canvas (not a child of
+        scroll_frame) it does NOT scroll with the content — that gives the
+        floating-on-the-margin effect.
+
+        Responsive collapse (narrow window): when the panel would push the
+        content past the visible canvas edge — clipping the SSO character-row
+        action buttons, since there is no horizontal scrollbar — the panel
+        yields. It pack_forget()s and a slim ribbon takes its place; the content
+        reclaims the width. Hovering/clicking the ribbon overlays the full TOC
+        via place() ON TOP of the content, so it never steals layout width
+        again. See _settings_toc_eval_fit / _settings_toc_collapse.
 
         ``self._settings_toc_anchors`` must already be populated (ordered list of
         (title, header_widget)). Clicking a row scrolls ``canvas`` so the anchor
-        sits near the top."""
+        sits near the top (identical in packed and overlay modes)."""
         anchors = getattr(self, "_settings_toc_anchors", None) or []
         panel = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                          highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -15271,7 +15294,7 @@ class FCToolGUI:
         # order becomes [canvas | toc | scrollbar]. (The scrollbar was packed
         # side=RIGHT first, so it stays right-most; the canvas packs LEFT and
         # expands to fill the gap.)
-        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=10)
+        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 2), pady=_SETTINGS_TOC_PADY)
 
         tk.Label(panel, text="Sections", font=("Consolas", 8, "bold"),
                  fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
@@ -15297,18 +15320,79 @@ class FCToolGUI:
 
             def _click(_e, w=widget):
                 self._settings_toc_jump(canvas, scroll_frame, w)
+                # In collapsed/overlay mode a jump also dismisses the overlay.
+                self._settings_toc_hide_overlay(immediate=True)
 
             row.bind("<Enter>", _enter)
             row.bind("<Leave>", _leave)
             row.bind("<Button-1>", _click)
+            # Re-entering any row cancels a pending overlay-hide so ribbon→panel
+            # →row pointer travel never flickers the overlay away.
+            row.bind("<Enter>", self._settings_toc_cancel_overlay_hide, add="+")
 
+        # Leaving the panel body hides the overlay (debounced); re-entering it
+        # cancels that hide. Both are no-ops unless we're in collapsed mode.
+        panel.bind("<Enter>", self._settings_toc_cancel_overlay_hide, add="+")
+        panel.bind("<Leave>", self._settings_toc_hide_overlay, add="+")
+
+        # ── Slim collapsed ribbon (built once, packed only while collapsed) ──
+        # Same panel chrome; a vertical "≡" glyph. Hover or click overlays the
+        # full TOC. pack_propagate(False) pins it to the narrow fixed width.
+        ribbon = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                          highlightbackground=BORDER_COLOR, highlightthickness=1,
+                          width=_SETTINGS_TOC_RIBBON_W)
+        ribbon.pack_propagate(False)
+        glyph = tk.Label(ribbon, text="≡", font=("Consolas", 11, "bold"),
+                         fg=FG_DIM, bg=BG_PANEL, cursor="hand2")
+        glyph.pack(fill=tk.BOTH, expand=True)
+
+        def _ribbon_enter(e):
+            self._settings_toc_show_overlay(e)
+            self._show_tooltip(e, "Sections")
+
+        def _ribbon_leave(_e):
+            self._hide_tooltip()
+
+        for _w in (ribbon, glyph):
+            _w.bind("<Enter>", _ribbon_enter)
+            _w.bind("<Leave>", _ribbon_leave)
+            _w.bind("<Button-1>", self._settings_toc_show_overlay)
+
+        self._settings_toc_panel = panel
+        self._settings_toc_ribbon = ribbon
+        self._settings_toc_tab = tab
         self._settings_toc_canvas = canvas
         self._settings_toc_scroll_frame = scroll_frame
-        # Prime the active-section highlight once geometry settles (widget sizes
-        # aren't realized until the tab is mapped). Guarded: an absent/dead root
-        # `after` (e.g. a SimpleNamespace test host) is simply skipped.
+        self._settings_toc_collapsed = False
+        self._settings_toc_overlay_shown = False
+        self._settings_toc_resize_after = None
+        self._settings_toc_overlay_hide_after = None
+
+        # Re-evaluate fit whenever the tab is resized (debounced, house style).
+        # ALSO bind on scroll_frame: content can grow with NO tab resize —
+        # _rebuild_esi_char_list (connect/re-auth/disconnect) widens the natural
+        # content width (longer character name, col-5 Re-authorize appearing),
+        # and since the canvas window item is not width-synced, scroll_frame
+        # resizes to its new reqwidth and fires <Configure>. Without this, a
+        # borderline window clips the grown rows until a manual resize. add="+"
+        # is required — scroll_frame's <Configure> already carries the
+        # scrollregion-update binding. Loop-safe: the panel↔ribbon swap changes
+        # only the canvas VIEWPORT width, never scroll_frame's requested width,
+        # so a swap cannot re-trigger this binding into oscillation.
+        try:
+            tab.bind("<Configure>", self._settings_toc_on_tab_configure, add="+")
+            scroll_frame.bind("<Configure>",
+                              self._settings_toc_on_tab_configure, add="+")
+        except tk.TclError:
+            pass
+
+        # Prime the active-section highlight AND the initial fit decision once
+        # geometry settles (widget sizes aren't realized until the tab is
+        # mapped). Guarded: an absent/dead root `after` (e.g. a SimpleNamespace
+        # test host) is simply skipped.
         try:
             self.root.after(200, self._settings_toc_update_active)
+            self.root.after(200, self._settings_toc_eval_fit)
         except (AttributeError, tk.TclError):
             pass
         return panel
@@ -15339,6 +15423,13 @@ class FCToolGUI:
         scroll_frame = getattr(self, "_settings_toc_scroll_frame", None)
         if not rows or canvas is None or scroll_frame is None:
             return
+        # While collapsed with no overlay showing, the rows are hidden — skip the
+        # highlight refresh (cheap no-op; nothing visible to update, and the
+        # wheel router calls this on every scroll). When the overlay IS up we
+        # still refresh so the accent tracks the content.
+        if (getattr(self, "_settings_toc_collapsed", False)
+                and not getattr(self, "_settings_toc_overlay_shown", False)):
+            return
         try:
             total = scroll_frame.winfo_height()
             top_frac = canvas.yview()[0]
@@ -15361,6 +15452,192 @@ class FCToolGUI:
                 row.configure(fg=FG_ACCENT if i == active_idx else FG_DIM)
         except (tk.TclError, IndexError, ZeroDivisionError):
             return
+
+    # ── Responsive TOC collapse (yields to content so it can never clip) ─────
+    @staticmethod
+    def _settings_toc_fits(tab_w, content_req_w, toc_w, sb_w, margin=12):
+        """Pure predicate: does the full TOC panel fit beside the settings
+        content without clipping it? True iff the tab is wide enough to hold the
+        content at its natural (requested) width plus the TOC panel, the vertical
+        scrollbar, and a little breathing ``margin``. All-int, headless-safe (no
+        widget access) so it can be unit-tested directly."""
+        return int(tab_w) >= (int(content_req_w) + int(toc_w)
+                              + int(sb_w) + int(margin))
+
+    def _settings_toc_full_w(self):
+        """Measured requested width of the full TOC panel (px). Falls back to a
+        constant before geometry is realized (reqwidth 1) or when headless."""
+        panel = getattr(self, "_settings_toc_panel", None)
+        try:
+            w = panel.winfo_reqwidth() if panel is not None else 0
+        except tk.TclError:
+            w = 0
+        return w if w > 1 else _SETTINGS_TOC_FULL_W_FALLBACK
+
+    def _settings_toc_sb_w(self):
+        """Measured requested width of the settings vertical scrollbar (px), with
+        a constant fallback (pre-realization / headless)."""
+        sb = getattr(self, "_settings_toc_scrollbar", None)
+        try:
+            w = sb.winfo_reqwidth() if sb is not None else 0
+        except tk.TclError:
+            w = 0
+        return w if w > 1 else _SETTINGS_TOC_SB_W_FALLBACK
+
+    def _settings_toc_eval_fit(self, _e=None):
+        """Decide whether the full TOC fits beside the content and switch modes
+        accordingly. A ~24px hysteresis dead-band (collapse at the base margin,
+        re-expand only with extra room) prevents flapping at the boundary. This
+        is also the belt-and-suspenders that keeps content un-clipped: any time
+        we are expanded and the content no longer fits, we collapse. Fully
+        guarded — TclError / missing wiring (headless host) is a quiet no-op."""
+        panel = getattr(self, "_settings_toc_panel", None)
+        tab = getattr(self, "_settings_toc_tab", None)
+        scroll_frame = getattr(self, "_settings_toc_scroll_frame", None)
+        if panel is None or tab is None or scroll_frame is None:
+            return
+        try:
+            tab_w = tab.winfo_width()
+            content_req_w = scroll_frame.winfo_reqwidth()
+        except tk.TclError:
+            return
+        # Pre-map 1x1 phase — geometry not realized yet; wait for the next
+        # <Configure> / the after(200) prime.
+        if tab_w <= 1:
+            return
+        toc_w = self._settings_toc_full_w()
+        sb_w = self._settings_toc_sb_w()
+        if getattr(self, "_settings_toc_collapsed", False):
+            # Collapsed → require the base margin PLUS the hysteresis band before
+            # re-expanding, so we do not flap right at the threshold.
+            if self._settings_toc_fits(
+                    tab_w, content_req_w, toc_w, sb_w,
+                    margin=_SETTINGS_TOC_FIT_MARGIN + _SETTINGS_TOC_HYSTERESIS):
+                self._settings_toc_expand()
+        else:
+            # Expanded → collapse the moment the content would be clipped.
+            if not self._settings_toc_fits(
+                    tab_w, content_req_w, toc_w, sb_w,
+                    margin=_SETTINGS_TOC_FIT_MARGIN):
+                self._settings_toc_collapse()
+
+    def _settings_toc_collapse(self):
+        """Enter slim-ribbon mode: hide the full TOC panel (and any overlay) and
+        pack the narrow ribbon in its place so the content reclaims the panel's
+        width. The ribbon packs side=RIGHT after the (still-packed) scrollbar, so
+        it lands just left of it → [canvas | ribbon | scrollbar]. Guarded for
+        headless hosts."""
+        panel = getattr(self, "_settings_toc_panel", None)
+        ribbon = getattr(self, "_settings_toc_ribbon", None)
+        if panel is None or ribbon is None:
+            return
+        self._settings_toc_collapsed = True
+        self._settings_toc_hide_overlay(immediate=True)
+        try:
+            panel.pack_forget()
+            ribbon.pack(side=tk.RIGHT, fill=tk.Y,
+                        padx=(0, 2), pady=_SETTINGS_TOC_PADY)
+        except tk.TclError:
+            pass
+
+    def _settings_toc_expand(self):
+        """Return to packed full-TOC mode: hide the ribbon (and any overlay) and
+        re-pack the panel so the tab reads [canvas | TOC | scrollbar] again.
+        Guarded for headless hosts."""
+        panel = getattr(self, "_settings_toc_panel", None)
+        ribbon = getattr(self, "_settings_toc_ribbon", None)
+        if panel is None or ribbon is None:
+            return
+        self._settings_toc_collapsed = False
+        self._settings_toc_hide_overlay(immediate=True)
+        try:
+            ribbon.pack_forget()
+            panel.place_forget()   # in case it was showing as an overlay
+            panel.pack(side=tk.RIGHT, fill=tk.Y,
+                       padx=(0, 2), pady=_SETTINGS_TOC_PADY)
+        except tk.TclError:
+            pass
+        self._settings_toc_update_active()
+
+    def _settings_toc_show_overlay(self, _e=None):
+        """While collapsed, float the full TOC panel over the content at the
+        top-right via place() (never steals layout width, so content can't be
+        clipped). Cancels any pending hide. No-op when expanded or headless."""
+        if not getattr(self, "_settings_toc_collapsed", False):
+            return
+        panel = getattr(self, "_settings_toc_panel", None)
+        tab = getattr(self, "_settings_toc_tab", None)
+        if panel is None or tab is None:
+            return
+        self._settings_toc_cancel_overlay_hide()
+        try:
+            # Sit just left of the scrollbar; float above the content.
+            panel.place(in_=tab, relx=1.0, rely=0.0,
+                        x=-(self._settings_toc_sb_w() + 2),
+                        y=_SETTINGS_TOC_PADY, anchor="ne", bordermode="outside")
+            panel.lift()
+            self._settings_toc_overlay_shown = True
+        except tk.TclError:
+            return
+        self._settings_toc_update_active()
+
+    def _settings_toc_hide_overlay(self, _e=None, immediate=False):
+        """Hide the overlay panel. From <Leave> we wait a short beat (so
+        ribbon→panel pointer travel doesn't flicker it away); ``immediate=True``
+        (collapse/expand/jump) hides at once. Guarded — a headless host with no
+        usable ``root.after`` just hides synchronously."""
+        if immediate:
+            self._settings_toc_cancel_overlay_hide()
+            self._settings_toc_do_hide_overlay()
+            return
+        self._settings_toc_cancel_overlay_hide()
+        try:
+            self._settings_toc_overlay_hide_after = self.root.after(
+                160, self._settings_toc_do_hide_overlay)
+        except (AttributeError, tk.TclError):
+            self._settings_toc_do_hide_overlay()
+
+    def _settings_toc_do_hide_overlay(self):
+        """Actually place_forget the overlay panel (if shown). Guarded."""
+        self._settings_toc_overlay_hide_after = None
+        if not getattr(self, "_settings_toc_overlay_shown", False):
+            return
+        self._settings_toc_overlay_shown = False
+        panel = getattr(self, "_settings_toc_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.place_forget()
+        except tk.TclError:
+            pass
+
+    def _settings_toc_cancel_overlay_hide(self, _e=None):
+        """Cancel a pending debounced overlay-hide (pointer re-entered the
+        ribbon / panel / a row). Guarded."""
+        after_id = getattr(self, "_settings_toc_overlay_hide_after", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self._settings_toc_overlay_hide_after = None
+
+    def _settings_toc_on_tab_configure(self, _e=None):
+        """<Configure> handler on the Settings tab: debounce (house style —
+        cancel-previous + after 120ms) then re-evaluate the TOC fit. Guarded so a
+        headless host without a usable ``root.after`` evaluates synchronously."""
+        after_id = getattr(self, "_settings_toc_resize_after", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+            self._settings_toc_resize_after = None
+        try:
+            self._settings_toc_resize_after = self.root.after(
+                120, self._settings_toc_eval_fit)
+        except (AttributeError, tk.TclError):
+            self._settings_toc_eval_fit()
 
     def _add_setting(self, parent, label, key, default="", tooltip=None):
         frame = tk.Frame(parent, bg=BG_DARK)
