@@ -559,6 +559,13 @@ class MarketScanner:
           per-page bar comes from.
         * ``{"stage": "market", "status": "orders_done", "orders": N}`` — pull done.
         * ``{"stage": "market", "status": "depth_done", "types": M}`` — depth built.
+        * ``{"stage": "market", "status": "orders_ready", "snapshot": snap}`` —
+          the finished, analysis-ready ``MarketSnapshot`` (emitted AFTER it is
+          built + cached, so it is the same object this method returns). A live
+          consumer can render order-derived doctrine/fit availability from it
+          immediately — before the separate, far slower contract scan runs — with
+          contract-derived figures shown as pending. The snapshot is not mutated
+          after this point, so it is safe to read from another (Tk) thread.
 
         Callbacks are exception-swallowed (a raising callback can't break the
         scan) and fire on the scanning thread — the GUI marshals them.
@@ -615,6 +622,16 @@ class MarketScanner:
             scope_label=((scope_label or "") if targeted else ""),
         )
         self._store_snapshot(snap)
+        # Analysis-ready hand-off: the depth snapshot is fully built and cached,
+        # so hand the finished object to any live consumer NOW. This is the seam
+        # that lets the GUI paint doctrine/fit availability from ORDER data before
+        # the (separate, ~100x slower) contract scan even starts — the caller
+        # renders contract-derived figures as pending until scan_contracts lands.
+        # Carries the snap itself (not just counts) so no second fetch is needed;
+        # emitted after store so a consumer and the disk cache never disagree.
+        _emit_progress(
+            progress, {"stage": "market", "status": "orders_ready", "snapshot": snap}
+        )
         log.info(
             "[market] order scan: source=%s/%s scope=%s orders=%d types=%d elapsed=%.2fs",
             source.kind, source.source_id, ("doctrine" if targeted else "full"),
@@ -1507,17 +1524,24 @@ def fit_bom(parsed, catalog=None) -> list[Component]:
 
     This is the SINGLE definition of "what a fit needs" for seeding; it is kept
     deliberately parallel to ``to_dna`` so the seeding math and the MOTD DNA link
-    agree on the fit's contents. (Unlike ``to_dna``, module identity here is
-    ``type_id`` only — online/offline copies of the same module are one BoM line,
-    because for buying purposes they are the same item.)
+    agree on the fit's contents. Like ``to_dna`` (which since the cargo-grammar
+    rework in commit 210a874 also collapses the online/offline copies of a type
+    into one token), module identity here is ``type_id`` only — an online and an
+    offline copy of the same module are ONE BoM line, because for buying purposes
+    they are the same item.
 
-    Cargo note: this intentionally DIVERGES from ``to_dna``'s cargo-safety drop.
-    ``to_dna`` omits/limits cargo (a DNA link shouldn't force-load a hold); the
-    BoM keeps every cargo + loaded-charge line (role ``"cargo"``/``"charge"``) so
-    a full component table is available, but the two scored numbers
-    (``completable_fits`` / >=95% similarity) and the default gap list exclude
-    cargo/charges (see ``_SCORING_MODULE_ROLES``), so keeping them here is
-    harmless to seeding math while still surfacing them for display.
+    Cargo note: ``fit_bom`` remains a SUPERSET of ``to_dna``'s items, and since
+    commit 210a874 the two largely agree on cargo. ``to_dna`` no longer drops
+    module-category cargo — it now EMITS it as an unfitted ``typeID_;qty`` token
+    (a spare module/subsystem carried in the hold, marked unfitted so it lands in
+    cargo instead of ghost-fitting into a slot) rather than omitting it; only a
+    ship carried in cargo is still skipped (no sanctioned cargo-ship token in the
+    grammar), which ``fit_bom`` keeps — hence "superset". ``fit_bom`` likewise
+    carries every cargo + loaded-charge line (role ``"cargo"``/``"charge"``) so a
+    full component table is available. The two scored numbers
+    (``completable_fits`` / >=95% similarity) and the default gap list still
+    exclude cargo/charges (see ``_SCORING_MODULE_ROLES``), so carrying them here
+    is harmless to the seeding math while still surfacing them for display.
     """
 
     def _name(type_id: int, fallback: str = "") -> str:

@@ -859,6 +859,10 @@ class FCToolGUI:
         self._market_contracts = None          # last ContractScan
         self._market_scan_ts = None            # datetime of the last scan / cache load
         self._market_scanning = False          # in-flight guard (no concurrent scans)
+        self._market_contracts_pending = False  # True while orders are rendered but
+        #                                        contracts are still scanning (the
+        #                                        analysis shows contract figures as
+        #                                        "scanning…", never a misleading "0")
         self._market_from_cache = False        # True while showing a disk-cached snapshot
         self._market_degraded_reasons = []     # snapshot degradation tags (e.g. structure_market)
         self._market_corp_id_cache = {}        # character_id -> corp id (1 GET per char)
@@ -7065,7 +7069,9 @@ class FCToolGUI:
         avail = (avail_map or {}).get(mem.fit_id) if fit is not None else None
         if avail is not None:
             row_target = self._market_seed_target(doctrine, mem)
-            text, colour = self._market_row_text(avail, row_target)
+            pending = getattr(self, "_market_contracts_pending", False)
+            text, colour = self._market_row_text(
+                avail, row_target, contracts_pending=pending)
             avail_lbl = tk.Label(info, text=text, font=("Consolas", 8),
                                  fg=colour, bg=BG_PANEL, anchor=tk.W)
             avail_lbl.pack(anchor=tk.W, pady=(1, 0))
@@ -22055,6 +22061,10 @@ $bmp.Dispose()
         self._market_scan_started = time.monotonic()
         self._market_scan_progress = {}
         self._market_prog_scheduled = False
+        # Clear any stale "contracts still scanning" flag from a prior run so this
+        # scan starts from a known state; the partial-apply sets it True once the
+        # order phase lands, the final apply clears it again.
+        self._market_contracts_pending = False
         if getattr(self, "_market_prog_lock", None) is None:
             self._market_prog_lock = threading.Lock()
 
@@ -22075,6 +22085,23 @@ $bmp.Dispose()
                         self._market_scan_progress, payload)
             except Exception:
                 return
+            # Order phase finished (snapshot built + cached): render the doctrine/
+            # fit analysis from ORDER data right now — contract figures pending —
+            # instead of waiting out the far slower contract scan. Marshalled onto
+            # the Tk thread via the SAME root.after path the completion uses (no
+            # new threading primitive); the snapshot rides the payload so the Tk
+            # side needs no second fetch. Guarded so a broken/late marshal can
+            # never break the scan.
+            if (isinstance(payload, dict)
+                    and payload.get("stage") == "market"
+                    and payload.get("status") == "orders_ready"):
+                partial_snap = payload.get("snapshot")
+                if partial_snap is not None:
+                    try:
+                        self.root.after(
+                            0, self._market_apply_partial_scan, partial_snap)
+                    except Exception:
+                        pass
             self._market_schedule_progress_apply()
 
         def worker():
@@ -22181,11 +22208,61 @@ $bmp.Dispose()
             cache[char_id] = corp_id
         return corp_id
 
+    def _market_apply_partial_scan(self, snap):
+        """Tk-thread PARTIAL apply: render doctrine/fit availability from the ORDER
+        snapshot the instant the order phase finishes, while the contract phase is
+        still running. Contract-derived figures render as pending ("scanning…"),
+        never a misleading "0 contracts". The scan continues; the final
+        ``_market_apply_scan`` replaces this preview once contracts land.
+
+        CRITICAL — this is a strictly in-memory/UI preview and must NOT mark the
+        scan complete. In particular it does NOT stamp ``_market_scan_ts`` (the
+        'last scan' time the startup re-scan staleness gate reads) and does NOT
+        touch ``_market_contracts``. Only the final apply owns those completion
+        signals, so a scan that stops after orders-done never persists as a
+        finished scan — the next startup still sees it as due for a re-scan.
+
+        Idempotent-safe: a partial that somehow arrives after the scan already
+        finished (``_market_scanning`` False) is dropped so it can't repaint over
+        the final results the completion step wrote."""
+        if snap is None:
+            return
+        if not getattr(self, "_market_scanning", False):
+            return  # scan already completed → don't stomp the final view
+        self._market_snapshot = snap
+        self._market_from_cache = False
+        self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
+        # Mark contract-derived figures pending: the doctrine avail-map ignores any
+        # (stale, prior-scan) contracts while this is set, and the per-fit row
+        # renders "contracts scanning…" instead of a misleading "0 ctr".
+        self._market_contracts_pending = True
+        # Deliberately NOT set here: _market_scan_ts, _market_contracts (see above).
+        self._refresh_market_status_labels()
+        try:
+            if getattr(self, "_doctrine_selected_id", None):
+                self._show_doctrine_detail(self._doctrine_selected_id)
+        except Exception:
+            log.exception("[market] doctrine partial refresh failed")
+        try:
+            if getattr(self, "_fit_selected_id", None):
+                self._show_fit_detail(self._fit_selected_id)
+        except Exception:
+            log.exception("[market] fit partial refresh failed")
+
     def _market_apply_scan(self, snap, contracts):
         """Apply scan results on the Tk main thread: store the snapshot/contracts
         + timestamp, clear the in-flight guard, and refresh the dependent views
         (Doctrine detail + Fittings detail) so availability marks appear."""
         self._market_scanning = False
+        # Contract phase has ended — clear the pending preview flag unconditionally
+        # so the analysis never sticks on "contracts scanning…". On success this
+        # falls through to the freshly-stored contracts below; on a contract
+        # FAILURE / cancel / disabled phase, ``contracts`` is None, so the
+        # ``if contracts is not None`` guard leaves ``_market_contracts`` at its
+        # previous value — the view reverts to the last completed scan's contracts
+        # (or, on a first-ever run with none, the honest orders-only "0 ctr"),
+        # never a silently-stuck pending state.
+        self._market_contracts_pending = False
         # Stop the elapsed ticker (guarded: may never have started / bare host).
         # The ticker also self-cancels on its next tick, but stopping here avoids
         # a trailing 'scanning…' repaint after the final status is written.
@@ -22455,7 +22532,7 @@ $bmp.Dispose()
         return self._global_seed_target()
 
     @staticmethod
-    def _market_row_text(avail, seed_target):
+    def _market_row_text(avail, seed_target, contracts_pending=False):
         """Pure formatter for a Doctrine-tab per-fit availability row. Returns
         (text, colour).
 
@@ -22469,7 +22546,15 @@ $bmp.Dispose()
         explicit ``seed_target`` of **0** ("don't seed this fit") renders a
         neutral dim "— not seeded" marker (never green/red — the owner opted
         out); otherwise green when N >= target, yellow when N > 0 (or the target
-        is unknown), red when N is 0."""
+        is unknown), red when N is 0.
+
+        ``contracts_pending`` (partial orders-only preview mid-scan): the contract
+        count is not known yet, so the row shows the market half now and the
+        contract figure as "contracts scanning…" — NEVER a misleading "0 ctr" /
+        red-0. The colour stays neutral/positive (yellow when there is market
+        stock, dim otherwise); it is never green (the seed target can't be
+        confirmed without the contract count) and never red (a 0 total isn't
+        known while contracts are still loading)."""
         breadth = getattr(avail, "breadth_pct", 0.0) or 0.0
         market_fits = getattr(avail, "completable_fits", 0) or 0
         ctr = getattr(avail, "contract_matches", 0) or 0
@@ -22478,6 +22563,15 @@ $bmp.Dispose()
             target = int(seed_target)
         except (TypeError, ValueError):
             target = None   # unknown/garbage — never "not seeded", never green
+        # Contracts still scanning → market half now, contract figure pending.
+        if contracts_pending:
+            if target == 0:
+                return (f"— not seeded · {breadth:.0f}% · {market_fits} mkt · "
+                        f"contracts scanning…", FG_DIM)
+            glyph = "✓" if market_fits > 0 else "…"
+            text = (f"{glyph} {breadth:.0f}% · {market_fits} mkt · "
+                    f"contracts scanning…")
+            return (text, FG_YELLOW if market_fits > 0 else FG_DIM)
         # Explicit "don't seed" target → a neutral marker, never the stocked
         # (green) / short (red) colours which imply an active seeding goal.
         if target == 0:
@@ -22515,9 +22609,15 @@ $bmp.Dispose()
         scanner = self._get_market_scanner()
         if scanner is None:
             return {}
+        # While contracts are still scanning (partial orders-only preview), pass
+        # contracts=None so availability is computed from ORDER data alone — this
+        # keeps a NEW order snapshot from being mixed with a PRIOR scan's stale
+        # contracts, and the per-fit row renders the contract figure as pending.
+        contracts = (None if getattr(self, "_market_contracts_pending", False)
+                     else self._market_contracts)
         try:
             avails = scanner.doctrine_availability(
-                doctrine, self.fittings, snap, self._market_contracts)
+                doctrine, self.fittings, snap, contracts)
         except Exception:
             log.exception("[market] doctrine_availability failed")
             return {}
