@@ -506,7 +506,11 @@ class MarketEsiAdapter(Protocol):
     def public_contracts(self, region_id: int) -> list[dict]:
         ...
 
-    def contract_items(self, contract_id: int) -> list[dict]:
+    def contract_items(self, contract_id: int) -> "tuple[list[dict], str]":
+        # Returns ``(items, status)``; ``status`` is the per-call negative-cache
+        # disposition ("ok"/"dead"/"transient"). Returned per call (not stashed on
+        # the adapter) so the parallel Pass-2 attributes each contract's outcome to
+        # its OWN fetch.
         ...
 
     def resolve_location_system(self, location_id: int) -> int | None:
@@ -516,7 +520,8 @@ class MarketEsiAdapter(Protocol):
     def corp_contracts(self, corporation_id: int) -> list[dict]:
         ...
 
-    def corp_contract_items(self, corporation_id: int, contract_id: int) -> list[dict]:
+    def corp_contract_items(self, corporation_id: int, contract_id: int) -> "tuple[list[dict], str]":
+        # Returns ``(items, status)`` — see ``contract_items``.
         ...
 
 
@@ -1269,22 +1274,24 @@ class MarketScanner:
         ``raised=True`` so the coordinator simply skips + does not cache it (the
         same transient treatment the old serial path gave a raising fetch).
 
-        The adapter's per-call disposition (``last_contract_items_status``) and
-        error-budget flag (``error_limited``) are read immediately after the call
-        and ride back on the result, so the coordinator classifies the cache write
-        from the worker's own captured values rather than re-reading the shared
-        adapter attributes on a later thread."""
+        The adapter RETURNS the per-call disposition as ``(items, status)`` — it is
+        NOT read back off a shared adapter attribute, so under concurrency each
+        contract's status belongs to its OWN fetch (reading a shared attribute on a
+        later thread could misattribute a genuinely-dead contract's "dead" to a
+        contract that merely hit a transient blip, tombstoning it forever). The
+        error-budget flag (``error_limited``) is a MONOTONIC GLOBAL signal, so it is
+        still polled off the adapter and rides back on the result."""
         cid = int(contract.get("contract_id") or 0)
         try:
             if is_alliance and corp_id and hasattr(self._adapter, "corp_contract_items"):
-                items = self._adapter.corp_contract_items(corp_id, cid)
+                items, status = self._adapter.corp_contract_items(corp_id, cid)
             else:
-                items = self._adapter.contract_items(cid)
+                items, status = self._adapter.contract_items(cid)
         except Exception:
             log.exception("[market] contract items pull failed for %s", cid)
             return _FetchResult(idx, cid, [], "raise", False, True, [])
-        # Capture the adapter's disposition + error-limit flag for THIS call.
-        status = getattr(self._adapter, "last_contract_items_status", "ok")
+        # ``error_limited`` is a monotonic global budget signal (not per-call), so
+        # reading it off the adapter here is safe under concurrency.
         err = bool(getattr(self._adapter, "error_limited", False))
         items = items or []
         match_list = (

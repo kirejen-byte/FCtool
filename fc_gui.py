@@ -21724,9 +21724,32 @@ $bmp.Dispose()
             if snap is not None and getattr(snap, "scope", "full") == "doctrine":
                 label = getattr(snap, "scope_label", "") or ""
                 tag = f"{label} scope" if label else "doctrine scope"
-                return (f"{when} {hhmm} · {n} types · {tag}", FG_DIM)
-            return (f"{when} {hhmm} · {n} types on market", FG_DIM)
+                base = f"{when} {hhmm} · {n} types · {tag}"
+            else:
+                base = f"{when} {hhmm} · {n} types on market"
+            # Surface a contract-phase degradation (e.g. the ESI error-limit abort)
+            # inline so an aborted contract pass isn't user-silent. (The structure-
+            # market 403 has its OWN dedicated re-auth banner, so it is deliberately
+            # NOT repeated in this line.)
+            suffix = self._market_degraded_status_suffix()
+            if suffix:
+                return (f"{base} · {suffix}", FG_ORANGE)
+            return (base, FG_DIM)
         return ("not scanned yet — click ⟳ Market", FG_DIM)
+
+    def _market_degraded_status_suffix(self):
+        """Inline ' · '-joined human text for any degraded reason surfaced in the
+        resting market status line, or '' when none apply.
+
+        Currently maps only the contract-phase ESI error-limit abort
+        (``contract_error_limit``); ``structure_market`` is intentionally absent —
+        it drives its own dedicated re-auth banner rather than this line. Reads
+        ``_market_degraded_reasons`` (getattr-guarded for a bare test host)."""
+        reasons = getattr(self, "_market_degraded_reasons", None) or []
+        labels = {
+            "contract_error_limit": "⚠ contract scan stopped early (ESI error limit)",
+        }
+        return " · ".join(labels[r] for r in reasons if r in labels)
 
     def _refresh_market_status_labels(self):
         """Push _market_status_text onto every Market status label that exists
@@ -22280,6 +22303,18 @@ $bmp.Dispose()
             self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
         if contracts is not None:
             self._market_contracts = contracts
+            # Fold the contract-phase degradation (e.g. the ESI error-limit abort
+            # ``ContractScan.degraded`` records) into the reasons so an aborted
+            # contract pass surfaces in the status line instead of being
+            # user-silent — dedup'd against the order snapshot's own reasons set
+            # just above. Guarded on ``contracts is not None``: the contract-phase
+            # FAILURE / cancel / disabled path passes None, leaving the reasons
+            # exactly as the order snapshot left them.
+            reasons = getattr(self, "_market_degraded_reasons", None) or []
+            for reason in getattr(contracts, "degraded", []) or []:
+                if reason not in reasons:
+                    reasons.append(reason)
+            self._market_degraded_reasons = reasons
         self._refresh_market_status_labels()
         # Re-render the currently open detail panes so the new marks show.
         try:

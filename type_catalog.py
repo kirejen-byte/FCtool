@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -125,6 +126,12 @@ class TypeCatalog:
 
         self._by_id: dict[int, dict] = {}
         self._by_name: dict[str, int] = {}
+        # Serialises the ESI ``_resolve_unknown`` fallback: the market scanner
+        # resolves categories from a POOL of worker threads (one per in-flight
+        # contract), so without this two workers could double-fetch the same
+        # unknown id AND race the disk-cache temp+replace write. A double-check
+        # inside the lock skips the network call if a peer already resolved it.
+        self._resolve_lock = threading.Lock()
 
         self._load_bundled()
         self._load_cache()
@@ -350,25 +357,38 @@ class TypeCatalog:
         Returns ``None`` if there is no adapter or it can't resolve the id.
         Slot stays ``None`` and category falls back to ``"other"`` because the
         public ``/universe/names/`` resolver carries no slot data and only a
-        coarse ESI category."""
+        coarse ESI category.
+
+        THREAD-SAFE: the network fetch, the ``_by_id`` mutation, and the disk-cache
+        write are serialised by ``self._resolve_lock`` because the market scanner
+        drives ``category_of`` from a pool of worker threads. The double-check
+        inside the lock means an id resolved by a peer while this thread waited is
+        returned without a second ESI call (and keeps the disk write single-writer).
+        This is a rare path (an unknown id), so the coarse lock's contention is
+        acceptable."""
         if self._esi is None:
             return None
-        try:
-            resolved = self._esi.resolve_names([type_id])
-        except Exception:
-            return None
-        if not isinstance(resolved, dict):
-            return None
-        info = resolved.get(type_id)
-        if info is None:
-            return None
-        name = info.get("name")
-        if not isinstance(name, str) or not name:
-            return None
-        entry = {"n": name, "c": None, "g": None, "s": None}
-        self._register(type_id, entry)
-        self._write_cache_entry(type_id, entry)
-        return entry
+        with self._resolve_lock:
+            # A peer thread may have resolved this id while we waited on the lock.
+            existing = self._by_id.get(type_id)
+            if existing is not None:
+                return existing
+            try:
+                resolved = self._esi.resolve_names([type_id])
+            except Exception:
+                return None
+            if not isinstance(resolved, dict):
+                return None
+            info = resolved.get(type_id)
+            if info is None:
+                return None
+            name = info.get("name")
+            if not isinstance(name, str) or not name:
+                return None
+            entry = {"n": name, "c": None, "g": None, "s": None}
+            self._register(type_id, entry)
+            self._write_cache_entry(type_id, entry)
+            return entry
 
     def _write_cache_entry(self, type_id: int, entry: dict) -> None:
         """Merge one resolved entry into the on-disk cache (atomic temp+replace)."""
