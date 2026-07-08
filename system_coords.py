@@ -89,6 +89,16 @@ def resolve_name(name: str) -> int | None:
     return _id_of_name.get(name.lower())
 
 
+def get_region_id(system_id: int) -> int | None:
+    """Return the region_id for a system from the bundled table, or None when the
+    system isn't in the table (e.g. J-space wormholes, or no table shipped).
+
+    Lets callers resolve a staging system's region locally/instantly instead of
+    the ESI systems->constellation->region traversal."""
+    _load()
+    return _region_of.get(system_id)
+
+
 def get_kspace_name_to_id() -> dict[str, int]:
     """{canonical_name: system_id} for every K-space system in the bundled table.
 

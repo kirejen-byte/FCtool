@@ -1394,6 +1394,71 @@ class ESIAuth:
             })
         return out
 
+    def search_structures(self, term: str) -> list[dict]:
+        """Live structure search via the authenticated
+        GET /characters/{id}/search/?categories=structure endpoint (non-strict,
+        so it matches substrings/prefixes), resolving each hit's name +
+        solar_system_id via the authenticated GET /universe/structures/{sid}/.
+
+        Returns up to ~20 results as a list of
+            {"id": int, "name": str, "solar_system_id": int|None,
+             "type_id": int|None}
+        in ESI's id order. Uses the ``esi-search.search_structures`` scope — the
+        SAME scope Ansiblex discovery already relies on, so no new grant is
+        needed.
+
+        NOTE: /search/ and /universe/structures/ only see structures the
+        character has docking access to; inaccessible citadels simply don't
+        appear (and their name GET 403s, which is skipped). Returns [] gracefully
+        when: term is empty, no authenticated character is available, the search
+        scope is missing, or any network error occurs. Never raises."""
+        MAX_RESULTS = 20
+        if not term or not term.strip():
+            return []
+
+        auth = self._any_authenticated_auth()
+        if auth is None or not auth.character_id:
+            return []
+
+        try:
+            results = auth.esi_get(
+                f"/characters/{auth.character_id}/search/",
+                params={
+                    "categories": "structure",
+                    "search": term.strip(),
+                    "strict": "false",
+                },
+            )
+        except Exception:
+            return []
+        if not isinstance(results, dict):
+            return []
+
+        ids = results.get("structure")
+        if not isinstance(ids, list):
+            return []
+
+        out: list[dict] = []
+        for sid in ids[:MAX_RESULTS]:
+            if not isinstance(sid, int):
+                continue
+            try:
+                info = auth.esi_get(f"/universe/structures/{sid}/")
+            except Exception:
+                info = None
+            if not isinstance(info, dict):
+                continue
+            name = info.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            out.append({
+                "id": sid,
+                "name": name,
+                "solar_system_id": info.get("solar_system_id"),
+                "type_id": info.get("type_id"),
+            })
+        return out
+
     def get_affiliations(self, char_ids: list[int]) -> list[dict]:
         """Resolve characters to corp/alliance affiliations. Public endpoint with
         auth fallback; chunks of 1000 with split-on-failure recovery."""

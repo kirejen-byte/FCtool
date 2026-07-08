@@ -860,6 +860,9 @@ class FCToolGUI:
         self._market_scanning = False          # in-flight guard (no concurrent scans)
         self._market_from_cache = False        # True while showing a disk-cached snapshot
         self._market_corp_id_cache = {}        # character_id -> corp id (1 GET per char)
+        self._market_staging_resolving = False  # in-flight guard: staging resolve
+        self._market_staging_pending = None     # selection queued behind an in-flight resolve
+        self._market_structure_searching = False  # in-flight guard: structure search
         self._load_market_cache()              # populate snapshot from disk if present
 
         # Discover ansiblex from ESI if authenticated, else fall back to config
@@ -991,7 +994,7 @@ class FCToolGUI:
                     labels[dest_name] = f"{dest_name} ({dest_region})"
             all_names.sort()
 
-        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_motd_staging_entry']:
+        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_motd_staging_entry', '_market_staging_entry']:
             widget = getattr(self, attr, None)
             if widget and hasattr(widget, 'update_completions'):
                 widget.update_completions(all_names, labels)
@@ -15658,19 +15661,27 @@ class FCToolGUI:
                 _w.bind("<Leave>", lambda e: self._hide_tooltip())
 
     def _build_market_settings_section(self, parent):
-        """Build the Settings-tab 'Market Scanner' section (Phase B).
+        """Build the Settings-tab 'Market Scanner' section (name-first UX).
 
-        Int-entry fields for the staging structure/station/region/system ids +
-        the fixed seed target, two contract checkboxes, and a 'Scan market'
-        button with a last-scan status label. All fields persist into
-        config["market"] on Save Settings (see _save_settings). The section
-        header is registered with the floating TOC via _add_section (toc_title
-        'Market')."""
+        Instead of copying raw ids, the FC types a STAGING SYSTEM name into a
+        local autocomplete; the system + region ids fill automatically (bundled
+        table, instant) and a background public-ESI lookup (cached forever)
+        populates a station picker. A 'Find structures…' button runs an authed
+        structure search (reusing the ``esi-search`` scope Ansiblex discovery
+        already grants) into a structure picker. The four raw id entries remain
+        as auto-filled *advanced* fields (manual paste still works); the config
+        keys and _collect_market_settings are UNCHANGED, so the Phase B/C scan
+        plumbing is untouched.
+
+        All ids persist into config["market"] on Save Settings (see
+        _save_settings). The section is kept COMPACT (rows stack vertically,
+        hints wrap below) so the Settings TOC doesn't collapse. The header is
+        registered with the floating TOC via _add_section (toc_title 'Market')."""
         self._add_section(parent, "Market Scanner", toc_title="Market")
         mkt = self.config.get("market", {}) or {}
 
         # Field vars kept on self so _save_settings can collect them. Ints are
-        # rendered as their str value (0 shows as "0").
+        # rendered as their str value (0 shows as "0"). Config keys UNCHANGED.
         self._market_setting_vars = {
             "staging_structure_id": tk.StringVar(
                 value=str(mkt.get("staging_structure_id", 0) or 0)),
@@ -15688,33 +15699,112 @@ class FCToolGUI:
         self._market_alliance_contracts_var = tk.BooleanVar(
             value=bool(mkt.get("include_alliance_contracts", True)))
 
-        def _int_row(label, key, hint):
-            frame = tk.Frame(parent, bg=BG_DARK)
-            frame.pack(fill=tk.X, padx=20, pady=2)
-            lbl = tk.Label(frame, text=f"{label}:", font=("Consolas", 10),
-                           fg=FG_TEXT, bg=BG_DARK, width=28, anchor=tk.W)
-            lbl.pack(side=tk.LEFT)
-            entry = tk.Entry(frame, textvariable=self._market_setting_vars[key],
-                             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-                             insertbackground=FG_WHITE, width=20,
-                             borderwidth=1, relief=tk.RIDGE)
-            entry.pack(side=tk.LEFT, padx=5)
-            if hint:
-                tk.Label(frame, text=hint, font=("Consolas", 9),
-                         fg=FG_DIM, bg=BG_DARK, anchor=tk.W).pack(
-                             side=tk.LEFT, padx=6)
+        def _hint(text):
+            tk.Label(parent, text=text, font=("Consolas", 8), fg=FG_DIM,
+                     bg=BG_DARK, anchor=tk.W, justify=tk.LEFT,
+                     wraplength=360).pack(anchor=tk.W, padx=22, pady=(0, 2))
 
-        _int_row("Staging structure ID", "staging_structure_id",
-                 "citadel (primary) — right-click your staging citadel market → "
-                 "Copy ID, or leave 0 and set station/region")
-        _int_row("Staging station ID", "staging_station_id",
-                 "NPC station fallback")
-        _int_row("Staging region ID", "staging_region_id",
-                 "region for orders + contracts")
-        _int_row("Staging system ID", "staging_system_id",
-                 "contract filter (0 = whole region)")
-        _int_row("Seed target per fit", "seed_target",
-                 "how many of each fit counts as 'fully seeded' (default 20)")
+        def _picker_row(label):
+            frame = tk.Frame(parent, bg=BG_DARK)
+            frame.pack(fill=tk.X, padx=20, pady=(4, 0))
+            tk.Label(frame, text=label, font=("Consolas", 10), fg=FG_TEXT,
+                     bg=BG_DARK, width=17, anchor=tk.W).pack(side=tk.LEFT)
+            return frame
+
+        # ── Staging system autocomplete (local, instant) ──────────────────────
+        self._market_staging_var = tk.StringVar(value="")
+        sys_row = _picker_row("Staging system:")
+        self._market_staging_entry = AutocompleteEntry(
+            sys_row, list(getattr(self, "_system_names", []) or []),
+            labels=dict(getattr(self, "_system_labels", {}) or {}),
+            textvariable=self._market_staging_var,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, width=22,
+            borderwidth=1, relief=tk.RIDGE,
+            on_select=self._market_on_staging_select)
+        self._market_staging_entry.pack(side=tk.LEFT, padx=5)
+        self._market_staging_status = tk.Label(
+            parent, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK,
+            anchor=tk.W, justify=tk.LEFT, wraplength=360)
+        self._market_staging_status.pack(anchor=tk.W, padx=22, pady=(1, 2))
+        _hint("type a system name — its system + region ids fill in "
+              "automatically, and the station list loads below")
+
+        # ── Station picker (public ESI, from the resolved system) ─────────────
+        self._market_station_var = tk.StringVar(value=self._MARKET_STATION_NONE)
+        self._market_station_options = [(self._MARKET_STATION_NONE, 0)]
+        st_row = _picker_row("Staging station:")
+        self._market_station_combo = ttk.Combobox(
+            st_row, textvariable=self._market_station_var, state="readonly",
+            values=[self._MARKET_STATION_NONE], width=36)
+        self._market_station_combo.pack(side=tk.LEFT, padx=5)
+        self._market_station_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._market_on_station_pick())
+
+        # ── Structure picker (authed search; reuses the ansiblex scope) ───────
+        self._market_structure_var = tk.StringVar(
+            value=self._MARKET_STRUCT_NONE)
+        self._market_structure_options = [(self._MARKET_STRUCT_NONE, 0)]
+        sc_row = _picker_row("Staging structure:")
+        self._market_structure_btn = ttk.Button(
+            sc_row, text="Find structures…", style="Dark.TButton",
+            command=self._market_find_structures)
+        self._market_structure_btn.pack(side=tk.LEFT)
+        self._market_structure_combo = ttk.Combobox(
+            sc_row, textvariable=self._market_structure_var, state="readonly",
+            values=[self._MARKET_STRUCT_NONE], width=24)
+        self._market_structure_combo.pack(side=tk.LEFT, padx=5)
+        self._market_structure_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._market_on_structure_pick())
+        self._market_structure_status = tk.Label(
+            parent, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK,
+            anchor=tk.W, justify=tk.LEFT, wraplength=360)
+        self._market_structure_status.pack(anchor=tk.W, padx=22, pady=(1, 2))
+        _struct_tip = ("Searches player structures your primary character has "
+                       "docking access to (same ESI search scope as Ansiblex "
+                       "discovery). Citadels are named like 'System - Name'.")
+        for _w in (self._market_structure_btn, self._market_structure_combo):
+            _w.bind("<Enter>",
+                    lambda e, t=_struct_tip: self._show_tooltip(e, t))
+            _w.bind("<Leave>", lambda e: self._hide_tooltip())
+
+        # ── Seed target (normal setting) ──────────────────────────────────────
+        seed_row = _picker_row("Seed target / fit:")
+        tk.Entry(seed_row, textvariable=self._market_setting_vars["seed_target"],
+                 font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                 insertbackground=FG_WHITE, width=8,
+                 borderwidth=1, relief=tk.RIDGE).pack(side=tk.LEFT, padx=5)
+        tk.Label(seed_row, text="how many of each fit = 'fully seeded' "
+                 "(default 20)", font=("Consolas", 8), fg=FG_DIM,
+                 bg=BG_DARK, anchor=tk.W).pack(side=tk.LEFT, padx=6)
+
+        # ── Advanced (auto-filled) id entries ─────────────────────────────────
+        tk.Label(parent, text="Advanced ids — auto-filled by the pickers above; "
+                 "paste to override:", font=("Consolas", 8, "italic"),
+                 fg=FG_DIM, bg=BG_DARK, anchor=tk.W, justify=tk.LEFT,
+                 wraplength=360).pack(anchor=tk.W, padx=22, pady=(8, 1))
+
+        def _int_row(label, key):
+            frame = tk.Frame(parent, bg=BG_DARK)
+            frame.pack(fill=tk.X, padx=22, pady=1)
+            tk.Label(frame, text=f"{label}:", font=("Consolas", 9),
+                     fg=FG_DIM, bg=BG_DARK, width=15, anchor=tk.W).pack(
+                         side=tk.LEFT)
+            tk.Entry(frame, textvariable=self._market_setting_vars[key],
+                     font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+                     insertbackground=FG_WHITE, width=16,
+                     borderwidth=1, relief=tk.RIDGE).pack(side=tk.LEFT, padx=5)
+            tk.Label(frame, text="(advanced)", font=("Consolas", 8),
+                     fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=6)
+
+        _int_row("Structure ID", "staging_structure_id")
+        _int_row("Station ID", "staging_station_id")
+        _int_row("Region ID", "staging_region_id")
+        _int_row("System ID", "staging_system_id")
+
+        # Prime the station picker from the currently-configured system (if any)
+        # so a saved staging system shows its stations without a re-type.
+        self._market_prime_pickers()
 
         cb_frame = tk.Frame(parent, bg=BG_DARK)
         cb_frame.pack(fill=tk.X, padx=20, pady=2)
@@ -15739,6 +15829,334 @@ class FCToolGUI:
         self._market_status_label.pack(side=tk.LEFT, padx=10)
         # Prime the status text from current config/cache state.
         self._refresh_market_status_labels()
+
+    # ── Market Scanner: name-first staging pickers ────────────────────────────
+    # Combobox placeholder rows. "(none)" maps to id 0 (nothing chosen);
+    # "(no NPC stations)" is the disabled-look placeholder for a station-less
+    # system. These strings are matched by the pick handlers, so keep them here.
+    _MARKET_STATION_NONE = "(none)"
+    _MARKET_STATION_EMPTY = "(no NPC stations)"
+    _MARKET_STRUCT_NONE = "(none)"
+
+    def _market_set_status(self, attr, text, colour=None):
+        """Set one of the market picker status labels, guarded for headless/dead
+        widgets (a bare host in tests may not have the label, or Tk may be gone
+        at shutdown)."""
+        lbl = getattr(self, attr, None)
+        if lbl is None:
+            return
+        try:
+            lbl.config(text=text, fg=(colour or FG_DIM))
+        except tk.TclError:
+            pass
+
+    def _market_set_id_var(self, key, value):
+        """Set an advanced-id StringVar to an int value (a VISIBLE auto-fill),
+        guarded for headless/dead widgets."""
+        var = (getattr(self, "_market_setting_vars", {}) or {}).get(key)
+        if var is None:
+            return
+        try:
+            var.set(str(int(value)))
+        except (tk.TclError, TypeError, ValueError):
+            pass
+
+    def _market_current_id(self, key):
+        """Read an advanced-id StringVar as an int (0 on blank/garbage/absent)."""
+        var = (getattr(self, "_market_setting_vars", {}) or {}).get(key)
+        if var is None:
+            return 0
+        try:
+            return int((var.get() or "0").strip() or 0)
+        except (tk.TclError, ValueError):
+            return 0
+
+    def _market_prime_pickers(self):
+        """Populate the station picker from the currently-configured staging
+        system, using ONLY the on-disk resolution cache (network-free). No-op
+        when nothing is configured or the system was never resolved."""
+        try:
+            import market_staging
+            sid = self._market_current_id("staging_system_id")
+            resolution = market_staging.get_cached(sid) if sid else None
+        except Exception:
+            resolution = None
+        if resolution:
+            self._market_set_station_options(resolution.get("stations") or [])
+
+    def _market_on_staging_select(self):
+        """A staging system was chosen (typed + selected from the dropdown).
+
+        Fills system + region ids INSTANTLY from local data (no network), then
+        kicks a background public-ESI worker to confirm ids and populate the
+        station picker (cached forever). No-op on a blank name; in-flight
+        guarded so a burst of selections doesn't stack workers."""
+        try:
+            name = (self._market_staging_var.get() or "").strip()
+        except (AttributeError, tk.TclError):
+            return
+        if not name:
+            return
+        # Instant local id auto-fill (no network).
+        try:
+            import market_staging
+            sid, rid = market_staging.local_ids(name)
+        except Exception:
+            sid, rid = None, None
+        if sid:
+            self._market_set_id_var("staging_system_id", sid)
+        if rid:
+            self._market_set_id_var("staging_region_id", rid)
+        self._market_set_status("_market_staging_status",
+                                f"resolving {name}…", FG_ACCENT)
+        if getattr(self, "_market_staging_resolving", False):
+            # A resolve for an EARLIER selection is still in flight. Don't
+            # stack a second worker — remember THIS (latest) name instead; the
+            # in-flight worker's apply detects its result is stale, drops it,
+            # and re-kicks the resolve for us (latest selection wins).
+            self._market_staging_pending = name
+            return
+        self._market_staging_pending = None
+        self._market_staging_resolving = True
+
+        def worker():
+            resolution = None
+            try:
+                import market_staging
+                resolution = market_staging.resolve_staging(name)
+            except Exception:
+                log.exception("[market] staging resolve failed")
+            finally:
+                try:
+                    self.root.after(0, self._market_apply_staging_resolution,
+                                    name, resolution)
+                except Exception:
+                    # Tk gone at shutdown: clear the guard directly so it can't
+                    # stick, mirroring the scan worker's finally-guard.
+                    self._market_staging_resolving = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _market_apply_staging_resolution(self, name, resolution):
+        """Tk-thread: apply a staging resolution — fill ids, populate the station
+        combobox, update status. Clears the in-flight guard.
+
+        LATEST-SELECTION-WINS: if the entry no longer shows the name this
+        worker resolved (the user selected/typed another system while it ran),
+        the result is STALE — it is dropped instead of clobbering the newer
+        selection's ids/stations. When the newer selection is still what the
+        entry shows, it was guard-blocked from starting its own worker, so its
+        resolve is re-kicked here the moment the slot frees up.
+
+        A None resolution (offline / unknown system) leaves the locally-filled
+        ids and shows a soft failure — never a crash."""
+        self._market_staging_resolving = False
+        pending = getattr(self, "_market_staging_pending", None)
+        self._market_staging_pending = None
+        try:
+            current = (self._market_staging_var.get() or "").strip()
+        except (AttributeError, tk.TclError):
+            current = ""
+        if current.casefold() != (name or "").strip().casefold():
+            # Stale resolution for a superseded selection — never apply it.
+            if pending and pending.casefold() == current.casefold():
+                # The superseding selection is still what the entry shows and
+                # never got a worker (in-flight guard) — resolve it now.
+                self._market_on_staging_select()
+            else:
+                # Typed-over / cleared (no queued selection owed a worker):
+                # just clear the now-stale "resolving…" text.
+                self._market_set_status("_market_staging_status", "")
+            return
+        if not resolution:
+            self._market_set_status(
+                "_market_staging_status",
+                f"couldn't resolve {name} online — using local ids only "
+                "(station list unavailable)", FG_ORANGE)
+            self._market_set_station_options([])
+            return
+        sid = resolution.get("system_id") or 0
+        rid = resolution.get("region_id") or 0
+        if sid:
+            self._market_set_id_var("staging_system_id", sid)
+        if rid:
+            self._market_set_id_var("staging_region_id", rid)
+        stations = resolution.get("stations") or []
+        self._market_set_station_options(stations)
+        n = len(stations)
+        region_txt = f"region {rid}" if rid else "region unknown"
+        tail = "  — pick a station below" if n else ""
+        self._market_set_status(
+            "_market_staging_status",
+            f"resolved {resolution.get('name', name)} → {region_txt} · "
+            f"{n} station{'s' if n != 1 else ''}{tail}",
+            FG_GREEN if (sid and rid) else FG_ORANGE)
+
+    def _market_set_station_options(self, stations):
+        """Populate the station combobox from [{"id","name"}].
+
+        Empty → a soft '(no NPC stations)' placeholder (id stays 0). Otherwise a
+        '(none)' row plus one row per station; the current staging_station_id is
+        preselected when it's among the options. Guarded for headless."""
+        options = [(self._MARKET_STATION_NONE, 0)]
+        for s in (stations or []):
+            sid = s.get("id")
+            if isinstance(sid, int):
+                options.append((s.get("name") or f"Station {sid}", sid))
+        self._market_station_options = options
+        combo = getattr(self, "_market_station_combo", None)
+        var = getattr(self, "_market_station_var", None)
+        if combo is None or var is None:
+            return
+        if len(options) == 1:
+            try:
+                combo.config(values=[self._MARKET_STATION_EMPTY])
+                var.set(self._MARKET_STATION_EMPTY)
+            except tk.TclError:
+                pass
+            return
+        cur_id = self._market_current_id("staging_station_id")
+        sel_label = self._MARKET_STATION_NONE
+        for (label, sid) in options:
+            if sid and sid == cur_id:
+                sel_label = label
+                break
+        try:
+            combo.config(values=[label for (label, _i) in options])
+            var.set(sel_label)
+        except tk.TclError:
+            pass
+
+    def _market_on_station_pick(self):
+        """Station combobox selection → write staging_station_id (0 for the
+        '(none)'/placeholder rows)."""
+        var = getattr(self, "_market_station_var", None)
+        if var is None:
+            return
+        try:
+            label = var.get()
+        except tk.TclError:
+            return
+        chosen = 0
+        for (opt_label, sid) in getattr(self, "_market_station_options", []):
+            if opt_label == label:
+                chosen = sid
+                break
+        self._market_set_id_var("staging_station_id", chosen)
+
+    def _market_find_structures(self):
+        """'Find structures…' → authed structure search for the chosen staging
+        system, filling the structure picker. Reuses ESIAuth.search_structures
+        (``esi-search`` scope, same as Ansiblex discovery). Degrades to a status
+        message (never a crash) when no staging system is chosen, the primary
+        character isn't logged in, or the search fails. In-flight guarded."""
+        if getattr(self, "_market_structure_searching", False):
+            return
+        try:
+            term = (self._market_staging_var.get() or "").strip()
+        except (AttributeError, tk.TclError):
+            term = ""
+        if not term:
+            self._market_set_status("_market_structure_status",
+                                    "type a staging system first", FG_ORANGE)
+            return
+        auth = getattr(self, "esi_auth", None)
+        if auth is None or not getattr(auth, "is_authenticated", False):
+            self._market_set_status(
+                "_market_structure_status",
+                "needs ESI login (primary character) to search structures",
+                FG_ORANGE)
+            return
+        # Resolved system id lets us also surface structures whose NAME deviates
+        # from the system name (matched by solar_system_id).
+        want_sid = self._market_current_id("staging_system_id")
+        self._market_set_status("_market_structure_status",
+                                f"searching structures in {term}…", FG_ACCENT)
+        self._market_structure_searching = True
+
+        def worker():
+            results = None
+            try:
+                results = auth.search_structures(term)
+            except Exception:
+                log.exception("[market] structure search failed")
+            finally:
+                try:
+                    self.root.after(0, self._market_apply_structures,
+                                    term, want_sid, results)
+                except Exception:
+                    self._market_structure_searching = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _market_apply_structures(self, term, want_sid, results):
+        """Tk-thread: populate the structure combobox from search results.
+
+        Structures IN the chosen system rank first — matched either by the
+        'System - Name' naming convention or by a resolved solar_system_id equal
+        to ``want_sid`` — then any other accessible hits. results is None only on
+        a network/search error (a soft status, never a crash); [] means the
+        search ran but found nothing. Clears the in-flight guard."""
+        self._market_structure_searching = False
+        if results is None:
+            self._market_set_status(
+                "_market_structure_status",
+                "structure search failed — see log (or re-auth ESI)", FG_ORANGE)
+            return
+        term_l = term.casefold()
+
+        def _in_system(r):
+            if want_sid and r.get("solar_system_id") == want_sid:
+                return True
+            nm = (r.get("name") or "").casefold()
+            return nm.startswith(term_l + " -") or nm.startswith(term_l + " ")
+
+        matches = [r for r in results if _in_system(r)]
+        rest = [r for r in results if r not in matches]
+        options = [(self._MARKET_STRUCT_NONE, 0)]
+        for r in matches + rest:
+            rid = r.get("id")
+            if isinstance(rid, int):
+                options.append((f"{r.get('name') or f'Structure {rid}'} ({rid})",
+                                rid))
+        self._market_structure_options = options
+        combo = getattr(self, "_market_structure_combo", None)
+        var = getattr(self, "_market_structure_var", None)
+        if combo is not None and var is not None:
+            try:
+                combo.config(values=[label for (label, _i) in options])
+                var.set(self._MARKET_STRUCT_NONE)
+            except tk.TclError:
+                pass
+        n = len(options) - 1
+        if n == 0:
+            self._market_set_status(
+                "_market_structure_status",
+                f"no structures found for {term} (docking access required)",
+                FG_ORANGE)
+        else:
+            self._market_set_status(
+                "_market_structure_status",
+                f"{n} structure{'s' if n != 1 else ''} found — pick one below",
+                FG_GREEN)
+
+    def _market_on_structure_pick(self):
+        """Structure combobox selection → write staging_structure_id (0 for the
+        '(none)' placeholder). Structure takes precedence over station in
+        MarketSource, so this is the primary staging source when set."""
+        var = getattr(self, "_market_structure_var", None)
+        if var is None:
+            return
+        try:
+            label = var.get()
+        except tk.TclError:
+            return
+        chosen = 0
+        for (opt_label, rid) in getattr(self, "_market_structure_options", []):
+            if opt_label == label:
+                chosen = rid
+                break
+        self._market_set_id_var("staging_structure_id", chosen)
 
     def _browse_logs(self):
         path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
