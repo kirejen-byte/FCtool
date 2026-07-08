@@ -376,6 +376,25 @@ class FittingsStore:
                 member.ideal_max = ideal_max
         doctrine.modified = _now()
 
+    def set_member_seed_target(
+        self, doctrine_id: str, fit_id: str, seed_target: int | None
+    ) -> None:
+        """Set the per-fit market seed target on a (doctrine, fit) membership.
+
+        None = "inherit the doctrine seed target" (omitted from JSON); a positive
+        int overrides it for THIS fit only — so a doctrine can seed e.g. 50
+        stabbers, 20 scythes and 10 bifrosts. Mirrors ``set_member_tags`` /
+        ``set_doctrine_seed_target``: mutates in memory + stamps ``modified``; the
+        caller persists via ``save()`` like the sibling member setters.
+        """
+        doctrine = self._doctrines.get(doctrine_id)
+        if doctrine is None:
+            return
+        for member in doctrine.members:
+            if member.fit_id == fit_id:
+                member.seed_target = seed_target
+        doctrine.modified = _now()
+
     def set_doctrine_exemptions(
         self, doctrine_id: str, entries: list[dict] | None
     ) -> None:
@@ -565,6 +584,10 @@ class FittingsStore:
                         ideal_mode=member.ideal_mode,
                         ideal_min=member.ideal_min,
                         ideal_max=member.ideal_max,
+                        # Carry the per-fit seed target across the import remap so
+                        # a shared doctrine keeps its "50 stabbers / 20 scythes"
+                        # seeding intent (field-drop guard).
+                        seed_target=member.seed_target,
                     )
                 )
             incoming.members = remapped

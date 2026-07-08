@@ -223,9 +223,42 @@ class MarketSnapshot:
     # instead of rendering an empty (forbidden) order book as a bare market.
     # JSON round-tripped through the cache so a stale cached load remembers it.
     degraded: list[str] = field(default_factory=list)
+    # ── Scan scope (honest cached rendering) ──────────────────────────────────
+    # "full"     → the whole market was pulled; ``scanned_type_ids`` is None
+    #              (covers EVERY type). This is the historical behaviour.
+    # "doctrine" → only a doctrine's bill-of-materials type_ids were scanned;
+    #              ``scanned_type_ids`` holds EXACTLY those ids. Such a snapshot
+    #              must NOT masquerade as coverage for a DIFFERENT doctrine/fit
+    #              whose types it never scanned — consumers gate on ``covers()``
+    #              so an unscanned type reads "not scanned" (unknown), never
+    #              "not on the market". ``scope_label`` is the scanned doctrine's
+    #              display name (for an honest "scanned for X only" UI message);
+    #              "" for a full scan. All three round-trip through the cache so a
+    #              disk-loaded doctrine-scoped snapshot keeps its honesty.
+    scope: str = "full"
+    scanned_type_ids: set[int] | None = None
+    scope_label: str = ""
 
     def get(self, type_id: int) -> TypeDepth | None:
         return self.depth.get(type_id)
+
+    def covers(self, type_ids) -> bool:
+        """True when this snapshot's scope covers ALL of ``type_ids`` — i.e. every
+        one of those types was actually scanned, so availability/marks/gaps built
+        from this snapshot are HONEST for them.
+
+        A full snapshot covers everything; a doctrine-scoped one covers only the
+        ids it scanned. An out-of-scope type means "not scanned" (unknown), never
+        "not on the market" — that distinction is the whole point of the scope
+        tag, so a doctrine-scoped cache can't silently paint a DIFFERENT
+        doctrine's items as absent."""
+        if self.scope == "full" or self.scanned_type_ids is None:
+            return True
+        try:
+            needed = {int(t) for t in type_ids}
+        except (TypeError, ValueError):
+            return False
+        return needed <= self.scanned_type_ids
 
     def mark_degraded(self, reason: str) -> None:
         """Record a degradation reason (deduped, order-preserving). Used by the
@@ -243,6 +276,12 @@ class MarketSnapshot:
             "taken_at": self.taken_at,
             "etag": self.etag,
             "degraded": list(self.degraded),
+            "scope": self.scope,
+            # A set isn't JSON-serializable — store a sorted list (None for full).
+            "scanned_type_ids": (
+                sorted(self.scanned_type_ids)
+                if self.scanned_type_ids is not None else None),
+            "scope_label": self.scope_label,
             # type_id keys become strings in JSON, ints in memory.
             "depth": {str(tid): d.to_dict() for tid, d in self.depth.items()},
         }
@@ -260,6 +299,18 @@ class MarketSnapshot:
         degraded = (
             [str(x) for x in raw_degraded] if isinstance(raw_degraded, list) else []
         )
+        # Scope round-trip. A legacy cache dict with none of these keys loads back
+        # as a FULL snapshot (scope "full", scanned None) — exactly the old
+        # behaviour, so pre-scope caches keep rendering as full coverage.
+        raw_scanned = d.get("scanned_type_ids")
+        scanned: set[int] | None = None
+        if isinstance(raw_scanned, list):
+            scanned = set()
+            for x in raw_scanned:
+                try:
+                    scanned.add(int(x))
+                except (TypeError, ValueError):
+                    continue
         return MarketSnapshot(
             source_id=int(d.get("source_id", 0)),
             source_kind=str(d.get("source_kind", "")),
@@ -269,6 +320,9 @@ class MarketSnapshot:
             depth=depth,
             etag=d.get("etag"),
             degraded=degraded,
+            scope=str(d.get("scope", "full") or "full"),
+            scanned_type_ids=scanned,
+            scope_label=str(d.get("scope_label", "") or ""),
         )
 
 
@@ -459,7 +513,14 @@ class MarketScanner:
 
     # ── Market depth scan ─────────────────────────────────────────────────────
 
-    def scan_market(self, source: MarketSource | None, *, progress=None) -> MarketSnapshot:
+    def scan_market(
+        self,
+        source: MarketSource | None,
+        *,
+        progress=None,
+        type_ids: "set[int] | None" = None,
+        scope_label: str = "",
+    ) -> MarketSnapshot:
         """Pull the staging market and return a depth snapshot (sell-side).
 
         ``None`` source (unconfigured) → an empty snapshot, no network. A
@@ -467,6 +528,26 @@ class MarketScanner:
         pulls region sell orders and filters to the station's ``location_id``.
         Adapter errors are surfaced as an empty snapshot (never raised) so a
         single bad pull degrades gracefully instead of crashing the worker.
+
+        **Scope.** ``type_ids=None`` (default) is a FULL scan — every market type,
+        exactly the historical behaviour. A ``type_ids`` set requests a
+        doctrine-TARGETED scan of only those types:
+
+        * **Region / NPC-station path** — one server-side ``type_id``-filtered
+          query PER type (see ``_pull_region_by_type``): a doctrine's ~30-120
+          types cost that many small one-page requests instead of paging the
+          whole busy region's order book (each per-type query is ETag-cached
+          independently, so re-scans are cheap 304s).
+        * **Citadel / structure path** — ESI offers NO per-type structure-market
+          filter, so the whole order book is STILL fetched (ETag makes repeats
+          cheap); the snapshot then RETAINS only ``type_ids`` (a smaller depth
+          build + a leaner cache). This is an ESI limitation, not a choice.
+
+        The resulting snapshot records its ``scope`` ("full"/"doctrine"), the
+        ``scanned_type_ids`` set, and a ``scope_label`` (the doctrine name, for an
+        honest UI message) so a doctrine-scoped cached snapshot never masquerades
+        as full coverage for a different doctrine (consumers gate on
+        ``MarketSnapshot.covers``).
 
         ``progress`` (optional) is a cheap callback the scan feeds coarse stage
         dicts as it works, so the GUI can move off a dead "Scanning" label:
@@ -494,6 +575,11 @@ class MarketScanner:
 
         t0 = time.monotonic()
 
+        # None → full pull (historical). A set → a doctrine-targeted scan of
+        # exactly these types (normalized to ints once, up front).
+        targeted = type_ids is not None
+        tid_set = {int(t) for t in type_ids} if targeted else None
+
         # Clear the adapter's per-pass forbidden record so a stale 403 from an
         # earlier scan can't leak into this snapshot (duck-typed: fake adapters
         # without ``last_forbidden`` are unaffected).
@@ -503,7 +589,7 @@ class MarketScanner:
 
         _emit_progress(progress, {"stage": "market", "status": "orders_start"})
         try:
-            raw = self._pull_orders(source, progress)
+            raw = self._pull_orders(source, progress, tid_set)
         except Exception:
             log.exception("[market] order pull failed for source %s", source)
             raw = []
@@ -512,7 +598,7 @@ class MarketScanner:
             progress, {"stage": "market", "status": "orders_done", "orders": len(raw)}
         )
 
-        depth = self._build_depth(raw, source)
+        depth = self._build_depth(raw, source, tid_set)
         _emit_progress(
             progress, {"stage": "market", "status": "depth_done", "types": len(depth)}
         )
@@ -524,29 +610,76 @@ class MarketScanner:
             taken_at=_now_iso(),
             depth=depth,
             degraded=self._degraded_reasons(source),
+            scope=("doctrine" if targeted else "full"),
+            scanned_type_ids=(tid_set if targeted else None),
+            scope_label=((scope_label or "") if targeted else ""),
         )
         self._store_snapshot(snap)
         log.info(
-            "[market] order scan: source=%s/%s orders=%d types=%d elapsed=%.2fs",
-            source.kind, source.source_id, len(raw), len(depth), time.monotonic() - t0,
+            "[market] order scan: source=%s/%s scope=%s orders=%d types=%d elapsed=%.2fs",
+            source.kind, source.source_id, ("doctrine" if targeted else "full"),
+            len(raw), len(depth), time.monotonic() - t0,
         )
         return snap
 
-    def _pull_orders(self, source: "MarketSource", progress) -> list[dict]:
+    def _pull_orders(self, source: "MarketSource", progress, type_ids=None) -> list[dict]:
         """Call the adapter's order endpoint for ``source``, wiring the optional
         per-page ``progress`` callback only when the adapter advertises support
         (``supports_progress``). Fake/older adapters — which take no ``progress``
-        kwarg — are called the classic way, so this stays backward-compatible."""
+        kwarg — are called the classic way, so this stays backward-compatible.
+
+        ``type_ids`` (a targeted scan) changes ONLY the region/station path: it
+        issues one server-side ``type_id`` query per type instead of paging the
+        whole region. The structure path has no per-type ESI filter, so it still
+        pulls the whole book — the caller trims it to ``type_ids`` in
+        ``_build_depth``."""
         prog_ok = progress is not None and getattr(self._adapter, "supports_progress", False)
         if source.kind == "structure":
+            # No server-side structure-market type filter (ESI limitation): pull
+            # the whole book whether targeted or not; _build_depth trims it.
             if prog_ok:
                 return self._adapter.structure_orders(source.source_id, progress=progress)
             return self._adapter.structure_orders(source.source_id)
+        # Region / NPC-station path.
+        if type_ids:
+            return self._pull_region_by_type(source.region_id, type_ids, progress)
         if prog_ok:
             return self._adapter.region_orders(
                 source.region_id, order_type="sell", progress=progress
             )
         return self._adapter.region_orders(source.region_id, order_type="sell")
+
+    def _pull_region_by_type(self, region_id: int, type_ids, progress) -> list[dict]:
+        """Targeted region pull: one server-side ``type_id``-filtered sell-order
+        query per type, concatenated.
+
+        This is the whole point of a targeted scan — a doctrine's ~30-120 types
+        cost that many small (usually one-page) requests instead of paging an
+        entire busy region's order book. Each per-type query is ETag-cached
+        independently by the adapter (one ETag per ``(region, type)``), so a
+        re-scan replays cheap 304s. A per-type failure is swallowed (that type
+        simply shows as absent) so one bad type can't abort the whole pass.
+
+        Progress ticks once per type as ``{"stage": "orders", "page": i,
+        "pages": N}`` — reusing the existing per-page status slot so the GUI shows
+        'orders page i/N' advancing over the doctrine's types. ``progress`` is
+        emitted directly (not delegated to the adapter) so it counts types, not
+        the single page each per-type query returns."""
+        tids = sorted({int(t) for t in type_ids})
+        total = len(tids)
+        orders: list[dict] = []
+        for i, tid in enumerate(tids, start=1):
+            try:
+                chunk = self._adapter.region_orders(
+                    region_id, type_id=tid, order_type="sell")
+            except Exception:
+                log.exception(
+                    "[market] region per-type order pull failed (type %s)", tid)
+                chunk = []
+            if chunk:
+                orders.extend(chunk)
+            _emit_progress(progress, {"stage": "orders", "page": i, "pages": total})
+        return orders
 
     def _degraded_reasons(self, source: "MarketSource") -> list[str]:
         """Reasons the just-pulled snapshot is degraded (forbidden != empty).
@@ -577,7 +710,7 @@ class MarketScanner:
         return sorted(reasons)
 
     def _build_depth(
-        self, orders: list[dict], source: MarketSource
+        self, orders: list[dict], source: MarketSource, type_ids=None
     ) -> dict[int, TypeDepth]:
         """Aggregate raw ESI order dicts into per-type sell ladders.
 
@@ -585,6 +718,10 @@ class MarketScanner:
         * For the STATION path, keeps only orders at ``source.source_id``
           (``location_id`` filter) since the region pull returns the whole
           region. For the STRUCTURE path every order is already structure-local.
+        * When ``type_ids`` is given (a targeted scan) only those types are
+          retained — this trims the structure path's whole-book pull down to the
+          doctrine's items. The region path is already type-filtered server-side,
+          so the guard is a cheap no-op there.
         * Builds an ascending-price ladder per type and the total sell volume.
         """
         buckets: dict[int, list[PriceLevel]] = {}
@@ -602,6 +739,8 @@ class MarketScanner:
                 vol = int(o.get("volume_remain", o.get("volume_total", 0)))
             except (KeyError, TypeError, ValueError):
                 continue
+            if type_ids is not None and tid not in type_ids:
+                continue  # targeted scan: retain only the requested types
             if vol <= 0:
                 continue
             buckets.setdefault(tid, []).append(PriceLevel(price=price, volume=vol))
@@ -967,13 +1106,23 @@ class MarketScanner:
         *,
         target_fits: int,
         components=None,
+        per_fit_targets: "dict[str, int] | None" = None,
     ) -> GapList:
-        """Build a shopping list to seed ``target_fits`` of every fit in the
-        doctrine, using the local market as on-hand stock.
+        """Build a shopping list to seed the doctrine, using the local market as
+        on-hand stock.
 
-        For each fit, ``needed`` per type = ``per_fit_qty * target_fits`` summed
+        For each fit, ``needed`` per type = ``per_fit_qty * <fit's target>`` summed
         across fits; ``available`` = current market sell qty; ``short`` =
         ``max(0, needed - available)``. Only short items appear.
+
+        **Per-fit seed targets.** ``target_fits`` is the doctrine-wide fallback.
+        ``per_fit_targets`` (optional) is a ``fit_id -> target`` mapping consulted
+        first for each member, falling back to ``target_fits`` for any fit not
+        present — so a doctrine can seed e.g. 50 stabbers, 20 scythes and 10
+        bifrosts instead of a flat N of every hull. When the applied targets vary
+        across fits, ``target_desc`` reads ``"per-fit seed targets · <doctrine>"``
+        (honest summary) instead of ``"Nx <doctrine>"``. Omitting the mapping
+        (``None``) reproduces the prior single-target behaviour exactly.
 
         By owner decision #4 the gap builder accepts whichever component subset
         it is handed: the ``components`` predicate/iterable selects roles to
@@ -985,15 +1134,26 @@ class MarketScanner:
         # needed[type_id] -> (name, total needed units)
         needed: dict[int, list] = {}  # type_id -> [name, needed]
         role_filter = _resolve_gap_role_filter(components)
+        overrides = per_fit_targets or {}
+        # Distinct targets actually applied to fits that resolved (drives the
+        # honest "varies" summary): a single value → "Nx"; two+ → per-fit.
+        applied_targets: set[int] = set()
 
         for member in getattr(doctrine, "members", []):
             fit = store.get_fit(member.fit_id) if store is not None else None
             if fit is None:
                 continue
+            fit_target = overrides.get(getattr(member, "fit_id", None), target_fits)
+            try:
+                fit_target = int(fit_target)
+            except (TypeError, ValueError):
+                fit_target = target_fits
+            fit_target = max(0, fit_target)
+            applied_targets.add(fit_target)
             for c in fit_bom(fit.parsed, self._catalog):
                 if not role_filter(c.role):
                     continue
-                units = c.per_fit_qty * max(0, target_fits)
+                units = c.per_fit_qty * fit_target
                 if units <= 0:
                     continue
                 entry = needed.setdefault(c.type_id, [c.name, 0])
@@ -1018,7 +1178,14 @@ class MarketScanner:
         # Stable, useful ordering: biggest shortfall first, then by name.
         items.sort(key=lambda it: (-it.short, it.name.lower()))
 
-        target_desc = f"{target_fits}x {getattr(doctrine, 'name', '') or 'doctrine'}"
+        doctrine_name = getattr(doctrine, "name", "") or "doctrine"
+        if len(applied_targets) > 1:
+            # Targets genuinely differ across fits — a single "Nx" would lie.
+            target_desc = f"per-fit seed targets · {doctrine_name}"
+        else:
+            # Uniform: the one applied value if any fit resolved, else the fallback.
+            uniform = next(iter(applied_targets)) if applied_targets else target_fits
+            target_desc = f"{uniform}x {doctrine_name}"
         return GapList(items=items, target_desc=target_desc)
 
     # ── Cache (JSON, atomic, lock-guarded) ────────────────────────────────────

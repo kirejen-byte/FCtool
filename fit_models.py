@@ -97,6 +97,12 @@ class DoctrineMember:
     ideal_mode: str | None = None      # "percent" | "count" | "off" | None
     ideal_min: int | None = None
     ideal_max: int | None = None       # None = no upper bound (e.g. defenders)
+    # Per-fit market seed target (units of THIS fit that count as "fully seeded").
+    # None = "inherit the doctrine's seed_target (which itself falls back to the
+    # global config["market"]["seed_target"] default)". Lets a doctrine seed e.g.
+    # 50 stabbers / 20 scythes / 10 bifrosts rather than a flat N of every hull.
+    # Resolved via fc_gui._market_seed_target(doctrine, member).
+    seed_target: int | None = None
 
 
 @dataclass
@@ -249,6 +255,11 @@ def doctrine_member_to_dict(member: DoctrineMember) -> dict:
         d["ideal_min"] = member.ideal_min
     if member.ideal_max is not None:
         d["ideal_max"] = member.ideal_max
+    # Serialize seed_target ONLY when overridden (None omitted so absence ==
+    # "inherit the doctrine seed target"; older libraries without the key load
+    # back as None, unaffected). Mirrors the doctrine-level seed_target/exemptions.
+    if member.seed_target is not None:
+        d["seed_target"] = member.seed_target
     return d
 
 
@@ -260,6 +271,7 @@ def doctrine_member_from_dict(d: dict) -> DoctrineMember:
         ideal_mode=d.get("ideal_mode"),
         ideal_min=d.get("ideal_min"),
         ideal_max=d.get("ideal_max"),
+        seed_target=d.get("seed_target"),
     )
 
 

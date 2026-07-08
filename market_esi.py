@@ -210,18 +210,26 @@ class AuthMarketAdapter:
         return out
 
     def _paginate_etag(
-        self, path, *, authed: bool, params=None, progress=None, stage: str = "page"
+        self, path, *, authed: bool, params=None, progress=None, stage: str = "page",
+        cache_key: str | None = None,
     ) -> list[dict]:
         """Like ``_paginate`` but sends ``If-None-Match`` from the in-memory ETag
         cache and replays the cached body on a 304 (first page's ETag gates the
         whole result). Used for the region-orders and contracts-list pulls where
         a 304 is common and cheap.
 
+        ``cache_key`` (optional) is the key under which the ETag + body are
+        stored; it defaults to ``path``. A per-``type_id`` region-orders query
+        passes a key that folds in the type so the many targeted queries against
+        ONE region each get their OWN ETag (one per ``(region, type)``) instead of
+        clobbering a single region-wide entry.
+
         ``progress`` (optional) is fed ``{"stage": stage, "page": i, "pages": n}``
         per page; a 304 (whole list served from the ETag cache) reports one page
         of one so the GUI still sees the stage tick over."""
         url = f"{ESI_BASE}{path}"
-        cached = self._etags.get(path)
+        key = cache_key or path
+        cached = self._etags.get(key)
         headers = {"If-None-Match": cached[0]} if cached else None
         # Probe page 1 with the conditional header.
         first = self._get_page(
@@ -262,7 +270,7 @@ class AuthMarketAdapter:
                 out.extend(more)
             _emit_progress(progress, {"stage": stage, "page": page, "pages": total})
         if etag:
-            self._etags[path] = (etag, out)
+            self._etags[key] = (etag, out)
         return out
 
     # ── MarketEsiAdapter protocol ─────────────────────────────────────────────
@@ -273,13 +281,20 @@ class AuthMarketAdapter:
     ) -> list[dict]:
         """Public region orders (NPC-station + ranged), ETag-cached. Optional
         single ``type_id`` filter; ``order_type`` default "sell". ``progress``
-        (optional) receives per-page ``{"stage": "orders", ...}`` dicts."""
+        (optional) receives per-page ``{"stage": "orders", ...}`` dicts.
+
+        The ETag cache key folds in ``order_type`` and (when set) ``type_id`` so a
+        targeted scan's many per-type queries against one region each keep their
+        OWN conditional-request ETag — one per ``(region, type)`` — rather than
+        clobbering a single region-wide entry."""
         params: dict = {"order_type": order_type}
+        cache_key = f"/markets/{region_id}/orders/|{order_type}"
         if type_id is not None:
             params["type_id"] = type_id
+            cache_key = f"{cache_key}|type={type_id}"
         return self._paginate_etag(
             f"/markets/{region_id}/orders/", authed=False, params=params,
-            progress=progress, stage="orders",
+            progress=progress, stage="orders", cache_key=cache_key,
         )
 
     def structure_orders(self, structure_id: int, *, progress=None) -> list[dict]:

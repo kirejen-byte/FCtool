@@ -871,6 +871,7 @@ class FCToolGUI:
         # time), and the id of the 1s elapsed-ticker after() (None when idle).
         self._market_scan_started = None       # time.monotonic() at scan start
         self._market_scan_progress = {}        # accumulated progress fields
+        self._market_scan_scope = None         # "full"/"doctrine" while a scan runs
         self._market_prog_scheduled = False    # True while one apply is pending
         self._market_prog_lock = threading.Lock()
         self._market_tick_after_id = None      # 1s elapsed ticker after() id / None
@@ -6870,6 +6871,20 @@ class FCToolGUI:
         # Gaps… button is gated off (a forbidden-empty book would say "buy all").
         blocked = self._market_structure_blocked()
 
+        # Scope coverage for THIS doctrine: a cached doctrine-scoped snapshot
+        # scanned for a DIFFERENT doctrine must not drive this one's marks/gaps
+        # (unknown != absent). Covered when there's no snapshot (nothing to
+        # mislead) or the snapshot's scope covers this doctrine's BoM. When NOT
+        # covered we suppress the rows and show an honest "rescan" note instead.
+        doc_bom_ids = self._market_doctrine_scan_type_ids(doctrine)
+        scope_covered = (
+            self._market_snapshot is None
+            or not doc_bom_ids
+            or self._market_snapshot_covers(doc_bom_ids))
+        scope_note = (
+            None if (blocked or scope_covered or self._market_snapshot is None)
+            else self._market_scope_mismatch_message(doctrine))
+
         # Header: name + rename/delete.
         head = tk.Frame(parent, bg=BG_PANEL)
         head.pack(fill=tk.X, padx=10, pady=(10, 0))
@@ -6912,11 +6927,13 @@ class FCToolGUI:
         # the rows with per-fit availability. Manual only — no polling.
         ttk.Button(add_row, text="⟳ Market", style="Dark.TButton",
                    command=self._market_scan_now).pack(side=tk.LEFT, padx=(10, 2))
-        # Gaps shopping-list export — only meaningful once a snapshot exists (the
-        # same snapshot the availability marks gate on). Shown disabled with an
-        # explanatory tip until then so the affordance is discoverable.
+        # Gaps shopping-list export — only meaningful once a snapshot that COVERS
+        # this doctrine exists (the same gate the availability marks use). Shown
+        # disabled with an explanatory tip otherwise so the affordance stays
+        # discoverable (blocked, no snapshot, or scanned for another doctrine).
         gaps_state = (tk.NORMAL if (self._market_snapshot is not None
-                                    and not blocked) else tk.DISABLED)
+                                    and not blocked and scope_covered)
+                      else tk.DISABLED)
         gaps_btn = ttk.Button(
             add_row, text="Gaps…", style="Dark.TButton", state=gaps_state,
             command=lambda: self._open_market_gaps_dialog(doctrine))
@@ -6928,6 +6945,10 @@ class FCToolGUI:
                 "Shopping list of items short of this doctrine's seed target — "
                 "copy for Janice or in-game Multibuy. Click ⟳ Market first to "
                 "load market stock.")
+        elif not scope_covered:
+            gaps_tip = (scope_note or
+                        "Market was scanned for a different doctrine — click "
+                        "⟳ Market to scan this one, then export its gaps.")
         else:
             gaps_tip = (
                 "Shopping list of items short of this doctrine's seed target — "
@@ -6958,9 +6979,18 @@ class FCToolGUI:
                          anchor=tk.W, padx=12, pady=(8, 10))
             return
 
-        # Per-fit market availability (empty dict when no snapshot OR blocked →
-        # rows show nothing, no clutter). Computed once for the whole doctrine.
-        avail_map = {} if blocked else self._market_doctrine_avail_map(doctrine)
+        # Per-fit market availability (empty dict when no snapshot, blocked, OR
+        # the snapshot's scope doesn't cover this doctrine → rows show nothing, no
+        # clutter). Computed once for the whole doctrine.
+        avail_map = ({} if (blocked or not scope_covered)
+                     else self._market_doctrine_avail_map(doctrine))
+        # Out-of-scope cached snapshot → an honest "rescan for this doctrine" note
+        # in place of the suppressed rows (never misleading ✗0 rows).
+        if scope_note:
+            note = tk.Label(
+                parent, text=scope_note, font=("Consolas", 8), fg=FG_ORANGE,
+                bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT, wraplength=420)
+            note.pack(anchor=tk.W, padx=12, pady=(6, 0))
         # Per-doctrine seed target (override wins; else the global default). Drives
         # the availability colour thresholds for THIS doctrine's rows.
         seed_target = self._market_seed_target(doctrine)
@@ -7021,10 +7051,15 @@ class FCToolGUI:
             tk.Label(info, text="(no tags)", font=("Consolas", 8),
                      fg=FG_DIM, bg=BG_PANEL).pack(anchor=tk.W, pady=(1, 0))
 
-        # Market availability line (only when a snapshot produced an entry).
+        # Market availability line (only when a snapshot produced an entry). The
+        # colour bar is the PER-FIT resolved seed target (member override wins,
+        # else the doctrine target, else the global default) — not the shared
+        # doctrine value — so a "10 bifrost" row can read green while a "50
+        # stabber" row on the same market reads yellow.
         avail = (avail_map or {}).get(mem.fit_id) if fit is not None else None
         if avail is not None:
-            text, colour = self._market_row_text(avail, seed_target)
+            row_target = self._market_seed_target(doctrine, mem)
+            text, colour = self._market_row_text(avail, row_target)
             avail_lbl = tk.Label(info, text=text, font=("Consolas", 8),
                                  fg=colour, bg=BG_PANEL, anchor=tk.W)
             avail_lbl.pack(anchor=tk.W, pady=(1, 0))
@@ -7035,6 +7070,14 @@ class FCToolGUI:
                     f"bottleneck for market seeding: {binding}"
                     f" (limits you to {avail.completable_fits} complete fits "
                     f"from local stock)")
+
+        # Per-fit seed-target editor (inline, always shown — the target is a
+        # persistent config that colours the availability line above and drives
+        # the Gaps shopping list, so it stays available with or without a scan).
+        # Blank = inherit; the dim "(inherit N)" hint shows the RESOLVED value the
+        # fit falls back to (doctrine override, else the global default).
+        if fit is not None:
+            self._build_member_seed_target_row(info, doctrine, mem)
 
         ctrls = tk.Frame(row, bg=BG_PANEL)
         ctrls.pack(side=tk.RIGHT)
@@ -7114,6 +7157,70 @@ class FCToolGUI:
         if new_val == getattr(doctrine, "seed_target", None):
             return  # unchanged — don't re-render (avoids focus thrash)
         self.fittings.set_doctrine_seed_target(doctrine_id, new_val)
+        self.fittings.save()
+        self._show_doctrine_detail(doctrine_id)
+
+    def _build_member_seed_target_row(self, parent, doctrine, mem):
+        """Compact per-fit seed-target editor for one doctrine member row.
+
+        Mirrors ``_build_doctrine_seed_target_row`` one level down: a small int
+        Entry showing the fit's own override (blank when inheriting), a dim
+        "(inherit N)" hint making the RESOLVED fallback visible (the doctrine
+        override, else the global default), and a tooltip. Commits on <Return>/
+        <FocusOut>: blank/invalid/<=0 → None (inherit), a positive int overrides
+        just this fit. The StringVar + commit closure capture the fit id by value
+        (default args) so they survive the detail re-render each commit triggers.
+        """
+        row = tk.Frame(parent, bg=BG_PANEL)
+        row.pack(anchor=tk.W, pady=(1, 0))
+        lbl = tk.Label(row, text="Seed:", font=("Consolas", 8),
+                       fg=FG_DIM, bg=BG_PANEL)
+        lbl.pack(side=tk.LEFT)
+        cur = getattr(mem, "seed_target", None)
+        var = tk.StringVar(value=("" if cur is None else str(cur)))
+        entry = tk.Entry(row, textvariable=var, width=5, font=("Consolas", 8),
+                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                         borderwidth=1, relief=tk.RIDGE)
+        entry.pack(side=tk.LEFT, padx=(3, 4))
+        # The value this fit falls back to when the field is blank = the doctrine/
+        # global resolution (member excluded).
+        inherited = self._market_seed_target(doctrine)
+        hint = tk.Label(row, text=f"(inherit {inherited})", font=("Consolas", 8),
+                        fg=FG_DIM, bg=BG_PANEL)
+        hint.pack(side=tk.LEFT)
+        tip = ("How many of THIS fit counts as 'fully seeded' (colours the "
+               "availability line + drives the Gaps shopping list). Blank = "
+               "inherit the doctrine's seed target. Set a number to override just "
+               "this fit — e.g. 50 stabbers, 20 scythes, 10 bifrosts.")
+        self._tip_widget(lbl, tip)
+        self._tip_widget(entry, tip)
+
+        def _commit(_evt=None, _did=doctrine.id, _fid=mem.fit_id, _var=var):
+            self._commit_member_seed_target(_did, _fid, _var.get())
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<FocusOut>", _commit)
+
+    def _commit_member_seed_target(self, doctrine_id, fit_id, text):
+        """Parse + persist a per-fit seed-target edit, then refresh.
+
+        Routes the raw entry text through ``_parse_seed_target_input`` (blank/
+        invalid/<=0 → None = inherit the doctrine target), persists via the store
+        setter + save, and re-renders the doctrine detail so the availability
+        colours re-evaluate immediately against the new per-fit bar. No-op'd early
+        when the value is unchanged so a bare focus-out doesn't churn the pane
+        (and steal focus mid-edit)."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = next((m for m in getattr(doctrine, "members", [])
+                    if m.fit_id == fit_id), None)
+        if mem is None:
+            return
+        new_val = self._parse_seed_target_input(text)
+        if new_val == getattr(mem, "seed_target", None):
+            return  # unchanged — don't re-render (avoids focus thrash)
+        self.fittings.set_member_seed_target(doctrine_id, fit_id, new_val)
         self.fittings.save()
         self._show_doctrine_detail(doctrine_id)
 
@@ -15971,8 +16078,21 @@ class FCToolGUI:
 
         scan_row = tk.Frame(parent, bg=BG_DARK)
         scan_row.pack(fill=tk.X, padx=20, pady=(4, 2))
-        ttk.Button(scan_row, text="Scan market", style="Dark.TButton",
-                   command=self._market_scan_now).pack(side=tk.LEFT)
+        # FULL scan (every market type). The Doctrine tab's ⟳ Market button does
+        # the fast, default TARGETED scan of just the active doctrine's items; this
+        # button is the deliberate "scan everything" escape hatch, warned as slow.
+        full_scan_btn = ttk.Button(
+            scan_row, text="Full market scan", style="Dark.TButton",
+            command=lambda: self._market_scan_now(full=True))
+        full_scan_btn.pack(side=tk.LEFT)
+        self._tip_widget(
+            full_scan_btn,
+            "Full scan: pulls EVERY market type in the region — this can take a "
+            "very long time on a busy trade-hub region. For normal use, the "
+            "Doctrine tab's ⟳ Market button runs a fast targeted scan of just the "
+            "active doctrine's items instead. (Citadel order books are always "
+            "fetched whole — an ESI limitation — but a targeted scan still keeps "
+            "the stored data lean.)")
         self._market_status_label = tk.Label(
             scan_row, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
             anchor=tk.W)
@@ -20678,6 +20798,12 @@ $bmp.Dispose()
                     state = dict(prog)
             else:
                 state = dict(prog)
+            # Inject the live scan scope into a COPY of the state (kept off the
+            # shared, backend-fed progress accumulator so that stays scope-free)
+            # so the line reads 'scanning (doctrine)…' / 'scanning (full)…'.
+            scope = getattr(self, "_market_scan_scope", None)
+            if scope:
+                state["scope"] = scope
             started = getattr(self, "_market_scan_started", None)
             try:
                 elapsed = time.monotonic() - started if started else 0.0
@@ -20700,9 +20826,16 @@ $bmp.Dispose()
         if self._market_scan_ts is not None:
             hhmm = self._market_scan_ts.strftime("%H:%M")
             when = "cached" if self._market_from_cache else "scanned"
-            n = len(self._market_snapshot.depth) if self._market_snapshot else 0
+            snap = self._market_snapshot
+            n = len(snap.depth) if snap else 0
+            # A doctrine-scoped snapshot says so (its coverage is limited to that
+            # doctrine's items) so the resting line is honest about what it holds.
+            if snap is not None and getattr(snap, "scope", "full") == "doctrine":
+                label = getattr(snap, "scope_label", "") or ""
+                tag = f"{label} scope" if label else "doctrine scope"
+                return (f"{when} {hhmm} · {n} types · {tag}", FG_DIM)
             return (f"{when} {hhmm} · {n} types on market", FG_DIM)
-        return ("not scanned yet — click Scan market", FG_DIM)
+        return ("not scanned yet — click ⟳ Market", FG_DIM)
 
     def _refresh_market_status_labels(self):
         """Push _market_status_text onto every Market status label that exists
@@ -20743,6 +20876,19 @@ $bmp.Dispose()
         the classic way, no TypeError, no double-run."""
         try:
             return "progress" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _market_fn_accepts(fn, param: str) -> bool:
+        """True when callable ``fn`` accepts a keyword parameter named ``param``.
+
+        Feature-detects the scanner's optional targeted-scan kwargs
+        (``type_ids`` / ``scope_label``) so an older / fake scanner without them
+        is still called the classic way — no TypeError, no double behaviour.
+        Unintrospectable / None → False (never raises)."""
+        try:
+            return param in inspect.signature(fn).parameters
         except (TypeError, ValueError):
             return False
 
@@ -20858,7 +21004,13 @@ $bmp.Dispose()
         # Elapsed is always the final segment; with no stage segments the line is
         # just 'scanning… <elapsed>' (no dangling separator).
         parts.append(_elapsed(elapsed_s))
-        return "scanning… " + " · ".join(parts)
+        # Scope tag when the caller injected one ('doctrine'/'full'): the line
+        # reads 'scanning (doctrine)…' so the owner knows a targeted vs full scan
+        # is running. Absent/unknown scope keeps the historical 'scanning… ' head
+        # byte-for-byte (so a full scan with no scope key is unchanged).
+        scope = state.get("scope")
+        head = f"scanning ({scope})… " if scope in ("doctrine", "full") else "scanning… "
+        return head + " · ".join(parts)
 
     def _market_schedule_progress_apply(self):
         """Coalesce worker→Tk progress refreshes: schedule AT MOST ONE pending
@@ -20947,14 +21099,19 @@ $bmp.Dispose()
         except (tk.TclError, RuntimeError):
             self._market_tick_after_id = None
 
-    def _market_scan_now(self):
+    def _market_scan_now(self, full=False):
         """Manual market scan: depth pull + (optional) contract scan on a daemon
         thread, results marshalled back to the Tk thread. In-flight guarded (a
         second click while a scan runs is ignored). Every error is swallowed to a
         status update — never a crash or dialog spam.
 
-        Both the Settings "Scan market" button and the Doctrine-tab "⟳ Market"
-        button call this."""
+        **Scope.** The Doctrine-tab "⟳ Market" button and the post-re-auth
+        auto-heal call this with ``full=False`` (the default) → a doctrine-
+        TARGETED scan of just the active doctrine's bill-of-materials type_ids, so
+        we never pull the entire market. The Settings "Full market scan" button
+        calls ``full=True`` → every market type (slow on a busy region; warned in
+        its tooltip). No active doctrine / no resolvable BoM → a full scan is run
+        as the honest fallback, and the status line's scope tag says which ran."""
         if self._market_scanning:
             return
         source = self._market_source()
@@ -20965,23 +21122,6 @@ $bmp.Dispose()
         if scanner is None:
             self._refresh_market_status_labels()
             return
-
-        # Fresh live-progress state for this scan: elapsed base, empty stage
-        # accumulator, cleared coalescing slot. Ensure the lock exists even for a
-        # scan kicked before the __init__ market block ran (defensive).
-        self._market_scan_started = time.monotonic()
-        self._market_scan_progress = {}
-        self._market_prog_scheduled = False
-        if getattr(self, "_market_prog_lock", None) is None:
-            self._market_prog_lock = threading.Lock()
-
-        self._market_scanning = True
-        self._refresh_market_status_labels()
-        # Tick the elapsed clock every 1s so the status never looks frozen even
-        # if the backend emits no progress. Guarded — bare hosts don't bind it.
-        starter = getattr(self, "_market_start_elapsed_ticker", None)
-        if callable(starter):
-            starter()
 
         market_cfg = self.config.get("market", {}) or {}
         scan_contracts = bool(market_cfg.get("scan_contracts", True))
@@ -21002,6 +21142,45 @@ $bmp.Dispose()
                 if fit is not None:
                     fits.append(fit)
 
+        # ── Scan scope ────────────────────────────────────────────────────────
+        # Targeted (default) unless the caller forced a full scan or there's no
+        # active doctrine with a resolvable BoM. ``scan_type_ids`` None → full.
+        # Collector is getattr-guarded so a bare test host (no doctrine plumbing)
+        # simply falls back to a full scan, never an AttributeError.
+        scan_type_ids = None
+        scope_label = ""
+        if not full and doctrine is not None:
+            collector = getattr(self, "_market_doctrine_scan_type_ids", None)
+            ids = None
+            if callable(collector):
+                try:
+                    ids = collector(doctrine)
+                except Exception:
+                    log.exception("[market] scan type_ids collection failed")
+            if ids:
+                scan_type_ids = set(ids)
+                scope_label = getattr(doctrine, "name", "") or ""
+        self._market_scan_scope = "full" if scan_type_ids is None else "doctrine"
+
+        # Fresh live-progress state for this scan: elapsed base, empty stage
+        # accumulator, cleared coalescing slot. Ensure the lock exists even for a
+        # scan kicked before the __init__ market block ran (defensive). The scope
+        # is kept on its OWN attribute (above), NOT in this accumulator, so the
+        # backend-fed progress state stays scope-free.
+        self._market_scan_started = time.monotonic()
+        self._market_scan_progress = {}
+        self._market_prog_scheduled = False
+        if getattr(self, "_market_prog_lock", None) is None:
+            self._market_prog_lock = threading.Lock()
+
+        self._market_scanning = True
+        self._refresh_market_status_labels()
+        # Tick the elapsed clock every 1s so the status never looks frozen even
+        # if the backend emits no progress. Guarded — bare hosts don't bind it.
+        starter = getattr(self, "_market_start_elapsed_ticker", None)
+        if callable(starter):
+            starter()
+
         def _progress(payload):
             # WORKER THREAD: fold the latest payload into the shared accumulator
             # under the lock, then coalesce a single Tk-thread status repaint.
@@ -21018,10 +21197,17 @@ $bmp.Dispose()
             contracts = None
             try:
                 try:
+                    # Build the scan_market call: pass ``progress`` and the
+                    # targeted-scan kwargs only when the scanner accepts them, so
+                    # an older / fake scanner is still called the classic way.
+                    mkwargs = {}
                     if FCToolGUI._market_supports_progress(scanner.scan_market):
-                        snap = scanner.scan_market(source, progress=_progress)
-                    else:
-                        snap = scanner.scan_market(source)
+                        mkwargs["progress"] = _progress
+                    if FCToolGUI._market_fn_accepts(scanner.scan_market, "type_ids"):
+                        mkwargs["type_ids"] = scan_type_ids  # None → full scan
+                    if FCToolGUI._market_fn_accepts(scanner.scan_market, "scope_label"):
+                        mkwargs["scope_label"] = scope_label
+                    snap = scanner.scan_market(source, **mkwargs)
                 except Exception:
                     log.exception("[market] scan_market failed")
                 # Pre-check belt: a structure source whose primary character
@@ -21145,6 +21331,77 @@ $bmp.Dispose()
         except Exception:
             log.exception("[market] fit refresh after scan failed")
 
+    def _market_doctrine_scan_type_ids(self, doctrine):
+        """The set of type_ids a doctrine-TARGETED market scan pulls: the UNION of
+        every member fit's FULL bill-of-materials (hull + modules + subsystems +
+        charges + drones + cargo).
+
+        The FULL BoM — not just the scored subset — because the fit-detail marks
+        render a ✓/✗ for EVERY component line, so a targeted scan must cover them
+        all for the marks to be honest. Doubles as the coverage set consumers test
+        a cached snapshot's scope against. Empty set when nothing resolves;
+        defensive throughout (a missing store/catalog or an unparsable fit yields
+        an empty set, so the caller falls back to a full scan / renders nothing)."""
+        out: set[int] = set()
+        if doctrine is None:
+            return out
+        store = getattr(self, "fittings", None)
+        if store is None:
+            return out
+        try:
+            import market_scanner
+        except Exception:
+            return out
+        catalog = getattr(self, "type_catalog", None)
+        for mem in getattr(doctrine, "members", []):
+            fid = getattr(mem, "fit_id", None)
+            if fid is None:
+                continue
+            try:
+                fit = store.get_fit(fid)
+            except Exception:
+                fit = None
+            if fit is None:
+                continue
+            try:
+                for c in market_scanner.fit_bom(fit.parsed, catalog):
+                    out.add(c.type_id)
+            except Exception:
+                log.exception("[market] fit_bom failed collecting scan type_ids")
+        return out
+
+    def _market_snapshot_covers(self, type_ids):
+        """True when the current snapshot's scope covers ALL of ``type_ids`` — so
+        availability/marks/gaps built from it are HONEST for those types (every
+        one was actually scanned). No snapshot → False. A legacy snapshot without
+        ``covers()`` (or any error) → treated as full coverage (True), matching
+        the pre-scope behaviour so old caches keep rendering."""
+        snap = self._market_snapshot
+        if snap is None:
+            return False
+        covers = getattr(snap, "covers", None)
+        if not callable(covers):
+            return True
+        try:
+            return bool(covers(type_ids))
+        except Exception:
+            return True
+
+    def _market_scope_mismatch_message(self, doctrine):
+        """Honest one-liner when the cached snapshot's scope doesn't cover the
+        doctrine being rendered: it was scanned for a DIFFERENT doctrine's items
+        (or not yet for this one), so this doctrine's availability is UNKNOWN —
+        not "everything is missing" — until a rescan. Names the scanned doctrine
+        when the snapshot carries its label."""
+        name = getattr(doctrine, "name", "") or "this doctrine"
+        snap = self._market_snapshot
+        scanned_for = (getattr(snap, "scope_label", "") or "") if snap is not None else ""
+        if scanned_for and scanned_for != name:
+            return (f"⚠ Market last scanned for {scanned_for} only — "
+                    f"click ⟳ Market to scan {name}.")
+        return (f"⚠ Market not yet scanned for {name} — "
+                f"click ⟳ Market to load its availability.")
+
     def _market_fit_component_map(self, fit):
         """type_id -> (on_market, market_qty, best_price) for one fit, from the
         current snapshot. Pure data lookup over fit_bom + snapshot.get — no
@@ -21162,6 +21419,12 @@ $bmp.Dispose()
             bom = market_scanner.fit_bom(fit.parsed, self.type_catalog)
         except Exception:
             log.exception("[market] fit_bom failed for fit detail marks")
+            return {}
+        # Scope honesty: a doctrine-scoped snapshot that didn't scan THIS fit's
+        # items must not paint them ✗ (unknown != absent). Suppress marks
+        # entirely (identical to the no-snapshot path) when out of scope.
+        fit_type_ids = {c.type_id for c in bom}
+        if not self._market_snapshot_covers(fit_type_ids):
             return {}
         out: dict[int, tuple] = {}
         for c in bom:
@@ -21260,14 +21523,30 @@ $bmp.Dispose()
             return 20
         return val if val > 0 else 20
 
-    def _market_seed_target(self, doctrine):
-        """Resolve the effective market seed target for ``doctrine``.
+    def _market_seed_target(self, doctrine, member=None):
+        """Resolve the effective market seed target for a fit / doctrine.
 
-        The per-doctrine override (``Doctrine.seed_target``) wins when set to a
-        positive int; otherwise the global ``config["market"]["seed_target"]``
-        default applies. Always >= 1 so availability colour thresholds have a
-        sane bar. A None/0/negative doctrine value falls through to the global.
+        Three-level resolution chain, most-specific wins:
+
+        1. the per-fit override (``member.seed_target``) when a positive int,
+        2. else the per-doctrine override (``Doctrine.seed_target``) when a
+           positive int,
+        3. else the global ``config["market"]["seed_target"]`` default.
+
+        Always >= 1 so availability colour thresholds have a sane bar. A None/0/
+        negative value at any level falls through to the next. ``member`` is
+        optional so the existing doctrine-level call sites are unaffected
+        (``_market_seed_target(doctrine)`` behaves exactly as before).
         """
+        # 1. Per-fit override (most specific).
+        m_override = getattr(member, "seed_target", None) if member is not None else None
+        try:
+            m_override = int(m_override) if m_override is not None else None
+        except (TypeError, ValueError):
+            m_override = None
+        if m_override is not None and m_override > 0:
+            return m_override
+        # 2. Per-doctrine override.
         override = getattr(doctrine, "seed_target", None) if doctrine is not None else None
         try:
             override = int(override) if override is not None else None
@@ -21275,6 +21554,7 @@ $bmp.Dispose()
             override = None
         if override is not None and override > 0:
             return override
+        # 3. Global default.
         return self._global_seed_target()
 
     @staticmethod
@@ -21319,6 +21599,12 @@ $bmp.Dispose()
         # Degraded/blocked structure market → no rows (the banner explains why);
         # an empty forbidden book must not render as "✗ 0% · 0 fits" everywhere.
         if self._market_structure_blocked():
+            return {}
+        # Scope honesty: a doctrine-scoped snapshot that doesn't cover THIS
+        # doctrine's BoM must not drive ✗0 rows for types it never scanned — the
+        # detail pane shows a "rescan for this doctrine" note instead.
+        bom_ids = self._market_doctrine_scan_type_ids(doctrine)
+        if bom_ids and not self._market_snapshot_covers(bom_ids):
             return {}
         scanner = self._get_market_scanner()
         if scanner is None:
@@ -21380,9 +21666,15 @@ $bmp.Dispose()
 
         Returns ``(gap, error)``: ``gap`` is a market_scanner.GapList (or None on
         failure), ``error`` a short user-facing string (or None on success). No
-        snapshot → a clear "scan first" error, never a crash. The per-doctrine
-        seed target (override wins, else the global default) flows in as
-        ``target_fits`` so the shopping list matches the availability bar's bar."""
+        snapshot → a clear "scan first" error, never a crash.
+
+        Seed-target resolution is per-fit: ``target_fits`` carries the doctrine-
+        level bar (per-doctrine override, else the global default) as the fallback,
+        and ``per_fit_targets`` maps the fit_ids whose per-fit override differs from
+        that fallback to their own resolved target — so the shopping list seeds
+        e.g. 50 stabbers / 20 scythes / 10 bifrosts, matching each row's colour
+        bar. When no member overrides, no mapping is passed (identical to the
+        prior single-target behaviour)."""
         # A gap list built from a forbidden-empty structure book would tell the
         # owner to buy EVERYTHING — suppress it with the re-auth message instead.
         if self._market_structure_blocked():
@@ -21390,13 +21682,33 @@ $bmp.Dispose()
         snap = self._market_snapshot
         if snap is None:
             return None, "No market snapshot yet — click ⟳ Market first."
+        # Scope honesty: a doctrine-scoped snapshot scanned for a DIFFERENT
+        # doctrine would tell the owner to "buy everything" for types it never
+        # scanned — suppress with an honest rescan message instead.
+        bom_ids = self._market_doctrine_scan_type_ids(doctrine)
+        if bom_ids and not self._market_snapshot_covers(bom_ids):
+            return None, self._market_scope_mismatch_message(doctrine)
         scanner = self._get_market_scanner()
         if scanner is None:
             return None, "Market scanner unavailable."
+        doctrine_target = self._market_seed_target(doctrine)
+        # Sparse per-fit override map: only members whose resolved target differs
+        # from the doctrine fallback. An empty map → the flat doctrine target for
+        # every fit (so target_desc stays "Nx <doctrine>" and the call is
+        # byte-identical to the pre-per-fit behaviour).
+        per_fit: dict[str, int] = {}
+        for m in getattr(doctrine, "members", []):
+            fid = getattr(m, "fit_id", None)
+            if fid is None:
+                continue
+            resolved = self._market_seed_target(doctrine, m)
+            if resolved != doctrine_target:
+                per_fit[fid] = resolved
         try:
             gap = scanner.gap_list(
                 doctrine, self.fittings, snap,
-                target_fits=self._market_seed_target(doctrine))
+                target_fits=doctrine_target,
+                per_fit_targets=(per_fit or None))
         except Exception:
             log.exception("[market] gap_list failed")
             return None, "Could not build the gap list (see log)."
