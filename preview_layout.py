@@ -81,8 +81,24 @@ def zoom_rect(rect, factor, anchor):
     return (nx, ny, nw, nh)
 
 
-def cycle_next(order, current, live, direction):
-    """Next live char key in the ordered ring. Empty order → sorted(live)."""
+def cycle_next(order, current, live, direction, strict=False):
+    """Next live char key in the ordered ring. Empty order → sorted(live).
+
+    strict=True → members-only ring: `[k for k in order if k in live]` with NO
+    extras-append (non-member live clients are never cycled) and direction-aware
+    entry when the anchor is outside the ring — forward starts at ring[0],
+    backward at ring[-1]. An empty ring (no live members, or empty `order`)
+    returns None. strict=False (the default) keeps the legacy cycle-all path
+    byte-for-byte.
+    """
+    if strict:
+        ring = [k for k in order if k in live]
+        if not ring:
+            return None
+        if current not in ring:
+            return ring[0] if direction > 0 else ring[-1]
+        i = ring.index(current)
+        return ring[(i + direction) % len(ring)]
     ring = [k for k in order if k in live] if order else sorted(live)
     if not ring:
         return None

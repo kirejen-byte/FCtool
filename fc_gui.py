@@ -12179,7 +12179,9 @@ class FCToolGUI:
         "login_position": [5, 5],
         "lock_layout": False,
         "snap": True, "grid": False, "grid_w": 100, "grid_h": 50,
-        "hotkeys": {"focus": {}, "groups": [{"next": [], "prev": [], "order": []}],
+        "hotkeys": {"focus": {},
+                    "groups": [{"name": "All clients", "members": [],
+                                "next": [], "prev": [], "order": []}],
                     "minimize_all": []},
         "hide_active": False, "hide_login": False,
         "hide_on_lost_focus": False, "hide_delay_ticks": 4,
@@ -12751,6 +12753,30 @@ class FCToolGUI:
                 break
         self._save_config()
 
+    def _preview_anchor_key(self, by_key):
+        """The char key a cycle press should start *from*.
+
+        Prefer the REAL foreground window's client key when that hwnd is one of
+        the tracked non-login clients in `by_key` — the user may have alt-tabbed
+        between clients manually, moving focus out from under `_preview_last_key`
+        (spec §3.3). Fall back to `_preview_last_key` when the foreground is
+        unknown / 0 or is not a tracked client. The foreground probe reuses the
+        injectable `_preview_foreground_hwnd` seam (the same win32 backend the
+        C2/C4 tick uses for hide-on-lost-focus); a missing hook or a raising
+        probe both resolve to the last-activated key, so pure test hosts and
+        errored probes never crash the drain."""
+        hook = getattr(self, "_preview_foreground_hwnd", None)
+        if callable(hook):
+            try:
+                fg = hook()
+            except Exception:
+                fg = None
+            if fg:
+                for key, client in by_key.items():
+                    if getattr(client, "hwnd", None) == fg:
+                        return key
+        return getattr(self, "_preview_last_key", "")
+
     def _preview_drain_hotkeys(self):
         """Drain the hotkey worker queue and act on each event. Focus APIs only —
         the compliance choke-point is window_activator; nothing is injected into
@@ -12777,11 +12803,25 @@ class FCToolGUI:
                 _, group, direction = action
                 cfg = self._preview_cfg()
                 groups = cfg.get("hotkeys", {}).get("groups", [])
-                order = groups[group].get("order", []) if group < len(groups) else []
+                if not (0 <= group < len(groups)):
+                    continue                            # stale / out-of-range group → ignore
+                g = groups[group]
                 # C4: skip session-excluded characters (Shift+Left toggles them).
                 live_keys = set(by_key) - self._preview_excluded
-                nxt = preview_layout.cycle_next(
-                    order, self._preview_last_key, live_keys, direction)
+                # Anchor on the REAL foreground client (manual alt-tabs move focus
+                # out from under _preview_last_key); fall back to the last switch.
+                anchor = self._preview_anchor_key(by_key)
+                members = [str(m).strip().lower()
+                           for m in g.get("members", []) if str(m).strip()]
+                if members:
+                    # STRICT: members-only ring, member order = cycle order, no extras.
+                    nxt = preview_layout.cycle_next(
+                        members, anchor, live_keys, direction, strict=True)
+                else:
+                    # Empty members → legacy cycle-all (Proopai empty-order convention).
+                    order = g.get("order", [])
+                    nxt = preview_layout.cycle_next(
+                        order, anchor, live_keys, direction)
                 c = by_key.get(nxt)
                 if c is not None:
                     self._preview_switch_to(c)          # C3: minimize-inactive aware
@@ -15275,7 +15315,10 @@ class FCToolGUI:
             if act[0] == "focus":
                 return f"focus {act[1]}"
             if act[0] == "cycle":
-                return "cycle " + ("next" if act[2] > 0 else "prev")
+                gi = act[1]
+                nm = groups[gi].get("name") if 0 <= gi < len(groups) else None
+                nm = nm or f"Group {gi + 1}"
+                return f"cycle {'next' if act[2] > 0 else 'prev'} — {nm}"
             if act[0] == "minall":
                 return "minimize all"
             return "hotkey"
