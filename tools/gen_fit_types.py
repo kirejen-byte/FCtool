@@ -2,23 +2,42 @@
 Generate fit_types.json — the bundled typeID -> name/category/slot table used
 by type_catalog.TypeCatalog for offline fit resolution.
 
-Downloads four Fuzzwork SDE CSV dumps, joins them, and writes a compact
+Downloads three Fuzzwork SDE CSV dumps, joins them, and writes a compact
 id->record JSON to the repo root:
 
-    invTypes.csv        typeID, typeName, groupID, marketGroupID, published
+    invTypes.csv        typeID, typeName, groupID, published
     invGroups.csv       groupID -> categoryID
     dgmTypeEffects.csv   typeID, effectID  (slot derivation)
-    invMarketGroups.csv  marketGroupID -> parentGroupID  (booster subtree)
 
-Only *published* types relevant to fittings are emitted (categories ship=6,
-module=7, charge=8, drone=18, fighter=87, subsystem=32) plus combat boosters
-(category 20 "Implant", group 303 "Booster") — see ``_is_bundled_booster`` for
-why boosters need a market-subtree gate rather than a bare group allowlist.
+Only *published* types relevant to fitting and cargo seeding are emitted
+(categories ship=6, module=7, charge=8, drone=18, fighter=87, subsystem=32,
+implant=20, deployable=22). Category 20 ("Implant") is bundled in FULL — it
+covers attribute implants, skill hardwirings, combat boosters, and cerebral/
+skill accelerators; category 22 ("Deployable") covers Mobile Depots and the
+like. Both are bundled so a pasted EFT CARGO section (a seeding shopping list)
+resolves entirely offline: implants/deployables were previously dropped with
+"Unknown item" warnings, which made the seeding tool useless for implant
+shopping lists.
+
 Slot is derived from dogma fitting effects for modules/rigs; subsystems get
-slot "subsystem" from their category; ships/charges/drones/fighters/boosters
-have slot null.
+slot "subsystem" from their category; everything else (ship/charge/drone/
+fighter/implant/deployable) has slot null.
 
-Run manually to refresh after a CCP expansion that adds/changes hulls/modules:
+IMPORTANT: categories 20 and 22 are deliberately NOT added to
+type_catalog.CATEGORY_NAMES, so an implant's or deployable's category_of()
+resolves to "other" — which fit_parser routes to cargo, matching the ESI-cache
+fallback path (cached entries carry c=None -> also "other"). The DNA serializer
+and EFT cargo-routing rely on that "other" classification, so keep 20/22 out of
+CATEGORY_NAMES even though they are bundled here.
+
+(History: category 20 used to be excluded except for a ~114-entry combat-booster
+carve-out — group 303 gated to the market-group-977 "Booster" subtree via a
+fourth CSV, invMarketGroups.csv — added to keep event accelerators and real
+implants out of the bundle. That gate and the fourth CSV are gone now that all
+of category 20 is bundled.)
+
+Run manually to refresh after a CCP expansion that adds/changes hulls/modules/
+implants/deployables:
     py -3.13 tools/gen_fit_types.py
 The static type data changes only with patches, so refresh is infrequent.
 
@@ -38,7 +57,6 @@ BASE_URL = "https://www.fuzzwork.co.uk/dump/latest/csv/"
 INV_TYPES_URL = BASE_URL + "invTypes.csv"
 INV_GROUPS_URL = BASE_URL + "invGroups.csv"
 DGM_TYPE_EFFECTS_URL = BASE_URL + "dgmTypeEffects.csv"
-INV_MARKET_GROUPS_URL = BASE_URL + "invMarketGroups.csv"
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "fit_types.json")
@@ -50,6 +68,13 @@ CATEGORY_CHARGE = 8
 CATEGORY_DRONE = 18
 CATEGORY_FIGHTER = 87
 CATEGORY_SUBSYSTEM = 32
+# Category 20 ("Implant": attribute implants, skill hardwirings, combat boosters,
+# cerebral/skill accelerators) and category 22 ("Deployable": Mobile Depot etc.)
+# are bundled in FULL so a pasted CARGO seeding list resolves offline. They are
+# deliberately NOT in type_catalog.CATEGORY_NAMES, so category_of() reports them
+# as "other" and fit_parser routes them to cargo (see the module docstring).
+CATEGORY_IMPLANT = 20
+CATEGORY_DEPLOYABLE = 22
 KEEP_CATEGORIES = {
     CATEGORY_SHIP,
     CATEGORY_MODULE,
@@ -57,22 +82,9 @@ KEEP_CATEGORIES = {
     CATEGORY_DRONE,
     CATEGORY_FIGHTER,
     CATEGORY_SUBSYSTEM,
+    CATEGORY_IMPLANT,
+    CATEGORY_DEPLOYABLE,
 }
-
-# Combat boosters ("drugs") are the ONE thing we bundle out of category 20
-# (Implant), which is otherwise excluded. They live in group 303 ("Booster"),
-# but that group ALSO holds ~350 event Cerebral/Skill Accelerators — so a bare
-# group allowlist would bloat the bundle by hundreds of entries. The combat
-# drugs are exactly the group-303 types sold under the on-market "Booster"
-# market tree (root marketGroupID 977); the accelerators sit off-market or
-# under a different market group. A market-subtree gate therefore isolates the
-# ~114 real boosters. Category 20 is deliberately NOT added to KEEP_CATEGORIES
-# (nor to type_catalog.CATEGORY_NAMES), so a bundled booster's category_of()
-# resolves to "other" — which fit_parser routes to cargo, matching the
-# ESI-cache fallback path (cached entries carry c=None -> also "other").
-CATEGORY_IMPLANT = 20
-BOOSTER_GROUP = 303
-BOOSTER_MARKET_ROOT = 977
 
 # dogma effectID -> fitting slot, for modules/rigs.
 EFFECT_HI_POWER = 12
@@ -110,41 +122,6 @@ def _as_int(value) -> int | None:
         return None
 
 
-def _market_parents() -> dict[int, int | None]:
-    """marketGroupID -> parentGroupID, for walking the booster market subtree."""
-    parents: dict[int, int | None] = {}
-    for row in _download_csv(INV_MARKET_GROUPS_URL):
-        mid = _as_int(row.get("marketGroupID"))
-        if mid is not None:
-            parents[mid] = _as_int(row.get("parentGroupID"))
-    return parents
-
-
-def _in_market_subtree(market_group_id: int | None,
-                       parents: dict[int, int | None], root: int) -> bool:
-    """True if ``market_group_id`` is ``root`` or descends from it."""
-    seen: set[int] = set()
-    mid = market_group_id
-    while mid is not None and mid not in seen:
-        if mid == root:
-            return True
-        seen.add(mid)
-        mid = parents.get(mid)
-    return False
-
-
-def _is_bundled_booster(category_id: int | None, group_id: int | None,
-                        market_group_id: int | None,
-                        parents: dict[int, int | None]) -> bool:
-    """Whether a type is a combat booster we bundle from otherwise-excluded
-    category 20. See the BOOSTER_* constants for the rationale: group 303 gated
-    to the market-group-977 "Booster" subtree, which excludes the ~350 event
-    Cerebral/Skill Accelerators that also share group 303."""
-    if category_id != CATEGORY_IMPLANT or group_id != BOOSTER_GROUP:
-        return False
-    return _in_market_subtree(market_group_id, parents, BOOSTER_MARKET_ROOT)
-
-
 def main() -> None:
     # groupID -> categoryID
     group_to_cat: dict[int, int] = {}
@@ -166,10 +143,6 @@ def main() -> None:
             # First fitting effect wins; a module has exactly one of these.
             slot_by_type.setdefault(tid, slot)
 
-    # marketGroupID -> parentGroupID, used only to gate the combat-booster
-    # subtree (see _is_bundled_booster).
-    market_parents = _market_parents()
-
     table: dict[str, dict] = {}
     for row in _download_csv(INV_TYPES_URL):
         published = _as_int(row.get("published"))
@@ -181,15 +154,15 @@ def main() -> None:
         if tid is None or gid is None or not name:
             continue
         cid = group_to_cat.get(gid)
-        # Keep the fitting categories, plus combat boosters carved out of the
-        # otherwise-excluded category 20 by market subtree.
-        if cid not in KEEP_CATEGORIES and not _is_bundled_booster(
-            cid, gid, _as_int(row.get("marketGroupID")), market_parents
-        ):
+        # Keep the fitting/cargo categories: ships, modules, charges, drones,
+        # fighters, subsystems, and all of implants (20) + deployables (22).
+        # Category 20/22 resolve to "other" and route to cargo (see docstring).
+        if cid not in KEEP_CATEGORIES:
             continue
 
         # Slot: modules/rigs from dogma effects; subsystems from their category;
-        # everything else (ship/charge/drone/fighter/booster) has no slot.
+        # everything else (ship/charge/drone/fighter/implant/deployable) has no
+        # slot.
         slot = slot_by_type.get(tid)
         if slot is None and cid == CATEGORY_SUBSYSTEM:
             slot = "subsystem"
@@ -220,11 +193,13 @@ def _sanity_check(table: dict) -> None:
     Warnings only — IDs can shift across SDE releases, so don't hard-fail."""
     expectations = [
         ("2048", "module", "low"),       # Damage Control II
-        ("12058", "drone", None),        # Hobgoblin II
+        ("2456", "drone", None),         # Hobgoblin II
         ("12015", "ship", None),         # Muninn
-        ("31794", "module", "rig"),      # Medium Ancillary Current Router II
-        ("37289", "fighter", None),      # a fighter (categoryID 87)
-        ("15463", "other", None),        # Standard Mindflood Booster (combat booster)
+        ("31794", "module", "rig"),      # Small Core Defense Field Extender II
+        ("40556", "fighter", None),      # Templar II (categoryID 87)
+        ("15463", "other", None),        # Standard Mindflood Booster (combat booster, cat 20)
+        ("20499", "other", None),        # High-grade Amulet Alpha (attribute implant, cat 20)
+        ("33474", "other", None),        # Mobile Depot (deployable, cat 22)
     ]
     cat_names = {6: "ship", 7: "module", 8: "charge",
                  18: "drone", 87: "fighter", 32: "subsystem"}

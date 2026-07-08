@@ -104,19 +104,19 @@ class AuthMarketAdapter:
         # genuinely bare market. The scanner clears this at the start of every
         # ``scan_market`` pass (duck-typed) so it only reflects the current scan.
         self.last_forbidden: set[str] = set()
-        # Classification of the most recent contract-items fetch, for the
-        # scanner's negative cache (duck-typed; the scanner reads it after each
-        # ``contract_items`` / ``corp_contract_items`` call):
-        #   "ok"        — got a response (even an empty 2xx body),
+        # Contract-items disposition (for the scanner's negative cache) is NOT
+        # stashed on the adapter: ``contract_items`` / ``corp_contract_items``
+        # RETURN it as ``(items, status)``. Returning it per call — rather than
+        # recording it on a shared attribute — is what lets the scanner's PARALLEL
+        # Pass-2 attribute each contract's disposition to its OWN fetch. (The shared
+        # attribute was read on the wrong thread under 6-way concurrency and could
+        # tombstone a live contract forever.) ``status`` is one of:
+        #   "ok"        — a response (even an empty 2xx body),
         #   "dead"      — 404/410 (gone), or a 403 on the PUBLIC route (a
         #                 permanently restricted contract) → tombstone forever,
         #   "transient" — transport error / 5xx / error-limit, or a 403 on the
         #                 CORP route (a scope/access shortfall re-auth may fix) →
         #                 do NOT cache, retry next scan.
-        # ``_last_paginate_status`` is the raw per-pull outcome ``_paginate``
-        # records; the two contract-items methods map it into the field above.
-        self.last_contract_items_status: str = "ok"
-        self._last_paginate_status: str = "ok"
 
     # ── Error-limit awareness (§8.2) ──────────────────────────────────────────
 
@@ -173,9 +173,32 @@ class AuthMarketAdapter:
         self, path, *, authed: bool, params=None, forbidden_tag: str | None = None,
         progress=None, stage: str = "page",
     ) -> list[dict]:
-        """Auto-paginate a list endpoint on ``X-Pages``. Returns the concatenated
-        items. A 403 (missing scope / no access) → ``[]``. Stops on the first
-        non-OK page or transport error. Honours the error-limit floor between
+        """Auto-paginate a list endpoint on ``X-Pages``, returning the concatenated
+        items. Thin wrapper over ``_paginate_status`` for the callers that don't
+        need the per-pull disposition — the single-threaded ORDER path
+        (``structure_orders`` / ``corp_contracts``). The concurrently-fetched
+        contract-items path calls ``_paginate_status`` directly and RETURNS the
+        status to its caller, so a parallel fetch never reads another thread's
+        disposition off a shared attribute."""
+        items, _status = self._paginate_status(
+            path, authed=authed, params=params, forbidden_tag=forbidden_tag,
+            progress=progress, stage=stage,
+        )
+        return items
+
+    def _paginate_status(
+        self, path, *, authed: bool, params=None, forbidden_tag: str | None = None,
+        progress=None, stage: str = "page",
+    ) -> "tuple[list[dict], str]":
+        """Pagination core. Returns ``(items, status)`` where ``status`` classifies
+        the pull for the contract-items negative cache: "ok" (a response, even an
+        empty 2xx body), "transient" (transport error / 5xx / 420 error-limit),
+        "forbidden" (403), or "dead" (404/410 gone). ``status`` is a LOCAL return
+        value — NEVER stored on the instance — so concurrent contract-item fetches
+        each get their OWN disposition with no cross-thread attribution race.
+
+        A 403 (missing scope / no access) → ``([], "forbidden")``. Stops on the
+        first non-OK page or transport error. Honours the error-limit floor between
         pages (aborts early, returning what it has).
 
         ``forbidden_tag`` (when given) is recorded in ``last_forbidden`` on a 403
@@ -190,29 +213,29 @@ class AuthMarketAdapter:
         page = 1
         # Outcome classification for the caller (contract-items negative cache):
         # optimistic "ok", downgraded on the terminal error branch reached below.
-        self._last_paginate_status = "ok"
+        # A LOCAL variable (not a shared attribute) — see the class docstring.
+        status = "ok"
         while True:
             page_params = dict(params or {})
             page_params["page"] = page
             resp = self._get_page(url, authed=authed, params=page_params)
             if resp is None:
                 # Transport error (timeout / connection reset) — retry next scan.
-                self._last_paginate_status = "transient"
+                status = "transient"
                 break
             if resp.status_code == 403:
                 log.info("[market-esi] 403 (scope/access) for %s", path)
                 if forbidden_tag:
                     self.last_forbidden.add(forbidden_tag)
-                self._last_paginate_status = "forbidden"
-                return []
+                return out, "forbidden"
             if resp.status_code in (404, 410):
                 # Gone: a deleted/expired contract (or missing resource). Permanent
                 # — the contract-items caller tombstones it so it never re-fetches.
-                self._last_paginate_status = "dead"
+                status = "dead"
                 break
             if not getattr(resp, "ok", False):
                 # 5xx / 420 error-limit / other non-OK — transient, retry next scan.
-                self._last_paginate_status = "transient"
+                status = "transient"
                 break
             try:
                 items = resp.json()
@@ -233,7 +256,7 @@ class AuthMarketAdapter:
                 log.warning("[market-esi] error-limit floor hit paginating %s", path)
                 break
             page += 1
-        return out
+        return out, status
 
     def _paginate_etag(
         self, path, *, authed: bool, params=None, progress=None, stage: str = "page",
@@ -342,17 +365,20 @@ class AuthMarketAdapter:
             progress=progress, stage="contracts_list",
         )
 
-    def contract_items(self, contract_id: int) -> list[dict]:
+    def contract_items(self, contract_id: int) -> "tuple[list[dict], str]":
         """Public contract items (no auth; 403 only for restricted contracts).
 
-        Records ``last_contract_items_status`` for the scanner's negative cache.
-        On the PUBLIC route a 403 means the contract is RESTRICTED (permanently
-        unreadable without membership), so it maps to "dead" (tombstone) alongside
-        404/410 — re-fetching a restricted/gone contract every scan is pointless."""
-        items = self._paginate(f"/contracts/public/items/{contract_id}/", authed=False)
-        st = self._last_paginate_status
-        self.last_contract_items_status = "dead" if st in ("dead", "forbidden") else st
-        return items
+        Returns ``(items, status)`` — the per-call disposition for the scanner's
+        negative cache. Returning it (instead of stashing it on the adapter) lets
+        the scanner's PARALLEL contract pass attribute each contract's disposition
+        to its OWN fetch. On the PUBLIC route a 403 means the contract is RESTRICTED
+        (permanently unreadable without membership), so it maps to "dead"
+        (tombstone) alongside 404/410 — re-fetching a restricted/gone contract every
+        scan is pointless."""
+        items, st = self._paginate_status(
+            f"/contracts/public/items/{contract_id}/", authed=False)
+        status = "dead" if st in ("dead", "forbidden") else st
+        return items, status
 
     def corp_contracts(self, corporation_id: int, *, progress=None) -> list[dict]:
         """Corp/alliance contracts (scope
@@ -365,21 +391,22 @@ class AuthMarketAdapter:
             forbidden_tag="corp_contracts", progress=progress, stage="contracts_list",
         )
 
-    def corp_contract_items(self, corporation_id: int, contract_id: int) -> list[dict]:
-        """Items for a corp/alliance contract (authed). 403 → [] and a
-        ``"corp_contracts"`` entry in ``last_forbidden``.
+    def corp_contract_items(self, corporation_id: int, contract_id: int) -> "tuple[list[dict], str]":
+        """Items for a corp/alliance contract (authed). 403 → ``([], "transient")``
+        and a ``"corp_contracts"`` entry in ``last_forbidden``.
 
-        Records ``last_contract_items_status`` for the scanner's negative cache.
-        Only 404/410 (the contract is gone) maps to "dead" here — a 403 on the
-        CORP route is a SCOPE/access shortfall (re-auth may restore it), so it maps
-        to "transient" (retry next scan), NOT a permanent tombstone."""
-        items = self._paginate(
+        Returns ``(items, status)`` — the per-call disposition for the scanner's
+        negative cache (returned, not stashed, so the parallel contract pass
+        attributes it per call). Only 404/410 (the contract is gone) maps to "dead"
+        here — a 403 on the CORP route is a SCOPE/access shortfall (re-auth may
+        restore it), so it maps to "transient" (retry next scan), NOT a permanent
+        tombstone."""
+        items, st = self._paginate_status(
             f"/corporations/{corporation_id}/contracts/{contract_id}/items/",
             authed=True, forbidden_tag="corp_contracts",
         )
-        st = self._last_paginate_status
-        self.last_contract_items_status = "transient" if st == "forbidden" else st
-        return items
+        status = "transient" if st == "forbidden" else st
+        return items, status
 
     def resolve_location_system(self, location_id: int) -> int | None:
         """Resolve a station/structure id to its solar-system id (design §7).
