@@ -52,6 +52,7 @@ from __future__ import annotations
 import os
 import statistics
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Protocol
@@ -71,6 +72,19 @@ log = get_logger(__name__)
 CACHE_TTL_ORDERS = 300
 CACHE_TTL_CONTRACTS = 1800
 CACHE_TTL_CONTRACT_ITEMS = 3600
+
+# During a contract scan the item cache is held in memory (one disk read at pass
+# start) and flushed back to disk every N *fetched* contracts (plus a final flush
+# at pass end). This does two things at once: it eliminates the O(n²) whole-file
+# re-read/re-write the naïve read-modify-write-per-contract cache incurred (the
+# real "3-minute scan" multiplier), AND it lets an interrupted first scan resume
+# from what it already fetched instead of restarting. See ``_ContractCacheSession``.
+_ITEM_FLUSH_EVERY = 25
+
+# Pass-1 (cheap pre-filter) progress is emitted at most once every N *listed*
+# contracts so the tight in-memory filter loop stays cheap on a huge region
+# contract book (a busy trade hub region can list thousands of contracts).
+_FILTER_PROGRESS_STRIDE = 25
 
 # The contract-similarity threshold (design §5): a contract matches a doctrine
 # fit iff same hull AND similarity >= this.
@@ -93,6 +107,23 @@ _SCORING_MODULE_ROLES = frozenset({"module", "subsystem"})
 def _now_iso() -> str:
     """An ISO-8601 UTC timestamp for ``taken_at`` stamps."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _emit_progress(progress, payload: dict) -> None:
+    """Invoke an optional progress callback, swallowing ANY exception it raises.
+
+    Progress callbacks are advisory (the GUI marshals them onto the Tk thread via
+    ``after()``); a raising — or merely slow — callback must never break or crash
+    a scan. Cheap no-op when ``progress`` is None, so callers can pass it through
+    unconditionally. Called synchronously from the scanning thread."""
+    if progress is None:
+        return
+    try:
+        progress(payload)
+    except Exception:
+        # A broken callback must not kill the scan, and it must not spam the log
+        # (it could fire per page / per contract) — a single debug line is enough.
+        log.debug("[market] progress callback raised (ignored)", exc_info=True)
 
 
 def _volume_weighted_median(ladder: "list[PriceLevel]") -> float | None:
@@ -421,10 +452,14 @@ class MarketScanner:
         self._catalog = catalog
         self._cache_path = cache_path
         self._lock = threading.Lock()
+        # In-memory cache view for the duration of ONE ``scan_contracts`` pass
+        # (set/cleared there). None outside a scan → the cache helpers fall back
+        # to their direct per-call disk read-modify-write. See _ContractCacheSession.
+        self._session: "_ContractCacheSession | None" = None
 
     # ── Market depth scan ─────────────────────────────────────────────────────
 
-    def scan_market(self, source: MarketSource | None) -> MarketSnapshot:
+    def scan_market(self, source: MarketSource | None, *, progress=None) -> MarketSnapshot:
         """Pull the staging market and return a depth snapshot (sell-side).
 
         ``None`` source (unconfigured) → an empty snapshot, no network. A
@@ -432,6 +467,20 @@ class MarketScanner:
         pulls region sell orders and filters to the station's ``location_id``.
         Adapter errors are surfaced as an empty snapshot (never raised) so a
         single bad pull degrades gracefully instead of crashing the worker.
+
+        ``progress`` (optional) is a cheap callback the scan feeds coarse stage
+        dicts as it works, so the GUI can move off a dead "Scanning" label:
+
+        * ``{"stage": "market", "status": "orders_start"}`` — before the pull.
+        * ``{"stage": "orders", "page": i, "pages": n}`` — per page of the order
+          book, ONLY when the adapter reports pages (``supports_progress``); the
+          big first-scan cost is a many-page structure book, so this is where the
+          per-page bar comes from.
+        * ``{"stage": "market", "status": "orders_done", "orders": N}`` — pull done.
+        * ``{"stage": "market", "status": "depth_done", "types": M}`` — depth built.
+
+        Callbacks are exception-swallowed (a raising callback can't break the
+        scan) and fire on the scanning thread — the GUI marshals them.
         """
         if source is None:
             return MarketSnapshot(
@@ -443,6 +492,8 @@ class MarketScanner:
                 depth={},
             )
 
+        t0 = time.monotonic()
+
         # Clear the adapter's per-pass forbidden record so a stale 403 from an
         # earlier scan can't leak into this snapshot (duck-typed: fake adapters
         # without ``last_forbidden`` are unaffected).
@@ -450,16 +501,21 @@ class MarketScanner:
         if isinstance(fb, set):
             fb.clear()
 
+        _emit_progress(progress, {"stage": "market", "status": "orders_start"})
         try:
-            if source.kind == "structure":
-                raw = self._adapter.structure_orders(source.source_id)
-            else:
-                raw = self._adapter.region_orders(source.region_id, order_type="sell")
+            raw = self._pull_orders(source, progress)
         except Exception:
             log.exception("[market] order pull failed for source %s", source)
             raw = []
+        raw = raw or []
+        _emit_progress(
+            progress, {"stage": "market", "status": "orders_done", "orders": len(raw)}
+        )
 
-        depth = self._build_depth(raw or [], source)
+        depth = self._build_depth(raw, source)
+        _emit_progress(
+            progress, {"stage": "market", "status": "depth_done", "types": len(depth)}
+        )
         snap = MarketSnapshot(
             source_id=source.source_id,
             source_kind=source.kind,
@@ -470,7 +526,27 @@ class MarketScanner:
             degraded=self._degraded_reasons(source),
         )
         self._store_snapshot(snap)
+        log.info(
+            "[market] order scan: source=%s/%s orders=%d types=%d elapsed=%.2fs",
+            source.kind, source.source_id, len(raw), len(depth), time.monotonic() - t0,
+        )
         return snap
+
+    def _pull_orders(self, source: "MarketSource", progress) -> list[dict]:
+        """Call the adapter's order endpoint for ``source``, wiring the optional
+        per-page ``progress`` callback only when the adapter advertises support
+        (``supports_progress``). Fake/older adapters — which take no ``progress``
+        kwarg — are called the classic way, so this stays backward-compatible."""
+        prog_ok = progress is not None and getattr(self._adapter, "supports_progress", False)
+        if source.kind == "structure":
+            if prog_ok:
+                return self._adapter.structure_orders(source.source_id, progress=progress)
+            return self._adapter.structure_orders(source.source_id)
+        if prog_ok:
+            return self._adapter.region_orders(
+                source.region_id, order_type="sell", progress=progress
+            )
+        return self._adapter.region_orders(source.region_id, order_type="sell")
 
     def _degraded_reasons(self, source: "MarketSource") -> list[str]:
         """Reasons the just-pulled snapshot is degraded (forbidden != empty).
@@ -633,6 +709,7 @@ class MarketScanner:
         system_id: int | None = None,
         corp_id: int | None = None,
         region_wide: bool = False,
+        progress=None,
     ) -> ContractScan:
         """Scan public (+ optional corp) item-exchange contracts in ``region_id``
         for ones that match any of ``fits`` (same hull, >=95% over modules +
@@ -643,11 +720,39 @@ class MarketScanner:
         other-system contracts are kept too). Contracts whose location can't be
         resolved are treated as unknown.
 
-        Uses the persistent contract-items cache (ETag replay) so a re-scan only
-        fetches new/changed contracts. Every adapter failure is swallowed per
-        contract (a bad item pull just skips that contract) so a firehose region
-        never crashes the pass.
+        **Order of operations (perf-critical).** The region contract *list* is
+        cheap (paginated, 1800s cache); the expensive part is the PER-CONTRACT
+        item fetch. So the scan runs in two passes, and NO item is fetched for a
+        contract that a cheap filter would drop:
+
+        * **Pass 1 — cheap pre-filters only, zero item fetches.** Drop non
+          ``item_exchange`` types and missing ids, then (when a ``system_id``
+          filter is active) resolve each survivor's ``start_location_id`` → system
+          via the *cached* resolver and drop out-of-staging contracts. Location
+          resolves are memoised per ``location_id``, so the hundreds of contracts
+          that overwhelmingly sit at the ONE staging citadel cost a single resolve.
+        * **Pass 2 — fetch items ONLY for the survivors, then match.**
+
+        The persistent contract-items cache (immutable per contract_id) is held in
+        memory for the pass and flushed back to disk every ``_ITEM_FLUSH_EVERY``
+        fetched contracts + at pass end, so a re-scan replays unchanged contracts
+        with no network AND an interrupted first scan resumes from what it already
+        fetched. Every adapter failure is swallowed per contract (a bad item pull
+        just skips that contract) so a firehose region never crashes the pass.
+
+        ``progress`` (optional) is a cheap, exception-swallowed callback fed:
+
+        * ``{"stage": "contracts_list", "page": i, "pages": n}`` — per contract-list
+          page (only when the adapter reports pages via ``supports_progress``).
+        * ``{"stage": "filter", "done": i, "total": n, "kept": k}`` — throttled,
+          during pass 1.
+        * ``{"stage": "contracts", "done": i, "total": n, "from_cache": k}`` — per
+          item fetch in pass 2 (the main progress bar; ``total`` is the exact count
+          of contracts that survived the filters).
+        * ``{"stage": "contracts", "status": "complete", "scanned": s,
+          "from_cache": k, "matches": m}`` — at the end.
         """
+        t0 = time.monotonic()
         matches: dict[str, list[ContractMatch]] = {f.id: [] for f in fits}
         scanned = 0
         from_cache = 0
@@ -665,74 +770,130 @@ class MarketScanner:
         fit_specs = [(f, _contract_scoring_spec(f, self._catalog)) for f in fits]
 
         try:
-            public = self._adapter.public_contracts(region_id) or []
+            public = self._contract_list(self._adapter.public_contracts, region_id, progress) or []
         except Exception:
             log.exception("[market] public contracts pull failed for region %s", region_id)
             public = []
 
         contract_source: list[tuple[dict, bool]] = [(c, False) for c in public]
 
-        # Optional corp/alliance contracts (duck-typed adapter method).
+        # Optional corp/alliance contracts (duck-typed adapter method). Corp lists
+        # can be huge (couriers etc.) — they go through the SAME two-pass filter,
+        # so a corp courier at the wrong end of the region is dropped before any
+        # item fetch, exactly like a public one.
+        n_corp = 0
         if corp_id and hasattr(self._adapter, "corp_contracts"):
             try:
-                corp = self._adapter.corp_contracts(corp_id) or []
+                corp = self._contract_list(self._adapter.corp_contracts, corp_id, progress) or []
+                n_corp = len(corp)
                 contract_source.extend((c, True) for c in corp)
             except Exception:
                 log.exception("[market] corp contracts pull failed for corp %s", corp_id)
 
-        for contract, is_alliance in contract_source:
-            if not isinstance(contract, dict):
-                continue
-            if str(contract.get("type", "")) != "item_exchange":
-                continue
-            cid = contract.get("contract_id")
-            if cid is None:
-                continue
+        n_listed = len(contract_source)
+        n_item_exchange = 0
 
-            loc_id = contract.get("start_location_id", 0) or 0
-            # Only resolve the contract's system when it is actually needed: a
-            # system filter is active (system_id given). With no filter the
-            # match is region-wide and csys is never used for filtering, and the
-            # stamped value would be informational only — skip the per-contract
-            # location resolve entirely (it's a network/cache hit each time).
-            if system_id is not None:
-                csys = self._resolve_system_cached(loc_id)
-                if not region_wide:
-                    # Strict system filter: drop known-other-system contracts.
-                    if csys is not None and csys != system_id:
+        # Hold the cache in memory for the whole pass (one disk read up front) and
+        # flush it back periodically + at the end (see the finally). This kills the
+        # O(n²) whole-file re-read/re-write the per-contract cache otherwise did.
+        self._session = _ContractCacheSession(self, flush_every=_ITEM_FLUSH_EVERY)
+        try:
+            # ── PASS 1 — cheap pre-filters ONLY (no item fetches). ──────────────
+            # (contract, is_alliance, csys, loc_id) for each survivor.
+            to_fetch: list[tuple[dict, bool, int | None, int]] = []
+            for idx, (contract, is_alliance) in enumerate(contract_source):
+                if not isinstance(contract, dict):
+                    continue
+                if str(contract.get("type", "")) != "item_exchange":
+                    continue
+                if contract.get("contract_id") is None:
+                    continue
+                n_item_exchange += 1
+
+                loc_id = int(contract.get("start_location_id", 0) or 0)
+                # Only resolve the contract's system when it is actually needed: a
+                # system filter is active. With no filter the match is region-wide
+                # and csys is informational only — skip the resolve entirely.
+                if system_id is not None:
+                    csys = self._resolve_system_cached(loc_id)
+                    # Strict system filter keeps ONLY confirmed in-staging
+                    # contracts (csys == system_id): other-system AND
+                    # unknown-location (csys is None) are both dropped BEFORE any
+                    # item fetch. region_wide keeps everything (unknown included).
+                    if not region_wide and csys != system_id:
                         continue
-                    # Unknown-location contracts are dropped in strict mode too
-                    # (they can't be confirmed in-system).
-                    if csys is None:
-                        continue
-            else:
-                csys = None
+                else:
+                    csys = None
 
-            items, was_cached = self._fetch_contract_items(cid, is_alliance, corp_id)
-            scanned += 1
-            if was_cached:
-                from_cache += 1
-            if not items:
-                continue
+                to_fetch.append((contract, is_alliance, csys, loc_id))
+                if progress is not None and idx % _FILTER_PROGRESS_STRIDE == 0:
+                    _emit_progress(
+                        progress,
+                        {"stage": "filter", "done": idx + 1, "total": n_listed,
+                         "kept": len(to_fetch)},
+                    )
+            _emit_progress(
+                progress,
+                {"stage": "filter", "done": n_listed, "total": n_listed,
+                 "kept": len(to_fetch)},
+            )
 
-            included = _included_for_match(items, self._catalog)
-
-            for fit, spec in fit_specs:
-                m = _match_contract(
-                    contract=contract,
-                    included=included,
-                    fit=fit,
-                    spec=spec,
-                    catalog=self._catalog,
-                    is_alliance=is_alliance,
-                    location_id=int(loc_id),
-                    system_id=csys,
+            # ── PASS 2 — fetch items ONLY for survivors, then match. ────────────
+            total_fetch = len(to_fetch)
+            for contract, is_alliance, csys, loc_id in to_fetch:
+                cid = contract.get("contract_id")
+                items, was_cached = self._fetch_contract_items(cid, is_alliance, corp_id)
+                scanned += 1
+                if was_cached:
+                    from_cache += 1
+                _emit_progress(
+                    progress,
+                    {"stage": "contracts", "done": scanned, "total": total_fetch,
+                     "from_cache": from_cache},
                 )
-                if m is not None:
-                    matches[fit.id].append(m)
+                if not items:
+                    continue
+
+                included = _included_for_match(items, self._catalog)
+                for fit, spec in fit_specs:
+                    m = _match_contract(
+                        contract=contract,
+                        included=included,
+                        fit=fit,
+                        spec=spec,
+                        catalog=self._catalog,
+                        is_alliance=is_alliance,
+                        location_id=int(loc_id),
+                        system_id=csys,
+                    )
+                    if m is not None:
+                        matches[fit.id].append(m)
+        finally:
+            # Final flush of anything not yet persisted (even on an unexpected
+            # error mid-pass) so an interrupted scan keeps its fetched items, then
+            # drop the in-memory view so the cache helpers go back to direct disk.
+            try:
+                if self._session is not None:
+                    self._session.flush()
+            except Exception:
+                log.exception("[market] final contract-items cache flush failed")
+            self._session = None
 
         for fid in matches:
             matches[fid].sort(key=lambda mm: mm.price)
+
+        total_matches = sum(len(v) for v in matches.values())
+        _emit_progress(
+            progress,
+            {"stage": "contracts", "status": "complete", "scanned": scanned,
+             "from_cache": from_cache, "matches": total_matches},
+        )
+        log.info(
+            "[market] contract scan: region=%s listed=%d (corp=%d) item_exchange=%d "
+            "fetched=%d (live=%d cache=%d) matches=%d elapsed=%.1fs",
+            region_id, n_listed, n_corp, n_item_exchange, scanned,
+            scanned - from_cache, from_cache, total_matches, time.monotonic() - t0,
+        )
 
         return ContractScan(
             region_id=region_id,
@@ -741,6 +902,16 @@ class MarketScanner:
             scanned_contracts=scanned,
             from_cache=from_cache,
         )
+
+    def _contract_list(self, fn, arg, progress) -> list[dict]:
+        """Call an adapter contract-*list* endpoint (``public_contracts`` /
+        ``corp_contracts``), wiring the optional per-page ``progress`` callback
+        only when the adapter advertises support (``supports_progress``). Fake /
+        older adapters that take no ``progress`` kwarg are called the classic way,
+        keeping this backward-compatible."""
+        if progress is not None and getattr(self._adapter, "supports_progress", False):
+            return fn(arg, progress=progress)
+        return fn(arg)
 
     def _fetch_contract_items(
         self, contract_id, is_alliance: bool, corp_id: int | None
@@ -921,7 +1092,13 @@ class MarketScanner:
 
     def _read_contract_items_cache(self, contract_id: int) -> list[dict] | None:
         """Return cached items for a contract if present and within the 1h TTL,
-        else None. Uses ``fetched_at`` age against ``CACHE_TTL_CONTRACT_ITEMS``."""
+        else None. Uses ``fetched_at`` age against ``CACHE_TTL_CONTRACT_ITEMS``.
+
+        During a scan (``self._session`` set) this reads the in-memory session
+        view — one disk read served the whole pass — instead of re-reading and
+        re-parsing the whole cache file per contract."""
+        if self._session is not None:
+            return self._session.get_items(int(contract_id))
         data = self._read_cache()
         entry = (data.get("contract_items") or {}).get(str(contract_id))
         if not isinstance(entry, dict):
@@ -935,6 +1112,12 @@ class MarketScanner:
     def _write_contract_items_cache(
         self, contract_id: int, items: list[dict], etag: str | None = None
     ) -> None:
+        # During a scan the write lands in the in-memory session (flushed to disk
+        # in merged batches) instead of a full read-modify-write per contract.
+        if self._session is not None:
+            self._session.put_items(int(contract_id), items, etag)
+            return
+
         def _mut(data: dict) -> None:
             data.setdefault("contract_items", {})[str(contract_id)] = {
                 "items": items,
@@ -945,15 +1128,121 @@ class MarketScanner:
         self._write_cache(_mut)
 
     def _read_location_cache(self, location_id: int) -> int | None:
+        # During a scan, served from the in-memory session (so hundreds of
+        # contracts at one citadel share a single resolve AND a single disk read).
+        if self._session is not None:
+            return self._session.get_location(int(location_id))
         data = self._read_cache()
         val = (data.get("locations") or {}).get(str(location_id))
         return int(val) if isinstance(val, int) else None
 
     def _write_location_cache(self, location_id: int, system_id: int) -> None:
+        if self._session is not None:
+            self._session.put_location(int(location_id), int(system_id))
+            return
+
         def _mut(data: dict) -> None:
             data.setdefault("locations", {})[str(location_id)] = int(system_id)
 
         self._write_cache(_mut)
+
+
+# ── In-memory cache session for one contract scan (§8, perf) ──────────────────
+
+
+class _ContractCacheSession:
+    """The persistent cache held in memory for the duration of ONE contract scan.
+
+    WHY: the contract-items + location caches are immutable-per-key, but the
+    naïve helper did a full ``_read_cache()`` (whole-file read + JSON parse) on
+    every lookup and a full read-modify-write on every store. As the
+    ``contract_items`` map fills during a first scan of a big staging citadel,
+    that is O(n²) disk churn — the dominant, avoidable share of a "stuck on
+    Scanning for minutes" pass. This session reads the cache ONCE, serves every
+    lookup from memory, accumulates new entries, and flushes them back to disk in
+    merged batches (every ``flush_every`` fetched contracts, plus a final flush),
+    which also means an interrupted first scan resumes from what it already
+    fetched instead of restarting.
+
+    Concurrency: flushes go through ``MarketScanner._write_cache``, which re-reads
+    the file under the scanner's lock and MERGES these pending entries in — so a
+    concurrent writer (another snapshot store, say) is never clobbered; the whole
+    in-memory view is never written back wholesale.
+    """
+
+    def __init__(self, scanner: "MarketScanner", *, flush_every: int = _ITEM_FLUSH_EVERY) -> None:
+        self._scanner = scanner
+        self._flush_every = max(1, int(flush_every))
+        data = scanner._read_cache()  # the ONE disk read for the whole pass
+        raw_items = data.get("contract_items")
+        raw_locs = data.get("locations")
+        # Full in-memory view (loaded ∪ fetched-this-pass), for serving lookups.
+        self._items: dict[str, dict] = dict(raw_items) if isinstance(raw_items, dict) else {}
+        self._locations: dict[str, int] = dict(raw_locs) if isinstance(raw_locs, dict) else {}
+        # Delta accumulated since the last flush (only these are written back, so
+        # a concurrent writer's other keys survive the merge).
+        self._pending_items: dict[str, dict] = {}
+        self._pending_locs: dict[str, int] = {}
+        self._fetched_since_flush = 0
+
+    # ── contract items ────────────────────────────────────────────────────────
+
+    def get_items(self, contract_id: int) -> list[dict] | None:
+        """Cached items for a contract within the 1h TTL, else None (same rule as
+        the direct disk path)."""
+        entry = self._items.get(str(contract_id))
+        if not isinstance(entry, dict):
+            return None
+        if _age_seconds(entry.get("fetched_at")) > CACHE_TTL_CONTRACT_ITEMS:
+            return None
+        items = entry.get("items")
+        return items if isinstance(items, list) else None
+
+    def put_items(self, contract_id: int, items: list[dict], etag: str | None = None) -> None:
+        entry = {"items": items, "etag": etag, "fetched_at": _now_iso()}
+        key = str(contract_id)
+        self._items[key] = entry
+        self._pending_items[key] = entry
+        # Only *fetched contracts* pace the flush cadence (per the task); location
+        # resolves piggyback on the next flush + the final one.
+        self._fetched_since_flush += 1
+        if self._fetched_since_flush >= self._flush_every:
+            self.flush()
+
+    # ── locations ─────────────────────────────────────────────────────────────
+
+    def get_location(self, location_id: int) -> int | None:
+        """Cached resolved system id (or the -1 unknown sentinel), else None. The
+        caller (`_resolve_system_cached`) interprets the sentinel."""
+        val = self._locations.get(str(location_id))
+        return int(val) if isinstance(val, int) else None
+
+    def put_location(self, location_id: int, system_id: int) -> None:
+        key = str(location_id)
+        self._locations[key] = int(system_id)
+        self._pending_locs[key] = int(system_id)
+
+    # ── flush ─────────────────────────────────────────────────────────────────
+
+    def flush(self) -> None:
+        """Persist the pending delta (merged into a fresh disk read) and reset the
+        counter. No-op when nothing is pending."""
+        if not self._pending_items and not self._pending_locs:
+            self._fetched_since_flush = 0
+            return
+        pend_items = self._pending_items
+        pend_locs = self._pending_locs
+
+        def _mut(data: dict) -> None:
+            if pend_items:
+                data.setdefault("contract_items", {}).update(pend_items)
+            if pend_locs:
+                data.setdefault("locations", {}).update(pend_locs)
+
+        self._scanner._write_cache(_mut)
+        self._pending_items = {}
+        self._pending_locs = {}
+        self._fetched_since_flush = 0
 
 
 # ── Bill-of-materials helper (§4.3) ──────────────────────────────────────────

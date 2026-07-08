@@ -4,6 +4,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 """
 
 import collections
+import inspect
 import json
 import os
 import queue
@@ -864,6 +865,15 @@ class FCToolGUI:
         self._market_staging_resolving = False  # in-flight guard: staging resolve
         self._market_staging_pending = None     # selection queued behind an in-flight resolve
         self._market_structure_searching = False  # in-flight guard: structure search
+        # Live-scan progress (see _market_scan_now / _market_progress_text): a
+        # monotonic start stamp for elapsed, the accumulated latest per-stage
+        # payload fields, the worker→Tk coalescing slot (one pending apply at a
+        # time), and the id of the 1s elapsed-ticker after() (None when idle).
+        self._market_scan_started = None       # time.monotonic() at scan start
+        self._market_scan_progress = {}        # accumulated progress fields
+        self._market_prog_scheduled = False    # True while one apply is pending
+        self._market_prog_lock = threading.Lock()
+        self._market_tick_after_id = None      # 1s elapsed ticker after() id / None
         self._load_market_cache()              # populate snapshot from disk if present
 
         # Discover ansiblex from ESI if authenticated, else fall back to config
@@ -20656,7 +20666,24 @@ $bmp.Dispose()
         and the freshness of the current snapshot ("cached HH:MM" for a
         disk-loaded snapshot, "scanned HH:MM" after a live scan)."""
         if self._market_scanning:
-            return ("scanning…", FG_ACCENT)
+            # Live progress line: accumulated stage state + monotonic elapsed.
+            # Read the shared state under the coalescing lock (a snapshot copy,
+            # since the scan worker mutates it). Every attr is getattr-guarded so
+            # a scan kicked before the progress state was ever set (or a bare
+            # test host) still yields the plain 'scanning… <elapsed>' line.
+            prog = getattr(self, "_market_scan_progress", None) or {}
+            lock = getattr(self, "_market_prog_lock", None)
+            if lock is not None:
+                with lock:
+                    state = dict(prog)
+            else:
+                state = dict(prog)
+            started = getattr(self, "_market_scan_started", None)
+            try:
+                elapsed = time.monotonic() - started if started else 0.0
+            except TypeError:
+                elapsed = 0.0
+            return (FCToolGUI._market_progress_text(state, elapsed), FG_ACCENT)
         source = self._market_source()
         if source is None:
             return ("market not configured — set a staging structure or "
@@ -20704,6 +20731,222 @@ $bmp.Dispose()
             except tk.TclError:
                 pass
 
+    # ── Live scan progress: formatter, accumulator, coalescer, elapsed ticker ──
+    @staticmethod
+    def _market_supports_progress(fn) -> bool:
+        """True when the scanner method ``fn`` accepts a ``progress`` kwarg.
+
+        The real MarketScanner.scan_market / scan_contracts take ``*, progress=
+        None``; older / fake scanners (e.g. the test doubles) do not. Probing the
+        signature — instead of passing ``progress`` unconditionally — keeps the
+        wiring backward-compatible: a scanner without the hook is simply called
+        the classic way, no TypeError, no double-run."""
+        try:
+            return "progress" in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _market_merge_progress(state: dict, payload) -> None:
+        """Fold ONE backend progress payload into the accumulator ``state`` (in
+        place). The scanner feeds coarse per-stage dicts on the worker thread
+        (shapes documented on MarketScanner.scan_market / scan_contracts); this
+        keeps the latest numbers per stage so the status line can show both the
+        orders phase and the contracts phase as they progress.
+
+        Fully defensive: a non-dict payload or missing/renamed keys are ignored
+        (never raise) — a drifted payload shape must never break a scan."""
+        if not isinstance(payload, dict):
+            return
+        stage = payload.get("stage")
+        status = payload.get("status")
+        if stage == "orders":
+            if payload.get("page") is not None:
+                state["orders_page"] = payload.get("page")
+            if payload.get("pages") is not None:
+                state["orders_pages"] = payload.get("pages")
+            state["orders_started"] = True
+        elif stage == "market":
+            if status == "orders_start":
+                state["orders_started"] = True
+            elif status == "orders_done":
+                state["orders_started"] = True
+                state["orders_done"] = True
+            elif status == "depth_done":
+                state["depth_done"] = True
+        elif stage == "contracts_list":
+            if payload.get("page") is not None:
+                state["clist_page"] = payload.get("page")
+            if payload.get("pages") is not None:
+                state["clist_pages"] = payload.get("pages")
+            state["contracts_started"] = True
+        elif stage == "filter":
+            if payload.get("done") is not None:
+                state["filter_done"] = payload.get("done")
+            if payload.get("total") is not None:
+                state["filter_total"] = payload.get("total")
+            if payload.get("kept") is not None:
+                state["filter_kept"] = payload.get("kept")
+            state["contracts_started"] = True
+        elif stage == "contracts":
+            state["contracts_started"] = True
+            if payload.get("done") is not None:
+                state["contracts_done"] = payload.get("done")
+            if payload.get("total") is not None:
+                state["contracts_total"] = payload.get("total")
+            if payload.get("from_cache") is not None:
+                state["contracts_cached"] = payload.get("from_cache")
+            if status == "complete":
+                state["contracts_complete"] = True
+
+    @staticmethod
+    def _market_progress_text(state, elapsed_s) -> str:
+        """Pure formatter → the live one-line scan status from the accumulated
+        progress ``state`` (see _market_merge_progress) and monotonic
+        ``elapsed_s``. Example:
+
+            scanning… orders page 12/38 · contracts 120/450 (89 cached) · 1m 42s
+
+        Orders-only until the contract phase begins; then both segments show. A
+        pre-item contract sub-stage (list pagination / pass-1 filter) renders in
+        the contracts slot so a big region never looks stalled between phases.
+        Defensive: an empty / partial / garbage ``state`` degrades to just the
+        elapsed clock ('scanning… 47s'). Lowercase 'scanning…' matches the app's
+        status voice (and the pre-progress status the label showed before)."""
+        state = state or {}
+
+        def _elapsed(sec):
+            try:
+                s = int(sec)
+            except (TypeError, ValueError):
+                s = 0
+            if s < 0:
+                s = 0
+            if s < 60:
+                return f"{s}s"
+            m, ss = divmod(s, 60)
+            if m < 60:
+                return f"{m}m {ss:02d}s"
+            h, m = divmod(m, 60)
+            return f"{h}h {m:02d}m"
+
+        parts = []
+        # Orders phase (structure / region order-book pull).
+        op, opn = state.get("orders_page"), state.get("orders_pages")
+        if op is not None and opn is not None:
+            parts.append(f"orders page {op}/{opn}")
+        elif state.get("orders_started"):
+            parts.append("orders")
+        # Contracts phase — show the most-advanced sub-stage seen so far.
+        cd, ct = state.get("contracts_done"), state.get("contracts_total")
+        fd, ft = state.get("filter_done"), state.get("filter_total")
+        cp, cpn = state.get("clist_page"), state.get("clist_pages")
+        if cd is not None and ct is not None:
+            seg = f"contracts {cd}/{ct}"
+            cached = state.get("contracts_cached")
+            try:
+                if cached is not None and int(cached) > 0:
+                    seg += f" ({int(cached)} cached)"
+            except (TypeError, ValueError):
+                pass
+            parts.append(seg)
+        elif fd is not None and ft is not None:
+            parts.append(f"filtering {fd}/{ft}")
+        elif cp is not None and cpn is not None:
+            parts.append(f"contracts list {cp}/{cpn}")
+
+        # Elapsed is always the final segment; with no stage segments the line is
+        # just 'scanning… <elapsed>' (no dangling separator).
+        parts.append(_elapsed(elapsed_s))
+        return "scanning… " + " · ".join(parts)
+
+    def _market_schedule_progress_apply(self):
+        """Coalesce worker→Tk progress refreshes: schedule AT MOST ONE pending
+        status apply at a time. The scan worker fires progress on its own thread
+        (potentially dozens of pages/sec) and mutates the shared state; this
+        marshals a single ``root.after(0, …)`` per burst so a fast paginator
+        can't flood the Tk queue. The next callback re-arms only after the
+        pending apply has run (which clears the flag)."""
+        lock = getattr(self, "_market_prog_lock", None)
+        if lock is not None:
+            with lock:
+                if self._market_prog_scheduled:
+                    return
+                self._market_prog_scheduled = True
+        else:
+            if getattr(self, "_market_prog_scheduled", False):
+                return
+            self._market_prog_scheduled = True
+        try:
+            self.root.after(0, self._market_progress_apply)
+        except Exception:
+            # Root gone / teardown → drop the guard so a later burst can retry.
+            if lock is not None:
+                with lock:
+                    self._market_prog_scheduled = False
+            else:
+                self._market_prog_scheduled = False
+
+    def _market_progress_apply(self):
+        """Tk-thread applier for a coalesced progress burst: clear the pending
+        flag, then repaint the status labels from the latest accumulated state —
+        but ONLY while a scan is still in flight, so a late apply can't stomp the
+        final 'scanned HH:MM' the completion step already wrote."""
+        lock = getattr(self, "_market_prog_lock", None)
+        if lock is not None:
+            with lock:
+                self._market_prog_scheduled = False
+        else:
+            self._market_prog_scheduled = False
+        if not getattr(self, "_market_scanning", False):
+            return
+        try:
+            self._refresh_market_status_labels()
+        except tk.TclError:
+            pass
+
+    def _market_start_elapsed_ticker(self):
+        """Arm the 1s elapsed-time ticker so the status shows a live, ticking
+        'scanning… 47s' even when the backend emits NO progress callbacks (an
+        older scanner object, or a degraded path that never paginates). Cancels
+        any prior pending tick first (idempotent)."""
+        self._market_stop_elapsed_ticker()
+        try:
+            self._market_tick_after_id = self.root.after(
+                1000, self._market_tick_elapsed)
+        except (tk.TclError, RuntimeError):
+            self._market_tick_after_id = None
+
+    def _market_stop_elapsed_ticker(self):
+        """Cancel the elapsed ticker's pending after() if any (safe to call when
+        none is armed, at teardown, or on a headless root)."""
+        tick_id = getattr(self, "_market_tick_after_id", None)
+        if tick_id is not None:
+            try:
+                self.root.after_cancel(tick_id)
+            except Exception:
+                pass
+        self._market_tick_after_id = None
+
+    def _market_tick_elapsed(self):
+        """1s status repaint while a scan runs; SELF-CANCELLING — it stops
+        rescheduling the instant ``_market_scanning`` goes False, so no ticker
+        leaks past a scan. Guards TclError/headless (a dead root just stops)."""
+        self._market_tick_after_id = None
+        if not getattr(self, "_market_scanning", False):
+            return
+        try:
+            self._refresh_market_status_labels()
+        except tk.TclError:
+            return
+        except Exception:
+            log.exception("[market] elapsed-ticker refresh failed")
+        try:
+            self._market_tick_after_id = self.root.after(
+                1000, self._market_tick_elapsed)
+        except (tk.TclError, RuntimeError):
+            self._market_tick_after_id = None
+
     def _market_scan_now(self):
         """Manual market scan: depth pull + (optional) contract scan on a daemon
         thread, results marshalled back to the Tk thread. In-flight guarded (a
@@ -20723,8 +20966,22 @@ $bmp.Dispose()
             self._refresh_market_status_labels()
             return
 
+        # Fresh live-progress state for this scan: elapsed base, empty stage
+        # accumulator, cleared coalescing slot. Ensure the lock exists even for a
+        # scan kicked before the __init__ market block ran (defensive).
+        self._market_scan_started = time.monotonic()
+        self._market_scan_progress = {}
+        self._market_prog_scheduled = False
+        if getattr(self, "_market_prog_lock", None) is None:
+            self._market_prog_lock = threading.Lock()
+
         self._market_scanning = True
         self._refresh_market_status_labels()
+        # Tick the elapsed clock every 1s so the status never looks frozen even
+        # if the backend emits no progress. Guarded — bare hosts don't bind it.
+        starter = getattr(self, "_market_start_elapsed_ticker", None)
+        if callable(starter):
+            starter()
 
         market_cfg = self.config.get("market", {}) or {}
         scan_contracts = bool(market_cfg.get("scan_contracts", True))
@@ -20745,12 +21002,26 @@ $bmp.Dispose()
                 if fit is not None:
                     fits.append(fit)
 
+        def _progress(payload):
+            # WORKER THREAD: fold the latest payload into the shared accumulator
+            # under the lock, then coalesce a single Tk-thread status repaint.
+            try:
+                with self._market_prog_lock:
+                    FCToolGUI._market_merge_progress(
+                        self._market_scan_progress, payload)
+            except Exception:
+                return
+            self._market_schedule_progress_apply()
+
         def worker():
             snap = None
             contracts = None
             try:
                 try:
-                    snap = scanner.scan_market(source)
+                    if FCToolGUI._market_supports_progress(scanner.scan_market):
+                        snap = scanner.scan_market(source, progress=_progress)
+                    else:
+                        snap = scanner.scan_market(source)
                 except Exception:
                     log.exception("[market] scan_market failed")
                 # Pre-check belt: a structure source whose primary character
@@ -20775,9 +21046,16 @@ $bmp.Dispose()
                     sys_filter = (source.system_id
                                   if contracts_scope == "system" else None)
                     try:
-                        contracts = scanner.scan_contracts(
-                            source.region_id, fits,
-                            system_id=sys_filter, corp_id=corp_id)
+                        if FCToolGUI._market_supports_progress(
+                                scanner.scan_contracts):
+                            contracts = scanner.scan_contracts(
+                                source.region_id, fits,
+                                system_id=sys_filter, corp_id=corp_id,
+                                progress=_progress)
+                        else:
+                            contracts = scanner.scan_contracts(
+                                source.region_id, fits,
+                                system_id=sys_filter, corp_id=corp_id)
                     except Exception:
                         log.exception("[market] scan_contracts failed")
             finally:
@@ -20837,6 +21115,16 @@ $bmp.Dispose()
         + timestamp, clear the in-flight guard, and refresh the dependent views
         (Doctrine detail + Fittings detail) so availability marks appear."""
         self._market_scanning = False
+        # Stop the elapsed ticker (guarded: may never have started / bare host).
+        # The ticker also self-cancels on its next tick, but stopping here avoids
+        # a trailing 'scanning…' repaint after the final status is written.
+        tick_id = getattr(self, "_market_tick_after_id", None)
+        if tick_id is not None:
+            try:
+                self.root.after_cancel(tick_id)
+            except Exception:
+                pass
+            self._market_tick_after_id = None
         if snap is not None:
             self._market_snapshot = snap
             self._market_from_cache = False
@@ -21264,6 +21552,15 @@ $bmp.Dispose()
             preview_teardown = getattr(self, "_preview_teardown", None)
             if callable(preview_teardown):
                 preview_teardown()
+        except Exception:
+            pass
+        # Cancel the market elapsed-ticker after() if a scan is mid-flight at
+        # shutdown, so nothing fires into a destroyed root.
+        try:
+            tick_id = getattr(self, "_market_tick_after_id", None)
+            if tick_id is not None:
+                self.root.after_cancel(tick_id)
+                self._market_tick_after_id = None
         except Exception:
             pass
         self.root.destroy()

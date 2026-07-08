@@ -58,6 +58,20 @@ _CAPTURED_HEADERS = (
 )
 
 
+def _emit_progress(progress, payload: dict) -> None:
+    """Invoke an optional progress callback, swallowing ANY exception it raises.
+
+    Kept local (not imported from ``market_scanner``) so the adapter stays
+    decoupled from the pure scanner. A raising or slow callback must never break a
+    paginated pull. No-op when ``progress`` is None."""
+    if progress is None:
+        return
+    try:
+        progress(payload)
+    except Exception:
+        log.debug("[market-esi] progress callback raised (ignored)", exc_info=True)
+
+
 class AuthMarketAdapter:
     """Live ESI adapter. Construct with an ``ESIAuth`` (for its ``requests``
     session + bearer token) and optionally a ``requests``-style public session
@@ -68,6 +82,12 @@ class AuthMarketAdapter:
     ETags are handled by the scanner's persistent cache; this adapter simply
     fetches when asked.
     """
+
+    # Advertises that the list methods accept an optional ``progress`` callback
+    # and emit ``{"stage": ..., "page": i, "pages": n}`` per page. The scanner
+    # feature-detects this before passing a callback, so fake/older adapters
+    # (which lack the kwarg) are still called the classic way.
+    supports_progress = True
 
     def __init__(self, auth, *, public_session=None, timeout: int = 15) -> None:
         self._auth = auth
@@ -137,7 +157,8 @@ class AuthMarketAdapter:
         return resp
 
     def _paginate(
-        self, path, *, authed: bool, params=None, forbidden_tag: str | None = None
+        self, path, *, authed: bool, params=None, forbidden_tag: str | None = None,
+        progress=None, stage: str = "page",
     ) -> list[dict]:
         """Auto-paginate a list endpoint on ``X-Pages``. Returns the concatenated
         items. A 403 (missing scope / no access) → ``[]``. Stops on the first
@@ -146,7 +167,11 @@ class AuthMarketAdapter:
 
         ``forbidden_tag`` (when given) is recorded in ``last_forbidden`` on a 403
         so the caller can distinguish "forbidden" (scope/access) from "genuinely
-        empty" — the 403 is still degraded to ``[]`` (no raise)."""
+        empty" — the 403 is still degraded to ``[]`` (no raise).
+
+        ``progress`` (optional) is fed ``{"stage": stage, "page": i, "pages": n}``
+        after each successful page so the GUI can show a real per-page bar during
+        a many-page pull (e.g. a large structure order book)."""
         url = f"{ESI_BASE}{path}"
         out: list[dict] = []
         page = 1
@@ -175,6 +200,7 @@ class AuthMarketAdapter:
                 total = int(resp.headers.get("x-pages", 1))
             except (TypeError, ValueError):
                 total = 1
+            _emit_progress(progress, {"stage": stage, "page": page, "pages": total})
             if page >= total:
                 break
             if self.error_limited:
@@ -183,11 +209,17 @@ class AuthMarketAdapter:
             page += 1
         return out
 
-    def _paginate_etag(self, path, *, authed: bool, params=None) -> list[dict]:
+    def _paginate_etag(
+        self, path, *, authed: bool, params=None, progress=None, stage: str = "page"
+    ) -> list[dict]:
         """Like ``_paginate`` but sends ``If-None-Match`` from the in-memory ETag
         cache and replays the cached body on a 304 (first page's ETag gates the
         whole result). Used for the region-orders and contracts-list pulls where
-        a 304 is common and cheap."""
+        a 304 is common and cheap.
+
+        ``progress`` (optional) is fed ``{"stage": stage, "page": i, "pages": n}``
+        per page; a 304 (whole list served from the ETag cache) reports one page
+        of one so the GUI still sees the stage tick over."""
         url = f"{ESI_BASE}{path}"
         cached = self._etags.get(path)
         headers = {"If-None-Match": cached[0]} if cached else None
@@ -198,6 +230,7 @@ class AuthMarketAdapter:
         if first is None:
             return cached[1] if cached else []
         if first.status_code == 304 and cached is not None:
+            _emit_progress(progress, {"stage": stage, "page": 1, "pages": 1})
             return cached[1]
         if first.status_code == 403:
             return []
@@ -213,6 +246,7 @@ class AuthMarketAdapter:
             total = int(first.headers.get("x-pages", 1))
         except (TypeError, ValueError):
             total = 1
+        _emit_progress(progress, {"stage": stage, "page": 1, "pages": total})
         # Remaining pages fetched unconditionally (ETag is for the first page).
         for page in range(2, total + 1):
             if self.error_limited:
@@ -226,6 +260,7 @@ class AuthMarketAdapter:
                 break
             if isinstance(more, list):
                 out.extend(more)
+            _emit_progress(progress, {"stage": stage, "page": page, "pages": total})
         if etag:
             self._etags[path] = (etag, out)
         return out
@@ -233,30 +268,37 @@ class AuthMarketAdapter:
     # ── MarketEsiAdapter protocol ─────────────────────────────────────────────
 
     def region_orders(
-        self, region_id: int, *, type_id: int | None = None, order_type: str = "sell"
+        self, region_id: int, *, type_id: int | None = None, order_type: str = "sell",
+        progress=None,
     ) -> list[dict]:
         """Public region orders (NPC-station + ranged), ETag-cached. Optional
-        single ``type_id`` filter; ``order_type`` default "sell"."""
+        single ``type_id`` filter; ``order_type`` default "sell". ``progress``
+        (optional) receives per-page ``{"stage": "orders", ...}`` dicts."""
         params: dict = {"order_type": order_type}
         if type_id is not None:
             params["type_id"] = type_id
         return self._paginate_etag(
-            f"/markets/{region_id}/orders/", authed=False, params=params
+            f"/markets/{region_id}/orders/", authed=False, params=params,
+            progress=progress, stage="orders",
         )
 
-    def structure_orders(self, structure_id: int) -> list[dict]:
+    def structure_orders(self, structure_id: int, *, progress=None) -> list[dict]:
         """Authed structure market — the whole order book, no filter (scope
         ``esi-markets.structure_markets.v1`` + docking access). 403 → [] and a
-        ``"structure_market"`` entry in ``last_forbidden`` (forbidden != empty)."""
+        ``"structure_market"`` entry in ``last_forbidden`` (forbidden != empty).
+        ``progress`` (optional) receives per-page ``{"stage": "orders", ...}``
+        dicts — the structure book is the many-page first-scan cost."""
         return self._paginate(
             f"/markets/structures/{structure_id}/", authed=True,
-            forbidden_tag="structure_market",
+            forbidden_tag="structure_market", progress=progress, stage="orders",
         )
 
-    def public_contracts(self, region_id: int) -> list[dict]:
-        """Public region contracts (no auth), ETag-cached."""
+    def public_contracts(self, region_id: int, *, progress=None) -> list[dict]:
+        """Public region contracts (no auth), ETag-cached. ``progress`` (optional)
+        receives per-page ``{"stage": "contracts_list", ...}`` dicts."""
         return self._paginate_etag(
-            f"/contracts/public/{region_id}/", authed=False
+            f"/contracts/public/{region_id}/", authed=False,
+            progress=progress, stage="contracts_list",
         )
 
     def contract_items(self, contract_id: int) -> list[dict]:
@@ -265,13 +307,15 @@ class AuthMarketAdapter:
             f"/contracts/public/items/{contract_id}/", authed=False
         )
 
-    def corp_contracts(self, corporation_id: int) -> list[dict]:
+    def corp_contracts(self, corporation_id: int, *, progress=None) -> list[dict]:
         """Corp/alliance contracts (scope
         ``esi-contracts.read_corporation_contracts.v1`` + a rolled character).
-        403 → [] and a ``"corp_contracts"`` entry in ``last_forbidden``."""
+        403 → [] and a ``"corp_contracts"`` entry in ``last_forbidden``.
+        ``progress`` (optional) receives per-page ``{"stage": "contracts_list",
+        ...}`` dicts — corp books can be large (couriers etc.)."""
         return self._paginate(
             f"/corporations/{corporation_id}/contracts/", authed=True,
-            forbidden_tag="corp_contracts",
+            forbidden_tag="corp_contracts", progress=progress, stage="contracts_list",
         )
 
     def corp_contract_items(self, corporation_id: int, contract_id: int) -> list[dict]:
