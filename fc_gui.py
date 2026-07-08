@@ -5873,6 +5873,10 @@ class FCToolGUI:
                             info["ship_type_id"], DEFAULT_OZONE_COST
                         )
                         info["cyno_low"] = info["cyno_ozone"] <= cost
+            # Fold in the currently-piloted capital (from the fresh get_ship_type
+            # signal, NOT the 10-min asset cache) so a titan/dread/blops/FAX flown
+            # right now — including in space — is a filter/card member.
+            self._inject_piloted_capital(info)
             return info
 
         CAPITAL_TYPES = {
@@ -5910,7 +5914,8 @@ class FCToolGUI:
                         item_id, (str(loc_id), "")
                     )
 
-                    entry = {"ship": ship_name, "location": loc_name, "region": loc_region}
+                    entry = {"ship": ship_name, "location": loc_name,
+                             "region": loc_region, "item_id": item_id}
                     for cat_key, cat_ids in CAPITAL_TYPES.items():
                         if type_id in cat_ids:
                             info[cat_key].append(entry)
@@ -5956,13 +5961,19 @@ class FCToolGUI:
                 continue
             counts = Counter()
             entry_map = {}
+            ids_map: dict = {}
             for e in entries:
                 key = (e["ship"], e["location"])
                 counts[key] += 1
                 entry_map[key] = e
+                # Retain every merged item_id so the piloted-ship dedupe
+                # (see _inject_piloted_capital) stays exact even when several
+                # identical hulls in one location collapse to a single "xN" row.
+                ids_map.setdefault(key, []).append(e.get("item_id", 0))
             deduped = []
             for key, count in counts.items():
                 e = dict(entry_map[key])
+                e["item_ids"] = ids_map[key]
                 if count > 1:
                     e["ship"] = f"{e['ship']} x{count}"
                 deduped.append(e)
@@ -5982,7 +5993,81 @@ class FCToolGUI:
         cap_data["dictor"] = info["dictor"]
         self._asset_cache[char_id] = (time.monotonic(), time.time(), cap_data)
 
+        # Fold the piloted capital in AFTER caching so the synthetic entry is
+        # never written to cap_data — it is recomputed fresh on every fetch and
+        # so is immune to the stale-cache flicker.
+        self._inject_piloted_capital(info)
         return info
+
+    def _inject_piloted_capital(self, info: dict) -> None:
+        """Fold the character's *currently-piloted* capital ship into the
+        matching capability list so the Characters-tab filter (and card) counts
+        a titan/dread/blops/FAX the pilot is actively flying.
+
+        Why this is needed: the capability lists are built only from assembled
+        ships sitting in personal hangars ("Hangar"/"AutoFit" + singleton). A
+        ship being actively flown in space never appears there (its asset row is
+        location_type 'solar_system', not a hangar flag), so a pilot sitting in
+        their titan in space would be filtered out entirely. This adds a
+        synthetic entry for the flown hull.
+
+        Category selection mirrors the asset classifier's CAPITAL_TYPES mapping
+        exactly — same ship_classes sets, same first-match iteration — so the
+        piloted hull lands in the same bucket a hangar copy would (lockstep).
+
+        Dedupe: when DOCKED the active ship ALSO appears in hangar assets (the
+        same physical item), so injecting unconditionally would double it. The
+        current-ship item_id (get_ship_type -> ship_item_id) is matched against
+        the item_id(s) retained on each entry; if it is already represented we
+        skip. Identity-by-item_id is exact and needs no docked-vs-space guess.
+
+        Freshness: the current-ship signal is fetched fresh every call and this
+        runs AFTER the asset cache is read/written, and it reassigns a NEW list
+        rather than mutating the (possibly cached) list object — so the piloted
+        entry is recomputed each fetch and never persisted (no stale flicker)."""
+        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS
+
+        tid = info.get("ship_type_id", 0)
+        if not tid:
+            return
+        # Same mapping and first-match order as the asset classifier.
+        CAPITAL_TYPES = {
+            "fax": FAX,
+            "dreads": DREADNOUGHTS,
+            "blops": BLACK_OPS,
+            "titans": TITANS,
+        }
+        cat_key = ""
+        for k, ids in CAPITAL_TYPES.items():
+            if tid in ids:
+                cat_key = k
+                break
+        if not cat_key:
+            return  # piloting a sub-capital / non-capital — nothing to fold in
+
+        iid = info.get("ship_item_id", 0)
+        existing = info.get(cat_key, []) or []
+        # Dedupe against the hangar copy that appears when DOCKED (same item_id).
+        if iid:
+            for e in existing:
+                if not isinstance(e, dict):
+                    continue
+                if iid == e.get("item_id") or iid in (e.get("item_ids") or ()):
+                    return
+
+        synthetic = {
+            "ship": f"{info.get('ship', '???')} (piloting)",
+            "location": info.get("system", "???"),
+            "region": info.get("region", ""),
+            "item_id": iid,
+            "item_ids": [iid],
+            "piloting": True,
+        }
+        # Reassign a NEW list rather than appending in place: in the cached path
+        # info[cat_key] aliases the cached list and in the fresh path it aliases
+        # the just-written cap_data list — appending to either would poison the
+        # cache with the (non-persistable) synthetic entry.
+        info[cat_key] = list(existing) + [synthetic]
 
     def _batch_resolve_asset_systems(self, acct: ESIAuth,
                                        capital_assets: list[dict],
