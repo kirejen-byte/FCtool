@@ -45,6 +45,58 @@ def parse_hotkey(text: str) -> tuple[int, int]:
     return (mods, _VK[key])
 
 
+# Tk `event.state` modifier bit masks ON WINDOWS. Only these three are real
+# hotkey modifiers here: Shift 0x0001, Control 0x0004, Alt 0x20000. 0x0008
+# (Mod1) is NumLock on Windows Tk — it must NOT be read as Alt, or every keypress
+# with NumLock on would spuriously gain an Alt modifier. Composed in the fixed
+# Control+Alt+Shift order so the result matches parse_hotkey's tolerant parser.
+_EVENT_MODS = ((0x0004, "Control"), (0x20000, "Alt"), (0x0001, "Shift"))
+
+# Named keysyms → the token parse_hotkey understands (see _VK above).
+_EVENT_KEYSYMS = {
+    "space": "SPACE", "Tab": "TAB", "Prior": "PGUP", "Next": "PGDN",
+    "Home": "HOME", "End": "END", "Insert": "INSERT", "Delete": "DELETE",
+}
+
+# Bare modifier / lock keysyms — a press of one of these alone is not a hotkey.
+_EVENT_MODIFIER_KEYSYMS = frozenset({
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    "Super_L", "Super_R", "Win_L", "Win_R", "Meta_L", "Meta_R",
+    "Caps_Lock", "Num_Lock", "Scroll_Lock",
+})
+
+
+def event_to_hotkey(keysym: str, state: int) -> "str | None":
+    """Build a parse_hotkey-valid string from a Tk key event, or None.
+
+    `keysym` is `event.keysym`, `state` is `event.state` (Windows Tk masks).
+    Returns e.g. "Control+Shift+F4" for the capture widget. Bare modifier
+    presses, unmapped keys, and anything parse_hotkey would reject all return
+    None (the caller keeps waiting / shows an inline note). Every non-None
+    result is validated by round-tripping through parse_hotkey."""
+    if not keysym or keysym in _EVENT_MODIFIER_KEYSYMS:
+        return None
+    key = None
+    if len(keysym) == 1 and keysym.isalpha():
+        key = keysym.upper()
+    elif len(keysym) == 1 and keysym.isdigit():
+        key = keysym
+    elif keysym[0] in "Ff" and keysym[1:].isdigit():   # F1..F24 (range checked below)
+        key = "F" + keysym[1:]
+    elif keysym in _EVENT_KEYSYMS:
+        key = _EVENT_KEYSYMS[keysym]
+    if key is None:
+        return None
+    parts = [name for mask, name in _EVENT_MODS if state & mask]
+    parts.append(key)
+    result = "+".join(parts)
+    try:
+        parse_hotkey(result)          # authoritative validation (VK range, modifiers)
+    except ValueError:
+        return None
+    return result
+
+
 def format_error(code: int) -> str:
     return ("in use by another application" if code == 1409
             else f"registration failed (error {code})")
