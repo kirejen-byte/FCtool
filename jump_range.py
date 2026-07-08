@@ -371,9 +371,10 @@ class JumpRangeChecker:
     Also provides stargate route calculation.
     """
 
-    # Base jump ranges in LY (at JDC 5)
+    # Base jump ranges in LY (at JDC 5) — each value is the hull base × 2.0.
     SHIP_RANGES = {
         "Dreadnought": 7.0,
+        "Lancer Dreadnought": 8.0,
         "Carrier": 7.0,
         "Command Carrier": 7.5,
         "Force Auxiliary": 7.0,
@@ -381,7 +382,7 @@ class JumpRangeChecker:
         "Titan": 6.0,
         "Black Ops": 8.0,
         "Jump Freighter": 10.0,
-        "Rorqual": 5.0,
+        "Rorqual": 10.0,
     }
 
     def __init__(self, ship_type: str = "Dreadnought", jdc_level: int = 5,
@@ -399,8 +400,9 @@ class JumpRangeChecker:
     @property
     def jump_range(self) -> float:
         base = self.SHIP_RANGES.get(self.ship_type, 7.0)
-        # JDC adds 25% per level to base range
-        return base * (1 + 0.25 * self.jdc_level) / (1 + 0.25 * 5)
+        # JDC adds 20% of the hull base per level; the dict value is the JDC-5
+        # range (hull base × 2.0), so range(L) = base_jdc5 * (1 + 0.20*L) / 2.0.
+        return base * (1 + 0.20 * self.jdc_level) / 2.0
 
     def check_range(self, origin: str, destination: str,
                     connections: list[str] | None = None,

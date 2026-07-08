@@ -3695,8 +3695,11 @@ class FCToolGUI:
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
         self._ship_type_var = tk.StringVar(
             value=self.config.get("jump_range", {}).get("ship_type", "Dreadnought"))
-        ship_types = ["Dreadnought", "Carrier", "Command Carrier", "Force Auxiliary",
-                      "Supercarrier", "Titan", "Black Ops", "Jump Freighter", "Rorqual"]
+        # Data-driven from the checker's range table so this dropdown can never
+        # drift from JumpRangeChecker.SHIP_RANGES — adding a hull there surfaces
+        # it here automatically. "Dreadnought" is the first key, so it stays the
+        # first/default entry (matches config default).
+        ship_types = list(JumpRangeChecker.SHIP_RANGES.keys())
         self._ship_menu = ttk.Combobox(row2, textvariable=self._ship_type_var,
                                         values=ship_types, state="readonly",
                                         font=("Consolas", 10), width=18)

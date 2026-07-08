@@ -44,14 +44,20 @@ DEFAULT_CONFIG = {
         "origin_system": "",
         "ship_type": "Dreadnought",
         "jump_drive_calibration_level": 5,
+        # Mirrors JumpRangeChecker.SHIP_RANGES (JDC-5 range = hull base × 2.0).
+        # Passed as custom_ranges, so keep it in sync with the class dict to
+        # avoid silently overriding a corrected default (e.g. Rorqual 10.0).
         "ranges_ly": {
             "Dreadnought": 7.0,
+            "Lancer Dreadnought": 8.0,
             "Carrier": 7.0,
+            "Command Carrier": 7.5,
+            "Force Auxiliary": 7.0,
             "Supercarrier": 6.0,
             "Titan": 6.0,
             "Black Ops": 8.0,
             "Jump Freighter": 10.0,
-            "Rorqual": 5.0,
+            "Rorqual": 10.0,
         },
     },
     # Market Scanner (design 2026-07-06-market-scanner-design.md §6.1). All ids
