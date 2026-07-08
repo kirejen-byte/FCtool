@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
         "staging_station_name": "",    # chosen NPC station display name
         "staging_structure_name": "",  # chosen structure name (no "(id)" suffix)
         "scan_contracts": True,     # allow the (expensive) contract scan
+        "scan_on_startup": True,    # background re-scan a few seconds after launch
         "include_alliance_contracts": True,  # also pull corp/alliance contracts (needs scope)
         "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)
         "seed_target": 20,          # FIXED target quantity of each fit for gap math
