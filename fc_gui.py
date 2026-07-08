@@ -14721,14 +14721,18 @@ class FCToolGUI:
     def parse_eveo_config(json_text: str) -> dict:
         """Pure parser for an EVE-O-Preview.json (Proopai fork). Returns
         {"layouts": {char_key: (x, y)}, "focus_hotkeys": {char_key: str},
-         "cycle_order": [char_key, ...], "errors": [str, ...]}.
+         "cycle_order": [char_key, ...],
+         "hotkeys": {"groups": [{"name","members","next","prev","order"}, ...]},
+         "errors": [str, ...]}.
 
         - FlatLayout: {title: "x, y"} — title prefix stripped to lowercased char
           key; bare "EVE" login windows and unparseable points are skipped.
         - ClientHotkey: {title: hotkey} — validated through parse_hotkey; invalid
           entries (Win modifier, unknown key, …) are skipped and reported.
-        - CycleGroup1ClientsOrder: {title: int} — cycle order = keys sorted by
-          value ascending.
+        - CycleGroup1ClientsOrder: {title: int} — legacy flat cycle_order = keys
+          sorted by value ascending.
+        - CycleGroup{1..5}Forward/BackwardHotkeys + ClientsOrder → named member
+          groups (see the group-building block below); trailing empties trimmed.
         Never raises: a bad JSON body returns empty maps + one error string."""
         errors: list = []
         try:
@@ -14784,8 +14788,61 @@ class FCToolGUI:
                 continue
         cycle_order = [k for _, k in sorted(order_pairs, key=lambda p: p[0])]
 
+        # ── CycleGroup{1..5} → named member groups (Proopai v8 schema) ────────
+        # Each N yields group N-1: next/prev from its Forward/BackwardHotkeys
+        # (kept only if parse_hotkey accepts — Win-modified etc. skipped), members
+        # from its ClientsOrder (titles → keys, lowercased, ordered by the dict's
+        # int values; login "EVE" and non-EVE titles dropped). Trailing all-empty
+        # groups are trimmed so a config with only group 1 doesn't emit 4 empty
+        # tails. `order` stays [] here — members are the modern cycle ring (the
+        # flat `cycle_order` above remains for the legacy group-0 order merge).
+        def _keep_hotkeys(seq, gnum, label):
+            out = []
+            if not isinstance(seq, (list, tuple)):
+                return out
+            for hk in seq:
+                text = str(hk).strip()
+                if not text:
+                    continue
+                try:
+                    hotkey_service.parse_hotkey(text)
+                except ValueError as e:
+                    errors.append(
+                        f"invalid CycleGroup{gnum} {label} hotkey {text!r}: {e}")
+                    continue
+                out.append(text)
+            return out
+
+        groups: list = []
+        for n in range(1, 6):
+            clients = data.get(f"CycleGroup{n}ClientsOrder")
+            member_pairs = []
+            if isinstance(clients, dict):
+                for title, idx in clients.items():
+                    key = _char_key(title)
+                    if key is None:
+                        continue
+                    try:
+                        member_pairs.append((int(idx), key))
+                    except (ValueError, TypeError):
+                        continue
+            members = [k for _, k in sorted(member_pairs, key=lambda p: p[0])]
+            groups.append({
+                "name": f"EVE-O group {n}",
+                "members": members,
+                "next": _keep_hotkeys(
+                    data.get(f"CycleGroup{n}ForwardHotkeys"), n, "forward"),
+                "prev": _keep_hotkeys(
+                    data.get(f"CycleGroup{n}BackwardHotkeys"), n, "backward"),
+                "order": [],
+            })
+        while groups and not (groups[-1]["members"] or groups[-1]["next"]
+                              or groups[-1]["prev"] or groups[-1]["order"]):
+            groups.pop()
+
         return {"layouts": layouts, "focus_hotkeys": focus_hotkeys,
-                "cycle_order": cycle_order, "errors": errors}
+                "cycle_order": cycle_order,
+                "hotkeys": {"groups": groups}, "errors": errors}
 
     def _preview_merge_eveo(self, parsed: dict) -> dict:
         """Fill-only merge of a parsed EVE-O config into the preview cfg. NEVER
@@ -14810,18 +14867,43 @@ class FCToolGUI:
                 added_hotkeys += 1
 
         groups = hk.setdefault("groups", [])
+        # Fill-only merge of the imported CycleGroup{1..5} groups. Index-aligned:
+        # imported group i fills config group i only when that slot is absent or
+        # completely empty (name alone never blocks); an occupied/user-edited slot
+        # is never clobbered; imported groups past the current length append.
+        added_groups = 0
+        for i, gimp in enumerate(parsed.get("hotkeys", {}).get("groups", [])):
+            gcopy = json.loads(json.dumps(gimp))
+            if i >= len(groups):
+                groups.append(gcopy)
+                added_groups += 1
+                continue
+            cur = groups[i]
+            if not (cur.get("members") or cur.get("next")
+                    or cur.get("prev") or cur.get("order")):
+                groups[i] = gcopy                    # empty slot → fill
+                added_groups += 1
+            # else: user-edited slot → keep as-is (fill-only contract)
+
+        # Legacy group-0 order-append from CycleGroup1ClientsOrder. Members
+        # supersede `order` at cycle time, so only append when group 0 has no
+        # members (an old order-only config, or the fill above left it memberless).
+        # A released config + the fill-only import test rely on this path; it is a
+        # no-op once group 0 has members.
         if not groups:
-            groups.append({"next": [], "prev": [], "order": []})
-        order = groups[0].setdefault("order", [])
+            groups.append({"name": "All clients", "members": [],
+                           "next": [], "prev": [], "order": []})
         added_order = 0
-        for key in parsed["cycle_order"]:
-            if key not in order:
-                order.append(key)
-                added_order += 1
+        if not groups[0].get("members"):
+            order = groups[0].setdefault("order", [])
+            for key in parsed["cycle_order"]:
+                if key not in order:
+                    order.append(key)
+                    added_order += 1
 
         self._save_config()
         return {"added_layouts": added_layouts, "added_hotkeys": added_hotkeys,
-                "added_order": added_order}
+                "added_order": added_order, "added_groups": added_groups}
 
     def _preview_import_eveo(self):
         """Settings button: pick an EVE-O-Preview.json, parse it, fill-only merge
@@ -14846,6 +14928,7 @@ class FCToolGUI:
             f"Imported from:\n{path}\n",
             f"Layouts added: {summary['added_layouts']}",
             f"Focus hotkeys added: {summary['added_hotkeys']}",
+            f"Cycle groups added: {summary.get('added_groups', 0)}",
             f"Cycle-order entries added: {summary['added_order']}",
             "\nExisting FCTool entries were kept (fill-only merge).",
         ]
@@ -15530,6 +15613,7 @@ class FCToolGUI:
 
         # ── EVE-O preset (immediate, EVE-O parity) ───────────────────────────
         def _preset():
+            _flush_right()                    # persist right-pane edits first
             self._preview_hotkey_preset()     # persists cfg groups[0] = F14/F13
             if not working:
                 working.append({"name": "All clients", "members": [],

@@ -42,6 +42,7 @@ Turn it on in **Settings → the previews section**: pick **FCPreview**. (The ot
 **Requirements & notes:**
 - Clients must run **windowed** (borderless-window or windowed-fullscreen). True exclusive fullscreen has no thumbnail for Windows to mirror.
 - Focus hotkeys are **swallowed** by Windows while registered — they will not also reach the game or other apps, so pick keys you don't otherwise use in EVE.
+- **Cycle groups** — name your own groups of clients in **Cycle groups…** (in the FCPreview settings row, next to **Hotkeys…**) and give each group its own next/prev cycle keys; a group with **no members cycles all clients**. Like focus keys, cycle keys are **swallowed** system-wide while FCPreview runs. Importing an `EVE-O-Preview.json` also brings in its **CycleGroup1–5** groups (fill-only — your own groups are never overwritten).
 - **Import EVE-O layout…** reads an existing `EVE-O-Preview.json` and fills in matching per-character positions, focus hotkeys, and cycle order (fill-only — it never overwrites layouts you've already set in FCTool).
 
 ### FCTool-exclusive extras
