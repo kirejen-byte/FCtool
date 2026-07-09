@@ -28,17 +28,20 @@ open questions):
 * **Seed target is a FIXED number per fit** (``config["market"]["seed_target"]``,
   default 20), NOT ``DoctrineMember.ideal_*``. The gap builder takes it as
   ``target_fits``.
-* **Modules + subsystems scores (decision #4, as amended by the owner).** BOTH
-  the >=95% contract-similarity score AND the completable-fits
-  binding-constraint computation use HULL + FITTED MODULES + T3 SUBSYSTEMS —
-  charges/drones/cargo are EXCLUDED from those two numbers. (A T3 without its
-  subsystems isn't the doctrine ship.) HOWEVER the per-component depth/breadth
-  DATA (``ComponentAvailability`` rows on ``DoctrineAvailability``) still covers
-  the FULL fit bill-of-materials (hull, modules, subsystems, charges, drones —
-  each row carries its ``role`` so a later UI can show complete tables), and the
-  gap/shopping-list exporters accept whatever component subset they are handed
-  (default: the scored set — hull + modules + subsystems). See
-  ``_SCORING_MODULE_ROLES`` and ``fit_bom``.
+* **Two seeding scores, two scopes (decision #4, as amended; cargo split added
+  in v3.1.0).** The MARKET-side seeding score — ``completable_fits`` and
+  ``breadth_pct`` in ``_fit_availability`` — covers the FULL bill of materials
+  (hull + modules + subsystems + charges + cargo + drones): it answers "can the
+  staging market supply EVERYTHING this fit needs", so a shopping-list hauler
+  whose gear rides in cargo is only as seedable as its scarcest cargo/ammo/drone
+  line. The CONTRACT >=95% similarity score keeps the fitted subset (HULL gate +
+  FITTED MODULES + T3 SUBSYSTEMS; charges/drones/cargo excluded) because an
+  item-exchange contract sells the *fitted hull*, not the cargo it happens to
+  carry — and a T3 without its subsystems isn't the doctrine ship. The
+  per-component depth/breadth DATA (``ComponentAvailability`` rows on
+  ``DoctrineAvailability``) has always covered the full BoM (each row carries its
+  ``role``), and the gap/shopping-list exporters default to that same full BoM.
+  See ``_CONTRACT_MATCH_ROLES`` (the contract-only subset) and ``fit_bom``.
 
 Thread-safety: a scan holds no mutable shared state except the JSON cache, which
 is guarded by a ``threading.Lock`` around every read-modify-write (the same
@@ -117,18 +120,23 @@ _FILTER_PROGRESS_STRIDE = 25
 # fit iff same hull AND similarity >= this.
 SIMILARITY_THRESHOLD = 0.95
 
-# Roles that count toward the TWO scored numbers (similarity + completable_fits)
-# under owner decision #4 (as amended): hull + fitted modules + T3 subsystems.
-# The hull is handled separately as the similarity GATE (condition (a)); for
-# completable_fits the hull IS one of the scored components (a fit needs its
-# hull). Charges, drones and cargo are EXCLUDED from these two scores but still
-# appear in the full-BoM component data.
+# Roles that count toward the CONTRACT >=95% similarity match — the ONLY score
+# that still uses the fitted subset (hull gate + fitted modules + T3 subsystems).
+# The hull is handled separately as the similarity GATE (condition (a)); the
+# multiset built from this set is modules + subsystems. Charges, drones and cargo
+# are EXCLUDED here because an item-exchange contract sells the *fitted hull* —
+# the ammo/boosters/drones a shopping-list fit carries in cargo are not part of
+# the ship being sold on contract.
 #
-# Subsystems count by explicit owner ruling: a T3 without its subsystems isn't
-# the doctrine ship, so a contract missing a subsystem must fall below the 95%
-# match and a market short on subsystems must show them as the seeding
-# bottleneck.
-_SCORING_MODULE_ROLES = frozenset({"module", "subsystem"})
+# THE SPLIT (v3.1.0): this governs CONTRACT matching ONLY. The MARKET-side seeding
+# score (``completable_fits`` + ``breadth_pct`` in ``_fit_availability``) counts
+# the FULL bill of materials — "can the market supply everything this fit needs,
+# cargo and ammo included" — so a hauler whose gear is all in cargo no longer
+# reads as fully seeded off its hull alone.
+#
+# Subsystems count by explicit owner ruling: a T3 without its subsystems isn't the
+# doctrine ship, so a contract missing a subsystem must fall below the 95% match.
+_CONTRACT_MATCH_ROLES = frozenset({"module", "subsystem"})
 
 
 def _now_iso() -> str:
@@ -378,10 +386,10 @@ class DoctrineAvailability:
     hull_type_id: int
     hull_name: str
     components: list[ComponentAvailability]  # FULL BoM (hull+modules+charges+drones)
-    completable_fits: int  # min(completable) over SCORED components = binding constraint
-    binding_type_id: int | None  # the component that limits completable_fits
+    completable_fits: int  # min(completable) over the FULL BoM = binding constraint
+    binding_type_id: int | None  # component that limits completable_fits (may be cargo/ammo/drone)
     binding_name: str | None
-    breadth_pct: float  # % of SCORED components with on_market == True
+    breadth_pct: float  # % of ALL BoM components (full fit) with on_market == True
     # Depth split for the birds-eye view:
     market_hulls: int  # hull units on the local market
     contract_matches: int  # count of similar contracts (from ContractScan)
@@ -838,11 +846,13 @@ class MarketScanner:
         the binding-constraint ``completable_fits``.
 
         ``components`` on each result carries the FULL bill-of-materials (hull +
-        modules + subsystems + charges + drones), each row flagged by ``role``,
-        so a later UI can render complete tables. ``completable_fits`` and
-        ``breadth_pct`` are computed over the SCORED subset only (hull + modules
-        + subsystems, per owner decision #4 as amended; charges/drones/cargo
-        excluded).
+        modules + subsystems + charges + cargo + drones), each row flagged by
+        ``role``, so a later UI can render complete tables. ``completable_fits``
+        and ``breadth_pct`` are computed over that SAME full BoM (v3.1.0): the
+        market must supply everything the fit needs — cargo, ammo and drones
+        included — so a shopping-list hauler's binding constraint can be a cargo
+        line. (Only the CONTRACT >=95% match keeps the fitted subset; see
+        ``_CONTRACT_MATCH_ROLES``.)
         """
         results: list[DoctrineAvailability] = []
         for member in getattr(doctrine, "members", []):
@@ -872,12 +882,14 @@ class MarketScanner:
                 )
             )
 
-        # Scored subset (hull + modules + subsystems) for completable_fits + breadth.
-        scored = [
-            ca
-            for ca in comps
-            if ca.component.role == "hull" or ca.component.role in _SCORING_MODULE_ROLES
-        ]
+        # Market-side seeding score spans the FULL bill of materials (hull +
+        # modules + subsystems + charges + cargo + drones): completable_fits and
+        # breadth answer "can the staging market supply EVERYTHING this fit
+        # needs". A shopping-list hauler that stashes its gear in cargo is only as
+        # seedable as its scarcest cargo/ammo/drone line — the binding component
+        # below may be a cargo item. (Contract >=95% matching keeps the fitted
+        # subset; see ``_CONTRACT_MATCH_ROLES``.)
+        scored = comps
         if scored:
             binding = min(scored, key=lambda ca: ca.completable)
             completable_fits = binding.completable
@@ -1414,12 +1426,12 @@ class MarketScanner:
         (``None``) = the FULL BoM — hull + modules + subsystems + charges + cargo
         + drones — so the seeding shopping list covers modules, implants,
         boosters, ammo, drones and everything else the doctrine's fits carry
-        (owner requirement). This is intentionally WIDER than the completable-fits
-        / breadth scoring (which stays modules + subsystems + the hull gate): a
-        fit is flyable without its cargo, but a seeding list is not complete
-        without it. Pass an explicit ``components`` iterable to narrow — e.g.
-        ``{"module", "subsystem"}`` for the flyable-only subset, or ``["hull"]``
-        for hulls alone. ``components="full"`` is a synonym for the default.
+        (owner requirement). Since v3.1.0 this MATCHES the completable-fits /
+        breadth scoring, which now spans the same full BoM — the shopping list and
+        the "N fits" score agree on what a fit needs. Pass an explicit
+        ``components`` iterable to narrow — e.g. ``{"module", "subsystem"}`` for a
+        fitted-only subset, or ``["hull"]`` for hulls alone. ``components="full"``
+        is a synonym for the default.
         """
         # needed[type_id] -> (name, total needed units)
         needed: dict[int, list] = {}  # type_id -> [name, needed]
@@ -1770,13 +1782,13 @@ def fit_bom(parsed, catalog=None) -> list[Component]:
     ship carried in cargo is still skipped (no sanctioned cargo-ship token in the
     grammar), which ``fit_bom`` keeps — hence "superset". ``fit_bom`` likewise
     carries every cargo + loaded-charge line (role ``"cargo"``/``"charge"``) so a
-    full component table is available. Only the two scored numbers
-    (``completable_fits`` / >=95% similarity) still exclude cargo/charges (see
-    ``_SCORING_MODULE_ROLES``). The default gap list, by contrast, INCLUDES them:
-    since commit 2ca9f42 ``gap_list(components=None)`` shops the full BoM — cargo,
-    charges and drones included — because a seeding list is not complete without
-    the ammo/boosters/drones the fits carry (narrow it with an explicit
-    ``components`` set for the flyable-only subset).
+    full component table is available. Since v3.1.0 the MARKET seeding score
+    (``completable_fits`` + breadth) counts this full BoM too — only the CONTRACT
+    >=95% similarity still excludes cargo/charges/drones (an item-exchange
+    contract sells the fitted hull; see ``_CONTRACT_MATCH_ROLES``). The default
+    gap list likewise shops the full BoM — cargo, charges and drones included —
+    since a seeding list is not complete without the ammo/boosters/drones the fits
+    carry (narrow it with an explicit ``components`` set for a fitted-only export).
     """
 
     def _name(type_id: int, fallback: str = "") -> str:
@@ -1899,7 +1911,7 @@ def _contract_scoring_spec(fit, catalog) -> _ScoringSpec:
     multiset: dict[int, int] = {}
     total = 0
     for c in fit_bom(fit.parsed, catalog):
-        if c.role in _SCORING_MODULE_ROLES:
+        if c.role in _CONTRACT_MATCH_ROLES:
             multiset[c.type_id] = multiset.get(c.type_id, 0) + c.per_fit_qty
             total += c.per_fit_qty
     return _ScoringSpec(
@@ -2078,10 +2090,9 @@ def _resolve_gap_role_filter(components):
       subsystems + charges + cargo + drones. The seeding export must cover
       modules, implants, boosters, ammo, drones, and anything else a doctrine's
       shopping-list fit carries in cargo — so the default is the whole BoM, not
-      the flyable-only scored subset. (This is deliberately wider than the
-      completable-fits / breadth scoring, which stays modules + subsystems + the
-      hull gate — a fit is flyable without its cargo, but a seeding list is not
-      complete without it.)
+      the fitted-only subset. (Since v3.1.0 the default matches the
+      completable-fits / breadth scoring, which now spans the same full BoM — the
+      shopping list and the seeding "N fits" score agree on what a fit needs.)
     * ``"full"`` → identical to the default (every role); kept as an explicit
       keyword for call sites that want to state the intent.
     * an iterable of role strings → exactly those roles (e.g. ``["hull"]`` or
