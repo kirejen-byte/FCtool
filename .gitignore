@@ -62,3 +62,7 @@ gamelog_monitor_state.json
 
 # Test suite: kept on disk for local TDD, not committed/published (owner preference)
 tests/
+
+# SDE download cache for tools/gen_map_layout.py (the ~SDE jsonl zip is large and
+# re-downloadable; only the generated map_layout.json is committed).
+tools/_cache/
