@@ -57,8 +57,11 @@ def _declutter(items, cell_w: float, cell_h: float) -> list:
 # --- zoom bands (spec §2.4; thresholds tunable) -----------------------------
 @dataclass(frozen=True)
 class BandStyle:
-    glow_radius: int      # sprite radius px
-    core_radius: int
+    """Per-band draw toggles. Node SIZES (glow radius, core radius) are no longer
+    band constants -- they are computed per frame from zoom depth by
+    node_metrics(), so deep zoom stays elegant at EVERY level (owner: cores read
+    too large close-in), not just band C. BandStyle now carries only the edge /
+    label / ring choices."""
     edge_width: int       # widest (dim) pass; 0 = aaline only
     edge_dim: float       # brightness of the aaline pass
     system_labels: bool
@@ -68,16 +71,26 @@ class BandStyle:
 
 
 BAND_STYLES = {
-    # U tuned at the Phase B checkpoint (glow 8->5, core 2->1, edge_dim 0.35->0.28,
-    # ring dropped) so ~2px-spaced systems stop fusing into white-cored blobs.
-    "U": BandStyle(glow_radius=5, core_radius=1, edge_width=0, edge_dim=0.28,
-                   system_labels=False, hub_labels=False, label_px=0,
-                   core_ring=False),
-    "M": BandStyle(glow_radius=14, core_radius=3, edge_width=2, edge_dim=0.55,
-                   system_labels=False, hub_labels=True, label_px=13),
-    "C": BandStyle(glow_radius=22, core_radius=3, edge_width=3, edge_dim=0.55,
-                   system_labels=True, hub_labels=False, label_px=13),
+    # U keeps the ring OFF so ~2px-spaced systems stop fusing into white-cored
+    # blobs; M/C request the sec-colour ring but node_metrics still gates it on
+    # core_r >= 2 (a ring around a 1px core reads as a blob -- the close-in
+    # complaint).
+    "U": BandStyle(edge_width=0, edge_dim=0.28, system_labels=False,
+                   hub_labels=False, label_px=0, core_ring=False),
+    "M": BandStyle(edge_width=2, edge_dim=0.55, system_labels=False,
+                   hub_labels=True, label_px=13),
+    "C": BandStyle(edge_width=3, edge_dim=0.55, system_labels=True,
+                   hub_labels=False, label_px=13),
 }
+
+
+def node_metrics(px_per_edge: float) -> tuple[int, int]:
+    """(glow_radius, core_radius) from zoom depth. px_per_edge = cam.scale x
+    median world edge length. Grows softly, capped so deep zoom stays elegant
+    (owner: cores read too large close-in)."""
+    glow = int(min(18.0, max(4.0, px_per_edge * 0.28)))
+    core = 1 if px_per_edge < 22 else 2
+    return glow, core
 
 
 def pick_band(visible_count: int) -> str:
@@ -100,7 +113,28 @@ class TintSpec:
 
 # --- cached asset factories --------------------------------------------------
 class SpriteFactory:
-    """Procedural radial glow sprites, cached by (color, radius). ~1 ms total."""
+    """Procedural radial glow sprites, cached by (color, radius).
+
+    Each sprite is a SMOOTH radial gradient: _N concentric filled circles drawn
+    from a wide dim ring (radius = ss/2) inward to a bright core (radius = ss/8)
+    on a supersampled SRCALPHA surface, then smoothscaled DOWN to (2r, 2r). The
+    supersample + downscale melts the discrete rings into a soft falloff, instead
+    of the blocky plateau+rim a single small upscaled disc produced (owner: live
+    app read blockier than the POC).
+
+    Mechanism (verified empirically, see report): the sprites are blitted with
+    BLEND_RGB_ADD, which in SDL/pygame IGNORES source per-pixel alpha and adds
+    only RGB -- (r,g,b,10) and (r,g,b,255) add identically. So the VISIBLE
+    gradient must live in the RGB channels: each ring's colour is scaled by a
+    quadratic-eased weight (_RGB_OUT.._RGB_IN). The alpha channel is ALSO ramped
+    (_A_OUT.._A_IN) as a faithful gradient descriptor (sampled by tests / usable
+    by any future alpha-respecting blit), but it does not affect the additive
+    render. Cache key is unchanged, so this is a drop-in for every caller."""
+
+    _N = 8                          # concentric rings
+    _SS_MAX = 512                   # supersample-surface cap (bounds big-nebula cost)
+    _A_IN, _A_OUT = 70, 6           # inner/outer alpha -- gradient descriptor only
+    _RGB_IN, _RGB_OUT = 0.90, 0.05  # inner/outer colour weight -- the ADDITIVE gradient
 
     def __init__(self) -> None:
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
@@ -109,12 +143,26 @@ class SpriteFactory:
         key = (color, radius)
         got = self._cache.get(key)
         if got is None:
-            s = pygame.Surface((radius, radius), pygame.SRCALPHA)
-            pygame.draw.circle(s, (*color, 70), (radius // 2, radius // 2),
-                               max(radius // 3, 1))
-            got = pygame.transform.smoothscale(s, (radius * 2, radius * 2))
+            got = self._build(color, radius)
             self._cache[key] = got
         return got
+
+    def _build(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
+        target = max(2 * radius, 2)
+        ss = max(min(8 * radius, self._SS_MAX), target)   # supersample edge, >= target
+        src = pygame.Surface((ss, ss), pygame.SRCALPHA)
+        c = ss // 2
+        outer, inner = ss / 2.0, ss / 8.0
+        n = self._N
+        for i in range(n):                                # outer(dim) -> inner(bright)
+            u = i / (n - 1)
+            e = u * u                                     # quadratic ease -> long soft tail
+            rr = max(int(round(outer - (outer - inner) * u)), 1)
+            a = int(round(self._A_OUT + (self._A_IN - self._A_OUT) * e))
+            w = self._RGB_OUT + (self._RGB_IN - self._RGB_OUT) * e
+            col = (int(color[0] * w), int(color[1] * w), int(color[2] * w), a)
+            pygame.draw.circle(src, col, (c, c), rr)
+        return pygame.transform.smoothscale(src, (target, target))
 
 
 class LabelFactory:
@@ -183,6 +231,7 @@ class Renderer:
         self.sprites = SpriteFactory()
         self.labels = LabelFactory()
         self._region_info = self._build_region_info()
+        self._median_edge = median_edge_length(model)
 
     def _build_region_info(self):
         """Per-region: (anchor_x, anchor_y, world_radius, tint) for the nebula.
@@ -216,6 +265,7 @@ class Renderer:
         x0, y0, x1, y1 = cam.visible_world_rect(vw, vh, margin_px=margin)
         visible = list(self.model.systems_in_rect(x0, y0, x1, y1))
         st = BAND_STYLES[band or pick_band(len(visible))]
+        glow_r, core_r = node_metrics(cam.scale * self._median_edge)
 
         self._draw_nebula(surf, cam, vw, vh)
         pos = {sid: cam.world_to_screen(self.model.systems[sid].x,
@@ -227,7 +277,7 @@ class Renderer:
             self._draw_edges_degraded(surf, cam, vw, vh, pos, vis_set)
         else:
             self._draw_edges(surf, st, pos, vis_set, cam, vw, vh)
-        self._draw_systems(surf, st, pos, tint)
+        self._draw_systems(surf, st, pos, glow_r, core_r, tint)
         if bloom and mode != "degraded":
             _bloom_pass(surf)
         self._draw_labels(surf, st, pos, cam, vw, vh)
@@ -277,29 +327,29 @@ class Renderer:
         _bloom_pass(layer)
         surf.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
-    def _draw_systems(self, surf, st, pos, tint=None):
+    def _draw_systems(self, surf, st, pos, glow_r, core_r, tint=None):
         systems = self.model.systems
         bright = tint.bright if tint is not None else None
         halo = tint.halo if tint is not None else None
+        hub_bonus = max(3, glow_r // 3)             # was a flat +6; scales with zoom
         for sid, (sx, sy) in pos.items():
             s = systems[sid]
             color = sec_color(s.sec)
             dimmed = bright is not None and sid not in bright
             if halo is not None and sid in halo:
-                hg = self.sprites.glow(SEC_NULL, st.glow_radius + 8)
+                hg = self.sprites.glow(SEC_NULL, glow_r + 8)
                 surf.blit(hg, (sx - hg.get_width() / 2, sy - hg.get_height() / 2),
                           special_flags=pygame.BLEND_RGB_ADD)
             draw_color = dim(color, 0.35) if dimmed else color
-            radius = st.glow_radius + (6 if sid in HUB_IDS else 0)
+            radius = glow_r + (hub_bonus if sid in HUB_IDS else 0)
             g = self.sprites.glow(draw_color, radius)
             surf.blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
                       special_flags=pygame.BLEND_RGB_ADD)
             if dimmed:
                 continue                            # no core/ring on dimmed systems
-            cr = st.core_radius
-            gfx.filled_circle(surf, int(sx), int(sy), cr, (255, 255, 255))
-            if st.core_ring:
-                gfx.aacircle(surf, int(sx), int(sy), cr, color)
+            gfx.filled_circle(surf, int(sx), int(sy), core_r, (255, 255, 255))
+            if st.core_ring and core_r >= 2:        # ring around a 1px core = blob
+                gfx.aacircle(surf, int(sx), int(sy), core_r, color)
 
     def _draw_labels(self, surf, st, pos, cam, vw, vh):
         if st.system_labels:
