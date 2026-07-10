@@ -192,9 +192,20 @@ class LabelFactory:
 
 # --- Tk hand-off -------------------------------------------------------------
 def surface_to_ppm(surf: pygame.Surface) -> bytes:
-    """P6 PPM bytes for tk.PhotoImage(data=...). ~5 ms at 1280x850 (measured)."""
+    """P6 PPM bytes for tk.PhotoImage(data=...). ~5 ms at 1280x850 (measured).
+    Accepts a subsurface (Task 17 center crop): pygame.image.tobytes walks the
+    subsurface's region/pitch correctly, so no copy is needed."""
     w, h = surf.get_size()
     return b"P6\n%d %d\n255\n" % (w, h) + pygame.image.tobytes(surf, "RGB")
+
+
+def center_subsurface(surf: pygame.Surface, margin: int, vw: int, vh: int) -> pygame.Surface:
+    """Viewport-sized center crop of a MARGINED render (Task 17). Returns a
+    subsurface VIEW that shares the parent's pixels (no copy); surface_to_ppm()
+    reads it directly. Kept here so map_tab.py never imports pygame (module
+    invariant: only map_render touches pygame). Use the result transiently -- a
+    retained subsurface keeps the parent surface subsurface-locked."""
+    return surf.subsurface(pygame.Rect(margin, margin, vw, vh))
 
 
 # --- frame pipeline (spec §4.2 order) ---------------------------------------
@@ -394,7 +405,13 @@ def _bloom_pass(surf: pygame.Surface) -> None:
 class FrameCache:
     """Holds the last crisp frame + its camera; quick_frame() derives a gesture
     frame by crop+smoothscale (round-2 benchmark: ~36 ms at 1280x850) so zoom
-    feels continuous while the worker renders the crisp frame in background."""
+    feels continuous while the worker renders the crisp frame in background.
+
+    The stored surface may be LARGER than the viewport (Task 17: the worker
+    renders a MARGIN border on every side so pan / zoom-out serve real content
+    instead of a black edge). store() records the SURFACE dims; the source-rect
+    math works in world space against the cached camera + those surface dims, so
+    a viewport smaller than the surface is normal -- not a bail."""
 
     def __init__(self) -> None:
         self._surf: pygame.Surface | None = None
@@ -404,16 +421,22 @@ class FrameCache:
         self._vw = 0
         self._vh = 0
 
-    def store(self, surf: pygame.Surface, cam, vw: int, vh: int) -> None:
+    def store(self, surf: pygame.Surface, cam, view_vw: int, view_vh: int) -> None:
+        """Cache the crisp frame + camera. `surf` may be MARGINED (larger than
+        the viewport); the source-rect math needs the SURFACE dims, so record
+        those from surf.get_size(). `view_vw`/`view_vh` are the viewport dims the
+        caller displays -- informational (the surface is centered on the same
+        camera with margin on every side); they are no longer used for a
+        size-match bail (Task 17)."""
         self._surf = surf
         self._cx, self._cy, self._scale = cam.cx, cam.cy, cam.scale
-        self._vw, self._vh = vw, vh
+        self._vw, self._vh = surf.get_size()
 
     def clear(self) -> None:
         self._surf = None
 
     def quick_frame(self, cam, vw: int, vh: int) -> pygame.Surface | None:
-        if self._surf is None or (vw, vh) != (self._vw, self._vh):
+        if self._surf is None:          # a viewport != surface dims is normal (margin)
             return None
         ratio = cam.scale / self._scale
         # Wanted viewport corners in CACHED-frame pixel coordinates:

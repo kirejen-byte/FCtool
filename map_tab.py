@@ -27,6 +27,10 @@ import map_render as mr
 ZOOM_STEP = 1.15
 SETTLE_MS = 120.0
 TICK_MS = 60
+# Worker renders this many px beyond the viewport on every side (Task 17). Tk
+# still shows a viewport-sized center crop, but the FULL margined frame is cached
+# so pan / zoom-out serve real content instead of a black edge within +/-MARGIN.
+MARGIN = 224
 BG_HEX = "#0a0a14"
 
 # Strips the " (X.X ly)" annotation the range/threat option labels carry so a
@@ -213,6 +217,7 @@ class MapTab:
         self._tick_scheduled = False
         self._drag_last: tuple[int, int] | None = None
         self._img_offset = (0.0, 0.0)
+        self._last_drag_qf = 0.0        # last drag quick-frame time (throttle, Task 17)
 
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -404,24 +409,33 @@ class MapTab:
             mode = req["mode"]
             if mode == "auto":
                 mode = self.stats.suggest_mode()
-            surf = self.renderer.render(cam, req["vw"], req["vh"],
+            vw, vh = req["vw"], req["vh"]
+            # Render a MARGIN-px border beyond the viewport on every side. The
+            # camera projects around the surface center, so a bigger surface just
+            # shows more world all around (no camera math changes) -- Task 17.
+            surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
                                         bloom=req["bloom"], mode=mode,
                                         tint=req.get("tint"))
             ms = (time.perf_counter() - t0) * 1000.0
             self.stats.record(ms)
-            ppm = mr.surface_to_ppm(surf)
+            # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
+            # surface_to_ppm reads it directly). Build it transiently so the
+            # parent surf is not left subsurface-locked across the queue hand-off.
+            ppm = mr.surface_to_ppm(mr.center_subsurface(surf, MARGIN, vw, vh))
             # Hand off to the main thread (no Tcl calls here); _tick applies it.
-            self._result_q.put((req["generation"], ppm, surf, cam,
-                                req["vw"], req["vh"], ms))
+            # surf is the FULL margined frame -> _apply_frame caches it (view dims).
+            self._result_q.put((req["generation"], ppm, surf, cam, vw, vh, ms))
 
     def _apply_frame(self, generation: int, ppm: bytes, surf, cam,
                      vw: int, vh: int, ms: float) -> None:
         if not self._visible or not self.state.is_current(generation):
             return
-        self._photo = tk.PhotoImage(data=ppm)
+        self._photo = tk.PhotoImage(data=ppm)   # ppm = viewport-sized center crop
         self.canvas.itemconfig(self._img_item, image=self._photo)
         self.canvas.coords(self._img_item, 0, 0)
         self._img_offset = (0.0, 0.0)
+        # surf is the FULL margined frame; store records its surface dims so
+        # quick_frame can serve the margin during pan/zoom-out (Task 17).
         self.frame_cache.store(surf, cam, vw, vh)
         self.status.config(text=f"render {ms:.0f} ms")
         self._redraw_overlays()          # reproject Tk overlay items onto the fresh frame
@@ -438,16 +452,23 @@ class MapTab:
             "tint": self.state.tint_spec(),   # immutable TintSpec -> thread-safe
         })
 
-    def _show_gesture_frame(self) -> None:
+    def _show_gesture_frame(self) -> bool:
+        """Swap in a FrameCache quick frame for the live camera. Returns True if a
+        frame was shown (cache had content), False if the cache was empty. On a
+        swap it resets _img_offset to (0, 0): the quick frame is already
+        camera-correct, so any drag-slide offset accumulated on the stale image
+        must be cleared (Task 17 relies on this)."""
         quick = self.frame_cache.quick_frame(self.state.camera,
                                              self.state.vw, self.state.vh)
-        if quick is not None:
-            self.state.next_generation()          # invalidate in-flight crisp
-            self._photo = tk.PhotoImage(data=mr.surface_to_ppm(quick))
-            self.canvas.itemconfig(self._img_item, image=self._photo)
-            self.canvas.coords(self._img_item, 0, 0)
-            self._img_offset = (0.0, 0.0)
-            self._redraw_overlays()           # reproject overlays onto the gesture frame
+        if quick is None:
+            return False
+        self.state.next_generation()          # invalidate in-flight crisp
+        self._photo = tk.PhotoImage(data=mr.surface_to_ppm(quick))
+        self.canvas.itemconfig(self._img_item, image=self._photo)
+        self.canvas.coords(self._img_item, 0, 0)
+        self._img_offset = (0.0, 0.0)
+        self._redraw_overlays()           # reproject overlays onto the gesture frame
+        return True
 
     # ---- tick loop ---------------------------------------------------------------
     def _schedule_tick(self) -> None:
@@ -507,7 +528,18 @@ class MapTab:
         ox, oy = self._img_offset
         self._img_offset = (ox + dx, oy + dy)
         self.canvas.coords(self._img_item, *self._img_offset)   # cheap live pan
-        self._redraw_overlays()                                 # keep overlays glued to nodes
+        # ALSO serve a throttled real-content frame from the margined cache
+        # (Task 17): the slide above covers the 0-33 ms window; a quick frame then
+        # swaps in real margin content (resetting _img_offset to 0) so panning
+        # shows no black edge within +/-MARGIN. _show_gesture_frame redraws the
+        # overlays itself on a swap, so only redraw here when it didn't swap.
+        now = _now_ms()
+        swapped = False
+        if now - self._last_drag_qf >= 33.0:
+            self._last_drag_qf = now
+            swapped = self._show_gesture_frame()
+        if not swapped:
+            self._redraw_overlays()                             # keep overlays glued to nodes
         self._schedule_tick()
 
     def _on_drag_end(self, _event) -> None:
