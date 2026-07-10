@@ -1,9 +1,11 @@
 """Star-map Tk tab: canvas + bitmap base layer + worker-thread rendering.
 
 Threading (house idiom): one daemon render worker; requests coalesce
-latest-wins via a generation counter; results marshal back with
-root.after(0, ...). The gesture path (wheel zoom) shows FrameCache
-quick-frames instantly; a crisp render lands ~settle_ms after input stops.
+latest-wins via a generation counter. The worker renders and puts finished
+frames on a thread-safe queue; the main-thread tick loop drains it
+(latest-wins) and applies frames. The gesture path (wheel zoom) shows
+FrameCache quick-frames instantly; a crisp render lands ~settle_ms after
+input stops.
 
 This module never imports fc_gui — the host injects config accessors and
 right-click callbacks. Only map_render touches pygame; only this file (and
@@ -149,7 +151,6 @@ class MapTab:
         self.canvas.pack(fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
-        self._hover_ring = None
 
         self.state = MapTabState(vw=800, vh=600)
         self.renderer = None
@@ -192,6 +193,13 @@ class MapTab:
         self._schedule_tick()
 
     def on_hidden(self) -> None:
+        if self.renderer is None:
+            # Hidden before the first show: the camera is still at fresh
+            # defaults (the fit-universe sentinel hasn't been applied yet).
+            # Persisting it now would clobber restore_camera's fit sentinel and
+            # reopen the map at max zoom on empty space -- save nothing.
+            self._visible = False
+            return
         self._visible = False
         cam = dict(self.state.camera.to_dict())
         merged = dict(self.cfg)
@@ -322,10 +330,13 @@ class MapTab:
         self.canvas.delete("hover")
         if sid is not None:
             s = self.state.model.systems[sid]
+            # The live camera projection already equals the on-canvas position
+            # of the translated stale image (pan updates the camera live while
+            # the image item is offset to match), so do NOT add _img_offset --
+            # that would overshoot by the drag distance during the pre-settle
+            # window.
             sx, sy = self.state.camera.world_to_screen(s.x, s.y,
                                                        self.state.vw, self.state.vh)
-            ox, oy = self._img_offset
-            sx, sy = sx + ox, sy + oy
             self.canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
                                     outline="#e0e0e0", width=1, tags="hover")
             self.canvas.create_text(sx + 12, sy - 12, anchor="w", tags="hover",
