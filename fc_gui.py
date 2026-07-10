@@ -163,6 +163,13 @@ FG_MAGENTA = "#ff66ff"
 FG_UNDER = "#ff6666"
 BORDER_COLOR = "#2a2a4a"
 
+# ── Main-thread UI dispatcher ──────────────────────────────────────────────────
+# How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
+# callbacks on the main thread. Workers never touch Tk; they enqueue via
+# _post_ui / _post_ui_after and this loop applies the work. See the tk-thread
+# audit: docs/superpowers/specs/2026-07-10-tk-thread-audit.md.
+DRAIN_MS = 50
+
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
 # The full TOC panel yields to content when the tab gets too narrow: it collapses
 # to a slim ribbon and the content reclaims the panel's width, so the SSO
@@ -656,6 +663,19 @@ class FCToolGUI:
         # one thread cannot interleave with a write on another and corrupt or
         # clobber settings. Created before any save path can run.
         self._config_lock = threading.Lock()
+        # Main-thread UI dispatcher queue. Background workers never touch Tk
+        # directly; they enqueue (fn, args) via _post_ui / _post_ui_after and the
+        # main-thread _drain_ui_q loop (armed once after the UI is built) applies
+        # them. This is the sole worker->UI channel and keeps Tcl single-threaded
+        # even under an update()-pumped host. See the tk-thread-safety audit.
+        self._ui_q = queue.Queue()
+        # Thread-safe mirrors of two Intel-panel Tk Vars that off-main workers
+        # would otherwise read directly (Class B data races). The fusion Event
+        # gates the intel poll loop; the min-reported int is read by the
+        # ChatMonitor message callback. Both are kept in sync on the main thread
+        # by Var write-traces wired when the widgets are created in _build_ui.
+        self._intel_fusion_enabled = threading.Event()
+        self._intel_min_reported = 0
         # Short TTL cache for get_fleet_info() shared by _fleet_boss_session and
         # _fleet_boss_info. The Fleet Templates window calls both back-to-back on
         # entering live mode; without this each does its own ESI round-trip.
@@ -903,6 +923,11 @@ class FCToolGUI:
         self._load_system_names_async()
 
         self._build_ui()
+        # Arm the main-thread UI dispatcher drain now that the notebook exists.
+        # From here on, background workers marshal UI work through _post_ui /
+        # _post_ui_after and this loop applies it on the main thread. Armed before
+        # _start_monitoring so it is running before any worker can enqueue.
+        self._drain_ui_q()
         self._setup_modules()
         self._start_monitoring()
 
@@ -946,6 +971,43 @@ class FCToolGUI:
         self.root.bind_all("<MouseWheel>", self._on_global_mousewheel)
         self.root.bind_all("<Button-4>", self._on_global_mousewheel)
         self.root.bind_all("<Button-5>", self._on_global_mousewheel)
+
+    # ── Main-thread UI dispatcher ─────────────────────────────────────────────
+    # Background workers never touch Tk directly. They enqueue callables via
+    # _post_ui / _post_ui_after; the main-thread _drain_ui_q loop (armed once in
+    # __init__ after _build_ui) applies them, keeping Tcl single-threaded even
+    # under an update()-pumped host. See the tk-thread-safety audit/spec.
+
+    def _post_ui(self, fn, *a):
+        """Queue ``fn(*a)`` to run on the main thread. Safe from any thread."""
+        self._ui_q.put((0, fn, a))
+
+    def _post_ui_after(self, ms, fn, *a):
+        """Queue ``fn(*a)`` to run on the main thread after ``ms`` ms.
+
+        Safe from any thread; the delay is applied by the main-thread drain via
+        ``root.after`` (a main-thread schedule)."""
+        self._ui_q.put((ms, fn, a))
+
+    def _drain_ui_q(self):
+        """Main-thread pump: apply queued worker->UI work, then re-arm itself.
+
+        ms>0 items are handed to ``root.after`` (a safe main-thread schedule);
+        ms==0 items run inline now. A raising callback is logged and never breaks
+        the drain. Re-arms every ``DRAIN_MS`` ms."""
+        while True:
+            try:
+                ms, fn, a = self._ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if ms:
+                    self.root.after(ms, fn, *a)   # main-thread schedule = safe
+                else:
+                    fn(*a)
+            except Exception as exc:
+                print(f"[UI-Q] {exc}")
+        self.root.after(DRAIN_MS, self._drain_ui_q)
 
     # ── System Names for Autocomplete ─────────────────────────────────────────
 
@@ -3466,6 +3528,12 @@ class FCToolGUI:
         intel_row.pack(fill=tk.X, padx=10, pady=5)
 
         self._intel_fusion_var = tk.BooleanVar(value=False)
+        # Mirror the fusion toggle into a thread-safe Event read by the off-main
+        # intel poll loop (Class B fix). The trace fires on the main thread for
+        # every Var change (checkbutton click or programmatic .set), so the Event
+        # always tracks the toggle without the worker ever reading the Tk Var.
+        self._intel_fusion_var.trace_add(
+            "write", self._mirror_intel_fusion_enabled)
         self._intel_fusion_btn = tk.Checkbutton(
             intel_row, text="Intelligence Fusion",
             variable=self._intel_fusion_var,
@@ -3491,6 +3559,11 @@ class FCToolGUI:
         tk.Label(intel_row, text="  Min Reported:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 0))
         self._intel_min_reported_var = tk.StringVar(value="0")
+        # Mirror the min-reported filter into a plain int read by the off-main
+        # intel message callback (Class B fix). The trace fires on the main
+        # thread whenever the spinbox value changes; the worker reads the int.
+        self._intel_min_reported_var.trace_add(
+            "write", self._mirror_intel_min_reported)
         tk.Spinbox(
             intel_row, from_=0, to=500, textvariable=self._intel_min_reported_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
@@ -19476,15 +19549,16 @@ class FCToolGUI:
         """Capture window screenshot and save to clipboard."""
         self._screenshot_link.config(text="Capturing...", fg=FG_DIM)
         self.root.update_idletasks()
+        # Read the window geometry on the MAIN thread before spawning the worker:
+        # Tk winfo_* is not thread-safe and must never run off-main (Class B fix).
+        # The worker closes over these plain ints and never touches Tk for reads.
+        x = self.root.winfo_rootx()
+        y = self.root.winfo_rooty()
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
 
         def do_capture():
             try:
-                # Capture the window using the window's geometry
-                x = self.root.winfo_rootx()
-                y = self.root.winfo_rooty()
-                w = self.root.winfo_width()
-                h = self.root.winfo_height()
-
                 if sys.platform == "win32":
                     ok, msg = self._capture_screenshot_windows(x, y, w, h)
                 elif sys.platform.startswith("linux"):
@@ -20620,6 +20694,26 @@ $bmp.Dispose()
 
     # ── Intelligence Fusion ────────────────────────────────────────────────
 
+    def _mirror_intel_fusion_enabled(self, *_):
+        """Main-thread Var-trace: keep the thread-safe fusion Event in sync with
+        the ``_intel_fusion_var`` checkbutton so the off-main poll loop never
+        reads a Tk Var (Class B fix). Fires for every Var change (checkbutton
+        click or programmatic .set), so the error-path reset is covered too."""
+        if self._intel_fusion_var.get():
+            self._intel_fusion_enabled.set()
+        else:
+            self._intel_fusion_enabled.clear()
+
+    def _mirror_intel_min_reported(self, *_):
+        """Main-thread Var-trace: mirror the min-reported spinbox into a plain int
+        read by the off-main intel message callback (Class B fix). Tolerates a
+        transient empty/garbage entry by falling back to 0 (same tolerance the
+        worker had when it parsed the Var directly)."""
+        try:
+            self._intel_min_reported = int(self._intel_min_reported_var.get())
+        except (ValueError, AttributeError):
+            self._intel_min_reported = 0
+
     def _toggle_intel_fusion(self):
         """Enable or disable intelligence fusion."""
         enabled = self._intel_fusion_var.get()
@@ -20770,7 +20864,7 @@ $bmp.Dispose()
 
     def _intel_poll_loop(self):
         """Background polling loop for intel channels."""
-        while self._intel_monitor and self._intel_fusion_var.get():
+        while self._intel_monitor and self._intel_fusion_enabled.is_set():
             try:
                 self._intel_monitor.poll()
             except Exception:
@@ -20852,10 +20946,10 @@ $bmp.Dispose()
                 report.has_cyno_beacon = self._check_cyno_beacon(report.system_id)
             except Exception:
                 pass
-        try:
-            min_rep = int(self._intel_min_reported_var.get())
-        except (ValueError, AttributeError):
-            min_rep = 0
+        # Read the thread-safe plain mirror (updated on the main thread by a Var
+        # write-trace); the worker must never touch the Tk Var directly (Class B
+        # fix). getattr keeps the original AttributeError tolerance.
+        min_rep = getattr(self, "_intel_min_reported", 0)
         priority = high_priority(report, min_rep) if report else False
         self.root.after(0, self._intel_stream_ingest, msg, spans, report, priority)
 
