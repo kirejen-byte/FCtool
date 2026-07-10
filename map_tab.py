@@ -14,6 +14,7 @@ fc_gui) touch tkinter.
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -27,6 +28,10 @@ ZOOM_STEP = 1.15
 SETTLE_MS = 120.0
 TICK_MS = 60
 BG_HEX = "#0a0a14"
+
+# Strips the " (X.X ly)" annotation the range/threat option labels carry so a
+# menu selection can be stored back as a bare ship/base name (spec §2.5).
+_LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
 
 
 def _now_ms() -> float:
@@ -130,6 +135,14 @@ class MapTabState:
         wx, wy = self.camera.screen_to_world(sx, sy, self.vw, self.vh)
         return self.model.nearest(wx, wy, max_dist=14.0 / self.camera.scale)
 
+    # -- range overlay (menu helper) -------------------------------------------
+    def compute_range_overlay(self, sid: int, ly: float, label: str = "",
+                              within_fn=None, legal_fn=None):
+        """Thin wrapper over map_overlays.compute_range (injectable data fns for
+        tests; defaults bind to system_coords via map_overlays)."""
+        return mo.compute_range(sid, ly, label,
+                                within_fn=within_fn, legal_fn=legal_fn)
+
 
 class MapTab:
     """Tk widget/controller. Host wires: frame into a Notebook tab,
@@ -158,6 +171,22 @@ class MapTab:
         tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=BG_HEX,
                        fg="#8b9bb5", selectcolor="#16213e",
                        command=self._on_bloom_toggle).pack(side="left", padx=8)
+        # --- Phase D layer toggles (fleet/staging/threat) ---
+        _layers = self.cfg.get("layers", {})
+        self._layer_vars: dict[str, tk.BooleanVar] = {
+            "fleet": tk.BooleanVar(value=bool(_layers.get("fleet", True))),
+            "staging": tk.BooleanVar(value=bool(_layers.get("staging", True))),
+            "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
+        }
+        # Current threat-ship selection label (radiobutton var; synced lazily
+        # from cfg["threat_ship"] when the empty-space menu is built).
+        self._threat_var = tk.StringVar()
+        for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
+                            ("threat", "Threat")):
+            tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
+                           bg=BG_HEX, fg="#8b9bb5", selectcolor="#16213e",
+                           command=lambda k=_key: self._on_layer_toggle(k)
+                           ).pack(side="left", padx=4)
         self.status = tk.Label(bar, text="", bg=BG_HEX, fg="#8b9bb5", anchor="e")
         self.status.pack(side="right", padx=6)
 
@@ -219,6 +248,12 @@ class MapTab:
         merged = dict(self.cfg)
         merged["camera"] = cam
         merged["bloom"] = bool(self._bloom_var.get())
+        # Persist the live layer-toggle state (range flag is overlay-driven and
+        # already carried on self.cfg["layers"]; the 3 vars mirror the toolbar).
+        layers = dict(self.cfg.get("layers", {}))
+        for key, var in self._layer_vars.items():
+            layers[key] = bool(var.get())
+        merged["layers"] = layers
         self.cfg.update(merged)
         self.save_cfg(merged)
 
@@ -243,6 +278,11 @@ class MapTab:
 
     def clear_range_overlay(self) -> None:
         self.state.range_overlay = None
+        # Range flag is overlay-driven: clearing unchecks it (decision log).
+        self.cfg.setdefault("layers", {})["range"] = False
+        rv = self._layer_vars.get("range")
+        if rv is not None:
+            rv.set(False)
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
@@ -425,16 +465,26 @@ class MapTab:
         self._schedule_tick()
 
     def _drain_results(self) -> None:
-        """Coalesce worker output to the newest frame and apply it here on the
-        main thread (the generation check in _apply_frame drops stale ones)."""
-        latest = None
+        """Coalesce worker output on the main thread. Two payload shapes share
+        the queue: 7-tuple render frames (latest-wins; the generation check in
+        _apply_frame drops stale ones) and ("threat", frozenset) results from the
+        recompute helper thread. Keep them apart so a threat result is never
+        dropped by frame coalescing, and so a frame is never misread as threat."""
+        latest_frame = None
+        latest_threat = None
         try:
             while True:
-                latest = self._result_q.get_nowait()
+                item = self._result_q.get_nowait()
+                if len(item) == 2 and item[0] == "threat":
+                    latest_threat = item
+                else:
+                    latest_frame = item
         except queue.Empty:
             pass
-        if latest is not None:
-            self._apply_frame(*latest)
+        if latest_frame is not None:
+            self._apply_frame(*latest_frame)
+        if latest_threat is not None:
+            self.set_threat(latest_threat[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -480,32 +530,155 @@ class MapTab:
                                                        self.state.vw, self.state.vh)
             self.canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
                                     outline="#e0e0e0", width=1, tags="hover")
+            label = f"{s.name}  {s.sec:.1f}"
+            ov = self.state.range_overlay
+            if ov is not None:                        # enrich with range info
+                ly = ov.distances.get(sid)
+                if ly is not None:
+                    label += f" · {ly:.1f} ly"
+                if sid in ov.illegal:
+                    label += " · ILLEGAL DEST"
             self.canvas.create_text(sx + 12, sy - 12, anchor="w", tags="hover",
-                                    text=f"{s.name}  {s.sec:.1f}", fill="#e0e0e0",
+                                    text=label, fill="#e0e0e0",
                                     font=("Segoe UI", 9))
 
     def _on_right_click(self, event) -> None:
         sid = self.state.hover_hit(event.x, event.y) if self.renderer else None
-        menu = tk.Menu(self.canvas, tearoff=0)
-        if sid is not None:
-            name = self.state.model.systems[sid].name
-            menu.add_command(label=name, state="disabled")
-            menu.add_separator()
-            self._menu_add(menu, "Set destination", "set_destination", name)
-            self._menu_add(menu, "Open in Dotlan", "open_dotlan", name)
-            self._menu_add(menu, "Navigate WH route", "navigate_wh", name)
-            self._menu_add(menu, "Titan bridge check", "titan_bridge", name)
-            self._menu_add(menu, "Copy name", "copy", name)
-        else:
-            menu.add_command(label="Fit universe", command=self._fit_universe)
-            menu.add_checkbutton(label="Bloom", variable=self._bloom_var,
-                                 command=self._on_bloom_toggle)
+        menu = (self._build_system_menu(sid) if sid is not None
+                else self._build_empty_menu())
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _build_system_menu(self, sid: int) -> tk.Menu:
+        """Right-click-on-a-system menu (spec §2.5): range submenu, clear-range,
+        then the callback-gated system actions incl. staging adds."""
+        name = self.state.model.systems[sid].name
+        menu = tk.Menu(self.canvas, tearoff=0)
+        menu.add_command(label=name, state="disabled")
+        menu.add_separator()
+        # Jump range submenu: 5 grouped classes (live LY) + Custom.
+        range_menu = tk.Menu(menu, tearoff=0)
+        for label, ly in mo.range_options():
+            range_menu.add_command(
+                label=label,
+                command=lambda s=sid, y=ly, l=label: self._menu_apply_range(s, y, l))
+        range_menu.add_separator()
+        range_menu.add_command(label="Custom…",
+                               command=lambda s=sid: self._menu_custom_range(s))
+        menu.add_cascade(label="Jump range from here", menu=range_menu)
+        if self.state.range_overlay is not None:
+            menu.add_command(label="Clear range overlay",
+                             command=self.clear_range_overlay)
+        menu.add_separator()
+        self._menu_add(menu, "Set destination", "set_destination", name)
+        self._menu_add(menu, "Open in Dotlan", "open_dotlan", name)
+        self._menu_add(menu, "Navigate WH route", "navigate_wh", name)
+        self._menu_add(menu, "Titan bridge check", "titan_bridge", name)
+        self._menu_add(menu, "Copy name", "copy", name)
+        self._menu_add(menu, "Add to friendly staging", "add_friendly_staging", name)
+        self._menu_add(menu, "Add to hostile staging", "add_hostile_staging", name)
+        return menu
+
+    def _build_empty_menu(self) -> tk.Menu:
+        """Right-click-on-empty-space menu: view + layer controls."""
+        menu = tk.Menu(self.canvas, tearoff=0)
+        menu.add_command(label="Fit universe", command=self._fit_universe)
+        menu.add_checkbutton(label="Bloom", variable=self._bloom_var,
+                             command=self._on_bloom_toggle)
+        menu.add_separator()
+        menu.add_checkbutton(label="Threat projection",
+                             variable=self._layer_vars["threat"],
+                             command=lambda: self._on_layer_toggle("threat"))
+        # Keep the radio selection in sync with the persisted threat ship.
+        opts = mo.threat_options()
+        current = self.cfg.get("threat_ship", "Titan Bridge")
+        sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
+                   opts[0][0] if opts else "")
+        self._threat_var.set(sel)
+        threat_menu = tk.Menu(menu, tearoff=0)
+        for label, _ly in opts:
+            threat_menu.add_radiobutton(
+                label=label, variable=self._threat_var, value=label,
+                command=lambda l=label: self._on_threat_ship(l))
+        menu.add_cascade(label="Threat ship", menu=threat_menu)
+        menu.add_separator()
+        menu.add_checkbutton(label="Fleet", variable=self._layer_vars["fleet"],
+                             command=lambda: self._on_layer_toggle("fleet"))
+        menu.add_checkbutton(label="Staging", variable=self._layer_vars["staging"],
+                             command=lambda: self._on_layer_toggle("staging"))
+        return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:
         cb = self.callbacks.get(key)
         if cb is not None:
             menu.add_command(label=label, command=lambda: cb(name))
+
+    # ---- range / threat menu helpers -------------------------------------------
+    def _menu_apply_range(self, sid: int, ly: float, label: str) -> None:
+        ov = self.state.compute_range_overlay(sid, ly, label)
+        self.apply_range_overlay(ov)
+        self.cfg.setdefault("layers", {})["range"] = True   # auto-enable the layer
+        rv = self._layer_vars.get("range")
+        if rv is not None:
+            rv.set(True)
+
+    def _menu_custom_range(self, sid: int) -> None:
+        from tkinter import simpledialog
+        ly = simpledialog.askfloat("Custom jump range", "Range (ly):",
+                                   parent=self.frame, minvalue=0.0, maxvalue=40.0)
+        if ly is None or ly <= 0 or ly > 40:       # clamp to (0, 40] (decision log)
+            return
+        self._menu_apply_range(sid, ly, f"Custom ({ly:.1f} ly)")
+
+    def _strip_ly_suffix(self, label: str) -> str:
+        return _LY_SUFFIX.sub("", label).strip()
+
+    def _on_threat_ship(self, label: str) -> None:
+        self.cfg["threat_ship"] = self._strip_ly_suffix(label)   # store base name
+        self._threat_var.set(label)
+        self._recompute_threat()
+
+    def _threat_ly(self) -> float:
+        """LY for the configured threat ship. The grouped option base-labels are
+        NOT SHIP_RANGES keys, so match them against threat_options first, then
+        fall back to ly_for_ship (real ship names + Titan Bridge), then default."""
+        ship = self.cfg.get("threat_ship", "Titan Bridge")
+        for label, ly in mo.threat_options():
+            if self._strip_ly_suffix(label) == ship:
+                return ly
+        return mo.ly_for_ship(ship)
+
+    def _on_layer_toggle(self, key: str) -> None:
+        var = self._layer_vars.get(key)
+        if var is None:
+            return
+        self.cfg.setdefault("layers", {})[key] = bool(var.get())
+        if key == "threat":
+            self._recompute_threat()
+        else:
+            self._redraw_overlays()
+
+    def _recompute_threat(self) -> None:
+        """Recompute the hostile-staging threat halo. Off / no staging -> clear.
+        Otherwise run the (per-staging ~5.5k-system) scan on a helper thread that
+        touches NO Tcl, feeding the result back through the main-thread result
+        queue as a ("threat", frozenset) tuple (drained by _drain_results)."""
+        tv = self._layer_vars.get("threat")
+        on = bool(tv.get()) if tv is not None else False
+        hostile = set(self.state.hostile_staging)
+        if not on or not hostile:
+            self.set_threat(None)
+            return
+        ly = self._threat_ly()
+
+        def work():
+            try:
+                fset = mo.compute_threat(hostile, ly)
+            except Exception as exc:               # never crash the helper thread
+                print(f"[MAP] threat recompute failed: {exc}")
+                return
+            self._result_q.put(("threat", fset))   # applied on the main thread
+
+        threading.Thread(target=work, daemon=True, name="map-threat").start()
 
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)

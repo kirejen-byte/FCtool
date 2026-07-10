@@ -1311,6 +1311,7 @@ class FCToolGUI:
         jr["friendly_staging_systems"] = list(self._friendly_staging)
         jr["hostile_staging_systems"] = list(self._hostile_staging)
         self._save_config()
+        self._push_staging_to_map()      # keep the map staging overlay in sync
 
     def _load_tracked_intel_channels(self) -> list[str]:
         """Return the tracked intel channels from config, seeding on first run.
@@ -5402,18 +5403,95 @@ class FCToolGUI:
 
         # Every handler takes a single system-name string (verified against
         # _intel_system_menu's working invocations), and MapTab calls each as
-        # cb(name) — so they wire straight through with no adapters.
+        # cb(name) — so they wire straight through with no adapters. The staging
+        # adds reuse the Jump Range tab's mutate+persist flow so both tabs (and
+        # the map overlay) stay in sync.
         callbacks = {
             "set_destination": self._set_destination_or_copy,
             "open_dotlan": open_dotlan,
             "navigate_wh": self._navigate_wh_route,
             "titan_bridge": self._navigate_jump_range,
             "copy": copy_name,
+            "add_friendly_staging": lambda name: self._add_staging_from_map(
+                name, "friendly"),
+            "add_hostile_staging": lambda name: self._add_staging_from_map(
+                name, "hostile"),
         }
         self.map_tab = _map_tab_mod.MapTab(tab, cfg=cfg, save_cfg=save_cfg,
                                            callbacks=callbacks,
                                            autocomplete_cls=None)
         self.map_tab.frame.pack(fill="both", expand=True)
+        # Seed the staging overlay from config (resolved names -> ids). Safe
+        # before the first on_shown: set_staging just stores state until render.
+        self._push_staging_to_map()
+
+    # ── Star-map data pushes (fleet / own-location / staging) ─────────────────
+    def _push_fleet_to_map(self, members):
+        """Forward the enriched fleet member list to the star-map tab so it can
+        draw location pins + count badges. Guarded so a missing/erroring map tab
+        never breaks the fleet poller."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.update_fleet(members)
+        except Exception as exc:
+            print(f"[MAP] fleet push failed: {exc}")
+
+    def _push_own_location_to_map(self, system_id):
+        """Forward the tracked character's current solar-system id (or None when
+        unknown/logged out) to the map tab for the own-location ring."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_own_location(system_id)
+        except Exception as exc:
+            print(f"[MAP] own-location push failed: {exc}")
+
+    def _push_staging_to_map(self):
+        """Resolve the friendly/hostile staging name lists to system ids and push
+        them to the map's staging overlay. Called at map build and from the
+        _save_staging_systems choke point so every staging edit propagates."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            import map_overlays as mo
+            jr = self.config.get("jump_range", {})
+            fr = mo.resolve_staging(jr.get("friendly_staging_systems", []))
+            ho = mo.resolve_staging(jr.get("hostile_staging_systems", []))
+            tab.set_staging(friendly_ids=set(fr), hostile_ids=set(ho))
+        except Exception as exc:
+            print(f"[MAP] staging push failed: {exc}")
+
+    def _add_staging_from_map(self, name, target):
+        """Map right-click -> add a system to a staging list. Reuses the Jump
+        Range tab's exact mutate+persist flow (mutate_staging_lists ->
+        _refresh_staging_listboxes -> _save_staging_systems -> re-check) so the
+        Jump Range tab lists and the map overlay both update."""
+        clean = (name or "").strip()
+        if not clean:
+            return
+        # Canonicalize against the loaded system-name list (best-effort).
+        canonical = clean
+        for known in (getattr(self, "_system_names", None) or ()):
+            if known.lower() == clean.lower():
+                canonical = known
+                break
+        self._friendly_staging, self._hostile_staging = mutate_staging_lists(
+            self._friendly_staging, self._hostile_staging,
+            "add", canonical, target,
+        )
+        try:
+            self._refresh_staging_listboxes()
+        except Exception:
+            pass
+        self._save_staging_systems()          # persists + pushes staging to map
+        try:
+            self._rerun_range_check_if_ready()
+        except Exception:
+            pass
 
     # ── Character Management Tab ──────────────────────────────────────────────
 
@@ -19161,6 +19239,9 @@ class FCToolGUI:
                             "is_tackle": is_tackle(stid) if stid else False,
                         })
                     self.root.after(0, self._process_loss_tracking, fleet_id, enriched)
+                    # Push the same enriched roster to the star-map overlay
+                    # (marshaled to the main thread — update_fleet touches Tk).
+                    self.root.after(0, self._push_fleet_to_map, enriched)
                 elif fleet_id:
                     # In a fleet but not boss (can't read members → members is None).
                     # Keep chat-fed command-burst charges; only the hull roster is
@@ -19205,15 +19286,18 @@ class FCToolGUI:
     def _refresh_current_system(self):
         """Periodically fetch the tracked character's current system from ESI."""
         if not self.esi_auth or not self.esi_auth.is_authenticated:
+            self._push_own_location_to_map(None)      # unknown/logged out
             self.root.after(30000, self._refresh_current_system)
             return
 
         def do_fetch():
+            own_sid = None
             try:
                 loc = self.esi_auth.get_location()
                 if loc:
                     sys_id = loc.get("solar_system_id")
                     if sys_id:
+                        own_sid = sys_id             # ESI id == map system id
                         sys_info = get_system_info(sys_id)
                         sys_name = sys_info.get("name", "???") if sys_info else "???"
                         region_name = ""
@@ -19229,6 +19313,8 @@ class FCToolGUI:
                         )
             except Exception as e:
                 print(f"[Location] Current system fetch error: {e}")
+            # Push own location to the map (main thread; None when unresolved).
+            self.root.after(0, self._push_own_location_to_map, own_sid)
             self.root.after(15000, self._refresh_current_system)
 
         threading.Thread(target=do_fetch, daemon=True).start()
