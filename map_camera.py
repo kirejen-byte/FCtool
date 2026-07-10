@@ -10,9 +10,12 @@ from __future__ import annotations
 
 def scale_limits(bounds: tuple[float, float, float, float], avg_edge_len: float,
                  vw: int, vh: int, pad_frac: float = 0.05) -> tuple[float, float]:
-    """(min_scale, max_scale): 0.9x the fit-universe scale up to 48px per avg edge."""
+    """(min_scale, max_scale): 0.9x the fit-universe scale up to 64px per typical
+    (median) edge. The 48->64 bump + median edge length (vs mean, which long
+    inter-region edges inflate ~2x) let dense regions reach band C (Phase B
+    checkpoint fix)."""
     fit = _fit_scale(bounds, vw, vh, pad_frac=0.0)
-    max_scale = 48.0 / avg_edge_len if avg_edge_len > 0 else fit * 1000.0
+    max_scale = 64.0 / avg_edge_len if avg_edge_len > 0 else fit * 1000.0
     return fit * 0.9, max(max_scale, fit)  # never let max < fit
 
 

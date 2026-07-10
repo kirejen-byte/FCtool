@@ -20,6 +20,11 @@ LABEL_COLOR = (200, 210, 225)
 REGION_LABEL_COLOR = (150, 165, 195)
 HUB_IDS = frozenset({30000142, 30002187, 30002659, 30002053, 30002510})
 
+# Nebula additive-glow brightness (fraction of the region tint). Lowered
+# 0.16 -> 0.11 at the Phase B checkpoint so dense-region blobs stop fusing
+# into hot white cores at universe zoom.
+NEBULA_DIM = 0.11
+
 _FONT_NAME = "segoeui"
 
 
@@ -33,6 +38,22 @@ def dim(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return (int(color[0] * factor), int(color[1] * factor), int(color[2] * factor))
 
 
+def _declutter(items, cell_w: float, cell_h: float) -> list:
+    """Occupancy-grid label suppression. `items` is an iterable of (key, sx, sy)
+    in PRIORITY order (highest-priority first); keeps the first item to claim each
+    (col, row) screen cell and drops later overlaps. Returns the kept (key, sx, sy)
+    tuples in input order. Shared by the system-label and region-label branches."""
+    occupied: set[tuple[int, int]] = set()
+    kept = []
+    for key, sx, sy in items:
+        cell = (int(sx // cell_w), int(sy // cell_h))
+        if cell in occupied:
+            continue
+        occupied.add(cell)
+        kept.append((key, sx, sy))
+    return kept
+
+
 # --- zoom bands (spec §2.4; thresholds tunable) -----------------------------
 @dataclass(frozen=True)
 class BandStyle:
@@ -43,11 +64,15 @@ class BandStyle:
     system_labels: bool
     hub_labels: bool      # spec §2.4: band M labels hub systems alongside regions
     label_px: int
+    core_ring: bool = True  # draw the aacircle sec-color ring around the white core
 
 
 BAND_STYLES = {
-    "U": BandStyle(glow_radius=8, core_radius=2, edge_width=0, edge_dim=0.35,
-                   system_labels=False, hub_labels=False, label_px=0),
+    # U tuned at the Phase B checkpoint (glow 8->5, core 2->1, edge_dim 0.35->0.28,
+    # ring dropped) so ~2px-spaced systems stop fusing into white-cored blobs.
+    "U": BandStyle(glow_radius=5, core_radius=1, edge_width=0, edge_dim=0.28,
+                   system_labels=False, hub_labels=False, label_px=0,
+                   core_ring=False),
     "M": BandStyle(glow_radius=14, core_radius=3, edge_width=2, edge_dim=0.55,
                    system_labels=False, hub_labels=True, label_px=13),
     "C": BandStyle(glow_radius=22, core_radius=3, edge_width=3, edge_dim=0.55,
@@ -123,6 +148,20 @@ def average_edge_length(model) -> float:
     return total / len(model.edges)
 
 
+def median_edge_length(model) -> float:
+    """Median gate-edge length — robust vs long inter-region edges, which
+    inflate the mean ~2x and (via the zoom ceiling) made band C unreachable
+    in dense regions (Phase B checkpoint finding)."""
+    if not model.edges:
+        return 1.0
+    lengths = []
+    for a, b in model.edges:
+        sa, sb = model.systems[a], model.systems[b]
+        lengths.append(((sa.x - sb.x) ** 2 + (sa.y - sb.y) ** 2) ** 0.5)
+    lengths.sort()
+    return lengths[len(lengths) // 2]
+
+
 class Renderer:
     """Turns (MapModel, Camera) into a finished glow frame. Stateless between
     frames except caches (sprites, labels, per-region nebula info)."""
@@ -134,10 +173,12 @@ class Renderer:
         self._region_info = self._build_region_info()
 
     def _build_region_info(self):
-        """Per-region: (anchor_x, anchor_y, world_radius, tint) for the nebula."""
+        """Per-region: (anchor_x, anchor_y, world_radius, tint) for the nebula.
+        Also records self._region_size (member count) for label declutter priority."""
         by_region: dict[int, list] = {}
         for s in self.model.systems.values():
             by_region.setdefault(s.region_id, []).append(s)
+        self._region_size = {rid: len(members) for rid, members in by_region.items()}
         info = []
         for rid, members in sorted(by_region.items()):
             anchor = self.model.region_anchors.get(rid)
@@ -187,7 +228,7 @@ class Renderer:
             if r_px < 24 or sx < -r_px or sy < -r_px or sx > vw + r_px or sy > vh + r_px:
                 continue
             bucket = min(int(r_px / 48) * 48 + 48, 480)
-            sprite = self.sprites.glow(dim(tint, 0.16), bucket // 2)
+            sprite = self.sprites.glow(dim(tint, NEBULA_DIM), bucket // 2)
             surf.blit(sprite, (sx - sprite.get_width() / 2, sy - sprite.get_height() / 2),
                       special_flags=pygame.BLEND_RGB_ADD)
 
@@ -235,28 +276,32 @@ class Renderer:
                       special_flags=pygame.BLEND_RGB_ADD)
             cr = st.core_radius
             gfx.filled_circle(surf, int(sx), int(sy), cr, (255, 255, 255))
-            gfx.aacircle(surf, int(sx), int(sy), cr, color)
+            if st.core_ring:
+                gfx.aacircle(surf, int(sx), int(sy), cr, color)
 
     def _draw_labels(self, surf, st, pos, cam, vw, vh):
         if st.system_labels:
-            occupied: set[tuple[int, int]] = set()
+            # Priority: hubs first, then alphabetical; occupancy grid drops overlaps.
             order = sorted(pos, key=lambda sid: (sid not in HUB_IDS,
                                                  self.model.systems[sid].name))
-            for sid in order:
-                sx, sy = pos[sid]
-                cell = (int(sx // 96), int(sy // 24))
-                if cell in occupied:
-                    continue
-                occupied.add(cell)
+            items = [(sid, pos[sid][0], pos[sid][1]) for sid in order]
+            for sid, sx, sy in _declutter(items, 96, 24):
                 lab = self.labels.label(self.model.systems[sid].name, st.label_px,
                                         LABEL_COLOR)
                 surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
         else:
-            for rid, (name, ax, ay) in sorted(self.model.region_anchors.items()):
+            # Region labels: biggest regions win the cell; overlapping small ones drop.
+            region_items = []
+            for rid, (name, ax, ay) in self.model.region_anchors.items():
                 sx, sy = cam.world_to_screen(ax, ay, vw, vh)
                 if -100 <= sx <= vw + 100 and -40 <= sy <= vh + 40:
-                    lab = self.labels.label(name, 15, REGION_LABEL_COLOR)
-                    surf.blit(lab, (sx - lab.get_width() / 2, sy - lab.get_height() / 2))
+                    region_items.append((rid, sx, sy))
+            region_items.sort(key=lambda t: self._region_size.get(t[0], 0),
+                              reverse=True)
+            for rid, sx, sy in _declutter(region_items, 110, 26):
+                lab = self.labels.label(self.model.region_anchors[rid][0], 15,
+                                        REGION_LABEL_COLOR)
+                surf.blit(lab, (sx - lab.get_width() / 2, sy - lab.get_height() / 2))
             if st.hub_labels:
                 for sid in pos:
                     if sid in HUB_IDS:
@@ -271,3 +316,80 @@ def _bloom_pass(surf: pygame.Surface) -> None:
     small = pygame.transform.smoothscale(surf, (max(w // 4, 1), max(h // 4, 1)))
     big = pygame.transform.smoothscale(small, (w, h))
     surf.blit(big, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+
+# --- gesture frame cache (slippy-map zoom) -----------------------------------
+class FrameCache:
+    """Holds the last crisp frame + its camera; quick_frame() derives a gesture
+    frame by crop+smoothscale (round-2 benchmark: ~36 ms at 1280x850) so zoom
+    feels continuous while the worker renders the crisp frame in background."""
+
+    def __init__(self) -> None:
+        self._surf: pygame.Surface | None = None
+        self._cx = 0.0
+        self._cy = 0.0
+        self._scale = 1.0
+        self._vw = 0
+        self._vh = 0
+
+    def store(self, surf: pygame.Surface, cam, vw: int, vh: int) -> None:
+        self._surf = surf
+        self._cx, self._cy, self._scale = cam.cx, cam.cy, cam.scale
+        self._vw, self._vh = vw, vh
+
+    def clear(self) -> None:
+        self._surf = None
+
+    def quick_frame(self, cam, vw: int, vh: int) -> pygame.Surface | None:
+        if self._surf is None or (vw, vh) != (self._vw, self._vh):
+            return None
+        ratio = cam.scale / self._scale
+        # Wanted viewport corners in CACHED-frame pixel coordinates:
+        #   cached_px = (world - cached_c) * cached_scale + v/2
+        # where world spans the wanted rect derived from cam.
+        wx0 = cam.cx - (vw / 2.0) / cam.scale
+        wy0 = cam.cy - (vh / 2.0) / cam.scale
+        src_x = (wx0 - self._cx) * self._scale + self._vw / 2.0
+        src_y = (wy0 - self._cy) * self._scale + self._vh / 2.0
+        src_w = vw / ratio
+        src_h = vh / ratio
+
+        out = pygame.Surface((vw, vh))
+        out.fill(BG)
+        # Intersect the wanted source rect with the cached surface:
+        ix0, iy0 = max(src_x, 0.0), max(src_y, 0.0)
+        ix1, iy1 = min(src_x + src_w, float(self._vw)), min(src_y + src_h, float(self._vh))
+        if ix1 - ix0 < 1.0 or iy1 - iy0 < 1.0:
+            return out                                   # fully off-cache: BG
+        sub = self._surf.subsurface(
+            pygame.Rect(int(ix0), int(iy0),
+                        max(int(ix1 - ix0), 1), max(int(iy1 - iy0), 1)))
+        dst_x = (ix0 - src_x) * ratio
+        dst_y = (iy0 - src_y) * ratio
+        dst_w = max(int((ix1 - ix0) * ratio), 1)
+        dst_h = max(int((iy1 - iy0) * ratio), 1)
+        out.blit(pygame.transform.smoothscale(sub, (dst_w, dst_h)),
+                 (int(dst_x), int(dst_y)))
+        return out
+
+
+class SettleStats:
+    """Rolling settle-render timings; suggests degraded mode when p90 exceeds
+    threshold (spec §8: auto-degrade on weak machines)."""
+
+    def __init__(self, threshold_ms: float = 250.0, window: int = 20) -> None:
+        self.threshold_ms = threshold_ms
+        self._times: list[float] = []
+        self._window = window
+
+    def record(self, ms: float) -> None:
+        self._times.append(ms)
+        if len(self._times) > self._window:
+            self._times.pop(0)
+
+    def suggest_mode(self) -> str:
+        if len(self._times) < self._window // 2:
+            return "full"
+        ordered = sorted(self._times)
+        p90 = ordered[min(int(len(ordered) * 0.9), len(ordered) - 1)]
+        return "degraded" if p90 > self.threshold_ms else "full"
