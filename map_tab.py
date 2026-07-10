@@ -26,7 +26,12 @@ import map_render as mr
 
 ZOOM_STEP = 1.15
 SETTLE_MS = 120.0
-TICK_MS = 60
+# 16 ms (~60 fps) drain cadence while the tab is VISIBLE: a finished worker frame
+# is applied within a frame of completion instead of the ~50-60 ms tail the old
+# 60 ms tick left (Task 18 Step 1a). The tick still no-ops when hidden -- see the
+# `not self._visible` early-return in _tick and the visibility guard in
+# _schedule_tick -- so a hidden tab costs nothing regardless of this cadence.
+TICK_MS = 16
 # Worker renders this many px beyond the viewport on every side (Task 17). Tk
 # still shows a viewport-sized center crop, but the FULL margined frame is cached
 # so pan / zoom-out serve real content instead of a black edge within +/-MARGIN.
@@ -40,6 +45,26 @@ _LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
+
+
+def _request_sig(req: dict) -> tuple:
+    """Comparable signature of a render request: camera center/scale + viewport
+    size + bloom + mode + tint (NOT generation -- that is a staleness token, and
+    duplicates by definition carry different generations). Used by the worker to
+    suppress a settle re-render that duplicates the crisp frame already applied
+    to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+
+    The camera travels as a ``{cx, cy, scale}`` dict (built by Camera.to_dict);
+    TintSpec is a frozen dataclass, so it is hashable and compares by value --
+    a plain tuple therefore compares two requests structurally. ``mode`` is the
+    RAW request value ("auto"/"full"/"degraded"): for an identical view an
+    "auto" duplicate would re-produce the same class of frame, and the one on
+    screen is already correct for that view, so suppressing it is safe (at
+    worst a rare auto full<->degraded flip is deferred to the next real
+    camera/toggle change)."""
+    c = req["camera"]
+    return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
+            bool(req["bloom"]), req["mode"], req.get("tint"))
 
 
 class MapTabState:
@@ -213,6 +238,21 @@ class MapTab:
         # the worker never touches Tcl; only the main thread applies frames.
         self._result_q: "queue.Queue[tuple]" = queue.Queue()
         self._worker: threading.Thread | None = None
+        # Signature of the crisp frame currently APPLIED to the canvas (duplicate-
+        # settle suppression, Task 18 Step 1b): the worker skips a request whose
+        # sig equals it -- that exact view is already on screen. WRITTEN by the
+        # main thread only (_apply_frame records it; _show_gesture_frame clears it
+        # when a quick frame replaces the crisp); READ by the worker (GIL-atomic
+        # reference read). A stale read is benign both ways: None/old sig -> one
+        # extra render (safe); a sig cleared just after the worker read it -> the
+        # gesture that cleared it also touched the settle tracker, so a fresh
+        # request for the moved camera follows anyway. NOTE: comparing against
+        # the last RENDERED request instead is unsound -- on a real-model first
+        # show the gen-1 render outlives TICK_MS, its frame is dropped as stale
+        # (the first tick already posted gen 2), and gen 2 would then be
+        # suppressed as a "duplicate" of a frame nobody ever saw, leaving the
+        # canvas black until the first input (measured, Task 18).
+        self._applied_sig: tuple | None = None
         self._visible = False
         self._tick_scheduled = False
         self._drag_last: tuple[int, int] | None = None
@@ -404,32 +444,49 @@ class MapTab:
                     req = self._req_q.get_nowait()
             except queue.Empty:
                 pass
-            cam = mc.Camera.from_dict(req["camera"])
-            t0 = time.perf_counter()
-            mode = req["mode"]
-            if mode == "auto":
-                mode = self.stats.suggest_mode()
-            vw, vh = req["vw"], req["vh"]
-            # Render a MARGIN-px border beyond the viewport on every side. The
-            # camera projects around the surface center, so a bigger surface just
-            # shows more world all around (no camera math changes) -- Task 17.
-            surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
-                                        bloom=req["bloom"], mode=mode,
-                                        tint=req.get("tint"))
-            ms = (time.perf_counter() - t0) * 1000.0
-            self.stats.record(ms)
-            # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
-            # surface_to_ppm reads it directly). Build it transiently so the
-            # parent surf is not left subsurface-locked across the queue hand-off.
-            ppm = mr.surface_to_ppm(mr.center_subsurface(surf, MARGIN, vw, vh))
-            # Hand off to the main thread (no Tcl calls here); _tick applies it.
-            # surf is the FULL margined frame -> _apply_frame caches it (view dims).
-            self._result_q.put((req["generation"], ppm, surf, cam, vw, vh, ms))
+            result = self._render_locked(req)      # None => duplicate suppressed
+            if result is not None:
+                self._result_q.put(result)
+
+    def _render_locked(self, req: dict) -> tuple | None:
+        """Render one coalesced request on the worker thread, or return None when
+        it exactly duplicates the crisp frame already APPLIED to the canvas
+        (camera + size + bloom + mode + tint) -- duplicate-settle suppression
+        (Task 18 Step 1b): that exact view is on screen, so re-rendering is
+        wasted work. The sig travels in the result tuple; _apply_frame records
+        it only when the frame actually lands (visible + current generation), so
+        a dropped frame can never block its own re-request (see _applied_sig).
+        Kept as a method (not inline in _worker_loop) so a duplicate-suppression
+        test can drive it directly without the render thread. Touches no Tcl."""
+        sig = _request_sig(req)
+        if sig == self._applied_sig:
+            return None
+        cam = mc.Camera.from_dict(req["camera"])
+        t0 = time.perf_counter()
+        mode = req["mode"]
+        if mode == "auto":
+            mode = self.stats.suggest_mode()
+        vw, vh = req["vw"], req["vh"]
+        # Render a MARGIN-px border beyond the viewport on every side. The camera
+        # projects around the surface center, so a bigger surface just shows more
+        # world all around (no camera math changes) -- Task 17.
+        surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
+                                    bloom=req["bloom"], mode=mode,
+                                    tint=req.get("tint"))
+        ms = (time.perf_counter() - t0) * 1000.0
+        self.stats.record(ms)
+        # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
+        # surface_to_ppm reads it directly). Build it transiently so the parent
+        # surf is not left subsurface-locked across the queue hand-off.
+        ppm = mr.surface_to_ppm(mr.center_subsurface(surf, MARGIN, vw, vh))
+        # Hand off to the main thread (no Tcl calls here); _tick applies it.
+        # surf is the FULL margined frame -> _apply_frame caches it (view dims).
+        return (req["generation"], ppm, surf, cam, vw, vh, ms, sig)
 
     def _apply_frame(self, generation: int, ppm: bytes, surf, cam,
-                     vw: int, vh: int, ms: float) -> None:
+                     vw: int, vh: int, ms: float, sig: tuple | None = None) -> None:
         if not self._visible or not self.state.is_current(generation):
-            return
+            return                       # dropped -> _applied_sig stays unrecorded
         self._photo = tk.PhotoImage(data=ppm)   # ppm = viewport-sized center crop
         self.canvas.itemconfig(self._img_item, image=self._photo)
         self.canvas.coords(self._img_item, 0, 0)
@@ -437,7 +494,8 @@ class MapTab:
         # surf is the FULL margined frame; store records its surface dims so
         # quick_frame can serve the margin during pan/zoom-out (Task 17).
         self.frame_cache.store(surf, cam, vw, vh)
-        self.status.config(text=f"render {ms:.0f} ms")
+        self._applied_sig = sig          # this view is now on screen -> the worker
+        self.status.config(text=f"render {ms:.0f} ms")  # may suppress duplicates
         self._redraw_overlays()          # reproject Tk overlay items onto the fresh frame
 
     def _request_crisp(self) -> None:
@@ -463,6 +521,11 @@ class MapTab:
         if quick is None:
             return False
         self.state.next_generation()          # invalidate in-flight crisp
+        # The canvas no longer shows the applied crisp -> clear the suppression
+        # sig, so a settle request that lands back on the exact same camera
+        # (e.g. a wheel in+out round-trip) re-renders crisp instead of being
+        # suppressed and leaving the smoothscaled quick frame on screen.
+        self._applied_sig = None
         self._photo = tk.PhotoImage(data=mr.surface_to_ppm(quick))
         self.canvas.itemconfig(self._img_item, image=self._photo)
         self.canvas.coords(self._img_item, 0, 0)
@@ -487,10 +550,12 @@ class MapTab:
 
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Two payload shapes share
-        the queue: 7-tuple render frames (latest-wins; the generation check in
-        _apply_frame drops stale ones) and ("threat", frozenset) results from the
-        recompute helper thread. Keep them apart so a threat result is never
-        dropped by frame coalescing, and so a frame is never misread as threat."""
+        the queue: 8-tuple render frames (latest-wins; the generation check in
+        _apply_frame drops stale ones; the trailing element is the request sig
+        recorded as _applied_sig on a successful apply) and ("threat", frozenset)
+        results from the recompute helper thread. Keep them apart so a threat
+        result is never dropped by frame coalescing, and so a frame is never
+        misread as threat."""
         latest_frame = None
         latest_threat = None
         try:

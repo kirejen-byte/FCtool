@@ -34,6 +34,20 @@ def sec_color(sec: float) -> tuple[int, int, int]:
     return SEC_LOW if sec > 0.0 else SEC_NULL
 
 
+# Index form of sec_color for the hot edge/system loops (Task 18 Step 3): the map
+# has only THREE possible node/edge tints, so a system's colour and an edge's
+# colour can be precomputed ONCE as an index into _SEC_TINTS. _SEC_TINTS[_sec_idx(sec)]
+# is the exact object sec_color(sec) returns, so downstream dim()/blits are
+# byte-identical -- this is a lookup-table cache, not an output change.
+_SEC_TINTS = (SEC_HI, SEC_LOW, SEC_NULL)
+
+
+def _sec_idx(sec: float) -> int:
+    if sec >= 0.45:
+        return 0
+    return 1 if sec > 0.0 else 2
+
+
 def dim(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return (int(color[0] * factor), int(color[1] * factor), int(color[2] * factor))
 
@@ -243,6 +257,20 @@ class Renderer:
         self.labels = LabelFactory()
         self._region_info = self._build_region_info()
         self._median_edge = median_edge_length(model)
+        # Task 18 Step 3 hot-loop caches (static; independent of camera/frame):
+        #  * per-edge sec tint index -> edge loop drops per-frame sec_color()+max()
+        #  * per-system (tint, is_hub) -> _draw_systems drops per-node sec_color()
+        #    + HUB_IDS membership + the systems[sid] lookup
+        #  * per-system world (x, y) -> the pos projection drops a dict lookup/node
+        # Every cached value equals what the old code recomputed, so rendered bytes
+        # are unchanged (determinism holds).
+        systems = model.systems
+        self._edge_sec_idx = [
+            _sec_idx(max(systems[a].sec, systems[b].sec)) for a, b in model.edges]
+        self._node_static = {
+            sid: (_SEC_TINTS[_sec_idx(s.sec)], sid in HUB_IDS)
+            for sid, s in systems.items()}
+        self._node_xy = {sid: (s.x, s.y) for sid, s in systems.items()}
 
     def _build_region_info(self):
         """Per-region: (anchor_x, anchor_y, world_radius, tint) for the nebula.
@@ -279,9 +307,17 @@ class Renderer:
         glow_r, core_r = node_metrics(cam.scale * self._median_edge)
 
         self._draw_nebula(surf, cam, vw, vh)
-        pos = {sid: cam.world_to_screen(self.model.systems[sid].x,
-                                        self.model.systems[sid].y, vw, vh)
-               for sid in visible}
+        # Project visible systems. Inlines world_to_screen (one dict lookup per
+        # system via the static _node_xy cache; no per-call function overhead) --
+        # the arithmetic is the SAME operations on the SAME float operands as
+        # cam.world_to_screen, so the projected coords are bit-identical.
+        cx, cy, scale = cam.cx, cam.cy, cam.scale
+        hw, hh = vw / 2.0, vh / 2.0
+        node_xy = self._node_xy
+        pos = {}
+        for sid in visible:
+            wx, wy = node_xy[sid]
+            pos[sid] = ((wx - cx) * scale + hw, (wy - cy) * scale + hh)
         vis_set = set(visible)
 
         if mode == "degraded":
@@ -307,59 +343,75 @@ class Renderer:
                       special_flags=pygame.BLEND_RGB_ADD)
 
     def _edge_endpoints(self, pos, vis_set):
+        """Yield (sec_idx, a, b, pa, pb, sa, sb) for every edge with a visible
+        endpoint. sec_idx is the precomputed tint index (Task 18 Step 3); pa/pb
+        are the cached projections (None => off-visible, the caller re-projects)."""
         systems = self.model.systems
-        for a, b in self.model.edges:
+        sec_idx = self._edge_sec_idx
+        get = pos.get
+        for i, (a, b) in enumerate(self.model.edges):
             if a in vis_set or b in vis_set:
-                pa = pos.get(a)
-                pb = pos.get(b)
-                yield a, b, pa, pb, systems[a], systems[b]
+                yield sec_idx[i], a, b, get(a), get(b), systems[a], systems[b]
 
     def _draw_edges(self, surf, st, pos, vis_set, cam, vw, vh):
-        for a, b, pa, pb, sa, sb in self._edge_endpoints(pos, vis_set):
+        # Only 3 possible edge tints -> derive the two dimmed colours (wide pass +
+        # aaline pass) ONCE per frame; the per-edge loop just indexes them by the
+        # precomputed sec index. Byte-identical to the old per-edge sec_color/dim.
+        ew = st.edge_width
+        wide = tuple(dim(t, 0.25) for t in _SEC_TINTS)
+        line = tuple(dim(t, st.edge_dim) for t in _SEC_TINTS)
+        draw_line, draw_aaline = pygame.draw.line, pygame.draw.aaline
+        for idx, a, b, pa, pb, sa, sb in self._edge_endpoints(pos, vis_set):
             if pa is None:
                 pa = cam.world_to_screen(sa.x, sa.y, vw, vh)
             if pb is None:
                 pb = cam.world_to_screen(sb.x, sb.y, vw, vh)
-            tint = sec_color(max(sa.sec, sb.sec))
-            if st.edge_width:
-                pygame.draw.line(surf, dim(tint, 0.25), pa, pb, st.edge_width)
-            pygame.draw.aaline(surf, dim(tint, st.edge_dim), pa, pb)
+            if ew:
+                draw_line(surf, wide[idx], pa, pb, ew)
+            draw_aaline(surf, line[idx], pa, pb)
 
     def _draw_edges_degraded(self, surf, cam, vw, vh, pos, vis_set):
         """Fast path (spec §4.3): crisp 1px edge layer + bloom of that layer only."""
         layer = pygame.Surface(surf.get_size())
         layer.fill((0, 0, 0))
-        for a, b, pa, pb, sa, sb in self._edge_endpoints(pos, vis_set):
+        line6 = tuple(dim(t, 0.6) for t in _SEC_TINTS)   # 3 dimmed tints, once/frame
+        draw_line = pygame.draw.line
+        for idx, a, b, pa, pb, sa, sb in self._edge_endpoints(pos, vis_set):
             if pa is None:
                 pa = cam.world_to_screen(sa.x, sa.y, vw, vh)
             if pb is None:
                 pb = cam.world_to_screen(sb.x, sb.y, vw, vh)
-            pygame.draw.line(layer, dim(sec_color(max(sa.sec, sb.sec)), 0.6), pa, pb, 1)
+            draw_line(layer, line6[idx], pa, pb, 1)
         _bloom_pass(layer)
         surf.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
     def _draw_systems(self, surf, st, pos, glow_r, core_r, tint=None):
-        systems = self.model.systems
+        # Per-node colour + hub flag are STATIC -> read them from _node_static
+        # instead of recomputing sec_color()/HUB_IDS membership every frame.
+        # Loop-invariant hub radius and ring gate are hoisted; local aliases cut
+        # attribute lookups. Rendered bytes are unchanged (same colours/radii).
+        node_static = self._node_static
         bright = tint.bright if tint is not None else None
         halo = tint.halo if tint is not None else None
-        hub_bonus = max(3, glow_r // 3)             # was a flat +6; scales with zoom
+        hub_r = glow_r + max(3, glow_r // 3)        # was a flat +6; scales with zoom
+        ring = st.core_ring and core_r >= 2         # ring around a 1px core = blob
+        glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
         for sid, (sx, sy) in pos.items():
-            s = systems[sid]
-            color = sec_color(s.sec)
+            color, is_hub = node_static[sid]
             dimmed = bright is not None and sid not in bright
             if halo is not None and sid in halo:
-                hg = self.sprites.glow(SEC_NULL, glow_r + 8)
-                surf.blit(hg, (sx - hg.get_width() / 2, sy - hg.get_height() / 2),
-                          special_flags=pygame.BLEND_RGB_ADD)
+                hg = glow(SEC_NULL, glow_r + 8)
+                blit(hg, (sx - hg.get_width() / 2, sy - hg.get_height() / 2),
+                     special_flags=add)
             draw_color = dim(color, 0.35) if dimmed else color
-            radius = glow_r + (hub_bonus if sid in HUB_IDS else 0)
-            g = self.sprites.glow(draw_color, radius)
-            surf.blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
-                      special_flags=pygame.BLEND_RGB_ADD)
+            radius = hub_r if is_hub else glow_r
+            g = glow(draw_color, radius)
+            blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
+                 special_flags=add)
             if dimmed:
                 continue                            # no core/ring on dimmed systems
             gfx.filled_circle(surf, int(sx), int(sy), core_r, (255, 255, 255))
-            if st.core_ring and core_r >= 2:        # ring around a 1px core = blob
+            if ring:
                 gfx.aacircle(surf, int(sx), int(sy), core_r, color)
 
     def _draw_labels(self, surf, st, pos, cam, vw, vh):
