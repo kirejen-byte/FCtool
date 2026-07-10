@@ -20,6 +20,7 @@ import tkinter as tk
 
 import map_camera as mc
 import map_data
+import map_overlays as mo
 import map_render as mr
 
 ZOOM_STEP = 1.15
@@ -44,6 +45,19 @@ class MapTabState:
         self._generation = 0
         self._dirty = False
         self._name_to_id: dict[str, int] = {}
+        # --- overlay layer state (Phase D) ---
+        self.range_overlay = None
+        self.threat_set = None
+        self.fleet: dict[int, int] = {}
+        self.friendly_staging: set[int] = set()
+        self.hostile_staging: set[int] = set()
+        self.own_system_id = None
+
+    def tint_spec(self):
+        import map_render as _mr
+        bright = self.range_overlay.bright_set() if self.range_overlay else None
+        return _mr.TintSpec(bright=bright, halo=self.threat_set) \
+            if (bright is not None or self.threat_set is not None) else None
 
     # -- model / camera -------------------------------------------------------
     def attach_model(self, model) -> None:
@@ -208,6 +222,128 @@ class MapTab:
         self.cfg.update(merged)
         self.save_cfg(merged)
 
+    # ---- overlay layers (Phase D) ----------------------------------------------
+    # Two strata: range/threat re-tint the base bitmap (settle re-render via
+    # _request_crisp), while fleet/staging/illegal/origin/own are pure Tk canvas
+    # items repainted instantly by _redraw_overlays.
+    def update_fleet(self, members) -> None:
+        self.state.fleet = mo.fleet_counts(members)
+        self._redraw_overlays()
+
+    def set_staging(self, friendly_ids, hostile_ids) -> None:
+        self.state.friendly_staging = set(friendly_ids or ())
+        self.state.hostile_staging = set(hostile_ids or ())
+        self._redraw_overlays()
+
+    def apply_range_overlay(self, overlay) -> None:
+        self.state.range_overlay = overlay          # base-layer change:
+        self.state.force_dirty()                    # settle re-render with tint
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def clear_range_overlay(self) -> None:
+        self.state.range_overlay = None
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def set_threat(self, threat_set) -> None:
+        self.state.threat_set = threat_set          # None clears
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
+        self.state.own_system_id = system_id
+        self._redraw_overlays()
+
+    def _layer_on(self, key: str) -> bool:
+        return bool(self.cfg.get("layers", {}).get(key, True))
+
+    def _draw_diamond(self, sx: float, sy: float, r: float,
+                      color: str, tag: str) -> None:
+        self.canvas.create_polygon(sx, sy - r, sx + r, sy, sx, sy + r, sx - r, sy,
+                                   fill=color, tags=tag)
+
+    def _redraw_overlays(self) -> None:
+        """Delete + repaint every Tk overlay item, projecting with the LIVE camera
+        and WITHOUT adding _img_offset -- the live projection already equals the
+        on-canvas position of the translated stale bitmap, so adding the offset
+        would double-count the drag during the pre-settle window (Task 9 finding
+        #2). Pure Tk; cheap enough to run on every gesture/drag frame."""
+        canvas = self.canvas
+        for tag in ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
+                    "ov_origin", "ov_own"):
+            canvas.delete(tag)
+        if self.renderer is None or self.state.model is None:
+            return
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        st = self.state
+
+        def project(sid):
+            s = systems.get(sid)
+            if s is None:
+                return None
+            sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
+            if sx < -40 or sy < -40 or sx > vw + 40 or sy > vh + 40:
+                return None
+            return sx, sy
+
+        # -- range: struck rings on illegal-in-sphere systems + origin badge
+        ov = st.range_overlay
+        if ov is not None and self._layer_on("range"):
+            for sid in ov.illegal:
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_oval(sx - 7, sy - 7, sx + 7, sy + 7,
+                                   outline="#ff5a76", width=2, tags="ov_illegal")
+                d = 7 * 0.70710678                  # 45deg strike-through the ring
+                canvas.create_line(sx - d, sy - d, sx + d, sy + d,
+                                   fill="#ff5a76", width=2, tags="ov_range_strike")
+            p = project(ov.origin_id)
+            if p is not None:
+                sx, sy = p
+                canvas.create_oval(sx - 12, sy - 12, sx + 12, sy + 12,
+                                   outline="#e0e0e0", width=2, tags="ov_origin")
+
+        # -- staging diamonds (friendly green / hostile red)
+        if self._layer_on("staging"):
+            for sid in st.friendly_staging:
+                p = project(sid)
+                if p is not None:
+                    self._draw_diamond(p[0], p[1], 8, "#59d98c", "ov_staging")
+            for sid in st.hostile_staging:
+                p = project(sid)
+                if p is not None:
+                    self._draw_diamond(p[0], p[1], 8, "#ff5a76", "ov_staging")
+
+        # -- fleet pins + count badges, own-location ring
+        if self._layer_on("fleet"):
+            for sid, count in st.fleet.items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_oval(sx - 6, sy - 6, sx + 6, sy + 6,
+                                   fill="#00d4ff", outline="#ffffff", width=1,
+                                   tags="ov_fleet")
+                canvas.create_text(sx + 9, sy, anchor="w", text=str(count),
+                                   fill="#e0e0e0", font=("Segoe UI", 9),
+                                   tags="ov_fleet")
+            own = st.own_system_id
+            if own is not None:
+                p = project(own)
+                if p is not None:
+                    sx, sy = p
+                    canvas.create_oval(sx - 10, sy - 10, sx + 10, sy + 10,
+                                       outline="#ffffff", width=2, tags="ov_own")
+                    canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
+                                       fill="#ffffff", outline="", tags="ov_own")
+
     # ---- worker ----------------------------------------------------------------
     def _start_worker(self) -> None:
         if self._worker is None:
@@ -229,7 +365,8 @@ class MapTab:
             if mode == "auto":
                 mode = self.stats.suggest_mode()
             surf = self.renderer.render(cam, req["vw"], req["vh"],
-                                        bloom=req["bloom"], mode=mode)
+                                        bloom=req["bloom"], mode=mode,
+                                        tint=req.get("tint"))
             ms = (time.perf_counter() - t0) * 1000.0
             self.stats.record(ms)
             ppm = mr.surface_to_ppm(surf)
@@ -247,6 +384,7 @@ class MapTab:
         self._img_offset = (0.0, 0.0)
         self.frame_cache.store(surf, cam, vw, vh)
         self.status.config(text=f"render {ms:.0f} ms")
+        self._redraw_overlays()          # reproject Tk overlay items onto the fresh frame
 
     def _request_crisp(self) -> None:
         if self.renderer is None:
@@ -257,6 +395,7 @@ class MapTab:
             "vw": self.state.vw, "vh": self.state.vh,
             "bloom": bool(self._bloom_var.get()),
             "mode": self._render_mode,
+            "tint": self.state.tint_spec(),   # immutable TintSpec -> thread-safe
         })
 
     def _show_gesture_frame(self) -> None:
@@ -268,6 +407,7 @@ class MapTab:
             self.canvas.itemconfig(self._img_item, image=self._photo)
             self.canvas.coords(self._img_item, 0, 0)
             self._img_offset = (0.0, 0.0)
+            self._redraw_overlays()           # reproject overlays onto the gesture frame
 
     # ---- tick loop ---------------------------------------------------------------
     def _schedule_tick(self) -> None:
@@ -317,6 +457,7 @@ class MapTab:
         ox, oy = self._img_offset
         self._img_offset = (ox + dx, oy + dy)
         self.canvas.coords(self._img_item, *self._img_offset)   # cheap live pan
+        self._redraw_overlays()                                 # keep overlays glued to nodes
         self._schedule_tick()
 
     def _on_drag_end(self, _event) -> None:

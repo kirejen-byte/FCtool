@@ -86,6 +86,18 @@ def pick_band(visible_count: int) -> str:
     return "M" if visible_count >= 300 else "C"
 
 
+@dataclass(frozen=True)
+class TintSpec:
+    """Base-layer tinting (spec §5.1/§5.2): range overlay brightens `bright`
+    and dims everything else; threat halo under-glows `halo` in red."""
+    bright: frozenset[int] | None = None    # None = no range tint
+    halo: frozenset[int] | None = None
+
+    def key(self) -> tuple:
+        return (tuple(sorted(self.bright)) if self.bright is not None else None,
+                tuple(sorted(self.halo)) if self.halo is not None else None)
+
+
 # --- cached asset factories --------------------------------------------------
 class SpriteFactory:
     """Procedural radial glow sprites, cached by (color, radius). ~1 ms total."""
@@ -195,7 +207,8 @@ class Renderer:
 
     # -- public ---------------------------------------------------------------
     def render(self, cam, vw: int, vh: int, *, bloom: bool = True,
-               mode: str = "full", band: str | None = None) -> pygame.Surface:
+               mode: str = "full", band: str | None = None,
+               tint: TintSpec | None = None) -> pygame.Surface:
         surf = pygame.Surface((vw, vh))
         surf.fill(BG)
 
@@ -214,7 +227,7 @@ class Renderer:
             self._draw_edges_degraded(surf, cam, vw, vh, pos, vis_set)
         else:
             self._draw_edges(surf, st, pos, vis_set, cam, vw, vh)
-        self._draw_systems(surf, st, pos)
+        self._draw_systems(surf, st, pos, tint)
         if bloom and mode != "degraded":
             _bloom_pass(surf)
         self._draw_labels(surf, st, pos, cam, vw, vh)
@@ -264,16 +277,25 @@ class Renderer:
         _bloom_pass(layer)
         surf.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
-    def _draw_systems(self, surf, st, pos):
+    def _draw_systems(self, surf, st, pos, tint=None):
         systems = self.model.systems
-        glow_cache = self.sprites
+        bright = tint.bright if tint is not None else None
+        halo = tint.halo if tint is not None else None
         for sid, (sx, sy) in pos.items():
             s = systems[sid]
             color = sec_color(s.sec)
+            dimmed = bright is not None and sid not in bright
+            if halo is not None and sid in halo:
+                hg = self.sprites.glow(SEC_NULL, st.glow_radius + 8)
+                surf.blit(hg, (sx - hg.get_width() / 2, sy - hg.get_height() / 2),
+                          special_flags=pygame.BLEND_RGB_ADD)
+            draw_color = dim(color, 0.35) if dimmed else color
             radius = st.glow_radius + (6 if sid in HUB_IDS else 0)
-            g = glow_cache.glow(color, radius)
+            g = self.sprites.glow(draw_color, radius)
             surf.blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
                       special_flags=pygame.BLEND_RGB_ADD)
+            if dimmed:
+                continue                            # no core/ring on dimmed systems
             cr = st.core_radius
             gfx.filled_circle(surf, int(sx), int(sy), cr, (255, 255, 255))
             if st.core_ring:
