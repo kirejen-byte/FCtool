@@ -178,10 +178,12 @@ _SETTINGS_TOC_PADY = 10             # panel/ribbon vertical padding (matches pac
 # ── Notebook tab indices ────────────────────────────────────────────────────────
 # Order of self.notebook.add() calls in _build_ui:
 #   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
-#   4 Characters, 5 Fittings, 6 Settings.
-# Inserting Fittings at index 5 leaves the earlier tabs (Intel=1, Characters=4)
-# unchanged; only the Settings tab shifts 5 -> 6.
-FITTINGS_TAB_INDEX = 5
+#   4 Map, 5 Characters, 6 Fittings, 7 Settings.
+# Map is inserted at index 4 (after Navigation): the earlier tabs (Fleet=0,
+# Intel=1, Jump Range=2, Navigation=3) are unchanged; Characters/Fittings/
+# Settings each shift +1 (4->5, 5->6, 6->7). _on_tab_changed's Characters check
+# and FITTINGS_TAB_INDEX below are updated to match.
+FITTINGS_TAB_INDEX = 6
 DOCTRINES_SUBTAB_INDEX = 1
 
 # ESI fittings scopes (added after some characters were already authed; SSO
@@ -1720,6 +1722,7 @@ class FCToolGUI:
         self._build_intel_tab()
         self._build_range_tab()
         self._build_wh_route_tab()
+        self._build_map_tab()
         self._build_character_tab()
         self._build_fitting_tab()
         self._build_settings_tab()
@@ -4855,20 +4858,34 @@ class FCToolGUI:
             self._append_wh_log("\n", "dim")
 
     def _on_tab_changed(self, event=None):
-        """Handle tab switches — clear zkill alerts, refresh character tab."""
+        """Handle tab switches — clear zkill alerts, refresh character tab,
+        gate star-map rendering on visibility."""
         current = self.notebook.index(self.notebook.select())
         if current == 1 and self._zkill_has_unread:
             # Switched to zKill tab — clear notification
             self._zkill_has_unread = False
             self.notebook.tab(1, text="  Intelligence  ")
             self._zkill_status.config(bg=BG_DARK)
-        elif current == 4 and hasattr(self, '_char_tab_content'):
-            # Switched to Characters tab — auto-refresh
+        elif current == 5 and hasattr(self, '_char_tab_content'):
+            # Switched to Characters tab (index shifted 4->5 by the Map tab) —
+            # auto-refresh.
             self._refresh_character_tab()
         elif current == 0:
             # Switched to Fleet Management — keep the doctrine dropdown fresh.
             try:
                 self._refresh_fleet_doctrine_combo()
+            except Exception:
+                pass
+        # Star map: gate the render worker on tab visibility. Matched by widget
+        # identity (not index) so it survives future tab reordering. on_hidden
+        # before the first on_shown is a safe no-op (the widget guards it).
+        if hasattr(self, "map_tab"):
+            try:
+                selected = self.notebook.nametowidget(self.notebook.select())
+                if selected is self.map_tab.frame.master:
+                    self.map_tab.on_shown()
+                else:
+                    self.map_tab.on_hidden()
             except Exception:
                 pass
 
@@ -5357,6 +5374,46 @@ class FCToolGUI:
             self._wh_log.insert(tk.END, text)
         self._wh_log.see(tk.END)
         self._wh_log.config(state=tk.DISABLED)
+
+    # ── Star Map Tab ──────────────────────────────────────────────────────────
+
+    def _build_map_tab(self):
+        """Star-map tab (inserted after Navigation). Lazy: MapTab loads the map
+        model and starts its render worker on the first on_shown (fired from
+        _on_tab_changed on visibility). The right-click actions reuse the exact
+        same handlers as the intel system menu."""
+        import map_tab as _map_tab_mod
+
+        tab = tk.Frame(self.notebook, bg=BG_DARK)
+        self.notebook.add(tab, text="  Map  ")
+        cfg = self._map_cfg()
+
+        def save_cfg(updated: dict) -> None:
+            self.config["map"] = updated
+            self._save_config()
+
+        def open_dotlan(name: str) -> None:
+            self._open_url(
+                f"https://evemaps.dotlan.net/system/{name.replace(' ', '_')}")
+
+        def copy_name(name: str) -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(name)
+
+        # Every handler takes a single system-name string (verified against
+        # _intel_system_menu's working invocations), and MapTab calls each as
+        # cb(name) — so they wire straight through with no adapters.
+        callbacks = {
+            "set_destination": self._set_destination_or_copy,
+            "open_dotlan": open_dotlan,
+            "navigate_wh": self._navigate_wh_route,
+            "titan_bridge": self._navigate_jump_range,
+            "copy": copy_name,
+        }
+        self.map_tab = _map_tab_mod.MapTab(tab, cfg=cfg, save_cfg=save_cfg,
+                                           callbacks=callbacks,
+                                           autocomplete_cls=None)
+        self.map_tab.frame.pack(fill="both", expand=True)
 
     # ── Character Management Tab ──────────────────────────────────────────────
 
@@ -12245,6 +12302,19 @@ class FCToolGUI:
             cfg.setdefault(key, json.loads(json.dumps(default)))
         if not migrated and self.config.get("overlay", {}).get("enabled"):
             cfg["mode"] = "eveo_labels"   # one-time legacy migration; sticky thereafter
+        return cfg
+
+    def _map_cfg(self) -> dict:
+        """Self-healing accessor for config['map'] (house per-key defaulting).
+
+        Reads defaults from the module-level DEFAULT_CONFIG (not self), so the
+        unit tests can bind this onto a bare SimpleNamespace host — same pattern
+        the other per-feature accessors use. Nested dicts (camera, layers) are
+        copied per key so the shared default is never mutated."""
+        from default_config import DEFAULT_CONFIG
+        cfg = self.config.setdefault("map", {})
+        for key, val in DEFAULT_CONFIG["map"].items():
+            cfg.setdefault(key, val if not isinstance(val, dict) else dict(val))
         return cfg
 
     @staticmethod
