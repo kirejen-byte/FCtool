@@ -14447,8 +14447,9 @@ class FCToolGUI:
         w.append(brst)
         self._preview_reset_btn = brst
         _tip(brst, "Bring all preview windows back on-screen and clear saved "
-                   "positions/sizes. Use this if previews were dragged "
-                   "off-screen or a monitor was disconnected.")
+                   "positions and per-window size overrides. Use this if "
+                   "previews were dragged off-screen or a monitor was "
+                   "disconnected.")
 
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
@@ -14762,12 +14763,21 @@ class FCToolGUI:
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):
             layouts[client.key] = [int(x), int(y), tile_w, body_h]
-            for tile in self._preview_tiles.values():
+            # Iterate hwnd->tile (not just .values()) so the newly-placed rect
+            # can be mirrored into _preview_tile_rects. Without this, the next
+            # tick's _preview_apply_tile_size (fc_gui.py:13460) reads the STALE
+            # rect still on file, sees a size mismatch (e.g. reset just cleared
+            # a per-char 'sizes' override), and re-places the tile using the
+            # stale rect's (x, y) as the anchor — silently undoing the arrange.
+            for hwnd, tile in self._preview_tiles.items():
                 if getattr(tile, "key", None) == client.key:
                     try:
                         tile.place(int(x), int(y), tile_w, body_h)
                     except Exception:
                         pass
+                    else:
+                        self._preview_tile_rects[hwnd] = (
+                            int(x), int(y), tile_w, body_h)
                     break
         self._save_config()
 
@@ -14780,7 +14790,14 @@ class FCToolGUI:
         sizes, login_position — and immediately snaps every live tile back
         onto the screen by reusing the exact same handler the "Arrange in
         grid" button uses (DRY; _preview_arrange_grid already re-places every
-        live non-login tile and persists its new rect). Non-geometry settings
+        live non-login tile and persists its new rect, including
+        _preview_tile_rects so the next tick doesn't fight the rescue). Login
+        screens are filtered OUT of arrange by design (their geometry is a
+        stacked position, not a saved per-char layout) — but a login window
+        stranded off-screen is exactly what this button exists to rescue, and
+        nothing else in the tick re-derives an EXISTING login tile's position
+        from config, so a dedicated loop below re-stacks every live login tile
+        at the freshly-reset login_position. Non-geometry settings
         (tile_w/tile_body_h/uniform_size/hotkeys/etc.) are never touched.
 
         ``_test_confirm`` mirrors the repo's ``_test_no_wait`` dialog-bypass
@@ -14791,7 +14808,7 @@ class FCToolGUI:
             proceed = messagebox.askyesno(
                 "Reset previews",
                 "Move all preview windows back on-screen and clear saved "
-                "positions and sizes?",
+                "positions and per-window size overrides?",
                 parent=self.root)
         else:
             proceed = _test_confirm
@@ -14808,6 +14825,28 @@ class FCToolGUI:
         # Nothing live to re-place → skip the (harmless but pointless) call.
         if self._preview_tiles:
             self._preview_arrange_grid()
+            # Re-stack every live login tile at the just-reset login_position,
+            # the same way a fresh spawn would (_preview_tile_rect's login
+            # branch) — arrange above never touches login tiles, and no other
+            # tick step re-derives an existing login tile's position from
+            # config, so a stranded login window would otherwise stay
+            # off-screen forever. Ordered by hwnd for a deterministic stack.
+            logins = sorted(
+                (c for c in self._preview_clients.values() if c.is_login),
+                key=lambda c: c.hwnd)
+            if logins:
+                base = tuple(cfg.get("login_position", [5, 5]))
+                for idx, client in enumerate(logins):
+                    tile = self._preview_tiles.get(client.hwnd)
+                    if tile is None:
+                        continue
+                    w, body_h = self._preview_resolve_size(cfg, client.key)
+                    x, y = preview_layout.login_stack_pos(idx, base)
+                    try:
+                        tile.place(x, y, w, body_h)
+                    except Exception:
+                        continue
+                    self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
 
     @staticmethod
     def parse_eveo_config(json_text: str) -> dict:
