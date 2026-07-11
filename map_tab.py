@@ -601,6 +601,15 @@ class MapTab:
         self._tick_scheduled = False
         if not self._visible:
             return
+        # Reschedule FIRST so the next tick's TICK_MS timer runs CONCURRENT with
+        # this tick's drain/anim/settle work instead of being tacked on after it:
+        # cadence becomes max(TICK_MS, work) rather than TICK_MS + work, so the
+        # ~16 ms after-delay no longer stacks on top of the ~8-17 ms frame cost
+        # during a zoom glide (Task 20b pacing fix). The hidden early-return above
+        # still stops rescheduling when the tab is hidden, and _tick_scheduled
+        # (cleared at entry, set again here) still admits exactly one pending tick
+        # -- the work below touches neither flag, so this is a pure reorder.
+        self._schedule_tick()
         self._drain_results()                    # apply finished frames (main thread)
         verdict = self.state.tick(_now_ms())
         if verdict == "anim":
@@ -614,7 +623,6 @@ class MapTab:
             self._show_gesture_frame()
         elif verdict == "crisp":
             self._request_crisp()
-        self._schedule_tick()
 
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Two payload shapes share
