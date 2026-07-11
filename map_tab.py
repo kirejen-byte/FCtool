@@ -49,10 +49,15 @@ def _now_ms() -> float:
 
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint (NOT generation -- that is a staleness token, and
-    duplicates by definition carry different generations). Used by the worker to
-    suppress a settle re-render that duplicates the crisp frame already applied
-    to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+    size + bloom + mode + tint + bridges (NOT generation -- that is a staleness
+    token, and duplicates by definition carry different generations). Used by the
+    worker to suppress a settle re-render that duplicates the crisp frame already
+    applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+
+    bridges participates so a Bridges-layer toggle (tuple <-> None) is NEVER
+    suppressed as a duplicate -- the on-screen frame drew a different bridge set,
+    so it must re-render. The bridges value is a hashable tuple of (id, id)
+    pairs (or None when the layer is off), so it compares by value here.
 
     The camera travels as a ``{cx, cy, scale}`` dict (built by Camera.to_dict);
     TintSpec is a frozen dataclass, so it is hashable and compares by value --
@@ -64,7 +69,7 @@ def _request_sig(req: dict) -> tuple:
     camera/toggle change)."""
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
-            bool(req["bloom"]), req["mode"], req.get("tint"))
+            bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"))
 
 
 class MapTabState:
@@ -86,6 +91,10 @@ class MapTabState:
         self.friendly_staging: set[int] = set()
         self.hostile_staging: set[int] = set()
         self.own_system_id = None
+        # Resolved Ansiblex bridge id-pairs (hashable tuple of unordered
+        # (id_a, id_b) pairs from map_overlays.resolve_bridges). A BASE-layer
+        # element -- drawn into the bitmap, not a Tk overlay item.
+        self.bridges: tuple = ()
 
     def tint_spec(self):
         import map_render as _mr
@@ -206,12 +215,13 @@ class MapTab:
             "fleet": tk.BooleanVar(value=bool(_layers.get("fleet", True))),
             "staging": tk.BooleanVar(value=bool(_layers.get("staging", True))),
             "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
+            "bridges": tk.BooleanVar(value=bool(_layers.get("bridges", True))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
-                            ("threat", "Threat")):
+                            ("threat", "Threat"), ("bridges", "Bridges")):
             tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                            bg=BG_HEX, fg="#8b9bb5", selectcolor="#16213e",
                            command=lambda k=_key: self._on_layer_toggle(k)
@@ -276,6 +286,16 @@ class MapTab:
             self.state.restore_camera(self.cfg.get("camera") or {})
             self.renderer = mr.Renderer(model)
             self._start_worker()
+        # Refresh Ansiblex bridges from the host on (re)show: config edits or ESI
+        # auto-discovery that happened while the tab was hidden are reflected, and
+        # the crisp request below carries them into the render (store only -- no
+        # extra request; _request_crisp fires immediately after).
+        gb = self.callbacks.get("get_bridges")
+        if gb is not None:
+            try:
+                self.state.bridges = tuple(gb() or ())
+            except Exception:
+                pass
         self.state.force_dirty()
         self._request_crisp()
         self._schedule_tick()
@@ -334,6 +354,19 @@ class MapTab:
 
     def set_threat(self, threat_set) -> None:
         self.state.threat_set = threat_set          # None clears
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def set_bridges(self, pairs) -> None:
+        """Store resolved Ansiblex bridge id-pairs (a hashable tuple of unordered
+        (id_a, id_b) pairs from map_overlays.resolve_bridges) and re-render.
+        Bridges are a BASE-layer element -- drawn into the bitmap under the node
+        glows -- so this is a settle re-render via _request_crisp, NOT a Tk
+        overlay repaint. Safe before the first on_shown: _request_crisp and
+        _redraw_overlays no-op while the renderer/model are unset, and the stored
+        tuple is picked up by the first crisp request."""
+        self.state.bridges = tuple(pairs or ())     # coerce to hashable tuple
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
@@ -472,7 +505,8 @@ class MapTab:
         # world all around (no camera math changes) -- Task 17.
         surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
                                     bloom=req["bloom"], mode=mode,
-                                    tint=req.get("tint"))
+                                    tint=req.get("tint"),
+                                    bridges=req.get("bridges"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -508,6 +542,9 @@ class MapTab:
             "bloom": bool(self._bloom_var.get()),
             "mode": self._render_mode,
             "tint": self.state.tint_spec(),   # immutable TintSpec -> thread-safe
+            # Hashable tuple (or None when the layer is off -> byte-identical to
+            # pre-bridge output); travels to the worker and into _request_sig.
+            "bridges": self.state.bridges if self._layer_on("bridges") else None,
         })
 
     def _show_gesture_frame(self) -> bool:
@@ -702,6 +739,8 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("fleet"))
         menu.add_checkbutton(label="Staging", variable=self._layer_vars["staging"],
                              command=lambda: self._on_layer_toggle("staging"))
+        menu.add_checkbutton(label="Bridges", variable=self._layer_vars["bridges"],
+                             command=lambda: self._on_layer_toggle("bridges"))
         return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:
@@ -751,6 +790,13 @@ class MapTab:
         self.cfg.setdefault("layers", {})[key] = bool(var.get())
         if key == "threat":
             self._recompute_threat()
+        elif key == "bridges":
+            # Bridges live in the base bitmap, so a toggle needs a settle
+            # re-render (the request carries the pairs, or None when off). The
+            # bridges key in _request_sig keeps this from being duplicate-suppressed.
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
         else:
             self._redraw_overlays()
 

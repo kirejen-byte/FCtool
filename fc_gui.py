@@ -1145,6 +1145,14 @@ class FCToolGUI:
             for k in stale:
                 del _route_disk_cache[k]
         print(f"[Ansiblex] Resolved {len(resolved)} gate(s), cleared {len(stale)} cached routes")
+        # Push the freshly-resolved bridges to the star map. This runs on a
+        # background thread (do_refresh / do_discover / the Settings-save thread),
+        # so marshal set_bridges (touches the Tk canvas) onto the main thread.
+        # Guarded: no map tab yet or no root -> silent no-op.
+        try:
+            self.root.after(0, self._push_bridges_to_map)
+        except Exception:
+            pass
 
     def _resolve_ansiblex_async(self):
         """Resolve Ansiblex system name pairs to ID pairs in background."""
@@ -5416,6 +5424,8 @@ class FCToolGUI:
                 name, "friendly"),
             "add_hostile_staging": lambda name: self._add_staging_from_map(
                 name, "hostile"),
+            # Resolved Ansiblex bridge id-pairs, refreshed on each tab-show.
+            "get_bridges": self._get_map_bridges,
         }
         self.map_tab = _map_tab_mod.MapTab(tab, cfg=cfg, save_cfg=save_cfg,
                                            callbacks=callbacks,
@@ -5448,6 +5458,32 @@ class FCToolGUI:
             tab.set_own_location(system_id)
         except Exception as exc:
             print(f"[MAP] own-location push failed: {exc}")
+
+    def _get_map_bridges(self):
+        """Resolved Ansiblex bridge id-pairs for the star map, parsed from the
+        SAME config["ansiblex_connections"] name pairs the jump-range BFS
+        consumes (see _resolve_ansiblex_sync). Pure/local name resolution
+        (map_overlays.resolve_bridges -> system_coords.resolve_name): NO ESI, so
+        it is safe to call on the Tk thread. Guarded -- a bad config yields ()."""
+        try:
+            import map_overlays as mo
+            return mo.resolve_bridges(self.config.get("ansiblex_connections", []))
+        except Exception as exc:
+            print(f"[MAP] bridges resolve failed: {exc}")
+            return ()
+
+    def _push_bridges_to_map(self):
+        """Push freshly-resolved Ansiblex bridges to the star-map tab. Runs on the
+        Tk thread (marshaled from the background resolver via root.after), since
+        set_bridges touches the canvas. Guarded so a missing/erroring map tab
+        never breaks Ansiblex resolution."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_bridges(self._get_map_bridges())
+        except Exception as exc:
+            print(f"[MAP] bridges push failed: {exc}")
 
     def _push_staging_to_map(self):
         """Resolve the friendly/hostile staging name lists to system ids and push

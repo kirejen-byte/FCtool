@@ -62,7 +62,8 @@ DEFAULT_CONFIG = {
     },
     "map": {
         "bloom": True,
-        "layers": {"fleet": True, "staging": True, "threat": False, "range": False},
+        "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
+                   "bridges": True},
         "threat_ship": "Titan Bridge",
         "range_ship": "Dreadnought",
         # Keys match map_camera.Camera.to_dict(); None scale = fit universe.

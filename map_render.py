@@ -20,6 +20,11 @@ LABEL_COLOR = (200, 210, 225)
 REGION_LABEL_COLOR = (150, 165, 195)
 HUB_IDS = frozenset({30000142, 30002187, 30002659, 30002053, 30002510})
 
+# Electric blue for friendly Ansiblex bridges (owner request 2026-07-10): a
+# glowing blue line between the two bridged systems, drawn UNDER the node glows
+# so systems stay readable. Three dim() passes (wide dim / mid / bright aaline).
+BRIDGE_BLUE = (0x3A, 0x86, 0xFF)
+
 # Nebula additive-glow brightness (fraction of the region tint). Lowered
 # 0.16 -> 0.11 at the Phase B checkpoint so dense-region blobs stop fusing
 # into hot white cores at universe zoom.
@@ -296,7 +301,8 @@ class Renderer:
     # -- public ---------------------------------------------------------------
     def render(self, cam, vw: int, vh: int, *, bloom: bool = True,
                mode: str = "full", band: str | None = None,
-               tint: TintSpec | None = None) -> pygame.Surface:
+               tint: TintSpec | None = None,
+               bridges: tuple | None = None) -> pygame.Surface:
         surf = pygame.Surface((vw, vh))
         surf.fill(BG)
 
@@ -324,6 +330,11 @@ class Renderer:
             self._draw_edges_degraded(surf, cam, vw, vh, pos, vis_set)
         else:
             self._draw_edges(surf, st, pos, vis_set, cam, vw, vh)
+        # Ansiblex bridges: after gate edges, before node glows (so systems stay
+        # readable). Gated on truthiness -> bridges=None/() runs the pre-change
+        # path exactly, keeping bytes byte-identical (determinism).
+        if bridges:
+            self._draw_bridges(surf, cam, pos, vis_set, vw, vh, bridges)
         self._draw_systems(surf, st, pos, glow_r, core_r, tint)
         if bloom and mode != "degraded":
             _bloom_pass(surf)
@@ -385,6 +396,41 @@ class Renderer:
         _bloom_pass(layer)
         surf.blit(layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
+    def _draw_bridges(self, surf, cam, pos, vis_set, vw, vh, bridges):
+        """Draw each friendly Ansiblex connection as a glowing blue line (owner
+        request). `bridges` is a tuple of unordered (id_a, id_b) system-id pairs
+        (map_overlays.resolve_bridges). Sorted iteration keeps the draw
+        deterministic regardless of input order. Endpoints reuse the cached
+        projection when visible (like _draw_edges) and re-project otherwise; a
+        bridge is drawn when either endpoint is in the visible set OR its
+        projected segment's bbox overlaps the surface (long cross-map bridges
+        whose endpoints are both off-view but which cross the frame). Three
+        passes -- wide dim / mid / bright aaline -- build the glow; all sit UNDER
+        the node glows drawn next, so systems stay readable."""
+        systems = self.model.systems
+        get = pos.get
+        wide = dim(BRIDGE_BLUE, 0.30)
+        mid = dim(BRIDGE_BLUE, 0.55)
+        bright = dim(BRIDGE_BLUE, 0.95)
+        draw_line, draw_aaline = pygame.draw.line, pygame.draw.aaline
+        for a, b in sorted(bridges):
+            sa = systems.get(a)
+            sb = systems.get(b)
+            if sa is None or sb is None:
+                continue
+            pa = get(a)
+            if pa is None:
+                pa = cam.world_to_screen(sa.x, sa.y, vw, vh)
+            pb = get(b)
+            if pb is None:
+                pb = cam.world_to_screen(sb.x, sb.y, vw, vh)
+            if not (a in vis_set or b in vis_set
+                    or _segment_on_surface(pa, pb, vw, vh)):
+                continue
+            draw_line(surf, wide, pa, pb, 4)
+            draw_line(surf, mid, pa, pb, 2)
+            draw_aaline(surf, bright, pa, pb)
+
     def _draw_systems(self, surf, st, pos, glow_r, core_r, tint=None):
         # Per-node colour + hub flag are STATIC -> read them from _node_static
         # instead of recomputing sec_color()/HUB_IDS membership every frame.
@@ -444,6 +490,17 @@ class Renderer:
                         lab = self.labels.label(self.model.systems[sid].name,
                                                 st.label_px, LABEL_COLOR)
                         surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
+
+
+def _segment_on_surface(pa, pb, vw: int, vh: int) -> bool:
+    """Cheap bbox overlap between a screen segment and the [0,vw]x[0,vh] surface
+    -- the bridge-cull "plausibly on-surface" test for long cross-map bridges
+    whose endpoints are both outside the visible node set. Conservative (a
+    diagonal whose bbox overlaps but which itself misses is still drawn), but
+    pygame clips the line, so an occasional wasted draw is harmless."""
+    minx, maxx = (pa[0], pb[0]) if pa[0] <= pb[0] else (pb[0], pa[0])
+    miny, maxy = (pa[1], pb[1]) if pa[1] <= pb[1] else (pb[1], pa[1])
+    return not (maxx < 0 or minx > vw or maxy < 0 or miny > vh)
 
 
 def _bloom_pass(surf: pygame.Surface) -> None:

@@ -88,6 +88,42 @@ def resolve_staging(names, resolve_fn=None) -> dict[int, str]:
     return out
 
 
+def resolve_bridges(entries, resolve_fn=None) -> tuple[tuple[int, int], ...]:
+    """Resolve config ``ansiblex_connections`` name pairs to a deterministic,
+    deduped tuple of unordered ``(id_a, id_b)`` system-id pairs for the map's
+    Ansiblex bridge layer.
+
+    Mirrors the canonical parse the jump-range BFS consumes
+    (``fc_gui._resolve_ansiblex_sync``): each entry is a 2-element
+    ``[name_a, name_b]``; each name resolves via ``resolve_fn`` (default
+    ``system_coords.resolve_name`` -- pure/local, NO ESI, so it is safe to call
+    on the Tk thread). Unresolvable endpoints, self-pairs, malformed entries,
+    and duplicate unordered pairs are dropped. The result is sorted and returned
+    as a hashable tuple so it can travel in the render request dict and
+    participate in the duplicate-render signature (``map_tab._request_sig``)."""
+    resolve = resolve_fn or _default_resolve
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int]] = []
+    for entry in entries or ():
+        try:
+            if len(entry) != 2:
+                continue
+            name_a, name_b = entry[0], entry[1]
+        except (TypeError, KeyError, IndexError):
+            continue
+        ida = resolve(name_a)
+        idb = resolve(name_b)
+        if ida is None or idb is None or ida == idb:
+            continue
+        pair = (ida, idb) if ida < idb else (idb, ida)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    out.sort()
+    return tuple(out)
+
+
 # Owner decision (spec §2.5): 5 grouped classes; labels carry the live LY value
 # read from SHIP_RANGES at runtime so the Rorqual/Lancer fix chip auto-propagates.
 _GROUPS = [
