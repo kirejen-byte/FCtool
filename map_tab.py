@@ -320,6 +320,7 @@ class MapTab:
         self._applied_sig: tuple | None = None
         self._visible = False
         self._tick_scheduled = False
+        self._tick_after_id: str | None = None   # pending _tick after() id (cancel on hide)
         self._drag_last: tuple[int, int] | None = None
         self._img_offset = (0.0, 0.0)
         self._last_drag_qf = 0.0        # last drag quick-frame time (throttle, Task 17)
@@ -340,7 +341,11 @@ class MapTab:
             self.state.attach_model(model)
             self.state.restore_camera(self.cfg.get("camera") or {})
             self.renderer = mr.Renderer(model)
-            self._start_worker()
+        # (Re)start the render worker on every show. _start_worker is idempotent
+        # (no-op while a worker is running), so this spawns a thread only on the
+        # first show and after an on_hidden shutdown -- letting a hide->show cycle
+        # resurrect the worker that on_hidden kills to stop the leak (Task 22).
+        self._start_worker()
         # Refresh Ansiblex bridges from the host on (re)show: config edits or ESI
         # auto-discovery that happened while the tab was hidden are reflected, and
         # the crisp request below carries them into the render (store only -- no
@@ -376,6 +381,20 @@ class MapTab:
         merged["layers"] = layers
         self.cfg.update(merged)
         self.save_cfg(merged)
+        # Stop the immortal render worker so a hidden tab does not leak a
+        # map-render daemon (Task 22). renderer/model/frame_cache and the last
+        # frame on the canvas all survive; on_shown restarts the thread.
+        self.shutdown_worker()
+        # Cancel the pending _tick after() so it cannot fire against a torn-down
+        # root ("invalid command name ..._tick" Tcl stderr noise) and reset the
+        # flag so on_shown can schedule a fresh tick.
+        if self._tick_after_id is not None:
+            try:
+                self.frame.after_cancel(self._tick_after_id)
+            except Exception:
+                pass
+            self._tick_after_id = None
+        self._tick_scheduled = False
 
     # ---- overlay layers (Phase D) ----------------------------------------------
     # Two strata: range/threat re-tint the base bitmap (settle re-render via
@@ -524,12 +543,37 @@ class MapTab:
                                             name="map-render")
             self._worker.start()
 
+    def shutdown_worker(self) -> None:
+        """Stop the render worker and drop the handle so the next on_shown can
+        start a fresh one (Task 22 leak fix). Enqueues a None sentinel that
+        _worker_loop returns on -- whether it surfaces from the blocking get() or
+        while coalescing (draining get_nowait to the newest request) -- then joins
+        briefly for test determinism (renders are ~8-17 ms, so 2 s is ample).
+        Clears _applied_sig so the fresh worker's first render after a re-show
+        (same camera as at hide) is NOT duplicate-suppressed: on_shown
+        force-dirties and re-requests crisp, and a cleared sig lets that request
+        actually render (one extra render, safe -- see _applied_sig). Keeps
+        renderer/model/frame_cache and the on-canvas frame intact; only the
+        thread dies."""
+        worker = self._worker
+        if worker is None:
+            return
+        self._req_q.put(None)              # sentinel -> _worker_loop returns
+        worker.join(timeout=2.0)
+        self._worker = None                # next on_shown spawns a fresh worker
+        self._applied_sig = None           # don't dup-suppress the re-show render
+
     def _worker_loop(self) -> None:
         while True:
             req = self._req_q.get()
+            if req is None:                        # shutdown sentinel (blocking get)
+                return
             try:                                   # drain to latest (coalesce)
                 while True:
-                    req = self._req_q.get_nowait()
+                    nxt = self._req_q.get_nowait()
+                    if nxt is None:                # sentinel queued behind requests
+                        return                     # -> it wins; exit without render
+                    req = nxt
             except queue.Empty:
                 pass
             result = self._render_locked(req)      # None => duplicate suppressed
@@ -629,7 +673,8 @@ class MapTab:
     def _schedule_tick(self) -> None:
         if not self._tick_scheduled and self._visible:
             self._tick_scheduled = True
-            self.frame.after(TICK_MS, self._tick)
+            # Keep the after() id so on_hidden can cancel a pending tick (Task 22).
+            self._tick_after_id = self.frame.after(TICK_MS, self._tick)
 
     def _tick(self) -> None:
         self._tick_scheduled = False
