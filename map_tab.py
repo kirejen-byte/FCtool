@@ -35,6 +35,23 @@ SETTLE_MS = 120.0
 # `not self._visible` early-return in _tick and the visibility guard in
 # _schedule_tick -- so a hidden tab costs nothing regardless of this cadence.
 TICK_MS = 16
+# Adaptive ~30 fps frame pacing (Task 24 / Phase G, P2). The 16 ms tick keeps
+# advancing the ZoomAnimator/camera every frame (state.tick ~0.0 ms), but a
+# worker GESTURE-FRAME request is only enqueued when the previous gesture apply
+# has completed (self._gesture_inflight) AND at least this long has elapsed since
+# the last request. Skip-when-behind emerges for free: while an apply is pending
+# the ticks advance the camera silently and the next request samples the newer
+# camera -- a loaded box gets clean ~30 fps instead of queued 60 fps jank
+# (Task 23 diagnosis: fast-burst generated 576-732 ms/s of frame work, > the
+# 1000 ms budget once worker+main are summed, so the pipeline collapsed).
+GESTURE_MIN_INTERVAL_MS = 30.0
+# (Task 24 EXP verdict: a cyclic-GC probe -- gc.disable() during a glide +
+# gc.collect(0) on the settle-apply -- was measured against the end-of-glide crisp
+# spike (ap_total ~200 ms) and REMOVED. It did not reduce the spike; the A/B put
+# gc-disabled runs equal-or-worse (glide loop-lag p95 ~70-79 ms vs ~35 ms without;
+# spike present in both). Disabling gc process-wide just batched the churn into a
+# worse later collection. The residual intermittent settle-apply spike is a Tk/
+# allocation hiccup, not cleanly GC-attributable, and predates Task 24.)
 # Worker renders this many px beyond the viewport on every side (Task 17). Tk
 # still shows a viewport-sized center crop, but the FULL margined frame is cached
 # so pan / zoom-out serve real content instead of a black edge within +/-MARGIN.
@@ -162,6 +179,17 @@ class MapTabState:
                              now_ms, self.camera.min_scale, self.camera.max_scale)
         self.gesture.touch(now_ms)
         return "anim"
+
+    def zoom_instant(self, delta_steps: int, sx: float, sy: float,
+                     now_ms: float) -> None:
+        """Instant cursor-anchored zoom (P3 escape hatch, zoom_animation=False):
+        moves the camera THIS instant (no eased glide) and touches the settle
+        tracker so the tick loop schedules a crisp once input stops -- the
+        pre-Phase-F snap behaviour, now driven through the worker gesture-frame
+        pipeline (the caller enqueues one quick frame)."""
+        self.camera.zoom_at(ZOOM_STEP ** delta_steps, sx, sy, self.vw, self.vh)
+        self.gesture.touch(now_ms)
+        self._dirty = True
 
     def on_drag(self, dx: float, dy: float, now_ms: float | None = None) -> None:
         self.camera.pan_pixels(dx, dy)
@@ -370,6 +398,12 @@ class MapTab:
         except tk.TclError:
             pass
         self._bloom_var = tk.BooleanVar(value=bool(self.cfg.get("bloom", True)))
+        # Zoom-animation escape hatch (Task 24, P3): True = eased glide (default),
+        # False = instant snap (pre-Phase-F feel) for owners who prefer it. No
+        # toolbar button -- toggled from the empty-space right-click menu and
+        # persisted on hide like bloom/layers.
+        self._zoom_anim_var = tk.BooleanVar(
+            value=bool(self.cfg.get("zoom_animation", True)))
         tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=t["bg"],
                        fg=t["fg"], selectcolor=t["panel"],
                        activebackground=t["bg"], activeforeground=t["accent"],
@@ -402,7 +436,16 @@ class MapTab:
 
         self.state = MapTabState(vw=800, vh=600)
         self.renderer = None
-        self.frame_cache = mr.FrameCache()
+        # FrameCache is now WORKER-OWNED (Task 24, P1): only the render worker
+        # thread touches it -- it stores the full margined surface after each
+        # crisp render (_render_locked) and serves gesture quick frames from it
+        # (_render_gesture), so quick_frame + surface_to_ppm (~11 ms) run OFF the
+        # main thread. The main thread only ever applies a finished ppm
+        # (PhotoImage + itemconfig, ~18 ms). Created once and shared across worker
+        # restarts (shutdown_worker joins before a re-show spawns a new worker, so
+        # there is never concurrent access); it survives hide/show like the
+        # renderer/model so a reshow can serve gestures from the last crisp.
+        self._worker_cache = mr.FrameCache()
         self.stats = mr.SettleStats()
         self._render_mode = self.cfg.get("render_mode", "auto")
 
@@ -417,8 +460,8 @@ class MapTab:
         # Signature of the crisp frame currently APPLIED to the canvas (duplicate-
         # settle suppression, Task 18 Step 1b): the worker skips a request whose
         # sig equals it -- that exact view is already on screen. WRITTEN by the
-        # main thread only (_apply_frame records it; _show_gesture_frame clears it
-        # when a quick frame replaces the crisp); READ by the worker (GIL-atomic
+        # main thread only (_apply_crisp_frame records it; _request_gesture_frame
+        # clears it when a quick frame replaces the crisp); READ by the worker (GIL-atomic
         # reference read). A stale read is benign both ways: None/old sig -> one
         # extra render (safe); a sig cleared just after the worker read it -> the
         # gesture that cleared it also touched the settle tracker, so a fresh
@@ -435,6 +478,13 @@ class MapTab:
         self._drag_last: tuple[int, int] | None = None
         self._img_offset = (0.0, 0.0)
         self._last_drag_qf = 0.0        # last drag quick-frame time (throttle, Task 17)
+        # Adaptive-pacing state (Task 24, P2). _gesture_inflight is True from the
+        # moment a gesture request is enqueued until its result is applied (or
+        # coalesced away / dropped) -- both apply paths clear it, so it can never
+        # wedge. _last_gesture_req_ms is the monotonic-ms stamp of the last
+        # gesture request for the >= GESTURE_MIN_INTERVAL_MS gate.
+        self._gesture_inflight = False
+        self._last_gesture_req_ms = 0.0
 
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -523,6 +573,7 @@ class MapTab:
         merged = dict(self.cfg)
         merged["camera"] = cam
         merged["bloom"] = bool(self._bloom_var.get())
+        merged["zoom_animation"] = bool(self._zoom_anim_var.get())   # P3 persist
         # Persist the live layer-toggle state (range flag is overlay-driven and
         # already carried on self.cfg["layers"]; the 3 vars mirror the toolbar).
         layers = dict(self.cfg.get("layers", {}))
@@ -532,7 +583,7 @@ class MapTab:
         self.cfg.update(merged)
         self.save_cfg(merged)
         # Stop the immortal render worker so a hidden tab does not leak a
-        # map-render daemon (Task 22). renderer/model/frame_cache and the last
+        # map-render daemon (Task 22). renderer/model/_worker_cache and the last
         # frame on the canvas all survive; on_shown restarts the thread.
         self.shutdown_worker()
         # Cancel the pending _tick after() so it cannot fire against a torn-down
@@ -703,8 +754,13 @@ class MapTab:
         (same camera as at hide) is NOT duplicate-suppressed: on_shown
         force-dirties and re-requests crisp, and a cleared sig lets that request
         actually render (one extra render, safe -- see _applied_sig). Keeps
-        renderer/model/frame_cache and the on-canvas frame intact; only the
-        thread dies."""
+        renderer/worker_cache and the on-canvas frame intact; only the thread
+        dies."""
+        # Guaranteed teardown of the Task-24 pacing state, BEFORE the worker-None
+        # early-return: a gesture request that was in flight when the worker died
+        # would otherwise never be applied (its result is discarded) and
+        # _gesture_inflight would then wedge the next glide.
+        self._gesture_inflight = False
         worker = self._worker
         if worker is None:
             return
@@ -731,15 +787,21 @@ class MapTab:
                 self._result_q.put(result)
 
     def _render_locked(self, req: dict) -> tuple | None:
-        """Render one coalesced request on the worker thread, or return None when
-        it exactly duplicates the crisp frame already APPLIED to the canvas
-        (camera + size + bloom + mode + tint) -- duplicate-settle suppression
-        (Task 18 Step 1b): that exact view is on screen, so re-rendering is
-        wasted work. The sig travels in the result tuple; _apply_frame records
-        it only when the frame actually lands (visible + current generation), so
-        a dropped frame can never block its own re-request (see _applied_sig).
-        Kept as a method (not inline in _worker_loop) so a duplicate-suppression
-        test can drive it directly without the render thread. Touches no Tcl."""
+        """Serve one coalesced request on the worker thread. GESTURE requests
+        (kind == "gesture") are dispatched to _render_gesture -- the worker crops+
+        smoothscales its own FrameCache off the main thread (Task 24, P1). A CRISP
+        request renders the full margined frame, stores it into the worker cache
+        (so subsequent gesture frames have real content), and returns None when it
+        exactly duplicates the crisp frame already APPLIED to the canvas (camera +
+        size + bloom + mode + tint) -- duplicate-settle suppression (Task 18 Step
+        1b). The sig travels in the result tuple; _apply_crisp_frame records it
+        only when the frame actually lands (visible + current generation), so a
+        dropped frame can never block its own re-request (see _applied_sig). Kept
+        as a method (not inline in _worker_loop) so the duplicate-suppression
+        tests can drive the crisp path directly without the render thread. Touches
+        no Tcl."""
+        if req.get("kind") == "gesture":
+            return self._render_gesture(req)
         sig = _request_sig(req)
         if sig == self._applied_sig:
             return None
@@ -760,14 +822,45 @@ class MapTab:
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
         # surface_to_ppm reads it directly). Build it transiently so the parent
-        # surf is not left subsurface-locked across the queue hand-off.
+        # surf is not left subsurface-locked before we store it in the cache.
         ppm = mr.surface_to_ppm(mr.center_subsurface(surf, MARGIN, vw, vh))
-        # Hand off to the main thread (no Tcl calls here); _tick applies it.
-        # surf is the FULL margined frame -> _apply_frame caches it (view dims).
-        return (req["generation"], ppm, surf, cam, vw, vh, ms, sig)
+        # P1: the WORKER owns the FrameCache now -- store the FULL margined surf
+        # here (view dims recorded) so gesture frames serve real margin content
+        # without the main thread ever touching pygame. Main only gets the ppm.
+        self._worker_cache.store(surf, cam, vw, vh)
+        # Hand off to the main thread (no Tcl calls here); _drain_results applies.
+        return ("crisp", req["generation"], ppm, ms, sig)
 
-    def _apply_frame(self, generation: int, ppm: bytes, surf, cam,
-                     vw: int, vh: int, ms: float, sig: tuple | None = None) -> None:
+    def _render_gesture(self, req: dict) -> tuple:
+        """Serve a gesture (zoom-glide / drag) quick frame from the worker's
+        FrameCache for the request's camera SNAPSHOT (Task 24, P1). quick_frame +
+        surface_to_ppm (~11 ms measured) run here, off the main thread; the main
+        thread applies the ppm with only PhotoImage + itemconfig (~18 ms). Always
+        returns a tuple so _drain_results can clear the pacing in-flight flag even
+        on the FIRST-SHOW empty cache (ppm None -> main keeps the prior photo, the
+        pre-Task-24 behaviour). The camera dict rides back so the apply can offset
+        the enqueue-time base image to align with the LIVE camera (drag/zoom lag).
+        Touches no Tcl."""
+        cam = mc.Camera.from_dict(req["camera"])
+        vw, vh = req["vw"], req["vh"]
+        t0 = time.perf_counter()
+        quick = self._worker_cache.quick_frame(cam, vw, vh)
+        if quick is None:                      # empty cache (first show, pre-crisp)
+            ms = (time.perf_counter() - t0) * 1000.0
+            return ("gesture", req["generation"], None, ms, req["camera"])
+        ppm = mr.surface_to_ppm(quick)
+        ms = (time.perf_counter() - t0) * 1000.0
+        return ("gesture", req["generation"], ppm, ms, req["camera"])
+
+    def _apply_crisp_frame(self, generation: int, ppm: bytes, ms: float,
+                           sig: tuple | None = None) -> None:
+        """Apply a finished CRISP frame (main thread). The worker already stored
+        the full margined surf in its cache and cropped the ppm, so this does only
+        PhotoImage + itemconfig + status + overlay reproject (no pygame). Resets
+        _img_offset to 0 (the crisp is for the settled camera). Clears the pacing
+        in-flight flag first so a gesture that was superseded by this crisp (and
+        thus never reached _apply_gesture_frame) cannot wedge the next glide."""
+        self._gesture_inflight = False
         if not self._visible or not self.state.is_current(generation):
             return                       # dropped -> _applied_sig stays unrecorded
         tele = self._tele
@@ -779,9 +872,6 @@ class MapTab:
         self.canvas.coords(self._img_item, 0, 0)
         self._img_offset = (0.0, 0.0)
         if _c: _a2 = _c()
-        # surf is the FULL margined frame; store records its surface dims so
-        # quick_frame can serve the margin during pan/zoom-out (Task 17).
-        self.frame_cache.store(surf, cam, vw, vh)
         self._applied_sig = sig          # this view is now on screen -> the worker
         self.status.config(text=f"render {ms:.0f} ms")  # may suppress duplicates
         if _c: _a3 = _c()
@@ -791,10 +881,57 @@ class MapTab:
             _now = tele._ms()
             tele.stage("ap_photoimage", (_a1 - _a0) * 1000.0, _now)
             tele.stage("ap_itemconfig", (_a2 - _a1) * 1000.0, _now)
-            tele.stage("ap_store_status", (_a3 - _a2) * 1000.0, _now)
+            tele.stage("ap_status", (_a3 - _a2) * 1000.0, _now)
             tele.stage("ap_overlay", (_a4 - _a3) * 1000.0, _now)
             tele.stage("ap_total", (_a4 - _a0) * 1000.0, _now)
             tele.stage("worker_render_ms", ms, _now)  # worker's own render time
+            tele.swap()
+            self._tele_applied_this_tick = True
+
+    def _apply_gesture_frame(self, generation: int, ppm: bytes | None,
+                             ms: float, cam_dict: dict) -> None:
+        """Apply a worker-served gesture quick frame (main thread, Task 24 P1).
+        Clears the pacing in-flight flag FIRST -- the request has resolved, so the
+        next tick may enqueue again -- even on the empty-cache (ppm None) or
+        stale-generation drop paths, so pacing can never wedge. On a real frame it
+        offsets the enqueue-time base image so it aligns with the LIVE camera: the
+        image is a quick frame for the camera SNAPSHOT taken when the request was
+        enqueued (~1 tick ago), while overlays are drawn from the live camera, so
+        without the offset the base + overlays would drift by the pan since
+        enqueue. For a pure pan (drag) the offset is EXACT and equals the
+        accumulated live-pan slide, so the swap is position-continuous; for a zoom
+        glide it removes the center-pan component (the small residual scale-stretch
+        of one glide step is inherent to an approximate gesture frame). Does NOT
+        touch _applied_sig (already cleared to None at enqueue -- the canvas no
+        longer shows the applied crisp)."""
+        self._gesture_inflight = False
+        if ppm is None:
+            return                       # empty cache (first show): keep prior photo
+        if not self._visible or not self.state.is_current(generation):
+            return                       # superseded -> drop, prior photo stays
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _g0 = _c()
+        # Residual offset that aligns the enqueue-camera base image with the live
+        # camera (see docstring). Pure-pan-exact; zoom keeps only a tiny stretch.
+        live = self.state.camera
+        ox = (cam_dict["cx"] - live.cx) * live.scale
+        oy = (cam_dict["cy"] - live.cy) * live.scale
+        self._photo = tk.PhotoImage(data=ppm)
+        if _c: _g1 = _c()
+        self.canvas.itemconfig(self._img_item, image=self._photo)
+        self.canvas.coords(self._img_item, ox, oy)
+        self._img_offset = (ox, oy)
+        if _c: _g2 = _c()
+        self._redraw_overlays()          # reproject overlays onto the gesture frame
+        if _c:
+            _g3 = _c()
+            _now = tele._ms()
+            tele.stage("gf_photoimage", (_g1 - _g0) * 1000.0, _now)
+            tele.stage("gf_itemconfig", (_g2 - _g1) * 1000.0, _now)
+            tele.stage("gf_overlay", (_g3 - _g2) * 1000.0, _now)
+            tele.stage("gf_total", (_g3 - _g0) * 1000.0, _now)
+            tele.stage("gf_worker_ms", ms, _now)   # worker quick_frame+ppm (off-main)
             tele.swap()
             self._tele_applied_this_tick = True
 
@@ -802,6 +939,7 @@ class MapTab:
         if self.renderer is None:
             return
         self._req_q.put({
+            "kind": "crisp",
             "generation": self.state.next_generation(),
             "camera": self.state.camera.to_dict(),
             "vw": self.state.vw, "vh": self.state.vh,
@@ -813,49 +951,39 @@ class MapTab:
             "bridges": self.state.bridges if self._layer_on("bridges") else None,
         })
 
-    def _show_gesture_frame(self) -> bool:
-        """Swap in a FrameCache quick frame for the live camera. Returns True if a
-        frame was shown (cache had content), False if the cache was empty. On a
-        swap it resets _img_offset to (0, 0): the quick frame is already
-        camera-correct, so any drag-slide offset accumulated on the stale image
-        must be cleared (Task 17 relies on this)."""
-        tele = self._tele
-        _c = time.perf_counter if tele is not None else None
-        if _c: _g0 = _c()
-        quick = self.frame_cache.quick_frame(self.state.camera,
-                                             self.state.vw, self.state.vh)
-        if quick is None:
-            return False
-        if _c: _g1 = _c()
-        self.state.next_generation()          # invalidate in-flight crisp
-        # The canvas no longer shows the applied crisp -> clear the suppression
-        # sig, so a settle request that lands back on the exact same camera
-        # (e.g. a wheel in+out round-trip) re-renders crisp instead of being
-        # suppressed and leaving the smoothscaled quick frame on screen.
+    def _request_gesture_frame(self) -> None:
+        """Enqueue a WORKER-served gesture (quick) frame for the LIVE camera
+        (Task 24, P1) -- replaces the old main-thread _show_gesture_frame. The
+        worker crops+smoothscales its FrameCache (~11 ms off-main) and posts a
+        ('gesture', gen, ppm, ms, cam) result that _drain_results applies with
+        only PhotoImage + itemconfig (~18 ms main). Bumps the generation so any
+        in-flight crisp is invalidated AND this gesture is generation-tagged (a
+        stale result drops in _apply_gesture_frame). Clears the duplicate-
+        suppression sig: the canvas no longer shows the applied crisp, so a settle
+        request that lands back on the exact same camera (wheel in+out round-trip)
+        re-renders crisp instead of being suppressed (Task 18). Marks a gesture
+        in flight for the pacing gate; the request carries the camera SNAPSHOT so
+        the async apply can realign the base image with the live camera."""
+        if self.renderer is None:
+            return
+        gen = self.state.next_generation()
         self._applied_sig = None
-        if _c: _g2 = _c()
-        _ppm = mr.surface_to_ppm(quick)
-        if _c: _g3 = _c()
-        self._photo = tk.PhotoImage(data=_ppm)
-        if _c: _g4 = _c()
-        self.canvas.itemconfig(self._img_item, image=self._photo)
-        self.canvas.coords(self._img_item, 0, 0)
-        self._img_offset = (0.0, 0.0)
-        if _c: _g5 = _c()
-        self._redraw_overlays()           # reproject overlays onto the gesture frame
-        if _c:
-            _g6 = _c()
-            _now = tele._ms()
-            tele.stage("gf_quick_frame", (_g1 - _g0) * 1000.0, _now)
-            tele.stage("gf_ppm", (_g3 - _g2) * 1000.0, _now)
-            tele.stage("gf_photoimage", (_g4 - _g3) * 1000.0, _now)
-            tele.stage("gf_itemconfig", (_g5 - _g4) * 1000.0, _now)
-            tele.stage("gf_overlay", (_g6 - _g5) * 1000.0, _now)
-            tele.stage("gf_total", (_g6 - _g0) * 1000.0, _now)
-            tele.swap()
-        return True
+        self._gesture_inflight = True
+        self._req_q.put({
+            "kind": "gesture",
+            "generation": gen,
+            "camera": self.state.camera.to_dict(),
+            "vw": self.state.vw, "vh": self.state.vh,
+        })
 
     # ---- tick loop ---------------------------------------------------------------
+    def _gesture_gate_open(self, now_ms: float) -> bool:
+        """P2 pacing gate for glide gesture frames: open only when the previous
+        gesture apply has completed (in-flight flag cleared) AND at least
+        GESTURE_MIN_INTERVAL_MS has elapsed since the last request. Pure/testable."""
+        return (not self._gesture_inflight
+                and now_ms - self._last_gesture_req_ms >= GESTURE_MIN_INTERVAL_MS)
+
     def _schedule_tick(self) -> None:
         if not self._tick_scheduled and self._visible:
             self._tick_scheduled = True
@@ -885,14 +1013,20 @@ class MapTab:
         verdict = self.state.tick(_now_ms())
         if _c: _k2 = _c()
         if verdict == "anim":
-            # Zoom glide frame: swap in a FrameCache quick frame for the freshly
-            # advanced camera (one code path for all animation frames). Empty
-            # cache (first show, no crisp yet) -> returns False and the previous
-            # crisp stays displayed while the camera keeps moving; the settle
-            # crisp lands at the end (FIRST-SHOW GUARD -> no black flash). Each
-            # quick swap clears _applied_sig, so the post-glide crisp is never
-            # duplicate-suppressed (Task 18).
-            self._show_gesture_frame()
+            # Glide active (Task 24). Enqueue a WORKER gesture frame -- but PACE it
+            # (P2): only when the previous gesture apply has completed AND
+            # >= GESTURE_MIN_INTERVAL_MS elapsed since the last request. When the
+            # gate is closed the camera still advanced (state.tick above), so the
+            # NEXT request samples the newer camera -- skip-when-behind for free,
+            # ~30 fps instead of queued 60 fps jank. Empty cache (first show, no
+            # crisp yet) -> the worker returns ppm None and the previous crisp
+            # stays while the camera keeps moving; the settle crisp lands at the
+            # end (no black flash). Each gesture enqueue clears _applied_sig so the
+            # post-glide crisp is never duplicate-suppressed (Task 18).
+            now = _now_ms()
+            if self._gesture_gate_open(now):
+                self._last_gesture_req_ms = now
+                self._request_gesture_frame()
         elif verdict == "crisp":
             self._request_crisp()
         if _c:
@@ -905,37 +1039,52 @@ class MapTab:
                        "state_tick_ms": (_k2 - _k1) * 1000.0})
 
     def _drain_results(self) -> None:
-        """Coalesce worker output on the main thread. Two payload shapes share
-        the queue: 8-tuple render frames (latest-wins; the generation check in
-        _apply_frame drops stale ones; the trailing element is the request sig
-        recorded as _applied_sig on a successful apply) and ("threat", frozenset)
-        results from the recompute helper thread. Keep them apart so a threat
-        result is never dropped by frame coalescing, and so a frame is never
-        misread as threat."""
+        """Coalesce worker output on the main thread. Every result is a tuple led
+        by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
+        ms, cam) and ('threat', frozenset). Frames (crisp OR gesture) share one
+        latest-wins slot -- the worker produces them in strictly increasing
+        generation order, so the last one drained has the highest generation and
+        any earlier one it superseded would be dropped by the is_current check in
+        the apply anyway (a queued crisp thus correctly supersedes older gesture
+        frames -- it also carries a newer cache). Threat results are kept in a
+        SEPARATE slot so a threat is never dropped by frame coalescing (nor a
+        frame misread as threat). Dispatch by tag: crisp and gesture take
+        different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
         try:
             while True:
                 item = self._result_q.get_nowait()
-                if len(item) == 2 and item[0] == "threat":
+                if item[0] == "threat":
                     latest_threat = item
                 else:
-                    latest_frame = item
+                    latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
             pass
         if latest_frame is not None:
-            self._apply_frame(*latest_frame)
+            if latest_frame[0] == "crisp":
+                self._apply_crisp_frame(*latest_frame[1:])
+            else:
+                self._apply_gesture_frame(*latest_frame[1:])
         if latest_threat is not None:
             self.set_threat(latest_threat[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
         steps = 1 if event.delta > 0 else -1
-        # Retarget only -- do NOT show a frame here. The tick loop owns every
-        # animation frame (glide quick frames + settle crisp), so the wheel just
-        # (re)arms the animator and ensures the loop is running. One code path
-        # keeps the eased motion continuous instead of one instant jump per notch.
-        self.state.on_wheel(steps, event.x, event.y, _now_ms())
+        if self._zoom_anim_var.get():
+            # Eased glide (default): retarget only -- the tick loop owns every
+            # animation frame (paced worker gesture frames + settle crisp), so the
+            # wheel just (re)arms the animator and ensures the loop is running. One
+            # code path keeps the motion continuous instead of an instant jump.
+            self.state.on_wheel(steps, event.x, event.y, _now_ms())
+        else:
+            # Instant snap (P3 escape hatch, zoom_animation=False): move the camera
+            # THIS instant and enqueue ONE worker gesture frame for immediate
+            # feedback; the tick loop then settles to a crisp ~SETTLE_MS later.
+            # The pre-Phase-F feel, routed through the new P1 pipeline.
+            self.state.zoom_instant(steps, event.x, event.y, _now_ms())
+            self._request_gesture_frame()
         self._schedule_tick()
         return "break"
 
@@ -952,18 +1101,18 @@ class MapTab:
         ox, oy = self._img_offset
         self._img_offset = (ox + dx, oy + dy)
         self.canvas.coords(self._img_item, *self._img_offset)   # cheap live pan
-        # ALSO serve a throttled real-content frame from the margined cache
-        # (Task 17): the slide above covers the 0-33 ms window; a quick frame then
-        # swaps in real margin content (resetting _img_offset to 0) so panning
-        # shows no black edge within +/-MARGIN. _show_gesture_frame redraws the
-        # overlays itself on a swap, so only redraw here when it didn't swap.
+        # ALSO request a throttled real-content frame through the WORKER gesture
+        # pipeline (Task 24 P1): the slide above covers the sub-frame window; the
+        # async quick frame swaps in real margin content (Task 17) realigned to the
+        # live camera by _apply_gesture_frame -- for a pure pan the realign offset
+        # EQUALS the accumulated live-pan slide, so the swap is position-continuous
+        # (no black edge within +/-MARGIN). Gate on the 33 ms throttle AND the
+        # in-flight flag so a fast drag never piles requests.
         now = _now_ms()
-        swapped = False
-        if now - self._last_drag_qf >= 33.0:
+        if not self._gesture_inflight and now - self._last_drag_qf >= 33.0:
             self._last_drag_qf = now
-            swapped = self._show_gesture_frame()
-        if not swapped:
-            self._redraw_overlays()                             # keep overlays glued to nodes
+            self._request_gesture_frame()
+        self._redraw_overlays()             # keep overlays glued to the live camera
         self._schedule_tick()
 
     def _on_drag_end(self, _event) -> None:
@@ -1058,6 +1207,8 @@ class MapTab:
         menu.add_command(label="Fit universe", command=self._fit_universe)
         menu.add_checkbutton(label="Bloom", variable=self._bloom_var,
                              command=self._on_bloom_toggle)
+        menu.add_checkbutton(label="Zoom animation", variable=self._zoom_anim_var,
+                             command=self._on_zoom_anim_toggle)
         menu.add_separator()
         menu.add_checkbutton(label="Threat projection",
                              variable=self._layer_vars["threat"],
@@ -1182,3 +1333,9 @@ class MapTab:
     def _on_bloom_toggle(self) -> None:
         self.state.force_dirty()
         self._request_crisp()
+
+    def _on_zoom_anim_toggle(self) -> None:
+        """P3: persist the zoom-animation preference to cfg immediately (also
+        re-saved on hide). No re-render needed -- it only changes how the NEXT
+        wheel notch behaves (eased glide vs instant snap)."""
+        self.cfg["zoom_animation"] = bool(self._zoom_anim_var.get())

@@ -62,6 +62,10 @@ DEFAULT_CONFIG = {
     },
     "map": {
         "bloom": True,
+        # Eased zoom glide (Task 24, P3). False = instant snap (pre-Phase-F feel)
+        # for owners who prefer it; toggled from the map empty-space right-click
+        # menu ("Zoom animation") and persisted on hide.
+        "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
                    "bridges": True},
         "threat_ship": "Titan Bridge",
