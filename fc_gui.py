@@ -14433,6 +14433,23 @@ class FCToolGUI:
         _tip(bimp, "Import tile positions/sizes from your existing Eve-O Preview "
                    "configuration.")
 
+        # Deliberately red, not Dark.TButton — this is a danger/recovery action
+        # (clears saved positions/sizes), so it must read as distinct from the
+        # neutral arrange/import controls beside it. A plain tk.Button (not
+        # ttk) is used so bg/activebackground are literal, testable colors.
+        brst = tk.Button(rowN4, text="Reset previews",
+                          font=("Consolas", 10, "bold"),
+                          bg="#aa2222", fg=FG_WHITE,
+                          activebackground="#cc3333", activeforeground=FG_WHITE,
+                          borderwidth=1, relief=tk.RIDGE, cursor="hand2",
+                          command=self._preview_reset_layout)
+        brst.grid(row=0, column=5, padx=(0, 6))
+        w.append(brst)
+        self._preview_reset_btn = brst
+        _tip(brst, "Bring all preview windows back on-screen and clear saved "
+                   "positions/sizes. Use this if previews were dragged "
+                   "off-screen or a monitor was disconnected.")
+
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
         # Stored so the active mode's panel packs *before* it (see
@@ -14753,6 +14770,44 @@ class FCToolGUI:
                         pass
                     break
         self._save_config()
+
+    def _preview_reset_layout(self, _test_confirm=None):
+        """Recovery action for the red 'Reset previews' button.
+
+        Real-world trigger: a tile got dragged off-screen, or a monitor was
+        disconnected, and the user can no longer see/reach a preview window.
+        This confirms, then wipes ONLY the persisted geometry keys — layouts,
+        sizes, login_position — and immediately snaps every live tile back
+        onto the screen by reusing the exact same handler the "Arrange in
+        grid" button uses (DRY; _preview_arrange_grid already re-places every
+        live non-login tile and persists its new rect). Non-geometry settings
+        (tile_w/tile_body_h/uniform_size/hotkeys/etc.) are never touched.
+
+        ``_test_confirm`` mirrors the repo's ``_test_no_wait`` dialog-bypass
+        idiom: None (default) shows the real confirmation dialog; True/False
+        supplies the answer directly so tests never block on a real modal.
+        """
+        if _test_confirm is None:
+            proceed = messagebox.askyesno(
+                "Reset previews",
+                "Move all preview windows back on-screen and clear saved "
+                "positions and sizes?",
+                parent=self.root)
+        else:
+            proceed = _test_confirm
+        if not proceed:
+            return
+        cfg = self._preview_cfg()
+        cfg["layouts"] = {}
+        cfg["sizes"] = {}
+        # Deep-copy idiom (matches _preview_cfg's own defaulting) — never
+        # alias the shared class-level default list.
+        cfg["login_position"] = json.loads(json.dumps(
+            FCToolGUI._PREVIEW_DEFAULTS["login_position"]))
+        self._save_config()
+        # Nothing live to re-place → skip the (harmless but pointless) call.
+        if self._preview_tiles:
+            self._preview_arrange_grid()
 
     @staticmethod
     def parse_eveo_config(json_text: str) -> dict:
