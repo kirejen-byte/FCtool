@@ -13,11 +13,14 @@ fc_gui) touch tkinter.
 """
 from __future__ import annotations
 
+import json
+import os
 import queue
 import re
 import threading
 import time
 import tkinter as tk
+from collections import deque
 
 import map_camera as mc
 import map_data
@@ -221,6 +224,113 @@ class MapTabState:
                                 within_fn=within_fn, legal_fn=legal_fn)
 
 
+class MapTelemetry:
+    """Opt-in frame-timing recorder for the map tab (Task 23 feel diagnosis).
+
+    Instantiated by MapTab ONLY when telemetry is enabled (``MapTab(telemetry=
+    True)`` or env ``FCTOOL_MAP_TELEMETRY``). When disabled the MapTab holds
+    ``self._tele = None`` and every instrumentation site short-circuits on a single
+    ``if _c:`` where ``_c = time.perf_counter if self._tele is not None else None``
+    -- so the OFF path is one attribute load, one ``is not None`` test, and N cheap
+    ``if None:`` branches: no ``perf_counter`` call, no ``_ms()``, no dict, no
+    allocation (measured in tools/spike/off_cost.py).
+
+    All series are bounded deques timestamped in monotonic-ms since construction so
+    analysis can slice any window by phase mark:
+      * ``stages``  name -> (t_ms, dur_ms)  per-stage durations (quick_frame / ppm /
+        PhotoImage / itemconfig+coords / overlay redraw / totals / worker render);
+      * ``ticks``   per-tick dicts (t, phase: idle|anim|drain-apply, verdict, and
+        tick / drain / state-tick ms);
+      * ``gaps``    (t_ms, ms-since-previous _photo swap) -- the felt frame cadence;
+      * ``lag``     (t_ms, actual_delay_ms - 50) from a 50 ms event-loop heartbeat.
+    ``mark(label)`` stamps phase boundaries the harness sets. ``summary()`` reduces
+    each series to p50/p90/p95/max/mean; ``dump()`` writes raw + summary JSON."""
+
+    def __init__(self, maxlen: int = 2000) -> None:
+        self._t0 = time.monotonic()
+        self._maxlen = maxlen
+        self.stages: dict[str, deque] = {}
+        self.ticks: deque = deque(maxlen=maxlen)
+        self.gaps: deque = deque(maxlen=maxlen)
+        self.lag: deque = deque(maxlen=maxlen)
+        self.marks: list = []
+        self._last_swap: float | None = None
+
+    def _ms(self) -> float:
+        return (time.monotonic() - self._t0) * 1000.0
+
+    def stage(self, name: str, dur_ms: float, t_ms: float | None = None) -> None:
+        d = self.stages.get(name)
+        if d is None:
+            d = self.stages[name] = deque(maxlen=self._maxlen)
+        d.append((self._ms() if t_ms is None else t_ms, dur_ms))
+
+    def tick(self, rec: dict) -> None:
+        self.ticks.append(rec)
+
+    def swap(self) -> None:
+        """Record a _photo swap; append the gap (ms) since the previous swap."""
+        now = time.monotonic()
+        if self._last_swap is not None:
+            self.gaps.append(((now - self._t0) * 1000.0,
+                              (now - self._last_swap) * 1000.0))
+        self._last_swap = now
+
+    def lag_sample(self, over_ms: float) -> None:
+        self.lag.append((self._ms(), over_ms))
+
+    def mark(self, label: str) -> None:
+        self.marks.append((self._ms(), label))
+
+    # -- reduction --------------------------------------------------------------
+    @staticmethod
+    def _pcts(values) -> dict:
+        xs = sorted(values)
+        n = len(xs)
+        if n == 0:
+            return {"n": 0}
+
+        def q(p: float) -> float:
+            return xs[min(int(n * p), n - 1)]
+
+        return {"n": n, "p50": q(0.50), "p90": q(0.90), "p95": q(0.95),
+                "max": xs[-1], "mean": sum(xs) / n}
+
+    def summary(self) -> dict:
+        out: dict = {"elapsed_ms": self._ms(), "stages": {}}
+        for name, series in self.stages.items():
+            out["stages"][name] = self._pcts([d for _, d in series])
+        out["gap"] = self._pcts([g for _, g in self.gaps])
+        out["lag"] = self._pcts([v for _, v in self.lag])
+        out["tick_ms"] = self._pcts([r["tick_ms"] for r in self.ticks])
+        phases: dict[str, int] = {}
+        for r in self.ticks:
+            phases[r["phase"]] = phases.get(r["phase"], 0) + 1
+        out["tick_phase_counts"] = phases
+        return out
+
+    def dump(self, path: str = "tools/spike/telemetry_out.json",
+             meta: dict | None = None) -> str:
+        payload = {
+            "meta": meta or {},
+            "summary": self.summary(),
+            "marks": list(self.marks),
+            "ticks": list(self.ticks),
+            "gaps": list(self.gaps),
+            "lag": list(self.lag),
+            "stages": {k: list(v) for k, v in self.stages.items()},
+        }
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        return path
+
+
 class MapTab:
     """Tk widget/controller. Host wires: frame into a Notebook tab,
     on_shown/on_hidden from <<NotebookTabChanged>>, cfg dict + save_cfg,
@@ -230,7 +340,8 @@ class MapTab:
 
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
-                 autocomplete_cls=None, theme: dict | None = None) -> None:
+                 autocomplete_cls=None, theme: dict | None = None,
+                 telemetry: bool = False) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -332,6 +443,45 @@ class MapTab:
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", self._on_right_click)
         self.canvas.bind("<Configure>", self._on_configure)
+
+        # --- opt-in feel telemetry (Task 23) -----------------------------------
+        # Enabled by the `telemetry=True` kwarg OR env FCTOOL_MAP_TELEMETRY (any
+        # value other than ""/"0"/"false"; a bare integer >1 also sets the deque
+        # maxlen so a long diagnosis run keeps every idle tick). Disabled by
+        # default -> self._tele is None -> every instrumentation site is a single
+        # short-circuiting `if _c:` (no perf_counter / dict / allocation). The lag
+        # heartbeat reschedules UNCONDITIONALLY (not gated on _visible) so it
+        # samples loop lag through non-map phases too (H2/H4 comparator).
+        _env = os.environ.get("FCTOOL_MAP_TELEMETRY", "")
+        _tele_on = bool(telemetry) or (_env not in ("", "0", "false", "False"))
+        _maxlen = int(_env) if _env.isdigit() and int(_env) > 1 else 2000
+        self._tele = MapTelemetry(maxlen=_maxlen) if _tele_on else None
+        self._tele_applied_this_tick = False
+        self._tele_lag_last: float | None = None
+        if self._tele is not None:
+            self._tele_lag_last = time.perf_counter()
+            try:
+                self.frame.after(50, self._tele_lag_beat)
+            except Exception:
+                pass
+
+    def _tele_lag_beat(self) -> None:
+        """Event-loop lag heartbeat (Task 23). Records actual_delay_ms - 50 each
+        50 ms beat and reschedules UNCONDITIONALLY (independent of _visible / the
+        map tick), so it measures loop lag through every harness phase -- including
+        the non-map-tab control window where the map tick is stopped. No-ops (and
+        stops rescheduling) once telemetry is cleared or the root is torn down."""
+        tele = self._tele
+        if tele is None:
+            return
+        now = time.perf_counter()
+        if self._tele_lag_last is not None:
+            tele.lag_sample((now - self._tele_lag_last) * 1000.0 - 50.0)
+        self._tele_lag_last = now
+        try:
+            self.frame.after(50, self._tele_lag_beat)
+        except Exception:
+            pass
 
     # ---- lifecycle ------------------------------------------------------------
     def on_shown(self) -> None:
@@ -620,16 +770,33 @@ class MapTab:
                      vw: int, vh: int, ms: float, sig: tuple | None = None) -> None:
         if not self._visible or not self.state.is_current(generation):
             return                       # dropped -> _applied_sig stays unrecorded
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _a0 = _c()
         self._photo = tk.PhotoImage(data=ppm)   # ppm = viewport-sized center crop
+        if _c: _a1 = _c()
         self.canvas.itemconfig(self._img_item, image=self._photo)
         self.canvas.coords(self._img_item, 0, 0)
         self._img_offset = (0.0, 0.0)
+        if _c: _a2 = _c()
         # surf is the FULL margined frame; store records its surface dims so
         # quick_frame can serve the margin during pan/zoom-out (Task 17).
         self.frame_cache.store(surf, cam, vw, vh)
         self._applied_sig = sig          # this view is now on screen -> the worker
         self.status.config(text=f"render {ms:.0f} ms")  # may suppress duplicates
+        if _c: _a3 = _c()
         self._redraw_overlays()          # reproject Tk overlay items onto the fresh frame
+        if _c:
+            _a4 = _c()
+            _now = tele._ms()
+            tele.stage("ap_photoimage", (_a1 - _a0) * 1000.0, _now)
+            tele.stage("ap_itemconfig", (_a2 - _a1) * 1000.0, _now)
+            tele.stage("ap_store_status", (_a3 - _a2) * 1000.0, _now)
+            tele.stage("ap_overlay", (_a4 - _a3) * 1000.0, _now)
+            tele.stage("ap_total", (_a4 - _a0) * 1000.0, _now)
+            tele.stage("worker_render_ms", ms, _now)  # worker's own render time
+            tele.swap()
+            self._tele_applied_this_tick = True
 
     def _request_crisp(self) -> None:
         if self.renderer is None:
@@ -652,21 +819,40 @@ class MapTab:
         swap it resets _img_offset to (0, 0): the quick frame is already
         camera-correct, so any drag-slide offset accumulated on the stale image
         must be cleared (Task 17 relies on this)."""
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _g0 = _c()
         quick = self.frame_cache.quick_frame(self.state.camera,
                                              self.state.vw, self.state.vh)
         if quick is None:
             return False
+        if _c: _g1 = _c()
         self.state.next_generation()          # invalidate in-flight crisp
         # The canvas no longer shows the applied crisp -> clear the suppression
         # sig, so a settle request that lands back on the exact same camera
         # (e.g. a wheel in+out round-trip) re-renders crisp instead of being
         # suppressed and leaving the smoothscaled quick frame on screen.
         self._applied_sig = None
-        self._photo = tk.PhotoImage(data=mr.surface_to_ppm(quick))
+        if _c: _g2 = _c()
+        _ppm = mr.surface_to_ppm(quick)
+        if _c: _g3 = _c()
+        self._photo = tk.PhotoImage(data=_ppm)
+        if _c: _g4 = _c()
         self.canvas.itemconfig(self._img_item, image=self._photo)
         self.canvas.coords(self._img_item, 0, 0)
         self._img_offset = (0.0, 0.0)
+        if _c: _g5 = _c()
         self._redraw_overlays()           # reproject overlays onto the gesture frame
+        if _c:
+            _g6 = _c()
+            _now = tele._ms()
+            tele.stage("gf_quick_frame", (_g1 - _g0) * 1000.0, _now)
+            tele.stage("gf_ppm", (_g3 - _g2) * 1000.0, _now)
+            tele.stage("gf_photoimage", (_g4 - _g3) * 1000.0, _now)
+            tele.stage("gf_itemconfig", (_g5 - _g4) * 1000.0, _now)
+            tele.stage("gf_overlay", (_g6 - _g5) * 1000.0, _now)
+            tele.stage("gf_total", (_g6 - _g0) * 1000.0, _now)
+            tele.swap()
         return True
 
     # ---- tick loop ---------------------------------------------------------------
@@ -689,8 +875,15 @@ class MapTab:
         # (cleared at entry, set again here) still admits exactly one pending tick
         # -- the work below touches neither flag, so this is a pure reorder.
         self._schedule_tick()
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c:
+            self._tele_applied_this_tick = False
+            _k0 = _c()
         self._drain_results()                    # apply finished frames (main thread)
+        if _c: _k1 = _c()
         verdict = self.state.tick(_now_ms())
+        if _c: _k2 = _c()
         if verdict == "anim":
             # Zoom glide frame: swap in a FrameCache quick frame for the freshly
             # advanced camera (one code path for all animation frames). Empty
@@ -702,6 +895,14 @@ class MapTab:
             self._show_gesture_frame()
         elif verdict == "crisp":
             self._request_crisp()
+        if _c:
+            _k3 = _c()
+            phase = ("anim" if verdict == "anim"
+                     else "drain-apply" if self._tele_applied_this_tick else "idle")
+            tele.tick({"t": tele._ms(), "phase": phase, "verdict": verdict,
+                       "tick_ms": (_k3 - _k0) * 1000.0,
+                       "drain_ms": (_k1 - _k0) * 1000.0,
+                       "state_tick_ms": (_k2 - _k1) * 1000.0})
 
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Two payload shapes share
