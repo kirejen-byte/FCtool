@@ -18920,7 +18920,7 @@ class FCToolGUI:
                     frame.grid(row=row, column=0, columnspan=2,
                                sticky="nsew", padx=2, pady=2)
                 else:
-                    frame.grid(row=row, column=col,
+                    frame.grid(row=row, column=col, columnspan=1,
                                sticky="nsew", padx=2, pady=2)
             else:
                 frame.grid(row=i, column=0, columnspan=2,
