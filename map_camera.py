@@ -101,3 +101,42 @@ class GestureTracker:
         if self._last_touch_ms is None:
             return True
         return (now_ms - self._last_touch_ms) > self.settle_ms
+
+
+class ZoomAnimator:
+    """Exponential ease toward a target scale. tick() returns the factor to
+    apply this frame (via Camera.zoom_at at the stored anchor) or None when idle.
+    Convergence: ~95% of the remaining distance covered in ~120 ms."""
+
+    RATE = 0.022  # per-ms exponential rate: 1-exp(-0.022*120) ~ 0.93
+
+    def __init__(self) -> None:
+        self.active = False
+        self._target = 1.0
+        self._anchor = (0.0, 0.0)
+        self._last_ms = 0.0
+
+    def start(self, current_scale: float, factor: float, sx: float, sy: float,
+              now_ms: float, min_scale: float, max_scale: float) -> None:
+        base = self._target if self.active else current_scale
+        self._target = min(max(base * factor, min_scale), max_scale)
+        self._anchor = (sx, sy)
+        self._last_ms = now_ms
+        self.active = True
+
+    def tick(self, current_scale: float, now_ms: float) -> float | None:
+        if not self.active:
+            return None
+        dt = max(now_ms - self._last_ms, 0.0)
+        self._last_ms = now_ms
+        import math
+        alpha = 1.0 - math.exp(-self.RATE * dt)
+        new_scale = current_scale + (self._target - current_scale) * alpha
+        if abs(new_scale / self._target - 1.0) < 0.004:
+            new_scale = self._target
+            self.active = False
+        return new_scale / current_scale        # factor for Camera.zoom_at
+
+    @property
+    def anchor(self) -> tuple[float, float]:
+        return self._anchor

@@ -81,6 +81,11 @@ class MapTabState:
         self.model = None
         self.camera = mc.Camera()
         self.gesture = mc.GestureTracker(settle_ms=SETTLE_MS)
+        # Wheel notches retarget this animator instead of jumping the camera; the
+        # tick loop applies its per-frame factors (cursor-anchored) so zoom GLIDES
+        # to the target (~120 ms ease) rather than stepping in discrete jumps
+        # (owner feedback: "doesn't feel smooth"). Pure/injected-time -> headless.
+        self.zoom_anim = mc.ZoomAnimator()
         self._generation = 0
         self._dirty = False
         self._name_to_id: dict[str, int] = {}
@@ -126,11 +131,16 @@ class MapTabState:
 
     # -- inputs ----------------------------------------------------------------
     def on_wheel(self, delta_steps: int, sx: float, sy: float, now_ms: float) -> str:
-        factor = ZOOM_STEP ** delta_steps
-        self.camera.zoom_at(factor, sx, sy, self.vw, self.vh)
+        """Retarget the eased zoom (does NOT move the camera this instant): the
+        tick loop advances the glide and mutates the camera. Rapid notches
+        compound the TARGET (ZoomAnimator.start bases off the live target while
+        active), so three quick notches aim at scale*ZOOM_STEP**3 (Maps feel).
+        Touch the settle tracker so a crisp render is scheduled once the glide
+        ends; the animator keeps touching it every anim tick so settle waits."""
+        self.zoom_anim.start(self.camera.scale, ZOOM_STEP ** delta_steps, sx, sy,
+                             now_ms, self.camera.min_scale, self.camera.max_scale)
         self.gesture.touch(now_ms)
-        self._dirty = True
-        return "gesture"
+        return "anim"
 
     def on_drag(self, dx: float, dy: float, now_ms: float | None = None) -> None:
         self.camera.pan_pixels(dx, dy)
@@ -139,7 +149,18 @@ class MapTabState:
         self._dirty = True
 
     def tick(self, now_ms: float) -> str | None:
-        """Called periodically; returns 'crisp' when a settled re-render is due."""
+        """Called periodically. FIRST advances the zoom animation: while it runs
+        the camera glides toward the wheel target (cursor-anchored via zoom_at at
+        the stored anchor) and the gesture tracker is kept 'touched' so the settle
+        crisp waits for the glide to finish -> returns 'anim'. Once the animator
+        goes idle, falls through to the settle path: returns 'crisp' when a
+        settled re-render is due, else None."""
+        f = self.zoom_anim.tick(self.camera.scale, now_ms)
+        if f is not None:
+            self.camera.zoom_at(f, *self.zoom_anim.anchor, self.vw, self.vh)
+            self.gesture.touch(now_ms)      # settle waits until the glide ends
+            self._dirty = True
+            return "anim"
         if self._dirty and self.gesture.is_settled(now_ms):
             self._dirty = False
             return "crisp"
@@ -581,7 +602,17 @@ class MapTab:
         if not self._visible:
             return
         self._drain_results()                    # apply finished frames (main thread)
-        if self.state.tick(_now_ms()) == "crisp":
+        verdict = self.state.tick(_now_ms())
+        if verdict == "anim":
+            # Zoom glide frame: swap in a FrameCache quick frame for the freshly
+            # advanced camera (one code path for all animation frames). Empty
+            # cache (first show, no crisp yet) -> returns False and the previous
+            # crisp stays displayed while the camera keeps moving; the settle
+            # crisp lands at the end (FIRST-SHOW GUARD -> no black flash). Each
+            # quick swap clears _applied_sig, so the post-glide crisp is never
+            # duplicate-suppressed (Task 18).
+            self._show_gesture_frame()
+        elif verdict == "crisp":
             self._request_crisp()
         self._schedule_tick()
 
@@ -612,8 +643,11 @@ class MapTab:
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
         steps = 1 if event.delta > 0 else -1
+        # Retarget only -- do NOT show a frame here. The tick loop owns every
+        # animation frame (glide quick frames + settle crisp), so the wheel just
+        # (re)arms the animator and ensures the loop is running. One code path
+        # keeps the eased motion continuous instead of one instant jump per notch.
         self.state.on_wheel(steps, event.x, event.y, _now_ms())
-        self._show_gesture_frame()
         self._schedule_tick()
         return "break"
 
