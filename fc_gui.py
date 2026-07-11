@@ -12481,13 +12481,13 @@ class FCToolGUI:
             "FG_ACCENT": FG_ACCENT, "FG_DIM": FG_DIM,
         }
 
-    def _preview_make_tile(self, char_key, x, y, w, body_h):
+    def _preview_make_tile(self, char_key, x, y, w, body_h, src_hwnd=None):
         """Construct + place a real TileWindow. Injectable: the unit tests bind a
         recording factory over this name so no Tk/DWM window is ever created."""
         tile = TileWindow(
             self.root, char_key, self._preview_palette(),
-            on_activate=self._preview_on_tile_activate,
-            on_minimize=self._preview_on_tile_minimize,
+            on_activate=lambda k, h=src_hwnd: self._preview_on_tile_activate(k, h),
+            on_minimize=lambda k, h=src_hwnd: self._preview_on_tile_minimize(k, h),
             on_move_end=self._preview_on_tile_move_end,
             on_resize_end=self._preview_on_tile_resize_end,
             on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
@@ -12554,7 +12554,7 @@ class FCToolGUI:
     def _preview_spawn_tile(self, client):
         cfg = self._preview_cfg()
         x, y, w, body_h = self._preview_tile_rect(client, cfg)
-        tile = self._preview_make_tile(client.key, x, y, w, body_h)
+        tile = self._preview_make_tile(client.key, x, y, w, body_h, client.hwnd)
         try:
             tile.attach_source(client.hwnd)
         except OSError:
@@ -12627,7 +12627,8 @@ class FCToolGUI:
                 if other.key == prev_key:
                     window_activator.minimize(other.hwnd)
                     break
-        self._preview_last_key = client.key
+        if not client.is_login:
+            self._preview_last_key = client.key
         window_activator.activate(client.hwnd)
         # BUG A (occlusion): the just-activated EVE client jumps to the top of the
         # z-order. Without an immediate re-assert the tiles vanish behind it for up
@@ -12647,13 +12648,29 @@ class FCToolGUI:
             except Exception:
                 pass
 
-    def _preview_on_tile_activate(self, key):
+    def _preview_on_tile_activate(self, key, hwnd=None):
+        # hwnd-first: login screens (title exactly "EVE") all share key ""
+        # (eve_client_tracker.ClientWindow.key), so resolving by key alone
+        # would activate whichever key=="" client happens to be first in
+        # _preview_clients (a {hwnd: ClientWindow} dict) — not the one the
+        # user actually clicked. The tile's hwnd (threaded through the
+        # on_activate closure at tile-creation) disambiguates; fall back to
+        # the key loop only when no hwnd is given or it isn't a live client.
+        c = self._preview_clients.get(hwnd) if hwnd is not None else None
+        if c is not None:
+            self._preview_switch_to(c)
+            return
         for c in self._preview_clients.values():
             if c.key == key:
                 self._preview_switch_to(c)
                 return
 
-    def _preview_on_tile_minimize(self, key):
+    def _preview_on_tile_minimize(self, key, hwnd=None):
+        # Same key=="" collision as activate (see above) — hwnd-first here too.
+        c = self._preview_clients.get(hwnd) if hwnd is not None else None
+        if c is not None:
+            window_activator.minimize(c.hwnd)
+            return
         for c in self._preview_clients.values():
             if c.key == key:
                 window_activator.minimize(c.hwnd)
