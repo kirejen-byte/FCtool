@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -57,6 +58,95 @@ GESTURE_MIN_INTERVAL_MS = 30.0
 # so pan / zoom-out serve real content instead of a black edge within +/-MARGIN.
 MARGIN = 224
 BG_HEX = "#0a0a14"
+
+# --- Phase H stutter-hunt experiment flags (Task 25) -------------------------
+# DEFAULT-OFF mitigation experiments the harness A/B-tests against the intermittent
+# settle-apply spike (crisp/gesture apply intermittently jumps 180-260 ms while the
+# median is ~18 ms). Each is a temporary flag Task 26 will PROMOTE (make the default
+# path, delete the flag) or DELETE (dead path) once the data convicts or acquits it.
+# Read once at import so the harness can toggle a run via env WITHOUT editing code;
+# a MapTab kwarg (exp_pingpong=...) overrides per instance for tests. OFF by default
+# -> the production apply/hover/overlay paths are byte-for-byte the pre-Task-25 code.
+#   M1 FCTOOL_MAP_EXP_PINGPONG   : two persistent PhotoImages, alternate
+#      configure(data=) instead of a fresh tk.PhotoImage per frame (kills the
+#      ~4 MB Tcl image create/free churn ~30x/s).
+#   M2 FCTOOL_MAP_EXP_HOVER_DIET : one persistent hover ring + text moved via
+#      coords/itemconfig (no delete+create per <Motion>) + ~30 Hz throttle.
+#   M3 FCTOOL_MAP_EXP_OVERLAY_POOL: batch the six per-frame overlay-tag deletes
+#      into ONE Tcl delete call (shrinks the overlay Tcl-op window a stall lands in).
+def _env_flag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v not in ("", "0", "false", "False")
+
+
+MAP_EXP_PHOTO_PINGPONG = _env_flag("FCTOOL_MAP_EXP_PINGPONG")
+MAP_EXP_HOVER_DIET = _env_flag("FCTOOL_MAP_EXP_HOVER_DIET")
+MAP_EXP_OVERLAY_POOL = _env_flag("FCTOOL_MAP_EXP_OVERLAY_POOL")
+# Hover redraw throttle for the M2 diet path (~30 Hz). Only consulted when
+# self._exp_hover_diet is on; the default hover path is unthrottled (unchanged).
+HOVER_MIN_INTERVAL_MS = 33.0
+
+
+# --- process working-set / page-fault correlate (Task 25, telemetry only) ----
+# The apply spike lands on whichever Tcl op is mid-flight (probe: overlay 180 ms,
+# itemconfig 53 ms, PhotoImage only 32 ms) -> a global main-thread stall, not a slow
+# stage. Page-fault-count and working-set deltas across an apply are the prime
+# correlate for an OS/allocator cause (the pipeline churns ~210 MB/s of PPM+image
+# bytes). GetProcessMemoryInfo is ~1.4 us/call (probe) so it is sampled every apply
+# WHEN TELEMETRY IS ON. Lazily initialised on first use so the ctypes/WinDLL setup
+# never runs on the default (telemetry-off) path. _PSAPI: None=uninit, False=
+# unavailable, else the resolved (ctypes, GetProcessMemoryInfo, hProcess, struct).
+_PSAPI = None
+
+
+def _init_psapi():
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        psapi = ctypes.WinDLL("psapi.dll")
+        k32 = ctypes.WinDLL("kernel32.dll")
+        gpmi = psapi.GetProcessMemoryInfo
+        gpmi.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC), wintypes.DWORD]
+        gpmi.restype = wintypes.BOOL
+        return (ctypes, gpmi, k32.GetCurrentProcess(), _PMC)
+    except Exception:
+        return False
+
+
+def _proc_mem() -> tuple:
+    """(working_set_kb, page_fault_count) for THIS process, or (None, None) when
+    unavailable. Called only from telemetry-on apply records (guarded)."""
+    global _PSAPI
+    if _PSAPI is None:
+        _PSAPI = _init_psapi()
+    if not _PSAPI:
+        return (None, None)
+    ctypes, gpmi, cur, _PMC = _PSAPI
+    try:
+        c = _PMC()
+        c.cb = ctypes.sizeof(_PMC)
+        if gpmi(cur, ctypes.byref(c), c.cb):
+            return (int(c.WorkingSetSize) // 1024, int(c.PageFaultCount))
+    except Exception:
+        pass
+    return (None, None)
 
 # Default theme = the map tab's PRE-theming standalone palette, so a MapTab built
 # without a theme (standalone / tests) looks exactly as before. fc_gui injects its
@@ -281,6 +371,16 @@ class MapTelemetry:
         self.ticks: deque = deque(maxlen=maxlen)
         self.gaps: deque = deque(maxlen=maxlen)
         self.lag: deque = deque(maxlen=maxlen)
+        # Phase H (Task 25): one rich dict per frame APPLY (crisp + gesture) carrying
+        # the finer sub-stage split (photo / itemconfig / coords / status / overlay-
+        # delete / overlay-create) + spike correlates (image-name count, working-set
+        # KB + delta, page-fault count + delta, burst length, camera scale). Lets the
+        # analyzer attribute each spike to a sub-stage AND correlate it with paging /
+        # allocation / burst-following in ONE row instead of joining stage series by
+        # timestamp. self.hover is one row per <Motion>: (t, hit_test_ms, draw_ms,
+        # hit) -> A2 hover-cost profile + events/sec (bucketed in analysis).
+        self.applies: deque = deque(maxlen=maxlen)
+        self.hover: deque = deque(maxlen=maxlen)
         self.marks: list = []
         self._last_swap: float | None = None
 
@@ -295,6 +395,12 @@ class MapTelemetry:
 
     def tick(self, rec: dict) -> None:
         self.ticks.append(rec)
+
+    def apply_rec(self, rec: dict) -> None:
+        self.applies.append(rec)
+
+    def hover_rec(self, hit_ms: float, draw_ms: float, hit: bool) -> None:
+        self.hover.append((self._ms(), hit_ms, draw_ms, hit))
 
     def swap(self) -> None:
         """Record a _photo swap; append the gap (ms) since the previous swap."""
@@ -335,6 +441,15 @@ class MapTelemetry:
         for r in self.ticks:
             phases[r["phase"]] = phases.get(r["phase"], 0) + 1
         out["tick_phase_counts"] = phases
+        # Phase H apply/hover reductions (Task 25). apply_total is the felt
+        # per-frame apply cost (spikes live here); hover_total is the per-<Motion>
+        # cost (A2). spike_count is applies whose total exceeds 100 ms.
+        out["apply_total"] = self._pcts([r["total"] for r in self.applies])
+        out["hover_total"] = self._pcts(
+            [h + d for _, h, d, _ in self.hover])
+        out["apply_n"] = len(self.applies)
+        out["spike_count_100ms"] = sum(1 for r in self.applies
+                                       if r.get("total", 0.0) > 100.0)
         return out
 
     def dump(self, path: str = "tools/spike/telemetry_out.json",
@@ -347,6 +462,8 @@ class MapTelemetry:
             "gaps": list(self.gaps),
             "lag": list(self.lag),
             "stages": {k: list(v) for k, v in self.stages.items()},
+            "applies": list(self.applies),
+            "hover": list(self.hover),
         }
         try:
             d = os.path.dirname(path)
@@ -369,7 +486,9 @@ class MapTab:
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
-                 telemetry: bool = False) -> None:
+                 telemetry: bool = False, exp_pingpong: bool | None = None,
+                 exp_overlay_pool: bool | None = None,
+                 exp_hover_diet: bool | None = None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -485,6 +604,31 @@ class MapTab:
         # gesture request for the >= GESTURE_MIN_INTERVAL_MS gate.
         self._gesture_inflight = False
         self._last_gesture_req_ms = 0.0
+
+        # --- Phase H stutter-hunt experiment state (Task 25) -------------------
+        # Per-instance flag = explicit kwarg when given, else the import-time env
+        # default. OFF keeps every apply/hover/overlay path byte-identical.
+        self._exp_pingpong = (MAP_EXP_PHOTO_PINGPONG if exp_pingpong is None
+                              else bool(exp_pingpong))
+        self._exp_overlay_pool = (MAP_EXP_OVERLAY_POOL if exp_overlay_pool is None
+                                 else bool(exp_overlay_pool))
+        self._exp_hover_diet = (MAP_EXP_HOVER_DIET if exp_hover_diet is None
+                               else bool(exp_hover_diet))
+        # M1 ping-pong: two persistent PhotoImages (created lazily on first apply),
+        # alternated so the currently-displayed one is never reconfigured mid-frame.
+        self._photo_a = None
+        self._photo_b = None
+        self._photo_flip = False
+        # M2 hover diet: one persistent ring + text item, moved not recreated.
+        self._hover_ring = None
+        self._hover_text = None
+        self._last_hover_ms = 0.0
+        # Telemetry correlate state (only written on the telemetry-on apply path).
+        self._tele_ws_last: int | None = None    # last working-set KB (for delta)
+        self._tele_pf_last: int | None = None     # last page-fault count (for delta)
+        self._burst_len = 0                        # gesture applies since last crisp
+        self._tele_ov_del = 0.0                    # last overlay delete-ms (apply row)
+        self._tele_ov_new = 0.0                    # last overlay create-ms (apply row)
 
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -663,12 +807,34 @@ class MapTab:
         and WITHOUT adding _img_offset -- the live projection already equals the
         on-canvas position of the translated stale bitmap, so adding the offset
         would double-count the drag during the pre-settle window (Task 9 finding
-        #2). Pure Tk; cheap enough to run on every gesture/drag frame."""
+        #2). Pure Tk; cheap enough to run on every gesture/drag frame.
+
+        Task 25 splits the delete and create phases into ov_delete / ov_create
+        stages so the analyzer can tell whether an overlay-carried apply spike sits
+        in the tag deletes or the item creates. M3 experiment (self._exp_overlay_pool):
+        batch the six per-tag deletes into ONE Tcl delete call, shrinking the
+        overlay-delete window a global stall can land in (probe: the stall landed on
+        the overlay phase at 180 ms)."""
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _o0 = _c()
         canvas = self.canvas
-        for tag in ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                    "ov_origin", "ov_own"):
-            canvas.delete(tag)
+        _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
+                 "ov_origin", "ov_own")
+        if self._exp_overlay_pool:
+            canvas.delete(*_tags)          # M3: one Tcl round-trip, not six
+        else:
+            for tag in _tags:
+                canvas.delete(tag)
+        if _c: _od = _c()
         if self.renderer is None or self.state.model is None:
+            if _c:
+                _now = tele._ms()
+                self._tele_ov_del = (_od - _o0) * 1000.0
+                self._tele_ov_new = 0.0
+                tele.stage("ov_delete", self._tele_ov_del, _now)
+                tele.stage("ov_create", 0.0, _now)
+                tele.stage("ov_total", self._tele_ov_del, _now)
             return
         cam = self.state.camera
         vw, vh = self.state.vw, self.state.vh
@@ -736,6 +902,14 @@ class MapTab:
                                        outline="#ffffff", width=2, tags="ov_own")
                     canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
                                        fill="#ffffff", outline="", tags="ov_own")
+        if _c:
+            _o1 = _c()
+            _now = tele._ms()
+            self._tele_ov_del = (_od - _o0) * 1000.0
+            self._tele_ov_new = (_o1 - _od) * 1000.0
+            tele.stage("ov_delete", self._tele_ov_del, _now)
+            tele.stage("ov_create", self._tele_ov_new, _now)
+            tele.stage("ov_total", (_o1 - _o0) * 1000.0, _now)
 
     # ---- worker ----------------------------------------------------------------
     def _start_worker(self) -> None:
@@ -852,6 +1026,67 @@ class MapTab:
         ms = (time.perf_counter() - t0) * 1000.0
         return ("gesture", req["generation"], ppm, ms, req["camera"])
 
+    def _make_photo(self, ppm: bytes):
+        """Return the tk image to hand to itemconfig for `ppm`. DEFAULT path builds
+        a fresh tk.PhotoImage every frame (the ~4 MB Tcl image create + implicit
+        free churn ~30x/s). M1 experiment (self._exp_pingpong): two persistent
+        PhotoImages, reconfigure the NON-displayed one via configure(data=) -- no
+        per-frame Tcl image create/delete. Ping-pong (not a single reused image) so
+        the image currently on the canvas is never the one being rewritten. Keeps a
+        ref on self._photo either way so Tk never drops the live image."""
+        if not self._exp_pingpong:
+            self._photo = tk.PhotoImage(data=ppm)
+            return self._photo
+        if self._photo_a is None:
+            self._photo_a = tk.PhotoImage()
+            self._photo_b = tk.PhotoImage()
+        img = self._photo_b if self._photo_flip else self._photo_a
+        img.configure(data=ppm)
+        self._photo_flip = not self._photo_flip
+        self._photo = img
+        return img
+
+    def _record_apply(self, tele, t_ms: float, kind: str, total: float,
+                      photo: float, item: float, coords: float, status: float,
+                      overlay: float, worker_ms: float) -> None:
+        """Append one rich per-apply correlate row (Task 25). Correlates are
+        sampled AFTER the ap_total window closed, so image-count / working-set /
+        page-fault probing never inflates the very stage timings being attributed.
+        image-count (~1 us) and GetProcessMemoryInfo (~1.4 us) are cheap enough to
+        sample every apply; a page-fault or working-set jump coincident with a
+        spike is the OS/allocation-stall fingerprint."""
+        img_n = None
+        try:
+            img_n = len(self.canvas.tk.call("image", "names"))
+        except Exception:
+            pass
+        ws_kb, pf = _proc_mem()
+        ws_d = pf_d = None
+        if ws_kb is not None and self._tele_ws_last is not None:
+            ws_d = ws_kb - self._tele_ws_last
+        if pf is not None and self._tele_pf_last is not None:
+            pf_d = pf - self._tele_pf_last
+        if ws_kb is not None:
+            self._tele_ws_last = ws_kb
+        if pf is not None:
+            self._tele_pf_last = pf
+        try:
+            scale = self.state.camera.scale
+            ppe = scale * self.renderer._median_edge if self.renderer else 0.0
+        except Exception:
+            scale = ppe = 0.0
+        tele.apply_rec({
+            "t": t_ms, "kind": kind, "total": total,
+            "photo": photo, "item": item, "coords": coords,
+            "status": status, "overlay": overlay,
+            "ov_del": self._tele_ov_del, "ov_new": self._tele_ov_new,
+            "worker_ms": worker_ms,
+            "img_n": img_n, "ws_kb": ws_kb, "ws_d": ws_d, "pf": pf, "pf_d": pf_d,
+            "burst": self._burst_len, "after_burst": self._burst_len > 0,
+            "scale": scale, "ppe": ppe,
+            "pingpong": self._exp_pingpong, "ovpool": self._exp_overlay_pool,
+        })
+
     def _apply_crisp_frame(self, generation: int, ppm: bytes, ms: float,
                            sig: tuple | None = None) -> None:
         """Apply a finished CRISP frame (main thread). The worker already stored
@@ -859,34 +1094,51 @@ class MapTab:
         PhotoImage + itemconfig + status + overlay reproject (no pygame). Resets
         _img_offset to 0 (the crisp is for the settled camera). Clears the pacing
         in-flight flag first so a gesture that was superseded by this crisp (and
-        thus never reached _apply_gesture_frame) cannot wedge the next glide."""
+        thus never reached _apply_gesture_frame) cannot wedge the next glide.
+
+        Task 25 telemetry splits the apply into PhotoImage / itemconfig / coords /
+        status / overlay (each its own stage) plus a rich correlate row; the split
+        is what lets the analyzer see WHICH sub-stage a given spike landed in (probe:
+        the stall lands on overlay or itemconfig far more often than PhotoImage)."""
         self._gesture_inflight = False
         if not self._visible or not self.state.is_current(generation):
             return                       # dropped -> _applied_sig stays unrecorded
         tele = self._tele
         _c = time.perf_counter if tele is not None else None
         if _c: _a0 = _c()
-        self._photo = tk.PhotoImage(data=ppm)   # ppm = viewport-sized center crop
+        img = self._make_photo(ppm)             # ppm = viewport-sized center crop
         if _c: _a1 = _c()
-        self.canvas.itemconfig(self._img_item, image=self._photo)
+        self.canvas.itemconfig(self._img_item, image=img)
+        if _c: _a2 = _c()
         self.canvas.coords(self._img_item, 0, 0)
         self._img_offset = (0.0, 0.0)
-        if _c: _a2 = _c()
+        if _c: _a3 = _c()
         self._applied_sig = sig          # this view is now on screen -> the worker
         self.status.config(text=f"render {ms:.0f} ms")  # may suppress duplicates
-        if _c: _a3 = _c()
+        if _c: _a4 = _c()
         self._redraw_overlays()          # reproject Tk overlay items onto the fresh frame
         if _c:
-            _a4 = _c()
+            _a5 = _c()
             _now = tele._ms()
-            tele.stage("ap_photoimage", (_a1 - _a0) * 1000.0, _now)
-            tele.stage("ap_itemconfig", (_a2 - _a1) * 1000.0, _now)
-            tele.stage("ap_status", (_a3 - _a2) * 1000.0, _now)
-            tele.stage("ap_overlay", (_a4 - _a3) * 1000.0, _now)
-            tele.stage("ap_total", (_a4 - _a0) * 1000.0, _now)
+            photo = (_a1 - _a0) * 1000.0
+            item = (_a2 - _a1) * 1000.0
+            coords = (_a3 - _a2) * 1000.0
+            status = (_a4 - _a3) * 1000.0
+            overlay = (_a5 - _a4) * 1000.0
+            total = (_a5 - _a0) * 1000.0
+            tele.stage("ap_photoimage", photo, _now)
+            tele.stage("ap_itemconfig", item, _now)
+            tele.stage("ap_coords", coords, _now)
+            tele.stage("ap_status", status, _now)
+            tele.stage("ap_overlay", overlay, _now)
+            tele.stage("ap_total", total, _now)
             tele.stage("worker_render_ms", ms, _now)  # worker's own render time
+            self._record_apply(tele, _now, "crisp", total, photo, item, coords,
+                               status, overlay, ms)
             tele.swap()
             self._tele_applied_this_tick = True
+        if tele is not None:
+            self._burst_len = 0          # a crisp settle ends the gesture burst
 
     def _apply_gesture_frame(self, generation: int, ppm: bytes | None,
                              ms: float, cam_dict: dict) -> None:
@@ -909,17 +1161,19 @@ class MapTab:
             return                       # empty cache (first show): keep prior photo
         if not self._visible or not self.state.is_current(generation):
             return                       # superseded -> drop, prior photo stays
-        tele = self._tele
-        _c = time.perf_counter if tele is not None else None
-        if _c: _g0 = _c()
         # Residual offset that aligns the enqueue-camera base image with the live
         # camera (see docstring). Pure-pan-exact; zoom keeps only a tiny stretch.
+        # Computed before the timed window (cheap arithmetic, not a stage).
         live = self.state.camera
         ox = (cam_dict["cx"] - live.cx) * live.scale
         oy = (cam_dict["cy"] - live.cy) * live.scale
-        self._photo = tk.PhotoImage(data=ppm)
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _g0 = _c()
+        img = self._make_photo(ppm)
         if _c: _g1 = _c()
-        self.canvas.itemconfig(self._img_item, image=self._photo)
+        self.canvas.itemconfig(self._img_item, image=img)
+        if _c: _g1b = _c()
         self.canvas.coords(self._img_item, ox, oy)
         self._img_offset = (ox, oy)
         if _c: _g2 = _c()
@@ -927,13 +1181,22 @@ class MapTab:
         if _c:
             _g3 = _c()
             _now = tele._ms()
-            tele.stage("gf_photoimage", (_g1 - _g0) * 1000.0, _now)
-            tele.stage("gf_itemconfig", (_g2 - _g1) * 1000.0, _now)
-            tele.stage("gf_overlay", (_g3 - _g2) * 1000.0, _now)
-            tele.stage("gf_total", (_g3 - _g0) * 1000.0, _now)
+            photo = (_g1 - _g0) * 1000.0
+            item = (_g1b - _g1) * 1000.0
+            coords = (_g2 - _g1b) * 1000.0
+            overlay = (_g3 - _g2) * 1000.0
+            total = (_g3 - _g0) * 1000.0
+            tele.stage("gf_photoimage", photo, _now)
+            tele.stage("gf_itemconfig", item, _now)
+            tele.stage("gf_coords", coords, _now)
+            tele.stage("gf_overlay", overlay, _now)
+            tele.stage("gf_total", total, _now)
             tele.stage("gf_worker_ms", ms, _now)   # worker quick_frame+ppm (off-main)
+            self._record_apply(tele, _now, "gesture", total, photo, item, coords,
+                               0.0, overlay, ms)
             tele.swap()
             self._tele_applied_this_tick = True
+            self._burst_len += 1         # this gesture apply is part of a burst
 
     def _request_crisp(self) -> None:
         if self.renderer is None:
@@ -1120,32 +1383,93 @@ class MapTab:
         self._schedule_tick()
 
     def _on_motion(self, event) -> None:
+        """Hover: hit-test the cursor system and draw a ring + label. A2 suspect
+        for close-zoom cost (fires at mouse-motion rate, ~60/s, and at close zoom
+        the cursor is always near a system). Task 25 records per-<Motion> cost split
+        into hit-test vs draw so the analyzer can bucket events/sec and decide A2.
+        M2 experiment (self._exp_hover_diet): ~30 Hz throttle + one persistent ring
+        + text moved via coords/itemconfig instead of delete+create per motion."""
         if self.renderer is None:
             return
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if self._exp_hover_diet:
+            now = _now_ms()
+            if now - self._last_hover_ms < HOVER_MIN_INTERVAL_MS:
+                return                        # M2: throttle the hover redraw to ~30 Hz
+            self._last_hover_ms = now
+        if _c: _h0 = _c()
         sid = self.state.hover_hit(event.x, event.y)
-        self.canvas.delete("hover")
-        if sid is not None:
-            s = self.state.model.systems[sid]
-            # The live camera projection already equals the on-canvas position
-            # of the translated stale image (pan updates the camera live while
-            # the image item is offset to match), so do NOT add _img_offset --
-            # that would overshoot by the drag distance during the pre-settle
-            # window.
-            sx, sy = self.state.camera.world_to_screen(s.x, s.y,
-                                                       self.state.vw, self.state.vh)
-            self.canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
-                                    outline="#e0e0e0", width=1, tags="hover")
-            label = f"{s.name}  {s.sec:.1f}"
-            ov = self.state.range_overlay
-            if ov is not None:                        # enrich with range info
-                ly = ov.distances.get(sid)
-                if ly is not None:
-                    label += f" · {ly:.1f} ly"
-                if sid in ov.illegal:
-                    label += " · ILLEGAL DEST"
-            self.canvas.create_text(sx + 12, sy - 12, anchor="w", tags="hover",
-                                    text=label, fill="#e0e0e0",
-                                    font=("Segoe UI", 9))
+        if _c: _h1 = _c()
+        if self._exp_hover_diet:
+            self._hover_diet_draw(sid)        # move persistent items (no delete/create)
+        else:
+            self.canvas.delete("hover")
+            if sid is not None:
+                s = self.state.model.systems[sid]
+                # The live camera projection already equals the on-canvas position
+                # of the translated stale image (pan updates the camera live while
+                # the image item is offset to match), so do NOT add _img_offset --
+                # that would overshoot by the drag distance during the pre-settle
+                # window.
+                sx, sy = self.state.camera.world_to_screen(s.x, s.y,
+                                                           self.state.vw, self.state.vh)
+                self.canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
+                                        outline="#e0e0e0", width=1, tags="hover")
+                label = f"{s.name}  {s.sec:.1f}"
+                ov = self.state.range_overlay
+                if ov is not None:                        # enrich with range info
+                    ly = ov.distances.get(sid)
+                    if ly is not None:
+                        label += f" · {ly:.1f} ly"
+                    if sid in ov.illegal:
+                        label += " · ILLEGAL DEST"
+                self.canvas.create_text(sx + 12, sy - 12, anchor="w", tags="hover",
+                                        text=label, fill="#e0e0e0",
+                                        font=("Segoe UI", 9))
+        if _c:
+            _h2 = _c()
+            tele.hover_rec((_h1 - _h0) * 1000.0, (_h2 - _h1) * 1000.0, sid is not None)
+
+    def _hover_label(self, sid: int) -> tuple:
+        """(sx, sy, label) for the hover ring/text of system `sid` under the LIVE
+        camera. Shared by the default draw and the M2 diet path."""
+        s = self.state.model.systems[sid]
+        sx, sy = self.state.camera.world_to_screen(s.x, s.y,
+                                                   self.state.vw, self.state.vh)
+        label = f"{s.name}  {s.sec:.1f}"
+        ov = self.state.range_overlay
+        if ov is not None:
+            ly = ov.distances.get(sid)
+            if ly is not None:
+                label += f" · {ly:.1f} ly"
+            if sid in ov.illegal:
+                label += " · ILLEGAL DEST"
+        return sx, sy, label
+
+    def _hover_diet_draw(self, sid) -> None:
+        """M2 hover diet: one persistent ring + text item, moved (coords/itemconfig)
+        not recreated. Hidden when the cursor is over empty space. The items carry
+        NO 'hover' tag, so the default path's delete('hover') and the ov_* overlay
+        redraws never touch them."""
+        canvas = self.canvas
+        if sid is None:
+            if self._hover_ring is not None:
+                canvas.itemconfigure(self._hover_ring, state="hidden")
+                canvas.itemconfigure(self._hover_text, state="hidden")
+            return
+        sx, sy, label = self._hover_label(sid)
+        if self._hover_ring is None:
+            self._hover_ring = canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
+                                                  outline="#e0e0e0", width=1)
+            self._hover_text = canvas.create_text(sx + 12, sy - 12, anchor="w",
+                                                  text=label, fill="#e0e0e0",
+                                                  font=("Segoe UI", 9))
+            return
+        canvas.coords(self._hover_ring, sx - 9, sy - 9, sx + 9, sy + 9)
+        canvas.coords(self._hover_text, sx + 12, sy - 12)
+        canvas.itemconfigure(self._hover_text, text=label, state="normal")
+        canvas.itemconfigure(self._hover_ring, state="normal")
 
     def _on_right_click(self, event) -> None:
         sid = self.state.hover_hit(event.x, event.y) if self.renderer else None
