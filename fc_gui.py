@@ -6537,7 +6537,7 @@ class FCToolGUI:
                     panel.grid(row=row, column=0, columnspan=2,
                                sticky="nsew", padx=4, pady=3)
                 else:
-                    panel.grid(row=row, column=col,
+                    panel.grid(row=row, column=col, columnspan=1,
                                sticky="nsew", padx=4, pady=3)
             else:
                 panel.grid(row=i, column=0, columnspan=2,
