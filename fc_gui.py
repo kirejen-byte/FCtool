@@ -5427,9 +5427,14 @@ class FCToolGUI:
             # Resolved Ansiblex bridge id-pairs, refreshed on each tab-show.
             "get_bridges": self._get_map_bridges,
         }
-        self.map_tab = _map_tab_mod.MapTab(tab, cfg=cfg, save_cfg=save_cfg,
-                                           callbacks=callbacks,
-                                           autocomplete_cls=None)
+        self.map_tab = _map_tab_mod.MapTab(
+            tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
+            autocomplete_cls=None,
+            # Match the map context menus + toolbar to the app palette (owner
+            # request 2026-07-10). map_tab must not import fc_gui, so the
+            # constants travel in as a plain dict.
+            theme={"bg": BG_DARK, "panel": BG_PANEL, "entry_bg": BG_ENTRY,
+                   "fg": FG_TEXT, "accent": FG_ACCENT, "border": BORDER_COLOR})
         self.map_tab.frame.pack(fill="both", expand=True)
         # Seed the staging overlay from config (resolved names -> ids). Safe
         # before the first on_shown: set_staging just stores state until render.

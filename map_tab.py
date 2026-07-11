@@ -38,6 +38,24 @@ TICK_MS = 16
 MARGIN = 224
 BG_HEX = "#0a0a14"
 
+# Default theme = the map tab's PRE-theming standalone palette, so a MapTab built
+# without a theme (standalone / tests) looks exactly as before. fc_gui injects its
+# app constants (BG_DARK/BG_PANEL/BG_ENTRY/FG_TEXT/FG_ACCENT/BORDER_COLOR) via
+# _build_map_tab so the context menus + toolbar match the rest of the application
+# (owner request 2026-07-10). Keys: bg (frame/toolbar/canvas backdrop), panel
+# (menu bg + checkbutton selectcolor), entry_bg (search field + menu selection
+# bar), fg (toolbar + menu text), accent (menu disabled title + toggle hover),
+# border (search-field focus ring). This module never imports fc_gui — the host
+# passes the constants in; the defaults keep standalone identical.
+_DEFAULT_THEME = {
+    "bg": BG_HEX,          # "#0a0a14" — current frame/bar/canvas bg (unchanged)
+    "panel": "#16213e",    # current checkbutton selectcolor (== fc_gui BG_PANEL)
+    "entry_bg": "#0f3460", # fc_gui BG_ENTRY — new search-field + menu-active bg
+    "fg": "#8b9bb5",       # current toolbar text gray (unchanged)
+    "accent": "#00d4ff",   # fc_gui FG_ACCENT — menu title + toggle hover accent
+    "border": "#2a2a4a",   # fc_gui BORDER_COLOR — search-field focus ring
+}
+
 # Strips the " (X.X ly)" annotation the range/threat option labels carry so a
 # menu selection can be stored back as a bare ship/base name (spec §2.5).
 _LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
@@ -212,23 +230,38 @@ class MapTab:
 
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
-                 autocomplete_cls=None) -> None:
+                 autocomplete_cls=None, theme: dict | None = None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
         self._model_loader = model_loader
+        # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
+        # keeps standalone identical and lets a caller pass a partial dict. fc_gui
+        # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
+        self.theme = {**_DEFAULT_THEME, **(theme or {})}
+        t = self.theme
 
-        self.frame = tk.Frame(parent, bg=BG_HEX)
-        bar = tk.Frame(self.frame, bg=BG_HEX)
+        self.frame = tk.Frame(parent, bg=t["bg"])
+        bar = tk.Frame(self.frame, bg=t["bg"])
         bar.pack(side="top", fill="x")
-        tk.Label(bar, text="Search:", bg=BG_HEX, fg="#8b9bb5").pack(side="left", padx=(6, 2))
+        tk.Label(bar, text="Search:", bg=t["bg"], fg=t["fg"]).pack(side="left", padx=(6, 2))
         entry_cls = autocomplete_cls or tk.Entry
         self.search_entry = entry_cls(bar, width=24)
         self.search_entry.pack(side="left", padx=2, pady=3)
         self.search_entry.bind("<Return>", self._on_search)
+        # Style the search field to the theme. Guarded: a custom autocomplete
+        # widget might reject a Tk option (plain tk.Entry accepts them all).
+        try:
+            self.search_entry.configure(
+                bg=t["entry_bg"], fg=t["fg"], insertbackground=t["fg"],
+                relief="flat", highlightthickness=1,
+                highlightbackground=t["border"], highlightcolor=t["accent"])
+        except tk.TclError:
+            pass
         self._bloom_var = tk.BooleanVar(value=bool(self.cfg.get("bloom", True)))
-        tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=BG_HEX,
-                       fg="#8b9bb5", selectcolor="#16213e",
+        tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=t["bg"],
+                       fg=t["fg"], selectcolor=t["panel"],
+                       activebackground=t["bg"], activeforeground=t["accent"],
                        command=self._on_bloom_toggle).pack(side="left", padx=8)
         # --- Phase D layer toggles (fleet/staging/threat) ---
         _layers = self.cfg.get("layers", {})
@@ -244,13 +277,14 @@ class MapTab:
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges")):
             tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
-                           bg=BG_HEX, fg="#8b9bb5", selectcolor="#16213e",
+                           bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
+                           activebackground=t["bg"], activeforeground=t["accent"],
                            command=lambda k=_key: self._on_layer_toggle(k)
                            ).pack(side="left", padx=4)
-        self.status = tk.Label(bar, text="", bg=BG_HEX, fg="#8b9bb5", anchor="e")
+        self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
-        self.canvas = tk.Canvas(self.frame, bg=BG_HEX, highlightthickness=0)
+        self.canvas = tk.Canvas(self.frame, bg=t["bg"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
@@ -724,15 +758,33 @@ class MapTab:
                 else self._build_empty_menu())
         menu.tk_popup(event.x_root, event.y_root)
 
+    def _make_menu(self, parent) -> tk.Menu:
+        """Factory for EVERY map context menu AND cascade so they all carry the
+        app palette (owner ask 2026-07-10: match the rest of the application).
+        Mirrors the intel system menu's dark idiom (panel bg + text fg, tearoff=0)
+        and extends it with a flat, accent-lit treatment — disabled titles in
+        accent, a solid selection bar, no bevel — so the popups read as native to
+        the dark app instead of the OS-default light menu the map used before.
+        On Windows tk popup menus honor bg/fg/active*/relief/borderwidth (asserted
+        in tests/test_map_theme.py via cget)."""
+        t = self.theme
+        return tk.Menu(
+            parent, tearoff=0,
+            bg=t["panel"], fg=t["fg"],
+            activebackground=t["entry_bg"], activeforeground=t["fg"],
+            disabledforeground=t["accent"],
+            borderwidth=0, activeborderwidth=0, relief="flat",
+        )
+
     def _build_system_menu(self, sid: int) -> tk.Menu:
         """Right-click-on-a-system menu (spec §2.5): range submenu, clear-range,
         then the callback-gated system actions incl. staging adds."""
         name = self.state.model.systems[sid].name
-        menu = tk.Menu(self.canvas, tearoff=0)
+        menu = self._make_menu(self.canvas)
         menu.add_command(label=name, state="disabled")
         menu.add_separator()
         # Jump range submenu: 5 grouped classes (live LY) + Custom.
-        range_menu = tk.Menu(menu, tearoff=0)
+        range_menu = self._make_menu(menu)
         for label, ly in mo.range_options():
             range_menu.add_command(
                 label=label,
@@ -756,7 +808,7 @@ class MapTab:
 
     def _build_empty_menu(self) -> tk.Menu:
         """Right-click-on-empty-space menu: view + layer controls."""
-        menu = tk.Menu(self.canvas, tearoff=0)
+        menu = self._make_menu(self.canvas)
         menu.add_command(label="Fit universe", command=self._fit_universe)
         menu.add_checkbutton(label="Bloom", variable=self._bloom_var,
                              command=self._on_bloom_toggle)
@@ -770,7 +822,7 @@ class MapTab:
         sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
                    opts[0][0] if opts else "")
         self._threat_var.set(sel)
-        threat_menu = tk.Menu(menu, tearoff=0)
+        threat_menu = self._make_menu(menu)
         for label, _ly in opts:
             threat_menu.add_radiobutton(
                 label=label, variable=self._threat_var, value=label,
