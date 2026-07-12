@@ -163,6 +163,13 @@ FG_MAGENTA = "#ff66ff"
 FG_UNDER = "#ff6666"
 BORDER_COLOR = "#2a2a4a"
 
+# ── Main-thread UI dispatcher ──────────────────────────────────────────────────
+# How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
+# callbacks on the main thread. Workers never touch Tk; they enqueue via
+# _post_ui / _post_ui_after and this loop applies the work. See the tk-thread
+# audit: docs/superpowers/specs/2026-07-10-tk-thread-audit.md.
+DRAIN_MS = 50
+
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
 # The full TOC panel yields to content when the tab gets too narrow: it collapses
 # to a slim ribbon and the content reclaims the panel's width, so the SSO
@@ -656,6 +663,19 @@ class FCToolGUI:
         # one thread cannot interleave with a write on another and corrupt or
         # clobber settings. Created before any save path can run.
         self._config_lock = threading.Lock()
+        # Main-thread UI dispatcher queue. Background workers never touch Tk
+        # directly; they enqueue (fn, args) via _post_ui / _post_ui_after and the
+        # main-thread _drain_ui_q loop (armed once after the UI is built) applies
+        # them. This is the sole worker->UI channel and keeps Tcl single-threaded
+        # even under an update()-pumped host. See the tk-thread-safety audit.
+        self._ui_q = queue.Queue()
+        # Thread-safe mirrors of two Intel-panel Tk Vars that off-main workers
+        # would otherwise read directly (Class B data races). The fusion Event
+        # gates the intel poll loop; the min-reported int is read by the
+        # ChatMonitor message callback. Both are kept in sync on the main thread
+        # by Var write-traces wired when the widgets are created in _build_ui.
+        self._intel_fusion_enabled = threading.Event()
+        self._intel_min_reported = 0
         # Short TTL cache for get_fleet_info() shared by _fleet_boss_session and
         # _fleet_boss_info. The Fleet Templates window calls both back-to-back on
         # entering live mode; without this each does its own ESI round-trip.
@@ -903,6 +923,11 @@ class FCToolGUI:
         self._load_system_names_async()
 
         self._build_ui()
+        # Arm the main-thread UI dispatcher drain now that the notebook exists.
+        # From here on, background workers marshal UI work through _post_ui /
+        # _post_ui_after and this loop applies it on the main thread. Armed before
+        # _start_monitoring so it is running before any worker can enqueue.
+        self._drain_ui_q()
         self._setup_modules()
         self._start_monitoring()
 
@@ -947,6 +972,43 @@ class FCToolGUI:
         self.root.bind_all("<Button-4>", self._on_global_mousewheel)
         self.root.bind_all("<Button-5>", self._on_global_mousewheel)
 
+    # ── Main-thread UI dispatcher ─────────────────────────────────────────────
+    # Background workers never touch Tk directly. They enqueue callables via
+    # _post_ui / _post_ui_after; the main-thread _drain_ui_q loop (armed once in
+    # __init__ after _build_ui) applies them, keeping Tcl single-threaded even
+    # under an update()-pumped host. See the tk-thread-safety audit/spec.
+
+    def _post_ui(self, fn, *a):
+        """Queue ``fn(*a)`` to run on the main thread. Safe from any thread."""
+        self._ui_q.put((0, fn, a))
+
+    def _post_ui_after(self, ms, fn, *a):
+        """Queue ``fn(*a)`` to run on the main thread after ``ms`` ms.
+
+        Safe from any thread; the delay is applied by the main-thread drain via
+        ``root.after`` (a main-thread schedule)."""
+        self._ui_q.put((ms, fn, a))
+
+    def _drain_ui_q(self):
+        """Main-thread pump: apply queued worker->UI work, then re-arm itself.
+
+        ms>0 items are handed to ``root.after`` (a safe main-thread schedule);
+        ms==0 items run inline now. A raising callback is logged and never breaks
+        the drain. Re-arms every ``DRAIN_MS`` ms."""
+        while True:
+            try:
+                ms, fn, a = self._ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if ms:
+                    self.root.after(ms, fn, *a)   # main-thread schedule = safe
+                else:
+                    fn(*a)
+            except Exception as exc:
+                print(f"[UI-Q] {exc}")
+        self.root.after(DRAIN_MS, self._drain_ui_q)
+
     # ── System Names for Autocomplete ─────────────────────────────────────────
 
     def _load_system_names_async(self):
@@ -956,7 +1018,7 @@ class FCToolGUI:
                 names = get_sorted_names()
                 self._system_names = names
                 wh_names = self._fetch_wh_names()
-                self.root.after(0, self._update_autocomplete_lists, wh_names)
+                self._post_ui(self._update_autocomplete_lists, wh_names)
             except Exception as e:
                 print(f"[FCTool] Error loading system names: {e}")
 
@@ -972,7 +1034,7 @@ class FCToolGUI:
                         labels[name] = f"{name} ({region})"
                 self._system_labels = labels
                 wh_names = self._fetch_wh_names()
-                self.root.after(0, self._update_autocomplete_lists, wh_names)
+                self._post_ui(self._update_autocomplete_lists, wh_names)
             except Exception as e:
                 print(f"[FCTool] Error loading region map: {e}")
 
@@ -1110,8 +1172,8 @@ class FCToolGUI:
                 # Clear the in-flight flag back on the Tk thread so the next SSO
                 # add can start a fresh scan.
                 try:
-                    self.root.after(
-                        0, lambda: setattr(
+                    self._post_ui(
+                        lambda: setattr(
                             self, "_ansiblex_autodiscover_inflight", False))
                 except Exception:
                     self._ansiblex_autodiscover_inflight = False
@@ -1496,7 +1558,7 @@ class FCToolGUI:
                 return
             if not res or "id" not in res:
                 return
-            self.root.after(0, self._apply_triumvirate_resolution, res)
+            self._post_ui(self._apply_triumvirate_resolution, res)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2531,8 +2593,8 @@ class FCToolGUI:
                     sid = search_system(name)
                 except Exception:
                     sid = None
-                self.root.after(
-                    0, self._apply_location_add, "systems", sid, name)
+                self._post_ui(
+                    self._apply_location_add, "systems", sid, name)
 
             threading.Thread(target=worker, daemon=True).start()
         else:  # Region
@@ -2547,8 +2609,8 @@ class FCToolGUI:
                     res = None
                 rid = res.get("id") if res else None
                 rname = res.get("name") if res else name
-                self.root.after(
-                    0, self._apply_location_add, "regions", rid, rname)
+                self._post_ui(
+                    self._apply_location_add, "regions", rid, rname)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -2617,7 +2679,7 @@ class FCToolGUI:
             except Exception:
                 res = None
             dest = "alliances" if category == "alliance" else "corporations"
-            self.root.after(0, self._apply_parties_add, dest, res, name)
+            self._post_ui(self._apply_parties_add, dest, res, name)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2730,8 +2792,8 @@ class FCToolGUI:
             names = [r["name"] for r in results
                      if isinstance(r, dict) and r.get("name")]
             if names:
-                self.root.after(
-                    0, self._par_add_entry.update_completions, names)
+                self._post_ui(
+                    self._par_add_entry.update_completions, names)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3287,8 +3349,8 @@ class FCToolGUI:
             except Exception:
                 res = None
             dest = "alliances" if category == "alliance" else "corporations"
-            self.root.after(
-                0, self._cm_apply_member_add, target_name, dest, res, name)
+            self._post_ui(
+                self._cm_apply_member_add, target_name, dest, res, name)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3362,8 +3424,8 @@ class FCToolGUI:
             names = [r["name"] for r in results
                      if isinstance(r, dict) and r.get("name")]
             if names and getattr(self, "_coalition_mgr", None) is not None:
-                self.root.after(
-                    0, self._cm_add_entry.update_completions, names)
+                self._post_ui(
+                    self._cm_add_entry.update_completions, names)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3466,6 +3528,12 @@ class FCToolGUI:
         intel_row.pack(fill=tk.X, padx=10, pady=5)
 
         self._intel_fusion_var = tk.BooleanVar(value=False)
+        # Mirror the fusion toggle into a thread-safe Event read by the off-main
+        # intel poll loop (Class B fix). The trace fires on the main thread for
+        # every Var change (checkbutton click or programmatic .set), so the Event
+        # always tracks the toggle without the worker ever reading the Tk Var.
+        self._intel_fusion_var.trace_add(
+            "write", self._mirror_intel_fusion_enabled)
         self._intel_fusion_btn = tk.Checkbutton(
             intel_row, text="Intelligence Fusion",
             variable=self._intel_fusion_var,
@@ -3491,6 +3559,11 @@ class FCToolGUI:
         tk.Label(intel_row, text="  Min Reported:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 0))
         self._intel_min_reported_var = tk.StringVar(value="0")
+        # Mirror the min-reported filter into a plain int read by the off-main
+        # intel message callback (Class B fix). The trace fires on the main
+        # thread whenever the spinbox value changes; the worker reads the int.
+        self._intel_min_reported_var.trace_add(
+            "write", self._mirror_intel_min_reported)
         tk.Spinbox(
             intel_row, from_=0, to=500, textvariable=self._intel_min_reported_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
@@ -4113,7 +4186,7 @@ class FCToolGUI:
                 all_ansiblex = wh_ansiblex
             else:
                 all_ansiblex = direct_ansiblex
-            self.root.after(0, self._show_wh_result, result, all_ansiblex, leg_ansiblex)
+            self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex)
 
         threading.Thread(target=do_search, daemon=True).start()
 
@@ -4817,15 +4890,15 @@ class FCToolGUI:
             conns = fetch_connections()
             thera = sum(1 for c in conns if c.hub_name == "Thera")
             turnur = sum(1 for c in conns if c.hub_name == "Turnur")
-            self.root.after(0, self._wh_status_label.config,
+            self._post_ui(self._wh_status_label.config,
                             {"text": f"Thera: {thera} | Turnur: {turnur} connections",
                              "fg": FG_GREEN})
             # Show in log
-            self.root.after(0, self._show_connections_summary, conns)
+            self._post_ui(self._show_connections_summary, conns)
             # Update autocomplete with WH system names (reuse the conns we
             # already fetched here on the worker thread — never fetch on Tk).
             wh_names = [(c.dest_system_name, c.dest_region_name) for c in conns]
-            self.root.after(0, self._update_autocomplete_lists, wh_names)
+            self._post_ui(self._update_autocomplete_lists, wh_names)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -5099,7 +5172,7 @@ class FCToolGUI:
                             entry_widget.insert(0, sys_name)
                         except tk.TclError:
                             pass
-                    self.root.after(0, apply)
+                    self._post_ui(apply)
             except Exception as e:
                 print(f"[CurrentSystem] Fetch error: {e}")
 
@@ -5132,8 +5205,7 @@ class FCToolGUI:
                         self._current_system_name = sys_name
                         self._current_system_region = region_name
                         region_str = f" ({region_name})" if region_name else ""
-                        self.root.after(
-                            0,
+                        self._post_ui(
                             self._current_system_display.config,
                             {"text": f"System: {sys_name}{region_str}",
                              "fg": FG_GREEN},
@@ -5195,7 +5267,7 @@ class FCToolGUI:
         )
 
         def on_complete(success, info):
-            self.root.after(0, self._esi_login_complete, success, info, new_auth)
+            self._post_ui(self._esi_login_complete, success, info, new_auth)
 
         new_auth.login(on_complete=on_complete)
 
@@ -5280,7 +5352,7 @@ class FCToolGUI:
 
         def do_discover():
             gates = self.esi_auth.discover_ansiblex_gates()
-            self.root.after(0, self._esi_ansiblex_done, gates)
+            self._post_ui(self._esi_ansiblex_done, gates)
 
         threading.Thread(target=do_discover, daemon=True).start()
 
@@ -5570,7 +5642,7 @@ class FCToolGUI:
                     had_errors = True
                     results.append((panel, None, str(e)))
             self._char_force_refresh = False
-            self.root.after(0, self._apply_character_refresh, results, had_errors)
+            self._post_ui(self._apply_character_refresh, results, had_errors)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -5693,7 +5765,7 @@ class FCToolGUI:
         def do_refresh():
             try:
                 info = self._fetch_character_info(acct)
-                self.root.after(0, self._apply_single_refresh, panel, info)
+                self._post_ui(self._apply_single_refresh, panel, info)
             except Exception as e:
                 print(f"[Characters] Single-refresh error for "
                       f"{acct.character_name}: {e}")
@@ -5702,7 +5774,7 @@ class FCToolGUI:
                         panel._loc_label.config(
                             text=f"  —  ⚠ ESI error: {e}", fg=FG_RED,
                         )
-                self.root.after(0, show_err)
+                self._post_ui(show_err)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -8629,6 +8701,7 @@ class FCToolGUI:
             doctrine_provider=self._active_doctrine_obj,
             character_names_provider=self._authed_character_names,
             resolve_names_provider=self._resolve_names,
+            host=self,
         )
         # Clear the handle when the window closes so re-open works.
         win = self._fleet_template_window
@@ -9340,7 +9413,7 @@ class FCToolGUI:
                 names = [d["name"] for d in found]
             except Exception:
                 names = []
-            self.root.after(0, self._apply_motd_scanned_channels, names)
+            self._post_ui(self._apply_motd_scanned_channels, names)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -9477,7 +9550,7 @@ class FCToolGUI:
                     self._rebuild_motd_preview()
 
                 try:
-                    self.root.after(0, done)
+                    self._post_ui(done)
                 except Exception:
                     pass
 
@@ -9864,7 +9937,7 @@ class FCToolGUI:
                            "set the MOTD.")
             except Exception as e:
                 msg = f"Could not read fleet status: {e}"
-            self.root.after(0, self._apply_motd_fleet_status,
+            self._post_ui(self._apply_motd_fleet_status,
                             fleet_id, is_boss, msg)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -9923,7 +9996,7 @@ class FCToolGUI:
                 ok = auth.set_fleet_motd(fleet_id, markup)
             except Exception as e:
                 err = str(e)
-            self.root.after(0, _done, ok, err)
+            self._post_ui(_done, ok, err)
 
         def _done(ok, err):
             if ok:
@@ -10016,7 +10089,7 @@ class FCToolGUI:
                         reason = "error"
             except Exception as e:
                 reason = str(e) or "error"
-            self.root.after(0, _done, ok, reason, markup)
+            self._post_ui(_done, ok, reason, markup)
 
         def _done(ok, reason, pushed):
             import time
@@ -10150,7 +10223,7 @@ class FCToolGUI:
                         raw = fleet.get("motd", "") or ""
             except Exception as e:
                 err = str(e)
-            self.root.after(0, self._apply_imported_motd, raw, err)
+            self._post_ui(self._apply_imported_motd, raw, err)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -10242,7 +10315,7 @@ class FCToolGUI:
                 ok = auth.set_fleet_motd(fleet_id, "")
             except Exception as e:
                 err = str(e)
-            self.root.after(0, _done, ok, err)
+            self._post_ui(_done, ok, err)
 
         def _done(ok, err):
             if ok:
@@ -11117,7 +11190,7 @@ class FCToolGUI:
                     result, err = None, str(getattr(e, "message", e) or e)
                 except Exception as e:  # pragma: no cover - defensive
                     result, err = None, str(e)
-                self.root.after(0, _apply, result, err, raw_text)
+                self._post_ui(_apply, result, err, raw_text)
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -11231,7 +11304,7 @@ class FCToolGUI:
                 err = str(e)
             except Exception as e:
                 err = str(e)
-            self.root.after(0, _apply, db_path, fits, err)
+            self._post_ui(_apply, db_path, fits, err)
 
         def _apply(db_path, fits, err):
             if db_path and fits is not None:
@@ -11303,7 +11376,7 @@ class FCToolGUI:
                 err = None
             except Exception as e:
                 result, raw_text, err = None, "", str(e)
-            self.root.after(0, _apply, result, raw_text, err)
+            self._post_ui(_apply, result, raw_text, err)
 
         def _apply(result, raw_text, err):
             if err is not None or result is None:
@@ -11643,9 +11716,9 @@ class FCToolGUI:
                         failed += 1
                     # Per-fit save would be O(n^2); update progress occasionally.
                     if i % 5 == 0 or i == total:
-                        self.root.after(
-                            0, ctl.set_status, f"Importing {i}/{total}…")
-                self.root.after(0, _done, imported, skipped, failed)
+                        self._post_ui(
+                            ctl.set_status, f"Importing {i}/{total}…")
+                self._post_ui(_done, imported, skipped, failed)
 
             def _done(imported, skipped, failed):
                 # Single save at the very end (one disk write for the batch).
@@ -11754,7 +11827,7 @@ class FCToolGUI:
                     })
                 except Exception:
                     continue
-            self.root.after(0, _apply, entries, err)
+            self._post_ui(_apply, entries, err)
 
         def _finish():
             """Reset the busy flag + re-enable the button. Runs on the Tk thread
@@ -11857,9 +11930,9 @@ class FCToolGUI:
                     except Exception:
                         failed += 1
                     if i % 5 == 0 or i == total:
-                        self.root.after(
-                            0, ctl.set_status, f"Importing {i}/{total}…")
-                self.root.after(0, _done, imported, skipped, failed)
+                        self._post_ui(
+                            ctl.set_status, f"Importing {i}/{total}…")
+                self._post_ui(_done, imported, skipped, failed)
 
             def _done(imported, skipped, failed):
                 # Single save at the very end (one disk write for the batch).
@@ -11897,7 +11970,7 @@ class FCToolGUI:
                 err = None
             except Exception as e:
                 ok, err = False, str(e)
-            self.root.after(0, _apply, ok, err)
+            self._post_ui(_apply, ok, err)
 
         def _apply(ok, err):
             if ok:
@@ -13644,8 +13717,8 @@ class FCToolGUI:
             chat_path = resolve_eve_logs_path(self.config.get("eve_logs_path", ""))
             logs_dir = gamelogs_dir_for(chat_path)
             mon = self._preview_gamelog_factory(
-                on_event=lambda ev: self.root.after(0, self._preview_on_damage, ev),
-                on_decloak=lambda ev: self.root.after(0, self._preview_on_decloak, ev),
+                on_event=lambda ev: self._post_ui(self._preview_on_damage, ev),
+                on_decloak=lambda ev: self._post_ui(self._preview_on_decloak, ev),
                 logs_dir=logs_dir)
             mon.start()
             self._preview_gamelog = mon
@@ -17114,7 +17187,7 @@ class FCToolGUI:
                 log.exception("[market] staging resolve failed")
             finally:
                 try:
-                    self.root.after(0, self._market_apply_staging_resolution,
+                    self._post_ui(self._market_apply_staging_resolution,
                                     name, resolution)
                 except Exception:
                     # Tk gone at shutdown: clear the guard directly so it can't
@@ -17295,7 +17368,7 @@ class FCToolGUI:
                 log.exception("[market] structure search failed")
             finally:
                 try:
-                    self.root.after(0, self._market_apply_structures,
+                    self._post_ui(self._market_apply_structures,
                                     term, want_sid, results)
                 except Exception:
                     self._market_structure_searching = False
@@ -17490,7 +17563,7 @@ class FCToolGUI:
                 listeners = temp_monitor.get_available_listeners()
             except Exception:
                 listeners = []
-            self.root.after(0, self._apply_scanned_characters, listeners)
+            self._post_ui(self._apply_scanned_characters, listeners)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -17784,7 +17857,7 @@ class FCToolGUI:
                 names = [d["name"] for d in found]
             except Exception:
                 names = []
-            self.root.after(0, self._apply_scanned_intel_channels, names)
+            self._post_ui(self._apply_scanned_intel_channels, names)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -18178,16 +18251,16 @@ class FCToolGUI:
         if self.charge_tracker.record(msg.sender, msg.message):
             self._schedule_booster_refresh()
         # Check role tracker letters (must run on main thread for UI updates)
-        self.root.after(0, self._check_role_letters, msg)
+        self._post_ui(self._check_role_letters, msg)
 
     def _on_xup_update(self, state: XUpState):
-        self.root.after(0, self._update_xup_display, state)
+        self._post_ui(self._update_xup_display, state)
 
     def _on_xup_ready(self, state: XUpState):
-        self.root.after(0, self._flash_ready, state)
+        self._post_ui(self._flash_ready, state)
 
     def _on_xup_fire(self, state: XUpState):
-        self.root.after(0, self._show_fire, state)
+        self._post_ui(self._show_fire, state)
 
     # ── Command-burst / charge tracking ───────────────────────────────────────
 
@@ -18230,7 +18303,7 @@ class FCToolGUI:
         if self._booster_refresh_pending:
             return
         self._booster_refresh_pending = True
-        self.root.after(250, self._run_booster_refresh)
+        self._post_ui_after(250, self._run_booster_refresh)
 
     def _run_booster_refresh(self):
         self._booster_refresh_pending = False
@@ -18256,8 +18329,8 @@ class FCToolGUI:
             # Pre-index rows by lowercased pilot name (off-thread) so the Tk-thread
             # Links render does pure dict lookups when matching pilots to charges.
             rows_by_name = {r.name.lower(): r for r in rows}
-            self.root.after(
-                0, lambda: self._apply_booster_compute(rows_by_name, coverage, ship_names))
+            self._post_ui(
+                lambda: self._apply_booster_compute(rows_by_name, coverage, ship_names))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -18494,7 +18567,7 @@ class FCToolGUI:
                 pass
             alert.route_from_staging = route_info
 
-        self.root.after(0, self._show_zkill_alert, alert)
+        self._post_ui(self._show_zkill_alert, alert)
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
@@ -19216,7 +19289,7 @@ class FCToolGUI:
                     # Derive locations (pass pre-fetched members to avoid duplicate call)
                     locations = self.esi_auth.get_fleet_member_locations(members=members)
                     if locations:
-                        self.root.after(0, self._apply_fleet_locations, locations)
+                        self._post_ui(self._apply_fleet_locations, locations)
 
                     # Derive fleet composition
                     ship_counts: dict[int, int] = {}
@@ -19226,8 +19299,8 @@ class FCToolGUI:
                             ship_counts[stid] = ship_counts.get(stid, 0) + 1
                     total = len(members)
 
-                    self.root.after(0, self._update_fleet_composition, ship_counts, total)
-                    self.root.after(0, self._update_specialized_roles, members, ship_counts, total)
+                    self._post_ui(self._update_fleet_composition, ship_counts, total)
+                    self._post_ui(self._update_specialized_roles, members, ship_counts, total)
 
                     # Enrich member records with names for loss tracker.
                     # Pre-compute is_tackle here (BG thread) to avoid ESI calls
@@ -19251,7 +19324,7 @@ class FCToolGUI:
                             "role": m.get("role", ""),
                             "is_tackle": is_tackle(stid) if stid else False,
                         })
-                    self.root.after(0, self._process_loss_tracking, fleet_id, enriched)
+                    self._post_ui(self._process_loss_tracking, fleet_id, enriched)
                 elif fleet_id:
                     # In a fleet but not boss (can't read members → members is None).
                     # Keep chat-fed command-burst charges; only the hull roster is
@@ -19259,7 +19332,7 @@ class FCToolGUI:
                     self._no_fleet_misses = 0
                     self._booster_roster = {}        # hulls unverified; charges kept
                     self._schedule_booster_refresh()
-                    self.root.after(60000, self._refresh_fleet_locations)
+                    self._post_ui_after(60000, self._refresh_fleet_locations)
                     return
                 else:
                     # Genuinely not in a fleet (no fleet_id) — could also be a
@@ -19267,18 +19340,18 @@ class FCToolGUI:
                     # consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
-                        self.root.after(0, self._update_fleet_composition, {}, 0)
-                        self.root.after(0, self._process_loss_tracking, None, [])
+                        self._post_ui(self._update_fleet_composition, {}, 0)
+                        self._post_ui(self._process_loss_tracking, None, [])
                         self._clear_booster_state()
                     else:
                         print(f"[Fleet] No fleet data (miss {self._no_fleet_misses}/"
                               f"{NO_FLEET_GRACE}) — keeping previous state")
                     # Use longer backoff to reduce ESI 404 spam
-                    self.root.after(60000, self._refresh_fleet_locations)
+                    self._post_ui_after(60000, self._refresh_fleet_locations)
                     return
             except Exception as e:
                 print(f"[Fleet] Location/composition fetch error: {e}")
-            self.root.after(15000, self._refresh_fleet_locations)
+            self._post_ui_after(15000, self._refresh_fleet_locations)
 
         threading.Thread(target=do_fetch, daemon=True).start()
 
@@ -19313,14 +19386,13 @@ class FCToolGUI:
                         self._current_system_name = sys_name
                         self._current_system_region = region_name
                         region_str = f" ({region_name})" if region_name else ""
-                        self.root.after(
-                            0,
+                        self._post_ui(
                             self._current_system_display.config,
                             {"text": f"System: {sys_name}{region_str}"},
                         )
             except Exception as e:
                 print(f"[Location] Current system fetch error: {e}")
-            self.root.after(15000, self._refresh_current_system)
+            self._post_ui_after(15000, self._refresh_current_system)
 
         threading.Thread(target=do_fetch, daemon=True).start()
 
@@ -19569,7 +19641,7 @@ class FCToolGUI:
                             pods.append((cid, resolve_name(cid, "character") or str(cid)))
             except Exception as e:
                 err = str(e)
-            self.root.after(0, _confirm, pods, err)
+            self._post_ui(_confirm, pods, err)
 
         def _confirm(pods, err):
             if err:
@@ -19601,7 +19673,7 @@ class FCToolGUI:
                         kicked += 1
                     else:
                         failed += 1
-                self.root.after(0, _done, kicked, failed)
+                self._post_ui(_done, kicked, failed)
             threading.Thread(target=worker, daemon=True).start()
 
         def _done(kicked, failed):
@@ -19637,15 +19709,16 @@ class FCToolGUI:
         """Capture window screenshot and save to clipboard."""
         self._screenshot_link.config(text="Capturing...", fg=FG_DIM)
         self.root.update_idletasks()
+        # Read the window geometry on the MAIN thread before spawning the worker:
+        # Tk winfo_* is not thread-safe and must never run off-main (Class B fix).
+        # The worker closes over these plain ints and never touches Tk for reads.
+        x = self.root.winfo_rootx()
+        y = self.root.winfo_rooty()
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
 
         def do_capture():
             try:
-                # Capture the window using the window's geometry
-                x = self.root.winfo_rootx()
-                y = self.root.winfo_rooty()
-                w = self.root.winfo_width()
-                h = self.root.winfo_height()
-
                 if sys.platform == "win32":
                     ok, msg = self._capture_screenshot_windows(x, y, w, h)
                 elif sys.platform.startswith("linux"):
@@ -19653,9 +19726,9 @@ class FCToolGUI:
                 else:
                     ok, msg = False, "Screenshot not supported on this platform"
                 color = FG_GREEN if ok else FG_RED
-                self.root.after(0, self._screenshot_link.config, {"text": msg, "fg": color})
+                self._post_ui(self._screenshot_link.config, {"text": msg, "fg": color})
             except Exception as e:
-                self.root.after(0, self._screenshot_link.config,
+                self._post_ui(self._screenshot_link.config,
                                {"text": f"Error: {e}", "fg": FG_RED})
 
         threading.Thread(target=do_capture, daemon=True).start()
@@ -20243,7 +20316,7 @@ $bmp.Dispose()
                     names.append(nm)
                     name_map[nm.lower()] = rid
             if getattr(self, "_cyno_entry", None) is not None:
-                self.root.after(0, self._cyno_apply_typeahead, names, name_map)
+                self._post_ui(self._cyno_apply_typeahead, names, name_map)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -20272,23 +20345,23 @@ $bmp.Dispose()
         def worker():
             cid = self._cyno_resolve_character_id(name)
             if not cid:
-                self.root.after(
-                    0, self._cyno_resolve_failed, name)
+                self._post_ui(
+                    self._cyno_resolve_failed, name)
                 return
-            self.root.after(
-                0, self._cyno_set_status,
+            self._post_ui(
+                self._cyno_set_status,
                 f"Checking {name} ...", FG_DIM)
 
             def progress(msg):
                 # Marshal each backend status line to the UI thread.
-                self.root.after(0, self._cyno_set_status, msg, FG_DIM)
+                self._post_ui(self._cyno_set_status, msg, FG_DIM)
 
             try:
                 result = cyno_analyze_character(cid, progress=progress)
             except Exception as exc:
-                self.root.after(0, self._cyno_render_error, str(exc))
+                self._post_ui(self._cyno_render_error, str(exc))
                 return
-            self.root.after(0, self._cyno_render_result, name, result)
+            self._post_ui(self._cyno_render_result, name, result)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -20501,8 +20574,7 @@ $bmp.Dispose()
                 # Broad catch: surface any failure to the user as a friendly
                 # message rather than crashing the Tk mainloop.
                 except Exception as exc:
-                    self.root.after(
-                        0,
+                    self._post_ui(
                         lambda exc=exc: self._set_paste_result(
                             f"Local-scan analysis failed: {exc}"
                         ),
@@ -20543,7 +20615,7 @@ $bmp.Dispose()
                         f"{effective_hostile} hostile{delta_str}"
                     )
 
-                self.root.after(0, _finish)
+                self._post_ui(_finish)
 
             threading.Thread(
                 target=_worker, daemon=True, name="LocalScanAnalyze",
@@ -20692,7 +20764,7 @@ $bmp.Dispose()
                     # not subclass-style self).
                     if hasattr(self, "_paste_standings_age"):
                         try:
-                            self.root.after(0, self._update_standings_label)
+                            self._post_ui(self._update_standings_label)
                         except Exception:
                             pass
                     return
@@ -20780,6 +20852,26 @@ $bmp.Dispose()
         self._intel_log.config(state=tk.DISABLED)
 
     # ── Intelligence Fusion ────────────────────────────────────────────────
+
+    def _mirror_intel_fusion_enabled(self, *_):
+        """Main-thread Var-trace: keep the thread-safe fusion Event in sync with
+        the ``_intel_fusion_var`` checkbutton so the off-main poll loop never
+        reads a Tk Var (Class B fix). Fires for every Var change (checkbutton
+        click or programmatic .set), so the error-path reset is covered too."""
+        if self._intel_fusion_var.get():
+            self._intel_fusion_enabled.set()
+        else:
+            self._intel_fusion_enabled.clear()
+
+    def _mirror_intel_min_reported(self, *_):
+        """Main-thread Var-trace: mirror the min-reported spinbox into a plain int
+        read by the off-main intel message callback (Class B fix). Tolerates a
+        transient empty/garbage entry by falling back to 0 (same tolerance the
+        worker had when it parsed the Var directly)."""
+        try:
+            self._intel_min_reported = int(self._intel_min_reported_var.get())
+        except (ValueError, AttributeError):
+            self._intel_min_reported = 0
 
     def _toggle_intel_fusion(self):
         """Enable or disable intelligence fusion."""
@@ -20931,7 +21023,7 @@ $bmp.Dispose()
 
     def _intel_poll_loop(self):
         """Background polling loop for intel channels."""
-        while self._intel_monitor and self._intel_fusion_var.get():
+        while self._intel_monitor and self._intel_fusion_enabled.is_set():
             try:
                 self._intel_monitor.poll()
             except Exception:
@@ -21013,12 +21105,12 @@ $bmp.Dispose()
                 report.has_cyno_beacon = self._check_cyno_beacon(report.system_id)
             except Exception:
                 pass
-        try:
-            min_rep = int(self._intel_min_reported_var.get())
-        except (ValueError, AttributeError):
-            min_rep = 0
+        # Read the thread-safe plain mirror (updated on the main thread by a Var
+        # write-trace); the worker must never touch the Tk Var directly (Class B
+        # fix). getattr keeps the original AttributeError tolerance.
+        min_rep = getattr(self, "_intel_min_reported", 0)
         priority = high_priority(report, min_rep) if report else False
-        self.root.after(0, self._intel_stream_ingest, msg, spans, report, priority)
+        self._post_ui(self._intel_stream_ingest, msg, spans, report, priority)
 
     def _passes_view_filter(self, msg) -> bool:
         if msg.channel not in self._intel_channels_enabled:
@@ -21052,8 +21144,8 @@ $bmp.Dispose()
                 if names:
                     self._intel_resolver.request(
                         names,
-                        lambda d: self.root.after(
-                            0, self._intel_apply_resolutions, d),
+                        lambda d: self._post_ui(
+                            self._intel_apply_resolutions, d),
                     )
             except Exception:
                 pass
@@ -21433,12 +21525,12 @@ $bmp.Dispose()
                 result["no_staging"] = no_staging
 
                 save_route_cache()
-                self.root.after(0, self._show_range_result, result)
+                self._post_ui(self._show_range_result, result)
             except Exception as e:
                 print(f"[JumpRange] Error in range check: {e}")
                 import traceback
                 traceback.print_exc()
-                self.root.after(0, self._range_result_label.config,
+                self._post_ui(self._range_result_label.config,
                                 {"text": f"Error: {e}", "fg": FG_RED})
 
         threading.Thread(target=do_check, daemon=True).start()
@@ -22105,7 +22197,7 @@ $bmp.Dispose()
                 return
             self._market_prog_scheduled = True
         try:
-            self.root.after(0, self._market_progress_apply)
+            self._post_ui(self._market_progress_apply)
         except Exception:
             # Root gone / teardown → drop the guard so a later burst can retry.
             if lock is not None:
@@ -22282,8 +22374,8 @@ $bmp.Dispose()
                 partial_snap = payload.get("snapshot")
                 if partial_snap is not None:
                     try:
-                        self.root.after(
-                            0, self._market_apply_partial_scan, partial_snap)
+                        self._post_ui(
+                            self._market_apply_partial_scan, partial_snap)
                     except Exception:
                         pass
             self._market_schedule_progress_apply()
@@ -22346,7 +22438,7 @@ $bmp.Dispose()
                 # interpreter teardown), clear the flag directly so no exception
                 # type can ever leave the guard stuck.
                 try:
-                    self.root.after(0, self._market_apply_scan, snap, contracts)
+                    self._post_ui(self._market_apply_scan, snap, contracts)
                 except Exception:
                     self._market_scanning = False
 

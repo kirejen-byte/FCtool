@@ -149,7 +149,7 @@ def member_matches_filter(member: dict, query: str) -> bool:
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
-                 resolve_names_provider=None):
+                 resolve_names_provider=None, host=None):
         self.store = store
         self.fittings = fittings
         self.config = config
@@ -159,6 +159,11 @@ class FleetTemplateWindow:
         self._character_names_provider = character_names_provider
         # names -> {name_lower: character_id}; None/absent = no-auth (returns {}).
         self._resolve_names_provider = resolve_names_provider or (lambda names: {})
+        # Host GUI exposing the shared main-thread UI dispatcher (_post_ui). When
+        # present (normal in-app use) worker→UI marshalling routes through its
+        # queue so no Tcl call runs off the main thread; tests construct the
+        # window with a bare Tk root (no host), and _post falls back to win.after.
+        self._host = host
 
         self.mode = "template"
         self._current_template_id = (store.templates[0].id if store.templates else None)
@@ -1738,7 +1743,16 @@ class FleetTemplateWindow:
         """Schedule fn on the Tk thread from a worker; ignore the teardown race
         when a daemon worker outlives the GUI. Tk raises TclError (widget gone)
         or RuntimeError ('main thread is not in main loop') during shutdown —
-        both mean 'the window is gone', so both are safe to swallow here."""
+        both mean 'the window is gone', so both are safe to swallow here.
+
+        Prefers the host GUI's shared main-thread UI dispatcher (``_post_ui``)
+        when available so workers never touch Tcl off the main thread (safe even
+        under an update()-pumped host). Falls back to the hardened ``win.after``
+        schedule when constructed without a host (tests use a bare Tk root)."""
+        post = getattr(self._host, "_post_ui", None) if self._host is not None else None
+        if callable(post):
+            post(fn, *args)
+            return
         try:
             self.win.after(0, fn, *args)
         except (tk.TclError, RuntimeError):
