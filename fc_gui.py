@@ -12497,21 +12497,64 @@ class FCToolGUI:
         tile.place(x, y, w, body_h)
         return tile
 
+    def _preview_virtual_bounds_xywh(self):
+        """(bx, by, bw, bh) form of _virtual_screen_bounds(), for preview_layout's
+        x/y/width/height rect convention (clamp_rect/clamp_visible/grid_arrange) —
+        the win32-backed hook itself returns (x0, y0, x1, y1) edges. Mirrors the
+        conversion _preview_arrange_ordered already does for the same reason."""
+        try:
+            x0, y0, x1, y1 = self._virtual_screen_bounds()
+            bx, by = int(x0), int(y0)
+            bw, bh = int(x1) - bx, int(y1) - by
+        except Exception:
+            bx, by, bw, bh = 0, 0, 1920, 1080
+        return bx, by, bw, bh
+
+    def _preview_clamp_saved_rect(self, rect):
+        """Clamp a SAVED layout rect onto the currently visible desktop so a
+        restored tile never lands stranded on a disconnected/reconfigured
+        monitor (preventive companion to the "Reset previews" button). Shared
+        by every consumer that resolves a persisted position for placement —
+        _preview_tile_rect's saved-layout branch (spawn) and
+        _preview_rekey_tile (retitle). Returns (clamped_rect, moved); `moved`
+        is True only when clamping actually changed (x, y), so callers gate a
+        config write-back + save on a real correction, not on every
+        placement — clamping is a rare recovery event, not a routine rewrite."""
+        x, y, w, h = rect
+        cx, cy = preview_layout.clamp_visible(
+            x, y, w, h, self._preview_virtual_bounds_xywh())
+        return (cx, cy, w, h), (cx, cy) != (x, y)
+
     def _preview_tile_rect(self, client, cfg):
         """Resolve (x, y, w, body_h) for a NEW tile: saved layout for the char,
         else login-stack position for a login screen, else a default grid spawn.
-        Never mutates saved layouts."""
+        Never mutates saved layouts — EXCEPT to clamp one back onto the visible
+        desktop when it has drifted off it entirely (see
+        _preview_clamp_saved_rect); that rare recovery correction is the only
+        case that persists a change here."""
         w, body_h = self._preview_resolve_size(cfg, client.key)
         layouts = cfg.get("layouts", {}) or {}
         saved = layouts.get(client.key)
         if saved and len(saved) >= 4:
             # Saved rect carries its own w/body_h; under uniform_size the tick's
             # _preview_apply_tile_size re-places it at the global size next cycle.
-            return (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
+            rect = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
+            rect, moved = self._preview_clamp_saved_rect(rect)
+            if moved:
+                layouts[client.key] = [int(rect[0]), int(rect[1]),
+                                        int(rect[2]), int(rect[3])]
+                self._save_config()
+            return rect
         if client.is_login:
             n = sum(1 for c in self._preview_clients.values() if c.is_login)
             base = tuple(cfg.get("login_position", [5, 5]))
             x, y = preview_layout.login_stack_pos(n, base)
+            # The stack's base can itself be stranded (same disconnected-
+            # monitor scenario) — clamp the computed position, but never
+            # rewrite the saved login_position: it's a stack anchor/base for
+            # every login tile, not a per-tile placement.
+            x, y = preview_layout.clamp_visible(
+                x, y, w, body_h, self._preview_virtual_bounds_xywh())
             return (x, y, w, body_h)
         # default spawn: cascade by current tile count so new clients don't stack
         idx = len(self._preview_tiles)
@@ -12571,8 +12614,10 @@ class FCToolGUI:
 
     def _preview_rekey_tile(self, old, new):
         """Same hwnd, changed title (login<->char or char rename). Re-key the tile
-        and move it to the new key's saved layout if one exists. Saved layouts of
-        the OLD key are left untouched (foot-gun fix)."""
+        and move it to the new key's saved layout if one exists (clamped onto
+        the visible desktop — see _preview_clamp_saved_rect — so a retitle
+        never restores a tile stranded on a disconnected monitor). Saved
+        layouts of the OLD key are left untouched (foot-gun fix)."""
         tile = self._preview_tiles.get(new.hwnd)
         if tile is None:
             self._preview_spawn_tile(new)
@@ -12583,6 +12628,11 @@ class FCToolGUI:
             saved = (cfg.get("layouts", {}) or {}).get(new.key)
             if saved and len(saved) >= 4:
                 r = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
+                r, moved = self._preview_clamp_saved_rect(r)
+                if moved:
+                    cfg["layouts"][new.key] = [int(r[0]), int(r[1]),
+                                                int(r[2]), int(r[3])]
+                    self._save_config()
                 tile.place(*r)
                 self._preview_tile_rects[new.hwnd] = r
         except OSError:

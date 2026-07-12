@@ -4,6 +4,7 @@ from __future__ import annotations
 
 EDGE_SNAP_MIN = 20          # EVE-O parity: max(20, w // 10)
 LOGIN_STACK_STEP = 24
+CLAMP_MIN_VISIBLE_PX = 40   # clamp_visible: min on-desktop overlap (both axes) to leave a rect alone
 
 
 def clamp_rect(rect, bounds):
@@ -12,6 +13,30 @@ def clamp_rect(rect, bounds):
     x = max(bx, min(x, bx + bw - w))
     y = max(by, min(y, by + bh - h))
     return (x, y, w, h)
+
+
+def clamp_visible(x, y, w, h, bounds, min_px=CLAMP_MIN_VISIBLE_PX):
+    """Clamp a RESTORED tile position onto `bounds` only when it isn't usably
+    visible there — the stranded-monitor guard for saved preview layouts.
+    `bounds` is (bx, by, bw, bh), the same x/y/width/height convention as
+    clamp_rect/grid_arrange (NOT the (x0, y0, x1, y1) edges that the win32
+    _virtual_screen_bounds() hook itself returns — callers must convert).
+
+    A rect is left UNCHANGED as long as its intersection with bounds is at
+    least `min_px` wide AND `min_px` tall: a multi-monitor user with a
+    temporarily-off display must not have a still-grabbable tile silently
+    rearranged. Anything less (fully offscreen, or a sliver under min_px on
+    either axis) is fully clamped via clamp_rect's formula, which pins a
+    tile wider/taller than bounds to the bounds' own (bx, by) origin.
+
+    Returns (x, y) only — w/h never change here."""
+    bx, by, bw, bh = bounds
+    ix = max(0, min(x + w, bx + bw) - max(x, bx))
+    iy = max(0, min(y + h, by + bh) - max(y, by))
+    if ix >= min_px and iy >= min_px:
+        return (x, y)
+    cx, cy, _, _ = clamp_rect((x, y, w, h), bounds)
+    return (cx, cy)
 
 
 def snap_to_grid(x, y, grid_w, grid_h):
