@@ -100,6 +100,27 @@ INTEL_STRUCT_MS = 1000.0     # cull + reproject cadence (structure changes only)
 INTEL_CLICK_SLOP2 = 25       # (5 px)^2: press/release within this = a click, not a pan
 _TWO_PI = 2.0 * math.pi
 
+# Kill-ping layer (Task 36). DISCRETE zkill ALERT pings -- distinct from the
+# ambient decaying kill-heat glow (Task 30). A fresh alert BURSTS as expanding
+# radar rings in a vivid hostile RED (#ff1744) chosen to read apart from the amber
+# intel pulses (#ffd166), the static capital double-ring (#ff3b30 / #ff5a76 family)
+# and the soft heat glow; then it LINGERS as a small steady diamond marker for
+# ~5 min so an older kill stays findable. Rings emanate on a ~1 s radar sweep whose
+# phase is shared (time-based, like the intel oscillator) so the per-tick tween
+# only MUTATES existing ring items (coords / width), never delete/recreates; the
+# linger marker is static (no tween). Structure changes (burst<->linger, cull,
+# reproject) are batched to ~1 s (KILLPING_STRUCT_MS) exactly like the intel idiom.
+KILLPING_RED = "#ff1744"
+KILLPING_R0 = 5.0            # inner (birth) ring radius (px)
+KILLPING_SPAN = 22.0        # radial travel of an emanating ring (px), non-capital
+KILLPING_SPAN_CAP = 32.0    # capital burst reaches farther (bigger, louder ping)
+KILLPING_RINGS = 2          # concurrent emanating rings (non-capital)
+KILLPING_RINGS_CAP = 3      # capital burst adds a third emanating ring
+KILLPING_SWEEP_MS = 1000.0  # radar-sweep period (one ring's birth -> death)
+KILLPING_MARK_R = 5.0       # linger diamond marker half-size (px)
+KILLPING_MARK_R_CAP = 7.0   # capital linger marker is a touch larger (doubled)
+KILLPING_STRUCT_MS = 1000.0 # cull + reproject + stage-flip cadence (structure only)
+
 # Sovereignty tint layer (Task 33). ESI /sovereignty/map/ (public, cached long)
 # gives per-system sovereign alliance; a dim hashed tint per alliance washes the
 # map behind the nodes (map_render._draw_sov / map_overlays.sov_color). OFF by
@@ -351,6 +372,12 @@ class MapTabState:
         # (fc_gui marshals the intel stream through _post_ui before the push), read
         # via active() by MapTab to draw the amber pulse rings. Pure decay model.
         self.intel_pulses = mo.IntelPulses()
+        # --- kill-ping layer (Task 36) ---
+        # Discrete zkill ALERT pings (distinct from the ambient kill-heat glow):
+        # ping()ed on the MAIN thread (fc_gui marshals the zkill worker callback
+        # through _post_ui -> _push_kill_to_map -> add_kill_ping), read via active()
+        # to draw the red radar-burst rings + linger markers. Pure decay model.
+        self.kill_pings = mo.KillPings()
         # --- sovereignty tint layer (Task 33) ---
         # sov_map: {system_id: alliance_id} from ESI /sovereignty/map/, applied on
         # the MAIN thread from the result queue (canonical_sov -> the render request
@@ -756,6 +783,10 @@ class MapTab:
             # Intel pulse layer (Task 31): ON by default -- tracked-channel system
             # mentions pulse amber and fade over ~5 min.
             "intel": tk.BooleanVar(value=bool(_layers.get("intel", True))),
+            # Kill-ping layer (Task 36): ON by default -- it only fires when the
+            # user's configured zkill monitoring raises an alert (the checkbox is
+            # the requested opt-out). Discrete red radar bursts, distinct from heat.
+            "kill_pings": tk.BooleanVar(value=bool(_layers.get("kill_pings", True))),
             # Sovereignty tint layer (Task 33): OFF by default (owner's palette-
             # noise call) -- so the var default is False, matching _layer_on's
             # off-by-default handling and keeping the fetch dormant until enabled.
@@ -770,7 +801,8 @@ class MapTab:
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
-                            ("intel", "Intel"), ("sov", "Sov")):
+                            ("intel", "Intel"), ("kill_pings", "Pings"),
+                            ("sov", "Sov")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
@@ -948,6 +980,22 @@ class MapTab:
         self._intel_struct_ms = 0.0
         self._press_xy: tuple[int, int] | None = None
 
+        # --- kill-ping layer (Task 36) -------------------------------------------
+        # _killping_items maps system_id -> the LIST of canvas item ids drawn for it
+        # (a burst has KILLPING_RINGS[_CAP] ring ovals; a linger has 1-2 diamond
+        # markers), rebuilt by _redraw_overlays in lockstep with the ov_killping tag
+        # deletes; _killping_cache holds each ping's (stage, capital) captured at the
+        # last structure rebuild so the per-tick tween knows which items are bursting
+        # (animate) vs lingering (static) WITHOUT re-running active() every 16 ms;
+        # _killping_struct_ms gates the ~1 s cull/reproject/stage-flip. _pending_focus_sid
+        # is a focus_kill target deferred until on_shown (the notebook <<TabChanged>>
+        # that runs on_shown fires ASYNC -- see _apply_pending_focus), applied AFTER
+        # restore_camera so the kill focus wins over the restored camera.
+        self._killping_items: dict[int, list[int]] = {}
+        self._killping_cache: dict[int, tuple] = {}
+        self._killping_struct_ms = 0.0
+        self._pending_focus_sid: int | None = None
+
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -1028,6 +1076,12 @@ class MapTab:
         # default -> no-op -> zero network). The one-shot thread dies after one
         # fetch; an in-flight fetch across a hide/show is not double-spawned.
         self._maybe_start_sov_fetch()
+        # Task 36: apply a focus_kill target that arrived while the tab was hidden.
+        # Runs LAST -- after restore_camera above -- so a "jump to this kill from the
+        # Intelligence tab" wins over the restored camera (the <<NotebookTabChanged>>
+        # that runs on_shown fires asynchronously, so focus_kill can't center before
+        # this point). No-op when nothing is pending.
+        self._apply_pending_focus()
 
     def on_hidden(self) -> None:
         if self.renderer is None:
@@ -1490,6 +1544,145 @@ class MapTab:
             print(f"[MAP] intel click callback failed: {exc}")
         return True
 
+    # ---- kill-ping layer (Task 36) --------------------------------------------
+    def add_kill_ping(self, system_id, capital=False, count=1, now=None) -> None:
+        """Record a discrete zkill ALERT ping so its system radar-bursts on the map
+        (Task 36). Called on the MAIN thread -- fc_gui marshals the zkill worker
+        callback (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which
+        forwards here alongside the kill-heat push. Stamps the ping with wall-clock
+        time (the alert just fired; zkill is near-real-time). When the layer is on,
+        rebuilds the overlay at once so the burst lights up immediately (the tick
+        loop then animates it). INDEPENDENTLY gated from heat by its own layer
+        toggle. Guarded/no-throw so a malformed alert never breaks the zkill path."""
+        ts = time.time() if now is None else now
+        try:
+            self.state.kill_pings.ping(system_id, ts, capital=bool(capital),
+                                       count=count)
+        except Exception as exc:
+            print(f"[MAP] kill ping note failed: {exc}")
+            return
+        if self._layer_on("kill_pings"):
+            self._redraw_overlays()          # draw the new burst now
+            self._schedule_tick()            # ensure the tick loop animates it
+
+    def focus_kill(self, system_id) -> None:
+        """Center the camera on ``system_id`` at a readable zoom and REPLAY its burst
+        (Task 36). Invoked by fc_gui's Intelligence-tab '[Map]' affordance after
+        selecting the Map tab. Robust to the tab not having been shown yet: because
+        the <<NotebookTabChanged>> that runs on_shown fires ASYNCHRONOUSLY (verified
+        empirically), this can't center before on_shown's restore_camera runs, so the
+        target is DEFERRED to _apply_pending_focus (called at the end of on_shown,
+        after restore_camera) and applied there. When the map is already the visible
+        tab, centers immediately. Silently no-ops on a bad / unknown id."""
+        if isinstance(system_id, bool):
+            return
+        try:
+            sid = int(system_id)
+        except (TypeError, ValueError):
+            return
+        known = self.state.model is not None and sid in self.state.model.systems
+        # Retrigger the burst so it replays on arrival (no-op if the ping was culled).
+        try:
+            self.state.kill_pings.retrigger(sid, time.time())
+        except Exception:
+            pass
+        if self._visible and known:
+            self._center_on_kill(sid)        # already shown -> focus now
+        elif not self._visible:
+            # Hidden / never-shown: defer to on_shown (the model may load only then;
+            # deferring past restore_camera also prevents a camera clobber). We stash
+            # regardless of `known` -- on_shown re-checks the id against the model.
+            self._pending_focus_sid = sid
+        # visible + unknown id -> silent no-op (nothing to center on)
+
+    def _center_on_kill(self, sid: int) -> None:
+        """Recenter + zoom the camera onto ``sid`` (Task 36). Reuses fly_to's camera
+        pathway: set center to the system's world coords and bump to a readable zoom
+        (max_scale / 3), then force a crisp re-render + overlay repaint. No-op on an
+        unknown id."""
+        s = self.state.model.systems.get(sid) if self.state.model is not None else None
+        if s is None:
+            return
+        cam = self.state.camera
+        cam.cx, cam.cy = s.x, s.y
+        cam.scale = max(cam.scale, cam.max_scale / 3.0)
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+        self._schedule_tick()
+
+    def _apply_pending_focus(self) -> None:
+        """Apply a focus_kill target that was deferred until the tab was shown (Task
+        36). Called at the END of on_shown -- AFTER restore_camera -- so the kill
+        focus wins over the restored camera. Retriggers the burst so it replays on
+        arrival, then centers. No-op when nothing is pending or the id is unknown to
+        the (now-loaded) model."""
+        sid = self._pending_focus_sid
+        if sid is None:
+            return
+        self._pending_focus_sid = None
+        if self.state.model is None or sid not in self.state.model.systems:
+            return
+        try:
+            self.state.kill_pings.retrigger(sid, time.time())
+        except Exception:
+            pass
+        self._center_on_kill(sid)
+
+    def _killping_ring(self, k: int, n: int, span: float,
+                       now_ms: float) -> tuple[float, int]:
+        """Radar ring (radius, width) for emanating ring ``k`` of ``n`` at ``now_ms``.
+        Each ring rides the shared sweep phase offset by k/n so the rings chase each
+        other outward continuously; radius grows from KILLPING_R0 across ``span`` as
+        the phase advances, and the line THINS (3 -> 1 px) as it expands so a ring
+        visually fades out at the edge (Tk ovals have no alpha)."""
+        ph = ((now_ms / KILLPING_SWEEP_MS) + (k / n)) % 1.0
+        r = KILLPING_R0 + ph * span
+        w = max(1, int(round(3.0 * (1.0 - ph))))
+        return r, w
+
+    def _animate_kill_pings(self, now_ms: float) -> None:
+        """Per-tick kill-ping animation (Task 36). HARD empty-fast-path FIRST: zero
+        work when the layer is off or nothing is pinging (one dict-get + one O(1)
+        truthiness, then return) -- so ~100 idle ticks cause zero canvas mutation.
+        While bursts are live, MUTATE the existing burst ring items (coords + width)
+        from the shared radar sweep so the hot 16 ms path never allocates or
+        delete/recreates; the linger markers are static (skipped). Structure changes
+        (burst->linger, cull, reproject) are batched to ~1 s (KILLPING_STRUCT_MS) via
+        a cheap time gate that defers to _redraw_overlays -- the intel-pulse idiom."""
+        if not self._layer_on("kill_pings"):
+            return
+        pings = self.state.kill_pings
+        if not pings.has_any():
+            return
+        if now_ms - self._killping_struct_ms >= KILLPING_STRUCT_MS:
+            self._redraw_overlays()          # cull + reproject + stage flips
+            return
+        if not self._killping_items or self.state.model is None:
+            return
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        canvas = self.canvas
+        for sid, ids in self._killping_items.items():
+            cached = self._killping_cache.get(sid)
+            if cached is None or cached[0] != "burst":
+                continue                     # linger markers are static -> no tween
+            s = systems.get(sid)
+            if s is None:
+                continue
+            cap = cached[1]
+            n = KILLPING_RINGS_CAP if cap else KILLPING_RINGS
+            span = KILLPING_SPAN_CAP if cap else KILLPING_SPAN
+            sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
+            for k, item in enumerate(ids):
+                r, w = self._killping_ring(k, n, span, now_ms)
+                try:
+                    canvas.coords(item, sx - r, sy - r, sx + r, sy + r)
+                    canvas.itemconfigure(item, width=w)
+                except tk.TclError:
+                    pass
+
     # ---- sovereignty tint layer (Task 33) -------------------------------------
     def _sov_request_value(self):
         """Canonical hashable sov tuple for the render request + sig, or None when
@@ -1754,14 +1947,18 @@ class MapTab:
         if _c: _o0 = _c()
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel")
+                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
+                 "ov_killping")
         for tag in _tags:
             canvas.delete(tag)
-        # Task 31: the ov_intel items were just deleted -> drop their stale ids so
-        # the dicts stay in lockstep with the canvas (repopulated in the intel block
-        # below; left empty on the no-model early-return, which is correct).
+        # Task 31 / Task 36: the ov_intel + ov_killping items were just deleted ->
+        # drop their stale ids so the dicts stay in lockstep with the canvas
+        # (repopulated in the intel / kill-ping blocks below; left empty on the
+        # no-model early-return, which is correct).
         self._intel_items = {}
         self._intel_cache = {}
+        self._killping_items = {}
+        self._killping_cache = {}
         if _c: _od = _c()
         if self.renderer is None or self.state.model is None:
             if _c:
@@ -1917,6 +2114,45 @@ class MapTab:
                 self._intel_items[sid] = item
                 self._intel_cache[sid] = intensity
             self._intel_struct_ms = _now_ms_i
+        # -- kill pings (Task 36): discrete zkill-ALERT radar bursts (vivid red,
+        # expanding rings) that decay to a small steady diamond marker over ~5 min --
+        # DISTINCT from the amber intel pulses and the ambient heat glow. STRUCTURE
+        # path: create the burst rings / linger marker items (drawn topmost) and
+        # cache each ping's (stage, capital) so the per-tick _animate_kill_pings can
+        # tween the burst rings in place without delete/recreate. active() culls
+        # expired pings; off-screen ones are skipped by `project`. Sets the structure
+        # clock so the 1 s cull/stage-flip gate does not immediately re-fire.
+        if self._layer_on("kill_pings"):
+            _now_ms_k = _now_ms()
+            for sid, pstate in st.kill_pings.active(time.time()).items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                cap = pstate.capital
+                if pstate.stage == "burst":
+                    n = KILLPING_RINGS_CAP if cap else KILLPING_RINGS
+                    span = KILLPING_SPAN_CAP if cap else KILLPING_SPAN
+                    ids = []
+                    for k in range(n):
+                        r, w = self._killping_ring(k, n, span, _now_ms_k)
+                        ids.append(canvas.create_oval(
+                            sx - r, sy - r, sx + r, sy + r, outline=KILLPING_RED,
+                            width=w, tags="ov_killping"))
+                    self._killping_items[sid] = ids
+                else:                        # linger: small steady diamond outline
+                    mrk = KILLPING_MARK_R_CAP if cap else KILLPING_MARK_R
+                    ids = [canvas.create_polygon(
+                        sx, sy - mrk, sx + mrk, sy, sx, sy + mrk, sx - mrk, sy,
+                        fill="", outline=KILLPING_RED, width=1, tags="ov_killping")]
+                    if cap:                  # capital linger doubles the marker
+                        m2 = mrk + 3.0
+                        ids.append(canvas.create_polygon(
+                            sx, sy - m2, sx + m2, sy, sx, sy + m2, sx - m2, sy,
+                            fill="", outline=KILLPING_RED, width=1, tags="ov_killping"))
+                    self._killping_items[sid] = ids
+                self._killping_cache[sid] = (pstate.stage, cap)
+            self._killping_struct_ms = _now_ms_k
         if _c:
             _o1 = _c()
             _now = tele._ms()
@@ -2435,6 +2671,11 @@ class MapTab:
         # changes batched to ~1 s. Runs regardless of verdict -- pulses breathe
         # whether or not the camera is moving.
         self._animate_intel_pulses(_now_ms())
+        # (Task 36) kill-ping radar animation: same cheap empty-fast-path idiom --
+        # zero work when the layer is off or nothing is pinging; otherwise tween the
+        # red burst rings (structure changes batched to ~1 s). Runs every tick so a
+        # burst emanates whether or not the camera is moving.
+        self._animate_kill_pings(_now_ms())
         # (Task 33) sov hourly re-fetch gate: fully guarded + cheap (layer-off /
         # in-flight / freshness checks short-circuit before any work), so calling it
         # each tick costs a dict-get + bool when the layer is off -- and spawns the
@@ -2713,6 +2954,9 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("heat"))
         menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
                              command=lambda: self._on_layer_toggle("intel"))
+        # Kill pings (Task 36): discrete zkill-alert radar bursts; ON by default.
+        menu.add_checkbutton(label="Pings", variable=self._layer_vars["kill_pings"],
+                             command=lambda: self._on_layer_toggle("kill_pings"))
         # Sov tint (Task 33): OFF by default; enabling it kicks the lazy ESI fetch.
         menu.add_checkbutton(label="Sov", variable=self._layer_vars["sov"],
                              command=lambda: self._on_layer_toggle("sov"))

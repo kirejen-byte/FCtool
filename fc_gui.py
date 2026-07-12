@@ -5558,10 +5558,14 @@ class FCToolGUI:
 
     def _push_kill_to_map(self, alert):
         """Forward a zkill engagement alert to the star map's kill-heat layer
-        (Task 30). Runs on the MAIN thread (marshaled from the zkill worker
-        callback via _post_ui in _on_zkill_alert). Guarded so a missing/erroring
-        map tab never breaks the zkill alert path. KillAlert fields used:
-        system_id, kill_count, capitals_involved (all present on the dataclass)."""
+        (Task 30) AND its discrete kill-ping layer (Task 36). Runs on the MAIN
+        thread (marshaled from the zkill worker callback via _post_ui in
+        _on_zkill_alert). Guarded so a missing/erroring map tab never breaks the
+        zkill alert path. Heat and pings are pushed under SEPARATE try/except so
+        one failing never skips the other, and each is INDEPENDENTLY gated inside
+        the map by its own layer toggle (add_kill_heat -> "heat", add_kill_ping ->
+        "kill_pings"). KillAlert fields used: system_id, kill_count,
+        capitals_involved (all present on the dataclass)."""
         tab = getattr(self, "map_tab", None)
         if tab is None:
             return
@@ -5570,6 +5574,11 @@ class FCToolGUI:
                               capital=alert.capitals_involved)
         except Exception as exc:
             print(f"[MAP] kill-heat push failed: {exc}")
+        try:
+            tab.add_kill_ping(alert.system_id, capital=alert.capitals_involved,
+                              count=alert.kill_count)
+        except Exception as exc:
+            print(f"[MAP] kill-ping push failed: {exc}")
 
     def _push_intel_to_map(self, system_id_or_name):
         """Forward an intel-channel system mention to the star map's pulse layer
@@ -5611,6 +5620,42 @@ class FCToolGUI:
         for tab_id in nb.tabs():
             try:
                 if "Intel" in nb.tab(tab_id, "text"):
+                    nb.select(tab_id)
+                    return
+            except Exception:
+                continue
+
+    def _focus_map_on_kill(self, system_id):
+        """Intelligence-tab '[Map]' affordance (Task 36): jump to the star map and
+        ping the given system. Selects the Map tab (matched by tab TEXT, no
+        hardcoded index) then focus_kill on the map, which centers the camera and
+        replays the kill's radar burst. Every step is guarded so a missing notebook
+        / map tab / stale id degrades silently. NOTE: the map's on_shown runs from
+        the async <<NotebookTabChanged>> the select fires, so focus_kill DEFERS the
+        centering to on_shown when the tab wasn't already visible (map_tab handles
+        the ordering); we simply select then call focus_kill."""
+        try:
+            self._select_map_tab()
+        except Exception:
+            pass
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.focus_kill(system_id)
+        except Exception:
+            pass
+
+    def _select_map_tab(self):
+        """Select the star-map notebook tab. Matches by tab TEXT (contains 'Map')
+        so it survives index shifts and is the only tab whose title contains 'Map'.
+        No-op if the notebook or the tab is missing."""
+        nb = getattr(self, "notebook", None)
+        if nb is None:
+            return
+        for tab_id in nb.tabs():
+            try:
+                if "Map" in nb.tab(tab_id, "text"):
                     nb.select(tab_id)
                     return
             except Exception:
@@ -20436,6 +20481,22 @@ $bmp.Dispose()
             )
             self._zkill_log.window_create("alert_ins", window=wb_btn)
             self._zkill_log.insert("alert_ins", "  ")
+
+        # "▸ Map" button (Task 36) -> jump to the star map and ping this system.
+        # A REAL embedded button, matching the sibling link/action buttons: this
+        # zkill panel is BOUNDED (_ZKILL_LOG_MAX_LINES) and the tail-trim destroys
+        # old blocks' embedded buttons, so there is no window_create leak here (the
+        # leak concern only applies to the unbounded intel-fusion stream). Always
+        # shown (ungated, unlike Navigate/Titan-Bridge which need a staging system).
+        map_btn = tk.Button(
+            self._zkill_log, text="▸ Map", font=("Consolas", 8, "bold"),
+            fg=FG_ACCENT, bg=BG_ENTRY, activebackground="#1a5a90",
+            activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
+            cursor="hand2",
+            command=lambda sid=alert.system_id: self._focus_map_on_kill(sid),
+        )
+        self._zkill_log.window_create("alert_ins", window=map_btn)
+        self._zkill_log.insert("alert_ins", "  ")
 
         # "WH Route" button -> fills WH Route tab and searches
         staging = self._get_staging_system()

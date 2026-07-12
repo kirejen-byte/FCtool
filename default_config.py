@@ -68,6 +68,10 @@ DEFAULT_CONFIG = {
         "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
                    "bridges": True, "route": True, "heat": True, "intel": True,
+                   # Kill pings (Task 36): discrete zkill-ALERT radar bursts on the
+                   # map (distinct from the ambient kill-heat glow). ON by default --
+                   # only fires when the user's zkill monitoring raises an alert.
+                   "kill_pings": True,
                    # Sovereignty tint (Task 33): OFF by default -- the palette-noise
                    # call is the owner's. Enabling it lazily fetches ESI sov data.
                    "sov": False},

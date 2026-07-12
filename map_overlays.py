@@ -508,3 +508,136 @@ def sov_legend_rows(mapping, names=None, top_n: int = 15) -> list:
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:max(0, top_n)]
     return [(aid, names.get(aid) or str(aid), cnt, sov_color(aid))
             for aid, cnt in ordered]
+
+
+# --- kill-ping layer (Task 36) ----------------------------------------------
+# Discrete zkill ALERT pings -- distinct from the ambient decaying kill-heat glow
+# (Task 30). When the zkill monitor raises an intelligence alert, its system PINGS
+# on the map. Two stages: a BURST (expanding radar-ring animation) for the first
+# KILLPING_BURST_S after the ping / retrigger, then a subtle LINGER marker until
+# KILLPING_LINGER_S so a kill from a few minutes ago is still findable. Re-ping or
+# an explicit retrigger() restarts the burst. Clock-injected like KillHeat /
+# IntelPulses (every method takes ``now`` -- wall-clock epoch seconds from the
+# MapTab callers -- and never reads a clock internally) so the burst->linger->cull
+# transitions are deterministic in tests. The live set is eviction-bounded.
+KILLPING_BURST_S = 8.0        # radar-burst duration after a ping / retrigger
+KILLPING_LINGER_S = 300.0     # marker persists this long, then the ping is culled
+KILLPING_MAX = 100            # eviction bound (oldest ping dropped beyond this)
+
+
+@dataclass(frozen=True)
+class KillPingState:
+    """One active kill-ping's render state at a queried instant (Task 36).
+      * ``stage``: ``"burst"`` (first KILLPING_BURST_S -> expanding radar rings) or
+        ``"linger"`` (subtle steady marker until KILLPING_LINGER_S).
+      * ``t``: burst progress in [0, 1) (age / KILLPING_BURST_S) while bursting;
+        1.0 once lingering -- lets the renderer fade the burst into the marker.
+      * ``capital``: a hostile capital was on the killmail -> larger / doubled
+        visual (matches the kill-heat capital marker intuition).
+      * ``count``: the alert's killmail count (KillAlert.kill_count), for labeling.
+    """
+    stage: str
+    t: float
+    capital: bool
+    count: int
+
+
+class KillPings:
+    """Discrete zkill-alert ping set for the star map (Task 36). Pure /
+    clock-injected -- mirrors IntelPulses: every method takes ``now`` and never
+    reads a clock internally, so tests drive the burst->linger->cull transitions
+    deterministically.
+
+      * ``ping(system_id, now, capital=False, count=1)`` records or REFRESHES a
+        ping; a re-ping restarts the burst (timestamp reset to ``now``) and STICKS
+        the capital flag on (a later frigate kill in the same system can't downgrade
+        a capital burst) while adopting the freshest killmail count.
+      * ``retrigger(system_id, now)`` restarts an EXISTING ping's burst (the map's
+        focus_kill uses it so the burst replays on arrival from the Intelligence
+        tab); an unknown / already-culled id is a silent no-op.
+      * ``active(now)`` -> ``{system_id: KillPingState}`` for every un-culled ping,
+        dropping (culling) any past KILLPING_LINGER_S as a side effect so memory
+        stays bounded by live activity.
+      * ``has_any()`` is the O(1) 'anything to draw?' gate for the MapTab hot path.
+
+    The set is bounded to ``maxlen`` (oldest ping evicted first) so a burst of
+    alerts can never grow the store without limit."""
+
+    def __init__(self, maxlen: int = KILLPING_MAX) -> None:
+        self._maxlen = int(maxlen)
+        # system_id -> (ts, capital, count). Insertion-ordered dict: ping()
+        # re-inserts on refresh so iteration is LRU (oldest-first) and eviction
+        # simply drops the front entry -- the IntelPulses idiom.
+        self._pings: dict[int, tuple[float, bool, int]] = {}
+
+    @staticmethod
+    def _coerce(system_id):
+        """system_id -> int, or None for None / bool / unparseable (never a sid)."""
+        if system_id is None or isinstance(system_id, bool):
+            return None
+        try:
+            return int(system_id)
+        except (TypeError, ValueError):
+            return None
+
+    def ping(self, system_id, now: float, capital: bool = False,
+             count: int = 1) -> None:
+        """Record / refresh a ping of ``system_id`` at ``now`` (restarts its burst).
+        A bad / None id is ignored. The capital flag STICKS on across re-pings; the
+        killmail count adopts the freshest value (>= 1). Evicts the oldest ping when
+        the set would exceed ``maxlen``."""
+        sid = self._coerce(system_id)
+        if sid is None:
+            return
+        prev = self._pings.pop(sid, None)            # move-to-end on refresh (LRU)
+        cap = bool(capital) or (prev[1] if prev is not None else False)
+        try:
+            cnt = max(1, int(count))
+        except (TypeError, ValueError):
+            cnt = 1
+        self._pings[sid] = (float(now), cap, cnt)
+        while len(self._pings) > self._maxlen:
+            self._pings.pop(next(iter(self._pings)), None)   # drop the oldest
+
+    def retrigger(self, system_id, now: float) -> None:
+        """Restart an EXISTING ping's burst at ``now`` (keeping its capital / count).
+        Unknown or already-culled id -> silent no-op (does NOT fabricate a ping)."""
+        sid = self._coerce(system_id)
+        if sid is None:
+            return
+        prev = self._pings.get(sid)
+        if prev is None:
+            return
+        self._pings.pop(sid, None)                   # restart burst + move-to-end
+        self._pings[sid] = (float(now), prev[1], prev[2])
+
+    def has_any(self) -> bool:
+        """True iff any ping is stored. Cheap dict truthiness -- the MapTab
+        empty-fast-path checks this every tick before doing any ping work. May
+        briefly report True for an expired-but-uncalled entry; the next ``active``
+        call culls it."""
+        return bool(self._pings)
+
+    def active(self, now: float) -> dict:
+        """``{system_id: KillPingState}`` for every un-culled ping at ``now``.
+        A ping is in the ``"burst"`` stage for its first KILLPING_BURST_S (progress
+        ``t = age / KILLPING_BURST_S`` in [0, 1)) then ``"linger"`` (t = 1.0) until
+        KILLPING_LINGER_S, past which it is dropped from the store as a side effect
+        (the cull, keeping memory bounded by live activity). Clock skew (age < 0) is
+        treated as 'just now' -> a fresh burst at t = 0."""
+        out: dict = {}
+        expired: list = []
+        for sid, (ts, cap, cnt) in self._pings.items():
+            dt = now - ts
+            if dt < 0.0:
+                dt = 0.0                             # clock skew -> just now
+            if dt >= KILLPING_LINGER_S:
+                expired.append(sid)
+                continue
+            if dt < KILLPING_BURST_S:
+                out[sid] = KillPingState("burst", dt / KILLPING_BURST_S, cap, cnt)
+            else:
+                out[sid] = KillPingState("linger", 1.0, cap, cnt)
+        for sid in expired:
+            self._pings.pop(sid, None)
+        return out
