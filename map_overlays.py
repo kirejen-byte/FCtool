@@ -124,6 +124,36 @@ def resolve_bridges(entries, resolve_fn=None) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
+def classify_route_segments(path, bridges):
+    """Per-segment classification of a travel route for the map's route overlay
+    (Task 35). ``path`` is an ordered sequence of system ids (as returned by the
+    Ansiblex-aware stargate BFS ``jump_range.get_stargate_route`` -- origin first,
+    destination last). ``bridges`` is an iterable of unordered ``(id_a, id_b)``
+    system-id pairs (``resolve_bridges`` output). Returns a list of
+    ``(from_id, to_id, kind)`` tuples, one per consecutive hop
+    (``len == len(path) - 1``); ``kind`` is ``"bridge"`` when the hop's unordered
+    endpoint pair is an Ansiblex pair, else ``"gate"``.
+
+    Mirrors ``fc_gui._find_ansiblex_in_route``'s pair-membership heuristic: the
+    BFS adds each bridge as an extra graph edge, so a consecutive bridge pair in
+    the resolved path means the route takes that bridge. Pure / headless-testable
+    -- no game-data lookups; malformed bridge entries are skipped."""
+    bset: set[tuple[int, int]] = set()
+    for pr in bridges or ():
+        try:
+            a, b = pr
+        except (TypeError, ValueError):
+            continue
+        bset.add((a, b))
+        bset.add((b, a))
+    seq = list(path or ())
+    out: list[tuple[int, int, str]] = []
+    for i in range(len(seq) - 1):
+        a, b = seq[i], seq[i + 1]
+        out.append((a, b, "bridge" if (a, b) in bset else "gate"))
+    return out
+
+
 # Owner decision (spec §2.5): 5 grouped classes; labels carry the live LY value
 # read from SHIP_RANGES at runtime so the Rorqual/Lancer fix chip auto-propagates.
 _GROUPS = [

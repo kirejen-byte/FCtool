@@ -59,6 +59,14 @@ GESTURE_MIN_INTERVAL_MS = 30.0
 MARGIN = 224
 BG_HEX = "#0a0a14"
 
+# Destination-route overlay (Task 35). Gold dashed polyline for stargate hops;
+# Ansiblex hops reuse the base-layer BRIDGE_BLUE (map_render) as a dash-dot line
+# with diamond endpoint markers, so the overlay matches the bridge tint drawn
+# into the bitmap. Both are pure Tk overlay items (crisp during gestures). The
+# blue is derived from mr.BRIDGE_BLUE so the two stay in lockstep.
+ROUTE_GOLD = "#ffcc44"
+BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
+
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
 # spike. The freeze is a periodic Windows working-set-growth stall: under the
@@ -194,6 +202,18 @@ def _now_ms() -> float:
     return time.monotonic() * 1000.0
 
 
+def _default_route_fn(origin_id: int, dest_id: int, connections=None):
+    """Default travel-route solver for the destination overlay (Task 35): the
+    app's Ansiblex-aware stargate BFS, reusing the Navigation tab's invocation
+    exactly (``get_stargate_route(origin_id, dest_id, connections=<'a|b' str list>)``
+    -- default preference "shortest"). Lazily imported so map_tab keeps its light
+    import surface (jump_range pulls in requests / system_coords) and tests /
+    standalone can inject a stub via ``MapTab(route_fn=...)``. Returns the ordered
+    system-id path (origin..dest) or None when unreachable."""
+    from jump_range import get_stargate_route
+    return get_stargate_route(origin_id, dest_id, connections=connections)
+
+
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
     size + bloom + mode + tint + bridges (NOT generation -- that is a staleness
@@ -247,6 +267,13 @@ class MapTabState:
         self.friendly_staging: set[int] = set()
         self.hostile_staging: set[int] = set()
         self.own_system_id = None
+        # --- destination route overlay (Task 35, SESSION-scoped, not persisted) --
+        # route_dest: the tool-set destination system id (pushed by fc_gui's
+        # _set_destination_or_copy after a successful ESI set_waypoint).
+        # route_path: the resolved ordered system-id path origin..dest from the
+        # Ansiblex-aware BFS, or None when unrouted / cleared.
+        self.route_dest = None
+        self.route_path: tuple | None = None
         # Resolved Ansiblex bridge id-pairs (hashable tuple of unordered
         # (id_a, id_b) pairs from map_overlays.resolve_bridges). A BASE-layer
         # element -- drawn into the bitmap, not a Tk overlay item.
@@ -561,11 +588,15 @@ class MapTab:
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
-                 telemetry: bool = False) -> None:
+                 telemetry: bool = False, route_fn=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
         self._model_loader = model_loader
+        # Injectable travel-route solver (Task 35); defaults to the Ansiblex-aware
+        # stargate BFS. Tests / standalone pass a stub so _recompute_route runs
+        # deterministically without the jump_range import.
+        self._route_fn = route_fn or _default_route_fn
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -627,17 +658,32 @@ class MapTab:
             "staging": tk.BooleanVar(value=bool(_layers.get("staging", True))),
             "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
             "bridges": tk.BooleanVar(value=bool(_layers.get("bridges", True))),
+            "route": tk.BooleanVar(value=bool(_layers.get("route", True))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
+        # Hover-tooltip Toplevel (created on demand; see _show_tooltip). Used to
+        # document the route overlay's ESI limitation on the "Route" toggle.
+        self._tooltip = None
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
-                            ("threat", "Threat"), ("bridges", "Bridges")):
-            tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
-                           bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
-                           activebackground=t["bg"], activeforeground=t["accent"],
-                           command=lambda k=_key: self._on_layer_toggle(k)
-                           ).pack(side="left", padx=4)
+                            ("threat", "Threat"), ("bridges", "Bridges"),
+                            ("route", "Route")):
+            _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
+                                 bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
+                                 activebackground=t["bg"], activeforeground=t["accent"],
+                                 command=lambda k=_key: self._on_layer_toggle(k))
+            _cb.pack(side="left", padx=4)
+            if _key == "route":
+                # Owner note (Task 35): purely in-game-set destinations can't be
+                # shown -- ESI exposes no autopilot-route READ endpoint (verified
+                # against the live swagger). This overlay covers destinations set
+                # with the tool.
+                self._attach_tooltip(
+                    _cb, "Travel route to a destination set with the tool "
+                    "(map / intel / zkill 'Set destination'), incl. Ansiblex "
+                    "hops. Destinations set only in the game client can't be "
+                    "drawn — ESI has no route-read endpoint.")
         # "Threat ▾" opens the in-tab threat drawer (Task 34, owner ask
         # 2026-07-12): per-staging selection + the ship-class picker, both
         # previously buried in a right-click cascade. Flat panel-coloured button
@@ -925,10 +971,119 @@ class MapTab:
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
+        # Ansiblex list changed (Task 35): a live route may now take (or drop) a
+        # bridge, so re-solve it from the current origin.
+        if self.state.route_dest is not None:
+            self._recompute_route()
 
     def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
+        prev = self.state.own_system_id
         self.state.own_system_id = system_id
+        # Route overlay (Task 35): the 15s own-location poll re-pushes the SAME id
+        # every tick, so react only when the own system actually changed. Arrival
+        # (own == destination) auto-clears the route; any other move re-solves it
+        # from the new origin.
+        if system_id != prev and self.state.route_dest is not None:
+            if system_id is not None and system_id == self.state.route_dest:
+                self.clear_route()
+                return
+            self._recompute_route()
         self._redraw_overlays()
+
+    # ---- destination route overlay (Task 35) ----------------------------------
+    def set_route_destination(self, system_id) -> None:
+        """Set (or replace) the travel-route destination and re-solve the route
+        overlay from the tracked character's current location. Called by fc_gui
+        after a successful in-tool 'Set destination' (ESI set_waypoint) -- a Tk
+        menu/bind handler, so it runs on the main thread. A new destination
+        REPLACES any prior one; the route is session-scoped (never persisted).
+        ``None`` clears."""
+        if system_id is None:
+            self.clear_route()
+            return
+        self.state.route_dest = system_id
+        self.state.route_path = None             # replace: drop any stale path
+        self._recompute_route()                  # async BFS (handles own == dest)
+        self._redraw_overlays()                  # show the destination ring at once
+
+    def clear_route(self) -> None:
+        """Drop the destination-route overlay (arrival, replacement, or the user's
+        'Clear route' menu action). Session state only -- nothing persisted."""
+        self.state.route_dest = None
+        self.state.route_path = None
+        self._redraw_overlays()
+
+    def _recompute_route(self) -> None:
+        """Re-solve the travel route from own location to route_dest on a worker
+        thread (Ansiblex-aware BFS), feeding the result back through the main-
+        thread result queue as a ``("route", tuple)`` message (drained by
+        _drain_results, applied by _apply_route -- the same off-thread pattern as
+        _recompute_threat). No-ops while origin / dest / model are missing (the
+        destination ring still draws); arrival (own == dest) clears. Ansiblex
+        connection strings are built from the resolved bridge pairs the map
+        already holds -- the SAME resolution the jump-range BFS consumes -- so no
+        fc_gui import is needed."""
+        dest = self.state.route_dest
+        origin = self.state.own_system_id
+        if dest is None or origin is None or self.state.model is None:
+            return
+        if origin == dest:                       # already there -> arrival clear
+            self.clear_route()
+            return
+        # "id1|id2" strings for get_stargate_route's extra-edge parser (order does
+        # not matter -- _bfs_route adds both directions). Empty -> None (gate-only).
+        conns = [f"{a}|{b}" for (a, b) in self.state.bridges] or None
+        route_fn = self._route_fn
+
+        def work():
+            try:
+                path = route_fn(origin, dest, connections=conns)
+            except Exception as exc:             # never crash the helper thread
+                print(f"[MAP] route recompute failed: {exc}")
+                return
+            self._result_q.put(("route", tuple(path or ())))
+
+        threading.Thread(target=work, daemon=True, name="map-route").start()
+
+    def _apply_route(self, path) -> None:
+        """Apply a worker-resolved route path on the main thread (Task 35). An
+        empty path (no gate route found) clears the polyline but KEEPS route_dest
+        so the destination ring still marks the target."""
+        self.state.route_path = tuple(path) or None
+        self._redraw_overlays()
+
+    # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
+    def _attach_tooltip(self, widget, text: str) -> None:
+        """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
+        destroyed on <Leave>) to a toolbar widget. add='+' so it never clobbers a
+        widget's own bindings. Used to document the route overlay's ESI limitation
+        (Task 35) without pulling in fc_gui's tooltip helper."""
+        widget.bind("<Enter>", lambda _e: self._show_tooltip(widget, text), add="+")
+        widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
+
+    def _show_tooltip(self, widget, text: str) -> None:
+        self._hide_tooltip()
+        t = self.theme
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 2
+            tip = self._tooltip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=text, justify="left", wraplength=280,
+                     bg=t["panel"], fg=t["fg"], relief="solid", borderwidth=1,
+                     padx=6, pady=4).pack()
+        except Exception:
+            self._tooltip = None
+
+    def _hide_tooltip(self) -> None:
+        tip = getattr(self, "_tooltip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            self._tooltip = None
 
     def _layer_on(self, key: str) -> bool:
         return bool(self.cfg.get("layers", {}).get(key, True))
@@ -956,7 +1111,7 @@ class MapTab:
         if _c: _o0 = _c()
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own")
+                 "ov_origin", "ov_own", "ov_route")
         for tag in _tags:
             canvas.delete(tag)
         if _c: _od = _c()
@@ -982,6 +1137,48 @@ class MapTab:
             if sx < -40 or sy < -40 or sx > vw + 40 or sy > vh + 40:
                 return None
             return sx, sy
+
+        # -- destination route (Task 35): gold dashed stargate hops + BRIDGE_BLUE
+        # dash-dot Ansiblex hops (diamond endpoint markers) + a gold dest ring.
+        # Drawn FIRST so node markers (staging / fleet / own) sit on top. Segments
+        # are culled by endpoint visibility (draw when EITHER end is near-viewport)
+        # so the route reaches one hop past the screen edge, like the node cull.
+        rp = st.route_path
+        if self._layer_on("route") and rp and len(rp) >= 2:
+            _RCULL = 60.0
+
+            def route_pt(sid):
+                s = systems.get(sid)
+                if s is None:
+                    return None
+                px, py = cam.world_to_screen(s.x, s.y, vw, vh)
+                vis = (-_RCULL <= px <= vw + _RCULL and -_RCULL <= py <= vh + _RCULL)
+                return (px, py, vis)
+
+            for a_id, b_id, kind in mo.classify_route_segments(rp, st.bridges):
+                pa, pb = route_pt(a_id), route_pt(b_id)
+                if pa is None or pb is None or not (pa[2] or pb[2]):
+                    continue
+                if kind == "bridge":
+                    canvas.create_line(pa[0], pa[1], pb[0], pb[1],
+                                       fill=BRIDGE_BLUE_HEX, width=2,
+                                       dash=(6, 2, 2, 2), tags="ov_route")
+                    if pa[2]:
+                        self._draw_diamond(pa[0], pa[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                    if pb[2]:
+                        self._draw_diamond(pb[0], pb[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                else:
+                    canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=ROUTE_GOLD,
+                                       width=2, dash=(6, 4), tags="ov_route")
+        # destination ring marker (whenever a destination is set AND on-screen)
+        if self._layer_on("route") and st.route_dest is not None:
+            p = project(st.route_dest)
+            if p is not None:
+                sx, sy = p
+                canvas.create_oval(sx - 11, sy - 11, sx + 11, sy + 11,
+                                   outline=ROUTE_GOLD, width=2, tags="ov_route")
+                canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
+                                   outline=ROUTE_GOLD, width=1, tags="ov_route")
 
         # -- range: struck rings on illegal-in-sphere systems + origin badge
         ov = st.range_overlay
@@ -1542,22 +1739,25 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam) and ('threat', frozenset). Frames (crisp OR gesture) share one
-        latest-wins slot -- the worker produces them in strictly increasing
-        generation order, so the last one drained has the highest generation and
-        any earlier one it superseded would be dropped by the is_current check in
-        the apply anyway (a queued crisp thus correctly supersedes older gesture
-        frames -- it also carries a newer cache). Threat results are kept in a
-        SEPARATE slot so a threat is never dropped by frame coalescing (nor a
-        frame misread as threat). Dispatch by tag: crisp and gesture take
-        different apply paths (sig vs base-image realignment)."""
+        ms, cam), ('threat', frozenset) and ('route', tuple). Frames (crisp OR
+        gesture) share one latest-wins slot -- the worker produces them in strictly
+        increasing generation order, so the last one drained has the highest
+        generation and any earlier one it superseded would be dropped by the
+        is_current check in the apply anyway (a queued crisp thus correctly
+        supersedes older gesture frames -- it also carries a newer cache). Threat
+        and route results are kept in SEPARATE slots so neither is dropped by frame
+        coalescing (nor a frame misread as one). Dispatch by tag: crisp and gesture
+        take different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
+        latest_route = None
         try:
             while True:
                 item = self._result_q.get_nowait()
                 if item[0] == "threat":
                     latest_threat = item
+                elif item[0] == "route":
+                    latest_route = item
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -1569,6 +1769,8 @@ class MapTab:
                 self._apply_gesture_frame(*latest_frame[1:])
         if latest_threat is not None:
             self.set_threat(latest_threat[1])
+        if latest_route is not None:
+            self._apply_route(latest_route[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -1710,6 +1912,8 @@ class MapTab:
         if self.state.range_overlay is not None:
             menu.add_command(label="Clear range overlay",
                              command=self.clear_range_overlay)
+        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+            menu.add_command(label="Clear route", command=self.clear_route)
         menu.add_separator()
         self._menu_add(menu, "Set destination", "set_destination", name)
         self._menu_add(menu, "Open in Dotlan", "open_dotlan", name)
@@ -1747,6 +1951,10 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("staging"))
         menu.add_checkbutton(label="Bridges", variable=self._layer_vars["bridges"],
                              command=lambda: self._on_layer_toggle("bridges"))
+        menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
+                             command=lambda: self._on_layer_toggle("route"))
+        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+            menu.add_command(label="Clear route", command=self.clear_route)
         return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:

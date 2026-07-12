@@ -4215,6 +4215,9 @@ class FCToolGUI:
                 sys_id = search_system(system_name)
                 if sys_id and self.esi_auth.set_waypoint(sys_id, clear_other=True):
                     print(f"[Nav] Set destination + copied: {system_name}")
+                    # Star-map route overlay (Task 35): draw the travel route from
+                    # the tracked character's location to this destination.
+                    self._push_route_destination_to_map(sys_id)
                     return
         except Exception as e:
             print(f"[Nav] ESI waypoint failed: {e}")
@@ -5536,6 +5539,20 @@ class FCToolGUI:
             tab.set_own_location(system_id)
         except Exception as exc:
             print(f"[MAP] own-location push failed: {exc}")
+
+    def _push_route_destination_to_map(self, system_id):
+        """Forward a tool-set destination to the star map's route overlay so the
+        travel route (incl. Ansiblex hops) is drawn from the tracked character's
+        location (Task 35). Called from _set_destination_or_copy after a successful
+        ESI set_waypoint -- a Tk menu/bind handler, so it runs on the main thread.
+        Guarded so a missing/erroring map tab never breaks destination-setting."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_route_destination(system_id)
+        except Exception as exc:
+            print(f"[MAP] route destination push failed: {exc}")
 
     def _get_map_bridges(self):
         """Resolved Ansiblex bridge id-pairs for the star map, parsed from the

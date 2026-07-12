@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
         # menu ("Zoom animation") and persisted on hide.
         "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
-                   "bridges": True},
+                   "bridges": True, "route": True},
         "threat_ship": "Titan Bridge",
         # Hostile-staging systems (by NAME) excluded from the threat halo via the
         # map's Threat drawer (Task 34). Empty = every staging contributes, so a
