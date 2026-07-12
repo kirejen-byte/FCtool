@@ -13,6 +13,7 @@ fc_gui) touch tkinter.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -133,8 +134,33 @@ SOV_REFRESH_S = 3600.0
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
 # live overlay object), _layer_on("sov") directly controls both the fetch and the
-# render -- so an absent key must read False, not the blanket True.
-_LAYERS_OFF_BY_DEFAULT = frozenset({"sov"})
+# render -- so an absent key must read False, not the blanket True. Infra (Task 5)
+# joins it: the friendly-structure chips stay dark until the user enables the layer
+# AND the host has pushed badges, so _layer_on("infra") gates its request value.
+_LAYERS_OFF_BY_DEFAULT = frozenset({"sov", "infra"})
+
+# Infrastructure overlay filter state (Task 5). This module imports NO infra_*
+# module (architecture rule: the map holds ZERO infra logic -- fc_gui composes
+# parser/store/overlay and pushes PRE-COMPUTED badges via set_infrastructure), so
+# it keeps a LOCAL copy of infra_overlay.FILTER_DEFAULTS's shape (§3.7) purely to
+# seed the toolbar/popover UI. Only fc_gui bridges this UI state back to the real
+# infra_overlay.FILTER_DEFAULTS. "enabled" mirrors the toolbar Infra checkbutton;
+# the popover writes categories / stale_only. A private deepcopy is handed to the
+# host's get_infrastructure callback on every change.
+INFRA_FILTER_DEFAULTS = {
+    "enabled": True,
+    "categories": {"citadel": True, "engineering": True, "refinery": True,
+                   "gate": True, "flex": True, "npc": False, "unknown": True},
+    "regions": None,
+    "stale_only": False,
+    "sources": None,
+}
+# Ordered (display label, category key) pairs for the filter popover checkbuttons.
+_INFRA_CATEGORY_LABELS = (
+    ("Citadels", "citadel"), ("Engineering", "engineering"),
+    ("Refineries", "refinery"), ("Ansiblexes", "gate"), ("Flex", "flex"),
+    ("NPC stations", "npc"), ("Unknown", "unknown"),
+)
 
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
@@ -285,8 +311,13 @@ def _default_route_fn(origin_id: int, dest_id: int, connections=None):
 
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint + bridges + heat + sov (NOT generation -- that is a
-    staleness token, and duplicates by definition carry different generations).
+    size + bloom + mode + tint + bridges + heat + sov + infra (NOT generation --
+    that is a staleness token, and duplicates carry different generations).
+
+    infra participates exactly like sov/heat/bridges: the canonical infra tuple
+    (or None when the layer is off / no badges) compares by value, so an Infra
+    toggle, a filter change, or a fresh push is never suppressed as a duplicate,
+    while a settle on an unchanged view+infra still is.
 
     sov participates exactly like heat/bridges: the canonical sov tuple (or None
     when the layer is off / no data) compares by value, so a sov toggle or a fresh
@@ -316,7 +347,7 @@ def _request_sig(req: dict) -> tuple:
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
             bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
-            req.get("heat"), req.get("sov"))
+            req.get("heat"), req.get("sov"), req.get("infra"))
 
 
 class MapTabState:
@@ -387,6 +418,20 @@ class MapTabState:
         # network until then).
         self.sov_map: dict[int, int] = {}
         self.sov_names: dict[int, str] = {}
+        # --- infrastructure overlay layer (Task 5) ---
+        # infra: PRE-COMPUTED badges {system_id: {"total", "counts", "top",
+        # "stale"}} pushed by the host via MapTab.set_infrastructure (None = layer
+        # off / no data). The map holds ZERO infra logic -- fc_gui computes badges
+        # from the store through infra_overlay and pushes them here. Folded into
+        # the render request + sig as a canonical ((sid, total, top, stale), ...)
+        # tuple by _infra_request_value (that tuple is BOTH the sig component and
+        # the data the renderer iterates).
+        self.infra: dict | None = None
+        # Filter UI state (LOCAL mirror of infra_overlay.FILTER_DEFAULTS's shape --
+        # this file imports no infra module). "enabled" tracks the toolbar Infra
+        # checkbutton; the popover writes categories / stale_only. A deepcopy is
+        # handed to the host's get_infrastructure callback on every change.
+        self.infra_filters: dict = copy.deepcopy(INFRA_FILTER_DEFAULTS)
 
     def tint_spec(self):
         import map_render as _mr
@@ -791,7 +836,23 @@ class MapTab:
             # noise call) -- so the var default is False, matching _layer_on's
             # off-by-default handling and keeping the fetch dormant until enabled.
             "sov": tk.BooleanVar(value=bool(_layers.get("sov", False))),
+            # Infrastructure chips (Task 5): OFF by default (like sov) -- the
+            # friendly-structure count badges stay dark until the user enables the
+            # layer AND the host pushes badges via set_infrastructure.
+            "infra": tk.BooleanVar(value=bool(_layers.get("infra", False))),
         }
+        # Infra filter popover state (Task 5): per-category + stale-only vars
+        # mirroring INFRA_FILTER_DEFAULTS (self.state is built later, so seed from
+        # the module constant; the "enabled" flag is synced from the toolbar var
+        # once self.state exists). Each popover checkbutton writes back into
+        # self.state.infra_filters and re-emits to the host. The popover Toplevel
+        # is created lazily and REUSED per open (built in _build_infra_popover).
+        self._infra_cat_vars: dict[str, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=bool(INFRA_FILTER_DEFAULTS["categories"][key]))
+            for _label, key in _INFRA_CATEGORY_LABELS}
+        self._infra_stale_var = tk.BooleanVar(
+            value=bool(INFRA_FILTER_DEFAULTS["stale_only"]))
+        self._infra_popover = None
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
@@ -802,12 +863,24 @@ class MapTab:
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
-                            ("sov", "Sov")):
+                            ("sov", "Sov"), ("infra", "Infra")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
                                  command=lambda k=_key: self._on_layer_toggle(k))
             _cb.pack(side="left", padx=4)
+            if _key == "infra":
+                # Filter affordance (Task 5): a "▾" microbutton right after the
+                # Infra toggle opening the borderless filter popover (per-category
+                # toggles, Stale-only, Manage…). Always enabled -- unlike sov's
+                # legend it is useful even when the layer is off (it hosts Manage…
+                # and pre-shapes what appears once enabled).
+                self._infra_filter_btn = tk.Button(
+                    bar, text="▾", command=self._show_infra_filters,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._infra_filter_btn.pack(side="left", padx=(0, 4))
             if _key == "sov":
                 # Legend affordance (Task 33): a small "▾" microbutton right after
                 # the Sov toggle, ENABLED only while the layer is on. Opens the
@@ -864,6 +937,10 @@ class MapTab:
         self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
+        # Sync the infra layer's enabled flag from its toolbar var (OFF by default);
+        # categories / stale_only already match INFRA_FILTER_DEFAULTS in the fresh
+        # state, so only "enabled" needs reconciling with cfg["layers"]["infra"].
+        self.state.infra_filters["enabled"] = self._layer_on("infra")
         self.renderer = None
         # FrameCache is now WORKER-OWNED (Task 24, P1): only the render worker
         # thread touches it -- it stores the full margined surface after each
@@ -1193,6 +1270,23 @@ class MapTab:
         # bridge, so re-solve it from the current origin.
         if self.state.route_dest is not None:
             self._recompute_route()
+
+    def set_infrastructure(self, badges: dict[int, dict] | None) -> None:
+        """Store PRE-COMPUTED infrastructure badges from the host and re-render.
+        ``badges`` maps ``system_id -> {"total", "counts", "top", "stale"}``;
+        ``None`` (or an empty dict) means no chips -- an on-but-empty layer draws
+        the same frame as off. The chips are a BASE-layer element -- drawn into
+        the bitmap in the label pass (map_render._draw_infra_chips), riding the
+        system-label zoom LOD -- so this is a settle re-render via _request_crisp
+        (mirrors set_bridges), NOT a Tk overlay repaint. The host owns the data:
+        it computes badges from the store via infra_overlay and pushes them here,
+        so this file keeps ZERO infra imports. Safe before the first on_shown:
+        _request_crisp / _redraw_overlays no-op while the renderer / model are
+        unset, and the stored badges are picked up by the first crisp request."""
+        self.state.infra = badges if badges else None
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
 
     def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
         prev = self.state.own_system_id
@@ -1693,6 +1787,35 @@ class MapTab:
             return None
         return mo.canonical_sov(self.state.sov_map) or None
 
+    def _infra_request_value(self):
+        """Canonical hashable infra tuple for the render request + sig, or None
+        when the layer is off OR there are no badges -- both collapse to None so an
+        infra-off (or on-but-empty) frame is byte-identical to the pre-infra output
+        and its sig matches (determinism, exactly like sov/heat/bridges). The tuple
+        is ((system_id, total, top_category, stale), ...), sorted for determinism;
+        it is BOTH the sig component AND the exact data the renderer iterates
+        (map_render._draw_infra_chips)."""
+        if not self._layer_on("infra"):
+            return None
+        infra = self.state.infra
+        if not infra:
+            return None
+        return tuple(sorted(
+            (sid, b["total"], b["top"], b["stale"]) for sid, b in infra.items()))
+
+    def _emit_infra_filters(self) -> None:
+        """Sync the enabled flag from the toolbar Infra var and hand a private
+        deepcopy of the filter state to the host's get_infrastructure callback,
+        which recomputes badges and pushes them back via set_infrastructure. A COPY
+        so a host that retains the dict can't mutate our internal filter state (and
+        vice-versa). No-op (beyond the enabled sync) when no host is wired."""
+        var = self._layer_vars.get("infra")
+        if var is not None:
+            self.state.infra_filters["enabled"] = bool(var.get())
+        cb = self.callbacks.get("get_infrastructure")
+        if cb is not None:
+            cb(copy.deepcopy(self.state.infra_filters))
+
     def _maybe_start_sov_fetch(self, now_ms: float | None = None) -> None:
         """Spawn the ONE-SHOT sov fetch thread iff the layer is on, no fetch is in
         flight, and the data is stale (older than SOV_REFRESH_S). OFF by default ->
@@ -1884,6 +2007,93 @@ class MapTab:
             except Exception:
                 pass
             self._sov_legend = None
+
+    # ---- infrastructure filter popover (Task 5) -------------------------------
+    def _show_infra_filters(self) -> None:
+        """Open the borderless infra filter popover under the "▾" microbutton:
+        per-category toggles, a Stale-only toggle, and a Manage… button. Built
+        once and REUSED per open (withdrawn on close, never destroyed); never
+        grabs the pointer; dismisses on Escape or click-away (FocusOut). Matches
+        the sov-legend dark idiom -- a 1px border-color frame around a panel body."""
+        try:
+            pop = self._infra_popover
+            if pop is None or not pop.winfo_exists():
+                pop = self._infra_popover = self._build_infra_popover()
+            # Reflect the live filter state onto the checkbutton vars before showing
+            # (defensive -- the popover is their only writer, but keep them in sync).
+            for _label, key in _INFRA_CATEGORY_LABELS:
+                self._infra_cat_vars[key].set(
+                    bool(self.state.infra_filters["categories"].get(key, True)))
+            self._infra_stale_var.set(bool(self.state.infra_filters["stale_only"]))
+            anchor = getattr(self, "_infra_filter_btn", None) or self.frame
+            x = anchor.winfo_rootx()
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+            pop.wm_geometry(f"+{x}+{y}")
+            pop.deiconify()
+            pop.lift()
+            pop.focus_set()
+        except Exception:
+            self._infra_popover = None
+
+    def _build_infra_popover(self) -> tk.Toplevel:
+        t = self.theme
+        pop = tk.Toplevel(self.frame)
+        pop.wm_overrideredirect(True)
+        pop.withdraw()
+        pop.configure(bg=t["border"])                    # 1px themed border
+        inner = tk.Frame(pop, bg=t["panel"])
+        inner.pack(padx=1, pady=1, fill="both")
+        tk.Label(inner, text="Show categories", bg=t["panel"], fg=t["accent"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        for label, key in _INFRA_CATEGORY_LABELS:
+            tk.Checkbutton(
+                inner, text=label, variable=self._infra_cat_vars[key], anchor="w",
+                bg=t["panel"], fg=t["fg"], selectcolor=t["panel"],
+                activebackground=t["entry_bg"], activeforeground=t["accent"],
+                command=lambda k=key: self._on_infra_cat_toggle(k)
+            ).pack(anchor="w", fill="x", padx=8)
+        tk.Frame(inner, bg=t["border"], height=1).pack(fill="x", padx=8, pady=4)
+        tk.Checkbutton(
+            inner, text="Stale only", variable=self._infra_stale_var, anchor="w",
+            bg=t["panel"], fg=t["fg"], selectcolor=t["panel"],
+            activebackground=t["entry_bg"], activeforeground=t["accent"],
+            command=self._on_infra_stale_toggle
+        ).pack(anchor="w", fill="x", padx=8)
+        tk.Button(
+            inner, text="Manage…", command=self._infra_manage_clicked, anchor="w",
+            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, cursor="hand2"
+        ).pack(anchor="w", fill="x", padx=8, pady=(4, 6))
+        pop.bind("<Escape>", lambda _e: self._hide_infra_filters())
+        pop.bind("<FocusOut>", lambda _e: self._hide_infra_filters())
+        return pop
+
+    def _hide_infra_filters(self) -> None:
+        pop = getattr(self, "_infra_popover", None)
+        if pop is not None:
+            try:
+                pop.withdraw()                           # reused -> withdraw, not destroy
+            except Exception:
+                pass
+
+    def _on_infra_cat_toggle(self, key: str) -> None:
+        var = self._infra_cat_vars.get(key)
+        if var is not None:
+            self.state.infra_filters["categories"][key] = bool(var.get())
+        self._emit_infra_filters()
+
+    def _on_infra_stale_toggle(self) -> None:
+        self.state.infra_filters["stale_only"] = bool(self._infra_stale_var.get())
+        self._emit_infra_filters()
+
+    def _infra_manage_clicked(self) -> None:
+        """Popover 'Manage…' -> open the infra manager for the whole DB (no
+        pre-filter). Hide the popover first so it does not linger over the dialog."""
+        self._hide_infra_filters()
+        cb = self.callbacks.get("open_infra_manager")
+        if cb is not None:
+            cb(None)
 
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
@@ -2244,7 +2454,8 @@ class MapTab:
                                     tint=req.get("tint"),
                                     bridges=req.get("bridges"),
                                     heat=req.get("heat"),
-                                    sov=req.get("sov"))
+                                    sov=req.get("sov"),
+                                    infra=req.get("infra"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -2468,6 +2679,10 @@ class MapTab:
             # Canonical sov tuple, or None when the layer is off / no data
             # (byte-identical to pre-sov output). Joins _request_sig.
             "sov": self._sov_request_value(),
+            # Canonical infra tuple ((sid, total, top, stale), ...), or None when
+            # the layer is off / no badges (byte-identical to pre-infra output).
+            # Joins _request_sig; the renderer draws it as per-system count chips.
+            "infra": self._infra_request_value(),
         })
 
     def _request_gesture_frame(self) -> None:
@@ -2919,6 +3134,13 @@ class MapTab:
         self._menu_add(menu, "Copy name", "copy", name)
         self._menu_add(menu, "Add to friendly staging", "add_friendly_staging", name)
         self._menu_add(menu, "Add to hostile staging", "add_hostile_staging", name)
+        # Structures here… (Task 5): open the infra manager PRE-FILTERED to this
+        # system. NOT routed through _menu_add -- that binds cb(name); the infra
+        # manager wants the system ID, so bind a bespoke command passing sid.
+        cb_infra = self.callbacks.get("open_infra_manager")
+        if cb_infra is not None:
+            menu.add_command(label="Structures here…",
+                             command=lambda s=sid: cb_infra(s))
         return menu
 
     def _build_empty_menu(self) -> tk.Menu:
@@ -2960,8 +3182,17 @@ class MapTab:
         # Sov tint (Task 33): OFF by default; enabling it kicks the lazy ESI fetch.
         menu.add_checkbutton(label="Sov", variable=self._layer_vars["sov"],
                              command=lambda: self._on_layer_toggle("sov"))
+        # Infra chips (Task 5): OFF by default; the toolbar "▾" hosts the filters.
+        menu.add_checkbutton(label="Infra", variable=self._layer_vars["infra"],
+                             command=lambda: self._on_layer_toggle("infra"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
+        # Manage infrastructure… (Task 5): open the manager for the whole DB.
+        cb_infra = self.callbacks.get("open_infra_manager")
+        if cb_infra is not None:
+            menu.add_separator()
+            menu.add_command(label="Manage infrastructure…",
+                             command=lambda: cb_infra(None))
         return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:
@@ -3024,6 +3255,16 @@ class MapTab:
                 # OFF case (and a re-ON within the hour) a no-op.
                 self._sync_sov_legend_btn()
                 self._maybe_start_sov_fetch()
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+        elif key == "infra":
+            # Infra badges are a base-bitmap layer (chips ride the label pass) fed
+            # by PRE-COMPUTED data from the host. Toggling gates the request value
+            # (like sov) for an immediate settle re-render AND asks the host to
+            # (re)push or clear the overlay to match the new enabled flag; the two
+            # crisp requests coalesce latest-wins, so it is one render.
+            self._emit_infra_filters()
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()
