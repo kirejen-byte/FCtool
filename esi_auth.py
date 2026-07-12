@@ -683,11 +683,23 @@ class ESIAuth:
 
     # ── ESI API Helpers ──────────────────────────────────────────────────────
 
-    def esi_get(self, path: str, params: dict = None) -> dict | list | None:
-        """Make an authenticated GET request to ESI."""
+    def esi_get_ex(self, path: str, params: dict = None) -> tuple[object | None, int, dict]:
+        """Authenticated GET returning (parsed_json_or_None, http_status, headers).
+
+        Same auth/refresh/rate-limit/logging behaviour as ``esi_get`` but also
+        surfaces the HTTP status and response headers, so bulk callers (the infra
+        region scanner) can read the ``X-ESI-Error-Limit-Remain``/``-Reset``
+        budget headers that ``esi_get`` discards. ``esi_get`` delegates here and
+        returns element ``[0]``, so every existing caller is untouched.
+
+        Returns ``(None, 0, {})`` on the no-token and exception paths (keeping the
+        delegation None-returning) and ``(None, status, headers)`` on a non-OK
+        response — with the SAME quiet-error suppression as before. Token refresh
+        happens in the ``access_token`` property before the request, so there is
+        no post-401 retry to preserve."""
         token = self.access_token
         if not token:
-            return None
+            return None, 0, {}
         try:
             rate_limit('esi')
             resp = self._session.get(
@@ -696,8 +708,9 @@ class ESIAuth:
                 params=params,
                 timeout=10,
             )
+            headers = dict(getattr(resp, "headers", {}) or {})
             if resp.ok:
-                return resp.json()
+                return resp.json(), resp.status_code, headers
             # Suppress noisy expected errors
             if resp.status_code == 404 and "/fleet/" in path:
                 pass  # Not in fleet
@@ -705,9 +718,14 @@ class ESIAuth:
                 pass  # No access to structure (different corp/alliance)
             else:
                 print(f"[ESI] {path} returned {resp.status_code}")
+            return None, resp.status_code, headers
         except Exception as e:
             print(f"[ESI] Error: {e}")
-        return None
+        return None, 0, {}
+
+    def esi_get(self, path: str, params: dict = None) -> dict | list | None:
+        """Make an authenticated GET request to ESI."""
+        return self.esi_get_ex(path, params)[0]
 
     def esi_post(self, path: str, json_data: dict = None) -> dict | list | None:
         """Make an authenticated POST request to ESI."""
@@ -1621,8 +1639,10 @@ class ESIAuth:
         structure_ids = set()
 
         # Approach 1: Character search for structures containing "»"
-        # ESI search requires minimum 3 characters, so we try " » " with spaces
-        for search_term in ["»", " » "]:
+        # ESI search requires minimum 3 characters, so we use " » " with spaces
+        # (the bare "»" is a guaranteed 400 — one char, below the 3-char floor —
+        # and every 4xx eats the shared error budget).
+        for search_term in [" » "]:
             results = self.esi_get(
                 f"/characters/{self._character_id}/search/",
                 params={
