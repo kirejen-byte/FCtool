@@ -236,6 +236,10 @@ class MapTabState:
         self._generation = 0
         self._dirty = False
         self._name_to_id: dict[str, int] = {}
+        # Sorted lowercase-name keys (rebuilt at attach_model) so fly_to's
+        # prefix/contains fallback is one linear pass in a deterministic,
+        # sorted-first order (sub-ms over ~5,485 names).
+        self._sorted_names: list[str] = []
         # --- overlay layer state (Phase D) ---
         self.range_overlay = None
         self.threat_set = None
@@ -262,6 +266,7 @@ class MapTabState:
         self.camera.set_scale_limits(lo, hi)
         self.camera.fit_bounds(model.bounds, self.vw, self.vh)
         self._name_to_id = {s.name.lower(): sid for sid, s in model.systems.items()}
+        self._sorted_names = sorted(self._name_to_id)
         self._dirty = True
 
     def resize(self, vw: int, vh: int) -> None:
@@ -337,8 +342,27 @@ class MapTabState:
 
     # -- queries ----------------------------------------------------------------
     def fly_to(self, name: str) -> bool:
-        sid = self._name_to_id.get(name.strip().lower())
-        if sid is None or self.model is None:
+        """Center + zoom onto a system resolved from a (partial) name. Resolution
+        order: exact (case-insensitive) -> sorted-first case-insensitive PREFIX
+        (startswith) -> sorted-first case-insensitive CONTAINS -> miss. An exact
+        hit always wins over a longer prefix sibling (e.g. "Jita" beats "Jitand"),
+        and among equal-class matches the sorted-first name is chosen so the
+        result is deterministic. Empty input is a miss (never matches everything
+        via the empty-prefix). Camera behavior is unchanged from the exact-only
+        version (recenter + min-zoom bump + dirty)."""
+        if self.model is None:
+            return False
+        q = name.strip().lower()
+        if not q:
+            return False
+        sid = self._name_to_id.get(q)                       # 1) exact
+        if sid is None:                                     # 2) prefix (sorted-first)
+            sid = next((self._name_to_id[k] for k in self._sorted_names
+                        if k.startswith(q)), None)
+        if sid is None:                                     # 3) contains (sorted-first)
+            sid = next((self._name_to_id[k] for k in self._sorted_names
+                        if q in k), None)
+        if sid is None:
             return False
         s = self.model.systems[sid]
         self.camera.cx, self.camera.cy = s.x, s.y
@@ -531,9 +555,29 @@ class MapTab:
         bar.pack(side="top", fill="x")
         tk.Label(bar, text="Search:", bg=t["bg"], fg=t["fg"]).pack(side="left", padx=(6, 2))
         entry_cls = autocomplete_cls or tk.Entry
-        self.search_entry = entry_cls(bar, width=24)
+        # An injected AutocompleteEntry takes the completion contract
+        # (completions/labels/on_select); on_select flies to the picked system
+        # immediately (a dropdown selection never raises <KeyRelease>). Gate on
+        # the update_completions capability rather than try/except: a plain
+        # tk.Entry FORWARDS unknown options to Tcl and raises tk.TclError -- not
+        # TypeError -- AND leaves a half-registered orphan child, so a bare
+        # (bar, width=24) construction is the right path for it (and for any
+        # non-autocomplete widget). The inner TypeError guard still tolerates an
+        # autocomplete widget with a stricter ctor signature.
+        if hasattr(entry_cls, "update_completions"):
+            try:
+                self.search_entry = entry_cls(bar, completions=[], labels={},
+                                              on_select=self._on_search, width=24)
+            except TypeError:
+                self.search_entry = entry_cls(bar, width=24)
+        else:
+            self.search_entry = entry_cls(bar, width=24)
         self.search_entry.pack(side="left", padx=2, pady=3)
-        self.search_entry.bind("<Return>", self._on_search)
+        # add="+" so we DON'T clobber AutocompleteEntry's own <Return> dropdown-
+        # select binding -- both fire (typed-name Enter flies via _on_search; a
+        # highlighted dropdown row is selected by the widget's own handler, which
+        # then calls on_select=_on_search). fc_gui.py:2441 documents the same trap.
+        self.search_entry.bind("<Return>", self._on_search, add="+")
         # Style the search field to the theme. Guarded: a custom autocomplete
         # widget might reject a Tk option (plain tk.Entry accepts them all).
         try:
@@ -716,6 +760,7 @@ class MapTab:
             self.state.attach_model(model)
             self.state.restore_camera(self.cfg.get("camera") or {})
             self.renderer = mr.Renderer(model)
+            self._wire_completions(model)       # first show only: fill autocomplete
         # (Re)start the render worker on every show. _start_worker is idempotent
         # (no-op while a worker is running), so this spawns a thread only on the
         # first show and after an on_hidden shutdown -- letting a hide->show cycle
@@ -1743,6 +1788,30 @@ class MapTab:
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)
         self._schedule_tick()
+
+    def _wire_completions(self, model) -> None:
+        """First-show only: push display-case system names + "Name (Region)"
+        labels into the search widget's autocomplete dropdown. No-op for a plain
+        tk.Entry (no update_completions). Names are the DISPLAY-case
+        model.systems[sid].name (not the lowercase fly_to keys); the region name
+        comes from model.region_anchors[region_id][0], omitted from the label
+        when a region has no anchor."""
+        uc = getattr(self.search_entry, "update_completions", None)
+        if uc is None:
+            return
+        anchors = getattr(model, "region_anchors", {}) or {}
+        names: list[str] = []
+        labels: dict[str, str] = {}
+        for s in model.systems.values():
+            names.append(s.name)
+            anc = anchors.get(s.region_id)
+            region = anc[0] if anc else ""
+            labels[s.name] = f"{s.name} ({region})" if region else s.name
+        names.sort()
+        try:
+            uc(names, labels)
+        except Exception:
+            pass
 
     def _on_search(self, _event=None) -> None:
         if self.state.fly_to(self.search_entry.get()):

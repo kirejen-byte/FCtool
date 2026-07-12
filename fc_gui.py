@@ -5502,7 +5502,7 @@ class FCToolGUI:
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
-            autocomplete_cls=None,
+            autocomplete_cls=AutocompleteEntry,
             # Match the map context menus + toolbar to the app palette (owner
             # request 2026-07-10). map_tab must not import fc_gui, so the
             # constants travel in as a plain dict.
