@@ -14,6 +14,7 @@ fc_gui) touch tkinter.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -79,6 +80,25 @@ CAPKILL_RED = "#ff3b30"
 HEAT_REFRESH_MS = 60_000.0
 AMBIENT_START_DELAY_S = 5.0
 AMBIENT_INTERVAL_S = 3600.0
+
+# Intel pulse layer (Task 31). Systems named in tracked intel channels pulse with
+# a ~5-min decay. AMBER (#ffd166) is chosen so the ring reads DISTINCTLY from the
+# red threat/capital family (#ff5a76 / #ff3b30) and the blue Ansiblex bridges -- a
+# warm "attention" hue no other overlay claims. Rings OSCILLATE (radius + line
+# width) on a gentle ~1.1 s period; the oscillation AMPLITUDE scales with the
+# mention's decay intensity, so a fresh call throbs hard and an old one barely
+# breathes. Structure (which systems have rings, reprojection after the set
+# changed) is rebuilt at ~1 s granularity (INTEL_STRUCT_MS -- the Task 30 heat-
+# refresh idiom) while each 16 ms tick only MUTATES the existing ring items
+# (coords / itemconfigure), never delete/recreate -- so the hot path stays cheap.
+INTEL_AMBER = "#ffd166"
+INTEL_R0 = 9.0               # base ring radius (px) at the oscillation trough
+INTEL_AMP = 6.0              # max radial oscillation amplitude (px), * intensity
+INTEL_PULSE_MS = 1100.0      # oscillation period (~0.9 Hz throb)
+INTEL_HIT_R = 16.0           # click hit radius (>= max ring radius R0 + AMP = 15)
+INTEL_STRUCT_MS = 1000.0     # cull + reproject cadence (structure changes only)
+INTEL_CLICK_SLOP2 = 25       # (5 px)^2: press/release within this = a click, not a pan
+_TWO_PI = 2.0 * math.pi
 
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
@@ -306,6 +326,11 @@ class MapTabState:
         # produce the 0..1 heat the renderer draws as a red-orange under-glow.
         self.kill_heat = mo.KillHeat()
         self.ambient_heat: dict[int, int] = {}
+        # --- intel pulse layer (Task 31) ---
+        # Systems named in tracked intel channels. note()d on the MAIN thread
+        # (fc_gui marshals the intel stream through _post_ui before the push), read
+        # via active() by MapTab to draw the amber pulse rings. Pure decay model.
+        self.intel_pulses = mo.IntelPulses()
 
     def tint_spec(self):
         import map_render as _mr
@@ -693,6 +718,9 @@ class MapTab:
             "route": tk.BooleanVar(value=bool(_layers.get("route", True))),
             # Kill-heat layer (Task 30): ON by default (owner-approved ESI ambient).
             "heat": tk.BooleanVar(value=bool(_layers.get("heat", True))),
+            # Intel pulse layer (Task 31): ON by default -- tracked-channel system
+            # mentions pulse amber and fade over ~5 min.
+            "intel": tk.BooleanVar(value=bool(_layers.get("intel", True))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
@@ -702,7 +730,8 @@ class MapTab:
         self._tooltip = None
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
-                            ("route", "Route"), ("heat", "Heat")):
+                            ("route", "Route"), ("heat", "Heat"),
+                            ("intel", "Intel")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
@@ -841,6 +870,19 @@ class MapTab:
         self._ambient_thread: threading.Thread | None = None
         self._ambient_stop = threading.Event()
         self._last_heat_refresh_ms = 0.0
+
+        # --- intel pulse layer (Task 31) -----------------------------------------
+        # _intel_items maps system_id -> the canvas ring item drawn for it (rebuilt
+        # by _redraw_overlays, in lockstep with the ov_intel tag deletes);
+        # _intel_cache holds the per-system decay intensity captured at the last
+        # structure rebuild (the per-tick tween reads it so it need NOT re-run the
+        # decay every 16 ms); _intel_struct_ms gates the ~1 s cull/reproject.
+        # _press_xy is the last ButtonPress-1 position, for click-vs-pan
+        # discrimination in _on_drag_end (a pulse click focuses the Intel tab).
+        self._intel_items: dict[int, int] = {}
+        self._intel_cache: dict[int, float] = {}
+        self._intel_struct_ms = 0.0
+        self._press_xy: tuple[int, int] | None = None
 
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -1245,6 +1287,136 @@ class MapTab:
             self._request_crisp()
             self._redraw_overlays()
 
+    # ---- intel pulse layer (Task 31) ------------------------------------------
+    def add_intel_pulse(self, system_id_or_name, now=None) -> None:
+        """Record/refresh an intel mention of a system so it pulses on the map.
+        Accepts a system id (int / numeric str) OR a system NAME (resolved via the
+        model's exact case-insensitive name index; anything unresolvable -> a silent
+        no-op). Called on the MAIN thread (fc_gui marshals the intel stream through
+        _post_ui before pushing, so no extra hop here). Stamps the mention with
+        wall-clock time; when the layer is on, rebuilds the ring overlay at once so a
+        fresh call lights up immediately (the tick loop then animates it).
+        Guarded/no-throw so a malformed push never breaks the intel path."""
+        sid = self._resolve_intel_target(system_id_or_name)
+        if sid is None:
+            return
+        ts = time.time() if now is None else now
+        try:
+            self.state.intel_pulses.note(sid, ts)
+        except Exception as exc:
+            print(f"[MAP] intel pulse note failed: {exc}")
+            return
+        if self._layer_on("intel"):
+            self._redraw_overlays()          # draw the new ring now
+            self._schedule_tick()            # ensure the tick loop animates it
+
+    def _resolve_intel_target(self, system_id_or_name):
+        """Resolve an intel push target to a system id. int / numeric-str -> that id;
+        a name -> the model's exact (case-insensitive) name index; anything
+        unresolvable (unknown name, empty, bool, wrong type) -> None (silent skip)."""
+        v = system_id_or_name
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            q = v.strip()
+            if not q:
+                return None
+            if q.lstrip("-").isdigit():
+                try:
+                    return int(q)
+                except ValueError:
+                    return None
+            return self.state._name_to_id.get(q.lower())
+        return None
+
+    def _intel_osc(self, now_ms: float) -> float:
+        """Shared 0..1 oscillator for the pulse ring (time-based phase so every ring
+        breathes in unison)."""
+        return 0.5 + 0.5 * math.sin((now_ms / INTEL_PULSE_MS) * _TWO_PI)
+
+    def _intel_radius(self, intensity: float, now_ms: float) -> float:
+        """Oscillating ring radius: base R0 plus a sinusoid whose amplitude scales
+        with the mention's decay intensity (fresh -> full throb, old -> nearly
+        static)."""
+        return INTEL_R0 + INTEL_AMP * intensity * self._intel_osc(now_ms)
+
+    def _intel_width(self, intensity: float, now_ms: float) -> int:
+        """Oscillating ring line width (1..3 px); amplitude scaled by intensity so a
+        decayed pulse also thins out."""
+        return 1 + int(round(2.0 * intensity * self._intel_osc(now_ms)))
+
+    def _animate_intel_pulses(self, now_ms: float) -> None:
+        """Per-tick intel-pulse animation. HARD empty-fast-path FIRST: zero extra
+        work when the layer is off or nothing is pulsing (the common case) -- one
+        dict lookup + one O(1) truthiness, then return. While pulses are live, MUTATE
+        the existing ring items in place (coords + width) so the hot 16 ms path never
+        allocates or delete/recreates. Structure changes (culling an expired mention,
+        reprojecting the set) are batched to ~1 s via a cheap time gate that defers to
+        _redraw_overlays -- the same idiom as the Task 30 heat-refresh gate."""
+        if not self._layer_on("intel"):
+            return
+        pulses = self.state.intel_pulses
+        if not pulses.has_any():
+            return
+        if now_ms - self._intel_struct_ms >= INTEL_STRUCT_MS:
+            self._redraw_overlays()          # cull + reproject; resets _intel_struct_ms
+            return
+        if not self._intel_items or self.state.model is None:
+            return
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        canvas = self.canvas
+        for sid, item in self._intel_items.items():
+            s = systems.get(sid)
+            if s is None:
+                continue
+            intensity = self._intel_cache.get(sid, 1.0)
+            sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
+            r = self._intel_radius(intensity, now_ms)
+            try:
+                canvas.coords(item, sx - r, sy - r, sx + r, sy + r)
+                canvas.itemconfigure(item, width=self._intel_width(intensity, now_ms))
+            except tk.TclError:
+                pass
+
+    def _intel_click_hit(self, sx: float, sy: float) -> bool:
+        """Fire the ``on_intel_click`` callback if (sx, sy) lands within an active
+        pulse's hit radius (nearest pulse wins). Returns True when a pulse consumed
+        the click. No-op (False) when the layer is off, no callback is wired, no
+        model, or no pulse is near. Guarded so a bad callback never breaks the
+        click-release path."""
+        if not self._layer_on("intel") or self.state.model is None:
+            return False
+        cb = self.callbacks.get("on_intel_click")
+        if cb is None:
+            return False
+        active = self.state.intel_pulses.active(time.time())
+        if not active:
+            return False
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        best = None
+        best_d2 = None
+        for sid in active:
+            s = systems.get(sid)
+            if s is None:
+                continue
+            px, py = cam.world_to_screen(s.x, s.y, vw, vh)
+            d2 = (px - sx) ** 2 + (py - sy) ** 2
+            if d2 <= INTEL_HIT_R ** 2 and (best_d2 is None or d2 < best_d2):
+                best, best_d2 = sid, d2
+        if best is None:
+            return False
+        try:
+            cb(best)
+        except Exception as exc:
+            print(f"[MAP] intel click callback failed: {exc}")
+        return True
+
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
         """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
@@ -1304,9 +1476,14 @@ class MapTab:
         if _c: _o0 = _c()
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own", "ov_route", "ov_capkill")
+                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel")
         for tag in _tags:
             canvas.delete(tag)
+        # Task 31: the ov_intel items were just deleted -> drop their stale ids so
+        # the dicts stay in lockstep with the canvas (repopulated in the intel block
+        # below; left empty on the no-model early-return, which is correct).
+        self._intel_items = {}
+        self._intel_cache = {}
         if _c: _od = _c()
         if self.renderer is None or self.state.model is None:
             if _c:
@@ -1441,6 +1618,27 @@ class MapTab:
                                    outline=CAPKILL_RED, width=2, tags="ov_capkill")
                 canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
                                    outline=CAPKILL_RED, width=2, tags="ov_capkill")
+        # -- intel pulses (Task 31): amber oscillating rings at systems named in
+        # tracked intel channels, fading over ~5 min. This is the STRUCTURE path --
+        # it creates the ring items (drawn topmost, after the node markers) and
+        # records each item id + intensity so the per-tick _animate_intel_pulses can
+        # tween them in place without delete/recreate. Only un-expired mentions draw
+        # (active() culls the rest); off-screen ones are skipped by `project`. Sets
+        # the structure clock so the 1 s cull gate does not immediately re-fire.
+        if self._layer_on("intel"):
+            _now_ms_i = _now_ms()
+            for sid, intensity in st.intel_pulses.active(time.time()).items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                r = self._intel_radius(intensity, _now_ms_i)
+                item = canvas.create_oval(
+                    sx - r, sy - r, sx + r, sy + r, outline=INTEL_AMBER,
+                    width=self._intel_width(intensity, _now_ms_i), tags="ov_intel")
+                self._intel_items[sid] = item
+                self._intel_cache[sid] = intensity
+            self._intel_struct_ms = _now_ms_i
         if _c:
             _o1 = _c()
             _now = tele._ms()
@@ -1950,6 +2148,11 @@ class MapTab:
             self._last_heat_refresh_ms = _now_ms()
             self.state.force_dirty()
             self._request_crisp()
+        # (Task 31) intel-pulse animation: a cheap empty-fast-path when nothing is
+        # pulsing (the common case); otherwise tween the amber rings, with structure
+        # changes batched to ~1 s. Runs regardless of verdict -- pulses breathe
+        # whether or not the camera is moving.
+        self._animate_intel_pulses(_now_ms())
         if _c:
             _k3 = _c()
             phase = ("anim" if verdict == "anim"
@@ -2022,6 +2225,7 @@ class MapTab:
 
     def _on_drag_start(self, event) -> None:
         self._drag_last = (event.x, event.y)
+        self._press_xy = (event.x, event.y)   # click-vs-pan discrimination (Task 31)
 
     def _on_drag_move(self, event) -> None:
         if self._drag_last is None:
@@ -2054,8 +2258,23 @@ class MapTab:
         self._redraw_overlays()             # keep overlays glued to the live camera
         self._schedule_tick()
 
-    def _on_drag_end(self, _event) -> None:
+    def _on_drag_end(self, event) -> None:
+        press = self._press_xy
         self._drag_last = None
+        self._press_xy = None
+        # Click (not a pan): press and release within a few px -> let an active intel
+        # pulse under the cursor consume it (focus the Intelligence tab). A real drag
+        # moves farther and just pans, exactly as before -- integrating here (rather
+        # than a naive tag binding) is what keeps the pulse click from fighting the
+        # pan. Guarded so a hit-test/callback error never breaks button release.
+        if press is not None:
+            try:
+                dx = event.x - press[0]
+                dy = event.y - press[1]
+                if dx * dx + dy * dy <= INTEL_CLICK_SLOP2:
+                    self._intel_click_hit(event.x, event.y)
+            except Exception:
+                pass
         self._schedule_tick()
 
     def _on_motion(self, event) -> None:
@@ -2184,6 +2403,8 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("route"))
         menu.add_checkbutton(label="Heat", variable=self._layer_vars["heat"],
                              command=lambda: self._on_layer_toggle("heat"))
+        menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
+                             command=lambda: self._on_layer_toggle("intel"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         return menu

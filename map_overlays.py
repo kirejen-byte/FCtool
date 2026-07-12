@@ -336,3 +336,83 @@ def parse_system_kills(rows) -> dict[int, int]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+# --- intel pulse layer (Task 31) --------------------------------------------
+# Systems named in tracked intel channels pulse on the map and fade over a
+# 5-minute window. Decay is LINEAR (not exponential like KillHeat): the intensity
+# hits an EXACT zero at PULSE_DECAY_S and reads as exactly "half" at the midpoint
+# -- a hard, test-pinnable cutoff. An exponential curve only asymptotes toward
+# zero, so it would never cull; the linear ramp gives a clean "gone after 5 min".
+# The live set is bounded (PULSE_MAX) so pathological intel spam can never grow it
+# without limit -- realistic intel traffic never approaches the bound.
+PULSE_DECAY_S = 300.0        # a mention is fully faded 5 min after it lands
+PULSE_MAX = 200              # eviction bound (oldest mention dropped beyond this)
+
+
+class IntelPulses:
+    """Time-decayed set of intel-mentioned systems for the star map's pulse layer
+    (Task 31). Pure / clock-injected -- mirrors KillHeat: every method takes ``now``
+    (wall-clock epoch seconds from the MapTab callers) and never reads a clock
+    internally, so tests drive the decay deterministically.
+
+      * ``note(system_id, now)`` records or REFRESHES a mention; a re-mention resets
+        that system's decay to full (intensity 1.0) by overwriting its timestamp.
+      * ``active(now)`` -> ``{system_id: intensity}`` where intensity fades LINEARLY
+        1.0 -> 0 over ``PULSE_DECAY_S`` (0.5 at the midpoint, exactly 0 at/after the
+        window). Expired entries are dropped from the internal store as a side
+        effect (the 'cull'), so memory stays bounded by live activity.
+      * ``has_any()`` is an O(1) 'anything to draw?' gate for the MapTab hot path.
+
+    The most-recently-mentioned set is bounded to ``maxlen`` (oldest mention evicted
+    first) so intel spam can't grow the store without limit."""
+
+    def __init__(self, maxlen: int = PULSE_MAX) -> None:
+        self._maxlen = int(maxlen)
+        # system_id -> last-mention wall-clock ts. A plain dict: Python preserves
+        # insertion order, and note() re-inserts on refresh, so iteration order is
+        # LRU (oldest-first) and eviction simply drops the front entry.
+        self._last: dict[int, float] = {}
+
+    def note(self, system_id, now: float) -> None:
+        """Record/refresh a mention of ``system_id`` at ``now``. A re-mention resets
+        decay to full (the timestamp is overwritten). A bad/None id is ignored.
+        Evicts the oldest mention when the set would exceed ``maxlen``."""
+        if system_id is None or isinstance(system_id, bool):
+            return
+        try:
+            sid = int(system_id)
+        except (TypeError, ValueError):
+            return
+        self._last.pop(sid, None)            # move-to-end on refresh (LRU order)
+        self._last[sid] = float(now)
+        while len(self._last) > self._maxlen:
+            # drop the oldest (front) mention -- bounded memory under intel spam.
+            self._last.pop(next(iter(self._last)), None)
+
+    def has_any(self) -> bool:
+        """True iff any mention is stored. Cheap (dict truthiness) -- the MapTab
+        empty-fast-path checks this every tick before doing any pulse work. May
+        briefly report True for an expired-but-uncalled entry; the next ``active``
+        call culls it."""
+        return bool(self._last)
+
+    def active(self, now: float) -> dict[int, float]:
+        """``{system_id: intensity}`` for every un-expired mention at ``now``, with
+        intensity ``= 1 - dt / PULSE_DECAY_S`` in (0, 1]. Expired mentions (dt >=
+        PULSE_DECAY_S) are removed from the store as a side effect (the cull, which
+        keeps memory bounded by live activity). Clock skew (dt < 0) is treated as
+        'just now' -> intensity 1.0."""
+        out: dict[int, float] = {}
+        expired: list[int] = []
+        for sid, ts in self._last.items():
+            dt = now - ts
+            if dt < 0.0:
+                dt = 0.0                     # clock skew -> just now
+            if dt >= PULSE_DECAY_S:
+                expired.append(sid)
+                continue
+            out[sid] = 1.0 - dt / PULSE_DECAY_S
+        for sid in expired:
+            self._last.pop(sid, None)
+        return out

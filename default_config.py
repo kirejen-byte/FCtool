@@ -67,7 +67,7 @@ DEFAULT_CONFIG = {
         # menu ("Zoom animation") and persisted on hide.
         "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
-                   "bridges": True, "route": True, "heat": True},
+                   "bridges": True, "route": True, "heat": True, "intel": True},
         # Kill-heat layer (Task 30): hourly ESI ambient kills feed a LOW heat band
         # under the live zkill decay-heat. OWNER-APPROVED 2026-07-12 ("Ok to make 2
         # calls per hour") -> ON by default. Set False to run zkill-only (no ESI).

@@ -5502,6 +5502,8 @@ class FCToolGUI:
                 name, "hostile"),
             # Resolved Ansiblex bridge id-pairs, refreshed on each tab-show.
             "get_bridges": self._get_map_bridges,
+            # Task 31: a click on an intel pulse focuses the Intelligence tab.
+            "on_intel_click": self._on_map_intel_click,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -5568,6 +5570,107 @@ class FCToolGUI:
                               capital=alert.capitals_involved)
         except Exception as exc:
             print(f"[MAP] kill-heat push failed: {exc}")
+
+    def _push_intel_to_map(self, system_id_or_name):
+        """Forward an intel-channel system mention to the star map's pulse layer
+        (Task 31). Runs on the MAIN thread -- the intel stream is already marshaled
+        through _post_ui (in _on_intel_message) before this is reached, so there is
+        no extra hop and no worker-thread touch of Tk. Guarded so a missing/erroring
+        map tab never breaks the intel pipeline. Mirrors _push_kill_to_map."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.add_intel_pulse(system_id_or_name)
+        except Exception as exc:
+            print(f"[MAP] intel pulse push failed: {exc}")
+
+    def _on_map_intel_click(self, system_id):
+        """Map intel-pulse click (Task 31): focus the Intelligence tab and reveal the
+        most recent line naming the clicked system. Every step is guarded so a
+        missing notebook / log widget / unknown id degrades silently."""
+        try:
+            self._select_intel_tab()
+        except Exception:
+            pass
+        name = self._system_name_from_id(system_id)
+        if not name:
+            return
+        try:
+            self._intel_reveal_system(name)
+        except Exception:
+            pass
+
+    def _select_intel_tab(self):
+        """Select the Intelligence notebook tab. Matches by tab TEXT (contains
+        'Intel') so it survives the '** Intel ALERT **' retitle and any index shift.
+        No-op if the notebook or the tab is missing."""
+        nb = getattr(self, "notebook", None)
+        if nb is None:
+            return
+        for tab_id in nb.tabs():
+            try:
+                if "Intel" in nb.tab(tab_id, "text"):
+                    nb.select(tab_id)
+                    return
+            except Exception:
+                continue
+
+    def _intel_reveal_system(self, name):
+        """Scroll the Intelligence log to the most recent line containing ``name``
+        and flash it for ~2 s. Search is backwards from the end and CASE-INSENSITIVE:
+        the log renders intel verbatim, so a player's typed name matches the
+        canonical name up to case. No-op if the log widget or the name is missing."""
+        log = getattr(self, "_intel_log", None)
+        if log is None or not name:
+            return
+        try:
+            pos = log.search(name, "end", stopindex="1.0",
+                             backwards=True, nocase=True)
+        except Exception:
+            pos = ""
+        if not pos:
+            return
+        end = f"{pos}+{len(name)}c"
+        try:
+            log.config(state=tk.NORMAL)
+            log.see(pos)
+            log.tag_add("intel_click_flash", pos, end)
+            log.tag_config("intel_click_flash",
+                           background=FG_ACCENT, foreground=BG_DARK)
+        except Exception:
+            pass
+        finally:
+            try:
+                log.config(state=tk.DISABLED)
+            except Exception:
+                pass
+        # Remove the flash after ~2 s (main-thread schedule; guarded).
+        try:
+            self.root.after(
+                2000,
+                lambda: log.tag_remove("intel_click_flash", "1.0", "end"))
+        except Exception:
+            pass
+
+    def _system_name_from_id(self, system_id):
+        """Local (no-ESI) solar-system id -> canonical name, via the bundled
+        system_coords K-space table (inverted once and cached on self). Returns None
+        for an unknown id or on any failure."""
+        try:
+            sid = int(system_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            cache = getattr(self, "_sysid_name_cache", None)
+            if cache is None:
+                import system_coords
+                cache = {v: k for k, v in
+                         system_coords.get_kspace_name_to_id().items()}
+                self._sysid_name_cache = cache
+            return cache.get(sid)
+        except Exception:
+            return None
 
     def _get_map_bridges(self):
         """Resolved Ansiblex bridge id-pairs for the star map, parsed from the
@@ -21370,6 +21473,20 @@ $bmp.Dispose()
                                          time.monotonic())
             except Exception:
                 pass
+        # Task 31: pulse the star map at every system NAMED in this intel line. This
+        # runs on the Tk thread (the method is _post_ui-marshaled from the intel
+        # worker) and only for enabled intel channels (gated upstream in
+        # _on_intel_message) -- fleet chat never reaches here. Each system span
+        # already carries the resolved solar_system_id; guarded so a bad span or a
+        # missing map tab never breaks intel ingest.
+        try:
+            for sp in spans or ():
+                if getattr(sp, "kind", None) == "system":
+                    _sid = (getattr(sp, "payload", None) or {}).get("system_id")
+                    if _sid is not None:
+                        self._push_intel_to_map(_sid)
+        except Exception:
+            pass
         if self._passes_view_filter(msg):
             self._render_line((msg, spans, report, priority))
         # async name resolution
