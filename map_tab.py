@@ -67,6 +67,19 @@ BG_HEX = "#0a0a14"
 ROUTE_GOLD = "#ffcc44"
 BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
 
+# Kill-heat layer (Task 30). Capital-kill markers reuse a red hex derived from
+# the base-layer HEAT_COLOR family. The periodic decay refresh re-requests a
+# crisp at most every HEAT_REFRESH_MS while the layer is on and heat is live, so
+# the under-glow shrinks with decay even absent camera/kill activity (the 16 ms
+# tick is far too fast to re-render every frame). The ESI ambient fetch loop runs
+# ~hourly (owner-approved: "2 calls per hour"; we fetch ONE endpoint -- see
+# _fetch_ambient_heat's jumps decision), with a short first-fetch delay so a rapid
+# hide/show right after launch never fires a burst.
+CAPKILL_RED = "#ff3b30"
+HEAT_REFRESH_MS = 60_000.0
+AMBIENT_START_DELAY_S = 5.0
+AMBIENT_INTERVAL_S = 3600.0
+
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
 # spike. The freeze is a periodic Windows working-set-growth stall: under the
@@ -216,10 +229,15 @@ def _default_route_fn(origin_id: int, dest_id: int, connections=None):
 
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint + bridges (NOT generation -- that is a staleness
-    token, and duplicates by definition carry different generations). Used by the
-    worker to suppress a settle re-render that duplicates the crisp frame already
-    applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+    size + bloom + mode + tint + bridges + heat (NOT generation -- that is a
+    staleness token, and duplicates by definition carry different generations).
+    Used by the worker to suppress a settle re-render that duplicates the crisp
+    frame already applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+
+    heat participates exactly like bridges: the canonical rounded heat tuple (or
+    None when the layer is off / no activity) compares by value, so a kill arrival,
+    an ambient refresh, or a decay step that MOVES the rounded heat is never
+    suppressed as a duplicate, while a settle on an unchanged view+heat still is.
 
     bridges participates so a Bridges-layer toggle (tuple <-> None) is NEVER
     suppressed as a duplicate -- the on-screen frame drew a different bridge set,
@@ -236,7 +254,8 @@ def _request_sig(req: dict) -> tuple:
     camera/toggle change)."""
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
-            bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"))
+            bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
+            req.get("heat"))
 
 
 class MapTabState:
@@ -278,6 +297,15 @@ class MapTabState:
         # (id_a, id_b) pairs from map_overlays.resolve_bridges). A BASE-layer
         # element -- drawn into the bitmap, not a Tk overlay item.
         self.bridges: tuple = ()
+        # --- kill-heat layer (Task 30) ---
+        # kill_heat: the LIVE zkill decay-heat ring (mutated on the MAIN thread
+        # via add_kill, marshaled from fc_gui's zkill worker callback through
+        # _post_ui). ambient_heat: the last hourly ESI ambient counts
+        # ({system_id: ship+pod kills}), applied on the main thread from the
+        # result queue. Both feed KillHeat.merge_ambient at request-build time to
+        # produce the 0..1 heat the renderer draws as a red-orange under-glow.
+        self.kill_heat = mo.KillHeat()
+        self.ambient_heat: dict[int, int] = {}
 
     def tint_spec(self):
         import map_render as _mr
@@ -588,7 +616,7 @@ class MapTab:
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
-                 telemetry: bool = False, route_fn=None) -> None:
+                 telemetry: bool = False, route_fn=None, ambient_fetch=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -597,6 +625,10 @@ class MapTab:
         # stargate BFS. Tests / standalone pass a stub so _recompute_route runs
         # deterministically without the jump_range import.
         self._route_fn = route_fn or _default_route_fn
+        # Injectable ESI ambient-heat fetcher (Task 30); defaults to the real
+        # /universe/system_kills/ pull. Tests inject a stub so the ambient loop's
+        # lifecycle can be exercised without any network.
+        self._ambient_fetch = ambient_fetch or self._fetch_ambient_heat
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -659,6 +691,8 @@ class MapTab:
             "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
             "bridges": tk.BooleanVar(value=bool(_layers.get("bridges", True))),
             "route": tk.BooleanVar(value=bool(_layers.get("route", True))),
+            # Kill-heat layer (Task 30): ON by default (owner-approved ESI ambient).
+            "heat": tk.BooleanVar(value=bool(_layers.get("heat", True))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
@@ -668,7 +702,7 @@ class MapTab:
         self._tooltip = None
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
-                            ("route", "Route")):
+                            ("route", "Route"), ("heat", "Heat")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
@@ -798,6 +832,16 @@ class MapTab:
         self._tele_ov_del = 0.0                    # last overlay delete-ms (apply row)
         self._tele_ov_new = 0.0                    # last overlay create-ms (apply row)
 
+        # --- kill-heat ESI ambient loop + decay refresh (Task 30) ---------------
+        # A dedicated daemon loop thread (started on show, stopped on hide) fetches
+        # hourly ESI ambient kills and posts them onto the result queue; the stop
+        # Event lets on_hidden join it PROMPTLY (Event.wait returns the instant the
+        # event is set, so no thread leaks -- the Task-22 lesson). _last_heat_refresh_ms
+        # gates the periodic decay re-render (see _heat_refresh_due).
+        self._ambient_thread: threading.Thread | None = None
+        self._ambient_stop = threading.Event()
+        self._last_heat_refresh_ms = 0.0
+
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -873,6 +917,7 @@ class MapTab:
         self._request_crisp()
         self._schedule_tick()
         self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
+        self._start_ambient_loop()               # Task 30: hourly ESI ambient heat
 
     def on_hidden(self) -> None:
         if self.renderer is None:
@@ -900,6 +945,10 @@ class MapTab:
         # map-render daemon (Task 22). renderer/model/_worker_cache and the last
         # frame on the canvas all survive; on_shown restarts the thread.
         self.shutdown_worker()
+        # Stop the kill-heat ESI ambient loop too (Task 30) -- same no-leak rule:
+        # a hidden tab must not keep an hourly fetch daemon alive. on_shown
+        # restarts it; kill_heat/ambient_heat state survives on the state object.
+        self.shutdown_ambient_loop()
         # Cancel the pending _tick after() so it cannot fire against a torn-down
         # root ("invalid command name ..._tick" Tcl stderr noise) and reset the
         # flag so on_shown can schedule a fresh tick.
@@ -1052,6 +1101,150 @@ class MapTab:
         self.state.route_path = tuple(path) or None
         self._redraw_overlays()
 
+    # ---- kill-heat layer (Task 30) --------------------------------------------
+    def add_kill_heat(self, system_id, kill_count, capital=False) -> None:
+        """Record a zkill engagement alert into the live kill-heat ring. Called on
+        the MAIN thread -- fc_gui marshals the zkill worker-thread callback
+        (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which calls
+        this. Stamps the event with wall-clock time (the kill just arrived; zkill
+        is near-real-time). When the heat layer is on, force-dirties + re-requests
+        a crisp so the new hot system lights up promptly, and repaints overlays so
+        a capital marker can appear at once. Guarded/no-throw so a malformed alert
+        never breaks the zkill path."""
+        try:
+            self.state.kill_heat.add_kill(system_id, kill_count, time.time(),
+                                          bool(capital))
+        except Exception as exc:
+            print(f"[MAP] add_kill_heat failed: {exc}")
+            return
+        if self._layer_on("heat"):
+            self._last_heat_refresh_ms = _now_ms()   # a fresh crisp resets the decay clock
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
+    def _current_heat_dict(self) -> dict:
+        """Merged live+ambient 0..1 heat for NOW (empty dict when no activity).
+        Single source used by both the request builder and the decay-refresh
+        gate so they can never disagree on what heat is live."""
+        return self.state.kill_heat.merge_ambient(self.state.ambient_heat,
+                                                  time.time())
+
+    def _heat_request_value(self):
+        """Canonical hashable heat tuple for the render request + sig, or None
+        when the heat layer is off OR there is no live heat -- both collapse to
+        None so a heat-off (or heat-on-but-empty) frame is byte-identical to the
+        pre-heat output and its sig matches, keeping duplicate suppression sound."""
+        if not self._layer_on("heat"):
+            return None
+        return mo.canonical_heat(self._current_heat_dict()) or None
+
+    def _heat_refresh_due(self, now_ms: float) -> bool:
+        """True when the periodic decay refresh should re-request a crisp: the
+        heat layer is on, at least HEAT_REFRESH_MS has elapsed since the last
+        heat-driven refresh, AND there is currently live heat. The cheap time gate
+        is checked FIRST so the (bounded but non-trivial) heat merge runs at most
+        once per HEAT_REFRESH_MS, not every 16 ms tick. Pure/testable (injected
+        clock)."""
+        if not self._layer_on("heat"):
+            return False
+        if now_ms - self._last_heat_refresh_ms < HEAT_REFRESH_MS:
+            return False
+        return bool(mo.canonical_heat(self._current_heat_dict()))
+
+    # ---- kill-heat ESI ambient loop (Task 30) ---------------------------------
+    def _start_ambient_loop(self) -> None:
+        """Start the hourly ESI ambient-heat fetch thread. Idempotent: a no-op
+        when disabled in cfg (cfg["kill_heat_esi"], default True) or when a loop
+        is already running. Owner-approved (2026-07-12: "Ok to make 2 calls per
+        hour") -> ON by default; we actually issue ONE call/hour (see
+        _fetch_ambient_heat's jumps decision)."""
+        if not self.cfg.get("kill_heat_esi", True):
+            return
+        if self._ambient_thread is not None and self._ambient_thread.is_alive():
+            return
+        self._ambient_stop.clear()
+        self._ambient_thread = threading.Thread(
+            target=self._ambient_loop, daemon=True, name="map-ambient-heat")
+        self._ambient_thread.start()
+
+    def _ambient_loop(self) -> None:
+        """Daemon body: after a short first-fetch delay, fetch ambient kills and
+        post them onto the result queue, then repeat every ~hour. The stop Event
+        is WAITED on (not sleep) for both the initial delay and the interval, so
+        on_hidden's shutdown_ambient_loop wakes it the instant the event is set --
+        it never sleeps out a full hour past a hide (the no-leak guarantee).
+        Failures silent-degrade: _ambient_fetch returns None and the loop simply
+        retries next cycle (zkill-only heat meanwhile)."""
+        stop = self._ambient_stop
+        if stop.wait(AMBIENT_START_DELAY_S):
+            return                               # stopped during the initial delay
+        while not stop.is_set():
+            try:
+                kills = self._ambient_fetch()
+            except Exception as exc:             # never let the loop die on a fetch
+                print(f"[MAP] ambient heat loop error: {exc}")
+                kills = None
+            if kills and not stop.is_set():
+                # Post the sorted (sid, count) pairs; _apply_ambient rebuilds the
+                # dict on the main thread. A stale put after a hide is harmless --
+                # the queue just holds it until the next show drains it.
+                self._result_q.put(("ambient", tuple(sorted(kills.items()))))
+            if stop.wait(AMBIENT_INTERVAL_S):
+                return                           # stopped during the hourly wait
+
+    def shutdown_ambient_loop(self) -> None:
+        """Stop the ambient loop and join it briefly so a hidden tab leaks no
+        fetch daemon (Task 22 lesson). Idempotent: safe when no loop is running.
+        Setting the Event wakes a loop blocked in stop.wait() immediately; the
+        join only has to outlast an in-flight request (~10 s worst case, but the
+        loop re-checks is_set right after), so the thread exits promptly."""
+        self._ambient_stop.set()
+        t = self._ambient_thread
+        if t is not None:
+            t.join(timeout=2.0)
+            self._ambient_thread = None
+
+    def _fetch_ambient_heat(self):
+        """Fetch hourly ESI ambient kills (public endpoint, no auth) ->
+        ``{system_id: ship+pod kills}``, or None on any failure (silent-degrade to
+        zkill-only heat). Uses the repo rate limiter + ESI_HEADERS. Runs ONLY on
+        the ambient loop thread.
+
+        JUMPS DECISION (Task 30, owner delegated "skip jumps entirely if you judge
+        it dead weight"): the sibling /universe/system_jumps/ endpoint is NOT
+        fetched. Nothing consumes jump counts yet -- the future hover tooltip that
+        would use them is unbuilt -- so fetching them would be dead weight AND a
+        second ESI call for zero rendered effect. We issue ONE call/hour, well
+        under the owner-approved 2/hour budget. Add the jumps fetch alongside the
+        tooltip that needs it."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS
+            from rate_limiter import rate_limit
+            rate_limit("esi")
+            resp = requests.get(f"{ESI_BASE}/universe/system_kills/",
+                                timeout=10, headers=ESI_HEADERS)
+            if not resp.ok:
+                return None
+            return mo.parse_system_kills(resp.json())
+        except Exception as exc:
+            print(f"[MAP] ambient heat fetch failed: {exc}")
+            return None
+
+    def _apply_ambient(self, pairs) -> None:
+        """Apply worker-fetched hourly ambient kills on the MAIN thread (drained
+        from the result queue by _drain_results). Stores the {sid: ship+pod}
+        counts; when the heat layer is on, force-dirties + re-requests a crisp so
+        the low ambient band updates. ``pairs`` is the sorted ((sid, count), ...)
+        tuple the ambient loop posted."""
+        self.state.ambient_heat = {int(sid): int(c) for sid, c in pairs}
+        if self._layer_on("heat"):
+            self._last_heat_refresh_ms = _now_ms()
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
         """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
@@ -1111,7 +1304,7 @@ class MapTab:
         if _c: _o0 = _c()
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own", "ov_route")
+                 "ov_origin", "ov_own", "ov_route", "ov_capkill")
         for tag in _tags:
             canvas.delete(tag)
         if _c: _od = _c()
@@ -1232,6 +1425,22 @@ class MapTab:
                                        outline="#ffffff", width=2, tags="ov_own")
                     canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
                                        fill="#ffffff", outline="", tags="ov_own")
+        # -- capital-kill markers (Task 30): a double-ring red marker at systems
+        # with a capital kill in the last ~30 min. Gated by the heat layer (they
+        # accompany the base-layer heat under-glow) and drawn LAST so they sit on
+        # top of the heat glow and the other node markers. Pure Tk -> crisp during
+        # gestures. capital_systems iterates the bounded (<=500) event ring, cheap
+        # enough per frame.
+        if self._layer_on("heat"):
+            for sid in st.kill_heat.capital_systems(time.time()):
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
+                                   outline=CAPKILL_RED, width=2, tags="ov_capkill")
+                canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
+                                   outline=CAPKILL_RED, width=2, tags="ov_capkill")
         if _c:
             _o1 = _c()
             _now = tele._ms()
@@ -1321,7 +1530,8 @@ class MapTab:
         surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
                                     bloom=req["bloom"], mode=mode,
                                     tint=req.get("tint"),
-                                    bridges=req.get("bridges"))
+                                    bridges=req.get("bridges"),
+                                    heat=req.get("heat"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -1539,6 +1749,9 @@ class MapTab:
             # Hashable tuple (or None when the layer is off -> byte-identical to
             # pre-bridge output); travels to the worker and into _request_sig.
             "bridges": self.state.bridges if self._layer_on("bridges") else None,
+            # Canonical rounded heat tuple, or None when the layer is off / no
+            # activity (byte-identical to pre-heat output). Joins _request_sig.
+            "heat": self._heat_request_value(),
         })
 
     def _request_gesture_frame(self) -> None:
@@ -1727,6 +1940,16 @@ class MapTab:
                 self._request_gesture_frame()
         elif verdict == "crisp":
             self._request_crisp()
+            self._last_heat_refresh_ms = _now_ms()   # settle crisp already reflects decay
+        elif verdict is None and self._heat_refresh_due(_now_ms()):
+            # (c) periodic kill-heat decay refresh (Task 30): while the heat layer
+            # is on and heat is live, re-request a crisp at most every
+            # HEAT_REFRESH_MS so the red-orange under-glow shrinks as events decay,
+            # even with no camera/kill activity. The pure _heat_refresh_due gate
+            # (cheap time check first) keeps the heat merge off the hot 16 ms path.
+            self._last_heat_refresh_ms = _now_ms()
+            self.state.force_dirty()
+            self._request_crisp()
         if _c:
             _k3 = _c()
             phase = ("anim" if verdict == "anim"
@@ -1739,7 +1962,8 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam), ('threat', frozenset) and ('route', tuple). Frames (crisp OR
+        ms, cam), ('threat', frozenset), ('route', tuple) and ('ambient', tuple).
+        Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
         generation and any earlier one it superseded would be dropped by the
@@ -1751,6 +1975,7 @@ class MapTab:
         latest_frame = None
         latest_threat = None
         latest_route = None
+        latest_ambient = None
         try:
             while True:
                 item = self._result_q.get_nowait()
@@ -1758,6 +1983,8 @@ class MapTab:
                     latest_threat = item
                 elif item[0] == "route":
                     latest_route = item
+                elif item[0] == "ambient":
+                    latest_ambient = item        # Task 30: hourly ESI ambient heat
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -1771,6 +1998,8 @@ class MapTab:
             self.set_threat(latest_threat[1])
         if latest_route is not None:
             self._apply_route(latest_route[1])
+        if latest_ambient is not None:
+            self._apply_ambient(latest_ambient[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -1953,6 +2182,8 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("bridges"))
         menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
                              command=lambda: self._on_layer_toggle("route"))
+        menu.add_checkbutton(label="Heat", variable=self._layer_vars["heat"],
+                             command=lambda: self._on_layer_toggle("heat"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         return menu
@@ -2004,10 +2235,12 @@ class MapTab:
         self.cfg.setdefault("layers", {})[key] = bool(var.get())
         if key == "threat":
             self._recompute_threat()
-        elif key == "bridges":
-            # Bridges live in the base bitmap, so a toggle needs a settle
-            # re-render (the request carries the pairs, or None when off). The
-            # bridges key in _request_sig keeps this from being duplicate-suppressed.
+        elif key in ("bridges", "heat"):
+            # Bridges AND kill-heat live in the base bitmap, so a toggle needs a
+            # settle re-render (the request carries the layer value, or None when
+            # off). Their keys in _request_sig keep this from being duplicate-
+            # suppressed. Heat also repaints overlays so the capital markers appear/
+            # vanish with the layer.
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()

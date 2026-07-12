@@ -67,7 +67,11 @@ DEFAULT_CONFIG = {
         # menu ("Zoom animation") and persisted on hide.
         "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
-                   "bridges": True, "route": True},
+                   "bridges": True, "route": True, "heat": True},
+        # Kill-heat layer (Task 30): hourly ESI ambient kills feed a LOW heat band
+        # under the live zkill decay-heat. OWNER-APPROVED 2026-07-12 ("Ok to make 2
+        # calls per hour") -> ON by default. Set False to run zkill-only (no ESI).
+        "kill_heat_esi": True,
         "threat_ship": "Titan Bridge",
         # Hostile-staging systems (by NAME) excluded from the threat halo via the
         # map's Threat drawer (Task 34). Empty = every staging contributes, so a

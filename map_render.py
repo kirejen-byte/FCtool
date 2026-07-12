@@ -25,6 +25,11 @@ HUB_IDS = frozenset({30000142, 30002187, 30002659, 30002053, 30002510})
 # so systems stay readable. Three dim() passes (wide dim / mid / bright aaline).
 BRIDGE_BLUE = (0x3A, 0x86, 0xFF)
 
+# Red-orange kill-heat under-glow (Task 30): an additive glow at each hot system,
+# radius scaled by the 0..1 heat intensity, drawn UNDER the node glows (like the
+# bridge lines) so the system cores stay readable on top of the heat.
+HEAT_COLOR = (0xFF, 0x5A, 0x2E)
+
 # Nebula additive-glow brightness (fraction of the region tint). Lowered
 # 0.16 -> 0.11 at the Phase B checkpoint so dense-region blobs stop fusing
 # into hot white cores at universe zoom.
@@ -302,7 +307,8 @@ class Renderer:
     def render(self, cam, vw: int, vh: int, *, bloom: bool = True,
                mode: str = "full", band: str | None = None,
                tint: TintSpec | None = None,
-               bridges: tuple | None = None) -> pygame.Surface:
+               bridges: tuple | None = None,
+               heat: tuple | None = None) -> pygame.Surface:
         surf = pygame.Surface((vw, vh))
         surf.fill(BG)
 
@@ -335,6 +341,12 @@ class Renderer:
         # path exactly, keeping bytes byte-identical (determinism).
         if bridges:
             self._draw_bridges(surf, cam, pos, vis_set, vw, vh, bridges)
+        # Kill-heat under-glow (Task 30): after bridges, before node glows, so the
+        # red-orange heat sits under the system cores. Same truthiness gate ->
+        # heat=None/() is byte-identical to the pre-heat frame (determinism). The
+        # pass is bloom-independent -- it runs whether or not the bloom pass fires.
+        if heat:
+            self._draw_heat(surf, cam, pos, vis_set, vw, vh, heat)
         self._draw_systems(surf, st, pos, glow_r, core_r, tint)
         if bloom and mode != "degraded":
             _bloom_pass(surf)
@@ -430,6 +442,37 @@ class Renderer:
             draw_line(surf, wide, pa, pb, 4)
             draw_line(surf, mid, pa, pb, 2)
             draw_aaline(surf, bright, pa, pb)
+
+    def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
+        """Kill-heat under-glow (Task 30). `heat` is an iterable of
+        ``(system_id, intensity)`` pairs (the canonical request tuple;
+        intensity 0..1). Each hot system gets ONE additive red-orange glow sprite
+        whose radius scales with intensity (``8 + 14 * heat`` px -- the same
+        node_metrics-style soft growth the node glows use), drawn under the node
+        glows so cores stay readable. Endpoints reuse the cached projection when
+        visible and re-project otherwise; off-surface systems are culled. Sprites
+        are cached by (color, radius) in the shared SpriteFactory, so repeated
+        intensities are free. Byte-behaviour matches bridges: the caller gates on
+        truthiness, so heat=None/() never calls this."""
+        systems = self.model.systems
+        get = pos.get
+        glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
+        for sid, h in heat:
+            if h <= 0.0:
+                continue
+            s = systems.get(sid)
+            if s is None:
+                continue
+            p = get(sid)
+            if p is None:
+                p = cam.world_to_screen(s.x, s.y, vw, vh)
+            sx, sy = p
+            if sx < -60 or sy < -60 or sx > vw + 60 or sy > vh + 60:
+                continue
+            radius = int(8 + 14 * h)
+            g = glow(HEAT_COLOR, radius)
+            blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
+                 special_flags=add)
 
     def _draw_systems(self, surf, st, pos, glow_r, core_r, tint=None):
         # Per-node colour + hub flag are STATIC -> read them from _node_static

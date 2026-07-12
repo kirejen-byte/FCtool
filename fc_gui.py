@@ -5554,6 +5554,21 @@ class FCToolGUI:
         except Exception as exc:
             print(f"[MAP] route destination push failed: {exc}")
 
+    def _push_kill_to_map(self, alert):
+        """Forward a zkill engagement alert to the star map's kill-heat layer
+        (Task 30). Runs on the MAIN thread (marshaled from the zkill worker
+        callback via _post_ui in _on_zkill_alert). Guarded so a missing/erroring
+        map tab never breaks the zkill alert path. KillAlert fields used:
+        system_id, kill_count, capitals_involved (all present on the dataclass)."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.add_kill_heat(alert.system_id, alert.kill_count,
+                              capital=alert.capitals_involved)
+        except Exception as exc:
+            print(f"[MAP] kill-heat push failed: {exc}")
+
     def _get_map_bridges(self):
         """Resolved Ansiblex bridge id-pairs for the star map, parsed from the
         SAME config["ansiblex_connections"] name pairs the jump-range BFS
@@ -18775,6 +18790,11 @@ class FCToolGUI:
             alert.route_from_staging = route_info
 
         self._post_ui(self._show_zkill_alert, alert)
+        # Star-map kill-heat layer (Task 30): feed the engagement into the map's
+        # decay-heat ring. Marshaled onto the main thread (this callback runs on
+        # the zkill worker thread); _push_kill_to_map is guarded so a missing map
+        # tab never breaks the zkill path.
+        self._post_ui(self._push_kill_to_map, alert)
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
