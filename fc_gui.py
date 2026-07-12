@@ -958,6 +958,11 @@ class FCToolGUI:
         # Silent no-op unless a market is configured, enabled in Settings,
         # and not already fresh — see _auto_market_rescan_if_needed's gates.
         self.root.after(4500, self._auto_market_rescan_if_needed)
+        # Infra region auto-scan, later still (15 s) so it never piles onto the
+        # startup burst and gives ESI login a beat to settle. Silent no-op unless
+        # opted in (config["infra"]["auto_scan_on_start"]), authenticated, and
+        # regions are configured — see _auto_infra_scan_if_needed's gates.
+        self.root.after(15000, self._auto_infra_scan_if_needed)
 
         # Pre-generate loss threshold TTS audio in the background
         tts_helper.pregenerate([
@@ -4970,6 +4975,12 @@ class FCToolGUI:
                 selected = self.notebook.nametowidget(self.notebook.select())
                 if selected is self.map_tab.frame.master:
                     self.map_tab.on_shown()
+                    # Refresh the infra chip overlay on show: the layer's enabled
+                    # flag persists across restarts (map on_hidden saves it), but
+                    # on_shown does not re-pull infra like it does bridges. When
+                    # infra is OFF (default) this pushes None cheaply WITHOUT
+                    # building the store, so map-only users pay nothing.
+                    self._push_infra_to_map()
                 else:
                     self.map_tab.on_hidden()
             except Exception:
@@ -5468,6 +5479,7 @@ class FCToolGUI:
         _on_tab_changed on visibility). The right-click actions reuse the exact
         same handlers as the intel system menu."""
         import map_tab as _map_tab_mod
+        import infra_overlay
 
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Map  ")
@@ -5504,6 +5516,11 @@ class FCToolGUI:
             "get_bridges": self._get_map_bridges,
             # Task 31: a click on an intel pulse focuses the Intelligence tab.
             "on_intel_click": self._on_map_intel_click,
+            # Infra layer (Task 7): the map's filter popover hands us a deepcopy of
+            # its filter dict; we recompute badges + push. "Structures here…" /
+            # "Manage infrastructure…" open the singleton manager dialog.
+            "get_infrastructure": self._infra_get_infrastructure,
+            "open_infra_manager": self._open_infra_manager,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -5517,6 +5534,23 @@ class FCToolGUI:
         # Seed the staging overlay from config (resolved names -> ids). Safe
         # before the first on_shown: set_staging just stores state until render.
         self._push_staging_to_map()
+
+        # Infrastructure layer (Task 7) — LAZY. The store/scanner/model are built
+        # on first actual infra use (_ensure_infra: enabling the chip layer,
+        # opening the manager dialog, or the startup auto-scan), so a user who
+        # never touches infra pays zero model-load cost at startup. Only the
+        # filter state + singleton handles are initialised here. "enabled" mirrors
+        # the map's OFF-by-default infra layer (map.layers has no "infra" key, so
+        # this defaults False) — the map re-sends the true flag via
+        # get_infrastructure on every toggle.
+        import copy as _copy
+        self._infra_store = None
+        self._infra_scanner = None
+        self._infra_model = None
+        self._infra_dialog = None
+        self._infra_filters = _copy.deepcopy(infra_overlay.FILTER_DEFAULTS)
+        self._infra_filters["enabled"] = bool(
+            (cfg.get("layers") or {}).get("infra", False))
 
     # ── Star-map data pushes (fleet / own-location / staging) ─────────────────
     def _push_fleet_to_map(self, members):
@@ -5718,14 +5752,26 @@ class FCToolGUI:
             return None
 
     def _get_map_bridges(self):
-        """Resolved Ansiblex bridge id-pairs for the star map, parsed from the
-        SAME config["ansiblex_connections"] name pairs the jump-range BFS
-        consumes (see _resolve_ansiblex_sync). Pure/local name resolution
-        (map_overlays.resolve_bridges -> system_coords.resolve_name): NO ESI, so
-        it is safe to call on the Tk thread. Guarded -- a bad config yields ()."""
+        """Resolved Ansiblex bridge id-pairs for the star map. UNION (at the
+        NAME-pair level, before resolution) of config["ansiblex_connections"] —
+        the SAME pairs the jump-range BFS consumes — and any imported-gate pairs
+        from the infra store (infra_overlay.gate_pairs). resolve_bridges resolves
+        each name pair and dedupes by unordered id-pair, so duplicate/ case-variant
+        gates collapse automatically. Pure/local name resolution (NO ESI), safe on
+        the Tk thread. The infra store is only consulted when ALREADY built — this
+        is called on every map show, so we never force the model load here for a
+        map user who has not touched infra. Guarded -- a bad config yields ()."""
         try:
             import map_overlays as mo
-            return mo.resolve_bridges(self.config.get("ansiblex_connections", []))
+            name_pairs = list(self.config.get("ansiblex_connections", []))
+            store = getattr(self, "_infra_store", None)   # do NOT force-build
+            if store is not None:
+                try:
+                    import infra_overlay
+                    name_pairs += infra_overlay.gate_pairs(store.entries())
+                except Exception as exc:
+                    print(f"[MAP] infra gate-pairs union failed: {exc}")
+            return mo.resolve_bridges(name_pairs)
         except Exception as exc:
             print(f"[MAP] bridges resolve failed: {exc}")
             return ()
@@ -5786,6 +5832,268 @@ class FCToolGUI:
             self._rerun_range_check_if_ready()
         except Exception:
             pass
+
+    # ── Infrastructure layer wiring (Task 7) ──────────────────────────────────
+    # The infra_* modules NEVER import each other or fc_gui (plan §2); fc_gui is
+    # the sole composer. Everything here is LAZY: the store/scanner/model build on
+    # first real infra use (_ensure_infra), so non-infra users pay nothing.
+
+    @staticmethod
+    def _infra_system_lookup(model):
+        """casefolded system_name -> (system_id, region_id) for InfraStore id
+        resolution, built from the bundled map model (MapSystem: .id/.name/
+        .region_id — map_data.py:26). Pure; testable against the real model with
+        no GUI."""
+        return {s.name.casefold(): (s.id, s.region_id)
+                for s in model.systems.values()}
+
+    def _ensure_infra(self):
+        """Build (once) the InfraStore + InfraScanner, loading the map model on
+        first infra use. Returns (store, scanner); (None, None) on failure. The
+        scanner's ``auth`` is refreshed every call so a login / account switch
+        after construction is honoured (self.esi_auth is reassigned on login).
+        Runs on the Tk thread — every caller is main-thread — so no marshalling."""
+        store = getattr(self, "_infra_store", None)
+        if store is not None:
+            scanner = getattr(self, "_infra_scanner", None)
+            if scanner is not None:
+                scanner.auth = self.esi_auth      # keep auth fresh across re-login
+            return store, scanner
+        try:
+            import map_data
+            import infra_store
+            import infra_scan
+            if getattr(self, "_infra_model", None) is None:
+                self._infra_model = map_data.load_map_model()
+            model = self._infra_model
+            store = infra_store.InfraStore(
+                system_lookup=self._infra_system_lookup(model))
+            store.load()
+            scanner = infra_scan.InfraScanner(
+                auth=self.esi_auth, store=store, model=model,
+                ui_post=self._post_ui,
+                on_progress=self._infra_scan_on_progress,
+                on_done=self._infra_scan_on_done)
+            self._infra_store = store
+            self._infra_scanner = scanner
+        except Exception as exc:
+            print(f"[INFRA] setup failed: {exc}")
+            return None, None
+        return self._infra_store, self._infra_scanner
+
+    def _infra_get_infrastructure(self, filters):
+        """Map filter-popover callback: it hands us a private deepcopy of its
+        filter dict (shape = infra_overlay.FILTER_DEFAULTS). Adopt it as our live
+        filter state and recompute+push the chip overlay. Runs on the Tk thread
+        (a map UI event)."""
+        if isinstance(filters, dict):
+            self._infra_filters = filters
+        self._push_infra_to_map()
+
+    def _push_infra_to_map(self):
+        """Recompute infrastructure badges from the store and push them to the
+        map's chip layer. The Tk touch (set_infrastructure) is marshalled through
+        the UI dispatcher (self._post_ui), so this is safe from ANY thread — the
+        scan on_done path reaches here after the scanner's own ui_post hop. When
+        the layer is disabled we push None WITHOUT building the store, so a user
+        who never enables infra pays zero model-load cost. Mirrors the
+        _push_bridges_to_map idiom; guarded so a missing map tab never breaks."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        filters = getattr(self, "_infra_filters", None) or {}
+        if not filters.get("enabled"):
+            self._post_ui(tab.set_infrastructure, None)
+            return
+        store, _ = self._ensure_infra()
+        if store is None:
+            self._post_ui(tab.set_infrastructure, None)
+            return
+        try:
+            import infra_overlay
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            badges = infra_overlay.infra_badges(store.entries(), filters, now_iso)
+        except Exception as exc:
+            print(f"[INFRA] badge compute failed: {exc}")
+            return
+        self._post_ui(tab.set_infrastructure, badges)
+
+    def _infra_on_changed(self):
+        """Manager-dialog on_changed hook: an import / scan / edit changed the
+        store. Refresh BOTH the chip layer and the Ansiblex bridge layer so
+        imported gates light up their bridge lines immediately (not only on the
+        next map re-show). Runs on the Tk thread (the dialog calls it)."""
+        self._push_infra_to_map()
+        self._push_bridges_to_map()
+
+    def _infra_scan_on_progress(self, payload):
+        """InfraScanner on_progress host handler. The scanner already marshals
+        this via ui_post=self._post_ui, but we re-marshal the dialog update
+        through the dispatcher so the method stays worker-safe regardless of
+        caller (grep-guard discipline: no direct Tk / self.root.after here)."""
+        self._post_ui(self._infra_apply_scan_progress, payload)
+
+    def _infra_apply_scan_progress(self, payload):
+        """Main-thread applier: update the open manager dialog's status line with
+        a scan-progress payload. No-op when the dialog is closed."""
+        dlg = getattr(self, "_infra_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if dlg.winfo_exists():
+                dlg.push_scan_progress(payload)
+        except Exception:
+            pass
+
+    def _infra_scan_on_done(self, report):
+        """InfraScanner on_done host handler. Marshals the completion apply
+        through the dispatcher (worker-safe regardless of caller; no direct Tk /
+        self.root.after here)."""
+        self._post_ui(self._infra_apply_scan_done, report)
+
+    def _infra_apply_scan_done(self, report):
+        """Main-thread applier for scan completion: hand the summary to the open
+        dialog (which appends the role-gated caveat itself) and refresh the map
+        overlays so newly-resolved structures + gates appear."""
+        dlg = getattr(self, "_infra_dialog", None)
+        if dlg is not None:
+            try:
+                if dlg.winfo_exists():
+                    dlg.push_scan_done(report)
+            except Exception:
+                pass
+        self._push_infra_to_map()
+        self._push_bridges_to_map()
+
+    def _infra_clipboard_get(self):
+        """Zero-arg clipboard text reader for the manager dialog. Returns "" on an
+        empty / non-text clipboard so the dialog never sees an exception."""
+        try:
+            return self.root.clipboard_get()
+        except Exception:
+            return ""
+
+    def _infra_import_clipboard(self, text, include_npc=False, preview=False):
+        """Parser+store composition for the dialog's clipboard import (§3.9
+        contract). Two-phase: preview=True parses WITHOUT writing (report None);
+        otherwise upserts under source "clipboard". NPC-station rows are dropped
+        unless include_npc. Returns {"report", "links", "npc", "unparsed",
+        "by_category"}; by_category counts the NON-NPC rows (npc is surfaced
+        separately so the dialog preview shows it as "excluded by default")."""
+        import infra_parser
+        result = infra_parser.parse_clipboard(text or "")
+        npc_count = sum(1 for e in result.entries if e.category == "npc")
+        by_category: dict = {}
+        for e in result.entries:
+            if e.category == "npc":
+                continue
+            by_category[e.category] = by_category.get(e.category, 0) + 1
+        summary = {"report": None, "links": result.total_links,
+                   "npc": npc_count, "unparsed": len(result.unparsed),
+                   "by_category": by_category}
+        if preview:
+            return summary
+        store, _ = self._ensure_infra()
+        if store is None:
+            return summary
+        rows = [{"name": e.name, "type_id": e.type_id,
+                 "structure_id": e.structure_id, "category": e.category,
+                 "system_name": e.system_name,
+                 "gate_to_system_name": e.gate_to_system_name}
+                for e in result.entries
+                if include_npc or e.category != "npc"]
+        summary["report"] = store.upsert_many(rows, "clipboard")
+        return summary
+
+    def _infra_import_manual(self, entry):
+        """Manager-dialog manual-add hook: upsert one entry under source
+        "manual". The dialog invokes on_changed itself afterwards, so no re-push
+        here."""
+        store, _ = self._ensure_infra()
+        if store is None:
+            return
+        try:
+            store.upsert_many([entry], "manual")
+        except Exception as exc:
+            print(f"[INFRA] manual add failed: {exc}")
+
+    def _open_infra_manager(self, system_id=None):
+        """Open (or raise) the SINGLETON infrastructure manager dialog, optionally
+        pre-filtered to one system id (map "Structures here…"). Builds the
+        store/scanner lazily. Runs on the Tk thread (menu / settings button /
+        popover). scanner may be None (not logged in) => the dialog disables its
+        scan controls with a 'needs ESI login' tooltip."""
+        store, scanner = self._ensure_infra()
+        if store is None:
+            return
+        existing = getattr(self, "_infra_dialog", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except Exception:
+                pass
+            self._infra_dialog = None
+        try:
+            import infra_dialog
+            import infra_overlay
+            model = getattr(self, "_infra_model", None)
+            regions_catalog = infra_overlay.regions_catalog(model) if model else []
+            if model is not None:
+                system_names = sorted(s.name for s in model.systems.values())
+            else:
+                system_names = list(getattr(self, "_system_names", []) or [])
+            dlg = infra_dialog.InfraManagerDialog(
+                self.root, store, scanner, regions_catalog, system_names,
+                clipboard_get=self._infra_clipboard_get,
+                import_clipboard=self._infra_import_clipboard,
+                import_manual=self._infra_import_manual,
+                on_changed=self._infra_on_changed,
+                initial_system_id=system_id)
+        except Exception as exc:
+            print(f"[INFRA] manager dialog failed to open: {exc}")
+            return
+        self._infra_dialog = dlg
+
+        def _on_close():
+            self._infra_dialog = None
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        try:
+            dlg.protocol("WM_DELETE_WINDOW", _on_close)
+        except Exception:
+            pass
+
+    def _auto_infra_scan_if_needed(self):
+        """Startup infra region auto-scan (mirrors _auto_market_rescan_if_needed).
+        Silent no-op unless ALL of: config["infra"]["auto_scan_on_start"] is
+        truthy; a character is authenticated; and ≥1 scan region is configured.
+        The scanner's own per-system RESCAN_GATE_S (server search cache) skips
+        systems searched within the last hour, so re-kicking a fresh region does
+        no ESI work — that is the effective staleness gate (the store tracks
+        per-SYSTEM, not per-region, scan times). getattr-guarded so a bare /
+        headless host never raises."""
+        cfg = self.config.get("infra", {}) or {}
+        if not bool(cfg.get("auto_scan_on_start", False)):
+            return
+        if not getattr(self.esi_auth, "is_authenticated", False):
+            return
+        store, scanner = self._ensure_infra()
+        if store is None or scanner is None:
+            return
+        regions = store.get_regions()
+        if not regions:
+            return
+        try:
+            scanner.scan_regions(regions)
+        except Exception as exc:
+            print(f"[INFRA] startup auto-scan failed: {exc}")
 
     # ── Character Management Tab ──────────────────────────────────────────────
 
@@ -12561,6 +12869,9 @@ class FCToolGUI:
         # ── Market Scanner Settings ──────────────────────────────────────────
         self._build_market_settings_section(scroll_frame)
 
+        # ── Infrastructure Settings ──────────────────────────────────────────
+        self._build_infra_settings_section(scroll_frame)
+
         # (Save button is at the top of the settings tab)
 
         # ── Floating section index (right margin) ─────────────────────────
@@ -17108,6 +17419,41 @@ class FCToolGUI:
                         lambda e, t=tooltip: self._show_tooltip(e, t))
                 _w.bind("<Leave>", lambda e: self._hide_tooltip())
 
+    def _build_infra_settings_section(self, parent):
+        """Build the Settings-tab 'Infrastructure' section (Task 7, plan §3.10):
+        a Manage… button that opens the singleton manager dialog and an
+        'Auto-scan configured regions at startup' checkbutton bound to
+        config["infra"]["auto_scan_on_start"] (collected in _save_settings). The
+        scan-region list itself lives in the store (managed inside the dialog),
+        not here. Header registered with the floating TOC via _add_section."""
+        self._add_section(parent, "Infrastructure", toc_title="Infrastructure")
+        infra_cfg = self.config.setdefault("infra", {})
+        self._infra_auto_scan_var = tk.BooleanVar(
+            value=bool(infra_cfg.get("auto_scan_on_start", False)))
+
+        row = tk.Frame(parent, bg=BG_DARK)
+        row.pack(fill=tk.X, padx=20, pady=(4, 0))
+        ttk.Button(row, text="Manage…", style="Dark.TButton",
+                   command=lambda: self._open_infra_manager(None)).pack(
+                       side=tk.LEFT)
+        auto_cb = tk.Checkbutton(
+            row, text="Auto-scan configured regions at startup",
+            variable=self._infra_auto_scan_var,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        auto_cb.pack(side=tk.LEFT, padx=(16, 0))
+        self._tip_widget(
+            auto_cb,
+            "Runs a friendly-structure ESI region scan in the background at "
+            "launch, for the regions configured in the manager. Needs a logged-in "
+            "character; systems searched in the last hour are skipped.")
+        tk.Label(parent, text="Paste from the in-game structure browser or run "
+                 "an ESI region scan; the map's Infra layer draws the results.",
+                 font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK, anchor=tk.W,
+                 justify=tk.LEFT, wraplength=360).pack(
+                     anchor=tk.W, padx=22, pady=(0, 2))
+
     def _build_market_settings_section(self, parent):
         """Build the Settings-tab 'Market Scanner' section (name-first UX).
 
@@ -18438,6 +18784,13 @@ class FCToolGUI:
         # Market Scanner fields (guarded — the section may not be built if the
         # Settings tab was never opened; then there is nothing to collect).
         self._collect_market_settings()
+
+        # Infrastructure auto-scan toggle (guarded — the section may be unbuilt).
+        # Regions are NOT here: they live in the store, managed in the dialog.
+        infra_var = getattr(self, "_infra_auto_scan_var", None)
+        if infra_var is not None:
+            self.config.setdefault("infra", {})["auto_scan_on_start"] = bool(
+                infra_var.get())
 
         self._save_config()
         self._save_status.config(text="Saved!", fg=FG_GREEN)

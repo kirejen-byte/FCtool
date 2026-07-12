@@ -110,4 +110,13 @@ DEFAULT_CONFIG = {
         "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)
         "seed_target": 20,          # FIXED target quantity of each fit for gap math
     },
+    # Friendly-infrastructure scan (infra_* feature, plan 2026-07-11-infra-scan).
+    # Simplification (plan §3.10): the configured scan-region list lives ONLY in
+    # the store file (infrastructure.json) — config holds just the startup toggle.
+    # OFF by default: a region scan spends the shared ESI error budget, so opting
+    # in is the owner's call. The map's Infra chip layer defaults OFF via
+    # map_tab._LAYERS_OFF_BY_DEFAULT (deliberately NOT a map.layers key here).
+    "infra": {
+        "auto_scan_on_start": False,
+    },
 }
