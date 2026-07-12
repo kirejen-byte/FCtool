@@ -69,11 +69,59 @@ def _pick_top(counts: dict) -> str | None:
     return max(ordered, key=lambda cat: counts.get(cat, 0))
 
 
+def _entry_survives(entry: dict, categories_filter: dict, regions_filter,
+                    sources_filter, stale_only: bool, now, threshold) -> bool:
+    """Single overlay-filter predicate (status!='dead' + category / region /
+    source / stale-only). Shared by infra_badges and filter_entries so the map
+    chips and the right-click structure list apply IDENTICAL rules -- one source
+    of truth. Does NOT consider system_id placement (that grouping rule is
+    badge-specific and stays in infra_badges)."""
+    if entry.get("status") == "dead":
+        return False
+    if not categories_filter.get(entry.get("category", "unknown"), True):
+        return False
+    if regions_filter is not None and entry.get("region_id") not in regions_filter:
+        return False
+    if sources_filter is not None and entry.get("source") not in sources_filter:
+        return False
+    if stale_only and not _is_stale(entry, now, threshold):
+        return False
+    return True
+
+
+def filter_entries(entries: list[dict], filters: dict, now_iso: str,
+                   stale_days: int = 14) -> list[dict]:
+    """Return the entries surviving the overlay filters, in input order -- the
+    EXACT predicate infra_badges uses to build its per-system groups, exposed so
+    a caller (fc_gui's right-click structure list) can show precisely what the
+    chips show. Does NOT drop system_id-None entries -- placement is a
+    badge-specific concern; pass already-placed entries (e.g. from
+    InfraStore.by_system) when you want only located ones. Pure, deterministic."""
+    now = _parse_iso(now_iso)
+    threshold = timedelta(days=stale_days)
+    categories_filter = filters.get("categories") or {}
+    regions_filter = filters.get("regions")
+    sources_filter = filters.get("sources")
+    stale_only = filters.get("stale_only", False)
+    return [e for e in entries
+            if _entry_survives(e, categories_filter, regions_filter,
+                               sources_filter, stale_only, now, threshold)]
+
+
 def infra_badges(entries: list[dict], filters: dict, now_iso: str,
-                 stale_days: int = 14) -> dict[int, dict]:
-    """system_id -> {"total": n, "counts": {category: n}, "top": category, "stale": bool}
-    Skips entries with system_id None; applies filters; 'stale' if ALL entries in the
-    system have last_seen older than stale_days. Pure function, deterministic."""
+                 stale_days: int = 14, type_name_fn=None) -> dict[int, dict]:
+    """system_id -> {"total": n, "counts": {category: n}, "top": category,
+    "stale": bool, "type_counts": {display_type: n}}.
+
+    Skips entries with system_id None; applies filters; 'stale' if ALL entries in
+    the system have last_seen older than stale_days. ``type_counts`` tallies the
+    SPECIFIC structure type of each FILTER-SURVIVING entry (what the map hover
+    tooltip lists) -- keyed by ``type_name_fn(type_id, structure_id)`` when a
+    resolver is injected (fc_gui passes infra_parser.type_name), else a stdlib
+    fallback of ``"npc"`` for npc-category rows and ``str(type_id)`` otherwise, so
+    the module stays stdlib-pure. ``type_counts`` is metadata only: the map's
+    render-tuple fold (_infra_request_value) reads sid/total/top/stale, so it is
+    byte-stable regardless of type_counts. Pure function, deterministic."""
     now = _parse_iso(now_iso)
     threshold = timedelta(days=stale_days)
     categories_filter = filters.get("categories") or {}
@@ -86,29 +134,29 @@ def infra_badges(entries: list[dict], filters: dict, now_iso: str,
         system_id = entry.get("system_id")
         if system_id is None:
             continue
-        if entry.get("status") == "dead":
-            continue
-        if not categories_filter.get(entry.get("category", "unknown"), True):
-            continue
-        if regions_filter is not None and entry.get("region_id") not in regions_filter:
-            continue
-        if sources_filter is not None and entry.get("source") not in sources_filter:
-            continue
-        if stale_only and not _is_stale(entry, now, threshold):
+        if not _entry_survives(entry, categories_filter, regions_filter,
+                               sources_filter, stale_only, now, threshold):
             continue
         per_system.setdefault(system_id, []).append(entry)
 
     badges: dict[int, dict] = {}
     for system_id, sys_entries in per_system.items():
         counts: dict[str, int] = {}
+        type_counts: dict[str, int] = {}
         for e in sys_entries:
             cat = e.get("category", "unknown")
             counts[cat] = counts.get(cat, 0) + 1
+            if type_name_fn is not None:
+                tkey = type_name_fn(e.get("type_id"), e.get("structure_id"))
+            else:
+                tkey = "npc" if cat == "npc" else str(e.get("type_id"))
+            type_counts[tkey] = type_counts.get(tkey, 0) + 1
         badges[system_id] = {
             "total": len(sys_entries),
             "counts": counts,
             "top": _pick_top(counts),
             "stale": all(_is_stale(e, now, threshold) for e in sys_entries),
+            "type_counts": type_counts,
         }
     return badges
 

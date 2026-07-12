@@ -292,6 +292,22 @@ _DEFAULT_THEME = {
 # menu selection can be stored back as a bare ship/base name (spec §2.5).
 _LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
 
+# --- reusable hover summary tooltip engine (owner feedback round B) -----------
+# A layer-gated hover tooltip: providers registered via register_hover_provider
+# each contribute a section for the system under the cursor; enabled sections are
+# joined (blank-line separated) into one reused themed Toplevel shown after a
+# short dwell. The <Motion> path is near-zero when no provider's layer is on (the
+# FIRST guard short-circuits before any allocation), so idle hover cost is
+# unchanged from the pre-tooltip renderer -- the map's perf discipline is sacred.
+HOVER_TOOLTIP_DELAY_MS = 350        # dwell before the summary tooltip appears
+HOVER_TOOLTIP_MOVE_R2 = 100         # px^2: motion beyond ~10px reschedules/hides
+
+# Cap on structure rows in the right-click "Structures (N)" submenu (owner
+# feedback round B): a busy staging system can hold dozens of structures, so the
+# grouped list is truncated with a trailing "…and N more (Manage…)" row rather
+# than spawning a menu taller than the screen.
+_STRUCT_MENU_CAP = 25
+
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
@@ -1073,12 +1089,33 @@ class MapTab:
         self._killping_struct_ms = 0.0
         self._pending_focus_sid: int | None = None
 
+        # --- reusable hover summary tooltip engine (owner feedback round B) ----
+        # _hover_providers: (layer_key, fn) pairs. fn(system_id) -> list[str] |
+        # None; sections from every provider whose layer_key is _layer_on() are
+        # joined into ONE reused themed Toplevel (_hover_tip) shown ~350 ms after
+        # the cursor settles on a system. Kept minimal so the <Motion> idle path
+        # (no provider layer on) does zero tooltip work. Task D will register a
+        # characters-layer provider through the same register_hover_provider API.
+        self._hover_providers: list[tuple[str, "callable"]] = []
+        self._hover_delay_ms = HOVER_TOOLTIP_DELAY_MS   # instance-tunable (tests)
+        self._hover_tip = None                          # reused Toplevel (lazy)
+        self._hover_tip_label = None                    # the Label inside it
+        self._hover_after_id = None                     # pending delayed-show after()
+        self._hover_sid = None                          # system the pending/shown tip is for
+        self._hover_anchor: tuple[int, int] | None = None   # canvas-xy where dwell began
+        # Infra chips summary (Task 5 / round B): per-type counts for the hovered
+        # system, honouring the SAME filters as the chips (the host already folded
+        # them into the pushed badges' "type_counts"). Registered here because the
+        # infra badge state (state.infra) lives on this tab.
+        self.register_hover_provider("infra", self._infra_hover_lines)
+
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<Leave>", self._on_canvas_leave)
         self.canvas.bind("<Configure>", self._on_configure)
 
         # --- opt-in feel telemetry (Task 23) -----------------------------------
@@ -1161,6 +1198,7 @@ class MapTab:
         self._apply_pending_focus()
 
     def on_hidden(self) -> None:
+        self._hover_cancel()                 # never leave a tooltip over a hidden tab
         if self.renderer is None:
             # Hidden before the first show: the camera is still at fresh
             # defaults (the fit-universe sentinel hasn't been applied yet).
@@ -2962,6 +3000,7 @@ class MapTab:
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
+        self._hover_cancel()                 # a zoom gesture dismisses the tooltip
         steps = 1 if event.delta > 0 else -1
         if self._zoom_anim_var.get():
             # Eased glide (default): retarget only -- the tick loop owns every
@@ -2980,6 +3019,7 @@ class MapTab:
         return "break"
 
     def _on_drag_start(self, event) -> None:
+        self._hover_cancel()                 # a press / drag dismisses the tooltip
         self._drag_last = (event.x, event.y)
         self._press_xy = (event.x, event.y)   # click-vs-pan discrimination (Task 31)
 
@@ -3071,8 +3111,163 @@ class MapTab:
         if _c:
             _h2 = _c()
             tele.hover_rec((_h1 - _h0) * 1000.0, (_h2 - _h1) * 1000.0, sid is not None)
+        # Drive the delayed summary tooltip, REUSING the hover hit-test above (no
+        # second nearest() call). The engine's own first guard makes this ~free
+        # when no provider's layer is on (idle hover cost unchanged).
+        self._hover_tooltip_motion(event, sid)
+
+    # ---- reusable hover summary tooltip engine (owner feedback round B) ---------
+    def register_hover_provider(self, layer_key: str, fn) -> None:
+        """Register a hover-tooltip section provider. ``fn(system_id)`` returns a
+        list of display lines (or None / [] for no contribution). The section is
+        included only while ``_layer_on(layer_key)`` is true, so a provider costs
+        nothing until its layer is enabled. Sections from all enabled providers
+        are blank-line separated in one reused themed tooltip. Public so sibling
+        layers (Task D's characters layer) plug in without touching the engine."""
+        self._hover_providers.append((layer_key, fn))
+
+    def _hover_any_layer_on(self) -> bool:
+        """True iff at least one registered provider's layer is enabled. Plain
+        loop (no generator / allocation) so the <Motion> idle guard stays cheap."""
+        for key, _fn in self._hover_providers:
+            if self._layer_on(key):
+                return True
+        return False
+
+    def _hover_gesture_active(self) -> bool:
+        """True while a pan / zoom / worker-gesture is in flight -- the tooltip
+        must never schedule or show mid-gesture. Cheap attribute reads only."""
+        return (self._drag_last is not None
+                or self._gesture_inflight
+                or self.state.zoom_anim.active)
+
+    def _hover_tooltip_motion(self, event, sid) -> None:
+        """<Motion> driver for the summary tooltip. FIRST guard: if no provider's
+        layer is on, do nothing beyond dismissing any lingering tip -- near-zero
+        idle cost, no allocation. Otherwise (re)arm a single delayed show for the
+        hovered system, re-anchoring only when the cursor changes system or moves
+        beyond a small radius (jitter within the radius does NOT restack after()s)."""
+        if not self._hover_any_layer_on():
+            if self._hover_after_id is not None or self._hover_tip is not None:
+                self._hover_cancel()
+            return
+        # Never show mid pan/zoom, or when off a system.
+        if sid is None or self._hover_gesture_active():
+            self._hover_cancel()
+            return
+        x, y = event.x, event.y
+        anc = self._hover_anchor
+        if sid == self._hover_sid and anc is not None:
+            dx = x - anc[0]
+            dy = y - anc[1]
+            if dx * dx + dy * dy <= HOVER_TOOLTIP_MOVE_R2:
+                return                       # same target, within radius -> leave armed
+        # New target (system changed or moved past the radius): reschedule ONCE.
+        self._hover_cancel()
+        self._hover_sid = sid
+        self._hover_anchor = (x, y)
+        self._hover_after_id = self.canvas.after(
+            self._hover_delay_ms, lambda s=sid: self._hover_tooltip_show(s))
+
+    def _hover_compose(self, sid) -> str | None:
+        """Join the sections from every enabled provider for ``sid`` (blank-line
+        separated), or None when nothing contributes. A provider raising is
+        treated as no content -- a broken provider can never break hover."""
+        sections: list[str] = []
+        for key, fn in self._hover_providers:
+            if not self._layer_on(key):
+                continue
+            try:
+                lines = fn(sid)
+            except Exception:
+                lines = None
+            if lines:
+                sections.append("\n".join(str(ln) for ln in lines))
+        if not sections:
+            return None
+        return "\n\n".join(sections)
+
+    def _hover_tooltip_show(self, sid) -> None:
+        """Delayed-show callback: re-validate (layer still on, same target, no
+        gesture), compose the text, and place the reused themed Toplevel near the
+        cursor. Never shows an empty tooltip."""
+        self._hover_after_id = None
+        if sid != self._hover_sid or not self._hover_any_layer_on():
+            return
+        if self._hover_gesture_active():
+            return
+        text = self._hover_compose(sid)
+        if not text:
+            return                           # no content -> no window
+        t = self.theme
+        try:
+            tip = self._hover_tip
+            if tip is None or not tip.winfo_exists():
+                tip = self._hover_tip = tk.Toplevel(self.canvas)
+                tip.wm_overrideredirect(True)
+                self._hover_tip_label = tk.Label(
+                    tip, justify="left", bg=t["panel"], fg=t["fg"],
+                    relief="solid", borderwidth=1, padx=6, pady=4,
+                    font=("Segoe UI", 9))
+                self._hover_tip_label.pack()
+            self._hover_tip_label.configure(text=text)
+            anc = self._hover_anchor or (0, 0)
+            x = self.canvas.winfo_rootx() + anc[0] + 14
+            y = self.canvas.winfo_rooty() + anc[1] + 18
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.deiconify()
+            tip.lift()
+        except Exception:
+            # A torn-down canvas / display race must never crash a hover.
+            self._hover_tip = None
+            self._hover_tip_label = None
+
+    def _hover_cancel(self) -> None:
+        """Cancel any pending delayed show and withdraw the tip (reused, not
+        destroyed -- same idiom as the sov legend / infra popover)."""
+        if self._hover_after_id is not None:
+            try:
+                self.canvas.after_cancel(self._hover_after_id)
+            except Exception:
+                pass
+            self._hover_after_id = None
+        self._hover_sid = None
+        self._hover_anchor = None
+        tip = self._hover_tip
+        if tip is not None:
+            try:
+                tip.withdraw()
+            except Exception:
+                pass
+
+    def _on_canvas_leave(self, _event) -> None:
+        """Cursor left the canvas -> dismiss the summary tooltip."""
+        self._hover_cancel()
+
+    def _infra_hover_lines(self, sid) -> list[str] | None:
+        """Infra hover-tooltip provider: per-type structure counts for the hovered
+        system, e.g. ["3× Fortizar", "1× Athanor"], sorted by count desc then
+        name, with a dim "(stale)" line when the badge is stale-flagged. Reads the
+        PRE-COMPUTED "type_counts" the host folded into the pushed badges (already
+        filter-respecting), so this file keeps zero infra logic. None when the
+        hovered system has no badge / no counts."""
+        infra = self.state.infra
+        if not infra:
+            return None
+        badge = infra.get(sid)
+        if not badge:
+            return None
+        type_counts = badge.get("type_counts") or {}
+        if not type_counts:
+            return None
+        items = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = [f"{count}× {name}" for name, count in items]
+        if badge.get("stale"):
+            lines.append("(stale)")
+        return lines
 
     def _on_right_click(self, event) -> None:
+        self._hover_cancel()                 # a click dismisses the summary tooltip
         sid = self.state.hover_hit(event.x, event.y) if self.renderer else None
         menu = (self._build_system_menu(sid) if sid is not None
                 else self._build_empty_menu())
@@ -3141,7 +3336,53 @@ class MapTab:
         if cb_infra is not None:
             menu.add_command(label="Structures here…",
                              command=lambda s=sid: cb_infra(s))
+        # Organized structure list (owner feedback round B): when the infra layer
+        # is on and the host supplies grouped structures for this system, add a
+        # "Structures (N)" cascade grouping the FILTER-SURVIVING structures by
+        # type. The host applies the SAME filters the chips use, so the menu shows
+        # exactly what the overlay shows.
+        if self._layer_on("infra") and cb_infra is not None:
+            gss = self.callbacks.get("get_system_structures")
+            groups = None
+            if gss is not None:
+                try:
+                    groups = gss(sid)
+                except Exception:
+                    groups = None
+            if groups:
+                self._add_structures_submenu(menu, sid, groups, cb_infra)
         return menu
+
+    def _add_structures_submenu(self, menu, sid, groups, cb_infra) -> None:
+        """Attach a "Structures (N)" cascade grouping ``groups`` -- a list of
+        (type_display_name, [structure_names]) already ordered by the host -- under
+        disabled "— Type —" header rows. Each structure row and the trailing
+        "Manage…" row open the infra manager at ``sid`` via ``cb_infra``. Rows are
+        capped at _STRUCT_MENU_CAP with a trailing disabled "…and N more (Manage…)"
+        row so a busy system stays navigable."""
+        total = sum(len(names) for _t, names in groups)
+        sub = self._make_menu(menu)
+        shown = 0
+        capped = False
+        for type_name, names in groups:
+            if not names:
+                continue
+            if shown >= _STRUCT_MENU_CAP:
+                capped = True
+                break
+            sub.add_command(label=f"— {type_name} —", state="disabled")
+            for nm in names:
+                if shown >= _STRUCT_MENU_CAP:
+                    capped = True
+                    break
+                sub.add_command(label=nm, command=lambda s=sid: cb_infra(s))
+                shown += 1
+        if capped:
+            sub.add_command(label=f"…and {total - shown} more (Manage…)",
+                            state="disabled")
+        sub.add_separator()
+        sub.add_command(label="Manage…", command=lambda s=sid: cb_infra(s))
+        menu.add_cascade(label=f"Structures ({total})", menu=sub)
 
     def _build_empty_menu(self) -> tk.Menu:
         """Right-click-on-empty-space menu: view + layer controls."""

@@ -5521,6 +5521,9 @@ class FCToolGUI:
             # "Manage infrastructure…" open the singleton manager dialog.
             "get_infrastructure": self._infra_get_infrastructure,
             "open_infra_manager": self._open_infra_manager,
+            # Right-click organized structure list: grouped, filter-respecting
+            # structures for a system (owner feedback round B).
+            "get_system_structures": self._infra_get_system_structures,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -5911,12 +5914,52 @@ class FCToolGUI:
             return
         try:
             import infra_overlay
+            import infra_parser
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            badges = infra_overlay.infra_badges(store.entries(), filters, now_iso)
+            # Inject the specific-type-name resolver so each badge carries a
+            # "type_counts" map ("Fortizar" -> 3, …) for the map's hover tooltip.
+            # It is metadata only -- the map's render-tuple fold ignores it, so the
+            # drawn chips are byte-identical with or without it.
+            badges = infra_overlay.infra_badges(
+                store.entries(), filters, now_iso,
+                type_name_fn=infra_parser.type_name)
         except Exception as exc:
             print(f"[INFRA] badge compute failed: {exc}")
             return
         self._post_ui(tab.set_infrastructure, badges)
+
+    def _infra_get_system_structures(self, system_id):
+        """Map right-click callback (organized "Structures (N)" submenu): the
+        FILTER-SURVIVING structures in ``system_id`` grouped by specific type name,
+        as ``list[(type_display_name, [sorted structure names])]`` ordered by count
+        desc then type name. Applies the SAME live overlay filters (_infra_filters)
+        the chip badges use -- through infra_overlay.filter_entries, the exact
+        predicate infra_badges shares -- so the menu shows precisely what the
+        overlay shows. Runs on the Tk thread (a menu build). Returns [] when the
+        store isn't built yet or nothing survives (never force-builds the store)."""
+        store = getattr(self, "_infra_store", None)
+        if store is None:
+            return []
+        filters = getattr(self, "_infra_filters", None) or {}
+        try:
+            import infra_overlay
+            import infra_parser
+            entries = store.by_system().get(system_id) or []
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            surviving = infra_overlay.filter_entries(entries, filters, now_iso)
+            groups: dict = {}
+            for e in surviving:
+                tname = infra_parser.type_name(e.get("type_id"),
+                                               e.get("structure_id"))
+                groups.setdefault(tname, []).append(e.get("name") or "")
+            for names in groups.values():
+                names.sort()
+            # Groups ordered by count desc, then type name asc (the map renders
+            # them verbatim under disabled type-header rows).
+            return sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        except Exception as exc:
+            print(f"[INFRA] structure list failed: {exc}")
+            return []
 
     def _infra_on_changed(self):
         """Manager-dialog on_changed hook: an import / scan / edit changed the
