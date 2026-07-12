@@ -37,6 +37,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Duplicated BY VALUE from the frozen §3.2 contract (single source: infra_parser.TYPE_CATEGORY); architecture rule forbids sibling imports — keep in lockstep.
+TYPE_CATEGORY = {
+    35832: "citadel", 35833: "citadel", 35834: "citadel",            # Astrahus, Fortizar, Keepstar
+    47512: "citadel", 47513: "citadel", 47514: "citadel",            # faction Fortizars
+    47515: "citadel", 47516: "citadel",
+    35825: "engineering", 35826: "engineering", 35827: "engineering",# Raitaru, Azbel, Sotiyo
+    35835: "refinery", 35836: "refinery", 81826: "refinery",         # Athanor, Tatara, Metenox
+    35841: "gate",                                                   # Ansiblex
+    35840: "flex", 37534: "flex",                                    # Pharolux, Tenebrex
+}
+
+
+def categorize(type_id: int | None, structure_id: int | None) -> str:
+    if structure_id is not None and structure_id < 1_000_000_000:
+        return "npc"                       # NPC stations: ids ~6.0e7 (fixture-proven)
+    return TYPE_CATEGORY.get(type_id or 0, "unknown")
+
+
 class InfraScanner:
     PACE_SECONDS = 0.35          # bulk pacing between ESI calls (~3/s; bucket is 15/s)
     ERROR_FLOOR = 20             # pause when X-ESI-Error-Limit-Remain < this
@@ -138,6 +156,7 @@ class InfraScanner:
                     # Already resolved elsewhere: a light "seen" row bumps
                     # last_seen without spending an ESI call or error budget.
                     rows.append({"structure_id": sid, "type_id": None,
+                                 "category": categorize(None, sid),
                                  "system_id": sys_id, "system_name": sys_name,
                                  "status": "alive"})
                     continue
@@ -233,8 +252,11 @@ class InfraScanner:
     @staticmethod
     def _stub(sid, sys_id, sys_name):
         """A 403/unreachable structure: recorded with the system context from the
-        queue (known even when resolve fails) so it still places on the map."""
-        return {"structure_id": sid, "type_id": None, "system_id": sys_id,
+        queue (known even when resolve fails) so it still places on the map. With
+        no type_id, categorize() reads only the id: "npc" for an NPC-range id,
+        else "unknown" — never a wrong guess for a player structure."""
+        return {"structure_id": sid, "type_id": None,
+                "category": categorize(None, sid), "system_id": sys_id,
                 "system_name": sys_name, "status": "unresolved"}
 
     @staticmethod
@@ -244,9 +266,11 @@ class InfraScanner:
         if isinstance(pos, dict) and all(k in pos for k in ("x", "y", "z")):
             position = [pos["x"], pos["y"], pos["z"]]
         ssid = info.get("solar_system_id")
+        type_id = info.get("type_id")
         return {
             "structure_id": sid,
-            "type_id": info.get("type_id"),
+            "type_id": type_id,
+            "category": categorize(type_id, sid),
             "name": info.get("name", ""),
             "system_id": ssid if isinstance(ssid, int) else sys_id,
             "system_name": sys_name,
