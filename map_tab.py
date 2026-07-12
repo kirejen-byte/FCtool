@@ -93,6 +93,19 @@ CONSERVATION_HOLD_MS = 8000.0       # hold conservation this long past a stall (
 # continuously through a bad patch.
 STALL_MS = 100.0
 STALL_WS_KB = 150
+# Task 27: an always-on main-loop stall SENTINEL closes the gap that _m4_note_apply
+# (which samples ONLY inside the two _apply_* paths) leaves open during a SUSTAINED
+# pan. Measured (tools/spike sustained_pan): ~1/3-1/2 of the ~2 s-cadence working-set
+# freezes land on _on_drag_move / overlay redraw -- OUTSIDE any apply -- so the apply-
+# path detector never sees them and conservation never arms for the freeze. This is a
+# self-rescheduling frame.after() heartbeat on the MAIN thread (started with the tick
+# when shown, cancelled on hide): it measures its OWN scheduling delay, and when a beat
+# lands late by more than STALL_MS *and* this process's working set grew past
+# STALL_WS_KB over the beat it arms the SAME conservation window M4 does (idempotent --
+# arming only extends _conserve_until_ms). One 10 Hz timer whose only per-beat cost is
+# the ~1.4 us GetProcessMemoryInfo probe (negligible idle cost); wedge-proof (a probe
+# failure -> _proc_mem None -> the beat never arms and keeps rescheduling).
+STALL_SENTINEL_MS = 100.0
 
 
 # --- process working-set / page-fault correlate (Task 25, telemetry only) ----
@@ -387,6 +400,11 @@ class MapTelemetry:
         # hit) -> A2 hover-cost profile + events/sec (bucketed in analysis).
         self.applies: deque = deque(maxlen=maxlen)
         self.hover: deque = deque(maxlen=maxlen)
+        # Task 27: one row per main-loop stall-sentinel beat -- (t, observed_delay_ms,
+        # ws_delta_kb|None, armed) -- so the harness can see whether the sentinel
+        # caught the stalls the apply-path M4 detector missed (recorded only when
+        # telemetry is on; the sentinel's ARMING is telemetry-independent).
+        self.sentinel: deque = deque(maxlen=maxlen)
         self.marks: list = []
         self._last_swap: float | None = None
 
@@ -407,6 +425,10 @@ class MapTelemetry:
 
     def hover_rec(self, hit_ms: float, draw_ms: float, hit: bool) -> None:
         self.hover.append((self._ms(), hit_ms, draw_ms, hit))
+
+    def sentinel_rec(self, t_ms: float, observed_ms: float,
+                     ws_delta_kb: int | None, armed: bool) -> None:
+        self.sentinel.append((t_ms, observed_ms, ws_delta_kb, armed))
 
     def swap(self) -> None:
         """Record a _photo swap; append the gap (ms) since the previous swap."""
@@ -470,6 +492,7 @@ class MapTelemetry:
             "stages": {k: list(v) for k, v in self.stages.items()},
             "applies": list(self.applies),
             "hover": list(self.hover),
+            "sentinel": list(self.sentinel),
         }
         try:
             d = os.path.dirname(path)
@@ -620,6 +643,17 @@ class MapTab:
         self._healthy_interval_ms = GESTURE_MIN_INTERVAL_MS
         self._conserve_until_ms = 0.0
         self._m4_ws_last: int | None = None
+        # --- Task 27 main-loop stall sentinel -----------------------------------
+        # A wall-clock frame.after() heartbeat (started with the tick on show,
+        # cancelled on hide) that arms the SAME conservation window M4 does when a
+        # stall lands OUTSIDE the apply paths (sustained pan). _stall_sentinel_last_ms
+        # is the monotonic-ms stamp of the last beat's schedule (for the observed-delay
+        # measurement); _stall_sentinel_ws_last is the previous beat's working-set KB
+        # (per-beat growth delta; None re-establishes the baseline after a show).
+        self._stall_sentinel_after_id: str | None = None
+        self._stall_sentinel_scheduled = False
+        self._stall_sentinel_last_ms: float | None = None
+        self._stall_sentinel_ws_last: int | None = None
         # Telemetry correlate state (only written on the telemetry-on apply path).
         self._tele_ws_last: int | None = None    # last working-set KB (for delta)
         self._tele_pf_last: int | None = None     # last page-fault count (for delta)
@@ -700,6 +734,7 @@ class MapTab:
         self.state.force_dirty()
         self._request_crisp()
         self._schedule_tick()
+        self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
 
     def on_hidden(self) -> None:
         if self.renderer is None:
@@ -737,6 +772,17 @@ class MapTab:
                 pass
             self._tick_after_id = None
         self._tick_scheduled = False
+        # Cancel the stall sentinel too (Task 27) and drop its baselines so the next
+        # show re-establishes them cleanly (no bogus ws delta across the hidden gap).
+        if self._stall_sentinel_after_id is not None:
+            try:
+                self.frame.after_cancel(self._stall_sentinel_after_id)
+            except Exception:
+                pass
+            self._stall_sentinel_after_id = None
+        self._stall_sentinel_scheduled = False
+        self._stall_sentinel_last_ms = None
+        self._stall_sentinel_ws_last = None
 
     # ---- overlay layers (Phase D) ----------------------------------------------
     # Two strata: range/threat re-tint the base bitmap (settle re-render via
@@ -1286,6 +1332,72 @@ class MapTab:
             # Keep the after() id so on_hidden can cancel a pending tick (Task 22).
             self._tick_after_id = self.frame.after(TICK_MS, self._tick)
 
+    # ---- main-loop stall sentinel (Task 27) ----------------------------------
+    def _schedule_stall_sentinel(self) -> None:
+        """Arm the next stall-sentinel beat. Mirrors _schedule_tick: admits exactly one
+        pending beat, only while visible, and stamps the schedule time so the beat can
+        measure its own scheduling delay. Cancelled (and its baselines dropped) on hide,
+        so a hidden tab spends nothing here."""
+        if not self._stall_sentinel_scheduled and self._visible:
+            self._stall_sentinel_scheduled = True
+            self._stall_sentinel_last_ms = _now_ms()
+            try:
+                self._stall_sentinel_after_id = self.frame.after(
+                    int(STALL_SENTINEL_MS), self._stall_sentinel_beat)
+            except Exception:
+                self._stall_sentinel_scheduled = False
+
+    def _stall_sentinel_beat(self) -> None:
+        """One heartbeat of the main-loop stall sentinel (Task 27). Measures how late
+        this beat fired versus its scheduled STALL_SENTINEL_MS interval -- a delay that
+        captures a stall landing on ANY main-thread op (the _on_drag_move / overlay
+        redraw a sustained pan spends most of its time in, which the apply-sampled M4
+        detector never sees) -- then delegates the arm decision to the pure
+        _stall_sentinel_note and reschedules. The hidden early-return stops the loop on
+        hide exactly like _tick."""
+        self._stall_sentinel_scheduled = False
+        if not self._visible:
+            return
+        now = _now_ms()
+        last = self._stall_sentinel_last_ms
+        observed = (now - last) if last is not None else float(STALL_SENTINEL_MS)
+        ws_delta, armed = self._stall_sentinel_note(observed, now)
+        tele = self._tele
+        if tele is not None:
+            try:
+                tele.sentinel_rec(tele._ms(), observed, ws_delta, armed)
+            except Exception:
+                pass
+        self._schedule_stall_sentinel()
+
+    def _stall_sentinel_note(self, observed_ms: float, now_ms: float) -> tuple:
+        """Pure stall-sentinel decision, split from the Tk timer so it is unit-testable
+        (mirrors _m4_note_apply). Samples this process's working set and arms the SAME
+        conservation window M4 does iff the beat landed late by more than STALL_MS on
+        top of its interval AND the working set grew past STALL_WS_KB since the previous
+        beat. Arming only assigns _conserve_until_ms = now + CONSERVATION_HOLD_MS, which
+        is idempotent with M4's arm (monotonic now -> a later arm from either source
+        only ever rolls the window forward, never shrinks it -- no double-arm guard
+        needed). Returns (ws_delta_kb|None, armed) for telemetry. Wedge-proof: a
+        _proc_mem probe that is unavailable (None) or throws yields (…, False), never
+        arms, never raises into the main loop."""
+        ws_delta = None
+        try:
+            ws_kb, _pf = _proc_mem()
+            if ws_kb is None:
+                return (None, False)             # probe unavailable -> sentinel idle
+            last = self._stall_sentinel_ws_last
+            self._stall_sentinel_ws_last = ws_kb
+            if last is None:
+                return (None, False)             # first beat: establish the baseline only
+            ws_delta = ws_kb - last
+            if (observed_ms - STALL_SENTINEL_MS) > STALL_MS and ws_delta > STALL_WS_KB:
+                self._conserve_until_ms = now_ms + CONSERVATION_HOLD_MS
+                return (ws_delta, True)
+        except Exception:
+            return (ws_delta, False)             # must never break the main loop
+        return (ws_delta, False)
+
     def _tick(self) -> None:
         self._tick_scheduled = False
         if not self._visible:
@@ -1402,10 +1514,17 @@ class MapTab:
         # async quick frame swaps in real margin content (Task 17) realigned to the
         # live camera by _apply_gesture_frame -- for a pure pan the realign offset
         # EQUALS the accumulated live-pan slide, so the swap is position-continuous
-        # (no black edge within +/-MARGIN). Gate on the 33 ms throttle AND the
-        # in-flight flag so a fast drag never piles requests.
+        # (no black edge within +/-MARGIN). Gate on the EFFECTIVE gesture interval AND
+        # the in-flight flag so a fast drag never piles requests. Task 27: read
+        # _effective_gesture_interval (not a hardcoded 33 ms) so a SUSTAINED pan honours
+        # conservation -- a healthy box keeps ~30 fps pan frames, but while a stall
+        # window is armed (by M4 or the new main-loop sentinel) the pan drops to the
+        # ~12 fps conservation floor exactly like a zoom glide. Without this the pan
+        # kept requesting at full rate even while conservation was armed (measured:
+        # apply-gap held ~47 ms / ~21 fps while 71% of applies were flagged conserve).
         now = _now_ms()
-        if not self._gesture_inflight and now - self._last_drag_qf >= 33.0:
+        if (not self._gesture_inflight
+                and now - self._last_drag_qf >= self._effective_gesture_interval(now)):
             self._last_drag_qf = now
             self._request_gesture_frame()
         self._redraw_overlays()             # keep overlays glued to the live camera
