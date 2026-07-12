@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import pygame
 import pygame.gfxdraw as gfx
 
+import map_overlays as mo   # pure sov_color hash for the sovereignty tint (Task 33)
+
 # --- palette (POC v2 / Spike A approved) -----------------------------------
 BG = (10, 10, 20)
 SEC_HI = (0x33, 0xB5, 0xE5)
@@ -29,6 +31,15 @@ BRIDGE_BLUE = (0x3A, 0x86, 0xFF)
 # radius scaled by the 0..1 heat intensity, drawn UNDER the node glows (like the
 # bridge lines) so the system cores stay readable on top of the heat.
 HEAT_COLOR = (0xFF, 0x5A, 0x2E)
+
+# Sovereignty tint (Task 33): a dim per-alliance blob washed BEHIND everything
+# else. FIXED radius (not zoom-scaled) so the SpriteFactory cache stays bounded
+# by the alliance COUNT (color) alone, not color x radius -- and it is
+# comfortably larger than the node glows (node_metrics caps glow at 18 px) so
+# adjacent same-alliance systems merge into one regional wash instead of reading
+# as separate dots. The color is dim (map_overlays._SOV_VAL) so additive stacking
+# of neighbor blobs can't wash the map to white.
+SOV_RADIUS = 34
 
 # Nebula additive-glow brightness (fraction of the region tint). Lowered
 # 0.16 -> 0.11 at the Phase B checkpoint so dense-region blobs stop fusing
@@ -308,7 +319,8 @@ class Renderer:
                mode: str = "full", band: str | None = None,
                tint: TintSpec | None = None,
                bridges: tuple | None = None,
-               heat: tuple | None = None) -> pygame.Surface:
+               heat: tuple | None = None,
+               sov: tuple | None = None) -> pygame.Surface:
         surf = pygame.Surface((vw, vh))
         surf.fill(BG)
 
@@ -331,6 +343,13 @@ class Renderer:
             wx, wy = node_xy[sid]
             pos[sid] = ((wx - cx) * scale + hw, (wy - cy) * scale + hh)
         vis_set = set(visible)
+
+        # Sovereignty tint (Task 33): the DEEPEST overlay wash -- drawn before
+        # edges / bridges / heat / nodes so the whole glowing map sits on top of
+        # it. Same truthiness gate as bridges/heat: sov=None/() runs the
+        # pre-change path exactly, keeping frames byte-identical (determinism).
+        if sov:
+            self._draw_sov(surf, cam, pos, vis_set, vw, vh, sov)
 
         if mode == "degraded":
             self._draw_edges_degraded(surf, cam, vw, vh, pos, vis_set)
@@ -442,6 +461,43 @@ class Renderer:
             draw_line(surf, wide, pa, pb, 4)
             draw_line(surf, mid, pa, pb, 2)
             draw_aaline(surf, bright, pa, pb)
+
+    def _draw_sov(self, surf, cam, pos, vis_set, vw, vh, sov):
+        """Sovereignty tint under-wash (Task 33). `sov` is an iterable of
+        ``(system_id, alliance_id)`` pairs (the canonical request tuple). Each
+        sov'd system gets ONE dim additive blob in its alliance's hashed color
+        (map_overlays.sov_color) at the FIXED ``SOV_RADIUS`` -- comfortably larger
+        than the node glows -- so adjacent same-alliance systems merge into a soft
+        regional wash. Drawn FIRST (under heat / bridges / nodes) so the glowing
+        node cores stay readable on top. Endpoints reuse the cached projection
+        when visible and re-project otherwise; off-surface systems are culled.
+        Sprites cache by (color, radius) in the shared SpriteFactory, and radius
+        is FIXED, so the cache is bounded by the alliance count; a per-frame memo
+        avoids re-hashing a color when a whole null bloc shares one alliance.
+        Byte-behaviour matches heat/bridges: the caller gates on truthiness, so
+        sov=None/() never calls this."""
+        systems = self.model.systems
+        get = pos.get
+        glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
+        sov_color = mo.sov_color
+        color_memo: dict[int, tuple[int, int, int]] = {}
+        for sid, aid in sov:
+            s = systems.get(sid)
+            if s is None:
+                continue
+            p = get(sid)
+            if p is None:
+                p = cam.world_to_screen(s.x, s.y, vw, vh)
+            sx, sy = p
+            if (sx < -SOV_RADIUS or sy < -SOV_RADIUS
+                    or sx > vw + SOV_RADIUS or sy > vh + SOV_RADIUS):
+                continue
+            color = color_memo.get(aid)
+            if color is None:
+                color = color_memo[aid] = sov_color(aid)
+            g = glow(color, SOV_RADIUS)
+            blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
+                 special_flags=add)
 
     def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
         """Kill-heat under-glow (Task 30). `heat` is an iterable of

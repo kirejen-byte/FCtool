@@ -100,6 +100,21 @@ INTEL_STRUCT_MS = 1000.0     # cull + reproject cadence (structure changes only)
 INTEL_CLICK_SLOP2 = 25       # (5 px)^2: press/release within this = a click, not a pan
 _TWO_PI = 2.0 * math.pi
 
+# Sovereignty tint layer (Task 33). ESI /sovereignty/map/ (public, cached long)
+# gives per-system sovereign alliance; a dim hashed tint per alliance washes the
+# map behind the nodes (map_render._draw_sov / map_overlays.sov_color). OFF by
+# default -- the palette-noise call is the owner's, so ZERO network until enabled.
+# While the layer is on the data is refreshed at most once per SOV_REFRESH_S via a
+# ONE-SHOT daemon thread (not a persistent loop): it fetches, posts to the result
+# queue, and dies -- nothing to join on hide.
+SOV_REFRESH_S = 3600.0
+
+# Layers whose _layer_on() default is FALSE when cfg omits the key (everything
+# else defaults True). Sov is off-by-default AND, unlike range (always gated by a
+# live overlay object), _layer_on("sov") directly controls both the fetch and the
+# render -- so an absent key must read False, not the blanket True.
+_LAYERS_OFF_BY_DEFAULT = frozenset({"sov"})
+
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
 # spike. The freeze is a periodic Windows working-set-growth stall: under the
@@ -249,8 +264,13 @@ def _default_route_fn(origin_id: int, dest_id: int, connections=None):
 
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint + bridges + heat (NOT generation -- that is a
+    size + bloom + mode + tint + bridges + heat + sov (NOT generation -- that is a
     staleness token, and duplicates by definition carry different generations).
+
+    sov participates exactly like heat/bridges: the canonical sov tuple (or None
+    when the layer is off / no data) compares by value, so a sov toggle or a fresh
+    sov fetch is never suppressed as a duplicate, while a settle on an unchanged
+    view+sov still is.
     Used by the worker to suppress a settle re-render that duplicates the crisp
     frame already applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
 
@@ -275,7 +295,7 @@ def _request_sig(req: dict) -> tuple:
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
             bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
-            req.get("heat"))
+            req.get("heat"), req.get("sov"))
 
 
 class MapTabState:
@@ -331,6 +351,15 @@ class MapTabState:
         # (fc_gui marshals the intel stream through _post_ui before the push), read
         # via active() by MapTab to draw the amber pulse rings. Pure decay model.
         self.intel_pulses = mo.IntelPulses()
+        # --- sovereignty tint layer (Task 33) ---
+        # sov_map: {system_id: alliance_id} from ESI /sovereignty/map/, applied on
+        # the MAIN thread from the result queue (canonical_sov -> the render request
+        # tuple the base bitmap draws). sov_names: {alliance_id: name} for the
+        # legend + right-click info row, bulk-resolved via /universe/names/. Both
+        # stay empty until the layer is first enabled (OFF by default -> zero
+        # network until then).
+        self.sov_map: dict[int, int] = {}
+        self.sov_names: dict[int, str] = {}
 
     def tint_spec(self):
         import map_render as _mr
@@ -641,7 +670,8 @@ class MapTab:
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
-                 telemetry: bool = False, route_fn=None, ambient_fetch=None) -> None:
+                 telemetry: bool = False, route_fn=None, ambient_fetch=None,
+                 sov_fetch=None, names_fetch=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -654,6 +684,11 @@ class MapTab:
         # /universe/system_kills/ pull. Tests inject a stub so the ambient loop's
         # lifecycle can be exercised without any network.
         self._ambient_fetch = ambient_fetch or self._fetch_ambient_heat
+        # Injectable ESI sov fetchers (Task 33); default to the real /sovereignty/
+        # map/ pull + /universe/names/ bulk resolve. Tests inject stubs so the
+        # one-shot fetch lifecycle runs with no network.
+        self._sov_fetch = sov_fetch or self._fetch_sov_map
+        self._names_fetch = names_fetch or self._fetch_alliance_names
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -721,6 +756,10 @@ class MapTab:
             # Intel pulse layer (Task 31): ON by default -- tracked-channel system
             # mentions pulse amber and fade over ~5 min.
             "intel": tk.BooleanVar(value=bool(_layers.get("intel", True))),
+            # Sovereignty tint layer (Task 33): OFF by default (owner's palette-
+            # noise call) -- so the var default is False, matching _layer_on's
+            # off-by-default handling and keeping the fetch dormant until enabled.
+            "sov": tk.BooleanVar(value=bool(_layers.get("sov", False))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
@@ -731,12 +770,24 @@ class MapTab:
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
-                            ("intel", "Intel")):
+                            ("intel", "Intel"), ("sov", "Sov")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
                                  command=lambda k=_key: self._on_layer_toggle(k))
             _cb.pack(side="left", padx=4)
+            if _key == "sov":
+                # Legend affordance (Task 33): a small "▾" microbutton right after
+                # the Sov toggle, ENABLED only while the layer is on. Opens the
+                # per-alliance color/name/count legend popup.
+                self._sov_legend_btn = tk.Button(
+                    bar, text="▾", command=self._show_sov_legend,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2",
+                    state=("normal" if bool(_layers.get("sov", False))
+                           else "disabled"))
+                self._sov_legend_btn.pack(side="left", padx=(0, 4))
             if _key == "route":
                 # Owner note (Task 35): purely in-game-set destinations can't be
                 # shown -- ESI exposes no autopilot-route READ endpoint (verified
@@ -871,6 +922,19 @@ class MapTab:
         self._ambient_stop = threading.Event()
         self._last_heat_refresh_ms = 0.0
 
+        # --- sovereignty tint layer lazy fetch (Task 33) ------------------------
+        # OFF by default -> ZERO network until enabled. When the layer is toggled
+        # on (or is on at show time) and the data is stale, a ONE-SHOT daemon
+        # thread ("map-sov") fetches /sovereignty/map/ + resolves alliance names,
+        # posts the results onto the result queue, and DIES (not a persistent loop
+        # -> nothing to join on hide). _sov_inflight guards against a double-spawn
+        # (set on the main thread before the spawn, cleared on the main thread when
+        # the result drains); _sov_fetched_ms is the last successful-fetch stamp
+        # for the hourly freshness gate. _sov_legend holds the open legend popup.
+        self._sov_inflight = False
+        self._sov_fetched_ms = 0.0
+        self._sov_legend = None
+
         # --- intel pulse layer (Task 31) -----------------------------------------
         # _intel_items maps system_id -> the canvas ring item drawn for it (rebuilt
         # by _redraw_overlays, in lockstep with the ov_intel tag deletes);
@@ -960,6 +1024,10 @@ class MapTab:
         self._schedule_tick()
         self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
         self._start_ambient_loop()               # Task 30: hourly ESI ambient heat
+        # Task 33: fetch the sov map ONLY if the layer is on at show time (OFF by
+        # default -> no-op -> zero network). The one-shot thread dies after one
+        # fetch; an in-flight fetch across a hide/show is not double-spawned.
+        self._maybe_start_sov_fetch()
 
     def on_hidden(self) -> None:
         if self.renderer is None:
@@ -991,6 +1059,11 @@ class MapTab:
         # a hidden tab must not keep an hourly fetch daemon alive. on_shown
         # restarts it; kill_heat/ambient_heat state survives on the state object.
         self.shutdown_ambient_loop()
+        # Task 33: dismiss any open sov legend popup (the one-shot sov FETCH thread
+        # is not a loop -> nothing to stop; sov_map/sov_names survive on state, and
+        # an in-flight fetch's _sov_inflight flag is intentionally left set so a
+        # re-show does not double-spawn -- the daemon posts its result either way).
+        self._hide_sov_legend()
         # Cancel the pending _tick after() so it cannot fire against a torn-down
         # root ("invalid command name ..._tick" Tcl stderr noise) and reset the
         # flag so on_shown can schedule a fresh tick.
@@ -1417,6 +1490,208 @@ class MapTab:
             print(f"[MAP] intel click callback failed: {exc}")
         return True
 
+    # ---- sovereignty tint layer (Task 33) -------------------------------------
+    def _sov_request_value(self):
+        """Canonical hashable sov tuple for the render request + sig, or None when
+        the sov layer is off OR there is no sov data -- both collapse to None so a
+        sov-off (or on-but-empty) frame is byte-identical to the pre-sov output and
+        its sig matches, keeping duplicate suppression sound."""
+        if not self._layer_on("sov"):
+            return None
+        return mo.canonical_sov(self.state.sov_map) or None
+
+    def _maybe_start_sov_fetch(self, now_ms: float | None = None) -> None:
+        """Spawn the ONE-SHOT sov fetch thread iff the layer is on, no fetch is in
+        flight, and the data is stale (older than SOV_REFRESH_S). OFF by default ->
+        never spawns until the owner enables the layer (zero network). Idempotent:
+        the in-flight flag blocks a double-spawn (a hide/show while a fetch runs, or
+        the per-tick gate racing a toggle), and the freshness gate blocks an
+        immediate re-fetch on a toggle within the hour. The thread dies after one
+        fetch -- no loop, nothing to join on hide. Cheap-gate-first so the per-tick
+        call costs a dict-get + bool when the layer is off."""
+        if not self._layer_on("sov"):
+            return
+        if self._sov_inflight:
+            return
+        now = _now_ms() if now_ms is None else now_ms
+        # Throttle EVERY attempt (success, failure OR empty result) to at most one
+        # per SOV_REFRESH_S by stamping the attempt time at SPAWN, not only on
+        # success: a failed/empty fetch leaves sov_map empty, so a success-only
+        # stamp gated on sov_map would leave the gate permanently open and
+        # retry-STORM the endpoint every tick. _sov_fetched_ms == 0 is the
+        # never-fetched sentinel, so the first enable always fetches.
+        if self._sov_fetched_ms > 0.0 and \
+                (now - self._sov_fetched_ms) < SOV_REFRESH_S * 1000.0:
+            return                               # attempted recently -> no re-fetch
+        self._sov_fetched_ms = now               # stamp the ATTEMPT (storm guard)
+        self._sov_inflight = True
+        threading.Thread(target=self._sov_fetch_worker, daemon=True,
+                         name="map-sov").start()
+
+    def _sov_fetch_worker(self) -> None:
+        """One-shot daemon body (Task 33): fetch the sov map, then bulk-resolve the
+        distinct alliance names, posting each result onto the MAIN-thread result
+        queue. Touches NO Tk. ALWAYS posts a ('sov', payload|None) message so the
+        main thread clears the in-flight flag on every outcome (a None payload =
+        failed/empty fetch -> flag cleared, sov_map + freshness stamp left untouched
+        so the next enable retries). A successful map ALSO triggers a best-effort
+        name resolve posted as ('sov_names', ...); a name failure still leaves the
+        tint applied with raw-id legend entries (silent degrade). Exits after one
+        pass -- there is no loop to leak."""
+        try:
+            mapping = self._sov_fetch()
+        except Exception as exc:                 # never let the one-shot die noisily
+            print(f"[MAP] sov fetch failed: {exc}")
+            mapping = None
+        if not mapping:
+            self._result_q.put(("sov", None))    # failure -> clear in-flight, keep stale
+            return
+        self._result_q.put(("sov", tuple(sorted(mapping.items()))))
+        try:
+            ids = sorted(set(mapping.values()))
+            names = self._names_fetch(ids) if ids else {}
+        except Exception as exc:
+            print(f"[MAP] sov name resolve failed: {exc}")
+            names = None
+        if names:
+            self._result_q.put(("sov_names", tuple(sorted(names.items()))))
+
+    def _apply_sov(self, pairs) -> None:
+        """Apply a worker-fetched sov map on the MAIN thread (drained from the result
+        queue). ALWAYS clears the in-flight flag so a later refresh can spawn again.
+        A None payload is a failed/empty fetch: clear the flag and leave sov_map
+        untouched (map stays untinted); the SPAWN-time freshness stamp
+        (_maybe_start_sov_fetch) throttles the next attempt to the hourly gate --
+        silent degrade, no retry storm. A real payload replaces sov_map, re-stamps
+        the fetch time (refreshing the hourly gate) and -- when the layer is on --
+        force-dirties + re-requests a crisp so the tint appears, plus a redraw so
+        the right-click info row reflects it."""
+        self._sov_inflight = False
+        if pairs is None:
+            return
+        self.state.sov_map = {int(sid): int(aid) for sid, aid in pairs}
+        self._sov_fetched_ms = _now_ms()
+        if self._layer_on("sov"):
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
+    def _apply_sov_names(self, pairs) -> None:
+        """Apply worker-resolved alliance names on the MAIN thread (legend data).
+        Does NOT trigger a re-render -- names only enrich the legend popup and the
+        right-click info row, which read state.sov_names lazily when opened."""
+        self.state.sov_names = {int(aid): str(name) for aid, name in pairs}
+
+    def _fetch_sov_map(self):
+        """Fetch ESI /sovereignty/map/ (public, no auth, long-cached) ->
+        {system_id: alliance_id}, or None on any failure (silent-degrade -> the map
+        stays untinted). Uses the repo rate limiter + ESI_HEADERS. Runs ONLY on the
+        one-shot sov thread."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS
+            from rate_limiter import rate_limit
+            rate_limit("esi")
+            resp = requests.get(f"{ESI_BASE}/sovereignty/map/",
+                                timeout=10, headers=ESI_HEADERS)
+            if not resp.ok:
+                return None
+            return mo.parse_sov_map(resp.json())
+        except Exception as exc:
+            print(f"[MAP] sov map fetch failed: {exc}")
+            return None
+
+    def _fetch_alliance_names(self, alliance_ids):
+        """Bulk-resolve alliance ids -> {id: name} via POST ESI /universe/names/
+        (public, <=1000 ids/call, JSON body = list of ids), or None on failure (the
+        legend then falls back to raw ids). Keeps only 'alliance'-category rows.
+        Chunks defensively at 1000 though EVE has far fewer alliances. Runs ONLY on
+        the one-shot sov thread."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS_JSON
+            from rate_limiter import rate_limit
+            out: dict[int, str] = {}
+            ids = [int(a) for a in alliance_ids]
+            for i in range(0, len(ids), 1000):
+                chunk = ids[i:i + 1000]
+                if not chunk:
+                    continue
+                rate_limit("esi")
+                resp = requests.post(f"{ESI_BASE}/universe/names/",
+                                     json=chunk, timeout=10,
+                                     headers=ESI_HEADERS_JSON)
+                if not resp.ok:
+                    return None
+                for row in resp.json() or ():
+                    if row.get("category") == "alliance":
+                        out[int(row["id"])] = row.get("name") or str(row["id"])
+            return out
+        except Exception as exc:
+            print(f"[MAP] alliance name resolve failed: {exc}")
+            return None
+
+    # ---- sov legend popup (Task 33) -------------------------------------------
+    def _sync_sov_legend_btn(self) -> None:
+        """Enable the Sov legend "▾" microbutton only while the sov layer is on."""
+        btn = getattr(self, "_sov_legend_btn", None)
+        if btn is not None:
+            try:
+                btn.configure(state=("normal" if self._layer_on("sov")
+                                     else "disabled"))
+            except tk.TclError:
+                pass
+
+    def _show_sov_legend(self) -> None:
+        """Popup a compact themed legend of the top sov alliances (color swatch +
+        name + tinted-system count), anchored under the "▾" microbutton. Dismisses
+        on click-away (focus-out) or Escape. Rebuilt fresh each open from the live
+        sov map + resolved names (raw id when a name is unresolved). Matches the
+        _make_menu dark idiom -- a 1px border-color frame around a panel-bg body."""
+        self._hide_sov_legend()
+        t = self.theme
+        rows = mo.sov_legend_rows(self.state.sov_map, self.state.sov_names)
+        try:
+            anchor = getattr(self, "_sov_legend_btn", None) or self.frame
+            x = anchor.winfo_rootx()
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+            top = self._sov_legend = tk.Toplevel(anchor)
+            top.wm_overrideredirect(True)
+            top.wm_geometry(f"+{x}+{y}")
+            top.configure(bg=t["border"])                # 1px themed border
+            inner = tk.Frame(top, bg=t["panel"])
+            inner.pack(padx=1, pady=1, fill="both")
+            tk.Label(inner, text="Sovereignty", bg=t["panel"], fg=t["accent"],
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8,
+                                                         pady=(6, 2))
+            if not rows:
+                tk.Label(inner, text="No sovereignty data yet.", bg=t["panel"],
+                         fg=t["fg"], font=("Segoe UI", 8)).pack(anchor="w", padx=8,
+                                                                pady=(0, 6))
+            for _aid, label, cnt, rgb in rows:
+                r = tk.Frame(inner, bg=t["panel"])
+                r.pack(fill="x", padx=8, pady=1)
+                sw = tk.Frame(r, bg="#%02x%02x%02x" % rgb, width=12, height=12)
+                sw.pack_propagate(False)
+                sw.pack(side="left", padx=(0, 6))
+                tk.Label(r, text=f"{label}  ({cnt})", bg=t["panel"], fg=t["fg"],
+                         font=("Segoe UI", 8), anchor="w").pack(side="left")
+            tk.Frame(inner, bg=t["panel"], height=4).pack()
+            top.bind("<Escape>", lambda _e: self._hide_sov_legend())
+            top.bind("<FocusOut>", lambda _e: self._hide_sov_legend())
+            top.focus_set()
+        except Exception:
+            self._sov_legend = None
+
+    def _hide_sov_legend(self) -> None:
+        top = getattr(self, "_sov_legend", None)
+        if top is not None:
+            try:
+                top.destroy()
+            except Exception:
+                pass
+            self._sov_legend = None
+
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
         """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
@@ -1451,7 +1726,10 @@ class MapTab:
             self._tooltip = None
 
     def _layer_on(self, key: str) -> bool:
-        return bool(self.cfg.get("layers", {}).get(key, True))
+        # Most layers default ON when cfg omits the key; sov (and any future
+        # off-by-default layer) defaults OFF -- see _LAYERS_OFF_BY_DEFAULT.
+        default = key not in _LAYERS_OFF_BY_DEFAULT
+        return bool(self.cfg.get("layers", {}).get(key, default))
 
     def _draw_diamond(self, sx: float, sy: float, r: float,
                       color: str, tag: str) -> None:
@@ -1729,7 +2007,8 @@ class MapTab:
                                     bloom=req["bloom"], mode=mode,
                                     tint=req.get("tint"),
                                     bridges=req.get("bridges"),
-                                    heat=req.get("heat"))
+                                    heat=req.get("heat"),
+                                    sov=req.get("sov"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -1950,6 +2229,9 @@ class MapTab:
             # Canonical rounded heat tuple, or None when the layer is off / no
             # activity (byte-identical to pre-heat output). Joins _request_sig.
             "heat": self._heat_request_value(),
+            # Canonical sov tuple, or None when the layer is off / no data
+            # (byte-identical to pre-sov output). Joins _request_sig.
+            "sov": self._sov_request_value(),
         })
 
     def _request_gesture_frame(self) -> None:
@@ -2153,6 +2435,11 @@ class MapTab:
         # changes batched to ~1 s. Runs regardless of verdict -- pulses breathe
         # whether or not the camera is moving.
         self._animate_intel_pulses(_now_ms())
+        # (Task 33) sov hourly re-fetch gate: fully guarded + cheap (layer-off /
+        # in-flight / freshness checks short-circuit before any work), so calling it
+        # each tick costs a dict-get + bool when the layer is off -- and spawns the
+        # one-shot fetch at most once per SOV_REFRESH_S while the layer is on.
+        self._maybe_start_sov_fetch()
         if _c:
             _k3 = _c()
             phase = ("anim" if verdict == "anim"
@@ -2165,20 +2452,22 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam), ('threat', frozenset), ('route', tuple) and ('ambient', tuple).
-        Frames (crisp OR
+        ms, cam), ('threat', frozenset), ('route', tuple), ('ambient', tuple),
+        ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
         generation and any earlier one it superseded would be dropped by the
         is_current check in the apply anyway (a queued crisp thus correctly
-        supersedes older gesture frames -- it also carries a newer cache). Threat
-        and route results are kept in SEPARATE slots so neither is dropped by frame
-        coalescing (nor a frame misread as one). Dispatch by tag: crisp and gesture
-        take different apply paths (sig vs base-image realignment)."""
+        supersedes older gesture frames -- it also carries a newer cache). Threat,
+        route, ambient and sov results are kept in SEPARATE slots so none is dropped
+        by frame coalescing (nor a frame misread as one). Dispatch by tag: crisp and
+        gesture take different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
         latest_route = None
         latest_ambient = None
+        latest_sov = None
+        latest_sov_names = None
         try:
             while True:
                 item = self._result_q.get_nowait()
@@ -2188,6 +2477,10 @@ class MapTab:
                     latest_route = item
                 elif item[0] == "ambient":
                     latest_ambient = item        # Task 30: hourly ESI ambient heat
+                elif item[0] == "sov":
+                    latest_sov = item            # Task 33: sov map (one-shot fetch)
+                elif item[0] == "sov_names":
+                    latest_sov_names = item       # Task 33: alliance-name legend data
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -2203,6 +2496,13 @@ class MapTab:
             self._apply_route(latest_route[1])
         if latest_ambient is not None:
             self._apply_ambient(latest_ambient[1])
+        # sov names BEFORE sov so a same-drain names+map pair leaves the legend
+        # populated when the sov-triggered redraw runs (order is belt-and-suspenders
+        # -- the legend reads state lazily on open regardless).
+        if latest_sov_names is not None:
+            self._apply_sov_names(latest_sov_names[1])
+        if latest_sov is not None:
+            self._apply_sov(latest_sov[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -2346,6 +2646,14 @@ class MapTab:
         name = self.state.model.systems[sid].name
         menu = self._make_menu(self.canvas)
         menu.add_command(label=name, state="disabled")
+        # Sov affiliation (Task 33): a disabled info row near the top when the layer
+        # is on and this system is tinted. Alliance name from the resolved legend
+        # map; raw-id fallback when names haven't resolved yet.
+        if self._layer_on("sov"):
+            aid = self.state.sov_map.get(sid)
+            if aid is not None:
+                alliance = self.state.sov_names.get(aid) or str(aid)
+                menu.add_command(label=f"Sov: {alliance}", state="disabled")
         menu.add_separator()
         # Jump range submenu: 5 grouped classes (live LY) + Custom.
         range_menu = self._make_menu(menu)
@@ -2405,6 +2713,9 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("heat"))
         menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
                              command=lambda: self._on_layer_toggle("intel"))
+        # Sov tint (Task 33): OFF by default; enabling it kicks the lazy ESI fetch.
+        menu.add_checkbutton(label="Sov", variable=self._layer_vars["sov"],
+                             command=lambda: self._on_layer_toggle("sov"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         return menu
@@ -2456,12 +2767,19 @@ class MapTab:
         self.cfg.setdefault("layers", {})[key] = bool(var.get())
         if key == "threat":
             self._recompute_threat()
-        elif key in ("bridges", "heat"):
-            # Bridges AND kill-heat live in the base bitmap, so a toggle needs a
-            # settle re-render (the request carries the layer value, or None when
+        elif key in ("bridges", "heat", "sov"):
+            # Bridges, kill-heat AND sov live in the base bitmap, so a toggle needs
+            # a settle re-render (the request carries the layer value, or None when
             # off). Their keys in _request_sig keep this from being duplicate-
             # suppressed. Heat also repaints overlays so the capital markers appear/
             # vanish with the layer.
+            if key == "sov":
+                # Turning sov ON kicks the lazy fetch (zero network until now) and
+                # enables the legend microbutton; OFF disables the legend. The
+                # freshness/in-flight guards inside _maybe_start_sov_fetch make the
+                # OFF case (and a re-ON within the hour) a no-op.
+                self._sync_sov_legend_btn()
+                self._maybe_start_sov_fetch()
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()

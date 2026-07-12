@@ -7,6 +7,7 @@ systems, never draw a circle).
 """
 from __future__ import annotations
 
+import colorsys
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -416,3 +417,90 @@ class IntelPulses:
         for sid in expired:
             self._last.pop(sid, None)
         return out
+
+
+# --- sovereignty tint layer (Task 33) ---------------------------------------
+# ESI /sovereignty/map/ (public, cached long) gives each system's sovereign
+# alliance. We tint each sov'd system with a dim, per-alliance hashed color so
+# same-alliance neighbors merge into a soft regional wash BEHIND the glowing
+# nodes. OFF by default (owner's call on palette noise) -- these helpers are
+# pure/testable and never touch the network (the fetch lives in MapTab).
+#
+# The color hash spaces hues by the golden-ratio conjugate, so consecutive /
+# nearby alliance ids land far apart on the color wheel (distinct even for a big
+# legend), while a FIXED muted saturation + dim value keep every tint a dark
+# background wash. Dim is load-bearing: the renderer blits these additively
+# (BLEND_RGB_ADD), so overlapping same/other-alliance blobs SUM -- a bright base
+# color would wash a dense region to white (the hard-won phase-1 lesson). We use
+# explicit arithmetic (golden-ratio multiply + colorsys), never hash(): Python
+# randomizes str hashing per run, so hash() would repaint every alliance a
+# different color each launch.
+_SOV_GOLDEN = 0.618033988749895   # golden-ratio conjugate: hue increment per id
+_SOV_SAT = 0.55                   # muted saturation (background wash, not a node)
+_SOV_VAL = 0.40                   # dim value: max channel ~102/255 so additive
+                                  # stacking of neighbor blobs can't wash to white
+
+
+def parse_sov_map(payload):
+    """Parse the ESI ``/sovereignty/map/`` payload into ``{system_id: alliance_id}``
+    for the sovereignty tint layer (Task 33). The endpoint returns a list of
+    ``{system_id, alliance_id?, corporation_id?, faction_id?}`` entries; ONLY
+    entries carrying an ``alliance_id`` are kept -- corp-only, faction-only and
+    unclaimed systems are dropped, because the tint is an ALLIANCE wash. Malformed
+    rows (non-dict, missing ``system_id``) are skipped. Pure/testable."""
+    out: dict[int, int] = {}
+    for r in payload or ():
+        try:
+            sid = r.get("system_id")
+            aid = r.get("alliance_id")
+        except AttributeError:
+            continue                           # non-dict row -> skip
+        if sid is None or aid is None:
+            continue
+        try:
+            out[int(sid)] = int(aid)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def sov_color(alliance_id) -> tuple[int, int, int]:
+    """Deterministic dim tint ``(r, g, b)`` for an alliance id (Task 33). Hue is
+    spaced by the golden-ratio conjugate (``(id * 0.618033988749895) % 1``) so
+    consecutive / nearby ids land far apart on the color wheel -- distinct even
+    across a large legend -- while a FIXED muted saturation and dim value keep
+    every tint a dark background wash the additive node glows sit cleanly on top
+    of. Arithmetic-only (NO ``hash()`` -- Python randomizes str hashing per run,
+    so an alliance would change color every launch), so a given alliance's color
+    is byte-identical across runs and sessions."""
+    hue = (int(alliance_id) * _SOV_GOLDEN) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(hue, _SOV_SAT, _SOV_VAL)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def canonical_sov(mapping) -> tuple:
+    """Canonical hashable signature of a ``{system_id: alliance_id}`` sov mapping
+    for the render request tuple + ``map_tab._request_sig`` (Task 33): sorted
+    ``((system_id, alliance_id), ...)``. Empty / None -> ``()`` so the request
+    layer can collapse it to ``None`` with ``or None`` (a sov-off / on-but-empty
+    frame is then byte-identical to the pre-sov output and its sig matches,
+    keeping duplicate-render suppression sound). Pure/testable."""
+    out = [(int(sid), int(aid)) for sid, aid in (mapping or {}).items()]
+    out.sort()
+    return tuple(out)
+
+
+def sov_legend_rows(mapping, names=None, top_n: int = 15) -> list:
+    """Legend rows for the sov layer (Task 33): the ``top_n`` alliances by
+    tinted-system count, each as ``(alliance_id, label, count, (r, g, b))``.
+    ``mapping`` is ``{system_id: alliance_id}``; ``names`` is an optional
+    ``{alliance_id: name}`` (a missing / unresolved name falls back to the raw id
+    string, so the legend still renders when the name resolve failed). Ties break
+    by ascending alliance_id for a deterministic order. Pure/testable."""
+    counts: dict[int, int] = {}
+    for aid in (mapping or {}).values():
+        counts[aid] = counts.get(aid, 0) + 1
+    names = names or {}
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:max(0, top_n)]
+    return [(aid, names.get(aid) or str(aid), cnt, sov_color(aid))
+            for aid, cnt in ordered]
