@@ -60,6 +60,20 @@ DEFAULT_CONFIG = {
             "Rorqual": 10.0,
         },
     },
+    "map": {
+        "bloom": True,
+        # Eased zoom glide (Task 24, P3). False = instant snap (pre-Phase-F feel)
+        # for owners who prefer it; toggled from the map empty-space right-click
+        # menu ("Zoom animation") and persisted on hide.
+        "zoom_animation": True,
+        "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
+                   "bridges": True},
+        "threat_ship": "Titan Bridge",
+        "range_ship": "Dreadnought",
+        # Keys match map_camera.Camera.to_dict(); None scale = fit universe.
+        "camera": {"cx": None, "cy": None, "scale": None},
+        "render_mode": "auto",
+    },
     # Market Scanner (design 2026-07-06-market-scanner-design.md §6.1). All ids
     # default to 0 = "not set" → the scanner returns an empty snapshot with a
     # "configure staging market" status and touches no network. Phase B adds the
