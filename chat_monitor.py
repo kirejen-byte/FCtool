@@ -257,6 +257,15 @@ class ChatMonitor:
         self.channel_filters = channel_filters  # Multiple channel prefixes
         self.listener_filter = listener_filter  # Character name to track
         self._tracked_files: dict[str, ChatLogFile] = {}
+        # New-file discovery gate (see _discover_files). Re-globbing the EVE
+        # Chatlogs directory is O(files-in-dir) and that directory accumulates one
+        # file per channel per session indefinitely (tens of thousands over time),
+        # so an unconditional glob every poll holds the GIL long enough to stall the
+        # Tk main thread. A new chat-log FILE bumps the directory's mtime (creation),
+        # while message appends do not — so we glob only when the directory changed
+        # since the last scan, with a long safety-net interval as a backstop.
+        self._last_dir_mtime: float | None = None
+        self._last_full_scan_monotonic: float = 0.0
         self._callbacks: list[Callable[[ChatMessage], None]] = []
         self._running = False
 
@@ -336,8 +345,38 @@ class ChatMonitor:
 
     # -- internals -----------------------------------------------------
 
+    # Backstop: force a full directory re-glob at least this often even when the
+    # directory mtime looks unchanged, so a new file is still discovered on any
+    # exotic filesystem whose directory mtime does not advance on file creation
+    # (or when two events land within one mtime tick). 60 s bounds worst-case
+    # new-channel latency while cutting the per-second glob by ~60x.
+    _DIR_RESCAN_INTERVAL_SECONDS = 60.0
+
     def _discover_files(self):
-        """Find chat log files matching the channel and listener filters."""
+        """Find chat log files matching the channel and listener filters.
+
+        Skips the (potentially very expensive) directory glob when the logs
+        directory is unchanged since the last scan: a new EVE chat-log file bumps
+        the directory's mtime, whereas appends to already-tracked files do not, so
+        a stable mtime means there is no new file to discover. A long backstop
+        interval still forces an occasional full re-glob as a safety net. This
+        keeps the common idle poll off the GIL-heavy glob that otherwise stalls the
+        Tk main thread when the Chatlogs folder holds tens of thousands of files."""
+        now_monotonic = time.monotonic()
+        try:
+            dir_mtime = os.path.getmtime(self.logs_path)
+        except OSError:
+            dir_mtime = None
+        unchanged = (dir_mtime is not None
+                     and dir_mtime == self._last_dir_mtime)
+        within_backstop = (
+            (now_monotonic - self._last_full_scan_monotonic)
+            < self._DIR_RESCAN_INTERVAL_SECONDS)
+        if unchanged and within_backstop:
+            return  # directory unchanged since last scan — no new files to find
+        self._last_dir_mtime = dir_mtime
+        self._last_full_scan_monotonic = now_monotonic
+
         # If multiple channel filters are set, glob each one separately (much faster)
         # Glob once and match channel prefixes case-INSENSITIVELY so a
         # case-sensitive filesystem (Linux) behaves like Windows.
