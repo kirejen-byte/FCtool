@@ -44,6 +44,7 @@ Turn it on in **Settings → the previews section**: pick **FCPreview**. (The ot
 - Focus hotkeys are **swallowed** by Windows while registered — they will not also reach the game or other apps, so pick keys you don't otherwise use in EVE.
 - **Cycle groups** — name your own groups of clients in **Cycle groups…** (in the FCPreview settings row, next to **Hotkeys…**) and give each group its own next/prev cycle keys; a group with **no members cycles all clients**. Like focus keys, cycle keys are **swallowed** system-wide while FCPreview runs. Importing an `EVE-O-Preview.json` also brings in its **CycleGroup1–5** groups (fill-only — your own groups are never overwritten).
 - **Import EVE-O layout…** reads an existing `EVE-O-Preview.json` and fills in matching per-character positions, focus hotkeys, and cycle order (fill-only — it never overwrites layouts you've already set in FCTool).
+- **Reset previews** — a red button next to **Import EVE-O layout…** brings every preview window (including login-screen previews) back on-screen and clears saved positions and per-window size overrides, for when tiles get dragged off-screen or a monitor disconnects. Saved positions also **auto-clamp** onto the visible desktop at restore when they'd otherwise be effectively off-screen; positions that are still reachable (e.g. a second monitor that's merely switched off) are left exactly where you put them.
 
 ### FCTool-exclusive extras
 
