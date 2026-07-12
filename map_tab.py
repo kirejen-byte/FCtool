@@ -370,6 +370,28 @@ class MapTabState:
         self._dirty = True
         return True
 
+    def selected_hostile_staging(self, excluded_names=()) -> set[int]:
+        """Hostile-staging ids that CONTRIBUTE to the threat halo: the full
+        ``hostile_staging`` set minus those whose display name is excluded.
+
+        Exclusions are stored by NAME (config staging lists are names), so each
+        hostile id is resolved to its display name via the model. An id with no
+        model record (name unknown) can't match an exclusion and stays INCLUDED
+        -- new/unknown staging defaults to contributing (Task 34). Pure /
+        headless-testable; MapTab supplies ``excluded_names`` from
+        ``cfg["threat_staging_excluded"]``."""
+        excluded = set(excluded_names or ())
+        if not excluded:
+            return set(self.hostile_staging)
+        systems = self.model.systems if self.model is not None else {}
+        keep: set[int] = set()
+        for sid in self.hostile_staging:
+            s = systems.get(sid)
+            if s is not None and s.name in excluded:
+                continue                         # excluded by name
+            keep.add(sid)                        # included (or name unknown)
+        return keep
+
     def hover_hit(self, sx: float, sy: float) -> int | None:
         if self.model is None:
             return None
@@ -616,13 +638,38 @@ class MapTab:
                            activebackground=t["bg"], activeforeground=t["accent"],
                            command=lambda k=_key: self._on_layer_toggle(k)
                            ).pack(side="left", padx=4)
+        # "Threat ▾" opens the in-tab threat drawer (Task 34, owner ask
+        # 2026-07-12): per-staging selection + the ship-class picker, both
+        # previously buried in a right-click cascade. Flat panel-coloured button
+        # so it reads as native to the app palette.
+        self._threat_drawer_btn = tk.Button(
+            bar, text="Threat ▾", command=self._toggle_threat_drawer,
+            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, padx=8, pady=1, cursor="hand2")
+        self._threat_drawer_btn.pack(side="left", padx=(10, 4))
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
+        # Canvas + right-side threat drawer share the body row: the canvas packs
+        # side=left/expand and the drawer (when open) packs side=right/fill=y, so
+        # opening it just reflows the canvas narrower and its <Configure> updates
+        # the renderer viewport (Task 34). With no drawer packed the canvas fills
+        # the whole body exactly as before (side=left == side=top for a lone
+        # expanding slave -- expand redistributes leftover space at the end).
         self.canvas = tk.Canvas(self.frame, bg=t["bg"], highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.pack(side="left", fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
+        # Transient threat-settings drawer (Task 34): a fixed-width themed panel
+        # created hidden; _open/_close_threat_drawer pack/pack_forget it on the
+        # right. State is NOT persisted (transient UI). pack_propagate(False)
+        # holds the ~230px width regardless of the (short) EVE system names.
+        self._threat_drawer = tk.Frame(self.frame, bg=t["panel"], width=230)
+        self._threat_drawer.pack_propagate(False)
+        self._threat_drawer_open = False
+        self._threat_rows = None                 # staging-row container (built on open)
+        self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
         self.renderer = None
@@ -841,6 +888,7 @@ class MapTab:
         self.state.friendly_staging = set(friendly_ids or ())
         self.state.hostile_staging = set(hostile_ids or ())
         self._redraw_overlays()
+        self._rebuild_threat_staging_rows()      # keep the drawer's rows in sync
 
     def apply_range_overlay(self, overlay) -> None:
         self.state.range_overlay = overlay          # base-layer change:
@@ -1684,18 +1732,14 @@ class MapTab:
         menu.add_checkbutton(label="Threat projection",
                              variable=self._layer_vars["threat"],
                              command=lambda: self._on_layer_toggle("threat"))
-        # Keep the radio selection in sync with the persisted threat ship.
-        opts = mo.threat_options()
-        current = self.cfg.get("threat_ship", "Titan Bridge")
-        sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
-                   opts[0][0] if opts else "")
-        self._threat_var.set(sel)
-        threat_menu = self._make_menu(menu)
-        for label, _ly in opts:
-            threat_menu.add_radiobutton(
-                label=label, variable=self._threat_var, value=label,
-                command=lambda l=label: self._on_threat_ship(l))
-        menu.add_cascade(label="Threat ship", menu=threat_menu)
+        # The old "Threat ship" cascade was the discoverability failure (owner
+        # 2026-07-12): replace it with a single opener for the in-tab drawer,
+        # which owns the ship-class picker AND per-staging selection. One source
+        # of truth -- the drawer's master checkbutton shares _layer_vars["threat"]
+        # with the "Threat projection" item above, and the ship radios drive the
+        # same _threat_var/cfg["threat_ship"] the cascade did.
+        menu.add_command(label="Threat settings…",
+                         command=self._open_threat_drawer)
         menu.add_separator()
         menu.add_checkbutton(label="Fleet", variable=self._layer_vars["fleet"],
                              command=lambda: self._on_layer_toggle("fleet"))
@@ -1769,7 +1813,10 @@ class MapTab:
         queue as a ("threat", frozenset) tuple (drained by _drain_results)."""
         tv = self._layer_vars.get("threat")
         on = bool(tv.get()) if tv is not None else False
-        hostile = set(self.state.hostile_staging)
+        # Union only over the staging the drawer left INCLUDED (exclusions persist
+        # by name in cfg["threat_staging_excluded"]; empty list -> all included).
+        excluded = self.cfg.get("threat_staging_excluded", []) or []
+        hostile = self.state.selected_hostile_staging(excluded)
         if not on or not hostile:
             self.set_threat(None)
             return
@@ -1784,6 +1831,148 @@ class MapTab:
             self._result_q.put(("threat", fset))   # applied on the main thread
 
         threading.Thread(target=work, daemon=True, name="map-threat").start()
+
+    # ---- threat drawer (Task 34) ----------------------------------------------
+    def _toggle_threat_drawer(self) -> None:
+        """Toolbar "Threat ▾" handler: open the drawer if closed, else close it."""
+        if self._threat_drawer_open:
+            self._close_threat_drawer()
+        else:
+            self._open_threat_drawer()
+
+    def _open_threat_drawer(self) -> None:
+        """Build (fresh) and slide the drawer in on the right. Idempotent -- a
+        second open is a no-op. Packing narrows the canvas, whose <Configure>
+        updates the renderer viewport (no manual resize needed)."""
+        if self._threat_drawer_open:
+            return
+        self._threat_drawer_open = True
+        self._build_threat_drawer()
+        self._threat_drawer.pack(side="right", fill="y")
+
+    def _close_threat_drawer(self) -> None:
+        """Slide the drawer out (pack_forget); the canvas reflows back to full
+        width via its <Configure>. Children are kept until the next open, which
+        rebuilds them fresh from current cfg/staging."""
+        if not self._threat_drawer_open:
+            return
+        self._threat_drawer_open = False
+        self._threat_drawer.pack_forget()
+
+    def _build_threat_drawer(self) -> None:
+        """(Re)build the drawer contents top-to-bottom: master overlay toggle,
+        ship-class radio list, then the per-staging checkbox rows. Themed via the
+        shared theme dict; the drawer bg is the panel colour, so select
+        indicators use entry_bg for contrast against it."""
+        t = self.theme
+        d = self._threat_drawer
+        for w in d.winfo_children():
+            w.destroy()
+        tk.Label(d, text="Threat overlay", bg=t["panel"], fg=t["accent"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10,
+                                                      pady=(10, 4))
+        # 1) master toggle -- the SAME var the toolbar/menu use (one source of truth)
+        tk.Checkbutton(d, text="Show threat overlay",
+                       variable=self._layer_vars["threat"],
+                       command=lambda: self._on_layer_toggle("threat"),
+                       bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                       activebackground=t["panel"], activeforeground=t["accent"],
+                       anchor="w").pack(fill="x", padx=8, pady=2)
+        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"]
+        tk.Label(d, text="Ship class", bg=t["panel"], fg=t["fg"]).pack(
+            anchor="w", padx=10, pady=(8, 0))
+        opts = mo.threat_options()
+        current = self.cfg.get("threat_ship", "Titan Bridge")
+        sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
+                   opts[0][0] if opts else "")
+        self._threat_var.set(sel)
+        for label, _ly in opts:
+            tk.Radiobutton(d, text=label, variable=self._threat_var, value=label,
+                           command=lambda l=label: self._on_threat_ship(l),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(
+                               fill="x", padx=8)
+        # 3) per-staging selection: All/None links + one checkbox per staging
+        head = tk.Frame(d, bg=t["panel"])
+        head.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Label(head, text="Staging systems", bg=t["panel"], fg=t["fg"]).pack(
+            side="left")
+        tk.Button(head, text="None", command=self._threat_staging_none,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right")
+        tk.Button(head, text="All", command=self._threat_staging_all,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right",
+                                                             padx=(0, 4))
+        self._threat_rows = tk.Frame(d, bg=t["panel"])
+        self._threat_rows.pack(fill="x", padx=8, pady=(2, 8))
+        self._rebuild_threat_staging_rows()
+
+    def _rebuild_threat_staging_rows(self) -> None:
+        """Repopulate the per-staging checkbox rows from the current hostile
+        staging (id->name via the model). Checked = contributes to the threat
+        union; unchecking persists a NAME exclusion. No-op before the drawer has
+        ever been built (rows container None) so it is safe to call from
+        set_staging at any time. Empty staging shows a dim hint instead of rows."""
+        rows = self._threat_rows
+        if rows is None:
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._threat_staging_vars = {}
+        t = self.theme
+        model = self.state.model
+        systems = model.systems if model is not None else {}
+        names = sorted({systems[sid].name for sid in self.state.hostile_staging
+                        if sid in systems})
+        if not names:
+            tk.Label(rows,
+                     text="No hostile staging configured — right-click a system "
+                          "→ Add to hostile staging.",
+                     bg=t["panel"], fg=t["fg"], justify="left", wraplength=205,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            return
+        excluded = set(self.cfg.get("threat_staging_excluded", []) or [])
+        for name in names:
+            var = tk.BooleanVar(value=(name not in excluded))
+            self._threat_staging_vars[name] = var
+            tk.Checkbutton(rows, text=name, variable=var,
+                           command=lambda n=name: self._on_threat_staging_toggle(n),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(fill="x")
+
+    def _on_threat_staging_toggle(self, name: str) -> None:
+        """A staging row toggled: add/drop the NAME from the persisted exclusion
+        list (reassigned, never mutated in place -- the DEFAULT_CONFIG list may be
+        shared) and recompute the halo over the new subset."""
+        var = self._threat_staging_vars.get(name)
+        if var is None:
+            return
+        excluded = set(self.cfg.get("threat_staging_excluded", []) or [])
+        if var.get():
+            excluded.discard(name)               # included
+        else:
+            excluded.add(name)                   # excluded
+        self.cfg["threat_staging_excluded"] = sorted(excluded)
+        self._recompute_threat()
+
+    def _threat_staging_all(self) -> None:
+        """Include every staging: clear the exclusion list, check all rows."""
+        self.cfg["threat_staging_excluded"] = []
+        for var in self._threat_staging_vars.values():
+            var.set(True)
+        self._recompute_threat()
+
+    def _threat_staging_none(self) -> None:
+        """Exclude every CURRENT staging: persist their names, uncheck all rows."""
+        self.cfg["threat_staging_excluded"] = sorted(self._threat_staging_vars)
+        for var in self._threat_staging_vars.values():
+            var.set(False)
+        self._recompute_threat()
 
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)

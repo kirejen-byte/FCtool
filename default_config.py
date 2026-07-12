@@ -69,6 +69,10 @@ DEFAULT_CONFIG = {
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
                    "bridges": True},
         "threat_ship": "Titan Bridge",
+        # Hostile-staging systems (by NAME) excluded from the threat halo via the
+        # map's Threat drawer (Task 34). Empty = every staging contributes, so a
+        # newly-added staging defaults to INCLUDED.
+        "threat_staging_excluded": [],
         "range_ship": "Dreadnought",
         # Keys match map_camera.Camera.to_dict(); None scale = fit universe.
         "camera": {"cx": None, "cy": None, "scale": None},
