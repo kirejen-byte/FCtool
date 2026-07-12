@@ -45,6 +45,27 @@ HEAT_COLOR = (0xFF, 0x5A, 0x2E)
 # regions to ~(245,245,235); the MAX compose is the fix.)
 SOV_RADIUS = 34
 
+# Infrastructure count chips (Task 5): a small rounded badge per system carrying
+# its structure count, tinted by the DOMINANT category. Drawn in the label pass
+# (rides the SAME zoom LOD as system labels -- st.system_labels), so chips only
+# appear at the band where labels already show. Stale systems (all entries older
+# than the store threshold) dim their fill; the count text auto-picks dark/light
+# by fill luminance so it stays legible on every tint and in both states. Colors
+# are the plan's §3.8 category palette.
+INFRA_CHIP_COLORS = {
+    "citadel": (0x4d, 0x9d, 0xe0),
+    "engineering": (0xb0, 0x85, 0xf5),
+    "refinery": (0xe0, 0xa9, 0x4d),
+    "gate": (0x37, 0xd1, 0xc0),
+    "flex": (0x9a, 0xa7, 0xb5),
+    "npc": (0x66, 0x77, 0x88),
+    "unknown": (0x88, 0x99, 0xaa),
+}
+INFRA_CHIP_PX = 12                # count-text pixel size (reuses the label font)
+INFRA_CHIP_STALE_DIM = 0.6        # dim the fill 40% when the system is stale
+INFRA_CHIP_TEXT_DARK = (18, 22, 30)
+INFRA_CHIP_TEXT_LIGHT = (238, 242, 248)
+
 # Nebula additive-glow brightness (fraction of the region tint). Lowered
 # 0.16 -> 0.11 at the Phase B checkpoint so dense-region blobs stop fusing
 # into hot white cores at universe zoom.
@@ -375,7 +396,8 @@ class Renderer:
                tint: TintSpec | None = None,
                bridges: tuple | None = None,
                heat: tuple | None = None,
-               sov: tuple | None = None) -> pygame.Surface:
+               sov: tuple | None = None,
+               infra: tuple | None = None) -> pygame.Surface:
         surf = pygame.Surface((vw, vh))
         surf.fill(BG)
 
@@ -424,7 +446,10 @@ class Renderer:
         self._draw_systems(surf, st, pos, glow_r, core_r, tint)
         if bloom and mode != "degraded":
             _bloom_pass(surf)
-        self._draw_labels(surf, st, pos, cam, vw, vh)
+        # Infra count chips ride the label pass (same st.system_labels zoom LOD);
+        # infra=None/() draws nothing, keeping the frame byte-identical to the
+        # pre-infra output (determinism, exactly like bridges/heat/sov).
+        self._draw_labels(surf, st, pos, cam, vw, vh, infra)
         return surf
 
     # -- passes ----------------------------------------------------------------
@@ -636,7 +661,7 @@ class Renderer:
             if ring:
                 gfx.aacircle(surf, int(sx), int(sy), core_r, color)
 
-    def _draw_labels(self, surf, st, pos, cam, vw, vh):
+    def _draw_labels(self, surf, st, pos, cam, vw, vh, infra=None):
         if st.system_labels:
             # Priority: hubs first, then alphabetical; occupancy grid drops overlaps.
             order = sorted(pos, key=lambda sid: (sid not in HUB_IDS,
@@ -646,6 +671,10 @@ class Renderer:
                 lab = self.labels.label(self.model.systems[sid].name, st.label_px,
                                         LABEL_COLOR)
                 surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
+            # Infra chips share this zoom LOD (Task 5): drawn AFTER labels so a
+            # badge sits over its system's label when they overlap.
+            if infra:
+                self._draw_infra_chips(surf, pos, infra)
         else:
             # Region labels: biggest regions win the cell; overlapping small ones drop.
             region_items = []
@@ -666,6 +695,46 @@ class Renderer:
                         lab = self.labels.label(self.model.systems[sid].name,
                                                 st.label_px, LABEL_COLOR)
                         surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
+
+    def _draw_infra_chips(self, surf, pos, infra):
+        """Per-system infrastructure count chips (Task 5). ``infra`` is the render
+        request tuple ``((system_id, total, top_category, stale), ...)`` -- the
+        SAME value that joins _request_sig, so the drawn frame matches the sig.
+        Only systems in ``pos`` (currently projected / visible) get a chip; the
+        count text reuses the cached label font (one Surface per distinct
+        text+color -- NO per-chip font work, so a few hundred chips add no
+        measurable frame cost). Called ONLY from the st.system_labels branch, so
+        chips share the system-label zoom LOD (no new heuristic). Each chip is a
+        rounded rect tinted by the dominant category with the count centered;
+        stale systems dim the fill by INFRA_CHIP_STALE_DIM, and the text color
+        auto-picks dark/light by the (possibly dimmed) fill luminance so it stays
+        legible on every tint and in both states."""
+        get = pos.get
+        label = self.labels.label
+        draw_rect = pygame.draw.rect
+        chip_colors = INFRA_CHIP_COLORS
+        unknown = chip_colors["unknown"]
+        for sid, total, top, stale in infra:
+            p = get(sid)
+            if p is None:
+                continue                       # off-screen system -> no chip
+            fill = chip_colors.get(top, unknown)
+            if stale:
+                fill = dim(fill, INFRA_CHIP_STALE_DIM)
+            # Perceptual luminance -> dark number on light chips, light on dark.
+            lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+            text_color = INFRA_CHIP_TEXT_DARK if lum >= 140 else INFRA_CHIP_TEXT_LIGHT
+            txt = label(str(total), INFRA_CHIP_PX, text_color)
+            tw, th = txt.get_width(), txt.get_height()
+            cw, ch = tw + 8, th + 4          # 4px horiz / 2px vert padding
+            # Fixed (+7, -9) px offset from the node dot (like the label's +7,
+            # NOT scaled by zoom -- labels don't scale their offset either); the
+            # chip's left edge sits at +7 and its vertical center at -9.
+            cx = int(p[0]) + 7
+            cy = int(p[1]) - 9
+            draw_rect(surf, fill, pygame.Rect(cx, cy - ch // 2, cw, ch),
+                      border_radius=ch // 2)
+            surf.blit(txt, (cx + 4, cy - th // 2))
 
 
 def _segment_on_surface(pa, pb, vw: int, vh: int) -> bool:
