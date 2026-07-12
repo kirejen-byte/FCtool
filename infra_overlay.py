@@ -9,7 +9,7 @@ Task 7). Every function here is a pure, deterministic computation.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
 
@@ -32,16 +32,23 @@ FILTER_DEFAULTS = {
 def _parse_iso(value) -> datetime | None:
     """Best-effort aware-datetime parse of a house-rule aware-UTC ISO string.
     Returns None on anything missing/unparsable rather than raising, so one
-    malformed record can't take down the whole overlay computation."""
+    malformed record can't take down the whole overlay computation.
+
+    Naive (offset-less) values -- e.g. a hand-edited store file with a
+    last_seen/now_iso missing its UTC offset -- are coerced to UTC rather
+    than returned naive: comparing a naive and an aware datetime raises
+    TypeError, which would otherwise take down the whole computation (the
+    exact failure this docstring promises can't happen)."""
     if isinstance(value, datetime):
-        return value
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         log.warning("infra_overlay: unparsable timestamp %r", value)
         return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
 def _is_stale(entry: dict, now: datetime | None, threshold: timedelta) -> bool:
