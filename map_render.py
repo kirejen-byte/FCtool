@@ -33,12 +33,16 @@ BRIDGE_BLUE = (0x3A, 0x86, 0xFF)
 HEAT_COLOR = (0xFF, 0x5A, 0x2E)
 
 # Sovereignty tint (Task 33): a dim per-alliance blob washed BEHIND everything
-# else. FIXED radius (not zoom-scaled) so the SpriteFactory cache stays bounded
-# by the alliance COUNT (color) alone, not color x radius -- and it is
-# comfortably larger than the node glows (node_metrics caps glow at 18 px) so
-# adjacent same-alliance systems merge into one regional wash instead of reading
-# as separate dots. The color is dim (map_overlays._SOV_VAL) so additive stacking
-# of neighbor blobs can't wash the map to white.
+# else. FIXED radius (not zoom-scaled) so the disc-sprite cache stays bounded by
+# the alliance COUNT (color) alone, not color x radius -- and it is comfortably
+# larger than the node glows (node_metrics caps glow at 18 px) so adjacent
+# same-alliance systems merge into one regional wash instead of reading as
+# separate dots. Dimness alone does NOT keep the wash off white: _draw_sov
+# composes the blobs per-pixel with BLEND_RGB_MAX (max(a, a) = a) onto a scratch
+# surface, so any number of overlapping same-alliance discs tops out at a single
+# disc's peak channel (~102) -- the wash goes FLAT, never additive toward white.
+# (An earlier build ADD-stacked the blobs and DID wash dense single-alliance
+# regions to ~(245,245,235); the MAX compose is the fix.)
 SOV_RADIUS = 34
 
 # Nebula additive-glow brightness (fraction of the region tint). Lowered
@@ -173,6 +177,7 @@ class SpriteFactory:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
+        self._disc_cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
 
     def glow(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
         key = (color, radius)
@@ -196,6 +201,50 @@ class SpriteFactory:
             a = int(round(self._A_OUT + (self._A_IN - self._A_OUT) * e))
             w = self._RGB_OUT + (self._RGB_IN - self._RGB_OUT) * e
             col = (int(color[0] * w), int(color[1] * w), int(color[2] * w), a)
+            pygame.draw.circle(src, col, (c, c), rr)
+        return pygame.transform.smoothscale(src, (target, target))
+
+    # --- sov disc (Task 33 fix) ---------------------------------------------
+    # A SOFT-EDGED disc for the sovereignty wash: a broad flat plateau at full
+    # colour weight (1.0) out to _DISC_PLATEAU of the radius, then a smoothstep
+    # falloff to 0 at the rim. UNLIKE .glow()'s peaky bright-core ramp, this reads
+    # as an EVEN region fill -- which is what makes _draw_sov's per-pixel
+    # BLEND_RGB_MAX compose produce a FLAT wash: overlapping same-alliance discs
+    # take max(a, a) = a, so ANY density of blobs tops out at ONE disc's peak
+    # channel (~102) instead of ADD-summing toward white. Kept in a SEPARATE cache
+    # from .glow() (the same (color, radius) key would otherwise collide); radius
+    # is fixed (SOV_RADIUS) so the cache stays bounded by the alliance count.
+    _DISC_N = 16                    # concentric rings (plateau + smoothstep tail)
+    _DISC_PLATEAU = 0.60            # inner fraction of the radius held at full weight
+    _DISC_A = 80                    # peak gradient-descriptor alpha (RGB blit ignores it)
+
+    def disc(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
+        key = (color, radius)
+        got = self._disc_cache.get(key)
+        if got is None:
+            got = self._build_disc(color, radius)
+            self._disc_cache[key] = got
+        return got
+
+    def _build_disc(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
+        target = max(2 * radius, 2)
+        ss = max(min(8 * radius, self._SS_MAX), target)   # supersample edge, >= target
+        src = pygame.Surface((ss, ss), pygame.SRCALPHA)
+        c = ss // 2
+        outer = ss / 2.0
+        plateau = self._DISC_PLATEAU
+        n = self._DISC_N
+        r0, g0, b0 = color
+        for i in range(n):                                # rim(large) -> centre(small)
+            u = i / (n - 1)
+            rr = max(int(round(outer * (1.0 - u))), 1)
+            t = 1.0 - u                                   # normalized radius: 1 rim, 0 centre
+            if t <= plateau:
+                w = 1.0                                   # flat plateau at full colour
+            else:
+                f = (t - plateau) / (1.0 - plateau)       # 0 at plateau edge, 1 at rim
+                w = 1.0 - f * f * (3.0 - 2.0 * f)         # smoothstep 1 -> 0 (gentle both ends)
+            col = (int(r0 * w), int(g0 * w), int(b0 * w), int(self._DISC_A * w))
             pygame.draw.circle(src, col, (c, c), rr)
         return pygame.transform.smoothscale(src, (target, target))
 
@@ -278,6 +327,12 @@ class Renderer:
         self.labels = LabelFactory()
         self._region_info = self._build_region_info()
         self._median_edge = median_edge_length(model)
+        # Sov MAX-compose scratch (Task 33 fix): a plain-RGB surface the sov blobs
+        # are MAX-composed onto before a single additive blit to the frame. Lazily
+        # allocated and cached by frame size (reallocated only on a size change),
+        # so a steady viewport reuses one buffer -- no per-frame allocation churn.
+        self._sov_scratch: pygame.Surface | None = None
+        self._sov_scratch_size: tuple[int, int] | None = None
         # Task 18 Step 3 hot-loop caches (static; independent of camera/frame):
         #  * per-edge sec tint index -> edge loop drops per-frame sec_color()+max()
         #  * per-system (tint, is_hub) -> _draw_systems drops per-node sec_color()
@@ -465,20 +520,41 @@ class Renderer:
     def _draw_sov(self, surf, cam, pos, vis_set, vw, vh, sov):
         """Sovereignty tint under-wash (Task 33). `sov` is an iterable of
         ``(system_id, alliance_id)`` pairs (the canonical request tuple). Each
-        sov'd system gets ONE dim additive blob in its alliance's hashed color
+        sov'd system gets ONE soft disc in its alliance's hashed color
         (map_overlays.sov_color) at the FIXED ``SOV_RADIUS`` -- comfortably larger
         than the node glows -- so adjacent same-alliance systems merge into a soft
         regional wash. Drawn FIRST (under heat / bridges / nodes) so the glowing
         node cores stay readable on top. Endpoints reuse the cached projection
         when visible and re-project otherwise; off-surface systems are culled.
-        Sprites cache by (color, radius) in the shared SpriteFactory, and radius
-        is FIXED, so the cache is bounded by the alliance count; a per-frame memo
-        avoids re-hashing a color when a whole null bloc shares one alliance.
+
+        COMPOSE (the white-out fix): the discs are NOT ADD-blitted onto the frame
+        (that summed overlapping blobs toward white in dense single-alliance
+        regions -- measured (245,245,235) with all of Delve on one alliance at
+        fit-universe). Instead every disc is composited per-pixel with
+        ``BLEND_RGB_MAX`` onto a black scratch surface, then the scratch is blitted
+        ONCE onto the frame with ``BLEND_RGB_ADD``. Guarantees:
+          * SAME-alliance overlap can never exceed a single disc's peak per channel
+            -- ``max(a, a) = a`` -- so a dense region becomes a FLAT wash at the
+            sprite brightness (~102/255), the original "adjacent systems merge into
+            a region wash" intent, and can NEVER brighten toward white.
+          * DIFFERENT-alliance borders take the per-channel max of the two colors
+            (a mild hue blend, no brightening beyond either color).
+        Disc sprites cache by (color, radius) in the SpriteFactory; radius is
+        FIXED, so the cache is bounded by the alliance count. A per-frame memo
+        avoids re-hashing a color when a whole null bloc shares one alliance. The
+        scratch is cached by frame size (reallocated only on a size change).
         Byte-behaviour matches heat/bridges: the caller gates on truthiness, so
-        sov=None/() never calls this."""
+        sov=None/() never calls this (frame stays byte-identical to pre-sov)."""
         systems = self.model.systems
         get = pos.get
-        glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
+        size = surf.get_size()
+        scratch = self._sov_scratch
+        if scratch is None or self._sov_scratch_size != size:
+            scratch = self._sov_scratch = pygame.Surface(size)   # plain RGB
+            self._sov_scratch_size = size
+        scratch.fill((0, 0, 0))
+        disc, blit_max = self.sprites.disc, pygame.BLEND_RGB_MAX
+        blit_s = scratch.blit
         sov_color = mo.sov_color
         color_memo: dict[int, tuple[int, int, int]] = {}
         for sid, aid in sov:
@@ -495,9 +571,10 @@ class Renderer:
             color = color_memo.get(aid)
             if color is None:
                 color = color_memo[aid] = sov_color(aid)
-            g = glow(color, SOV_RADIUS)
-            blit(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
-                 special_flags=add)
+            g = disc(color, SOV_RADIUS)
+            blit_s(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
+                   special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
     def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
         """Kill-heat under-glow (Task 30). `heat` is an iterable of

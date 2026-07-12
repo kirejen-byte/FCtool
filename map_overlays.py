@@ -429,16 +429,20 @@ class IntelPulses:
 # The color hash spaces hues by the golden-ratio conjugate, so consecutive /
 # nearby alliance ids land far apart on the color wheel (distinct even for a big
 # legend), while a FIXED muted saturation + dim value keep every tint a dark
-# background wash. Dim is load-bearing: the renderer blits these additively
-# (BLEND_RGB_ADD), so overlapping same/other-alliance blobs SUM -- a bright base
-# color would wash a dense region to white (the hard-won phase-1 lesson). We use
-# explicit arithmetic (golden-ratio multiply + colorsys), never hash(): Python
-# randomizes str hashing per run, so hash() would repaint every alliance a
-# different color each launch.
+# background wash. The renderer composes overlapping blobs per-pixel with
+# BLEND_RGB_MAX (map_render._draw_sov), NOT additively: same-alliance neighbors
+# merge to a FLAT wash at the sprite brightness (max(a, a) = a) and can never sum
+# toward white, so dimness sets the wash LEVEL rather than guarding a white-out.
+# (Additive stacking of a bright base color WAS the phase-1 white-out; the MAX
+# compose retired it.) We use explicit arithmetic (golden-ratio multiply +
+# colorsys), never hash(): Python randomizes str hashing per run, so hash() would
+# repaint every alliance a different color each launch.
 _SOV_GOLDEN = 0.618033988749895   # golden-ratio conjugate: hue increment per id
 _SOV_SAT = 0.55                   # muted saturation (background wash, not a node)
-_SOV_VAL = 0.40                   # dim value: max channel ~102/255 so additive
-                                  # stacking of neighbor blobs can't wash to white
+_SOV_VAL = 0.40                   # dim value: max channel ~102/255 -- under the
+                                  # renderer's BLEND_RGB_MAX compose this is the
+                                  # FLAT level a dense same-alliance region tops
+                                  # out at (max(a, a) = a; never sums to white)
 
 
 def parse_sov_map(payload):
