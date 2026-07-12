@@ -46,11 +46,18 @@ FG_RED = "#d35f5f"
 BORDER_COLOR = "#3a3a3a"
 
 # Tree columns (order is the display order) and their header labels.
+#
+# Owner UX round: the "category" and "type" column KEYS keep their positions, but
+# their SEMANTICS are swapped. The prominent "category" slot now shows the
+# SPECIFIC structure type (header "Type", e.g. "Fortizar"/"Keepstar" — sortable
+# via the existing header machinery); the narrower "type" slot now shows the
+# coarse category (header "Category", e.g. "citadel"). Keys stay put so
+# _sort_key (which zips COLUMNS with _row_values) needs no change.
 COLUMNS = ("system", "name", "category", "type", "source", "last_seen", "status")
-HEADINGS = {"system": "System", "name": "Name", "category": "Category",
-            "type": "Type", "source": "Source", "last_seen": "Last seen",
+HEADINGS = {"system": "System", "name": "Name", "category": "Type",
+            "type": "Category", "source": "Source", "last_seen": "Last seen",
             "status": "Status"}
-_COL_WIDTH = {"system": 90, "name": 260, "category": 90, "type": 64,
+_COL_WIDTH = {"system": 90, "name": 240, "category": 150, "type": 92,
               "source": 84, "last_seen": 128, "status": 74}
 
 
@@ -133,11 +140,21 @@ class InfraManagerDialog(tk.Toplevel):
     import_manual    callable(entry_dict) -> None (source="manual" upsert).
     on_changed       zero-arg callable the host uses to re-push the overlay.
     initial_system_id  pre-filter the list to one system (or None for all).
+    type_name_fn     optional callable(type_id, structure_id) -> str giving the
+                     SPECIFIC type label for the prominent "Type" column
+                     (fc_gui passes infra_parser.type_name). None (default) falls
+                     back to the coarse category, honouring the tkinter-only
+                     isolation rule (the dialog never imports infra_parser).
+    autocomplete_cls optional widget CLASS for the region entry. When it exposes
+                     ``update_completions`` (an AutocompleteEntry) it is used so
+                     matches pop up AS YOU TYPE; otherwise (default) a plain
+                     ttk.Combobox is built. Appended last / backwards compatible.
     """
 
     def __init__(self, parent, store, scanner, regions_catalog, system_names,
                  clipboard_get, import_clipboard, import_manual,
-                 on_changed, initial_system_id=None):
+                 on_changed, initial_system_id=None,
+                 type_name_fn=None, autocomplete_cls=None):
         super().__init__(parent)
         self.store = store
         self.scanner = scanner
@@ -149,6 +166,8 @@ class InfraManagerDialog(tk.Toplevel):
         self._import_manual = import_manual
         self._on_changed = on_changed if callable(on_changed) else (lambda: None)
         self._system_filter = initial_system_id
+        self._type_name_fn = type_name_fn if callable(type_name_fn) else None
+        self._autocomplete_cls = autocomplete_cls
 
         self._sort_col = None
         self._sort_reverse = False
@@ -238,9 +257,27 @@ class InfraManagerDialog(tk.Toplevel):
         add_row = tk.Frame(panel, bg=BG_PANEL)
         add_row.pack(fill=tk.X, padx=6, pady=(4, 2))
         names = sorted(n for _rid, n in self._regions_catalog)
-        self._region_combo = ttk.Combobox(add_row, values=names, width=16)
-        self._region_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._region_combo.bind("<KeyRelease>", self._on_region_type)
+        entry_cls = self._autocomplete_cls or ttk.Combobox
+        # Capability-gate on update_completions (the house pattern — mirrors
+        # map_tab's search box). An injected AutocompleteEntry pops its suggestion
+        # list AS YOU TYPE; the plain ttk.Combobox only opens on the arrow.
+        if hasattr(entry_cls, "update_completions"):
+            try:
+                self._region_combo = entry_cls(
+                    add_row, completions=names,
+                    on_select=self._on_region_selected, width=16)
+            except TypeError:
+                self._region_combo = entry_cls(add_row, width=16)
+            self._region_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            # AutocompleteEntry self-binds <Return> to select the highlighted
+            # suggestion; add="+" so BOTH fire — the widget inserts the name into
+            # the field first, then our handler commits it like the Add button.
+            # Without add="+" we'd clobber the widget's own selection handler.
+            self._region_combo.bind("<Return>", self._on_add_region, add="+")
+        else:
+            self._region_combo = entry_cls(add_row, values=names, width=16)
+            self._region_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._region_combo.bind("<KeyRelease>", self._on_region_type)
 
         btns = tk.Frame(panel, bg=BG_PANEL)
         btns.pack(fill=tk.X, padx=6, pady=(0, 6))
@@ -298,8 +335,10 @@ class InfraManagerDialog(tk.Toplevel):
             if sysf is not None and e.get("system_id") != sysf:
                 continue
             if query:
-                hay = " ".join(str(e.get(k, "") or "") for k in (
-                    "system_name", "name", "category", "source", "status")).casefold()
+                parts = [str(e.get(k, "") or "") for k in (
+                    "system_name", "name", "category", "source", "status")]
+                parts.append(self._entry_type_name(e))   # match the specific type name too
+                hay = " ".join(parts).casefold()
                 if query not in hay:
                     continue
             out.append(e)
@@ -311,13 +350,27 @@ class InfraManagerDialog(tk.Toplevel):
         val = dict(zip(COLUMNS, self._row_values(entry)))[self._sort_col]
         return str(val).casefold()
 
+    def _entry_type_name(self, entry):
+        """Specific type label for the prominent "Type" column. Uses the injected
+        type_name_fn(type_id, structure_id) when present; without it (the
+        backwards-compatible default) falls back to the coarse category — what
+        this column displayed before the UX round."""
+        fn = self._type_name_fn
+        if fn is None:
+            return entry.get("category") or ""
+        try:
+            return fn(entry.get("type_id"), entry.get("structure_id")) or ""
+        except Exception:
+            return entry.get("category") or ""
+
     def _row_values(self, entry):
-        tid = entry.get("type_id")
+        # "category" slot → SPECIFIC type (header "Type"); "type" slot → coarse
+        # category (header "Category"). See the COLUMNS/HEADINGS note above.
         return (
             entry.get("system_name") or "—",
             entry.get("name") or "",
+            self._entry_type_name(entry),
             entry.get("category") or "",
-            str(tid) if tid is not None else "",
             entry.get("source") or "",
             _fmt_last_seen(entry.get("last_seen")),
             entry.get("status") or "alive",
@@ -696,7 +749,16 @@ class InfraManagerDialog(tk.Toplevel):
         self._region_combo.config(
             values=matches or [n for _r, n in self._regions_catalog])
 
-    def _on_add_region(self):
+    def _on_region_selected(self):
+        """AutocompleteEntry on_select hook. The widget has already inserted the
+        picked region name into the entry (feeding the Add button), exactly like
+        choosing a value in the old combobox; reflect it in the status line. The
+        user still commits with Add / Enter — a selection alone does not add."""
+        name = (self._region_combo.get() or "").strip()
+        if name:
+            self._set_status(f"Region '{name}' selected — press Enter or click Add.")
+
+    def _on_add_region(self, _evt=None):
         name = (self._region_combo.get() or "").strip()
         rid = next((r for r, n in self._regions_catalog if n == name), None)
         if rid is None:

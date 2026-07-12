@@ -40,11 +40,38 @@ TYPE_CATEGORY = {
     35840: "flex", 37534: "flex",                                    # Pharolux, Tenebrex
 }
 
+# Human-readable SPECIFIC structure type names, keyed by the same type_ids as
+# TYPE_CATEGORY (kept in lockstep — the parser test asserts identical key sets).
+# TYPE_CATEGORY drives the coarse category (overlay colour / filters); TYPE_NAMES
+# drives the manager dialog's prominent, sortable "Type" column.
+TYPE_NAMES = {
+    35832: "Astrahus", 35833: "Fortizar", 35834: "Keepstar",
+    47512: "'Moreau' Fortizar", 47513: "'Draccous' Fortizar",
+    47514: "'Horizon' Fortizar", 47515: "'Marginis' Fortizar",
+    47516: "'Prometheus' Fortizar",
+    35825: "Raitaru", 35826: "Azbel", 35827: "Sotiyo",
+    35835: "Athanor", 35836: "Tatara", 81826: "Metenox Moon Drill",
+    35841: "Ansiblex Jump Gate", 35840: "Pharolux Cyno Beacon",
+    37534: "Tenebrex Cyno Jammer",
+}
+
 
 def categorize(type_id: int | None, structure_id: int | None) -> str:
     if structure_id is not None and structure_id < 1_000_000_000:
         return "npc"                       # NPC stations: ids ~6.0e7 (fixture-proven)
     return TYPE_CATEGORY.get(type_id or 0, "unknown")
+
+
+def type_name(type_id: int | None, structure_id: int | None) -> str:
+    """Specific structure type name for the manager dialog's Type column.
+
+    Mirrors ``categorize`` NPC-range handling: an id below the citadel-id floor
+    (~1e9; NPC stations sit at ~6.0e7) is an "NPC Station" regardless of type_id.
+    Otherwise map the type_id via TYPE_NAMES, falling back to "Unknown" for
+    unmapped or None type_ids (e.g. plain-copy / manual name-only entries)."""
+    if structure_id is not None and structure_id < 1_000_000_000:
+        return "NPC Station"               # NPC stations: ids ~6.0e7 (fixture-proven)
+    return TYPE_NAMES.get(type_id or 0, "Unknown")
 
 
 # ── Public dataclasses ──────────────────────────────────────────────────────

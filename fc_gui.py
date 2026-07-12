@@ -6040,6 +6040,7 @@ class FCToolGUI:
         try:
             import infra_dialog
             import infra_overlay
+            import infra_parser
             model = getattr(self, "_infra_model", None)
             regions_catalog = infra_overlay.regions_catalog(model) if model else []
             if model is not None:
@@ -6052,7 +6053,13 @@ class FCToolGUI:
                 import_clipboard=self._infra_import_clipboard,
                 import_manual=self._infra_import_manual,
                 on_changed=self._infra_on_changed,
-                initial_system_id=system_id)
+                initial_system_id=system_id,
+                # Prominent, sortable SPECIFIC "Type" column + type-ahead region
+                # autocomplete (owner UX round). type_name lives in infra_parser
+                # (the §3.2 single source of truth); AutocompleteEntry is the same
+                # widget the map search box uses.
+                type_name_fn=infra_parser.type_name,
+                autocomplete_cls=AutocompleteEntry)
         except Exception as exc:
             print(f"[INFRA] manager dialog failed to open: {exc}")
             return
