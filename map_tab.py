@@ -14,6 +14,7 @@ fc_gui) touch tkinter.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import re
@@ -58,6 +59,82 @@ GESTURE_MIN_INTERVAL_MS = 30.0
 # so pan / zoom-out serve real content instead of a black edge within +/-MARGIN.
 MARGIN = 224
 BG_HEX = "#0a0a14"
+
+# Destination-route overlay (Task 35). Gold dashed polyline for stargate hops;
+# Ansiblex hops reuse the base-layer BRIDGE_BLUE (map_render) as a dash-dot line
+# with diamond endpoint markers, so the overlay matches the bridge tint drawn
+# into the bitmap. Both are pure Tk overlay items (crisp during gestures). The
+# blue is derived from mr.BRIDGE_BLUE so the two stay in lockstep.
+ROUTE_GOLD = "#ffcc44"
+BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
+
+# Kill-heat layer (Task 30). Capital-kill markers reuse a red hex derived from
+# the base-layer HEAT_COLOR family. The periodic decay refresh re-requests a
+# crisp at most every HEAT_REFRESH_MS while the layer is on and heat is live, so
+# the under-glow shrinks with decay even absent camera/kill activity (the 16 ms
+# tick is far too fast to re-render every frame). The ESI ambient fetch loop runs
+# ~hourly (owner-approved: "2 calls per hour"; we fetch ONE endpoint -- see
+# _fetch_ambient_heat's jumps decision), with a short first-fetch delay so a rapid
+# hide/show right after launch never fires a burst.
+CAPKILL_RED = "#ff3b30"
+HEAT_REFRESH_MS = 60_000.0
+AMBIENT_START_DELAY_S = 5.0
+AMBIENT_INTERVAL_S = 3600.0
+
+# Intel pulse layer (Task 31). Systems named in tracked intel channels pulse with
+# a ~5-min decay. AMBER (#ffd166) is chosen so the ring reads DISTINCTLY from the
+# red threat/capital family (#ff5a76 / #ff3b30) and the blue Ansiblex bridges -- a
+# warm "attention" hue no other overlay claims. Rings OSCILLATE (radius + line
+# width) on a gentle ~1.1 s period; the oscillation AMPLITUDE scales with the
+# mention's decay intensity, so a fresh call throbs hard and an old one barely
+# breathes. Structure (which systems have rings, reprojection after the set
+# changed) is rebuilt at ~1 s granularity (INTEL_STRUCT_MS -- the Task 30 heat-
+# refresh idiom) while each 16 ms tick only MUTATES the existing ring items
+# (coords / itemconfigure), never delete/recreate -- so the hot path stays cheap.
+INTEL_AMBER = "#ffd166"
+INTEL_R0 = 9.0               # base ring radius (px) at the oscillation trough
+INTEL_AMP = 6.0              # max radial oscillation amplitude (px), * intensity
+INTEL_PULSE_MS = 1100.0      # oscillation period (~0.9 Hz throb)
+INTEL_HIT_R = 16.0           # click hit radius (>= max ring radius R0 + AMP = 15)
+INTEL_STRUCT_MS = 1000.0     # cull + reproject cadence (structure changes only)
+INTEL_CLICK_SLOP2 = 25       # (5 px)^2: press/release within this = a click, not a pan
+_TWO_PI = 2.0 * math.pi
+
+# Kill-ping layer (Task 36). DISCRETE zkill ALERT pings -- distinct from the
+# ambient decaying kill-heat glow (Task 30). A fresh alert BURSTS as expanding
+# radar rings in a vivid hostile RED (#ff1744) chosen to read apart from the amber
+# intel pulses (#ffd166), the static capital double-ring (#ff3b30 / #ff5a76 family)
+# and the soft heat glow; then it LINGERS as a small steady diamond marker for
+# ~5 min so an older kill stays findable. Rings emanate on a ~1 s radar sweep whose
+# phase is shared (time-based, like the intel oscillator) so the per-tick tween
+# only MUTATES existing ring items (coords / width), never delete/recreates; the
+# linger marker is static (no tween). Structure changes (burst<->linger, cull,
+# reproject) are batched to ~1 s (KILLPING_STRUCT_MS) exactly like the intel idiom.
+KILLPING_RED = "#ff1744"
+KILLPING_R0 = 5.0            # inner (birth) ring radius (px)
+KILLPING_SPAN = 22.0        # radial travel of an emanating ring (px), non-capital
+KILLPING_SPAN_CAP = 32.0    # capital burst reaches farther (bigger, louder ping)
+KILLPING_RINGS = 2          # concurrent emanating rings (non-capital)
+KILLPING_RINGS_CAP = 3      # capital burst adds a third emanating ring
+KILLPING_SWEEP_MS = 1000.0  # radar-sweep period (one ring's birth -> death)
+KILLPING_MARK_R = 5.0       # linger diamond marker half-size (px)
+KILLPING_MARK_R_CAP = 7.0   # capital linger marker is a touch larger (doubled)
+KILLPING_STRUCT_MS = 1000.0 # cull + reproject + stage-flip cadence (structure only)
+
+# Sovereignty tint layer (Task 33). ESI /sovereignty/map/ (public, cached long)
+# gives per-system sovereign alliance; a dim hashed tint per alliance washes the
+# map behind the nodes (map_render._draw_sov / map_overlays.sov_color). OFF by
+# default -- the palette-noise call is the owner's, so ZERO network until enabled.
+# While the layer is on the data is refreshed at most once per SOV_REFRESH_S via a
+# ONE-SHOT daemon thread (not a persistent loop): it fetches, posts to the result
+# queue, and dies -- nothing to join on hide.
+SOV_REFRESH_S = 3600.0
+
+# Layers whose _layer_on() default is FALSE when cfg omits the key (everything
+# else defaults True). Sov is off-by-default AND, unlike range (always gated by a
+# live overlay object), _layer_on("sov") directly controls both the fetch and the
+# render -- so an absent key must read False, not the blanket True.
+_LAYERS_OFF_BY_DEFAULT = frozenset({"sov"})
 
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
@@ -194,12 +271,34 @@ def _now_ms() -> float:
     return time.monotonic() * 1000.0
 
 
+def _default_route_fn(origin_id: int, dest_id: int, connections=None):
+    """Default travel-route solver for the destination overlay (Task 35): the
+    app's Ansiblex-aware stargate BFS, reusing the Navigation tab's invocation
+    exactly (``get_stargate_route(origin_id, dest_id, connections=<'a|b' str list>)``
+    -- default preference "shortest"). Lazily imported so map_tab keeps its light
+    import surface (jump_range pulls in requests / system_coords) and tests /
+    standalone can inject a stub via ``MapTab(route_fn=...)``. Returns the ordered
+    system-id path (origin..dest) or None when unreachable."""
+    from jump_range import get_stargate_route
+    return get_stargate_route(origin_id, dest_id, connections=connections)
+
+
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint + bridges (NOT generation -- that is a staleness
-    token, and duplicates by definition carry different generations). Used by the
-    worker to suppress a settle re-render that duplicates the crisp frame already
-    applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+    size + bloom + mode + tint + bridges + heat + sov (NOT generation -- that is a
+    staleness token, and duplicates by definition carry different generations).
+
+    sov participates exactly like heat/bridges: the canonical sov tuple (or None
+    when the layer is off / no data) compares by value, so a sov toggle or a fresh
+    sov fetch is never suppressed as a duplicate, while a settle on an unchanged
+    view+sov still is.
+    Used by the worker to suppress a settle re-render that duplicates the crisp
+    frame already applied to the canvas (Task 18 Step 1b; see MapTab._applied_sig).
+
+    heat participates exactly like bridges: the canonical rounded heat tuple (or
+    None when the layer is off / no activity) compares by value, so a kill arrival,
+    an ambient refresh, or a decay step that MOVES the rounded heat is never
+    suppressed as a duplicate, while a settle on an unchanged view+heat still is.
 
     bridges participates so a Bridges-layer toggle (tuple <-> None) is NEVER
     suppressed as a duplicate -- the on-screen frame drew a different bridge set,
@@ -216,7 +315,8 @@ def _request_sig(req: dict) -> tuple:
     camera/toggle change)."""
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
-            bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"))
+            bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
+            req.get("heat"), req.get("sov"))
 
 
 class MapTabState:
@@ -236,6 +336,10 @@ class MapTabState:
         self._generation = 0
         self._dirty = False
         self._name_to_id: dict[str, int] = {}
+        # Sorted lowercase-name keys (rebuilt at attach_model) so fly_to's
+        # prefix/contains fallback is one linear pass in a deterministic,
+        # sorted-first order (sub-ms over ~5,485 names).
+        self._sorted_names: list[str] = []
         # --- overlay layer state (Phase D) ---
         self.range_overlay = None
         self.threat_set = None
@@ -243,10 +347,46 @@ class MapTabState:
         self.friendly_staging: set[int] = set()
         self.hostile_staging: set[int] = set()
         self.own_system_id = None
+        # --- destination route overlay (Task 35, SESSION-scoped, not persisted) --
+        # route_dest: the tool-set destination system id (pushed by fc_gui's
+        # _set_destination_or_copy after a successful ESI set_waypoint).
+        # route_path: the resolved ordered system-id path origin..dest from the
+        # Ansiblex-aware BFS, or None when unrouted / cleared.
+        self.route_dest = None
+        self.route_path: tuple | None = None
         # Resolved Ansiblex bridge id-pairs (hashable tuple of unordered
         # (id_a, id_b) pairs from map_overlays.resolve_bridges). A BASE-layer
         # element -- drawn into the bitmap, not a Tk overlay item.
         self.bridges: tuple = ()
+        # --- kill-heat layer (Task 30) ---
+        # kill_heat: the LIVE zkill decay-heat ring (mutated on the MAIN thread
+        # via add_kill, marshaled from fc_gui's zkill worker callback through
+        # _post_ui). ambient_heat: the last hourly ESI ambient counts
+        # ({system_id: ship+pod kills}), applied on the main thread from the
+        # result queue. Both feed KillHeat.merge_ambient at request-build time to
+        # produce the 0..1 heat the renderer draws as a red-orange under-glow.
+        self.kill_heat = mo.KillHeat()
+        self.ambient_heat: dict[int, int] = {}
+        # --- intel pulse layer (Task 31) ---
+        # Systems named in tracked intel channels. note()d on the MAIN thread
+        # (fc_gui marshals the intel stream through _post_ui before the push), read
+        # via active() by MapTab to draw the amber pulse rings. Pure decay model.
+        self.intel_pulses = mo.IntelPulses()
+        # --- kill-ping layer (Task 36) ---
+        # Discrete zkill ALERT pings (distinct from the ambient kill-heat glow):
+        # ping()ed on the MAIN thread (fc_gui marshals the zkill worker callback
+        # through _post_ui -> _push_kill_to_map -> add_kill_ping), read via active()
+        # to draw the red radar-burst rings + linger markers. Pure decay model.
+        self.kill_pings = mo.KillPings()
+        # --- sovereignty tint layer (Task 33) ---
+        # sov_map: {system_id: alliance_id} from ESI /sovereignty/map/, applied on
+        # the MAIN thread from the result queue (canonical_sov -> the render request
+        # tuple the base bitmap draws). sov_names: {alliance_id: name} for the
+        # legend + right-click info row, bulk-resolved via /universe/names/. Both
+        # stay empty until the layer is first enabled (OFF by default -> zero
+        # network until then).
+        self.sov_map: dict[int, int] = {}
+        self.sov_names: dict[int, str] = {}
 
     def tint_spec(self):
         import map_render as _mr
@@ -262,6 +402,7 @@ class MapTabState:
         self.camera.set_scale_limits(lo, hi)
         self.camera.fit_bounds(model.bounds, self.vw, self.vh)
         self._name_to_id = {s.name.lower(): sid for sid, s in model.systems.items()}
+        self._sorted_names = sorted(self._name_to_id)
         self._dirty = True
 
     def resize(self, vw: int, vh: int) -> None:
@@ -337,14 +478,55 @@ class MapTabState:
 
     # -- queries ----------------------------------------------------------------
     def fly_to(self, name: str) -> bool:
-        sid = self._name_to_id.get(name.strip().lower())
-        if sid is None or self.model is None:
+        """Center + zoom onto a system resolved from a (partial) name. Resolution
+        order: exact (case-insensitive) -> sorted-first case-insensitive PREFIX
+        (startswith) -> sorted-first case-insensitive CONTAINS -> miss. An exact
+        hit always wins over a longer prefix sibling (e.g. "Jita" beats "Jitand"),
+        and among equal-class matches the sorted-first name is chosen so the
+        result is deterministic. Empty input is a miss (never matches everything
+        via the empty-prefix). Camera behavior is unchanged from the exact-only
+        version (recenter + min-zoom bump + dirty)."""
+        if self.model is None:
+            return False
+        q = name.strip().lower()
+        if not q:
+            return False
+        sid = self._name_to_id.get(q)                       # 1) exact
+        if sid is None:                                     # 2) prefix (sorted-first)
+            sid = next((self._name_to_id[k] for k in self._sorted_names
+                        if k.startswith(q)), None)
+        if sid is None:                                     # 3) contains (sorted-first)
+            sid = next((self._name_to_id[k] for k in self._sorted_names
+                        if q in k), None)
+        if sid is None:
             return False
         s = self.model.systems[sid]
         self.camera.cx, self.camera.cy = s.x, s.y
         self.camera.scale = max(self.camera.scale, self.camera.max_scale / 3.0)
         self._dirty = True
         return True
+
+    def selected_hostile_staging(self, excluded_names=()) -> set[int]:
+        """Hostile-staging ids that CONTRIBUTE to the threat halo: the full
+        ``hostile_staging`` set minus those whose display name is excluded.
+
+        Exclusions are stored by NAME (config staging lists are names), so each
+        hostile id is resolved to its display name via the model. An id with no
+        model record (name unknown) can't match an exclusion and stays INCLUDED
+        -- new/unknown staging defaults to contributing (Task 34). Pure /
+        headless-testable; MapTab supplies ``excluded_names`` from
+        ``cfg["threat_staging_excluded"]``."""
+        excluded = set(excluded_names or ())
+        if not excluded:
+            return set(self.hostile_staging)
+        systems = self.model.systems if self.model is not None else {}
+        keep: set[int] = set()
+        for sid in self.hostile_staging:
+            s = systems.get(sid)
+            if s is not None and s.name in excluded:
+                continue                         # excluded by name
+            keep.add(sid)                        # included (or name unknown)
+        return keep
 
     def hover_hit(self, sx: float, sy: float) -> int | None:
         if self.model is None:
@@ -515,11 +697,25 @@ class MapTab:
     def __init__(self, parent, *, model_loader=map_data.load_map_model,
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
-                 telemetry: bool = False) -> None:
+                 telemetry: bool = False, route_fn=None, ambient_fetch=None,
+                 sov_fetch=None, names_fetch=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
         self._model_loader = model_loader
+        # Injectable travel-route solver (Task 35); defaults to the Ansiblex-aware
+        # stargate BFS. Tests / standalone pass a stub so _recompute_route runs
+        # deterministically without the jump_range import.
+        self._route_fn = route_fn or _default_route_fn
+        # Injectable ESI ambient-heat fetcher (Task 30); defaults to the real
+        # /universe/system_kills/ pull. Tests inject a stub so the ambient loop's
+        # lifecycle can be exercised without any network.
+        self._ambient_fetch = ambient_fetch or self._fetch_ambient_heat
+        # Injectable ESI sov fetchers (Task 33); default to the real /sovereignty/
+        # map/ pull + /universe/names/ bulk resolve. Tests inject stubs so the
+        # one-shot fetch lifecycle runs with no network.
+        self._sov_fetch = sov_fetch or self._fetch_sov_map
+        self._names_fetch = names_fetch or self._fetch_alliance_names
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -531,9 +727,29 @@ class MapTab:
         bar.pack(side="top", fill="x")
         tk.Label(bar, text="Search:", bg=t["bg"], fg=t["fg"]).pack(side="left", padx=(6, 2))
         entry_cls = autocomplete_cls or tk.Entry
-        self.search_entry = entry_cls(bar, width=24)
+        # An injected AutocompleteEntry takes the completion contract
+        # (completions/labels/on_select); on_select flies to the picked system
+        # immediately (a dropdown selection never raises <KeyRelease>). Gate on
+        # the update_completions capability rather than try/except: a plain
+        # tk.Entry FORWARDS unknown options to Tcl and raises tk.TclError -- not
+        # TypeError -- AND leaves a half-registered orphan child, so a bare
+        # (bar, width=24) construction is the right path for it (and for any
+        # non-autocomplete widget). The inner TypeError guard still tolerates an
+        # autocomplete widget with a stricter ctor signature.
+        if hasattr(entry_cls, "update_completions"):
+            try:
+                self.search_entry = entry_cls(bar, completions=[], labels={},
+                                              on_select=self._on_search, width=24)
+            except TypeError:
+                self.search_entry = entry_cls(bar, width=24)
+        else:
+            self.search_entry = entry_cls(bar, width=24)
         self.search_entry.pack(side="left", padx=2, pady=3)
-        self.search_entry.bind("<Return>", self._on_search)
+        # add="+" so we DON'T clobber AutocompleteEntry's own <Return> dropdown-
+        # select binding -- both fire (typed-name Enter flies via _on_search; a
+        # highlighted dropdown row is selected by the widget's own handler, which
+        # then calls on_select=_on_search). fc_gui.py:2441 documents the same trap.
+        self.search_entry.bind("<Return>", self._on_search, add="+")
         # Style the search field to the theme. Guarded: a custom autocomplete
         # widget might reject a Tk option (plain tk.Entry accepts them all).
         try:
@@ -561,24 +777,91 @@ class MapTab:
             "staging": tk.BooleanVar(value=bool(_layers.get("staging", True))),
             "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
             "bridges": tk.BooleanVar(value=bool(_layers.get("bridges", True))),
+            "route": tk.BooleanVar(value=bool(_layers.get("route", True))),
+            # Kill-heat layer (Task 30): ON by default (owner-approved ESI ambient).
+            "heat": tk.BooleanVar(value=bool(_layers.get("heat", True))),
+            # Intel pulse layer (Task 31): ON by default -- tracked-channel system
+            # mentions pulse amber and fade over ~5 min.
+            "intel": tk.BooleanVar(value=bool(_layers.get("intel", True))),
+            # Kill-ping layer (Task 36): ON by default -- it only fires when the
+            # user's configured zkill monitoring raises an alert (the checkbox is
+            # the requested opt-out). Discrete red radar bursts, distinct from heat.
+            "kill_pings": tk.BooleanVar(value=bool(_layers.get("kill_pings", True))),
+            # Sovereignty tint layer (Task 33): OFF by default (owner's palette-
+            # noise call) -- so the var default is False, matching _layer_on's
+            # off-by-default handling and keeping the fetch dormant until enabled.
+            "sov": tk.BooleanVar(value=bool(_layers.get("sov", False))),
         }
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
+        # Hover-tooltip Toplevel (created on demand; see _show_tooltip). Used to
+        # document the route overlay's ESI limitation on the "Route" toggle.
+        self._tooltip = None
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
-                            ("threat", "Threat"), ("bridges", "Bridges")):
-            tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
-                           bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
-                           activebackground=t["bg"], activeforeground=t["accent"],
-                           command=lambda k=_key: self._on_layer_toggle(k)
-                           ).pack(side="left", padx=4)
+                            ("threat", "Threat"), ("bridges", "Bridges"),
+                            ("route", "Route"), ("heat", "Heat"),
+                            ("intel", "Intel"), ("kill_pings", "Pings"),
+                            ("sov", "Sov")):
+            _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
+                                 bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
+                                 activebackground=t["bg"], activeforeground=t["accent"],
+                                 command=lambda k=_key: self._on_layer_toggle(k))
+            _cb.pack(side="left", padx=4)
+            if _key == "sov":
+                # Legend affordance (Task 33): a small "▾" microbutton right after
+                # the Sov toggle, ENABLED only while the layer is on. Opens the
+                # per-alliance color/name/count legend popup.
+                self._sov_legend_btn = tk.Button(
+                    bar, text="▾", command=self._show_sov_legend,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2",
+                    state=("normal" if bool(_layers.get("sov", False))
+                           else "disabled"))
+                self._sov_legend_btn.pack(side="left", padx=(0, 4))
+            if _key == "route":
+                # Owner note (Task 35): purely in-game-set destinations can't be
+                # shown -- ESI exposes no autopilot-route READ endpoint (verified
+                # against the live swagger). This overlay covers destinations set
+                # with the tool.
+                self._attach_tooltip(
+                    _cb, "Travel route to a destination set with the tool "
+                    "(map / intel / zkill 'Set destination'), incl. Ansiblex "
+                    "hops. Destinations set only in the game client can't be "
+                    "drawn — ESI has no route-read endpoint.")
+        # "Threat ▾" opens the in-tab threat drawer (Task 34, owner ask
+        # 2026-07-12): per-staging selection + the ship-class picker, both
+        # previously buried in a right-click cascade. Flat panel-coloured button
+        # so it reads as native to the app palette.
+        self._threat_drawer_btn = tk.Button(
+            bar, text="Threat ▾", command=self._toggle_threat_drawer,
+            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, padx=8, pady=1, cursor="hand2")
+        self._threat_drawer_btn.pack(side="left", padx=(10, 4))
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
+        # Canvas + right-side threat drawer share the body row: the canvas packs
+        # side=left/expand and the drawer (when open) packs side=right/fill=y, so
+        # opening it just reflows the canvas narrower and its <Configure> updates
+        # the renderer viewport (Task 34). With no drawer packed the canvas fills
+        # the whole body exactly as before (side=left == side=top for a lone
+        # expanding slave -- expand redistributes leftover space at the end).
         self.canvas = tk.Canvas(self.frame, bg=t["bg"], highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.pack(side="left", fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
+        # Transient threat-settings drawer (Task 34): a fixed-width themed panel
+        # created hidden; _open/_close_threat_drawer pack/pack_forget it on the
+        # right. State is NOT persisted (transient UI). pack_propagate(False)
+        # holds the ~230px width regardless of the (short) EVE system names.
+        self._threat_drawer = tk.Frame(self.frame, bg=t["panel"], width=230)
+        self._threat_drawer.pack_propagate(False)
+        self._threat_drawer_open = False
+        self._threat_rows = None                 # staging-row container (built on open)
+        self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
         self.renderer = None
@@ -661,6 +944,58 @@ class MapTab:
         self._tele_ov_del = 0.0                    # last overlay delete-ms (apply row)
         self._tele_ov_new = 0.0                    # last overlay create-ms (apply row)
 
+        # --- kill-heat ESI ambient loop + decay refresh (Task 30) ---------------
+        # A dedicated daemon loop thread (started on show, stopped on hide) fetches
+        # hourly ESI ambient kills and posts them onto the result queue; the stop
+        # Event lets on_hidden join it PROMPTLY (Event.wait returns the instant the
+        # event is set, so no thread leaks -- the Task-22 lesson). _last_heat_refresh_ms
+        # gates the periodic decay re-render (see _heat_refresh_due).
+        self._ambient_thread: threading.Thread | None = None
+        self._ambient_stop = threading.Event()
+        self._last_heat_refresh_ms = 0.0
+
+        # --- sovereignty tint layer lazy fetch (Task 33) ------------------------
+        # OFF by default -> ZERO network until enabled. When the layer is toggled
+        # on (or is on at show time) and the data is stale, a ONE-SHOT daemon
+        # thread ("map-sov") fetches /sovereignty/map/ + resolves alliance names,
+        # posts the results onto the result queue, and DIES (not a persistent loop
+        # -> nothing to join on hide). _sov_inflight guards against a double-spawn
+        # (set on the main thread before the spawn, cleared on the main thread when
+        # the result drains); _sov_fetched_ms is the last successful-fetch stamp
+        # for the hourly freshness gate. _sov_legend holds the open legend popup.
+        self._sov_inflight = False
+        self._sov_fetched_ms = 0.0
+        self._sov_legend = None
+
+        # --- intel pulse layer (Task 31) -----------------------------------------
+        # _intel_items maps system_id -> the canvas ring item drawn for it (rebuilt
+        # by _redraw_overlays, in lockstep with the ov_intel tag deletes);
+        # _intel_cache holds the per-system decay intensity captured at the last
+        # structure rebuild (the per-tick tween reads it so it need NOT re-run the
+        # decay every 16 ms); _intel_struct_ms gates the ~1 s cull/reproject.
+        # _press_xy is the last ButtonPress-1 position, for click-vs-pan
+        # discrimination in _on_drag_end (a pulse click focuses the Intel tab).
+        self._intel_items: dict[int, int] = {}
+        self._intel_cache: dict[int, float] = {}
+        self._intel_struct_ms = 0.0
+        self._press_xy: tuple[int, int] | None = None
+
+        # --- kill-ping layer (Task 36) -------------------------------------------
+        # _killping_items maps system_id -> the LIST of canvas item ids drawn for it
+        # (a burst has KILLPING_RINGS[_CAP] ring ovals; a linger has 1-2 diamond
+        # markers), rebuilt by _redraw_overlays in lockstep with the ov_killping tag
+        # deletes; _killping_cache holds each ping's (stage, capital) captured at the
+        # last structure rebuild so the per-tick tween knows which items are bursting
+        # (animate) vs lingering (static) WITHOUT re-running active() every 16 ms;
+        # _killping_struct_ms gates the ~1 s cull/reproject/stage-flip. _pending_focus_sid
+        # is a focus_kill target deferred until on_shown (the notebook <<TabChanged>>
+        # that runs on_shown fires ASYNC -- see _apply_pending_focus), applied AFTER
+        # restore_camera so the kill focus wins over the restored camera.
+        self._killping_items: dict[int, list[int]] = {}
+        self._killping_cache: dict[int, tuple] = {}
+        self._killping_struct_ms = 0.0
+        self._pending_focus_sid: int | None = None
+
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
@@ -716,6 +1051,7 @@ class MapTab:
             self.state.attach_model(model)
             self.state.restore_camera(self.cfg.get("camera") or {})
             self.renderer = mr.Renderer(model)
+            self._wire_completions(model)       # first show only: fill autocomplete
         # (Re)start the render worker on every show. _start_worker is idempotent
         # (no-op while a worker is running), so this spawns a thread only on the
         # first show and after an on_hidden shutdown -- letting a hide->show cycle
@@ -735,6 +1071,17 @@ class MapTab:
         self._request_crisp()
         self._schedule_tick()
         self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
+        self._start_ambient_loop()               # Task 30: hourly ESI ambient heat
+        # Task 33: fetch the sov map ONLY if the layer is on at show time (OFF by
+        # default -> no-op -> zero network). The one-shot thread dies after one
+        # fetch; an in-flight fetch across a hide/show is not double-spawned.
+        self._maybe_start_sov_fetch()
+        # Task 36: apply a focus_kill target that arrived while the tab was hidden.
+        # Runs LAST -- after restore_camera above -- so a "jump to this kill from the
+        # Intelligence tab" wins over the restored camera (the <<NotebookTabChanged>>
+        # that runs on_shown fires asynchronously, so focus_kill can't center before
+        # this point). No-op when nothing is pending.
+        self._apply_pending_focus()
 
     def on_hidden(self) -> None:
         if self.renderer is None:
@@ -762,6 +1109,15 @@ class MapTab:
         # map-render daemon (Task 22). renderer/model/_worker_cache and the last
         # frame on the canvas all survive; on_shown restarts the thread.
         self.shutdown_worker()
+        # Stop the kill-heat ESI ambient loop too (Task 30) -- same no-leak rule:
+        # a hidden tab must not keep an hourly fetch daemon alive. on_shown
+        # restarts it; kill_heat/ambient_heat state survives on the state object.
+        self.shutdown_ambient_loop()
+        # Task 33: dismiss any open sov legend popup (the one-shot sov FETCH thread
+        # is not a loop -> nothing to stop; sov_map/sov_names survive on state, and
+        # an in-flight fetch's _sov_inflight flag is intentionally left set so a
+        # re-show does not double-spawn -- the daemon posts its result either way).
+        self._hide_sov_legend()
         # Cancel the pending _tick after() so it cannot fire against a torn-down
         # root ("invalid command name ..._tick" Tcl stderr noise) and reset the
         # flag so on_shown can schedule a fresh tick.
@@ -796,6 +1152,7 @@ class MapTab:
         self.state.friendly_staging = set(friendly_ids or ())
         self.state.hostile_staging = set(hostile_ids or ())
         self._redraw_overlays()
+        self._rebuild_threat_staging_rows()      # keep the drawer's rows in sync
 
     def apply_range_overlay(self, overlay) -> None:
         self.state.range_overlay = overlay          # base-layer change:
@@ -832,13 +1189,740 @@ class MapTab:
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
+        # Ansiblex list changed (Task 35): a live route may now take (or drop) a
+        # bridge, so re-solve it from the current origin.
+        if self.state.route_dest is not None:
+            self._recompute_route()
 
     def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
+        prev = self.state.own_system_id
         self.state.own_system_id = system_id
+        # Route overlay (Task 35): the 15s own-location poll re-pushes the SAME id
+        # every tick, so react only when the own system actually changed. Arrival
+        # (own == destination) auto-clears the route; any other move re-solves it
+        # from the new origin.
+        if system_id != prev and self.state.route_dest is not None:
+            if system_id is not None and system_id == self.state.route_dest:
+                self.clear_route()
+                return
+            self._recompute_route()
         self._redraw_overlays()
 
+    # ---- destination route overlay (Task 35) ----------------------------------
+    def set_route_destination(self, system_id) -> None:
+        """Set (or replace) the travel-route destination and re-solve the route
+        overlay from the tracked character's current location. Called by fc_gui
+        after a successful in-tool 'Set destination' (ESI set_waypoint) -- a Tk
+        menu/bind handler, so it runs on the main thread. A new destination
+        REPLACES any prior one; the route is session-scoped (never persisted).
+        ``None`` clears."""
+        if system_id is None:
+            self.clear_route()
+            return
+        self.state.route_dest = system_id
+        self.state.route_path = None             # replace: drop any stale path
+        self._recompute_route()                  # async BFS (handles own == dest)
+        self._redraw_overlays()                  # show the destination ring at once
+
+    def clear_route(self) -> None:
+        """Drop the destination-route overlay (arrival, replacement, or the user's
+        'Clear route' menu action). Session state only -- nothing persisted."""
+        self.state.route_dest = None
+        self.state.route_path = None
+        self._redraw_overlays()
+
+    def _recompute_route(self) -> None:
+        """Re-solve the travel route from own location to route_dest on a worker
+        thread (Ansiblex-aware BFS), feeding the result back through the main-
+        thread result queue as a ``("route", tuple)`` message (drained by
+        _drain_results, applied by _apply_route -- the same off-thread pattern as
+        _recompute_threat). No-ops while origin / dest / model are missing (the
+        destination ring still draws); arrival (own == dest) clears. Ansiblex
+        connection strings are built from the resolved bridge pairs the map
+        already holds -- the SAME resolution the jump-range BFS consumes -- so no
+        fc_gui import is needed."""
+        dest = self.state.route_dest
+        origin = self.state.own_system_id
+        if dest is None or origin is None or self.state.model is None:
+            return
+        if origin == dest:                       # already there -> arrival clear
+            self.clear_route()
+            return
+        # "id1|id2" strings for get_stargate_route's extra-edge parser (order does
+        # not matter -- _bfs_route adds both directions). Empty -> None (gate-only).
+        conns = [f"{a}|{b}" for (a, b) in self.state.bridges] or None
+        route_fn = self._route_fn
+
+        def work():
+            try:
+                path = route_fn(origin, dest, connections=conns)
+            except Exception as exc:             # never crash the helper thread
+                print(f"[MAP] route recompute failed: {exc}")
+                return
+            self._result_q.put(("route", tuple(path or ())))
+
+        threading.Thread(target=work, daemon=True, name="map-route").start()
+
+    def _apply_route(self, path) -> None:
+        """Apply a worker-resolved route path on the main thread (Task 35). An
+        empty path (no gate route found) clears the polyline but KEEPS route_dest
+        so the destination ring still marks the target."""
+        self.state.route_path = tuple(path) or None
+        self._redraw_overlays()
+
+    # ---- kill-heat layer (Task 30) --------------------------------------------
+    def add_kill_heat(self, system_id, kill_count, capital=False) -> None:
+        """Record a zkill engagement alert into the live kill-heat ring. Called on
+        the MAIN thread -- fc_gui marshals the zkill worker-thread callback
+        (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which calls
+        this. Stamps the event with wall-clock time (the kill just arrived; zkill
+        is near-real-time). When the heat layer is on, force-dirties + re-requests
+        a crisp so the new hot system lights up promptly, and repaints overlays so
+        a capital marker can appear at once. Guarded/no-throw so a malformed alert
+        never breaks the zkill path."""
+        try:
+            self.state.kill_heat.add_kill(system_id, kill_count, time.time(),
+                                          bool(capital))
+        except Exception as exc:
+            print(f"[MAP] add_kill_heat failed: {exc}")
+            return
+        if self._layer_on("heat"):
+            self._last_heat_refresh_ms = _now_ms()   # a fresh crisp resets the decay clock
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
+    def _current_heat_dict(self) -> dict:
+        """Merged live+ambient 0..1 heat for NOW (empty dict when no activity).
+        Single source used by both the request builder and the decay-refresh
+        gate so they can never disagree on what heat is live."""
+        return self.state.kill_heat.merge_ambient(self.state.ambient_heat,
+                                                  time.time())
+
+    def _heat_request_value(self):
+        """Canonical hashable heat tuple for the render request + sig, or None
+        when the heat layer is off OR there is no live heat -- both collapse to
+        None so a heat-off (or heat-on-but-empty) frame is byte-identical to the
+        pre-heat output and its sig matches, keeping duplicate suppression sound."""
+        if not self._layer_on("heat"):
+            return None
+        return mo.canonical_heat(self._current_heat_dict()) or None
+
+    def _heat_refresh_due(self, now_ms: float) -> bool:
+        """True when the periodic decay refresh should re-request a crisp: the
+        heat layer is on, at least HEAT_REFRESH_MS has elapsed since the last
+        heat-driven refresh, AND there is currently live heat. The cheap time gate
+        is checked FIRST so the (bounded but non-trivial) heat merge runs at most
+        once per HEAT_REFRESH_MS, not every 16 ms tick. Pure/testable (injected
+        clock)."""
+        if not self._layer_on("heat"):
+            return False
+        if now_ms - self._last_heat_refresh_ms < HEAT_REFRESH_MS:
+            return False
+        return bool(mo.canonical_heat(self._current_heat_dict()))
+
+    # ---- kill-heat ESI ambient loop (Task 30) ---------------------------------
+    def _start_ambient_loop(self) -> None:
+        """Start the hourly ESI ambient-heat fetch thread. Idempotent: a no-op
+        when disabled in cfg (cfg["kill_heat_esi"], default True) or when a loop
+        is already running. Owner-approved (2026-07-12: "Ok to make 2 calls per
+        hour") -> ON by default; we actually issue ONE call/hour (see
+        _fetch_ambient_heat's jumps decision)."""
+        if not self.cfg.get("kill_heat_esi", True):
+            return
+        if self._ambient_thread is not None and self._ambient_thread.is_alive():
+            return
+        self._ambient_stop.clear()
+        self._ambient_thread = threading.Thread(
+            target=self._ambient_loop, daemon=True, name="map-ambient-heat")
+        self._ambient_thread.start()
+
+    def _ambient_loop(self) -> None:
+        """Daemon body: after a short first-fetch delay, fetch ambient kills and
+        post them onto the result queue, then repeat every ~hour. The stop Event
+        is WAITED on (not sleep) for both the initial delay and the interval, so
+        on_hidden's shutdown_ambient_loop wakes it the instant the event is set --
+        it never sleeps out a full hour past a hide (the no-leak guarantee).
+        Failures silent-degrade: _ambient_fetch returns None and the loop simply
+        retries next cycle (zkill-only heat meanwhile)."""
+        stop = self._ambient_stop
+        if stop.wait(AMBIENT_START_DELAY_S):
+            return                               # stopped during the initial delay
+        while not stop.is_set():
+            try:
+                kills = self._ambient_fetch()
+            except Exception as exc:             # never let the loop die on a fetch
+                print(f"[MAP] ambient heat loop error: {exc}")
+                kills = None
+            if kills and not stop.is_set():
+                # Post the sorted (sid, count) pairs; _apply_ambient rebuilds the
+                # dict on the main thread. A stale put after a hide is harmless --
+                # the queue just holds it until the next show drains it.
+                self._result_q.put(("ambient", tuple(sorted(kills.items()))))
+            if stop.wait(AMBIENT_INTERVAL_S):
+                return                           # stopped during the hourly wait
+
+    def shutdown_ambient_loop(self) -> None:
+        """Stop the ambient loop and join it briefly so a hidden tab leaks no
+        fetch daemon (Task 22 lesson). Idempotent: safe when no loop is running.
+        Setting the Event wakes a loop blocked in stop.wait() immediately; the
+        join only has to outlast an in-flight request (~10 s worst case, but the
+        loop re-checks is_set right after), so the thread exits promptly."""
+        self._ambient_stop.set()
+        t = self._ambient_thread
+        if t is not None:
+            t.join(timeout=2.0)
+            self._ambient_thread = None
+
+    def _fetch_ambient_heat(self):
+        """Fetch hourly ESI ambient kills (public endpoint, no auth) ->
+        ``{system_id: ship+pod kills}``, or None on any failure (silent-degrade to
+        zkill-only heat). Uses the repo rate limiter + ESI_HEADERS. Runs ONLY on
+        the ambient loop thread.
+
+        JUMPS DECISION (Task 30, owner delegated "skip jumps entirely if you judge
+        it dead weight"): the sibling /universe/system_jumps/ endpoint is NOT
+        fetched. Nothing consumes jump counts yet -- the future hover tooltip that
+        would use them is unbuilt -- so fetching them would be dead weight AND a
+        second ESI call for zero rendered effect. We issue ONE call/hour, well
+        under the owner-approved 2/hour budget. Add the jumps fetch alongside the
+        tooltip that needs it."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS
+            from rate_limiter import rate_limit
+            rate_limit("esi")
+            resp = requests.get(f"{ESI_BASE}/universe/system_kills/",
+                                timeout=10, headers=ESI_HEADERS)
+            if not resp.ok:
+                return None
+            return mo.parse_system_kills(resp.json())
+        except Exception as exc:
+            print(f"[MAP] ambient heat fetch failed: {exc}")
+            return None
+
+    def _apply_ambient(self, pairs) -> None:
+        """Apply worker-fetched hourly ambient kills on the MAIN thread (drained
+        from the result queue by _drain_results). Stores the {sid: ship+pod}
+        counts; when the heat layer is on, force-dirties + re-requests a crisp so
+        the low ambient band updates. ``pairs`` is the sorted ((sid, count), ...)
+        tuple the ambient loop posted."""
+        self.state.ambient_heat = {int(sid): int(c) for sid, c in pairs}
+        if self._layer_on("heat"):
+            self._last_heat_refresh_ms = _now_ms()
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
+    # ---- intel pulse layer (Task 31) ------------------------------------------
+    def add_intel_pulse(self, system_id_or_name, now=None) -> None:
+        """Record/refresh an intel mention of a system so it pulses on the map.
+        Accepts a system id (int / numeric str) OR a system NAME (resolved via the
+        model's exact case-insensitive name index; anything unresolvable -> a silent
+        no-op). Called on the MAIN thread (fc_gui marshals the intel stream through
+        _post_ui before pushing, so no extra hop here). Stamps the mention with
+        wall-clock time; when the layer is on, rebuilds the ring overlay at once so a
+        fresh call lights up immediately (the tick loop then animates it).
+        Guarded/no-throw so a malformed push never breaks the intel path."""
+        sid = self._resolve_intel_target(system_id_or_name)
+        if sid is None:
+            return
+        ts = time.time() if now is None else now
+        try:
+            self.state.intel_pulses.note(sid, ts)
+        except Exception as exc:
+            print(f"[MAP] intel pulse note failed: {exc}")
+            return
+        if self._layer_on("intel"):
+            self._redraw_overlays()          # draw the new ring now
+            self._schedule_tick()            # ensure the tick loop animates it
+
+    def _resolve_intel_target(self, system_id_or_name):
+        """Resolve an intel push target to a system id. int / numeric-str -> that id;
+        a name -> the model's exact (case-insensitive) name index; anything
+        unresolvable (unknown name, empty, bool, wrong type) -> None (silent skip)."""
+        v = system_id_or_name
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            q = v.strip()
+            if not q:
+                return None
+            if q.lstrip("-").isdigit():
+                try:
+                    return int(q)
+                except ValueError:
+                    return None
+            return self.state._name_to_id.get(q.lower())
+        return None
+
+    def _intel_osc(self, now_ms: float) -> float:
+        """Shared 0..1 oscillator for the pulse ring (time-based phase so every ring
+        breathes in unison)."""
+        return 0.5 + 0.5 * math.sin((now_ms / INTEL_PULSE_MS) * _TWO_PI)
+
+    def _intel_radius(self, intensity: float, now_ms: float) -> float:
+        """Oscillating ring radius: base R0 plus a sinusoid whose amplitude scales
+        with the mention's decay intensity (fresh -> full throb, old -> nearly
+        static)."""
+        return INTEL_R0 + INTEL_AMP * intensity * self._intel_osc(now_ms)
+
+    def _intel_width(self, intensity: float, now_ms: float) -> int:
+        """Oscillating ring line width (1..3 px); amplitude scaled by intensity so a
+        decayed pulse also thins out."""
+        return 1 + int(round(2.0 * intensity * self._intel_osc(now_ms)))
+
+    def _animate_intel_pulses(self, now_ms: float) -> None:
+        """Per-tick intel-pulse animation. HARD empty-fast-path FIRST: zero extra
+        work when the layer is off or nothing is pulsing (the common case) -- one
+        dict lookup + one O(1) truthiness, then return. While pulses are live, MUTATE
+        the existing ring items in place (coords + width) so the hot 16 ms path never
+        allocates or delete/recreates. Structure changes (culling an expired mention,
+        reprojecting the set) are batched to ~1 s via a cheap time gate that defers to
+        _redraw_overlays -- the same idiom as the Task 30 heat-refresh gate."""
+        if not self._layer_on("intel"):
+            return
+        pulses = self.state.intel_pulses
+        if not pulses.has_any():
+            return
+        if now_ms - self._intel_struct_ms >= INTEL_STRUCT_MS:
+            self._redraw_overlays()          # cull + reproject; resets _intel_struct_ms
+            return
+        if not self._intel_items or self.state.model is None:
+            return
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        canvas = self.canvas
+        for sid, item in self._intel_items.items():
+            s = systems.get(sid)
+            if s is None:
+                continue
+            intensity = self._intel_cache.get(sid, 1.0)
+            sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
+            r = self._intel_radius(intensity, now_ms)
+            try:
+                canvas.coords(item, sx - r, sy - r, sx + r, sy + r)
+                canvas.itemconfigure(item, width=self._intel_width(intensity, now_ms))
+            except tk.TclError:
+                pass
+
+    def _intel_click_hit(self, sx: float, sy: float) -> bool:
+        """Fire the ``on_intel_click`` callback if (sx, sy) lands within an active
+        pulse's hit radius (nearest pulse wins). Returns True when a pulse consumed
+        the click. No-op (False) when the layer is off, no callback is wired, no
+        model, or no pulse is near. Guarded so a bad callback never breaks the
+        click-release path."""
+        if not self._layer_on("intel") or self.state.model is None:
+            return False
+        cb = self.callbacks.get("on_intel_click")
+        if cb is None:
+            return False
+        active = self.state.intel_pulses.active(time.time())
+        if not active:
+            return False
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        best = None
+        best_d2 = None
+        for sid in active:
+            s = systems.get(sid)
+            if s is None:
+                continue
+            px, py = cam.world_to_screen(s.x, s.y, vw, vh)
+            d2 = (px - sx) ** 2 + (py - sy) ** 2
+            if d2 <= INTEL_HIT_R ** 2 and (best_d2 is None or d2 < best_d2):
+                best, best_d2 = sid, d2
+        if best is None:
+            return False
+        try:
+            cb(best)
+        except Exception as exc:
+            print(f"[MAP] intel click callback failed: {exc}")
+        return True
+
+    # ---- kill-ping layer (Task 36) --------------------------------------------
+    def add_kill_ping(self, system_id, capital=False, count=1, now=None) -> None:
+        """Record a discrete zkill ALERT ping so its system radar-bursts on the map
+        (Task 36). Called on the MAIN thread -- fc_gui marshals the zkill worker
+        callback (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which
+        forwards here alongside the kill-heat push. Stamps the ping with wall-clock
+        time (the alert just fired; zkill is near-real-time). When the layer is on,
+        rebuilds the overlay at once so the burst lights up immediately (the tick
+        loop then animates it). INDEPENDENTLY gated from heat by its own layer
+        toggle. Guarded/no-throw so a malformed alert never breaks the zkill path."""
+        ts = time.time() if now is None else now
+        try:
+            self.state.kill_pings.ping(system_id, ts, capital=bool(capital),
+                                       count=count)
+        except Exception as exc:
+            print(f"[MAP] kill ping note failed: {exc}")
+            return
+        if self._layer_on("kill_pings"):
+            self._redraw_overlays()          # draw the new burst now
+            self._schedule_tick()            # ensure the tick loop animates it
+
+    def focus_kill(self, system_id) -> None:
+        """Center the camera on ``system_id`` at a readable zoom and REPLAY its burst
+        (Task 36). Invoked by fc_gui's Intelligence-tab '[Map]' affordance after
+        selecting the Map tab. Robust to the tab not having been shown yet: because
+        the <<NotebookTabChanged>> that runs on_shown fires ASYNCHRONOUSLY (verified
+        empirically), this can't center before on_shown's restore_camera runs, so the
+        target is DEFERRED to _apply_pending_focus (called at the end of on_shown,
+        after restore_camera) and applied there. When the map is already the visible
+        tab, centers immediately. Silently no-ops on a bad / unknown id."""
+        if isinstance(system_id, bool):
+            return
+        try:
+            sid = int(system_id)
+        except (TypeError, ValueError):
+            return
+        known = self.state.model is not None and sid in self.state.model.systems
+        # Retrigger the burst so it replays on arrival (no-op if the ping was culled).
+        try:
+            self.state.kill_pings.retrigger(sid, time.time())
+        except Exception:
+            pass
+        if self._visible and known:
+            self._center_on_kill(sid)        # already shown -> focus now
+        elif not self._visible:
+            # Hidden / never-shown: defer to on_shown (the model may load only then;
+            # deferring past restore_camera also prevents a camera clobber). We stash
+            # regardless of `known` -- on_shown re-checks the id against the model.
+            self._pending_focus_sid = sid
+        # visible + unknown id -> silent no-op (nothing to center on)
+
+    def _center_on_kill(self, sid: int) -> None:
+        """Recenter + zoom the camera onto ``sid`` (Task 36). Reuses fly_to's camera
+        pathway: set center to the system's world coords and bump to a readable zoom
+        (max_scale / 3), then force a crisp re-render + overlay repaint. No-op on an
+        unknown id."""
+        s = self.state.model.systems.get(sid) if self.state.model is not None else None
+        if s is None:
+            return
+        cam = self.state.camera
+        cam.cx, cam.cy = s.x, s.y
+        cam.scale = max(cam.scale, cam.max_scale / 3.0)
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+        self._schedule_tick()
+
+    def _apply_pending_focus(self) -> None:
+        """Apply a focus_kill target that was deferred until the tab was shown (Task
+        36). Called at the END of on_shown -- AFTER restore_camera -- so the kill
+        focus wins over the restored camera. Retriggers the burst so it replays on
+        arrival, then centers. No-op when nothing is pending or the id is unknown to
+        the (now-loaded) model."""
+        sid = self._pending_focus_sid
+        if sid is None:
+            return
+        self._pending_focus_sid = None
+        if self.state.model is None or sid not in self.state.model.systems:
+            return
+        try:
+            self.state.kill_pings.retrigger(sid, time.time())
+        except Exception:
+            pass
+        self._center_on_kill(sid)
+
+    def _killping_ring(self, k: int, n: int, span: float,
+                       now_ms: float) -> tuple[float, int]:
+        """Radar ring (radius, width) for emanating ring ``k`` of ``n`` at ``now_ms``.
+        Each ring rides the shared sweep phase offset by k/n so the rings chase each
+        other outward continuously; radius grows from KILLPING_R0 across ``span`` as
+        the phase advances, and the line THINS (3 -> 1 px) as it expands so a ring
+        visually fades out at the edge (Tk ovals have no alpha)."""
+        ph = ((now_ms / KILLPING_SWEEP_MS) + (k / n)) % 1.0
+        r = KILLPING_R0 + ph * span
+        w = max(1, int(round(3.0 * (1.0 - ph))))
+        return r, w
+
+    def _animate_kill_pings(self, now_ms: float) -> None:
+        """Per-tick kill-ping animation (Task 36). HARD empty-fast-path FIRST: zero
+        work when the layer is off or nothing is pinging (one dict-get + one O(1)
+        truthiness, then return) -- so ~100 idle ticks cause zero canvas mutation.
+        While bursts are live, MUTATE the existing burst ring items (coords + width)
+        from the shared radar sweep so the hot 16 ms path never allocates or
+        delete/recreates; the linger markers are static (skipped). Structure changes
+        (burst->linger, cull, reproject) are batched to ~1 s (KILLPING_STRUCT_MS) via
+        a cheap time gate that defers to _redraw_overlays -- the intel-pulse idiom."""
+        if not self._layer_on("kill_pings"):
+            return
+        pings = self.state.kill_pings
+        if not pings.has_any():
+            return
+        if now_ms - self._killping_struct_ms >= KILLPING_STRUCT_MS:
+            self._redraw_overlays()          # cull + reproject + stage flips
+            return
+        if not self._killping_items or self.state.model is None:
+            return
+        cam = self.state.camera
+        vw, vh = self.state.vw, self.state.vh
+        systems = self.state.model.systems
+        canvas = self.canvas
+        for sid, ids in self._killping_items.items():
+            cached = self._killping_cache.get(sid)
+            if cached is None or cached[0] != "burst":
+                continue                     # linger markers are static -> no tween
+            s = systems.get(sid)
+            if s is None:
+                continue
+            cap = cached[1]
+            n = KILLPING_RINGS_CAP if cap else KILLPING_RINGS
+            span = KILLPING_SPAN_CAP if cap else KILLPING_SPAN
+            sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
+            for k, item in enumerate(ids):
+                r, w = self._killping_ring(k, n, span, now_ms)
+                try:
+                    canvas.coords(item, sx - r, sy - r, sx + r, sy + r)
+                    canvas.itemconfigure(item, width=w)
+                except tk.TclError:
+                    pass
+
+    # ---- sovereignty tint layer (Task 33) -------------------------------------
+    def _sov_request_value(self):
+        """Canonical hashable sov tuple for the render request + sig, or None when
+        the sov layer is off OR there is no sov data -- both collapse to None so a
+        sov-off (or on-but-empty) frame is byte-identical to the pre-sov output and
+        its sig matches, keeping duplicate suppression sound."""
+        if not self._layer_on("sov"):
+            return None
+        return mo.canonical_sov(self.state.sov_map) or None
+
+    def _maybe_start_sov_fetch(self, now_ms: float | None = None) -> None:
+        """Spawn the ONE-SHOT sov fetch thread iff the layer is on, no fetch is in
+        flight, and the data is stale (older than SOV_REFRESH_S). OFF by default ->
+        never spawns until the owner enables the layer (zero network). Idempotent:
+        the in-flight flag blocks a double-spawn (a hide/show while a fetch runs, or
+        the per-tick gate racing a toggle), and the freshness gate blocks an
+        immediate re-fetch on a toggle within the hour. The thread dies after one
+        fetch -- no loop, nothing to join on hide. Cheap-gate-first so the per-tick
+        call costs a dict-get + bool when the layer is off."""
+        if not self._layer_on("sov"):
+            return
+        if self._sov_inflight:
+            return
+        now = _now_ms() if now_ms is None else now_ms
+        # Throttle EVERY attempt (success, failure OR empty result) to at most one
+        # per SOV_REFRESH_S by stamping the attempt time at SPAWN, not only on
+        # success: a failed/empty fetch leaves sov_map empty, so a success-only
+        # stamp gated on sov_map would leave the gate permanently open and
+        # retry-STORM the endpoint every tick. _sov_fetched_ms == 0 is the
+        # never-fetched sentinel, so the first enable always fetches.
+        if self._sov_fetched_ms > 0.0 and \
+                (now - self._sov_fetched_ms) < SOV_REFRESH_S * 1000.0:
+            return                               # attempted recently -> no re-fetch
+        self._sov_fetched_ms = now               # stamp the ATTEMPT (storm guard)
+        self._sov_inflight = True
+        threading.Thread(target=self._sov_fetch_worker, daemon=True,
+                         name="map-sov").start()
+
+    def _sov_fetch_worker(self) -> None:
+        """One-shot daemon body (Task 33): fetch the sov map, then bulk-resolve the
+        distinct alliance names, posting each result onto the MAIN-thread result
+        queue. Touches NO Tk. ALWAYS posts a ('sov', payload|None) message so the
+        main thread clears the in-flight flag on every outcome (a None payload =
+        failed/empty fetch -> flag cleared, sov_map + freshness stamp left untouched
+        so the next enable retries). A successful map ALSO triggers a best-effort
+        name resolve posted as ('sov_names', ...); a name failure still leaves the
+        tint applied with raw-id legend entries (silent degrade). Exits after one
+        pass -- there is no loop to leak."""
+        try:
+            mapping = self._sov_fetch()
+        except Exception as exc:                 # never let the one-shot die noisily
+            print(f"[MAP] sov fetch failed: {exc}")
+            mapping = None
+        if not mapping:
+            self._result_q.put(("sov", None))    # failure -> clear in-flight, keep stale
+            return
+        self._result_q.put(("sov", tuple(sorted(mapping.items()))))
+        try:
+            ids = sorted(set(mapping.values()))
+            names = self._names_fetch(ids) if ids else {}
+        except Exception as exc:
+            print(f"[MAP] sov name resolve failed: {exc}")
+            names = None
+        if names:
+            self._result_q.put(("sov_names", tuple(sorted(names.items()))))
+
+    def _apply_sov(self, pairs) -> None:
+        """Apply a worker-fetched sov map on the MAIN thread (drained from the result
+        queue). ALWAYS clears the in-flight flag so a later refresh can spawn again.
+        A None payload is a failed/empty fetch: clear the flag and leave sov_map
+        untouched (map stays untinted); the SPAWN-time freshness stamp
+        (_maybe_start_sov_fetch) throttles the next attempt to the hourly gate --
+        silent degrade, no retry storm. A real payload replaces sov_map, re-stamps
+        the fetch time (refreshing the hourly gate) and -- when the layer is on --
+        force-dirties + re-requests a crisp so the tint appears, plus a redraw so
+        the right-click info row reflects it."""
+        self._sov_inflight = False
+        if pairs is None:
+            return
+        self.state.sov_map = {int(sid): int(aid) for sid, aid in pairs}
+        self._sov_fetched_ms = _now_ms()
+        if self._layer_on("sov"):
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+
+    def _apply_sov_names(self, pairs) -> None:
+        """Apply worker-resolved alliance names on the MAIN thread (legend data).
+        Does NOT trigger a re-render -- names only enrich the legend popup and the
+        right-click info row, which read state.sov_names lazily when opened."""
+        self.state.sov_names = {int(aid): str(name) for aid, name in pairs}
+
+    def _fetch_sov_map(self):
+        """Fetch ESI /sovereignty/map/ (public, no auth, long-cached) ->
+        {system_id: alliance_id}, or None on any failure (silent-degrade -> the map
+        stays untinted). Uses the repo rate limiter + ESI_HEADERS. Runs ONLY on the
+        one-shot sov thread."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS
+            from rate_limiter import rate_limit
+            rate_limit("esi")
+            resp = requests.get(f"{ESI_BASE}/sovereignty/map/",
+                                timeout=10, headers=ESI_HEADERS)
+            if not resp.ok:
+                return None
+            return mo.parse_sov_map(resp.json())
+        except Exception as exc:
+            print(f"[MAP] sov map fetch failed: {exc}")
+            return None
+
+    def _fetch_alliance_names(self, alliance_ids):
+        """Bulk-resolve alliance ids -> {id: name} via POST ESI /universe/names/
+        (public, <=1000 ids/call, JSON body = list of ids), or None on failure (the
+        legend then falls back to raw ids). Keeps only 'alliance'-category rows.
+        Chunks defensively at 1000 though EVE has far fewer alliances. Runs ONLY on
+        the one-shot sov thread."""
+        try:
+            import requests
+            from esi_constants import ESI_BASE, ESI_HEADERS_JSON
+            from rate_limiter import rate_limit
+            out: dict[int, str] = {}
+            ids = [int(a) for a in alliance_ids]
+            for i in range(0, len(ids), 1000):
+                chunk = ids[i:i + 1000]
+                if not chunk:
+                    continue
+                rate_limit("esi")
+                resp = requests.post(f"{ESI_BASE}/universe/names/",
+                                     json=chunk, timeout=10,
+                                     headers=ESI_HEADERS_JSON)
+                if not resp.ok:
+                    return None
+                for row in resp.json() or ():
+                    if row.get("category") == "alliance":
+                        out[int(row["id"])] = row.get("name") or str(row["id"])
+            return out
+        except Exception as exc:
+            print(f"[MAP] alliance name resolve failed: {exc}")
+            return None
+
+    # ---- sov legend popup (Task 33) -------------------------------------------
+    def _sync_sov_legend_btn(self) -> None:
+        """Enable the Sov legend "▾" microbutton only while the sov layer is on."""
+        btn = getattr(self, "_sov_legend_btn", None)
+        if btn is not None:
+            try:
+                btn.configure(state=("normal" if self._layer_on("sov")
+                                     else "disabled"))
+            except tk.TclError:
+                pass
+
+    def _show_sov_legend(self) -> None:
+        """Popup a compact themed legend of the top sov alliances (color swatch +
+        name + tinted-system count), anchored under the "▾" microbutton. Dismisses
+        on click-away (focus-out) or Escape. Rebuilt fresh each open from the live
+        sov map + resolved names (raw id when a name is unresolved). Matches the
+        _make_menu dark idiom -- a 1px border-color frame around a panel-bg body."""
+        self._hide_sov_legend()
+        t = self.theme
+        rows = mo.sov_legend_rows(self.state.sov_map, self.state.sov_names)
+        try:
+            anchor = getattr(self, "_sov_legend_btn", None) or self.frame
+            x = anchor.winfo_rootx()
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+            top = self._sov_legend = tk.Toplevel(anchor)
+            top.wm_overrideredirect(True)
+            top.wm_geometry(f"+{x}+{y}")
+            top.configure(bg=t["border"])                # 1px themed border
+            inner = tk.Frame(top, bg=t["panel"])
+            inner.pack(padx=1, pady=1, fill="both")
+            tk.Label(inner, text="Sovereignty", bg=t["panel"], fg=t["accent"],
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8,
+                                                         pady=(6, 2))
+            if not rows:
+                tk.Label(inner, text="No sovereignty data yet.", bg=t["panel"],
+                         fg=t["fg"], font=("Segoe UI", 8)).pack(anchor="w", padx=8,
+                                                                pady=(0, 6))
+            for _aid, label, cnt, rgb in rows:
+                r = tk.Frame(inner, bg=t["panel"])
+                r.pack(fill="x", padx=8, pady=1)
+                sw = tk.Frame(r, bg="#%02x%02x%02x" % rgb, width=12, height=12)
+                sw.pack_propagate(False)
+                sw.pack(side="left", padx=(0, 6))
+                tk.Label(r, text=f"{label}  ({cnt})", bg=t["panel"], fg=t["fg"],
+                         font=("Segoe UI", 8), anchor="w").pack(side="left")
+            tk.Frame(inner, bg=t["panel"], height=4).pack()
+            top.bind("<Escape>", lambda _e: self._hide_sov_legend())
+            top.bind("<FocusOut>", lambda _e: self._hide_sov_legend())
+            top.focus_set()
+        except Exception:
+            self._sov_legend = None
+
+    def _hide_sov_legend(self) -> None:
+        top = getattr(self, "_sov_legend", None)
+        if top is not None:
+            try:
+                top.destroy()
+            except Exception:
+                pass
+            self._sov_legend = None
+
+    # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
+    def _attach_tooltip(self, widget, text: str) -> None:
+        """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
+        destroyed on <Leave>) to a toolbar widget. add='+' so it never clobbers a
+        widget's own bindings. Used to document the route overlay's ESI limitation
+        (Task 35) without pulling in fc_gui's tooltip helper."""
+        widget.bind("<Enter>", lambda _e: self._show_tooltip(widget, text), add="+")
+        widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
+
+    def _show_tooltip(self, widget, text: str) -> None:
+        self._hide_tooltip()
+        t = self.theme
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 2
+            tip = self._tooltip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=text, justify="left", wraplength=280,
+                     bg=t["panel"], fg=t["fg"], relief="solid", borderwidth=1,
+                     padx=6, pady=4).pack()
+        except Exception:
+            self._tooltip = None
+
+    def _hide_tooltip(self) -> None:
+        tip = getattr(self, "_tooltip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            self._tooltip = None
+
     def _layer_on(self, key: str) -> bool:
-        return bool(self.cfg.get("layers", {}).get(key, True))
+        # Most layers default ON when cfg omits the key; sov (and any future
+        # off-by-default layer) defaults OFF -- see _LAYERS_OFF_BY_DEFAULT.
+        default = key not in _LAYERS_OFF_BY_DEFAULT
+        return bool(self.cfg.get("layers", {}).get(key, default))
 
     def _draw_diamond(self, sx: float, sy: float, r: float,
                       color: str, tag: str) -> None:
@@ -863,9 +1947,18 @@ class MapTab:
         if _c: _o0 = _c()
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own")
+                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
+                 "ov_killping")
         for tag in _tags:
             canvas.delete(tag)
+        # Task 31 / Task 36: the ov_intel + ov_killping items were just deleted ->
+        # drop their stale ids so the dicts stay in lockstep with the canvas
+        # (repopulated in the intel / kill-ping blocks below; left empty on the
+        # no-model early-return, which is correct).
+        self._intel_items = {}
+        self._intel_cache = {}
+        self._killping_items = {}
+        self._killping_cache = {}
         if _c: _od = _c()
         if self.renderer is None or self.state.model is None:
             if _c:
@@ -889,6 +1982,48 @@ class MapTab:
             if sx < -40 or sy < -40 or sx > vw + 40 or sy > vh + 40:
                 return None
             return sx, sy
+
+        # -- destination route (Task 35): gold dashed stargate hops + BRIDGE_BLUE
+        # dash-dot Ansiblex hops (diamond endpoint markers) + a gold dest ring.
+        # Drawn FIRST so node markers (staging / fleet / own) sit on top. Segments
+        # are culled by endpoint visibility (draw when EITHER end is near-viewport)
+        # so the route reaches one hop past the screen edge, like the node cull.
+        rp = st.route_path
+        if self._layer_on("route") and rp and len(rp) >= 2:
+            _RCULL = 60.0
+
+            def route_pt(sid):
+                s = systems.get(sid)
+                if s is None:
+                    return None
+                px, py = cam.world_to_screen(s.x, s.y, vw, vh)
+                vis = (-_RCULL <= px <= vw + _RCULL and -_RCULL <= py <= vh + _RCULL)
+                return (px, py, vis)
+
+            for a_id, b_id, kind in mo.classify_route_segments(rp, st.bridges):
+                pa, pb = route_pt(a_id), route_pt(b_id)
+                if pa is None or pb is None or not (pa[2] or pb[2]):
+                    continue
+                if kind == "bridge":
+                    canvas.create_line(pa[0], pa[1], pb[0], pb[1],
+                                       fill=BRIDGE_BLUE_HEX, width=2,
+                                       dash=(6, 2, 2, 2), tags="ov_route")
+                    if pa[2]:
+                        self._draw_diamond(pa[0], pa[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                    if pb[2]:
+                        self._draw_diamond(pb[0], pb[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                else:
+                    canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=ROUTE_GOLD,
+                                       width=2, dash=(6, 4), tags="ov_route")
+        # destination ring marker (whenever a destination is set AND on-screen)
+        if self._layer_on("route") and st.route_dest is not None:
+            p = project(st.route_dest)
+            if p is not None:
+                sx, sy = p
+                canvas.create_oval(sx - 11, sy - 11, sx + 11, sy + 11,
+                                   outline=ROUTE_GOLD, width=2, tags="ov_route")
+                canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
+                                   outline=ROUTE_GOLD, width=1, tags="ov_route")
 
         # -- range: struck rings on illegal-in-sphere systems + origin badge
         ov = st.range_overlay
@@ -942,6 +2077,82 @@ class MapTab:
                                        outline="#ffffff", width=2, tags="ov_own")
                     canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
                                        fill="#ffffff", outline="", tags="ov_own")
+        # -- capital-kill markers (Task 30): a double-ring red marker at systems
+        # with a capital kill in the last ~30 min. Gated by the heat layer (they
+        # accompany the base-layer heat under-glow) and drawn LAST so they sit on
+        # top of the heat glow and the other node markers. Pure Tk -> crisp during
+        # gestures. capital_systems iterates the bounded (<=500) event ring, cheap
+        # enough per frame.
+        if self._layer_on("heat"):
+            for sid in st.kill_heat.capital_systems(time.time()):
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_oval(sx - 9, sy - 9, sx + 9, sy + 9,
+                                   outline=CAPKILL_RED, width=2, tags="ov_capkill")
+                canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
+                                   outline=CAPKILL_RED, width=2, tags="ov_capkill")
+        # -- intel pulses (Task 31): amber oscillating rings at systems named in
+        # tracked intel channels, fading over ~5 min. This is the STRUCTURE path --
+        # it creates the ring items (drawn topmost, after the node markers) and
+        # records each item id + intensity so the per-tick _animate_intel_pulses can
+        # tween them in place without delete/recreate. Only un-expired mentions draw
+        # (active() culls the rest); off-screen ones are skipped by `project`. Sets
+        # the structure clock so the 1 s cull gate does not immediately re-fire.
+        if self._layer_on("intel"):
+            _now_ms_i = _now_ms()
+            for sid, intensity in st.intel_pulses.active(time.time()).items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                r = self._intel_radius(intensity, _now_ms_i)
+                item = canvas.create_oval(
+                    sx - r, sy - r, sx + r, sy + r, outline=INTEL_AMBER,
+                    width=self._intel_width(intensity, _now_ms_i), tags="ov_intel")
+                self._intel_items[sid] = item
+                self._intel_cache[sid] = intensity
+            self._intel_struct_ms = _now_ms_i
+        # -- kill pings (Task 36): discrete zkill-ALERT radar bursts (vivid red,
+        # expanding rings) that decay to a small steady diamond marker over ~5 min --
+        # DISTINCT from the amber intel pulses and the ambient heat glow. STRUCTURE
+        # path: create the burst rings / linger marker items (drawn topmost) and
+        # cache each ping's (stage, capital) so the per-tick _animate_kill_pings can
+        # tween the burst rings in place without delete/recreate. active() culls
+        # expired pings; off-screen ones are skipped by `project`. Sets the structure
+        # clock so the 1 s cull/stage-flip gate does not immediately re-fire.
+        if self._layer_on("kill_pings"):
+            _now_ms_k = _now_ms()
+            for sid, pstate in st.kill_pings.active(time.time()).items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                cap = pstate.capital
+                if pstate.stage == "burst":
+                    n = KILLPING_RINGS_CAP if cap else KILLPING_RINGS
+                    span = KILLPING_SPAN_CAP if cap else KILLPING_SPAN
+                    ids = []
+                    for k in range(n):
+                        r, w = self._killping_ring(k, n, span, _now_ms_k)
+                        ids.append(canvas.create_oval(
+                            sx - r, sy - r, sx + r, sy + r, outline=KILLPING_RED,
+                            width=w, tags="ov_killping"))
+                    self._killping_items[sid] = ids
+                else:                        # linger: small steady diamond outline
+                    mrk = KILLPING_MARK_R_CAP if cap else KILLPING_MARK_R
+                    ids = [canvas.create_polygon(
+                        sx, sy - mrk, sx + mrk, sy, sx, sy + mrk, sx - mrk, sy,
+                        fill="", outline=KILLPING_RED, width=1, tags="ov_killping")]
+                    if cap:                  # capital linger doubles the marker
+                        m2 = mrk + 3.0
+                        ids.append(canvas.create_polygon(
+                            sx, sy - m2, sx + m2, sy, sx, sy + m2, sx - m2, sy,
+                            fill="", outline=KILLPING_RED, width=1, tags="ov_killping"))
+                    self._killping_items[sid] = ids
+                self._killping_cache[sid] = (pstate.stage, cap)
+            self._killping_struct_ms = _now_ms_k
         if _c:
             _o1 = _c()
             _now = tele._ms()
@@ -1031,7 +2242,9 @@ class MapTab:
         surf = self.renderer.render(cam, vw + 2 * MARGIN, vh + 2 * MARGIN,
                                     bloom=req["bloom"], mode=mode,
                                     tint=req.get("tint"),
-                                    bridges=req.get("bridges"))
+                                    bridges=req.get("bridges"),
+                                    heat=req.get("heat"),
+                                    sov=req.get("sov"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -1249,6 +2462,12 @@ class MapTab:
             # Hashable tuple (or None when the layer is off -> byte-identical to
             # pre-bridge output); travels to the worker and into _request_sig.
             "bridges": self.state.bridges if self._layer_on("bridges") else None,
+            # Canonical rounded heat tuple, or None when the layer is off / no
+            # activity (byte-identical to pre-heat output). Joins _request_sig.
+            "heat": self._heat_request_value(),
+            # Canonical sov tuple, or None when the layer is off / no data
+            # (byte-identical to pre-sov output). Joins _request_sig.
+            "sov": self._sov_request_value(),
         })
 
     def _request_gesture_frame(self) -> None:
@@ -1437,6 +2656,31 @@ class MapTab:
                 self._request_gesture_frame()
         elif verdict == "crisp":
             self._request_crisp()
+            self._last_heat_refresh_ms = _now_ms()   # settle crisp already reflects decay
+        elif verdict is None and self._heat_refresh_due(_now_ms()):
+            # (c) periodic kill-heat decay refresh (Task 30): while the heat layer
+            # is on and heat is live, re-request a crisp at most every
+            # HEAT_REFRESH_MS so the red-orange under-glow shrinks as events decay,
+            # even with no camera/kill activity. The pure _heat_refresh_due gate
+            # (cheap time check first) keeps the heat merge off the hot 16 ms path.
+            self._last_heat_refresh_ms = _now_ms()
+            self.state.force_dirty()
+            self._request_crisp()
+        # (Task 31) intel-pulse animation: a cheap empty-fast-path when nothing is
+        # pulsing (the common case); otherwise tween the amber rings, with structure
+        # changes batched to ~1 s. Runs regardless of verdict -- pulses breathe
+        # whether or not the camera is moving.
+        self._animate_intel_pulses(_now_ms())
+        # (Task 36) kill-ping radar animation: same cheap empty-fast-path idiom --
+        # zero work when the layer is off or nothing is pinging; otherwise tween the
+        # red burst rings (structure changes batched to ~1 s). Runs every tick so a
+        # burst emanates whether or not the camera is moving.
+        self._animate_kill_pings(_now_ms())
+        # (Task 33) sov hourly re-fetch gate: fully guarded + cheap (layer-off /
+        # in-flight / freshness checks short-circuit before any work), so calling it
+        # each tick costs a dict-get + bool when the layer is off -- and spawns the
+        # one-shot fetch at most once per SOV_REFRESH_S while the layer is on.
+        self._maybe_start_sov_fetch()
         if _c:
             _k3 = _c()
             phase = ("anim" if verdict == "anim"
@@ -1449,22 +2693,35 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam) and ('threat', frozenset). Frames (crisp OR gesture) share one
-        latest-wins slot -- the worker produces them in strictly increasing
-        generation order, so the last one drained has the highest generation and
-        any earlier one it superseded would be dropped by the is_current check in
-        the apply anyway (a queued crisp thus correctly supersedes older gesture
-        frames -- it also carries a newer cache). Threat results are kept in a
-        SEPARATE slot so a threat is never dropped by frame coalescing (nor a
-        frame misread as threat). Dispatch by tag: crisp and gesture take
-        different apply paths (sig vs base-image realignment)."""
+        ms, cam), ('threat', frozenset), ('route', tuple), ('ambient', tuple),
+        ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
+        gesture) share one latest-wins slot -- the worker produces them in strictly
+        increasing generation order, so the last one drained has the highest
+        generation and any earlier one it superseded would be dropped by the
+        is_current check in the apply anyway (a queued crisp thus correctly
+        supersedes older gesture frames -- it also carries a newer cache). Threat,
+        route, ambient and sov results are kept in SEPARATE slots so none is dropped
+        by frame coalescing (nor a frame misread as one). Dispatch by tag: crisp and
+        gesture take different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
+        latest_route = None
+        latest_ambient = None
+        latest_sov = None
+        latest_sov_names = None
         try:
             while True:
                 item = self._result_q.get_nowait()
                 if item[0] == "threat":
                     latest_threat = item
+                elif item[0] == "route":
+                    latest_route = item
+                elif item[0] == "ambient":
+                    latest_ambient = item        # Task 30: hourly ESI ambient heat
+                elif item[0] == "sov":
+                    latest_sov = item            # Task 33: sov map (one-shot fetch)
+                elif item[0] == "sov_names":
+                    latest_sov_names = item       # Task 33: alliance-name legend data
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -1476,6 +2733,17 @@ class MapTab:
                 self._apply_gesture_frame(*latest_frame[1:])
         if latest_threat is not None:
             self.set_threat(latest_threat[1])
+        if latest_route is not None:
+            self._apply_route(latest_route[1])
+        if latest_ambient is not None:
+            self._apply_ambient(latest_ambient[1])
+        # sov names BEFORE sov so a same-drain names+map pair leaves the legend
+        # populated when the sov-triggered redraw runs (order is belt-and-suspenders
+        # -- the legend reads state lazily on open regardless).
+        if latest_sov_names is not None:
+            self._apply_sov_names(latest_sov_names[1])
+        if latest_sov is not None:
+            self._apply_sov(latest_sov[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -1498,6 +2766,7 @@ class MapTab:
 
     def _on_drag_start(self, event) -> None:
         self._drag_last = (event.x, event.y)
+        self._press_xy = (event.x, event.y)   # click-vs-pan discrimination (Task 31)
 
     def _on_drag_move(self, event) -> None:
         if self._drag_last is None:
@@ -1530,8 +2799,23 @@ class MapTab:
         self._redraw_overlays()             # keep overlays glued to the live camera
         self._schedule_tick()
 
-    def _on_drag_end(self, _event) -> None:
+    def _on_drag_end(self, event) -> None:
+        press = self._press_xy
         self._drag_last = None
+        self._press_xy = None
+        # Click (not a pan): press and release within a few px -> let an active intel
+        # pulse under the cursor consume it (focus the Intelligence tab). A real drag
+        # moves farther and just pans, exactly as before -- integrating here (rather
+        # than a naive tag binding) is what keeps the pulse click from fighting the
+        # pan. Guarded so a hit-test/callback error never breaks button release.
+        if press is not None:
+            try:
+                dx = event.x - press[0]
+                dy = event.y - press[1]
+                if dx * dx + dy * dy <= INTEL_CLICK_SLOP2:
+                    self._intel_click_hit(event.x, event.y)
+            except Exception:
+                pass
         self._schedule_tick()
 
     def _on_motion(self, event) -> None:
@@ -1603,6 +2887,14 @@ class MapTab:
         name = self.state.model.systems[sid].name
         menu = self._make_menu(self.canvas)
         menu.add_command(label=name, state="disabled")
+        # Sov affiliation (Task 33): a disabled info row near the top when the layer
+        # is on and this system is tinted. Alliance name from the resolved legend
+        # map; raw-id fallback when names haven't resolved yet.
+        if self._layer_on("sov"):
+            aid = self.state.sov_map.get(sid)
+            if aid is not None:
+                alliance = self.state.sov_names.get(aid) or str(aid)
+                menu.add_command(label=f"Sov: {alliance}", state="disabled")
         menu.add_separator()
         # Jump range submenu: 5 grouped classes (live LY) + Custom.
         range_menu = self._make_menu(menu)
@@ -1617,6 +2909,8 @@ class MapTab:
         if self.state.range_overlay is not None:
             menu.add_command(label="Clear range overlay",
                              command=self.clear_range_overlay)
+        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+            menu.add_command(label="Clear route", command=self.clear_route)
         menu.add_separator()
         self._menu_add(menu, "Set destination", "set_destination", name)
         self._menu_add(menu, "Open in Dotlan", "open_dotlan", name)
@@ -1639,18 +2933,14 @@ class MapTab:
         menu.add_checkbutton(label="Threat projection",
                              variable=self._layer_vars["threat"],
                              command=lambda: self._on_layer_toggle("threat"))
-        # Keep the radio selection in sync with the persisted threat ship.
-        opts = mo.threat_options()
-        current = self.cfg.get("threat_ship", "Titan Bridge")
-        sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
-                   opts[0][0] if opts else "")
-        self._threat_var.set(sel)
-        threat_menu = self._make_menu(menu)
-        for label, _ly in opts:
-            threat_menu.add_radiobutton(
-                label=label, variable=self._threat_var, value=label,
-                command=lambda l=label: self._on_threat_ship(l))
-        menu.add_cascade(label="Threat ship", menu=threat_menu)
+        # The old "Threat ship" cascade was the discoverability failure (owner
+        # 2026-07-12): replace it with a single opener for the in-tab drawer,
+        # which owns the ship-class picker AND per-staging selection. One source
+        # of truth -- the drawer's master checkbutton shares _layer_vars["threat"]
+        # with the "Threat projection" item above, and the ship radios drive the
+        # same _threat_var/cfg["threat_ship"] the cascade did.
+        menu.add_command(label="Threat settings…",
+                         command=self._open_threat_drawer)
         menu.add_separator()
         menu.add_checkbutton(label="Fleet", variable=self._layer_vars["fleet"],
                              command=lambda: self._on_layer_toggle("fleet"))
@@ -1658,6 +2948,20 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("staging"))
         menu.add_checkbutton(label="Bridges", variable=self._layer_vars["bridges"],
                              command=lambda: self._on_layer_toggle("bridges"))
+        menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
+                             command=lambda: self._on_layer_toggle("route"))
+        menu.add_checkbutton(label="Heat", variable=self._layer_vars["heat"],
+                             command=lambda: self._on_layer_toggle("heat"))
+        menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
+                             command=lambda: self._on_layer_toggle("intel"))
+        # Kill pings (Task 36): discrete zkill-alert radar bursts; ON by default.
+        menu.add_checkbutton(label="Pings", variable=self._layer_vars["kill_pings"],
+                             command=lambda: self._on_layer_toggle("kill_pings"))
+        # Sov tint (Task 33): OFF by default; enabling it kicks the lazy ESI fetch.
+        menu.add_checkbutton(label="Sov", variable=self._layer_vars["sov"],
+                             command=lambda: self._on_layer_toggle("sov"))
+        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+            menu.add_command(label="Clear route", command=self.clear_route)
         return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:
@@ -1707,10 +3011,19 @@ class MapTab:
         self.cfg.setdefault("layers", {})[key] = bool(var.get())
         if key == "threat":
             self._recompute_threat()
-        elif key == "bridges":
-            # Bridges live in the base bitmap, so a toggle needs a settle
-            # re-render (the request carries the pairs, or None when off). The
-            # bridges key in _request_sig keeps this from being duplicate-suppressed.
+        elif key in ("bridges", "heat", "sov"):
+            # Bridges, kill-heat AND sov live in the base bitmap, so a toggle needs
+            # a settle re-render (the request carries the layer value, or None when
+            # off). Their keys in _request_sig keep this from being duplicate-
+            # suppressed. Heat also repaints overlays so the capital markers appear/
+            # vanish with the layer.
+            if key == "sov":
+                # Turning sov ON kicks the lazy fetch (zero network until now) and
+                # enables the legend microbutton; OFF disables the legend. The
+                # freshness/in-flight guards inside _maybe_start_sov_fetch make the
+                # OFF case (and a re-ON within the hour) a no-op.
+                self._sync_sov_legend_btn()
+                self._maybe_start_sov_fetch()
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()
@@ -1724,7 +3037,10 @@ class MapTab:
         queue as a ("threat", frozenset) tuple (drained by _drain_results)."""
         tv = self._layer_vars.get("threat")
         on = bool(tv.get()) if tv is not None else False
-        hostile = set(self.state.hostile_staging)
+        # Union only over the staging the drawer left INCLUDED (exclusions persist
+        # by name in cfg["threat_staging_excluded"]; empty list -> all included).
+        excluded = self.cfg.get("threat_staging_excluded", []) or []
+        hostile = self.state.selected_hostile_staging(excluded)
         if not on or not hostile:
             self.set_threat(None)
             return
@@ -1740,9 +3056,175 @@ class MapTab:
 
         threading.Thread(target=work, daemon=True, name="map-threat").start()
 
+    # ---- threat drawer (Task 34) ----------------------------------------------
+    def _toggle_threat_drawer(self) -> None:
+        """Toolbar "Threat ▾" handler: open the drawer if closed, else close it."""
+        if self._threat_drawer_open:
+            self._close_threat_drawer()
+        else:
+            self._open_threat_drawer()
+
+    def _open_threat_drawer(self) -> None:
+        """Build (fresh) and slide the drawer in on the right. Idempotent -- a
+        second open is a no-op. Packing narrows the canvas, whose <Configure>
+        updates the renderer viewport (no manual resize needed)."""
+        if self._threat_drawer_open:
+            return
+        self._threat_drawer_open = True
+        self._build_threat_drawer()
+        self._threat_drawer.pack(side="right", fill="y")
+
+    def _close_threat_drawer(self) -> None:
+        """Slide the drawer out (pack_forget); the canvas reflows back to full
+        width via its <Configure>. Children are kept until the next open, which
+        rebuilds them fresh from current cfg/staging."""
+        if not self._threat_drawer_open:
+            return
+        self._threat_drawer_open = False
+        self._threat_drawer.pack_forget()
+
+    def _build_threat_drawer(self) -> None:
+        """(Re)build the drawer contents top-to-bottom: master overlay toggle,
+        ship-class radio list, then the per-staging checkbox rows. Themed via the
+        shared theme dict; the drawer bg is the panel colour, so select
+        indicators use entry_bg for contrast against it."""
+        t = self.theme
+        d = self._threat_drawer
+        for w in d.winfo_children():
+            w.destroy()
+        tk.Label(d, text="Threat overlay", bg=t["panel"], fg=t["accent"],
+                 font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10,
+                                                      pady=(10, 4))
+        # 1) master toggle -- the SAME var the toolbar/menu use (one source of truth)
+        tk.Checkbutton(d, text="Show threat overlay",
+                       variable=self._layer_vars["threat"],
+                       command=lambda: self._on_layer_toggle("threat"),
+                       bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                       activebackground=t["panel"], activeforeground=t["accent"],
+                       anchor="w").pack(fill="x", padx=8, pady=2)
+        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"]
+        tk.Label(d, text="Ship class", bg=t["panel"], fg=t["fg"]).pack(
+            anchor="w", padx=10, pady=(8, 0))
+        opts = mo.threat_options()
+        current = self.cfg.get("threat_ship", "Titan Bridge")
+        sel = next((l for l, _ in opts if self._strip_ly_suffix(l) == current),
+                   opts[0][0] if opts else "")
+        self._threat_var.set(sel)
+        for label, _ly in opts:
+            tk.Radiobutton(d, text=label, variable=self._threat_var, value=label,
+                           command=lambda l=label: self._on_threat_ship(l),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(
+                               fill="x", padx=8)
+        # 3) per-staging selection: All/None links + one checkbox per staging
+        head = tk.Frame(d, bg=t["panel"])
+        head.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Label(head, text="Staging systems", bg=t["panel"], fg=t["fg"]).pack(
+            side="left")
+        tk.Button(head, text="None", command=self._threat_staging_none,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right")
+        tk.Button(head, text="All", command=self._threat_staging_all,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right",
+                                                             padx=(0, 4))
+        self._threat_rows = tk.Frame(d, bg=t["panel"])
+        self._threat_rows.pack(fill="x", padx=8, pady=(2, 8))
+        self._rebuild_threat_staging_rows()
+
+    def _rebuild_threat_staging_rows(self) -> None:
+        """Repopulate the per-staging checkbox rows from the current hostile
+        staging (id->name via the model). Checked = contributes to the threat
+        union; unchecking persists a NAME exclusion. No-op before the drawer has
+        ever been built (rows container None) so it is safe to call from
+        set_staging at any time. Empty staging shows a dim hint instead of rows."""
+        rows = self._threat_rows
+        if rows is None:
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._threat_staging_vars = {}
+        t = self.theme
+        model = self.state.model
+        systems = model.systems if model is not None else {}
+        names = sorted({systems[sid].name for sid in self.state.hostile_staging
+                        if sid in systems})
+        if not names:
+            tk.Label(rows,
+                     text="No hostile staging configured — right-click a system "
+                          "→ Add to hostile staging.",
+                     bg=t["panel"], fg=t["fg"], justify="left", wraplength=205,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            return
+        excluded = set(self.cfg.get("threat_staging_excluded", []) or [])
+        for name in names:
+            var = tk.BooleanVar(value=(name not in excluded))
+            self._threat_staging_vars[name] = var
+            tk.Checkbutton(rows, text=name, variable=var,
+                           command=lambda n=name: self._on_threat_staging_toggle(n),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(fill="x")
+
+    def _on_threat_staging_toggle(self, name: str) -> None:
+        """A staging row toggled: add/drop the NAME from the persisted exclusion
+        list (reassigned, never mutated in place -- the DEFAULT_CONFIG list may be
+        shared) and recompute the halo over the new subset."""
+        var = self._threat_staging_vars.get(name)
+        if var is None:
+            return
+        excluded = set(self.cfg.get("threat_staging_excluded", []) or [])
+        if var.get():
+            excluded.discard(name)               # included
+        else:
+            excluded.add(name)                   # excluded
+        self.cfg["threat_staging_excluded"] = sorted(excluded)
+        self._recompute_threat()
+
+    def _threat_staging_all(self) -> None:
+        """Include every staging: clear the exclusion list, check all rows."""
+        self.cfg["threat_staging_excluded"] = []
+        for var in self._threat_staging_vars.values():
+            var.set(True)
+        self._recompute_threat()
+
+    def _threat_staging_none(self) -> None:
+        """Exclude every CURRENT staging: persist their names, uncheck all rows."""
+        self.cfg["threat_staging_excluded"] = sorted(self._threat_staging_vars)
+        for var in self._threat_staging_vars.values():
+            var.set(False)
+        self._recompute_threat()
+
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)
         self._schedule_tick()
+
+    def _wire_completions(self, model) -> None:
+        """First-show only: push display-case system names + "Name (Region)"
+        labels into the search widget's autocomplete dropdown. No-op for a plain
+        tk.Entry (no update_completions). Names are the DISPLAY-case
+        model.systems[sid].name (not the lowercase fly_to keys); the region name
+        comes from model.region_anchors[region_id][0], omitted from the label
+        when a region has no anchor."""
+        uc = getattr(self.search_entry, "update_completions", None)
+        if uc is None:
+            return
+        anchors = getattr(model, "region_anchors", {}) or {}
+        names: list[str] = []
+        labels: dict[str, str] = {}
+        for s in model.systems.values():
+            names.append(s.name)
+            anc = anchors.get(s.region_id)
+            region = anc[0] if anc else ""
+            labels[s.name] = f"{s.name} ({region})" if region else s.name
+        names.sort()
+        try:
+            uc(names, labels)
+        except Exception:
+            pass
 
     def _on_search(self, _event=None) -> None:
         if self.state.fly_to(self.search_entry.get()):

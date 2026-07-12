@@ -4215,6 +4215,9 @@ class FCToolGUI:
                 sys_id = search_system(system_name)
                 if sys_id and self.esi_auth.set_waypoint(sys_id, clear_other=True):
                     print(f"[Nav] Set destination + copied: {system_name}")
+                    # Star-map route overlay (Task 35): draw the travel route from
+                    # the tracked character's location to this destination.
+                    self._push_route_destination_to_map(sys_id)
                     return
         except Exception as e:
             print(f"[Nav] ESI waypoint failed: {e}")
@@ -5499,10 +5502,12 @@ class FCToolGUI:
                 name, "hostile"),
             # Resolved Ansiblex bridge id-pairs, refreshed on each tab-show.
             "get_bridges": self._get_map_bridges,
+            # Task 31: a click on an intel pulse focuses the Intelligence tab.
+            "on_intel_click": self._on_map_intel_click,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
-            autocomplete_cls=None,
+            autocomplete_cls=AutocompleteEntry,
             # Match the map context menus + toolbar to the app palette (owner
             # request 2026-07-10). map_tab must not import fc_gui, so the
             # constants travel in as a plain dict.
@@ -5536,6 +5541,181 @@ class FCToolGUI:
             tab.set_own_location(system_id)
         except Exception as exc:
             print(f"[MAP] own-location push failed: {exc}")
+
+    def _push_route_destination_to_map(self, system_id):
+        """Forward a tool-set destination to the star map's route overlay so the
+        travel route (incl. Ansiblex hops) is drawn from the tracked character's
+        location (Task 35). Called from _set_destination_or_copy after a successful
+        ESI set_waypoint -- a Tk menu/bind handler, so it runs on the main thread.
+        Guarded so a missing/erroring map tab never breaks destination-setting."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_route_destination(system_id)
+        except Exception as exc:
+            print(f"[MAP] route destination push failed: {exc}")
+
+    def _push_kill_to_map(self, alert):
+        """Forward a zkill engagement alert to the star map's kill-heat layer
+        (Task 30) AND its discrete kill-ping layer (Task 36). Runs on the MAIN
+        thread (marshaled from the zkill worker callback via _post_ui in
+        _on_zkill_alert). Guarded so a missing/erroring map tab never breaks the
+        zkill alert path. Heat and pings are pushed under SEPARATE try/except so
+        one failing never skips the other, and each is INDEPENDENTLY gated inside
+        the map by its own layer toggle (add_kill_heat -> "heat", add_kill_ping ->
+        "kill_pings"). KillAlert fields used: system_id, kill_count,
+        capitals_involved (all present on the dataclass)."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.add_kill_heat(alert.system_id, alert.kill_count,
+                              capital=alert.capitals_involved)
+        except Exception as exc:
+            print(f"[MAP] kill-heat push failed: {exc}")
+        try:
+            tab.add_kill_ping(alert.system_id, capital=alert.capitals_involved,
+                              count=alert.kill_count)
+        except Exception as exc:
+            print(f"[MAP] kill-ping push failed: {exc}")
+
+    def _push_intel_to_map(self, system_id_or_name):
+        """Forward an intel-channel system mention to the star map's pulse layer
+        (Task 31). Runs on the MAIN thread -- the intel stream is already marshaled
+        through _post_ui (in _on_intel_message) before this is reached, so there is
+        no extra hop and no worker-thread touch of Tk. Guarded so a missing/erroring
+        map tab never breaks the intel pipeline. Mirrors _push_kill_to_map."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.add_intel_pulse(system_id_or_name)
+        except Exception as exc:
+            print(f"[MAP] intel pulse push failed: {exc}")
+
+    def _on_map_intel_click(self, system_id):
+        """Map intel-pulse click (Task 31): focus the Intelligence tab and reveal the
+        most recent line naming the clicked system. Every step is guarded so a
+        missing notebook / log widget / unknown id degrades silently."""
+        try:
+            self._select_intel_tab()
+        except Exception:
+            pass
+        name = self._system_name_from_id(system_id)
+        if not name:
+            return
+        try:
+            self._intel_reveal_system(name)
+        except Exception:
+            pass
+
+    def _select_intel_tab(self):
+        """Select the Intelligence notebook tab. Matches by tab TEXT (contains
+        'Intel') so it survives the '** Intel ALERT **' retitle and any index shift.
+        No-op if the notebook or the tab is missing."""
+        nb = getattr(self, "notebook", None)
+        if nb is None:
+            return
+        for tab_id in nb.tabs():
+            try:
+                if "Intel" in nb.tab(tab_id, "text"):
+                    nb.select(tab_id)
+                    return
+            except Exception:
+                continue
+
+    def _focus_map_on_kill(self, system_id):
+        """Intelligence-tab '[Map]' affordance (Task 36): jump to the star map and
+        ping the given system. Selects the Map tab (matched by tab TEXT, no
+        hardcoded index) then focus_kill on the map, which centers the camera and
+        replays the kill's radar burst. Every step is guarded so a missing notebook
+        / map tab / stale id degrades silently. NOTE: the map's on_shown runs from
+        the async <<NotebookTabChanged>> the select fires, so focus_kill DEFERS the
+        centering to on_shown when the tab wasn't already visible (map_tab handles
+        the ordering); we simply select then call focus_kill."""
+        try:
+            self._select_map_tab()
+        except Exception:
+            pass
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.focus_kill(system_id)
+        except Exception:
+            pass
+
+    def _select_map_tab(self):
+        """Select the star-map notebook tab. Matches by tab TEXT (contains 'Map')
+        so it survives index shifts and is the only tab whose title contains 'Map'.
+        No-op if the notebook or the tab is missing."""
+        nb = getattr(self, "notebook", None)
+        if nb is None:
+            return
+        for tab_id in nb.tabs():
+            try:
+                if "Map" in nb.tab(tab_id, "text"):
+                    nb.select(tab_id)
+                    return
+            except Exception:
+                continue
+
+    def _intel_reveal_system(self, name):
+        """Scroll the Intelligence log to the most recent line containing ``name``
+        and flash it for ~2 s. Search is backwards from the end and CASE-INSENSITIVE:
+        the log renders intel verbatim, so a player's typed name matches the
+        canonical name up to case. No-op if the log widget or the name is missing."""
+        log = getattr(self, "_intel_log", None)
+        if log is None or not name:
+            return
+        try:
+            pos = log.search(name, "end", stopindex="1.0",
+                             backwards=True, nocase=True)
+        except Exception:
+            pos = ""
+        if not pos:
+            return
+        end = f"{pos}+{len(name)}c"
+        try:
+            log.config(state=tk.NORMAL)
+            log.see(pos)
+            log.tag_add("intel_click_flash", pos, end)
+            log.tag_config("intel_click_flash",
+                           background=FG_ACCENT, foreground=BG_DARK)
+        except Exception:
+            pass
+        finally:
+            try:
+                log.config(state=tk.DISABLED)
+            except Exception:
+                pass
+        # Remove the flash after ~2 s (main-thread schedule; guarded).
+        try:
+            self.root.after(
+                2000,
+                lambda: log.tag_remove("intel_click_flash", "1.0", "end"))
+        except Exception:
+            pass
+
+    def _system_name_from_id(self, system_id):
+        """Local (no-ESI) solar-system id -> canonical name, via the bundled
+        system_coords K-space table (inverted once and cached on self). Returns None
+        for an unknown id or on any failure."""
+        try:
+            sid = int(system_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            cache = getattr(self, "_sysid_name_cache", None)
+            if cache is None:
+                import system_coords
+                cache = {v: k for k, v in
+                         system_coords.get_kspace_name_to_id().items()}
+                self._sysid_name_cache = cache
+            return cache.get(sid)
+        except Exception:
+            return None
 
     def _get_map_bridges(self):
         """Resolved Ansiblex bridge id-pairs for the star map, parsed from the
@@ -18758,6 +18938,11 @@ class FCToolGUI:
             alert.route_from_staging = route_info
 
         self._post_ui(self._show_zkill_alert, alert)
+        # Star-map kill-heat layer (Task 30): feed the engagement into the map's
+        # decay-heat ring. Marshaled onto the main thread (this callback runs on
+        # the zkill worker thread); _push_kill_to_map is guarded so a missing map
+        # tab never breaks the zkill path.
+        self._post_ui(self._push_kill_to_map, alert)
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
@@ -20297,6 +20482,22 @@ $bmp.Dispose()
             self._zkill_log.window_create("alert_ins", window=wb_btn)
             self._zkill_log.insert("alert_ins", "  ")
 
+        # "▸ Map" button (Task 36) -> jump to the star map and ping this system.
+        # A REAL embedded button, matching the sibling link/action buttons: this
+        # zkill panel is BOUNDED (_ZKILL_LOG_MAX_LINES) and the tail-trim destroys
+        # old blocks' embedded buttons, so there is no window_create leak here (the
+        # leak concern only applies to the unbounded intel-fusion stream). Always
+        # shown (ungated, unlike Navigate/Titan-Bridge which need a staging system).
+        map_btn = tk.Button(
+            self._zkill_log, text="▸ Map", font=("Consolas", 8, "bold"),
+            fg=FG_ACCENT, bg=BG_ENTRY, activebackground="#1a5a90",
+            activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
+            cursor="hand2",
+            command=lambda sid=alert.system_id: self._focus_map_on_kill(sid),
+        )
+        self._zkill_log.window_create("alert_ins", window=map_btn)
+        self._zkill_log.insert("alert_ins", "  ")
+
         # "WH Route" button -> fills WH Route tab and searches
         staging = self._get_staging_system()
         if staging:
@@ -21333,6 +21534,20 @@ $bmp.Dispose()
                                          time.monotonic())
             except Exception:
                 pass
+        # Task 31: pulse the star map at every system NAMED in this intel line. This
+        # runs on the Tk thread (the method is _post_ui-marshaled from the intel
+        # worker) and only for enabled intel channels (gated upstream in
+        # _on_intel_message) -- fleet chat never reaches here. Each system span
+        # already carries the resolved solar_system_id; guarded so a bad span or a
+        # missing map tab never breaks intel ingest.
+        try:
+            for sp in spans or ():
+                if getattr(sp, "kind", None) == "system":
+                    _sid = (getattr(sp, "payload", None) or {}).get("system_id")
+                    if _sid is not None:
+                        self._push_intel_to_map(_sid)
+        except Exception:
+            pass
         if self._passes_view_filter(msg):
             self._render_line((msg, spans, report, priority))
         # async name resolution
