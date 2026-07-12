@@ -128,7 +128,8 @@ def parse_clipboard(text: str) -> ParseResult:
         type_id, structure_id, label = int(m.group(1)), int(m.group(2)), m.group(3)
         entries.append(_entry_from(type_id, structure_id, label))
 
-    for m in RE_SMT.finditer(text):
+    smt_matches = list(RE_SMT.finditer(text))
+    for m in smt_matches:
         structure_id = int(m.group(1))
         origin, dest = m.group(2).strip(), m.group(3).strip()
         entries.append(ParsedEntry(name=f"{origin} » {dest}", type_id=None,
@@ -138,7 +139,14 @@ def parse_clipboard(text: str) -> ParseResult:
     plain_names = 0
     unparsed: list[str] = []
     if total_links == 0:
-        for chunk in PLAIN_SPLIT.split(text):
+        # Blank out spans RE_SMT already turned into gate entries (same
+        # length, so newline/line structure is untouched) so the plain-copy
+        # fallback doesn't also dump them into `unparsed` as unclassifiable.
+        plain_source = text
+        for m in smt_matches:
+            plain_source = (plain_source[:m.start()] + (" " * (m.end() - m.start()))
+                            + plain_source[m.end():])
+        for chunk in PLAIN_SPLIT.split(plain_source):
             chunk = chunk.strip()
             if not chunk:
                 continue
