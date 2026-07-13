@@ -362,6 +362,11 @@ TOOLBAR_TOOLTIP_DELAY_MS = 500      # dwell before a toolbar control's tip appea
 # than spawning a menu taller than the screen.
 _STRUCT_MENU_CAP = 25
 
+# Infra hover detail threshold: at or below this many SURVIVING structures the
+# hover tooltip lists each structure ("<Type> — <Name> [TICKER]") via the
+# get_system_structures callback; above it, the compact per-type counts stand.
+_INFRA_HOVER_DETAIL_MAX = 5
+
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
@@ -3754,12 +3759,16 @@ class MapTab:
         self._hover_cancel()
 
     def _infra_hover_lines(self, sid) -> list[str] | None:
-        """Infra hover-tooltip provider: per-type structure counts for the hovered
-        system, e.g. ["3× Fortizar", "1× Athanor"], sorted by count desc then
-        name, with a dim "(stale)" line when the badge is stale-flagged. Reads the
-        PRE-COMPUTED "type_counts" the host folded into the pushed badges (already
+        """Infra hover-tooltip provider. For a lightly-populated system (≤
+        _INFRA_HOVER_DETAIL_MAX surviving structures) it lists each structure as
+        "<Type> — <Name> [TICKER]" via the get_system_structures callback (whose
+        names already carry the owner's alliance/corp ticker when resolved);
+        otherwise it shows the compact per-type counts (e.g. ["3× Fortizar",
+        "1× Athanor"]), sorted by count desc then name. A dim "(stale)" line is
+        appended when the badge is stale-flagged. Reads the PRE-COMPUTED
+        "type_counts" the host folded into the pushed badges (already
         filter-respecting), so this file keeps zero infra logic. None when the
-        hovered system has no badge / no counts."""
+        hovered system has no badge / no content."""
         infra = self.state.infra
         if not infra:
             return None
@@ -3767,6 +3776,27 @@ class MapTab:
         if not badge:
             return None
         type_counts = badge.get("type_counts") or {}
+        total = badge.get("total")
+        if total is None:
+            total = sum(type_counts.values())
+        # Detailed per-structure listing for a small system (owner ask): flatten
+        # the host's grouped structures into "<Type> — <Name> [TICKER]" lines. The
+        # host applies the same filters the badge uses, so the counts agree. Falls
+        # through to the compact summary when no callback / nothing survives.
+        if total and total <= _INFRA_HOVER_DETAIL_MAX:
+            gss = self.callbacks.get("get_system_structures")
+            if gss is not None:
+                try:
+                    groups = gss(sid)
+                except Exception:
+                    groups = None
+                if groups:
+                    lines = [f"{type_name} — {nm}"
+                             for type_name, names in groups for nm in names]
+                    if lines:
+                        if badge.get("stale"):
+                            lines.append("(stale)")
+                        return lines
         if not type_counts:
             return None
         items = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))
