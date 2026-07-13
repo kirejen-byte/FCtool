@@ -67,7 +67,12 @@ DEFAULT_CONFIG = {
         # menu ("Zoom animation") and persisted on hide.
         "zoom_animation": True,
         "layers": {"fleet": True, "staging": True, "threat": False, "range": False,
-                   "bridges": True, "route": True, "heat": True, "intel": True,
+                   "bridges": True, "route": True,
+                   # Kill-heat (Task 30): key stays for programmatic/config
+                   # enablement, but the toolbar/menu control is removed (owner
+                   # ask 2026-07-12) -- default OFF so a hidden layer doesn't
+                   # silently draw or spend the ambient ESI call.
+                   "heat": False, "intel": True,
                    # Kill pings (Task 36): discrete zkill-ALERT radar bursts on the
                    # map (distinct from the ambient kill-heat glow). ON by default --
                    # only fires when the user's zkill monitoring raises an alert.
@@ -80,14 +85,24 @@ DEFAULT_CONFIG = {
                    # while the Map tab is shown, so idle cost is nil.
                    "chars": True},
         # Kill-heat layer (Task 30): hourly ESI ambient kills feed a LOW heat band
-        # under the live zkill decay-heat. OWNER-APPROVED 2026-07-12 ("Ok to make 2
-        # calls per hour") -> ON by default. Set False to run zkill-only (no ESI).
-        "kill_heat_esi": True,
+        # under the live zkill decay-heat. Owner-approved 2026-07-12 to spend the
+        # call ("Ok to make 2 calls per hour") WHILE the layer was on the toolbar;
+        # now that the layer is hidden by default (owner ask 2026-07-12, same day),
+        # default OFF so a hidden layer doesn't spend the hourly ESI call. Set True
+        # to run the ambient fetch when heat is force-enabled by config.
+        "kill_heat_esi": False,
         "threat_ship": "Titan Bridge",
         # Hostile-staging systems (by NAME) excluded from the threat halo via the
         # map's Threat drawer (Task 34). Empty = every staging contributes, so a
         # newly-added staging defaults to INCLUDED.
         "threat_staging_excluded": [],
+        # Friendly-staging PROJECTION (owner ask): a SECOND, blue halo showing the
+        # jump/bridge reach of your OWN stagings, opt-in from the map's Threat drawer.
+        # Default OFF -- a new visual the owner enables. The by-NAME exclusion list
+        # mirrors threat_staging_excluded above (empty = every friendly staging
+        # contributes). The SAME threat_ship class drives both halos.
+        "threat_friendly_enabled": False,
+        "threat_friendly_excluded": [],
         "range_ship": "Dreadnought",
         # Keys match map_camera.Camera.to_dict(); None scale = fit universe.
         "camera": {"cx": None, "cy": None, "scale": None},

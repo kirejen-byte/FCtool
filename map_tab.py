@@ -68,6 +68,14 @@ BG_HEX = "#0a0a14"
 # blue is derived from mr.BRIDGE_BLUE so the two stay in lockstep.
 ROUTE_GOLD = "#ffcc44"
 BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
+# Route-overlay Ansiblex-hop colour: a LIGHTENED tint of the bridge-layer blue,
+# drawn BRIGHTER and WIDER than the resting bridge glow (map_render._draw_bridges
+# lays down up to a 4px line in dim(BRIDGE_BLUE, …)). A route that RIDES a bridge
+# was previously painted in BRIDGE_BLUE_HEX at width 2 -- the SAME hue, NARROWER
+# than the glow beneath it -- so it vanished blue-on-blue and the owner saw "no
+# highlight" over the Ansiblex. Same #3A86FF family, so it still reads as a bridge.
+ROUTE_BRIDGE_HEX = "#%02x%02x%02x" % tuple(
+    min(255, round(c + (255 - c) * 0.45)) for c in mr.BRIDGE_BLUE)
 
 # Kill-heat layer (Task 30). Capital-kill markers reuse a red hex derived from
 # the base-layer HEAT_COLOR family. The periodic decay refresh re-requests a
@@ -147,6 +155,24 @@ SOV_REFRESH_S = 3600.0
 CHARS_MAGENTA = "#ff44e1"
 CHARS_POLL_S = 60.0
 CHARS_START_DELAY_S = 2.0
+
+# Staging-diamond contrast fix (owner report: hostile red diamonds blend into the
+# red nullsec node glow -- both sit in the same #cc2233/#ff5a76 red family, so a
+# plain fill-colour distinction washes out). A brighter hostile red alone would
+# still fight a red background, so BOTH staging diamonds now carry a white/near-
+# white outline -- the rim, not the fill, is what guarantees contrast against
+# ANY wash (red nullsec, the violet threat wash, a future blue friendly-
+# projection wash). Friendly gets the same rim purely for visual consistency.
+# Hostile is also drawn ~20% larger than friendly so it reads as the more urgent
+# marker at a glance. Hostile stays in the red family (map_render.THREAT_PURPLE's
+# comment block notes staging red is intentional/untouched semantics) -- only the
+# exact shade brightened.
+STAGING_FRIENDLY_FILL = "#59d98c"
+STAGING_HOSTILE_FILL = "#ff2d55"
+STAGING_OUTLINE = "#ffffff"
+STAGING_OUTLINE_W = 2
+STAGING_R_FRIENDLY = 8
+STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
@@ -336,6 +362,11 @@ TOOLBAR_TOOLTIP_DELAY_MS = 500      # dwell before a toolbar control's tip appea
 # than spawning a menu taller than the screen.
 _STRUCT_MENU_CAP = 25
 
+# Infra hover detail threshold: at or below this many SURVIVING structures the
+# hover tooltip lists each structure ("<Type> — <Name> [TICKER]") via the
+# get_system_structures callback; above it, the compact per-type counts stand.
+_INFRA_HOVER_DETAIL_MAX = 5
+
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
@@ -443,6 +474,10 @@ class MapTabState:
         # --- overlay layer state (Phase D) ---
         self.range_overlay = None
         self.threat_set = None
+        # Friendly-staging PROJECTION halo (owner ask): the SECOND, blue halo over the
+        # jump/bridge reach of your OWN stagings. None = off/empty (byte-identical to
+        # no friendly wash). Independent of threat_set -- both travel in one TintSpec.
+        self.friendly_threat_set = None
         self.fleet: dict[int, int] = {}
         self.friendly_staging: set[int] = set()
         self.hostile_staging: set[int] = set()
@@ -513,8 +548,11 @@ class MapTabState:
     def tint_spec(self):
         import map_render as _mr
         bright = self.range_overlay.bright_set() if self.range_overlay else None
-        return _mr.TintSpec(bright=bright, halo=self.threat_set) \
-            if (bright is not None or self.threat_set is not None) else None
+        halo = self.threat_set
+        friendly = self.friendly_threat_set
+        if bright is None and halo is None and friendly is None:
+            return None                          # all-None -> byte-identical to no tint
+        return _mr.TintSpec(bright=bright, halo=halo, friendly=friendly)
 
     # -- model / camera -------------------------------------------------------
     def attach_model(self, model) -> None:
@@ -644,6 +682,25 @@ class MapTabState:
         systems = self.model.systems if self.model is not None else {}
         keep: set[int] = set()
         for sid in self.hostile_staging:
+            s = systems.get(sid)
+            if s is not None and s.name in excluded:
+                continue                         # excluded by name
+            keep.add(sid)                        # included (or name unknown)
+        return keep
+
+    def selected_friendly_staging(self, excluded_names=()) -> set[int]:
+        """Friendly-staging ids that CONTRIBUTE to the friendly projection halo: the
+        full ``friendly_staging`` set minus those whose display name is excluded.
+        Mirrors ``selected_hostile_staging`` EXACTLY -- exclusions persist by NAME in
+        ``cfg["threat_friendly_excluded"]``, and an id with no model record (name
+        unknown) can't match an exclusion so it stays INCLUDED (new/unknown friendly
+        staging defaults to contributing). Pure / headless-testable."""
+        excluded = set(excluded_names or ())
+        if not excluded:
+            return set(self.friendly_staging)
+        systems = self.model.systems if self.model is not None else {}
+        keep: set[int] = set()
+        for sid in self.friendly_staging:
             s = systems.get(sid)
             if s is not None and s.name in excluded:
                 continue                         # excluded by name
@@ -991,7 +1048,6 @@ class MapTab:
             "threat": "Purple shade over systems inside hostile jump/bridge range",
             "bridges": "Your Ansiblex gates as blue lines",
             "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
-            "heat": "Red-orange glow where kills are happening (live zkill + hourly baseline)",
             "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
             "kill_pings": "Radar bursts for zkill reports that match your alert settings",
             "sov": "Dim alliance-color wash over sovereign space",
@@ -1000,7 +1056,7 @@ class MapTab:
         }
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
-                            ("route", "Route"), ("heat", "Heat"),
+                            ("route", "Route"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
                             ("sov", "Sov"), ("infra", "Infra"),
                             ("chars", "Chars")):
@@ -1030,7 +1086,8 @@ class MapTab:
                 self._threat_drawer_btn.pack(side="left", padx=(0, 4))
                 self._attach_tooltip(
                     self._threat_drawer_btn,
-                    "Threat settings — ship class and which hostile stagings project")
+                    "Threat settings — ship class, hostile (purple) + friendly "
+                    "(blue) staging projections")
             if _key == "infra":
                 # Filter affordance (Task 5): a "▾" microbutton right after the
                 # Infra toggle opening the borderless filter popover (per-category
@@ -1059,6 +1116,25 @@ class MapTab:
                 self._sov_legend_btn.pack(side="left", padx=(0, 4))
                 self._attach_tooltip(self._sov_legend_btn,
                                      "Sov legend — top alliances by systems shown")
+            if _key == "chars":
+                # Role-filter affordance (owner ask): a "▾" microbutton right after
+                # the Chars toggle — SAME compact pattern as Sov / Infra / Threat ▾ —
+                # opening a themed menu of the host's character-filter roles (cyno,
+                # dread, …) plus "Clear filter". Applying a role restricts the
+                # magenta overlay to those pilots (see set_chars_filter). ALWAYS
+                # enabled: like Infra's, it is useful even while another surface set
+                # the filter, and the menu degrades cleanly when no roles callback
+                # is injected (standalone / tests). The roles + the apply action
+                # travel in as callbacks so this file stays fc_gui-free.
+                self._chars_menu_btn = tk.Button(
+                    bar, text="▾", command=self._show_chars_menu,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._chars_menu_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(
+                    self._chars_menu_btn,
+                    "Filter the Chars overlay by character role (cyno, dread, …)")
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
@@ -1072,6 +1148,29 @@ class MapTab:
         self.canvas.pack(side="left", fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
+        # --- Chars filter banner + session state (owner ask) ------------------
+        # A SESSION-scoped filter that narrows the magenta Chars overlay to a set
+        # of character NAMES the host computes from its role data (cyno, dread, …).
+        # _chars_filter_names is None => no filter (byte-identical to before); a
+        # frozenset (even empty) => an ACTIVE filter matched by simple membership.
+        # The slim themed banner below the toolbar announces the active filter and
+        # carries an "✕" to clear it. Created UNPACKED so an inactive filter has
+        # ZERO layout footprint; _sync_chars_banner packs it BEFORE the canvas so
+        # it reads as a strip under the toolbar, above the map body.
+        self._chars_filter_label: str | None = None
+        self._chars_filter_names: frozenset | None = None
+        self._chars_banner = tk.Frame(self.frame, bg=t["panel"])
+        self._chars_banner_label = tk.Label(
+            self._chars_banner, text="", bg=t["panel"], fg=t["accent"],
+            font=("Segoe UI", 9, "bold"), anchor="w")
+        self._chars_banner_label.pack(side="left", padx=(8, 4), pady=2)
+        self._chars_banner_x = tk.Button(
+            self._chars_banner, text="✕",
+            command=lambda: self.set_chars_filter(None),
+            bg=t["panel"], fg=t["fg"], activebackground=t["panel"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, padx=6, pady=0, cursor="hand2")
+        self._chars_banner_x.pack(side="right", padx=(4, 8), pady=2)
         # Transient threat-settings drawer (Task 34): a fixed-width themed panel
         # created hidden; _open/_close_threat_drawer pack/pack_forget it on the
         # right. State is NOT persisted (transient UI). pack_propagate(False)
@@ -1081,6 +1180,17 @@ class MapTab:
         self._threat_drawer_open = False
         self._threat_rows = None                 # staging-row container (built on open)
         self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
+        # Friendly-staging PROJECTION (owner ask): a SECOND, BLUE halo over the reach
+        # of your OWN stagings, opt-in below the hostile block in the SAME drawer. The
+        # master enabled-state persists in cfg["threat_friendly_enabled"] (default OFF
+        # -- a new visual the owner opts into); a PERSISTENT var mirrors it (like
+        # _layer_vars["threat"] does for the hostile master) so a recompute can read the
+        # state even while the drawer is closed. The ship-class picker is SHARED -- one
+        # class drives both halos -- so only the master + per-staging rows live here.
+        self._friendly_master_var = tk.BooleanVar(
+            value=bool(self.cfg.get("threat_friendly_enabled", False)))
+        self._friendly_rows = None               # friendly staging-row container
+        self._friendly_staging_vars: dict[str, tk.BooleanVar] = {}  # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
         # Sync the infra layer's enabled flag from its toolbar var (OFF by default);
@@ -1418,6 +1528,7 @@ class MapTab:
         self.state.hostile_staging = set(hostile_ids or ())
         self._redraw_overlays()
         self._rebuild_threat_staging_rows()      # keep the drawer's rows in sync
+        self._rebuild_friendly_staging_rows()    # ...incl. the friendly-projection rows
 
     def apply_range_overlay(self, overlay) -> None:
         self.state.range_overlay = overlay          # base-layer change:
@@ -1438,6 +1549,16 @@ class MapTab:
 
     def set_threat(self, threat_set) -> None:
         self.state.threat_set = threat_set          # None clears
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def set_friendly_threat(self, friendly_set) -> None:
+        """Apply the friendly-staging projection halo (owner ask). Mirrors
+        ``set_threat`` -- stores the frozenset (None clears), forces a settle
+        re-render so the blue wash is (re)painted into the base bitmap, and repaints
+        the Tk overlays. The halo travels alongside the hostile one in one TintSpec."""
+        self.state.friendly_threat_set = friendly_set   # None clears
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
@@ -1764,14 +1885,108 @@ class MapTab:
         """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
         per character currently in the hovered system, sorted by name (the stored
         snapshot is already name-sorted by _canonical_chars). None when no tracked
-        character is there. Gated on _layer_on("chars") by the hover engine."""
+        character is there. Honours the active session filter (a filtered-out
+        system contributes no section). Gated on _layer_on("chars") by the engine."""
         chars = self.state.chars
         if not chars:
             return None
         here = chars.get(sid)
         if not here:
             return None
+        here = self._chars_visible_occupants(here)      # session filter
+        if not here:
+            return None
         return [f"{name} — {ship}" for name, ship in here]
+
+    # ---- Chars session filter (owner ask) -------------------------------------
+    def _chars_visible_occupants(self, occ):
+        """Restrict a system's ``[(name, ship), …]`` occupant list to the active
+        session filter. No filter (names is None) -> the list UNCHANGED (byte-
+        identical to the pre-filter overlay). An active filter -> only the pilots
+        whose name is in the set (possibly the empty list -> the system draws no
+        marker, an honest empty match). Pure; cheap membership test."""
+        names = self._chars_filter_names
+        if names is None:
+            return occ
+        return [(n, s) for (n, s) in occ if n in names]
+
+    def set_chars_filter(self, label, names=None) -> None:
+        """Apply / clear the SESSION Chars-overlay filter (owner ask). ``label`` is
+        a human role name (e.g. "Cyno") and ``names`` the character-NAME frozenset
+        the host computed from its role data; the overlay then shows ONLY those
+        pilots (markers + hover), matched by simple membership on the poll payload
+        so the filter survives poll refreshes for free (names are stable keys).
+        ``set_chars_filter(None)`` clears it. Toggles the slim banner and repaints
+        the Tk overlay at once (no crisp re-render — a pure overlay change). An
+        empty ``names`` set with a non-None label is a VALID active filter that
+        honestly shows zero markers."""
+        if label is None:
+            self._chars_filter_label = None
+            self._chars_filter_names = None
+        else:
+            self._chars_filter_label = str(label)
+            self._chars_filter_names = frozenset(names or ())
+        self._sync_chars_banner()
+        self._redraw_overlays()
+
+    def _sync_chars_banner(self) -> None:
+        """Show / update / hide the "Custom filter active" banner to match the
+        current filter. Packed (BEFORE the canvas, so it reads as a strip under the
+        toolbar) only while a filter is active; pack_forgotten otherwise so an
+        inactive filter leaves ZERO layout footprint. Pluralises the pilot count."""
+        label = self._chars_filter_label
+        if label is None:
+            if self._chars_banner.winfo_manager():
+                self._chars_banner.pack_forget()
+            return
+        n = len(self._chars_filter_names or ())
+        self._chars_banner_label.config(
+            text=f"Custom filter active: {label}  "
+                 f"({n} {'pilot' if n == 1 else 'pilots'})")
+        if not self._chars_banner.winfo_manager():
+            self._chars_banner.pack(side="top", fill="x", before=self.canvas)
+
+    def _build_chars_menu(self) -> tk.Menu:
+        """Build (but do NOT post) the Chars ▾ role menu — a testable factory that
+        mirrors _build_empty_menu. One command per host-supplied filter role (each
+        applying that role via the injected ``apply_char_filter`` callback), then
+        "Clear filter" (enabled only while a filter is active). Degrades to a
+        single disabled "No character roles" row when the host injected no roles
+        (standalone / tests)."""
+        menu = self._make_menu(self.frame)
+        roles_cb = self.callbacks.get("get_char_filter_roles")
+        apply_cb = self.callbacks.get("apply_char_filter")
+        roles = []
+        if callable(roles_cb):
+            try:
+                roles = list(roles_cb() or [])
+            except Exception:
+                roles = []
+        if roles and callable(apply_cb):
+            for role in roles:
+                menu.add_command(label=str(role),
+                                 command=lambda r=role: apply_cb(r))
+        else:
+            menu.add_command(label="No character roles", state="disabled")
+        menu.add_separator()
+        menu.add_command(
+            label="Clear filter",
+            command=lambda: self.set_chars_filter(None),
+            state=("normal" if self._chars_filter_label is not None
+                   else "disabled"))
+        return menu
+
+    def _show_chars_menu(self) -> None:
+        """Open the Chars ▾ role menu just under its microbutton. Mirrors the
+        sov-legend anchoring; grab_release matches the app's other tk_popup menus."""
+        menu = self._build_chars_menu()
+        try:
+            btn = self._chars_menu_btn
+            x = btn.winfo_rootx()
+            y = btn.winfo_rooty() + btn.winfo_height() + 2
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # ---- intel pulse layer (Task 31) ------------------------------------------
     def add_intel_pulse(self, system_id_or_name, now=None) -> None:
@@ -2426,13 +2641,25 @@ class MapTab:
         it in ``self._toolbar_tooltips`` (owner ask 2026-07-12). The tip appears
         ~500 ms after the cursor settles on the widget (never on a fly-over),
         reuses the single ``self._tooltip`` slot, and is dismissed instantly on
-        <Leave>, ANY mouse press, or the widget's <Destroy> -- so it can never sit
-        between the cursor and a click. ``add='+'`` so it never clobbers the
-        widget's own bindings, and the timer is only armed on <Enter>, so an idle
-        toolbar (cursor elsewhere) costs nothing. Empty text is a no-op. Shared by
-        every toolbar control -- the layer checkboxes, the search box, and the
-        Sov / Infra / Threat ▾ drawer buttons. The registry lets a test walk the
-        toolbar and assert every control is documented (fails if a new one isn't)."""
+        <Leave> or ANY mouse press -- so it can never sit between the cursor and a
+        click. ``add='+'`` so it never clobbers the widget's own bindings, and the
+        timer is only armed on <Enter>, so an idle toolbar (cursor elsewhere) costs
+        nothing. Empty text is a no-op. Shared by every toolbar control -- the layer
+        checkboxes, the search box, and the Sov / Infra / Threat / Chars ▾ drawer
+        buttons. The registry lets a test walk the toolbar and assert every control
+        is documented (fails if a new one isn't).
+
+        NOTE: we deliberately do NOT bind ``<Destroy>``. The tip is a child
+        ``Toplevel`` of ``widget`` (see _show_tooltip), so Tk cascades its destroy
+        automatically; a per-widget ``<Destroy>`` handler would only add a
+        ``self``-capturing Tcl command that Tk does NOT delete when a parent ROOT
+        is torn down without per-child .destroy() -- leaking the MapTab (and its Tk
+        Variables) past the interpreter. That is harmless with the single
+        long-lived MapTab of production, but across a test that spins up many
+        tk.Tk() roots the retained Variables' late __del__ ("main thread is not in
+        main loop") corrupts a later interpreter. Dropping the bind removes the leak
+        with no behaviour loss (a live tip over a widget being destroyed dies with
+        its parent, and the next _show/_hide_tooltip clears any stale state)."""
         if not text:
             return
         self._toolbar_tooltips[widget] = text
@@ -2441,7 +2668,6 @@ class MapTab:
                     add="+")
         widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
         widget.bind("<ButtonPress>", lambda _e: self._hide_tooltip(), add="+")
-        widget.bind("<Destroy>", lambda _e: self._hide_tooltip(), add="+")
 
     def _tooltip_schedule(self, widget, text: str) -> None:
         """Arm the dwell timer for ``widget``'s tip, first tearing down any pending
@@ -2498,9 +2724,14 @@ class MapTab:
         return bool(self.cfg.get("layers", {}).get(key, default))
 
     def _draw_diamond(self, sx: float, sy: float, r: float,
-                      color: str, tag: str) -> None:
+                      color: str, tag: str, outline: str = "",
+                      width: float = 1.0) -> None:
+        # outline/width default to Tk's own polygon defaults (no outline, 1px) so
+        # existing callers that don't pass them (route-overlay bridge endpoint
+        # markers) are byte-identical to before -- only staging diamonds opt into
+        # the white-rim treatment (see STAGING_OUTLINE).
         self.canvas.create_polygon(sx, sy - r, sx + r, sy, sx, sy + r, sx - r, sy,
-                                   fill=color, tags=tag)
+                                   fill=color, outline=outline, width=width, tags=tag)
 
     def _redraw_overlays(self) -> None:
         """Delete + repaint every Tk overlay item, projecting with the LIVE camera
@@ -2578,13 +2809,18 @@ class MapTab:
                 if pa is None or pb is None or not (pa[2] or pb[2]):
                     continue
                 if kind == "bridge":
+                    # Brighter + wider than the resting bridge glow (map_render
+                    # _draw_bridges draws up to 4px in dim(BRIDGE_BLUE, …)) so a
+                    # route RIDING an Ansiblex reads instantly instead of vanishing
+                    # blue-on-blue over the bridge line it sits on. Still the
+                    # #3A86FF family + dashed, so it stays legible as a bridge hop.
                     canvas.create_line(pa[0], pa[1], pb[0], pb[1],
-                                       fill=BRIDGE_BLUE_HEX, width=2,
-                                       dash=(6, 2, 2, 2), tags="ov_route")
+                                       fill=ROUTE_BRIDGE_HEX, width=5,
+                                       dash=(10, 6), tags="ov_route")
                     if pa[2]:
-                        self._draw_diamond(pa[0], pa[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                        self._draw_diamond(pa[0], pa[1], 6, ROUTE_BRIDGE_HEX, "ov_route")
                     if pb[2]:
-                        self._draw_diamond(pb[0], pb[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                        self._draw_diamond(pb[0], pb[1], 6, ROUTE_BRIDGE_HEX, "ov_route")
                 else:
                     canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=ROUTE_GOLD,
                                        width=2, dash=(6, 4), tags="ov_route")
@@ -2617,16 +2853,23 @@ class MapTab:
                 canvas.create_oval(sx - 12, sy - 12, sx + 12, sy + 12,
                                    outline="#e0e0e0", width=2, tags="ov_origin")
 
-        # -- staging diamonds (friendly green / hostile red)
+        # -- staging diamonds (friendly green / hostile red), both white-rimmed for
+        # contrast against any background wash -- see the STAGING_* comment block.
         if self._layer_on("staging"):
             for sid in st.friendly_staging:
                 p = project(sid)
                 if p is not None:
-                    self._draw_diamond(p[0], p[1], 8, "#59d98c", "ov_staging")
+                    self._draw_diamond(p[0], p[1], STAGING_R_FRIENDLY,
+                                       STAGING_FRIENDLY_FILL, "ov_staging",
+                                       outline=STAGING_OUTLINE,
+                                       width=STAGING_OUTLINE_W)
             for sid in st.hostile_staging:
                 p = project(sid)
                 if p is not None:
-                    self._draw_diamond(p[0], p[1], 8, "#ff5a76", "ov_staging")
+                    self._draw_diamond(p[0], p[1], STAGING_R_HOSTILE,
+                                       STAGING_HOSTILE_FILL, "ov_staging",
+                                       outline=STAGING_OUTLINE,
+                                       width=STAGING_OUTLINE_W)
 
         # -- fleet pins + high-contrast count chips, own-location ring
         # The member count is COMMAND-CRITICAL and must stay legible even where
@@ -2712,6 +2955,9 @@ class MapTab:
         # but-empty layer performs zero canvas ops here.
         if self._layer_on("chars") and st.chars:
             for sid, occ in st.chars.items():
+                occ = self._chars_visible_occupants(occ)   # session filter
+                if not occ:                                # filtered out entirely
+                    continue
                 p = project(sid)
                 if p is None:
                     continue
@@ -3353,7 +3599,8 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam), ('threat', frozenset), ('route', tuple), ('ambient', tuple),
+        ms, cam), ('threat', frozenset), ('friendly_threat', frozenset),
+        ('route', tuple), ('ambient', tuple),
         ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
@@ -3365,6 +3612,7 @@ class MapTab:
         gesture take different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
+        latest_friendly_threat = None
         latest_route = None
         latest_ambient = None
         latest_sov = None
@@ -3375,6 +3623,8 @@ class MapTab:
                 item = self._result_q.get_nowait()
                 if item[0] == "threat":
                     latest_threat = item
+                elif item[0] == "friendly_threat":
+                    latest_friendly_threat = item
                 elif item[0] == "route":
                     latest_route = item
                 elif item[0] == "ambient":
@@ -3396,6 +3646,8 @@ class MapTab:
                 self._apply_gesture_frame(*latest_frame[1:])
         if latest_threat is not None:
             self.set_threat(latest_threat[1])
+        if latest_friendly_threat is not None:
+            self.set_friendly_threat(latest_friendly_threat[1])
         if latest_route is not None:
             self._apply_route(latest_route[1])
         if latest_ambient is not None:
@@ -3657,12 +3909,16 @@ class MapTab:
         self._hover_cancel()
 
     def _infra_hover_lines(self, sid) -> list[str] | None:
-        """Infra hover-tooltip provider: per-type structure counts for the hovered
-        system, e.g. ["3× Fortizar", "1× Athanor"], sorted by count desc then
-        name, with a dim "(stale)" line when the badge is stale-flagged. Reads the
-        PRE-COMPUTED "type_counts" the host folded into the pushed badges (already
+        """Infra hover-tooltip provider. For a lightly-populated system (≤
+        _INFRA_HOVER_DETAIL_MAX surviving structures) it lists each structure as
+        "<Type> — <Name> [TICKER]" via the get_system_structures callback (whose
+        names already carry the owner's alliance/corp ticker when resolved);
+        otherwise it shows the compact per-type counts (e.g. ["3× Fortizar",
+        "1× Athanor"]), sorted by count desc then name. A dim "(stale)" line is
+        appended when the badge is stale-flagged. Reads the PRE-COMPUTED
+        "type_counts" the host folded into the pushed badges (already
         filter-respecting), so this file keeps zero infra logic. None when the
-        hovered system has no badge / no counts."""
+        hovered system has no badge / no content."""
         infra = self.state.infra
         if not infra:
             return None
@@ -3670,6 +3926,27 @@ class MapTab:
         if not badge:
             return None
         type_counts = badge.get("type_counts") or {}
+        total = badge.get("total")
+        if total is None:
+            total = sum(type_counts.values())
+        # Detailed per-structure listing for a small system (owner ask): flatten
+        # the host's grouped structures into "<Type> — <Name> [TICKER]" lines. The
+        # host applies the same filters the badge uses, so the counts agree. Falls
+        # through to the compact summary when no callback / nothing survives.
+        if total and total <= _INFRA_HOVER_DETAIL_MAX:
+            gss = self.callbacks.get("get_system_structures")
+            if gss is not None:
+                try:
+                    groups = gss(sid)
+                except Exception:
+                    groups = None
+                if groups:
+                    lines = [f"{type_name} — {nm}"
+                             for type_name, names in groups for nm in names]
+                    if lines:
+                        if badge.get("stale"):
+                            lines.append("(stale)")
+                        return lines
         if not type_counts:
             return None
         items = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -3825,8 +4102,6 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("bridges"))
         menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
                              command=lambda: self._on_layer_toggle("route"))
-        menu.add_checkbutton(label="Heat", variable=self._layer_vars["heat"],
-                             command=lambda: self._on_layer_toggle("heat"))
         menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
                              command=lambda: self._on_layer_toggle("intel"))
         # Kill pings (Task 36): discrete zkill-alert radar bursts; ON by default.
@@ -3880,6 +4155,7 @@ class MapTab:
         self.cfg["threat_ship"] = self._strip_ly_suffix(label)   # store base name
         self._threat_var.set(label)
         self._recompute_threat()
+        self._recompute_friendly_threat()   # SAME ship class drives both halos
 
     def _threat_ly(self) -> float:
         """LY for the configured threat ship. The grouped option base-labels are
@@ -3963,6 +4239,36 @@ class MapTab:
 
         threading.Thread(target=work, daemon=True, name="map-threat").start()
 
+    def _recompute_friendly_threat(self) -> None:
+        """Recompute the friendly-staging projection halo (owner ask). Mirrors
+        ``_recompute_threat`` EXACTLY but over the FRIENDLY set and gated on the
+        drawer's master state (``cfg["threat_friendly_enabled"]``, mirrored by
+        ``_friendly_master_var``) rather than a toolbar layer -- OFF / no included
+        friendly staging clears the halo. The SAME ``threat_ship`` range drives it, so
+        it is one class, two halos. The scan runs on a helper thread touching NO Tcl,
+        feeding back through the main-thread result queue as a ('friendly_threat',
+        frozenset) tuple (drained by ``_drain_results``)."""
+        on = bool(self._friendly_master_var.get())
+        # Union only over the friendly staging the drawer left INCLUDED (exclusions
+        # persist by name in cfg["threat_friendly_excluded"]; empty list -> all).
+        excluded = self.cfg.get("threat_friendly_excluded", []) or []
+        friendly = self.state.selected_friendly_staging(excluded)
+        if not on or not friendly:
+            self.set_friendly_threat(None)
+            return
+        ly = self._threat_ly()
+
+        def work():
+            try:
+                fset = mo.compute_threat(friendly, ly)
+            except Exception as exc:               # never crash the helper thread
+                print(f"[MAP] friendly threat recompute failed: {exc}")
+                return
+            self._result_q.put(("friendly_threat", fset))   # applied on main thread
+
+        threading.Thread(target=work, daemon=True,
+                         name="map-threat-friendly").start()
+
     # ---- threat drawer (Task 34) ----------------------------------------------
     def _toggle_threat_drawer(self) -> None:
         """Threat ▾ microbutton handler: open the drawer if closed, else close it."""
@@ -3991,10 +4297,11 @@ class MapTab:
         self._threat_drawer.pack_forget()
 
     def _build_threat_drawer(self) -> None:
-        """(Re)build the drawer contents top-to-bottom: master overlay toggle,
-        ship-class radio list, then the per-staging checkbox rows. Themed via the
-        shared theme dict; the drawer bg is the panel colour, so select
-        indicators use entry_bg for contrast against it."""
+        """(Re)build the drawer contents top-to-bottom: hostile master overlay toggle,
+        the SHARED ship-class radio list (one class drives both halos), the hostile
+        per-staging checkbox rows, then the friendly-projection section (its own master
+        toggle + per-staging rows). Themed via the shared theme dict; the drawer bg is
+        the panel colour, so select indicators use entry_bg for contrast against it."""
         t = self.theme
         d = self._threat_drawer
         for w in d.winfo_children():
@@ -4009,8 +4316,9 @@ class MapTab:
                        bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
                        activebackground=t["panel"], activeforeground=t["accent"],
                        anchor="w").pack(fill="x", padx=8, pady=2)
-        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"]
-        tk.Label(d, text="Ship class", bg=t["panel"], fg=t["fg"]).pack(
+        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"].
+        # SHARED: this one class drives BOTH the hostile and friendly halos.
+        tk.Label(d, text="Ship class (both halos)", bg=t["panel"], fg=t["fg"]).pack(
             anchor="w", padx=10, pady=(8, 0))
         opts = mo.threat_options()
         current = self.cfg.get("threat_ship", "Titan Bridge")
@@ -4041,6 +4349,42 @@ class MapTab:
         self._threat_rows = tk.Frame(d, bg=t["panel"])
         self._threat_rows.pack(fill="x", padx=8, pady=(2, 8))
         self._rebuild_threat_staging_rows()
+
+        # 4) Friendly-staging PROJECTION (owner ask): a SECOND, BLUE halo over the
+        # jump/bridge reach of your OWN stagings. Default OFF -- a new visual the owner
+        # opts into. Shares the ship-class picker above (one class, two halos); only
+        # the master toggle + per-staging selection are separate. A thin divider sets
+        # it apart from the hostile block above.
+        tk.Frame(d, bg=t["border"], height=1).pack(fill="x", padx=8, pady=(10, 0))
+        tk.Label(d, text="Friendly staging projection", bg=t["panel"],
+                 fg=t["accent"], font=("Segoe UI", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(8, 4))
+        # Re-sync the persistent master var from cfg on each build (belt-and-suspenders,
+        # the staging-rows idiom): cfg is the source of truth the recompute also reads.
+        self._friendly_master_var.set(
+            bool(self.cfg.get("threat_friendly_enabled", False)))
+        tk.Checkbutton(d, text="Show friendly projection (blue)",
+                       variable=self._friendly_master_var,
+                       command=self._on_friendly_master_toggle,
+                       bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                       activebackground=t["panel"], activeforeground=t["accent"],
+                       anchor="w").pack(fill="x", padx=8, pady=2)
+        fhead = tk.Frame(d, bg=t["panel"])
+        fhead.pack(fill="x", padx=10, pady=(6, 0))
+        tk.Label(fhead, text="Friendly systems", bg=t["panel"], fg=t["fg"]).pack(
+            side="left")
+        tk.Button(fhead, text="None", command=self._friendly_staging_none,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right")
+        tk.Button(fhead, text="All", command=self._friendly_staging_all,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right",
+                                                             padx=(0, 4))
+        self._friendly_rows = tk.Frame(d, bg=t["panel"])
+        self._friendly_rows.pack(fill="x", padx=8, pady=(2, 8))
+        self._rebuild_friendly_staging_rows()
 
     def _rebuild_threat_staging_rows(self) -> None:
         """Repopulate the per-staging checkbox rows from the current hostile
@@ -4104,6 +4448,81 @@ class MapTab:
         for var in self._threat_staging_vars.values():
             var.set(False)
         self._recompute_threat()
+
+    # ---- friendly-staging projection (owner ask) -------------------------------
+    # All four mirror the hostile handlers above EXACTLY, over the FRIENDLY staging
+    # set + cfg["threat_friendly_excluded"] + the friendly master var, and end in
+    # _recompute_friendly_threat instead of _recompute_threat.
+    def _rebuild_friendly_staging_rows(self) -> None:
+        """Repopulate the friendly-projection per-staging checkbox rows from the
+        current friendly staging (id->name via the model). Checked = contributes to
+        the friendly halo; unchecking persists a NAME exclusion in
+        ``cfg["threat_friendly_excluded"]``. No-op before the drawer built the rows
+        container (so it is safe to call from ``set_staging`` any time). Empty friendly
+        staging shows a dim hint instead of rows. Mirrors _rebuild_threat_staging_rows."""
+        rows = self._friendly_rows
+        if rows is None:
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._friendly_staging_vars = {}
+        t = self.theme
+        model = self.state.model
+        systems = model.systems if model is not None else {}
+        names = sorted({systems[sid].name for sid in self.state.friendly_staging
+                        if sid in systems})
+        if not names:
+            tk.Label(rows,
+                     text="No friendly staging configured — right-click a system "
+                          "→ Add to friendly staging.",
+                     bg=t["panel"], fg=t["fg"], justify="left", wraplength=205,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            return
+        excluded = set(self.cfg.get("threat_friendly_excluded", []) or [])
+        for name in names:
+            var = tk.BooleanVar(value=(name not in excluded))
+            self._friendly_staging_vars[name] = var
+            tk.Checkbutton(rows, text=name, variable=var,
+                           command=lambda n=name: self._on_friendly_staging_toggle(n),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(fill="x")
+
+    def _on_friendly_master_toggle(self) -> None:
+        """The friendly-projection master checkbox: persist the enabled flag to
+        ``cfg["threat_friendly_enabled"]`` and recompute (the drawer-only, cfg-backed
+        analogue of _on_layer_toggle('threat') for the toolbar hostile layer)."""
+        self.cfg["threat_friendly_enabled"] = bool(self._friendly_master_var.get())
+        self._recompute_friendly_threat()
+
+    def _on_friendly_staging_toggle(self, name: str) -> None:
+        """A friendly-staging row toggled: add/drop the NAME from the persisted
+        exclusion list (reassigned, never mutated in place -- the DEFAULT_CONFIG list
+        may be shared) and recompute over the new subset."""
+        var = self._friendly_staging_vars.get(name)
+        if var is None:
+            return
+        excluded = set(self.cfg.get("threat_friendly_excluded", []) or [])
+        if var.get():
+            excluded.discard(name)               # included
+        else:
+            excluded.add(name)                   # excluded
+        self.cfg["threat_friendly_excluded"] = sorted(excluded)
+        self._recompute_friendly_threat()
+
+    def _friendly_staging_all(self) -> None:
+        """Include every friendly staging: clear the exclusion list, check all rows."""
+        self.cfg["threat_friendly_excluded"] = []
+        for var in self._friendly_staging_vars.values():
+            var.set(True)
+        self._recompute_friendly_threat()
+
+    def _friendly_staging_none(self) -> None:
+        """Exclude every CURRENT friendly staging: persist names, uncheck all rows."""
+        self.cfg["threat_friendly_excluded"] = sorted(self._friendly_staging_vars)
+        for var in self._friendly_staging_vars.values():
+            var.set(False)
+        self._recompute_friendly_threat()
 
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)

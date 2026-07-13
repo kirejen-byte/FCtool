@@ -5524,6 +5524,11 @@ class FCToolGUI:
             # Right-click organized structure list: grouped, filter-respecting
             # structures for a system (owner feedback round B).
             "get_system_structures": self._infra_get_system_structures,
+            # Chars overlay role filter (owner ask): the map's Chars ▾ menu lists
+            # these role labels and applies the picked one — both routed through
+            # fc_gui (which owns the role data) so map_tab stays fc_gui-free.
+            "get_char_filter_roles": self._get_char_filter_roles,
+            "apply_char_filter": self._apply_char_map_filter,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -5562,6 +5567,16 @@ class FCToolGUI:
         self._infra_filters = _copy.deepcopy(infra_overlay.FILTER_DEFAULTS)
         self._infra_filters["enabled"] = bool(
             (cfg.get("layers") or {}).get("infra", False))
+        # Session cache of resolved structure-owner tickers: {corp owner_id ->
+        # ticker|None}, ALLIANCE ticker preferred (corp fallback). Populated
+        # one-shot in the background by _maybe_resolve_owner_tickers after a store
+        # load / import / scan-apply; read lazily by the map hover + right-click
+        # structure list. A None value means "attempted, no ticker" so a dead /
+        # 404 corp is not re-fetched (anti-restorm, mirrors the sov freshness
+        # stamp). _owner_ticker_get is an injectable public-ESI GET (tests).
+        self._owner_ticker_cache = {}
+        self._owner_ticker_inflight = False
+        self._owner_ticker_get = None
 
     # ── Star-map data pushes (fleet / own-location / staging) ─────────────────
     def _push_fleet_to_map(self, members):
@@ -5937,6 +5952,10 @@ class FCToolGUI:
         except Exception as exc:
             print(f"[INFRA] setup failed: {exc}")
             return None, None
+        # First build only (subsequent calls return early above): resolve owner
+        # tickers for any ESI-scanned structures the freshly-loaded store already
+        # holds. One-shot + census-guarded -> a no-op when nothing is unresolved.
+        self._maybe_resolve_owner_tickers()
         return self._infra_store, self._infra_scanner
 
     def _infra_get_infrastructure(self, filters):
@@ -5987,11 +6006,16 @@ class FCToolGUI:
         """Map right-click callback (organized "Structures (N)" submenu): the
         FILTER-SURVIVING structures in ``system_id`` grouped by specific type name,
         as ``list[(type_display_name, [sorted structure names])]`` ordered by count
-        desc then type name. Applies the SAME live overlay filters (_infra_filters)
-        the chip badges use -- through infra_overlay.filter_entries, the exact
-        predicate infra_badges shares -- so the menu shows precisely what the
-        overlay shows. Runs on the Tk thread (a menu build). Returns [] when the
-        store isn't built yet or nothing survives (never force-builds the store)."""
+        desc then type name. Each structure name gains a `` [TICKER]`` suffix (the
+        owner's ALLIANCE ticker preferred, corp fallback) when that owner's ticker
+        is resolved in the session cache -- silently plain otherwise (clipboard
+        imports carry no owner). This single enrichment point feeds BOTH the
+        right-click cascade AND the map hover (which flattens these groups).
+        Applies the SAME live overlay filters (_infra_filters) the chip badges use
+        -- through infra_overlay.filter_entries, the exact predicate infra_badges
+        shares -- so the menu shows precisely what the overlay shows. Runs on the
+        Tk thread (a menu build). Returns [] when the store isn't built yet or
+        nothing survives (never force-builds the store)."""
         store = getattr(self, "_infra_store", None)
         if store is None:
             return []
@@ -6002,11 +6026,16 @@ class FCToolGUI:
             entries = store.by_system().get(system_id) or []
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
             surviving = infra_overlay.filter_entries(entries, filters, now_iso)
+            ticker_cache = getattr(self, "_owner_ticker_cache", None) or {}
             groups: dict = {}
             for e in surviving:
                 tname = infra_parser.type_name(e.get("type_id"),
                                                e.get("structure_id"))
-                groups.setdefault(tname, []).append(e.get("name") or "")
+                name = e.get("name") or ""
+                ticker = ticker_cache.get(e.get("owner_id"))
+                if ticker:
+                    name = f"{name} [{ticker}]"
+                groups.setdefault(tname, []).append(name)
             for names in groups.values():
                 names.sort()
             # Groups ordered by count desc, then type name asc (the map renders
@@ -6016,6 +6045,102 @@ class FCToolGUI:
             print(f"[INFRA] structure list failed: {exc}")
             return []
 
+    # ── Structure-owner ticker resolver (owner ask) ───────────────────────────
+    @staticmethod
+    def _resolve_owner_ticker(owner_id, get_fn):
+        """Resolve ONE corporation ``owner_id`` to a display ticker: the
+        ALLIANCE ticker preferred, the corp ticker as fallback, ``None`` when the
+        corp can't be fetched or carries no ticker. ``get_fn(path)`` is a public
+        ESI GET returning a parsed dict (or None on 404 / error). Pure given
+        ``get_fn`` -- no Tk, no shared state -- so tests drive it with a fake
+        fetcher (corp-with-alliance -> alliance ticker; corp-without-alliance ->
+        corp ticker; 404 -> None)."""
+        corp = get_fn(f"/corporations/{owner_id}/")
+        if not isinstance(corp, dict):
+            return None
+        alliance_id = corp.get("alliance_id")
+        if alliance_id:
+            alli = get_fn(f"/alliances/{alliance_id}/")
+            if isinstance(alli, dict):
+                ticker = alli.get("ticker")
+                if ticker:
+                    return ticker
+        ticker = corp.get("ticker")
+        return ticker or None
+
+    def _owner_ticker_esi_get(self, path):
+        """Default public-ESI GET for the ticker resolver: shared ``rate_limit``
+        token bucket, house headers, 10 s timeout, SILENT-DEGRADE to ``None`` on
+        any non-200 / exception. Runs on the resolver worker thread only (touches
+        no Tk) -- the house ESI pattern the rest of the tool uses."""
+        try:
+            rate_limit('esi')
+            resp = requests.get(f"{ESI_BASE}{path}",
+                                headers=ESI_HEADERS, timeout=10)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception:
+            return None
+
+    def _maybe_resolve_owner_tickers(self):
+        """One-shot background resolver: after a store load / import / scan-apply,
+        resolve the DISTINCT corporation ``owner_id``s the store holds into
+        display tickers (alliance preferred) so structure names can carry a
+        `` [TICKER]`` suffix in the map hover, the right-click cascade, and the
+        structure info panel. Clipboard-only imports carry no ``owner_id`` -> the
+        ticker is silently absent there (the in-game markup has no owner).
+
+        Mirrors the sov-name resolver: an in-flight flag debounces double-spawns;
+        the DISTINCT owners are fetched off the Tk thread (1-2 public ESI calls
+        each, cached for the session); results marshal back via ``_post_ui``. A
+        no-op when nothing is unresolved (census-clean) or no store is built.
+        Refreshes nothing aggressively -- the next hover / menu build reads the
+        cache. Called on the Tk thread from the store lifecycle points."""
+        store = getattr(self, "_infra_store", None)
+        if store is None:
+            return
+        cache = getattr(self, "_owner_ticker_cache", None)
+        if cache is None:
+            cache = self._owner_ticker_cache = {}
+        # DISTINCT owner_ids present in the store, minus already-attempted ones.
+        unresolved = {oid for oid in
+                      (e.get("owner_id") for e in store.entries())
+                      if oid is not None and oid not in cache}
+        if not unresolved:
+            return
+        if getattr(self, "_owner_ticker_inflight", False):
+            return
+        self._owner_ticker_inflight = True
+        get_fn = getattr(self, "_owner_ticker_get", None) or \
+            self._owner_ticker_esi_get
+
+        def do_resolve():
+            # Record an outcome for EVERY attempted owner (ticker or None) so a
+            # dead / 404 corp is not re-fetched on the next lifecycle spawn.
+            results = {}
+            try:
+                for oid in unresolved:
+                    try:
+                        results[oid] = self._resolve_owner_ticker(oid, get_fn)
+                    except Exception:
+                        results[oid] = None
+            finally:
+                self._post_ui(self._apply_owner_tickers, results)
+
+        threading.Thread(target=do_resolve, daemon=True).start()
+
+    def _apply_owner_tickers(self, results):
+        """Main-thread applier (via ``_post_ui``): fold the resolved
+        ``{owner_id: ticker|None}`` into the session cache and clear the in-flight
+        flag. No re-render -- the next hover / menu build picks the tickers up."""
+        cache = getattr(self, "_owner_ticker_cache", None)
+        if cache is None:
+            cache = self._owner_ticker_cache = {}
+        if results:
+            cache.update(results)
+        self._owner_ticker_inflight = False
+
     def _infra_on_changed(self):
         """Manager-dialog on_changed hook: an import / scan / edit changed the
         store. Refresh BOTH the chip layer and the Ansiblex bridge layer so
@@ -6023,6 +6148,7 @@ class FCToolGUI:
         next map re-show). Runs on the Tk thread (the dialog calls it)."""
         self._push_infra_to_map()
         self._push_bridges_to_map()
+        self._maybe_resolve_owner_tickers()      # resolve any new owners' tickers
 
     def _infra_scan_on_progress(self, payload):
         """InfraScanner on_progress host handler. The scanner already marshals
@@ -6062,6 +6188,8 @@ class FCToolGUI:
                 pass
         self._push_infra_to_map()
         self._push_bridges_to_map()
+        # A scan resolves structures WITH their corp owner_id -> resolve tickers.
+        self._maybe_resolve_owner_tickers()
 
     def _infra_clipboard_get(self):
         """Zero-arg clipboard text reader for the manager dialog. Returns "" on an
@@ -6202,6 +6330,13 @@ class FCToolGUI:
 
     # ── Character Management Tab ──────────────────────────────────────────────
 
+    # Capability/role filter labels offered by the Characters-tab Filter dropdown
+    # AND surfaced on the map's Chars ▾ role menu (owner ask). Single source of
+    # truth so both stay in lock-step; the empty "no filter" entry is added only
+    # to the combobox, never exported as a role. Lower-cased these become the
+    # ``cap_key`` _char_matches_filter switches on ("hic/dictor" -> the dictor flag).
+    _CHAR_FILTER_ROLES = ["FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"]
+
     def _build_character_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Characters  ")
@@ -6233,7 +6368,7 @@ class FCToolGUI:
         self._char_filter_cap_var = tk.StringVar(value="")
         self._char_filter_cap = ttk.Combobox(
             filter_frame, textvariable=self._char_filter_cap_var,
-            values=["", "FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"],
+            values=[""] + self._CHAR_FILTER_ROLES,
             state="readonly", width=12,
         )
         self._char_filter_cap.pack(side=tk.LEFT, padx=5, pady=5)
@@ -6249,6 +6384,15 @@ class FCToolGUI:
         )
         self._char_filter_region.pack(side=tk.LEFT, padx=5, pady=5)
         self._char_filter_region.bind("<<ComboboxSelected>>", self._on_region_filter_changed)
+
+        # View on Map (owner ask): push the SELECTED capability filter to the map's
+        # Chars overlay and raise the Map tab. Disabled until a role is picked, so
+        # the option surfaces "after a filter has been selected"; synced from
+        # _on_cap_filter_changed / _clear_char_filter.
+        self._char_view_map_btn = ttk.Button(
+            filter_frame, text="View on Map", style="Dark.TButton",
+            state="disabled", command=self._view_char_filter_on_map)
+        self._char_view_map_btn.pack(side=tk.LEFT, padx=(10, 0), pady=5)
 
         ttk.Button(filter_frame, text="Clear", style="Dark.TButton",
                    command=self._clear_char_filter).pack(side=tk.LEFT, padx=10, pady=5)
@@ -7247,6 +7391,7 @@ class FCToolGUI:
         else:
             self._char_filter_region.config(state="disabled")
             self._char_filter_region_var.set("")
+        self._sync_view_on_map_btn()
         self._apply_char_filter()
 
     def _on_region_filter_changed(self, event=None):
@@ -7259,7 +7404,74 @@ class FCToolGUI:
         self._char_filter_region_var.set("")
         self._char_filter_region.config(state="disabled")
         self._char_filter_count_label.config(text="")
+        self._sync_view_on_map_btn()
         self._apply_char_filter()
+
+    def _sync_view_on_map_btn(self):
+        """Enable "View on Map" only once a capability/role is selected (owner ask:
+        the option appears "after a filter has been selected"). No-op if the button
+        was not built yet (defensive)."""
+        btn = getattr(self, "_char_view_map_btn", None)
+        if btn is None:
+            return
+        state = "normal" if self._char_filter_cap_var.get() else "disabled"
+        try:
+            btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _get_char_filter_roles(self) -> list[str]:
+        """The character-role filter labels the map's Chars ▾ menu lists — the same
+        capability set the Characters-tab Filter dropdown offers, minus the empty
+        "no filter" entry. Plain data so map_tab stays fc_gui-free."""
+        return list(self._CHAR_FILTER_ROLES)
+
+    def _char_names_for_role(self, role_label: str) -> frozenset:
+        """Character NAMES whose cached role/capability info matches ``role_label``
+        — the map Chars filter's match-set. Reuses _char_matches_filter with NO
+        region constraint so the set mirrors the Characters-tab capability filter
+        (region is a Characters-tab-only refinement). Names are the same stable key
+        _map_characters_fetch stamps on the overlay payload, so this frozenset
+        filters the map by simple membership. Empty when nothing matches (an honest
+        empty overlay). Reads the panels' cached _info, so it is a pure snapshot —
+        no ESI."""
+        cap_key = (role_label or "").lower()
+        names: set[str] = set()
+        for panel in getattr(self, "_char_panels", []) or []:
+            info = getattr(panel, "_info", None)
+            if not info:
+                continue
+            if self._char_matches_filter(info, cap_key, ""):
+                acct = getattr(panel, "_acct", None)
+                name = getattr(acct, "character_name", None) if acct else None
+                if name:
+                    names.add(name)
+        return frozenset(names)
+
+    def _apply_char_map_filter(self, role_label, switch_to_map: bool = False):
+        """Apply ``role_label`` as the map Chars overlay's session filter: compute
+        the matching character-name set (from cached role data) and push it to the
+        map via set_chars_filter. When ``switch_to_map`` is true (the Characters-tab
+        "View on Map" entry) also raise the Map tab. Injected into the map as the
+        ``apply_char_filter`` callback, where it is called with a single role label
+        (no tab switch — the user is already on the map). No-op if the map tab is
+        not built."""
+        mt = getattr(self, "map_tab", None)
+        if mt is None:
+            return
+        names = self._char_names_for_role(role_label)
+        mt.set_chars_filter(role_label, names)
+        if switch_to_map:
+            self._select_map_tab()
+
+    def _view_char_filter_on_map(self):
+        """Characters-tab "View on Map": push the currently-selected capability
+        filter to the map's Chars overlay and raise the Map tab. No-op when no
+        capability is selected (the button is disabled in that state anyway)."""
+        cap = self._char_filter_cap_var.get()
+        if not cap:
+            return
+        self._apply_char_map_filter(cap, switch_to_map=True)
 
     def _get_regions_for_capability(self, cap_key: str) -> set[str]:
         """Get all regions where a given capability exists across all characters."""

@@ -18,7 +18,12 @@ BG = (10, 10, 20)
 SEC_HI = (0x33, 0xB5, 0xE5)
 SEC_LOW = (0xFF, 0xB3, 0x47)
 SEC_NULL = (0xCC, 0x22, 0x33)
-LABEL_COLOR = (200, 210, 225)
+LABEL_COLOR = (219, 226, 237)   # system-name text; brightened past #d8d8e0 (owner
+                                # 2026-07-12 readability pass -- was (200,210,225),
+                                # a touch dim over bright range/threat washes)
+LABEL_OUTLINE = (10, 10, 20)    # near-black (#0a0a14, the space-bg family) 1px ring
+                                # baked under system-name labels so they read on ANY
+                                # background (green range, purple threat, sov, nebula)
 REGION_LABEL_COLOR = (150, 165, 195)
 HUB_IDS = frozenset({30000142, 30002187, 30002659, 30002053, 30002510})
 
@@ -49,15 +54,26 @@ SOV_RADIUS = 34
 # left in-range systems at FULL native colour and dimmed the rest -- so an in-range
 # NULLSEC system stayed bright red while out-of-range nulls dimmed to darker red, a
 # red-on-red distinction the owner found hard to read. In-range systems now also get
-# a bright-green glow aura (a hair LARGER than the node glow so it peeks out AROUND
-# the node), MAX-composed on the shared scratch then ADD-blitted ONCE (the _draw_sov
+# a green glow aura (a hair LARGER than the node glow so it peeks out AROUND the
+# node), MAX-composed on the shared scratch then ADD-blitted ONCE (the _draw_sov
 # house pattern) so dense in-range clusters wash FLAT green and never toward white.
 # Green reads clearly against red nullsec (#cc2233), amber lowsec, cyan highsec, and
 # stays distinct from the dim violet threat wash below. The green is an ACCENT: the
 # node's own colour + white core still ride on top, so in-range stays "bright as
 # today" -- the green is the readability cue, not a recolour.
-RANGE_GREEN = (0x39, 0xFF, 0x8C)
-RANGE_GLOW_PAD = 8            # green aura radius = node glow_r + this (aura peeks out)
+#
+# Readability pass (owner 2026-07-12): the first cut was a floodlight -- too LARGE
+# (pad 8) and too LIGHT green, which drowned the system-name labels and hurt to read.
+# Tighten the halo (pad 3, hugs the node) and DIM the glow to ~57% brightness. The
+# RGB is scaled BEFORE the sprite build (RANGE_GREEN_GLOW), so the whole additive
+# gradient -- and its MAX-compose ceiling -- drops proportionally while the hue is
+# preserved: in-range still reads clearly as green, just no longer a wash.
+RANGE_GREEN = (0x39, 0xFF, 0x8C)          # reference in-range hue (bright green)
+RANGE_GREEN_DIM = 0.57                     # glow brightness vs RANGE_GREEN (~57%)
+RANGE_GREEN_GLOW = (int(RANGE_GREEN[0] * RANGE_GREEN_DIM),
+                    int(RANGE_GREEN[1] * RANGE_GREEN_DIM),
+                    int(RANGE_GREEN[2] * RANGE_GREEN_DIM))   # (32, 145, 79)
+RANGE_GLOW_PAD = 3            # green aura radius = node glow_r + this (tight halo)
 
 # Threat projection wash (owner 2026-07-12): the projected-reach warning under a
 # threatened system, switched from RED to a DIM violet so it is distinguishable from
@@ -68,6 +84,20 @@ RANGE_GLOW_PAD = 8            # green aura radius = node glow_r + this (aura pee
 # point markers of a DIFFERENT semantic (where hostiles ARE, not their reach), so
 # their red is intentional and untouched.
 THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
+
+# Friendly-staging PROJECTION wash (owner ask): the projected jump/bridge reach of
+# your OWN stagings -- a SECOND, opt-in halo drawn beside the hostile purple threat.
+# A deep azure BLUE (#3d7dd6), chosen to read DISTINCT from every neighbour: the
+# purple hostile wash (blue's GREEN channel sits ABOVE red, whereas purple's RED sits
+# above green -- opposite low-channel ordering), the green range aura, and the
+# BRIGHTER blue Ansiblex bridge LINES (#3a86ff) -- this is an area WASH one hue deeper
+# than the bridges so the two blues separate by both form and shade. MAX-composed onto
+# the shared scratch then ONE additive blit, exactly like THREAT_PURPLE, so overlapping
+# friendly blobs top out FLAT (never white). Where a system sits inside BOTH the hostile
+# and friendly reach the purple + blue ADD to a saturated blue-violet: both peak the
+# BLUE channel (~193 each -> clamps at 255) while R/G stay ~185/195 -- readable, never
+# a white-out (verified: a dense worst-case overlap never trips all-3 contribution > 200).
+FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
 
 # Infrastructure count chips (Task 5): a small rounded badge per system carrying
 # its structure count, tinted by the DOMINANT category. Drawn in the label pass
@@ -186,13 +216,19 @@ def pick_band(visible_count: int) -> str:
 @dataclass(frozen=True)
 class TintSpec:
     """Base-layer tinting (spec §5.1/§5.2): range overlay brightens `bright`
-    and dims everything else; threat halo under-glows `halo` in red."""
+    and dims everything else; `halo` under-glows the hostile-staging reach in
+    purple, and `friendly` under-glows the friendly-staging reach in blue (owner
+    ask -- a second, opt-in projection sharing the same ship-class range). Any
+    field None means that pass is skipped, so an all-None spec is byte-identical
+    to no tint at all."""
     bright: frozenset[int] | None = None    # None = no range tint
-    halo: frozenset[int] | None = None
+    halo: frozenset[int] | None = None      # None = no hostile-staging projection
+    friendly: frozenset[int] | None = None  # None = no friendly-staging projection
 
     def key(self) -> tuple:
         return (tuple(sorted(self.bright)) if self.bright is not None else None,
-                tuple(sorted(self.halo)) if self.halo is not None else None)
+                tuple(sorted(self.halo)) if self.halo is not None else None,
+                tuple(sorted(self.friendly)) if self.friendly is not None else None)
 
 
 # --- cached asset factories --------------------------------------------------
@@ -295,11 +331,19 @@ class SpriteFactory:
 
 
 class LabelFactory:
-    """Cached AA text surfaces keyed by (text, px, color). font.init lazy."""
+    """Cached AA text surfaces keyed by (text, px, color, outline). font.init lazy.
+
+    An ``outline`` colour (owner 2026-07-12 readability pass) bakes a 1px dark ring
+    UNDER the glyphs so system names stay legible on any map background. The outlined
+    composite is cached exactly like a plain label, so a caller that always passes the
+    same outline pays the 2-render + 5-blit build ONCE per distinct (text, px, colour)
+    -- the per-frame cost is a single blit of a prebuilt surface, ZERO delta vs the
+    un-outlined label. Callers that omit ``outline`` (region + hub labels, infra chips)
+    get the byte-identical plain render they always did."""
 
     def __init__(self) -> None:
         self._fonts: dict[int, pygame.font.Font] = {}
-        self._cache: dict[tuple[str, int, tuple[int, int, int]], pygame.Surface] = {}
+        self._cache: dict[tuple, pygame.Surface] = {}
 
     def _font(self, px: int) -> pygame.font.Font:
         f = self._fonts.get(px)
@@ -310,13 +354,35 @@ class LabelFactory:
             self._fonts[px] = f
         return f
 
-    def label(self, text: str, px: int, color: tuple[int, int, int]) -> pygame.Surface:
-        key = (text, px, color)
+    def label(self, text: str, px: int, color: tuple[int, int, int],
+              outline: tuple[int, int, int] | None = None) -> pygame.Surface:
+        key = (text, px, color, outline)
         got = self._cache.get(key)
         if got is None:
-            got = self._font(px).render(text, True, color)
+            if outline is None:
+                got = self._font(px).render(text, True, color)
+            else:
+                got = self._render_outlined(text, px, color, outline)
             self._cache[key] = got
         return got
+
+    def _render_outlined(self, text: str, px: int, color: tuple[int, int, int],
+                         outline: tuple[int, int, int]) -> pygame.Surface:
+        """Glyphs with a 1px dark outline baked in. Render the text once in the
+        outline colour and blit it at the four cardinal +/-1px offsets, then the
+        bright text on top (2 renders + 5 blits). The composite is 1px larger on
+        every side (the ring), and the bright glyph lands at (1, 1) so its interior
+        sits exactly where the un-outlined glyph would minus that 1px pad."""
+        font = self._font(px)
+        base = font.render(text, True, color)
+        dark = font.render(text, True, outline)
+        w, h = base.get_size()
+        out = pygame.Surface((w + 2, h + 2), pygame.SRCALPHA)
+        blit = out.blit
+        for dx, dy in ((0, 1), (2, 1), (1, 0), (1, 2)):   # W, E, N, S of (1, 1)
+            blit(dark, (dx, dy))
+        blit(base, (1, 1))
+        return out
 
 
 # --- Tk hand-off -------------------------------------------------------------
@@ -642,21 +708,24 @@ class Renderer:
     def _draw_range_glow(self, surf, pos, bright, glow_r):
         """In-range GREEN accent (owner 2026-07-12): the readability fix for the old
         red-on-red range overlay. Every in-range system (``TintSpec.bright``) gets
-        ONE soft green glow at ``glow_r + RANGE_GLOW_PAD`` -- a hair larger than the
-        node glow so the aura peeks out AROUND the node -- MAX-composed onto the
-        shared scratch, then blitted ONCE with BLEND_RGB_ADD (the _draw_sov house
-        pattern). So a dense in-range cluster washes FLAT green (per-pixel
-        max(a, a) = a) and can NEVER brighten toward white, while a lone in-range
-        system reads as a clear green halo even against red nullsec cores (#cc2233).
-        Drawn UNDER the node glows (called from _draw_systems before its per-node
-        loop) so each system's own colour + white core stay bright on top -- the
-        green is the accent, not a recolour. The sprite is identical for every
+        ONE soft green glow at ``glow_r + RANGE_GLOW_PAD`` -- a tight halo that hugs
+        the node so the aura just peeks out AROUND it -- MAX-composed onto the shared
+        scratch, then blitted ONCE with BLEND_RGB_ADD (the _draw_sov house pattern).
+        So a dense in-range cluster washes FLAT green (per-pixel max(a, a) = a) and
+        can NEVER brighten toward white, while a lone in-range system reads as a clear
+        green halo even against red nullsec cores (#cc2233). The sprite colour is
+        ``RANGE_GREEN_GLOW`` -- RANGE_GREEN dimmed to ~57% (owner readability pass) so
+        the aura no longer floods over the system-name labels; the RGB is scaled
+        BEFORE the build so the whole gradient + its MAX ceiling drop together, hue
+        intact. Drawn UNDER the node glows (called from _draw_systems before its
+        per-node loop) so each system's own colour + white core stay bright on top --
+        the green is the accent, not a recolour. The sprite is identical for every
         in-range system, so it is built once; only currently-projected systems are
         in ``pos``, so off-screen in-range systems cost nothing."""
         size = surf.get_size()
         scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
-        g = self.sprites.glow(RANGE_GREEN, glow_r + RANGE_GLOW_PAD)
+        g = self.sprites.glow(RANGE_GREEN_GLOW, glow_r + RANGE_GLOW_PAD)
         off = g.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         for sid, (sx, sy) in pos.items():
@@ -687,6 +756,34 @@ class Renderer:
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         for sid, (sx, sy) in pos.items():
             if sid in halo:
+                blit_s(g, (sx - off, sy - off), special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _draw_friendly_glow(self, surf, pos, friendly, glow_r):
+        """Friendly-staging PROJECTION wash (owner ask): a SECOND halo beside the
+        hostile purple threat, in deep azure BLUE (FRIENDLY_BLUE #3d7dd6). Every
+        system inside a FRIENDLY staging's jump/bridge reach (``TintSpec.friendly``)
+        gets ONE dim blue glow at ``glow_r + 8``, MAX-composed onto the shared scratch
+        then blitted ONCE with BLEND_RGB_ADD -- so overlapping friendly blobs top out
+        FLAT (never white), byte-for-byte the same compose as _draw_threat_glow, just
+        a different hue. Blue reads distinct from the purple hostile wash (its GREEN
+        channel sits above red, purple's RED sits above green), the green range aura,
+        and the brighter blue Ansiblex bridge LINES. Where a system is in BOTH the
+        hostile and friendly reach the two washes ADD to a saturated blue-violet whose
+        R/G stay well under white (both peak the BLUE channel to clamp; the MAX-then-add
+        compose was chosen so the overlap never whitens). Drawn UNDER the node glows
+        (from _draw_systems before its per-node loop, ADJACENT to the threat pass at the
+        same layer depth) so cores stay readable on top. Sequential scratch reuse: the
+        threat pass already ADD-blitted its scratch to the frame before this fills black
+        again (the _draw_sov / _draw_range_glow / _draw_threat_glow house pattern)."""
+        size = surf.get_size()
+        scratch = self._get_scratch(size)
+        scratch.fill((0, 0, 0))
+        g = self.sprites.glow(FRIENDLY_BLUE, glow_r + 8)
+        off = g.get_width() / 2.0
+        blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
+        for sid, (sx, sy) in pos.items():
+            if sid in friendly:
                 blit_s(g, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
@@ -729,16 +826,22 @@ class Renderer:
         node_static = self._node_static
         bright = tint.bright if tint is not None else None
         halo = tint.halo if tint is not None else None
-        # In-range GREEN accent + threat PURPLE wash (owner 2026-07-12): each is a
-        # MAX-composed under-glow drawn BEFORE the per-node loop, so the node cores
-        # stay bright ON TOP and each pass tops out FLAT (never washes toward white).
-        # Both gate on `is not None`, so range/threat INACTIVE runs the pre-change
-        # path byte-identically (like sov/heat/bridges) -- the passes simply never
-        # fire. See _draw_range_glow / _draw_threat_glow.
+        friendly = tint.friendly if tint is not None else None
+        # In-range GREEN accent + hostile-threat PURPLE wash + friendly-projection
+        # BLUE wash (owner asks): each is a MAX-composed under-glow drawn BEFORE the
+        # per-node loop, so the node cores stay bright ON TOP and each pass tops out
+        # FLAT (never washes toward white). All gate on `is not None`, so an INACTIVE
+        # layer runs the pre-change path byte-identically (like sov/heat/bridges) --
+        # the pass simply never fires. The friendly pass sits ADJACENT to the threat
+        # pass at the same layer depth; where both fire, purple + blue ADD to a
+        # readable blue-violet, never white. See _draw_range_glow / _draw_threat_glow
+        # / _draw_friendly_glow.
         if bright is not None:
             self._draw_range_glow(surf, pos, bright, glow_r)
         if halo is not None:
             self._draw_threat_glow(surf, pos, halo, glow_r)
+        if friendly is not None:
+            self._draw_friendly_glow(surf, pos, friendly, glow_r)
         hub_r = glow_r + max(3, glow_r // 3)        # was a flat +6; scales with zoom
         ring = st.core_ring and core_r >= 2         # ring around a 1px core = blob
         glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
@@ -763,8 +866,13 @@ class Renderer:
                                                  self.model.systems[sid].name))
             items = [(sid, pos[sid][0], pos[sid][1]) for sid in order]
             for sid, sx, sy in _declutter(items, 96, 24):
+                # Dark 1px outline baked in (owner 2026-07-12): system names must read
+                # over the green range wash / purple threat / sov tint / nebula. The
+                # outlined surface is cached, so this stays one blit of a prebuilt
+                # sprite -- zero per-frame cost delta. Region + hub labels (else branch
+                # below) pass no outline, so the zoomed-out bands are byte-unchanged.
                 lab = self.labels.label(self.model.systems[sid].name, st.label_px,
-                                        LABEL_COLOR)
+                                        LABEL_COLOR, outline=LABEL_OUTLINE)
                 surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
             # Infra chips share this zoom LOD (Task 5): drawn AFTER labels so a
             # badge sits over its system's label when they overlap.
