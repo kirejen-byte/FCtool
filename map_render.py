@@ -45,6 +45,30 @@ HEAT_COLOR = (0xFF, 0x5A, 0x2E)
 # regions to ~(245,245,235); the MAX compose is the fix.)
 SOV_RADIUS = 34
 
+# Range-overlay in-range GREEN accent (owner 2026-07-12): the old range overlay
+# left in-range systems at FULL native colour and dimmed the rest -- so an in-range
+# NULLSEC system stayed bright red while out-of-range nulls dimmed to darker red, a
+# red-on-red distinction the owner found hard to read. In-range systems now also get
+# a bright-green glow aura (a hair LARGER than the node glow so it peeks out AROUND
+# the node), MAX-composed on the shared scratch then ADD-blitted ONCE (the _draw_sov
+# house pattern) so dense in-range clusters wash FLAT green and never toward white.
+# Green reads clearly against red nullsec (#cc2233), amber lowsec, cyan highsec, and
+# stays distinct from the dim violet threat wash below. The green is an ACCENT: the
+# node's own colour + white core still ride on top, so in-range stays "bright as
+# today" -- the green is the readability cue, not a recolour.
+RANGE_GREEN = (0x39, 0xFF, 0x8C)
+RANGE_GLOW_PAD = 8            # green aura radius = node glow_r + this (aura peeks out)
+
+# Threat projection wash (owner 2026-07-12): the projected-reach warning under a
+# threatened system, switched from RED to a DIM violet so it is distinguishable from
+# red nullsec nodes, blue Ansiblex bridges, green range, and amber intel (the owner
+# found the old red "hard to distinguish"). Drawn UNDER the node glows as a MAX-
+# composed background wash (same white-out-proof compose as sov/range). NOTE: the
+# hostile-staging DIAMONDS stay RED (map_tab._draw_diamond, ov_staging) -- those are
+# point markers of a DIFFERENT semantic (where hostiles ARE, not their reach), so
+# their red is intentional and untouched.
+THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
+
 # Infrastructure count chips (Task 5): a small rounded badge per system carrying
 # its structure count, tinted by the DOMINANT category. Drawn in the label pass
 # (rides the SAME zoom LOD as system labels -- st.system_labels), so chips only
@@ -348,12 +372,16 @@ class Renderer:
         self.labels = LabelFactory()
         self._region_info = self._build_region_info()
         self._median_edge = median_edge_length(model)
-        # Sov MAX-compose scratch (Task 33 fix): a plain-RGB surface the sov blobs
-        # are MAX-composed onto before a single additive blit to the frame. Lazily
-        # allocated and cached by frame size (reallocated only on a size change),
-        # so a steady viewport reuses one buffer -- no per-frame allocation churn.
-        self._sov_scratch: pygame.Surface | None = None
-        self._sov_scratch_size: tuple[int, int] | None = None
+        # Shared MAX-compose scratch: a plain-RGB surface the additive overlay
+        # passes (sov Task 33; range-green + threat-purple, owner 2026-07-12)
+        # MAX-compose their blobs onto before a SINGLE additive blit to the frame.
+        # Lazily allocated and cached by frame size (reallocated only on a size
+        # change) and reused SEQUENTIALLY within a frame -- each pass fills black,
+        # MAX-composes, then blits before the next pass touches it -- so a steady
+        # viewport reuses ONE buffer with no per-frame allocation churn. See
+        # _get_scratch (the sole allocator).
+        self._scratch: pygame.Surface | None = None
+        self._scratch_size: tuple[int, int] | None = None
         # Task 18 Step 3 hot-loop caches (static; independent of camera/frame):
         #  * per-edge sec tint index -> edge loop drops per-frame sec_color()+max()
         #  * per-system (tint, is_hub) -> _draw_systems drops per-node sec_color()
@@ -542,6 +570,19 @@ class Renderer:
             draw_line(surf, mid, pa, pb, 2)
             draw_aaline(surf, bright, pa, pb)
 
+    def _get_scratch(self, size):
+        """Return the shared plain-RGB MAX-compose scratch, (re)allocated only on a
+        frame-size change. Reused SEQUENTIALLY within a frame by the sov /
+        range-green / threat-purple passes: each fills it black, BLEND_RGB_MAX-
+        composes its blobs, then does ONE BLEND_RGB_ADD blit to the frame before the
+        next pass touches it -- so a steady viewport reuses one buffer with no
+        per-frame allocation churn. The sole allocator of the scratch."""
+        scratch = self._scratch
+        if scratch is None or self._scratch_size != size:
+            scratch = self._scratch = pygame.Surface(size)   # plain RGB
+            self._scratch_size = size
+        return scratch
+
     def _draw_sov(self, surf, cam, pos, vis_set, vw, vh, sov):
         """Sovereignty tint under-wash (Task 33). `sov` is an iterable of
         ``(system_id, alliance_id)`` pairs (the canonical request tuple). Each
@@ -573,10 +614,7 @@ class Renderer:
         systems = self.model.systems
         get = pos.get
         size = surf.get_size()
-        scratch = self._sov_scratch
-        if scratch is None or self._sov_scratch_size != size:
-            scratch = self._sov_scratch = pygame.Surface(size)   # plain RGB
-            self._sov_scratch_size = size
+        scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
         disc, blit_max = self.sprites.disc, pygame.BLEND_RGB_MAX
         blit_s = scratch.blit
@@ -599,6 +637,57 @@ class Renderer:
             g = disc(color, SOV_RADIUS)
             blit_s(g, (sx - g.get_width() / 2, sy - g.get_height() / 2),
                    special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _draw_range_glow(self, surf, pos, bright, glow_r):
+        """In-range GREEN accent (owner 2026-07-12): the readability fix for the old
+        red-on-red range overlay. Every in-range system (``TintSpec.bright``) gets
+        ONE soft green glow at ``glow_r + RANGE_GLOW_PAD`` -- a hair larger than the
+        node glow so the aura peeks out AROUND the node -- MAX-composed onto the
+        shared scratch, then blitted ONCE with BLEND_RGB_ADD (the _draw_sov house
+        pattern). So a dense in-range cluster washes FLAT green (per-pixel
+        max(a, a) = a) and can NEVER brighten toward white, while a lone in-range
+        system reads as a clear green halo even against red nullsec cores (#cc2233).
+        Drawn UNDER the node glows (called from _draw_systems before its per-node
+        loop) so each system's own colour + white core stay bright on top -- the
+        green is the accent, not a recolour. The sprite is identical for every
+        in-range system, so it is built once; only currently-projected systems are
+        in ``pos``, so off-screen in-range systems cost nothing."""
+        size = surf.get_size()
+        scratch = self._get_scratch(size)
+        scratch.fill((0, 0, 0))
+        g = self.sprites.glow(RANGE_GREEN, glow_r + RANGE_GLOW_PAD)
+        off = g.get_width() / 2.0
+        blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
+        for sid, (sx, sy) in pos.items():
+            if sid in bright:
+                blit_s(g, (sx - off, sy - off), special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _draw_threat_glow(self, surf, pos, halo, glow_r):
+        """Threat PURPLE under-wash (owner 2026-07-12; replaces the old per-node RED
+        additive halo). Every threatened system (``TintSpec.halo``) gets ONE dim
+        violet glow at ``glow_r + 8``, MAX-composed onto the shared scratch then
+        blitted ONCE with BLEND_RGB_ADD -- so overlapping threat blobs top out FLAT
+        (never white), exactly like sov/range. Violet (#8e5bd6) reads as a distinct
+        background warning wash vs red nullsec nodes, blue Ansiblex bridges, green
+        range, and amber intel -- the owner's "hard to distinguish" red is gone.
+        Drawn UNDER the node glows (from _draw_systems before its per-node loop) so
+        the cores stay readable on top.
+
+        NOTE: hostile-staging DIAMONDS stay RED (map_tab._draw_diamond, ov_staging)
+        -- those are POINT markers of a DIFFERENT semantic (where the hostiles ARE,
+        not their projected jump reach), so their red is intentional and untouched
+        here. This purple wash is only the projected-threat sphere."""
+        size = surf.get_size()
+        scratch = self._get_scratch(size)
+        scratch.fill((0, 0, 0))
+        g = self.sprites.glow(THREAT_PURPLE, glow_r + 8)
+        off = g.get_width() / 2.0
+        blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
+        for sid, (sx, sy) in pos.items():
+            if sid in halo:
+                blit_s(g, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
     def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
@@ -640,16 +729,22 @@ class Renderer:
         node_static = self._node_static
         bright = tint.bright if tint is not None else None
         halo = tint.halo if tint is not None else None
+        # In-range GREEN accent + threat PURPLE wash (owner 2026-07-12): each is a
+        # MAX-composed under-glow drawn BEFORE the per-node loop, so the node cores
+        # stay bright ON TOP and each pass tops out FLAT (never washes toward white).
+        # Both gate on `is not None`, so range/threat INACTIVE runs the pre-change
+        # path byte-identically (like sov/heat/bridges) -- the passes simply never
+        # fire. See _draw_range_glow / _draw_threat_glow.
+        if bright is not None:
+            self._draw_range_glow(surf, pos, bright, glow_r)
+        if halo is not None:
+            self._draw_threat_glow(surf, pos, halo, glow_r)
         hub_r = glow_r + max(3, glow_r // 3)        # was a flat +6; scales with zoom
         ring = st.core_ring and core_r >= 2         # ring around a 1px core = blob
         glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
         for sid, (sx, sy) in pos.items():
             color, is_hub = node_static[sid]
             dimmed = bright is not None and sid not in bright
-            if halo is not None and sid in halo:
-                hg = glow(SEC_NULL, glow_r + 8)
-                blit(hg, (sx - hg.get_width() / 2, sy - hg.get_height() / 2),
-                     special_flags=add)
             draw_color = dim(color, 0.35) if dimmed else color
             radius = hub_r if is_hub else glow_r
             g = glow(draw_color, radius)

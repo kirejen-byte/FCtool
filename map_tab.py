@@ -421,9 +421,10 @@ class MapTabState:
         self.intel_pulses = mo.IntelPulses()
         # --- kill-ping layer (Task 36) ---
         # Discrete zkill ALERT pings (distinct from the ambient kill-heat glow):
-        # ping()ed on the MAIN thread (fc_gui marshals the zkill worker callback
-        # through _post_ui -> _push_kill_to_map -> add_kill_ping), read via active()
-        # to draw the red radar-burst rings + linger markers. Pure decay model.
+        # ping()ed on the MAIN thread -- fc_gui fires these from the report-render
+        # path (_show_zkill_alert -> _push_kill_ping_to_map -> add_kill_ping) AFTER
+        # the display gates pass, so pings match rendered reports 1:1. Read via
+        # active() to draw the red radar-burst rings + linger markers. Pure decay.
         self.kill_pings = mo.KillPings()
         # --- sovereignty tint layer (Task 33) ---
         # sov_map: {system_id: alliance_id} from ESI /sovereignty/map/, applied on
@@ -1406,8 +1407,8 @@ class MapTab:
     def add_kill_heat(self, system_id, kill_count, capital=False) -> None:
         """Record a zkill engagement alert into the live kill-heat ring. Called on
         the MAIN thread -- fc_gui marshals the zkill worker-thread callback
-        (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which calls
-        this. Stamps the event with wall-clock time (the kill just arrived; zkill
+        (_on_zkill_alert) through _post_ui(_push_kill_heat_to_map, alert), which
+        calls this. Stamps the event with wall-clock time (the kill just arrived; zkill
         is near-real-time). When the heat layer is on, force-dirties + re-requests
         a crisp so the new hot system lights up promptly, and repaints overlays so
         a capital marker can appear at once. Guarded/no-throw so a malformed alert
@@ -1679,10 +1680,12 @@ class MapTab:
     # ---- kill-ping layer (Task 36) --------------------------------------------
     def add_kill_ping(self, system_id, capital=False, count=1, now=None) -> None:
         """Record a discrete zkill ALERT ping so its system radar-bursts on the map
-        (Task 36). Called on the MAIN thread -- fc_gui marshals the zkill worker
-        callback (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which
-        forwards here alongside the kill-heat push. Stamps the ping with wall-clock
-        time (the alert just fired; zkill is near-real-time). When the layer is on,
+        (Task 36). Called on the MAIN thread -- fc_gui fires this from the report-
+        render path (_show_zkill_alert -> _push_kill_ping_to_map) AFTER the display
+        gates pass, so pings match rendered reports 1:1 (NOT alongside the broad
+        kill-heat push, which stays wider by design -- owner's "4 pings, 1 report"
+        fix). Stamps the ping with wall-clock time (the alert just fired; zkill is
+        near-real-time). When the layer is on,
         rebuilds the overlay at once so the burst lights up immediately (the tick
         loop then animates it). INDEPENDENTLY gated from heat by its own layer
         toggle. Guarded/no-throw so a malformed alert never breaks the zkill path."""
