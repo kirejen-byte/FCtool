@@ -2546,8 +2546,23 @@ class MapTab:
                 if p is not None:
                     self._draw_diamond(p[0], p[1], 8, "#ff5a76", "ov_staging")
 
-        # -- fleet pins + count badges, own-location ring
+        # -- fleet pins + high-contrast count chips, own-location ring
+        # The member count is COMMAND-CRITICAL and must stay legible even where
+        # systems pack tightly together (owner feedback): each count is bold fleet-
+        # cyan text on a dark theme-panel chip with a bright cyan border, offset
+        # above-right of the pin so the node glow / base-layer name label never sits
+        # under it. The chips are tag_raise-d above EVERY other overlay at the end of
+        # this method (counts win), and a cheap greedy pass below nudges colliding
+        # chips apart. Chips carry BOTH ov_fleet (so the tag sweep at the top of this
+        # method deletes them with the layer, and the legacy "count is an ov_fleet
+        # text item" contract holds) AND ov_fleet_count (the raise + nudge group).
+        # EMPTY-FAST-PATH: _fleet_chips stays [] when the layer is off or no fleet is
+        # tracked, so the nudge loop AND the end-of-method raise are both skipped --
+        # zero extra canvas work.
+        _fleet_chips: list = []          # (rect_id, text_id, x0, y0, x1, y1) per chip
         if self._layer_on("fleet"):
+            t = self.theme
+            _chip_fill, _chip_edge = t["panel"], t["accent"]
             for sid, count in st.fleet.items():
                 p = project(sid)
                 if p is None:
@@ -2556,9 +2571,47 @@ class MapTab:
                 canvas.create_oval(sx - 6, sy - 6, sx + 6, sy + 6,
                                    fill="#00d4ff", outline="#ffffff", width=1,
                                    tags="ov_fleet")
-                canvas.create_text(sx + 9, sy, anchor="w", text=str(count),
-                                   fill="#e0e0e0", font=("Segoe UI", 9),
-                                   tags="ov_fleet")
+                # Count text FIRST (so bbox can measure it) then a backing chip
+                # lowered behind it -- the dark plate + bright border is what makes
+                # the number readable over any node glow or adjacent label.
+                txt = canvas.create_text(
+                    sx + 10, sy - 11, anchor="w", text=str(count),
+                    fill=_chip_edge, font=("Segoe UI", 9, "bold"),
+                    tags=("ov_fleet", "ov_fleet_count"))
+                bb = canvas.bbox(txt)
+                if bb is None:                       # defensive: estimate if unmeasured
+                    _w = 7 * len(str(count)) + 4
+                    bb = (sx + 10, sy - 18, sx + 10 + _w, sy - 4)
+                x0, y0, x1, y1 = bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1
+                rect = canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=_chip_fill, outline=_chip_edge, width=1,
+                    tags=("ov_fleet", "ov_fleet_count"))
+                canvas.tag_lower(rect, txt)          # chip plate sits behind its count
+                _fleet_chips.append((rect, txt, x0, y0, x1, y1))
+            # De-overlap nudge (structure path only; <=~30 counted systems): push each
+            # later chip that intersects an already-placed one straight DOWN past it,
+            # bounded iterations, so every count stays readable. Chips with no
+            # collision never move (dy stays 0 -> no canvas.move) -- distant counts
+            # are left exactly where they landed.
+            if len(_fleet_chips) > 1:
+                _placed: list = []
+                for _i, (rect, txt, x0, y0, x1, y1) in enumerate(_fleet_chips):
+                    dy = 0.0
+                    for _ in range(16):              # bounded cascade
+                        _below = None
+                        for (px0, py0, px1, py1) in _placed:
+                            if x0 < px1 and px0 < x1 and y0 < py1 and py0 < y1:
+                                _below = py1
+                                break
+                        if _below is None:
+                            break
+                        _shift = (_below - y0) + 2.0  # drop just past the blocker + gap
+                        y0 += _shift; y1 += _shift; dy += _shift
+                    if dy:
+                        canvas.move(rect, 0, dy)
+                        canvas.move(txt, 0, dy)
+                    _placed.append((x0, y0, x1, y1))
+                    _fleet_chips[_i] = (rect, txt, x0, y0, x1, y1)
             own = st.own_system_id
             if own is not None:
                 p = project(own)
@@ -2664,6 +2717,15 @@ class MapTab:
                     self._killping_items[sid] = ids
                 self._killping_cache[sid] = (pstate.stage, cap)
             self._killping_struct_ms = _now_ms_k
+        # Fleet member counts are command-critical -> lift the count chips (dark
+        # plate + bright text) above EVERY other overlay just drawn (staging
+        # diamonds, chars squares, capkill rings, intel / kill pulses, route, and
+        # any infra hover target) so a densely-packed count is never occluded.
+        # Single-arg tag_raise moves the whole group to the top of the display list
+        # while preserving its internal order (each chip's plate stays behind its own
+        # text). Guarded by _fleet_chips so the empty-fast-path adds no canvas work.
+        if _fleet_chips:
+            canvas.tag_raise("ov_fleet_count")
         if _c:
             _o1 = _c()
             _now = tele._ms()
