@@ -171,6 +171,9 @@ INFRA_FILTER_DEFAULTS = {
     "regions": None,
     "stale_only": False,
     "sources": None,
+    "types": None,            # None = no per-type restriction (all types shown);
+                              # else a tuple of checked type_ids. Mirrors
+                              # infra_overlay.FILTER_DEFAULTS (a test pins equality).
 }
 # Ordered (display label, category key) pairs for the filter popover checkbuttons.
 _INFRA_CATEGORY_LABELS = (
@@ -817,11 +820,19 @@ class MapTab:
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
                  telemetry: bool = False, route_fn=None, ambient_fetch=None,
-                 sov_fetch=None, names_fetch=None, characters_fetch=None) -> None:
+                 sov_fetch=None, names_fetch=None, characters_fetch=None,
+                 infra_type_index=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
         self._model_loader = model_loader
+        # Per-type infra filter index (owner ask 2026-07-12) injected by the host
+        # (fc_gui builds it from infra_parser -- the map imports no infra module).
+        # [(category, [(type_id, display_name), …]), …], categories in display
+        # order, types name-sorted, npc/unknown omitted. Empty in standalone/tests
+        # (no index) -> the popover shows the coarse category toggles only and the
+        # emitted filters["types"] stays None (no restriction).
+        self._infra_type_index = infra_type_index or []
         # Injectable travel-route solver (Task 35); defaults to the Ansiblex-aware
         # stargate BFS. Tests / standalone pass a stub so _recompute_route runs
         # deterministically without the jump_range import.
@@ -953,6 +964,19 @@ class MapTab:
             for _label, key in _INFRA_CATEGORY_LABELS}
         self._infra_stale_var = tk.BooleanVar(
             value=bool(INFRA_FILTER_DEFAULTS["stale_only"]))
+        # Per-type filter vars (owner ask 2026-07-12): one BooleanVar per known
+        # structure type from the injected index, default ALL-checked so the
+        # emitted filters["types"] collapses to None (no restriction -- keeps the
+        # pre-feature emit byte-identical). The popover renders these grouped under
+        # their category master; writes fold into state.infra_filters["types"] via
+        # _recompute_infra_types. _infra_types_by_cat keeps the per-category
+        # (type_id, name) lists for the master-mirrors-children toggle + layout.
+        self._infra_types_by_cat: dict[str, list] = {}
+        self._infra_type_vars: dict[int, tk.BooleanVar] = {}
+        for _cat, _types in self._infra_type_index:
+            self._infra_types_by_cat[_cat] = list(_types)
+            for _tid, _name in _types:
+                self._infra_type_vars[_tid] = tk.BooleanVar(value=True)
         self._infra_popover = None
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
@@ -2268,6 +2292,12 @@ class MapTab:
                 self._infra_cat_vars[key].set(
                     bool(self.state.infra_filters["categories"].get(key, True)))
             self._infra_stale_var.set(bool(self.state.infra_filters["stale_only"]))
+            # Re-sync the per-type boxes from state (types=None -> all checked;
+            # else checked iff the type_id is in the restriction set). Defensive --
+            # the popover is their only writer, but keep them in lockstep.
+            _types = self.state.infra_filters.get("types")
+            for tid, var in self._infra_type_vars.items():
+                var.set(_types is None or tid in _types)
             anchor = getattr(self, "_infra_filter_btn", None) or self.frame
             x = anchor.winfo_rootx()
             y = anchor.winfo_rooty() + anchor.winfo_height() + 2
@@ -2295,6 +2325,12 @@ class MapTab:
                 activebackground=t["entry_bg"], activeforeground=t["accent"],
                 command=lambda k=key: self._on_infra_cat_toggle(k)
             ).pack(anchor="w", fill="x", padx=8)
+            # Indented per-type checkboxes under any category that has known types
+            # (from the injected index; npc/unknown never do). The master above is
+            # unchanged (category on/off); these narrow WHICH types show.
+            types = self._infra_types_by_cat.get(key)
+            if types:
+                self._build_infra_type_group(inner, types)
         tk.Frame(inner, bg=t["border"], height=1).pack(fill="x", padx=8, pady=4)
         tk.Checkbutton(
             inner, text="Stale only", variable=self._infra_stale_var, anchor="w",
@@ -2312,6 +2348,27 @@ class MapTab:
         pop.bind("<FocusOut>", lambda _e: self._hide_infra_filters())
         return pop
 
+    def _build_infra_type_group(self, parent, types) -> None:
+        """Render the indented per-type checkboxes for one category group inside
+        the infra popover. Two columns when a group has >3 types (keeps the popover
+        compact -- Citadels has 8), a single column otherwise. Each box drives
+        self._infra_type_vars[type_id] and re-emits via _on_infra_type_toggle."""
+        t = self.theme
+        grp = tk.Frame(parent, bg=t["panel"])
+        grp.pack(anchor="w", fill="x", padx=(26, 8))
+        two_col = len(types) > 3
+        for i, (tid, name) in enumerate(types):
+            cb = tk.Checkbutton(
+                grp, text=name, variable=self._infra_type_vars[tid], anchor="w",
+                bg=t["panel"], fg=t["fg"], selectcolor=t["panel"],
+                activebackground=t["entry_bg"], activeforeground=t["accent"],
+                font=("Segoe UI", 8),
+                command=lambda i_tid=tid: self._on_infra_type_toggle(i_tid))
+            if two_col:
+                cb.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 10))
+            else:
+                cb.grid(row=i, column=0, sticky="w")
+
     def _hide_infra_filters(self) -> None:
         pop = getattr(self, "_infra_popover", None)
         if pop is not None:
@@ -2323,8 +2380,33 @@ class MapTab:
     def _on_infra_cat_toggle(self, key: str) -> None:
         var = self._infra_cat_vars.get(key)
         if var is not None:
-            self.state.infra_filters["categories"][key] = bool(var.get())
+            state = bool(var.get())
+            self.state.infra_filters["categories"][key] = state
+            # Master mirrors onto its children (owner ask): ticking/unticking a
+            # category sets every per-type box in that group to match, then folds
+            # the whole type selection back into filters["types"].
+            for tid, _name in self._infra_types_by_cat.get(key, []):
+                tv = self._infra_type_vars.get(tid)
+                if tv is not None:
+                    tv.set(state)
+            self._recompute_infra_types()
         self._emit_infra_filters()
+
+    def _on_infra_type_toggle(self, type_id: int) -> None:
+        self._recompute_infra_types()
+        self._emit_infra_filters()
+
+    def _recompute_infra_types(self) -> None:
+        """Fold the per-type checkbox vars into filters["types"]: None when EVERY
+        box is checked (no restriction -- byte-identical to the pre-feature emit,
+        and the all-checked default), else the sorted tuple of checked type_ids.
+        The SOLE writer of state.infra_filters["types"]. With no injected index
+        (standalone/tests) there are no type vars, so this stays None."""
+        checked = [tid for tid, var in self._infra_type_vars.items() if var.get()]
+        if len(checked) == len(self._infra_type_vars):
+            self.state.infra_filters["types"] = None
+        else:
+            self.state.infra_filters["types"] = tuple(sorted(checked))
 
     def _on_infra_stale_toggle(self) -> None:
         self.state.infra_filters["stale_only"] = bool(self._infra_stale_var.get())
@@ -2546,8 +2628,23 @@ class MapTab:
                 if p is not None:
                     self._draw_diamond(p[0], p[1], 8, "#ff5a76", "ov_staging")
 
-        # -- fleet pins + count badges, own-location ring
+        # -- fleet pins + high-contrast count chips, own-location ring
+        # The member count is COMMAND-CRITICAL and must stay legible even where
+        # systems pack tightly together (owner feedback): each count is bold fleet-
+        # cyan text on a dark theme-panel chip with a bright cyan border, offset
+        # above-right of the pin so the node glow / base-layer name label never sits
+        # under it. The chips are tag_raise-d above EVERY other overlay at the end of
+        # this method (counts win), and a cheap greedy pass below nudges colliding
+        # chips apart. Chips carry BOTH ov_fleet (so the tag sweep at the top of this
+        # method deletes them with the layer, and the legacy "count is an ov_fleet
+        # text item" contract holds) AND ov_fleet_count (the raise + nudge group).
+        # EMPTY-FAST-PATH: _fleet_chips stays [] when the layer is off or no fleet is
+        # tracked, so the nudge loop AND the end-of-method raise are both skipped --
+        # zero extra canvas work.
+        _fleet_chips: list = []          # (rect_id, text_id, x0, y0, x1, y1) per chip
         if self._layer_on("fleet"):
+            t = self.theme
+            _chip_fill, _chip_edge = t["panel"], t["accent"]
             for sid, count in st.fleet.items():
                 p = project(sid)
                 if p is None:
@@ -2556,9 +2653,47 @@ class MapTab:
                 canvas.create_oval(sx - 6, sy - 6, sx + 6, sy + 6,
                                    fill="#00d4ff", outline="#ffffff", width=1,
                                    tags="ov_fleet")
-                canvas.create_text(sx + 9, sy, anchor="w", text=str(count),
-                                   fill="#e0e0e0", font=("Segoe UI", 9),
-                                   tags="ov_fleet")
+                # Count text FIRST (so bbox can measure it) then a backing chip
+                # lowered behind it -- the dark plate + bright border is what makes
+                # the number readable over any node glow or adjacent label.
+                txt = canvas.create_text(
+                    sx + 10, sy - 11, anchor="w", text=str(count),
+                    fill=_chip_edge, font=("Segoe UI", 9, "bold"),
+                    tags=("ov_fleet", "ov_fleet_count"))
+                bb = canvas.bbox(txt)
+                if bb is None:                       # defensive: estimate if unmeasured
+                    _w = 7 * len(str(count)) + 4
+                    bb = (sx + 10, sy - 18, sx + 10 + _w, sy - 4)
+                x0, y0, x1, y1 = bb[0] - 3, bb[1] - 1, bb[2] + 3, bb[3] + 1
+                rect = canvas.create_rectangle(
+                    x0, y0, x1, y1, fill=_chip_fill, outline=_chip_edge, width=1,
+                    tags=("ov_fleet", "ov_fleet_count"))
+                canvas.tag_lower(rect, txt)          # chip plate sits behind its count
+                _fleet_chips.append((rect, txt, x0, y0, x1, y1))
+            # De-overlap nudge (structure path only; <=~30 counted systems): push each
+            # later chip that intersects an already-placed one straight DOWN past it,
+            # bounded iterations, so every count stays readable. Chips with no
+            # collision never move (dy stays 0 -> no canvas.move) -- distant counts
+            # are left exactly where they landed.
+            if len(_fleet_chips) > 1:
+                _placed: list = []
+                for _i, (rect, txt, x0, y0, x1, y1) in enumerate(_fleet_chips):
+                    dy = 0.0
+                    for _ in range(16):              # bounded cascade
+                        _below = None
+                        for (px0, py0, px1, py1) in _placed:
+                            if x0 < px1 and px0 < x1 and y0 < py1 and py0 < y1:
+                                _below = py1
+                                break
+                        if _below is None:
+                            break
+                        _shift = (_below - y0) + 2.0  # drop just past the blocker + gap
+                        y0 += _shift; y1 += _shift; dy += _shift
+                    if dy:
+                        canvas.move(rect, 0, dy)
+                        canvas.move(txt, 0, dy)
+                    _placed.append((x0, y0, x1, y1))
+                    _fleet_chips[_i] = (rect, txt, x0, y0, x1, y1)
             own = st.own_system_id
             if own is not None:
                 p = project(own)
@@ -2664,6 +2799,15 @@ class MapTab:
                     self._killping_items[sid] = ids
                 self._killping_cache[sid] = (pstate.stage, cap)
             self._killping_struct_ms = _now_ms_k
+        # Fleet member counts are command-critical -> lift the count chips (dark
+        # plate + bright text) above EVERY other overlay just drawn (staging
+        # diamonds, chars squares, capkill rings, intel / kill pulses, route, and
+        # any infra hover target) so a densely-packed count is never occluded.
+        # Single-arg tag_raise moves the whole group to the top of the display list
+        # while preserving its internal order (each chip's plate stays behind its own
+        # text). Guarded by _fleet_chips so the empty-fast-path adds no canvas work.
+        if _fleet_chips:
+            canvas.tag_raise("ov_fleet_count")
         if _c:
             _o1 = _c()
             _now = tele._ms()

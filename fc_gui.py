@@ -5532,6 +5532,10 @@ class FCToolGUI:
             # injects the authed-character location/ship sweep (runs on the map's
             # own poll thread; see _map_characters_fetch).
             characters_fetch=self._map_characters_fetch,
+            # Per-type infra filter groups (owner ask 2026-07-12): the popover's
+            # Fortizar / Keepstar / … checkboxes. map_tab imports no infra module,
+            # so the (category, [(type_id, name)…]) index travels in as plain data.
+            infra_type_index=self._build_infra_type_index(),
             # Match the map context menus + toolbar to the app palette (owner
             # request 2026-07-10). map_tab must not import fc_gui, so the
             # constants travel in as a plain dict.
@@ -5873,6 +5877,33 @@ class FCToolGUI:
         no GUI."""
         return {s.name.casefold(): (s.id, s.region_id)
                 for s in model.systems.values()}
+
+    @staticmethod
+    def _build_infra_type_index():
+        """[(category, [(type_id, display_name), …]), …] for the map's Infra ▾
+        popover per-type filter checkboxes (owner ask 2026-07-12: filter by
+        Fortizar / Keepstar / Astrahus …). Built from infra_parser's TYPE_CATEGORY +
+        TYPE_NAMES: grouped by category in infra_parser.CATEGORIES order, the types
+        inside each group display-name-sorted. The npc and unknown categories are
+        omitted — they carry no specific-type rows (NPC stations and unmapped /
+        name-only imports are governed solely by their category toggle), so they get
+        no group. Injected into MapTab (which imports no infra module — architecture
+        rule). Pure; testable with no GUI."""
+        import infra_parser
+        by_cat: dict = {}
+        for tid, cat in infra_parser.TYPE_CATEGORY.items():
+            by_cat.setdefault(cat, []).append(
+                (tid, infra_parser.TYPE_NAMES.get(tid, str(tid))))
+        index = []
+        for cat in infra_parser.CATEGORIES:
+            if cat in ("npc", "unknown"):
+                continue
+            types = by_cat.get(cat)
+            if not types:
+                continue
+            types.sort(key=lambda pair: pair[1])       # display-name sorted
+            index.append((cat, types))
+        return index
 
     def _ensure_infra(self):
         """Build (once) the InfraStore + InfraScanner, loading the map model on

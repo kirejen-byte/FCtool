@@ -26,6 +26,8 @@ FILTER_DEFAULTS = {
     "regions": None,          # None = all configured; else list[int]
     "stale_only": False,
     "sources": None,          # None = all; else list[str]
+    "types": None,            # None = no per-type restriction beyond categories;
+                              # else a collection of type_ids (see _entry_survives)
 }
 
 
@@ -70,15 +72,34 @@ def _pick_top(counts: dict) -> str | None:
 
 
 def _entry_survives(entry: dict, categories_filter: dict, regions_filter,
-                    sources_filter, stale_only: bool, now, threshold) -> bool:
+                    sources_filter, stale_only: bool, now, threshold,
+                    types_filter=None) -> bool:
     """Single overlay-filter predicate (status!='dead' + category / region /
-    source / stale-only). Shared by infra_badges and filter_entries so the map
-    chips and the right-click structure list apply IDENTICAL rules -- one source
-    of truth. Does NOT consider system_id placement (that grouping rule is
-    badge-specific and stays in infra_badges)."""
+    source / stale-only / per-type). Shared by infra_badges and filter_entries so
+    the map chips, hover tooltip and the right-click structure list apply IDENTICAL
+    rules -- one source of truth. Does NOT consider system_id placement (that
+    grouping rule is badge-specific and stays in infra_badges).
+
+    ``types_filter`` (filters["types"]): None = no per-type restriction beyond the
+    category toggles -- the default, byte-identical to the pre-type-filter
+    behaviour. A non-None collection of type_ids restricts ONLY entries in a *known
+    structure category* (category not in {"npc", "unknown"}): such an entry
+    survives the type gate iff its ``type_id`` is in the collection. npc- and
+    unknown-category entries are DELIBERATELY exempt -- they stay governed solely by
+    their category toggles, so unticking "Fortizar" can never hide an NPC station,
+    and an unknown-type manual (name-only) entry never vanishes when any type
+    filter is active. This category-based gate is the stdlib-pure equivalent of
+    "type_id in infra_parser.TYPE_CATEGORY": categorize() places exactly the
+    TYPE_CATEGORY type_ids into the real categories and everything else into
+    npc/unknown, so the two coincide for every parser-produced entry (and
+    infra_overlay must not import infra_parser -- architecture rule, plan §2)."""
     if entry.get("status") == "dead":
         return False
-    if not categories_filter.get(entry.get("category", "unknown"), True):
+    category = entry.get("category", "unknown")
+    if not categories_filter.get(category, True):
+        return False
+    if types_filter is not None and category not in ("npc", "unknown") \
+            and entry.get("type_id") not in types_filter:
         return False
     if regions_filter is not None and entry.get("region_id") not in regions_filter:
         return False
@@ -103,9 +124,11 @@ def filter_entries(entries: list[dict], filters: dict, now_iso: str,
     regions_filter = filters.get("regions")
     sources_filter = filters.get("sources")
     stale_only = filters.get("stale_only", False)
+    types_filter = filters.get("types")
     return [e for e in entries
             if _entry_survives(e, categories_filter, regions_filter,
-                               sources_filter, stale_only, now, threshold)]
+                               sources_filter, stale_only, now, threshold,
+                               types_filter)]
 
 
 def infra_badges(entries: list[dict], filters: dict, now_iso: str,
@@ -128,6 +151,7 @@ def infra_badges(entries: list[dict], filters: dict, now_iso: str,
     regions_filter = filters.get("regions")
     sources_filter = filters.get("sources")
     stale_only = filters.get("stale_only", False)
+    types_filter = filters.get("types")
 
     per_system: dict[int, list[dict]] = {}
     for entry in entries:
@@ -135,7 +159,8 @@ def infra_badges(entries: list[dict], filters: dict, now_iso: str,
         if system_id is None:
             continue
         if not _entry_survives(entry, categories_filter, regions_filter,
-                               sources_filter, stale_only, now, threshold):
+                               sources_filter, stale_only, now, threshold,
+                               types_filter):
             continue
         per_system.setdefault(system_id, []).append(entry)
 
@@ -161,15 +186,46 @@ def infra_badges(entries: list[dict], filters: dict, now_iso: str,
     return badges
 
 
+def _gate_endpoints_from_name(name: str) -> tuple[str | None, str | None]:
+    """(system, gate_to) endpoints parsed from an Ansiblex gate structure name
+    ``"A » B - LABEL"`` -> ``("A", "B")`` (the destination is the text between the
+    ``»`` and the first ``" - "`` that follows it).
+
+    The in-game structure name is the GROUND TRUTH for a gate's endpoints;
+    ``gate_to_system_name`` is a pre-parsed cache of it. The clipboard parser fills
+    that cache (infra_parser); the ESI region scanner records only ``name`` (see
+    infra_scan._resolved_row), so without this fallback every SCANNED Ansiblex gate
+    is dropped from the bridge union and its hop never lights on the map/route.
+
+    Duplicated BY VALUE from ``infra_parser._split_gate_name`` (the ``»`` branch) --
+    infra_* modules never import each other (see CATEGORIES above); keep in
+    lockstep. Returns ``(None, None)`` when the name lacks the ``»`` marker."""
+    if not name or "»" not in name:
+        return None, None
+    a, _, rest = name.partition("»")
+    rest = rest.strip()
+    b = rest.split(" - ", 1)[0].strip() if " - " in rest else rest
+    return (a.strip() or None), (b or None)
+
+
 def gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
     """Unordered-deduped [(system_name, gate_to_system_name), ...] for status!='dead'
-    gates -- the exact shape config['ansiblex_connections'] already uses."""
+    gates -- the exact shape config['ansiblex_connections'] already uses.
+
+    Endpoints come from the explicit ``system_name``/``gate_to_system_name`` fields
+    when present (clipboard/config imports), else are parsed from the structure
+    ``name`` (``"A » B - Ansiblex"``). The ESI scanner fills only ``name``, so this
+    fallback is what lets SCANNED gates join the SAME bridge union that feeds both
+    the map's bridge layer and the destination-route overlay."""
     seen: set[frozenset] = set()
     pairs: list[tuple[str, str]] = []
     for entry in entries:
         if entry.get("category") != "gate" or entry.get("status") == "dead":
             continue
         a, b = entry.get("system_name"), entry.get("gate_to_system_name")
+        if not a or not b:                       # scanned gate: derive from the name
+            na, nb = _gate_endpoints_from_name(entry.get("name") or "")
+            a, b = (a or na), (b or nb)
         if not a or not b:
             continue
         key = frozenset((a, b))
