@@ -6,6 +6,9 @@ esi_tokens_web.json
 esi_auth_error.log
 fittings_library.json
 fleet_templates.json
+# InfraStore runtime file — holds the owner's REAL friendly-structure data after
+# live use; must never be committable (it is user data, not source).
+infrastructure.json
 
 # Caches (auto-generated)
 esi_cache.json

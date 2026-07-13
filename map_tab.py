@@ -13,6 +13,7 @@ fc_gui) touch tkinter.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -130,11 +131,53 @@ KILLPING_STRUCT_MS = 1000.0 # cull + reproject + stage-flip cadence (structure o
 # queue, and dies -- nothing to join on hide.
 SOV_REFRESH_S = 3600.0
 
+# Characters overlay (owner ask: "see where all your characters are"). A 60 s
+# poll enumerates the tool's AUTHED characters (fc_gui injects the fetch -- the
+# map holds NO auth/token logic, exactly like it holds no infra logic) and marks
+# each occupied system. MAGENTA is a hue FREE in the current palette: distinct
+# from cyan fleet (#00d4ff), the red staging/capital/ping family (#ff5a76 /
+# #ff3b30 / #ff1744), amber intel (#ffd166), green range (#59d98c), blue-purple
+# threat (map_render.THREAT_PURPLE #8e5bd6), gold route (#ffcc44) and blue
+# bridges. Drawn as a filled SQUARE (no other overlay uses an axis-aligned
+# square -- fleet is a circle, staging a diamond, the pulses are rings) so the
+# shape reads apart from the cyan fleet pins at a glance too. The poll mirrors
+# the Task-30 ambient daemon EXACTLY (map-chars Event.wait thread, ~2 s first
+# fetch, prompt join on hide -> no leak) but runs ONLY while the tab is shown AND
+# the layer is on, so idle cost is nil.
+CHARS_MAGENTA = "#ff44e1"
+CHARS_POLL_S = 60.0
+CHARS_START_DELAY_S = 2.0
+
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
 # live overlay object), _layer_on("sov") directly controls both the fetch and the
-# render -- so an absent key must read False, not the blanket True.
-_LAYERS_OFF_BY_DEFAULT = frozenset({"sov"})
+# render -- so an absent key must read False, not the blanket True. Infra (Task 5)
+# joins it: the friendly-structure chips stay dark until the user enables the layer
+# AND the host has pushed badges, so _layer_on("infra") gates its request value.
+_LAYERS_OFF_BY_DEFAULT = frozenset({"sov", "infra"})
+
+# Infrastructure overlay filter state (Task 5). This module imports NO infra_*
+# module (architecture rule: the map holds ZERO infra logic -- fc_gui composes
+# parser/store/overlay and pushes PRE-COMPUTED badges via set_infrastructure), so
+# it keeps a LOCAL copy of infra_overlay.FILTER_DEFAULTS's shape (§3.7) purely to
+# seed the toolbar/popover UI. Only fc_gui bridges this UI state back to the real
+# infra_overlay.FILTER_DEFAULTS. "enabled" mirrors the toolbar Infra checkbutton;
+# the popover writes categories / stale_only. A private deepcopy is handed to the
+# host's get_infrastructure callback on every change.
+INFRA_FILTER_DEFAULTS = {
+    "enabled": True,
+    "categories": {"citadel": True, "engineering": True, "refinery": True,
+                   "gate": True, "flex": True, "npc": False, "unknown": True},
+    "regions": None,
+    "stale_only": False,
+    "sources": None,
+}
+# Ordered (display label, category key) pairs for the filter popover checkbuttons.
+_INFRA_CATEGORY_LABELS = (
+    ("Citadels", "citadel"), ("Engineering", "engineering"),
+    ("Refineries", "refinery"), ("Ansiblexes", "gate"), ("Flex", "flex"),
+    ("NPC stations", "npc"), ("Unknown", "unknown"),
+)
 
 # --- Phase H adaptive conservation pacing (Task 26) --------------------------
 # Task 25 convicted the apply RATE as the ONLY lever over the intermittent settle
@@ -266,6 +309,30 @@ _DEFAULT_THEME = {
 # menu selection can be stored back as a bare ship/base name (spec §2.5).
 _LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
 
+# --- reusable hover summary tooltip engine (owner feedback round B) -----------
+# A layer-gated hover tooltip: providers registered via register_hover_provider
+# each contribute a section for the system under the cursor; enabled sections are
+# joined (blank-line separated) into one reused themed Toplevel shown after a
+# short dwell. The <Motion> path is near-zero when no provider's layer is on (the
+# FIRST guard short-circuits before any allocation), so idle hover cost is
+# unchanged from the pre-tooltip renderer -- the map's perf discipline is sacred.
+HOVER_TOOLTIP_DELAY_MS = 350        # dwell before the summary tooltip appears
+HOVER_TOOLTIP_MOVE_R2 = 100         # px^2: motion beyond ~10px reschedules/hides
+
+# --- toolbar control tooltips (owner ask 2026-07-12) -------------------------
+# Distinct from the canvas summary tooltip above: a per-control hover tip on the
+# toolbar widgets (search box / layer checkboxes / ▾ drawer buttons). Same dwell-
+# then-single-Toplevel discipline, longer dwell (500ms) so a fly-over across the
+# strip never flashes tips, and hidden instantly on leave/press so it can never
+# sit between the cursor and a click.
+TOOLBAR_TOOLTIP_DELAY_MS = 500      # dwell before a toolbar control's tip appears
+
+# Cap on structure rows in the right-click "Structures (N)" submenu (owner
+# feedback round B): a busy staging system can hold dozens of structures, so the
+# grouped list is truncated with a trailing "…and N more (Manage…)" row rather
+# than spawning a menu taller than the screen.
+_STRUCT_MENU_CAP = 25
+
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
@@ -285,8 +352,13 @@ def _default_route_fn(origin_id: int, dest_id: int, connections=None):
 
 def _request_sig(req: dict) -> tuple:
     """Comparable signature of a render request: camera center/scale + viewport
-    size + bloom + mode + tint + bridges + heat + sov (NOT generation -- that is a
-    staleness token, and duplicates by definition carry different generations).
+    size + bloom + mode + tint + bridges + heat + sov + infra (NOT generation --
+    that is a staleness token, and duplicates carry different generations).
+
+    infra participates exactly like sov/heat/bridges: the canonical infra tuple
+    (or None when the layer is off / no badges) compares by value, so an Infra
+    toggle, a filter change, or a fresh push is never suppressed as a duplicate,
+    while a settle on an unchanged view+infra still is.
 
     sov participates exactly like heat/bridges: the canonical sov tuple (or None
     when the layer is off / no data) compares by value, so a sov toggle or a fresh
@@ -316,7 +388,32 @@ def _request_sig(req: dict) -> tuple:
     c = req["camera"]
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
             bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
-            req.get("heat"), req.get("sov"))
+            req.get("heat"), req.get("sov"), req.get("infra"))
+
+
+def _canonical_chars(payload) -> tuple:
+    """Normalise a characters_fetch payload ({system_id: [(char, ship), ...]})
+    into a sorted, hashable tuple ((system_id, ((char, ship), ...)), ...) with the
+    per-system pairs sorted by character name. Mirrors the ambient/sov canonical
+    idiom so the worker posts a frozen, thread-safe snapshot (no dict aliased
+    across the poll thread and the main thread) and both the markers and the
+    name-sorted hover read a deterministic order. Empty / malformed systems are
+    dropped. Tolerant of a bad payload (returns () rather than raising) so a
+    broken fetch never wedges the drain."""
+    out = []
+    try:
+        items = payload.items()
+    except AttributeError:
+        return ()
+    for sid, pairs in items:
+        try:
+            sp = tuple(sorted((str(n), str(s)) for n, s in (pairs or ())))
+        except (TypeError, ValueError):
+            continue
+        if sp:
+            out.append((int(sid), sp))
+    out.sort()
+    return tuple(out)
 
 
 class MapTabState:
@@ -374,9 +471,10 @@ class MapTabState:
         self.intel_pulses = mo.IntelPulses()
         # --- kill-ping layer (Task 36) ---
         # Discrete zkill ALERT pings (distinct from the ambient kill-heat glow):
-        # ping()ed on the MAIN thread (fc_gui marshals the zkill worker callback
-        # through _post_ui -> _push_kill_to_map -> add_kill_ping), read via active()
-        # to draw the red radar-burst rings + linger markers. Pure decay model.
+        # ping()ed on the MAIN thread -- fc_gui fires these from the report-render
+        # path (_show_zkill_alert -> _push_kill_ping_to_map -> add_kill_ping) AFTER
+        # the display gates pass, so pings match rendered reports 1:1. Read via
+        # active() to draw the red radar-burst rings + linger markers. Pure decay.
         self.kill_pings = mo.KillPings()
         # --- sovereignty tint layer (Task 33) ---
         # sov_map: {system_id: alliance_id} from ESI /sovereignty/map/, applied on
@@ -387,6 +485,27 @@ class MapTabState:
         # network until then).
         self.sov_map: dict[int, int] = {}
         self.sov_names: dict[int, str] = {}
+        # --- infrastructure overlay layer (Task 5) ---
+        # infra: PRE-COMPUTED badges {system_id: {"total", "counts", "top",
+        # "stale"}} pushed by the host via MapTab.set_infrastructure (None = layer
+        # off / no data). The map holds ZERO infra logic -- fc_gui computes badges
+        # from the store through infra_overlay and pushes them here. Folded into
+        # the render request + sig as a canonical ((sid, total, top, stale), ...)
+        # tuple by _infra_request_value (that tuple is BOTH the sig component and
+        # the data the renderer iterates).
+        self.infra: dict | None = None
+        # Filter UI state (LOCAL mirror of infra_overlay.FILTER_DEFAULTS's shape --
+        # this file imports no infra module). "enabled" tracks the toolbar Infra
+        # checkbutton; the popover writes categories / stale_only. A deepcopy is
+        # handed to the host's get_infrastructure callback on every change.
+        self.infra_filters: dict = copy.deepcopy(INFRA_FILTER_DEFAULTS)
+        # --- characters overlay ---
+        # {system_id: [(char_name, ship_type_name), ...]} for the authed
+        # characters, applied on the MAIN thread from the result queue (the
+        # map-chars poll posts a canonical snapshot). A pure Tk overlay (like
+        # fleet) -- NOT part of the render request/sig; _redraw_overlays paints a
+        # magenta square per occupied system. Empty until the first poll drains.
+        self.chars: dict[int, list] = {}
 
     def tint_spec(self):
         import map_render as _mr
@@ -698,7 +817,7 @@ class MapTab:
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
                  telemetry: bool = False, route_fn=None, ambient_fetch=None,
-                 sov_fetch=None, names_fetch=None) -> None:
+                 sov_fetch=None, names_fetch=None, characters_fetch=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -716,6 +835,13 @@ class MapTab:
         # one-shot fetch lifecycle runs with no network.
         self._sov_fetch = sov_fetch or self._fetch_sov_map
         self._names_fetch = names_fetch or self._fetch_alliance_names
+        # Injectable AUTHED-characters fetcher (owner ask). Unlike the ambient/sov
+        # fetchers (public endpoints the map hits itself), enumerating the tool's
+        # characters needs their per-character tokens, which live in fc_gui -- so
+        # this is ALWAYS injected by the host (fc_gui._map_characters_fetch) and
+        # defaults to a no-op returning {} for standalone/tests (no auth -> no
+        # characters). Called on the map-chars poll thread -> MUST stay Tk-free.
+        self._characters_fetch = characters_fetch or (lambda: {})
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -725,6 +851,16 @@ class MapTab:
         self.frame = tk.Frame(parent, bg=t["bg"])
         bar = tk.Frame(self.frame, bg=t["bg"])
         bar.pack(side="top", fill="x")
+        # Toolbar hover-tooltip state (owner ask 2026-07-12): a dwell-delayed tip
+        # shown ~500ms after the cursor settles on a control, reusing ONE Toplevel
+        # slot (self._tooltip) and dismissed instantly on leave/press. Initialised
+        # here (before the first control is built) so _attach_tooltip can register
+        # the search box below. _toolbar_tooltips is the widget->text registry a
+        # test walks to assert every toolbar control is documented.
+        self._toolbar_tooltips: dict = {}
+        self._tooltip = None                 # the single live tip Toplevel (lazy)
+        self._tooltip_after = None           # pending dwell-timer id (after_cancel)
+        self._tooltip_delay_ms = TOOLBAR_TOOLTIP_DELAY_MS   # instance-tunable (tests)
         tk.Label(bar, text="Search:", bg=t["bg"], fg=t["fg"]).pack(side="left", padx=(6, 2))
         entry_cls = autocomplete_cls or tk.Entry
         # An injected AutocompleteEntry takes the completion contract
@@ -759,6 +895,9 @@ class MapTab:
                 highlightbackground=t["border"], highlightcolor=t["accent"])
         except tk.TclError:
             pass
+        self._attach_tooltip(
+            self.search_entry,
+            "Find a system — autocompletes as you type; Enter flies to the best match")
         self._bloom_var = tk.BooleanVar(value=bool(self.cfg.get("bloom", True)))
         # Zoom-animation escape hatch (Task 24, P3): True = eased glide (default),
         # False = instant snap (pre-Phase-F feel) for owners who prefer it. No
@@ -766,10 +905,13 @@ class MapTab:
         # persisted on hide like bloom/layers.
         self._zoom_anim_var = tk.BooleanVar(
             value=bool(self.cfg.get("zoom_animation", True)))
-        tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=t["bg"],
-                       fg=t["fg"], selectcolor=t["panel"],
+        _bloom_cb = tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var,
+                       bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                        activebackground=t["bg"], activeforeground=t["accent"],
-                       command=self._on_bloom_toggle).pack(side="left", padx=8)
+                       command=self._on_bloom_toggle)
+        _bloom_cb.pack(side="left", padx=8)
+        self._attach_tooltip(_bloom_cb,
+                             "Cinematic glow rendering; off = flat tactical look")
         # --- Phase D layer toggles (fleet/staging/threat) ---
         _layers = self.cfg.get("layers", {})
         self._layer_vars: dict[str, tk.BooleanVar] = {
@@ -791,23 +933,94 @@ class MapTab:
             # noise call) -- so the var default is False, matching _layer_on's
             # off-by-default handling and keeping the fetch dormant until enabled.
             "sov": tk.BooleanVar(value=bool(_layers.get("sov", False))),
+            # Infrastructure chips (Task 5): OFF by default (like sov) -- the
+            # friendly-structure count badges stay dark until the user enables the
+            # layer AND the host pushes badges via set_infrastructure.
+            "infra": tk.BooleanVar(value=bool(_layers.get("infra", False))),
+            # Characters overlay (owner ask): ON by default -- magenta markers at
+            # each authed character's system. The poll only runs while the tab is
+            # shown, so a visible-by-default layer still costs nothing when idle.
+            "chars": tk.BooleanVar(value=bool(_layers.get("chars", True))),
         }
+        # Infra filter popover state (Task 5): per-category + stale-only vars
+        # mirroring INFRA_FILTER_DEFAULTS (self.state is built later, so seed from
+        # the module constant; the "enabled" flag is synced from the toolbar var
+        # once self.state exists). Each popover checkbutton writes back into
+        # self.state.infra_filters and re-emits to the host. The popover Toplevel
+        # is created lazily and REUSED per open (built in _build_infra_popover).
+        self._infra_cat_vars: dict[str, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=bool(INFRA_FILTER_DEFAULTS["categories"][key]))
+            for _label, key in _INFRA_CATEGORY_LABELS}
+        self._infra_stale_var = tk.BooleanVar(
+            value=bool(INFRA_FILTER_DEFAULTS["stale_only"]))
+        self._infra_popover = None
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
-        # Hover-tooltip Toplevel (created on demand; see _show_tooltip). Used to
-        # document the route overlay's ESI limitation on the "Route" toggle.
-        self._tooltip = None
+        # Concise, behaviour-accurate hover tips for every layer toggle (owner ask
+        # 2026-07-12). Keyed by layer key; the ▾ drawer buttons get their own tips
+        # in the loop below. Route keeps its ESI caveat (destinations set only in
+        # the game client can't be read back -- ESI exposes no route endpoint).
+        _layer_tips = {
+            "fleet": "Pins where your fleet members are (from the boss fleet poll)",
+            "staging": "Diamond markers on friendly (green) and hostile (red) staging systems",
+            "threat": "Purple shade over systems inside hostile jump/bridge range",
+            "bridges": "Your Ansiblex gates as blue lines",
+            "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
+            "heat": "Red-orange glow where kills are happening (live zkill + hourly baseline)",
+            "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
+            "kill_pings": "Radar bursts for zkill reports that match your alert settings",
+            "sov": "Dim alliance-color wash over sovereign space",
+            "infra": "Friendly structure count chips from your infrastructure DB",
+            "chars": "Magenta squares where your logged characters are; hover a system for pilot + ship",
+        }
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
-                            ("sov", "Sov")):
+                            ("sov", "Sov"), ("infra", "Infra"),
+                            ("chars", "Chars")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
                                  command=lambda k=_key: self._on_layer_toggle(k))
             _cb.pack(side="left", padx=4)
+            # Every layer toggle gets a concise hover tip (owner ask 2026-07-12).
+            self._attach_tooltip(_cb, _layer_tips.get(_key, ""))
+            if _key == "threat":
+                # Drawer affordance (owner ask 2026-07-12): a "▾" microbutton right
+                # after the Threat toggle -- the SAME compact pattern as Sov ▾ /
+                # Infra ▾ -- replacing the old standalone "Threat ▾" button that sat
+                # detached at the far end of the bar (owner: the toggle + its opener
+                # should read as one compact control). Opens the in-tab threat
+                # drawer (master overlay toggle + ship-class picker + per-staging
+                # rows). DELIBERATELY always enabled -- UNLIKE Sov's legend (only
+                # useful once the tint is drawn), the drawer HOSTS the master
+                # overlay toggle, so it must stay reachable to turn the layer ON
+                # while it is still off.
+                self._threat_drawer_btn = tk.Button(
+                    bar, text="▾", command=self._toggle_threat_drawer,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._threat_drawer_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(
+                    self._threat_drawer_btn,
+                    "Threat settings — ship class and which hostile stagings project")
+            if _key == "infra":
+                # Filter affordance (Task 5): a "▾" microbutton right after the
+                # Infra toggle opening the borderless filter popover (per-category
+                # toggles, Stale-only, Manage…). Always enabled -- unlike sov's
+                # legend it is useful even when the layer is off (it hosts Manage…
+                # and pre-shapes what appears once enabled).
+                self._infra_filter_btn = tk.Button(
+                    bar, text="▾", command=self._show_infra_filters,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._infra_filter_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(self._infra_filter_btn,
+                                     "Infra filters and the structure manager")
             if _key == "sov":
                 # Legend affordance (Task 33): a small "▾" microbutton right after
                 # the Sov toggle, ENABLED only while the layer is on. Opens the
@@ -820,26 +1033,8 @@ class MapTab:
                     state=("normal" if bool(_layers.get("sov", False))
                            else "disabled"))
                 self._sov_legend_btn.pack(side="left", padx=(0, 4))
-            if _key == "route":
-                # Owner note (Task 35): purely in-game-set destinations can't be
-                # shown -- ESI exposes no autopilot-route READ endpoint (verified
-                # against the live swagger). This overlay covers destinations set
-                # with the tool.
-                self._attach_tooltip(
-                    _cb, "Travel route to a destination set with the tool "
-                    "(map / intel / zkill 'Set destination'), incl. Ansiblex "
-                    "hops. Destinations set only in the game client can't be "
-                    "drawn — ESI has no route-read endpoint.")
-        # "Threat ▾" opens the in-tab threat drawer (Task 34, owner ask
-        # 2026-07-12): per-staging selection + the ship-class picker, both
-        # previously buried in a right-click cascade. Flat panel-coloured button
-        # so it reads as native to the app palette.
-        self._threat_drawer_btn = tk.Button(
-            bar, text="Threat ▾", command=self._toggle_threat_drawer,
-            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
-            activeforeground=t["accent"], relief="flat", borderwidth=0,
-            highlightthickness=0, padx=8, pady=1, cursor="hand2")
-        self._threat_drawer_btn.pack(side="left", padx=(10, 4))
+                self._attach_tooltip(self._sov_legend_btn,
+                                     "Sov legend — top alliances by systems shown")
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
@@ -864,6 +1059,10 @@ class MapTab:
         self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
+        # Sync the infra layer's enabled flag from its toolbar var (OFF by default);
+        # categories / stale_only already match INFRA_FILTER_DEFAULTS in the fresh
+        # state, so only "enabled" needs reconciling with cfg["layers"]["infra"].
+        self.state.infra_filters["enabled"] = self._layer_on("infra")
         self.renderer = None
         # FrameCache is now WORKER-OWNED (Task 24, P1): only the render worker
         # thread touches it -- it stores the full margined surface after each
@@ -954,6 +1153,15 @@ class MapTab:
         self._ambient_stop = threading.Event()
         self._last_heat_refresh_ms = 0.0
 
+        # --- characters overlay poll (map-chars daemon) -------------------------
+        # Same no-leak contract as the ambient loop (Task 22): a daemon started on
+        # show / STOPPED on hide, its stop Event letting on_hidden join it promptly.
+        # UNLIKE ambient it also starts/stops on the toolbar toggle and runs ONLY
+        # while _layer_on("chars") -- so a hidden tab or a disabled layer keeps zero
+        # poll threads. state.chars survives on the state object across a hide/show.
+        self._chars_thread: threading.Thread | None = None
+        self._chars_stop = threading.Event()
+
         # --- sovereignty tint layer lazy fetch (Task 33) ------------------------
         # OFF by default -> ZERO network until enabled. When the layer is toggled
         # on (or is on at show time) and the data is stale, a ONE-SHOT daemon
@@ -996,12 +1204,37 @@ class MapTab:
         self._killping_struct_ms = 0.0
         self._pending_focus_sid: int | None = None
 
+        # --- reusable hover summary tooltip engine (owner feedback round B) ----
+        # _hover_providers: (layer_key, fn) pairs. fn(system_id) -> list[str] |
+        # None; sections from every provider whose layer_key is _layer_on() are
+        # joined into ONE reused themed Toplevel (_hover_tip) shown ~350 ms after
+        # the cursor settles on a system. Kept minimal so the <Motion> idle path
+        # (no provider layer on) does zero tooltip work. Task D will register a
+        # characters-layer provider through the same register_hover_provider API.
+        self._hover_providers: list[tuple[str, "callable"]] = []
+        self._hover_delay_ms = HOVER_TOOLTIP_DELAY_MS   # instance-tunable (tests)
+        self._hover_tip = None                          # reused Toplevel (lazy)
+        self._hover_tip_label = None                    # the Label inside it
+        self._hover_after_id = None                     # pending delayed-show after()
+        self._hover_sid = None                          # system the pending/shown tip is for
+        self._hover_anchor: tuple[int, int] | None = None   # canvas-xy where dwell began
+        # Infra chips summary (Task 5 / round B): per-type counts for the hovered
+        # system, honouring the SAME filters as the chips (the host already folded
+        # them into the pushed badges' "type_counts"). Registered here because the
+        # infra badge state (state.infra) lives on this tab.
+        self.register_hover_provider("infra", self._infra_hover_lines)
+        # Characters overlay hover (owner ask): "CharName — ShipType" per character
+        # in the hovered system, gated on _layer_on("chars") by the engine and
+        # composed alongside the infra section.
+        self.register_hover_provider("chars", self._chars_hover_lines)
+
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
         self.canvas.bind("<Motion>", self._on_motion)
         self.canvas.bind("<Button-3>", self._on_right_click)
+        self.canvas.bind("<Leave>", self._on_canvas_leave)
         self.canvas.bind("<Configure>", self._on_configure)
 
         # --- opt-in feel telemetry (Task 23) -----------------------------------
@@ -1072,6 +1305,10 @@ class MapTab:
         self._schedule_tick()
         self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
         self._start_ambient_loop()               # Task 30: hourly ESI ambient heat
+        # Characters overlay: start the 60 s poll ONLY if the layer is on at show
+        # time (ON by default). Idempotent; the toolbar toggle starts/stops it too.
+        if self._layer_on("chars"):
+            self._start_chars_loop()
         # Task 33: fetch the sov map ONLY if the layer is on at show time (OFF by
         # default -> no-op -> zero network). The one-shot thread dies after one
         # fetch; an in-flight fetch across a hide/show is not double-spawned.
@@ -1084,6 +1321,7 @@ class MapTab:
         self._apply_pending_focus()
 
     def on_hidden(self) -> None:
+        self._hover_cancel()                 # never leave a tooltip over a hidden tab
         if self.renderer is None:
             # Hidden before the first show: the camera is still at fresh
             # defaults (the fit-universe sentinel hasn't been applied yet).
@@ -1113,6 +1351,9 @@ class MapTab:
         # a hidden tab must not keep an hourly fetch daemon alive. on_shown
         # restarts it; kill_heat/ambient_heat state survives on the state object.
         self.shutdown_ambient_loop()
+        # Characters overlay: stop the poll daemon too (same no-leak rule). on_shown
+        # restarts it when the layer is on; state.chars survives on the state object.
+        self.shutdown_chars_loop()
         # Task 33: dismiss any open sov legend popup (the one-shot sov FETCH thread
         # is not a loop -> nothing to stop; sov_map/sov_names survive on state, and
         # an in-flight fetch's _sov_inflight flag is intentionally left set so a
@@ -1194,6 +1435,23 @@ class MapTab:
         if self.state.route_dest is not None:
             self._recompute_route()
 
+    def set_infrastructure(self, badges: dict[int, dict] | None) -> None:
+        """Store PRE-COMPUTED infrastructure badges from the host and re-render.
+        ``badges`` maps ``system_id -> {"total", "counts", "top", "stale"}``;
+        ``None`` (or an empty dict) means no chips -- an on-but-empty layer draws
+        the same frame as off. The chips are a BASE-layer element -- drawn into
+        the bitmap in the label pass (map_render._draw_infra_chips), riding the
+        system-label zoom LOD -- so this is a settle re-render via _request_crisp
+        (mirrors set_bridges), NOT a Tk overlay repaint. The host owns the data:
+        it computes badges from the store via infra_overlay and pushes them here,
+        so this file keeps ZERO infra imports. Safe before the first on_shown:
+        _request_crisp / _redraw_overlays no-op while the renderer / model are
+        unset, and the stored badges are picked up by the first crisp request."""
+        self.state.infra = badges if badges else None
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
     def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
         prev = self.state.own_system_id
         self.state.own_system_id = system_id
@@ -1274,8 +1532,8 @@ class MapTab:
     def add_kill_heat(self, system_id, kill_count, capital=False) -> None:
         """Record a zkill engagement alert into the live kill-heat ring. Called on
         the MAIN thread -- fc_gui marshals the zkill worker-thread callback
-        (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which calls
-        this. Stamps the event with wall-clock time (the kill just arrived; zkill
+        (_on_zkill_alert) through _post_ui(_push_kill_heat_to_map, alert), which
+        calls this. Stamps the event with wall-clock time (the kill just arrived; zkill
         is near-real-time). When the heat layer is on, force-dirties + re-requests
         a crisp so the new hot system lights up promptly, and repaints overlays so
         a capital marker can appear at once. Guarded/no-throw so a malformed alert
@@ -1414,6 +1672,83 @@ class MapTab:
             self._request_crisp()
             self._redraw_overlays()
 
+    # ---- characters overlay poll ----------------------------------------------
+    def _start_chars_loop(self) -> None:
+        """Start the map-chars poll thread. Idempotent: a no-op when the layer is
+        off or a loop is already running. Mirrors _start_ambient_loop; the caller
+        (on_shown / the toolbar toggle) has already confirmed the tab is shown."""
+        if not self._layer_on("chars"):
+            return
+        if self._chars_thread is not None and self._chars_thread.is_alive():
+            return
+        self._chars_stop.clear()
+        self._chars_thread = threading.Thread(
+            target=self._chars_loop, daemon=True, name="map-chars")
+        self._chars_thread.start()
+
+    def _chars_loop(self) -> None:
+        """Daemon body: after a short first-fetch delay, fetch the authed
+        characters' locations+ships and post a canonical snapshot onto the result
+        queue, then repeat every CHARS_POLL_S. The stop Event is WAITED on (not
+        slept) for both the initial delay and the interval so shutdown_chars_loop
+        wakes it the instant the event is set -- no leak past a hide/toggle-off.
+        The fetch silent-degrades (per-character inside fc_gui; a total failure
+        returns None here) -> a None result is simply not posted, leaving the last
+        snapshot on screen; an empty dict IS posted so markers clear when every
+        character has logged off. Runs on this thread only -> the injected fetch
+        must be Tk-free."""
+        stop = self._chars_stop
+        if stop.wait(CHARS_START_DELAY_S):
+            return                               # stopped during the initial delay
+        while not stop.is_set():
+            try:
+                payload = self._characters_fetch()
+            except Exception as exc:             # never let the loop die on a fetch
+                print(f"[MAP] characters loop error: {exc}")
+                payload = None
+            if payload is not None and not stop.is_set():
+                # A stale put after a hide is harmless -- the queue just holds it
+                # until the next show drains it (and on_hidden left state.chars as-is).
+                self._result_q.put(("chars", _canonical_chars(payload)))
+            if stop.wait(CHARS_POLL_S):
+                return                           # stopped during the interval wait
+
+    def shutdown_chars_loop(self) -> None:
+        """Stop the chars poll and join it briefly so a hidden tab / disabled layer
+        leaks no daemon (Task 22 lesson). Idempotent: safe when no loop is running.
+        Setting the Event wakes a loop blocked in stop.wait() immediately; the join
+        only has to outlast an in-flight sweep, then the handle is dropped so a
+        later _start_chars_loop spawns a fresh thread."""
+        self._chars_stop.set()
+        t = self._chars_thread
+        if t is not None:
+            t.join(timeout=2.0)
+            self._chars_thread = None
+
+    def _apply_chars(self, pairs) -> None:
+        """Apply a worker-fetched characters snapshot on the MAIN thread (drained
+        from the result queue). ``pairs`` is the canonical ((sid, ((char, ship),
+        ...)), ...) tuple the poll posted. Rebuilds state.chars and -- when the
+        layer is on -- repaints the overlays so the magenta markers track the
+        latest positions (an empty tuple clears them). Pure Tk overlay: no crisp
+        re-render (the base bitmap is unaffected)."""
+        self.state.chars = {int(sid): list(sp) for sid, sp in pairs}
+        if self._layer_on("chars"):
+            self._redraw_overlays()
+
+    def _chars_hover_lines(self, sid) -> list[str] | None:
+        """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
+        per character currently in the hovered system, sorted by name (the stored
+        snapshot is already name-sorted by _canonical_chars). None when no tracked
+        character is there. Gated on _layer_on("chars") by the hover engine."""
+        chars = self.state.chars
+        if not chars:
+            return None
+        here = chars.get(sid)
+        if not here:
+            return None
+        return [f"{name} — {ship}" for name, ship in here]
+
     # ---- intel pulse layer (Task 31) ------------------------------------------
     def add_intel_pulse(self, system_id_or_name, now=None) -> None:
         """Record/refresh an intel mention of a system so it pulses on the map.
@@ -1547,10 +1882,12 @@ class MapTab:
     # ---- kill-ping layer (Task 36) --------------------------------------------
     def add_kill_ping(self, system_id, capital=False, count=1, now=None) -> None:
         """Record a discrete zkill ALERT ping so its system radar-bursts on the map
-        (Task 36). Called on the MAIN thread -- fc_gui marshals the zkill worker
-        callback (_on_zkill_alert) through _post_ui(_push_kill_to_map, alert), which
-        forwards here alongside the kill-heat push. Stamps the ping with wall-clock
-        time (the alert just fired; zkill is near-real-time). When the layer is on,
+        (Task 36). Called on the MAIN thread -- fc_gui fires this from the report-
+        render path (_show_zkill_alert -> _push_kill_ping_to_map) AFTER the display
+        gates pass, so pings match rendered reports 1:1 (NOT alongside the broad
+        kill-heat push, which stays wider by design -- owner's "4 pings, 1 report"
+        fix). Stamps the ping with wall-clock time (the alert just fired; zkill is
+        near-real-time). When the layer is on,
         rebuilds the overlay at once so the burst lights up immediately (the tick
         loop then animates it). INDEPENDENTLY gated from heat by its own layer
         toggle. Guarded/no-throw so a malformed alert never breaks the zkill path."""
@@ -1692,6 +2029,35 @@ class MapTab:
         if not self._layer_on("sov"):
             return None
         return mo.canonical_sov(self.state.sov_map) or None
+
+    def _infra_request_value(self):
+        """Canonical hashable infra tuple for the render request + sig, or None
+        when the layer is off OR there are no badges -- both collapse to None so an
+        infra-off (or on-but-empty) frame is byte-identical to the pre-infra output
+        and its sig matches (determinism, exactly like sov/heat/bridges). The tuple
+        is ((system_id, total, top_category, stale), ...), sorted for determinism;
+        it is BOTH the sig component AND the exact data the renderer iterates
+        (map_render._draw_infra_chips)."""
+        if not self._layer_on("infra"):
+            return None
+        infra = self.state.infra
+        if not infra:
+            return None
+        return tuple(sorted(
+            (sid, b["total"], b["top"], b["stale"]) for sid, b in infra.items()))
+
+    def _emit_infra_filters(self) -> None:
+        """Sync the enabled flag from the toolbar Infra var and hand a private
+        deepcopy of the filter state to the host's get_infrastructure callback,
+        which recomputes badges and pushes them back via set_infrastructure. A COPY
+        so a host that retains the dict can't mutate our internal filter state (and
+        vice-versa). No-op (beyond the enabled sync) when no host is wired."""
+        var = self._layer_vars.get("infra")
+        if var is not None:
+            self.state.infra_filters["enabled"] = bool(var.get())
+        cb = self.callbacks.get("get_infrastructure")
+        if cb is not None:
+            cb(copy.deepcopy(self.state.infra_filters))
 
     def _maybe_start_sov_fetch(self, now_ms: float | None = None) -> None:
         """Spawn the ONE-SHOT sov fetch thread iff the layer is on, no fetch is in
@@ -1885,16 +2251,131 @@ class MapTab:
                 pass
             self._sov_legend = None
 
+    # ---- infrastructure filter popover (Task 5) -------------------------------
+    def _show_infra_filters(self) -> None:
+        """Open the borderless infra filter popover under the "▾" microbutton:
+        per-category toggles, a Stale-only toggle, and a Manage… button. Built
+        once and REUSED per open (withdrawn on close, never destroyed); never
+        grabs the pointer; dismisses on Escape or click-away (FocusOut). Matches
+        the sov-legend dark idiom -- a 1px border-color frame around a panel body."""
+        try:
+            pop = self._infra_popover
+            if pop is None or not pop.winfo_exists():
+                pop = self._infra_popover = self._build_infra_popover()
+            # Reflect the live filter state onto the checkbutton vars before showing
+            # (defensive -- the popover is their only writer, but keep them in sync).
+            for _label, key in _INFRA_CATEGORY_LABELS:
+                self._infra_cat_vars[key].set(
+                    bool(self.state.infra_filters["categories"].get(key, True)))
+            self._infra_stale_var.set(bool(self.state.infra_filters["stale_only"]))
+            anchor = getattr(self, "_infra_filter_btn", None) or self.frame
+            x = anchor.winfo_rootx()
+            y = anchor.winfo_rooty() + anchor.winfo_height() + 2
+            pop.wm_geometry(f"+{x}+{y}")
+            pop.deiconify()
+            pop.lift()
+            pop.focus_set()
+        except Exception:
+            self._infra_popover = None
+
+    def _build_infra_popover(self) -> tk.Toplevel:
+        t = self.theme
+        pop = tk.Toplevel(self.frame)
+        pop.wm_overrideredirect(True)
+        pop.withdraw()
+        pop.configure(bg=t["border"])                    # 1px themed border
+        inner = tk.Frame(pop, bg=t["panel"])
+        inner.pack(padx=1, pady=1, fill="both")
+        tk.Label(inner, text="Show categories", bg=t["panel"], fg=t["accent"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        for label, key in _INFRA_CATEGORY_LABELS:
+            tk.Checkbutton(
+                inner, text=label, variable=self._infra_cat_vars[key], anchor="w",
+                bg=t["panel"], fg=t["fg"], selectcolor=t["panel"],
+                activebackground=t["entry_bg"], activeforeground=t["accent"],
+                command=lambda k=key: self._on_infra_cat_toggle(k)
+            ).pack(anchor="w", fill="x", padx=8)
+        tk.Frame(inner, bg=t["border"], height=1).pack(fill="x", padx=8, pady=4)
+        tk.Checkbutton(
+            inner, text="Stale only", variable=self._infra_stale_var, anchor="w",
+            bg=t["panel"], fg=t["fg"], selectcolor=t["panel"],
+            activebackground=t["entry_bg"], activeforeground=t["accent"],
+            command=self._on_infra_stale_toggle
+        ).pack(anchor="w", fill="x", padx=8)
+        tk.Button(
+            inner, text="Manage…", command=self._infra_manage_clicked, anchor="w",
+            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, cursor="hand2"
+        ).pack(anchor="w", fill="x", padx=8, pady=(4, 6))
+        pop.bind("<Escape>", lambda _e: self._hide_infra_filters())
+        pop.bind("<FocusOut>", lambda _e: self._hide_infra_filters())
+        return pop
+
+    def _hide_infra_filters(self) -> None:
+        pop = getattr(self, "_infra_popover", None)
+        if pop is not None:
+            try:
+                pop.withdraw()                           # reused -> withdraw, not destroy
+            except Exception:
+                pass
+
+    def _on_infra_cat_toggle(self, key: str) -> None:
+        var = self._infra_cat_vars.get(key)
+        if var is not None:
+            self.state.infra_filters["categories"][key] = bool(var.get())
+        self._emit_infra_filters()
+
+    def _on_infra_stale_toggle(self) -> None:
+        self.state.infra_filters["stale_only"] = bool(self._infra_stale_var.get())
+        self._emit_infra_filters()
+
+    def _infra_manage_clicked(self) -> None:
+        """Popover 'Manage…' -> open the infra manager for the whole DB (no
+        pre-filter). Hide the popover first so it does not linger over the dialog."""
+        self._hide_infra_filters()
+        cb = self.callbacks.get("open_infra_manager")
+        if cb is not None:
+            cb(None)
+
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
-        """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
-        destroyed on <Leave>) to a toolbar widget. add='+' so it never clobbers a
-        widget's own bindings. Used to document the route overlay's ESI limitation
-        (Task 35) without pulling in fc_gui's tooltip helper."""
-        widget.bind("<Enter>", lambda _e: self._show_tooltip(widget, text), add="+")
+        """Attach a dwell-delayed hover tooltip to a toolbar control and register
+        it in ``self._toolbar_tooltips`` (owner ask 2026-07-12). The tip appears
+        ~500 ms after the cursor settles on the widget (never on a fly-over),
+        reuses the single ``self._tooltip`` slot, and is dismissed instantly on
+        <Leave>, ANY mouse press, or the widget's <Destroy> -- so it can never sit
+        between the cursor and a click. ``add='+'`` so it never clobbers the
+        widget's own bindings, and the timer is only armed on <Enter>, so an idle
+        toolbar (cursor elsewhere) costs nothing. Empty text is a no-op. Shared by
+        every toolbar control -- the layer checkboxes, the search box, and the
+        Sov / Infra / Threat ▾ drawer buttons. The registry lets a test walk the
+        toolbar and assert every control is documented (fails if a new one isn't)."""
+        if not text:
+            return
+        self._toolbar_tooltips[widget] = text
+        widget.bind("<Enter>",
+                    lambda _e, w=widget, s=text: self._tooltip_schedule(w, s),
+                    add="+")
         widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
+        widget.bind("<ButtonPress>", lambda _e: self._hide_tooltip(), add="+")
+        widget.bind("<Destroy>", lambda _e: self._hide_tooltip(), add="+")
+
+    def _tooltip_schedule(self, widget, text: str) -> None:
+        """Arm the dwell timer for ``widget``'s tip, first tearing down any pending
+        timer / live tip so only the newest hover ever shows (after_cancel
+        discipline). Uses self.frame.after so it rides the tab's own event loop."""
+        self._hide_tooltip()
+        try:
+            self._tooltip_after = self.frame.after(
+                self._tooltip_delay_ms, lambda: self._show_tooltip(widget, text))
+        except Exception:
+            self._tooltip_after = None
 
     def _show_tooltip(self, widget, text: str) -> None:
+        """Create + place the tip NOW below ``widget`` in the single ``self._tooltip``
+        slot. Called by the dwell timer (and directly by tests). Any prior tip is
+        torn down first; a torn-down widget mid-dwell degrades to no tip (guarded)."""
         self._hide_tooltip()
         t = self.theme
         try:
@@ -1910,6 +2391,16 @@ class MapTab:
             self._tooltip = None
 
     def _hide_tooltip(self) -> None:
+        """Single dismissal path: cancel a pending dwell timer AND destroy any live
+        tip (idempotent). <Leave>, a press, a destroy, and the next <Enter> all
+        route here, so a tip never lingers or stacks."""
+        aid = getattr(self, "_tooltip_after", None)
+        if aid is not None:
+            try:
+                self.frame.after_cancel(aid)
+            except Exception:
+                pass
+            self._tooltip_after = None
         tip = getattr(self, "_tooltip", None)
         if tip is not None:
             try:
@@ -1948,7 +2439,7 @@ class MapTab:
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
                  "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
-                 "ov_killping")
+                 "ov_killping", "ov_chars")
         for tag in _tags:
             canvas.delete(tag)
         # Task 31 / Task 36: the ov_intel + ov_killping items were just deleted ->
@@ -2077,6 +2568,26 @@ class MapTab:
                                        outline="#ffffff", width=2, tags="ov_own")
                     canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
                                        fill="#ffffff", outline="", tags="ov_own")
+        # -- characters overlay (owner ask): a magenta filled SQUARE at each system
+        # holding an authed character (a shape + hue both free in the palette --
+        # distinct from the cyan fleet circles), with a count label when more than
+        # one character is there; the hover tooltip names each character + ship.
+        # Pure Tk -> crisp during gestures. EMPTY-FAST-PATH: the whole block is
+        # skipped when the layer is off OR no character is tracked, so an enabled-
+        # but-empty layer performs zero canvas ops here.
+        if self._layer_on("chars") and st.chars:
+            for sid, occ in st.chars.items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_rectangle(sx - 5, sy - 5, sx + 5, sy + 5,
+                                        fill=CHARS_MAGENTA, outline="#ffffff",
+                                        width=1, tags="ov_chars")
+                if len(occ) > 1:
+                    canvas.create_text(sx + 9, sy, anchor="w", text=str(len(occ)),
+                                       fill=CHARS_MAGENTA, font=("Segoe UI", 9),
+                                       tags="ov_chars")
         # -- capital-kill markers (Task 30): a double-ring red marker at systems
         # with a capital kill in the last ~30 min. Gated by the heat layer (they
         # accompany the base-layer heat under-glow) and drawn LAST so they sit on
@@ -2244,7 +2755,8 @@ class MapTab:
                                     tint=req.get("tint"),
                                     bridges=req.get("bridges"),
                                     heat=req.get("heat"),
-                                    sov=req.get("sov"))
+                                    sov=req.get("sov"),
+                                    infra=req.get("infra"))
         ms = (time.perf_counter() - t0) * 1000.0
         self.stats.record(ms)
         # Tk gets a viewport-sized CENTER CROP (a subsurface view -- no copy;
@@ -2468,6 +2980,10 @@ class MapTab:
             # Canonical sov tuple, or None when the layer is off / no data
             # (byte-identical to pre-sov output). Joins _request_sig.
             "sov": self._sov_request_value(),
+            # Canonical infra tuple ((sid, total, top, stale), ...), or None when
+            # the layer is off / no badges (byte-identical to pre-infra output).
+            # Joins _request_sig; the renderer draws it as per-system count chips.
+            "infra": self._infra_request_value(),
         })
 
     def _request_gesture_frame(self) -> None:
@@ -2709,6 +3225,7 @@ class MapTab:
         latest_ambient = None
         latest_sov = None
         latest_sov_names = None
+        latest_chars = None
         try:
             while True:
                 item = self._result_q.get_nowait()
@@ -2722,6 +3239,8 @@ class MapTab:
                     latest_sov = item            # Task 33: sov map (one-shot fetch)
                 elif item[0] == "sov_names":
                     latest_sov_names = item       # Task 33: alliance-name legend data
+                elif item[0] == "chars":
+                    latest_chars = item          # characters overlay (60 s poll)
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -2744,9 +3263,12 @@ class MapTab:
             self._apply_sov_names(latest_sov_names[1])
         if latest_sov is not None:
             self._apply_sov(latest_sov[1])
+        if latest_chars is not None:
+            self._apply_chars(latest_chars[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
+        self._hover_cancel()                 # a zoom gesture dismisses the tooltip
         steps = 1 if event.delta > 0 else -1
         if self._zoom_anim_var.get():
             # Eased glide (default): retarget only -- the tick loop owns every
@@ -2765,6 +3287,7 @@ class MapTab:
         return "break"
 
     def _on_drag_start(self, event) -> None:
+        self._hover_cancel()                 # a press / drag dismisses the tooltip
         self._drag_last = (event.x, event.y)
         self._press_xy = (event.x, event.y)   # click-vs-pan discrimination (Task 31)
 
@@ -2856,8 +3379,163 @@ class MapTab:
         if _c:
             _h2 = _c()
             tele.hover_rec((_h1 - _h0) * 1000.0, (_h2 - _h1) * 1000.0, sid is not None)
+        # Drive the delayed summary tooltip, REUSING the hover hit-test above (no
+        # second nearest() call). The engine's own first guard makes this ~free
+        # when no provider's layer is on (idle hover cost unchanged).
+        self._hover_tooltip_motion(event, sid)
+
+    # ---- reusable hover summary tooltip engine (owner feedback round B) ---------
+    def register_hover_provider(self, layer_key: str, fn) -> None:
+        """Register a hover-tooltip section provider. ``fn(system_id)`` returns a
+        list of display lines (or None / [] for no contribution). The section is
+        included only while ``_layer_on(layer_key)`` is true, so a provider costs
+        nothing until its layer is enabled. Sections from all enabled providers
+        are blank-line separated in one reused themed tooltip. Public so sibling
+        layers (Task D's characters layer) plug in without touching the engine."""
+        self._hover_providers.append((layer_key, fn))
+
+    def _hover_any_layer_on(self) -> bool:
+        """True iff at least one registered provider's layer is enabled. Plain
+        loop (no generator / allocation) so the <Motion> idle guard stays cheap."""
+        for key, _fn in self._hover_providers:
+            if self._layer_on(key):
+                return True
+        return False
+
+    def _hover_gesture_active(self) -> bool:
+        """True while a pan / zoom / worker-gesture is in flight -- the tooltip
+        must never schedule or show mid-gesture. Cheap attribute reads only."""
+        return (self._drag_last is not None
+                or self._gesture_inflight
+                or self.state.zoom_anim.active)
+
+    def _hover_tooltip_motion(self, event, sid) -> None:
+        """<Motion> driver for the summary tooltip. FIRST guard: if no provider's
+        layer is on, do nothing beyond dismissing any lingering tip -- near-zero
+        idle cost, no allocation. Otherwise (re)arm a single delayed show for the
+        hovered system, re-anchoring only when the cursor changes system or moves
+        beyond a small radius (jitter within the radius does NOT restack after()s)."""
+        if not self._hover_any_layer_on():
+            if self._hover_after_id is not None or self._hover_tip is not None:
+                self._hover_cancel()
+            return
+        # Never show mid pan/zoom, or when off a system.
+        if sid is None or self._hover_gesture_active():
+            self._hover_cancel()
+            return
+        x, y = event.x, event.y
+        anc = self._hover_anchor
+        if sid == self._hover_sid and anc is not None:
+            dx = x - anc[0]
+            dy = y - anc[1]
+            if dx * dx + dy * dy <= HOVER_TOOLTIP_MOVE_R2:
+                return                       # same target, within radius -> leave armed
+        # New target (system changed or moved past the radius): reschedule ONCE.
+        self._hover_cancel()
+        self._hover_sid = sid
+        self._hover_anchor = (x, y)
+        self._hover_after_id = self.canvas.after(
+            self._hover_delay_ms, lambda s=sid: self._hover_tooltip_show(s))
+
+    def _hover_compose(self, sid) -> str | None:
+        """Join the sections from every enabled provider for ``sid`` (blank-line
+        separated), or None when nothing contributes. A provider raising is
+        treated as no content -- a broken provider can never break hover."""
+        sections: list[str] = []
+        for key, fn in self._hover_providers:
+            if not self._layer_on(key):
+                continue
+            try:
+                lines = fn(sid)
+            except Exception:
+                lines = None
+            if lines:
+                sections.append("\n".join(str(ln) for ln in lines))
+        if not sections:
+            return None
+        return "\n\n".join(sections)
+
+    def _hover_tooltip_show(self, sid) -> None:
+        """Delayed-show callback: re-validate (layer still on, same target, no
+        gesture), compose the text, and place the reused themed Toplevel near the
+        cursor. Never shows an empty tooltip."""
+        self._hover_after_id = None
+        if sid != self._hover_sid or not self._hover_any_layer_on():
+            return
+        if self._hover_gesture_active():
+            return
+        text = self._hover_compose(sid)
+        if not text:
+            return                           # no content -> no window
+        t = self.theme
+        try:
+            tip = self._hover_tip
+            if tip is None or not tip.winfo_exists():
+                tip = self._hover_tip = tk.Toplevel(self.canvas)
+                tip.wm_overrideredirect(True)
+                self._hover_tip_label = tk.Label(
+                    tip, justify="left", bg=t["panel"], fg=t["fg"],
+                    relief="solid", borderwidth=1, padx=6, pady=4,
+                    font=("Segoe UI", 9))
+                self._hover_tip_label.pack()
+            self._hover_tip_label.configure(text=text)
+            anc = self._hover_anchor or (0, 0)
+            x = self.canvas.winfo_rootx() + anc[0] + 14
+            y = self.canvas.winfo_rooty() + anc[1] + 18
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.deiconify()
+            tip.lift()
+        except Exception:
+            # A torn-down canvas / display race must never crash a hover.
+            self._hover_tip = None
+            self._hover_tip_label = None
+
+    def _hover_cancel(self) -> None:
+        """Cancel any pending delayed show and withdraw the tip (reused, not
+        destroyed -- same idiom as the sov legend / infra popover)."""
+        if self._hover_after_id is not None:
+            try:
+                self.canvas.after_cancel(self._hover_after_id)
+            except Exception:
+                pass
+            self._hover_after_id = None
+        self._hover_sid = None
+        self._hover_anchor = None
+        tip = self._hover_tip
+        if tip is not None:
+            try:
+                tip.withdraw()
+            except Exception:
+                pass
+
+    def _on_canvas_leave(self, _event) -> None:
+        """Cursor left the canvas -> dismiss the summary tooltip."""
+        self._hover_cancel()
+
+    def _infra_hover_lines(self, sid) -> list[str] | None:
+        """Infra hover-tooltip provider: per-type structure counts for the hovered
+        system, e.g. ["3× Fortizar", "1× Athanor"], sorted by count desc then
+        name, with a dim "(stale)" line when the badge is stale-flagged. Reads the
+        PRE-COMPUTED "type_counts" the host folded into the pushed badges (already
+        filter-respecting), so this file keeps zero infra logic. None when the
+        hovered system has no badge / no counts."""
+        infra = self.state.infra
+        if not infra:
+            return None
+        badge = infra.get(sid)
+        if not badge:
+            return None
+        type_counts = badge.get("type_counts") or {}
+        if not type_counts:
+            return None
+        items = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        lines = [f"{count}× {name}" for name, count in items]
+        if badge.get("stale"):
+            lines.append("(stale)")
+        return lines
 
     def _on_right_click(self, event) -> None:
+        self._hover_cancel()                 # a click dismisses the summary tooltip
         sid = self.state.hover_hit(event.x, event.y) if self.renderer else None
         menu = (self._build_system_menu(sid) if sid is not None
                 else self._build_empty_menu())
@@ -2919,7 +3597,60 @@ class MapTab:
         self._menu_add(menu, "Copy name", "copy", name)
         self._menu_add(menu, "Add to friendly staging", "add_friendly_staging", name)
         self._menu_add(menu, "Add to hostile staging", "add_hostile_staging", name)
+        # Structures here… (Task 5): open the infra manager PRE-FILTERED to this
+        # system. NOT routed through _menu_add -- that binds cb(name); the infra
+        # manager wants the system ID, so bind a bespoke command passing sid.
+        cb_infra = self.callbacks.get("open_infra_manager")
+        if cb_infra is not None:
+            menu.add_command(label="Structures here…",
+                             command=lambda s=sid: cb_infra(s))
+        # Organized structure list (owner feedback round B): when the infra layer
+        # is on and the host supplies grouped structures for this system, add a
+        # "Structures (N)" cascade grouping the FILTER-SURVIVING structures by
+        # type. The host applies the SAME filters the chips use, so the menu shows
+        # exactly what the overlay shows.
+        if self._layer_on("infra") and cb_infra is not None:
+            gss = self.callbacks.get("get_system_structures")
+            groups = None
+            if gss is not None:
+                try:
+                    groups = gss(sid)
+                except Exception:
+                    groups = None
+            if groups:
+                self._add_structures_submenu(menu, sid, groups, cb_infra)
         return menu
+
+    def _add_structures_submenu(self, menu, sid, groups, cb_infra) -> None:
+        """Attach a "Structures (N)" cascade grouping ``groups`` -- a list of
+        (type_display_name, [structure_names]) already ordered by the host -- under
+        disabled "— Type —" header rows. Each structure row and the trailing
+        "Manage…" row open the infra manager at ``sid`` via ``cb_infra``. Rows are
+        capped at _STRUCT_MENU_CAP with a trailing disabled "…and N more (Manage…)"
+        row so a busy system stays navigable."""
+        total = sum(len(names) for _t, names in groups)
+        sub = self._make_menu(menu)
+        shown = 0
+        capped = False
+        for type_name, names in groups:
+            if not names:
+                continue
+            if shown >= _STRUCT_MENU_CAP:
+                capped = True
+                break
+            sub.add_command(label=f"— {type_name} —", state="disabled")
+            for nm in names:
+                if shown >= _STRUCT_MENU_CAP:
+                    capped = True
+                    break
+                sub.add_command(label=nm, command=lambda s=sid: cb_infra(s))
+                shown += 1
+        if capped:
+            sub.add_command(label=f"…and {total - shown} more (Manage…)",
+                            state="disabled")
+        sub.add_separator()
+        sub.add_command(label="Manage…", command=lambda s=sid: cb_infra(s))
+        menu.add_cascade(label=f"Structures ({total})", menu=sub)
 
     def _build_empty_menu(self) -> tk.Menu:
         """Right-click-on-empty-space menu: view + layer controls."""
@@ -2960,8 +3691,20 @@ class MapTab:
         # Sov tint (Task 33): OFF by default; enabling it kicks the lazy ESI fetch.
         menu.add_checkbutton(label="Sov", variable=self._layer_vars["sov"],
                              command=lambda: self._on_layer_toggle("sov"))
+        # Infra chips (Task 5): OFF by default; the toolbar "▾" hosts the filters.
+        menu.add_checkbutton(label="Infra", variable=self._layer_vars["infra"],
+                             command=lambda: self._on_layer_toggle("infra"))
+        # Characters overlay (owner ask): ON by default; magenta markers + hover.
+        menu.add_checkbutton(label="Chars", variable=self._layer_vars["chars"],
+                             command=lambda: self._on_layer_toggle("chars"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
+        # Manage infrastructure… (Task 5): open the manager for the whole DB.
+        cb_infra = self.callbacks.get("open_infra_manager")
+        if cb_infra is not None:
+            menu.add_separator()
+            menu.add_command(label="Manage infrastructure…",
+                             command=lambda: cb_infra(None))
         return menu
 
     def _menu_add(self, menu, label: str, key: str, name: str) -> None:
@@ -3027,6 +3770,26 @@ class MapTab:
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()
+        elif key == "infra":
+            # Infra badges are a base-bitmap layer (chips ride the label pass) fed
+            # by PRE-COMPUTED data from the host. Toggling gates the request value
+            # (like sov) for an immediate settle re-render AND asks the host to
+            # (re)push or clear the overlay to match the new enabled flag; the two
+            # crisp requests coalesce latest-wins, so it is one render.
+            self._emit_infra_filters()
+            self.state.force_dirty()
+            self._request_crisp()
+            self._redraw_overlays()
+        elif key == "chars":
+            # Characters overlay: match the 60 s poll to the new layer state. Start
+            # only while the tab is shown (on_shown restarts it after a hidden
+            # toggle-on); stop as soon as it is turned off. A pure Tk overlay -> just
+            # repaint (no crisp) so the magenta markers appear now / clear at once.
+            if self._layer_on("chars") and self._visible:
+                self._start_chars_loop()
+            else:
+                self.shutdown_chars_loop()
+            self._redraw_overlays()
         else:
             self._redraw_overlays()
 
@@ -3058,7 +3821,7 @@ class MapTab:
 
     # ---- threat drawer (Task 34) ----------------------------------------------
     def _toggle_threat_drawer(self) -> None:
-        """Toolbar "Threat ▾" handler: open the drawer if closed, else close it."""
+        """Threat ▾ microbutton handler: open the drawer if closed, else close it."""
         if self._threat_drawer_open:
             self._close_threat_drawer()
         else:

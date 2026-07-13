@@ -74,7 +74,11 @@ DEFAULT_CONFIG = {
                    "kill_pings": True,
                    # Sovereignty tint (Task 33): OFF by default -- the palette-noise
                    # call is the owner's. Enabling it lazily fetches ESI sov data.
-                   "sov": False},
+                   "sov": False,
+                   # Characters overlay (owner ask): magenta markers at each authed
+                   # character's system. ON by default -- the 60 s poll runs ONLY
+                   # while the Map tab is shown, so idle cost is nil.
+                   "chars": True},
         # Kill-heat layer (Task 30): hourly ESI ambient kills feed a LOW heat band
         # under the live zkill decay-heat. OWNER-APPROVED 2026-07-12 ("Ok to make 2
         # calls per hour") -> ON by default. Set False to run zkill-only (no ESI).
@@ -109,5 +113,14 @@ DEFAULT_CONFIG = {
         "include_alliance_contracts": True,  # also pull corp/alliance contracts (needs scope)
         "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)
         "seed_target": 20,          # FIXED target quantity of each fit for gap math
+    },
+    # Friendly-infrastructure scan (infra_* feature, plan 2026-07-11-infra-scan).
+    # Simplification (plan §3.10): the configured scan-region list lives ONLY in
+    # the store file (infrastructure.json) — config holds just the startup toggle.
+    # OFF by default: a region scan spends the shared ESI error budget, so opting
+    # in is the owner's call. The map's Infra chip layer defaults OFF via
+    # map_tab._LAYERS_OFF_BY_DEFAULT (deliberately NOT a map.layers key here).
+    "infra": {
+        "auto_scan_on_start": False,
     },
 }
