@@ -186,15 +186,46 @@ def infra_badges(entries: list[dict], filters: dict, now_iso: str,
     return badges
 
 
+def _gate_endpoints_from_name(name: str) -> tuple[str | None, str | None]:
+    """(system, gate_to) endpoints parsed from an Ansiblex gate structure name
+    ``"A » B - LABEL"`` -> ``("A", "B")`` (the destination is the text between the
+    ``»`` and the first ``" - "`` that follows it).
+
+    The in-game structure name is the GROUND TRUTH for a gate's endpoints;
+    ``gate_to_system_name`` is a pre-parsed cache of it. The clipboard parser fills
+    that cache (infra_parser); the ESI region scanner records only ``name`` (see
+    infra_scan._resolved_row), so without this fallback every SCANNED Ansiblex gate
+    is dropped from the bridge union and its hop never lights on the map/route.
+
+    Duplicated BY VALUE from ``infra_parser._split_gate_name`` (the ``»`` branch) --
+    infra_* modules never import each other (see CATEGORIES above); keep in
+    lockstep. Returns ``(None, None)`` when the name lacks the ``»`` marker."""
+    if not name or "»" not in name:
+        return None, None
+    a, _, rest = name.partition("»")
+    rest = rest.strip()
+    b = rest.split(" - ", 1)[0].strip() if " - " in rest else rest
+    return (a.strip() or None), (b or None)
+
+
 def gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
     """Unordered-deduped [(system_name, gate_to_system_name), ...] for status!='dead'
-    gates -- the exact shape config['ansiblex_connections'] already uses."""
+    gates -- the exact shape config['ansiblex_connections'] already uses.
+
+    Endpoints come from the explicit ``system_name``/``gate_to_system_name`` fields
+    when present (clipboard/config imports), else are parsed from the structure
+    ``name`` (``"A » B - Ansiblex"``). The ESI scanner fills only ``name``, so this
+    fallback is what lets SCANNED gates join the SAME bridge union that feeds both
+    the map's bridge layer and the destination-route overlay."""
     seen: set[frozenset] = set()
     pairs: list[tuple[str, str]] = []
     for entry in entries:
         if entry.get("category") != "gate" or entry.get("status") == "dead":
             continue
         a, b = entry.get("system_name"), entry.get("gate_to_system_name")
+        if not a or not b:                       # scanned gate: derive from the name
+            na, nb = _gate_endpoints_from_name(entry.get("name") or "")
+            a, b = (a or na), (b or nb)
         if not a or not b:
             continue
         key = frozenset((a, b))
