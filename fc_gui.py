@@ -5593,16 +5593,20 @@ class FCToolGUI:
         except Exception as exc:
             print(f"[MAP] route destination push failed: {exc}")
 
-    def _push_kill_to_map(self, alert):
-        """Forward a zkill engagement alert to the star map's kill-heat layer
-        (Task 30) AND its discrete kill-ping layer (Task 36). Runs on the MAIN
-        thread (marshaled from the zkill worker callback via _post_ui in
-        _on_zkill_alert). Guarded so a missing/erroring map tab never breaks the
-        zkill alert path. Heat and pings are pushed under SEPARATE try/except so
-        one failing never skips the other, and each is INDEPENDENTLY gated inside
-        the map by its own layer toggle (add_kill_heat -> "heat", add_kill_ping ->
-        "kill_pings"). KillAlert fields used: system_id, kill_count,
-        capitals_involved (all present on the dataclass)."""
+    def _push_kill_heat_to_map(self, alert):
+        """Forward a zkill engagement alert to the star map's kill-HEAT layer
+        (Task 30). Runs on the MAIN thread (marshaled from the zkill worker
+        callback via _post_ui in _on_zkill_alert). Guarded so a missing/erroring
+        map tab never breaks the zkill alert path.
+
+        INTENTIONAL ASYMMETRY (owner bug: 4 pings but 1 report): heat rides the
+        BROAD monitor feed -- every alert the ZKillMonitor's watch filters +
+        threshold + dedup let through -- which is deliberately WIDER than the
+        rendered Intelligence report. Heat is ambient decay-glow awareness and the
+        hourly ESI baseline is broader still. The discrete kill PING is NOT pushed
+        here; it fires from _show_zkill_alert only AFTER the display gates pass
+        (see _push_kill_ping_to_map), so pings match rendered reports 1:1.
+        KillAlert fields used: system_id, kill_count, capitals_involved."""
         tab = getattr(self, "map_tab", None)
         if tab is None:
             return
@@ -5611,6 +5615,22 @@ class FCToolGUI:
                               capital=alert.capitals_involved)
         except Exception as exc:
             print(f"[MAP] kill-heat push failed: {exc}")
+
+    def _push_kill_ping_to_map(self, alert):
+        """Forward a zkill engagement alert to the star map's discrete kill-PING
+        layer (Task 36) -- the red radar burst, plus the extra hostile-capital
+        ring drawn inside add_kill_ping via capital=. Called DIRECTLY from
+        _show_zkill_alert AFTER every display gate (min-pilots, location/parties
+        criteria, max-jumps) passes, so a ping is emitted for EXACTLY the alerts
+        that produce a rendered Intelligence report -- the two can never diverge
+        again (owner bug: the ping used to ride the broad pre-gate feed, giving 4
+        pings for 1 report). _show_zkill_alert already runs on the MAIN thread
+        (marshaled via _post_ui in _on_zkill_alert), so no extra hop is needed;
+        guarded so a missing/erroring map tab never breaks report rendering.
+        KillAlert fields used: system_id, capitals_involved, kill_count."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
         try:
             tab.add_kill_ping(alert.system_id, capital=alert.capitals_involved,
                               count=alert.kill_count)
@@ -5622,7 +5642,7 @@ class FCToolGUI:
         (Task 31). Runs on the MAIN thread -- the intel stream is already marshaled
         through _post_ui (in _on_intel_message) before this is reached, so there is
         no extra hop and no worker-thread touch of Tk. Guarded so a missing/erroring
-        map tab never breaks the intel pipeline. Mirrors _push_kill_to_map."""
+        map tab never breaks the intel pipeline. Mirrors _push_kill_heat_to_map."""
         tab = getattr(self, "map_tab", None)
         if tab is None:
             return
@@ -19341,11 +19361,16 @@ class FCToolGUI:
             alert.route_from_staging = route_info
 
         self._post_ui(self._show_zkill_alert, alert)
-        # Star-map kill-heat layer (Task 30): feed the engagement into the map's
-        # decay-heat ring. Marshaled onto the main thread (this callback runs on
-        # the zkill worker thread); _push_kill_to_map is guarded so a missing map
-        # tab never breaks the zkill path.
-        self._post_ui(self._push_kill_to_map, alert)
+        # Star-map kill-HEAT layer (Task 30): feed the engagement into the map's
+        # decay-heat ring. Heat is INTENTIONALLY broader than the rendered report
+        # -- it rides every monitor-qualified alert (ambient awareness; the hourly
+        # ESI baseline is broader still). The discrete kill PING is deliberately
+        # NOT pushed here: it fires from _show_zkill_alert after the display gates
+        # pass, so a filtered-out alert can never leave a ping without a matching
+        # report (owner bug: 4 pings, 1 report). Marshaled onto the main thread
+        # (this callback runs on the zkill worker thread); the push is guarded so
+        # a missing map tab never breaks the zkill path.
+        self._post_ui(self._push_kill_heat_to_map, alert)
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
@@ -20773,6 +20798,15 @@ $bmp.Dispose()
             m = re.search(r"\*\*(\d+) jumps\*\*", alert.route_from_staging)
             if m and int(m.group(1)) > max_jumps:
                 return  # Too far, skip this alert
+
+        # ── All display gates passed: this alert WILL render a report below (no
+        # further early-returns follow this point). Fire the discrete star-map
+        # kill-ping (and the hostile-capital ring) from here so pings match
+        # rendered reports 1:1 -- the fix for the owner's "4 pings but 1 report"
+        # bug, where the ping used to ride the broad pre-gate feed pushed from
+        # _on_zkill_alert. The kill-HEAT layer stays broad by design and is pushed
+        # separately (see _push_kill_heat_to_map). Already on the main thread. ──
+        self._push_kill_ping_to_map(alert)
 
         ts = alert.timestamp.strftime("%H:%M:%S")
         caps_tag = " [CAPITALS]" if alert.capitals_involved else ""
