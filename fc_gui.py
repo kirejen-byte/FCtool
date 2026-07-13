@@ -5524,6 +5524,11 @@ class FCToolGUI:
             # Right-click organized structure list: grouped, filter-respecting
             # structures for a system (owner feedback round B).
             "get_system_structures": self._infra_get_system_structures,
+            # Chars overlay role filter (owner ask): the map's Chars ▾ menu lists
+            # these role labels and applies the picked one — both routed through
+            # fc_gui (which owns the role data) so map_tab stays fc_gui-free.
+            "get_char_filter_roles": self._get_char_filter_roles,
+            "apply_char_filter": self._apply_char_map_filter,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -6325,6 +6330,13 @@ class FCToolGUI:
 
     # ── Character Management Tab ──────────────────────────────────────────────
 
+    # Capability/role filter labels offered by the Characters-tab Filter dropdown
+    # AND surfaced on the map's Chars ▾ role menu (owner ask). Single source of
+    # truth so both stay in lock-step; the empty "no filter" entry is added only
+    # to the combobox, never exported as a role. Lower-cased these become the
+    # ``cap_key`` _char_matches_filter switches on ("hic/dictor" -> the dictor flag).
+    _CHAR_FILTER_ROLES = ["FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"]
+
     def _build_character_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Characters  ")
@@ -6356,7 +6368,7 @@ class FCToolGUI:
         self._char_filter_cap_var = tk.StringVar(value="")
         self._char_filter_cap = ttk.Combobox(
             filter_frame, textvariable=self._char_filter_cap_var,
-            values=["", "FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"],
+            values=[""] + self._CHAR_FILTER_ROLES,
             state="readonly", width=12,
         )
         self._char_filter_cap.pack(side=tk.LEFT, padx=5, pady=5)
@@ -6372,6 +6384,15 @@ class FCToolGUI:
         )
         self._char_filter_region.pack(side=tk.LEFT, padx=5, pady=5)
         self._char_filter_region.bind("<<ComboboxSelected>>", self._on_region_filter_changed)
+
+        # View on Map (owner ask): push the SELECTED capability filter to the map's
+        # Chars overlay and raise the Map tab. Disabled until a role is picked, so
+        # the option surfaces "after a filter has been selected"; synced from
+        # _on_cap_filter_changed / _clear_char_filter.
+        self._char_view_map_btn = ttk.Button(
+            filter_frame, text="View on Map", style="Dark.TButton",
+            state="disabled", command=self._view_char_filter_on_map)
+        self._char_view_map_btn.pack(side=tk.LEFT, padx=(10, 0), pady=5)
 
         ttk.Button(filter_frame, text="Clear", style="Dark.TButton",
                    command=self._clear_char_filter).pack(side=tk.LEFT, padx=10, pady=5)
@@ -7370,6 +7391,7 @@ class FCToolGUI:
         else:
             self._char_filter_region.config(state="disabled")
             self._char_filter_region_var.set("")
+        self._sync_view_on_map_btn()
         self._apply_char_filter()
 
     def _on_region_filter_changed(self, event=None):
@@ -7382,7 +7404,74 @@ class FCToolGUI:
         self._char_filter_region_var.set("")
         self._char_filter_region.config(state="disabled")
         self._char_filter_count_label.config(text="")
+        self._sync_view_on_map_btn()
         self._apply_char_filter()
+
+    def _sync_view_on_map_btn(self):
+        """Enable "View on Map" only once a capability/role is selected (owner ask:
+        the option appears "after a filter has been selected"). No-op if the button
+        was not built yet (defensive)."""
+        btn = getattr(self, "_char_view_map_btn", None)
+        if btn is None:
+            return
+        state = "normal" if self._char_filter_cap_var.get() else "disabled"
+        try:
+            btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _get_char_filter_roles(self) -> list[str]:
+        """The character-role filter labels the map's Chars ▾ menu lists — the same
+        capability set the Characters-tab Filter dropdown offers, minus the empty
+        "no filter" entry. Plain data so map_tab stays fc_gui-free."""
+        return list(self._CHAR_FILTER_ROLES)
+
+    def _char_names_for_role(self, role_label: str) -> frozenset:
+        """Character NAMES whose cached role/capability info matches ``role_label``
+        — the map Chars filter's match-set. Reuses _char_matches_filter with NO
+        region constraint so the set mirrors the Characters-tab capability filter
+        (region is a Characters-tab-only refinement). Names are the same stable key
+        _map_characters_fetch stamps on the overlay payload, so this frozenset
+        filters the map by simple membership. Empty when nothing matches (an honest
+        empty overlay). Reads the panels' cached _info, so it is a pure snapshot —
+        no ESI."""
+        cap_key = (role_label or "").lower()
+        names: set[str] = set()
+        for panel in getattr(self, "_char_panels", []) or []:
+            info = getattr(panel, "_info", None)
+            if not info:
+                continue
+            if self._char_matches_filter(info, cap_key, ""):
+                acct = getattr(panel, "_acct", None)
+                name = getattr(acct, "character_name", None) if acct else None
+                if name:
+                    names.add(name)
+        return frozenset(names)
+
+    def _apply_char_map_filter(self, role_label, switch_to_map: bool = False):
+        """Apply ``role_label`` as the map Chars overlay's session filter: compute
+        the matching character-name set (from cached role data) and push it to the
+        map via set_chars_filter. When ``switch_to_map`` is true (the Characters-tab
+        "View on Map" entry) also raise the Map tab. Injected into the map as the
+        ``apply_char_filter`` callback, where it is called with a single role label
+        (no tab switch — the user is already on the map). No-op if the map tab is
+        not built."""
+        mt = getattr(self, "map_tab", None)
+        if mt is None:
+            return
+        names = self._char_names_for_role(role_label)
+        mt.set_chars_filter(role_label, names)
+        if switch_to_map:
+            self._select_map_tab()
+
+    def _view_char_filter_on_map(self):
+        """Characters-tab "View on Map": push the currently-selected capability
+        filter to the map's Chars overlay and raise the Map tab. No-op when no
+        capability is selected (the button is disabled in that state anyway)."""
+        cap = self._char_filter_cap_var.get()
+        if not cap:
+            return
+        self._apply_char_map_filter(cap, switch_to_map=True)
 
     def _get_regions_for_capability(self, cap_key: str) -> set[str]:
         """Get all regions where a given capability exists across all characters."""

@@ -1116,6 +1116,25 @@ class MapTab:
                 self._sov_legend_btn.pack(side="left", padx=(0, 4))
                 self._attach_tooltip(self._sov_legend_btn,
                                      "Sov legend — top alliances by systems shown")
+            if _key == "chars":
+                # Role-filter affordance (owner ask): a "▾" microbutton right after
+                # the Chars toggle — SAME compact pattern as Sov / Infra / Threat ▾ —
+                # opening a themed menu of the host's character-filter roles (cyno,
+                # dread, …) plus "Clear filter". Applying a role restricts the
+                # magenta overlay to those pilots (see set_chars_filter). ALWAYS
+                # enabled: like Infra's, it is useful even while another surface set
+                # the filter, and the menu degrades cleanly when no roles callback
+                # is injected (standalone / tests). The roles + the apply action
+                # travel in as callbacks so this file stays fc_gui-free.
+                self._chars_menu_btn = tk.Button(
+                    bar, text="▾", command=self._show_chars_menu,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._chars_menu_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(
+                    self._chars_menu_btn,
+                    "Filter the Chars overlay by character role (cyno, dread, …)")
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
@@ -1129,6 +1148,29 @@ class MapTab:
         self.canvas.pack(side="left", fill="both", expand=True)
         self._img_item = self.canvas.create_image(0, 0, anchor="nw")
         self._photo = None                      # keep a ref or Tk drops the image
+        # --- Chars filter banner + session state (owner ask) ------------------
+        # A SESSION-scoped filter that narrows the magenta Chars overlay to a set
+        # of character NAMES the host computes from its role data (cyno, dread, …).
+        # _chars_filter_names is None => no filter (byte-identical to before); a
+        # frozenset (even empty) => an ACTIVE filter matched by simple membership.
+        # The slim themed banner below the toolbar announces the active filter and
+        # carries an "✕" to clear it. Created UNPACKED so an inactive filter has
+        # ZERO layout footprint; _sync_chars_banner packs it BEFORE the canvas so
+        # it reads as a strip under the toolbar, above the map body.
+        self._chars_filter_label: str | None = None
+        self._chars_filter_names: frozenset | None = None
+        self._chars_banner = tk.Frame(self.frame, bg=t["panel"])
+        self._chars_banner_label = tk.Label(
+            self._chars_banner, text="", bg=t["panel"], fg=t["accent"],
+            font=("Segoe UI", 9, "bold"), anchor="w")
+        self._chars_banner_label.pack(side="left", padx=(8, 4), pady=2)
+        self._chars_banner_x = tk.Button(
+            self._chars_banner, text="✕",
+            command=lambda: self.set_chars_filter(None),
+            bg=t["panel"], fg=t["fg"], activebackground=t["panel"],
+            activeforeground=t["accent"], relief="flat", borderwidth=0,
+            highlightthickness=0, padx=6, pady=0, cursor="hand2")
+        self._chars_banner_x.pack(side="right", padx=(4, 8), pady=2)
         # Transient threat-settings drawer (Task 34): a fixed-width themed panel
         # created hidden; _open/_close_threat_drawer pack/pack_forget it on the
         # right. State is NOT persisted (transient UI). pack_propagate(False)
@@ -1843,14 +1885,108 @@ class MapTab:
         """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
         per character currently in the hovered system, sorted by name (the stored
         snapshot is already name-sorted by _canonical_chars). None when no tracked
-        character is there. Gated on _layer_on("chars") by the hover engine."""
+        character is there. Honours the active session filter (a filtered-out
+        system contributes no section). Gated on _layer_on("chars") by the engine."""
         chars = self.state.chars
         if not chars:
             return None
         here = chars.get(sid)
         if not here:
             return None
+        here = self._chars_visible_occupants(here)      # session filter
+        if not here:
+            return None
         return [f"{name} — {ship}" for name, ship in here]
+
+    # ---- Chars session filter (owner ask) -------------------------------------
+    def _chars_visible_occupants(self, occ):
+        """Restrict a system's ``[(name, ship), …]`` occupant list to the active
+        session filter. No filter (names is None) -> the list UNCHANGED (byte-
+        identical to the pre-filter overlay). An active filter -> only the pilots
+        whose name is in the set (possibly the empty list -> the system draws no
+        marker, an honest empty match). Pure; cheap membership test."""
+        names = self._chars_filter_names
+        if names is None:
+            return occ
+        return [(n, s) for (n, s) in occ if n in names]
+
+    def set_chars_filter(self, label, names=None) -> None:
+        """Apply / clear the SESSION Chars-overlay filter (owner ask). ``label`` is
+        a human role name (e.g. "Cyno") and ``names`` the character-NAME frozenset
+        the host computed from its role data; the overlay then shows ONLY those
+        pilots (markers + hover), matched by simple membership on the poll payload
+        so the filter survives poll refreshes for free (names are stable keys).
+        ``set_chars_filter(None)`` clears it. Toggles the slim banner and repaints
+        the Tk overlay at once (no crisp re-render — a pure overlay change). An
+        empty ``names`` set with a non-None label is a VALID active filter that
+        honestly shows zero markers."""
+        if label is None:
+            self._chars_filter_label = None
+            self._chars_filter_names = None
+        else:
+            self._chars_filter_label = str(label)
+            self._chars_filter_names = frozenset(names or ())
+        self._sync_chars_banner()
+        self._redraw_overlays()
+
+    def _sync_chars_banner(self) -> None:
+        """Show / update / hide the "Custom filter active" banner to match the
+        current filter. Packed (BEFORE the canvas, so it reads as a strip under the
+        toolbar) only while a filter is active; pack_forgotten otherwise so an
+        inactive filter leaves ZERO layout footprint. Pluralises the pilot count."""
+        label = self._chars_filter_label
+        if label is None:
+            if self._chars_banner.winfo_manager():
+                self._chars_banner.pack_forget()
+            return
+        n = len(self._chars_filter_names or ())
+        self._chars_banner_label.config(
+            text=f"Custom filter active: {label}  "
+                 f"({n} {'pilot' if n == 1 else 'pilots'})")
+        if not self._chars_banner.winfo_manager():
+            self._chars_banner.pack(side="top", fill="x", before=self.canvas)
+
+    def _build_chars_menu(self) -> tk.Menu:
+        """Build (but do NOT post) the Chars ▾ role menu — a testable factory that
+        mirrors _build_empty_menu. One command per host-supplied filter role (each
+        applying that role via the injected ``apply_char_filter`` callback), then
+        "Clear filter" (enabled only while a filter is active). Degrades to a
+        single disabled "No character roles" row when the host injected no roles
+        (standalone / tests)."""
+        menu = self._make_menu(self.frame)
+        roles_cb = self.callbacks.get("get_char_filter_roles")
+        apply_cb = self.callbacks.get("apply_char_filter")
+        roles = []
+        if callable(roles_cb):
+            try:
+                roles = list(roles_cb() or [])
+            except Exception:
+                roles = []
+        if roles and callable(apply_cb):
+            for role in roles:
+                menu.add_command(label=str(role),
+                                 command=lambda r=role: apply_cb(r))
+        else:
+            menu.add_command(label="No character roles", state="disabled")
+        menu.add_separator()
+        menu.add_command(
+            label="Clear filter",
+            command=lambda: self.set_chars_filter(None),
+            state=("normal" if self._chars_filter_label is not None
+                   else "disabled"))
+        return menu
+
+    def _show_chars_menu(self) -> None:
+        """Open the Chars ▾ role menu just under its microbutton. Mirrors the
+        sov-legend anchoring; grab_release matches the app's other tk_popup menus."""
+        menu = self._build_chars_menu()
+        try:
+            btn = self._chars_menu_btn
+            x = btn.winfo_rootx()
+            y = btn.winfo_rooty() + btn.winfo_height() + 2
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
 
     # ---- intel pulse layer (Task 31) ------------------------------------------
     def add_intel_pulse(self, system_id_or_name, now=None) -> None:
@@ -2505,13 +2641,25 @@ class MapTab:
         it in ``self._toolbar_tooltips`` (owner ask 2026-07-12). The tip appears
         ~500 ms after the cursor settles on the widget (never on a fly-over),
         reuses the single ``self._tooltip`` slot, and is dismissed instantly on
-        <Leave>, ANY mouse press, or the widget's <Destroy> -- so it can never sit
-        between the cursor and a click. ``add='+'`` so it never clobbers the
-        widget's own bindings, and the timer is only armed on <Enter>, so an idle
-        toolbar (cursor elsewhere) costs nothing. Empty text is a no-op. Shared by
-        every toolbar control -- the layer checkboxes, the search box, and the
-        Sov / Infra / Threat ▾ drawer buttons. The registry lets a test walk the
-        toolbar and assert every control is documented (fails if a new one isn't)."""
+        <Leave> or ANY mouse press -- so it can never sit between the cursor and a
+        click. ``add='+'`` so it never clobbers the widget's own bindings, and the
+        timer is only armed on <Enter>, so an idle toolbar (cursor elsewhere) costs
+        nothing. Empty text is a no-op. Shared by every toolbar control -- the layer
+        checkboxes, the search box, and the Sov / Infra / Threat / Chars ▾ drawer
+        buttons. The registry lets a test walk the toolbar and assert every control
+        is documented (fails if a new one isn't).
+
+        NOTE: we deliberately do NOT bind ``<Destroy>``. The tip is a child
+        ``Toplevel`` of ``widget`` (see _show_tooltip), so Tk cascades its destroy
+        automatically; a per-widget ``<Destroy>`` handler would only add a
+        ``self``-capturing Tcl command that Tk does NOT delete when a parent ROOT
+        is torn down without per-child .destroy() -- leaking the MapTab (and its Tk
+        Variables) past the interpreter. That is harmless with the single
+        long-lived MapTab of production, but across a test that spins up many
+        tk.Tk() roots the retained Variables' late __del__ ("main thread is not in
+        main loop") corrupts a later interpreter. Dropping the bind removes the leak
+        with no behaviour loss (a live tip over a widget being destroyed dies with
+        its parent, and the next _show/_hide_tooltip clears any stale state)."""
         if not text:
             return
         self._toolbar_tooltips[widget] = text
@@ -2520,7 +2668,6 @@ class MapTab:
                     add="+")
         widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
         widget.bind("<ButtonPress>", lambda _e: self._hide_tooltip(), add="+")
-        widget.bind("<Destroy>", lambda _e: self._hide_tooltip(), add="+")
 
     def _tooltip_schedule(self, widget, text: str) -> None:
         """Arm the dwell timer for ``widget``'s tip, first tearing down any pending
@@ -2808,6 +2955,9 @@ class MapTab:
         # but-empty layer performs zero canvas ops here.
         if self._layer_on("chars") and st.chars:
             for sid, occ in st.chars.items():
+                occ = self._chars_visible_occupants(occ)   # session filter
+                if not occ:                                # filtered out entirely
+                    continue
                 p = project(sid)
                 if p is None:
                     continue
