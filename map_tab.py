@@ -68,6 +68,14 @@ BG_HEX = "#0a0a14"
 # blue is derived from mr.BRIDGE_BLUE so the two stay in lockstep.
 ROUTE_GOLD = "#ffcc44"
 BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
+# Route-overlay Ansiblex-hop colour: a LIGHTENED tint of the bridge-layer blue,
+# drawn BRIGHTER and WIDER than the resting bridge glow (map_render._draw_bridges
+# lays down up to a 4px line in dim(BRIDGE_BLUE, …)). A route that RIDES a bridge
+# was previously painted in BRIDGE_BLUE_HEX at width 2 -- the SAME hue, NARROWER
+# than the glow beneath it -- so it vanished blue-on-blue and the owner saw "no
+# highlight" over the Ansiblex. Same #3A86FF family, so it still reads as a bridge.
+ROUTE_BRIDGE_HEX = "#%02x%02x%02x" % tuple(
+    min(255, round(c + (255 - c) * 0.45)) for c in mr.BRIDGE_BLUE)
 
 # Kill-heat layer (Task 30). Capital-kill markers reuse a red hex derived from
 # the base-layer HEAT_COLOR family. The periodic decay refresh re-requests a
@@ -2578,13 +2586,18 @@ class MapTab:
                 if pa is None or pb is None or not (pa[2] or pb[2]):
                     continue
                 if kind == "bridge":
+                    # Brighter + wider than the resting bridge glow (map_render
+                    # _draw_bridges draws up to 4px in dim(BRIDGE_BLUE, …)) so a
+                    # route RIDING an Ansiblex reads instantly instead of vanishing
+                    # blue-on-blue over the bridge line it sits on. Still the
+                    # #3A86FF family + dashed, so it stays legible as a bridge hop.
                     canvas.create_line(pa[0], pa[1], pb[0], pb[1],
-                                       fill=BRIDGE_BLUE_HEX, width=2,
-                                       dash=(6, 2, 2, 2), tags="ov_route")
+                                       fill=ROUTE_BRIDGE_HEX, width=5,
+                                       dash=(10, 6), tags="ov_route")
                     if pa[2]:
-                        self._draw_diamond(pa[0], pa[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                        self._draw_diamond(pa[0], pa[1], 6, ROUTE_BRIDGE_HEX, "ov_route")
                     if pb[2]:
-                        self._draw_diamond(pb[0], pb[1], 5, BRIDGE_BLUE_HEX, "ov_route")
+                        self._draw_diamond(pb[0], pb[1], 6, ROUTE_BRIDGE_HEX, "ov_route")
                 else:
                     canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=ROUTE_GOLD,
                                        width=2, dash=(6, 4), tags="ov_route")
