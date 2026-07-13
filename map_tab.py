@@ -131,6 +131,23 @@ KILLPING_STRUCT_MS = 1000.0 # cull + reproject + stage-flip cadence (structure o
 # queue, and dies -- nothing to join on hide.
 SOV_REFRESH_S = 3600.0
 
+# Characters overlay (owner ask: "see where all your characters are"). A 60 s
+# poll enumerates the tool's AUTHED characters (fc_gui injects the fetch -- the
+# map holds NO auth/token logic, exactly like it holds no infra logic) and marks
+# each occupied system. MAGENTA is a hue FREE in the current palette: distinct
+# from cyan fleet (#00d4ff), the red staging/capital/ping family (#ff5a76 /
+# #ff3b30 / #ff1744), amber intel (#ffd166), green range (#59d98c), blue-purple
+# threat (map_render.THREAT_PURPLE #8e5bd6), gold route (#ffcc44) and blue
+# bridges. Drawn as a filled SQUARE (no other overlay uses an axis-aligned
+# square -- fleet is a circle, staging a diamond, the pulses are rings) so the
+# shape reads apart from the cyan fleet pins at a glance too. The poll mirrors
+# the Task-30 ambient daemon EXACTLY (map-chars Event.wait thread, ~2 s first
+# fetch, prompt join on hide -> no leak) but runs ONLY while the tab is shown AND
+# the layer is on, so idle cost is nil.
+CHARS_MAGENTA = "#ff44e1"
+CHARS_POLL_S = 60.0
+CHARS_START_DELAY_S = 2.0
+
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
 # live overlay object), _layer_on("sov") directly controls both the fetch and the
@@ -366,6 +383,31 @@ def _request_sig(req: dict) -> tuple:
             req.get("heat"), req.get("sov"), req.get("infra"))
 
 
+def _canonical_chars(payload) -> tuple:
+    """Normalise a characters_fetch payload ({system_id: [(char, ship), ...]})
+    into a sorted, hashable tuple ((system_id, ((char, ship), ...)), ...) with the
+    per-system pairs sorted by character name. Mirrors the ambient/sov canonical
+    idiom so the worker posts a frozen, thread-safe snapshot (no dict aliased
+    across the poll thread and the main thread) and both the markers and the
+    name-sorted hover read a deterministic order. Empty / malformed systems are
+    dropped. Tolerant of a bad payload (returns () rather than raising) so a
+    broken fetch never wedges the drain."""
+    out = []
+    try:
+        items = payload.items()
+    except AttributeError:
+        return ()
+    for sid, pairs in items:
+        try:
+            sp = tuple(sorted((str(n), str(s)) for n, s in (pairs or ())))
+        except (TypeError, ValueError):
+            continue
+        if sp:
+            out.append((int(sid), sp))
+    out.sort()
+    return tuple(out)
+
+
 class MapTabState:
     """Pure camera/gesture/generation bookkeeping (headless-testable)."""
 
@@ -449,6 +491,13 @@ class MapTabState:
         # checkbutton; the popover writes categories / stale_only. A deepcopy is
         # handed to the host's get_infrastructure callback on every change.
         self.infra_filters: dict = copy.deepcopy(INFRA_FILTER_DEFAULTS)
+        # --- characters overlay ---
+        # {system_id: [(char_name, ship_type_name), ...]} for the authed
+        # characters, applied on the MAIN thread from the result queue (the
+        # map-chars poll posts a canonical snapshot). A pure Tk overlay (like
+        # fleet) -- NOT part of the render request/sig; _redraw_overlays paints a
+        # magenta square per occupied system. Empty until the first poll drains.
+        self.chars: dict[int, list] = {}
 
     def tint_spec(self):
         import map_render as _mr
@@ -760,7 +809,7 @@ class MapTab:
                  cfg: dict | None = None, save_cfg=None, callbacks: dict | None = None,
                  autocomplete_cls=None, theme: dict | None = None,
                  telemetry: bool = False, route_fn=None, ambient_fetch=None,
-                 sov_fetch=None, names_fetch=None) -> None:
+                 sov_fetch=None, names_fetch=None, characters_fetch=None) -> None:
         self.cfg = cfg or {}
         self.save_cfg = save_cfg or (lambda d: None)
         self.callbacks = callbacks or {}
@@ -778,6 +827,13 @@ class MapTab:
         # one-shot fetch lifecycle runs with no network.
         self._sov_fetch = sov_fetch or self._fetch_sov_map
         self._names_fetch = names_fetch or self._fetch_alliance_names
+        # Injectable AUTHED-characters fetcher (owner ask). Unlike the ambient/sov
+        # fetchers (public endpoints the map hits itself), enumerating the tool's
+        # characters needs their per-character tokens, which live in fc_gui -- so
+        # this is ALWAYS injected by the host (fc_gui._map_characters_fetch) and
+        # defaults to a no-op returning {} for standalone/tests (no auth -> no
+        # characters). Called on the map-chars poll thread -> MUST stay Tk-free.
+        self._characters_fetch = characters_fetch or (lambda: {})
         # App-palette theme for the menus + toolbar. Merging over _DEFAULT_THEME
         # keeps standalone identical and lets a caller pass a partial dict. fc_gui
         # injects its BG_DARK/BG_PANEL/... constants so the map matches the app.
@@ -857,6 +913,10 @@ class MapTab:
             # friendly-structure count badges stay dark until the user enables the
             # layer AND the host pushes badges via set_infrastructure.
             "infra": tk.BooleanVar(value=bool(_layers.get("infra", False))),
+            # Characters overlay (owner ask): ON by default -- magenta markers at
+            # each authed character's system. The poll only runs while the tab is
+            # shown, so a visible-by-default layer still costs nothing when idle.
+            "chars": tk.BooleanVar(value=bool(_layers.get("chars", True))),
         }
         # Infra filter popover state (Task 5): per-category + stale-only vars
         # mirroring INFRA_FILTER_DEFAULTS (self.state is built later, so seed from
@@ -880,7 +940,8 @@ class MapTab:
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
-                            ("sov", "Sov"), ("infra", "Infra")):
+                            ("sov", "Sov"), ("infra", "Infra"),
+                            ("chars", "Chars")):
             _cb = tk.Checkbutton(bar, text=_text, variable=self._layer_vars[_key],
                                  bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                                  activebackground=t["bg"], activeforeground=t["accent"],
@@ -1048,6 +1109,15 @@ class MapTab:
         self._ambient_stop = threading.Event()
         self._last_heat_refresh_ms = 0.0
 
+        # --- characters overlay poll (map-chars daemon) -------------------------
+        # Same no-leak contract as the ambient loop (Task 22): a daemon started on
+        # show / STOPPED on hide, its stop Event letting on_hidden join it promptly.
+        # UNLIKE ambient it also starts/stops on the toolbar toggle and runs ONLY
+        # while _layer_on("chars") -- so a hidden tab or a disabled layer keeps zero
+        # poll threads. state.chars survives on the state object across a hide/show.
+        self._chars_thread: threading.Thread | None = None
+        self._chars_stop = threading.Event()
+
         # --- sovereignty tint layer lazy fetch (Task 33) ------------------------
         # OFF by default -> ZERO network until enabled. When the layer is toggled
         # on (or is on at show time) and the data is stale, a ONE-SHOT daemon
@@ -1109,6 +1179,10 @@ class MapTab:
         # them into the pushed badges' "type_counts"). Registered here because the
         # infra badge state (state.infra) lives on this tab.
         self.register_hover_provider("infra", self._infra_hover_lines)
+        # Characters overlay hover (owner ask): "CharName — ShipType" per character
+        # in the hovered system, gated on _layer_on("chars") by the engine and
+        # composed alongside the infra section.
+        self.register_hover_provider("chars", self._chars_hover_lines)
 
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
@@ -1187,6 +1261,10 @@ class MapTab:
         self._schedule_tick()
         self._schedule_stall_sentinel()          # Task 27: main-loop stall watchdog
         self._start_ambient_loop()               # Task 30: hourly ESI ambient heat
+        # Characters overlay: start the 60 s poll ONLY if the layer is on at show
+        # time (ON by default). Idempotent; the toolbar toggle starts/stops it too.
+        if self._layer_on("chars"):
+            self._start_chars_loop()
         # Task 33: fetch the sov map ONLY if the layer is on at show time (OFF by
         # default -> no-op -> zero network). The one-shot thread dies after one
         # fetch; an in-flight fetch across a hide/show is not double-spawned.
@@ -1229,6 +1307,9 @@ class MapTab:
         # a hidden tab must not keep an hourly fetch daemon alive. on_shown
         # restarts it; kill_heat/ambient_heat state survives on the state object.
         self.shutdown_ambient_loop()
+        # Characters overlay: stop the poll daemon too (same no-leak rule). on_shown
+        # restarts it when the layer is on; state.chars survives on the state object.
+        self.shutdown_chars_loop()
         # Task 33: dismiss any open sov legend popup (the one-shot sov FETCH thread
         # is not a loop -> nothing to stop; sov_map/sov_names survive on state, and
         # an in-flight fetch's _sov_inflight flag is intentionally left set so a
@@ -1546,6 +1627,83 @@ class MapTab:
             self.state.force_dirty()
             self._request_crisp()
             self._redraw_overlays()
+
+    # ---- characters overlay poll ----------------------------------------------
+    def _start_chars_loop(self) -> None:
+        """Start the map-chars poll thread. Idempotent: a no-op when the layer is
+        off or a loop is already running. Mirrors _start_ambient_loop; the caller
+        (on_shown / the toolbar toggle) has already confirmed the tab is shown."""
+        if not self._layer_on("chars"):
+            return
+        if self._chars_thread is not None and self._chars_thread.is_alive():
+            return
+        self._chars_stop.clear()
+        self._chars_thread = threading.Thread(
+            target=self._chars_loop, daemon=True, name="map-chars")
+        self._chars_thread.start()
+
+    def _chars_loop(self) -> None:
+        """Daemon body: after a short first-fetch delay, fetch the authed
+        characters' locations+ships and post a canonical snapshot onto the result
+        queue, then repeat every CHARS_POLL_S. The stop Event is WAITED on (not
+        slept) for both the initial delay and the interval so shutdown_chars_loop
+        wakes it the instant the event is set -- no leak past a hide/toggle-off.
+        The fetch silent-degrades (per-character inside fc_gui; a total failure
+        returns None here) -> a None result is simply not posted, leaving the last
+        snapshot on screen; an empty dict IS posted so markers clear when every
+        character has logged off. Runs on this thread only -> the injected fetch
+        must be Tk-free."""
+        stop = self._chars_stop
+        if stop.wait(CHARS_START_DELAY_S):
+            return                               # stopped during the initial delay
+        while not stop.is_set():
+            try:
+                payload = self._characters_fetch()
+            except Exception as exc:             # never let the loop die on a fetch
+                print(f"[MAP] characters loop error: {exc}")
+                payload = None
+            if payload is not None and not stop.is_set():
+                # A stale put after a hide is harmless -- the queue just holds it
+                # until the next show drains it (and on_hidden left state.chars as-is).
+                self._result_q.put(("chars", _canonical_chars(payload)))
+            if stop.wait(CHARS_POLL_S):
+                return                           # stopped during the interval wait
+
+    def shutdown_chars_loop(self) -> None:
+        """Stop the chars poll and join it briefly so a hidden tab / disabled layer
+        leaks no daemon (Task 22 lesson). Idempotent: safe when no loop is running.
+        Setting the Event wakes a loop blocked in stop.wait() immediately; the join
+        only has to outlast an in-flight sweep, then the handle is dropped so a
+        later _start_chars_loop spawns a fresh thread."""
+        self._chars_stop.set()
+        t = self._chars_thread
+        if t is not None:
+            t.join(timeout=2.0)
+            self._chars_thread = None
+
+    def _apply_chars(self, pairs) -> None:
+        """Apply a worker-fetched characters snapshot on the MAIN thread (drained
+        from the result queue). ``pairs`` is the canonical ((sid, ((char, ship),
+        ...)), ...) tuple the poll posted. Rebuilds state.chars and -- when the
+        layer is on -- repaints the overlays so the magenta markers track the
+        latest positions (an empty tuple clears them). Pure Tk overlay: no crisp
+        re-render (the base bitmap is unaffected)."""
+        self.state.chars = {int(sid): list(sp) for sid, sp in pairs}
+        if self._layer_on("chars"):
+            self._redraw_overlays()
+
+    def _chars_hover_lines(self, sid) -> list[str] | None:
+        """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
+        per character currently in the hovered system, sorted by name (the stored
+        snapshot is already name-sorted by _canonical_chars). None when no tracked
+        character is there. Gated on _layer_on("chars") by the hover engine."""
+        chars = self.state.chars
+        if not chars:
+            return None
+        here = chars.get(sid)
+        if not here:
+            return None
+        return [f"{name} — {ship}" for name, ship in here]
 
     # ---- intel pulse layer (Task 31) ------------------------------------------
     def add_intel_pulse(self, system_id_or_name, now=None) -> None:
@@ -2199,7 +2357,7 @@ class MapTab:
         canvas = self.canvas
         _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
                  "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
-                 "ov_killping")
+                 "ov_killping", "ov_chars")
         for tag in _tags:
             canvas.delete(tag)
         # Task 31 / Task 36: the ov_intel + ov_killping items were just deleted ->
@@ -2328,6 +2486,26 @@ class MapTab:
                                        outline="#ffffff", width=2, tags="ov_own")
                     canvas.create_oval(sx - 2, sy - 2, sx + 2, sy + 2,
                                        fill="#ffffff", outline="", tags="ov_own")
+        # -- characters overlay (owner ask): a magenta filled SQUARE at each system
+        # holding an authed character (a shape + hue both free in the palette --
+        # distinct from the cyan fleet circles), with a count label when more than
+        # one character is there; the hover tooltip names each character + ship.
+        # Pure Tk -> crisp during gestures. EMPTY-FAST-PATH: the whole block is
+        # skipped when the layer is off OR no character is tracked, so an enabled-
+        # but-empty layer performs zero canvas ops here.
+        if self._layer_on("chars") and st.chars:
+            for sid, occ in st.chars.items():
+                p = project(sid)
+                if p is None:
+                    continue
+                sx, sy = p
+                canvas.create_rectangle(sx - 5, sy - 5, sx + 5, sy + 5,
+                                        fill=CHARS_MAGENTA, outline="#ffffff",
+                                        width=1, tags="ov_chars")
+                if len(occ) > 1:
+                    canvas.create_text(sx + 9, sy, anchor="w", text=str(len(occ)),
+                                       fill=CHARS_MAGENTA, font=("Segoe UI", 9),
+                                       tags="ov_chars")
         # -- capital-kill markers (Task 30): a double-ring red marker at systems
         # with a capital kill in the last ~30 min. Gated by the heat layer (they
         # accompany the base-layer heat under-glow) and drawn LAST so they sit on
@@ -2965,6 +3143,7 @@ class MapTab:
         latest_ambient = None
         latest_sov = None
         latest_sov_names = None
+        latest_chars = None
         try:
             while True:
                 item = self._result_q.get_nowait()
@@ -2978,6 +3157,8 @@ class MapTab:
                     latest_sov = item            # Task 33: sov map (one-shot fetch)
                 elif item[0] == "sov_names":
                     latest_sov_names = item       # Task 33: alliance-name legend data
+                elif item[0] == "chars":
+                    latest_chars = item          # characters overlay (60 s poll)
                 else:
                     latest_frame = item          # 'crisp' or 'gesture' (latest-wins)
         except queue.Empty:
@@ -3000,6 +3181,8 @@ class MapTab:
             self._apply_sov_names(latest_sov_names[1])
         if latest_sov is not None:
             self._apply_sov(latest_sov[1])
+        if latest_chars is not None:
+            self._apply_chars(latest_chars[1])
 
     # ---- events --------------------------------------------------------------------
     def _on_mousewheel(self, event) -> str:
@@ -3429,6 +3612,9 @@ class MapTab:
         # Infra chips (Task 5): OFF by default; the toolbar "▾" hosts the filters.
         menu.add_checkbutton(label="Infra", variable=self._layer_vars["infra"],
                              command=lambda: self._on_layer_toggle("infra"))
+        # Characters overlay (owner ask): ON by default; magenta markers + hover.
+        menu.add_checkbutton(label="Chars", variable=self._layer_vars["chars"],
+                             command=lambda: self._on_layer_toggle("chars"))
         if self.state.route_dest is not None:      # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         # Manage infrastructure… (Task 5): open the manager for the whole DB.
@@ -3511,6 +3697,16 @@ class MapTab:
             self._emit_infra_filters()
             self.state.force_dirty()
             self._request_crisp()
+            self._redraw_overlays()
+        elif key == "chars":
+            # Characters overlay: match the 60 s poll to the new layer state. Start
+            # only while the tab is shown (on_shown restarts it after a hidden
+            # toggle-on); stop as soon as it is turned off. A pure Tk overlay -> just
+            # repaint (no crisp) so the magenta markers appear now / clear at once.
+            if self._layer_on("chars") and self._visible:
+                self._start_chars_loop()
+            else:
+                self.shutdown_chars_loop()
             self._redraw_overlays()
         else:
             self._redraw_overlays()

@@ -74,7 +74,11 @@ DEFAULT_CONFIG = {
                    "kill_pings": True,
                    # Sovereignty tint (Task 33): OFF by default -- the palette-noise
                    # call is the owner's. Enabling it lazily fetches ESI sov data.
-                   "sov": False},
+                   "sov": False,
+                   # Characters overlay (owner ask): magenta markers at each authed
+                   # character's system. ON by default -- the 60 s poll runs ONLY
+                   # while the Map tab is shown, so idle cost is nil.
+                   "chars": True},
         # Kill-heat layer (Task 30): hourly ESI ambient kills feed a LOW heat band
         # under the live zkill decay-heat. OWNER-APPROVED 2026-07-12 ("Ok to make 2
         # calls per hour") -> ON by default. Set False to run zkill-only (no ESI).

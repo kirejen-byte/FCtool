@@ -5528,6 +5528,10 @@ class FCToolGUI:
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
             autocomplete_cls=AutocompleteEntry,
+            # Characters overlay (owner ask): the map holds no auth, so the host
+            # injects the authed-character location/ship sweep (runs on the map's
+            # own poll thread; see _map_characters_fetch).
+            characters_fetch=self._map_characters_fetch,
             # Match the map context menus + toolbar to the app palette (owner
             # request 2026-07-10). map_tab must not import fc_gui, so the
             # constants travel in as a plain dict.
@@ -13070,6 +13074,56 @@ class FCToolGUI:
         for key, val in DEFAULT_CONFIG["map"].items():
             cfg.setdefault(key, val if not isinstance(val, dict) else dict(val))
         return cfg
+
+    def _map_characters_fetch(self) -> dict:
+        """Enumerate the tool's AUTHED characters for the map's Characters overlay:
+        return ``{solar_system_id: [(character_name, ship_type_name), ...]}``.
+
+        Injected into MapTab as ``characters_fetch`` and called on the map's
+        ``map-chars`` poll thread (NOT the UI thread) -> touches NO Tk. The
+        authoritative enumeration is ``self.esi_accounts`` (the list the Characters
+        tab renders; each entry is an ``ESIAuth`` holding that character's own
+        token). Per character it uses the house ESI pattern via the account's own
+        methods (``ESIAuth.get_location`` / ``get_ship_type`` -> ``esi_get`` ->
+        ``rate_limit('esi')`` + auth header + 10 s timeout) and SILENT-DEGRADES per
+        character: an unauthenticated account, a missing scope, an HTTP error, or
+        any exception simply skips that character so one broken token never kills
+        the sweep. Ship TYPE names resolve through the shared OFFLINE
+        ``self.type_catalog`` (SDE-bundled ``fit_types.json`` -> no network for
+        known hulls; its permanent in-memory + disk cache backs the rare ESI
+        fallback), so a sweep issues at most the two location/ship calls per
+        character. A snapshot of ``esi_accounts`` is taken first so a concurrent
+        connect/disconnect/re-auth on the UI thread can't mutate the list mid-sweep."""
+        out: dict[int, list] = {}
+        accounts = list(getattr(self, "esi_accounts", None) or ())
+        if not accounts:
+            return out
+        catalog = getattr(self, "type_catalog", None)
+        for acct in accounts:
+            try:
+                if not getattr(acct, "is_authenticated", False):
+                    continue                       # not signed in -> nothing to show
+                loc = acct.get_location()
+                if not loc:
+                    continue                       # no scope / HTTP error -> skip char
+                sid = loc.get("solar_system_id")
+                if not sid:
+                    continue
+                ship_name = "Unknown ship"
+                ship = acct.get_ship_type()        # None when docked-privacy/no scope
+                if ship:
+                    tid = ship.get("ship_type_id")
+                    if tid and catalog is not None:
+                        resolved = catalog.resolve_name(tid)
+                        if resolved:
+                            ship_name = resolved
+                name = getattr(acct, "character_name", None) or "Unknown"
+                out.setdefault(int(sid), []).append((name, ship_name))
+            except Exception as exc:
+                # One character's failure must never abort the whole sweep.
+                print(f"[MAP] characters fetch: skipping an account: {exc}")
+                continue
+        return out
 
     @staticmethod
     def _overlay_poll_plan(names, last, now, online_ok):
