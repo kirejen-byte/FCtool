@@ -999,7 +999,6 @@ class MapTab:
             "threat": "Purple shade over systems inside hostile jump/bridge range",
             "bridges": "Your Ansiblex gates as blue lines",
             "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
-            "heat": "Red-orange glow where kills are happening (live zkill + hourly baseline)",
             "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
             "kill_pings": "Radar bursts for zkill reports that match your alert settings",
             "sov": "Dim alliance-color wash over sovereign space",
@@ -1008,7 +1007,7 @@ class MapTab:
         }
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
-                            ("route", "Route"), ("heat", "Heat"),
+                            ("route", "Route"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
                             ("sov", "Sov"), ("infra", "Infra"),
                             ("chars", "Chars")):
@@ -3838,8 +3837,6 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("bridges"))
         menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
                              command=lambda: self._on_layer_toggle("route"))
-        menu.add_checkbutton(label="Heat", variable=self._layer_vars["heat"],
-                             command=lambda: self._on_layer_toggle("heat"))
         menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
                              command=lambda: self._on_layer_toggle("intel"))
         # Kill pings (Task 36): discrete zkill-alert radar bursts; ON by default.
