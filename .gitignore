@@ -43,6 +43,9 @@ fctool.log.*
 # Misc
 *.msi
 
+# Local release archive (release zips + notes; moved out of the repo root 2026-07-12)
+releases/
+
 # PyInstaller
 build/
 dist/
@@ -61,6 +64,7 @@ CLAUDE.md
 # AI-agent dev artifacts (local only)
 docs/superpowers/
 docs/eve_reference/
+docs/agents/
 gamelog_monitor_state.json
 
 # Test suite: kept on disk for local TDD, not committed/published (owner preference)
