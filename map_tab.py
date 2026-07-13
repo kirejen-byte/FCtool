@@ -469,6 +469,10 @@ class MapTabState:
         # --- overlay layer state (Phase D) ---
         self.range_overlay = None
         self.threat_set = None
+        # Friendly-staging PROJECTION halo (owner ask): the SECOND, blue halo over the
+        # jump/bridge reach of your OWN stagings. None = off/empty (byte-identical to
+        # no friendly wash). Independent of threat_set -- both travel in one TintSpec.
+        self.friendly_threat_set = None
         self.fleet: dict[int, int] = {}
         self.friendly_staging: set[int] = set()
         self.hostile_staging: set[int] = set()
@@ -539,8 +543,11 @@ class MapTabState:
     def tint_spec(self):
         import map_render as _mr
         bright = self.range_overlay.bright_set() if self.range_overlay else None
-        return _mr.TintSpec(bright=bright, halo=self.threat_set) \
-            if (bright is not None or self.threat_set is not None) else None
+        halo = self.threat_set
+        friendly = self.friendly_threat_set
+        if bright is None and halo is None and friendly is None:
+            return None                          # all-None -> byte-identical to no tint
+        return _mr.TintSpec(bright=bright, halo=halo, friendly=friendly)
 
     # -- model / camera -------------------------------------------------------
     def attach_model(self, model) -> None:
@@ -670,6 +677,25 @@ class MapTabState:
         systems = self.model.systems if self.model is not None else {}
         keep: set[int] = set()
         for sid in self.hostile_staging:
+            s = systems.get(sid)
+            if s is not None and s.name in excluded:
+                continue                         # excluded by name
+            keep.add(sid)                        # included (or name unknown)
+        return keep
+
+    def selected_friendly_staging(self, excluded_names=()) -> set[int]:
+        """Friendly-staging ids that CONTRIBUTE to the friendly projection halo: the
+        full ``friendly_staging`` set minus those whose display name is excluded.
+        Mirrors ``selected_hostile_staging`` EXACTLY -- exclusions persist by NAME in
+        ``cfg["threat_friendly_excluded"]``, and an id with no model record (name
+        unknown) can't match an exclusion so it stays INCLUDED (new/unknown friendly
+        staging defaults to contributing). Pure / headless-testable."""
+        excluded = set(excluded_names or ())
+        if not excluded:
+            return set(self.friendly_staging)
+        systems = self.model.systems if self.model is not None else {}
+        keep: set[int] = set()
+        for sid in self.friendly_staging:
             s = systems.get(sid)
             if s is not None and s.name in excluded:
                 continue                         # excluded by name
@@ -1055,7 +1081,8 @@ class MapTab:
                 self._threat_drawer_btn.pack(side="left", padx=(0, 4))
                 self._attach_tooltip(
                     self._threat_drawer_btn,
-                    "Threat settings — ship class and which hostile stagings project")
+                    "Threat settings — ship class, hostile (purple) + friendly "
+                    "(blue) staging projections")
             if _key == "infra":
                 # Filter affordance (Task 5): a "▾" microbutton right after the
                 # Infra toggle opening the borderless filter popover (per-category
@@ -1106,6 +1133,17 @@ class MapTab:
         self._threat_drawer_open = False
         self._threat_rows = None                 # staging-row container (built on open)
         self._threat_staging_vars: dict[str, tk.BooleanVar] = {}   # name -> included?
+        # Friendly-staging PROJECTION (owner ask): a SECOND, BLUE halo over the reach
+        # of your OWN stagings, opt-in below the hostile block in the SAME drawer. The
+        # master enabled-state persists in cfg["threat_friendly_enabled"] (default OFF
+        # -- a new visual the owner opts into); a PERSISTENT var mirrors it (like
+        # _layer_vars["threat"] does for the hostile master) so a recompute can read the
+        # state even while the drawer is closed. The ship-class picker is SHARED -- one
+        # class drives both halos -- so only the master + per-staging rows live here.
+        self._friendly_master_var = tk.BooleanVar(
+            value=bool(self.cfg.get("threat_friendly_enabled", False)))
+        self._friendly_rows = None               # friendly staging-row container
+        self._friendly_staging_vars: dict[str, tk.BooleanVar] = {}  # name -> included?
 
         self.state = MapTabState(vw=800, vh=600)
         # Sync the infra layer's enabled flag from its toolbar var (OFF by default);
@@ -1443,6 +1481,7 @@ class MapTab:
         self.state.hostile_staging = set(hostile_ids or ())
         self._redraw_overlays()
         self._rebuild_threat_staging_rows()      # keep the drawer's rows in sync
+        self._rebuild_friendly_staging_rows()    # ...incl. the friendly-projection rows
 
     def apply_range_overlay(self, overlay) -> None:
         self.state.range_overlay = overlay          # base-layer change:
@@ -1463,6 +1502,16 @@ class MapTab:
 
     def set_threat(self, threat_set) -> None:
         self.state.threat_set = threat_set          # None clears
+        self.state.force_dirty()
+        self._request_crisp()
+        self._redraw_overlays()
+
+    def set_friendly_threat(self, friendly_set) -> None:
+        """Apply the friendly-staging projection halo (owner ask). Mirrors
+        ``set_threat`` -- stores the frozenset (None clears), forces a settle
+        re-render so the blue wash is (re)painted into the base bitmap, and repaints
+        the Tk overlays. The halo travels alongside the hostile one in one TintSpec."""
+        self.state.friendly_threat_set = friendly_set   # None clears
         self.state.force_dirty()
         self._request_crisp()
         self._redraw_overlays()
@@ -3395,7 +3444,8 @@ class MapTab:
     def _drain_results(self) -> None:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
-        ms, cam), ('threat', frozenset), ('route', tuple), ('ambient', tuple),
+        ms, cam), ('threat', frozenset), ('friendly_threat', frozenset),
+        ('route', tuple), ('ambient', tuple),
         ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
@@ -3407,6 +3457,7 @@ class MapTab:
         gesture take different apply paths (sig vs base-image realignment)."""
         latest_frame = None
         latest_threat = None
+        latest_friendly_threat = None
         latest_route = None
         latest_ambient = None
         latest_sov = None
@@ -3417,6 +3468,8 @@ class MapTab:
                 item = self._result_q.get_nowait()
                 if item[0] == "threat":
                     latest_threat = item
+                elif item[0] == "friendly_threat":
+                    latest_friendly_threat = item
                 elif item[0] == "route":
                     latest_route = item
                 elif item[0] == "ambient":
@@ -3438,6 +3491,8 @@ class MapTab:
                 self._apply_gesture_frame(*latest_frame[1:])
         if latest_threat is not None:
             self.set_threat(latest_threat[1])
+        if latest_friendly_threat is not None:
+            self.set_friendly_threat(latest_friendly_threat[1])
         if latest_route is not None:
             self._apply_route(latest_route[1])
         if latest_ambient is not None:
@@ -3920,6 +3975,7 @@ class MapTab:
         self.cfg["threat_ship"] = self._strip_ly_suffix(label)   # store base name
         self._threat_var.set(label)
         self._recompute_threat()
+        self._recompute_friendly_threat()   # SAME ship class drives both halos
 
     def _threat_ly(self) -> float:
         """LY for the configured threat ship. The grouped option base-labels are
@@ -4003,6 +4059,36 @@ class MapTab:
 
         threading.Thread(target=work, daemon=True, name="map-threat").start()
 
+    def _recompute_friendly_threat(self) -> None:
+        """Recompute the friendly-staging projection halo (owner ask). Mirrors
+        ``_recompute_threat`` EXACTLY but over the FRIENDLY set and gated on the
+        drawer's master state (``cfg["threat_friendly_enabled"]``, mirrored by
+        ``_friendly_master_var``) rather than a toolbar layer -- OFF / no included
+        friendly staging clears the halo. The SAME ``threat_ship`` range drives it, so
+        it is one class, two halos. The scan runs on a helper thread touching NO Tcl,
+        feeding back through the main-thread result queue as a ('friendly_threat',
+        frozenset) tuple (drained by ``_drain_results``)."""
+        on = bool(self._friendly_master_var.get())
+        # Union only over the friendly staging the drawer left INCLUDED (exclusions
+        # persist by name in cfg["threat_friendly_excluded"]; empty list -> all).
+        excluded = self.cfg.get("threat_friendly_excluded", []) or []
+        friendly = self.state.selected_friendly_staging(excluded)
+        if not on or not friendly:
+            self.set_friendly_threat(None)
+            return
+        ly = self._threat_ly()
+
+        def work():
+            try:
+                fset = mo.compute_threat(friendly, ly)
+            except Exception as exc:               # never crash the helper thread
+                print(f"[MAP] friendly threat recompute failed: {exc}")
+                return
+            self._result_q.put(("friendly_threat", fset))   # applied on main thread
+
+        threading.Thread(target=work, daemon=True,
+                         name="map-threat-friendly").start()
+
     # ---- threat drawer (Task 34) ----------------------------------------------
     def _toggle_threat_drawer(self) -> None:
         """Threat ▾ microbutton handler: open the drawer if closed, else close it."""
@@ -4031,10 +4117,11 @@ class MapTab:
         self._threat_drawer.pack_forget()
 
     def _build_threat_drawer(self) -> None:
-        """(Re)build the drawer contents top-to-bottom: master overlay toggle,
-        ship-class radio list, then the per-staging checkbox rows. Themed via the
-        shared theme dict; the drawer bg is the panel colour, so select
-        indicators use entry_bg for contrast against it."""
+        """(Re)build the drawer contents top-to-bottom: hostile master overlay toggle,
+        the SHARED ship-class radio list (one class drives both halos), the hostile
+        per-staging checkbox rows, then the friendly-projection section (its own master
+        toggle + per-staging rows). Themed via the shared theme dict; the drawer bg is
+        the panel colour, so select indicators use entry_bg for contrast against it."""
         t = self.theme
         d = self._threat_drawer
         for w in d.winfo_children():
@@ -4049,8 +4136,9 @@ class MapTab:
                        bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
                        activebackground=t["panel"], activeforeground=t["accent"],
                        anchor="w").pack(fill="x", padx=8, pady=2)
-        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"]
-        tk.Label(d, text="Ship class", bg=t["panel"], fg=t["fg"]).pack(
+        # 2) ship-class radios (Titan Bridge first); base name -> cfg["threat_ship"].
+        # SHARED: this one class drives BOTH the hostile and friendly halos.
+        tk.Label(d, text="Ship class (both halos)", bg=t["panel"], fg=t["fg"]).pack(
             anchor="w", padx=10, pady=(8, 0))
         opts = mo.threat_options()
         current = self.cfg.get("threat_ship", "Titan Bridge")
@@ -4081,6 +4169,42 @@ class MapTab:
         self._threat_rows = tk.Frame(d, bg=t["panel"])
         self._threat_rows.pack(fill="x", padx=8, pady=(2, 8))
         self._rebuild_threat_staging_rows()
+
+        # 4) Friendly-staging PROJECTION (owner ask): a SECOND, BLUE halo over the
+        # jump/bridge reach of your OWN stagings. Default OFF -- a new visual the owner
+        # opts into. Shares the ship-class picker above (one class, two halos); only
+        # the master toggle + per-staging selection are separate. A thin divider sets
+        # it apart from the hostile block above.
+        tk.Frame(d, bg=t["border"], height=1).pack(fill="x", padx=8, pady=(10, 0))
+        tk.Label(d, text="Friendly staging projection", bg=t["panel"],
+                 fg=t["accent"], font=("Segoe UI", 10, "bold")).pack(
+                     anchor="w", padx=10, pady=(8, 4))
+        # Re-sync the persistent master var from cfg on each build (belt-and-suspenders,
+        # the staging-rows idiom): cfg is the source of truth the recompute also reads.
+        self._friendly_master_var.set(
+            bool(self.cfg.get("threat_friendly_enabled", False)))
+        tk.Checkbutton(d, text="Show friendly projection (blue)",
+                       variable=self._friendly_master_var,
+                       command=self._on_friendly_master_toggle,
+                       bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                       activebackground=t["panel"], activeforeground=t["accent"],
+                       anchor="w").pack(fill="x", padx=8, pady=2)
+        fhead = tk.Frame(d, bg=t["panel"])
+        fhead.pack(fill="x", padx=10, pady=(6, 0))
+        tk.Label(fhead, text="Friendly systems", bg=t["panel"], fg=t["fg"]).pack(
+            side="left")
+        tk.Button(fhead, text="None", command=self._friendly_staging_none,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right")
+        tk.Button(fhead, text="All", command=self._friendly_staging_all,
+                  bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
+                  activeforeground=t["accent"], relief="flat", borderwidth=0,
+                  highlightthickness=0, cursor="hand2").pack(side="right",
+                                                             padx=(0, 4))
+        self._friendly_rows = tk.Frame(d, bg=t["panel"])
+        self._friendly_rows.pack(fill="x", padx=8, pady=(2, 8))
+        self._rebuild_friendly_staging_rows()
 
     def _rebuild_threat_staging_rows(self) -> None:
         """Repopulate the per-staging checkbox rows from the current hostile
@@ -4144,6 +4268,81 @@ class MapTab:
         for var in self._threat_staging_vars.values():
             var.set(False)
         self._recompute_threat()
+
+    # ---- friendly-staging projection (owner ask) -------------------------------
+    # All four mirror the hostile handlers above EXACTLY, over the FRIENDLY staging
+    # set + cfg["threat_friendly_excluded"] + the friendly master var, and end in
+    # _recompute_friendly_threat instead of _recompute_threat.
+    def _rebuild_friendly_staging_rows(self) -> None:
+        """Repopulate the friendly-projection per-staging checkbox rows from the
+        current friendly staging (id->name via the model). Checked = contributes to
+        the friendly halo; unchecking persists a NAME exclusion in
+        ``cfg["threat_friendly_excluded"]``. No-op before the drawer built the rows
+        container (so it is safe to call from ``set_staging`` any time). Empty friendly
+        staging shows a dim hint instead of rows. Mirrors _rebuild_threat_staging_rows."""
+        rows = self._friendly_rows
+        if rows is None:
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._friendly_staging_vars = {}
+        t = self.theme
+        model = self.state.model
+        systems = model.systems if model is not None else {}
+        names = sorted({systems[sid].name for sid in self.state.friendly_staging
+                        if sid in systems})
+        if not names:
+            tk.Label(rows,
+                     text="No friendly staging configured — right-click a system "
+                          "→ Add to friendly staging.",
+                     bg=t["panel"], fg=t["fg"], justify="left", wraplength=205,
+                     font=("Segoe UI", 8)).pack(anchor="w")
+            return
+        excluded = set(self.cfg.get("threat_friendly_excluded", []) or [])
+        for name in names:
+            var = tk.BooleanVar(value=(name not in excluded))
+            self._friendly_staging_vars[name] = var
+            tk.Checkbutton(rows, text=name, variable=var,
+                           command=lambda n=name: self._on_friendly_staging_toggle(n),
+                           bg=t["panel"], fg=t["fg"], selectcolor=t["entry_bg"],
+                           activebackground=t["panel"],
+                           activeforeground=t["accent"], anchor="w").pack(fill="x")
+
+    def _on_friendly_master_toggle(self) -> None:
+        """The friendly-projection master checkbox: persist the enabled flag to
+        ``cfg["threat_friendly_enabled"]`` and recompute (the drawer-only, cfg-backed
+        analogue of _on_layer_toggle('threat') for the toolbar hostile layer)."""
+        self.cfg["threat_friendly_enabled"] = bool(self._friendly_master_var.get())
+        self._recompute_friendly_threat()
+
+    def _on_friendly_staging_toggle(self, name: str) -> None:
+        """A friendly-staging row toggled: add/drop the NAME from the persisted
+        exclusion list (reassigned, never mutated in place -- the DEFAULT_CONFIG list
+        may be shared) and recompute over the new subset."""
+        var = self._friendly_staging_vars.get(name)
+        if var is None:
+            return
+        excluded = set(self.cfg.get("threat_friendly_excluded", []) or [])
+        if var.get():
+            excluded.discard(name)               # included
+        else:
+            excluded.add(name)                   # excluded
+        self.cfg["threat_friendly_excluded"] = sorted(excluded)
+        self._recompute_friendly_threat()
+
+    def _friendly_staging_all(self) -> None:
+        """Include every friendly staging: clear the exclusion list, check all rows."""
+        self.cfg["threat_friendly_excluded"] = []
+        for var in self._friendly_staging_vars.values():
+            var.set(True)
+        self._recompute_friendly_threat()
+
+    def _friendly_staging_none(self) -> None:
+        """Exclude every CURRENT friendly staging: persist names, uncheck all rows."""
+        self.cfg["threat_friendly_excluded"] = sorted(self._friendly_staging_vars)
+        for var in self._friendly_staging_vars.values():
+            var.set(False)
+        self._recompute_friendly_threat()
 
     def _on_configure(self, event) -> None:
         self.state.resize(event.width, event.height)

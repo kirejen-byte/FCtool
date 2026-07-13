@@ -96,6 +96,13 @@ DEFAULT_CONFIG = {
         # map's Threat drawer (Task 34). Empty = every staging contributes, so a
         # newly-added staging defaults to INCLUDED.
         "threat_staging_excluded": [],
+        # Friendly-staging PROJECTION (owner ask): a SECOND, blue halo showing the
+        # jump/bridge reach of your OWN stagings, opt-in from the map's Threat drawer.
+        # Default OFF -- a new visual the owner enables. The by-NAME exclusion list
+        # mirrors threat_staging_excluded above (empty = every friendly staging
+        # contributes). The SAME threat_ship class drives both halos.
+        "threat_friendly_enabled": False,
+        "threat_friendly_excluded": [],
         "range_ship": "Dreadnought",
         # Keys match map_camera.Camera.to_dict(); None scale = fit universe.
         "camera": {"cx": None, "cy": None, "scale": None},

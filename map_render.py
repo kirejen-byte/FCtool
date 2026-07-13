@@ -85,6 +85,20 @@ RANGE_GLOW_PAD = 3            # green aura radius = node glow_r + this (tight ha
 # their red is intentional and untouched.
 THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
 
+# Friendly-staging PROJECTION wash (owner ask): the projected jump/bridge reach of
+# your OWN stagings -- a SECOND, opt-in halo drawn beside the hostile purple threat.
+# A deep azure BLUE (#3d7dd6), chosen to read DISTINCT from every neighbour: the
+# purple hostile wash (blue's GREEN channel sits ABOVE red, whereas purple's RED sits
+# above green -- opposite low-channel ordering), the green range aura, and the
+# BRIGHTER blue Ansiblex bridge LINES (#3a86ff) -- this is an area WASH one hue deeper
+# than the bridges so the two blues separate by both form and shade. MAX-composed onto
+# the shared scratch then ONE additive blit, exactly like THREAT_PURPLE, so overlapping
+# friendly blobs top out FLAT (never white). Where a system sits inside BOTH the hostile
+# and friendly reach the purple + blue ADD to a saturated blue-violet: both peak the
+# BLUE channel (~193 each -> clamps at 255) while R/G stay ~185/195 -- readable, never
+# a white-out (verified: a dense worst-case overlap never trips all-3 contribution > 200).
+FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
+
 # Infrastructure count chips (Task 5): a small rounded badge per system carrying
 # its structure count, tinted by the DOMINANT category. Drawn in the label pass
 # (rides the SAME zoom LOD as system labels -- st.system_labels), so chips only
@@ -202,13 +216,19 @@ def pick_band(visible_count: int) -> str:
 @dataclass(frozen=True)
 class TintSpec:
     """Base-layer tinting (spec §5.1/§5.2): range overlay brightens `bright`
-    and dims everything else; threat halo under-glows `halo` in red."""
+    and dims everything else; `halo` under-glows the hostile-staging reach in
+    purple, and `friendly` under-glows the friendly-staging reach in blue (owner
+    ask -- a second, opt-in projection sharing the same ship-class range). Any
+    field None means that pass is skipped, so an all-None spec is byte-identical
+    to no tint at all."""
     bright: frozenset[int] | None = None    # None = no range tint
-    halo: frozenset[int] | None = None
+    halo: frozenset[int] | None = None      # None = no hostile-staging projection
+    friendly: frozenset[int] | None = None  # None = no friendly-staging projection
 
     def key(self) -> tuple:
         return (tuple(sorted(self.bright)) if self.bright is not None else None,
-                tuple(sorted(self.halo)) if self.halo is not None else None)
+                tuple(sorted(self.halo)) if self.halo is not None else None,
+                tuple(sorted(self.friendly)) if self.friendly is not None else None)
 
 
 # --- cached asset factories --------------------------------------------------
@@ -739,6 +759,34 @@ class Renderer:
                 blit_s(g, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
+    def _draw_friendly_glow(self, surf, pos, friendly, glow_r):
+        """Friendly-staging PROJECTION wash (owner ask): a SECOND halo beside the
+        hostile purple threat, in deep azure BLUE (FRIENDLY_BLUE #3d7dd6). Every
+        system inside a FRIENDLY staging's jump/bridge reach (``TintSpec.friendly``)
+        gets ONE dim blue glow at ``glow_r + 8``, MAX-composed onto the shared scratch
+        then blitted ONCE with BLEND_RGB_ADD -- so overlapping friendly blobs top out
+        FLAT (never white), byte-for-byte the same compose as _draw_threat_glow, just
+        a different hue. Blue reads distinct from the purple hostile wash (its GREEN
+        channel sits above red, purple's RED sits above green), the green range aura,
+        and the brighter blue Ansiblex bridge LINES. Where a system is in BOTH the
+        hostile and friendly reach the two washes ADD to a saturated blue-violet whose
+        R/G stay well under white (both peak the BLUE channel to clamp; the MAX-then-add
+        compose was chosen so the overlap never whitens). Drawn UNDER the node glows
+        (from _draw_systems before its per-node loop, ADJACENT to the threat pass at the
+        same layer depth) so cores stay readable on top. Sequential scratch reuse: the
+        threat pass already ADD-blitted its scratch to the frame before this fills black
+        again (the _draw_sov / _draw_range_glow / _draw_threat_glow house pattern)."""
+        size = surf.get_size()
+        scratch = self._get_scratch(size)
+        scratch.fill((0, 0, 0))
+        g = self.sprites.glow(FRIENDLY_BLUE, glow_r + 8)
+        off = g.get_width() / 2.0
+        blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
+        for sid, (sx, sy) in pos.items():
+            if sid in friendly:
+                blit_s(g, (sx - off, sy - off), special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
     def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
         """Kill-heat under-glow (Task 30). `heat` is an iterable of
         ``(system_id, intensity)`` pairs (the canonical request tuple;
@@ -778,16 +826,22 @@ class Renderer:
         node_static = self._node_static
         bright = tint.bright if tint is not None else None
         halo = tint.halo if tint is not None else None
-        # In-range GREEN accent + threat PURPLE wash (owner 2026-07-12): each is a
-        # MAX-composed under-glow drawn BEFORE the per-node loop, so the node cores
-        # stay bright ON TOP and each pass tops out FLAT (never washes toward white).
-        # Both gate on `is not None`, so range/threat INACTIVE runs the pre-change
-        # path byte-identically (like sov/heat/bridges) -- the passes simply never
-        # fire. See _draw_range_glow / _draw_threat_glow.
+        friendly = tint.friendly if tint is not None else None
+        # In-range GREEN accent + hostile-threat PURPLE wash + friendly-projection
+        # BLUE wash (owner asks): each is a MAX-composed under-glow drawn BEFORE the
+        # per-node loop, so the node cores stay bright ON TOP and each pass tops out
+        # FLAT (never washes toward white). All gate on `is not None`, so an INACTIVE
+        # layer runs the pre-change path byte-identically (like sov/heat/bridges) --
+        # the pass simply never fires. The friendly pass sits ADJACENT to the threat
+        # pass at the same layer depth; where both fire, purple + blue ADD to a
+        # readable blue-violet, never white. See _draw_range_glow / _draw_threat_glow
+        # / _draw_friendly_glow.
         if bright is not None:
             self._draw_range_glow(surf, pos, bright, glow_r)
         if halo is not None:
             self._draw_threat_glow(surf, pos, halo, glow_r)
+        if friendly is not None:
+            self._draw_friendly_glow(surf, pos, friendly, glow_r)
         hub_r = glow_r + max(3, glow_r // 3)        # was a flat +6; scales with zoom
         ring = st.core_ring and core_r >= 2         # ring around a 1px core = blob
         glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
