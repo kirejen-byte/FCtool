@@ -319,6 +319,14 @@ _LY_SUFFIX = re.compile(r"\s*\([^()]*ly\)\s*$")
 HOVER_TOOLTIP_DELAY_MS = 350        # dwell before the summary tooltip appears
 HOVER_TOOLTIP_MOVE_R2 = 100         # px^2: motion beyond ~10px reschedules/hides
 
+# --- toolbar control tooltips (owner ask 2026-07-12) -------------------------
+# Distinct from the canvas summary tooltip above: a per-control hover tip on the
+# toolbar widgets (search box / layer checkboxes / ▾ drawer buttons). Same dwell-
+# then-single-Toplevel discipline, longer dwell (500ms) so a fly-over across the
+# strip never flashes tips, and hidden instantly on leave/press so it can never
+# sit between the cursor and a click.
+TOOLBAR_TOOLTIP_DELAY_MS = 500      # dwell before a toolbar control's tip appears
+
 # Cap on structure rows in the right-click "Structures (N)" submenu (owner
 # feedback round B): a busy staging system can hold dozens of structures, so the
 # grouped list is truncated with a trailing "…and N more (Manage…)" row rather
@@ -843,6 +851,16 @@ class MapTab:
         self.frame = tk.Frame(parent, bg=t["bg"])
         bar = tk.Frame(self.frame, bg=t["bg"])
         bar.pack(side="top", fill="x")
+        # Toolbar hover-tooltip state (owner ask 2026-07-12): a dwell-delayed tip
+        # shown ~500ms after the cursor settles on a control, reusing ONE Toplevel
+        # slot (self._tooltip) and dismissed instantly on leave/press. Initialised
+        # here (before the first control is built) so _attach_tooltip can register
+        # the search box below. _toolbar_tooltips is the widget->text registry a
+        # test walks to assert every toolbar control is documented.
+        self._toolbar_tooltips: dict = {}
+        self._tooltip = None                 # the single live tip Toplevel (lazy)
+        self._tooltip_after = None           # pending dwell-timer id (after_cancel)
+        self._tooltip_delay_ms = TOOLBAR_TOOLTIP_DELAY_MS   # instance-tunable (tests)
         tk.Label(bar, text="Search:", bg=t["bg"], fg=t["fg"]).pack(side="left", padx=(6, 2))
         entry_cls = autocomplete_cls or tk.Entry
         # An injected AutocompleteEntry takes the completion contract
@@ -877,6 +895,9 @@ class MapTab:
                 highlightbackground=t["border"], highlightcolor=t["accent"])
         except tk.TclError:
             pass
+        self._attach_tooltip(
+            self.search_entry,
+            "Find a system — autocompletes as you type; Enter flies to the best match")
         self._bloom_var = tk.BooleanVar(value=bool(self.cfg.get("bloom", True)))
         # Zoom-animation escape hatch (Task 24, P3): True = eased glide (default),
         # False = instant snap (pre-Phase-F feel) for owners who prefer it. No
@@ -884,10 +905,13 @@ class MapTab:
         # persisted on hide like bloom/layers.
         self._zoom_anim_var = tk.BooleanVar(
             value=bool(self.cfg.get("zoom_animation", True)))
-        tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var, bg=t["bg"],
-                       fg=t["fg"], selectcolor=t["panel"],
+        _bloom_cb = tk.Checkbutton(bar, text="Bloom", variable=self._bloom_var,
+                       bg=t["bg"], fg=t["fg"], selectcolor=t["panel"],
                        activebackground=t["bg"], activeforeground=t["accent"],
-                       command=self._on_bloom_toggle).pack(side="left", padx=8)
+                       command=self._on_bloom_toggle)
+        _bloom_cb.pack(side="left", padx=8)
+        self._attach_tooltip(_bloom_cb,
+                             "Cinematic glow rendering; off = flat tactical look")
         # --- Phase D layer toggles (fleet/staging/threat) ---
         _layers = self.cfg.get("layers", {})
         self._layer_vars: dict[str, tk.BooleanVar] = {
@@ -933,9 +957,23 @@ class MapTab:
         # Current threat-ship selection label (radiobutton var; synced lazily
         # from cfg["threat_ship"] when the empty-space menu is built).
         self._threat_var = tk.StringVar()
-        # Hover-tooltip Toplevel (created on demand; see _show_tooltip). Used to
-        # document the route overlay's ESI limitation on the "Route" toggle.
-        self._tooltip = None
+        # Concise, behaviour-accurate hover tips for every layer toggle (owner ask
+        # 2026-07-12). Keyed by layer key; the ▾ drawer buttons get their own tips
+        # in the loop below. Route keeps its ESI caveat (destinations set only in
+        # the game client can't be read back -- ESI exposes no route endpoint).
+        _layer_tips = {
+            "fleet": "Pins where your fleet members are (from the boss fleet poll)",
+            "staging": "Diamond markers on friendly (green) and hostile (red) staging systems",
+            "threat": "Purple shade over systems inside hostile jump/bridge range",
+            "bridges": "Your Ansiblex gates as blue lines",
+            "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
+            "heat": "Red-orange glow where kills are happening (live zkill + hourly baseline)",
+            "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
+            "kill_pings": "Radar bursts for zkill reports that match your alert settings",
+            "sov": "Dim alliance-color wash over sovereign space",
+            "infra": "Friendly structure count chips from your infrastructure DB",
+            "chars": "Magenta squares where your logged characters are; hover a system for pilot + ship",
+        }
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
                             ("route", "Route"), ("heat", "Heat"),
@@ -947,6 +985,28 @@ class MapTab:
                                  activebackground=t["bg"], activeforeground=t["accent"],
                                  command=lambda k=_key: self._on_layer_toggle(k))
             _cb.pack(side="left", padx=4)
+            # Every layer toggle gets a concise hover tip (owner ask 2026-07-12).
+            self._attach_tooltip(_cb, _layer_tips.get(_key, ""))
+            if _key == "threat":
+                # Drawer affordance (owner ask 2026-07-12): a "▾" microbutton right
+                # after the Threat toggle -- the SAME compact pattern as Sov ▾ /
+                # Infra ▾ -- replacing the old standalone "Threat ▾" button that sat
+                # detached at the far end of the bar (owner: the toggle + its opener
+                # should read as one compact control). Opens the in-tab threat
+                # drawer (master overlay toggle + ship-class picker + per-staging
+                # rows). DELIBERATELY always enabled -- UNLIKE Sov's legend (only
+                # useful once the tint is drawn), the drawer HOSTS the master
+                # overlay toggle, so it must stay reachable to turn the layer ON
+                # while it is still off.
+                self._threat_drawer_btn = tk.Button(
+                    bar, text="▾", command=self._toggle_threat_drawer,
+                    bg=t["bg"], fg=t["fg"], activebackground=t["bg"],
+                    activeforeground=t["accent"], relief="flat", borderwidth=0,
+                    highlightthickness=0, padx=3, pady=0, cursor="hand2")
+                self._threat_drawer_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(
+                    self._threat_drawer_btn,
+                    "Threat settings — ship class and which hostile stagings project")
             if _key == "infra":
                 # Filter affordance (Task 5): a "▾" microbutton right after the
                 # Infra toggle opening the borderless filter popover (per-category
@@ -959,6 +1019,8 @@ class MapTab:
                     activeforeground=t["accent"], relief="flat", borderwidth=0,
                     highlightthickness=0, padx=3, pady=0, cursor="hand2")
                 self._infra_filter_btn.pack(side="left", padx=(0, 4))
+                self._attach_tooltip(self._infra_filter_btn,
+                                     "Infra filters and the structure manager")
             if _key == "sov":
                 # Legend affordance (Task 33): a small "▾" microbutton right after
                 # the Sov toggle, ENABLED only while the layer is on. Opens the
@@ -971,26 +1033,8 @@ class MapTab:
                     state=("normal" if bool(_layers.get("sov", False))
                            else "disabled"))
                 self._sov_legend_btn.pack(side="left", padx=(0, 4))
-            if _key == "route":
-                # Owner note (Task 35): purely in-game-set destinations can't be
-                # shown -- ESI exposes no autopilot-route READ endpoint (verified
-                # against the live swagger). This overlay covers destinations set
-                # with the tool.
-                self._attach_tooltip(
-                    _cb, "Travel route to a destination set with the tool "
-                    "(map / intel / zkill 'Set destination'), incl. Ansiblex "
-                    "hops. Destinations set only in the game client can't be "
-                    "drawn — ESI has no route-read endpoint.")
-        # "Threat ▾" opens the in-tab threat drawer (Task 34, owner ask
-        # 2026-07-12): per-staging selection + the ship-class picker, both
-        # previously buried in a right-click cascade. Flat panel-coloured button
-        # so it reads as native to the app palette.
-        self._threat_drawer_btn = tk.Button(
-            bar, text="Threat ▾", command=self._toggle_threat_drawer,
-            bg=t["panel"], fg=t["fg"], activebackground=t["entry_bg"],
-            activeforeground=t["accent"], relief="flat", borderwidth=0,
-            highlightthickness=0, padx=8, pady=1, cursor="hand2")
-        self._threat_drawer_btn.pack(side="left", padx=(10, 4))
+                self._attach_tooltip(self._sov_legend_btn,
+                                     "Sov legend — top alliances by systems shown")
         self.status = tk.Label(bar, text="", bg=t["bg"], fg=t["fg"], anchor="e")
         self.status.pack(side="right", padx=6)
 
@@ -2296,14 +2340,42 @@ class MapTab:
 
     # ---- hover tooltip (self-contained; no fc_gui import) -----------------------
     def _attach_tooltip(self, widget, text: str) -> None:
-        """Attach a lightweight hover tooltip (themed Toplevel shown on <Enter>,
-        destroyed on <Leave>) to a toolbar widget. add='+' so it never clobbers a
-        widget's own bindings. Used to document the route overlay's ESI limitation
-        (Task 35) without pulling in fc_gui's tooltip helper."""
-        widget.bind("<Enter>", lambda _e: self._show_tooltip(widget, text), add="+")
+        """Attach a dwell-delayed hover tooltip to a toolbar control and register
+        it in ``self._toolbar_tooltips`` (owner ask 2026-07-12). The tip appears
+        ~500 ms after the cursor settles on the widget (never on a fly-over),
+        reuses the single ``self._tooltip`` slot, and is dismissed instantly on
+        <Leave>, ANY mouse press, or the widget's <Destroy> -- so it can never sit
+        between the cursor and a click. ``add='+'`` so it never clobbers the
+        widget's own bindings, and the timer is only armed on <Enter>, so an idle
+        toolbar (cursor elsewhere) costs nothing. Empty text is a no-op. Shared by
+        every toolbar control -- the layer checkboxes, the search box, and the
+        Sov / Infra / Threat ▾ drawer buttons. The registry lets a test walk the
+        toolbar and assert every control is documented (fails if a new one isn't)."""
+        if not text:
+            return
+        self._toolbar_tooltips[widget] = text
+        widget.bind("<Enter>",
+                    lambda _e, w=widget, s=text: self._tooltip_schedule(w, s),
+                    add="+")
         widget.bind("<Leave>", lambda _e: self._hide_tooltip(), add="+")
+        widget.bind("<ButtonPress>", lambda _e: self._hide_tooltip(), add="+")
+        widget.bind("<Destroy>", lambda _e: self._hide_tooltip(), add="+")
+
+    def _tooltip_schedule(self, widget, text: str) -> None:
+        """Arm the dwell timer for ``widget``'s tip, first tearing down any pending
+        timer / live tip so only the newest hover ever shows (after_cancel
+        discipline). Uses self.frame.after so it rides the tab's own event loop."""
+        self._hide_tooltip()
+        try:
+            self._tooltip_after = self.frame.after(
+                self._tooltip_delay_ms, lambda: self._show_tooltip(widget, text))
+        except Exception:
+            self._tooltip_after = None
 
     def _show_tooltip(self, widget, text: str) -> None:
+        """Create + place the tip NOW below ``widget`` in the single ``self._tooltip``
+        slot. Called by the dwell timer (and directly by tests). Any prior tip is
+        torn down first; a torn-down widget mid-dwell degrades to no tip (guarded)."""
         self._hide_tooltip()
         t = self.theme
         try:
@@ -2319,6 +2391,16 @@ class MapTab:
             self._tooltip = None
 
     def _hide_tooltip(self) -> None:
+        """Single dismissal path: cancel a pending dwell timer AND destroy any live
+        tip (idempotent). <Leave>, a press, a destroy, and the next <Enter> all
+        route here, so a tip never lingers or stacks."""
+        aid = getattr(self, "_tooltip_after", None)
+        if aid is not None:
+            try:
+                self.frame.after_cancel(aid)
+            except Exception:
+                pass
+            self._tooltip_after = None
         tip = getattr(self, "_tooltip", None)
         if tip is not None:
             try:
@@ -3739,7 +3821,7 @@ class MapTab:
 
     # ---- threat drawer (Task 34) ----------------------------------------------
     def _toggle_threat_drawer(self) -> None:
-        """Toolbar "Threat ▾" handler: open the drawer if closed, else close it."""
+        """Threat ▾ microbutton handler: open the drawer if closed, else close it."""
         if self._threat_drawer_open:
             self._close_threat_drawer()
         else:
