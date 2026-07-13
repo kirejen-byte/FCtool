@@ -265,3 +265,44 @@ def resolve_eve_logs_path(configured, *, documents=None, home=None,
     if documents is None:
         documents = get_documents_dir()
     return _logs_under(documents) or os.path.join(*_EVE_LOGS_SUBPATH)
+
+
+# --- Overview Manager paths (spec 2026-07-12-overview-manager-design.md) ----
+
+OVERVIEW_SUBPATH = ("EVE", "Overview")
+
+
+def overview_dir(documents=None):
+    """Documents\\EVE\\Overview — where the client exports overview YAML and
+    the ONLY folder its import dialog lists (R §A.10). Created by the client
+    on first export; callers may need to create it when staging first."""
+    docs = documents if documents is not None else get_documents_dir()
+    return os.path.join(docs, *OVERVIEW_SUBPATH)
+
+
+def tranquility_settings_dirs(localappdata=None):
+    """All settings_* profile dirs under Tranquility installs.
+
+    Matches *_tranquility only, which excludes Singularity
+    (*_sisi_singularity) and EVE Frontier trees by construction.
+    """
+    base = localappdata if localappdata is not None else os.environ.get(
+        "LOCALAPPDATA", "")
+    if not base:
+        return []
+    pattern = os.path.join(base, "CCP", "EVE", "*_tranquility", "settings_*")
+    return sorted(d for d in glob.glob(pattern) if os.path.isdir(d))
+
+
+def list_core_user_files(settings_dir):
+    """[(account_id, path)] for numeric core_user_<id>.dat files, sorted by id.
+
+    The client writes placeholder junk names (core_user__.dat and even
+    tuple-repr filenames) — skip anything whose id is not a pure integer
+    (observed on this box, R §B.2)."""
+    out = []
+    for path in glob.glob(os.path.join(settings_dir, "core_user_*.dat")):
+        stem = os.path.basename(path)[len("core_user_"):-len(".dat")]
+        if stem.isdigit():
+            out.append((int(stem), path))
+    return sorted(out)
