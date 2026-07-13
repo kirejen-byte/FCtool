@@ -156,6 +156,24 @@ CHARS_MAGENTA = "#ff44e1"
 CHARS_POLL_S = 60.0
 CHARS_START_DELAY_S = 2.0
 
+# Staging-diamond contrast fix (owner report: hostile red diamonds blend into the
+# red nullsec node glow -- both sit in the same #cc2233/#ff5a76 red family, so a
+# plain fill-colour distinction washes out). A brighter hostile red alone would
+# still fight a red background, so BOTH staging diamonds now carry a white/near-
+# white outline -- the rim, not the fill, is what guarantees contrast against
+# ANY wash (red nullsec, the violet threat wash, a future blue friendly-
+# projection wash). Friendly gets the same rim purely for visual consistency.
+# Hostile is also drawn ~20% larger than friendly so it reads as the more urgent
+# marker at a glance. Hostile stays in the red family (map_render.THREAT_PURPLE's
+# comment block notes staging red is intentional/untouched semantics) -- only the
+# exact shade brightened.
+STAGING_FRIENDLY_FILL = "#59d98c"
+STAGING_HOSTILE_FILL = "#ff2d55"
+STAGING_OUTLINE = "#ffffff"
+STAGING_OUTLINE_W = 2
+STAGING_R_FRIENDLY = 8
+STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
+
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
 # live overlay object), _layer_on("sov") directly controls both the fetch and the
@@ -2505,9 +2523,14 @@ class MapTab:
         return bool(self.cfg.get("layers", {}).get(key, default))
 
     def _draw_diamond(self, sx: float, sy: float, r: float,
-                      color: str, tag: str) -> None:
+                      color: str, tag: str, outline: str = "",
+                      width: float = 1.0) -> None:
+        # outline/width default to Tk's own polygon defaults (no outline, 1px) so
+        # existing callers that don't pass them (route-overlay bridge endpoint
+        # markers) are byte-identical to before -- only staging diamonds opt into
+        # the white-rim treatment (see STAGING_OUTLINE).
         self.canvas.create_polygon(sx, sy - r, sx + r, sy, sx, sy + r, sx - r, sy,
-                                   fill=color, tags=tag)
+                                   fill=color, outline=outline, width=width, tags=tag)
 
     def _redraw_overlays(self) -> None:
         """Delete + repaint every Tk overlay item, projecting with the LIVE camera
@@ -2629,16 +2652,23 @@ class MapTab:
                 canvas.create_oval(sx - 12, sy - 12, sx + 12, sy + 12,
                                    outline="#e0e0e0", width=2, tags="ov_origin")
 
-        # -- staging diamonds (friendly green / hostile red)
+        # -- staging diamonds (friendly green / hostile red), both white-rimmed for
+        # contrast against any background wash -- see the STAGING_* comment block.
         if self._layer_on("staging"):
             for sid in st.friendly_staging:
                 p = project(sid)
                 if p is not None:
-                    self._draw_diamond(p[0], p[1], 8, "#59d98c", "ov_staging")
+                    self._draw_diamond(p[0], p[1], STAGING_R_FRIENDLY,
+                                       STAGING_FRIENDLY_FILL, "ov_staging",
+                                       outline=STAGING_OUTLINE,
+                                       width=STAGING_OUTLINE_W)
             for sid in st.hostile_staging:
                 p = project(sid)
                 if p is not None:
-                    self._draw_diamond(p[0], p[1], 8, "#ff5a76", "ov_staging")
+                    self._draw_diamond(p[0], p[1], STAGING_R_HOSTILE,
+                                       STAGING_HOSTILE_FILL, "ov_staging",
+                                       outline=STAGING_OUTLINE,
+                                       width=STAGING_OUTLINE_W)
 
         # -- fleet pins + high-contrast count chips, own-location ring
         # The member count is COMMAND-CRITICAL and must stay legible even where
