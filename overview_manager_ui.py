@@ -167,7 +167,7 @@ def _fmt_iso(s) -> str:
 # AND account-scoped (owner feedback: the panel was "clear as mud"). Reused by
 # the panel header and the Instructions dialog so the two never drift.
 _DISTRIBUTION_EXPLAINER = (
-    "EVE can't be changed from outside — to apply a pack, FCTool stages the "
+    "EVE can't be changed from outside — to apply a pack, FCTool exports the "
     "file and YOU import it in-game on each account (one import covers all that "
     "account's characters). Overview settings are per-ACCOUNT."
 )
@@ -322,12 +322,13 @@ class OverviewTab(tk.Frame):
     def _build_actions(self) -> None:
         bar = tk.Frame(self, bg=BG_PANEL)
         bar.pack(side=tk.BOTTOM, fill=tk.X)
-        stage = ttk.Button(bar, text="Stage to EVE", style="Dark.TButton",
+        stage = ttk.Button(bar, text="Export to EVE", style="Dark.TButton",
                            command=self._stage_selected)
         stage.pack(side=tk.LEFT, padx=6, pady=6)
         _attach_tooltip(stage,
-                        "Writes 'FCTool - <pack>.yaml' into Documents\\EVE\\"
-                        "Overview — the folder the in-game Import dialog lists.")
+                        "Exports the selected pack as 'FCTool - <pack>.yaml' "
+                        "into Documents\\EVE\\Overview — the folder the "
+                        "in-game Import Overview Settings dialog lists.")
         self._selection_buttons.append(stage)
         ttk.Button(bar, text="Open Overview folder", style="Dark.TButton",
                    command=self._open_overview_folder).pack(side=tk.LEFT, padx=2)
@@ -461,7 +462,7 @@ class OverviewTab(tk.Frame):
         meta = tk.Label(row, text=f"acct {account_id} · settings updated {_fmt_mtime(mtime)}",
                         bg=BG_PANEL, fg=FG_DIM, font=_FONT_SM, anchor="w")
         meta.grid(row=0, column=1, sticky="w")
-        staged = tk.Label(row, text="staged: —", bg=BG_PANEL, fg=FG_DIM,
+        staged = tk.Label(row, text="exported: —", bg=BG_PANEL, fg=FG_DIM,
                           font=_FONT_SM, anchor="w")
         staged.grid(row=0, column=2, padx=8, sticky="w")
         drift = tk.Label(row, text="drift: —", bg=BG_PANEL, fg=FG_DIM,
@@ -693,9 +694,9 @@ class OverviewTab(tk.Frame):
         try:
             path = self._stage_pack(rec)
         except Exception as e:
-            self._error("Stage to EVE", f"Could not stage '{rec.name}':\n{e}")
+            self._error("Export to EVE", f"Could not export '{rec.name}':\n{e}")
             return
-        self._info("Staged",
+        self._info("Exported",
                    f"Wrote {os.path.basename(path)} into your Overview folder.\n"
                    f"Import it in-game — see Instructions.")
         self._refresh_distribution_for_selection()
@@ -705,7 +706,7 @@ class OverviewTab(tk.Frame):
         if not os.path.isdir(d):
             self._info("Overview folder",
                        f"The Overview folder doesn't exist yet:\n{d}\n\n"
-                       f"Stage a pack to create it.")
+                       f"Export a pack to create it.")
             return
         open_folder(d)
 
@@ -764,15 +765,15 @@ class OverviewTab(tk.Frame):
         win.configure(bg=BG_DARK)
         text = (
             _DISTRIBUTION_EXPLAINER + "\n\n"
-            "How to import a staged overview pack in EVE\n"
+            "How to import an exported overview pack in EVE\n"
             "──────────────────────────────────────────\n\n"
-            "1. Select a pack and click 'Stage to EVE'. It writes\n"
+            "1. Select a pack and click 'Export to EVE'. It writes\n"
             f"       {fname}\n"
             "   into Documents\\EVE\\Overview (the only folder the game's\n"
             "   import dialog can see).\n\n"
             "2. In-game: click the three-dot (⋯) menu on the Overview window\n"
             "   → Open Overview Settings → the Misc tab → Import Overview.\n\n"
-            "3. Choose the staged file from the list.\n\n"
+            "3. Choose the exported file from the list.\n\n"
             "Important notes\n"
             "───────────────\n"
             "• Importing MERGES into the current overview — it does not replace\n"
@@ -822,7 +823,7 @@ class OverviewTab(tk.Frame):
         for aid, widgets in self._account_rows.items():
             try:
                 widgets["staged"].config(
-                    text=("staged: yes" if staged_exists else "staged: no"),
+                    text=("exported: yes" if staged_exists else "exported: no"),
                     fg=(FG_GREEN if staged_exists else FG_DIM))
                 ts = dist_log.get(str(aid))
                 widgets["last"].config(
