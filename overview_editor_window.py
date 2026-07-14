@@ -30,6 +30,7 @@ import re
 import tkinter as tk
 from tkinter import ttk, messagebox, colorchooser
 
+import overview_markup as om
 import overview_schema as osch
 
 # ── House dark palette (mirrors fc_gui.py:150-164; importing fc_gui would be
@@ -67,6 +68,11 @@ BASE_COLOR_NAMES = ["blue", "darkBlue", "orange", "red", "white"]
 _APPEARANCE_FIELDS = ("flag_order", "flag_states", "background_order",
                       "background_states", "state_blinks", "state_colors")
 
+# The overview/bracket comboboxes show display_text (markup rendered/stripped),
+# but the bracket "show all" sentinel has no name to render — it displays as
+# this friendly string and stores osch.BRACKET_SHOW_ALL.
+_BRACKET_SHOW_ALL_DISPLAY = "(show all brackets)"
+
 
 def wrap_color_markup(name: str, rgb) -> str:
     """Wrap ``name`` in an EVE ``<color=0xAARRGGBB>…</color>`` span (alpha FF).
@@ -87,6 +93,33 @@ def strip_color_markup(name: str) -> str:
     Pure — unit-testable without Tk."""
     m = _COLOR_WRAP_RE.match(name or "")
     return m.group(1) if m else (name or "")
+
+
+# Whole-string <b>/<i>/<u> wrappers, for the preset-name B/I/U toggles. Matched
+# case-insensitively; DOTALL so the wrapped run may itself hold a color span.
+_STYLE_WRAP_RES = {
+    "b": re.compile(r"(?is)^<b>(.*)</b>$"),
+    "i": re.compile(r"(?is)^<i>(.*)</i>$"),
+    "u": re.compile(r"(?is)^<u>(.*)</u>$"),
+}
+
+
+def toggle_style_markup(name: str, tag: str) -> str:
+    """Toggle a whole-name ``<b>``/``<i>``/``<u>`` wrapper.
+
+    If the entire ``name`` is already wrapped in ``<tag>…</tag>`` (``tag`` being
+    ``"b"``, ``"i"`` or ``"u"``), unwrap it; otherwise wrap the whole name.
+    Same strip-before-decide discipline as the color wrap — a re-toggle removes
+    the outer wrapper rather than nesting a second one. Pure — unit-testable
+    without Tk."""
+    name = name or ""
+    rx = _STYLE_WRAP_RES.get(tag)
+    if rx is None:
+        return name
+    m = rx.match(name)
+    if m is not None:
+        return m.group(1)
+    return f"<{tag}>{name}</{tag}>"
 
 
 def rgb01_from_askcolor(rgb) -> list:
@@ -145,6 +178,11 @@ class PackEditorWindow(tk.Toplevel):
 
         self._loading_states = False          # guards Listbox programmatic loads
         self._search_after_id = None          # debounce handle (group search, L3)
+        self._preset_prev_after_id = None     # debounce handle (name preview)
+        # Preset name display↔raw maps for the tab comboboxes (rebuilt with the
+        # Tabs sub-tab; seeded empty so handlers are safe before the first build).
+        self._ov_raw_to_disp: dict = {}
+        self._ov_disp_to_raw: dict = {}
         self._init_state()
 
         self.notebook = ttk.Notebook(self)
@@ -366,18 +404,45 @@ class PackEditorWindow(tk.Toplevel):
         self._btn(crud, "Delete", self._preset_delete, style="Red.TButton").pack(
             side=tk.LEFT, padx=1)
 
-        namerow = tk.Frame(left, bg=BG_PANEL)
-        namerow.pack(fill=tk.X, pady=(6, 0))
+        # Name editor: the RAW markup entry (power users keep full control) +
+        # a color/B/I/U toolbar that wraps the WHOLE name + a live rendered
+        # preview showing how the client will draw it. RAW stays the model.
+        nameblock = tk.Frame(left, bg=BG_PANEL)
+        nameblock.pack(fill=tk.X, pady=(6, 0))
+        namerow = tk.Frame(nameblock, bg=BG_PANEL)
+        namerow.pack(fill=tk.X)
         tk.Label(namerow, text="Name", bg=BG_PANEL, fg=FG_DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
         self._preset_name_var = tk.StringVar()
-        ent = tk.Entry(namerow, textvariable=self._preset_name_var, width=20,
+        ent = tk.Entry(namerow, textvariable=self._preset_name_var, width=22,
                        bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_WHITE,
                        font=("Consolas", 9))
         ent.pack(side=tk.LEFT, padx=2)
         ent.bind("<FocusOut>", lambda e: self._preset_rename(self._preset_name_var.get()))
         ent.bind("<Return>", lambda e: self._preset_rename(self._preset_name_var.get()))
-        self._btn(namerow, "color…", self._preset_wrap_color).pack(side=tk.LEFT)
+        ent.bind("<KeyRelease>", self._on_preset_name_keyrelease, add="+")
+
+        toolbar = tk.Frame(nameblock, bg=BG_PANEL)
+        toolbar.pack(fill=tk.X, pady=(2, 0))
+        self._btn(toolbar, "color…", self._preset_wrap_color).pack(side=tk.LEFT)
+        self._btn(toolbar, "B", lambda: self._preset_toggle_style("b")).pack(
+            side=tk.LEFT, padx=(4, 0))
+        self._btn(toolbar, "I", lambda: self._preset_toggle_style("i")).pack(
+            side=tk.LEFT, padx=1)
+        self._btn(toolbar, "U", lambda: self._preset_toggle_style("u")).pack(
+            side=tk.LEFT, padx=1)
+
+        prevrow = tk.Frame(nameblock, bg=BG_PANEL)
+        prevrow.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(prevrow, text="looks like", bg=BG_PANEL, fg=FG_DIM,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        self._preset_preview = tk.Text(
+            prevrow, height=1, width=26, bg=BG_DARK, fg=FG_TEXT,
+            relief=tk.FLAT, bd=0, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, wrap="none", cursor="arrow",
+            font=("Consolas", 9))
+        self._preset_preview.pack(side=tk.LEFT, padx=(4, 0))
+        self._preset_preview.configure(state=tk.DISABLED)
 
         # Right: two-pane group picker (search + category→group ☐/☑ tree) and,
         # below it, the two state list editors.
@@ -528,8 +593,15 @@ class PackEditorWindow(tk.Toplevel):
     def _refresh_preset_list(self, keep_index=True):
         idx = self._sel_preset
         self._preset_list.delete(0, tk.END)
-        for p in (self.pack.presets or []):
-            self._preset_list.insert(tk.END, p.name)
+        for i, p in enumerate(self.pack.presets or []):
+            # Show the name the client draws (tags stripped, glyph kept) and
+            # tint the row with the author's chosen color. RAW stays the model.
+            self._preset_list.insert(tk.END, om.display_text(p.name) or p.name)
+            try:
+                self._preset_list.itemconfig(
+                    i, foreground=om.primary_color(p.name) or FG_TEXT)
+            except tk.TclError:
+                pass
         if keep_index and idx is not None and self.pack.presets \
                 and 0 <= idx < len(self.pack.presets):
             self._preset_list.selection_clear(0, tk.END)
@@ -548,6 +620,7 @@ class PackEditorWindow(tk.Toplevel):
         self._preset_list.selection_set(idx)
         p = self.pack.presets[idx]
         self._preset_name_var.set(p.name)
+        self._update_preset_preview()
         self._refresh_group_checks()
         self._load_preset_states(p)
 
@@ -612,6 +685,7 @@ class PackEditorWindow(tk.Toplevel):
             self._select_preset(0)
         else:
             self._preset_name_var.set("")
+            self._update_preset_preview()
             self._refresh_group_checks()
         self._rebuild_tabs_tab()
 
@@ -663,6 +737,44 @@ class PackEditorWindow(tk.Toplevel):
         wrapped = wrap_color_markup(base, rgb)
         self._preset_name_var.set(wrapped)
         self._preset_rename(wrapped)
+        self._update_preset_preview()
+
+    def _preset_toggle_style(self, tag):
+        """Wrap/unwrap the whole preset name in ``<b>``/``<i>``/``<u>`` and
+        propagate (routes through rename so any tab referencing the old name
+        follows). Operates on the current entry text, like the color button."""
+        p = self._current_preset()
+        if p is None:
+            return
+        base = self._preset_name_var.get() or p.name
+        toggled = toggle_style_markup(base, tag)
+        self._preset_name_var.set(toggled)
+        self._preset_rename(toggled)
+        self._update_preset_preview()
+
+    def _on_preset_name_keyrelease(self, _evt=None):
+        """Debounce a live preview refresh while typing the raw name (the model
+        rename still lands on FocusOut/Return — this only repaints the preview)."""
+        if self._preset_prev_after_id is not None:
+            try:
+                self.after_cancel(self._preset_prev_after_id)
+            except (tk.TclError, ValueError):
+                pass
+        self._preset_prev_after_id = self.after(120, self._update_preset_preview)
+
+    def _update_preset_preview(self):
+        """Render the current raw name into the preset preview strip."""
+        self._preset_prev_after_id = None
+        prev = getattr(self, "_preset_preview", None)
+        if prev is None:
+            return
+        try:
+            if not prev.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        om.render_into_text(prev, self._preset_name_var.get(),
+                            base_font=("Consolas", 9))
 
     # ════════════════════════════════════════════════════════════════════════
     # TABS
@@ -704,38 +816,75 @@ class PackEditorWindow(tk.Toplevel):
             tk.Label(grid, text=h, bg=BG_PANEL, fg=FG_DIM,
                      font=("Consolas", 8, "bold")).grid(row=0, column=c, sticky="w",
                                                         padx=2)
-        names = self._preset_names()
+        # Comboboxes show disambiguated display_text; the model keeps RAW names.
+        self._ov_raw_to_disp, self._ov_disp_to_raw = \
+            self._build_preset_display_maps()
+        ov_values = [self._ov_raw_to_disp[n] for n in self._preset_names()]
         for r, tab in enumerate(self.pack.tabs, start=1):
-            self._build_tab_row(grid, r, tab, names)
+            self._build_tab_row(grid, r, tab, ov_values)
 
-    def _build_tab_row(self, grid, r, tab, names):
+    def _build_preset_display_maps(self):
+        """Return ``(raw→display, display→raw)`` maps for the tab comboboxes.
+
+        Built from the preset names PLUS every tab's current overview/bracket
+        ref, so even a dangling reference round-trips losslessly (its display
+        maps back to the exact raw). ``om.disambiguate`` guarantees unique
+        display strings, so ``display→raw`` is well-defined. The bracket "show
+        all" sentinel is handled by the row builder, never entered here."""
+        raws = list(self._preset_names())
+        for t in (self.pack.tabs or []):
+            for ref in (t.overview_preset, t.bracket_preset):
+                if ref and ref != osch.BRACKET_SHOW_ALL and ref not in raws:
+                    raws.append(ref)
+        raw_to_disp = om.disambiguate(raws)
+        disp_to_raw = {d: r for r, d in raw_to_disp.items()}
+        return raw_to_disp, disp_to_raw
+
+    def _bracket_display_for(self, raw):
+        """The bracket combobox display for a raw bracket value (the sentinel
+        and blank both show the friendly 'show all' string)."""
+        if not raw or raw == osch.BRACKET_SHOW_ALL:
+            return _BRACKET_SHOW_ALL_DISPLAY
+        return self._ov_raw_to_disp.get(raw, om.display_text(raw))
+
+    def _build_tab_row(self, grid, r, tab, ov_values):
         i = r - 1
         tk.Label(grid, text=str(tab.index), bg=BG_PANEL, fg=FG_TEXT,
                  font=("Consolas", 9)).grid(row=r, column=0, padx=2)
 
-        # Name cell: entry + a visible "c…" name-color-wrap button (L1 — the
-        # right-click binding stays as a shortcut, not the only affordance).
+        # Name cell: raw entry + a visible "c…" name-color-wrap button (L1 — the
+        # right-click binding stays as a shortcut, not the only affordance), with
+        # a live rendered preview below (RAW stays the model).
         namewrap = tk.Frame(grid, bg=BG_PANEL)
         namewrap.grid(row=r, column=1, padx=2, sticky="w")
+        topline = tk.Frame(namewrap, bg=BG_PANEL)
+        topline.pack(fill=tk.X)
         name_var = tk.StringVar(value=tab.name)
-        ne = tk.Entry(namewrap, textvariable=name_var, width=14, bg=BG_ENTRY,
+        ne = tk.Entry(topline, textvariable=name_var, width=14, bg=BG_ENTRY,
                       fg=FG_TEXT, insertbackground=FG_WHITE, font=("Consolas", 9))
         ne.pack(side=tk.LEFT)
-        ne.bind("<KeyRelease>", lambda e, idx=i: self._tab_set_name(idx, self._tab_rows[idx]["name"].get()))
+        ne.bind("<KeyRelease>", lambda e, idx=i: self._on_tab_name_keyrelease(idx))
         ne.bind("<Button-3>", lambda e, idx=i: self._tab_wrap_color(idx))
-        ttk.Button(namewrap, text="c…", width=3, style="Dark.TButton",
+        ttk.Button(topline, text="c…", width=3, style="Dark.TButton",
                    command=lambda idx=i: self._tab_wrap_color(idx)).pack(
             side=tk.LEFT, padx=(1, 0))
+        name_prev = tk.Text(namewrap, height=1, width=16, bg=BG_DARK, fg=FG_TEXT,
+                            relief=tk.FLAT, bd=0, highlightthickness=0,
+                            wrap="none", cursor="arrow", font=("Consolas", 8))
+        name_prev.pack(fill=tk.X, pady=(1, 0))
+        name_prev.configure(state=tk.DISABLED)
+        om.render_into_text(name_prev, tab.name, base_font=("Consolas", 8))
 
-        ov_var = tk.StringVar(value=tab.overview_preset)
-        ov = ttk.Combobox(grid, textvariable=ov_var, values=names, width=18)
+        ov_var = tk.StringVar(value=self._ov_raw_to_disp.get(
+            tab.overview_preset, om.display_text(tab.overview_preset)))
+        ov = ttk.Combobox(grid, textvariable=ov_var, values=ov_values, width=18)
         ov.grid(row=r, column=2, padx=2)
         ov.bind("<<ComboboxSelected>>", lambda e, idx=i: self._tab_set_overview(idx, self._tab_rows[idx]["overview"].get()))
         ov.bind("<KeyRelease>", lambda e, idx=i: self._tab_set_overview(idx, self._tab_rows[idx]["overview"].get()))
 
-        br_var = tk.StringVar(value=tab.bracket_preset)
+        br_var = tk.StringVar(value=self._bracket_display_for(tab.bracket_preset))
         br = ttk.Combobox(grid, textvariable=br_var,
-                          values=[osch.BRACKET_SHOW_ALL] + names, width=16)
+                          values=[_BRACKET_SHOW_ALL_DISPLAY] + ov_values, width=16)
         br.grid(row=r, column=3, padx=2)
         br.bind("<<ComboboxSelected>>", lambda e, idx=i: self._tab_set_bracket(idx, self._tab_rows[idx]["bracket"].get()))
         br.bind("<KeyRelease>", lambda e, idx=i: self._tab_set_bracket(idx, self._tab_rows[idx]["bracket"].get()))
@@ -762,7 +911,26 @@ class PackEditorWindow(tk.Toplevel):
 
         self._tab_rows.append({"name": name_var, "overview": ov_var,
                                "bracket": br_var, "swatch": swatch,
-                               "colbtn": colbtn})
+                               "colbtn": colbtn, "preview": name_prev})
+
+    def _on_tab_name_keyrelease(self, idx):
+        """Commit the tab name AND repaint its preview as the user types."""
+        if not (0 <= idx < len(self._tab_rows)):
+            return
+        name = self._tab_rows[idx]["name"].get()
+        self._tab_set_name(idx, name)
+        self._render_tab_name_preview(idx, name)
+
+    def _render_tab_name_preview(self, idx, name):
+        prev = self._tab_rows[idx].get("preview") if idx < len(self._tab_rows) \
+            else None
+        if prev is None:
+            return
+        try:
+            if prev.winfo_exists():
+                om.render_into_text(prev, name, base_font=("Consolas", 8))
+        except tk.TclError:
+            pass
 
     def _tab_add(self):
         """Append a tab with the next contiguous index. Refused (returns False)
@@ -794,13 +962,21 @@ class PackEditorWindow(tk.Toplevel):
         if self.pack.tabs and 0 <= row < len(self.pack.tabs):
             self.pack.tabs[row].name = name
 
-    def _tab_set_overview(self, row, name):
+    def _tab_set_overview(self, row, value):
+        """Store the RAW preset name for the chosen combobox display (falls
+        back to the value verbatim for a typed/unknown entry — lossless)."""
         if self.pack.tabs and 0 <= row < len(self.pack.tabs):
-            self.pack.tabs[row].overview_preset = name
+            self.pack.tabs[row].overview_preset = \
+                self._ov_disp_to_raw.get(value, value)
 
-    def _tab_set_bracket(self, row, val):
+    def _tab_set_bracket(self, row, value):
         if self.pack.tabs and 0 <= row < len(self.pack.tabs):
-            self.pack.tabs[row].bracket_preset = val
+            self.pack.tabs[row].bracket_preset = self._resolve_bracket(value)
+
+    def _resolve_bracket(self, value):
+        if value == _BRACKET_SHOW_ALL_DISPLAY:
+            return osch.BRACKET_SHOW_ALL
+        return self._ov_disp_to_raw.get(value, value)
 
     def _tab_pick_color(self, row):
         if not (self.pack.tabs and 0 <= row < len(self.pack.tabs)):
@@ -836,6 +1012,7 @@ class PackEditorWindow(tk.Toplevel):
         self.pack.tabs[row].name = wrapped
         if row < len(self._tab_rows):
             self._tab_rows[row]["name"].set(wrapped)
+            self._render_tab_name_preview(row, wrapped)
 
     def _tab_edit_columns(self, row):
         if not (self.pack.tabs and 0 <= row < len(self.pack.tabs)):
@@ -1270,12 +1447,14 @@ class PackEditorWindow(tk.Toplevel):
         self._close()
 
     def _close(self):
-        if self._search_after_id is not None:
-            try:
-                self.after_cancel(self._search_after_id)
-            except (tk.TclError, ValueError):
-                pass
-            self._search_after_id = None
+        for attr in ("_search_after_id", "_preset_prev_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.after_cancel(aid)
+                except (tk.TclError, ValueError):
+                    pass
+                setattr(self, attr, None)
         try:
             self.grab_release()
         except tk.TclError:

@@ -163,6 +163,55 @@ def _fmt_iso(s) -> str:
         return str(s)
 
 
+# Baked-in explanation of why distribution is a stage-then-import-in-game dance
+# AND account-scoped (owner feedback: the panel was "clear as mud"). Reused by
+# the panel header and the Instructions dialog so the two never drift.
+_DISTRIBUTION_EXPLAINER = (
+    "EVE can't be changed from outside — to apply a pack, FCTool stages the "
+    "file and YOU import it in-game on each account (one import covers all that "
+    "account's characters). Overview settings are per-ACCOUNT."
+)
+
+
+def _attach_tooltip(widget, text: str):
+    """Attach a simple hover tooltip to ``widget`` (house closure pattern,
+    mirrors markup_editor._show_tip).
+
+    The tooltip text is also stashed on the widget as ``_tooltip_text`` so it is
+    assertable in tests without simulating a hover. Returns ``widget``."""
+    widget._tooltip_text = text
+    state = {"tip": None}
+
+    def _hide(_e=None):
+        tip = state.get("tip")
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+            state["tip"] = None
+
+    def _show(_e=None):
+        _hide()
+        try:
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tk.Label(tip, text=text, font=_FONT_SM, fg=FG_TEXT, bg=BG_PANEL,
+                     borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
+                     wraplength=340, padx=5, pady=3).pack()
+            tip.wm_geometry(
+                f"+{widget.winfo_rootx() + 12}"
+                f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            state["tip"] = tip
+        except tk.TclError:
+            state["tip"] = None
+
+    widget.bind("<Enter>", _show, add="+")
+    widget.bind("<Leave>", _hide, add="+")
+    widget.bind("<Destroy>", _hide, add="+")
+    return widget
+
+
 def build_overview_tab(parent, providers: OverviewProviders) -> tk.Frame:
     """Construct the Overview tab and return its frame (the frame IS the
     controller — an OverviewTab, a tk.Frame subclass carrying all state)."""
@@ -276,6 +325,9 @@ class OverviewTab(tk.Frame):
         stage = ttk.Button(bar, text="Stage to EVE", style="Dark.TButton",
                            command=self._stage_selected)
         stage.pack(side=tk.LEFT, padx=6, pady=6)
+        _attach_tooltip(stage,
+                        "Writes 'FCTool - <pack>.yaml' into Documents\\EVE\\"
+                        "Overview — the folder the in-game Import dialog lists.")
         self._selection_buttons.append(stage)
         ttk.Button(bar, text="Open Overview folder", style="Dark.TButton",
                    command=self._open_overview_folder).pack(side=tk.LEFT, padx=2)
@@ -338,10 +390,20 @@ class OverviewTab(tk.Frame):
         header.pack(fill=tk.X, padx=4, pady=4)
         tk.Label(header, text="Distribution", font=_FONT_BOLD, fg=FG_ACCENT,
                  bg=BG_PANEL).pack(side=tk.LEFT)
-        refresh = ttk.Button(header, text="Refresh drift", style="Dark.TButton",
-                             command=self._refresh_drift)
-        refresh.pack(side=tk.RIGHT)
-        self._selection_buttons.append(refresh)
+        verify = ttk.Button(header, text="Verify accounts", style="Dark.TButton",
+                            command=self._refresh_drift)
+        verify.pack(side=tk.RIGHT)
+        _attach_tooltip(verify,
+                        "Reads each account's LIVE overview from EVE's settings "
+                        "files (read-only) and compares to this pack: matches / "
+                        "differs / unreadable. Fresh as of each account's last "
+                        "clean logout.")
+        self._selection_buttons.append(verify)
+
+        # Baked-in account-scoped explainer (owner: the panel was "clear as mud").
+        tk.Label(right, text=_DISTRIBUTION_EXPLAINER, bg=BG_PANEL, fg=FG_DIM,
+                 font=_FONT_SM, justify=tk.LEFT, wraplength=360,
+                 anchor="w").pack(fill=tk.X, padx=6, pady=(0, 4))
 
         holder = tk.Frame(right, bg=BG_DARK)
         holder.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
@@ -409,6 +471,10 @@ class OverviewTab(tk.Frame):
         mark = ttk.Button(row, text="Mark imported ✓", style="Dark.TButton",
                           command=lambda aid=account_id: self._mark_imported(aid))
         mark.grid(row=1, column=1, sticky="w", pady=(0, 2))
+        _attach_tooltip(mark,
+                        "Check off after YOU click Import in-game on this "
+                        "account — FCTool can't see in-game clicks; this just "
+                        "records the date.")
         last = tk.Label(row, text="not imported", bg=BG_PANEL, fg=FG_DIM,
                         font=_FONT_SM, anchor="w")
         last.grid(row=1, column=2, columnspan=2, padx=8, sticky="w")
@@ -697,6 +763,7 @@ class OverviewTab(tk.Frame):
         win.title("Import an overview in-game")
         win.configure(bg=BG_DARK)
         text = (
+            _DISTRIBUTION_EXPLAINER + "\n\n"
             "How to import a staged overview pack in EVE\n"
             "──────────────────────────────────────────\n\n"
             "1. Select a pack and click 'Stage to EVE'. It writes\n"
