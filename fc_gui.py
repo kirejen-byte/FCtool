@@ -106,6 +106,16 @@ from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
 from esi_constants import ESI_BASE, ESI_HEADERS
+# Overview Manager (native EVE overview pack repository, editor + per-account
+# distributor). Engine/decoder modules are Tk-free; overview_manager_ui and
+# overview_editor_window are self-contained windows that import no fc_gui (house
+# containment pattern, like fleet_template_window). Wired by _build_overview_tab.
+import eve_paths
+import overview_dat
+import overview_manager_ui
+import overview_editor_window
+import overview_templates
+from overview_store import OverviewStore
 
 log = get_logger(__name__)
 
@@ -185,11 +195,13 @@ _SETTINGS_TOC_PADY = 10             # panel/ribbon vertical padding (matches pac
 # ── Notebook tab indices ────────────────────────────────────────────────────────
 # Order of self.notebook.add() calls in _build_ui:
 #   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
-#   4 Map, 5 Characters, 6 Fittings, 7 Settings.
-# Map is inserted at index 4 (after Navigation): the earlier tabs (Fleet=0,
-# Intel=1, Jump Range=2, Navigation=3) are unchanged; Characters/Fittings/
-# Settings each shift +1 (4->5, 5->6, 6->7). _on_tab_changed's Characters check
-# and FITTINGS_TAB_INDEX below are updated to match.
+#   4 Map, 5 Characters, 6 Fittings, 7 Overview, 8 Settings.
+# Map is inserted at index 4 (after Navigation), so Characters=5 and Fittings=6
+# follow it. Overview is inserted at index 7 (after Fittings, before Settings),
+# so Settings shifts 7->8. _on_tab_changed keys ONLY off indices 0/1/5 (all
+# before the Overview insertion) and matches the Map tab by widget identity, so
+# none of its checks change; FITTINGS_TAB_INDEX stays 6 and nothing references
+# the Settings tab by index.
 FITTINGS_TAB_INDEX = 6
 DOCTRINES_SUBTAB_INDEX = 1
 
@@ -1802,6 +1814,7 @@ class FCToolGUI:
         self._build_map_tab()
         self._build_character_tab()
         self._build_fitting_tab()
+        self._build_overview_tab()
         self._build_settings_tab()
 
         # Track zkill alert notifications
@@ -12971,6 +12984,76 @@ class FCToolGUI:
                     + detail)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ── Overview Tab ──────────────────────────────────────────────────────────
+
+    def _build_overview_tab(self):
+        """Overview Manager tab (inserted before Settings) — native EVE overview
+        pack repository, full editor and per-account distributor. WIRING ONLY:
+        the tab content, editor window and .dat decode all live in their own
+        modules (overview_manager_ui / overview_editor_window / overview_dat /
+        overview_templates), none of which import fc_gui. This method just builds
+        the provider bundle from app services and registers the frame with the
+        notebook (mirrors _build_map_tab's construct-controller-then-add shape)."""
+        # Lazy singletons: the pack store (schema-versioned JSON under app_dir)
+        # and the parsed SDE group/category tables the editor + FC-Standard
+        # template consume. The table load is guarded so a missing/broken bundled
+        # JSON degrades to "editor/template unavailable" instead of blocking the
+        # whole tab (and, since this runs during _build_ui, the whole app).
+        if not hasattr(self, "_overview_store"):
+            self._overview_store = OverviewStore()
+        try:
+            groups, categories = overview_templates.load_tables()
+        except Exception:
+            log.exception(
+                "[overview] SDE tables failed to load; editor/template disabled")
+            groups, categories = None, None
+
+        def overview_dir():
+            override = (self.config.get("overview", {}) or {}).get(
+                "overview_dir_override")
+            return override or eve_paths.overview_dir()
+
+        def build_fc_standard():
+            if groups is None or categories is None:
+                return None
+            try:
+                return overview_templates.build_fc_standard(groups, categories)
+            except Exception:
+                log.exception("[overview] build_fc_standard failed")
+                return None
+
+        def open_editor(record):
+            if groups is None or categories is None:
+                messagebox.showinfo(
+                    "Overview editor unavailable",
+                    "The bundled EVE type tables (inv_groups.json / "
+                    "inv_categories.json) could not be loaded, so the pack "
+                    "editor cannot open. Reinstalling FCTool restores them.")
+                return
+
+            def on_save(pack_id, pack):
+                self._overview_store.update_pack(pack_id, pack=pack)
+                tab.refresh()
+
+            overview_editor_window.PackEditorWindow(
+                self.root, record, groups, categories, on_save=on_save)
+
+        providers = overview_manager_ui.OverviewProviders(
+            store=self._overview_store,
+            get_config=lambda: self.config,
+            save_config=self._save_config,
+            overview_dir=overview_dir,
+            list_accounts=overview_dat.list_accounts,
+            read_live=overview_dat.read_overview,
+            live_fingerprint=overview_dat.live_fingerprint,
+            post_ui=self._post_ui,
+            open_editor=open_editor,
+            build_fc_standard=build_fc_standard,
+        )
+        tab = overview_manager_ui.build_overview_tab(self.notebook, providers)
+        self.notebook.add(tab, text="  Overview  ")
+        self._overview_tab = tab
 
     # ── Settings Tab ──────────────────────────────────────────────────────────
 
