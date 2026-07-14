@@ -13,7 +13,7 @@ import os
 
 import yaml
 
-from app_io import _replace_with_retry
+from app_io import _replace_with_retry, _unique_tmp
 import overview_schema as osch
 
 
@@ -72,7 +72,9 @@ def write_file(pack: osch.OverviewPack, path: str) -> None:
     # CRLF: the client's own export is CRLF-only (golden, 2026-07-12) —
     # match its byte style. emit() produces LF, so this translation is total.
     data = emit(pack).replace("\n", "\r\n").encode("utf-8")
-    tmp = path + ".tmp"
+    # Per-writer-unique temp name (app_io._unique_tmp): the OneDrive-synced
+    # target dir means a second writer could otherwise collide on <path>.tmp.
+    tmp = _unique_tmp(path)
     try:
         with open(tmp, "wb") as f:      # bytes mode => exact newline control
             f.write(data)

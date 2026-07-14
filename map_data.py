@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from app_path import app_dir, bundle_dir
+from app_path import bundle_dir, resolve_data_file
 
 _GRID_CELLS = 64  # per axis; ~5.4k systems -> a few per cell
 
@@ -19,8 +19,11 @@ _GRID_CELLS = 64  # per axis; ~5.4k systems -> a few per cell
 def _data_path(fname: str, override: Path | None) -> Path:
     if override is not None:
         return Path(override)
-    local = Path(app_dir()) / fname
-    return local if local.exists() else Path(bundle_dir()) / fname
+    # app_dir() wins over bundle_dir() (prefer="writable"); when neither has the
+    # file, fall back to the bundled path unconditionally (historic behavior —
+    # the caller surfaces the missing-file error on open()).
+    resolved = resolve_data_file(fname, prefer="writable")
+    return Path(resolved) if resolved is not None else Path(bundle_dir()) / fname
 
 
 @dataclass(frozen=True)

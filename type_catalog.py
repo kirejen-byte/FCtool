@@ -29,7 +29,7 @@ import threading
 
 from app_io import atomic_write_json
 from app_log import get_logger
-from app_path import app_dir, bundle_dir
+from app_path import app_dir, bundle_dir, resolve_data_file
 
 log = get_logger(__name__)
 
@@ -117,8 +117,17 @@ class TypeCatalog:
         esi=None,
     ) -> None:
         if bundled_path is None:
-            bundled_path = os.path.join(bundle_dir(), "fit_types.json")
+            # Pristine shipped SDE table: prefer the bundled copy so a stray
+            # writable-dir file can't shadow it (resolve_data_file prefer=
+            # "bundle"). The `or` keeps the historic unconditional bundle path
+            # when the file is absent everywhere (a missing table is non-fatal;
+            # _ingest_file just returns None).
+            bundled_path = (resolve_data_file("fit_types.json", prefer="bundle")
+                            or os.path.join(bundle_dir(), "fit_types.json"))
         if cache_path is None:
+            # WRITE target (ESI-resolved entries persist here), so it MUST live
+            # in the writable app_dir() — not a resolve_data_file lookup, which
+            # could hand back a read-only bundled path.
             cache_path = os.path.join(app_dir(), "fit_types_cache.json")
         self._bundled_path = bundled_path
         self._cache_path = cache_path

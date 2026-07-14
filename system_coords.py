@@ -9,7 +9,7 @@ import json
 import os
 import threading
 
-from app_path import app_dir, bundle_dir
+from app_path import resolve_data_file
 
 _COORDS_FILENAME = "system_coords.json"
 
@@ -35,14 +35,9 @@ HIGHSEC_CUTOFF = 0.45          # true_security >= 0.45 is highsec (cyno blocked)
 
 
 def _data_path() -> str | None:
-    """Prefer a writable copy next to the exe, else the bundled read-only copy."""
-    p = os.path.join(app_dir(), _COORDS_FILENAME)
-    if os.path.exists(p):
-        return p
-    p = os.path.join(bundle_dir(), _COORDS_FILENAME)
-    if os.path.exists(p):
-        return p
-    return None
+    """Prefer a writable copy next to the exe, else the bundled read-only copy
+    (``prefer="writable"``); None when neither exists so callers fall back to ESI."""
+    return resolve_data_file(_COORDS_FILENAME, prefer="writable")
 
 
 def _load() -> None:
