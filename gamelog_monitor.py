@@ -174,6 +174,16 @@ class GamelogMonitor:
         self._fingerprints: dict[str, bytes] = {}    # path -> tail bytes
         self._buffers: dict[str, str] = {}           # path -> partial-line text
         self._listeners: dict[str, str] = {}         # path -> char name
+        # New-file discovery gate (see discover_files) — mirrors chat_monitor's
+        # `_last_dir_mtime` gate verbatim: re-globbing the Gamelogs directory is
+        # O(files-in-dir) and, like Chatlogs, it accumulates files indefinitely
+        # over a long session, so an unconditional glob every 1s poll holds the
+        # GIL long enough to stall the Tk main thread. A new Gamelog file bumps
+        # the directory's mtime (creation), while damage/decloak lines appended
+        # to already-tracked files do not, so we glob only when the directory
+        # changed since the last scan, with a backstop interval as a safety net.
+        self._last_dir_mtime: float | None = None
+        self._last_full_scan_monotonic: float = 0.0
         # Set of lowercased character names with a live preview tile; None means
         # "track everything" (before the tick has told us otherwise).
         self._tracked: set[str] | None = None
@@ -245,12 +255,41 @@ class GamelogMonitor:
     def _logs_directory(self):
         return self._logs_dir
 
+    # Backstop: force a full directory re-glob at least this often even when the
+    # directory mtime looks unchanged, mirroring chat_monitor._discover_files's
+    # _DIR_RESCAN_INTERVAL_SECONDS. 60s bounds worst-case new-file discovery
+    # latency while cutting the per-second glob by ~60x on a long session.
+    _DIR_RESCAN_INTERVAL_SECONDS = 60.0
+
     def discover_files(self):
         """Register any new Gamelog files (seed to EOF). Constant-rotation safe:
-        new files appear every jump/warp/session change."""
+        new files appear every jump/warp/session change.
+
+        Skips the (potentially very expensive) directory glob when the Gamelogs
+        directory is unchanged since the last scan: a new Gamelog file bumps the
+        directory's mtime, whereas appends to already-tracked files do not, so a
+        stable mtime means there is no new file to discover. A long backstop
+        interval still forces an occasional full re-glob as a safety net. This
+        keeps the once-per-second poll off the GIL-heavy glob that otherwise
+        stalls the Tk main thread once the Gamelogs folder accumulates many
+        files over a long session (mirrors chat_monitor._discover_files)."""
         logs_dir = self._logs_directory()
         if not logs_dir:
             return
+        now_monotonic = time.monotonic()
+        try:
+            dir_mtime = os.path.getmtime(logs_dir)
+        except OSError:
+            dir_mtime = None
+        unchanged = (dir_mtime is not None
+                     and dir_mtime == self._last_dir_mtime)
+        within_backstop = (
+            (now_monotonic - self._last_full_scan_monotonic)
+            < self._DIR_RESCAN_INTERVAL_SECONDS)
+        if unchanged and within_backstop:
+            return  # directory unchanged since last scan — no new files to find
+        self._last_dir_mtime = dir_mtime
+        self._last_full_scan_monotonic = now_monotonic
         try:
             paths = glob.glob(os.path.join(logs_dir, "*.txt"))
         except OSError:
