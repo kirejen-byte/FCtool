@@ -123,12 +123,30 @@ class FittingsStore:
         # after construction. Used to auto-tag fits that mount a Defender Launcher.
         self.catalog = None
         self._lock = threading.RLock()
+        # Monotonic revision counter bumped on every persisted change (see save()).
+        # Lets callers cheaply detect "the library changed" without diffing it —
+        # e.g. the preview-caption memo keys its doctrine/tag-index bundle on this
+        # so it recomputes only when fits/doctrines change (OPTIMIZATION_REVIEW E3).
+        self._rev = 0
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def load(self) -> None:
         """Load the library from disk. A missing or unreadable file seeds an
-        empty library with the default tag vocabulary."""
+        empty library with the default tag vocabulary.
+
+        Each fit/doctrine entry is constructed independently: valid JSON with
+        the wrong shape (e.g. a required field missing) raises out of
+        ``fit_from_dict``/``doctrine_from_dict`` for THAT entry only, so it is
+        skipped (logged via ``log.warning`` with the entry id and the error,
+        plus a load-level summary line with the total skip count) rather than
+        aborting the whole load — mirroring
+        ``fleet_template_store.load()``'s per-entry discipline. A doctrine
+        member left pointing at a skipped/missing fit id is NOT cleaned up
+        here: every consumer already treats an unresolvable ``get_fit`` as a
+        tolerated case (skip in `fleet_composer`/`fleet_guidance`, an explicit
+        "(missing fit ...)" label in the GUI), so leaving it as-is is
+        consistent with existing behavior."""
         with self._lock:
             if not os.path.exists(self.path):
                 self._fits = {}
@@ -165,14 +183,42 @@ class FittingsStore:
                 self._tags = list(DEFAULT_TAGS)
                 return
 
-            self._fits = {
-                fid: fit_from_dict(raw)
-                for fid, raw in (data.get("fits") or {}).items()
-            }
-            self._doctrines = {
-                did: doctrine_from_dict(raw)
-                for did, raw in (data.get("doctrines") or {}).items()
-            }
+            self._fits = {}
+            skipped_fits = 0
+            for fid, raw in (data.get("fits") or {}).items():
+                try:
+                    self._fits[fid] = fit_from_dict(raw)
+                except Exception as exc:
+                    skipped_fits += 1
+                    log.warning(
+                        "Skipping malformed fit %r in %s: %s", fid, self.path, exc
+                    )
+
+            self._doctrines = {}
+            skipped_doctrines = 0
+            for did, raw in (data.get("doctrines") or {}).items():
+                try:
+                    self._doctrines[did] = doctrine_from_dict(raw)
+                except Exception as exc:
+                    skipped_doctrines += 1
+                    log.warning(
+                        "Skipping malformed doctrine %r in %s: %s", did, self.path, exc
+                    )
+
+            total_skipped = skipped_fits + skipped_doctrines
+            if total_skipped:
+                log.warning(
+                    "Fittings library at %s: skipped %d malformed entr%s on load "
+                    "(%d fit%s, %d doctrine%s) — see warnings above for details.",
+                    self.path,
+                    total_skipped,
+                    "y" if total_skipped == 1 else "ies",
+                    skipped_fits,
+                    "" if skipped_fits == 1 else "s",
+                    skipped_doctrines,
+                    "" if skipped_doctrines == 1 else "s",
+                )
+
             tags = data.get("tags")
             self._tags = list(tags) if tags else list(DEFAULT_TAGS)
             self._migrate_tags()
@@ -204,6 +250,10 @@ class FittingsStore:
         against).
         """
         with self._lock:
+            # Bump BEFORE the write (not after success): the in-memory library has
+            # already been mutated by the caller, so the revision must advance even
+            # if persistence later fails — consumers memoise off in-memory state.
+            self._rev += 1
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "fits": {fid: fit_to_dict(fit) for fid, fit in self._fits.items()},
@@ -222,6 +272,16 @@ class FittingsStore:
             except Exception:
                 log.exception("Failed to save fittings library to %s", self.path)
                 raise
+
+    def revision(self) -> int:
+        """Monotonic change counter (advances once per ``save()``).
+
+        Read WITHOUT the lock on purpose: a single int read is atomic under the
+        GIL, and callers use it only as a cheap change signal — a value that is
+        stale by one merely defers one memo refresh, never corrupts anything. A
+        locked read would let a long ``save()`` fsync briefly stall the Tk thread
+        that polls this every ~250 ms."""
+        return self._rev
 
     # ── Fit CRUD ──────────────────────────────────────────────────────────────
 

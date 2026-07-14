@@ -44,10 +44,12 @@ open questions):
   See ``_CONTRACT_MATCH_ROLES`` (the contract-only subset) and ``fit_bom``.
 
 Thread-safety: a scan holds no mutable shared state except the JSON cache, which
-is guarded by a ``threading.Lock`` around every read-modify-write (the same
-discipline ``TypeCatalog._write_cache_entries`` uses: re-read before writing so
-concurrent scanners don't clobber). All returned dataclasses are fresh per call,
-safe to hand to the Tk thread via the app's ``after()`` marshalling.
+is guarded by a ``threading.Lock`` around every read-modify-write (a sibling
+discipline to ``TypeCatalog._write_cache_entries``, which merges each resolved
+entry into a lock-guarded in-memory snapshot — one instance per process — and
+flushes it to disk in a single write per call, rather than re-reading before
+every write). All returned dataclasses are fresh per call, safe to hand to the
+Tk thread via the app's ``after()`` marshalling.
 """
 
 from __future__ import annotations
