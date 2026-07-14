@@ -233,6 +233,12 @@ def resolve_staging(name: str, adapter=None, *, use_cache: bool = True) -> dict 
     ``/universe/ids/`` on each call to find the id before the cache can answer —
     only steps 3-4 below are saved for those. Returns None only when the name
     cannot be resolved to a system id at all. Never raises.
+
+    A resolution is only WRITTEN to the cache once the station fetch actually
+    succeeds. A transient ESI failure (``/universe/systems/`` unreachable, 5xx,
+    timeout, ...) is therefore a plain cache MISS, not a permanently-cached
+    empty result — the next call retries the network instead of replaying a
+    stale ``region_id=0`` / ``stations=[]`` forever.
     """
     if not name or not name.strip():
         return None
@@ -300,8 +306,16 @@ def resolve_staging(name: str, adapter=None, *, use_cache: bool = True) -> dict 
         "stations": stations,
     }
 
-    # 5) persist forever.
-    if use_cache:
+    # 5) persist forever — but ONLY on a genuine success. A cached resolution
+    #    is treated as immutable (see step 2's fast path + the module
+    #    docstring), so writing one whose station fetch failed would strand a
+    #    failure-shaped result (region_id==0, stations=[]) in the cache
+    #    PERMANENTLY — indistinguishable on every future call from a real
+    #    "no stations here" system. Persist only when the /universe/systems/
+    #    fetch for stations actually succeeded (sysinfo is a dict); a failed
+    #    fetch is left as a cache MISS so the next resolve_staging() call
+    #    retries the network instead of replaying stale emptiness.
+    if use_cache and isinstance(sysinfo, dict):
         cache[key] = resolution
         _save_cache(cache)
     return resolution
