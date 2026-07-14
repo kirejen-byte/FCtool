@@ -73,3 +73,12 @@ tests/
 # SDE download cache for tools/gen_map_layout.py (the ~SDE jsonl zip is large and
 # re-downloadable; only the generated map_layout.json is committed).
 tools/_cache/
+
+# Hygiene (OPTIMIZATION_REVIEW.md F5): dev/spike artifacts, never ship
+tools/spike_*
+# Hygiene (OPTIMIZATION_REVIEW.md F5): dev/spike artifacts, never ship
+tools/probe_*
+# Hygiene (OPTIMIZATION_REVIEW.md F5): dev/spike artifacts, never ship
+*_dump_sample.txt
+# Hygiene (OPTIMIZATION_REVIEW.md F5): dev/spike artifacts, never ship
+diag_python.bat

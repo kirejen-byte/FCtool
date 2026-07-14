@@ -404,16 +404,6 @@ def center_subsurface(surf: pygame.Surface, margin: int, vw: int, vh: int) -> py
 
 
 # --- frame pipeline (spec §4.2 order) ---------------------------------------
-def average_edge_length(model) -> float:
-    if not model.edges:
-        return 1.0
-    total = 0.0
-    for a, b in model.edges:
-        sa, sb = model.systems[a], model.systems[b]
-        total += ((sa.x - sb.x) ** 2 + (sa.y - sb.y) ** 2) ** 0.5
-    return total / len(model.edges)
-
-
 def median_edge_length(model) -> float:
     """Median gate-edge length — robust vs long inter-region edges, which
     inflate the mean ~2x and (via the zoom ceiling) made band C unreachable

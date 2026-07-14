@@ -124,6 +124,10 @@ DEFAULT_CONFIG = {
         "staging_station_name": "",    # chosen NPC station display name
         "staging_structure_name": "",  # chosen structure name (no "(id)" suffix)
         "scan_contracts": True,     # allow the (expensive) contract scan
+        # Naming convention for FUTURE boolean startup-scan-style keys: `<verb>_on_startup`
+        # (as below). infra.auto_scan_on_start (below) predates this convention and is
+        # grandfathered as-is -- renaming a persisted config key needs a migration, which
+        # isn't worth it on its own (OPTIMIZATION_REVIEW.md F2).
         "scan_on_startup": True,    # background re-scan a few seconds after launch
         "include_alliance_contracts": True,  # also pull corp/alliance contracts (needs scope)
         "contracts_scope": "system",  # "system" (staging system only) | "region" (whole region)
@@ -136,6 +140,9 @@ DEFAULT_CONFIG = {
     # in is the owner's call. The map's Infra chip layer defaults OFF via
     # map_tab._LAYERS_OFF_BY_DEFAULT (deliberately NOT a map.layers key here).
     "infra": {
+        # Grandfathered spelling -- predates the `<verb>_on_startup` convention documented
+        # at market.scan_on_startup above; not renamed since persisted-key renames need a
+        # migration path (OPTIMIZATION_REVIEW.md F2).
         "auto_scan_on_start": False,
     },
     "overview": {

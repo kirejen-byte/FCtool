@@ -1,5 +1,6 @@
 """Named overview-pack repository. Pattern: fittings_store.py (schema-versioned
-atomic JSON in app_dir; refuse files from a newer FCTool)."""
+atomic JSON in app_dir; a file from a newer FCTool is backed up aside and the
+store degrades to empty rather than raising out of the constructor)."""
 from __future__ import annotations
 
 import os
@@ -9,8 +10,11 @@ import uuid
 from dataclasses import dataclass
 
 from app_io import atomic_write_json
+from app_log import get_logger
 from app_path import app_dir
 import overview_schema as osch
+
+log = get_logger(__name__)
 
 SCHEMA_VERSION = 1
 DEFAULT_FILENAME = "overview_packs.json"
@@ -50,9 +54,24 @@ class OverviewStore:
             return
         schema = data.get("schema", 0)
         if schema > SCHEMA_VERSION:
-            raise ValueError(
-                f"overview pack store schema {schema} is newer than this "
-                f"FCTool supports ({SCHEMA_VERSION})")
+            # A newer FCTool (or an OneDrive-synced file from one) wrote a
+            # schema we don't understand. Never raise out of the constructor
+            # (that would take down the whole _build_ui path, see fc_gui.py)
+            # -- back the file up aside and open empty, same shape as the
+            # corrupt-JSON handling just above.
+            backup = self.path + ".newer-schema"
+            try:
+                shutil.copyfile(self.path, backup)
+                log.warning(
+                    "overview pack store schema %s is newer than this "
+                    "FCTool supports (%s); backed up to %s and starting "
+                    "empty.", schema, SCHEMA_VERSION, backup)
+            except OSError:
+                log.exception(
+                    "overview pack store schema %s is newer than this "
+                    "FCTool supports (%s) and could not be backed up to "
+                    "%s; starting empty.", schema, SCHEMA_VERSION, backup)
+            return
         self._packs = dict(data.get("packs", {}))
 
     def _save(self):

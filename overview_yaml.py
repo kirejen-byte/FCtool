@@ -13,6 +13,7 @@ import os
 
 import yaml
 
+from app_io import _replace_with_retry
 import overview_schema as osch
 
 
@@ -72,8 +73,19 @@ def write_file(pack: osch.OverviewPack, path: str) -> None:
     # match its byte style. emit() produces LF, so this translation is total.
     data = emit(pack).replace("\n", "\r\n").encode("utf-8")
     tmp = path + ".tmp"
-    with open(tmp, "wb") as f:      # bytes mode => exact newline control
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:      # bytes mode => exact newline control
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # Target dir is OneDrive-synced Documents\EVE\Overview -- reuse the
+        # house os.replace retry (app_io._replace_with_retry) for the same
+        # transient WinError-32 lock app_io's own writers already defend
+        # against, instead of a bare os.replace that fails on first hit.
+        _replace_with_retry(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise

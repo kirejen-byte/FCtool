@@ -17,7 +17,7 @@ here — so this module makes no thread-safety assumptions of its own.
 """
 import logging
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 log = logging.getLogger(__name__)
 
@@ -411,6 +411,12 @@ class InfraManagerDialog(tk.Toplevel):
         if not keys:
             self._set_status("Select rows to delete.")
             return
+        count = len(keys)
+        if not messagebox.askyesno(
+                "Delete structures",
+                f"Delete {count} structure{'s' if count != 1 else ''} from "
+                "the local database?"):
+            return
         try:
             n = self.store.remove(keys)
         except Exception as exc:
@@ -426,6 +432,11 @@ class InfraManagerDialog(tk.Toplevel):
         keys = self._selected_keys()
         if not keys:
             self._set_status("Select rows to mark dead.")
+            return
+        count = len(keys)
+        if not messagebox.askyesno(
+                "Mark dead",
+                f"Mark {count} structure{'s' if count != 1 else ''} dead?"):
             return
         for k in keys:
             try:

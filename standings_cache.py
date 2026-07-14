@@ -60,9 +60,16 @@ class StandingsCache:
         ts = data.get("fetched_at")
         if ts:
             try:
-                self.fetched_at = datetime.fromisoformat(ts)
+                parsed = datetime.fromisoformat(ts)
             except ValueError:
-                self.fetched_at = None
+                parsed = None
+            if parsed is not None and parsed.tzinfo is None:
+                # Rehydrated naive timestamp (e.g. an older file written before
+                # this field was always UTC-aware): assume UTC rather than let
+                # is_stale()/age_string() raise a naive-vs-aware TypeError when
+                # they diff it against datetime.now(timezone.utc).
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            self.fetched_at = parsed
         self.source_character_id = data.get("source_character_id")
 
     def save(self) -> None:

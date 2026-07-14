@@ -763,6 +763,11 @@ class OverviewTab(tk.Frame):
         win = tk.Toplevel(self)
         win.title("Import an overview in-game")
         win.configure(bg=BG_DARK)
+        try:
+            win.transient(self)
+        except tk.TclError:
+            pass
+        win.bind("<Escape>", lambda e: win.destroy())
         text = (
             _DISTRIBUTION_EXPLAINER + "\n\n"
             "How to import an exported overview pack in EVE\n"

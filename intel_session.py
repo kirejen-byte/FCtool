@@ -15,6 +15,16 @@ from intel_paste import (
 
 T = TypeVar("T")
 
+# Cap on retained history per session list (A14): these lists were append-only
+# for the life of the GUI process, so a long session accumulates local scans /
+# d-scans / fleet pastes without bound, even though only recent entries are
+# ever consulted (prior_dscan/prior_local_scan default to a 15-minute window;
+# find_recent_system to 60s). 200 is generous for real ops (hours of scans
+# every few seconds) while bounding memory and the linear rescans in those
+# lookups. Plain list + trim-on-append (not deque) so `== []`, slicing, and
+# every other list-like usage stays byte-identical to before the cap.
+_SCAN_HISTORY_CAP = 200
+
 
 @dataclass
 class ScanEntry(Generic[T]):
@@ -41,6 +51,8 @@ class IntelSession:
             system=system,
             parsed=parsed,
         ))
+        if len(self.local_scans) > _SCAN_HISTORY_CAP:
+            del self.local_scans[0]
 
     def add_dscan(self, system: str, parsed: DScan) -> None:
         self.dscan_scans.append(ScanEntry(
@@ -48,12 +60,16 @@ class IntelSession:
             system=system,
             parsed=parsed,
         ))
+        if len(self.dscan_scans) > _SCAN_HISTORY_CAP:
+            del self.dscan_scans[0]
 
     def add_fleet_paste(self, parsed: FleetComposition | FleetSummary) -> None:
         self.fleet_pastes.append(FleetPasteEntry(
             timestamp=datetime.now(timezone.utc),
             parsed=parsed,
         ))
+        if len(self.fleet_pastes) > _SCAN_HISTORY_CAP:
+            del self.fleet_pastes[0]
 
     def latest_fleet_paste(self) -> FleetPasteEntry | None:
         return self.fleet_pastes[-1] if self.fleet_pastes else None

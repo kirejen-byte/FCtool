@@ -74,8 +74,12 @@ def resolve_name(entity_id: int, category: str = "solar_system") -> str:
         fallback, expiry = neg
         if time.monotonic() < expiry:
             return fallback
-        # Expired — drop it and fall through to retry the HTTP request.
-        del _name_neg_cache[key]
+        # Expired — drop it and fall through to retry the HTTP request. Use
+        # pop(key, None) rather than `del`: resolve_name is called from ~12
+        # sites across threads, so two callers can both observe the same
+        # expired entry before either evicts it (check-then-act race). `del`
+        # would KeyError on the second eviction; pop(key, None) is idempotent.
+        _name_neg_cache.pop(key, None)
     try:
         endpoints = {
             "solar_system": f"{ESI_BASE}/universe/systems/{entity_id}/",

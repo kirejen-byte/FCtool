@@ -231,9 +231,3 @@ def build_fc_standard(groups: dict, categories: dict) -> OverviewPack:
         overview_columns=list(_OVERVIEW_COLUMNS),
         # appearance / ship labels / user settings intentionally absent (partial pack)
     )
-
-
-def build_fc_standard_from_tables() -> OverviewPack:
-    """Convenience: ``build_fc_standard(*load_tables())`` in one call."""
-    groups, categories = load_tables()
-    return build_fc_standard(groups, categories)
