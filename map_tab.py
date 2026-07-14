@@ -1600,15 +1600,23 @@ class MapTab:
     def set_own_location(self, system_id) -> None:  # spec §5.2: own char distinct
         prev = self.state.own_system_id
         self.state.own_system_id = system_id
+        changed = system_id != prev
         # Route overlay (Task 35): the 15s own-location poll re-pushes the SAME id
         # every tick, so react only when the own system actually changed. Arrival
         # (own == destination) auto-clears the route; any other move re-solves it
         # from the new origin.
-        if system_id != prev and self.state.route_dest is not None:
+        if changed and self.state.route_dest is not None:
             if system_id is not None and system_id == self.state.route_dest:
                 self.clear_route()
                 return
             self._recompute_route()
+        # E5: the 15 s poll re-pushes the SAME id most ticks -- when nothing
+        # changed (and so no route recompute could have run above either), the
+        # own-location marker's screen position is identical to what's already
+        # painted, so skip the repaint. A real move (or the branches above)
+        # still repaints -- via clear_route() above or the fall-through here.
+        if not changed:
+            return
         self._redraw_overlays()
 
     # ---- destination route overlay (Task 35) ----------------------------------
@@ -1682,7 +1690,16 @@ class MapTab:
         is near-real-time). When the heat layer is on, force-dirties + re-requests
         a crisp so the new hot system lights up promptly, and repaints overlays so
         a capital marker can appear at once. Guarded/no-throw so a malformed alert
-        never breaks the zkill path."""
+        never breaks the zkill path.
+
+        E1: the record + force_dirty always land (so a hidden tab's state is
+        correct the instant it is shown), but the worker-side crisp request is
+        skipped while hidden -- this is an externally-driven push (zkill), not
+        part of the render pipeline's own gesture/settle flow, so it is safe to
+        gate here specifically. on_shown's own force_dirty()+_request_crisp()
+        (~1437-1439) picks up the pending heat the moment the tab is shown; the
+        overlay repaint itself no-ops while hidden via _redraw_overlays' own
+        visibility guard."""
         try:
             self.state.kill_heat.add_kill(system_id, kill_count, time.time(),
                                           bool(capital))
@@ -1692,7 +1709,8 @@ class MapTab:
         if self._layer_on("heat"):
             self._last_heat_refresh_ms = _now_ms()   # a fresh crisp resets the decay clock
             self.state.force_dirty()
-            self._request_crisp()
+            if self._visible:
+                self._request_crisp()
             self._redraw_overlays()
 
     def _current_heat_dict(self) -> dict:
@@ -2745,7 +2763,17 @@ class MapTab:
         in the tag deletes or the item creates (the split telemetry is kept as the
         standing diagnostic instrument; Task 25 A/B-rejected batching the six deletes
         into one Tcl call -- it did not move the spike, which is an OS working-set
-        stall, not Tcl-op count)."""
+        stall, not Tcl-op count).
+
+        E1: no-ops entirely while the tab is hidden -- a backgrounded zkill/intel
+        push (add_kill_heat / add_intel_pulse / ...) still mutates state (the
+        caller-side model writes happen before this is called), but the 11-tag
+        canvas delete+recreate is pure waste on a canvas nobody sees. on_shown
+        force-dirties and requests a crisp render (which itself reprojects
+        overlays via _apply_crisp_frame), so the tab repaints correctly the
+        moment it is shown again -- see on_shown, ~1437-1439."""
+        if not self._visible:
+            return
         tele = self._tele
         _c = time.perf_counter if tele is not None else None
         if _c: _o0 = _c()
