@@ -84,6 +84,17 @@ MARKET_CONTRACT_SCOPES = (
     "esi-contracts.read_corporation_contracts.v1",
 )
 
+# Static-SDE memo backing ESIAuth._get_region_name(): constellation->region
+# and region->name are immutable game data, never re-derived once seen, so
+# they are cached permanently at module scope (shared across every ESIAuth
+# instance/character for the process lifetime — see B1 in
+# OPTIMIZATION_REVIEW.md, ~5,000 wasted calls/hr for a 10-man fleet before
+# this). Thread-safety: plain dict get/set with no lock — concurrent racing
+# writers can only ever write the SAME value for a given key (idempotent
+# lookups), so the benign race needs no synchronization.
+_CONSTELLATION_REGION_MEMO: dict[int, int] = {}
+_REGION_NAME_MEMO: dict[int, str] = {}
+
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     """HTTP handler that captures the OAuth callback."""
@@ -170,6 +181,17 @@ class ESIAuth:
         # character the user logs in.
         self._delegate_auth: "ESIAuth | None" = None
         self._delegate_last_fail_ts: float = 0.0
+
+        # Short-TTL per-instance memo for get_location()/get_ship_type() (B3
+        # in OPTIMIZATION_REVIEW.md). Three independent pollers (preview
+        # overlay ~10s, map-chars ~60s, char tab) hit the same character's
+        # location/ship on overlapping cadences; ESI's own server-side cache
+        # is ~5s, so a short client-side memo collapses duplicate calls
+        # inside that window. Each is (monotonic_ts_of_fetch, value); only a
+        # successful (non-None) result is ever stored, so a transient error
+        # is retried on the very next call instead of being cached.
+        self._loc_memo: "tuple[float, dict] | None" = None
+        self._ship_memo: "tuple[float, dict] | None" = None
 
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
@@ -814,17 +836,42 @@ class ESIAuth:
 
     # ── Character Info ───────────────────────────────────────────────────────
 
+    # TTL for the get_location()/get_ship_type() per-instance memo (B3). ESI's
+    # own server-side cache on these endpoints is ~5s; 4s keeps us just under
+    # that so a memoized read is never staler than a fresh one would be.
+    _POLL_MEMO_TTL_S = 4.0
+
     def get_location(self) -> dict | None:
-        """Get the authenticated character's current location."""
+        """Get the authenticated character's current location.
+
+        Memoized for _POLL_MEMO_TTL_S seconds — see _loc_memo in __init__."""
         if not self._character_id:
             return None
-        return self.esi_get(f"/characters/{self._character_id}/location/")
+        now = time.monotonic()
+        if self._loc_memo is not None:
+            ts, value = self._loc_memo
+            if now - ts < self._POLL_MEMO_TTL_S:
+                return value
+        value = self.esi_get(f"/characters/{self._character_id}/location/")
+        if value is not None:
+            self._loc_memo = (now, value)
+        return value
 
     def get_ship_type(self) -> dict | None:
-        """Get the authenticated character's current ship."""
+        """Get the authenticated character's current ship.
+
+        Memoized for _POLL_MEMO_TTL_S seconds — see _ship_memo in __init__."""
         if not self._character_id:
             return None
-        return self.esi_get(f"/characters/{self._character_id}/ship/")
+        now = time.monotonic()
+        if self._ship_memo is not None:
+            ts, value = self._ship_memo
+            if now - ts < self._POLL_MEMO_TTL_S:
+                return value
+        value = self.esi_get(f"/characters/{self._character_id}/ship/")
+        if value is not None:
+            self._ship_memo = (now, value)
+        return value
 
     def set_waypoint(self, destination_id: int, clear_other: bool = False,
                      add_to_beginning: bool = False) -> bool:
@@ -953,20 +1000,38 @@ class ESIAuth:
         return result
 
     def _get_region_name(self, sys_info: dict) -> str:
-        """Resolve system info -> constellation -> region name."""
+        """Resolve system info -> constellation -> region name.
+
+        Both hops are memoized in module-level dicts (_CONSTELLATION_REGION_MEMO,
+        _REGION_NAME_MEMO) since constellation->region and region->name are
+        static SDE data that never changes — a permanent memo is correct. Only
+        successful lookups are cached; a failed/empty response is retried on
+        the next call instead of being pinned as a permanent miss."""
         try:
             constellation_id = sys_info.get("constellation_id")
             if not constellation_id:
                 return ""
-            const_info = self.esi_get(f"/universe/constellations/{constellation_id}/")
-            if not const_info:
-                return ""
-            region_id = const_info.get("region_id")
-            if not region_id:
-                return ""
-            region_info = self.esi_get(f"/universe/regions/{region_id}/")
-            if region_info:
-                return region_info.get("name", "")
+
+            region_id = _CONSTELLATION_REGION_MEMO.get(constellation_id)
+            if region_id is None:
+                const_info = self.esi_get(f"/universe/constellations/{constellation_id}/")
+                if not const_info:
+                    return ""
+                region_id = const_info.get("region_id")
+                if not region_id:
+                    return ""
+                _CONSTELLATION_REGION_MEMO[constellation_id] = region_id
+
+            region_name = _REGION_NAME_MEMO.get(region_id)
+            if region_name is None:
+                region_info = self.esi_get(f"/universe/regions/{region_id}/")
+                if not region_info:
+                    return ""
+                region_name = region_info.get("name", "")
+                if not region_name:
+                    return ""
+                _REGION_NAME_MEMO[region_id] = region_name
+            return region_name
         except Exception:
             pass
         return ""
@@ -1664,21 +1729,45 @@ class ESIAuth:
             corp_id = self._get_character_corp_id()
             if corp_id:
                 print(f"[ESI Auth] Trying corporation {corp_id} structures...")
+                # X-Pages-driven pagination (mirrors get_assets): a page-size
+                # heuristic like `len(page) < 250` ends discovery early
+                # whenever a full page happens to come back under 250 items
+                # while more pages remain. Bypasses esi_get/esi_get_ex (whose
+                # header dict loses the original casing) for the same reason
+                # get_assets does — resp.headers on the raw Session response
+                # is case-insensitive.
                 page = 1
                 while True:
-                    corp_structs = self.esi_get(
-                        f"/corporations/{corp_id}/structures/",
-                        params={"page": page},
-                    )
-                    if not corp_structs:
+                    token = self.access_token
+                    if not token:
                         break
-                    for s in corp_structs:
-                        # Ansiblex Jump Gate type_id = 35841
-                        if s.get("type_id") == 35841:
-                            structure_ids.add(s["structure_id"])
-                    if len(corp_structs) < 250:
+                    try:
+                        rate_limit('esi')
+                        resp = self._session.get(
+                            f"{ESI_BASE}/corporations/{corp_id}/structures/",
+                            headers={"Authorization": f"Bearer {token}"},
+                            params={"page": page},
+                            timeout=10,
+                        )
+                        if resp.status_code == 403:
+                            # No access (scope not granted / wrong corp)
+                            break
+                        if not resp.ok:
+                            break
+                        corp_structs = resp.json()
+                        if not corp_structs:
+                            break
+                        for s in corp_structs:
+                            # Ansiblex Jump Gate type_id = 35841
+                            if s.get("type_id") == 35841:
+                                structure_ids.add(s["structure_id"])
+                        total_pages = int(resp.headers.get("x-pages", 1))
+                        if page >= total_pages:
+                            break
+                        page += 1
+                    except Exception as e:
+                        print(f"[ESI Auth] Corp structures page {page} error: {e}")
                         break
-                    page += 1
                 if structure_ids:
                     print(f"[ESI Auth] Found {len(structure_ids)} Ansiblex gates from corp structures")
 
