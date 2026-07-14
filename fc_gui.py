@@ -69,7 +69,7 @@ from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_
 from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
 import system_cache
-from system_cache import get_sorted_names, get_system_names, get_region_map
+from system_cache import get_system_names, get_region_map
 from esi_auth import ESIAuth, load_all_tokens
 from loss_tracker import FleetLossTracker
 from cyno_check import analyze_character as cyno_analyze_character
@@ -828,6 +828,12 @@ class FCToolGUI:
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
         self._preview_tick_fails = 0           # consecutive failed ticks (BUG A guard)
         self._preview_last_key = ""            # last-activated char key (cycle anchor)
+        # E3: memoized (key, bundle) for _preview_compose_captions so the doctrine
+        # object + hull->tag index + overlay rules are rebuilt only on change, not
+        # every ~250 ms tick. Invalidated via _config_rev (any config save, which
+        # is how overlay-rule edits persist) + the fittings store's revision().
+        self._preview_caption_memo = None
+        self._config_rev = 0                    # bumped in _save_config; memo key
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
@@ -1031,34 +1037,34 @@ class FCToolGUI:
     # ── System Names for Autocomplete ─────────────────────────────────────────
 
     def _load_system_names_async(self):
-        """Load system names and region map in background threads."""
+        """Load system names + region labels in ONE background thread.
+
+        C3 (OPTIMIZATION_REVIEW): the previous version spawned two daemon
+        threads that EACH parsed the whole systems cache and EACH did an
+        uncached EVE-Scout WH-names GET, then each posted its own autocomplete
+        update. This single worker parses the systems cache ONCE (``get_sorted_names``
+        is just ``sorted(get_system_names().keys())``, so we derive the name list
+        from the same dict used to build region labels), fetches WH names ONCE,
+        and posts a SINGLE ``_update_autocomplete_lists`` update with both the
+        names and the labels already populated."""
         def load():
             try:
-                names = get_sorted_names()
-                self._system_names = names
-                wh_names = self._fetch_wh_names()
-                self._post_ui(self._update_autocomplete_lists, wh_names)
-            except Exception as e:
-                print(f"[FCTool] Error loading system names: {e}")
-
-        def load_regions():
-            try:
-                systems = get_system_names()
+                systems = get_system_names()            # single cache parse
+                self._system_names = sorted(systems.keys())
                 region_map = get_region_map()
-                # Build name -> "Name (Region)" label map
+                # Build name -> "Name (Region)" label map from the same parse.
                 labels = {}
                 for name, sid in systems.items():
                     region = region_map.get(str(sid), "")
                     if region:
                         labels[name] = f"{name} ({region})"
                 self._system_labels = labels
-                wh_names = self._fetch_wh_names()
+                wh_names = self._fetch_wh_names()        # single WH-names GET
                 self._post_ui(self._update_autocomplete_lists, wh_names)
             except Exception as e:
-                print(f"[FCTool] Error loading region map: {e}")
+                print(f"[FCTool] Error loading system names: {e}")
 
         threading.Thread(target=load, daemon=True).start()
-        threading.Thread(target=load_regions, daemon=True).start()
 
     def _fetch_wh_names(self):
         """Fetch EVE Scout WH (system_name, region_name) pairs off the Tk thread.
@@ -1357,6 +1363,11 @@ class FCToolGUI:
         # mid-write cannot corrupt every setting at once. Locked so the Tk
         # thread and background workers cannot interleave writes. A failed
         # settings save must never crash the UI.
+        # E3: advance the config revision so memoized views keyed on it (the
+        # preview-caption bundle) invalidate on the next change. Bumped
+        # unconditionally — over-invalidation on an unrelated save is a cheap
+        # recompute, under-invalidation would show a stale overlay rule/tag.
+        self._config_rev = getattr(self, "_config_rev", 0) + 1
         try:
             with self._config_lock:
                 atomic_write_json(CONFIG_PATH, self.config, indent=4)
@@ -3623,6 +3634,15 @@ class FCToolGUI:
         self._intel_channels_enabled: set[str] = set()
         self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
         self._intel_channel_colors: dict[str, str] = {}
+        # E2: channel -> stable Text tag name ("chan_0", "chan_1", ...). Each is
+        # tag_config'd ONCE on first sight (not per line) and reused, which also
+        # retires the old masked-24-bit-hash tag names + their collision risk.
+        self._intel_chan_tags: dict[str, str] = {}
+        # E2: per-instance dynamic tags (sysclick_/dscan_/nametip_) created for
+        # individual spans. Tracked here so the trim path can tag_delete the ones
+        # whose text scrolled out (empty tag_ranges), keeping the widget's tag +
+        # binding count bounded over a long session instead of leaking forever.
+        self._intel_dynamic_tags: set[str] = set()
         self._intel_autoscroll_paused = False
         self._intel_new_count = 0
         self._intel_new_btn = None
@@ -14269,16 +14289,35 @@ class FCToolGUI:
         do_strip = bool(cfg.get("captions", True))
         do_video = bool(cfg.get("labels_on_video", False))
         do_location = bool(cfg.get("show_location", True))
-        rules = self._overlay_rules()
-        overrides = self._overlay_cfg().get("overrides", {}) or {}
+        # E3: the doctrine object, hull->tag index, overlay rules, overlay-config
+        # dict and overrides are "rarely-changing inputs" — rebuilding them every
+        # ~250 ms tick is waste. Memoise the bundle, keyed on a cheap O(1) signal:
+        #   * the active-doctrine config value  -> catches doctrine switches;
+        #   * self.fittings.revision()          -> catches ANY fit/doctrine edit
+        #     (every mutator persists via FittingsStore.save(), which bumps it);
+        #   * self._config_rev                  -> catches overlay rule/override
+        #     edits (they persist via _save_config) and any other config change.
+        # Recompute only when that key changes, not per tick.
+        store = getattr(self, "fittings", None)
+        frev = store.revision() if store is not None else 0
+        bundle_key = (self.config.get("fleet", {}).get("active_doctrine", ""),
+                      frev, getattr(self, "_config_rev", 0))
+        memo = getattr(self, "_preview_caption_memo", None)
+        if memo is not None and memo[0] == bundle_key:
+            doctrine, tag_index, rules, ocfg, overrides = memo[1]
+        else:
+            doctrine = self._active_doctrine_obj()
+            tag_index = fleet_composer.build_tag_index(doctrine, store)
+            rules = self._overlay_rules()
+            ocfg = self._overlay_cfg()
+            overrides = ocfg.get("overrides", {}) or {}
+            self._preview_caption_memo = (
+                bundle_key, (doctrine, tag_index, rules, ocfg, overrides))
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
         show_chip = bool(cfg.get("show_role_chip", True))
-        doctrine = self._active_doctrine_obj()
-        tag_index = fleet_composer.build_tag_index(doctrine, self.fittings)
         # Bottom-strip label style (shared with the eveo overlay): config['overlay']
         # color + font_size. The label now shows in a strip BELOW each tile's video
         # (set_bottom_label) — never over it — so no topmost overlay is driven.
-        ocfg = self._overlay_cfg()
         bottom_color = ocfg.get("color", "#ffffff")
         try:
             bottom_size = int(ocfg.get("font_size", 11))
@@ -22299,6 +22338,9 @@ $bmp.Dispose()
         log = self._intel_log
         log.config(state=tk.NORMAL)
         log.delete("1.0", tk.END)
+        # E2: the full clear empties every dynamic tag's ranges — sweep them so a
+        # channel toggle / find-filter re-render doesn't leak the old span tags.
+        self._intel_sweep_dynamic_tags(log)
         log.config(state=tk.DISABLED)
         for entry in list(self._intel_buffer):
             msg = entry[0]
@@ -22439,8 +22481,13 @@ $bmp.Dispose()
         ch_start = log.index("end-1c")
         log.insert("end", msg.channel)
         ch_end = log.index("end-1c")
-        ch_tag = f"chan_{abs(hash(msg.channel)) & 0xffffff}"
-        log.tag_config(ch_tag, foreground=self._channel_color(msg.channel))
+        # E2: one stable tag per channel, configured once (was: a fresh
+        # tag_config on a masked-hash tag name every single line).
+        ch_tag = self._intel_chan_tags.get(msg.channel)
+        if ch_tag is None:
+            ch_tag = f"chan_{len(self._intel_chan_tags)}"
+            self._intel_chan_tags[msg.channel] = ch_tag
+            log.tag_config(ch_tag, foreground=self._channel_color(msg.channel))
         log.tag_add(ch_tag, ch_start, ch_end)
 
         log.insert("end", f"  {msg.sender} > ")
@@ -22476,6 +22523,10 @@ $bmp.Dispose()
         line_count = int(log.index("end-1c").split(".")[0])
         if line_count > cap:
             log.delete("1.0", f"{line_count - cap + 1}.0")
+            # E2: the delete drops the trimmed text's tag RANGES but leaves the
+            # per-instance tag definitions + their bindings registered forever.
+            # Sweep the ones now covering no text so tags don't accumulate.
+            self._intel_sweep_dynamic_tags(log)
 
         log.config(state=tk.DISABLED)
         if at_bottom and not self._intel_autoscroll_paused:
@@ -22484,10 +22535,29 @@ $bmp.Dispose()
             self._intel_new_count += 1
             self._intel_update_new_button()
 
+    def _intel_sweep_dynamic_tags(self, log):
+        """E2: delete tracked per-instance tags (sysclick_/dscan_/nametip_) whose
+        covered text has been trimmed/cleared away — their ``tag_ranges`` is now
+        empty — which also drops their leaked bindings, and remove them from the
+        tracking set so it stays bounded (roughly one entry per span still on
+        screen). Reused structural tags (chan_/intel_*/name_*) are never tracked
+        here, so this never touches them."""
+        tracked = self._intel_dynamic_tags
+        if not tracked:
+            return
+        dead = [t for t in tracked if not log.tag_ranges(t)]
+        for t in dead:
+            try:
+                log.tag_delete(t)
+            except tk.TclError:
+                pass
+            tracked.discard(t)
+
     def _bind_system_span(self, log, base_tag, s, e, system_name):
         """Per-instance click + right-click bindings for a system span."""
         click_tag = f"sysclick_{abs(hash((system_name, s))) & 0xffffff}"
         log.tag_add(click_tag, s, e)
+        self._intel_dynamic_tags.add(click_tag)   # E2: track for trim-sweep
         log.tag_bind(click_tag, "<Button-1>",
                      lambda ev, n=system_name: self._set_destination_or_copy(n))
         log.tag_bind(click_tag, "<Button-3>",
@@ -22505,6 +22575,7 @@ $bmp.Dispose()
             return
         click_tag = f"dscan_{abs(hash((url, s))) & 0xffffff}"
         log.tag_add(click_tag, s, e)
+        self._intel_dynamic_tags.add(click_tag)   # E2: track for trim-sweep
         log.tag_bind(click_tag, "<Button-1>",
                      lambda ev, u=url: self._open_url(u))
         log.tag_bind(click_tag, "<Enter>",
@@ -22546,6 +22617,7 @@ $bmp.Dispose()
                     if tip:
                         bind_tag = f"nametip_{abs(hash((name, pos))) & 0xffffff}"
                         log.tag_add(bind_tag, pos, end)
+                        self._intel_dynamic_tags.add(bind_tag)  # E2: trim-sweep
                         log.tag_bind(bind_tag, "<Enter>",
                                      lambda e, t=f"[{tip}]": self._show_tooltip(e, t))
                         log.tag_bind(bind_tag, "<Leave>",
