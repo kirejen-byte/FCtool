@@ -445,20 +445,49 @@ _SOV_VAL = 0.40                   # dim value: max channel ~102/255 -- under the
                                   # out at (max(a, a) = a; never sums to white)
 
 
+def _sov_alliance_id(row):
+    """Owning alliance_id from ONE ``/sovereignty/systems`` row, tolerating BOTH
+    the current nested-``claim`` shape and the legacy flat shape.
+
+    Current (compat date >= 2025-08-26): ``{"claim": {"alliance":
+    {"alliance_id": N, "corporation_id": M, ...}}}`` for alliance-held systems,
+    or ``{"claim": {"faction": {...}}}`` / ``{"claim": {"unclaimed": true}}`` for
+    non-alliance owners. Legacy flat (old ``/sovereignty/map``): ``{"alliance_id":
+    N}``. Returns None for any non-alliance owner (faction / unclaimed / corp-only)
+    -- the tint is an ALLIANCE wash, so those drop out exactly as before."""
+    claim = row.get("claim")
+    if isinstance(claim, dict):
+        alliance = claim.get("alliance")
+        if isinstance(alliance, dict):
+            return alliance.get("alliance_id")
+        return None                            # faction / unclaimed / corp-only
+    return row.get("alliance_id")              # legacy flat shape
+
+
 def parse_sov_map(payload):
-    """Parse the ESI ``/sovereignty/map/`` payload into ``{system_id: alliance_id}``
-    for the sovereignty tint layer (Task 33). The endpoint returns a list of
-    ``{system_id, alliance_id?, corporation_id?, faction_id?}`` entries; ONLY
-    entries carrying an ``alliance_id`` are kept -- corp-only, faction-only and
-    unclaimed systems are dropped, because the tint is an ALLIANCE wash. Malformed
-    rows (non-dict, missing ``system_id``) are skipped. Pure/testable."""
+    """Parse the ESI ``/sovereignty/systems`` payload into ``{system_id:
+    alliance_id}`` for the sovereignty tint layer (Task 33).
+
+    The current endpoint (compat date >= 2025-08-26; the old ``/sovereignty/map``
+    was REMOVED -- see map_tab._fetch_sov_map / B5) returns a DICT
+    ``{"solar_systems": [{"solar_system_id": int, "claim": {"alliance":
+    {"alliance_id": int, ...}} | {"faction": {...}} | {"unclaimed": true}}]}``.
+    ONLY alliance-claimed systems are kept -- faction, unclaimed and (defensively)
+    corp-only entries are dropped, because the tint is an ALLIANCE wash. The
+    LEGACY flat shape (a bare list of ``{system_id, alliance_id?}``) is still
+    tolerated so older fixtures/callers keep parsing (dual-shape robustness).
+    Malformed rows (non-dict, missing ids) are skipped. Returns the SAME
+    ``{system_id: alliance_id}`` dict the worker/legend consume. Pure/testable."""
+    # New shape wraps the rows under "solar_systems"; legacy shape is the bare list.
+    rows = payload.get("solar_systems") if isinstance(payload, dict) else payload
     out: dict[int, int] = {}
-    for r in payload or ():
-        try:
-            sid = r.get("system_id")
-            aid = r.get("alliance_id")
-        except AttributeError:
+    for r in rows or ():
+        if not isinstance(r, dict):
             continue                           # non-dict row -> skip
+        sid = r.get("solar_system_id")
+        if sid is None:
+            sid = r.get("system_id")           # legacy flat shape
+        aid = _sov_alliance_id(r)
         if sid is None or aid is None:
             continue
         try:

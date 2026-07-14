@@ -72,6 +72,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -98,6 +99,17 @@ ZKILL_PAGE_SIZE = 1000
 MAX_PAGES_PER_GROUP = 10  # safety bound: 10 * 1000 = 10000 mails/group max
 
 LOOKBACK_DAYS = 182  # ~6 months
+
+# Cache retention window for CynoCache's age-prune-on-load (OPTIMIZATION_REVIEW
+# C1: 9.8 MB / 79 entries measured, "grows forever"). No analysis ever looks
+# back further than LOOKBACK_DAYS, so a results/killmails/related entry older
+# than this is guaranteed dead weight -- it will never be read again. 2x
+# lookback is a safety margin (covers a CynoChecker built with a smaller custom
+# lookback_days, and avoids pruning right at the exact edge of the window). All
+# three caches hold immutable/idempotent data, so a wrongly-pruned entry is
+# simply re-fetched next time it's needed -- pruning is never a correctness
+# hazard, only a disk-size one.
+_RETENTION_DAYS = 2 * LOOKBACK_DAYS  # ~364 days
 
 # Battle-inferred association bound. We sample at most the MAX_BATTLES most
 # recent qualifying cyno losses. Each battle is ONE related-endpoint fetch whose
@@ -370,6 +382,55 @@ class CynoCache:
                 self.killmails = kms
             if isinstance(rel, dict):
                 self.related = rel
+        self._prune_aged_entries()
+
+    def _prune_aged_entries(self) -> None:
+        """Age-prune all three caches in memory (OPTIMIZATION_REVIEW C1).
+
+        Runs once, right after the on-disk data is parsed and BEFORE first use,
+        so both the in-memory dicts and the next natural save() shrink. This
+        does NOT write the file itself -- forcing a save here would trade a
+        startup read storm for a startup write storm; a pruned dict simply
+        rides along on whatever save() the caller was already going to do
+        (e.g. the end of a successful analyze_character()).
+
+        An entry is dropped only when its embedded timestamp positively proves
+        it is older than ``_RETENTION_DAYS``:
+          * ``results``  values carry ``fetched_at`` (ISO-8601, see put_result);
+          * ``killmails``values carry ``killmail_time`` (ESI ISO-8601);
+          * ``related``  keys carry the hour-floored timestamp inline
+            (``<system_id>:<YYYYMMDDHH00>``, see _related_key).
+        A missing/unparseable timestamp is left ALONE -- pruning only ever
+        removes what it can prove is stale, never guesses.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=_RETENTION_DAYS)
+        pruned = 0
+
+        for cid, entry in list(self.results.items()):
+            fetched_at = None
+            if isinstance(entry, dict):
+                ts = entry.get("fetched_at")
+                if isinstance(ts, str):
+                    fetched_at = _parse_km_time(ts)
+            if fetched_at is not None and fetched_at < cutoff:
+                del self.results[cid]
+                pruned += 1
+
+        for kid, km in list(self.killmails.items()):
+            kt = _parse_km_time(km.get("killmail_time")) if isinstance(km, dict) else None
+            if kt is not None and kt < cutoff:
+                del self.killmails[kid]
+                pruned += 1
+
+        for key in list(self.related.keys()):
+            kt = self._related_key_time(key)
+            if kt is not None and kt < cutoff:
+                del self.related[key]
+                pruned += 1
+
+        if pruned:
+            log.info("cyno cache: pruned %d aged entries (older than %d days)",
+                      pruned, _RETENTION_DAYS)
 
     def save(self) -> None:
         payload = {
@@ -424,6 +485,20 @@ class CynoCache:
     @staticmethod
     def _related_key(system_id, ts_hour) -> str:
         return f"{system_id}:{ts_hour}"
+
+    @staticmethod
+    def _related_key_time(key: str) -> datetime | None:
+        """Parse the hour-floored UTC timestamp embedded in a ``related`` cache
+        key (``<system_id>:<YYYYMMDDHH00>``), or None if ``key`` doesn't match
+        the expected shape. Used only by age-pruning; a malformed key is left
+        alone rather than guessed at."""
+        if not isinstance(key, str) or ":" not in key:
+            return None
+        _, _, ts_hour = key.rpartition(":")
+        try:
+            return datetime.strptime(ts_hour, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
 
     def get_related(self, system_id, ts_hour):
         if not self._loaded:
@@ -1168,10 +1243,43 @@ class CynoChecker:
         }
 
 
-def analyze_character(character_id: int, progress=None, **kwargs) -> dict:
-    """Module-level convenience wrapper: build a default CynoChecker and run it.
+# Process-lifetime CynoChecker singleton (OPTIMIZATION_REVIEW C1): building a
+# fresh CynoChecker per call means a fresh CynoCache() -> load() of the whole
+# on-disk cache (9.8 MB / 79 entries measured in production) on every button
+# press. One shared instance keeps that cache warm in memory for the rest of
+# the process, so CynoCache.load() only runs once (plus once more per caller
+# that explicitly opts into a `fresh` instance).
+_shared_checker_lock = threading.Lock()
+_shared_checker_instance: CynoChecker | None = None
+
+
+def _shared_checker() -> CynoChecker:
+    """Return the process-lifetime CynoChecker, creating it on first use.
+
+    Double-checked locking: the lock only guards the (rare) first-call
+    construction race; callers never contend on it afterwards.
+    """
+    global _shared_checker_instance
+    if _shared_checker_instance is None:
+        with _shared_checker_lock:
+            if _shared_checker_instance is None:
+                _shared_checker_instance = CynoChecker()
+    return _shared_checker_instance
+
+
+def analyze_character(character_id: int, progress=None, fresh: bool = False,
+                      **kwargs) -> dict:
+    """Module-level convenience wrapper: analyze via the process-lifetime
+    CynoChecker singleton (see :func:`_shared_checker`), so repeated calls
+    reuse one already-loaded CynoCache instead of reloading + rewriting the
+    on-disk cache from scratch every time (OPTIMIZATION_REVIEW C1).
+
+    Pass ``fresh=True`` to bypass the singleton and build a brand-new
+    CynoChecker for this one call instead (its own fresh CynoCache reload) --
+    an escape hatch for a caller that specifically needs an isolated instance.
 
     The GUI can call this directly; tests typically construct ``CynoChecker``
     with an injected fetcher instead.
     """
-    return CynoChecker().analyze_character(character_id, progress=progress, **kwargs)
+    checker = CynoChecker() if fresh else _shared_checker()
+    return checker.analyze_character(character_id, progress=progress, **kwargs)

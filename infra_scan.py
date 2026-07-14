@@ -132,66 +132,80 @@ class InfraScanner:
         found = 0
         errors = 0
 
-        for idx, (sys_id, sys_name) in enumerate(queue, start=1):
-            if self._cancel.is_set():
-                cancelled = True
-                break
-
-            self._emit(self.on_progress, {
-                "phase": "search", "done": idx, "total": total,
-                "system": sys_name, "found": found, "errors": errors})
-
-            ids, search_errored = self._search(sys_name)
-            if search_errored:
-                errors += 1
-
-            known = self._known_type_ids()
-            rows: list[dict] = []
-            system_cancelled = False
-            for sid in ids:
+        # Batch every store write for this run into a single on-disk flush
+        # (perf finding C2): upsert_many + mark_system_scanned each persist
+        # the whole ~300 KB file, so uncached this loop was 2 whole-file
+        # rewrites PER scanned system — hundreds on a big region. queue
+        # already flattens every requested region into ONE flat pass (built
+        # above by _build_queue, which has no per-region grouping/boundary),
+        # so "once per scan run" is the boundary this loop actually has, not
+        # "once per region". deferred_save() flushes in its own finally, so
+        # an early break (cancel) or an unexpected raise out of this loop
+        # still persists everything merged before that point — the same
+        # partial-work-survives spirit as the cancel/403-abort handling
+        # already below (only _thread_body wraps this in a try/except, so an
+        # exception here propagates there after the flush).
+        with self.store.deferred_save():
+            for idx, (sys_id, sys_name) in enumerate(queue, start=1):
                 if self._cancel.is_set():
-                    cancelled = system_cancelled = True
+                    cancelled = True
                     break
-                if sid in known:
-                    # Already resolved elsewhere: a light "seen" row bumps
-                    # last_seen without spending an ESI call or error budget.
-                    rows.append({"structure_id": sid, "type_id": None,
-                                 "category": categorize(None, sid),
-                                 "system_id": sys_id, "system_name": sys_name,
-                                 "status": "alive"})
-                    continue
-                if resolve_aborted:
-                    rows.append(self._stub(sid, sys_id, sys_name))
-                    errors += 1
-                    continue
-                self._emit(self.on_progress, {
-                    "phase": "resolve", "done": idx, "total": total,
-                    "system": sys_name, "found": found, "errors": errors})
-                info, status, headers = self.auth.esi_get_ex(
-                    f"/universe/structures/{sid}/")
-                self._governor(status, headers)
-                self._sleep(self.PACE_SECONDS)
-                if isinstance(info, dict):
-                    rows.append(self._resolved_row(sid, info, sys_id, sys_name))
-                    found += 1
-                    streak_403 = 0
-                else:
-                    rows.append(self._stub(sid, sys_id, sys_name))
-                    errors += 1
-                    if status == 403:
-                        streak_403 += 1
-                        if streak_403 >= self.MAX_403_STREAK:
-                            resolve_aborted = True
-                    else:
-                        streak_403 = 0
 
-            if rows:
-                self._merge_report(report, self.store.upsert_many(rows, "esi_scan"))
-            if system_cancelled:
-                break
-            # Only mark fully-completed systems scanned so a cancel mid-system
-            # re-scans next time rather than skipping via the rescan gate.
-            self.store.mark_system_scanned(sys_id, _now_iso())
+                self._emit(self.on_progress, {
+                    "phase": "search", "done": idx, "total": total,
+                    "system": sys_name, "found": found, "errors": errors})
+
+                ids, search_errored = self._search(sys_name)
+                if search_errored:
+                    errors += 1
+
+                known = self._known_type_ids()
+                rows: list[dict] = []
+                system_cancelled = False
+                for sid in ids:
+                    if self._cancel.is_set():
+                        cancelled = system_cancelled = True
+                        break
+                    if sid in known:
+                        # Already resolved elsewhere: a light "seen" row bumps
+                        # last_seen without spending an ESI call or error budget.
+                        rows.append({"structure_id": sid, "type_id": None,
+                                     "category": categorize(None, sid),
+                                     "system_id": sys_id, "system_name": sys_name,
+                                     "status": "alive"})
+                        continue
+                    if resolve_aborted:
+                        rows.append(self._stub(sid, sys_id, sys_name))
+                        errors += 1
+                        continue
+                    self._emit(self.on_progress, {
+                        "phase": "resolve", "done": idx, "total": total,
+                        "system": sys_name, "found": found, "errors": errors})
+                    info, status, headers = self.auth.esi_get_ex(
+                        f"/universe/structures/{sid}/")
+                    self._governor(status, headers)
+                    self._sleep(self.PACE_SECONDS)
+                    if isinstance(info, dict):
+                        rows.append(self._resolved_row(sid, info, sys_id, sys_name))
+                        found += 1
+                        streak_403 = 0
+                    else:
+                        rows.append(self._stub(sid, sys_id, sys_name))
+                        errors += 1
+                        if status == 403:
+                            streak_403 += 1
+                            if streak_403 >= self.MAX_403_STREAK:
+                                resolve_aborted = True
+                        else:
+                            streak_403 = 0
+
+                if rows:
+                    self._merge_report(report, self.store.upsert_many(rows, "esi_scan"))
+                if system_cancelled:
+                    break
+                # Only mark fully-completed systems scanned so a cancel mid-system
+                # re-scans next time rather than skipping via the rescan gate.
+                self.store.mark_system_scanned(sys_id, _now_iso())
 
         done = dict(report)
         done["cancelled"] = cancelled

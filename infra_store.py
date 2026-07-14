@@ -17,7 +17,11 @@ The store resolves ``system_id``/``region_id`` (and an Ansiblex's
 ``gate_to_system_id``) from an injected ``system_lookup`` (casefolded
 system_name -> (system_id, region_id)); with no lookup those stay ``None``.
 
-Thread-safe (`threading.RLock`); every mutator persists. No Tkinter, no network.
+Thread-safe (`threading.RLock`); every mutator persists — unless the calling
+thread has an open `deferred_save()` batch (see below), which collapses a
+multi-mutation run (e.g. a region scan's per-system loop) into one on-disk
+flush instead of one whole-file rewrite per mutator call. No Tkinter, no
+network.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import app_io
@@ -96,6 +101,11 @@ class InfraStore:
         self._entries: dict[str, dict] = {}
         self._regions: list[int] = []
         self._scan_state: dict = {"regions": {}, "systems": {}}
+        # Per-thread deferred-save bookkeeping (see deferred_save()). Thread-
+        # local so a batch opened on one thread (the scan worker) never
+        # suppresses a mutator call made from a DIFFERENT thread (e.g. a
+        # dialog edit on the Tk thread) — those keep saving immediately.
+        self._defer_local = threading.local()
 
     # ── Timestamp / key helpers ───────────────────────────────────────────────
 
@@ -200,6 +210,71 @@ class InfraStore:
             except Exception:
                 log.exception("Failed to save infrastructure store to %s", self.path)
                 raise
+
+    # ── Batch mode (deferred save) ───────────────────────────────────────────
+
+    def _defer_state(self) -> dict:
+        """This thread's deferred-save bookkeeping — ``{"depth": int, "dirty":
+        bool}`` — created lazily on first use. Thread-local by design; see
+        ``deferred_save``."""
+        state = getattr(self._defer_local, "state", None)
+        if state is None:
+            state = {"depth": 0, "dirty": False}
+            self._defer_local.state = state
+        return state
+
+    def _save_or_defer(self) -> None:
+        """The single choke point every mutator calls instead of ``save()``
+        directly. Persists immediately UNLESS *this thread* currently has a
+        ``deferred_save()`` batch open, in which case the pending mutation is
+        marked dirty and left for that batch's own exit-flush. A mutator call
+        made from a different thread (no open batch on its own thread) is
+        completely unaffected and still saves immediately."""
+        state = self._defer_state()
+        if state["depth"] > 0:
+            state["dirty"] = True
+            return
+        self.save()
+
+    @contextmanager
+    def deferred_save(self):
+        """Batch this thread's mutations into a single on-disk flush.
+
+        WHY: a region scan calls ``upsert_many`` + ``mark_system_scanned``
+        once per system, and each is a whole-file ``save()`` — two full
+        ~300 KB rewrites per scanned system (perf finding C2). Wrapping a
+        multi-system loop in ``with store.deferred_save():`` keeps every
+        mutator's in-memory update immediate (``entries()``/``scan_state()``
+        reflect each change exactly as before) but skips the mutator's own
+        disk write; exactly ONE ``save()`` happens when the outermost
+        ``with`` exits.
+
+        Flushes on the happy path AND when an exception propagates out of
+        the block, matching ``InfraScanner``'s own partial-failure handling
+        (a cancelled or 403-aborted scan already keeps its partial merge
+        report) — so a batch that dies partway through still persists
+        everything it completed before that point. No-op flush when nothing
+        was actually mutated (e.g. an empty queue — every system already
+        within the rescan gate). Nestable: only the outermost level flushes.
+
+        Thread-scoped, not global: the depth/dirty bookkeeping is
+        thread-local, so this batch can only ever suppress saves triggered
+        by calls made on the SAME thread that opened it. A concurrent
+        mutator call from another thread (e.g. a dialog edit on the Tk
+        thread while a background scan batches on its own worker thread)
+        keeps saving immediately — no behavior change for non-scan callers.
+        """
+        state = self._defer_state()
+        state["depth"] += 1
+        try:
+            yield self
+        finally:
+            state["depth"] -= 1
+            if state["depth"] == 0:
+                dirty = state["dirty"]
+                state["dirty"] = False
+                if dirty:
+                    self.save()
 
     # ── Merge / upsert ────────────────────────────────────────────────────────
 
@@ -334,7 +409,7 @@ class InfraStore:
                     else:
                         self._entries[name_key] = self._new_entry(inc, source, now)
                         report["added"] += 1
-            self.save()
+            self._save_or_defer()
         return report
 
     # ── Editing / removal ─────────────────────────────────────────────────────
@@ -349,7 +424,7 @@ class InfraStore:
                     del self._entries[key]
                     removed += 1
             if removed:
-                self.save()
+                self._save_or_defer()
         return removed
 
     def set_status(self, key: str, status: str) -> None:
@@ -358,7 +433,7 @@ class InfraStore:
             if entry is None:
                 return
             entry["status"] = status
-            self.save()
+            self._save_or_defer()
 
     def set_notes(self, key: str, notes: str) -> None:
         with self._lock:
@@ -366,7 +441,7 @@ class InfraStore:
             if entry is None:
                 return
             entry["notes"] = notes or ""
-            self.save()
+            self._save_or_defer()
 
     # ── Read views ────────────────────────────────────────────────────────────
 
@@ -405,7 +480,7 @@ class InfraStore:
                 if ri is not None and ri not in out:
                     out.append(ri)
             self._regions = out
-            self.save()
+            self._save_or_defer()
 
     def scan_state(self) -> dict:
         """A defensive deep copy of ``{"regions": {rid: iso}, "systems": {sid: iso}}``.
@@ -416,4 +491,4 @@ class InfraStore:
     def mark_system_scanned(self, system_id: int, when_iso: str) -> None:
         with self._lock:
             self._scan_state.setdefault("systems", {})[str(system_id)] = when_iso
-            self.save()
+            self._save_or_defer()

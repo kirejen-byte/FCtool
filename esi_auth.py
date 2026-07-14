@@ -193,6 +193,15 @@ class ESIAuth:
         self._loc_memo: "tuple[float, dict] | None" = None
         self._ship_memo: "tuple[float, dict] | None" = None
 
+        # Per-instance ETag cache for esi_get_ex (B2): key (path + folded params)
+        # -> (etag, parsed_body). On a repeat GET we send If-None-Match; a 304
+        # replays the cached body, so the hot location/ship/online/fleet pollers
+        # pay ~1 rate-token instead of a full 200's 2 when data is unchanged.
+        # Bounded by _ETAG_CACHE_MAX; sits BELOW the get_location/get_ship_type
+        # TTL memos. Lock-free by design (GIL-atomic dict ops + idempotent
+        # eviction), mirroring fleet_esi/market_esi's ETag caches.
+        self._etag_cache: "dict[str, tuple]" = {}
+
         self._session = requests.Session()
         self._session.headers.update(HEADERS)
 
@@ -705,6 +714,31 @@ class ESIAuth:
 
     # ── ESI API Helpers ──────────────────────────────────────────────────────
 
+    # Upper bound on the per-instance ETag cache (B2). The hot pollers touch a
+    # small fixed set of paths; a long multi-region infra scan adds one entry per
+    # resolved structure, so cap growth and evict oldest-first when full.
+    _ETAG_CACHE_MAX = 512
+
+    @staticmethod
+    def _etag_key(path: str, params: "dict | None") -> str:
+        """Key for the ETag cache: the path with any query params folded in
+        deterministically, so two GETs to the same path with DIFFERENT params
+        (e.g. per-system structure searches) never collide on one ETag entry.
+        Param-less calls (the location/ship/online/fleet pollers) key on the bare
+        path. Mirrors market_esi's per-(region, type) cache_key folding."""
+        if not params:
+            return path
+        return f"{path}?{urlencode(sorted(params.items()))}"
+
+    def _etag_store(self, key: str, etag: str, body) -> None:
+        """Record ``(etag, body)`` under ``key``, bounding the cache to
+        ``_ETAG_CACHE_MAX`` by evicting the oldest inserted entry (dicts preserve
+        insertion order). Eviction is best-effort/idempotent — safe lock-free."""
+        cache = self._etag_cache
+        if key not in cache and len(cache) >= self._ETAG_CACHE_MAX:
+            cache.pop(next(iter(cache)), None)
+        cache[key] = (etag, body)
+
     def esi_get_ex(self, path: str, params: dict = None) -> tuple[object | None, int, dict]:
         """Authenticated GET returning (parsed_json_or_None, http_status, headers).
 
@@ -718,21 +752,50 @@ class ESIAuth:
         delegation None-returning) and ``(None, status, headers)`` on a non-OK
         response — with the SAME quiet-error suppression as before. Token refresh
         happens in the ``access_token`` property before the request, so there is
-        no post-401 retry to preserve."""
+        no post-401 retry to preserve.
+
+        ETag/conditional GET (B2): a per-instance cache (see ``_etag_cache`` in
+        ``__init__``) maps the path(+params) key to the last ``(ETag, body)``.
+        When an ETag is known it is replayed as ``If-None-Match``; a **304** then
+        returns the cached body AS A 200 — transparent to every caller (``esi_get``
+        still gets the body; the infra scanner still sees a success + the real
+        budget headers off the 304). Only true 200s that carry an ``ETag`` header
+        are cached; error/304 bodies are never stored. This layer sits BELOW the
+        get_location/get_ship_type TTL memos (they memoize whatever body this
+        returns), so nothing goes stale."""
         token = self.access_token
         if not token:
             return None, 0, {}
+        key = self._etag_key(path, params)
+        cached = self._etag_cache.get(key)
+        req_headers = {"Authorization": f"Bearer {token}"}
+        if cached is not None:
+            req_headers["If-None-Match"] = cached[0]
         try:
             rate_limit('esi')
             resp = self._session.get(
                 f"{ESI_BASE}{path}",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=req_headers,
                 params=params,
                 timeout=10,
             )
-            headers = dict(getattr(resp, "headers", {}) or {})
+            raw = getattr(resp, "headers", {}) or {}
+            headers = dict(raw)
+            if resp.status_code == 304:
+                # A 304 only comes back because we sent If-None-Match from the
+                # cache: replay the stored body AS a 200 so esi_get and the infra
+                # scanner see an ordinary success (the real budget headers off the
+                # 304 are still surfaced). Never call .json() on a 304 (empty body).
+                if cached is not None:
+                    return cached[1], 200, headers
+                return None, 304, headers
             if resp.ok:
-                return resp.json(), resp.status_code, headers
+                body = resp.json()
+                if resp.status_code == 200:
+                    etag = raw.get("ETag")
+                    if etag:
+                        self._etag_store(key, etag, body)
+                return body, resp.status_code, headers
             # Suppress noisy expected errors
             if resp.status_code == 404 and "/fleet/" in path:
                 pass  # Not in fleet

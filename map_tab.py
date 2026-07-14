@@ -2399,16 +2399,22 @@ class MapTab:
         self.state.sov_names = {int(aid): str(name) for aid, name in pairs}
 
     def _fetch_sov_map(self):
-        """Fetch ESI /sovereignty/map/ (public, no auth, long-cached) ->
+        """Fetch ESI /sovereignty/systems (public, no auth, 300s cache) ->
         {system_id: alliance_id}, or None on any failure (silent-degrade -> the map
         stays untinted). Uses the repo rate limiter + ESI_HEADERS. Runs ONLY on the
-        one-shot sov thread."""
+        one-shot sov thread.
+
+        (B5) /sovereignty/map was REMOVED at compat dates >= 2025-08-26; the
+        replacement /sovereignty/systems returns a DIFFERENT, nested shape
+        ({"solar_systems": [{"solar_system_id", "claim": {...}}]}) which
+        mo.parse_sov_map now parses (verified live 2026-07-14). Its 300s cache
+        (vs the old route's 3600s) also means fresher sov."""
         try:
             import requests
             from esi_constants import ESI_BASE, ESI_HEADERS
             from rate_limiter import rate_limit
             rate_limit("esi")
-            resp = requests.get(f"{ESI_BASE}/sovereignty/map/",
+            resp = requests.get(f"{ESI_BASE}/sovereignty/systems/",
                                 timeout=10, headers=ESI_HEADERS)
             if not resp.ok:
                 return None
