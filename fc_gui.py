@@ -158,20 +158,22 @@ def _apply_dpi_awareness(pref: str, user32=None) -> None:
 
 
 # ── Color Scheme ──────────────────────────────────────────────────────────────
-BG_DARK = "#1a1a2e"
-BG_PANEL = "#16213e"
-BG_ENTRY = "#0f3460"
-FG_TEXT = "#e0e0e0"
-FG_DIM = "#888899"
-FG_ACCENT = "#00d4ff"
-FG_GREEN = "#00ff88"
-FG_RED = "#ff4444"
-FG_ORANGE = "#ff8c00"
-FG_YELLOW = "#ffdd00"
-FG_WHITE = "#ffffff"
-FG_MAGENTA = "#ff66ff"
-FG_UNDER = "#ff6666"
-BORDER_COLOR = "#2a2a4a"
+# The canonical dark palette lives in ui_theme.py (a stdlib-only, containment-safe
+# leaf module) so fc_gui and every standalone window module share ONE source of
+# truth — no more copy-paste value drift. These names are re-exported here at
+# module scope, so `fc_gui.BG_DARK` (and every sibling) still resolves for callers
+# and tests.
+from ui_theme import (
+    BG_DARK, BG_PANEL, BG_ENTRY,
+    FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_RED, FG_ORANGE,
+    FG_YELLOW, FG_WHITE, FG_MAGENTA, FG_UNDER,
+    BORDER_COLOR,
+)
+# Shared house dialog + tooltip helpers (both stdlib-only leaves): make_modal
+# wires guarded transient/grab + Escape→cancel + base bg once (D2), attach_tooltip
+# is the single hover-tooltip impl (D9). Adopted here only in the preview-cluster
+# dialogs; fc_gui's other tooltip sites keep their existing helper (scope).
+from ui_helpers import make_modal, attach_tooltip
 
 # ── Main-thread UI dispatcher ──────────────────────────────────────────────────
 # How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
@@ -16456,12 +16458,7 @@ class FCToolGUI:
         cfg = self._overlay_cfg()
         win = tk.Toplevel(self.root)
         win.title("Overlay label rules")
-        win.configure(bg=BG_PANEL)
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except tk.TclError:
-            pass
+        make_modal(win, self.root, base_bg=BG_DARK)
 
         tk.Label(win, text="Rules (first match wins):", bg=BG_PANEL, fg=FG_TEXT,
                  font=("Consolas", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 0))
@@ -16737,20 +16734,12 @@ class FCToolGUI:
 
         win = tk.Toplevel(self.root)
         win.title("Cycle groups")
-        win.configure(bg=BG_PANEL)
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except tk.TclError:
-            pass
+        make_modal(win, self.root, base_bg=BG_DARK)
 
         def _tip(widget, text):
-            widget.bind("<Enter>", lambda e, t=text: self._show_tooltip(e, t))
-            widget.bind("<Leave>", lambda e: self._hide_tooltip())
-            try:
-                widget._fctool_tooltip = text
-            except Exception:
-                pass
+            # Shared hover tooltip (D9) — replaces this dialog's bespoke closure
+            # that bound _show_tooltip/_hide_tooltip; text preserved verbatim.
+            attach_tooltip(widget, text)
 
         tk.Label(win, text="Groups of clients, each cycled by its own hotkey. "
                  "No members = cycles ALL clients. Cycle keys are swallowed "
@@ -17184,12 +17173,7 @@ class FCToolGUI:
 
         win = tk.Toplevel(self.root)
         win.title("Preview hotkeys")
-        win.configure(bg=BG_PANEL)
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except tk.TclError:
-            pass
+        make_modal(win, self.root, base_bg=BG_DARK)
 
         tk.Label(win, text="Per-character focus keys "
                  "(e.g. Control+F9 — brings that client to the front):",
@@ -17365,12 +17349,7 @@ class FCToolGUI:
 
         win = tk.Toplevel(self.root)
         win.title("Which previews to show")
-        win.configure(bg=BG_PANEL)
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except tk.TclError:
-            pass
+        make_modal(win, self.root, base_bg=BG_DARK)
 
         tk.Label(win, text="Check a character to show its live preview. "
                  "Unchecking only hides it — layouts and hotkeys are kept.",
@@ -17457,12 +17436,7 @@ class FCToolGUI:
 
         win = tk.Toplevel(self.root)
         win.title("Never minimize")
-        win.configure(bg=BG_PANEL)
-        try:
-            win.transient(self.root)
-            win.grab_set()
-        except tk.TclError:
-            pass
+        make_modal(win, self.root, base_bg=BG_DARK)
 
         tk.Label(win, text="Check a character to keep it OPEN when you switch "
                  "away (exempt from Minimize inactive).",
