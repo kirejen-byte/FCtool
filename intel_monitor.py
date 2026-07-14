@@ -964,11 +964,22 @@ def resolve_names(
     """Resolve pilot-name candidates to Resolutions via the public ESI
     /universe/ids/ endpoint plus corp/alliance lookups, bucketing each by
     classify_standing(friendly, hostile). Shared by resolve_characters and the
-    async IntelResolver (DRY). Never raises; returns [] on failure."""
+    async IntelResolver (DRY). Never raises; returns [] on failure.
+
+    Corp/alliance NAME lookups are routed through zkill_monitor.resolve_name
+    (permanent (category, id) cache there) instead of raw ESI GETs, and are
+    additionally memoized per-invocation below so N pilots sharing one
+    corp/alliance in a single resolve burst cost exactly one lookup each,
+    not N (B7). The per-character detail fetch stays a direct ESI call:
+    resolve_name only maps id->name, it can't tell us a character's corp/
+    alliance membership."""
     import requests as _req
+    import zkill_monitor
     if not names:
         return []
     results: list[Resolution] = []
+    alliance_names: dict[int, str] = {}
+    corp_names: dict[int, str] = {}
     try:
         resp = _req.post(
             f"{ESI_BASE}/universe/ids/",
@@ -994,23 +1005,25 @@ def resolve_names(
                     corp_id = cdata.get("corporation_id")
                     alliance_id = cdata.get("alliance_id")
                     if alliance_id:
-                        aresp = _req.get(
-                            f"{ESI_BASE}/alliances/{alliance_id}/",
-                            headers=ESI_HEADERS, timeout=5,
-                        )
-                        if aresp.ok:
-                            alliance_name = aresp.json().get("name", "")
+                        if alliance_id in alliance_names:
+                            alliance_name = alliance_names[alliance_id]
+                        else:
+                            alliance_name = zkill_monitor.resolve_name(
+                                alliance_id, "alliance",
+                            )
+                            alliance_names[alliance_id] = alliance_name
                     if corp_id:
-                        cresp2 = _req.get(
-                            f"{ESI_BASE}/corporations/{corp_id}/",
-                            headers=ESI_HEADERS, timeout=5,
-                        )
-                        if cresp2.ok:
-                            corp_name = cresp2.json().get("name", "")
+                        if corp_id in corp_names:
+                            corp_name = corp_names[corp_id]
+                        else:
+                            corp_name = zkill_monitor.resolve_name(
+                                corp_id, "corporation",
+                            )
+                            corp_names[corp_id] = corp_name
             except Exception:
-                log.exception(
+                log.debug(
                     "resolve_names: failed to fetch corp/alliance detail "
-                    "for character_id=%s", char.get("id"),
+                    "for character_id=%s", char.get("id"), exc_info=True,
                 )
             info = {"character_id": char["id"],
                     "corporation_id": corp_id, "alliance_id": alliance_id}
@@ -1025,10 +1038,14 @@ def resolve_names(
                 standing=standing,
             ))
     except Exception:
-        log.exception(
+        # Whole-batch failure is worth surfacing at default log levels (it can
+        # be a genuine non-transient fault, not just an ESI blip); the noisy
+        # traceback stays at debug.
+        log.warning(
             "resolve_names: ESI /universe/ids/ resolution failed for "
             "%d candidate(s)", len(names),
         )
+        log.debug("resolve_names: /universe/ids/ failure detail", exc_info=True)
     return results
 
 
