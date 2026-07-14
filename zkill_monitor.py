@@ -385,6 +385,12 @@ class ZKillMonitor:
                                           friendly_ids=self._friendly_ids)
         self._thread: threading.Thread | None = None
         self._running = False
+        # Set by stop() / cleared by start() (mirrors gamelog_monitor/
+        # intel_resolver). Waiting on this Event instead of a bare time.sleep
+        # inside _poll_loop lets stop() interrupt an in-progress delay (up to
+        # 15s on the R2Z2 404 backoff) immediately instead of the caller
+        # blocking for whatever was left of it.
+        self._stop_event = threading.Event()
         self._sequence: int = 0
         self._kills_processed: int = 0
         # Track which system alerts we've already fired (to avoid spam)
@@ -606,7 +612,7 @@ class ZKillMonitor:
             if seq is not None:
                 break
             print("[zKill] ERROR: Could not fetch initial sequence. Retrying in 10s...")
-            time.sleep(10)
+            self._stop_event.wait(10)
         if seq is None:
             # Only reached when we were asked to stop before acquiring a sequence.
             return
@@ -637,7 +643,7 @@ class ZKillMonitor:
                     consecutive_404s += 1
                     # R2Z2 docs say minimum 6 seconds on 404
                     wait = min(6 + consecutive_404s, 15)  # Cap at 15s
-                    time.sleep(wait)
+                    self._stop_event.wait(wait)
                     continue
 
                 # Got a kill — process it
@@ -655,21 +661,51 @@ class ZKillMonitor:
 
                 # During catchup, poll faster; normal mode: 0.1s between fetches
                 if catching_up:
-                    time.sleep(0.05)
+                    self._stop_event.wait(0.05)
                 else:
-                    time.sleep(0.1)
+                    self._stop_event.wait(0.1)
 
             except Exception as e:
                 print(f"[zKill] Poll error: {e}")
-                time.sleep(5)
+                self._stop_event.wait(5)
 
         print("[zKill] Poll loop stopped.")
 
     def start(self):
-        """Start the zKillboard monitor in a background thread."""
+        """Start the zKillboard monitor in a background thread.
+
+        Guards against a double-start (mirrors gamelog_monitor/intel_resolver):
+        if a poll thread from a prior start() is still alive, log and return
+        rather than spawning a second one. This is what makes the fc_gui
+        settings-reconfigure path (_stop_monitoring -> new ZKillMonitor
+        instance -> _start_monitoring) safe: stop() below blocks until the
+        outgoing thread has actually exited, so by the time a caller can reach
+        a NEW instance's start(), the old poll thread is already gone -- at
+        most one poll thread (and one source of alerts) exists at a time.
+        """
+        if self._thread and self._thread.is_alive():
+            log.info("ZKillMonitor.start() called while a poll thread is "
+                      "already running; ignoring double-start")
+            return
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
+        """Signal the poll loop to exit and wait for it to actually stop.
+
+        Sets _running=False (kept for direct inspection/tests -- it still
+        gates both `while self._running` loops in _poll_loop) AND the stop
+        event, which interrupts any _stop_event.wait(...) currently in
+        progress immediately instead of letting it run out its full delay
+        (previously up to 15s on the R2Z2 404 backoff). Then joins the poll
+        thread (bounded, and skipped if this is somehow called from the poll
+        thread itself, which cannot join itself) so the caller can rely on the
+        thread being gone once stop() returns.
+        """
         self._running = False
+        self._stop_event.set()
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=20)
