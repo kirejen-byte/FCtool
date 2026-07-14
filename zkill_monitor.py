@@ -347,6 +347,12 @@ class EngagementTracker:
         return None
 
 
+# How long _fetch_kill waits before its single retry on a transient network
+# failure (requests.RequestException — e.g. an SSLError CDN blip). Module-level
+# so tests can patch zkill_monitor.time.sleep instead of waiting for real.
+_RETRY_DELAY = 2.0
+
+
 class ZKillMonitor:
     """
     Real-time zKillboard monitor using the R2Z2 polling API.
@@ -529,25 +535,58 @@ class ZKillMonitor:
         non-404 HTTP error or a request exception — signals an outage rather
         than idleness, so it is logged (with context) while still returning
         None to preserve the caller's polling behavior.
+
+        A requests.RequestException (SSLError/ConnectionError/Timeout/etc. —
+        e.g. the SSL "UNEXPECTED_EOF_WHILE_READING" blips seen from
+        r2z2.zkillboard.com) is treated as a routine, self-healing CDN hiccup:
+        it gets ONE retry after a short backoff before giving up. A failure
+        that survives the retry logs a single WARNING line (seq id + exception
+        class + reason, no traceback) instead of ERROR, so routine network
+        noise no longer buries real errors; the full traceback is still
+        available at DEBUG via exc_info. Any other exception (an unexpected
+        programming error, e.g. AttributeError/TypeError) is not a network
+        blip, so it keeps the original ERROR + traceback behavior with no
+        retry.
         """
-        try:
-            resp = requests.get(
-                f"{R2Z2_BASE}/{sequence_id}.json",
-                headers=HEADERS, timeout=10
-            )
-            if resp.ok:
-                return resp.json()
-            elif resp.status_code == 404:
-                return None  # No kill at this sequence yet (idle, not an outage)
-            # Any other status is an unexpected R2Z2 response (possible outage).
-            log.warning(
-                "R2Z2 _fetch_kill seq=%s returned HTTP %s (not OK / not 404)",
-                sequence_id, resp.status_code,
-            )
-        except Exception:
-            # Network/parse failure — an outage, distinct from the idle None above.
-            log.exception("R2Z2 _fetch_kill seq=%s failed (request error)", sequence_id)
-        return None
+        for attempt in range(2):
+            try:
+                resp = requests.get(
+                    f"{R2Z2_BASE}/{sequence_id}.json",
+                    headers=HEADERS, timeout=10
+                )
+                if resp.ok:
+                    return resp.json()
+                elif resp.status_code == 404:
+                    return None  # No kill at this sequence yet (idle, not an outage)
+                # Any other status is an unexpected R2Z2 response (possible outage).
+                log.warning(
+                    "R2Z2 _fetch_kill seq=%s returned HTTP %s (not OK / not 404)",
+                    sequence_id, resp.status_code,
+                )
+                return None
+            except requests.RequestException as e:
+                if attempt == 0:
+                    # First failure: almost always a transient CDN blip — wait
+                    # briefly and retry once before treating it as an outage.
+                    time.sleep(_RETRY_DELAY)
+                    continue
+                # Retry also failed. Routine + self-healing -> WARNING, not
+                # ERROR; the traceback is demoted to DEBUG instead of dropped.
+                log.warning(
+                    "R2Z2 _fetch_kill seq=%s skipped after retry: %s: %s",
+                    sequence_id, type(e).__name__, e,
+                )
+                log.debug(
+                    "R2Z2 _fetch_kill seq=%s retry traceback", sequence_id,
+                    exc_info=True,
+                )
+                return None
+            except Exception:
+                # Unexpected programming error (e.g. AttributeError/TypeError)
+                # — not a routine blip, so no retry; keep full ERROR + traceback.
+                log.exception("R2Z2 _fetch_kill seq=%s failed (request error)", sequence_id)
+                return None
+        return None  # Unreachable: every branch above returns.
 
     def _poll_loop(self):
         """Main polling loop using R2Z2 API."""
