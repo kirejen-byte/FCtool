@@ -131,7 +131,19 @@ class TypeCatalog:
         # contract), so without this two workers could double-fetch the same
         # unknown id AND race the disk-cache temp+replace write. A double-check
         # inside the lock skips the network call if a peer already resolved it.
+        # ``prime()`` takes the same lock around its own register+write section
+        # (see ``prime``) so the two writers can never interleave either.
         self._resolve_lock = threading.Lock()
+
+        # In-memory mirror of the on-disk cache file's raw content (str(type_id)
+        # -> entry), seeded by _load_cache() below and kept in sync by every
+        # subsequent _write_cache_entries() call from THIS instance. Lets
+        # _write_cache_entries merge-and-write from memory instead of
+        # re-reading + re-parsing the whole (potentially large) cache file
+        # before every single resolved id, while still writing through to disk
+        # on every call so a resolved id is immediately visible to a fresh
+        # TypeCatalog instance over the same cache_path (e.g. process restart).
+        self._cache_snapshot: dict[str, dict] = {}
 
         self._load_bundled()
         self._load_cache()
@@ -145,20 +157,29 @@ class TypeCatalog:
 
     def _load_cache(self) -> None:
         """Load previously ESI-resolved entries so they survive process
-        restarts without another network call."""
-        self._ingest_file(self._cache_path)
+        restarts without another network call.
 
-    def _ingest_file(self, path: str) -> None:
+        Also seeds self._cache_snapshot with the raw parsed dict so later
+        writes (see _write_cache_entries) start from exactly what's on disk
+        without a second read."""
+        data = self._ingest_file(self._cache_path)
+        if isinstance(data, dict):
+            self._cache_snapshot = data
+
+    def _ingest_file(self, path: str) -> dict | None:
+        """Parse `path` as a type-catalog JSON file, register every valid
+        entry into self._by_id/_by_name, and return the raw parsed dict (or
+        None if the file is absent/unreadable/corrupt/not-a-dict)."""
         if not path or not os.path.exists(path):
-            return
+            return None
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError):
             log.warning("Discarding unreadable/corrupt type catalog file: %s", path)
-            return
+            return None
         if not isinstance(data, dict):
-            return
+            return None
         for raw_id, entry in data.items():
             try:
                 tid = int(raw_id)
@@ -167,6 +188,7 @@ class TypeCatalog:
             if not isinstance(entry, dict):
                 continue
             self._register(tid, entry)
+        return data
 
     def _register(self, type_id: int, entry: dict) -> None:
         self._by_id[type_id] = entry
@@ -307,7 +329,16 @@ class TypeCatalog:
         disk error) is swallowed — priming is an optimization, never a hard
         dependency, so this method never raises. After ``prime(ids)``,
         ``resolve_name(id)`` for those ids returns the primed name without a
-        further ESI call."""
+        further ESI call.
+
+        THREAD-SAFE: the network fetch runs unlocked (so it never blocks a
+        concurrent ``_resolve_unknown``), but registering the results into
+        ``_by_id``/``_by_name`` and the single cache write are serialised by
+        ``self._resolve_lock`` — the same lock ``_resolve_unknown`` holds for
+        its own register+write — so the two writers can never interleave and
+        corrupt/clobber the on-disk cache (each write fully completes before
+        the other starts). A double-check inside the lock skips re-registering
+        any id a peer already resolved while the batch fetch was in flight."""
         if self._esi is None:
             return
         try:
@@ -332,18 +363,25 @@ class TypeCatalog:
             if not isinstance(resolved, dict):
                 return
             new_entries: dict[int, dict] = {}
-            for tid in unknown:
-                info = resolved.get(tid)
-                if not isinstance(info, dict):
-                    continue
-                name = info.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                entry = {"n": name, "c": None, "g": None, "s": None}
-                self._register(tid, entry)
-                new_entries[tid] = entry
-            if new_entries:
-                self._write_cache_entries(new_entries)
+            with self._resolve_lock:
+                for tid in unknown:
+                    if tid in self._by_id:
+                        # A peer thread (e.g. _resolve_unknown) registered this
+                        # id while our batch fetch was in flight — reuse it
+                        # rather than clobber with our own (identically-shaped)
+                        # entry.
+                        continue
+                    info = resolved.get(tid)
+                    if not isinstance(info, dict):
+                        continue
+                    name = info.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    entry = {"n": name, "c": None, "g": None, "s": None}
+                    self._register(tid, entry)
+                    new_entries[tid] = entry
+                if new_entries:
+                    self._write_cache_entries(new_entries)
         except Exception:
             # Priming is best-effort; never let it propagate.
             return
@@ -391,32 +429,29 @@ class TypeCatalog:
             return entry
 
     def _write_cache_entry(self, type_id: int, entry: dict) -> None:
-        """Merge one resolved entry into the on-disk cache (atomic temp+replace)."""
+        """Merge one resolved entry into the on-disk cache (atomic temp+replace).
+
+        Caller must hold self._resolve_lock (see _resolve_unknown)."""
         self._write_cache_entries({type_id: entry})
 
     def _write_cache_entries(self, entries: dict[int, dict]) -> None:
-        """Merge one or more resolved entries into the on-disk cache in a SINGLE
-        atomic temp+replace write.
+        """Merge one or more resolved entries into the in-memory cache mirror
+        and flush it to disk in a SINGLE atomic temp+replace write.
 
-        Re-reads the current cache so concurrent catalogs don't clobber each
-        other's additions, then writes the union back."""
+        Caller must hold self._resolve_lock (both call sites — _resolve_unknown
+        and prime() — do). self._cache_snapshot mirrors the on-disk cache
+        file's raw content: seeded once from disk in _load_cache() at
+        construction and updated here on every write this instance performs,
+        so repeated calls (e.g. many individually-resolved unknown ids across
+        one market scan) merge-and-write from memory instead of re-reading and
+        re-parsing the whole, potentially large, cache file before every single
+        write — the write itself still happens on every call (never deferred),
+        preserving the existing contract that a resolved id is immediately
+        visible to a fresh TypeCatalog instance over the same cache_path."""
         if not entries:
             return
-        cache: dict[str, dict] = {}
-        if os.path.exists(self._cache_path):
-            try:
-                with open(self._cache_path, encoding="utf-8") as f:
-                    existing = json.load(f)
-                if isinstance(existing, dict):
-                    cache = existing
-            except (OSError, ValueError):
-                log.warning(
-                    "Discarding unreadable/corrupt type catalog cache: %s",
-                    self._cache_path,
-                )
-                cache = {}
         for type_id, entry in entries.items():
-            cache[str(type_id)] = entry
+            self._cache_snapshot[str(type_id)] = entry
 
         parent = os.path.dirname(self._cache_path)
         if parent and not os.path.isdir(parent):
@@ -425,7 +460,7 @@ class TypeCatalog:
             except OSError:
                 return
         try:
-            atomic_write_json(self._cache_path, cache, indent=None)
+            atomic_write_json(self._cache_path, self._cache_snapshot, indent=None)
         except Exception:
             log.exception(
                 "Failed to write type catalog cache: %s", self._cache_path

@@ -23,6 +23,50 @@ CACHE_FILE = os.path.join(app_dir(), "systems_cache.json")
 REGION_CACHE_FILE = os.path.join(app_dir(), "regions_cache.json")
 CACHE_MAX_AGE = 7 * 24 * 3600  # Refresh weekly (system list rarely changes)
 
+_refresh_lock = threading.Lock()
+_refreshing = False
+
+# In-memory memo of parsed on-disk cache JSON, keyed by absolute file path, so
+# repeated calls to get_system_names()/get_region_map()/get_region_name_to_id()
+# (and thus search_region()) within one process don't each re-open and
+# re-parse a 100-200KB+ cache file (C4). Guarded by _refresh_lock (already
+# used for refresh coordination — no new lock introduced). Keyed by path
+# (not a single slot) so tests that monkeypatch CACHE_FILE/REGION_CACHE_FILE
+# to different tmp paths never see cross-test staleness. save_cache() and
+# save_region_cache() invalidate the entry for the path they just wrote so
+# the NEXT read reflects the write instead of serving a stale in-memory copy.
+_parsed_json_memo: dict[str, dict] = {}
+
+
+def _read_cached_json(path: str) -> dict:
+    """Return the parsed JSON dict at `path`, from the in-memory memo when
+    present.
+
+    Raises FileNotFoundError if the path doesn't exist (never memoized, so a
+    file created later is picked up immediately). Propagates the underlying
+    OSError/ValueError on a corrupt/unreadable file (also never memoized, so
+    the caller's existing discard-and-log handling is unchanged and a
+    fixed/rewritten file is retried on the next call). A successful parse IS
+    memoized."""
+    with _refresh_lock:
+        cached = _parsed_json_memo.get(path)
+    if cached is not None:
+        return cached
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r") as f:
+        data = json.load(f)
+    with _refresh_lock:
+        _parsed_json_memo[path] = data
+    return data
+
+
+def _invalidate_json_memo(path: str) -> None:
+    """Drop the memoized parse for `path`, if any, so the next read is fresh
+    from disk. Called after a successful write to that path."""
+    with _refresh_lock:
+        _parsed_json_memo.pop(path, None)
+
 
 def _is_kspace_system(system_id: int) -> bool:
     """K-space systems have IDs 30000000-30999999. J-space is 31000000+."""
@@ -76,33 +120,37 @@ def download_system_names() -> dict[str, int]:
 
 
 def save_cache(systems: dict[str, int]):
-    """Save system cache to disk."""
+    """Save system cache to disk and invalidate the in-memory parse memo so
+    the next load reflects this write."""
     data = {
         "timestamp": time.time(),
         "systems": systems,
     }
     atomic_write_json(CACHE_FILE, data, indent=None)
+    _invalidate_json_memo(CACHE_FILE)
 
 
 def load_cache() -> dict[str, int] | None:
-    """Load system cache from disk if fresh enough."""
-    if not os.path.exists(CACHE_FILE):
-        return None
+    """Load system cache from disk if fresh enough.
+
+    The parsed JSON is memoized in-memory per path (see _read_cached_json) so
+    repeated calls within a process don't re-open/re-parse the file;
+    save_cache() invalidates the memo so a fresh write is observed on the
+    very next call. File-absent/corrupt semantics are unchanged: a missing
+    file returns None silently, a corrupt/unreadable one returns None and
+    logs."""
     try:
-        with open(CACHE_FILE, "r") as f:
-            data = json.load(f)
-        age = time.time() - data.get("timestamp", 0)
-        if age > CACHE_MAX_AGE:
-            print("[SystemCache] Cache expired, will refresh.")
-            return None
-        return data.get("systems", {})
+        data = _read_cached_json(CACHE_FILE)
+    except FileNotFoundError:
+        return None
     except Exception:
         log.exception("Failed to load system cache %s; discarding", CACHE_FILE)
         return None
-
-
-_refresh_lock = threading.Lock()
-_refreshing = False
+    age = time.time() - data.get("timestamp", 0)
+    if age > CACHE_MAX_AGE:
+        print("[SystemCache] Cache expired, will refresh.")
+        return None
+    return data.get("systems", {})
 
 
 def _seed_from_coords() -> dict[str, int]:
@@ -245,7 +293,7 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
 
 def save_region_cache(region_map: dict[str, str],
                       region_ids: dict[str, int] | None = None):
-    """Save region mapping to disk.
+    """Save region mapping to disk and invalidate the in-memory parse memo.
 
     Persists the system_id -> region_name map under "regions" (unchanged) and,
     when provided, the region_name -> region_id map under "region_ids" so
@@ -255,50 +303,53 @@ def save_region_cache(region_map: dict[str, str],
     if region_ids:
         data["region_ids"] = region_ids
     atomic_write_json(REGION_CACHE_FILE, data, indent=None)
+    _invalidate_json_memo(REGION_CACHE_FILE)
 
 
 def load_region_cache() -> dict[str, str] | None:
-    """Load the system_id -> region_name map from disk (unchanged contract)."""
-    if not os.path.exists(REGION_CACHE_FILE):
-        return None
+    """Load the system_id -> region_name map from disk (unchanged contract).
+
+    Shares the memoized parse of REGION_CACHE_FILE with load_region_ids_cache
+    below (both read the same file) — see _read_cached_json."""
     try:
-        with open(REGION_CACHE_FILE, "r") as f:
-            data = json.load(f)
-        # Region assignments never change, so no expiry needed
-        return data.get("regions", {})
+        data = _read_cached_json(REGION_CACHE_FILE)
+    except FileNotFoundError:
+        return None
     except Exception:
         log.exception(
             "Failed to load region cache %s; discarding", REGION_CACHE_FILE
         )
         return None
+    # Region assignments never change, so no expiry needed
+    return data.get("regions", {})
 
 
 def load_region_ids_cache() -> dict[str, int] | None:
     """Load the region_name -> region_id map from disk, if present.
 
     Returns None when the cache file is missing or has no "region_ids" key
-    (e.g. an older cache written before this map was added)."""
-    if not os.path.exists(REGION_CACHE_FILE):
-        return None
+    (e.g. an older cache written before this map was added). Shares the
+    memoized parse of REGION_CACHE_FILE with load_region_cache above."""
     try:
-        with open(REGION_CACHE_FILE, "r") as f:
-            data = json.load(f)
-        region_ids = data.get("region_ids")
-        if isinstance(region_ids, dict) and region_ids:
-            # JSON object keys are strings; coerce values to int defensively.
-            out: dict[str, int] = {}
-            for name, rid in region_ids.items():
-                try:
-                    out[name] = int(rid)
-                except (TypeError, ValueError):
-                    continue
-            return out or None
+        data = _read_cached_json(REGION_CACHE_FILE)
+    except FileNotFoundError:
         return None
     except Exception:
         log.exception(
             "Failed to load region id cache %s; discarding", REGION_CACHE_FILE
         )
         return None
+    region_ids = data.get("region_ids")
+    if isinstance(region_ids, dict) and region_ids:
+        # JSON object keys are strings; coerce values to int defensively.
+        out: dict[str, int] = {}
+        for name, rid in region_ids.items():
+            try:
+                out[name] = int(rid)
+            except (TypeError, ValueError):
+                continue
+        return out or None
+    return None
 
 
 def get_region_map() -> dict[str, str]:
