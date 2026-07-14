@@ -13326,8 +13326,16 @@ class FCToolGUI:
     _OVERLAY_PROBE_MS = 2000        # when enabled but Eve-O not detected
     _OVERLAY_STALE_SECS = 300       # drop a CharState label after 5 min stale
 
-    _OVERLAY_LOCSHIP_EVERY = 10.0    # seconds between location+ship polls / char
+    _OVERLAY_LOCSHIP_EVERY = 10.0    # seconds between location polls / char
     _OVERLAY_ONLINE_EVERY = 60.0     # seconds between online polls / char
+    # B6 (optimization review): ship type rarely changes between passes, so
+    # it rides a slower cadence than location -- fetched only every Nth
+    # "locship" pass (3 * 10s = ~30s) instead of every pass. Location itself
+    # is UNCHANGED at _OVERLAY_LOCSHIP_EVERY. _overlay_build_state also
+    # forces an off-cadence ship fetch when the freshly-polled location
+    # shows the character changed systems since the prior pass, and always
+    # on a character's first pass (no prior state yet).
+    _OVERLAY_SHIP_EVERY_N = 3        # fetch ship every Nth locship pass
 
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
@@ -15004,10 +15012,21 @@ class FCToolGUI:
             except tk.TclError:
                 pass
 
-    def _overlay_build_state(self, auth, do_online: bool):
-        """Fetch this ONE character's ESI location/ship (+ online when do_online)
-        with its OWN auth, returning a CharState. Merges onto any prior state so
-        a partial pass doesn't clobber the other field. Never raises."""
+    def _overlay_build_state(self, auth, do_online: bool, force_ship: bool = True):
+        """Fetch this ONE character's ESI location (+ ship when due, + online
+        when do_online) with its OWN auth, returning a CharState. Merges onto
+        any prior state so a partial pass doesn't clobber the other field.
+        Never raises.
+
+        B6 (optimization review): ship type is comparatively expensive and
+        rarely changes pass-to-pass, so the caller (poll loop) only sets
+        force_ship=True every _OVERLAY_SHIP_EVERY_N-th locship pass. Location
+        is ALWAYS fetched here (unchanged cadence). Even when the caller
+        didn't request it, a ship fetch still happens on this character's
+        very first pass (no prior state) or when the fresh location shows the
+        character is in a different system than the prior pass -- a system
+        change (undock into a fresh ship, jump clone, etc.) is exactly when
+        the hull is most likely to have actually changed."""
         name = getattr(auth, "character_name", "") or ""
         key = name.strip().lower()
         prior = self._overlay_states.get(key)
@@ -15017,36 +15036,12 @@ class FCToolGUI:
         ship_type_name = prior.ship_type_name if prior else ""
         ship_group = prior.ship_group if prior else ""
         is_cap = prior.is_capital if prior else None
-        sys_id = prior.solar_system_id if prior else None
+        prior_sys_id = prior.solar_system_id if prior else None
+        sys_id = prior_sys_id
         sys_name = prior.system_name if prior else ""
         docked = prior.docked if prior else False
         online = prior.online if prior else None
 
-        try:
-            ship = auth.get_ship_type() or {}
-            if ship.get("ship_type_id"):
-                ship_type_id = ship.get("ship_type_id")
-                # HULL TYPE (Thrasher, Onyx, …) from the local bundled SDE — NOT
-                # ship.get("ship_name"), which is the pilot's CUSTOM ship name.
-                # type_catalog.resolve_name is a pure in-memory SDE lookup (all
-                # hulls are bundled → no network, thread-safe in the poller).
-                ship_type_name = (self.type_catalog.resolve_name(ship_type_id)
-                                  or ship_type_name)
-                ship_group = ship_classes.get_group_name(ship_type_id) or ""
-                is_cap = bool(ship_classes.is_capital(ship_type_id))
-        except Exception:
-            pass
-        # B6: base layer HP for the damage-flash reference pool. Cached in
-        # ship_classes; only (re)fetched when the hull changes (or never seen)
-        # to avoid an ESI call every poll. Poller-thread write into the
-        # _preview_layer_hp dict — the tick only reads it (single-writer, same
-        # discipline as _overlay_states).
-        try:
-            if ship_type_id and (ship_type_id != prior_ship_type_id
-                                 or key not in self._preview_layer_hp):
-                self._preview_layer_hp[key] = ship_classes.get_layer_hp(ship_type_id)
-        except Exception:
-            pass
         try:
             loc = auth.get_location() or {}
             if loc:
@@ -15056,6 +15051,33 @@ class FCToolGUI:
                     info = get_system_info(sys_id)
                     if info and info.get("name"):
                         sys_name = info["name"]
+        except Exception:
+            pass
+
+        if force_ship or prior is None or sys_id != prior_sys_id:
+            try:
+                ship = auth.get_ship_type() or {}
+                if ship.get("ship_type_id"):
+                    ship_type_id = ship.get("ship_type_id")
+                    # HULL TYPE (Thrasher, Onyx, …) from the local bundled SDE — NOT
+                    # ship.get("ship_name"), which is the pilot's CUSTOM ship name.
+                    # type_catalog.resolve_name is a pure in-memory SDE lookup (all
+                    # hulls are bundled → no network, thread-safe in the poller).
+                    ship_type_name = (self.type_catalog.resolve_name(ship_type_id)
+                                      or ship_type_name)
+                    ship_group = ship_classes.get_group_name(ship_type_id) or ""
+                    is_cap = bool(ship_classes.is_capital(ship_type_id))
+            except Exception:
+                pass
+        # Base layer HP for the damage-flash reference pool. Cached in
+        # ship_classes; only (re)fetched when the hull changes (or never seen)
+        # to avoid an ESI call every poll. Poller-thread write into the
+        # _preview_layer_hp dict — the tick only reads it (single-writer, same
+        # discipline as _overlay_states).
+        try:
+            if ship_type_id and (ship_type_id != prior_ship_type_id
+                                 or key not in self._preview_layer_hp):
+                self._preview_layer_hp[key] = ship_classes.get_layer_hp(ship_type_id)
         except Exception:
             pass
         if do_online:
@@ -15104,9 +15126,19 @@ class FCToolGUI:
         """Daemon: round-robin ESI polling for the currently-matched characters.
         Uses each character's own ESIAuth. Writes into self._overlay_states
         (with a fetch timestamp) consumed by the controller tick. Sleeps in
-        short slices so a disable is responsive."""
+        short slices so a disable is responsive.
+
+        B6 (optimization review): the "locship" cadence still drives location
+        every _OVERLAY_LOCSHIP_EVERY s (unchanged), but locship_pass counts
+        completed locship passes per character so ship type is only actually
+        fetched (force_ship=True) every _OVERLAY_SHIP_EVERY_N-th one --
+        _overlay_build_state independently forces it sooner on a system
+        change or a character's first pass. "online"-kind passes (already a
+        slower, less frequent full refresh) keep force_ship at its True
+        default and are not counted here."""
         stop = self._overlay_poller_stop
-        last: dict = {}          # (name_lower, kind) -> ts
+        last: dict = {}           # (name_lower, kind) -> ts
+        locship_pass: dict = {}   # name_lower -> completed locship-pass count
         auth_by_name = {}
         online_ok = {}
         while not stop.is_set():
@@ -15133,7 +15165,13 @@ class FCToolGUI:
                     auth = auth_by_name.get(name)
                     if auth is None:
                         continue
-                    st = self._overlay_build_state(auth, do_online=(kind == "online"))
+                    force_ship = True
+                    if kind == "locship":
+                        count = locship_pass.get(name, 0) + 1
+                        locship_pass[name] = count
+                        force_ship = (count % self._OVERLAY_SHIP_EVERY_N == 1)
+                    st = self._overlay_build_state(
+                        auth, do_online=(kind == "online"), force_ship=force_ship)
                     self._overlay_states[name] = st
                     self._overlay_state_ts[name] = time.monotonic()
                     last[(name, kind)] = time.monotonic()
@@ -22522,7 +22560,15 @@ $bmp.Dispose()
         Dotlan / Navigate WH route / Titan bridge. D-scan is NOT here -- the
         legacy 'D-Scan' action (self._open_url(report.dscan_url)) is
         per-message, so it is exposed as a clickable dscan span instead (see
-        _bind_dscan_span), not as a system-menu item."""
+        _bind_dscan_span), not as a system-menu item.
+
+        E6a: the menu is destroyed after use instead of being leaked on every
+        right-click. Destroy is scheduled off the menu's <Unmap> event (fires
+        once Tk unposts the menu after a selection or dismissal) with a short
+        after() delay, NOT immediately after tk_popup() returns -- Tk invokes
+        the clicked entry's command via an idle callback that is not
+        guaranteed to have run yet at that point, so destroying right away
+        can race a live command invocation and swallow the click."""
         menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT)
         # Set destination — boss-gated copy/destination helper.
         menu.add_command(
@@ -22545,6 +22591,7 @@ $bmp.Dispose()
         menu.add_command(
             label="Titan bridge",
             command=lambda: self._navigate_jump_range(system_name))
+        menu.bind("<Unmap>", lambda ev: menu.after(100, menu.destroy))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -22916,13 +22963,31 @@ $bmp.Dispose()
                      width=14, anchor=tk.W, cursor="hand2")
             sys_label.grid(row=i, column=col, padx=(0, 10)); col += 1
             sys_name = sr["system"]
-            menu = tk.Menu(sys_label, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
-                           activebackground=FG_ACCENT, activeforeground=BG_DARK)
-            menu.add_command(label=f"Set destination: {sys_name}",
-                             command=lambda n=sys_name: self._set_destination_or_copy(n))
-            menu.add_command(label=f"Copy \"{sys_name}\"",
-                             command=lambda n=sys_name: (self.root.clipboard_clear(), self.root.clipboard_append(n)))
-            sys_label.bind("<Button-3>", lambda e, m=menu: m.tk_popup(e.x_root, e.y_root))
+
+            # E6b: build the row's context menu lazily on right-click instead
+            # of eagerly for every row rendered (most rows are never
+            # right-clicked) -- and destroy it after use rather than leaking
+            # it. Destroy is scheduled off <Unmap> (fires once Tk unposts the
+            # menu) with a short after() delay, matching _intel_system_menu's
+            # pattern: an immediate destroy right after tk_popup() returns can
+            # race Tk's idle-scheduled command invocation and swallow the
+            # click. `n` binds this row's system name at definition time;
+            # event.widget (not the loop's `sys_label`) is used as the menu's
+            # master so the closure can't pick up a later row's label.
+            def _show_row_menu(event, n=sys_name):
+                menu = tk.Menu(event.widget, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                               activebackground=FG_ACCENT, activeforeground=BG_DARK)
+                menu.add_command(label=f"Set destination: {n}",
+                                 command=lambda: self._set_destination_or_copy(n))
+                menu.add_command(label=f"Copy \"{n}\"",
+                                 command=lambda: (self.root.clipboard_clear(), self.root.clipboard_append(n)))
+                menu.bind("<Unmap>", lambda ev: menu.after(100, menu.destroy))
+                try:
+                    menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    menu.grab_release()
+
+            sys_label.bind("<Button-3>", _show_row_menu)
             sys_label.bind("<Button-1>", lambda e, n=sys_name: self._set_destination_or_copy(n))
 
             # Jumps from staging (friendly only)
