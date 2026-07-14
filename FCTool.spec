@@ -11,6 +11,8 @@ a = Analysis(
         ('system_coords.json', '.'),
         ('map_layout.json', '.'),
         ('fit_types.json', '.'),
+        ('inv_groups.json', '.'),
+        ('inv_categories.json', '.'),
         ('assets/bursts/shield.png', 'assets/bursts'),
         ('assets/bursts/armor.png', 'assets/bursts'),
         ('assets/bursts/skirmish.png', 'assets/bursts'),

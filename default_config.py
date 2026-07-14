@@ -138,4 +138,11 @@ DEFAULT_CONFIG = {
     "infra": {
         "auto_scan_on_start": False,
     },
+    "overview": {
+        "overview_dir_override": "",
+        "account_nicknames": {},
+        "distribution_log": {},
+        "dat_sync_enabled": False,
+        "dat_sync_acceptance_passed": False,
+    },
 }
