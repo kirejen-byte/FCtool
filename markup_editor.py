@@ -32,17 +32,22 @@ from tkinter import font as tkfont
 from tkinter import colorchooser
 
 import motd_markup
+from ui_helpers import attach_tooltip
 
 
-# Dark-theme defaults (mirror the fc_gui palette so the editor blends in). The
-# caller may override via constructor kwargs.
-_BG_PANEL = "#16213e"
-_BG_ENTRY = "#0f3460"
-_BG_DARK = "#1a1a2e"
-_FG_TEXT = "#e0e0e0"
-_FG_WHITE = "#ffffff"
-_FG_ACCENT = "#00d4ff"
-_BORDER = "#2a2a4a"
+# Dark-theme defaults — imports the shared ui_theme palette (a stdlib-only,
+# containment-safe leaf) so the editor blends into the app's navy scheme. The
+# caller may override any of these via constructor kwargs; kept as module-private
+# aliases so the rest of the module is untouched.
+from ui_theme import (
+    BG_PANEL as _BG_PANEL,
+    BG_ENTRY as _BG_ENTRY,
+    BG_DARK as _BG_DARK,
+    FG_TEXT as _FG_TEXT,
+    FG_WHITE as _FG_WHITE,
+    FG_ACCENT as _FG_ACCENT,
+    BORDER_COLOR as _BORDER,
+)
 
 # Toolbar colour swatches: (label-for-tooltip, "#rrggbb"). White first so it maps
 # to the MOTD's default text colour.
@@ -96,7 +101,6 @@ class MarkupEditor(tk.Frame):
         self._pending_tags = set()      # Tk tag names to apply to the next typed chars
         self._pending_press_idx = None  # insert index captured on a self-inserting KeyPress
         self._pending_armed = False
-        self._tooltip = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -140,9 +144,7 @@ class MarkupEditor(tk.Frame):
             sw.pack_propagate(False)
             sw.bind("<Button-1>",
                     lambda e, c=hexcolor: self.apply_color(c))
-            sw.bind("<Enter>",
-                    lambda e, t=f"Colour: {label}": self._show_tip(e, t))
-            sw.bind("<Leave>", lambda e: self._hide_tip())
+            attach_tooltip(sw, f"Colour: {label}")
 
         # Custom colour picker.
         custom = tk.Label(bar, text="…", bg=self._bg_entry, fg=self._fg_white,
@@ -151,9 +153,7 @@ class MarkupEditor(tk.Frame):
                           highlightbackground=self._border, highlightthickness=1)
         custom.pack(side=tk.LEFT, padx=(1, 6))
         custom.bind("<Button-1>", lambda e: self._pick_custom_color())
-        custom.bind("<Enter>",
-                    lambda e: self._show_tip(e, "Custom colour…"))
-        custom.bind("<Leave>", lambda e: self._hide_tip())
+        attach_tooltip(custom, "Custom colour…")
 
         # B / I / U toggle buttons (tk.Button so we can style them compactly).
         self._mk_toggle(bar, "B", ("Consolas", 9, "bold"), self.toggle_bold)
@@ -534,21 +534,3 @@ class MarkupEditor(tk.Frame):
         # user change on the next <<Modified>>.
         self.text.edit_modified(False)
 
-    # ── tooltip (swatch labels) ─────────────────────────────────────────────
-
-    def _show_tip(self, event, text):
-        self._hide_tip()
-        tip = self._tooltip = tk.Toplevel(self)
-        tip.wm_overrideredirect(True)
-        tk.Label(tip, text=text, font=("Consolas", 8),
-                 fg=self._fg_text, bg=self._bg_panel,
-                 borderwidth=1, relief=tk.SOLID, padx=4, pady=1).pack()
-        tip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
-
-    def _hide_tip(self):
-        if self._tooltip is not None:
-            try:
-                self._tooltip.destroy()
-            except Exception:
-                pass
-            self._tooltip = None

@@ -72,3 +72,43 @@ def bundle_dir() -> str:
     if getattr(sys, "frozen", False):
         return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_data_file(name: str, prefer: str = "writable") -> str | None:
+    """Resolve the on-disk path of a data file that ships bundled and/or lives
+    next to the app's writable data, trying candidate locations in the order
+    that fits the KIND of file. One shared implementation for the four
+    call-sites that used to hand-roll (and silently diverge on) this lookup.
+
+    ``prefer="writable"`` (default) — try :func:`app_dir` FIRST, then
+        :func:`bundle_dir`. Use for data the user may legitimately override or
+        that the app itself refreshes: caches, or generated tables a newer copy
+        of which can be dropped next to the exe to shadow the shipped one (e.g.
+        ``system_coords.json``, the star-map layout). A writable-dir copy WINS.
+
+    ``prefer="bundle"`` — try :func:`bundle_dir` FIRST, then this module's own
+        directory. Use for PRISTINE shipped tables that must always read the
+        packaged copy and never be shadowed by a stray file in the writable dir
+        (e.g. the SDE ``inv_groups``/``fit_types`` tables, overview starter
+        tables). The bundled copy WINS; the module-dir entry is only a
+        source-checkout fallback (unfrozen, ``bundle_dir()`` and this module's
+        directory are the same folder).
+
+    Returns the first candidate path that exists, or ``None`` when the file is
+    found in none of the candidate locations (callers decide whether that is
+    fatal — most degrade gracefully). Pure lookup: never creates or writes.
+    """
+    if prefer == "bundle":
+        candidates = (
+            os.path.join(bundle_dir(), name),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+        )
+    else:  # "writable" (default)
+        candidates = (
+            os.path.join(app_dir(), name),
+            os.path.join(bundle_dir(), name),
+        )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None

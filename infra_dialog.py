@@ -32,18 +32,18 @@ MANUAL_CATEGORIES = tuple(c for c in CATEGORIES if c != "npc")
 SCAN_CAVEAT = ("ESI scan can miss role-gated structures — "
                "paste from the structure browser for full coverage.")
 
-# Palette mirrors fc_gui / fleet_template_window (importing them would break the
-# isolation rule and, for fc_gui, be circular).
-BG_DARK = "#1a1a1a"
-BG_PANEL = "#252525"
-BG_ENTRY = "#2d2d2d"
-FG_TEXT = "#d0d0d0"
-FG_DIM = "#808080"
-FG_ACCENT = "#4ea1d3"
-FG_GREEN = "#5fb85f"
-FG_YELLOW = "#d6b656"
-FG_RED = "#d35f5f"
-BORDER_COLOR = "#3a3a3a"
+# House dark palette — imports the shared ui_theme palette (a stdlib-only,
+# containment-safe leaf; importing fc_gui here would be circular). This dialog
+# previously carried a divergent gray palette; it now uses the canonical navy
+# scheme like the rest of the app (OPTIMIZATION_REVIEW.md D1 reconciliation).
+from ui_theme import (
+    BG_DARK, BG_PANEL, BG_ENTRY,
+    FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_YELLOW, FG_RED,
+    BORDER_COLOR,
+)
+# Shared hover-tooltip helper (also a stdlib-only leaf) — replaces this dialog's
+# former bespoke ``_Tooltip`` class (OPTIMIZATION_REVIEW.md D9 dedupe).
+from ui_helpers import attach_tooltip
 
 # Tree columns (order is the display order) and their header labels.
 #
@@ -78,43 +78,6 @@ def _fmt_last_seen(iso) -> str:
     if not iso:
         return ""
     return str(iso)[:16].replace("T", " ")
-
-
-class _Tooltip:
-    """Minimal hover tooltip (used for the 'needs ESI login' hint on disabled
-    scan controls). tkinter-only; best-effort — never raises into the caller."""
-
-    def __init__(self, widget, text):
-        self.widget = widget
-        self.text = text
-        self.tip = None
-        try:
-            widget.bind("<Enter>", self._show, add="+")
-            widget.bind("<Leave>", self._hide, add="+")
-        except Exception:
-            pass
-
-    def _show(self, _evt=None):
-        if self.tip or not self.text:
-            return
-        try:
-            x = self.widget.winfo_rootx() + 12
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 2
-            self.tip = tk.Toplevel(self.widget)
-            self.tip.wm_overrideredirect(True)
-            self.tip.wm_geometry(f"+{x}+{y}")
-            tk.Label(self.tip, text=self.text, bg="#ffffe0", fg="#000000",
-                     relief="solid", borderwidth=1, padx=4, pady=1).pack()
-        except Exception:
-            self.tip = None
-
-    def _hide(self, _evt=None):
-        if self.tip is not None:
-            try:
-                self.tip.destroy()
-            except Exception:
-                pass
-            self.tip = None
 
 
 class InfraManagerDialog(tk.Toplevel):
@@ -229,8 +192,8 @@ class InfraManagerDialog(tk.Toplevel):
         if self.scanner is None:
             self._scan_btn.config(state="disabled")
             self._reverify_btn.config(state="disabled")
-            _Tooltip(self._scan_btn, "needs ESI login")
-            _Tooltip(self._reverify_btn, "needs ESI login")
+            attach_tooltip(self._scan_btn, "needs ESI login")
+            attach_tooltip(self._reverify_btn, "needs ESI login")
 
     # ── row 1: region panel + structure tree ─────────────────────────────────
     def _build_body(self):

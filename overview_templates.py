@@ -28,7 +28,7 @@ import os
 
 import overview_schema
 from overview_schema import BRACKET_SHOW_ALL, COLUMN_IDS, OverviewPack, Preset, TabConfig
-from app_path import bundle_dir
+from app_path import bundle_dir, resolve_data_file
 
 # --- state IDs used by the template ---------------------------------------
 # PROVENANCE (mirrors overview_schema.STATE_DEFS discipline): only 11 (pilot in
@@ -63,14 +63,13 @@ _OVERVIEW_COLUMNS = [
 # --- table loading ---------------------------------------------------------
 
 def _table_path(filename: str) -> str:
-    """Resolve a bundled table path: ``bundle_dir()`` first (the frozen-asset
-    home + this module's dir when unfrozen), then this module's directory as an
-    explicit fallback. Mirrors ``type_catalog.py``'s bundled-JSON load."""
-    for base in (bundle_dir(), os.path.dirname(os.path.abspath(__file__))):
-        candidate = os.path.join(base, filename)
-        if os.path.exists(candidate):
-            return candidate
-    return os.path.join(bundle_dir(), filename)
+    """Resolve a bundled table path via the shared ``resolve_data_file`` with
+    ``prefer="bundle"`` (``bundle_dir()`` first, this module's dir as the
+    source-checkout fallback) — a pristine shipped SDE table, never locally
+    overridden. When the file is absent everywhere, keep the historic
+    unconditional bundle path so ``_load_json`` raises a clear FileNotFound."""
+    return (resolve_data_file(filename, prefer="bundle")
+            or os.path.join(bundle_dir(), filename))
 
 
 def _load_json(filename: str) -> dict:

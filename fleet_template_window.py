@@ -28,17 +28,19 @@ from fleet_template_store import (
     Wing, Squad, Slot, RuleCondition, RuleAction, AssignmentRule, validate_template,
 )
 
-# Palette mirroring fc_gui's (importing fc_gui here would be circular).
-BG_DARK = "#1a1a1a"
-BG_PANEL = "#252525"
-BG_ENTRY = "#2d2d2d"
-FG_TEXT = "#d0d0d0"
-FG_DIM = "#808080"
-FG_ACCENT = "#4ea1d3"
-FG_GREEN = "#5fb85f"
-FG_YELLOW = "#d6b656"
-FG_RED = "#d35f5f"
-BORDER_COLOR = "#3a3a3a"
+# House dark palette — imports the shared ui_theme palette (a stdlib-only,
+# containment-safe leaf; importing fc_gui here would be circular). This window
+# previously carried a divergent gray palette; it now uses the canonical navy
+# scheme like the rest of the app (OPTIMIZATION_REVIEW.md D1 reconciliation).
+from ui_theme import (
+    BG_DARK, BG_PANEL, BG_ENTRY,
+    FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_YELLOW, FG_RED,
+    BORDER_COLOR,
+)
+# Shared house dialog + tooltip helpers (both stdlib-only leaves): make_modal
+# wires the guarded transient/grab + Escape→cancel + base bg once (D2/D6), and
+# attach_tooltip is the single hover-tooltip impl with the <Destroy> leak fix (D9).
+from ui_helpers import make_modal, attach_tooltip
 
 ROLE_VALUES = ["squad_member", "squad_commander", "wing_commander", "fleet_commander"]
 ROLE_ABBR = {"squad_member": "", "squad_commander": "SC",
@@ -1811,35 +1813,9 @@ class FleetTemplateWindow:
             self._auto_sort_tick()
 
     def _attach_tooltip(self, widget, text):
-        """Lightweight hover tooltip: a borderless Toplevel shown on <Enter>,
-        destroyed on <Leave>/<ButtonPress>. Self-contained (no external deps)."""
-        tip = {"win": None}
-
-        def show(_e=None):
-            if tip["win"] is not None:
-                return
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            tw = tk.Toplevel(widget)
-            tw.overrideredirect(True)
-            tw.attributes("-topmost", True)
-            tw.geometry(f"+{x}+{y}")
-            tk.Label(tw, text=text, bg=BG_PANEL, fg=FG_TEXT,
-                     font=("Consolas", 8), relief=tk.SOLID, borderwidth=1,
-                     padx=6, pady=2, justify=tk.LEFT, wraplength=280).pack()
-            tip["win"] = tw
-
-        def hide(_e=None):
-            if tip["win"] is not None:
-                try:
-                    tip["win"].destroy()
-                except tk.TclError:
-                    pass
-                tip["win"] = None
-
-        widget.bind("<Enter>", show)
-        widget.bind("<Leave>", hide)
-        widget.bind("<ButtonPress>", hide)
+        """Hover tooltip via the shared ui_helpers helper (D9 dedupe — the shared
+        impl carries the <Destroy> cleanup this window's bespoke copy lacked)."""
+        return attach_tooltip(widget, text)
 
     def _toggle_auto_sort(self):
         if self.mode != "live":
@@ -2184,9 +2160,7 @@ class SlotEditor:
         self._pending_char = None
         self.win = tk.Toplevel(parent)
         self.win.title("Edit Slot")
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        make_modal(self.win, parent, base_bg=BG_PANEL)
 
         tk.Label(self.win, text="Character (named slot):", bg=BG_PANEL,
                  fg=FG_TEXT, font=("Consolas", 9)).grid(row=0, column=0, sticky="w",
@@ -2295,9 +2269,7 @@ class _AddMyCharsDialog:
         self.on_ok = on_ok
         self.win = tk.Toplevel(parent)
         self.win.title("Add my characters")
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        make_modal(self.win, parent, base_bg=BG_PANEL)
         tk.Label(self.win, text="Select characters to add:", bg=BG_PANEL,
                  fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", padx=8, pady=(8, 2))
         self._vars = {}
@@ -2329,9 +2301,7 @@ class _BulkAddDialog:
         self.on_ok = on_ok
         self.win = tk.Toplevel(parent)
         self.win.title("Add pilots from list")
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        make_modal(self.win, parent, base_bg=BG_PANEL)
         tk.Label(self.win, text="One pilot name per line:", bg=BG_PANEL,
                  fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", padx=8, pady=(8, 2))
         self._text = tk.Text(self.win, width=36, height=12, bg=BG_ENTRY,
@@ -2360,9 +2330,8 @@ class _UnresolvedDialog:
         self.on_skip = on_skip
         self.win = tk.Toplevel(parent)
         self.win.title("Unresolved names")
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        # Escape == Skip (the non-destructive dismissal; runs on_skip like Skip).
+        make_modal(self.win, parent, on_cancel=self._skip, base_bg=BG_PANEL)
         tk.Label(self.win,
                  text=f"{len(unresolved)} name(s) not found on ESI:",
                  bg=BG_PANEL, fg=FG_YELLOW, font=("Consolas", 9)).pack(
@@ -2401,9 +2370,7 @@ class _QuickAddPicker:
         self.window = window
         self.win = tk.Toplevel(parent)
         self.win.title(self._MODE_LABEL.get(mode, "Route"))
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        make_modal(self.win, parent, base_bg=BG_PANEL)
 
         row = 0
         self._value = None
@@ -2480,9 +2447,7 @@ class _ApplyPreviewDialog:
         self.on_confirm = on_confirm
         self.win = tk.Toplevel(parent)
         self.win.title("Apply preview")
-        self.win.configure(bg=BG_PANEL)
-        self.win.transient(parent)
-        self.win.grab_set()
+        make_modal(self.win, parent, base_bg=BG_PANEL)
 
         moves = rows.get("moves", [])
         tk.Label(self.win, text=f"{len(moves)} move(s):", bg=BG_PANEL,

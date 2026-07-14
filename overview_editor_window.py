@@ -33,19 +33,18 @@ from tkinter import ttk, messagebox, colorchooser
 import overview_markup as om
 import overview_schema as osch
 
-# ── House dark palette (mirrors fc_gui.py:150-164; importing fc_gui would be
-# circular and would drag in the whole app). Defined locally by design. ──
-BG_DARK = "#1a1a2e"
-BG_PANEL = "#16213e"
-BG_ENTRY = "#0f3460"
-FG_TEXT = "#e0e0e0"
-FG_DIM = "#888899"
-FG_ACCENT = "#00d4ff"
-FG_GREEN = "#00ff88"
-FG_RED = "#ff4444"
-FG_YELLOW = "#ffdd00"
-FG_WHITE = "#ffffff"
-BORDER_COLOR = "#2a2a4a"
+# ── House dark palette — imports the shared ui_theme palette (a stdlib-only,
+# containment-safe leaf; importing fc_gui would be circular and drag in the whole
+# app). One source of truth for the app's navy scheme. ──
+from ui_theme import (
+    BG_DARK, BG_PANEL, BG_ENTRY,
+    FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_RED,
+    FG_YELLOW, FG_WHITE,
+    BORDER_COLOR,
+)
+# Shared house modal-dialog contract (guarded transient/grab + Escape→cancel +
+# base bg) — one wiring for every dialog (OPTIMIZATION_REVIEW.md D2/D6).
+from ui_helpers import make_modal
 
 # The 7 ship-label component types the client understands (research §A.2). "None"
 # is the editor's sentinel for an unused slot (emits nothing to the wire).
@@ -166,15 +165,12 @@ class PackEditorWindow(tk.Toplevel):
         self.on_save = on_save
 
         self.title(f"Edit overview pack — {record.name}")
-        self.configure(bg=BG_DARK)
         self.geometry("980x680")
         self.minsize(820, 560)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        try:
-            self.transient(master)
-            self.grab_set()
-        except tk.TclError:
-            pass
+        # Escape follows the SAME path as the window-close button (_cancel →
+        # _close: after-cancel + grab_release + destroy), never a blind destroy.
+        make_modal(self, master, on_cancel=self._cancel, base_bg=BG_DARK)
 
         self._loading_states = False          # guards Listbox programmatic loads
         self._search_after_id = None          # debounce handle (group search, L3)
@@ -1472,13 +1468,9 @@ class _ColumnPickerDialog(tk.Toplevel):
     def __init__(self, master, current, on_ok):
         super().__init__(master)
         self.title("Per-tab columns")
-        self.configure(bg=BG_PANEL)
         self.on_ok = on_ok
-        try:
-            self.transient(master)
-            self.grab_set()
-        except tk.TclError:
-            pass
+        # Escape == Cancel (both plain destroy); guarded transient/grab + base bg.
+        make_modal(self, master, base_bg=BG_PANEL)
 
         self._use_global = tk.BooleanVar(value=current is None)
         tk.Checkbutton(self, text="Use global columns", variable=self._use_global,

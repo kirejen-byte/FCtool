@@ -35,20 +35,20 @@ from app_log import get_logger
 
 log = get_logger(__name__)
 
-# ── Palette (mirrors fc_gui.py:150-164 by VALUE — importing fc_gui is circular
-# and forbidden by containment; keep these in sync if the app palette changes). ─
-BG_DARK = "#1a1a2e"
-BG_PANEL = "#16213e"
-BG_ENTRY = "#0f3460"
-FG_TEXT = "#e0e0e0"
-FG_DIM = "#888899"
-FG_ACCENT = "#00d4ff"
-FG_GREEN = "#00ff88"
-FG_RED = "#ff4444"
-FG_ORANGE = "#ff8c00"
-FG_YELLOW = "#ffdd00"
-FG_WHITE = "#ffffff"
-BORDER_COLOR = "#2a2a4a"
+# ── Palette — imports the shared ui_theme palette (a stdlib-only, containment-safe
+# leaf; importing fc_gui is circular and forbidden by containment). One source of
+# truth for the app's navy scheme. ─
+from ui_theme import (
+    BG_DARK, BG_PANEL, BG_ENTRY,
+    FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_RED, FG_ORANGE,
+    FG_YELLOW, FG_WHITE,
+    BORDER_COLOR,
+)
+# The shared hover-tooltip helper (D9). This module's ``_attach_tooltip`` was the
+# best-in-repo implementation and was PROMOTED verbatim-in-spirit into ui_helpers
+# (it carried the <Destroy> leak fix); the local name now aliases it so every
+# call site — and the ``_tooltip_text`` stash the tests assert — is unchanged.
+from ui_helpers import attach_tooltip as _attach_tooltip
 
 _FONT = ("Consolas", 9)
 _FONT_SM = ("Consolas", 8)
@@ -171,45 +171,6 @@ _DISTRIBUTION_EXPLAINER = (
     "file and YOU import it in-game on each account (one import covers all that "
     "account's characters). Overview settings are per-ACCOUNT."
 )
-
-
-def _attach_tooltip(widget, text: str):
-    """Attach a simple hover tooltip to ``widget`` (house closure pattern,
-    mirrors markup_editor._show_tip).
-
-    The tooltip text is also stashed on the widget as ``_tooltip_text`` so it is
-    assertable in tests without simulating a hover. Returns ``widget``."""
-    widget._tooltip_text = text
-    state = {"tip": None}
-
-    def _hide(_e=None):
-        tip = state.get("tip")
-        if tip is not None:
-            try:
-                tip.destroy()
-            except tk.TclError:
-                pass
-            state["tip"] = None
-
-    def _show(_e=None):
-        _hide()
-        try:
-            tip = tk.Toplevel(widget)
-            tip.wm_overrideredirect(True)
-            tk.Label(tip, text=text, font=_FONT_SM, fg=FG_TEXT, bg=BG_PANEL,
-                     borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
-                     wraplength=340, padx=5, pady=3).pack()
-            tip.wm_geometry(
-                f"+{widget.winfo_rootx() + 12}"
-                f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
-            state["tip"] = tip
-        except tk.TclError:
-            state["tip"] = None
-
-    widget.bind("<Enter>", _show, add="+")
-    widget.bind("<Leave>", _hide, add="+")
-    widget.bind("<Destroy>", _hide, add="+")
-    return widget
 
 
 def build_overview_tab(parent, providers: OverviewProviders) -> tk.Frame:
