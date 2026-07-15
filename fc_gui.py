@@ -13061,6 +13061,27 @@ class FCToolGUI:
             overview_editor_window.PackEditorWindow(
                 self.root, record, groups, categories, on_save=on_save)
 
+        # account_hint: last-active-character NAME per account, so the
+        # distribution panel labels accounts by a recognizable pilot instead of
+        # the raw numeric core_user id. overview_dat.account_char_hint joins the
+        # local settings co-flush heuristic with the ESI token name map (it reads
+        # only character_id/character_name — never token secrets). Computed once
+        # per panel build and cached (cheap mtime stats, but not per row);
+        # degrades to None for every account on any failure.
+        _hint_cache: dict = {}
+
+        def account_hint(account_id):
+            if "map" not in _hint_cache:
+                try:
+                    _hint_cache["map"] = overview_dat.account_char_hint()
+                except Exception:
+                    log.exception("[overview] account_char_hint failed")
+                    _hint_cache["map"] = {}
+            try:
+                return _hint_cache["map"].get(int(account_id))
+            except (TypeError, ValueError):
+                return None
+
         providers = overview_manager_ui.OverviewProviders(
             store=self._overview_store,
             get_config=lambda: self.config,
@@ -13072,6 +13093,7 @@ class FCToolGUI:
             post_ui=self._post_ui,
             open_editor=open_editor,
             build_fc_standard=build_fc_standard,
+            account_hint=account_hint,
         )
         tab = overview_manager_ui.build_overview_tab(self.notebook, providers)
         self.notebook.add(tab, text="  Overview  ")
