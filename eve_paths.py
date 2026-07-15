@@ -306,3 +306,19 @@ def list_core_user_files(settings_dir):
         if stem.isdigit():
             out.append((int(stem), path))
     return sorted(out)
+
+
+def list_core_char_files(settings_dir):
+    """[(char_id, path)] for numeric core_char_<id>.dat files, sorted by id.
+
+    Sibling of :func:`list_core_user_files`: the client writes placeholder junk
+    names (core_char__.dat and tuple-repr filenames) — skip anything whose id is
+    not a pure integer. Used by the last-active-character co-flush heuristic
+    (overview_dat.most_recent_char_by_account), which pairs a core_char with the
+    core_user flushed in the same second."""
+    out = []
+    for path in glob.glob(os.path.join(settings_dir, "core_char_*.dat")):
+        stem = os.path.basename(path)[len("core_char_"):-len(".dat")]
+        if stem.isdigit():
+            out.append((int(stem), path))
+    return sorted(out)

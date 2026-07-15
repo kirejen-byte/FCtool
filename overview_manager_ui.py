@@ -81,6 +81,10 @@ class OverviewProviders:
     post_ui:          (fn, *args) -> None marshal fn onto the Tk main thread.
     open_editor:      (record) -> None    open the pack editor for a PackRecord.
     build_fc_standard:() -> OverviewPack | None   starter template (None = n/a).
+    account_hint:     (account_id) -> str | None   last-active character NAME for
+                                          the account (local co-flush heuristic;
+                                          None when unknown/tokenless). Optional —
+                                          defaults to a no-op returning None.
     """
     store: Any
     get_config: Callable[[], dict]
@@ -92,6 +96,7 @@ class OverviewProviders:
     post_ui: Callable[..., None]
     open_editor: Callable[[Any], None]
     build_fc_standard: Callable[[], Any]
+    account_hint: Callable[[int], Any] | None = None
 
 
 # ── module-level helpers ───────────────────────────────────────────────────────
@@ -231,9 +236,38 @@ class OverviewTab(tk.Frame):
         override = (ov.get("overview_dir_override") or "").strip()
         return override or self.providers.overview_dir()
 
-    def _account_label(self, account_id) -> str:
+    def _account_hint(self, account_id):
+        """The last-active character NAME for ``account_id`` (co-flush heuristic),
+        or None. Safe: a missing/raising provider degrades to None so a bad token
+        read never breaks the panel."""
+        fn = getattr(self.providers, "account_hint", None)
+        if fn is None:
+            return None
+        try:
+            name = fn(account_id)
+        except Exception:
+            log.exception("[overview] account_hint provider failed for %s",
+                          account_id)
+            return None
+        return name.strip() if isinstance(name, str) and name.strip() else None
+
+    def _saved_nickname(self, account_id) -> str:
         nick = self._ov_config()["account_nicknames"].get(str(account_id), "")
         return nick.strip() if isinstance(nick, str) else ""
+
+    def _account_label(self, account_id) -> str:
+        """The most recognizable label for an account, in precedence order:
+        explicit nickname → last-active character name (local co-flush hint) →
+        ``"Account <id>"``. The raw numeric id surfaces ONLY in that final
+        fallback (and in the per-row tooltip); it is never the primary label when
+        a nickname or a confident hint exists. Never returns empty."""
+        nick = self._saved_nickname(account_id)
+        if nick:
+            return nick
+        hint = self._account_hint(account_id)
+        if hint:
+            return hint
+        return f"Account {account_id}"
 
     # ── first-run seeding ─────────────────────────────────────────────────────
     def _seed_fc_standard_if_needed(self) -> None:
@@ -410,19 +444,47 @@ class OverviewTab(tk.Frame):
     def _build_account_row(self, parent, account_id, mtime) -> None:
         row = tk.Frame(parent, bg=BG_PANEL)
         row.pack(fill=tk.X, padx=2, pady=2)
-        nick_var = tk.StringVar(value=self._account_label(account_id))
-        nick = tk.Entry(row, textvariable=nick_var, bg=BG_ENTRY, fg=FG_TEXT,
+
+        saved_nick = self._saved_nickname(account_id)
+        hint = self._account_hint(account_id)
+        # No saved nickname but a confident last-active character → seed the entry
+        # with that name (dim, to read as a suggestion) so a single Enter accepts
+        # it as the nickname. A saved nickname always wins the prefill.
+        hint_seeded = bool(not saved_nick and hint)
+        nick_var = tk.StringVar(value=saved_nick or (hint or ""))
+        nick = tk.Entry(row, textvariable=nick_var, bg=BG_ENTRY,
+                        fg=(FG_DIM if hint_seeded else FG_TEXT),
                         insertbackground=FG_TEXT, font=_FONT, width=16,
                         relief=tk.SOLID, borderwidth=1)
         nick.grid(row=0, column=0, rowspan=2, padx=(4, 8), pady=4, sticky="w")
-        nick.bind("<FocusOut>",
-                  lambda e, aid=account_id, v=nick_var: self._save_nickname(aid, v.get()))
+        # Enter always accepts whatever is shown (this is how a seeded suggestion
+        # becomes the nickname with one keystroke).
         nick.bind("<Return>",
                   lambda e, aid=account_id, v=nick_var: self._save_nickname(aid, v.get()))
+        if hint_seeded:
+            # As soon as the user engages the field, drop the dim "suggestion" look.
+            nick.bind("<FocusIn>", lambda e, w=nick: w.config(fg=FG_TEXT), add="+")
+            # Focus-out persists ONLY a real edit — an untouched suggestion is left
+            # hint-sourced so it stays fresh if the last-active character changes.
+            nick.bind("<FocusOut>",
+                      lambda e, aid=account_id, v=nick_var, h=hint:
+                      self._save_nickname_if_changed(aid, v.get(), h))
+        else:
+            nick.bind("<FocusOut>",
+                      lambda e, aid=account_id, v=nick_var: self._save_nickname(aid, v.get()))
 
-        meta = tk.Label(row, text=f"acct {account_id} · settings updated {_fmt_mtime(mtime)}",
+        # Always-visible meta line: NO raw account number. When the label came
+        # from the last-active-character hint, a dim qualifier makes clear it's the
+        # last-active char (not a rename the user set).
+        meta_text = f"settings updated {_fmt_mtime(mtime)}"
+        if hint_seeded:
+            meta_text += f" · last active: {hint}"
+        meta = tk.Label(row, text=meta_text,
                         bg=BG_PANEL, fg=FG_DIM, font=_FONT_SM, anchor="w")
         meta.grid(row=0, column=1, sticky="w")
+        # The unambiguous numeric account id lives in a TOOLTIP only — reachable as
+        # the real key without cluttering the human-facing label.
+        _attach_tooltip(meta, f"account {account_id}")
         staged = tk.Label(row, text="exported: —", bg=BG_PANEL, fg=FG_DIM,
                           font=_FONT_SM, anchor="w")
         staged.grid(row=0, column=2, padx=8, sticky="w")
@@ -442,7 +504,7 @@ class OverviewTab(tk.Frame):
         last.grid(row=1, column=2, columnspan=2, padx=8, sticky="w")
 
         self._account_rows[account_id] = {
-            "row": row, "nick": nick_var, "staged": staged,
+            "row": row, "nick": nick_var, "meta": meta, "staged": staged,
             "mark": mark, "last": last, "drift": drift,
         }
 
@@ -683,9 +745,10 @@ class OverviewTab(tk.Frame):
         if not accounts:
             m.add_command(label="(no accounts found)", state="disabled")
         for account_id, path, _mt in accounts:
-            label = self._account_label(account_id) or f"Account {account_id}"
+            # _account_label already resolves nickname → hint → "Account <id>"
+            # and never returns empty, so no bare-number fallback is needed here.
             m.add_command(
-                label=label,
+                label=self._account_label(account_id),
                 command=lambda aid=account_id, p=path: self._import_from_account(aid, p))
         try:
             b = self._import_acct_btn
@@ -703,7 +766,7 @@ class OverviewTab(tk.Frame):
             self._error("Import from account",
                         f"Account {account_id} is unreadable:\n{e}")
             return None
-        base = self._account_label(account_id) or f"acct {account_id}"
+        base = self._account_label(account_id)   # nickname → hint → "Account <id>"
         try:
             rec = self.providers.store.add_pack(
                 f"{base} overview", pack, source=f"dat:{account_id}")
@@ -764,6 +827,15 @@ class OverviewTab(tk.Frame):
             return  # unchanged (e.g. plain FocusOut) — skip the config write
         nicks[str(account_id)] = new
         self.providers.save_config()
+
+    def _save_nickname_if_changed(self, account_id, value, baseline) -> None:
+        """Persist a nickname only if the user edited it away from ``baseline``
+        (the seeded last-active-character suggestion). A bare focus-out over an
+        UNTOUCHED suggestion must NOT freeze it as a nickname — that would make the
+        label go stale once the account's last-active character changes. (Enter
+        still accepts the suggestion as-is via :meth:`_save_nickname`.)"""
+        if (value or "").strip() != baseline:
+            self._save_nickname(account_id, value)
 
     def _mark_imported(self, account_id) -> None:
         pid = self._selected_pack_id

@@ -16,9 +16,14 @@ Public surface:
     live_fingerprint(core_user_path)        -> sha1 hex of the translated pack
     OverviewDatError(account_id, detail)    -- one bad account never blocks others
     PALETTE                                 -- RGBA -> color-name (5-name floor)
+    most_recent_char_by_account()           -> {account_id: char_id} co-flush heuristic
+    char_names_by_id(token_dir)             -> {char_id: name} (id/name fields only)
+    account_char_hint()                     -> {account_id: last-active char NAME}
 """
 from __future__ import annotations
 
+import glob
+import json
 import os
 import shutil
 import tempfile
@@ -199,6 +204,110 @@ def list_accounts(localappdata=None):
                 mtime = None
             out.append((account_id, path, mtime))
     out.sort(key=lambda t: (t[0], t[1]))
+    return out
+
+
+# --- last-active-character heuristic (account -> char, LOCAL, never ESI) ----
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def most_recent_char_by_account(localappdata=None, window_s=3.0):
+    """Map ``account_id -> char_id`` for each account whose **last-active
+    character** can be named with confidence, from local settings co-flush.
+
+    This is a LAST-ACTIVE-CHARACTER HEURISTIC, not an account roster and NOT an
+    ESI account correlation (correlating an account to its characters via ESI is
+    impossible by design). When a character's session ends the client rewrites
+    both ``core_char_<charID>.dat`` and that account's ``core_user_<accountID>.dat``
+    in the same second, so a tight mtime pairing names the account's last-active
+    character. It is never-wrong-when-emitted but only partial-coverage.
+
+    A pairing is emitted ONLY when it is unambiguous: exactly ONE ``core_char``
+    lies within ``window_s`` of the ``core_user`` mtime, AND that char is not also
+    within ``window_s`` of any OTHER account (cross-account collisions are
+    dropped). Accounts with zero or ambiguous matches are omitted — never guessed.
+    Matching is per settings profile dir (co-flush is same-profile). Read-only:
+    stats mtimes via ``os.path.getmtime``; never decodes or writes.
+    """
+    result = {}
+    for settings_dir in eve_paths.tranquility_settings_dirs(localappdata):
+        users = [(aid, mt) for aid, p in eve_paths.list_core_user_files(settings_dir)
+                 if (mt := _safe_mtime(p)) is not None]
+        chars = [(cid, mt) for cid, p in eve_paths.list_core_char_files(settings_dir)
+                 if (mt := _safe_mtime(p)) is not None]
+        for account_id, u_mt in users:
+            near = [(cid, c_mt) for cid, c_mt in chars
+                    if abs(c_mt - u_mt) <= window_s]
+            if len(near) != 1:
+                continue                          # zero or ambiguous -> skip
+            char_id, char_mt = near[0]
+            # reject if this char co-flushed with more than one account
+            accts_near = [aid for aid, a_mt in users
+                          if abs(a_mt - char_mt) <= window_s]
+            if len(accts_near) != 1:
+                continue                          # cross-account collision -> drop
+            result[account_id] = char_id
+    return result
+
+
+def char_names_by_id(token_dir):
+    """``{character_id: character_name}`` from ``esi_tokens_<id>.json`` files in
+    ``token_dir``.
+
+    Reads ONLY the ``character_id``/``character_name`` fields — the token/refresh/
+    access secrets in these files are never touched. Any absent dir, unreadable
+    file, malformed JSON, missing id, or blank name is skipped; returns ``{}`` on
+    a missing/empty directory (used to name last-active characters, not to auth)."""
+    out = {}
+    try:
+        paths = glob.glob(os.path.join(token_dir, "esi_tokens_*.json"))
+    except Exception:
+        return out
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        cid = data.get("character_id")
+        name = data.get("character_name")
+        if isinstance(cid, int) and isinstance(name, str) and name.strip():
+            out[cid] = name.strip()
+    return out
+
+
+def account_char_hint(localappdata=None, token_dir=None, window_s=3.0):
+    """``{account_id: last_active_character_NAME}`` — the co-flush account→char
+    match (:func:`most_recent_char_by_account`) joined with the token name map
+    (:func:`char_names_by_id`).
+
+    Accounts whose matched character has no local token (name unknown) are
+    omitted: a nameless hint is no more recognizable than the raw account number.
+    ``token_dir`` defaults to the app's ESI token dir; passing it explicitly keeps
+    the join testable. Same LOCAL-heuristic caveat as the underlying pairing —
+    never an ESI account correlation, never a roster."""
+    acct_char = most_recent_char_by_account(
+        localappdata=localappdata, window_s=window_s)
+    if not acct_char:
+        return {}
+    if token_dir is None:
+        try:
+            import esi_auth
+            token_dir = esi_auth.TOKEN_DIR
+        except Exception:
+            token_dir = None
+    names = char_names_by_id(token_dir) if token_dir else {}
+    out = {}
+    for account_id, char_id in acct_char.items():
+        name = names.get(char_id)
+        if name:
+            out[account_id] = name
     return out
 
 
