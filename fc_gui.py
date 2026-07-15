@@ -5564,6 +5564,10 @@ class FCToolGUI:
             # fc_gui (which owns the role data) so map_tab stays fc_gui-free.
             "get_char_filter_roles": self._get_char_filter_roles,
             "apply_char_filter": self._apply_char_map_filter,
+            # Live hull-class refresh: recompute the active filter's members from
+            # each fresh sweep so "actively in that ship class" tracks current
+            # hulls (returns None for cyno/HIC-Dictor -> they stay frozen).
+            "recompute_char_filter": self._recompute_char_map_filter,
         }
         self.map_tab = _map_tab_mod.MapTab(
             tab, cfg=cfg, save_cfg=save_cfg, callbacks=callbacks,
@@ -6371,6 +6375,10 @@ class FCToolGUI:
     # to the combobox, never exported as a role. Lower-cased these become the
     # ``cap_key`` _char_matches_filter switches on ("hic/dictor" -> the dictor flag).
     _CHAR_FILTER_ROLES = ["FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"]
+    # Hull-class filter keys (mirror _char_names_for_role's hull_sets keys): ONLY
+    # these recompute LIVE from each map sweep; cyno / HIC-Dictor stay frozen at
+    # apply time (their fit data isn't in the live location/ship sweep).
+    _LIVE_HULL_FILTER_KEYS = frozenset({"fax", "dreads", "blops", "titans"})
 
     def _build_character_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
@@ -7462,15 +7470,33 @@ class FCToolGUI:
         return list(self._CHAR_FILTER_ROLES)
 
     def _char_names_for_role(self, role_label: str) -> frozenset:
-        """Character NAMES whose cached role/capability info matches ``role_label``
-        — the map Chars filter's match-set. Reuses _char_matches_filter with NO
-        region constraint so the set mirrors the Characters-tab capability filter
-        (region is a Characters-tab-only refinement). Names are the same stable key
-        _map_characters_fetch stamps on the overlay payload, so this frozenset
-        filters the map by simple membership. Empty when nothing matches (an honest
-        empty overlay). Reads the panels' cached _info, so it is a pure snapshot —
-        no ESI."""
+        """Character NAMES matching ``role_label`` — the map Chars filter's
+        match-set, keyed by the same names _map_characters_fetch stamps on the
+        overlay payload so the frozenset filters the map by simple membership.
+
+        HULL-CLASS roles (FAX / Dreads / Blops / Titans) classify by each
+        pilot's CURRENT hull — the live ``ship_type_id`` the map sweep captured
+        into ``self._map_live_ship_tid`` — so the filter shows ONLY pilots
+        ACTIVELY in that ship class and stays as fresh as the overlay squares
+        (owning a capital in a hangar is NOT flying one). CYNO / HIC-Dictor need
+        fit data the live sweep lacks, so they stay on the cached panel-info
+        predicate (``_char_matches_filter``, no region constraint — region is a
+        Characters-tab-only refinement). Empty when nothing matches (an honest
+        empty overlay); a pure snapshot, no ESI."""
         cap_key = (role_label or "").lower()
+        # Hull-class roles: classify the pilot's LIVE hull, not hangar ownership.
+        hull_sets = {
+            "fax": ship_classes.FAX,
+            "dreads": ship_classes.DREADNOUGHTS,
+            "blops": ship_classes.BLACK_OPS,
+            "titans": ship_classes.TITANS,
+        }
+        hull_set = hull_sets.get(cap_key)
+        if hull_set is not None:
+            live = getattr(self, "_map_live_ship_tid", None) or {}
+            return frozenset(name for name, tid in live.items()
+                             if tid in hull_set)
+        # CYNO / HIC-Dictor (fit-flag roles): cached panel-info predicate.
         names: set[str] = set()
         for panel in getattr(self, "_char_panels", []) or []:
             info = getattr(panel, "_info", None)
@@ -7498,6 +7524,18 @@ class FCToolGUI:
         mt.set_chars_filter(role_label, names)
         if switch_to_map:
             self._select_map_tab()
+
+    def _recompute_char_map_filter(self, role_label):
+        """Fresh CURRENT-hull member name-set for ``role_label`` so the map can
+        keep a LIVE hull-class filter that tracks each pilot's current hull on
+        every poll — or ``None`` for cyno / HIC-Dictor (fit-flag roles the live
+        location/ship sweep can't refresh, so they stay on their apply-time set).
+        Injected as the map's ``recompute_char_filter`` callback and called on the
+        UI thread after each map-chars sweep has updated ``_map_live_ship_tid``.
+        A pure snapshot (no ESI); reuses the approved ``_char_names_for_role``."""
+        if (role_label or "").lower() not in self._LIVE_HULL_FILTER_KEYS:
+            return None                       # cyno / HIC-Dictor: leave frozen
+        return self._char_names_for_role(role_label)
 
     def _view_char_filter_on_map(self):
         """Characters-tab "View on Map": push the currently-selected capability
@@ -13451,8 +13489,10 @@ class FCToolGUI:
         character. A snapshot of ``esi_accounts`` is taken first so a concurrent
         connect/disconnect/re-auth on the UI thread can't mutate the list mid-sweep."""
         out: dict[int, list] = {}
+        live_tid: dict[str, int] = {}
         accounts = list(getattr(self, "esi_accounts", None) or ())
         if not accounts:
+            self._map_live_ship_tid = live_tid
             return out
         catalog = getattr(self, "type_catalog", None)
         for acct in accounts:
@@ -13466,19 +13506,30 @@ class FCToolGUI:
                 if not sid:
                     continue
                 ship_name = "Unknown ship"
+                ship_tid = None
                 ship = acct.get_ship_type()        # None when docked-privacy/no scope
                 if ship:
-                    tid = ship.get("ship_type_id")
-                    if tid and catalog is not None:
-                        resolved = catalog.resolve_name(tid)
+                    ship_tid = ship.get("ship_type_id")
+                    if ship_tid and catalog is not None:
+                        resolved = catalog.resolve_name(ship_tid)
                         if resolved:
                             ship_name = resolved
                 name = getattr(acct, "character_name", None) or "Unknown"
+                # Capture the live hull for the map's hull-class filter, keyed by
+                # the SAME name the overlay square uses, so the class filter is as
+                # fresh as the squares (current-ship, not hangar-ownership). A
+                # docked / hull-less pilot contributes no tid.
+                if ship_tid:
+                    live_tid[name] = int(ship_tid)
                 out.setdefault(int(sid), []).append((name, ship_name))
             except Exception as exc:
                 # One character's failure must never abort the whole sweep.
                 print(f"[MAP] characters fetch: skipping an account: {exc}")
                 continue
+        # Atomic publish: rebind the whole map so the UI-thread reader
+        # (_char_names_for_role) always sees a consistent snapshot, never a
+        # half-built dict — the worker builds it locally, then swaps it in.
+        self._map_live_ship_tid = live_tid
         return out
 
     @staticmethod
