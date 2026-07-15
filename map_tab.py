@@ -1896,8 +1896,30 @@ class MapTab:
         latest positions (an empty tuple clears them). Pure Tk overlay: no crisp
         re-render (the base bitmap is unaffected)."""
         self.state.chars = {int(sid): list(sp) for sid, sp in pairs}
+        self._refresh_live_char_filter()         # LIVE hull-class filter tracks current hulls
         if self._layer_on("chars"):
             self._redraw_overlays()
+
+    def _refresh_live_char_filter(self) -> None:
+        """After a fresh sweep, recompute the members of an active LIVE (hull-
+        class) char-filter so membership tracks pilots' CURRENT hulls: one who
+        swapped INTO a matching hull appears, one who swapped OUT drops, on this
+        poll. The host's ``recompute_char_filter`` callback returns the fresh
+        name-set for hull-class roles, or ``None`` to leave the filter frozen
+        (cyno / HIC-Dictor keep their apply-time set — their fit data isn't in the
+        sweep). Refreshes the banner count; the caller repaints once (no redraw
+        here). No filter active or no callback wired -> a no-op (byte-identical to
+        the pre-refresh overlay path)."""
+        label = self._chars_filter_label
+        if label is None:
+            return
+        cb = self.callbacks.get("recompute_char_filter")
+        if cb is None:
+            return
+        fresh = cb(label)
+        if fresh is not None:
+            self._chars_filter_names = frozenset(fresh)
+            self._sync_chars_banner()
 
     def _chars_hover_lines(self, sid) -> list[str] | None:
         """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
