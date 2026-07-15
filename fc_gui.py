@@ -197,13 +197,16 @@ _SETTINGS_TOC_PADY = 10             # panel/ribbon vertical padding (matches pac
 # ── Notebook tab indices ────────────────────────────────────────────────────────
 # Order of self.notebook.add() calls in _build_ui:
 #   0 Fleet Management, 1 Intelligence, 2 Jump Range, 3 Navigation,
-#   4 Map, 5 Characters, 6 Fittings, 7 Overview, 8 Settings.
+#   4 Map, 5 Characters, 6 Fittings, [7 Overview], Settings.
 # Map is inserted at index 4 (after Navigation), so Characters=5 and Fittings=6
-# follow it. Overview is inserted at index 7 (after Fittings, before Settings),
-# so Settings shifts 7->8. _on_tab_changed keys ONLY off indices 0/1/5 (all
-# before the Overview insertion) and matches the Map tab by widget identity, so
-# none of its checks change; FITTINGS_TAB_INDEX stays 6 and nothing references
-# the Settings tab by index.
+# follow it. Overview is gated on config overview.tab_enabled (default False —
+# see default_config.py): when True it is inserted at index 7 (after Fittings,
+# before Settings) and Settings shifts 7->8; when False (shipped default)
+# Overview is never added and Settings stays at 7 — the pre-v3.6.0 layout.
+# _on_tab_changed keys ONLY off indices 0/1/5 (both cases unaffected) and
+# matches the Map tab by widget identity, so none of its checks change;
+# FITTINGS_TAB_INDEX stays 6 either way and nothing references the Settings
+# tab by a hardcoded index.
 FITTINGS_TAB_INDEX = 6
 DOCTRINES_SUBTAB_INDEX = 1
 
@@ -1827,7 +1830,11 @@ class FCToolGUI:
         self._build_map_tab()
         self._build_character_tab()
         self._build_fitting_tab()
-        self._build_overview_tab()
+        # Overview Manager is hidden by default (feature in progress) — gated on
+        # config overview.tab_enabled so none of its workers/providers spin up
+        # when off. See default_config.py DEFAULT_CONFIG["overview"]["tab_enabled"].
+        if self.config.get("overview", {}).get("tab_enabled", False):
+            self._build_overview_tab()
         self._build_settings_tab()
 
         # Track zkill alert notifications
