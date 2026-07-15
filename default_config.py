@@ -146,6 +146,8 @@ DEFAULT_CONFIG = {
         "auto_scan_on_start": False,
     },
     "overview": {
+        # Hidden by default (feature in progress); set true to show the Overview tab.
+        "tab_enabled": False,
         "overview_dir_override": "",
         "account_nicknames": {},
         "distribution_log": {},
