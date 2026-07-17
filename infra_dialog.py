@@ -112,12 +112,20 @@ class InfraManagerDialog(tk.Toplevel):
                      ``update_completions`` (an AutocompleteEntry) it is used so
                      matches pop up AS YOU TYPE; otherwise (default) a plain
                      ttk.Combobox is built. Appended last / backwards compatible.
+    ticker_fn        optional callable(owner_id) -> ticker|None giving the
+                     structure owner's display ticker (fc_gui passes its resolved
+                     session cache — alliance ticker preferred, corp fallback).
+                     When it resolves, the Name column RENDERS "<name> [TICKER]",
+                     the same format the map hover and the right-click Structures
+                     cascade use. None (default) => plain names, so the dialog
+                     still works standalone / in tests. Appended last / backwards
+                     compatible.
     """
 
     def __init__(self, parent, store, scanner, regions_catalog, system_names,
                  clipboard_get, import_clipboard, import_manual,
                  on_changed, initial_system_id=None,
-                 type_name_fn=None, autocomplete_cls=None):
+                 type_name_fn=None, autocomplete_cls=None, ticker_fn=None):
         super().__init__(parent)
         self.store = store
         self.scanner = scanner
@@ -131,6 +139,7 @@ class InfraManagerDialog(tk.Toplevel):
         self._system_filter = initial_system_id
         self._type_name_fn = type_name_fn if callable(type_name_fn) else None
         self._autocomplete_cls = autocomplete_cls
+        self._ticker_fn = ticker_fn if callable(ticker_fn) else None
 
         self._sort_col = None
         self._sort_reverse = False
@@ -301,6 +310,7 @@ class InfraManagerDialog(tk.Toplevel):
                 parts = [str(e.get(k, "") or "") for k in (
                     "system_name", "name", "category", "source", "status")]
                 parts.append(self._entry_type_name(e))   # match the specific type name too
+                parts.append(self._entry_display_name(e))  # …and the owner ticker
                 hay = " ".join(parts).casefold()
                 if query not in hay:
                     continue
@@ -326,12 +336,35 @@ class InfraManagerDialog(tk.Toplevel):
         except Exception:
             return entry.get("category") or ""
 
+    def _entry_display_name(self, entry):
+        """RENDER-ONLY Name cell: ``"<name> [TICKER]"`` when the injected
+        ticker_fn resolves this entry's ``owner_id``, else the plain name. The
+        format is byte-identical to the map hover / right-click cascade (one
+        format app-wide). Silently plain when no ticker_fn is injected, when the
+        owner is unresolved or has no ticker, when the row carries no owner_id
+        (clipboard imports never do), or when the callable raises.
+
+        CRITICAL — this must NEVER write back into ``entry``. ``entry_key()``
+        keys a structure_id-less row as ``name::{system_name}::{name}``, so a
+        suffix folded into the stored name would silently change the row's
+        identity and break remove / set_status / set_notes / dedup — and would
+        compound ("X [T] [T]") on every re-render."""
+        name = entry.get("name") or ""
+        fn = self._ticker_fn
+        if fn is None:
+            return name
+        try:
+            ticker = fn(entry.get("owner_id"))
+        except Exception:
+            return name
+        return f"{name} [{ticker}]" if ticker else name
+
     def _row_values(self, entry):
         # "category" slot → SPECIFIC type (header "Type"); "type" slot → coarse
         # category (header "Category"). See the COLUMNS/HEADINGS note above.
         return (
             entry.get("system_name") or "—",
-            entry.get("name") or "",
+            self._entry_display_name(entry),
             self._entry_type_name(entry),
             entry.get("category") or "",
             entry.get("source") or "",
@@ -438,7 +471,15 @@ class InfraManagerDialog(tk.Toplevel):
         self._set_status("Scanning configured regions…" if started
                          else "Scanner busy or not authenticated.")
 
-    # ── scanner progress sinks (host calls these, already _post_ui-marshalled) ─
+    # ── host-facing sinks (host calls these, already _post_ui-marshalled) ─────
+    def reload(self):
+        """Re-render the structure list from the store. The host calls this when
+        data the rows RENDER (but do not own) changes underneath an open dialog —
+        today: owner tickers resolving in the background, which arrive in batches
+        long after the dialog was built. Cheap (the tree is rebuilt from the
+        store) and safe to call at any time on the Tk thread."""
+        self._reload_tree()
+
     def set_scan_status(self, text):
         """Direct status-line setter for the host's scanner callbacks."""
         self._set_status(text)

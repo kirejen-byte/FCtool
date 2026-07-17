@@ -62,7 +62,7 @@ from standings_cache import StandingsCache
 import intel_analyzer
 import os as _os
 from app_path import app_dir as _app_dir
-from datetime import timezone
+from datetime import timezone, timedelta
 from xup_counter import XUpCounter, XUpState
 from zkill_monitor import ZKillMonitor, KillAlert
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
@@ -5613,15 +5613,22 @@ class FCToolGUI:
         self._infra_filters = _copy.deepcopy(infra_overlay.FILTER_DEFAULTS)
         self._infra_filters["enabled"] = bool(
             (cfg.get("layers") or {}).get("infra", False))
-        # Session cache of resolved structure-owner tickers: {corp owner_id ->
-        # ticker|None}, ALLIANCE ticker preferred (corp fallback). Populated
-        # one-shot in the background by _maybe_resolve_owner_tickers after a store
-        # load / import / scan-apply; read lazily by the map hover + right-click
-        # structure list. A None value means "attempted, no ticker" so a dead /
-        # 404 corp is not re-fetched (anti-restorm, mirrors the sov freshness
-        # stamp). _owner_ticker_get is an injectable public-ESI GET (tests).
-        self._owner_ticker_cache = {}
+        # Cache of resolved structure-owner tickers: {corp owner_id ->
+        # ticker|None}, ALLIANCE ticker preferred (corp fallback). WARM-STARTED
+        # from disk here so a returning user sees tickers instantly instead of
+        # re-paying a ~2-minute ESI resolve every launch; topped up in the
+        # background by _maybe_resolve_owner_tickers after a store load / import /
+        # scan-apply, and read by the map hover, the right-click structure list
+        # and the manager dialog's Name column. A None value means "attempted, no
+        # ticker" so a dead / 404 corp is not re-fetched (anti-restorm, mirrors
+        # the sov freshness stamp) — session-only, never persisted (see
+        # _OWNER_TICKER_CACHE_FILE). _owner_ticker_get is an injectable
+        # public-ESI GET (tests).
+        self._owner_ticker_cache = self._load_owner_ticker_cache()
         self._owner_ticker_inflight = False
+        # owner_ids ESI answered for during the CURRENT resolve pass — the only
+        # ones a save may stamp "now" (see _save_owner_ticker_cache).
+        self._owner_ticker_resolved = set()
         self._owner_ticker_get = None
 
     # ── Star-map data pushes (fleet / own-location / staging) ─────────────────
@@ -6114,20 +6121,170 @@ class FCToolGUI:
         ticker = corp.get("ticker")
         return ticker or None
 
-    def _owner_ticker_esi_get(self, path):
+    def _owner_ticker_esi_get(self, path, session=None):
         """Default public-ESI GET for the ticker resolver: shared ``rate_limit``
         token bucket, house headers, 10 s timeout, SILENT-DEGRADE to ``None`` on
         any non-200 / exception. Runs on the resolver worker thread only (touches
-        no Tk) -- the house ESI pattern the rest of the tool uses."""
+        no Tk) -- the house ESI pattern the rest of the tool uses.
+
+        ``session`` is an optional ``requests.Session`` so ONE resolve pass reuses
+        a single connection. Each owner costs 1-2 calls and the pass is
+        sequential, so a bare ``requests.get`` re-paid a full TCP+TLS handshake
+        every time (the bulk of the measured ~1.67 s/owner). Omitted (the default)
+        it falls back to the module-level ``requests.get``, exactly as before."""
         try:
             rate_limit('esi')
-            resp = requests.get(f"{ESI_BASE}{path}",
-                                headers=ESI_HEADERS, timeout=10)
+            getter = session.get if session is not None else requests.get
+            resp = getter(f"{ESI_BASE}{path}", headers=ESI_HEADERS, timeout=10)
             if resp.status_code != 200:
                 return None
             return resp.json()
         except Exception:
             return None
+
+    # Persisted owner-ticker cache, on-disk shape
+    # ``{str(owner_id): {"ticker": str, "at": <aware-UTC iso8601>}}``.
+    #
+    # Only SUCCESSES are written -- a None ("attempted, no ticker") stays
+    # session-only, so a corp that 404'd once, or every owner during an ESI
+    # outage, is retried on the next launch instead of being blacklisted forever.
+    #
+    # The stamp buys a TTL, and the TTL is NOT optional: the cache is keyed by
+    # CORP id but stores the ALLIANCE-preferred ticker, and corps change alliance
+    # routinely in EVE. A session-only cache self-healed on restart; a persisted
+    # one would show a stale tag forever. Entries older than the TTL are dropped
+    # on load so they re-resolve. 30 days is deliberately loose -- a wrong tag is
+    # cosmetic, and the point is a bounded worst case, not prompt detection.
+    #
+    # Any file that is not this shape (e.g. the pre-TTL ``{str(oid): "TICKER"}``
+    # v1 format) is discarded wholesale, so the format change costs existing
+    # users exactly one re-resolve.
+    _OWNER_TICKER_CACHE_FILE = os.path.join(app_dir(), "owner_tickers.json")
+    _OWNER_TICKER_TTL_DAYS = 30
+
+    @staticmethod
+    def _owner_ticker_stamp_utc(at):
+        """Parse a persisted ``"at"`` stamp into an AWARE-UTC datetime, or None
+        when it is missing / not a string / unparseable (callers treat that as
+        expired -- fail-safe: one re-resolve beats trusting a stamp of unknown
+        vintage).
+
+        HOUSE HAZARD (see the codebase map): timestamps across FCTool's config and
+        caches are MIXED aware/naive, and comparing a naive datetime with an aware
+        one raises TypeError. Everything this class writes is aware-UTC, but a
+        hand-edited file (or any future writer that drops the offset) can still
+        hand us a naive stamp -- so a naive value is assumed UTC and made aware
+        here, and a non-UTC offset is normalized, BEFORE any comparison can see
+        it. Nothing downstream does datetime math on the raw string."""
+        if not isinstance(at, str) or not at:
+            return None
+        try:
+            dt = datetime.fromisoformat(at)
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _read_owner_ticker_file(self):
+        """Raw ``{str(owner_id): {"ticker":…, "at":…}}`` straight off disk, with
+        NO TTL filtering. Missing file -> ``{}`` silently (first launch); corrupt
+        / unreadable / not-this-shape -> ``{}`` + log (the house discard-and-log
+        recovery). Both the loader (which applies the TTL) and the saver (which
+        carries unexpired stamps forward) read through here."""
+        path = self._OWNER_TICKER_CACHE_FILE
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            log.exception("Failed to load owner ticker cache %s; discarding", path)
+            return {}
+        if not isinstance(data, dict) or not all(
+                isinstance(rec, dict) for rec in data.values()):
+            log.warning("Owner ticker cache %s is not a {owner_id: {ticker, at}} "
+                        "map (pre-TTL format?); discarding", path)
+            return {}
+        return data
+
+    def _load_owner_ticker_cache(self):
+        """The persisted ``{owner_id: ticker}`` for every entry still inside the
+        TTL -- what warms _owner_ticker_cache at startup. Expired, unstamped and
+        junk-valued records are skipped so the resolver re-fetches them; only
+        non-empty string tickers survive, so a garbage file can never seed a None
+        (which reads as "attempted, don't retry") into the session cache. JSON
+        stringifies keys, so they are converted back to int (owner_ids are looked
+        up as ints)."""
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=self._OWNER_TICKER_TTL_DAYS)
+        out = {}
+        for key, rec in self._read_owner_ticker_file().items():
+            ticker = rec.get("ticker")
+            if not isinstance(ticker, str) or not ticker:
+                continue
+            stamp = self._owner_ticker_stamp_utc(rec.get("at"))
+            if stamp is None or stamp < cutoff:
+                continue                    # expired / unknown age -> re-resolve
+            try:
+                out[int(key)] = ticker
+            except (TypeError, ValueError):
+                continue                    # non-numeric key -> skip that record
+        return out
+
+    def _save_owner_ticker_cache(self):
+        """Persist the SUCCESSFUL tickers only (see _OWNER_TICKER_CACHE_FILE).
+        Called once per completed resolve pass -- never per owner.
+
+        Stamping rule: ``at`` means "when ESI last told us this", so ONLY a real
+        fetch may advance it. An owner is stamped now iff this pass actually
+        resolved it (``_owner_ticker_resolved``, accumulated by
+        _apply_owner_tickers); every other entry carries its prior stamp forward
+        VERBATIM -- expired or not. Carrying an expired stamp is CORRECT: the next
+        load drops it and re-resolves.
+
+        The saver must not judge freshness itself. It cannot see which owners were
+        fetched, so an "is it expired? then re-stamp" rule silently launders an
+        entry that ages out MID-SESSION: it is still in the session cache, so the
+        census never re-resolves it, yet it looks expired here -- its age would
+        reset to zero with no ESI call and the stale tag would survive every
+        future launch, defeating the TTL entirely. Expiry therefore lives ONLY in
+        _load_owner_ticker_cache.
+
+        Best-effort and FULLY inside the try (the build included): the caller
+        clears the resolver's in-flight flag right after, so anything escaping
+        here would wedge the resolver for the rest of the session."""
+        try:
+            cache = getattr(self, "_owner_ticker_cache", None) or {}
+            resolved = getattr(self, "_owner_ticker_resolved", None) or set()
+            prior = self._read_owner_ticker_file()
+            now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            data = {}
+            for oid, ticker in cache.items():
+                if not isinstance(ticker, str) or not ticker:
+                    continue            # never persist a failure -> session-only
+                old_at = (prior.get(str(oid)) or {}).get("at")
+                # No prior stamp + not fetched this pass shouldn't happen (the
+                # loader only yields on-disk entries), but "now" is the honest
+                # answer if it does: the value can only have come from a resolve.
+                fetched = oid in resolved or not (
+                    isinstance(old_at, str) and old_at)
+                data[str(oid)] = {"ticker": ticker,
+                                  "at": now_iso if fetched else old_at}
+            atomic_write_json(self._OWNER_TICKER_CACHE_FILE, data, indent=None)
+        except Exception:
+            log.exception("Failed to save owner ticker cache")
+
+    # Incremental-apply cadence for a resolve pass. The pass is latency-bound and
+    # highly variable (1 ESI call for an alliance-less corp, 2 otherwise), so BOTH
+    # bounds earn their keep: the COUNT bound keeps at most 10 owners' worth of
+    # work invisible when ESI is quick, and the TIME bound keeps the screen no
+    # more than ~2 s stale when it is slow (where a count-only rule at the
+    # measured ~1.67 s/owner would still blank the list for ~17 s). Before this
+    # the whole pass applied once at the very end: ~71 owners x ~1.67 s = a
+    # ~2-minute window with no tickers anywhere.
+    _TICKER_BATCH_N = 10
+    _TICKER_BATCH_S = 2.0
 
     def _maybe_resolve_owner_tickers(self):
         """One-shot background resolver: after a store load / import / scan-apply,
@@ -6139,10 +6296,11 @@ class FCToolGUI:
 
         Mirrors the sov-name resolver: an in-flight flag debounces double-spawns;
         the DISTINCT owners are fetched off the Tk thread (1-2 public ESI calls
-        each, cached for the session); results marshal back via ``_post_ui``. A
-        no-op when nothing is unresolved (census-clean) or no store is built.
-        Refreshes nothing aggressively -- the next hover / menu build reads the
-        cache. Called on the Tk thread from the store lifecycle points."""
+        each, over ONE reused session) and marshalled back via ``_post_ui`` in
+        BATCHES, so tickers appear progressively rather than all at once when the
+        pass finishes. A no-op when nothing is unresolved (census-clean -- the
+        common case once the disk cache is warm) or no store is built. Called on
+        the Tk thread from the store lifecycle points."""
         store = getattr(self, "_infra_store", None)
         if store is None:
             return
@@ -6158,34 +6316,116 @@ class FCToolGUI:
         if getattr(self, "_owner_ticker_inflight", False):
             return
         self._owner_ticker_inflight = True
-        get_fn = getattr(self, "_owner_ticker_get", None) or \
-            self._owner_ticker_esi_get
+        # Per-pass record of the owners ESI actually answered for. Only these get
+        # a fresh "at" stamp at save time (see _save_owner_ticker_cache); reset
+        # here so a previous pass's ids can never re-stamp an owner nobody
+        # fetched again. Tk-thread-only state: this method and the applier (which
+        # fills it) both run there, and the in-flight guard means the previous
+        # pass's final apply has already landed before a new pass can reset it.
+        self._owner_ticker_resolved = set()
+        injected_get = getattr(self, "_owner_ticker_get", None)
 
         def do_resolve():
             # Record an outcome for EVERY attempted owner (ticker or None) so a
             # dead / 404 corp is not re-fetched on the next lifecycle spawn.
-            results = {}
+            # Outcomes are posted in batches (see _TICKER_BATCH_N / _S) so the
+            # map hover + manager list light up as the pass proceeds.
+            pending = {}
+            session = None
+            last_flush = time.monotonic()
             try:
+                if injected_get is not None:
+                    fetch = injected_get
+                else:
+                    session = requests.Session()
+
+                    def fetch(path):
+                        return self._owner_ticker_esi_get(path, session=session)
+
                 for oid in unresolved:
                     try:
-                        results[oid] = self._resolve_owner_ticker(oid, get_fn)
+                        pending[oid] = self._resolve_owner_ticker(oid, fetch)
                     except Exception:
-                        results[oid] = None
+                        pending[oid] = None
+                    now = time.monotonic()
+                    if (len(pending) >= self._TICKER_BATCH_N
+                            or now - last_flush >= self._TICKER_BATCH_S):
+                        self._post_ui(self._apply_owner_tickers, pending, False)
+                        # REBIND, never .clear(): the dict just posted is read on
+                        # the main thread whenever the queue drains, so this
+                        # thread must not touch it again.
+                        pending = {}
+                        last_flush = now
             finally:
-                self._post_ui(self._apply_owner_tickers, results)
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                # The closing apply: folds the tail AND (final=True) clears the
+                # in-flight flag + persists. In the finally so an exception
+                # mid-pass can never strand the flag or lose the batches already
+                # applied.
+                self._post_ui(self._apply_owner_tickers, pending)
 
-        threading.Thread(target=do_resolve, daemon=True).start()
+        try:
+            threading.Thread(target=do_resolve, daemon=True).start()
+        except Exception:
+            # The in-flight flag is raised BEFORE the spawn, and only the worker's
+            # final apply lowers it -- so a thread that never starts (resource
+            # exhaustion) would wedge the resolver for the whole session. Reset
+            # and let the next lifecycle point try again.
+            log.exception("Owner ticker resolver thread failed to start")
+            self._owner_ticker_inflight = False
 
-    def _apply_owner_tickers(self, results):
-        """Main-thread applier (via ``_post_ui``): fold the resolved
-        ``{owner_id: ticker|None}`` into the session cache and clear the in-flight
-        flag. No re-render -- the next hover / menu build picks the tickers up."""
+    def _apply_owner_tickers(self, results, final=True):
+        """Main-thread applier (via ``_post_ui``): fold one resolved
+        ``{owner_id: ticker|None}`` BATCH into the cache and repaint an open
+        manager dialog so the tickers appear as they land (the map hover /
+        right-click cascade read the cache lazily and need no nudge).
+
+        The resolver posts several of these per pass (``final=False``) plus one
+        closing call (``final=True`` -- the default, so any other caller gets the
+        old whole-pass semantics) which additionally persists the cache and clears
+        the in-flight flag. Keeping the flag set across mid-pass batches is
+        load-bearing: a lifecycle re-spawn would otherwise see the shrunken
+        unresolved census and double-fetch the owners still in flight.
+
+        The flag is cleared LAST, so "not in flight" means the pass is completely
+        done -- applied AND persisted -- never "persist still pending"."""
         cache = getattr(self, "_owner_ticker_cache", None)
         if cache is None:
             cache = self._owner_ticker_cache = {}
         if results:
             cache.update(results)
-        self._owner_ticker_inflight = False
+            # These owners were just fetched -> they are the ONLY ones the save
+            # may stamp with "now" (see _save_owner_ticker_cache). Accumulates
+            # across the pass's batches; _maybe_resolve_owner_tickers resets it.
+            resolved = getattr(self, "_owner_ticker_resolved", None)
+            if resolved is None:
+                resolved = self._owner_ticker_resolved = set()
+            resolved.update(results)
+            self._infra_refresh_dialog_rows()
+        if final:
+            self._save_owner_ticker_cache()      # cannot raise (best-effort)
+            self._owner_ticker_inflight = False
+
+    def _infra_refresh_dialog_rows(self):
+        """Nudge the OPEN manager dialog to re-render its structure list. Its Name
+        column renders "<name> [TICKER]" through the injected ticker_fn, so owners
+        resolved after the dialog was built need a re-read of the cache. No-op
+        when the dialog was never opened / is closed / already destroyed, and
+        fully guarded -- the caller clears the resolver's in-flight flag on the
+        same call, so an escaping exception would wedge the resolver for the rest
+        of the session. Tk thread only (reached via _post_ui)."""
+        dlg = getattr(self, "_infra_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if dlg.winfo_exists():
+                dlg.reload()
+        except Exception:
+            pass
 
     def _infra_on_changed(self):
         """Manager-dialog on_changed hook: an import / scan / edit changed the
@@ -6331,7 +6571,14 @@ class FCToolGUI:
                 # (the §3.2 single source of truth); AutocompleteEntry is the same
                 # widget the map search box uses.
                 type_name_fn=infra_parser.type_name,
-                autocomplete_cls=AutocompleteEntry)
+                autocomplete_cls=AutocompleteEntry,
+                # Owner ticker suffix in the Name column ("Bait Shop [PGCOR]") —
+                # the SAME session cache the map hover / right-click cascade read,
+                # so all three agree. Read at CALL time (getattr-guarded) rather
+                # than captured, so owners resolved after the dialog opened light
+                # up on the next reload (_apply_owner_tickers nudges it).
+                ticker_fn=lambda oid: (
+                    getattr(self, "_owner_ticker_cache", None) or {}).get(oid))
         except Exception as exc:
             print(f"[INFRA] manager dialog failed to open: {exc}")
             return
