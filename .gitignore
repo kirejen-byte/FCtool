@@ -6,6 +6,11 @@ esi_tokens_web.json
 esi_auth_error.log
 fittings_library.json
 fleet_templates.json
+# OverviewStore runtime file — holds the owner's REAL created/imported overview
+# packs (overview_store.py, patterned on fittings_store.py above); must never be
+# committable (it is user data, not source) and it is NOT regenerable — deleting
+# it destroys the owner's work.
+overview_packs.json
 # InfraStore runtime file — holds the owner's REAL friendly-structure data after
 # live use; must never be committable (it is user data, not source).
 infrastructure.json
@@ -23,6 +28,10 @@ cyno_cache.json
 tts_cache/
 chat_monitor_state.json
 fit_types_cache.json
+# Structure-owner-ticker cache (fc_gui.py _OWNER_TICKER_CACHE_FILE) — holds the
+# owner's REAL alliance/corp ID -> ticker data resolved from ESI; must never be
+# committable (it is user data, not source).
+owner_tickers.json
 
 # Runtime log (rotating file handler in app_log.py)
 fctool.log
