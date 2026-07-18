@@ -236,6 +236,25 @@ def gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
     return pairs
 
 
+def reinforced_gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
+    """The ``gate_pairs`` subset for gates manually flagged ``reinforced``.
+
+    Same shape / endpoint derivation as :func:`gate_pairs` (explicit
+    ``system_name``/``gate_to_system_name`` fields, else parsed from the gate
+    ``name``), restricted to entries whose ``reinforced`` flag is truthy. The
+    manual reinforced/offline marker means the Ansiblex needs both ends online
+    to bridge, so the map bridge layer (``fc_gui._get_map_bridges``) and the
+    jump-range router resolve these to system-id pairs -- via the SAME resolver
+    the bridge union uses -- and EXCLUDE the matching pair, dropping the line and
+    the routing hop while flagged (reversible: clearing the flag re-includes it).
+
+    ``gate_pairs`` itself is deliberately UNCHANGED (it still emits a reinforced
+    gate's pair): a reinforced structure still EXISTS in space, so it stays a
+    chip / in the by-system breakdown -- only the bridge is suppressed, and that
+    suppression lives at the consumer, not in the pure union. Pure/deterministic."""
+    return gate_pairs([e for e in (entries or ()) if e.get("reinforced")])
+
+
 def regions_catalog(model) -> list[tuple[int, str]]:
     """(region_id, display_name) sorted by name. Source of truth:
     model.region_anchors -- dict[int, tuple[name, lx, ly]] (map_data.py:42,
