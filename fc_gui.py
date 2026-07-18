@@ -662,6 +662,32 @@ def build_default_fleet_template(primary_name, primary_id, *, new_id=None):
     return t
 
 
+def _resolve_reinforced_id_pairs(store):
+    """Unordered ``frozenset({system_id_a, system_id_b})`` for every store gate
+    manually flagged ``reinforced``, resolved to system ids the SAME pure/local
+    way the Ansiblex bridge union resolves names (``map_overlays.resolve_bridges``
+    over ``infra_overlay.reinforced_gate_pairs`` -- ``system_coords.resolve_name``,
+    no ESI, safe on the Tk thread).
+
+    Shared predicate for BOTH consumers so a flagged Ansiblex drops from the map
+    bridge line (``_get_map_bridges``) AND jump-range routing
+    (``_get_ansiblex_connections``) via one identity. ``resolve_bridges`` yields
+    SYSTEM-ID pairs (not structure ids), so a flagged store gate maps onto the
+    config ``ansiblex_connections`` pair it corresponds to purely by resolved
+    system id -- collapsing any name/case variance between the two sources. Empty
+    for no store / no flagged gates. Guarded: never raises into the caller."""
+    try:
+        if store is None:
+            return set()
+        import infra_overlay
+        import map_overlays as mo
+        names = infra_overlay.reinforced_gate_pairs(store.entries())
+        return {frozenset(pair) for pair in mo.resolve_bridges(names)}
+    except Exception as exc:
+        print(f"[MAP] reinforced pair resolve failed: {exc}")
+        return set()
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -1270,26 +1296,50 @@ class FCToolGUI:
         threading.Thread(target=resolve, daemon=True).start()
 
     def _get_ansiblex_connections(self) -> list[str] | None:
-        """Return Ansiblex connection strings, resolving synchronously if needed."""
-        if self._ansiblex_connections:
-            return self._ansiblex_connections
-        pairs = self.config.get("ansiblex_connections", [])
-        if not pairs:
-            return None
-        resolved = []
-        id_pairs = {}
-        for pair in pairs:
-            if len(pair) == 2:
-                id1 = search_system(pair[0])
-                id2 = search_system(pair[1])
-                if id1 and id2:
-                    resolved.append(f"{id1}|{id2}")
-                    id_pairs[(id1, id2)] = (pair[0], pair[1])
-                    id_pairs[(id2, id1)] = (pair[1], pair[0])
-        if resolved:
-            self._ansiblex_connections = resolved
-            self._ansiblex_id_pairs.update(id_pairs)
-            print(f"[Ansiblex] Sync-resolved {len(resolved)} gate(s)")
+        """Return Ansiblex connection strings, resolving synchronously if needed.
+
+        Reinforced/offline gates are dropped at read time (below): the full set
+        is still cached / kept in ``_ansiblex_id_pairs`` for labeling, but the
+        RETURNED routing list omits any hop whose Ansiblex is manually flagged,
+        so clearing the flag restores the hop on the next call with no cache
+        rebuild."""
+        resolved = self._ansiblex_connections
+        if not resolved:
+            pairs = self.config.get("ansiblex_connections", [])
+            if not pairs:
+                return None
+            resolved = []
+            id_pairs = {}
+            for pair in pairs:
+                if len(pair) == 2:
+                    id1 = search_system(pair[0])
+                    id2 = search_system(pair[1])
+                    if id1 and id2:
+                        resolved.append(f"{id1}|{id2}")
+                        id_pairs[(id1, id2)] = (pair[0], pair[1])
+                        id_pairs[(id2, id1)] = (pair[1], pair[0])
+            if resolved:
+                self._ansiblex_connections = resolved
+                self._ansiblex_id_pairs.update(id_pairs)
+                print(f"[Ansiblex] Sync-resolved {len(resolved)} gate(s)")
+        # Suppress reinforced/offline hops from jump-range routing. Read-time so a
+        # cleared flag restores the hop next call; the cache above stays full. The
+        # get_stargate_route cache keys on the sorted connection list, so a changed
+        # set routes correctly with no stale cache. Guarded/no-op when nothing is
+        # flagged (or no infra store) -> config-only routing is byte-identical.
+        reinforced = _resolve_reinforced_id_pairs(getattr(self, "_infra_store", None))
+        if reinforced and resolved:
+            kept = []
+            for conn in resolved:
+                parts = conn.split("|")
+                try:
+                    key = frozenset((int(parts[0]), int(parts[1])))
+                except (ValueError, IndexError):
+                    kept.append(conn)          # malformed -> keep, don't silently drop
+                    continue
+                if key not in reinforced:
+                    kept.append(conn)
+            resolved = kept
         return resolved or None
 
     def _prewarm_cache_async(self):
@@ -5870,7 +5920,18 @@ class FCToolGUI:
                     name_pairs += infra_overlay.gate_pairs(store.entries())
                 except Exception as exc:
                     print(f"[MAP] infra gate-pairs union failed: {exc}")
-            return mo.resolve_bridges(name_pairs)
+            resolved = mo.resolve_bridges(name_pairs)
+            # Drop any bridge whose Ansiblex is manually flagged reinforced/offline
+            # (a bridge needs both ends online). Applies to BOTH union sources: the
+            # flagged store gate resolves to the SAME unordered id-pair as its
+            # config counterpart, so excluding that id-pair removes the line no
+            # matter which source contributed it. Reversible (clear the flag ->
+            # the pair returns). Empty set when nothing is flagged -> no-op.
+            reinforced = _resolve_reinforced_id_pairs(store)
+            if reinforced:
+                resolved = tuple(p for p in resolved
+                                 if frozenset(p) not in reinforced)
+            return resolved
         except Exception as exc:
             print(f"[MAP] bridges resolve failed: {exc}")
             return ()

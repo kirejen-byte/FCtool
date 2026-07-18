@@ -90,7 +90,7 @@ class InfraManagerDialog(tk.Toplevel):
                            on_changed, initial_system_id=None)
 
     store            InfraStore-shaped (entries/remove/set_status/set_notes/
-                     get_regions/set_regions/scan_state/STALE_DAYS).
+                     set_reinforced/get_regions/set_regions/scan_state/STALE_DAYS).
     scanner          InfraScanner-shaped, or None => scan controls are disabled
                      with a 'needs ESI login' tooltip.
     regions_catalog  list[(region_id, name)].
@@ -190,6 +190,7 @@ class InfraManagerDialog(tk.Toplevel):
         self._add_btn = mkbtn("Add manual…", self._open_add_manual)
         self._reverify_btn = mkbtn("Re-verify selected", self._on_reverify)
         self._markdead_btn = mkbtn("Mark dead", self._on_mark_dead)
+        self._reinforced_btn = mkbtn("Toggle reinforced", self._on_toggle_reinforced)
         self._delete_btn = mkbtn("Delete", self._on_delete)
 
         # right-aligned live search
@@ -279,6 +280,7 @@ class InfraManagerDialog(tk.Toplevel):
         vsb.grid(row=0, column=1, sticky="ns")
 
         self._tree.tag_configure("dead", foreground=FG_RED)
+        self._tree.tag_configure("reinforced", foreground=FG_YELLOW)
         self._tree.tag_configure("manual", foreground=FG_ACCENT)
         self._tree.bind("<Double-Button-1>", lambda _e: self._on_edit_selected())
         self._tree.bind("<Button-3>", self._on_tree_right_click)
@@ -311,6 +313,7 @@ class InfraManagerDialog(tk.Toplevel):
                     "system_name", "name", "category", "source", "status")]
                 parts.append(self._entry_type_name(e))   # match the specific type name too
                 parts.append(self._entry_display_name(e))  # …and the owner ticker
+                parts.append(self._status_label(e))      # …and the shown status ("reinforced")
                 hay = " ".join(parts).casefold()
                 if query not in hay:
                     continue
@@ -359,6 +362,17 @@ class InfraManagerDialog(tk.Toplevel):
             return name
         return f"{name} [{ticker}]" if ticker else name
 
+    def _status_label(self, entry):
+        """Status cell text with precedence: dead -> "dead"; elif reinforced ->
+        "reinforced"; else the raw status (alive/…). A reinforced Ansiblex still
+        exists in space (its row stays), so "reinforced" is a display distinct
+        from "dead" and from the manual/offline suppression it drives on the map."""
+        if entry.get("status") == "dead":
+            return "dead"
+        if entry.get("reinforced"):
+            return "reinforced"
+        return entry.get("status") or "alive"
+
     def _row_values(self, entry):
         # "category" slot → SPECIFIC type (header "Type"); "type" slot → coarse
         # category (header "Category"). See the COLUMNS/HEADINGS note above.
@@ -369,7 +383,7 @@ class InfraManagerDialog(tk.Toplevel):
             entry.get("category") or "",
             entry.get("source") or "",
             _fmt_last_seen(entry.get("last_seen")),
-            entry.get("status") or "alive",
+            self._status_label(entry),
         )
 
     def _reload_tree(self):
@@ -380,6 +394,8 @@ class InfraManagerDialog(tk.Toplevel):
             self._entries_by_key[key] = entry
             if entry.get("status") == "dead":
                 tags = ("dead",)
+            elif entry.get("reinforced"):
+                tags = ("reinforced",)
             elif entry.get("source") == "manual":
                 tags = ("manual",)
             else:
@@ -442,6 +458,31 @@ class InfraManagerDialog(tk.Toplevel):
         self._on_changed()
         self._reload_tree()
         self._set_status(f"Marked {len(keys)} dead.")
+
+    def _on_toggle_reinforced(self):
+        """Toggle the manual reinforced/offline flag on the selected rows.
+
+        Reversible -> NO destructive confirm. If EVERY selected row is already
+        reinforced the toggle CLEARS them all; otherwise it MARKS them all. A
+        reinforced Ansiblex still exists (its row stays; the Status cell shows
+        "reinforced"), but the map bridge layer and jump-range routing suppress
+        its bridge line + hop -- the host re-pushes both via ``on_changed``."""
+        keys = self._selected_keys()
+        if not keys:
+            self._set_status("Select rows to flag reinforced.")
+            return
+        target = not all(
+            (self._entries_by_key.get(k) or {}).get("reinforced") for k in keys)
+        for k in keys:
+            try:
+                self.store.set_reinforced(k, target)
+            except Exception as exc:
+                log.warning("infra store.set_reinforced failed: %s", exc)
+        self._on_changed()
+        self._reload_tree()
+        self._set_status("{v} {n} structure{s} reinforced.".format(
+            v="Marked" if target else "Cleared", n=len(keys),
+            s="" if len(keys) == 1 else "s"))
 
     def _on_reverify(self):
         if self.scanner is None:
@@ -751,6 +792,8 @@ class InfraManagerDialog(tk.Toplevel):
         menu.add_command(label="Edit…", command=self._on_edit_selected)
         menu.add_command(label="Re-verify selected", command=self._on_reverify)
         menu.add_command(label="Mark dead", command=self._on_mark_dead)
+        menu.add_command(label="Toggle reinforced",
+                         command=self._on_toggle_reinforced)
         menu.add_command(label="Delete", command=self._on_delete)
         try:
             menu.tk_popup(evt.x_root, evt.y_root)

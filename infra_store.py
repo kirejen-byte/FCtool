@@ -60,6 +60,11 @@ _ENTRY_DEFAULTS: dict = {
     "last_seen": "",
     "status": "alive",
     "notes": "",
+    # Manual "reinforced/offline" flag (separate from status): a reinforced
+    # Ansiblex STILL exists in space (stays a chip / in the by-system breakdown,
+    # unlike a "dead" record which hides entirely) but its bridge line + jump-
+    # range hop are suppressed while flagged. Absent in older files -> False.
+    "reinforced": False,
 }
 
 
@@ -183,6 +188,7 @@ class InfraStore:
         entry["source"] = entry["source"] or "manual"
         entry["status"] = entry["status"] or "alive"
         entry["notes"] = entry["notes"] or ""
+        entry["reinforced"] = bool(entry["reinforced"])   # tolerate any JSON shape
         if not entry["first_seen"]:
             entry["first_seen"] = self._now_iso()
         if not entry["last_seen"]:
@@ -441,6 +447,21 @@ class InfraStore:
             if entry is None:
                 return
             entry["notes"] = notes or ""
+            self._save_or_defer()
+
+    def set_reinforced(self, key: str, reinforced: bool) -> None:
+        """Set the manual reinforced/offline flag on a record (atomic save).
+
+        Mirrors ``set_status``/``set_notes``: RLock-guarded, persists via the
+        deferred-save choke point, silent no-op for an unknown key. Independent
+        of ``status`` — a record can be both ``dead`` and ``reinforced``, and
+        clearing one never touches the other. Coerced to a real bool so the
+        stored value is always ``True``/``False``."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            entry["reinforced"] = bool(reinforced)
             self._save_or_defer()
 
     # ── Read views ────────────────────────────────────────────────────────────
