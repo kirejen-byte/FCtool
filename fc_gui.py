@@ -97,6 +97,7 @@ import fleet_composer
 import eve_client_tracker
 import window_activator
 import preview_layout
+import monitor_pin
 import hotkey_service
 import damage_flash
 from gamelog_monitor import GamelogMonitor
@@ -881,6 +882,9 @@ class FCToolGUI:
         # ── Hide rules / per-char selection (Task C2) ───────────────────────
         self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
         self._preview_win32 = None             # foreground backend; None → lazy real singleton
+        # Monitor pinning injectable backends (None → lazy real singletons).
+        self._preview_monitor_win32 = None     # monitor enumeration (monitor_pin)
+        self._preview_move_win32 = None        # window-move backend (window_activator)
         # ── Active highlight / cycle exclusion / switch-external (Task C4) ────
         self._preview_excluded = set()         # session-only cycle-exclusion char keys
         self._preview_last_external_hwnd = None  # last non-EVE, non-ours foreground hwnd
@@ -13753,6 +13757,9 @@ class FCToolGUI:
         "hide_on_lost_focus": False, "hide_delay_ticks": 4,
         "disabled_chars": [],
         "minimize_inactive": False, "never_minimize": [],
+        # Monitor pinning (monitor_pin.py): per-char {char_key: device|"none"} and
+        # a global default device ("" = off). Empty → the feature is fully inert.
+        "monitor_assignments": {}, "monitor_pin_default": "",
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
@@ -14259,6 +14266,13 @@ class FCToolGUI:
                 self._preview_tile_rects[new.hwnd] = r
         except OSError:
             self._preview_retire_tile(new.hwnd)
+            return
+        # Monitor pinning: the login→character retitle is the exact moment the
+        # pilot's identity becomes known, so resolve its monitor assignment and
+        # move the real client window now. No-op for login windows (key "") and
+        # for unassigned chars. Deliberately NOT done on plain spawn (a mid-session
+        # FCTool restart must not yank windows the user hand-placed).
+        self._preview_maybe_pin_monitor(new)
 
     def _preview_retire_tile(self, hwnd):
         """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
@@ -16147,9 +16161,16 @@ class FCToolGUI:
         _tip(bcg, "Define groups of clients and cycle each with its own hotkey. "
                   "Cycle keys are swallowed system-wide while FCPreview runs.")
 
+        bmp = ttk.Button(rowN4, text="Monitor pinning…", style="Dark.TButton",
+                         command=self._open_preview_monitor_pin_dialog)
+        bmp.grid(row=0, column=4, padx=(0, 6))
+        w.append(bmp)
+        _tip(bmp, "Assign each character's EVE client to a monitor — it moves there "
+                  "on login (needs FCPreview mode). Apply moves them anytime.")
+
         bimp = ttk.Button(rowN4, text="Import EVE-O layout…", style="Dark.TButton",
                           command=self._preview_import_eveo)
-        bimp.grid(row=0, column=4, padx=(0, 6))
+        bimp.grid(row=0, column=5, padx=(0, 6))
         w.append(bimp)
         _tip(bimp, "Import tile positions/sizes from your existing Eve-O Preview "
                    "configuration.")
@@ -16164,7 +16185,7 @@ class FCToolGUI:
                           activebackground="#cc3333", activeforeground=FG_WHITE,
                           borderwidth=1, relief=tk.RIDGE, cursor="hand2",
                           command=self._preview_reset_layout)
-        brst.grid(row=0, column=5, padx=(0, 6))
+        brst.grid(row=0, column=6, padx=(0, 6))
         w.append(brst)
         self._preview_reset_btn = brst
         _tip(brst, "Bring all preview windows back on-screen and clear saved "
@@ -17885,6 +17906,185 @@ class FCToolGUI:
         # Preserve keys not shown in this dialog; replace membership for shown keys.
         cfg["never_minimize"] = sorted((existing - shown) | checked)
         self._save_config()
+
+    # ── Monitor pinning (monitor_pin.py) ────────────────────────────────────
+    # Delay before the single re-assert move. With ~10 clients mass-launching,
+    # EVE can re-apply its own saved window position ~1s after login and clobber
+    # the first move; a second idempotent move to the same rect wins that race.
+    _MONITOR_PIN_REASSERT_MS = 1800
+
+    def _preview_maybe_pin_monitor(self, client):
+        """Resolve `client`'s monitor assignment and move its real window onto the
+        target monitor. Fires on the login→character rekey — the exact moment the
+        pilot's identity becomes known. No-op for login windows (key ""),
+        unassigned chars, or a target monitor that isn't currently present. Runs
+        on the UI thread (the native tick); move_window touches no Tk, and the
+        re-assert is scheduled via Tk `after`."""
+        if client.is_login or not client.key:
+            return
+        cfg = self._preview_cfg()
+        device = monitor_pin.resolve_assignment(
+            client.key, cfg.get("monitor_assignments", {}),
+            cfg.get("monitor_pin_default", ""))
+        if not device:
+            return
+        monitors = monitor_pin.list_monitors(
+            getattr(self, "_preview_monitor_win32", None))
+        plan = monitor_pin.plan_move_for_client(tuple(client.rect), monitors, device)
+        if plan is None:
+            log.info("[monitor-pin] target monitor %s not present for %s; skip",
+                     device, client.key)
+            return
+        hwnd = client.hwnd
+        try:
+            window_activator.move_window(
+                hwnd, *plan, win32=getattr(self, "_preview_move_win32", None))
+        except Exception:
+            log.exception("[monitor-pin] rekey move failed for %s", client.key)
+            return
+        # One delayed re-assert of the SAME rect (idempotent) — see the constant.
+        try:
+            self.root.after(
+                self._MONITOR_PIN_REASSERT_MS,
+                lambda h=hwnd, p=plan: self._preview_reassert_pin(h, p))
+        except Exception:
+            pass
+
+    def _preview_reassert_pin(self, hwnd, plan):
+        """Re-apply the planned rect once, guarded: the client/tile may have closed
+        during the delay (no exception may escape into the Tk after-loop)."""
+        if hwnd not in self._preview_clients and hwnd not in self._preview_tiles:
+            return
+        try:
+            window_activator.move_window(
+                hwnd, *plan, win32=getattr(self, "_preview_move_win32", None))
+        except Exception:
+            log.exception("[monitor-pin] re-assert move failed")
+
+    def _preview_pin_move_client(self, client, monitors, device):
+        """Plan + issue one move for a live client onto `device`. Returns True on a
+        move, False when the device isn't present or the move errored."""
+        plan = monitor_pin.plan_move_for_client(tuple(client.rect), monitors, device)
+        if plan is None:
+            log.info("[monitor-pin] target monitor %s not present for %s; skip",
+                     device, client.key)
+            return False
+        try:
+            window_activator.move_window(
+                client.hwnd, *plan,
+                win32=getattr(self, "_preview_move_win32", None))
+        except Exception:
+            log.exception("[monitor-pin] move failed for %s", client.key)
+            return False
+        return True
+
+    def _preview_pin_move_key(self, key):
+        """Move the live client(s) for one char key onto its resolved monitor NOW.
+        Fresh find_clients sweep so it works even when native preview mode is off."""
+        cfg = self._preview_cfg()
+        device = monitor_pin.resolve_assignment(
+            key, cfg.get("monitor_assignments", {}),
+            cfg.get("monitor_pin_default", ""))
+        if not device:
+            return
+        try:
+            clients = self._preview_find_clients()
+        except Exception:
+            log.exception("[monitor-pin] client sweep failed")
+            return
+        monitors = monitor_pin.list_monitors(
+            getattr(self, "_preview_monitor_win32", None))
+        for c in clients:
+            if not c.is_login and c.key == key:
+                self._preview_pin_move_client(c, monitors, device)
+
+    def _preview_pin_set_default(self, device):
+        """Persist the global-default device ("" = off). Does not move anyone — the
+        default takes effect on the next login or via Apply (changing the default
+        should never yank every live client mid-session)."""
+        cfg = self._preview_cfg()
+        cfg["monitor_pin_default"] = device or ""
+        self._save_config()
+
+    def _preview_pin_set_char(self, key, value):
+        """Persist one char's assignment and apply it to that char's live client
+        immediately (instant feedback). value: "" clears the explicit assignment
+        (fall back to the default), "none" = never move, else a device string."""
+        cfg = self._preview_cfg()
+        assigns = cfg.setdefault("monitor_assignments", {})
+        if value:
+            assigns[key] = value
+        else:
+            assigns.pop(key, None)
+        self._save_config()
+        self._preview_pin_move_key(key)
+
+    def _preview_pin_apply_all(self):
+        """Apply-now: a fresh sweep moves every live charactered client whose char
+        resolves to a present monitor. Skips login windows. Works with native
+        preview mode off (own enumeration). Returns the count moved."""
+        cfg = self._preview_cfg()
+        assigns = cfg.get("monitor_assignments", {})
+        default = cfg.get("monitor_pin_default", "")
+        try:
+            clients = self._preview_find_clients()
+        except Exception:
+            log.exception("[monitor-pin] apply sweep failed")
+            return 0
+        monitors = monitor_pin.list_monitors(
+            getattr(self, "_preview_monitor_win32", None))
+        moved = 0
+        for c in clients:
+            if c.is_login or not c.key:
+                continue
+            device = monitor_pin.resolve_assignment(c.key, assigns, default)
+            if not device:
+                continue
+            if self._preview_pin_move_client(c, monitors, device):
+                moved += 1
+        return moved
+
+    def _preview_monitor_pin_chars(self):
+        """Chars to show rows for: live client chars ∪ already-assigned chars,
+        sorted. Anchored to characters you actually run or have already pinned,
+        not the whole ESI roster."""
+        cfg = self._preview_cfg()
+        chars = {str(k).strip().lower()
+                 for k in (cfg.get("monitor_assignments", {}) or {})}
+        for c in self._preview_clients.values():
+            if not c.is_login and c.key:
+                chars.add(c.key)
+        return sorted(chars)
+
+    def _open_preview_monitor_pin_dialog(self, _test_no_wait=False):
+        """Monitor-pinning modal: global default + per-character monitor pickers +
+        Apply. The row/combobox assembly lives in
+        monitor_pin.build_settings_section (containment); this shell gathers
+        state, wires the persist/move callbacks, and owns the Toplevel. Returns
+        the Toplevel (tests pass _test_no_wait=True to skip wait_window)."""
+        monitors = monitor_pin.list_monitors(
+            getattr(self, "_preview_monitor_win32", None))
+        cfg = self._preview_cfg()
+        assigns = dict(cfg.get("monitor_assignments", {}) or {})
+        default = cfg.get("monitor_pin_default", "")
+        chars = self._preview_monitor_pin_chars()
+
+        win = tk.Toplevel(self.root)
+        win.title("Monitor pinning")
+        make_modal(win, self.root, base_bg=BG_DARK)
+        self._preview_monitor_pin_section = monitor_pin.build_settings_section(
+            win, monitors=monitors, assignments=assigns, default_device=default,
+            chars=chars, on_default_change=self._preview_pin_set_default,
+            on_char_change=self._preview_pin_set_char,
+            on_apply=self._preview_pin_apply_all)
+
+        btns = tk.Frame(win, bg=BG_PANEL)
+        btns.pack(fill=tk.X, pady=8)
+        ttk.Button(btns, text="Close", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.LEFT, padx=8)
+        if not _test_no_wait:
+            self.root.wait_window(win)
+        return win
 
     def _add_section(self, parent, title, toc_title=None):
         """Create a section header label. If a Settings-tab TOC is currently
