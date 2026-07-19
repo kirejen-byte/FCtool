@@ -9774,6 +9774,24 @@ class FCToolGUI:
         _ivl.bind("<Return>", lambda e: self._motd_link_interval_changed())
         tk.Label(link_row, text="s", font=("Consolas", 8), fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(1, 6))
+        # Optional guard: while auto-update is armed, disarm it the moment the FC
+        # character leaves the staging system set in the composer. Persisted
+        # (default OFF) alongside the interval; inert until ticked.
+        self._motd_stop_leave_staging_var = tk.BooleanVar(
+            value=self._motd_stop_leave_staging_enabled())
+        _stop_chk = tk.Checkbutton(
+            link_row, text="Stop when FC leaves staging",
+            variable=self._motd_stop_leave_staging_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
+            activebackground=BG_PANEL, activeforeground=FG_YELLOW,
+            command=self._motd_toggle_stop_leave_staging)
+        _stop_chk.pack(side=tk.LEFT, padx=(0, 2))
+        attach_tooltip(
+            _stop_chk,
+            "While Auto-update MOTD is armed, if the FC character leaves the "
+            "staging system set in the composer above, auto-updating turns "
+            "itself OFF (one-way — re-tick Auto-update MOTD to resume). Does "
+            "nothing if no staging system is set.")
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
             bg=BG_PANEL, cursor="question_arrow")
@@ -11431,12 +11449,27 @@ class FCToolGUI:
         """If linked, recompute the MOTD and re-push it to the fleet when it has
         changed since the last push. Called on the main thread each fleet poll.
         Markup is computed here (reads Tk widgets); boss resolution + the PUT run
-        on a worker thread."""
+        on a worker thread.
+
+        When the optional "stop when FC leaves staging" guard is armed (the
+        option is on AND a staging system is set/resolvable), each tick also
+        checks the FC's current location on the worker; if the FC has left the
+        staging system the link is disarmed (one-way) and nothing is pushed. The
+        guard runs even on quiet ticks (unchanged markup) so a departure is
+        noticed promptly, and it is fail-open — a location lookup that raises or
+        returns nothing proceeds exactly as if the guard were off, so a transient
+        ESI hiccup never drops the link."""
         if not getattr(self, "_motd_link_enabled", False):
             return
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             return
+        # Staging-guard reference system, resolved on the main thread (Tk reads).
+        # None ⇒ guard inert (option off, or staging unset/unresolvable), and this
+        # method behaves exactly as it did before the option existed.
+        staging_sid = (self._motd_current_staging_system_id()
+                       if self._motd_stop_leave_staging_enabled() else None)
+        guard_active = staging_sid is not None
         try:
             markup, _ = self._motd_output_markup()
         except Exception:
@@ -11445,13 +11478,29 @@ class FCToolGUI:
             self._motd_link_state = "overbudget"
             self._motd_update_link_indicator()
             return
-        if markup == self._motd_last_pushed_markup:
-            return  # unchanged → no redundant ESI write
+        unchanged = (markup == self._motd_last_pushed_markup)
+        if unchanged and not guard_active:
+            return  # unchanged and no staging guard → no redundant ESI write
 
         def worker():
             ok = False
             reason = None
             try:
+                # Staging guard runs first: a departed FC disarms the link and
+                # skips the push this tick. Fail-open — get_location raising or
+                # returning nothing proceeds as if the guard were off.
+                if guard_active:
+                    try:
+                        loc = auth.get_location()
+                    except Exception:
+                        loc = None
+                    cur_sid = (loc.get("solar_system_id")
+                               if isinstance(loc, dict) else None)
+                    if cur_sid is not None and cur_sid != staging_sid:
+                        self._post_ui(_done, False, "left_staging", markup)
+                        return
+                if unchanged:
+                    return  # guard passed, nothing changed → no push, no state change
                 info = auth.get_fleet_info()
                 fid = info["fleet_id"] if info else None
                 is_boss = bool(info and auth.is_boss(info, auth.character_id))
@@ -11473,6 +11522,13 @@ class FCToolGUI:
                 self._motd_link_state = "ok"
             elif reason == "not_boss":
                 self._motd_link_state = "not_boss"   # keep linked, just can't push
+            elif reason == "left_staging":
+                # FC left the staging system → disarm the link (one-way; re-tick
+                # Auto-update MOTD to resume). Mirrors the hard-failure disarm.
+                self._motd_link_enabled = False
+                if getattr(self, "_motd_link_var", None) is not None:
+                    self._motd_link_var.set(False)
+                self._motd_link_state = "left_staging"
             else:
                 # Hard failure (e.g. 403) — drop the link so we stop hammering ESI.
                 self._motd_link_enabled = False
@@ -11487,12 +11543,19 @@ class FCToolGUI:
         ind = getattr(self, "_motd_link_indicator", None)
         if ind is None:
             return
-        if not getattr(self, "_motd_link_enabled", False):
-            ind.config(text="○ not linked", fg=FG_DIM)
-            return
         state = getattr(self, "_motd_link_state", "waiting")
+        # Terminal disarm states must explain WHY they stopped, so they are
+        # checked BEFORE the not-enabled early return (which would otherwise mask
+        # them as a plain "not linked"). A re-arm resets state to "waiting"
+        # (_motd_toggle_link), clearing these.
+        if state == "left_staging":
+            ind.config(text="○ stopped — FC left staging", fg=FG_YELLOW)
+            return
         if state == "error":
             ind.config(text="○ link dropped (push failed)", fg=FG_RED)
+            return
+        if not getattr(self, "_motd_link_enabled", False):
+            ind.config(text="○ not linked", fg=FG_DIM)
             return
         if state == "overbudget":
             ind.config(text="🔗 over budget — not pushed", fg=FG_YELLOW)
@@ -11533,6 +11596,54 @@ class FCToolGUI:
         if v != self._motd_link_interval_var.get():
             self._motd_link_interval_var.set(v)
         self.config.setdefault("fittings", {})["motd_link_interval_s"] = v
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _motd_stop_leave_staging_enabled(self) -> bool:
+        """Whether the 'stop auto-update when the FC leaves staging' option is on.
+
+        Persisted under config['fittings']['motd_stop_leave_staging'] (default
+        False); config is the source of truth, mirroring the interval option."""
+        try:
+            return bool(self.config.get("fittings", {}).get(
+                "motd_stop_leave_staging", False))
+        except Exception:
+            return False
+
+    def _motd_current_staging_system_id(self):
+        """The staging system id the MOTD is currently composed with, or None.
+
+        None when the 'Include staging system' box is off, the field is blank, or
+        the name does not resolve — the same conditions under which
+        _current_motd_markup omits the staging line. Pure main-thread Tk reads +
+        a local name lookup (no ESI)."""
+        enabled = getattr(self, "_motd_staging_enabled", None)
+        if enabled is None or not enabled.get():
+            return None
+        var = getattr(self, "_motd_staging_var", None)
+        if var is None:
+            return None
+        raw = (var.get() or "").strip()
+        if not raw:
+            return None
+        try:
+            import system_coords
+            return system_coords.resolve_name(raw)
+        except Exception:
+            return None
+
+    def _motd_toggle_stop_leave_staging(self):
+        """Persist the 'stop when FC leaves staging' option immediately (mirrors
+        _motd_link_interval_changed's save pattern). This option only takes
+        effect while Auto-update is armed; it never itself arms/disarms the link
+        or changes link state."""
+        try:
+            on = bool(self._motd_stop_leave_staging_var.get())
+        except Exception:
+            return
+        self.config.setdefault("fittings", {})["motd_stop_leave_staging"] = on
         try:
             self._save_config()
         except Exception:
