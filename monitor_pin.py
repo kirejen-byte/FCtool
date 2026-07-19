@@ -284,7 +284,7 @@ def build_settings_section(parent, *, monitors, assignments, default_device,
     its pure logic never needs a display."""
     import tkinter as tk
     from tkinter import ttk
-    from ui_theme import BG_DARK, BG_PANEL, BG_ENTRY, FG_TEXT, FG_DIM
+    from ui_theme import BG_PANEL, FG_TEXT, FG_DIM
 
     section = MonitorPinSection()
 
