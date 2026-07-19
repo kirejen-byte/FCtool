@@ -9513,7 +9513,7 @@ class FCToolGUI:
         self._motd_last_push_ts = None          # time.monotonic() of last successful push
         self._motd_last_check_ts = None         # time.monotonic() of last auto-update check
         self._motd_last_pushed_markup = None    # for change-detection (no redundant writes)
-        self._motd_link_state = "off"           # off|waiting|ok|not_boss|overbudget|error
+        self._motd_link_state = "off"           # off|waiting|ok|not_boss|overbudget|error|left_staging
 
         # ── Master split: inputs (left) | preview (right) ────────────────────
         body = tk.Frame(tab, bg=BG_DARK)
