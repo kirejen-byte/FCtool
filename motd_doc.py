@@ -444,18 +444,30 @@ def default_doc(staging_name: str = "", channel: str = "",
 
 
 def _runs_from_markup(markup: str) -> list:
-    """Parse free-text markup into styled TextRuns (text ``html.unescape``d).
+    """Parse markup into runs — known links become item pills, else styled text.
 
-    Links are flattened to their visible text (legacy header/footer are free text;
-    the raw-markup-passthrough trick is retired — the Import path handles links).
+    Shared by the legacy header/footer migration (:func:`from_legacy_fields`) and
+    the MOTD import path (:func:`from_parsed_motd`) so both apply the SAME
+    link→token rules. Each segment's ``url=`` target is mapped via
+    :func:`_link_to_token` (fitting → ``fit``, showinfo char → ``char``,
+    ``showinfo:5`` → ``system``, joinChannel → ``channel``); a target matching no
+    pattern (an external ``http`` URL, an unknown showinfo type) keeps its visible
+    text as a styled :class:`TextRun` (``html.unescape``d) — the pre-amendment
+    flatten behavior. ``<br>`` becomes a ``\\n`` TextRun.
     """
     runs: list = []
     for seg in parse_markup(markup):
         if seg.newline:
             runs.append(TextRun("\n"))
-        else:
-            runs.append(TextRun(html.unescape(seg.text), color=seg.color, bold=seg.bold,
-                                italic=seg.italic, underline=seg.underline, size=seg.size))
+            continue
+        name = html.unescape(seg.text)
+        if seg.link is not None:
+            tok = _link_to_token(seg.link, name)
+            if tok is not None:
+                runs.append(tok)
+                continue
+        runs.append(TextRun(name, color=seg.color, bold=seg.bold,
+                            italic=seg.italic, underline=seg.underline, size=seg.size))
     return runs
 
 
@@ -465,7 +477,9 @@ def from_legacy_fields(saved: dict) -> Doc:
     Order mirrors ``build_motd``'s line list: header runs · ``fc_line(selected)``
     (the wiring sets the FC combo from ``saved['fc']``) · ``staging_line`` iff
     enabled + named · ``doctrine_line`` · a ``tag_line`` per saved tag ·
-    ``channel_line("Logi", …)`` iff a channel · footer runs. The saved ``fits``
+    ``channel_line("Logi", …)`` iff a channel · footer runs. Header/footer link
+    markup migrates losslessly to pills (a hand-pasted fit/char/system/channel
+    link becomes its live token) via :func:`_runs_from_markup`. The saved ``fits``
     fallback pairs are carried separately (as ``ctx.legacy_fits``) and only fire
     when every tag_line resolves empty (see :func:`resolve`); a tag-less template
     that still has saved fits gets one synthetic ``Fits`` tag_line so that
@@ -525,22 +539,10 @@ def from_parsed_motd(raw_markup: str) -> Doc:
     Known links become ``fit`` / ``char`` / ``system`` / ``channel`` pills; every
     other segment stays styled text (``html.unescape``d); ``<br>`` becomes a
     ``\\n`` TextRun. Line/block structure is not reverse-engineered (line-level
-    fidelity only).
+    fidelity only). Shares :func:`_runs_from_markup` with the legacy migration
+    path, so header/footer links and imported links resolve identically.
     """
-    runs: Doc = []
-    for seg in parse_markup(raw_markup):
-        if seg.newline:
-            runs.append(TextRun("\n"))
-            continue
-        name = html.unescape(seg.text)
-        if seg.link is not None:
-            tok = _link_to_token(seg.link, name)
-            if tok is not None:
-                runs.append(tok)
-                continue
-        runs.append(TextRun(name, color=seg.color, bold=seg.bold,
-                            italic=seg.italic, underline=seg.underline, size=seg.size))
-    return runs
+    return _runs_from_markup(raw_markup)
 
 
 # --- JSON persistence -----------------------------------------------------
