@@ -86,6 +86,13 @@ GROUP_ORDER = (
 #: Groups shown when the bar is focused with an empty query (§6 zero-state).
 ZERO_STATE_GROUPS = ("Recent", "Doctrine fits", "Lines & blocks", "Channels")
 
+#: Per-group row caps in zero-state (owner rule): every group always renders —
+#: there is NO shared total budget that could drop a later group — so recent
+#: channels + doctrine fits are visible without searching.
+ZERO_STATE_CAPS = {
+    "Recent": 3, "Doctrine fits": 3, "Lines & blocks": 2, "Channels": 2,
+}
+
 # action kinds -------------------------------------------------------------- #
 ACTION_MORE = "action:more"
 ACTION_SWITCH = "action:switch_doctrine"
@@ -184,6 +191,26 @@ def visible_slice(groups: list, per_group: int = 4, total: int = 10) -> list:
         if hidden > 0:
             shown.append(_more_item(name, hidden))
         remaining -= take
+        out.append((name, shown, hidden))
+    return out
+
+
+def zero_state_slice(groups: list, caps: dict | None = None) -> list:
+    """Zero-state slicing (owner rule): each group is capped by its OWN per-group
+    cap (:data:`ZERO_STATE_CAPS`) with NO shared total budget, so every non-empty
+    group always renders — a busy Recent/Doctrine fits can no longer starve
+    Channels. A truncated group still gets an ``action:more`` row (last) carrying
+    its ``hidden_count``. Returns ``[(name, shown_items, hidden_count)]``."""
+    caps = caps if caps is not None else ZERO_STATE_CAPS
+    out = []
+    for name, items in groups:
+        if not items:
+            continue
+        cap = caps.get(name, 4)
+        shown = list(items[:cap])
+        hidden = len(items) - len(shown)
+        if hidden > 0:
+            shown.append(_more_item(name, hidden))
         out.append((name, shown, hidden))
     return out
 
@@ -435,6 +462,10 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
     widget.bind("<B1-Motion>", motion, add="+")
     widget.bind("<ButtonRelease-1>", release, add="+")
     widget.bind("<Escape>", cancel, add="+")
+    # Test seam: the event closures are otherwise unreachable — expose them so a
+    # drag can be driven deterministically with synthetic events.
+    widget._dnd = {"press": press, "motion": motion, "release": release,
+                   "cancel": cancel, "state": state}
 
 
 # --------------------------------------------------------------------------- #
@@ -686,24 +717,29 @@ class MotdPalette(tk.Frame):
         }
         return [(name, by_name[name]) for name in group_order_for_mode(mode)]
 
-    def _inject_esi(self, base: list) -> list:
-        """Append the searching row and/or streamed ESI rows into the Characters
-        group, de-duping ESI rows against the local character rows by name."""
+    def _append_esi_signage(self, sliced: list, base: list) -> list:
+        """Append the ``Searching ESI…`` indicator and/or streamed ESI rows to the
+        VISIBLE Characters slice AS SIGNAGE — AFTER the per-group cap, like the
+        rescan row — so they show even when local matches fill the cap. ESI rows
+        are de-duped by name against the (full, pre-cap) local character set."""
         if not (self._esi_pending or self._esi_rows):
-            return base
-        out = []
+            return sliced
+        local = set()
         for name, items in base:
             if name == "Characters":
+                local = {_item_name(it).lower() for it in items if it.kind == "char"}
+                break
+        out = []
+        for group, items, hidden in sliced:
+            if group == "Characters":
                 items = list(items)
                 if self._esi_pending:
                     items.append(self._searching_item())
                 if self._esi_rows:
-                    local = {_item_name(it).lower() for it in items
-                             if it.kind == "char"}
                     for it in self._esi_rows:
                         if _item_name(it).lower() not in local:
                             items.append(it)
-            out.append((name, items))
+            out.append((group, items, hidden))
         return out
 
     @staticmethod
@@ -728,11 +764,13 @@ class MotdPalette(tk.Frame):
         if self._dd is None:
             return
         base = self._compute_groups(self._query, self._mode)
-        base = self._inject_esi(base)
         if self._show_all:
             sliced = [(n, list(it), 0) for n, it in base if it]
+        elif not self._query:
+            sliced = zero_state_slice(base)          # all four groups always render
         else:
             sliced = visible_slice(base, per_group=4, total=self._total_for_mode())
+        sliced = self._append_esi_signage(sliced, base)   # signage AFTER the cap
         sliced = self._append_rescan(sliced)
         self._rendered = [(g, list(items)) for g, items, _h in sliced]
         self._build_rows(sliced)
