@@ -121,6 +121,7 @@ class PillCanvas(MarkupEditor):
 
         self._trigger_state = None
         self._param_win = None             # most-recent param editor (test hook)
+        self._loading = False              # True during set_doc rebuild → silent
 
         # Tk native undo destroys embedded windows — we own undo instead (§5).
         try:
@@ -295,7 +296,8 @@ class PillCanvas(MarkupEditor):
             w.bind("<Double-Button-1>",
                    lambda e, n=name: self._chip_double(e, n), add="+")
             w.bind("<Button-3>", lambda e, n=name: self._chip_menu(e, n), add="+")
-        attach_tooltip(frame, "")
+        # The tooltip is attached inside _style_chip (guarded on text change) so a
+        # freshly-built chip gets exactly one attach.
         self._style_chip(frame, run, self._resolve_label(run))
         return frame
 
@@ -317,7 +319,11 @@ class PillCanvas(MarkupEditor):
         else:
             border = BORDER_COLOR if label.resolved else FG_YELLOW
         frame.config(highlightbackground=border, highlightcolor=border)
-        attach_tooltip(frame, label.tooltip)
+        # attach_tooltip is append-only (binds <Enter>/<Leave>/<Destroy> with
+        # add="+"), so re-attach ONLY when the tooltip text actually changed —
+        # otherwise a restyle storm (e.g. an oscillating delta) leaks binds.
+        if getattr(frame, "_tooltip_text", None) != label.tooltip:
+            attach_tooltip(frame, label.tooltip)
         frame._pill_label = label
 
     def _insert_token_widget(self, index, run: TokenRun):
@@ -459,9 +465,22 @@ class PillCanvas(MarkupEditor):
             pass
 
     def set_doc(self, doc: list) -> None:
-        """Rebuild the canvas from ``doc``; clears undo (not a user change)."""
+        """Rebuild the canvas from ``doc``; clears undo (not a user change).
+
+        Silent load: no ``on_change`` fires during the rebuild (``_loading`` guards
+        the change-fire path; a final ``edit_modified(False)`` neutralises the
+        queued ``<<Modified>>`` events, mirroring the base ``set_markup`` discipline).
+        """
         self._flush_burst()
-        self._rebuild([r for r in doc])
+        self._loading = True
+        try:
+            self._rebuild([r for r in doc])
+        finally:
+            self._loading = False
+        try:
+            self.text.edit_modified(False)
+        except tk.TclError:
+            pass
         self._undo_stack.clear()
         self._redo_stack.clear()
 
@@ -563,6 +582,13 @@ class PillCanvas(MarkupEditor):
         except tk.TclError:
             pass
         self._fire_change()
+
+    def _fire_change(self):
+        # Suppress change notification while set_doc is loading a document
+        # ("loading is not a user change" — the wiring's dirty flag depends on it).
+        if self._loading:
+            return
+        super()._fire_change()
 
     # ── key handling: atomic delete, burst capture, selection ───────────────
 
