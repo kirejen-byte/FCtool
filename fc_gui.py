@@ -9605,6 +9605,18 @@ class FCToolGUI:
         self._motd_palette.pack(fill=tk.X, padx=8, pady=(6, 2))
         # Persist recents on every insert (bar rows + tray chips route here).
         self._motd_palette._recent_hook = self._motd_record_recent_item
+        # Clear any pending inline-trigger range whenever the dropdown closes
+        # (Esc / focus-out / accept) so an abandoned trigger cannot cause a later
+        # insert to mis-fire as an accept. Wrap the instance's close_dropdown —
+        # MotdPalette calls it as ``self.close_dropdown()``, which resolves to the
+        # instance attribute first.
+        _orig_close_dropdown = self._motd_palette.close_dropdown
+
+        def _motd_palette_close_wrap(_orig=_orig_close_dropdown):
+            self._motd_on_palette_close()
+            _orig()
+
+        self._motd_palette.close_dropdown = _motd_palette_close_wrap
 
         self._motd_canvas = pill_canvas.PillCanvas(
             left,
@@ -9891,18 +9903,49 @@ class FCToolGUI:
     # ── inline trigger + drag/insert routing ──────────────────────────────────
 
     def _motd_on_canvas_trigger(self, mode, anchor, query_range):
-        """Canvas fired an inline @/ / trigger: open the palette at the caret."""
-        self._motd_trigger_range = query_range
+        """Canvas fired an inline @/ / trigger: open the palette at the caret.
+
+        A fresh trigger supersedes any stale range (clear-then-set), so an
+        abandoned earlier trigger can never be mistaken for this one."""
+        self._motd_trigger_range = None
         pal = getattr(self, "_motd_palette", None)
         if pal is not None:
             pal.open_at_caret(mode, anchor)
+        self._motd_trigger_range = query_range
+
+    def _motd_on_palette_close(self):
+        """Wired over ``MotdPalette.close_dropdown``: whenever the palette dropdown
+        closes (Esc, focus-out, accept, action) the inline-trigger context is over,
+        so drop any pending range. An abandoned trigger must never leave a stale
+        range that a later tray/bar insert would mistake for a live accept."""
+        self._motd_trigger_range = None
+
+    def _motd_trigger_range_is_live(self, cv, rng):
+        """True only when ``rng`` is a genuinely-live inline trigger: a (start, end)
+        index pair whose start still holds the trigger char (@ or /) AND whose end —
+        the query position where the trigger fired — is exactly where the live caret
+        sits. A moved caret (the user typed/navigated past the trigger) or a start
+        that no longer holds the trigger char is NOT live and inserts plainly. This
+        is the belt to the clear-on-close/clear-on-new-trigger suspenders."""
+        text = getattr(cv, "text", None)
+        if not rng or text is None:
+            return False
+        try:
+            start, end = rng[0], rng[1]
+            if text.get(start, f"{start}+1c") not in ("@", "/"):
+                return False
+            return text.index("insert") == text.index(end)
+        except Exception:
+            return False
 
     def _motd_palette_insert(self, item):
         """Palette/tray row accepted → insert its token at the caret.
 
-        In inline-trigger mode the canvas deletes the trigger+query chars itself
-        (``accept_trigger``); otherwise a plain caret insert. Recents are pushed
-        by the palette's ``_recent_hook`` after this returns."""
+        Routes to the canvas's ``accept_trigger`` (which deletes the trigger+query
+        chars) ONLY when a genuinely-live inline trigger is in play
+        (:meth:`_motd_trigger_range_is_live`); otherwise a plain caret insert. The
+        range is consumed either way. Recents are pushed by the palette's
+        ``_recent_hook`` after this returns."""
         kind = getattr(item, "kind", "")
         if not kind or kind.startswith("action:"):
             return
@@ -9911,14 +9954,8 @@ class FCToolGUI:
             return
         params = dict(getattr(item, "params", {}) or {})
         rng = getattr(self, "_motd_trigger_range", None)
-        use_trigger = False
-        if rng is not None:
-            try:
-                use_trigger = cv.text.get(rng[0], f"{rng[0]}+1c") in ("@", "/")
-            except Exception:
-                use_trigger = False
-        self._motd_trigger_range = None
-        if use_trigger:
+        self._motd_trigger_range = None                # consumed either way
+        if self._motd_trigger_range_is_live(cv, rng):
             cv.accept_trigger(rng, kind, params)
         else:
             cv.insert_token_at_caret(kind, params)
@@ -10975,6 +11012,10 @@ class FCToolGUI:
         self._motd_refresh_doctrines()
         if name in (self._motd_doctrine_combo["values"] or ()):
             self._motd_doctrine_var.set(name)
+            # Keep the doctrine switch-guard baseline in step (as _apply_motd_fields
+            # / _motd_palette_switch_doctrine do) so a later user switch is gated
+            # against the right previous value.
+            self._motd_doctrine_prev = name
         self._motd_on_doctrine_change()
 
         # Parse the imported MOTD and POPULATE the builder fields so the captured
@@ -11469,15 +11510,25 @@ class FCToolGUI:
 
     def _motd_snapshot_fleet_members(self):
         """Refresh ``self._motd_fleet_members_cache`` from the last live-fleet poll
-        snapshot (``_last_specialized_args``) — read-only, NO new ESI polling. Each
-        entry is ``{"name": str, "id": int}``; empty when there is no snapshot."""
+        snapshot (``_last_specialized_args``) for the palette's character provider.
+
+        Pre-warm invariant (Tk-thread safety): ``_update_specialized_roles`` runs
+        on the Tk thread and resolves every valid member's name — warming
+        zkill_monitor's PERMANENT name cache — in the same call that publishes
+        ``_last_specialized_args``, so by the time this reads that snapshot the
+        names are already cached. To GUARANTEE this never resolves an uncached name
+        on the Tk thread (a ``resolve_name`` cache miss does a blocking ESI
+        round-trip that would freeze the UI), it reads the permanent cache DIRECTLY
+        and SKIPS any member whose name is not yet cached. Read-only; NO new ESI
+        polling; empty when there is no snapshot. Each entry is
+        ``{"name": str, "id": int}``."""
         out = []
         cached = getattr(self, "_last_specialized_args", None)
         if cached:
             try:
-                from zkill_monitor import resolve_name as _rn
+                from zkill_monitor import _name_cache as _nc
             except Exception:
-                _rn = None
+                _nc = {}
             members = cached[0] if cached else []
             seen = set()
             for m in (members or []):
@@ -11485,10 +11536,7 @@ class FCToolGUI:
                 if not cid or cid in seen:
                     continue
                 seen.add(cid)
-                try:
-                    nm = _rn(cid, "character") if _rn else ""
-                except Exception:
-                    nm = ""
+                nm = _nc.get(("character", cid))     # permanent cache only — never resolve
                 if nm:
                     out.append({"name": nm, "id": cid})
         self._motd_fleet_members_cache = out
