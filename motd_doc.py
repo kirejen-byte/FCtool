@@ -467,7 +467,9 @@ def from_legacy_fields(saved: dict) -> Doc:
     enabled + named · ``doctrine_line`` · a ``tag_line`` per saved tag ·
     ``channel_line("Logi", …)`` iff a channel · footer runs. The saved ``fits``
     fallback pairs are carried separately (as ``ctx.legacy_fits``) and only fire
-    when every tag_line resolves empty (see :func:`resolve`).
+    when every tag_line resolves empty (see :func:`resolve`); a tag-less template
+    that still has saved fits gets one synthetic ``Fits`` tag_line so that
+    fallback has an anchor to render at.
     """
     units: list = []
     header = _runs_from_markup(saved.get("header", "") or "")
@@ -477,8 +479,19 @@ def from_legacy_fields(saved: dict) -> Doc:
     if saved.get("staging_enabled") and (saved.get("staging") or ""):
         units.append([TokenRun("staging_line", {"name": saved.get("staging", "")})])
     units.append([TokenRun("doctrine_line", {})])
-    for tag in saved.get("tags", []) or []:
-        units.append([TokenRun("tag_line", {"tag": tag})])
+    tags = saved.get("tags", []) or []
+    if tags:
+        for tag in tags:
+            units.append([TokenRun("tag_line", {"tag": tag})])
+    elif saved.get("fits"):
+        # A tag-less v1 template with saved fits: without a tag_line the
+        # resolve-time legacy_fits fallback (see :func:`resolve`) has no anchor
+        # and the "Fits:" line is silently lost. Emit one synthetic "Fits" anchor
+        # tag_line here (where the per-tag lines would have gone). The doctrine
+        # has no "Fits" tag so this tag_line resolves empty and the fallback
+        # renders "Fits: <links>" at this position — byte-parity with today's
+        # {"Fits": loaded} fallback.
+        units.append([TokenRun("tag_line", {"tag": "Fits"})])
     channel = saved.get("channel") or ""
     if channel:
         units.append([TokenRun("channel_line", {"label": "Logi", "name": channel})])
