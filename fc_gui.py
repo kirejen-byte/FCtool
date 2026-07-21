@@ -89,6 +89,10 @@ import fit_dna
 import pyfa_import
 import motd_builder
 import motd_markup
+import motd_doc
+import motd_palette
+import pill_canvas
+import system_coords
 from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running
 from eveo_overlay import OverlayWindow
@@ -1136,7 +1140,7 @@ class FCToolGUI:
                     labels[dest_name] = f"{dest_name} ({dest_region})"
             all_names.sort()
 
-        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_motd_staging_entry', '_market_staging_entry']:
+        for attr in ['_range_origin', '_range_dest', '_wh_origin', '_wh_dest', '_staging_entry', '_range_add_entry', '_market_staging_entry']:
             widget = getattr(self, attr, None)
             if widget and hasattr(widget, 'update_completions'):
                 widget.update_completions(all_names, labels)
@@ -8091,13 +8095,14 @@ class FCToolGUI:
             self._motd_sync_staging_default()
             self._motd_refresh_doctrines()
             self._motd_refresh_fc_choices()
-            # Rebuild the include-tag checkboxes and preview from the selected
-            # doctrine's CURRENT members. Fixing a doctrine in the Doctrines tab
-            # (adding ships, or tagging previously-untagged ones) is reflected
-            # the next time the MOTD tab is shown, instead of staying blank.
-            # Done directly (not via _motd_on_doctrine_change) so any explicitly
-            # loaded-fits fallback from a linked MOTD is preserved.
-            self._motd_rebuild_tag_checkboxes()
+            # Re-resolve the doctrine-bound pills + Quick-Add tray from the
+            # selected doctrine's CURRENT members, then rebuild the preview.
+            # Fixing a doctrine in the Doctrines tab (adding ships, or tagging
+            # previously-untagged ones) is reflected the next time the MOTD tab
+            # is shown. The loaded-fits fallback is preserved (not cleared here).
+            pal = getattr(self, "_motd_palette", None)
+            if pal is not None:
+                pal.refresh_tray()
             self._rebuild_motd_preview()
             # Run the fleet-boss check automatically on MOTD-tab open so the
             # Set button enables without the user clicking "Refresh fleet".
@@ -9481,203 +9486,140 @@ class FCToolGUI:
     _MOTD_FC_BLANK = "(leave blank)"
 
     def _build_motd_subtab(self):
-        """MOTD writer: compose a fleet MOTD from a doctrine (FC link, doctrine
-        name, role-grouped clickable fit links, optional logi channel + free
-        header/footer), preview it live with a length-budget meter, and either
-        set it on the active character's fleet (boss-only) or copy the markup.
-        Also imports an existing fleet MOTD back into the tool.
-
-        Tasks 7.1 (inputs + channel picker), 7.2 (preview/meter/set/copy) and
-        7.3 (import current MOTD + save/restore template)."""
+        """MOTD writer: compose a fleet MOTD on a free-form *pill canvas* — rich
+        text interleaved with live tokens (FC / staging / doctrine / tag / channel
+        / fit / char / system pills) that re-resolve on every compose — driven by
+        an "add anything" palette + Quick-Add tray. Named per-doctrine templates
+        (v1 saves auto-migrate); the right rail (RAW/RENDERED previews, budget
+        meter, warnings, Set/Copy/Clear/Refresh, auto-update row, fleet status) is
+        unchanged. See docs/superpowers/specs/2026-07-21-motd-composer-redesign-design.md."""
         tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
         self._fitting_subnb.add(tab, text="  MOTD  ")
 
-        # Per-tag include vars, keyed by tag name (rebuilt on doctrine change).
-        self._motd_tag_vars: dict[str, tk.BooleanVar] = {}
         self._motd_preview_job = None        # pending root.after debounce id
         self._motd_set_btn = None
         self._motd_fleet_id = None           # resolved active-FC fleet id
         self._motd_is_boss = False
         # FALLBACK source of fit links (a list of (dna, name) tuples, or None),
-        # used ONLY when the tag-based fits are empty (e.g. a tagless imported
-        # doctrine). Cleared on doctrine change / tag toggle so editing reverts
-        # to live tag-based fits; restored by _apply_motd_fields after the
-        # doctrine-change clear. See _current_motd_markup / _capture_motd_fields.
+        # used ONLY when the doc's tag_lines resolve empty (e.g. a tagless
+        # imported doctrine). Carried in a v2 template as ``legacy_fits``.
         self._motd_loaded_fits = None
+        # Live-fleet roster snapshot for the palette's character provider —
+        # populated read-only from the last fleet poll (no new polling); empty
+        # when stale. Each entry is {"name": str, "id": int}.
+        self._motd_fleet_members_cache = []
+        # Template dirty tracking (composer state vs the loaded/saved snapshot).
+        self._motd_template_dirty = False
+        self._motd_loaded_template_snapshot = None
+        self._motd_doctrine_prev = ""
+        self._motd_saved_prev = self._MOTD_SAVED_BLANK
+        self._motd_trigger_range = None      # active inline-trigger (@ / /) range
+        self._motd_ctx = None                # ResolveContext shared per preview cycle
+        # Remembered staging auto-fill value so _motd_sync_staging_default can tell
+        # "field still holds the global default" from "user/template owns it".
+        self._motd_staging_autofilled_value = (
+            self.config.get("zkillboard", {}).get("staging_system", "") or "").strip()
 
-        # Linked-MOTD auto-push state. The link is deliberately session-scoped:
-        # restoring it across restarts caused the app to push a freshly-opened
-        # (default) MOTD over the fleet's real one at startup, so it always
-        # starts OFF regardless of any persisted "motd_link" value.
+        # Linked-MOTD auto-push state (session-scoped; always OFF at startup).
         self._motd_link_enabled = _motd_link_initial_state(self.config)
-        self._motd_last_push_ts = None          # time.monotonic() of last successful push
-        self._motd_last_check_ts = None         # time.monotonic() of last auto-update check
-        self._motd_last_pushed_markup = None    # for change-detection (no redundant writes)
-        self._motd_link_state = "off"           # off|waiting|ok|not_boss|overbudget|error|left_staging
+        self._motd_last_push_ts = None
+        self._motd_last_check_ts = None
+        self._motd_last_pushed_markup = None
+        self._motd_link_state = "off"
 
-        # ── Master split: inputs (left) | preview (right) ────────────────────
+        # ── Master split: composer (left) | preview (right) ──────────────────
         body = tk.Frame(tab, bg=BG_DARK)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         body.columnconfigure(0, weight=2, uniform="motd")
         body.columnconfigure(1, weight=3, uniform="motd")
         body.rowconfigure(0, weight=1)
 
-        # Left: scrollable inputs panel.
+        # Left: context strip + palette + pill canvas.
         left = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
                         highlightbackground=BORDER_COLOR, highlightthickness=1)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-
-        in_canvas = tk.Canvas(left, bg=BG_PANEL, highlightthickness=0)
-        in_canvas.grid(row=0, column=0, sticky="nsew")
-        in_sb = ttk.Scrollbar(left, orient="vertical", command=in_canvas.yview)
-        in_sb.grid(row=0, column=1, sticky="ns")
-        in_canvas.configure(yscrollcommand=in_sb.set)
-        self._register_scroll_canvas(in_canvas)
-
-        inputs = tk.Frame(in_canvas, bg=BG_PANEL)
-        _in_win = in_canvas.create_window((0, 0), window=inputs, anchor="nw")
-        inputs.bind("<Configure>",
-                    lambda e: in_canvas.configure(
-                        scrollregion=in_canvas.bbox("all")))
-        in_canvas.bind("<Configure>",
-                       lambda e: in_canvas.itemconfig(_in_win, width=e.width))
 
         def _lbl(parent, text):
             return tk.Label(parent, text=text, font=("Consolas", 9, "bold"),
                             fg=FG_ACCENT, bg=BG_PANEL)
 
-        # Doctrine dropdown.
-        _lbl(inputs, "DOCTRINE").pack(anchor=tk.W, padx=8, pady=(8, 2))
+        cstrip = tk.Frame(left, bg=BG_PANEL)
+        cstrip.pack(fill=tk.X, padx=8, pady=(8, 2))
+
+        _lbl(cstrip, "DOCTRINE").pack(anchor=tk.W)
         self._motd_doctrine_var = tk.StringVar()
         self._motd_doctrine_combo = ttk.Combobox(
-            inputs, textvariable=self._motd_doctrine_var, state="readonly",
+            cstrip, textvariable=self._motd_doctrine_var, state="readonly",
             font=("Consolas", 10))
-        self._motd_doctrine_combo.pack(fill=tk.X, padx=8)
+        self._motd_doctrine_combo.pack(fill=tk.X)
         self._motd_doctrine_combo.bind(
-            "<<ComboboxSelected>>", self._motd_on_doctrine_change)
+            "<<ComboboxSelected>>", self._motd_on_doctrine_selected)
 
-        # Linked (saved) MOTD dropdown: lists the saved MOTDs attached to the
-        # currently-selected doctrine; picking one re-applies its saved fields.
-        _lbl(inputs, "MOTD TEMPLATE").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        saved_row = tk.Frame(inputs, bg=BG_PANEL)
-        saved_row.pack(fill=tk.X, padx=8)
+        _lbl(cstrip, "FC / ANCHOR").pack(anchor=tk.W, pady=(8, 0))
+        self._motd_fc_var = tk.StringVar()
+        self._motd_fc_combo = ttk.Combobox(
+            cstrip, textvariable=self._motd_fc_var, state="readonly",
+            font=("Consolas", 10))
+        self._motd_fc_combo.pack(fill=tk.X)
+        self._motd_fc_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_motd_fc_change())
+
+        _lbl(cstrip, "MOTD TEMPLATE").pack(anchor=tk.W, pady=(8, 0))
+        trow = tk.Frame(cstrip, bg=BG_PANEL)
+        trow.pack(fill=tk.X)
         self._motd_saved_var = tk.StringVar()
         self._motd_saved_combo = ttk.Combobox(
-            saved_row, textvariable=self._motd_saved_var, state="readonly",
+            trow, textvariable=self._motd_saved_var, state="readonly",
             font=("Consolas", 10))
         self._motd_saved_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._motd_saved_combo.bind(
             "<<ComboboxSelected>>", self._on_saved_motd_change)
-        ttk.Button(saved_row, text="Rename", style="Dark.TButton", width=7,
-                   command=self._rename_linked_motd).pack(side=tk.LEFT,
-                                                          padx=(5, 0))
-        ttk.Button(saved_row, text="Delete", style="Red.TButton", width=7,
-                   command=self._delete_linked_motd).pack(side=tk.LEFT,
-                                                          padx=(5, 0))
+        self._motd_dirty_label = tk.Label(
+            trow, text="", font=("Consolas", 12, "bold"), fg=FG_YELLOW,
+            bg=BG_PANEL, width=2)
+        self._motd_dirty_label.pack(side=tk.LEFT)
 
-        # FC / Anchor dropdown.
-        _lbl(inputs, "FC / ANCHOR").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_fc_var = tk.StringVar()
-        self._motd_fc_combo = ttk.Combobox(
-            inputs, textvariable=self._motd_fc_var, state="readonly",
-            font=("Consolas", 10))
-        self._motd_fc_combo.pack(fill=tk.X, padx=8)
-        self._motd_fc_combo.bind(
-            "<<ComboboxSelected>>", lambda e: self._on_motd_fc_change())
-
-        # Staging system (optional, checkbox-gated). Defaults to the FC's
-        # configured staging system (zkillboard.staging_system, a system NAME);
-        # the box is pre-checked when one is configured. Produces an in-game
-        # SYSTEM link in the MOTD. Mirrors the logi/cap channel row below.
-        _default_staging = self.config.get("zkillboard", {}).get(
-            "staging_system", "") or ""
-        self._motd_staging_enabled = tk.BooleanVar(
-            value=bool(_default_staging.strip()))
-        self._motd_staging_var = tk.StringVar(value=_default_staging)
-        # Remember the last value we AUTO-applied from the global staging default
-        # so a later refresh can tell "field still holds the default" (safe to
-        # re-sync) from "user typed / a template set it" (never clobber). See
-        # _motd_sync_staging_default. Kept stripped to match its comparison.
-        self._motd_staging_autofilled_value = _default_staging.strip()
-        st_chk = tk.Checkbutton(
-            inputs, text="Include staging system",
-            variable=self._motd_staging_enabled,
-            font=("Consolas", 9, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
-            activebackground=BG_PANEL, activeforeground=FG_ACCENT,
-            selectcolor=BG_ENTRY, anchor=tk.W,
-            command=self._motd_on_staging_toggle)
-        st_chk.pack(anchor=tk.W, padx=6, pady=(10, 2))
-        self._motd_staging_entry = AutocompleteEntry(
-            inputs, list(getattr(self, "_system_names", []) or []),
-            labels=dict(getattr(self, "_system_labels", {}) or {}),
-            textvariable=self._motd_staging_var,
-            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, borderwidth=1, relief=tk.RIDGE)
-        self._motd_staging_entry.pack(fill=tk.X, padx=8)
-        # The StringVar trace covers both typed and programmatic changes; no
-        # separate <KeyRelease> binding needed (and AutocompleteEntry owns it).
-        self._motd_staging_var.trace_add(
-            "write", lambda *a: self._schedule_motd_preview())
-
-        # Logi / cap channel: AutocompleteEntry + Scan.
-        _lbl(inputs, "LOGI / CAP CHANNEL").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        ch_row = tk.Frame(inputs, bg=BG_PANEL)
-        ch_row.pack(fill=tk.X, padx=8)
-        # Seed completions from the shared discovered-channel cache (the full
-        # set, not the noise-filtered intel suggestions) so previously-scanned
-        # channels are available immediately, regardless of tab build order.
-        _cached_channels = (self.config.get("intel_channels", {})
-                            .get("cached_discovered", []) or [])
-        self._motd_channel_entry = AutocompleteEntry(
-            ch_row, list(_cached_channels),
-            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, width=22,
-            borderwidth=1, relief=tk.RIDGE,
-            # Selecting a channel from the dropdown must also refresh the preview
-            # (a dropdown pick doesn't fire <KeyRelease>).
-            on_select=self._schedule_motd_preview)
-        self._motd_channel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        # add="+" so we don't clobber AutocompleteEntry's own <KeyRelease>.
-        self._motd_channel_entry.bind(
-            "<KeyRelease>", lambda e: self._schedule_motd_preview(), add="+")
-        ttk.Button(ch_row, text="Scan", style="Dark.TButton", width=6,
-                   command=self._motd_scan_channels).pack(side=tk.LEFT, padx=(5, 0))
-        self._motd_channel_status = tk.Label(
-            inputs, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
-        self._motd_channel_status.pack(anchor=tk.W, padx=8)
-
-        # Per-tag include checkboxes (rebuilt per doctrine).
-        _lbl(inputs, "INCLUDE FITS").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_tag_frame = tk.Frame(inputs, bg=BG_PANEL)
-        self._motd_tag_frame.pack(fill=tk.X, padx=8)
-
-        # Intro / outro free text — WYSIWYG markup editors (replacing the old
-        # plain header/footer Entrys). Each is a compact toolbar + Text that
-        # serialises to EVE markup via get_markup() / restores via set_markup().
-        # They map to the same saved-MOTD "header"/"footer" keys (now markup).
-        _lbl(inputs, "INTRO (header)").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_intro = MarkupEditor(
-            inputs, height=3, on_change=self._schedule_motd_preview,
-            bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
-            fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
-        self._motd_intro.pack(fill=tk.X, padx=8)
-
-        _lbl(inputs, "OUTRO (footer)").pack(anchor=tk.W, padx=8, pady=(10, 2))
-        self._motd_outro = MarkupEditor(
-            inputs, height=3, on_change=self._schedule_motd_preview,
-            bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
-            fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
-        self._motd_outro.pack(fill=tk.X, padx=8, pady=(0, 4))
-
-        # Save (link to doctrine) + import.
-        tmpl_row = tk.Frame(inputs, bg=BG_PANEL)
-        tmpl_row.pack(fill=tk.X, padx=8, pady=(10, 8))
-        ttk.Button(tmpl_row, text="Link to doctrine", style="Green.TButton",
+        brow = tk.Frame(cstrip, bg=BG_PANEL)
+        brow.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(brow, text="Save", style="Green.TButton", width=6,
+                   command=self._motd_save_template).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(brow, text="Save as…", style="Dark.TButton", width=8,
                    command=self._link_motd_to_doctrine).pack(side=tk.LEFT, padx=2)
-        ttk.Button(tmpl_row, text="Import current MOTD", style="Dark.TButton",
-                   command=self._import_current_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(brow, text="Rename", style="Dark.TButton", width=7,
+                   command=self._rename_linked_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(brow, text="Delete", style="Red.TButton", width=7,
+                   command=self._delete_linked_motd).pack(side=tk.LEFT, padx=2)
+        ttk.Button(brow, text="Reset", style="Dark.TButton", width=6,
+                   command=self._motd_reset_to_default).pack(side=tk.LEFT, padx=2)
+        ttk.Button(brow, text="Import current MOTD", style="Dark.TButton",
+                   command=self._import_current_motd).pack(side=tk.RIGHT)
+
+        # Palette (search bar + Quick-Add tray) then the pill canvas below it.
+        providers = self._motd_build_palette_providers()
+        self._motd_palette = motd_palette.MotdPalette(
+            left, providers,
+            on_insert=self._motd_palette_insert,
+            on_switch_doctrine=self._motd_palette_switch_doctrine,
+            on_rescan_channels=self._motd_scan_channels,
+            on_drag=self._motd_palette_drag)
+        self._motd_palette.pack(fill=tk.X, padx=8, pady=(6, 2))
+        # Persist recents on every insert (bar rows + tray chips route here).
+        self._motd_palette._recent_hook = self._motd_record_recent_item
+
+        self._motd_canvas = pill_canvas.PillCanvas(
+            left,
+            resolve_label=self._motd_resolve_token_label,
+            system_completions=lambda: list(
+                getattr(self, "_system_names", []) or []),
+            system_labels=lambda: dict(
+                getattr(self, "_system_labels", {}) or {}),
+            channel_completions=self._motd_channel_completions,
+            on_change=self._motd_on_canvas_change,
+            on_trigger=self._motd_on_canvas_trigger,
+            height=14,
+            bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
+            fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
+        self._motd_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
 
         # Right: preview + meter + actions.
         right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
@@ -9732,7 +9674,7 @@ class FCToolGUI:
             fg=FG_DIM, bg=BG_PANEL, width=14, anchor=tk.E)
         self._motd_meter_label.grid(row=0, column=1, padx=(6, 0))
 
-        # Non-blocking warnings (over-budget / long link attribute).
+        # Non-blocking warnings (over-budget / long link attribute / stale pills).
         self._motd_warn_label = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_YELLOW, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
@@ -9812,15 +9754,416 @@ class FCToolGUI:
         self._motd_fleet_status.grid(row=6, column=0, sticky="ew", padx=8,
                                      pady=(0, 8))
 
-        # Populate dropdowns, then first preview. The tab opens clean (no sticky
-        # single template); linked MOTDs are loaded on demand from the dropdown.
+        # Populate dropdowns, load the default document, then first preview. The
+        # tab opens on the default doc (never blank); templates load on demand.
         self._motd_refresh_doctrines()
         self._motd_refresh_fc_choices()
-        self._motd_rebuild_tag_checkboxes()
         self._motd_refresh_saved_dropdown()
+        self._motd_doctrine_prev = self._motd_doctrine_var.get()
+        self._motd_canvas.set_doc(self._motd_default_doc())
+        self._motd_template_dirty = False
+        self._motd_loaded_template_snapshot = None
+        self._motd_update_dirty_indicator()
+        self._motd_palette.refresh_tray()
         self._rebuild_motd_preview()
         self._motd_link_tick()
         self._motd_autopush_loop()
+
+    # ── MOTD: pill-canvas composer wiring (Task 4) ────────────────────────────
+
+    def _motd_default_doc(self):
+        """The fresh-tab document: staging default from config, remembered logi
+        channel from config (both may be empty)."""
+        staging = (self.config.get("zkillboard", {})
+                   .get("staging_system", "") or "")
+        channel = (self.config.get("fittings", {}).get("logi_channel", "") or "")
+        return motd_doc.default_doc(staging_name=staging, channel=channel)
+
+    def _motd_channel_completions(self):
+        """Channel names for the pill param editors — the shared discovered cache."""
+        return list(self.config.get("intel_channels", {})
+                    .get("cached_discovered", []) or [])
+
+    def _motd_build_resolve_context(self):
+        """Assemble a fresh :class:`motd_doc.ResolveContext` from the live seams.
+
+        ``fits_by_tag`` is memoised per (compact) bool so a single compose pass
+        that resolves several tag_lines only assembles the doctrine's fits once."""
+        doctrine = self._motd_selected_doctrine()
+        _fbt_cache = {}
+
+        def fits_by_tag(compact):
+            if compact not in _fbt_cache:
+                _fbt_cache[compact] = self._motd_build_fits_by_tag(
+                    doctrine, compact=compact)
+            return _fbt_cache[compact]
+
+        def parse_fit(dna):
+            try:
+                return fit_parser.parse_dna(dna, self.type_catalog).fit
+            except Exception:
+                return None
+
+        fc_auth = self._motd_selected_fc_auth()
+        fc_selected = ((fc_auth.character_id, fc_auth.character_name)
+                       if fc_auth else None)
+        return motd_doc.ResolveContext(
+            selected_doctrine=doctrine,
+            fits_by_tag=fits_by_tag,
+            deltas=self._motd_fit_deltas(),
+            canonical_dna=self._canonical_fit_dna,
+            parse_fit=parse_fit,
+            resolve_system=system_coords.resolve_name,
+            resolve_channel_id=self._motd_resolve_channel_id,
+            fc_selected=fc_selected,
+            legacy_fits=self._motd_loaded_fits,
+        )
+
+    def _motd_resolve_token_label(self, run):
+        """PillCanvas ``resolve_label``: the chip's live label for ``run``.
+
+        Reuses the per-cycle ctx (``self._motd_ctx``) when one is active (a
+        preview rebuild) so the ideal-fleet deltas are computed once per refresh,
+        not once per pill; builds a fresh ctx otherwise."""
+        ctx = getattr(self, "_motd_ctx", None) or self._motd_build_resolve_context()
+        return motd_doc.token_label(run, ctx)
+
+    def _motd_refresh_canvas_pills(self):
+        """Re-resolve every pill in place under a single shared ctx."""
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is None:
+            return
+        prev = getattr(self, "_motd_ctx", None)
+        self._motd_ctx = self._motd_build_resolve_context()
+        try:
+            cv.refresh_pills()
+        finally:
+            self._motd_ctx = prev
+
+    # ── dirty tracking + confirm ──────────────────────────────────────────────
+
+    def _motd_update_dirty_indicator(self):
+        lbl = getattr(self, "_motd_dirty_label", None)
+        if lbl is not None:
+            try:
+                lbl.config(text="•" if getattr(self, "_motd_template_dirty",
+                                                False) else "")
+            except tk.TclError:
+                pass
+
+    def _motd_mark_dirty(self):
+        self._motd_template_dirty = True
+        self._motd_update_dirty_indicator()
+
+    def _motd_on_canvas_change(self):
+        """PillCanvas ``on_change`` — a USER edit (set_doc is silent). Marks the
+        template dirty and schedules a debounced preview/pill refresh."""
+        self._motd_mark_dirty()
+        self._schedule_motd_preview()
+
+    def _motd_confirm(self, title, message):
+        try:
+            return bool(messagebox.askyesno(title, message))
+        except Exception:
+            return True
+
+    def _motd_confirm_discard_if_dirty(self):
+        """Return True to proceed (nothing dirty, or the user OK'd discarding)."""
+        if not getattr(self, "_motd_template_dirty", False):
+            return True
+        return self._motd_confirm("Discard changes?",
+                                  "Discard unsaved MOTD changes?")
+
+    def _motd_reset_to_default(self):
+        """'Reset' button: confirm, then load the default document (marks dirty)."""
+        if not self._motd_confirm(
+                "Reset MOTD",
+                "Reset the composer to the default MOTD? Unsaved changes to the "
+                "current composition will be lost."):
+            return
+        self._motd_canvas.set_doc(self._motd_default_doc())
+        self._motd_mark_dirty()
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.refresh_tray()
+        self._schedule_motd_preview()
+
+    # ── inline trigger + drag/insert routing ──────────────────────────────────
+
+    def _motd_on_canvas_trigger(self, mode, anchor, query_range):
+        """Canvas fired an inline @/ / trigger: open the palette at the caret."""
+        self._motd_trigger_range = query_range
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.open_at_caret(mode, anchor)
+
+    def _motd_palette_insert(self, item):
+        """Palette/tray row accepted → insert its token at the caret.
+
+        In inline-trigger mode the canvas deletes the trigger+query chars itself
+        (``accept_trigger``); otherwise a plain caret insert. Recents are pushed
+        by the palette's ``_recent_hook`` after this returns."""
+        kind = getattr(item, "kind", "")
+        if not kind or kind.startswith("action:"):
+            return
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is None:
+            return
+        params = dict(getattr(item, "params", {}) or {})
+        rng = getattr(self, "_motd_trigger_range", None)
+        use_trigger = False
+        if rng is not None:
+            try:
+                use_trigger = cv.text.get(rng[0], f"{rng[0]}+1c") in ("@", "/")
+            except Exception:
+                use_trigger = False
+        self._motd_trigger_range = None
+        if use_trigger:
+            cv.accept_trigger(rng, kind, params)
+        else:
+            cv.insert_token_at_caret(kind, params)
+
+    def _motd_palette_drag(self, item, x_root, y_root, phase):
+        """Palette/tray drag phases → the canvas drop-caret + drop APIs."""
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is None:
+            return
+        if phase == "motion":
+            cv.drag_feedback(x_root, y_root)
+        elif phase == "drop":
+            if getattr(item, "kind", "").startswith("action:"):
+                cv.cancel_drag_feedback()
+                return
+            ok = cv.drop_at_pointer(item.kind, dict(item.params or {}),
+                                    x_root, y_root)
+            if ok:                                   # a drop outside = no recents
+                self._motd_record_recent(item.kind, item.params, item.label)
+        elif phase == "cancel":
+            cv.cancel_drag_feedback()
+
+    def _motd_palette_switch_doctrine(self, name):
+        """A Doctrines palette row switches the doctrine combo (no pill insert)."""
+        combo = getattr(self, "_motd_doctrine_combo", None)
+        if combo is None or name not in (combo["values"] or ()):
+            return
+        if not self._motd_confirm_discard_if_dirty():
+            return
+        self._motd_doctrine_var.set(name)
+        self._motd_doctrine_prev = name
+        self._motd_on_doctrine_change()
+        self._motd_mark_dirty()
+
+    # ── recents ───────────────────────────────────────────────────────────────
+
+    def _motd_record_recent_item(self, item):
+        self._motd_record_recent(getattr(item, "kind", ""),
+                                 getattr(item, "params", {}) or {},
+                                 getattr(item, "label", "") or "")
+
+    def _motd_record_recent(self, kind, params, label):
+        """Push an inserted token onto the MRU recents list (cap 10, dedupe by
+        kind + sorted params); persist + refresh the tray's recent-channel chips."""
+        if not kind or kind.startswith("action:"):
+            return
+        params = dict(params or {})
+        fit_cfg = self.config.setdefault("fittings", {})
+        recents = fit_cfg.setdefault("motd_recent_tokens", [])
+        if not isinstance(recents, list):
+            recents = []
+            fit_cfg["motd_recent_tokens"] = recents
+
+        def _key(k, p):
+            return (k, tuple(sorted((str(a), str(b)) for a, b in (p or {}).items())))
+
+        want = _key(kind, params)
+        recents[:] = [r for r in recents
+                      if _key(r.get("kind"), r.get("params")) != want]
+        recents.insert(0, {"kind": kind, "params": params, "label": label})
+        del recents[10:]
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            try:
+                pal.refresh_tray()
+            except Exception:
+                pass
+
+    # ── palette providers (§6) ────────────────────────────────────────────────
+
+    def _motd_build_palette_providers(self):
+        return motd_palette.PaletteProviders(
+            doctrine_fits=self._motd_palette_doctrine_fits,
+            library_fits=self._motd_palette_library_fits,
+            characters_local=self._motd_palette_characters_local,
+            systems=self._motd_palette_systems,
+            channels=self._motd_palette_channels,
+            doctrines=self._motd_palette_doctrines,
+            lines_blocks=self._motd_palette_lines_blocks,
+            recents=self._motd_palette_recents,
+            esi_char_search=self._motd_palette_esi_char_search,
+            ui_post=self._post_ui,
+        )
+
+    def _motd_fit_palette_label(self, fit):
+        cls = self._motd_fit_compact_label(fit)
+        name = (getattr(fit, "name", "") or "").strip()
+        return f"{cls} — {name}" if name and name != cls else cls
+
+    def _motd_palette_doctrine_fits(self):
+        d = self._motd_selected_doctrine()
+        if d is None:
+            return []
+        out = []
+        for mem in d.members:
+            fit = self.fittings.get_fit(mem.fit_id)
+            if fit is None or not fit.dna:
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind="fit",
+                params={"dna": self._canonical_fit_dna(fit.dna, fit.parsed),
+                        "name": fit.name or self._motd_fit_compact_label(fit)},
+                label=self._motd_fit_palette_label(fit),
+                meta=", ".join(mem.tags or []), group="Doctrine fits"))
+        return out
+
+    def _motd_palette_library_fits(self, query):
+        q = (query or "").lower()
+        out = []
+        for fit in self.fittings.list_fits():
+            if not fit.dna:
+                continue
+            label = self._motd_fit_palette_label(fit)
+            if q and q not in label.lower():
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind="fit",
+                params={"dna": self._canonical_fit_dna(fit.dna, fit.parsed),
+                        "name": fit.name or self._motd_fit_compact_label(fit)},
+                label=label, meta="", group="Fittings"))
+            if len(out) >= 20:
+                break
+        return out
+
+    def _motd_palette_characters_local(self, query):
+        """Local character rows: authed accounts, then the live fleet roster
+        snapshot, then role-tracker names — de-duped by name in that priority."""
+        q = (query or "").lower()
+        seen = set()
+        out = []
+
+        def _add(name, cid, meta):
+            if not name:
+                return
+            key = name.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            if q and q not in key:
+                return
+            out.append(motd_palette.PaletteItem(
+                kind="char", params={"id": cid, "name": name},
+                label=name, meta=meta, group="Characters"))
+
+        for a in getattr(self, "esi_accounts", []) or []:
+            _add(getattr(a, "character_name", None),
+                 getattr(a, "character_id", None), "authed")
+        for m in getattr(self, "_motd_fleet_members_cache", []) or []:
+            _add(m.get("name"), m.get("id"), "fleet")
+        for name in (self.config.get("cached_tracked_characters", []) or []):
+            _add(name, None, "tracked")
+        return out
+
+    def _motd_palette_systems(self, query):
+        q = (query or "").lower()
+        if not q:
+            return []
+        labels = getattr(self, "_system_labels", {}) or {}
+        out = []
+        for name in getattr(self, "_system_names", []) or []:
+            if q not in name.lower():
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind="system", params={"name": name},
+                label=name, meta=labels.get(name, ""), group="Systems"))
+            if len(out) >= 20:
+                break
+        return out
+
+    def _motd_palette_channels(self, query):
+        """Channel rows, recents-first (recent MOTD channel tokens ahead of the
+        rest of the discovered-channel cache)."""
+        q = (query or "").lower()
+        cached = list(self.config.get("intel_channels", {})
+                      .get("cached_discovered", []) or [])
+        recent_names = []
+        for tok in (self.config.get("fittings", {})
+                    .get("motd_recent_tokens", []) or []):
+            if tok.get("kind") in ("channel", "channel_line"):
+                nm = (tok.get("params") or {}).get("name")
+                if nm and nm not in recent_names:
+                    recent_names.append(nm)
+        ordered = recent_names + [c for c in cached if c not in recent_names]
+        out = []
+        for name in ordered:
+            if q and q not in name.lower():
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind="channel", params={"name": name},
+                label=name, meta="", group="Channels"))
+        return out
+
+    def _motd_palette_doctrines(self, query):
+        q = (query or "").lower()
+        out = []
+        for d in self.fittings.list_doctrines():
+            name = d.name or ""
+            if not name or (q and q not in name.lower()):
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind=motd_palette.ACTION_SWITCH, params={"name": name},
+                label=name, meta="switch doctrine", group="Doctrines"))
+        return out
+
+    def _motd_palette_lines_blocks(self):
+        defs = [
+            ("fc_line", {"source": "selected"}, "FC line", "line"),
+            ("staging_line", {"name": ""}, "Staging line", "line"),
+            ("doctrine_line", {}, "Doctrine line", "line"),
+            ("tag_line", {"tag": "DPS"}, "Tag line: DPS", "line"),
+            ("tag_line", {"tag": "Logi"}, "Tag line: Logi", "line"),
+            ("tag_line", {"tag": "Links"}, "Tag line: Links", "line"),
+            ("channel_line", {"label": "Logi", "name": ""}, "Channel line", "line"),
+            ("doctrine_block", {}, "Doctrine block", "block"),
+        ]
+        return [motd_palette.PaletteItem(kind=k, params=dict(p), label=lbl,
+                                         meta=meta, group="Lines & blocks")
+                for k, p, lbl, meta in defs]
+
+    def _motd_palette_recents(self):
+        out = []
+        for tok in (self.config.get("fittings", {})
+                    .get("motd_recent_tokens", []) or []):
+            kind = tok.get("kind", "")
+            if not kind:
+                continue
+            out.append(motd_palette.PaletteItem(
+                kind=kind, params=dict(tok.get("params") or {}),
+                label=tok.get("label", "") or "", meta="recent", group="Recent"))
+        return out
+
+    def _motd_palette_esi_char_search(self, query):
+        """Blocking ESI character search (the palette threads it). Never raises —
+        ``search_entities`` returns [] on no-auth / missing scope / any error."""
+        auth = getattr(self, "esi_auth", None)
+        if auth is None:
+            return []
+        try:
+            return auth.search_entities(query, ("character",))
+        except Exception:
+            return []
 
     # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
 
@@ -10140,151 +10483,74 @@ class FCToolGUI:
                 return a
         return None
 
+    def _motd_on_doctrine_selected(self, event=None):
+        """The doctrine combo was changed by the USER: dirty-gate (prompt to
+        discard unsaved changes; revert the combo on cancel), then commit."""
+        new = self._motd_doctrine_var.get()
+        if new == getattr(self, "_motd_doctrine_prev", new):
+            return
+        if not self._motd_confirm_discard_if_dirty():
+            self._motd_doctrine_var.set(getattr(self, "_motd_doctrine_prev", ""))
+            return
+        self._motd_doctrine_prev = new
+        self._motd_on_doctrine_change()
+        self._motd_mark_dirty()
+
     def _motd_on_doctrine_change(self, event=None):
-        """Doctrine changed: rebuild the per-tag checkboxes from its tags,
-        refresh the linked-MOTD dropdown for the new doctrine, and refresh the
-        preview.
+        """Doctrine changed: refresh the linked-MOTD dropdown + Quick-Add tray for
+        the new doctrine and re-resolve the doctrine-bound pills + preview.
 
-        Changing the doctrine invalidates any explicit loaded-fits fallback
-        (those belonged to the previously-loaded MOTD), so it is cleared here.
-        ``_apply_motd_fields`` calls this first and re-sets the loaded fits
-        AFTER, so loading a saved MOTD survives this clear."""
+        Changing the doctrine invalidates any explicit loaded-fits fallback (those
+        belonged to the previously-loaded MOTD), so it is cleared here.
+        ``_apply_motd_fields`` restores the loaded fits AFTER its own refreshes, so
+        loading a saved MOTD survives this clear."""
         self._motd_loaded_fits = None
-        self._motd_rebuild_tag_checkboxes()
         self._motd_refresh_saved_dropdown()
-        self._rebuild_motd_preview()
-
-    def _on_motd_fc_change(self):
-        """FC changed: re-resolve fleet/boss status (changes which fleet the
-        Set button targets) and refresh the preview's FC line."""
-        self._motd_refresh_fleet_status()
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.refresh_tray()
+        self._motd_refresh_canvas_pills()
         self._schedule_motd_preview()
 
-    def _motd_on_staging_toggle(self):
-        """Checkbox toggle for 'Include staging system'.
-
-        When enabled and the staging entry is empty, auto-populate it with the
-        user's designated staging system (config zkillboard.staging_system) so the
-        preview reflects it without the user typing/selecting anything. Setting the
-        StringVar fires its write-trace, which schedules the preview; the explicit
-        schedule below covers the disable case (and a no-fill enable)."""
-        if (getattr(self, "_motd_staging_enabled", None) is not None
-                and self._motd_staging_enabled.get()):
-            cur = (self._motd_staging_var.get() or "").strip()
-            if not cur:
-                designated = (self.config.get("zkillboard", {})
-                              .get("staging_system", "") or "").strip()
-                if designated:
-                    self._motd_staging_var.set(designated)
-                    # This auto-fill IS the global default → track it so a later
-                    # global change still re-syncs (and so it isn't mistaken for
-                    # a manual entry).
-                    self._motd_staging_autofilled_value = designated
+    def _on_motd_fc_change(self):
+        """FC changed: re-resolve fleet/boss status (changes which fleet the Set
+        button targets), re-resolve the FC pill, and mark the template dirty."""
+        self._motd_mark_dirty()
+        self._motd_refresh_fleet_status()
+        self._motd_refresh_canvas_pills()
         self._schedule_motd_preview()
 
     def _motd_sync_staging_default(self):
-        """Re-sync the MOTD staging field to the global default (config
-        ``zkillboard.staging_system``) when the field still holds the last
-        auto-applied default — i.e. the user hasn't typed their own value and no
-        template/import has set one. Called on MOTD-tab show so a staging system
-        configured (or changed) in Settings AFTER this tab was built is reflected
-        without an app restart.
+        """Re-sync the composer's staging pill to the global default (config
+        ``zkillboard.staging_system``) when it still holds the last auto-applied
+        default — i.e. neither the user nor a template has set its own value.
+        Called on MOTD-tab show so a staging system configured (or changed) in
+        Settings after this tab was built is reflected without a restart.
 
-        Priority is preserved: a manual entry or a template-defined staging (any
-        value other than the remembered auto value) is never clobbered — only a
-        still-default field is refreshed, and only when the global value actually
-        changed (a no-op otherwise). The include-checkbox is nudged to match only
-        when it, too, is still in its auto state (so a deliberate user toggle is
-        respected)."""
-        var = getattr(self, "_motd_staging_var", None)
-        if var is None:
+        Never clobbers user/template input: only the FIRST ``staging_line`` pill
+        whose name equals the remembered auto value is retargeted, and only when
+        the global value actually changed (a no-op otherwise)."""
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is None:
             return
         new_default = (self.config.get("zkillboard", {})
                        .get("staging_system", "") or "").strip()
         last_auto = getattr(self, "_motd_staging_autofilled_value", "")
-        try:
-            cur = (var.get() or "").strip()
-        except tk.TclError:
-            return
-        if cur != last_auto:
-            return  # user- or template-owned — never clobber
-        if new_default == cur:
-            return  # already current — no-op
-        enabled = getattr(self, "_motd_staging_enabled", None)
-        checkbox_auto = False
-        if enabled is not None:
-            try:
-                checkbox_auto = (bool(enabled.get()) == bool(last_auto))
-            except tk.TclError:
-                checkbox_auto = False
+        doc = cv.get_doc()
+        cur = motd_doc.first_staging_name(doc)
+        if cur is None:
+            return                       # no staging pill → nothing to re-sync
+        if (cur or "").strip() != last_auto:
+            return                       # user- or template-owned — never clobber
+        if new_default == (cur or "").strip():
+            return                       # already current — no-op
+        for run in doc:
+            if isinstance(run, motd_doc.TokenRun) and run.kind == "staging_line":
+                run.params = dict(run.params)
+                run.params["name"] = new_default
+                break
         self._motd_staging_autofilled_value = new_default
-        try:
-            var.set(new_default)
-        except tk.TclError:
-            return
-        if enabled is not None and checkbox_auto:
-            try:
-                enabled.set(bool(new_default))
-            except tk.TclError:
-                pass
-
-    def _motd_rebuild_tag_checkboxes(self):
-        """Rebuild the include-tag checkboxes from the selected doctrine's tags.
-
-        Tags present on the doctrine's members (in canonical order, then any
-        extras) each get a checkbox; DPS/Logi/Links default checked. Prior
-        check states are preserved across rebuilds for tags that persist."""
-        frame = getattr(self, "_motd_tag_frame", None)
-        if frame is None:
-            return
-        prev = {t: v.get() for t, v in self._motd_tag_vars.items()}
-        for child in frame.winfo_children():
-            child.destroy()
-        self._motd_tag_vars = {}
-
-        doctrine = self._motd_selected_doctrine()
-        tags: list[str] = []
-        if doctrine is not None:
-            present = set()
-            for mem in doctrine.members:
-                present.update(mem.tags or [])
-            for t in self._DOCTRINE_TAG_ORDER:
-                if t in present:
-                    tags.append(t)
-            for t in sorted(present):
-                if t not in tags:
-                    tags.append(t)
-
-        if not tags:
-            tk.Label(frame, text="(no tagged fits in this doctrine)",
-                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
-                         anchor=tk.W)
-            return
-
-        # Preserve the live check state (prev) across rebuilds, falling back to
-        # the default-on roles for newly-appearing tags. Loading a saved/linked
-        # MOTD applies its tag set afterwards via _apply_motd_fields.
-        for t in tags:
-            if t in prev:
-                default = prev[t]
-            else:
-                default = t in self._MOTD_DEFAULT_TAGS
-            var = tk.BooleanVar(value=default)
-            self._motd_tag_vars[t] = var
-            cb = tk.Checkbutton(
-                frame, text=t, variable=var, font=("Consolas", 10),
-                fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
-                activebackground=BG_PANEL, activeforeground=FG_WHITE,
-                anchor=tk.W, command=self._on_motd_tag_toggle)
-            cb.pack(anchor=tk.W)
-
-    def _on_motd_tag_toggle(self):
-        """A USER toggle of an include-tag checkbox: drop any explicit loaded-fits
-        fallback (the user is now driving the fit set via live tags) and refresh
-        the preview. Only fires on user clicks — the programmatic ``var.set()``
-        in :meth:`_apply_motd_fields` does NOT invoke a Checkbutton command, so a
-        loaded MOTD's explicit fits survive an apply."""
-        self._motd_loaded_fits = None
+        cv.set_doc(doc)                  # silent (no on_change)
         self._schedule_motd_preview()
 
     # ── MOTD: saved (doctrine-linked) MOTDs ───────────────────────────────────
@@ -10298,91 +10564,64 @@ class FCToolGUI:
         return saved if isinstance(saved, list) else []
 
     def _capture_motd_fields(self) -> dict:
-        """Read the current MOTD inputs into a dict (without name/doctrine,
-        which the caller sets). Factored so the save path can be exercised in
-        tests without touching the dialogs."""
-        tags = [t for t, v in self._motd_tag_vars.items() if v.get()]
-        staging_enabled = bool(self._motd_staging_enabled.get()) \
-            if getattr(self, "_motd_staging_enabled", None) is not None else False
-        staging = (self._motd_staging_var.get() or "") \
-            if getattr(self, "_motd_staging_var", None) is not None else ""
-        channel = self._motd_channel_entry.get() \
-            if getattr(self, "_motd_channel_entry", None) is not None else ""
-        # Snapshot the CURRENT fits so a saved MOTD remembers them as a fallback
-        # (e.g. a tagless imported doctrine, whose tags yield nothing). Prefer
-        # the live tag-based fits; fall back to any explicit loaded fits. Stored
-        # as [dna, name] pairs (JSON-friendly lists, not tuples).
-        fits_by_tag = self._motd_build_fits_by_tag(self._motd_selected_doctrine())
-        fits_pairs: list[list] = []
-        for group in fits_by_tag.values():
-            for dna, name in group:
-                fits_pairs.append([dna, name])
-        if not fits_pairs and self._motd_loaded_fits:
-            fits_pairs = [[dna, name] for dna, name in self._motd_loaded_fits]
-        return {
+        """Read the composer into a v2 template payload (without name/doctrine,
+        which the caller sets): the FC selection + the pill-canvas document JSON.
+
+        A loaded-fits fallback (from a v1 template or a tagless import) is carried
+        forward as ``legacy_fits`` so the §4.5 empty-tag_line fallback survives a
+        re-save. Testable — no dialogs."""
+        data = {
             "fc": self._motd_fc_var.get(),
-            "staging_enabled": staging_enabled,
-            "staging": staging,
-            "channel": channel,
-            "header": self._motd_intro.get_markup(),
-            "footer": self._motd_outro.get_markup(),
-            "tags": tags,
-            "fits": fits_pairs,
+            "doc": motd_doc.doc_to_json(self._motd_canvas.get_doc()),
+            "version": 2,
         }
+        if self._motd_loaded_fits:
+            data["legacy_fits"] = [[dna, name]
+                                   for dna, name in self._motd_loaded_fits]
+        return data
 
     def _apply_motd_fields(self, data: dict):
-        """Apply a saved-MOTD dict back onto the builder inputs.
+        """Apply a saved-MOTD dict onto the composer (v1 auto-migrates to a doc).
 
-        Sets the doctrine (rebuilding its tag checkboxes), then the scalar
-        fields, then checks exactly the tags named in ``data['tags']`` (the rest
-        unchecked). Defensive when the saved doctrine no longer exists — the
-        other fields still apply. Schedules a preview refresh at the end."""
+        Sets the doctrine + FC combos (context strip), loads the document — v2
+        ``doc`` JSON, or a v1 legacy-field migration — onto the canvas (silently),
+        restores the loaded-fits fallback, snapshots the loaded state, and clears
+        the dirty flag. Defensive when the saved doctrine no longer exists."""
         if not isinstance(data, dict):
             return
 
-        # Doctrine first so the tag checkboxes reflect the right doctrine.
         doctrine = data.get("doctrine") or ""
         combo = getattr(self, "_motd_doctrine_combo", None)
         if combo is not None and doctrine in (combo["values"] or ()):
             self._motd_doctrine_var.set(doctrine)
-        # Rebuild tag checkboxes for the (possibly changed) doctrine. Use the
-        # full doctrine-change handler so the linked-MOTD dropdown stays in sync.
-        self._motd_on_doctrine_change()
+            self._motd_doctrine_prev = doctrine
+        # Refresh the doctrine-bound UI (template dropdown + tray) WITHOUT the
+        # dirty gate — this is a load, not a user switch.
+        self._motd_refresh_saved_dropdown()
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.refresh_tray()
 
-        # Scalar fields.
         self._motd_fc_var.set(data.get("fc", "") or "")
-        if getattr(self, "_motd_staging_enabled", None) is not None:
-            self._motd_staging_enabled.set(bool(data.get("staging_enabled")))
-        if getattr(self, "_motd_staging_var", None) is not None:
-            self._motd_staging_var.set(data.get("staging", "") or "")
-        entry = getattr(self, "_motd_channel_entry", None)
-        if entry is not None:
-            try:
-                entry.delete(0, tk.END)
-                entry.insert(0, data.get("channel", "") or "")
-            except Exception:
-                pass
-        self._motd_intro.set_markup(data.get("header", "") or "")
-        self._motd_outro.set_markup(data.get("footer", "") or "")
 
-        # Tags: check exactly the saved set, uncheck the rest. Programmatic
-        # var.set() does NOT fire the Checkbutton command, so this does not
-        # clear the loaded fits set just below.
-        want = set(data.get("tags") or [])
-        for t, v in self._motd_tag_vars.items():
-            v.set(t in want)
+        # Build the document: v2 (doc JSON) or a v1 legacy-field migration.
+        if data.get("version") == 2 or "doc" in data:
+            doc = motd_doc.doc_from_json(data.get("doc") or [])
+            legacy = data.get("legacy_fits") or []
+        else:
+            doc = motd_doc.from_legacy_fields(data)
+            legacy = data.get("fits") or []
+        self._motd_loaded_fits = [tuple(x) for x in legacy] or None
+        self._motd_canvas.set_doc(doc)               # silent (no on_change)
 
-        # Explicit loaded fits last: _motd_on_doctrine_change (called above)
-        # cleared self._motd_loaded_fits, so restore the saved MOTD's fits HERE
-        # as the fallback used when the checked tags yield nothing.
-        self._motd_loaded_fits = [
-            tuple(x) for x in (data.get("fits") or [])
-        ] or None
-
+        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
+            self._motd_canvas.get_doc())
+        self._motd_template_dirty = False
+        self._motd_update_dirty_indicator()
         self._schedule_motd_preview()
 
     def _motd_refresh_saved_dropdown(self):
-        """Populate the LINKED MOTD combo with a leading blank plus the names of
+        """Populate the MOTD TEMPLATE combo with a leading blank plus the names of
         saved MOTDs whose doctrine matches the currently-selected doctrine."""
         combo = getattr(self, "_motd_saved_combo", None)
         if combo is None:
@@ -10394,10 +10633,21 @@ class FCToolGUI:
         combo["values"] = values
         if self._motd_saved_var.get() not in values:
             self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
+        # Keep the switch-guard baseline in step with any programmatic reset so a
+        # later user pick of the same name is not mistaken for a no-op.
+        self._motd_saved_prev = self._motd_saved_var.get()
 
     def _on_saved_motd_change(self, event=None):
-        """A linked MOTD was picked: load its saved fields onto the builder."""
+        """A template was picked by the USER: dirty-gate (prompt to discard; revert
+        the combo on cancel), then load its saved fields onto the composer."""
         name = self._motd_saved_var.get()
+        if name == getattr(self, "_motd_saved_prev", name):
+            return
+        if not self._motd_confirm_discard_if_dirty():
+            self._motd_saved_var.set(
+                getattr(self, "_motd_saved_prev", self._MOTD_SAVED_BLANK))
+            return
+        self._motd_saved_prev = name
         if not name or name == self._MOTD_SAVED_BLANK:
             return
         doctrine = self._motd_doctrine_var.get()
@@ -10511,13 +10761,23 @@ class FCToolGUI:
                 text=f"Renamed MOTD template '{name}' to '{new_name}'.",
                 fg=FG_GREEN)
 
+    def _motd_save_template(self):
+        """'Save' button: update the selected template in place, or (when none is
+        selected) fall through to the Save-as… naming flow (``_link_motd_to_doctrine``)."""
+        name = self._motd_saved_var.get()
+        doctrine = self._motd_doctrine_var.get()
+        if not name or name == self._MOTD_SAVED_BLANK:
+            self._link_motd_to_doctrine()
+            return
+        self._save_linked_motd(doctrine, name)
+
     def _save_linked_motd(self, doctrine_name: str, motd_name: str):
-        """Capture the current builder fields and persist them as a saved MOTD
-        linked to ``doctrine_name`` under ``motd_name``.
+        """Capture the composer and persist it as a v2 saved MOTD linked to
+        ``doctrine_name`` under ``motd_name``.
 
         Replaces any existing saved MOTD with the same (doctrine, name); else
-        appends. Persists, then refreshes the linked-MOTD dropdown. Testable —
-        no dialogs."""
+        appends. Persists, refreshes the template dropdown, snapshots the saved
+        state, and clears the dirty flag. Testable — no dialogs."""
         data = self._capture_motd_fields()
         data["name"] = motd_name
         data["doctrine"] = doctrine_name
@@ -10543,6 +10803,12 @@ class FCToolGUI:
             combo = getattr(self, "_motd_saved_combo", None)
             if combo is not None and motd_name in (combo["values"] or ()):
                 self._motd_saved_var.set(motd_name)
+                self._motd_saved_prev = motd_name
+        # The just-saved state is now the clean baseline.
+        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
+            self._motd_canvas.get_doc())
+        self._motd_template_dirty = False
+        self._motd_update_dirty_indicator()
         status = getattr(self, "_motd_fleet_status", None)
         if status is not None:
             status.config(
@@ -10717,12 +10983,8 @@ class FCToolGUI:
         # these editable fields were empty and the saved MOTD lost them. Falls
         # back to the caller-supplied fittings if the parse found no fit links.
         parsed = motd_builder.parse_motd(raw)
-        self._motd_populate_fields_from_parsed(parsed, fallback_fittings=fittings)
-
-        # Do NOT dump the raw markup into the intro anymore — the fields above
-        # now carry the imported content, and build_motd re-renders it cleanly.
-        if getattr(self, "_motd_intro", None) is not None:
-            self._motd_intro.set_markup("")
+        self._motd_populate_fields_from_parsed(
+            parsed, raw_markup=raw, fallback_fittings=fittings)
 
         # Do NOT auto-save a doctrine-linked MOTD here — the user creates linked
         # MOTDs explicitly via "Link to doctrine". Just rebuild the preview from the
@@ -10735,34 +10997,17 @@ class FCToolGUI:
 
         return doctrine_id, name, added, reused, failed
 
-    def _motd_populate_fields_from_parsed(self, parsed, fallback_fittings=None):
-        """Populate the editable MOTD builder fields from a parsed MOTD dict.
+    def _motd_populate_fields_from_parsed(self, parsed, raw_markup="",
+                                          fallback_fittings=None):
+        """Replace the canvas with an imported MOTD (parsed to pills + styled text)
+        and set the FC combo + loaded-fits fallback from ``parsed``.
 
-        Sets the staging checkbox + system name, the logi/cap channel entry, a
-        best-effort FC selection, and the explicit loaded-fits fallback. Does
-        NOT touch the doctrine selection or the header — the caller owns those
-        (the import-create path selects the new doctrine first; the decline path
-        leaves the doctrine cleared). ``parsed`` is the dict from
-        :func:`motd_builder.parse_motd`; ``fallback_fittings`` is the raw
-        ``[{dna,name}]`` list used for the loaded-fits fallback when the parse
-        found no fit links."""
-        # Staging system → check the box + fill the system name.
-        if parsed.get("staging"):
-            if getattr(self, "_motd_staging_enabled", None) is not None:
-                self._motd_staging_enabled.set(True)
-            if getattr(self, "_motd_staging_var", None) is not None:
-                self._motd_staging_var.set(parsed["staging"]["name"])
-
-        # Logi/cap channel → fill the channel entry with the display name.
-        if parsed.get("channel"):
-            entry = getattr(self, "_motd_channel_entry", None)
-            if entry is not None:
-                try:
-                    entry.delete(0, tk.END)
-                    entry.insert(0, parsed["channel"]["name"])
-                except Exception:
-                    pass
-
+        ``raw_markup`` is the imported MOTD markup, walked by
+        :func:`motd_doc.from_parsed_motd` (known links → item pills, everything
+        else styled text). Does NOT touch the doctrine selection — the caller owns
+        that. ``fallback_fittings`` is the raw ``[{dna,name}]`` list used for the
+        loaded-fits fallback when the parse found no fit links. Marks the composer
+        dirty (imported content is unsaved)."""
         # Best-effort FC: select a loaded character whose name matches the FC in
         # the imported MOTD; otherwise leave the current selection untouched.
         if parsed.get("fc"):
@@ -10773,12 +11018,18 @@ class FCToolGUI:
                 self._motd_fc_var.set(fc_name)
 
         # Explicit loaded-fits fallback: the parsed fit links (these survive even
-        # when the doctrine is TAGLESS, so its checked tags yield no fits). Falls
-        # back to the caller-supplied fittings if the parse found none.
+        # when the doctrine is TAGLESS, so its tag_lines yield no fits). Falls back
+        # to the caller-supplied fittings if the parse found none.
         self._motd_loaded_fits = [
             (f["dna"], f["name"])
             for f in (parsed.get("fittings") or fallback_fittings or [])
         ] or None
+
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is not None:
+            cv.set_doc(motd_doc.from_parsed_motd(raw_markup or ""))
+        self._motd_mark_dirty()
+        self._schedule_motd_preview()
 
     def _motd_scan_channels(self):
         """Discover chat channels (off the Tk thread) to seed the channel
@@ -10792,11 +11043,7 @@ class FCToolGUI:
         except Exception:
             logs_path = self.config.get("eve_logs_path", "")
         if not logs_path or not os.path.isdir(logs_path):
-            self._motd_channel_status.config(
-                text="Set a valid EVE Chat Logs path first (Settings)",
-                fg=FG_ORANGE)
             return
-        self._motd_channel_status.config(text="Scanning...", fg=FG_ACCENT)
 
         def worker():
             try:
@@ -10810,20 +11057,17 @@ class FCToolGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_motd_scanned_channels(self, names):
-        """Apply channel-scan results on the Tk thread: cache the discovered
-        names (shared with the intel cache), update the entry's completion pool,
-        and the status line."""
+        """Apply channel-scan results on the Tk thread: cache the discovered names
+        (shared with the intel cache) and refresh the palette's channel chips."""
         ic = self.config.setdefault("intel_channels", {})
         ic["cached_discovered"] = list(names)
         self._save_config()
-        entry = getattr(self, "_motd_channel_entry", None)
-        if entry is not None:
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
             try:
-                entry.update_completions(list(names))
+                pal.refresh_tray()
             except Exception:
                 pass
-        self._motd_channel_status.config(
-            text=f"Found {len(names)} channel(s)", fg=FG_GREEN)
 
     # ── MOTD: live preview + length meter (Task 7.2) ──────────────────────────
 
@@ -10858,8 +11102,10 @@ class FCToolGUI:
         return resolved or fit.name
 
     def _motd_build_fits_by_tag(self, doctrine, compact: bool = False):
-        """Assemble ``{tag: [(dna, label), ...]}`` for the checked tags of a
-        doctrine. Pure assembly — no business logic. Fits with no DNA are skipped.
+        """Assemble ``{tag: [(dna, label), ...]}`` for ALL of a doctrine's tags —
+        the composer's ``tag_line`` pills pick their own tag, so (unlike the old
+        include-tag checkboxes) every present tag is offered. Fits with no DNA are
+        skipped.
 
         Two MOTD conventions are applied here:
 
@@ -10874,7 +11120,6 @@ class FCToolGUI:
         fits_by_tag: dict[str, list[tuple[str, str]]] = {}
         if doctrine is None:
             return fits_by_tag
-        checked = {t for t, v in self._motd_tag_vars.items() if v.get()}
         for mem in doctrine.members:
             fit = self.fittings.get_fit(mem.fit_id)
             if fit is None or not fit.dna:
@@ -10886,8 +11131,6 @@ class FCToolGUI:
             effective_tags = non_dps if ("DPS" in member_tags and non_dps) \
                 else member_tags
             for tag in effective_tags:
-                if tag not in checked:
-                    continue
                 fits_by_tag.setdefault(tag, []).append(
                     (self._canonical_fit_dna(fit.dna, fit.parsed), label))
         return fits_by_tag
@@ -11019,97 +11262,30 @@ class FCToolGUI:
         return {f.hull_type_id: f.delta for f in rep.fits if f.delta != 0}
 
     def _current_motd_markup(self, compact: bool = False):
-        """Build the MOTD markup string from the current input selections.
+        """Resolve the pill-canvas document to MOTD markup for the current context.
 
-        When ``compact`` is True, fit link labels collapse to the ship class
-        name (see :meth:`_motd_build_fits_by_tag`) to save room; otherwise full
-        fit names are used. The text colour is left at ``build_motd``'s white
-        default (``0xffffffff``) — the in-game default red is hard to read — so
-        the wrapper is always emitted and counted by the length meter.
+        Builds (or reuses the per-cycle) :class:`motd_doc.ResolveContext` and hands
+        the canvas document to :func:`motd_doc.resolve`. When ``compact`` is True,
+        fit link labels collapse to the ship class name to save room; otherwise
+        full fit names are used. The envelope (leading ``<br>`` + white colour) and
+        the delta / compaction / staging-omission behaviours are byte-identical to
+        the previous ``build_motd`` skeleton (the §4.4 parity test pins this).
 
-        Side effect: sets ``self._motd_staging_warn`` to a non-blocking warning
-        string (or "") describing an unresolvable staging system, which
+        Side effect: records ``self._motd_staging_warn`` (the staging warning, if
+        any) and ``self._motd_resolved_warnings`` (all resolver warnings), which
         :meth:`_rebuild_motd_preview` folds into the warnings line."""
-        doctrine = self._motd_selected_doctrine()
-        fits_by_tag = self._motd_build_fits_by_tag(doctrine, compact=compact)
+        ctx = getattr(self, "_motd_ctx", None)
+        if ctx is None:
+            ctx = self._motd_build_resolve_context()
+        resolved = motd_doc.resolve(self._motd_canvas.get_doc(), ctx, compact)
 
-        # Explicit-fits fallback: when the checked tags produce NO fits (e.g. a
-        # tagless imported doctrine) but a saved/imported MOTD carried explicit
-        # fit links, render those instead so the saved fits still appear. When
-        # tags DO produce fits we ignore the override — tags are live/current.
-        if (self._motd_loaded_fits
-                and not any(fits_by_tag.get(t) for t in fits_by_tag)):
-            fits_by_tag = {"Fits": list(self._motd_loaded_fits)}
-
-        # Canonicalise every fit DNA so the emitted <url=fitting:...> links use
-        # the client-correct form regardless of how the fit was stored. This is
-        # the single chokepoint for preview / Set / Copy, so a legacy bare-id
-        # T3 DNA (from an imported MOTD or an older library fit) is normalised to
-        # the "id;1" subsystem form here — the bare-id form makes the client
-        # mis-render a subsystem as the hull ("Tengu propulsion"). Idempotent
-        # for already-canonical DNA; raw DNA is kept if it cannot be parsed.
-        # Each displayed DNA is parsed exactly once here and the parsed fit feeds
-        # BOTH the T3 canonicalisation (passed in to skip a re-parse) and the live-
-        # fleet delta lookup. No live fleet / no active doctrine => empty deltas =>
-        # labels untouched. Parsing/canonicalisation failures keep the raw DNA.
-        deltas = self._motd_fit_deltas()
-
-        def _finalize(dna, name):
-            try:
-                parsed = fit_parser.parse_dna(dna, self.type_catalog).fit
-            except Exception:
-                return (self._canonical_fit_dna(dna), name, 0)
-            canon = self._canonical_fit_dna(dna, parsed)
-            d = deltas.get(parsed.ship_type_id) if deltas else 0
-            return (canon, name, d or 0)
-
-        fits_by_tag = {tag: [_finalize(dna, name) for dna, name in fits]
-                       for tag, fits in fits_by_tag.items()}
-
-        fc_auth = self._motd_selected_fc_auth()
-        fc_name = fc_auth.character_name if fc_auth else None
-        fc_cid = fc_auth.character_id if fc_auth else None
-
-        channel = (self._motd_channel_entry.get().strip()
-                   if getattr(self, "_motd_channel_entry", None) else "")
-        # Resolve the channel name to its numeric id so the Logi line becomes a
-        # clickable joinChannel link; None falls back to plain text. Cached per
-        # name to avoid re-reading the log header on every debounce.
-        channel_id = (self._motd_resolve_channel_id(channel)
-                      if channel else None)
-
-        # Optional staging system → in-game SYSTEM link. Only when the checkbox
-        # is on and the entry resolves to a real system; otherwise warn (non-
-        # blocking) and omit the line. resolve_name is a pure local lookup.
         self._motd_staging_warn = ""
-        staging_name = None
-        staging_system_id = None
-        if (getattr(self, "_motd_staging_enabled", None) is not None
-                and self._motd_staging_enabled.get()):
-            raw = (self._motd_staging_var.get() or "").strip()
-            if raw:
-                import system_coords
-                sid = system_coords.resolve_name(raw)
-                if sid is not None:
-                    staging_name = raw
-                    staging_system_id = sid
-                else:
-                    self._motd_staging_warn = (
-                        f"Staging system '{raw}' did not resolve to a known "
-                        f"system — the staging line was omitted.")
-
-        return motd_builder.build_motd(
-            fc_name=fc_name,
-            fc_character_id=fc_cid,
-            doctrine_name=(doctrine.name if doctrine else ""),
-            fits_by_tag=fits_by_tag,
-            channel=channel or None,
-            channel_id=channel_id,
-            header=self._motd_intro.get_markup(),
-            footer=self._motd_outro.get_markup(),
-            staging_name=staging_name,
-            staging_system_id=staging_system_id,
-        )
+        for w in resolved.warnings:
+            if "Staging system" in w:          # string-match the staging warning
+                self._motd_staging_warn = w
+                break
+        self._motd_resolved_warnings = list(resolved.warnings)
+        return resolved.markup
 
     def _motd_budget(self) -> int:
         """The configured raw-markup MOTD ceiling (defaults to ~3000)."""
@@ -11151,62 +11327,72 @@ class FCToolGUI:
         if preview is None:
             return
 
-        budget = self._motd_budget()
-        markup, compacted = self._motd_output_markup()
-
-        # Raw pane: the built markup verbatim.
-        preview.config(state=tk.NORMAL)
-        preview.delete("1.0", tk.END)
-        preview.insert("1.0", markup)
-        preview.config(state=tk.DISABLED)
-
-        # Rendered pane: parse the markup into styled segments and lay them out
-        # with Tk tags (colours/bold/italic/underline/size + link styling).
-        self._render_motd_markup(markup)
-
-        length = motd_builder.estimate_length(markup)
-        frac = (length / budget) if budget else 0.0
-        if frac < 0.8:
-            color = FG_GREEN
-        elif frac < 1.0:
-            color = FG_YELLOW
-        else:
-            color = FG_RED
-
-        canvas = self._motd_meter_canvas
-        canvas.delete("all")
+        # One ResolveContext per preview cycle: the pill refresh AND the markup
+        # build below share it, so the ideal-fleet deltas are computed once (not
+        # once per pill + once per compact/non-compact build).
+        self._motd_ctx = self._motd_build_resolve_context()
         try:
-            w = canvas.winfo_width() or 1
-        except Exception:
-            w = 1
-        fill_w = int(min(frac, 1.0) * w)
-        if fill_w > 0:
-            canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
-        self._motd_meter_label.config(
-            text=f"{length} / {budget}", fg=color)
+            cv = getattr(self, "_motd_canvas", None)
+            if cv is not None:
+                cv.refresh_pills()          # re-resolve chip labels/states in place
 
-        # Non-blocking warnings.
-        warns = []
-        staging_warn = getattr(self, "_motd_staging_warn", "")
-        if staging_warn:
-            warns.append(staging_warn)
-        if compacted:
-            warns.append("Shortened fit names to ship class to fit the MOTD "
-                         "length limit.")
-        if length >= budget:
-            warns.append(f"Over budget by {length - budget} chars — the server "
-                         f"may truncate this MOTD.")
-        long_links = [
-            m.group("dna")
-            for m in motd_builder._FITTING_RE.finditer(markup)
-            if len(m.group("dna")) > self._MOTD_LINK_ATTR_WARN
-        ]
-        if long_links:
-            warns.append(
-                f"{len(long_links)} fit link(s) exceed "
-                f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
-                f"not render in-game.")
-        self._motd_warn_label.config(text="  ".join(warns))
+            budget = self._motd_budget()
+            markup, compacted = self._motd_output_markup()
+
+            # Raw pane: the built markup verbatim.
+            preview.config(state=tk.NORMAL)
+            preview.delete("1.0", tk.END)
+            preview.insert("1.0", markup)
+            preview.config(state=tk.DISABLED)
+
+            # Rendered pane: parse the markup into styled segments and lay them
+            # out with Tk tags (colours/bold/italic/underline/size + link style).
+            self._render_motd_markup(markup)
+
+            length = motd_builder.estimate_length(markup)
+            frac = (length / budget) if budget else 0.0
+            if frac < 0.8:
+                color = FG_GREEN
+            elif frac < 1.0:
+                color = FG_YELLOW
+            else:
+                color = FG_RED
+
+            canvas = self._motd_meter_canvas
+            canvas.delete("all")
+            try:
+                w = canvas.winfo_width() or 1
+            except Exception:
+                w = 1
+            fill_w = int(min(frac, 1.0) * w)
+            if fill_w > 0:
+                canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
+            self._motd_meter_label.config(
+                text=f"{length} / {budget}", fg=color)
+
+            # Non-blocking warnings: the resolver's warnings (stale/omitted pills,
+            # unresolvable staging) plus the compaction / over-budget / long-link
+            # notices, joined into the warn label.
+            warns = list(getattr(self, "_motd_resolved_warnings", []) or [])
+            if compacted:
+                warns.append("Shortened fit names to ship class to fit the MOTD "
+                             "length limit.")
+            if length >= budget:
+                warns.append(f"Over budget by {length - budget} chars — the "
+                             f"server may truncate this MOTD.")
+            long_links = [
+                m.group("dna")
+                for m in motd_builder._FITTING_RE.finditer(markup)
+                if len(m.group("dna")) > self._MOTD_LINK_ATTR_WARN
+            ]
+            if long_links:
+                warns.append(
+                    f"{len(long_links)} fit link(s) exceed "
+                    f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
+                    f"not render in-game.")
+            self._motd_warn_label.config(text="  ".join(warns))
+        finally:
+            self._motd_ctx = None
 
     def _motd_render_tag(self, hexcolor, bold, italic, underline, size,
                          is_link):
@@ -11281,6 +11467,32 @@ class FCToolGUI:
 
     # ── MOTD: fleet resolution + set/copy (Task 7.2) ──────────────────────────
 
+    def _motd_snapshot_fleet_members(self):
+        """Refresh ``self._motd_fleet_members_cache`` from the last live-fleet poll
+        snapshot (``_last_specialized_args``) — read-only, NO new ESI polling. Each
+        entry is ``{"name": str, "id": int}``; empty when there is no snapshot."""
+        out = []
+        cached = getattr(self, "_last_specialized_args", None)
+        if cached:
+            try:
+                from zkill_monitor import resolve_name as _rn
+            except Exception:
+                _rn = None
+            members = cached[0] if cached else []
+            seen = set()
+            for m in (members or []):
+                cid = m.get("character_id", 0) if isinstance(m, dict) else 0
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                try:
+                    nm = _rn(cid, "character") if _rn else ""
+                except Exception:
+                    nm = ""
+                if nm:
+                    out.append({"name": nm, "id": cid})
+        self._motd_fleet_members_cache = out
+
     def _motd_refresh_fleet_status(self):
         """Resolve the active FC character's current fleet + boss flag off the
         Tk thread (reuses ESIAuth.get_fleet_info / is_boss) and update the Set
@@ -11291,6 +11503,9 @@ class FCToolGUI:
         state cached by :meth:`_refresh_fleet_locations` (the ~15s poll), then
         confirm with a fresh async ESI check below. Seeding only applies to the
         primary character; other characters rely solely on the async check."""
+        # Read-only snapshot of the live-fleet roster for the palette's character
+        # provider (no new polling — reuses the last fleet-poll members).
+        self._motd_snapshot_fleet_members()
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             self._motd_fleet_id = None
@@ -11615,22 +11830,28 @@ class FCToolGUI:
     def _motd_current_staging_system_id(self):
         """The staging system id the MOTD is currently composed with, or None.
 
-        None when the 'Include staging system' box is off, the field is blank, or
-        the name does not resolve — the same conditions under which
-        _current_motd_markup omits the staging line. Pure main-thread Tk reads +
-        a local name lookup (no ESI)."""
-        enabled = getattr(self, "_motd_staging_enabled", None)
-        if enabled is None or not enabled.get():
-            return None
-        var = getattr(self, "_motd_staging_var", None)
-        if var is None:
-            return None
-        raw = (var.get() or "").strip()
-        if not raw:
+        Reads the composer's FIRST ``staging_line`` pill and resolves its name
+        (case-insensitive exact via ``system_coords.resolve_name``); None when
+        there is no staging pill, its name is blank, or it does not resolve — the
+        same conditions under which the staging line is omitted. Pure main-thread
+        reads + a local name lookup (no ESI).
+
+        Legacy fallback: hosts without a pill canvas (the autostop unit + guard
+        tests graft this seam onto a bare host) still gate on the removed
+        ``_motd_staging_enabled`` / ``_motd_staging_var``, if supplied — so the
+        seam's signature/return contract is unchanged for those callers."""
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is not None:
+            name = motd_doc.first_staging_name(cv.get_doc())
+        else:
+            enabled = getattr(self, "_motd_staging_enabled", None)
+            var = getattr(self, "_motd_staging_var", None)
+            name = (var.get() if (var is not None and enabled is not None
+                                  and enabled.get()) else None)
+        if not name or not str(name).strip():
             return None
         try:
-            import system_coords
-            return system_coords.resolve_name(raw)
+            return system_coords.resolve_name(str(name).strip())
         except Exception:
             return None
 
@@ -11713,50 +11934,30 @@ class FCToolGUI:
         threading.Thread(target=worker, daemon=True).start()
 
     def _clear_motd_builder(self):
-        """Reset the MOTD builder to an empty state.
+        """Reset the composer to the default document.
 
-        Clears the header/footer, turns the staging checkbox off and empties
-        its entry, blanks the logi/cap channel, deselects the doctrine (which
-        empties the per-fit/tag include checkboxes), and rebuilds the now-empty
-        preview. Used by 'Clear MOTD' and by the import path (so an imported
-        MOTD replaces, rather than appends to, the current builder)."""
-        # Intro / outro free text (markup editors).
-        if getattr(self, "_motd_intro", None) is not None:
-            self._motd_intro.set_markup("")
-        if getattr(self, "_motd_outro", None) is not None:
-            self._motd_outro.set_markup("")
-
-        # Staging system: checkbox off + entry empty.
-        if getattr(self, "_motd_staging_enabled", None) is not None:
-            self._motd_staging_enabled.set(False)
-        if getattr(self, "_motd_staging_var", None) is not None:
-            self._motd_staging_var.set("")
-
-        # Logi / cap channel entry.
-        entry = getattr(self, "_motd_channel_entry", None)
-        if entry is not None:
-            try:
-                entry.delete(0, tk.END)
-            except Exception:
-                pass
-
-        # Drop any explicit loaded-fits fallback so a cleared builder renders no
-        # fits (this method bypasses _motd_on_doctrine_change, which would
-        # otherwise clear it).
+        Loads the default doc onto the canvas, deselects the doctrine + linked
+        template, drops any explicit loaded-fits fallback, clears the dirty flag,
+        and rebuilds the preview. Used by 'Clear MOTD' and by the import path (so
+        an imported MOTD replaces, rather than appends to, the current builder)."""
         self._motd_loaded_fits = None
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is not None:
+            cv.set_doc(self._motd_default_doc())     # silent (no on_change)
 
-        # Deselect the doctrine and clear the linked-MOTD selection, then rebuild
-        # the (now empty) tag checkboxes so the per-fit include boxes are cleared
-        # along with their selection. Clearing both means the user does not have
-        # to manually deselect/reselect a doctrine or linked MOTD to reload.
         if getattr(self, "_motd_doctrine_var", None) is not None:
             self._motd_doctrine_var.set("")
+            self._motd_doctrine_prev = ""
         if getattr(self, "_motd_saved_var", None) is not None:
             self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
         self._motd_refresh_saved_dropdown()
-        self._motd_rebuild_tag_checkboxes()
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.refresh_tray()
 
-        # Rebuild the (now empty) preview immediately.
+        self._motd_loaded_template_snapshot = None
+        self._motd_template_dirty = False
+        self._motd_update_dirty_indicator()
         self._rebuild_motd_preview()
 
     def _clear_motd(self):
@@ -11830,6 +12031,11 @@ class FCToolGUI:
                                  err or "Could not load the current MOTD.")
             return
 
+        # Confirm before replacing an unsaved composition with the imported MOTD.
+        if not self._motd_confirm_discard_if_dirty():
+            self._motd_fleet_status.config(text="Import cancelled.", fg=FG_DIM)
+            return
+
         parsed = motd_builder.parse_motd(raw)
         # Disambiguate the "imported but no fits" case: a non-empty MOTD that
         # yields zero fit links almost always means the fit markup was not
@@ -11854,7 +12060,8 @@ class FCToolGUI:
         # imported staging/channel/fits instead of empty fields.
         self._clear_motd_builder()
         fittings = parsed.get("fittings") or []
-        self._motd_populate_fields_from_parsed(parsed, fallback_fittings=fittings)
+        self._motd_populate_fields_from_parsed(
+            parsed, raw_markup=raw, fallback_fittings=fittings)
         self._rebuild_motd_preview()
 
         # Primary offer: build a new doctrine from this MOTD — import its linked

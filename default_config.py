@@ -154,4 +154,18 @@ DEFAULT_CONFIG = {
         "dat_sync_enabled": False,
         "dat_sync_acceptance_passed": False,
     },
+    # NOTE: the "fittings" block is NOT seeded here — its keys are created lazily
+    # (setdefault) by the Fittings/MOTD subsystem the first time they are needed,
+    # so the shape of this defaults dict is unchanged. For reference, the MOTD
+    # composer manages these "fittings" sub-keys:
+    #   * "saved_motds"        — list of named per-doctrine MOTD templates. v2
+    #     entries are {name, doctrine, fc, doc: [runs…], version: 2} (a pill-canvas
+    #     document; a v1 entry that pre-dates the composer redesign auto-migrates
+    #     on load and is rewritten as v2 only when the user next saves it, keeping
+    #     its old fit list as "legacy_fits" for the empty-tag_line fallback).
+    #   * "motd_recent_tokens" — MRU list (cap 10) of recently-inserted token specs
+    #     {kind, params, label} feeding the palette's Recent group + tray.
+    #   * "motd_budget", "motd_link_interval_s", "motd_stop_leave_staging",
+    #     "logi_channel" — the length ceiling, auto-update interval, leave-staging
+    #     guard toggle, and remembered default logi channel.
 }
