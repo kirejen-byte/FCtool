@@ -624,12 +624,21 @@ class PillCanvas(MarkupEditor):
     def _has_selection(self) -> bool:
         return self._selection_range() is not None
 
+    def _delete_range(self, start, end):
+        """Delete ``[start, end)`` and synchronously prune any pills it held.
+
+        The shared model-delete primitive (no snapshot of its own) used by the
+        Backspace/Delete selection path and by <<Paste>>-replaces-selection.
+        """
+        self.text.delete(start, end)
+        self._reconcile_registry()
+
     def _delete_selection(self):
         rng = self._selection_range()
         if rng is None:
             return
         self._snapshot()
-        self.text.delete(rng[0], rng[1])
+        self._delete_range(rng[0], rng[1])
         self._after_mutation()
 
     def _window_name_at(self, index):
@@ -901,20 +910,28 @@ class PillCanvas(MarkupEditor):
             clip = self.clipboard_get()
         except tk.TclError:
             clip = ""
-        if not clip and self._clip_fragment is None:
+        internal = (bool(clip) and clip == self._clip_string
+                    and self._clip_fragment is not None)
+        if not internal and not clip:
             return "break"
-        # Paste inserts at the caret (§9 "insert fragment runs at caret") — it does
-        # not replace the selection; the caller/user positions the caret first.
-        if (clip and clip == self._clip_string
-                and self._clip_fragment is not None):
-            runs = doc_from_json(self._clip_fragment)
-            self._snapshot()
-            self._insert_runs_at_caret(runs)
-            self._after_mutation()
-        elif clip:
-            self._snapshot()
+        # Match the Windows/Tk-native <<Paste>> convention: an active selection is
+        # replaced by the pasted content, as ONE undo step. Snapshot once, delete
+        # the selection through the registry-pruning model-delete, then insert at
+        # the collapsed caret — shared by both the internal-fragment and
+        # plain-text paths.
+        self._snapshot()
+        rng = self._selection_range()
+        if rng is not None:
+            self._delete_range(rng[0], rng[1])
+            try:
+                self.text.mark_set("insert", rng[0])
+            except tk.TclError:
+                pass
+        if internal:
+            self._insert_runs_at_caret(doc_from_json(self._clip_fragment))
+        else:
             self.text.insert("insert", clip)
-            self._after_mutation()
+        self._after_mutation()
         return "break"
 
     # ── inline triggers (§12) ───────────────────────────────────────────────
