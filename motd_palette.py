@@ -718,10 +718,15 @@ class MotdPalette(tk.Frame):
         return [(name, by_name[name]) for name in group_order_for_mode(mode)]
 
     def _append_esi_signage(self, sliced: list, base: list) -> list:
-        """Append the ``Searching ESI…`` indicator and/or streamed ESI rows to the
-        VISIBLE Characters slice AS SIGNAGE — AFTER the per-group cap, like the
-        rescan row — so they show even when local matches fill the cap. ESI rows
-        are de-duped by name against the (full, pre-cap) local character set."""
+        """Add the ``Searching ESI…`` indicator and/or streamed ESI rows to the
+        Characters group AS SIGNAGE — after the per-group cap, like the rescan row —
+        so they show even when local matches fill the cap. ESI rows are de-duped by
+        name against the (full, pre-cap) local character set.
+
+        When there are ZERO local matches the slicers drop the empty Characters
+        group entirely, so the group is SYNTHESIZED and inserted at its
+        ``group_order_for_mode`` slot — otherwise the primary ESI use case
+        (searching a character with no local record) would render nothing."""
         if not (self._esi_pending or self._esi_rows):
             return sliced
         local = set()
@@ -729,18 +734,47 @@ class MotdPalette(tk.Frame):
             if name == "Characters":
                 local = {_item_name(it).lower() for it in items if it.kind == "char"}
                 break
-        out = []
+
+        def signage_rows():
+            rows = []
+            if self._esi_pending:
+                rows.append(self._searching_item())
+            if self._esi_rows:
+                for it in self._esi_rows:
+                    if _item_name(it).lower() not in local:
+                        rows.append(it)
+            return rows
+
+        out, seen_chars = [], False
         for group, items, hidden in sliced:
             if group == "Characters":
-                items = list(items)
-                if self._esi_pending:
-                    items.append(self._searching_item())
-                if self._esi_rows:
-                    for it in self._esi_rows:
-                        if _item_name(it).lower() not in local:
-                            items.append(it)
+                seen_chars = True
+                items = list(items) + signage_rows()
             out.append((group, items, hidden))
+        if not seen_chars:
+            rows = signage_rows()
+            if rows:
+                out = self._insert_group_at_order_slot(out, "Characters", rows)
         return out
+
+    def _insert_group_at_order_slot(self, groups: list, name: str, items: list) -> list:
+        """Insert ``(name, items, 0)`` into ``groups`` at its position per
+        ``group_order_for_mode(self._mode)`` (before the first present group that
+        sorts after it), so a synthesized group leads/sits where it belongs."""
+        order = group_order_for_mode(self._mode)
+        try:
+            idx = order.index(name)
+        except ValueError:
+            idx = len(order)
+        insert_at = len(groups)
+        for i, (g, _items, _h) in enumerate(groups):
+            gi = order.index(g) if g in order else len(order)
+            if gi > idx:
+                insert_at = i
+                break
+        result = list(groups)
+        result.insert(insert_at, (name, list(items), 0))
+        return result
 
     @staticmethod
     def _searching_item() -> PaletteItem:
