@@ -10666,7 +10666,14 @@ class FCToolGUI:
             doc = motd_doc.doc_from_json(data.get("doc") or [])
             legacy = data.get("legacy_fits") or []
         else:
-            doc = motd_doc.from_legacy_fields(data)
+            # Feed the STORE's live rename table so a v1 template saved before a
+            # role-tag rename ("Logistics") migrates its tag_line pills onto the
+            # doctrine's current tag ("Logi") — the same map the store applies to
+            # doctrine membership tags on load. Referenced (single source), never
+            # copied, so the two migration paths cannot drift.
+            import fittings_store as _fittings_store
+            doc = motd_doc.from_legacy_fields(
+                data, tag_renames=_fittings_store._TAG_RENAMES)
             legacy = data.get("fits") or []
         self._motd_loaded_fits = [tuple(x) for x in legacy] or None
         self._motd_canvas.set_doc(doc)               # silent (no on_change)
