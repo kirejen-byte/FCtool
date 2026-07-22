@@ -715,7 +715,7 @@ class MotdPalette(tk.Frame):
         self._caret_mode = False
         self._anchor_xy = None
         self._query = ""
-        self._show_all = False    # set by an action:more expansion
+        self._expanded: set = set()  # group names uncapped by an action:more click
         self._nav: list = []      # selectable row dicts, in visual order
         self._sel = -1
         self._rendered: list = []  # [(group_name, [PaletteItem])] as shown
@@ -866,7 +866,7 @@ class MotdPalette(tk.Frame):
 
     def _apply_query(self, query: str) -> None:
         self._query = query
-        self._show_all = False
+        self._expanded = set()         # a new query invalidates prior expansions
         if not self._esi_eligible(query):
             self._reset_esi()
         self._render()
@@ -887,7 +887,7 @@ class MotdPalette(tk.Frame):
         self._mode = mode
         self._caret_mode = caret
         self._query = query
-        self._show_all = False
+        self._expanded = set()
         self._reset_esi()
         self._ensure_dropdown()
         self._render()
@@ -1009,16 +1009,44 @@ class MotdPalette(tk.Frame):
         if self._dd is None:
             return
         base = self._compute_groups(self._query, self._mode)
-        if self._show_all:
-            sliced = [(n, list(it), 0) for n, it in base if it]
-        elif not self._query:
+        if not self._query:
             sliced = zero_state_slice(base)          # all four groups always render
         else:
             sliced = visible_slice(base, per_group=4, total=self._total_for_mode())
+        if self._expanded:
+            sliced = self._apply_expansions(sliced, base)   # uncap clicked groups
         sliced = self._append_esi_signage(sliced, base)   # signage AFTER the cap
         sliced = self._append_rescan(sliced)
         self._rendered = [(g, list(items)) for g, items, _h in sliced]
         self._build_rows(sliced)
+
+    def _apply_expansions(self, sliced: list, base: list) -> list:
+        """Uncap every group the user expanded via a ``+N more`` click: replace its
+        capped slice with the full (pre-cap) item list and drop its more row. Groups
+        the user did not expand are returned untouched (spec §6: expand in place,
+        others unchanged)."""
+        base_map = dict(base)
+        out = []
+        for name, items, hidden in sliced:
+            if name in self._expanded and name in base_map:
+                out.append((name, list(base_map[name]), 0))
+            else:
+                out.append((name, items, hidden))
+        return out
+
+    def _expand_group(self, group: str) -> None:
+        """Handle an ``action:more`` activation (click or Enter): uncap ``group`` in
+        place and re-render. Crucially cancels the pending focus-out close so a
+        mouse click — which shifts focus off the entry — does not tear the dropdown
+        down 150 ms later. Entry focus is deliberately NOT re-grabbed: ``focus_set``
+        fires ``<FocusIn>`` -> ``_on_focus_in`` -> a fresh empty-query ``_open`` that
+        would wipe the query and the expansion itself."""
+        self._cancel_after("_focus_after")
+        if group:
+            self._expanded.add(group)
+        else:                              # defensive: no group tag -> expand all shown
+            self._expanded.update(g for g, _ in self._rendered)
+        self._render()
 
     # ==================================================================== #
     # row building + selection                                             #
@@ -1141,8 +1169,7 @@ class MotdPalette(tk.Frame):
             self.close_dropdown()
             self._on_rescan_channels()
         elif kind == ACTION_MORE:
-            self._show_all = True
-            self._render()
+            self._expand_group(item.params.get("group", ""))
         elif kind == ACTION_SEARCHING:
             return
         elif kind.startswith("action:"):
