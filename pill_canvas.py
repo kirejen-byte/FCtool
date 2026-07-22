@@ -338,7 +338,7 @@ class PillCanvas(MarkupEditor):
         frame._pill_label = label
 
     def _insert_token_widget(self, index, run: TokenRun):
-        """Embed a chip for ``run`` at ``index`` and register it."""
+        """Embed a chip for ``run`` at ``index``, register it, and return its name."""
         frame = self._make_chip(run)
         self.text.window_create(index, window=frame, align="center", padx=1)
         name = str(frame)
@@ -346,6 +346,7 @@ class PillCanvas(MarkupEditor):
         self._pill_frames[name] = frame
         frame.bind("<Destroy>",
                    lambda e, n=name: self._on_pill_destroyed(n), add="+")
+        return name
 
     def _on_pill_destroyed(self, name):
         self._pills.pop(name, None)
@@ -441,13 +442,36 @@ class PillCanvas(MarkupEditor):
     def insert_token_at_caret(self, kind: str, params: dict) -> None:
         self._snapshot()
         self._clear_pill_selection()
-        self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
+        name = self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
         self._after_mutation()
+        self._prompt_editor_for_incomplete(name)
 
     def insert_text_at_caret(self, text: str) -> None:
         self._snapshot()
         self.text.insert("insert", text)
         self._after_mutation()
+
+    def _prompt_editor_for_incomplete(self, name) -> None:
+        """The single choke every USER token-insert funnels through (click / Enter
+        via :meth:`insert_token_at_caret`, drag-drop via :meth:`drop_at_pointer`,
+        inline-trigger accept via :meth:`accept_trigger`): open the pill's own param
+        editor when the token is incomplete and would otherwise be a dead pill.
+
+        Today the only such case is a ``channel_line`` with no channel name — the
+        Lines & blocks "Channel line" building block defaults to
+        ``{label:"Logi", name:""}`` and resolves to nothing (the owner's stale
+        "Logi:" line). Prompting immediately lets the user pick the channel instead
+        of being handed a dead pill. An actual channel item (``kind="channel"``) or
+        a ``channel_line`` that already carries a name is complete and never
+        prompts. Document-load paths (``set_doc`` / undo / redo / paste) go through
+        ``_rebuild`` / ``_insert_runs_at_caret``, not here, so they never prompt."""
+        if name is None:
+            return
+        run = self._pills.get(name)
+        if run is None:
+            return
+        if run.kind == "channel_line" and not (run.params or {}).get("name"):
+            self._open_param_editor(name)
 
     def _insert_runs_at_caret(self, runs: list):
         for run in runs:
@@ -914,9 +938,10 @@ class PillCanvas(MarkupEditor):
         idx = self.text.index(f"@{x},{y}")
         self._snapshot()
         self.text.mark_set("insert", idx)
-        self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
+        name = self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
         self._restore_insertwidth_only()
         self._after_mutation()
+        self._prompt_editor_for_incomplete(name)
         return True
 
     def cancel_drag_feedback(self) -> None:
@@ -1058,9 +1083,10 @@ class PillCanvas(MarkupEditor):
             self.text.mark_set("insert", start)
         except tk.TclError:
             pass
-        self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
+        name = self._insert_token_widget("insert", TokenRun(kind, dict(params or {})))
         self._trigger_state = None
         self._after_mutation()
+        self._prompt_editor_for_incomplete(name)
 
     def dismiss_trigger(self) -> None:
         self._trigger_state = None
