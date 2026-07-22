@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
@@ -329,19 +330,146 @@ class _EsiStream:
 # Quick-Add tray                                                               #
 # --------------------------------------------------------------------------- #
 
-_FIT_CHIP_CAP = 10          # deterministic stand-in for "2 wrapped rows" (§7)
+_FIT_CHIP_CAP = 10          # fallback fit count when the width is unknown (§7)
 _RECENT_CHAN_CAP = 5
+_MAX_FIT_ROWS = 2           # §6: fit chips wrap into at most two rows, then +N more
+_QA_LABEL_TEXT = "QUICK ADD"
+_QA_LABEL_PAD = 10          # the label's own pack padx (4 + 6)
+_QA_HINT_TEXT = "select a doctrine to quick-add its fits"
+_QA_CHIP_CHROME = 16        # padx (6+6) + border/relief for the default measurer
+
+
+def _chip_channel_text(item: PaletteItem) -> str:
+    name = _item_name(item)
+    return name if name.startswith("#") else "#" + name
+
+
+def _qa_row_width(row: list, gap: int) -> int:
+    """Total pixel width of a planned row: sum of token widths + inter-token gaps."""
+    if not row:
+        return 0
+    return sum(w for _t, w in row) + gap * (len(row) - 1)
+
+
+def _qa_has_chip(row: list) -> bool:
+    """True if ``row`` holds anything other than the leading QUICK ADD label."""
+    return any(tok[0] != "label" for tok, _w in row)
+
+
+def _plan_quick_add_rows(avail, label_w, fit_ws, chan_ws, more_w_fn, *,
+                         hint_w=None, gap=4, max_fit_rows=_MAX_FIT_ROWS,
+                         max_fits_unconstrained=_FIT_CHIP_CAP):
+    """Pure, Tk-free width-aware wrapping planner for the Quick-Add tray.
+
+    Lays out a leading ``QUICK ADD`` label, then either the doctrine fit chips
+    (``fit_ws``) or a single dim hint chip (``hint_w``), then the recent-channel
+    chips (``chan_ws``). Fit chips wrap into at most ``max_fit_rows`` rows; any
+    overflow collapses into ONE trailing ``+N more…`` chip that is guaranteed to
+    itself fit (shown fits are dropped as needed and folded into ``N``). Channel
+    chips flow onto fresh row(s) below, wrapping as many rows as the width needs.
+
+    ``avail <= 1`` (or ``None``) means the width is unknown yet (widget not mapped
+    / headless): wrapping is disabled and fits fall back to ``max_fits_unconstrained``
+    followed by a ``+N more`` — preserving the pre-resize single-row behaviour.
+
+    Widths are opaque pixels from an injected measure seam; ``more_w_fn(n)`` gives
+    the width of a ``+n more…`` chip (its text width depends on ``n``). Returns::
+
+        {avail, rows, fit_rows, fit_shown, more, chan_shown, gap}
+
+    ``rows`` is ``[[(token, width), ...], ...]``; each ``token`` is one of
+    ``("label",)``, ``("hint",)``, ``("fit", i)``, ``("chan", j)``, ``("more", n)``.
+    """
+    unconstrained = avail is None or avail <= 1
+    rows: list = []
+    row: list = [(("label",), label_w)]
+
+    def commit():
+        nonlocal row
+        rows.append(row)
+        row = []
+
+    fit_shown = 0
+    more = 0
+
+    if hint_w is not None:
+        # No doctrine selected -> one dim hint chip trails the label (wrapping to
+        # its own row only if the label + hint cannot share the first row).
+        if not unconstrained and _qa_row_width(row, gap) + gap + hint_w > avail:
+            commit()
+        row.append((("hint",), hint_w))
+        commit()
+    else:
+        n = len(fit_ws)
+        i = 0
+        while i < n:
+            if unconstrained and i >= max_fits_unconstrained:
+                break
+            w = fit_ws[i]
+            add = w + (gap if row else 0)
+            if unconstrained or not _qa_has_chip(row) or \
+                    _qa_row_width(row, gap) + add <= avail:
+                row.append((("fit", i), w))     # fits (or forced: row has no chip yet)
+                i += 1
+            elif len(rows) + 1 < max_fit_rows:  # current row is full -> wrap if allowed
+                commit()
+            else:
+                break                            # out of fit rows
+        fit_shown = i
+        if i < n:
+            more = n - i
+            mw = more_w_fn(more)
+            # The +N more chip must itself fit: drop trailing shown fits (folding
+            # each into N) until it does, never dropping the label.
+            while (not unconstrained and _qa_has_chip(row) and
+                   _qa_row_width(row, gap) + gap + mw > avail):
+                tok, _wp = row[-1]
+                if tok[0] != "fit":
+                    break
+                row.pop()
+                i -= 1
+                fit_shown -= 1
+                more += 1
+                mw = more_w_fn(more)
+            row.append((("more", more), mw))
+        commit()
+
+    fit_rows = len(rows)
+
+    # Recent channel chips onto fresh row(s) below the fit region.
+    chan_shown = 0
+    if chan_ws:
+        row = []
+        for j, w in enumerate(chan_ws):
+            if (not unconstrained and row and
+                    _qa_row_width(row, gap) + gap + w > avail):
+                rows.append(row)
+                row = []
+            row.append((("chan", j), w))
+            chan_shown += 1
+        rows.append(row)
+
+    return {"avail": avail, "rows": rows, "fit_rows": fit_rows,
+            "fit_shown": fit_shown, "more": more, "chan_shown": chan_shown,
+            "gap": gap}
 
 
 class QuickAddTray(tk.Frame):
     """The always-visible chip strip under the search bar. Built and refreshed by
     :class:`MotdPalette`; exposed for tests as ``palette.tray``.
 
-    Layout: a ``QUICK ADD`` label, then the selected doctrine's fit chips (capped
-    at :data:`_FIT_CHIP_CAP`, then a ``+N more…`` chip) or a single dim hint chip
-    when no doctrine is selected, then up to :data:`_RECENT_CHAN_CAP` recent
-    ``#channel`` chips. Every fit/channel chip inserts via ``on_insert`` and drags
-    via ``on_drag``; the more chip calls ``on_more``.
+    Layout: a ``QUICK ADD`` label, then the selected doctrine's fit chips — or a
+    single dim hint chip when no doctrine is selected — then up to
+    :data:`_RECENT_CHAN_CAP` recent ``#channel`` chips. The strip is
+    **width-aware**: chips wrap into as many rows as the tray's current width
+    needs (fit chips capped at :data:`_MAX_FIT_ROWS` rows, then a single accurate
+    ``+N more…`` chip), re-laid-out on ``<Configure>`` (debounced through
+    ``after_idle`` and guarded so a resize that does not change the width is a
+    no-op). The wrapping math lives in the pure :func:`_plan_quick_add_rows`; the
+    available-width and text-measure functions are injectable seams
+    (:meth:`set_layout_metrics`) so the responsive contract is deterministically
+    testable. Every fit/channel chip inserts via ``on_insert`` and drags via
+    ``on_drag``; the more chip calls ``on_more``.
     """
 
     def __init__(self, master, providers: PaletteProviders, *, on_insert, on_drag,
@@ -353,16 +481,79 @@ class QuickAddTray(tk.Frame):
         self._on_drag = on_drag
         self._on_more = on_more
 
+        # layout seams (overridable for tests via set_layout_metrics) --------- #
+        self._chip_font = tkfont.Font(family="Consolas", size=9)
+        self._avail_width_fn = lambda: self.winfo_width()
+        self._measure_fn = self._default_measure
+        self._gap = 4
+        self._laid_out_width = None
+        self._relayout_pending = False
+
+        # cached provider data (re-fetched by refresh, re-laid-out on resize) -- #
+        self._fit_items: list = []
+        self._recent_items: list = []
+
         # test-observable census
         self.fit_chips: list = []       # [(widget, PaletteItem)]
         self.channel_chips: list = []   # [(widget, PaletteItem)]
         self.more_chip = None
         self.hint_chip = None
+        self.last_plan = None           # the most recent _plan_quick_add_rows dict
 
+        self.bind("<Configure>", self._on_configure)
         self.refresh()
+
+    # -- layout seams ------------------------------------------------------ #
+    def _default_measure(self, text: str) -> int:
+        return self._chip_font.measure(text) + _QA_CHIP_CHROME
+
+    def set_layout_metrics(self, *, avail_width_fn=None, measure_fn=None,
+                           gap=None) -> None:
+        """Override the responsive-layout seams and re-lay-out immediately.
+
+        ``avail_width_fn() -> px`` supplies the tray's available width;
+        ``measure_fn(text) -> px`` the rendered width of a chip's text; ``gap`` the
+        inter-chip spacing. Used by tests to drive wrapping deterministically."""
+        if avail_width_fn is not None:
+            self._avail_width_fn = avail_width_fn
+        if measure_fn is not None:
+            self._measure_fn = measure_fn
+        if gap is not None:
+            self._gap = gap
+        self._rebuild(force=True)
 
     # -- build ------------------------------------------------------------- #
     def refresh(self) -> None:
+        """Re-fetch provider data and re-lay-out the strip at the current width."""
+        self._fit_items = list(self._providers.doctrine_fits() or [])
+        self._recent_items = list(
+            self._providers.channels("") or [])[:_RECENT_CHAN_CAP]
+        self._rebuild(force=True)
+
+    def _on_configure(self, _e=None) -> None:
+        # Debounce a width change into a single idle relayout; guard re-entrancy
+        # (our own repacking fires <Configure> again with an unchanged width).
+        if self._relayout_pending:
+            return
+        self._relayout_pending = True
+        try:
+            self.after_idle(self._deferred_relayout)
+        except tk.TclError:
+            self._relayout_pending = False
+
+    def _deferred_relayout(self) -> None:
+        self._relayout_pending = False
+        try:
+            self._rebuild(force=False)
+        except tk.TclError:
+            pass
+
+    def _rebuild(self, *, force: bool) -> None:
+        avail = self._avail_width_fn()
+        if not force and avail == self._laid_out_width:
+            return                          # width unchanged -> nothing to do
+        self._laid_out_width = avail
+
         for w in list(self.winfo_children()):
             w.destroy()
         self.fit_chips = []
@@ -370,48 +561,68 @@ class QuickAddTray(tk.Frame):
         self.more_chip = None
         self.hint_chip = None
 
-        tk.Label(self, text="QUICK ADD", font=("Consolas", 8, "bold"),
-                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(4, 6))
+        fits = self._fit_items
+        chans = self._recent_items
+        label_w = self._measure_fn(_QA_LABEL_TEXT) + _QA_LABEL_PAD
+        if fits:
+            fit_ws = [self._measure_fn(_ellipsize(it.label, 24)) for it in fits]
+            hint_w = None
+        else:
+            fit_ws = []
+            hint_w = self._measure_fn(_QA_HINT_TEXT)
+        chan_ws = [self._measure_fn(_chip_channel_text(it)) for it in chans]
 
-        fits = list(self._providers.doctrine_fits() or [])
-        if not fits:
+        plan = _plan_quick_add_rows(
+            avail, label_w, fit_ws, chan_ws,
+            lambda k: self._measure_fn(f"+{k} more…"),
+            hint_w=hint_w, gap=self._gap, max_fit_rows=_MAX_FIT_ROWS,
+            max_fits_unconstrained=_FIT_CHIP_CAP)
+        self.last_plan = plan
+
+        for row_tokens in plan["rows"]:
+            rowf = tk.Frame(self, bg=BG_PANEL)
+            rowf.pack(side=tk.TOP, fill=tk.X, anchor="w")
+            for token, _w in row_tokens:
+                self._build_token(rowf, token, fits, chans)
+
+    def _build_token(self, parent, token, fits, chans) -> None:
+        kind = token[0]
+        if kind == "label":
+            tk.Label(parent, text=_QA_LABEL_TEXT, font=("Consolas", 8, "bold"),
+                     fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(4, 6))
+        elif kind == "hint":
             self.hint_chip = tk.Label(
-                self, text="select a doctrine to quick-add its fits",
+                parent, text=_QA_HINT_TEXT,
                 font=("Consolas", 9, "italic"), fg=FG_DIM, bg=BG_PANEL)
             self.hint_chip.pack(side=tk.LEFT, padx=2)
-        else:
-            for it in fits[:_FIT_CHIP_CAP]:
-                self._add_fit_chip(it)
-            if len(fits) > _FIT_CHIP_CAP:
-                self._add_more_chip(len(fits) - _FIT_CHIP_CAP)
+        elif kind == "fit":
+            self._add_fit_chip(parent, fits[token[1]])
+        elif kind == "chan":
+            self._add_channel_chip(parent, chans[token[1]])
+        elif kind == "more":
+            self._add_more_chip(parent, token[1])
 
-        recents = list(self._providers.channels("") or [])[:_RECENT_CHAN_CAP]
-        for it in recents:
-            self._add_channel_chip(it)
-
-    def _chip(self, text, fg):
-        return tk.Label(self, text=text, font=("Consolas", 9),
+    def _chip(self, parent, text, fg):
+        return tk.Label(parent, text=text, font=("Consolas", 9),
                         fg=fg, bg=BG_ENTRY, padx=6, pady=1,
                         borderwidth=1, relief=tk.RIDGE)
 
-    def _add_fit_chip(self, item: PaletteItem):
-        chip = self._chip(_ellipsize(item.label, 24), FG_ORANGE)
+    def _add_fit_chip(self, parent, item: PaletteItem):
+        chip = self._chip(parent, _ellipsize(item.label, 24), FG_ORANGE)
         tip = item.label + (f"  [{item.meta}]" if item.meta else "")
         attach_tooltip(chip, tip)
         _bind_chip_dnd(chip, item, self._on_insert, self._on_drag)
         chip.pack(side=tk.LEFT, padx=2)
         self.fit_chips.append((chip, item))
 
-    def _add_channel_chip(self, item: PaletteItem):
-        name = _item_name(item)
-        text = name if name.startswith("#") else "#" + name
-        chip = self._chip(text, FG_YELLOW)
+    def _add_channel_chip(self, parent, item: PaletteItem):
+        chip = self._chip(parent, _chip_channel_text(item), FG_YELLOW)
         _bind_chip_dnd(chip, item, self._on_insert, self._on_drag)
         chip.pack(side=tk.LEFT, padx=2)
         self.channel_chips.append((chip, item))
 
-    def _add_more_chip(self, n: int):
-        chip = tk.Label(self, text=f"+{n} more…", font=("Consolas", 9),
+    def _add_more_chip(self, parent, n: int):
+        chip = tk.Label(parent, text=f"+{n} more…", font=("Consolas", 9),
                         fg=FG_ACCENT, bg=BG_ENTRY, padx=6, pady=1,
                         borderwidth=1, relief=tk.RIDGE)
         chip.bind("<Button-1>", lambda _e=None: self._on_more())
@@ -504,10 +715,17 @@ class MotdPalette(tk.Frame):
         self._caret_mode = False
         self._anchor_xy = None
         self._query = ""
-        self._show_all = False    # set by an action:more expansion
+        self._expanded: set = set()  # group names uncapped by an action:more click
         self._nav: list = []      # selectable row dicts, in visual order
         self._sel = -1
         self._rendered: list = []  # [(group_name, [PaletteItem])] as shown
+
+        # A press on a dropdown row is a gesture in flight: an async ESI
+        # re-render that tears the body down mid-click would otherwise destroy
+        # the very row being released, dropping the insert (BUG C). Defer such a
+        # render until the gesture completes.
+        self._row_gesture_active = False
+        self._pending_render = False
 
         # debounce handles -------------------------------------------------- #
         self._local_after = None
@@ -565,6 +783,8 @@ class MotdPalette(tk.Frame):
         self._nav = []
         self._rendered = []
         self._sel = -1
+        self._row_gesture_active = False   # no rows left to release on
+        self._pending_render = False
 
     def refresh_tray(self) -> None:
         self.tray.refresh()
@@ -655,7 +875,7 @@ class MotdPalette(tk.Frame):
 
     def _apply_query(self, query: str) -> None:
         self._query = query
-        self._show_all = False
+        self._expanded = set()         # a new query invalidates prior expansions
         if not self._esi_eligible(query):
             self._reset_esi()
         self._render()
@@ -676,7 +896,7 @@ class MotdPalette(tk.Frame):
         self._mode = mode
         self._caret_mode = caret
         self._query = query
-        self._show_all = False
+        self._expanded = set()
         self._reset_esi()
         self._ensure_dropdown()
         self._render()
@@ -797,17 +1017,51 @@ class MotdPalette(tk.Frame):
     def _render(self) -> None:
         if self._dd is None:
             return
+        if self._row_gesture_active:
+            # A row press is in flight (click/drag). Rebuilding now would destroy
+            # the pressed widget and swallow its release (BUG C); defer until the
+            # gesture ends, then render with the freshest data.
+            self._pending_render = True
+            return
         base = self._compute_groups(self._query, self._mode)
-        if self._show_all:
-            sliced = [(n, list(it), 0) for n, it in base if it]
-        elif not self._query:
+        if not self._query:
             sliced = zero_state_slice(base)          # all four groups always render
         else:
             sliced = visible_slice(base, per_group=4, total=self._total_for_mode())
+        if self._expanded:
+            sliced = self._apply_expansions(sliced, base)   # uncap clicked groups
         sliced = self._append_esi_signage(sliced, base)   # signage AFTER the cap
         sliced = self._append_rescan(sliced)
         self._rendered = [(g, list(items)) for g, items, _h in sliced]
         self._build_rows(sliced)
+
+    def _apply_expansions(self, sliced: list, base: list) -> list:
+        """Uncap every group the user expanded via a ``+N more`` click: replace its
+        capped slice with the full (pre-cap) item list and drop its more row. Groups
+        the user did not expand are returned untouched (spec §6: expand in place,
+        others unchanged)."""
+        base_map = dict(base)
+        out = []
+        for name, items, hidden in sliced:
+            if name in self._expanded and name in base_map:
+                out.append((name, list(base_map[name]), 0))
+            else:
+                out.append((name, items, hidden))
+        return out
+
+    def _expand_group(self, group: str) -> None:
+        """Handle an ``action:more`` activation (click or Enter): uncap ``group`` in
+        place and re-render. Crucially cancels the pending focus-out close so a
+        mouse click — which shifts focus off the entry — does not tear the dropdown
+        down 150 ms later. Entry focus is deliberately NOT re-grabbed: ``focus_set``
+        fires ``<FocusIn>`` -> ``_on_focus_in`` -> a fresh empty-query ``_open`` that
+        would wipe the query and the expansion itself."""
+        self._cancel_after("_focus_after")
+        if group:
+            self._expanded.add(group)
+        else:                              # defensive: no group tag -> expand all shown
+            self._expanded.update(g for g, _ in self._rendered)
+        self._render()
 
     # ==================================================================== #
     # row building + selection                                             #
@@ -877,11 +1131,44 @@ class MotdPalette(tk.Frame):
             self._nav.append(rec)
             for w in (row, inner, glyph_label, prefix_label, tail_label, meta_label):
                 w.bind("<Enter>", lambda _e=None, i=idx: self._hover(i), add="+")
+                w.bind("<ButtonPress-1>",
+                       lambda _e=None: self._begin_row_gesture(), add="+")
+                w.bind("<ButtonRelease-1>",
+                       lambda _e=None: self._end_row_gesture(), add="+")
             _bind_chip_dnd(inner, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(glyph_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(prefix_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(tail_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(meta_label, item, self._accept, self._on_drag_ext)
+
+    def _begin_row_gesture(self) -> None:
+        """A dropdown row was pressed — mark a gesture in flight so an async ESI
+        ``_render`` defers rather than destroying the row before its release.
+
+        Also cancel the focus-out close armed when the press pulled focus off the
+        entry: a slow (or main-loop-stall-delayed) release arriving >150 ms later
+        would otherwise fire that timer first, tear the row down, and swallow the
+        insert (same 'inserts nothing, menu closed' symptom — for local rows too).
+        Clicking AWAY from any row never runs this, so dismiss-on-click-away still
+        works."""
+        self._row_gesture_active = True
+        self._cancel_after("_focus_after")
+
+    def _end_row_gesture(self) -> None:
+        """The row press ended (release). Flush any render deferred during the
+        gesture — but via ``after_idle`` so the CURRENT release dispatch (the DnD
+        handler that runs ``_accept`` → insert) finishes first; running it inline
+        here would destroy the row mid-dispatch and swallow the very insert we are
+        protecting."""
+        if not self._row_gesture_active:
+            return
+        self._row_gesture_active = False
+        if self._pending_render:
+            self._pending_render = False
+            try:
+                self.after_idle(self._render)
+            except tk.TclError:
+                pass
 
     def _split_label(self, item: PaletteItem):
         label = item.label or ""
@@ -930,8 +1217,7 @@ class MotdPalette(tk.Frame):
             self.close_dropdown()
             self._on_rescan_channels()
         elif kind == ACTION_MORE:
-            self._show_all = True
-            self._render()
+            self._expand_group(item.params.get("group", ""))
         elif kind == ACTION_SEARCHING:
             return
         elif kind.startswith("action:"):
