@@ -720,6 +720,13 @@ class MotdPalette(tk.Frame):
         self._sel = -1
         self._rendered: list = []  # [(group_name, [PaletteItem])] as shown
 
+        # A press on a dropdown row is a gesture in flight: an async ESI
+        # re-render that tears the body down mid-click would otherwise destroy
+        # the very row being released, dropping the insert (BUG C). Defer such a
+        # render until the gesture completes.
+        self._row_gesture_active = False
+        self._pending_render = False
+
         # debounce handles -------------------------------------------------- #
         self._local_after = None
         self._esi_after = None
@@ -776,6 +783,8 @@ class MotdPalette(tk.Frame):
         self._nav = []
         self._rendered = []
         self._sel = -1
+        self._row_gesture_active = False   # no rows left to release on
+        self._pending_render = False
 
     def refresh_tray(self) -> None:
         self.tray.refresh()
@@ -1008,6 +1017,12 @@ class MotdPalette(tk.Frame):
     def _render(self) -> None:
         if self._dd is None:
             return
+        if self._row_gesture_active:
+            # A row press is in flight (click/drag). Rebuilding now would destroy
+            # the pressed widget and swallow its release (BUG C); defer until the
+            # gesture ends, then render with the freshest data.
+            self._pending_render = True
+            return
         base = self._compute_groups(self._query, self._mode)
         if not self._query:
             sliced = zero_state_slice(base)          # all four groups always render
@@ -1116,11 +1131,36 @@ class MotdPalette(tk.Frame):
             self._nav.append(rec)
             for w in (row, inner, glyph_label, prefix_label, tail_label, meta_label):
                 w.bind("<Enter>", lambda _e=None, i=idx: self._hover(i), add="+")
+                w.bind("<ButtonPress-1>",
+                       lambda _e=None: self._begin_row_gesture(), add="+")
+                w.bind("<ButtonRelease-1>",
+                       lambda _e=None: self._end_row_gesture(), add="+")
             _bind_chip_dnd(inner, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(glyph_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(prefix_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(tail_label, item, self._accept, self._on_drag_ext)
             _bind_chip_dnd(meta_label, item, self._accept, self._on_drag_ext)
+
+    def _begin_row_gesture(self) -> None:
+        """A dropdown row was pressed — mark a gesture in flight so an async ESI
+        ``_render`` defers rather than destroying the row before its release."""
+        self._row_gesture_active = True
+
+    def _end_row_gesture(self) -> None:
+        """The row press ended (release). Flush any render deferred during the
+        gesture — but via ``after_idle`` so the CURRENT release dispatch (the DnD
+        handler that runs ``_accept`` → insert) finishes first; running it inline
+        here would destroy the row mid-dispatch and swallow the very insert we are
+        protecting."""
+        if not self._row_gesture_active:
+            return
+        self._row_gesture_active = False
+        if self._pending_render:
+            self._pending_render = False
+            try:
+                self.after_idle(self._render)
+            except tk.TclError:
+                pass
 
     def _split_label(self, item: PaletteItem):
         label = item.label or ""
