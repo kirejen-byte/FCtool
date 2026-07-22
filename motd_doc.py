@@ -161,8 +161,12 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
         return char_link(p.get("id"), p.get("name", "")), [], 0
 
     if kind == "fit":
-        markup, _delta, ok = _finalize_fit(p.get("dna", ""), p.get("name", ""), ctx)
-        return markup, [], (0 if ok else 1)
+        # A fit ALWAYS resolves: an unparseable DNA keeps the raw DNA and drops
+        # the delta (§4.2 "DNA unparseable → raw DNA kept, no delta"; §9 "degrades
+        # to … raw DNA"). It is never counted unresolved / rendered stale merely
+        # because the type-catalog could not parse it.
+        markup, _delta, _ok = _finalize_fit(p.get("dna", ""), p.get("name", ""), ctx)
+        return markup, [], 0
 
     if kind == "system":
         name = p.get("name", "")
@@ -341,7 +345,9 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         ok = parsed is not None
         delta = ctx.deltas.get(parsed.ship_type_id, 0) if ok else 0
         tip = f"resolves to fit link: {name}" if ok else f"unparseable DNA — link kept, no delta: {name}"
-        return TokenLabel(_ellip(name), ok, tip, delta)
+        # SOLID even when the DNA won't parse: the link is kept with the raw DNA
+        # (§4.2), only the delta drops — a fit chip is never stale on parse failure.
+        return TokenLabel(_ellip(name), True, tip, delta)
 
     if kind == "system":
         name = p.get("name", "")
@@ -383,7 +389,8 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
 
     if kind == "tag_line":
         tag = p.get("tag", "")
-        fits = (ctx.fits_by_tag(False) or {}).get(tag) or []
+        fbt = ctx.fits_by_tag(False) or {}
+        fits = fbt.get(tag) or []
         names = [n for _d, n in fits]
         net = 0
         for dna, _n in fits:
@@ -392,7 +399,17 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
                 net += ctx.deltas.get(parsed.ship_type_id, 0)
         ok = bool(fits)
         text = f"{tag}: {' | '.join(names)}" if ok else tag
-        tip = f"resolves to: {tag}: {' | '.join(names)}" if ok else f"no fits for '{tag}' — line omitted"
+        if ok:
+            tip = f"resolves to: {tag}: {' | '.join(names)}"
+        else:
+            # Actionable stale reason: name the doctrine's ACTUAL tags so a
+            # migrated/typo'd tag (e.g. a pre-rename "Logistics" vs the doctrine's
+            # "Logi") is one edit away from fixing. NO fuzzy matching — the pill
+            # stays unresolved; it is surfaced and explained, not silently guessed.
+            avail = [t for t in _ordered_tags(list(fbt.keys())) if fbt.get(t)]
+            tip = (f"no fits tagged '{tag}' in this doctrine — this doctrine's tags: "
+                   + ", ".join(avail)) if avail else \
+                  f"no fits tagged '{tag}' — this doctrine has no tagged fits"
         return TokenLabel(_ellip(text), ok, tip, net)
 
     if kind == "channel_line":
