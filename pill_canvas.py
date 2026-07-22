@@ -155,6 +155,7 @@ class PillCanvas(MarkupEditor):
 
     def _bind_canvas_events(self):
         t = self.text
+        t.bind("<Button-1>", self._on_text_click, add="+")
         t.bind("<KeyPress>", self._on_keypress, add="+")
         t.bind("<KeyRelease>", self._on_keyrelease_trigger, add="+")
         t.bind("<Escape>", self._on_escape, add="+")
@@ -397,6 +398,21 @@ class PillCanvas(MarkupEditor):
     def _clear_pill_selection(self):
         if self._selected_pill:
             self._deselect_current()
+
+    def _on_text_click(self, event=None):
+        """A Button-1 that reaches the Text body clears any active pill selection.
+
+        Clicking in the text is text-editing intent, so it must drop the pill
+        selection (and restyle the chip border) — otherwise a later Return, meant
+        as a newline, hits the "edit selected pill" shortcut (owner bug). A click
+        that lands on a chip is delivered to the chip's own embedded window and
+        does NOT bubble to the Text's bindtags in Tk (verified), so this handler
+        never fires for a chip-select click — chip selection survives. Returns
+        ``None`` so the default Text binding still positions the caret / starts a
+        drag-select normally.
+        """
+        self._clear_pill_selection()
+        return None
 
     # ── insert-at-caret API ─────────────────────────────────────────────────
 
