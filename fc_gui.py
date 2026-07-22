@@ -10188,6 +10188,8 @@ class FCToolGUI:
             recents=self._motd_palette_recents,
             esi_char_search=self._motd_palette_esi_char_search,
             ui_post=self._post_ui,
+            collapsed_groups=self._motd_palette_collapsed_groups,
+            save_collapsed=self._motd_palette_save_collapsed,
         )
 
     def _motd_fit_palette_label(self, fit):
@@ -10347,6 +10349,22 @@ class FCToolGUI:
             return auth.search_entities(query, ("character",))
         except Exception:
             return []
+
+    def _motd_palette_collapsed_groups(self):
+        """Persisted set of collapsed palette categories (Item 1). Read-only
+        provider seam — returns the stored group-name list (or [])."""
+        return list(self.config.get("fittings", {})
+                    .get("motd_palette_collapsed", []) or [])
+
+    def _motd_palette_save_collapsed(self, groups):
+        """Persist the collapsed-category set under ``fittings`` via lazy
+        setdefault, then save. Never raises on the save path."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        fit_cfg["motd_palette_collapsed"] = list(groups)
+        try:
+            self._save_config()
+        except Exception:
+            pass
 
     # ── MOTD: input population (Task 7.1) ─────────────────────────────────────
 

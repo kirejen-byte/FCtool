@@ -77,6 +77,10 @@ class PaletteProviders:
     recents: Callable[[], list]              # MRU [PaletteItem]
     esi_char_search: Callable[[str], list]   # BLOCKING -> [{"id","name","category"}]
     ui_post: Callable[[Callable], None]      # marshal worker result to the Tk thread
+    # Optional persistence seam for collapsed dropdown categories (Item 1). Safe
+    # no-op defaults so existing constructions/tests need no change.
+    collapsed_groups: Callable[[], list] = lambda: []            # -> [group_name]
+    save_collapsed: Callable[[list], None] = lambda groups: None  # persist the set
 
 
 GROUP_ORDER = (
@@ -137,6 +141,36 @@ def _ellipsize(text: str, n: int = 24) -> str:
     if len(text) <= n:
         return text
     return text[: n - 1] + "…"
+
+
+def used_channel_items(recents_items, cap=None) -> list:
+    """The channels the user has ACTUALLY used before (Item 2): the ``channel`` /
+    ``channel_line`` tokens from the recents MRU, deduped by channel name
+    (case-insensitive, first/most-recent wins), order-preserving, optionally
+    capped at ``cap``.
+
+    Discovered-but-never-used channels (e.g. the auto-joined "Alliance" you can't
+    leave) never entered a MOTD, so they never entered recents and are excluded by
+    construction. A ``channel_line`` with no channel name is skipped. Feeds BOTH
+    the Quick-Add tray channel chips and the zero-state dropdown Channels slice;
+    the full discovered list stays reachable by TYPING (query-mode Channels)."""
+    out, seen = [], set()
+    for it in recents_items or []:
+        if it.kind not in ("channel", "channel_line"):
+            continue
+        name = (it.params.get("name") or "").strip()
+        if not name and it.kind == "channel":
+            name = (it.label or "").strip()      # plain channel: label == name
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+        if cap is not None and len(out) >= cap:
+            break
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -524,10 +558,14 @@ class QuickAddTray(tk.Frame):
 
     # -- build ------------------------------------------------------------- #
     def refresh(self) -> None:
-        """Re-fetch provider data and re-lay-out the strip at the current width."""
+        """Re-fetch provider data and re-lay-out the strip at the current width.
+
+        Channel chips are the channels the user has ACTUALLY used (recents MRU),
+        never the full discovered/auto-joined list — see :func:`used_channel_items`.
+        Zero used channels ⇒ zero channel chips."""
         self._fit_items = list(self._providers.doctrine_fits() or [])
-        self._recent_items = list(
-            self._providers.channels("") or [])[:_RECENT_CHAN_CAP]
+        self._recent_items = used_channel_items(
+            list(self._providers.recents() or []), cap=_RECENT_CHAN_CAP)
         self._rebuild(force=True)
 
     def _on_configure(self, _e=None) -> None:
@@ -716,6 +754,15 @@ class MotdPalette(tk.Frame):
         self._anchor_xy = None
         self._query = ""
         self._expanded: set = set()  # group names uncapped by an action:more click
+        #: Groups the user has collapsed via a header click. Loaded from (and
+        #: persisted through) the providers seam; survives dropdown open/close AND
+        #: sessions. A collapsed group renders only its header (▸ + a dim count);
+        #: its rows are hidden and skipped by keyboard nav. Independent of
+        #: ``_expanded`` — a collapsed group ignores its ``+N more`` expansion until
+        #: it is re-expanded.
+        self._collapsed: set = set(providers.collapsed_groups() or [])
+        self._rendered_counts: dict = {}  # group -> full real-row count (header)
+        self._headers: list = []          # [{group, widget, collapsed, count}]
         self._nav: list = []      # selectable row dicts, in visual order
         self._sel = -1
         self._rendered: list = []  # [(group_name, [PaletteItem])] as shown
@@ -782,6 +829,8 @@ class MotdPalette(tk.Frame):
         self._dd_body = None
         self._nav = []
         self._rendered = []
+        self._headers = []
+        self._rendered_counts = {}
         self._sel = -1
         self._row_gesture_active = False   # no rows left to release on
         self._pending_render = False
@@ -800,6 +849,14 @@ class MotdPalette(tk.Frame):
 
     def visible_group_names(self) -> list:
         return [g for g, _ in self._rendered]
+
+    def _header_text(self, group: str):
+        """The rendered header label text for ``group`` (or None) — test seam for
+        the collapsed ``NAME ▸ <count>`` / expanded ``NAME ▾`` glyph+count."""
+        for h in self._headers:
+            if h["group"] == group:
+                return h["widget"].cget("text")
+        return None
 
     def items_in_group(self, name: str) -> list:
         for g, items in self._rendered:
@@ -919,11 +976,15 @@ class MotdPalette(tk.Frame):
         """Base groups (name, [items]) before ESI injection / rescan / capping."""
         p = self.providers
         if not query:
+            # Zero-state Channels follows the same used-only rule as the tray:
+            # only channels the user has actually inserted before (recents),
+            # never the discovered/auto-joined list. Discovered channels stay
+            # reachable by typing (the query branch below uses p.channels(query)).
             return [
                 ("Recent", list(p.recents() or [])),
                 ("Doctrine fits", list(p.doctrine_fits() or [])),
                 ("Lines & blocks", list(p.lines_blocks() or [])),
-                ("Channels", list(p.channels("") or [])),
+                ("Channels", used_channel_items(list(p.recents() or []))),
             ]
         by_name = {
             "Recent": rank_group(query, list(p.recents() or [])),
@@ -1032,8 +1093,7 @@ class MotdPalette(tk.Frame):
             sliced = self._apply_expansions(sliced, base)   # uncap clicked groups
         sliced = self._append_esi_signage(sliced, base)   # signage AFTER the cap
         sliced = self._append_rescan(sliced)
-        self._rendered = [(g, list(items)) for g, items, _h in sliced]
-        self._build_rows(sliced)
+        self._build_rows(sliced)                           # sets _rendered (collapse-aware)
 
     def _apply_expansions(self, sliced: list, base: list) -> list:
         """Uncap every group the user expanded via a ``+N more`` click: replace its
@@ -1063,6 +1123,29 @@ class MotdPalette(tk.Frame):
             self._expanded.update(g for g, _ in self._rendered)
         self._render()
 
+    def _toggle_group_collapsed(self, group: str) -> None:
+        """Collapse/expand a category from a header click. Cancels the pending
+        focus-out close (the click shifts focus off the entry) — mirroring
+        ``_expand_group`` — then persists the new set and re-renders. Deliberately
+        does NOT re-grab entry focus (``focus_set`` would fire ``<FocusIn>`` ->
+        ``_on_focus_in`` -> a fresh empty-query ``_open`` that wipes the query)."""
+        if not group:
+            return
+        self._cancel_after("_focus_after")
+        if group in self._collapsed:
+            self._collapsed.discard(group)
+        else:
+            self._collapsed.add(group)
+        self._persist_collapsed()
+        self._render()
+
+    def _persist_collapsed(self) -> None:
+        """Push the collapsed set through the providers seam (never raises)."""
+        try:
+            self.providers.save_collapsed(sorted(self._collapsed))
+        except Exception:
+            pass
+
     # ==================================================================== #
     # row building + selection                                             #
     # ==================================================================== #
@@ -1076,11 +1159,19 @@ class MotdPalette(tk.Frame):
         body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         self._dd_body = body
         self._nav = []
+        self._rendered = []
+        self._rendered_counts = {}
+        self._headers = []
 
-        for group, items, _hidden in sliced:
-            header = tk.Label(body, text=group.upper(), font=("Consolas", 8, "bold"),
-                              fg=FG_DIM, bg=BG_PANEL, anchor="w")
-            header.pack(fill=tk.X, padx=6, pady=(4, 0))
+        for group, items, hidden in sliced:
+            count = self._group_real_count(items, hidden)
+            self._rendered_counts[group] = count
+            collapsed = group in self._collapsed
+            self._build_group_header(body, group, collapsed, count)
+            if collapsed:                       # header only; rows hidden + nav-skipped
+                self._rendered.append((group, []))
+                continue
+            self._rendered.append((group, list(items)))
             for item in items:
                 self._build_row(body, item)
 
@@ -1090,6 +1181,31 @@ class MotdPalette(tk.Frame):
         else:
             self._sel = -1
         self._position_dropdown()
+
+    @staticmethod
+    def _group_real_count(items: list, hidden: int) -> int:
+        """The full number of real (non-action) rows a group holds: the capped
+        rows still shown PLUS the ``hidden`` overflow the ``+N more`` row stands
+        for. Drives the collapsed-header count; updates as ESI rows stream into
+        (e.g.) the Characters group."""
+        real = sum(1 for it in items if not it.kind.startswith("action:"))
+        return real + max(0, hidden)
+
+    def _build_group_header(self, parent, group: str, collapsed: bool,
+                            count: int) -> None:
+        """A clickable category header. Collapsed → ``NAME ▸ <count>`` (dim count of
+        hidden rows); expanded → ``NAME ▾``. Clicking toggles the group's collapsed
+        state (persisted)."""
+        glyph = "▸" if collapsed else "▾"        # ▸ collapsed / ▾ expanded
+        text = f"{group.upper()} {glyph} {count}" if collapsed \
+            else f"{group.upper()} {glyph}"
+        header = tk.Label(parent, text=text, font=("Consolas", 8, "bold"),
+                          fg=FG_DIM, bg=BG_PANEL, anchor="w", cursor="hand2")
+        header.pack(fill=tk.X, padx=6, pady=(4, 0))
+        header.bind("<Button-1>",
+                    lambda _e=None, g=group: self._toggle_group_collapsed(g))
+        self._headers.append({"group": group, "widget": header,
+                              "collapsed": collapsed, "count": count})
 
     def _build_row(self, parent, item: PaletteItem) -> None:
         selectable = item.kind != ACTION_SEARCHING
