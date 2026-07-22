@@ -1306,16 +1306,28 @@ class FCToolGUI:
     def _get_ansiblex_connections(self) -> list[str] | None:
         """Return Ansiblex connection strings, resolving synchronously if needed.
 
-        Reinforced/offline gates are dropped at read time (below): the full set
-        is still cached / kept in ``_ansiblex_id_pairs`` for labeling, but the
-        RETURNED routing list omits any hop whose Ansiblex is manually flagged,
-        so clearing the flag restores the hop on the next call with no cache
-        rebuild."""
+        UNION of two sources, in ``"id1|id2"`` routing-string form:
+          1. ``config["ansiblex_connections"]`` name pairs (resolved + cached in
+             ``_ansiblex_connections`` / ``_ansiblex_id_pairs`` for labeling).
+          2. Corroborated infra-store gate pairs -- the SAME set the map bridge
+             layer draws (``infra_overlay.corroborated_gate_pairs``, a gate at
+             BOTH ends). The owner made the store the source of truth for gates
+             (stale config pairs pruned), so imported/scanned gates now route.
+
+        The store union is computed on a LOCAL copy every call (never persisted
+        into the ``_ansiblex_connections`` config cache) so a store change is
+        reflected on the very next call; ``map_overlays.resolve_bridges`` resolves
+        names the SAME pure/local way (``system_coords.resolve_name`` -- no ESI,
+        Tk-safe) the map and the reinforced predicate use, so a store pair and its
+        config twin collapse to one id-pair (order-insensitive de-dupe).
+
+        Reinforced/offline gates are then dropped at read time (below), AFTER the
+        union, so a flagged gate drops from routing no matter which source
+        contributed it; clearing the flag restores the hop on the next call with
+        no cache rebuild."""
         resolved = self._ansiblex_connections
         if not resolved:
             pairs = self.config.get("ansiblex_connections", [])
-            if not pairs:
-                return None
             resolved = []
             id_pairs = {}
             for pair in pairs:
@@ -1330,11 +1342,39 @@ class FCToolGUI:
                 self._ansiblex_connections = resolved
                 self._ansiblex_id_pairs.update(id_pairs)
                 print(f"[Ansiblex] Sync-resolved {len(resolved)} gate(s)")
+        # Union corroborated store gate pairs onto a LOCAL copy (so the config
+        # cache above is never polluted -- a store change must be able to SHRINK
+        # the routing set on the next call). resolve_bridges gives deduped,
+        # unordered id-pairs via the same pure/local resolver the map uses;
+        # de-dupe against the config set by unordered id-pair. Cheap + thread-safe
+        # (RLock-guarded store.entries(), no ESI, no Tk) -> callable off-thread.
+        resolved = list(resolved)
+        store = getattr(self, "_infra_store", None)   # do NOT force-build
+        if store is not None:
+            try:
+                import infra_overlay
+                import map_overlays as mo
+                seen = set()
+                for conn in resolved:
+                    parts = conn.split("|")
+                    try:
+                        seen.add(frozenset((int(parts[0]), int(parts[1]))))
+                    except (ValueError, IndexError):
+                        pass
+                for ida, idb in mo.resolve_bridges(
+                        infra_overlay.corroborated_gate_pairs(store.entries())):
+                    key = frozenset((ida, idb))
+                    if key not in seen:
+                        seen.add(key)
+                        resolved.append(f"{ida}|{idb}")
+            except Exception as exc:
+                print(f"[Ansiblex] store gate union failed: {exc}")
         # Suppress reinforced/offline hops from jump-range routing. Read-time so a
-        # cleared flag restores the hop next call; the cache above stays full. The
+        # cleared flag restores the hop next call; the config cache stays full. The
         # get_stargate_route cache keys on the sorted connection list, so a changed
-        # set routes correctly with no stale cache. Guarded/no-op when nothing is
-        # flagged (or no infra store) -> config-only routing is byte-identical.
+        # set (config OR store) routes correctly with no stale cache. Applies to
+        # BOTH union sources -- a flagged store gate resolves to the same id-pair
+        # as its config twin. Guarded/no-op when nothing is flagged.
         reinforced = _resolve_reinforced_id_pairs(getattr(self, "_infra_store", None))
         if reinforced and resolved:
             kept = []
@@ -4304,7 +4344,11 @@ class FCToolGUI:
                 all_ansiblex = wh_ansiblex
             else:
                 all_ansiblex = direct_ansiblex
-            self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex)
+            # Share the routing set's truthiness (resolved once above as ``conns``)
+            # so the direct-route label matches what actually routed -- config pairs
+            # AND corroborated store gates -- instead of the raw config cache.
+            self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex,
+                          bool(conns))
 
         threading.Thread(target=do_search, daemon=True).start()
 
@@ -4863,7 +4907,8 @@ class FCToolGUI:
 
     def _show_wh_result(self, result: WHRoute | None,
                         ansiblex_in_route: list[tuple[str, str]] | None = None,
-                        leg_ansiblex: dict[int, list[tuple[str, str]]] | None = None):
+                        leg_ansiblex: dict[int, list[tuple[str, str]]] | None = None,
+                        has_ansiblex: bool = False):
         self._clear_waypoint_frame()
         if ansiblex_in_route is None:
             ansiblex_in_route = []
@@ -4878,8 +4923,10 @@ class FCToolGUI:
         direct = result.gate_jumps_direct
         via_wh = result.total_jumps_via_wh
 
-        # Show direct route info (includes Ansiblex if configured)
-        has_ansiblex = len(self._ansiblex_connections) > 0
+        # Show direct route info. ``has_ansiblex`` reflects the UNIONED, reinforced-
+        # filtered routing set (config pairs + corroborated store gates), resolved
+        # once by the caller (_do_wh_route) -- NOT the raw config cache, so a route
+        # that uses store-imported gates is labelled correctly after the config prune.
         route_label = "Direct route (with Ansiblex)" if has_ansiblex else "Direct gate route"
         if direct is not None:
             self._append_wh_log(f"{route_label}: {direct} jumps\n", "info")
