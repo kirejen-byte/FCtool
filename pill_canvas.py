@@ -1193,6 +1193,9 @@ class PillCanvas(MarkupEditor):
             win.destroy()
 
         make_modal(win, parent, on_cancel=cancel)
+        # The title-bar X (WM_DELETE_WINDOW) shares the one cancel path, so closing
+        # a fresh-insert prompt removes the pill net-zero instead of stranding it.
+        win.protocol("WM_DELETE_WINDOW", cancel)
         reader = self._build_param_body(win, run)
         btns = tk.Frame(win, bg=BG_DARK)
         btns.pack(fill="x", padx=8, pady=(2, 8))
