@@ -734,6 +734,8 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
     state = {"start": None, "dragging": False, "ghost": None}
 
     def press(e):
+        _destroy_drag_ghost(state["ghost"])   # defensive: never strand a prior ghost
+        state["ghost"] = None
         state["start"] = (e.x_root, e.y_root)
         state["dragging"] = False
 

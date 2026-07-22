@@ -471,7 +471,39 @@ class PillCanvas(MarkupEditor):
         if run is None:
             return
         if run.kind == "channel_line" and not (run.params or {}).get("name"):
-            self._open_param_editor(name)
+            self._open_param_editor(name, fresh_insert=True)
+
+    def _cancel_fresh_insert(self, name) -> None:
+        """Undo a freshly-inserted incomplete pill to net-zero: pop its insert
+        snapshot and restore that exact pre-insert state, so the dead pill is gone
+        AND Ctrl+Z cannot resurrect it (the insert snapshot captured the state
+        BEFORE the pill, and nothing pushed the empty-pill state, so it lives in
+        neither undo nor redo — as if the insert never happened). Only the
+        ``_prompt_editor_for_incomplete`` prompt routes here; editing an EXISTING
+        pill keeps the normal cancel-leaves-it semantics."""
+        if self._undo_stack:
+            cap = self._undo_stack.pop()              # discard the insert snapshot
+            self._rebuild_from_capture(cap)           # restore pre-insert doc+caret
+            self._reconcile_registry()
+        else:                                         # defensive: nothing to pop
+            try:
+                self.text.delete(self.text.index(name))
+            except tk.TclError:
+                pass
+            self._reconcile_registry()
+        self._fire_change()
+
+    def _fill_fresh_insert(self, name, new_params) -> None:
+        """Complete a freshly-inserted pill IN PLACE (no new snapshot): the
+        insert's own snapshot already stands for the whole 'add a channel' step, so
+        one Ctrl+Z removes the finished pill instead of stepping back onto an empty
+        one."""
+        run = self._pills.get(name)
+        if run is None:
+            return
+        run.params = dict(new_params)
+        self._refresh_pill(name, force=True)
+        self._after_mutation()
 
     def _insert_runs_at_caret(self, runs: list):
         for run in runs:
@@ -1136,14 +1168,31 @@ class PillCanvas(MarkupEditor):
 
     # ── param editors (§7) ──────────────────────────────────────────────────
 
-    def _open_param_editor(self, name):
+    def _open_param_editor(self, name, fresh_insert=False):
+        """Open the per-kind param editor for pill ``name``.
+
+        ``fresh_insert`` marks the ``_prompt_editor_for_incomplete`` flow — the pill
+        was just inserted and is still incomplete (an empty-name channel_line). In
+        that mode the dialog is a commit/abort gate rather than an edit: Cancel /
+        Escape / close, AND Apply while the channel is still empty, all REMOVE the
+        pill net-zero (:meth:`_cancel_fresh_insert`); Apply with a real channel
+        completes it in place under the insert's own snapshot
+        (:meth:`_fill_fresh_insert`). Editing an EXISTING pill (``fresh_insert``
+        False — double-click / menu / Return) keeps the normal edit semantics
+        (Cancel leaves the pill, Apply pushes its own undo step)."""
         run = self._pills.get(name)
         if run is None:
             return
         parent = self.winfo_toplevel()
         win = tk.Toplevel(parent)
         win.title(f"Edit {run.kind}")
-        make_modal(win, parent, on_cancel=win.destroy)
+
+        def cancel():
+            if fresh_insert:
+                self._cancel_fresh_insert(name)   # backing out a fresh pill = remove it
+            win.destroy()
+
+        make_modal(win, parent, on_cancel=cancel)
         reader = self._build_param_body(win, run)
         btns = tk.Frame(win, bg=BG_DARK)
         btns.pack(fill="x", padx=8, pady=(2, 8))
@@ -1155,12 +1204,20 @@ class PillCanvas(MarkupEditor):
             new_params = reader()
             if new_params is None:
                 return                       # invalid (e.g. bad int) — keep open
+            if fresh_insert and not (new_params or {}).get("name"):
+                self._cancel_fresh_insert(name)   # applied still-empty = remove it
+                win.destroy()
+                return
+            if fresh_insert:
+                self._fill_fresh_insert(name, new_params)   # complete in place
+                win.destroy()
+                return
             self._apply_params(name, new_params)
             win.destroy()
 
         tk.Button(btns, text="Apply", command=apply, **btn_kw).pack(
             side=tk.RIGHT, padx=2)
-        tk.Button(btns, text="Cancel", command=win.destroy, **btn_kw).pack(
+        tk.Button(btns, text="Cancel", command=cancel, **btn_kw).pack(
             side=tk.RIGHT, padx=2)
         self._param_win = win
         return win
