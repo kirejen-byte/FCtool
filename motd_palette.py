@@ -32,6 +32,7 @@ from typing import Callable
 
 from ui_helpers import attach_tooltip
 from ui_theme import (
+    BG_DARK,
     BG_ENTRY,
     BG_PANEL,
     BORDER_COLOR,
@@ -673,13 +674,68 @@ class QuickAddTray(tk.Frame):
 # --------------------------------------------------------------------------- #
 
 
+#: Cursor→ghost offset (px). Mirrors pill_canvas' in-canvas pill ghost so the two
+#: drag affordances look and behave identically (spec §5).
+_GHOST_DX, _GHOST_DY = 12, 10
+
+
+def _make_drag_ghost(master, item):
+    """The house ghost-chip for a palette/tray drag (spec §5): a borderless,
+    semi-transparent ``overrideredirect`` Toplevel that follows the cursor so the
+    user sees WHAT they are dragging out of the menu. Look mirrors
+    :meth:`pill_canvas.PillCanvas._create_ghost` (accent bg, dark fg, ``-alpha
+    0.85``, ``-topmost``); the label is the dragged item's glyph + its (ellipsised
+    ~28-char) label. Returns the Toplevel, or ``None`` if creation fails (headless
+    / teardown) — every mover/destroyer guards on ``None``."""
+    glyph, _color = _glyph_for(item.kind)
+    text = f"{glyph} {_ellipsize(item.label or '', 28)}"
+    try:
+        ghost = tk.Toplevel(master)
+        ghost.wm_overrideredirect(True)
+        try:
+            ghost.attributes("-topmost", True)
+            ghost.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+        tk.Label(ghost, text=text, bg=FG_ACCENT, fg=BG_DARK,
+                 font=("Consolas", 9), padx=6, pady=2,
+                 relief=tk.SOLID, borderwidth=1).pack()
+        return ghost
+    except tk.TclError:
+        return None
+
+
+def _move_drag_ghost(ghost, x_root, y_root):
+    if ghost is not None:
+        try:
+            ghost.geometry(f"+{int(x_root) + _GHOST_DX}+{int(y_root) + _GHOST_DY}")
+        except tk.TclError:
+            pass
+
+
+def _destroy_drag_ghost(ghost):
+    if ghost is not None:
+        try:
+            ghost.destroy()
+        except tk.TclError:
+            pass
+
+
 def _bind_chip_dnd(widget, item, on_click, on_drag):
     """Bind press/motion/release so a stationary release is a click (``on_click``)
     and a moved release is a drop; motion beyond a small threshold streams
-    ``on_drag`` phases (``"motion"`` / ``"drop"`` / ``"cancel"``)."""
-    state = {"start": None, "dragging": False}
+    ``on_drag`` phases (``"motion"`` / ``"drop"`` / ``"cancel"``).
+
+    Crossing the drag threshold also spawns the follow-the-cursor drag ghost
+    (:func:`_make_drag_ghost`), moved on every subsequent motion and destroyed on
+    drop, cancel/Esc, AND widget destruction. The ghost is a self-contained side
+    effect — the ``on_drag`` phase emission/ordering is unchanged (the wiring's
+    drop-caret contract, pinned by the drag-phase tests, depends on it)."""
+    state = {"start": None, "dragging": False, "ghost": None}
 
     def press(e):
+        _destroy_drag_ghost(state["ghost"])   # defensive: never strand a prior ghost
+        state["ghost"] = None
         state["start"] = (e.x_root, e.y_root)
         state["dragging"] = False
 
@@ -691,10 +747,14 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
             if abs(e.x_root - sx) + abs(e.y_root - sy) < 5:
                 return
             state["dragging"] = True
+            state["ghost"] = _make_drag_ghost(widget, item)   # threshold → ghost
+        _move_drag_ghost(state["ghost"], e.x_root, e.y_root)
         on_drag(item, e.x_root, e.y_root, "motion")
 
     def release(e):
         if state["dragging"]:
+            _destroy_drag_ghost(state["ghost"])
+            state["ghost"] = None
             on_drag(item, e.x_root, e.y_root, "drop")
         elif state["start"] is not None:
             on_click(item)
@@ -703,14 +763,23 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
 
     def cancel(_e=None):
         if state["dragging"]:
+            _destroy_drag_ghost(state["ghost"])
+            state["ghost"] = None
             on_drag(item, 0, 0, "cancel")
         state["start"] = None
         state["dragging"] = False
+
+    def _on_destroy(_e=None):
+        # A mid-drag teardown (e.g. an async tray rebuild) must not strand the
+        # ghost Toplevel; fires for the widget's own <Destroy>.
+        _destroy_drag_ghost(state["ghost"])
+        state["ghost"] = None
 
     widget.bind("<ButtonPress-1>", press, add="+")
     widget.bind("<B1-Motion>", motion, add="+")
     widget.bind("<ButtonRelease-1>", release, add="+")
     widget.bind("<Escape>", cancel, add="+")
+    widget.bind("<Destroy>", _on_destroy, add="+")
     # Test seam: the event closures are otherwise unreachable — expose them so a
     # drag can be driven deterministically with synthetic events.
     widget._dnd = {"press": press, "motion": motion, "release": release,
