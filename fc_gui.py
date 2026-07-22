@@ -4344,7 +4344,11 @@ class FCToolGUI:
                 all_ansiblex = wh_ansiblex
             else:
                 all_ansiblex = direct_ansiblex
-            self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex)
+            # Share the routing set's truthiness (resolved once above as ``conns``)
+            # so the direct-route label matches what actually routed -- config pairs
+            # AND corroborated store gates -- instead of the raw config cache.
+            self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex,
+                          bool(conns))
 
         threading.Thread(target=do_search, daemon=True).start()
 
@@ -4903,7 +4907,8 @@ class FCToolGUI:
 
     def _show_wh_result(self, result: WHRoute | None,
                         ansiblex_in_route: list[tuple[str, str]] | None = None,
-                        leg_ansiblex: dict[int, list[tuple[str, str]]] | None = None):
+                        leg_ansiblex: dict[int, list[tuple[str, str]]] | None = None,
+                        has_ansiblex: bool = False):
         self._clear_waypoint_frame()
         if ansiblex_in_route is None:
             ansiblex_in_route = []
@@ -4918,8 +4923,10 @@ class FCToolGUI:
         direct = result.gate_jumps_direct
         via_wh = result.total_jumps_via_wh
 
-        # Show direct route info (includes Ansiblex if configured)
-        has_ansiblex = len(self._ansiblex_connections) > 0
+        # Show direct route info. ``has_ansiblex`` reflects the UNIONED, reinforced-
+        # filtered routing set (config pairs + corroborated store gates), resolved
+        # once by the caller (_do_wh_route) -- NOT the raw config cache, so a route
+        # that uses store-imported gates is labelled correctly after the config prune.
         route_label = "Direct route (with Ansiblex)" if has_ansiblex else "Direct gate route"
         if direct is not None:
             self._append_wh_log(f"{route_label}: {direct} jumps\n", "info")
