@@ -143,6 +143,36 @@ def _ellipsize(text: str, n: int = 24) -> str:
     return text[: n - 1] + "…"
 
 
+def used_channel_items(recents_items, cap=None) -> list:
+    """The channels the user has ACTUALLY used before (Item 2): the ``channel`` /
+    ``channel_line`` tokens from the recents MRU, deduped by channel name
+    (case-insensitive, first/most-recent wins), order-preserving, optionally
+    capped at ``cap``.
+
+    Discovered-but-never-used channels (e.g. the auto-joined "Alliance" you can't
+    leave) never entered a MOTD, so they never entered recents and are excluded by
+    construction. A ``channel_line`` with no channel name is skipped. Feeds BOTH
+    the Quick-Add tray channel chips and the zero-state dropdown Channels slice;
+    the full discovered list stays reachable by TYPING (query-mode Channels)."""
+    out, seen = [], set()
+    for it in recents_items or []:
+        if it.kind not in ("channel", "channel_line"):
+            continue
+        name = (it.params.get("name") or "").strip()
+        if not name and it.kind == "channel":
+            name = (it.label or "").strip()      # plain channel: label == name
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+        if cap is not None and len(out) >= cap:
+            break
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # pure ranking / grouping                                                      #
 # --------------------------------------------------------------------------- #
@@ -528,10 +558,14 @@ class QuickAddTray(tk.Frame):
 
     # -- build ------------------------------------------------------------- #
     def refresh(self) -> None:
-        """Re-fetch provider data and re-lay-out the strip at the current width."""
+        """Re-fetch provider data and re-lay-out the strip at the current width.
+
+        Channel chips are the channels the user has ACTUALLY used (recents MRU),
+        never the full discovered/auto-joined list — see :func:`used_channel_items`.
+        Zero used channels ⇒ zero channel chips."""
         self._fit_items = list(self._providers.doctrine_fits() or [])
-        self._recent_items = list(
-            self._providers.channels("") or [])[:_RECENT_CHAN_CAP]
+        self._recent_items = used_channel_items(
+            list(self._providers.recents() or []), cap=_RECENT_CHAN_CAP)
         self._rebuild(force=True)
 
     def _on_configure(self, _e=None) -> None:
@@ -942,11 +976,15 @@ class MotdPalette(tk.Frame):
         """Base groups (name, [items]) before ESI injection / rescan / capping."""
         p = self.providers
         if not query:
+            # Zero-state Channels follows the same used-only rule as the tray:
+            # only channels the user has actually inserted before (recents),
+            # never the discovered/auto-joined list. Discovered channels stay
+            # reachable by typing (the query branch below uses p.channels(query)).
             return [
                 ("Recent", list(p.recents() or [])),
                 ("Doctrine fits", list(p.doctrine_fits() or [])),
                 ("Lines & blocks", list(p.lines_blocks() or [])),
-                ("Channels", list(p.channels("") or [])),
+                ("Channels", used_channel_items(list(p.recents() or []))),
             ]
         by_name = {
             "Recent": rank_group(query, list(p.recents() or [])),
