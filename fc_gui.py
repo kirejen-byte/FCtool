@@ -9490,9 +9490,12 @@ class FCToolGUI:
         text interleaved with live tokens (FC / staging / doctrine / tag / channel
         / fit / char / system pills) that re-resolve on every compose — driven by
         an "add anything" palette + Quick-Add tray. Named per-doctrine templates
-        (v1 saves auto-migrate); the right rail (RAW/RENDERED previews, budget
-        meter, warnings, Set/Copy/Clear/Refresh, auto-update row, fleet status) is
-        unchanged. See docs/superpowers/specs/2026-07-21-motd-composer-redesign-design.md."""
+        (v1 saves auto-migrate). Layout (2026-07-22): LEFT panel = palette bar +
+        Quick-Add tray + RENDERED preview + a collapsed "Raw markup" drawer;
+        RIGHT panel = the pill canvas (compose surface) + budget meter + warnings
+        + Set/Copy/Clear/Refresh + auto-update row + fleet status. The canvas sits
+        opposite the palette so its dropdown never overlaps the drag target.
+        See docs/superpowers/specs/2026-07-21-motd-composer-redesign-design.md."""
         tab = tk.Frame(self._fitting_subnb, bg=BG_DARK)
         self._fitting_subnb.add(tab, text="  MOTD  ")
 
@@ -9618,8 +9621,63 @@ class FCToolGUI:
 
         self._motd_palette.close_dropdown = _motd_palette_close_wrap
 
+        # Rendered preview (read-only) — the eye-friendly output; expands to fill
+        # the space vacated by the pill canvas (now on the right).
+        _lbl(left, "RENDERED").pack(anchor=tk.W, padx=8, pady=(6, 2))
+        self._motd_rendered = scrolledtext.ScrolledText(
+            left, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
+            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
+        self._motd_rendered.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self._theme_scrolledtext_bar(self._motd_rendered)
+        # Cache of configured render tags, keyed by
+        # (hex|None, bold, italic, underline, size|None, is_link).
+        self._motd_render_tags = {}
+        # Monotonic id for per-link hover tags (reset each render — see
+        # _render_motd_markup, which deletes the prior link tags first).
+        self._motd_link_seq = 0
+
+        # Raw markup behind a collapsible drawer at the bottom of the left panel
+        # (session-scoped; starts COLLAPSED so the palette dropdown no longer
+        # fights the compose surface). House collapsible-header pattern (mirrors
+        # _toggle_paste_drawer): a clickable header label flips ▶/▼ and
+        # pack()/pack_forget()s the body. The raw ScrolledText (_motd_preview)
+        # lives in the unpacked body and KEEPS its attribute name, so the preview
+        # pipeline writes to it whether the drawer is open or shut.
+        self._motd_raw_drawer_expanded = False
+        self._motd_raw_drawer_frame = tk.Frame(
+            left, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+            highlightbackground=BORDER_COLOR, highlightthickness=1)
+        self._motd_raw_drawer_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self._motd_raw_header = tk.Frame(self._motd_raw_drawer_frame, bg=BG_PANEL)
+        self._motd_raw_header.pack(fill=tk.X, padx=8, pady=4)
+        self._motd_raw_toggle_btn = tk.Label(
+            self._motd_raw_header, text="▶ Raw markup",
+            font=("Consolas", 9, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
+            cursor="hand2")
+        self._motd_raw_toggle_btn.pack(side=tk.LEFT)
+        self._motd_raw_toggle_btn.bind(
+            "<Button-1>", lambda e: self._toggle_motd_raw_drawer())
+        # Body (hidden by default — pack()/pack_forget() on toggle).
+        self._motd_raw_body = tk.Frame(self._motd_raw_drawer_frame, bg=BG_PANEL)
+        self._motd_preview = scrolledtext.ScrolledText(
+            self._motd_raw_body, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
+            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
+            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
+        self._motd_preview.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        self._theme_scrolledtext_bar(self._motd_preview)
+
+        # Right: the pill canvas (compose surface) is the dominant expanding
+        # widget; the meter + warnings + actions + auto-update + fleet status
+        # stack beneath it.
+        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
+                         highlightbackground=BORDER_COLOR, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
         self._motd_canvas = pill_canvas.PillCanvas(
-            left,
+            right,
             resolve_label=self._motd_resolve_token_label,
             system_completions=lambda: list(
                 getattr(self, "_system_names", []) or []),
@@ -9632,51 +9690,11 @@ class FCToolGUI:
             height=14,
             bg_panel=BG_PANEL, bg_entry=BG_ENTRY, fg_text=FG_TEXT,
             fg_white=FG_WHITE, fg_accent=FG_ACCENT, border=BORDER_COLOR)
-        self._motd_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
-
-        # Right: preview + meter + actions.
-        right = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.GROOVE,
-                         highlightbackground=BORDER_COLOR, highlightthickness=1)
-        right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
-
-        # Dual preview: Raw markup (top) + Rendered (bottom), both read-only.
-        panes = tk.Frame(right, bg=BG_PANEL)
-        panes.grid(row=1, column=0, sticky="nsew", padx=8, pady=(8, 0))
-        panes.columnconfigure(0, weight=1)
-        panes.rowconfigure(1, weight=1)   # Raw pane grows
-        panes.rowconfigure(3, weight=1)   # Rendered pane grows
-
-        tk.Label(panes, text="RAW MARKUP", font=("Consolas", 9, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).grid(
-                     row=0, column=0, sticky="w", pady=(0, 2))
-        self._motd_preview = scrolledtext.ScrolledText(
-            panes, font=("Consolas", 9), bg=BG_ENTRY, fg=FG_TEXT,
-            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
-            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
-        self._motd_preview.grid(row=1, column=0, sticky="nsew")
-        self._theme_scrolledtext_bar(self._motd_preview)
-
-        tk.Label(panes, text="RENDERED", font=("Consolas", 9, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).grid(
-                     row=2, column=0, sticky="w", pady=(6, 2))
-        self._motd_rendered = scrolledtext.ScrolledText(
-            panes, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            insertbackground=FG_WHITE, wrap=tk.WORD, height=6,
-            borderwidth=1, relief=tk.RIDGE, state=tk.DISABLED)
-        self._motd_rendered.grid(row=3, column=0, sticky="nsew")
-        self._theme_scrolledtext_bar(self._motd_rendered)
-        # Cache of configured render tags, keyed by
-        # (hex|None, bold, italic, underline, size|None, is_link).
-        self._motd_render_tags = {}
-        # Monotonic id for per-link hover tags (reset each render — see
-        # _render_motd_markup, which deletes the prior link tags first).
-        self._motd_link_seq = 0
+        self._motd_canvas.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
 
         # Length meter: a colored bar + numeric label.
         meter_wrap = tk.Frame(right, bg=BG_PANEL)
-        meter_wrap.grid(row=2, column=0, sticky="ew", padx=8, pady=(6, 0))
+        meter_wrap.grid(row=1, column=0, sticky="ew", padx=8, pady=(6, 0))
         meter_wrap.columnconfigure(0, weight=1)
         self._motd_meter_canvas = tk.Canvas(
             meter_wrap, height=14, bg=BG_ENTRY, highlightthickness=1,
@@ -9691,11 +9709,11 @@ class FCToolGUI:
         self._motd_warn_label = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_YELLOW, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
-        self._motd_warn_label.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 0))
+        self._motd_warn_label.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 0))
 
         # Actions: Set as fleet MOTD (boss-gated) + Copy.
         act_row = tk.Frame(right, bg=BG_PANEL)
-        act_row.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+        act_row.grid(row=3, column=0, sticky="ew", padx=8, pady=8)
         self._motd_set_btn = ttk.Button(
             act_row, text="Set as fleet MOTD", style="Green.TButton",
             command=self._set_fleet_motd, state=tk.DISABLED)
@@ -9710,7 +9728,7 @@ class FCToolGUI:
         # Auto-update controls on their own row so the interval ("every N s")
         # and the link indicator are never clipped when the window is narrow.
         link_row = tk.Frame(right, bg=BG_PANEL)
-        link_row.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
+        link_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
         tk.Checkbutton(
             link_row, text="Auto-update MOTD", variable=self._motd_link_var,
@@ -9764,7 +9782,7 @@ class FCToolGUI:
         self._motd_fleet_status = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
-        self._motd_fleet_status.grid(row=6, column=0, sticky="ew", padx=8,
+        self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
                                      pady=(0, 8))
 
         # Populate dropdowns, load the default document, then first preview. The
@@ -9781,6 +9799,23 @@ class FCToolGUI:
         self._rebuild_motd_preview()
         self._motd_link_tick()
         self._motd_autopush_loop()
+
+    def _toggle_motd_raw_drawer(self):
+        """Collapse / expand the raw-markup drawer (session-scoped; starts
+        collapsed each launch).
+
+        House collapsible-header pattern (mirrors ``_toggle_paste_drawer`` /
+        ``_toggle_xup_log``): flip the flag, retitle the arrow ▶/▼, and
+        pack() / pack_forget() the body. The raw ScrolledText (``_motd_preview``)
+        lives inside the unpacked body, so the preview pipeline keeps writing to
+        it while it is hidden — collapsing changes visibility only, not logic."""
+        self._motd_raw_drawer_expanded = not self._motd_raw_drawer_expanded
+        if self._motd_raw_drawer_expanded:
+            self._motd_raw_toggle_btn.config(text="▼ Raw markup")
+            self._motd_raw_body.pack(fill=tk.BOTH, expand=True)
+        else:
+            self._motd_raw_toggle_btn.config(text="▶ Raw markup")
+            self._motd_raw_body.pack_forget()
 
     # ── MOTD: pill-canvas composer wiring (Task 4) ────────────────────────────
 
