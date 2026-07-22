@@ -236,6 +236,54 @@ def gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
     return pairs
 
 
+def _gate_home(entry: dict) -> str | None:
+    """The system a gate structure is PLACED in for chip/bridge purposes -- the
+    same home endpoint :func:`gate_pairs` assigns to it: the explicit
+    ``system_name`` when present, else the origin parsed from the structure
+    ``name`` (``"A » B"`` -> ``A``). ``None`` when neither is known."""
+    home = entry.get("system_name")
+    if home:
+        return home
+    origin, _ = _gate_endpoints_from_name(entry.get("name") or "")
+    return origin
+
+
+def corroborated_gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
+    """The :func:`gate_pairs` subset whose BOTH endpoints actually CONTAIN a live
+    gate structure in the store -- the fix for the owner's phantom-bridge bug
+    (2026-07-22).
+
+    An Ansiblex bridge is a PAIR of structures, one anchored in each endpoint
+    system. :func:`gate_pairs` emits a name pair for EVERY live gate, so a lone /
+    one-way derivation -- a gate whose reciprocal end was never scanned, or (the
+    observed case) whose reciprocal end collapsed onto the same scanned system --
+    yields a bridge to a system that holds NO Ansiblex. This filter keeps a pair
+    only when BOTH endpoints are among the systems that host a gate structure, so
+    the map bridge layer (``fc_gui._get_map_bridges``) draws a bridge only when a
+    gate exists on each end (owner's request: "don't show an ansiblex connection
+    between 2 systems if one of them does not have an ansiblex in it").
+
+    "Contains a gate" is judged by the store's own PLACEMENT (``_gate_home`` --
+    ``system_name``, else the name-parsed origin), NEVER the name-parsed
+    DESTINATION: a gate NAMED ``"K-6K16 » SVM-3K"`` but anchored in SVM-3K does
+    NOT make K-6K16 gate-bearing. Endpoints compare case-insensitively. A gate
+    still EXISTS as a chip in its own system regardless of this filter (it acts on
+    the bridge union only, mirroring the reinforced-flag design where a suppressed
+    bridge keeps its chip). ``reinforced_gate_pairs`` deliberately does NOT route
+    through here -- it resolves flagged gates to id-pairs for SUPPRESSION matching
+    and must emit a flagged gate's pair regardless of far-end corroboration.
+    Pure/deterministic; input order preserved (as :func:`gate_pairs`)."""
+    homes = set()
+    for entry in (entries or ()):
+        if entry.get("category") != "gate" or entry.get("status") == "dead":
+            continue
+        home = _gate_home(entry)
+        if home:
+            homes.add(home.casefold())
+    return [(a, b) for a, b in gate_pairs(entries)
+            if a.casefold() in homes and b.casefold() in homes]
+
+
 def reinforced_gate_pairs(entries: list[dict]) -> list[tuple[str, str]]:
     """The ``gate_pairs`` subset for gates manually flagged ``reinforced``.
 

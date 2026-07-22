@@ -159,23 +159,31 @@ class InfraScanner:
                 if search_errored:
                     errors += 1
 
-                known = self._known_type_ids()
+                known, gate_ids = self._known_ids()
                 rows: list[dict] = []
                 system_cancelled = False
                 for sid in ids:
                     if self._cancel.is_set():
                         cancelled = system_cancelled = True
                         break
-                    if sid in known:
-                        # Already resolved elsewhere: a light "seen" row bumps
-                        # last_seen without spending an ESI call or error budget.
-                        rows.append({"structure_id": sid, "type_id": None,
-                                     "category": categorize(None, sid),
-                                     "system_id": sys_id, "system_name": sys_name,
-                                     "status": "alive"})
+                    if sid in known and sid not in gate_ids:
+                        # Already-resolved NON-gate: a light "seen" ping bumps
+                        # last_seen without an ESI call and carries NO placement.
+                        # It must NEVER restamp system_id/system_name from the
+                        # search term (sys_id/sys_name) -- the system we happened to
+                        # be scanning, not the structure's true home (the
+                        # phantom-bridge root cause). GATES are deliberately excluded
+                        # so they are re-resolved every scan and a mis-filed gate
+                        # self-heals to its true solar_system_id (gates are few ->
+                        # negligible budget).
+                        rows.append({"structure_id": sid, "status": "alive"})
                         continue
                     if resolve_aborted:
-                        rows.append(self._stub(sid, sys_id, sys_name))
+                        # A known structure keeps its record on abort (a "seen"
+                        # bump); only a genuinely new id becomes a placeholder stub.
+                        rows.append({"structure_id": sid, "status": "alive"}
+                                    if sid in known
+                                    else self._stub(sid, sys_id, sys_name))
                         errors += 1
                         continue
                     self._emit(self.on_progress, {
@@ -186,11 +194,18 @@ class InfraScanner:
                     self._governor(status, headers)
                     self._sleep(self.PACE_SECONDS)
                     if isinstance(info, dict):
-                        rows.append(self._resolved_row(sid, info, sys_id, sys_name))
+                        rows.append(self._resolved_row(sid, info, sys_id, sys_name,
+                                                       self._system_name))
                         found += 1
                         streak_403 = 0
                     else:
-                        rows.append(self._stub(sid, sys_id, sys_name))
+                        # A KNOWN structure that failed to re-resolve (e.g. a role-
+                        # gated 403) must NOT be stubbed: a stub restamps its system
+                        # from the search term and downgrades type/category. Keep the
+                        # existing record with a "seen" bump; only a new id stubs.
+                        rows.append({"structure_id": sid, "status": "alive"}
+                                    if sid in known
+                                    else self._stub(sid, sys_id, sys_name))
                         errors += 1
                         if status == 403:
                             streak_403 += 1
@@ -251,17 +266,28 @@ class InfraScanner:
             queue.append((s.id, name))
         return queue
 
-    def _known_type_ids(self):
-        """Structure ids the store already has a type_id for — skip resolving
-        these (their type never changes) to save error budget."""
-        known = set()
+    def _known_ids(self):
+        """``(typed_ids, gate_ids)`` from ONE store pass.
+
+        ``typed_ids``: structures the store already has a type_id for -- skipped from
+        re-resolution (their type never changes) to save error budget.
+        ``gate_ids``: structures of category ``gate`` -- the caller EXEMPTS these
+        from that skip so a mis-filed gate is re-resolved every scan and self-heals
+        to its true ``solar_system_id`` (the phantom-bridge heal). Gates are few, so
+        re-resolving them is negligible against the budget."""
+        typed, gates = set(), set()
         try:
             for e in self.store.entries():
-                if e.get("type_id") is not None and e.get("structure_id") is not None:
-                    known.add(e["structure_id"])
+                sid = e.get("structure_id")
+                if sid is None:
+                    continue
+                if e.get("type_id") is not None:
+                    typed.add(sid)
+                if e.get("category") == "gate":
+                    gates.add(sid)
         except Exception:
             log.debug("[infra-scan] store.entries() failed", exc_info=True)
-        return known
+        return typed, gates
 
     @staticmethod
     def _stub(sid, sys_id, sys_name):
@@ -273,21 +299,46 @@ class InfraScanner:
                 "category": categorize(None, sid), "system_id": sys_id,
                 "system_name": sys_name, "status": "unresolved"}
 
+    def _system_name(self, system_id):
+        """Local (no-ESI) solar-system id -> canonical name via the injected
+        MapModel (``self.model.systems[id].name``), so a scanned structure is filed
+        under its TRUE system. None for an id the model does not know (the caller
+        then falls back to the search-term name)."""
+        try:
+            sysobj = self.model.systems.get(int(system_id))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return getattr(sysobj, "name", None) if sysobj is not None else None
+
     @staticmethod
-    def _resolved_row(sid, info, sys_id, sys_name):
+    def _resolved_row(sid, info, sys_id, sys_name, name_of=None):
+        """Build a store row from a resolved ``/universe/structures`` payload.
+
+        The structure is filed under its TRUE system -- the payload's
+        ``solar_system_id`` -- NOT the search term ``sys_name`` (the system we
+        happened to be scanning). ESI structure ``/search/`` is a fuzzy substring
+        on the structure NAME, so scanning one system returns gates that physically
+        live in OTHER systems; stamping ``system_name`` from the search term
+        mis-filed those gates and drew phantom bridges (owner bug, 2026-07-22).
+        ``name_of`` (the injected ``self._system_name``) resolves the true id ->
+        canonical name locally (no ESI); it falls back to ``sys_id``/``sys_name``
+        only when ``solar_system_id`` is absent or unknown to the local map model."""
         pos = info.get("position")
         position = None
         if isinstance(pos, dict) and all(k in pos for k in ("x", "y", "z")):
             position = [pos["x"], pos["y"], pos["z"]]
         ssid = info.get("solar_system_id")
+        true_sid = ssid if isinstance(ssid, int) else sys_id
+        true_name = (name_of(true_sid) if (name_of is not None
+                                           and isinstance(ssid, int)) else None)
         type_id = info.get("type_id")
         return {
             "structure_id": sid,
             "type_id": type_id,
             "category": categorize(type_id, sid),
             "name": info.get("name", ""),
-            "system_id": ssid if isinstance(ssid, int) else sys_id,
-            "system_name": sys_name,
+            "system_id": true_sid,
+            "system_name": true_name or sys_name,
             "owner_id": info.get("owner_id"),
             "position": position,
             "status": "alive",

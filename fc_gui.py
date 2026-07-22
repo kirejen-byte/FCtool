@@ -5912,12 +5912,18 @@ class FCToolGUI:
         """Resolved Ansiblex bridge id-pairs for the star map. UNION (at the
         NAME-pair level, before resolution) of config["ansiblex_connections"] —
         the SAME pairs the jump-range BFS consumes — and any imported-gate pairs
-        from the infra store (infra_overlay.gate_pairs). resolve_bridges resolves
-        each name pair and dedupes by unordered id-pair, so duplicate/ case-variant
-        gates collapse automatically. Pure/local name resolution (NO ESI), safe on
-        the Tk thread. The infra store is only consulted when ALREADY built — this
-        is called on every map show, so we never force the model load here for a
-        map user who has not touched infra. Guarded -- a bad config yields ()."""
+        from the infra store (infra_overlay.corroborated_gate_pairs). resolve_bridges
+        resolves each name pair and dedupes by unordered id-pair, so duplicate/
+        case-variant gates collapse automatically. Pure/local name resolution (NO
+        ESI), safe on the Tk thread. The infra store is only consulted when ALREADY
+        built — this is called on every map show, so we never force the model load
+        here for a map user who has not touched infra. Guarded -- a bad config yields ().
+
+        STORE-derived bridges are corroboration-filtered (``corroborated_gate_pairs``):
+        an imported gate contributes a bridge only when BOTH endpoint systems hold a
+        gate structure, so a one-way / mis-scanned derivation to a system with no
+        Ansiblex is dropped (owner phantom-bridge bug, 2026-07-22). Config pairs are
+        explicit manual declarations and are NEVER corroboration-filtered."""
         try:
             import map_overlays as mo
             name_pairs = list(self.config.get("ansiblex_connections", []))
@@ -5925,7 +5931,7 @@ class FCToolGUI:
             if store is not None:
                 try:
                     import infra_overlay
-                    name_pairs += infra_overlay.gate_pairs(store.entries())
+                    name_pairs += infra_overlay.corroborated_gate_pairs(store.entries())
                 except Exception as exc:
                     print(f"[MAP] infra gate-pairs union failed: {exc}")
             resolved = mo.resolve_bridges(name_pairs)
