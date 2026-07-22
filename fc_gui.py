@@ -9626,6 +9626,7 @@ class FCToolGUI:
             system_labels=lambda: dict(
                 getattr(self, "_system_labels", {}) or {}),
             channel_completions=self._motd_channel_completions,
+            doctrine_tags=self._motd_doctrine_tag_options,
             on_change=self._motd_on_canvas_change,
             on_trigger=self._motd_on_canvas_trigger,
             height=14,
@@ -9795,6 +9796,25 @@ class FCToolGUI:
         """Channel names for the pill param editors — the shared discovered cache."""
         return list(self.config.get("intel_channels", {})
                     .get("cached_discovered", []) or [])
+
+    def _motd_doctrine_tag_options(self):
+        """Tags offered by the tag_line pill editor's combobox: every tag present
+        on the SELECTED doctrine's members (insertion-order union, dups collapsed).
+
+        Lets a stale or migrated tag_line pill — e.g. a pre-rename "Logistics" from
+        a v1 saved MOTD template, whose doctrine membership tags were renamed to
+        "Logi" by ``fittings_store._TAG_RENAMES`` — be re-pointed at the doctrine's
+        real tag from a dropdown instead of blind free-typing. Free text stays
+        allowed (the combobox is editable)."""
+        d = self._motd_selected_doctrine()
+        if d is None:
+            return []
+        seen: list = []
+        for mem in getattr(d, "members", []) or []:
+            for t in (mem.tags or []):
+                if t not in seen:
+                    seen.append(t)
+        return seen
 
     def _motd_build_resolve_context(self):
         """Assemble a fresh :class:`motd_doc.ResolveContext` from the live seams.
@@ -10693,7 +10713,14 @@ class FCToolGUI:
             doc = motd_doc.doc_from_json(data.get("doc") or [])
             legacy = data.get("legacy_fits") or []
         else:
-            doc = motd_doc.from_legacy_fields(data)
+            # Feed the STORE's live rename table so a v1 template saved before a
+            # role-tag rename ("Logistics") migrates its tag_line pills onto the
+            # doctrine's current tag ("Logi") — the same map the store applies to
+            # doctrine membership tags on load. Referenced (single source), never
+            # copied, so the two migration paths cannot drift.
+            import fittings_store as _fittings_store
+            doc = motd_doc.from_legacy_fields(
+                data, tag_renames=_fittings_store._TAG_RENAMES)
             legacy = data.get("fits") or []
         self._motd_loaded_fits = [tuple(x) for x in legacy] or None
         self._motd_canvas.set_doc(doc)               # silent (no on_change)

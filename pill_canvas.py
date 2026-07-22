@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import ttk
 from typing import Callable
 
 import markup_editor
@@ -88,6 +89,7 @@ class PillCanvas(MarkupEditor):
                  system_completions: Callable = lambda: [],
                  system_labels: Callable = lambda: {},
                  channel_completions: Callable = lambda: [],
+                 doctrine_tags: Callable = lambda: [],
                  on_change=None,
                  on_trigger: Callable = None,
                  height=14, **kw):
@@ -96,6 +98,7 @@ class PillCanvas(MarkupEditor):
         self._system_completions = system_completions
         self._system_labels = system_labels
         self._channel_completions = channel_completions
+        self._doctrine_tags = doctrine_tags
         self._on_trigger = on_trigger
 
         # name (embedded-window pathname) -> TokenRun / chip Frame
@@ -1103,9 +1106,18 @@ class PillCanvas(MarkupEditor):
 
         if kind == "tag_line":
             label("Tag:", 0)
-            e = self._entry(body, p.get("tag", ""))
-            e.grid(row=0, column=1, sticky="ew")
-            return lambda: {"tag": e.get().strip()}
+            try:
+                tags = list(self._doctrine_tags() or [])
+            except Exception:
+                tags = []
+            # Editable combobox (state="normal" → free text still allowed) seeded
+            # with the selected doctrine's tags, so a stale/migrated tag_line can be
+            # re-pointed at the doctrine's real tag (e.g. "Logistics" → "Logi") from
+            # a dropdown. App-wide dark TCombobox styling applies (fc_gui startup).
+            combo = ttk.Combobox(body, values=tags)
+            combo.set(p.get("tag", ""))
+            combo.grid(row=0, column=1, sticky="ew")
+            return lambda: {"tag": combo.get().strip()}
 
         if kind in ("staging_line", "system"):
             label("System:", 0)

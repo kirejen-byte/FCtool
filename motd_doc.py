@@ -161,8 +161,12 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
         return char_link(p.get("id"), p.get("name", "")), [], 0
 
     if kind == "fit":
-        markup, _delta, ok = _finalize_fit(p.get("dna", ""), p.get("name", ""), ctx)
-        return markup, [], (0 if ok else 1)
+        # A fit ALWAYS resolves: an unparseable DNA keeps the raw DNA and drops
+        # the delta (§4.2 "DNA unparseable → raw DNA kept, no delta"; §9 "degrades
+        # to … raw DNA"). It is never counted unresolved / rendered stale merely
+        # because the type-catalog could not parse it.
+        markup, _delta, _ok = _finalize_fit(p.get("dna", ""), p.get("name", ""), ctx)
+        return markup, [], 0
 
     if kind == "system":
         name = p.get("name", "")
@@ -341,7 +345,9 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         ok = parsed is not None
         delta = ctx.deltas.get(parsed.ship_type_id, 0) if ok else 0
         tip = f"resolves to fit link: {name}" if ok else f"unparseable DNA — link kept, no delta: {name}"
-        return TokenLabel(_ellip(name), ok, tip, delta)
+        # SOLID even when the DNA won't parse: the link is kept with the raw DNA
+        # (§4.2), only the delta drops — a fit chip is never stale on parse failure.
+        return TokenLabel(_ellip(name), True, tip, delta)
 
     if kind == "system":
         name = p.get("name", "")
@@ -383,7 +389,8 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
 
     if kind == "tag_line":
         tag = p.get("tag", "")
-        fits = (ctx.fits_by_tag(False) or {}).get(tag) or []
+        fbt = ctx.fits_by_tag(False) or {}
+        fits = fbt.get(tag) or []
         names = [n for _d, n in fits]
         net = 0
         for dna, _n in fits:
@@ -392,7 +399,17 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
                 net += ctx.deltas.get(parsed.ship_type_id, 0)
         ok = bool(fits)
         text = f"{tag}: {' | '.join(names)}" if ok else tag
-        tip = f"resolves to: {tag}: {' | '.join(names)}" if ok else f"no fits for '{tag}' — line omitted"
+        if ok:
+            tip = f"resolves to: {tag}: {' | '.join(names)}"
+        else:
+            # Actionable stale reason: name the doctrine's ACTUAL tags so a
+            # migrated/typo'd tag (e.g. a pre-rename "Logistics" vs the doctrine's
+            # "Logi") is one edit away from fixing. NO fuzzy matching — the pill
+            # stays unresolved; it is surfaced and explained, not silently guessed.
+            avail = [t for t in _ordered_tags(list(fbt.keys())) if fbt.get(t)]
+            tip = (f"no fits tagged '{tag}' in this doctrine — this doctrine's tags: "
+                   + ", ".join(avail)) if avail else \
+                  f"no fits tagged '{tag}' — this doctrine has no tagged fits"
         return TokenLabel(_ellip(text), ok, tip, net)
 
     if kind == "channel_line":
@@ -471,7 +488,29 @@ def _runs_from_markup(markup: str) -> list:
     return runs
 
 
-def from_legacy_fields(saved: dict) -> Doc:
+def _apply_tag_renames(tags: list, renames: dict) -> list:
+    """Map each tag through ``renames`` and de-dupe, preserving order.
+
+    MIRRORS :func:`fittings_store._migrate_tag_list` EXACTLY so the template-tag
+    path and the store's membership-tag path cannot drift: a SINGLE
+    ``renames.get(t, t)`` lookup (NO chaining — a mapped value is not re-mapped;
+    NO case-fold — keys match verbatim), unknown tags pass through unchanged, and
+    a legacy+target pair collapses to one entry at the legacy tag's position (the
+    target's later duplicate is dropped). ``motd_doc`` stays pure (no
+    ``fittings_store`` import) — the rename *table* is injected by the caller.
+    """
+    out: list = []
+    seen: set = set()
+    for t in tags:
+        new_t = renames.get(t, t)
+        if new_t in seen:
+            continue
+        seen.add(new_t)
+        out.append(new_t)
+    return out
+
+
+def from_legacy_fields(saved: dict, tag_renames: dict | None = None) -> Doc:
     """Migrate a v1 ``saved_motds`` entry into a v2 run list (deterministic).
 
     Order mirrors ``build_motd``'s line list: header runs · ``fc_line(selected)``
@@ -484,6 +523,14 @@ def from_legacy_fields(saved: dict) -> Doc:
     when every tag_line resolves empty (see :func:`resolve`); a tag-less template
     that still has saved fits gets one synthetic ``Fits`` tag_line so that
     fallback has an anchor to render at.
+
+    ``tag_renames`` (optional): the store's role-tag rename table
+    (``fittings_store._TAG_RENAMES``, injected by the wiring — kept out of this
+    pure module). When given, each saved tag is mapped through it via
+    :func:`_apply_tag_renames` BEFORE its ``tag_line`` is emitted, so a template
+    saved before a rename ("Logistics") lands on the doctrine's current tag
+    ("Logi") instead of a permanently-stale pill. ``None`` = no mapping (today's
+    verbatim behavior, for callers that don't want store coupling).
     """
     units: list = []
     header = _runs_from_markup(saved.get("header", "") or "")
@@ -494,6 +541,8 @@ def from_legacy_fields(saved: dict) -> Doc:
         units.append([TokenRun("staging_line", {"name": saved.get("staging", "")})])
     units.append([TokenRun("doctrine_line", {})])
     tags = saved.get("tags", []) or []
+    if tag_renames:
+        tags = _apply_tag_renames(tags, tag_renames)
     if tags:
         for tag in tags:
             units.append([TokenRun("tag_line", {"tag": tag})])
