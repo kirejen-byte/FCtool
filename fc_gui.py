@@ -9774,7 +9774,8 @@ class FCToolGUI:
         self._motd_doctrine_prev = self._motd_doctrine_var.get()
         self._motd_canvas.set_doc(self._motd_default_doc())
         self._motd_template_dirty = False
-        self._motd_loaded_template_snapshot = None
+        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
+            self._motd_canvas.get_doc())
         self._motd_update_dirty_indicator()
         self._motd_palette.refresh_tray()
         self._rebuild_motd_preview()
@@ -9854,12 +9855,33 @@ class FCToolGUI:
 
     # ── dirty tracking + confirm ──────────────────────────────────────────────
 
+    def _motd_is_dirty(self) -> bool:
+        """True only when the composer's DOCUMENT actually diverges from the
+        loaded/saved snapshot.
+
+        ``_motd_template_dirty`` is a fast-path *hint*, not the truth: doctrine/FC
+        dropdown navigation latches it (the FC/tag pills re-resolve), yet the pill
+        DOCUMENT is unchanged — so a mere switch used to raise a spurious "discard
+        unsaved changes?" prompt. The authoritative test is a cheap doc-JSON
+        compare against the snapshot captured on load/save (docs are small). No
+        latch ⇒ nothing changed; no snapshot/canvas yet (bare test hosts,
+        pre-first-load) ⇒ fall back to the latch."""
+        if not getattr(self, "_motd_template_dirty", False):
+            return False
+        snap = getattr(self, "_motd_loaded_template_snapshot", None)
+        cv = getattr(self, "_motd_canvas", None)
+        if snap is None or cv is None:
+            return True
+        try:
+            return motd_doc.doc_to_json(cv.get_doc()) != snap
+        except Exception:
+            return True
+
     def _motd_update_dirty_indicator(self):
         lbl = getattr(self, "_motd_dirty_label", None)
         if lbl is not None:
             try:
-                lbl.config(text="•" if getattr(self, "_motd_template_dirty",
-                                                False) else "")
+                lbl.config(text="•" if self._motd_is_dirty() else "")
             except tk.TclError:
                 pass
 
@@ -9880,8 +9902,9 @@ class FCToolGUI:
             return True
 
     def _motd_confirm_discard_if_dirty(self):
-        """Return True to proceed (nothing dirty, or the user OK'd discarding)."""
-        if not getattr(self, "_motd_template_dirty", False):
+        """Return True to proceed (the document actually diverges only if the user
+        OK's discarding real unsaved changes; a bare doctrine/FC switch is clean)."""
+        if not self._motd_is_dirty():
             return True
         return self._motd_confirm("Discard changes?",
                                   "Discard unsaved MOTD changes?")
@@ -12003,7 +12026,8 @@ class FCToolGUI:
         if pal is not None:
             pal.refresh_tray()
 
-        self._motd_loaded_template_snapshot = None
+        self._motd_loaded_template_snapshot = (
+            motd_doc.doc_to_json(cv.get_doc()) if cv is not None else None)
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         self._rebuild_motd_preview()
