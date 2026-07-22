@@ -1143,8 +1143,16 @@ class MotdPalette(tk.Frame):
 
     def _begin_row_gesture(self) -> None:
         """A dropdown row was pressed — mark a gesture in flight so an async ESI
-        ``_render`` defers rather than destroying the row before its release."""
+        ``_render`` defers rather than destroying the row before its release.
+
+        Also cancel the focus-out close armed when the press pulled focus off the
+        entry: a slow (or main-loop-stall-delayed) release arriving >150 ms later
+        would otherwise fire that timer first, tear the row down, and swallow the
+        insert (same 'inserts nothing, menu closed' symptom — for local rows too).
+        Clicking AWAY from any row never runs this, so dismiss-on-click-away still
+        works."""
         self._row_gesture_active = True
+        self._cancel_after("_focus_after")
 
     def _end_row_gesture(self) -> None:
         """The row press ended (release). Flush any render deferred during the
