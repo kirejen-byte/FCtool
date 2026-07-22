@@ -9774,8 +9774,7 @@ class FCToolGUI:
         self._motd_doctrine_prev = self._motd_doctrine_var.get()
         self._motd_canvas.set_doc(self._motd_default_doc())
         self._motd_template_dirty = False
-        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
-            self._motd_canvas.get_doc())
+        self._motd_loaded_template_snapshot = self._motd_snapshot_state()
         self._motd_update_dirty_indicator()
         self._motd_palette.refresh_tray()
         self._rebuild_motd_preview()
@@ -9855,17 +9854,33 @@ class FCToolGUI:
 
     # ── dirty tracking + confirm ──────────────────────────────────────────────
 
+    def _motd_snapshot_state(self):
+        """The clean-baseline of a template: the persisted ``{fc, doc}`` pair.
+
+        FC is a saved template field (``_capture_motd_fields``), so an FC-only
+        change must count as dirty — but DOCTRINE is navigation (which template
+        list you are browsing) and is deliberately excluded, so merely switching
+        doctrine never manufactures a discard prompt. Captured at every baseline
+        point (build / load / save / save-as / clear / auto-restage)."""
+        fc = ""
+        var = getattr(self, "_motd_fc_var", None)
+        if var is not None:
+            fc = var.get()
+        cv = getattr(self, "_motd_canvas", None)
+        doc = motd_doc.doc_to_json(cv.get_doc()) if cv is not None else None
+        return {"fc": fc, "doc": doc}
+
     def _motd_is_dirty(self) -> bool:
-        """True only when the composer's DOCUMENT actually diverges from the
-        loaded/saved snapshot.
+        """True only when the composer actually diverges from the loaded/saved
+        ``{fc, doc}`` baseline.
 
         ``_motd_template_dirty`` is a fast-path *hint*, not the truth: doctrine/FC
-        dropdown navigation latches it (the FC/tag pills re-resolve), yet the pill
-        DOCUMENT is unchanged — so a mere switch used to raise a spurious "discard
-        unsaved changes?" prompt. The authoritative test is a cheap doc-JSON
-        compare against the snapshot captured on load/save (docs are small). No
-        latch ⇒ nothing changed; no snapshot/canvas yet (bare test hosts,
-        pre-first-load) ⇒ fall back to the latch."""
+        dropdown navigation latches it (the FC/tag pills re-resolve), yet a bare
+        doctrine switch changes neither the FC nor the pill DOCUMENT — so it used
+        to raise a spurious "discard unsaved changes?" prompt. The authoritative
+        test compares the current ``{fc, doc}`` against the snapshot (docs are
+        small). No latch ⇒ nothing changed; no snapshot/canvas yet (bare test
+        hosts, pre-first-load) ⇒ fall back to the latch."""
         if not getattr(self, "_motd_template_dirty", False):
             return False
         snap = getattr(self, "_motd_loaded_template_snapshot", None)
@@ -9873,7 +9888,7 @@ class FCToolGUI:
         if snap is None or cv is None:
             return True
         try:
-            return motd_doc.doc_to_json(cv.get_doc()) != snap
+            return self._motd_snapshot_state() != snap
         except Exception:
             return True
 
@@ -10604,6 +10619,7 @@ class FCToolGUI:
             return                       # user- or template-owned — never clobber
         if new_default == (cur or "").strip():
             return                       # already current — no-op
+        was_clean = not self._motd_is_dirty()
         for run in doc:
             if isinstance(run, motd_doc.TokenRun) and run.kind == "staging_line":
                 run.params = dict(run.params)
@@ -10611,6 +10627,14 @@ class FCToolGUI:
                 break
         self._motd_staging_autofilled_value = new_default
         cv.set_doc(doc)                  # silent (no on_change)
+        # The auto-restage only ever rewrites a still-AUTO staging pill (never
+        # user content). When the composer was otherwise clean it must STAY clean,
+        # so fold the retarget into the baseline — otherwise a later flag latch
+        # (e.g. doctrine navigation) would surface this silent change as a spurious
+        # discard prompt. When already dirty, leave the baseline (the retarget
+        # rides along with the user's unsaved edits).
+        if was_clean:
+            self._motd_loaded_template_snapshot = self._motd_snapshot_state()
         self._schedule_motd_preview()
 
     # ── MOTD: saved (doctrine-linked) MOTDs ───────────────────────────────────
@@ -10674,8 +10698,7 @@ class FCToolGUI:
         self._motd_loaded_fits = [tuple(x) for x in legacy] or None
         self._motd_canvas.set_doc(doc)               # silent (no on_change)
 
-        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
-            self._motd_canvas.get_doc())
+        self._motd_loaded_template_snapshot = self._motd_snapshot_state()
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         self._schedule_motd_preview()
@@ -10865,8 +10888,7 @@ class FCToolGUI:
                 self._motd_saved_var.set(motd_name)
                 self._motd_saved_prev = motd_name
         # The just-saved state is now the clean baseline.
-        self._motd_loaded_template_snapshot = motd_doc.doc_to_json(
-            self._motd_canvas.get_doc())
+        self._motd_loaded_template_snapshot = self._motd_snapshot_state()
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         status = getattr(self, "_motd_fleet_status", None)
@@ -12027,7 +12049,7 @@ class FCToolGUI:
             pal.refresh_tray()
 
         self._motd_loaded_template_snapshot = (
-            motd_doc.doc_to_json(cv.get_doc()) if cv is not None else None)
+            self._motd_snapshot_state() if cv is not None else None)
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         self._rebuild_motd_preview()
