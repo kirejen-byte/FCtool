@@ -72,6 +72,13 @@ _CHIP_FONT = ("Consolas", 9)
 _UNDO_CAP = 100
 _TEXT_BURST_MS = 400        # debounce window that coalesces a typing burst -> 1 undo
 
+# Caret-navigation keysyms (they carry no printable char) that dismiss a pill
+# selection — once the user navigates the caret away, the accent highlight must
+# not linger. "Prior"/"Next" are PageUp/PageDown.
+_CARET_NAV_KEYS = frozenset({
+    "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+})
+
 
 class PillCanvas(MarkupEditor):
     """A :class:`MarkupEditor` with embedded live-token pills + a model + own undo.
@@ -155,6 +162,7 @@ class PillCanvas(MarkupEditor):
 
     def _bind_canvas_events(self):
         t = self.text
+        t.bind("<Button-1>", self._on_text_click, add="+")
         t.bind("<KeyPress>", self._on_keypress, add="+")
         t.bind("<KeyRelease>", self._on_keyrelease_trigger, add="+")
         t.bind("<Escape>", self._on_escape, add="+")
@@ -398,6 +406,36 @@ class PillCanvas(MarkupEditor):
         if self._selected_pill:
             self._deselect_current()
 
+    def _on_text_click(self, event=None):
+        """A Button-1 that reaches the Text body clears any active pill selection.
+
+        Clicking in the text is text-editing intent, so it must drop the pill
+        selection (and restyle the chip border) — otherwise a later Return, meant
+        as a newline, hits the "edit selected pill" shortcut (owner bug). A click
+        that lands on a chip is delivered to the chip's own embedded window and
+        does NOT bubble to the Text's bindtags in Tk (verified), so this handler
+        never fires for a chip-select click — chip selection survives. Returns
+        ``None`` so the default Text binding still positions the caret / starts a
+        drag-select normally.
+        """
+        self._clear_pill_selection()
+        return None
+
+    def _insert_adjacent_to(self, name) -> bool:
+        """True when the insert caret sits immediately before or after ``name``'s
+        embedded-window index — i.e. the selection is still "live" at the caret.
+
+        ``_select_pill`` parks the caret just after the chip, so this holds right
+        after a select; it goes False once the caret navigates away. It gates the
+        Return edit shortcut so a stale selection can't hijack a newline.
+        """
+        try:
+            pill_idx = self.text.index(name)
+            return (self.text.compare("insert", "==", pill_idx)
+                    or self.text.compare("insert", "==", f"{pill_idx}+1c"))
+        except tk.TclError:
+            return False
+
     # ── insert-at-caret API ─────────────────────────────────────────────────
 
     def insert_token_at_caret(self, kind: str, params: dict) -> None:
@@ -607,6 +645,13 @@ class PillCanvas(MarkupEditor):
             return self._handle_backspace(event)
         if ks == "Delete":
             return self._handle_delete(event)
+        if ks in _CARET_NAV_KEYS:
+            # Navigating the caret away from a selected pill drops the selection so
+            # the accent highlight doesn't linger (and a later Return becomes a
+            # plain newline, not the edit shortcut). Return None so the default
+            # binding still performs the caret movement.
+            self._clear_pill_selection()
+            return None
         if self._is_printable_insert(event):
             # A real insert dismisses pill selection (caret already sits after it)
             # and opens/extends a text-edit burst for undo.
@@ -1023,9 +1068,17 @@ class PillCanvas(MarkupEditor):
     # ── keyboard shortcuts ──────────────────────────────────────────────────
 
     def _on_return(self, event=None):
+        # The edit shortcut fires ONLY when the caret still sits against the
+        # selected pill (immediately before or after its embedded-window index).
+        # If the caret has wandered off — e.g. a navigation path that failed to
+        # clear the flag — the selection is stale: drop it and let Return be a
+        # plain newline (defense at the source for the owner's "move the cursor
+        # and try to make a new line" bug).
         if self._selected_pill:
-            self._open_param_editor(self._selected_pill)
-            return "break"
+            if self._insert_adjacent_to(self._selected_pill):
+                self._open_param_editor(self._selected_pill)
+                return "break"
+            self._clear_pill_selection()
         # A newline is a text edit; open/extend the undo burst (Return is more
         # specific than <KeyPress>, so _on_keypress never sees it).
         self._maybe_start_burst()
