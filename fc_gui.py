@@ -709,9 +709,9 @@ class FCToolGUI:
             pass
 
         # Serializes config.json writes across the Tk thread and background
-        # workers (e.g. _refresh_ansiblex_from_esi) so a read-modify-write on
-        # one thread cannot interleave with a write on another and corrupt or
-        # clobber settings. Created before any save path can run.
+        # workers so a read-modify-write on one thread cannot interleave with a
+        # write on another and corrupt or clobber settings. Created before any
+        # save path can run.
         self._config_lock = threading.Lock()
         # Main-thread UI dispatcher queue. Background workers never touch Tk
         # directly; they enqueue (fn, args) via _post_ui / _post_ui_after and the
@@ -960,8 +960,11 @@ class FCToolGUI:
         self._market_tick_after_id = None      # 1s elapsed ticker after() id / None
         self._load_market_cache()              # populate snapshot from disk if present
 
-        # Discover ansiblex from ESI if authenticated, else fall back to config
-        self._refresh_ansiblex_from_esi()
+        # Resolve any human-entered Ansiblex config pairs and push their bridges
+        # to the map. ESI auto-discovery is retired (F-1): the corroborated infra
+        # structure scan is the machine lane; config["ansiblex_connections"] is
+        # human-only.
+        self._resolve_ansiblex_at_startup()
         self._prewarm_cache_async()
 
         # If the coalition seed was freshly created this run, resolve
@@ -1154,95 +1157,42 @@ class FCToolGUI:
 
     # ── Ansiblex Connection Resolver ─────────────────────────────────────────
 
-    def _refresh_ansiblex_from_esi(self):
-        """Pull ansiblex gates from ESI if authenticated, else use config.
-        Runs in background. Updates config and re-resolves connections."""
-        def do_refresh():
-            if self.esi_auth and self.esi_auth.is_authenticated:
-                try:
-                    gates = self.esi_auth.discover_ansiblex_gates()
-                    if gates:
-                        # Hold the config lock across the mutate-then-write so
-                        # this background thread cannot interleave its
-                        # read-modify-write with a save on the Tk thread. The
-                        # write is done inline (not via _save_config) because
-                        # the lock is non-reentrant. A failed save must not
-                        # crash the worker.
-                        with self._config_lock:
-                            self.config["ansiblex_connections"] = gates
-                            try:
-                                atomic_write_json(
-                                    CONFIG_PATH, self.config, indent=4)
-                            except Exception:
-                                log.exception(
-                                    "Failed to save config.json (ansiblex refresh)")
-                        print(f"[Ansiblex] ESI refresh: {len(gates)} gate(s)")
-                    else:
-                        print("[Ansiblex] ESI returned no gates, keeping config")
-                except Exception as e:
-                    print(f"[Ansiblex] ESI refresh failed: {e}")
-            else:
-                print("[Ansiblex] Not authenticated, using config file")
-            # Resolve whatever is in config (ESI-refreshed or static)
-            self._resolve_ansiblex_sync()
+    def _resolve_ansiblex_at_startup(self):
+        """Resolve the human-maintained ``config["ansiblex_connections"]`` name
+        pairs in the background at startup and push the resulting bridges to the
+        star map.
 
-        threading.Thread(target=do_refresh, daemon=True).start()
+        RETIRED ESI discovery (2026-07-22, F-1): this used to call
+        ``esi_auth.discover_ansiblex_gates`` whenever authenticated and WRITE the
+        result into ``config["ansiblex_connections"]`` on every launch. That
+        discovery is an un-corroborated fuzzy ``" » "``-name ESI ``/search/`` and
+        config pairs bypass corroboration by design (the manual-override lane), so
+        it re-drew the owner's phantom ``K-6K16 <-> SVM-3K`` bridge on every
+        authenticated start. The corroborated infrastructure structure scan
+        (``infra_scan`` / ``infra_store``) is now the machine lane and already
+        feeds routing and the map (``_get_ansiblex_connections`` and
+        ``_get_map_bridges`` union corroborated store gate pairs);
+        ``ansiblex_connections`` is human-only. This method therefore only
+        resolves whatever the human entered -- a no-op when config is empty
+        (``_resolve_ansiblex_sync`` early-returns)."""
+        threading.Thread(target=self._resolve_ansiblex_sync, daemon=True).start()
 
     def _auto_discover_ansiblex_after_login(self):
-        """Auto-discover Ansiblex gates after a character is added/re-authed via
-        SSO, so a fresh install self-populates gate routes without the user
-        clicking "Discover Ansiblex Gates".
+        """RETIRED (2026-07-22, F-1) -- no longer discovers gates or writes config.
 
-        Fires unconditionally on each SSO success (discovery dedupes cheaply),
-        but is debounced by an in-flight flag: adding 5 characters back-to-back
-        starts ONE scan, not five — subsequent calls while a scan is running are
-        dropped. Fully headless: it only mutates config + resolves connections
-        (no Settings-tab widget access), mirroring
-        :meth:`_refresh_ansiblex_from_esi`, so it is safe before Settings is
-        opened. A no-op when ESI is not authenticated.
-
-        The flag is cleared on the Tk thread via ``root.after`` so the
-        clear/read never races the set on the Tk thread."""
-        if not (self.esi_auth and self.esi_auth.is_authenticated):
-            return
-        if getattr(self, "_ansiblex_autodiscover_inflight", False):
-            # A discovery is already running — its results will reflect this
-            # newly-added character too (config is shared), so drop this call.
-            return
-        self._ansiblex_autodiscover_inflight = True
-
-        def do_discover():
-            try:
-                try:
-                    gates = self.esi_auth.discover_ansiblex_gates()
-                except Exception as e:
-                    print(f"[Ansiblex] SSO auto-discover failed: {e}")
-                    gates = None
-                if gates:
-                    # Same locked mutate-then-write as _refresh_ansiblex_from_esi
-                    # (inline write because the config lock is non-reentrant).
-                    with self._config_lock:
-                        self.config["ansiblex_connections"] = gates
-                        try:
-                            atomic_write_json(
-                                CONFIG_PATH, self.config, indent=4)
-                        except Exception:
-                            log.exception(
-                                "Failed to save config.json "
-                                "(ansiblex SSO auto-discover)")
-                    print(f"[Ansiblex] SSO auto-discover: {len(gates)} gate(s)")
-                    self._resolve_ansiblex_sync()
-            finally:
-                # Clear the in-flight flag back on the Tk thread so the next SSO
-                # add can start a fresh scan.
-                try:
-                    self._post_ui(
-                        lambda: setattr(
-                            self, "_ansiblex_autodiscover_inflight", False))
-                except Exception:
-                    self._ansiblex_autodiscover_inflight = False
-
-        threading.Thread(target=do_discover, daemon=True).start()
+        This used to fire ``esi_auth.discover_ansiblex_gates`` after every SSO
+        add/re-auth and write the returned name pairs into
+        ``config["ansiblex_connections"]``. That un-corroborated fuzzy
+        ``" » "``-name ESI search re-drew the owner's phantom
+        ``K-6K16 <-> SVM-3K`` bridge on every authenticated login, because config
+        pairs bypass corroboration by design (the manual-override lane). The
+        corroborated infrastructure structure scan (``infra_scan`` /
+        ``infra_store``) supersedes discovery as the machine lane;
+        ``config["ansiblex_connections"]`` is human-only. Kept as a guarded no-op
+        (the SSO-add call sites are retained) so that path provably never
+        machine-writes config -- regression-guarded in
+        ``tests/test_first_run_autosetup.py``."""
+        return
 
     def _resolve_ansiblex_sync(self):
         """Resolve all ansiblex pairs from config into ID strings."""
@@ -5489,9 +5439,10 @@ class FCToolGUI:
                     # next program restart.
                     if hasattr(self, "_char_tab_content"):
                         self._populate_character_panels()
-                    # Re-auth may have (re)granted the ESI location/gate scopes,
-                    # so auto-discover Ansiblex gates (debounced) as on a fresh
-                    # add — cheap and dedupes.
+                    # Ansiblex gate auto-discovery is retired (F-1): the
+                    # corroborated infra structure scan is the machine lane and
+                    # config["ansiblex_connections"] is human-only. Call retained
+                    # as a no-op hook (see the method docstring).
                     self._auto_discover_ansiblex_after_login()
                     # Re-auth may have just granted the citadel-market scope
                     # while a cached forbidden-empty snapshot still latches the
@@ -5514,10 +5465,10 @@ class FCToolGUI:
             # Refresh only the new character's panel
             if hasattr(self, '_char_tab_content'):
                 self._refresh_single_character(new_auth)
-            # A new character can make ESI newly usable, so auto-discover
-            # Ansiblex gates so a first-time user's gate routes self-populate
-            # without clicking "Discover Ansiblex Gates". Debounced (in-flight
-            # flag) so adding several characters back-to-back runs one scan.
+            # Ansiblex gate auto-discovery is retired (F-1): the corroborated
+            # infra structure scan is the machine lane and
+            # config["ansiblex_connections"] is human-only. Call retained as a
+            # no-op hook (see the method docstring).
             self._auto_discover_ansiblex_after_login()
             # A new (or newly-primary) character can also unlatch a cached
             # structure-degraded market snapshot — same auto-heal as re-auth.
@@ -5553,19 +5504,20 @@ class FCToolGUI:
             )
             return
 
-        # Populate the Ansiblex text field
+        # Populate the human-editable Ansiblex review field. Discovery is an
+        # un-corroborated fuzzy " » "-name ESI search, so it is NOT auto-committed
+        # to config (that re-drew the owner's phantom bridge, F-1). The user
+        # reviews the pairs and clicks Save Settings to commit —
+        # config["ansiblex_connections"] is human-only; the corroborated infra
+        # structure scan is the machine lane.
         self._ansiblex_text.delete("1.0", tk.END)
         for pair in gates:
             self._ansiblex_text.insert(tk.END, f"{pair[0]}, {pair[1]}\n")
 
         self._esi_status_label.config(
-            text=f"Found {len(gates)} Ansiblex gate(s)", fg=FG_GREEN
+            text=f"Found {len(gates)} gate(s) — review & Save Settings to apply",
+            fg=FG_GREEN,
         )
-
-        # Auto-save to config and re-resolve
-        self.config["ansiblex_connections"] = gates
-        self._save_config()
-        threading.Thread(target=self._resolve_ansiblex_sync, daemon=True).start()
 
     def _get_staging_system(self) -> str:
         """Get the current staging system name."""
