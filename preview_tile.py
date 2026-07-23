@@ -281,7 +281,7 @@ class TileWindow:
     def __init__(self, root, char_key, palette, win32=None, dwm=None,
                  on_activate=None, on_minimize=None, on_move_end=None,
                  on_resize_end=None, on_exclude=None, on_switch_external=None,
-                 lock_layout=False):
+                 on_snap_others=None, lock_layout=False):
         self._win32 = win32 or _real_tile_win32()
         self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
@@ -293,6 +293,11 @@ class TileWindow:
         self._on_resize_end = on_resize_end or (lambda k, w, h: None)
         self._on_exclude = on_exclude or (lambda k: None)          # Shift+Left
         self._on_switch_external = on_switch_external or (lambda: None)  # Ctrl+Shift+Left
+        # Snap-to-neighbours: provider returns OTHER tiles' rects (x, y, w, body_h)
+        # from the host's hwnd-keyed _preview_tile_rects, self already excluded.
+        self._on_snap_others = on_snap_others
+        self._snap_enabled = False        # pushed live via configure_snap
+        self._snap_threshold = preview_layout.SNAP_THRESHOLD_PX
         self._excluded = False        # session-only cycle-exclusion flag (C4)
 
         self._thumb = None
@@ -531,6 +536,50 @@ class TileWindow:
         can't be nudged by an instinctive drag."""
         self._lock_layout = bool(flag)
 
+    def configure_snap(self, enabled, threshold=None):
+        """Enable/disable magnetic edge-snapping against other tiles while
+        dragging, and optionally set the snap threshold (px). The controller
+        pushes this live from config['preview']['snap_enabled'] on every tick via
+        _preview_style_tile — exactly like set_lock_layout / configure_hover — so
+        a live toggle takes effect without respawning the tile. `threshold` has
+        no UI (it defaults to the preview_layout module constant)."""
+        self._snap_enabled = bool(enabled)
+        if threshold is not None:
+            try:
+                self._snap_threshold = int(threshold)
+            except (TypeError, ValueError):
+                pass
+
+    def _maybe_snap(self, x, y):
+        """Snap a candidate drag position (x, y) to nearby OTHER tiles' edges when
+        snapping is enabled, else return it unchanged.
+
+        Neighbour rects come from the injected on_snap_others provider — the
+        host's _preview_tile_rects snapshot, which stores (x, y, w, BODY_H) with
+        self already excluded. Both the moving rect and every neighbour are
+        converted to FULL window height (body_h + STRIP_H) before snapping, so a
+        top/bottom butt sticks to the tile's VISIBLE edge (the strip edge) with
+        zero gap — using body_h alone would leave a STRIP_H gap/overlap. Pure
+        position math; the caller applies the result via set_window_pos /
+        on_move_end."""
+        if not self._snap_enabled or self._on_snap_others is None:
+            return x, y
+        try:
+            others = self._on_snap_others() or []
+        except Exception:
+            return x, y
+        full = []
+        for o in others:
+            try:
+                ox, oy, ow, oh = o
+            except (TypeError, ValueError):
+                continue
+            full.append((int(ox), int(oy), int(ow), int(oh) + STRIP_H))
+        if not full:
+            return x, y
+        moving = (x, y, self._w, self._body_h + STRIP_H)
+        return preview_layout.snap_rect(moving, full, self._snap_threshold)
+
     def _on_strip_b1_press(self, event):
         # A press on an armed corner starts a resize, not a strip-move. Consume it
         # so neither the move nor the click-activate path runs for this gesture.
@@ -561,6 +610,7 @@ class TileWindow:
             self._strip_moving = True
         x = self._strip_press_pos[0] + dx
         y = self._strip_press_pos[1] + dy
+        x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
         self._pos = (x, y)
         # SAME Win32 physical-px placement _on_b3_motion uses (GA_ROOT hwnd).
         self._win32.set_window_pos(self._hwnd, x, y, self._w,
@@ -582,6 +632,11 @@ class TileWindow:
             dy = event.y_root - press[1]
             x = self._strip_press_pos[0] + dx
             y = self._strip_press_pos[1] + dy
+            # Re-apply the SAME snap so the committed/persisted position matches
+            # the magnetic preview the user saw during the drag (on_move_end
+            # remains the sole write-back — its _preview_tile_rects/save contract
+            # is unchanged; only the coords it receives are snapped).
+            x, y = self._maybe_snap(x, y)
             self._pos = (x, y)
             self._on_move_end(self._key, x, y)
             return
@@ -729,6 +784,7 @@ class TileWindow:
                 return  # locked layout → right-drag move is a no-op (BUG B)
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
+            x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
             self._pos = (x, y)
             self._win32.set_window_pos(self._hwnd, x, y, self._w,
                                        self._body_h + STRIP_H)
@@ -746,6 +802,7 @@ class TileWindow:
         elif not self._lock_layout:
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
+            x, y = self._maybe_snap(x, y)     # persist the snapped position (see strip release)
             self._on_move_end(self._key, x, y)
 
     def _cur_pos(self):
