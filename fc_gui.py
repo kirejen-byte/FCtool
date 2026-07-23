@@ -12455,7 +12455,7 @@ class FCToolGUI:
         columns = ("name", "hull", "tags", "doctrines")
         self._fit_tree = ttk.Treeview(
             tree_wrap, columns=columns, show="headings",
-            style="Dark.Treeview", selectmode="browse")
+            style="Dark.Treeview", selectmode="extended")
         self._fit_tree.heading(
             "name", text="Name",
             command=lambda: self._on_fit_tree_sort("name"))
@@ -12626,12 +12626,19 @@ class FCToolGUI:
             self._show_fit_detail(None)
 
     def _on_fit_tree_select(self, event=None):
+        # selectmode="extended" → N rows may be selected. Drive the detail pane
+        # off the FOCUSED row (the one last clicked/navigated) so the preview
+        # follows the user's cursor as they build a multi-selection; fall back to
+        # the first selected row when focus is outside the selection. Empty
+        # selection is a no-op (never indexes an empty tuple).
         tree = self._fit_tree
         sel = tree.selection()
         if not sel:
             return
-        self._fit_selected_id = sel[0]
-        self._show_fit_detail(sel[0])
+        focus = tree.focus()
+        current = focus if focus in sel else sel[0]
+        self._fit_selected_id = current
+        self._show_fit_detail(current)
 
     def _clear_fit_detail(self):
         for w in self._fit_detail.winfo_children():
@@ -12677,7 +12684,10 @@ class FCToolGUI:
              lambda: self._save_fit_to_ingame(fit.id)),
             ("Add to doctrine…", "Dark.TButton",
              lambda: self._add_fit_to_doctrine_from_fit(fit.id)),
-            ("Delete", "Red.TButton", lambda: self._delete_fit(fit.id)),
+            # Deletes EVERY row currently selected in the library tree (Ctrl/Shift
+            # multi-select), not just the one shown here — routes single vs. batch
+            # through _delete_selected_fits.
+            ("Delete", "Red.TButton", lambda: self._delete_selected_fits()),
         ]
         for idx, (label, style, cmd) in enumerate(action_specs):
             ttk.Button(actions, text=label, style=style, command=cmd).grid(
@@ -12911,6 +12921,52 @@ class FCToolGUI:
         self.fittings.save()
         if self._fit_selected_id == fit_id:
             self._fit_selected_id = None
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_fit_detail(None)
+
+    def _delete_selected_fits(self):
+        """Delete every fit currently selected in the library tree.
+
+        The Delete button target under ``selectmode="extended"``:
+          • empty selection → no-op (matches the pre-multiselect button);
+          • exactly one selected → routes through ``_delete_fit`` for
+            byte-identical single-delete behaviour (its own confirm + save);
+          • two or more → ONE summary confirm (count + first few names, house
+            askyesno style), then a single batched store delete
+            (``FittingsStore.delete_fits``: N cascading membership removals +
+            ONE save — never N saves), then one list refresh and a cleared
+            detail pane.
+
+        Reads the LIVE tree selection (the source of truth for "what to delete"),
+        dropping any id whose fit vanished — defensive against a selection that
+        outlived a concurrent delete.
+        """
+        tree = getattr(self, "_fit_tree", None)
+        if tree is None:
+            return
+        sel = list(tree.selection())
+        if not sel:
+            return                                     # empty selection: no-op
+        # Resolve to live fits in tree order; skip ids that no longer exist.
+        fits = [(fid, self.fittings.get_fit(fid)) for fid in sel]
+        fits = [(fid, f) for fid, f in fits if f is not None]
+        if not fits:
+            return
+        if len(fits) == 1:
+            # Single selection is exactly the classic single-fit delete.
+            self._delete_fit(fits[0][0])
+            return
+        # None-safe: a corrupt/hand-edited library can carry "name": null; the
+        # single-delete f-string stringifies None, so join must not TypeError.
+        names = [(f.name or "") for _, f in fits]
+        shown = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
+        if not messagebox.askyesno(
+                "Delete Fittings",
+                f"Delete {len(fits)} fittings?\n\n{shown}\n\n"
+                "This also removes them from any doctrine."):
+            return
+        self.fittings.delete_fits([fid for fid, _ in fits])  # N cascades + ONE save
+        self._fit_selected_id = None
         self._refresh_fit_list(self._fit_search_var.get())
         self._show_fit_detail(None)
 
