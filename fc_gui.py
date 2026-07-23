@@ -713,6 +713,12 @@ class FCToolGUI:
         # write on another and corrupt or clobber settings. Created before any
         # save path can run.
         self._config_lock = threading.Lock()
+        # Serializes the LAZY, UI-free build of the infra store when a routing
+        # consumer (zkill/intel/WH/range-check) needs corroborated Ansiblex gates
+        # on a worker thread. Double-checked in _ensure_infra_store so concurrent
+        # workers build exactly ONE shared InfraStore. Created here in __init__ so
+        # it exists before _start_monitoring launches any worker.
+        self._infra_store_lock = threading.Lock()
         # Main-thread UI dispatcher queue. Background workers never touch Tk
         # directly; they enqueue (fn, args) via _post_ui / _post_ui_after and the
         # main-thread _drain_ui_q loop (armed once after the UI is built) applies
@@ -1299,7 +1305,13 @@ class FCToolGUI:
         # de-dupe against the config set by unordered id-pair. Cheap + thread-safe
         # (RLock-guarded store.entries(), no ESI, no Tk) -> callable off-thread.
         resolved = list(resolved)
-        store = getattr(self, "_infra_store", None)   # do NOT force-build
+        # Ensure the store is available for routing even when the map infra
+        # DISPLAY layer is off (owner config) and nothing has built it -- else the
+        # post-prune config ([]) leaves this None and every route drops its
+        # Ansiblex hops (the "zkill lost its jump range" symptom). Fast path: an
+        # already-built store short-circuits; otherwise build it (cheap + thread-
+        # safe + build-once). None only on genuine load failure -> gate-only route.
+        store = getattr(self, "_infra_store", None) or self._ensure_infra_store()
         if store is not None:
             try:
                 import infra_overlay
@@ -4245,17 +4257,6 @@ class FCToolGUI:
         self.root.update_idletasks()
 
         ansiblex_pairs = self._ansiblex_id_pairs.copy()
-        # If ID pairs haven't been resolved yet, build them now
-        if not ansiblex_pairs and conns:
-            for conn_str in conns:
-                parts = conn_str.split("|")
-                if len(parts) == 2:
-                    id1, id2 = int(parts[0]), int(parts[1])
-                    from zkill_monitor import resolve_name
-                    n1 = resolve_name(id1, "solar_system")
-                    n2 = resolve_name(id2, "solar_system")
-                    ansiblex_pairs[(id1, id2)] = (n1, n2)
-                    ansiblex_pairs[(id2, id1)] = (n2, n1)
 
         def _find_ansiblex_in_route(from_name, to_name):
             """Find which Ansiblex gates are used in a gate route segment."""
@@ -4272,6 +4273,22 @@ class FCToolGUI:
             return gates_used
 
         def do_search():
+            # Resolve any missing Ansiblex id->name display pairs HERE, on the WH
+            # worker thread. resolve_name can hit ESI on a cache miss, and after the
+            # config prune the routing set is store-derived (so _ansiblex_id_pairs is
+            # empty and this block now runs) -- doing it on the Tk thread would freeze
+            # the UI during a WH search. Mutates the enclosing ansiblex_pairs dict in
+            # place (no rebind), so _find_ansiblex_in_route sees the resolved names.
+            if not ansiblex_pairs and conns:
+                for conn_str in conns:
+                    parts = conn_str.split("|")
+                    if len(parts) == 2:
+                        id1, id2 = int(parts[0]), int(parts[1])
+                        from zkill_monitor import resolve_name
+                        n1 = resolve_name(id1, "solar_system")
+                        n2 = resolve_name(id2, "solar_system")
+                        ansiblex_pairs[(id1, id2)] = (n1, n2)
+                        ansiblex_pairs[(id2, id1)] = (n2, n1)
             result = find_wh_route(origin, dest, ship_size, connections=conns)
             # Build per-leg Ansiblex usage for WH route display
             leg_ansiblex: dict[int, list[tuple[str, str]]] = {}
@@ -5926,7 +5943,12 @@ class FCToolGUI:
         try:
             import map_overlays as mo
             name_pairs = list(self.config.get("ansiblex_connections", []))
-            store = getattr(self, "_infra_store", None)   # do NOT force-build
+            # Ensure the store so the bridge layer renders corroborated gates even
+            # when the infra DISPLAY layer is off and no scan has run this session
+            # (post-prune the store is the sole gate source). Fast path reuses an
+            # already-built store; else build once (cheap, thread-safe). Shared with
+            # the routing choke so there is only ever one store.
+            store = getattr(self, "_infra_store", None) or self._ensure_infra_store()
             if store is not None:
                 try:
                     import infra_overlay
@@ -6047,43 +6069,96 @@ class FCToolGUI:
             index.append((cat, types))
         return index
 
-    def _ensure_infra(self):
-        """Build (once) the InfraStore + InfraScanner, loading the map model on
-        first infra use. Returns (store, scanner); (None, None) on failure. The
-        scanner's ``auth`` is refreshed every call so a login / account switch
-        after construction is honoured (self.esi_auth is reassigned on login).
-        Runs on the Tk thread — every caller is main-thread — so no marshalling."""
+    @staticmethod
+    def _infra_system_lookup_from_coords():
+        """casefolded system_name -> (system_id, region_id) built from the bundled
+        ``system_coords`` table instead of the map model.
+
+        Same ``{name: (id, region)}`` shape :meth:`_infra_system_lookup` yields, but
+        sourced from ``system_coords`` -- which routing (``search_system`` /
+        ``get_stargate_route``) has ALREADY loaded -- so the routing/corroboration
+        store can be built on a worker thread WITHOUT paying the ~130 ms
+        ``map_data.load_map_model`` load. Pure/local, no ESI, no Tk (idempotent
+        ``system_coords._load``), so it is safe from any thread. Covers the same
+        K-space system set the map model does (verified 5,485 each)."""
+        import system_coords
+        out: dict[str, tuple[int, int]] = {}
+        for name, sid in system_coords.get_kspace_name_to_id().items():
+            out[name.casefold()] = (sid, system_coords.get_region_id(sid))
+        return out
+
+    def _ensure_infra_store(self):
+        """Build + disk-load the shared ``InfraStore`` ONCE, UI-free and thread-safe.
+
+        WHY (owner "zkill lost its jump range" bug, 2026-07-23): after the config
+        ``ansiblex_connections`` prune the STORE is the source of truth for gates,
+        so Ansiblex-aware routing (zkill/intel/WH/range-check) needs the store --
+        but the store used to be built ONLY by ``_ensure_infra``, gated behind the
+        map infra *display* layer (off in the owner's config) or the infra dialog.
+        On a default boot nothing built it, so ``_get_ansiblex_connections``
+        returned ``None`` and every route dropped its bridge hops (longer/degraded
+        jump counts -- the reported symptom). This decouples store AVAILABILITY
+        from the display toggle: any routing/corroboration caller builds it lazily.
+
+        Cheap + safe: the ``system_coords`` lookup avoids the map-model load; the
+        JSON is read once (``store.load``); a ``threading.Lock`` (double-checked)
+        makes concurrent worker callers build exactly one shared store; the map
+        display layer is NOT flipped on (``_infra_filters['enabled']`` untouched).
+        Returns the store, or ``None`` on failure (routing then falls back to
+        config-only, i.e. ``None`` -> gate-only routing, never a crash)."""
         store = getattr(self, "_infra_store", None)
         if store is not None:
-            scanner = getattr(self, "_infra_scanner", None)
-            if scanner is not None:
-                scanner.auth = self.esi_auth      # keep auth fresh across re-login
+            return store
+        with self._infra_store_lock:
+            store = getattr(self, "_infra_store", None)   # re-check under the lock
+            if store is not None:
+                return store
+            try:
+                import infra_store
+                store = infra_store.InfraStore(
+                    system_lookup=self._infra_system_lookup_from_coords())
+                store.load()
+                self._infra_store = store
+            except Exception as exc:
+                print(f"[INFRA] store load failed: {exc}")
+                return None
+        return store
+
+    def _ensure_infra(self):
+        """Ensure the InfraStore (via :meth:`_ensure_infra_store`) AND the
+        InfraScanner, loading the map model on first scanner build. Returns
+        (store, scanner); (None, None) on failure. The scanner's ``auth`` is
+        refreshed every call so a login / account switch after construction is
+        honoured (self.esi_auth is reassigned on login). Runs on the Tk thread --
+        every SCANNER caller is main-thread -- so no marshalling. The store itself
+        may have been pre-built off-thread by a routing consumer; this reuses that
+        SAME shared object (never a second store)."""
+        store = self._ensure_infra_store()
+        if store is None:
+            return None, None
+        scanner = getattr(self, "_infra_scanner", None)
+        if scanner is not None:
+            scanner.auth = self.esi_auth          # keep auth fresh across re-login
             return store, scanner
         try:
             import map_data
-            import infra_store
             import infra_scan
             if getattr(self, "_infra_model", None) is None:
                 self._infra_model = map_data.load_map_model()
-            model = self._infra_model
-            store = infra_store.InfraStore(
-                system_lookup=self._infra_system_lookup(model))
-            store.load()
             scanner = infra_scan.InfraScanner(
-                auth=self.esi_auth, store=store, model=model,
+                auth=self.esi_auth, store=store, model=self._infra_model,
                 ui_post=self._post_ui,
                 on_progress=self._infra_scan_on_progress,
                 on_done=self._infra_scan_on_done)
-            self._infra_store = store
             self._infra_scanner = scanner
         except Exception as exc:
-            print(f"[INFRA] setup failed: {exc}")
-            return None, None
-        # First build only (subsequent calls return early above): resolve owner
-        # tickers for any ESI-scanned structures the freshly-loaded store already
-        # holds. One-shot + census-guarded -> a no-op when nothing is unresolved.
+            print(f"[INFRA] scanner setup failed: {exc}")
+            return store, None
+        # First scanner build only (subsequent calls return early above): resolve
+        # owner tickers for any ESI-scanned structures the store already holds.
+        # One-shot + census-guarded -> a no-op when nothing is unresolved.
         self._maybe_resolve_owner_tickers()
-        return self._infra_store, self._infra_scanner
+        return store, scanner
 
     def _infra_get_infrastructure(self, filters):
         """Map filter-popover callback: it hands us a private deepcopy of its

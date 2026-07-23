@@ -131,6 +131,14 @@ class InfraScanner:
         streak_403 = 0
         found = 0
         errors = 0
+        # Undead-gate reaper bookkeeping (owner "SVM again" bug, 2026-07-23).
+        # scan_start = the aware-UTC instant this run began, floored to whole
+        # seconds so it can never trail a same-second upsert "seen" bump.
+        # scanned_ok = {system_id: system_name} for systems this run FULLY walked
+        # with a SUCCESSFUL, NON-EMPTY search -- the only systems whose gate roster
+        # is trusted as authoritative (see _reap_missing_gates).
+        scan_start = datetime.now(timezone.utc).replace(microsecond=0)
+        scanned_ok: dict[int, str] = {}
 
         # Batch every store write for this run into a single on-disk flush
         # (perf finding C2): upsert_many + mark_system_scanned each persist
@@ -221,11 +229,87 @@ class InfraScanner:
                 # Only mark fully-completed systems scanned so a cancel mid-system
                 # re-scans next time rather than skipping via the rescan gate.
                 self.store.mark_system_scanned(sys_id, _now_iso())
+                # This system was fully walked; trust its gate roster for reaping
+                # ONLY when the search actually SUCCEEDED and returned something --
+                # an errored or empty result must never mass-reap on an ESI hiccup.
+                if not search_errored and ids:
+                    scanned_ok[sys_id] = sys_name
+
+            # After the walk (still inside the batch so set_status folds into the
+            # single flush): dead-mark gates a searched system should have returned
+            # but did not -- their Ansiblex is gone from ESI (see below).
+            reaped = self._reap_missing_gates(scanned_ok, scan_start)
 
         done = dict(report)
         done["cancelled"] = cancelled
         done["resolve_aborted"] = resolve_aborted
+        done["reaped"] = reaped
         self._emit(self.on_done, done)
+
+    def _reap_missing_gates(self, scanned_ok: dict, scan_start) -> int:
+        """Mark ``status='dead'`` any stored ALIVE, non-reinforced GATE that a
+        fully-searched system this run should have returned but did NOT -- its
+        Ansiblex is gone from ESI (unanchored/destroyed). Leaving it 'alive' draws
+        a phantom bridge + a duplicate chip long after the structure died, because
+        it still emits a ``gate_pairs`` pair AND both endpoint systems may still
+        host a DIFFERENT current gate, so ``corroborated_gate_pairs``'s system-level
+        check cannot tell the stale cross-pair from a real bridge (owner "SVM again"
+        bug, 2026-07-23). ``status='dead'`` is the existing hide-but-keep mechanism:
+        ``_entry_survives`` drops it from chips/lists and ``gate_pairs`` skips it, so
+        the phantom vanishes from map + routing at once; the record is PRESERVED
+        (reversible -- a rebuilt gate flips back to 'alive' on its next sighting).
+
+        Gate-scoped + why that is safe:
+          * Gates are re-resolved EVERY scan (exempt from the known-type skip), and a
+            live gate in system X is named ``"X » Y"`` so ESI's fuzzy NAME
+            ``/search/`` for X returns it -> its record's ``last_seen`` is bumped past
+            ``scan_start``. A gate whose id has vanished from that authoritative
+            search keeps its OLD ``last_seen`` -- the reap signal.
+          * Only ``scanned_ok`` systems (this run FULLY walked, search SUCCEEDED and
+            was NON-EMPTY) are trusted -- a transient errored/empty search never
+            mass-reaps.
+          * Extra guard: reap only when the scanned system's NAME is a substring of
+            the gate's stored name, i.e. the search that ran WOULD have returned this
+            structure if it still existed. Protects a live gate whose name lost its
+            system tag from ever being deaded on absence.
+          * ``reinforced`` is the owner's explicit manual flag -> never auto-reaped.
+
+        Returns the count newly marked dead. No-op (and never calls ``store_key``/
+        ``set_status``) when nothing matches, so FakeStore-driven tests whose
+        ``entries()`` is empty are untouched."""
+        if not scanned_ok:
+            return 0
+        reaped = 0
+        try:
+            for e in self.store.entries():
+                if e.get("category") != "gate" or e.get("status") != "alive":
+                    continue
+                if e.get("reinforced"):
+                    continue
+                sys_name = scanned_ok.get(e.get("system_id"))
+                if not sys_name:
+                    continue
+                if sys_name.casefold() not in (e.get("name") or "").casefold():
+                    continue
+                last = self._parse_seen(e.get("last_seen"))
+                if last is not None and last >= scan_start:
+                    continue                       # re-seen this run -> still alive
+                self.store.set_status(self.store.store_key(e), "dead")
+                reaped += 1
+        except Exception:
+            log.exception("[infra-scan] gate reaper failed")
+        return reaped
+
+    @staticmethod
+    def _parse_seen(value):
+        """Aware-UTC datetime from a store ISO ``last_seen``; None on missing/junk.
+        Naive values are coerced to UTC (store house-rule is aware, but tolerate a
+        hand-edited file) so the reaper comparison never raises."""
+        try:
+            dt = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
     # ── steps ─────────────────────────────────────────────────────────────────
 
