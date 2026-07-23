@@ -5,6 +5,7 @@ from __future__ import annotations
 EDGE_SNAP_MIN = 20          # EVE-O parity: max(20, w // 10)
 LOGIN_STACK_STEP = 24
 CLAMP_MIN_VISIBLE_PX = 40   # clamp_visible: min on-desktop overlap (both axes) to leave a rect alone
+SNAP_THRESHOLD_PX = 12      # snap_rect: max px gap at which an edge sticks to a neighbour's edge
 
 
 def clamp_rect(rect, bounds):
@@ -62,6 +63,44 @@ def snap_to_edges(rect, others):
 
 def _overlaps(a, alen, b, blen):
     return a < b + blen and b < a + alen
+
+
+def snap_rect(rect, others, threshold=SNAP_THRESHOLD_PX):
+    """Magnetically snap a moving tile's top-left to nearby OTHER tiles' edges.
+
+    `rect` and each of `others` are (x, y, w, h). Returns the snapped (x, y).
+    The two axes are handled INDEPENDENTLY; on each axis the candidate whose
+    distance to the current coordinate is smallest AND within `threshold` wins
+    (ties keep the first candidate seen). If no candidate is within `threshold`
+    on an axis, that coordinate is returned unchanged.
+
+    Per neighbour, the candidate positions are:
+      X: butt  left↔right  -> x = ox + ow      (stick to the right of it)
+         butt  right↔left  -> x = ox - w       (stick to the left of it)
+         align left↔left   -> x = ox
+         align right↔right  -> x = ox + ow - w
+      Y: butt  top↔bottom  -> y = oy + oh      (stick below it)
+         butt  bottom↔top  -> y = oy - h       (stick above it)
+         align top↔top     -> y = oy
+         align bottom↔bot. -> y = oy + oh - h
+
+    Pure (no Tk / Win32). `others` must ALREADY exclude the moving rect — this
+    function does not self-exclude (a caller that leaves the moving rect in
+    `others` gets a harmless self-alignment no-op, never a crash)."""
+    x, y, w, h = rect
+    best_x, best_dx = x, threshold + 1
+    best_y, best_dy = y, threshold + 1
+    for o in others:
+        ox, oy, ow, oh = o
+        for cand in (ox + ow, ox - w, ox, ox + ow - w):     # x: butt, butt, align, align
+            d = abs(x - cand)
+            if d <= threshold and d < best_dx:
+                best_dx, best_x = d, cand
+        for cand in (oy + oh, oy - h, oy, oy + oh - h):     # y: butt, butt, align, align
+            d = abs(y - cand)
+            if d <= threshold and d < best_dy:
+                best_dy, best_y = d, cand
+    return best_x, best_y
 
 
 def grid_arrange(count, tile_w, tile_h, bounds, origin=(10, 10), gap=8):

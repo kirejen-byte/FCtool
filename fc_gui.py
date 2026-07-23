@@ -14324,6 +14324,7 @@ class FCToolGUI:
         "layouts": {}, "sizes": {},
         "login_position": [5, 5],
         "lock_layout": False,
+        "snap_enabled": False,      # snap previews to each other while dragging (feat/preview-snap)
         "snap": True, "grid": False, "grid_w": 100, "grid_h": 50,
         "hotkeys": {"focus": {},
                     "groups": [{"name": "All clients", "members": [],
@@ -14697,6 +14698,12 @@ class FCToolGUI:
             on_resize_end=self._preview_on_tile_resize_end,
             on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
             on_switch_external=self._preview_on_tile_switch_external,  # C4: Ctrl+Shift+Left
+            # Snap-to-neighbours provider: OTHER tiles' current rects from the
+            # hwnd-keyed _preview_tile_rects, self (this client's hwnd) excluded.
+            # _preview_tile_rects stores (x, y, w, body_h); the tile converts to
+            # full window height before snapping.
+            on_snap_others=(lambda h=src_hwnd: [
+                r for k, r in self._preview_tile_rects.items() if k != h]),
             lock_layout=bool(self._preview_cfg().get("lock_layout", False)),
         )
         tile.place(x, y, w, body_h)
@@ -14794,6 +14801,11 @@ class FCToolGUI:
         set_lock = getattr(tile, "set_lock_layout", None)
         if set_lock is not None:
             set_lock(bool(cfg.get("lock_layout", False)))
+        # Snap-to-neighbours: keep the tile's snap flag in lockstep with config
+        # (same live-toggle-without-respawn contract as lock_layout).
+        conf_snap = getattr(tile, "configure_snap", None)
+        if conf_snap is not None:
+            conf_snap(enabled=bool(cfg.get("snap_enabled", False)))
         # C4: keep the cycle-exclusion badge in sync (survives retire/respawn).
         set_excluded = getattr(tile, "set_excluded", None)
         if set_excluded is not None:
@@ -16524,6 +16536,24 @@ class FCToolGUI:
         _tip(bnm, "Pick characters that should stay open and never be minimized "
                   "by 'Minimize inactive'.")
 
+        # Snap previews to each other: while dragging a preview, its edges stick
+        # to nearby previews' edges (butt together or align flush). Placement
+        # comfort only — never touches saved data. Default OFF. Native-mode only.
+        rowSnap = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowSnap.pack(fill=tk.X, pady=2)
+        self._preview_snap_var = tk.BooleanVar(
+            value=bool(pcfg.get("snap_enabled", False)))
+        cbsnap = tk.Checkbutton(
+            rowSnap, text="Snap previews to each other",
+            variable=self._preview_snap_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbsnap.grid(row=0, column=0, padx=(0, 16))
+        w.append(cbsnap)
+        _tip(cbsnap, "While dragging a preview, edges within ~12 px of another "
+                     "preview's edges stick to them — butt together or align flush.")
+
         # Decloak alert — when one of YOUR chars is decloaked (proximity or a
         # Mobile Observatory), read from your own combat logs, its tile flashes
         # yellow + shows a DECLOAKED banner for 10s. Optional spoken cue (OFF by
@@ -16966,6 +16996,7 @@ class FCToolGUI:
             ("_preview_show_location_var", "show_location", bool),
             ("_preview_highlight_var", "highlight_active", bool),
             ("_preview_lock_var", "lock_layout", bool),
+            ("_preview_snap_var", "snap_enabled", bool),
             ("_preview_intel_flash_var", "intel_flash", bool),
             ("_preview_minimize_inactive_var", "minimize_inactive", bool),
             ("_preview_hide_active_var", "hide_active", bool),
