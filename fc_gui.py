@@ -12474,6 +12474,11 @@ class FCToolGUI:
         self._fit_tree.column("doctrines", width=44, anchor=tk.CENTER, stretch=False)
         self._fit_tree.grid(row=0, column=0, sticky="nsew")
         self._fit_tree.bind("<<TreeviewSelect>>", self._on_fit_tree_select)
+        # Right-click context menu (mirrors the detail-pane action buttons) and a
+        # Delete-key accelerator for the batch delete. selectmode="extended" above
+        # already gives Ctrl/Shift multi-select; these make it act on that set.
+        self._fit_tree.bind("<Button-3>", self._on_fit_tree_right_click)
+        self._fit_tree.bind("<Delete>", self._on_fit_tree_delete_key)
 
         tree_sb = ttk.Scrollbar(tree_wrap, orient="vertical",
                                 command=self._fit_tree.yview)
@@ -12575,11 +12580,28 @@ class FCToolGUI:
     def _refresh_fit_list(self, filter_text: str = ""):
         """Clear + repopulate the fittings Treeview, filtering case-insensitively
         on name / hull / tags and sorting by the active column (click-to-sort).
-        Preserves the current selection when possible."""
+
+        Selection handling: the FULL live multi-selection is snapshotted and
+        restored (intersected with rows that still exist), so a Ctrl/Shift
+        selection survives a sort/filter/refresh instead of collapsing to a
+        single row; the focused row is preserved when it survives. A caller that
+        set ``_fit_selected_id`` to a row OUTSIDE the live selection (e.g. after
+        adding a fit) is honoured as an explicit single-selection intent, and a
+        refresh with no live selection falls back to that id — so the
+        programmatic / single-selection callers behave as before."""
         tree = getattr(self, "_fit_tree", None)
         if tree is None:
             return
-        prev = self._fit_selected_id
+        # Snapshot BEFORE clearing. The live tree selection is the source of
+        # truth for a user's (possibly multi-row) selection; the detail id
+        # (_fit_selected_id) covers programmatic targets not yet in the live
+        # selection and refreshes that run before any row was clicked.
+        prev_sel = set(tree.selection())
+        prev_focus = tree.focus()
+        detail = self._fit_selected_id
+        if detail is not None and detail not in prev_sel:
+            prev_sel = {detail}          # explicit single-selection intent
+            prev_focus = detail
         for iid in tree.get_children():
             tree.delete(iid)
         needle = (filter_text or "").strip().lower()
@@ -12609,19 +12631,27 @@ class FCToolGUI:
             key = lambda r: (r[0].name or "").lower()
         rows.sort(key=key, reverse=self._fit_sort_reverse)
 
-        restored = False
+        present = []
         for fit, tags_str, n_doc in rows:
             tree.insert("", tk.END, iid=fit.id,
                         values=(fit.name, fit.hull_name, tags_str, n_doc))
-            if fit.id == prev:
-                restored = True
+            present.append(fit.id)
 
         self._update_fit_headings()
 
-        if restored:
-            tree.selection_set(prev)
-        elif prev is not None and self.fittings.get_fit(prev) is None:
-            # Selected fit was deleted/filtered away — clear the detail pane.
+        present_set = set(present)
+        # Restore the surviving selected rows in tree order (deterministic).
+        restore = [iid for iid in present if iid in prev_sel]
+        if restore:
+            # Re-focus the previously-focused row FIRST (before selection_set
+            # fires <<TreeviewSelect>>) so the detail pane follows it; if it did
+            # not survive, _on_fit_tree_select falls back to the first row.
+            if prev_focus and prev_focus in prev_sel and prev_focus in present_set:
+                tree.focus(prev_focus)
+            tree.selection_set(*restore)
+        elif detail is not None and self.fittings.get_fit(detail) is None:
+            # The selected/detail fit was deleted or filtered to nonexistence —
+            # clear the detail pane (matches the pre-multiselect behaviour).
             self._fit_selected_id = None
             self._show_fit_detail(None)
 
@@ -12639,6 +12669,94 @@ class FCToolGUI:
         current = focus if focus in sel else sel[0]
         self._fit_selected_id = current
         self._show_fit_detail(current)
+
+    # ── Fittings library right-click menu + Delete-key accelerator ─────────────
+
+    # Single-fit context-menu actions: (label, handler attribute). Each MIRRORS
+    # the same-named button in the detail action bar (_show_fit_detail) and acts
+    # on the ONE selected fit — so all are enabled only when exactly one row is
+    # selected. The batch Delete item is added separately (always enabled, live
+    # count) and routes to _delete_selected_fits like the Delete button.
+    _FIT_MENU_SINGLE_ACTIONS = (
+        ("Rename", "_rename_fit"),
+        ("Edit notes", "_edit_fit_notes"),
+        ("Edit fitting", "_replace_fit_text"),
+        ("Copy EFT", "_copy_fit_eft"),
+        ("Copy DNA", "_copy_fit_dna"),
+        ("Save to in-game", "_save_fit_to_ingame"),
+        ("Add to doctrine…", "_add_fit_to_doctrine_from_fit"),
+    )
+
+    def _build_fit_context_menu(self, selection):
+        """Construct (but do NOT post) the fits-tree right-click menu for the
+        given selection tuple.
+
+        The seven single-fit items mirror the detail-pane action buttons and are
+        enabled only when exactly one row is selected (disabled otherwise, each
+        routing to the same handler as its button). A ``Delete N fitting(s)…``
+        item always shows the live selection count and routes to
+        ``_delete_selected_fits`` (the same confirm + batch machinery as the
+        Delete button). Returned for the caller to ``tk_popup`` and for tests to
+        inspect without driving Tk's popup grab."""
+        sel = tuple(selection)
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        single = len(sel) == 1
+        state = tk.NORMAL if single else tk.DISABLED
+        only_id = sel[0] if single else None
+        for label, attr in self._FIT_MENU_SINGLE_ACTIONS:
+            handler = getattr(self, attr)
+            menu.add_command(
+                label=label, state=state,
+                command=lambda h=handler, fid=only_id: h(fid))
+        menu.add_separator()
+        n = len(sel)
+        del_state = tk.NORMAL if n >= 1 else tk.DISABLED
+        del_label = "Delete %d fitting%s…" % (n, "" if n == 1 else "s")
+        menu.add_command(label=del_label, state=del_state,
+                         command=self._delete_selected_fits)
+        return menu
+
+    def _post_menu(self, menu, x_root, y_root):
+        """Post a context menu at screen coords and schedule its teardown.
+
+        Isolated behind this seam so headless tests can stub the actual popup —
+        ``tk_popup`` grabs the pointer and enters Tk's menu loop, which a test
+        must not trigger. Destroy is deferred off ``<Unmap>`` (fires once Tk
+        unposts the menu) rather than immediately after ``tk_popup`` returns,
+        matching the intel/system menus: an immediate destroy can race Tk's
+        idle-scheduled command invocation and swallow the click."""
+        menu.bind("<Unmap>", lambda ev: menu.after(100, menu.destroy))
+        try:
+            menu.tk_popup(x_root, y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_fit_tree_right_click(self, event):
+        """``<Button-3>`` on the fits tree: select the row under the cursor
+        (unless it is already part of the current selection — right-clicking
+        inside a multi-selection keeps it), then post the context menu. A
+        right-click on empty space posts nothing. Returns the posted menu (or
+        ``None``) so tests can inspect it."""
+        tree = getattr(self, "_fit_tree", None)
+        if tree is None:
+            return None
+        row = tree.identify_row(event.y)
+        if not row:
+            return None                                # empty space → no menu
+        if row not in tree.selection():
+            tree.selection_set(row)
+            tree.focus(row)
+        menu = self._build_fit_context_menu(tree.selection())
+        self._post_menu(menu, event.x_root, event.y_root)
+        return menu
+
+    def _on_fit_tree_delete_key(self, event=None):
+        """``<Delete>`` on the fits tree → the same batch delete as the Delete
+        button / context-menu item. No-op on an empty selection (handled by
+        ``_delete_selected_fits``)."""
+        self._delete_selected_fits()
+        return "break"
 
     def _clear_fit_detail(self):
         for w in self._fit_detail.winfo_children():
