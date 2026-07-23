@@ -12956,7 +12956,9 @@ class FCToolGUI:
             # Single selection is exactly the classic single-fit delete.
             self._delete_fit(fits[0][0])
             return
-        names = [f.name for _, f in fits]
+        # None-safe: a corrupt/hand-edited library can carry "name": null; the
+        # single-delete f-string stringifies None, so join must not TypeError.
+        names = [(f.name or "") for _, f in fits]
         shown = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
         if not messagebox.askyesno(
                 "Delete Fittings",
