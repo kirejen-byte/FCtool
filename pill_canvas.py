@@ -40,7 +40,8 @@ from typing import Callable
 import markup_editor
 import motd_markup
 from markup_editor import MarkupEditor
-from motd_doc import TextRun, TokenRun, doc_to_json, doc_from_json
+from motd_doc import (TextRun, TokenRun, doc_to_json, doc_from_json,
+                      CHANNEL_LINE_DEFAULT_LABEL)
 from ui_theme import (
     BG_DARK, BG_PANEL, BG_ENTRY,
     FG_TEXT, FG_DIM, FG_WHITE, FG_ACCENT, FG_GREEN, FG_RED, FG_YELLOW,
@@ -459,12 +460,16 @@ class PillCanvas(MarkupEditor):
 
         Today the only such case is a ``channel_line`` with no channel name — the
         Lines & blocks "Channel line" building block defaults to
-        ``{label:"Logi", name:""}`` and resolves to nothing (the owner's stale
-        "Logi:" line). Prompting immediately lets the user pick the channel instead
-        of being handed a dead pill. An actual channel item (``kind="channel"``) or
-        a ``channel_line`` that already carries a name is complete and never
-        prompts. Document-load paths (``set_doc`` / undo / redo / paste) go through
-        ``_rebuild`` / ``_insert_runs_at_caret``, not here, so they never prompt."""
+        ``{label:CHANNEL_LINE_DEFAULT_LABEL, name:""}`` and resolves to nothing
+        (originally the owner's stale "Logi:" line — the default label was "Logi"
+        until the 2026-07-22 amendment renamed it to "Channel" to stop colliding
+        with the "Logi:" fits line; the empty-name prompt behavior below predates
+        and is independent of that rename). Prompting immediately lets the user
+        pick the channel instead of being handed a dead pill. An actual channel
+        item (``kind="channel"``) or a ``channel_line`` that already carries a
+        name is complete and never prompts. Document-load paths (``set_doc`` /
+        undo / redo / paste) go through ``_rebuild`` / ``_insert_runs_at_caret``,
+        not here, so they never prompt."""
         if name is None:
             return
         run = self._pills.get(name)
@@ -1281,7 +1286,11 @@ class PillCanvas(MarkupEditor):
 
         if kind == "channel_line":
             label("Label:", 0)
-            lab = self._entry(body, p.get("label", "Logi"))
+            # Owner amendment 2026-07-22 (spec §4.2): default "Channel", not
+            # "Logi" — see CHANNEL_LINE_DEFAULT_LABEL. from_legacy_fields-migrated
+            # pills still carry an explicit "Logi" params label and are unaffected
+            # (this default only fires when no label key is present at all).
+            lab = self._entry(body, p.get("label", CHANNEL_LINE_DEFAULT_LABEL))
             lab.grid(row=0, column=1, sticky="ew")
             label("Channel:", 1)
             e = AutocompleteEntry(body, self._channel_completions(), bg=BG_ENTRY,
@@ -1290,7 +1299,7 @@ class PillCanvas(MarkupEditor):
             e.grid(row=1, column=1, sticky="ew")
             if p.get("name"):
                 e.insert(0, p.get("name"))
-            return lambda: {"label": lab.get().strip() or "Logi",
+            return lambda: {"label": lab.get().strip() or CHANNEL_LINE_DEFAULT_LABEL,
                             "name": e.get().strip()}
 
         if kind == "fc_line":
