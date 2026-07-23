@@ -104,6 +104,7 @@ import preview_layout
 import monitor_pin
 import hotkey_service
 import damage_flash
+import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
 from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
@@ -14285,6 +14286,12 @@ class FCToolGUI:
         "decloak_audio": False,              # spoken "Decloaked" cue (off by default)
         "decloak_flash_secs": 10,            # how long the flash + banner hold
         "decloak_flash_color": "#ffcc00",    # hazard-yellow pulse peak
+        # Gamelogs folder override (feat/gamelog-path): the Gamelogs directory the
+        # damage-flash + decloak monitor reads. BLANK = auto-detect beside the
+        # resolved Chatlogs folder (eve_paths.gamelogs_dir_for); a non-blank value
+        # is an explicit user override that wins over auto-detection (for friends
+        # whose Documents/OneDrive layout the auto-detect ladder misses).
+        "gamelogs_path": "",
     }
 
     def _preview_cfg(self):
@@ -15797,8 +15804,7 @@ class FCToolGUI:
         try:
             if self._preview_gamelog is not None:
                 return
-            chat_path = resolve_eve_logs_path(self.config.get("eve_logs_path", ""))
-            logs_dir = gamelogs_dir_for(chat_path)
+            logs_dir, _src = self._preview_effective_gamelogs_dir()
             mon = self._preview_gamelog_factory(
                 on_event=lambda ev: self._post_ui(self._preview_on_damage, ev),
                 on_decloak=lambda ev: self._post_ui(self._preview_on_decloak, ev),
@@ -15808,6 +15814,96 @@ class FCToolGUI:
         except Exception:
             log.exception("[preview] gamelog monitor failed to start")
             self._preview_gamelog = None
+
+    def _preview_effective_gamelogs_dir(self):
+        """Resolve the Gamelogs directory the monitor should watch, and how.
+
+        Returns ``(dir, source)`` where ``source`` is ``"override"`` (an explicit
+        ``config['preview']['gamelogs_path']``) or ``"auto"`` (derived beside the
+        resolved Chatlogs folder via ``eve_paths.gamelogs_dir_for``). A non-blank
+        override always wins over derivation — that is the whole point of the fix
+        (a friend whose Documents/OneDrive layout the auto-detect ladder misses
+        can point FCTool straight at their real Gamelogs folder). Blank override =
+        today's auto-detect behaviour."""
+        override = str(self._preview_cfg().get("gamelogs_path", "") or "").strip()
+        if override:
+            return override, "override"
+        chat_path = resolve_eve_logs_path(self.config.get("eve_logs_path", ""))
+        return gamelogs_dir_for(chat_path) or "", "auto"
+
+    def _preview_repoint_gamelog(self):
+        """Re-point the running Gamelog monitor at the current effective dir after
+        an override change (Browse/Auto). Live — no restart needed: set_logs_dir
+        clears the old dir's tail state and re-globs the new dir next poll. No-op
+        when the monitor isn't running (the new dir is picked up on next start).
+        Fails soft."""
+        mon = getattr(self, "_preview_gamelog", None)
+        if mon is None:
+            return
+        try:
+            new_dir, _src = self._preview_effective_gamelogs_dir()
+            mon.set_logs_dir(new_dir)
+        except Exception:
+            log.exception("[preview] gamelog re-point failed")
+
+    def _preview_browse_gamelogs(self):
+        """Settings 'Browse…' — pick an explicit Gamelogs folder override, persist
+        it, re-point a live monitor, and refresh the diagnostic line/entry."""
+        path = filedialog.askdirectory(title="Select EVE Gamelogs Folder")
+        if not path:
+            return
+        self._preview_cfg()["gamelogs_path"] = path
+        self._save_config()
+        self._preview_repoint_gamelog()
+        self._preview_update_gamelog_status(refresh_path=True)
+
+    def _preview_clear_gamelogs(self):
+        """Settings 'Auto' — clear the override back to auto-detect, persist,
+        re-point a live monitor, and refresh the diagnostic line/entry."""
+        self._preview_cfg()["gamelogs_path"] = ""
+        self._save_config()
+        self._preview_repoint_gamelog()
+        self._preview_update_gamelog_status(refresh_path=True)
+
+    def _preview_gamelog_status_snapshot(self):
+        """Current Gamelog source snapshot for the settings line. Prefers the live
+        monitor's cached snapshot (computed on ITS poll thread — zero Tk-thread
+        IO); when the monitor isn't running, falls back to a one-time static probe
+        (a single isdir on the effective dir, never a glob)."""
+        mon = getattr(self, "_preview_gamelog", None)
+        if mon is not None:
+            try:
+                return mon.status_snapshot()
+            except Exception:
+                log.exception("[preview] gamelog status snapshot failed")
+        d, _src = self._preview_effective_gamelogs_dir()
+        return gamelog_monitor.probe_status(d)
+
+    def _preview_update_gamelog_status(self, refresh_path=False):
+        """Refresh the Gamelogs diagnostic label (and, when ``refresh_path``, the
+        effective-path entry). Called on section build, on override change, and on
+        the native tick heartbeat. The tick path reads only the cached snapshot
+        (no IO); ``refresh_path`` (build / override change) recomputes the
+        effective dir once for the entry. Fails soft if the widgets are gone."""
+        lbl = getattr(self, "_preview_gamelog_status_lbl", None)
+        if lbl is None:
+            return
+        try:
+            snap = self._preview_gamelog_status_snapshot()
+            lbl.config(text=gamelog_monitor.gamelog_status_line(snap))
+        except tk.TclError:
+            return
+        except Exception:
+            log.exception("[preview] gamelog status update failed")
+            return
+        if refresh_path:
+            var = getattr(self, "_preview_gamelogs_path_var", None)
+            if var is not None:
+                try:
+                    d, _src = self._preview_effective_gamelogs_dir()
+                    var.set(d)
+                except tk.TclError:
+                    pass
 
     def _preview_sync_gamelog_scope(self):
         """Restrict the GamelogMonitor to the shown (checked) character set so
@@ -15918,6 +16014,12 @@ class FCToolGUI:
                 self._preview_status_label.config(text=status)
             except tk.TclError:
                 pass
+        # Heartbeat the Gamelogs diagnostic from the monitor's cached snapshot
+        # (no Tk-thread IO — the worker computed it). Guarded so tick hosts that
+        # don't build the settings row are unaffected.
+        _gl = getattr(self, "_preview_update_gamelog_status", None)
+        if _gl is not None:
+            _gl()
         if self._preview_disabled_session:
             self._preview_after_id = None
             return
@@ -16632,6 +16734,56 @@ class FCToolGUI:
         # Apply initial threshold-only visibility from the loaded mode.
         self._preview_apply_dmg_mode_visibility()
 
+        # Row 6b (native): Gamelogs source. Damage flash AND decloak both read
+        # EVE's combat Gamelogs, so a missing/empty/mis-detected folder kills BOTH
+        # silently (the friend-box bug). Show the EFFECTIVE folder (an override,
+        # else auto-detected beside Chatlogs) with a Browse override + Auto reset
+        # and a live diagnostic line so the source is never a silent dead end.
+        _gl_tip = (
+            "Damage flash and the decloak alert both read EVE's combat Gamelogs. "
+            "FCTool auto-detects that folder beside your Chatlogs; if a friend "
+            "sees no flashes it's almost always because the folder was moved, "
+            "OneDrive-redirected, or empty. Requires EVE ▸ Settings ▸ 'Log game "
+            "events to file' ON and the English client. Browse sets an override; "
+            "Auto clears it back to auto-detect. Changes apply immediately.")
+        rowGamelog = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowGamelog.pack(fill=tk.X, pady=2)
+        tk.Label(rowGamelog, text="Gamelogs folder", font=("Consolas", 10),
+                 fg=FG_TEXT, bg=BG_DARK).grid(row=0, column=0, padx=(0, 4),
+                                              sticky=tk.W)
+        self._preview_gamelogs_path_var = tk.StringVar(value="")
+        gl_entry = tk.Entry(
+            rowGamelog, textvariable=self._preview_gamelogs_path_var,
+            font=("Consolas", 9), bg=BG_ENTRY, fg=FG_WHITE,
+            readonlybackground=BG_ENTRY, disabledbackground=BG_ENTRY,
+            insertbackground=FG_WHITE, width=52, state="readonly",
+            borderwidth=1, relief=tk.RIDGE)
+        gl_entry.grid(row=0, column=1, padx=(0, 6), sticky=tk.W)
+        self._preview_gamelogs_entry = gl_entry
+        _tip(gl_entry, _gl_tip)
+        gl_browse = ttk.Button(rowGamelog, text="Browse…", style="Dark.TButton",
+                               command=self._preview_browse_gamelogs)
+        gl_browse.grid(row=0, column=2, padx=(0, 4))
+        w.append(gl_browse)
+        _tip(gl_browse, "Pick the EVE Gamelogs folder to read for damage flash and "
+                        "decloak alerts. Use this if the auto-detected folder is "
+                        "wrong (Documents moved, or OneDrive redirection).")
+        gl_auto = ttk.Button(rowGamelog, text="Auto", style="Dark.TButton",
+                             command=self._preview_clear_gamelogs)
+        gl_auto.grid(row=0, column=3, padx=(0, 4))
+        w.append(gl_auto)
+        _tip(gl_auto, "Clear the override and auto-detect the Gamelogs folder "
+                      "beside your Chatlogs folder (the default).")
+        # Live diagnostic — updated on build, on override change, and on the native
+        # tick heartbeat. States: watching N file(s) / folder not found / folder
+        # empty (logging off?) / no recent log for <char>.
+        self._preview_gamelog_status_lbl = tk.Label(
+            rowGamelog, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+            anchor=tk.W, justify=tk.LEFT)
+        self._preview_gamelog_status_lbl.grid(row=1, column=0, columnspan=4,
+                                              pady=(2, 0), sticky=tk.W)
+        _tip(self._preview_gamelog_status_lbl, _gl_tip)
+
         # Row 7 (native): arrange / hotkey buttons.
         rowN4 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
         rowN4.pack(fill=tk.X, pady=2)
@@ -16717,6 +16869,8 @@ class FCToolGUI:
         self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
         self._preview_sync_anchor_enabled()
+        # Seed the Gamelogs source line + effective-path entry (one-time probe).
+        self._preview_update_gamelog_status(refresh_path=True)
 
     # Button layout: (internal mode key, exact label). Labels are user-facing and
     # must stay verbatim; keys are the persisted mode values (no migration).
@@ -16871,6 +17025,12 @@ class FCToolGUI:
                 self._preview_status_label.config(text=self._preview_status_text())
             except tk.TclError:
                 pass
+        # refresh the Gamelogs source line on a mode change (live monitor started
+        # by native → scanning; leaving native → static probe). Guarded so it is a
+        # no-op before the settings row is built / on bare test hosts.
+        _gl = getattr(self, "_preview_update_gamelog_status", None)
+        if _gl is not None and getattr(self, "_preview_gamelog_status_lbl", None) is not None:
+            _gl(refresh_path=True)
         # swap the visible option panel + repaint the mode buttons (no-ops before
         # the settings UI is built — both guard on their widgets existing).
         self._preview_show_mode_panel()
