@@ -149,6 +149,86 @@ def _ts_of(line: str) -> str:
     return m.group("ts") if m else ""
 
 
+# ── source diagnostics ───────────────────────────────────────────────────────
+# The damage-flash AND decloak features both read the Gamelogs folder, so a
+# missing/empty/mis-detected folder kills BOTH silently (the friend-box bug:
+# flashes work for the owner, dead for a friend whose Documents layout differs).
+# The monitor keeps a cheap immutable status snapshot — computed on its OWN poll
+# thread, read by the settings status line via status_snapshot() — so the source
+# is diagnosable at a glance without any per-tick IO on the Tk thread.
+@dataclass(frozen=True)
+class GamelogStatus:
+    logs_dir: str           # the effective Gamelogs directory ("" if none)
+    dir_exists: bool        # os.path.isdir(logs_dir)
+    scanning: bool          # True once a live poll produced this (vs a static probe)
+    file_count: int         # gamelog files discovered in the folder
+    active_count: int       # discovered files whose Listener is a tracked character
+    unmatched: tuple        # tracked characters with no discovered gamelog file yet
+
+
+def compute_status(logs_dir, positions, listeners, tracked, *,
+                   scanning, dir_exists=None):
+    """Build a :class:`GamelogStatus` from the monitor's in-memory dicts.
+
+    Does at most one cheap ``os.path.isdir`` stat (NEVER a glob — the mtime-gate
+    invariant forbids per-poll globbing) unless ``dir_exists`` is supplied.
+    ``positions`` is ``{path: offset}``; ``listeners`` is ``{path: char}``;
+    ``tracked`` is the lowercased tracked-char set, or ``None`` (track everything).
+    Pure apart from the optional single stat — fully unit-testable."""
+    d = logs_dir or ""
+    if dir_exists is None:
+        try:
+            dir_exists = bool(d) and os.path.isdir(d)
+        except OSError:
+            dir_exists = False
+    tset = (None if tracked is None
+            else {str(t).strip().lower() for t in tracked if str(t).strip()})
+    present = set()
+    active = 0
+    for path in positions:
+        ln = (listeners.get(path) or "").strip().lower()
+        if not ln:
+            continue
+        present.add(ln)
+        if tset is None or ln in tset:
+            active += 1
+    unmatched = tuple(sorted(tset - present)) if tset else ()
+    return GamelogStatus(logs_dir=d, dir_exists=bool(dir_exists),
+                         scanning=bool(scanning), file_count=len(positions),
+                         active_count=active, unmatched=unmatched)
+
+
+def probe_status(logs_dir):
+    """Static (monitor-not-running) snapshot: folder existence only, no scan."""
+    return compute_status(logs_dir, {}, {}, None, scanning=False)
+
+
+def gamelog_status_line(snap):
+    """Concise, actionable one-liner for the settings status label. Pure.
+
+    Order matters: absence beats emptiness beats character-mismatch, so the most
+    actionable message always wins."""
+    if snap is None:
+        return "Gamelogs: source unknown"
+    d = snap.logs_dir
+    if not d:
+        return "Gamelogs: no folder found — set one with Browse…"
+    if not snap.dir_exists:
+        return f"Gamelogs: folder not found — {d}"
+    if not snap.scanning:
+        return f"Gamelogs: {d}"                 # idle: monitor not running yet
+    if snap.file_count == 0:
+        return ("Gamelogs: folder has no gamelog files — enable EVE ▸ "
+                "Settings ▸ 'Log game events to file'")
+    if snap.active_count == 0:
+        return (f"Gamelogs: {snap.file_count} file(s) found, none for your "
+                f"previewed characters yet")
+    if snap.unmatched:
+        return (f"Gamelogs: watching {snap.active_count} file(s) — no recent log "
+                f"for {', '.join(snap.unmatched)}")
+    return f"Gamelogs: watching {snap.active_count} file(s)"
+
+
 class GamelogMonitor:
     """UTF-8 Gamelog tailer. on_event(DamageEvent) is called on the polling
     thread; the fc_gui wiring (Task B6) marshals to the Tk thread. An optional
@@ -193,8 +273,40 @@ class GamelogMonitor:
         self._state_dirty = False
         self._last_state_flush = 0.0
         self._persisted_state: dict[str, dict] = self._load_state()
+        # Cheap diagnostic snapshot read by the settings status line via
+        # status_snapshot(); refreshed at the end of every poll_once and whenever
+        # the watched dir is re-pointed. Immutable → atomic reference swap, so the
+        # Tk thread reads it without a lock. Seeded here so a reader before the
+        # first poll gets a valid (idle) snapshot rather than None.
+        self._status = probe_status(self._logs_dir)
 
     # --- public interface --------------------------------------------------
+
+    def status_snapshot(self):
+        """Return the latest :class:`GamelogStatus` (atomic reference read; the
+        poll thread swaps in a fresh immutable snapshot each cycle)."""
+        return self._status
+
+    def set_logs_dir(self, logs_dir) -> None:
+        """Re-point the monitor at a new Gamelogs directory (settings override
+        change) WITHOUT a restart.
+
+        Clears per-file tail state so the old dir's files stop being tailed,
+        resets the discovery mtime-gate so the new dir is re-globbed on the next
+        poll, and refreshes the status snapshot immediately. A no-op when the
+        directory is unchanged (so a redundant Clear/Browse never wipes live
+        tail positions)."""
+        new = logs_dir or None
+        if new == self._logs_dir:
+            return
+        self._logs_dir = new
+        self._positions.clear()
+        self._fingerprints.clear()
+        self._buffers.clear()
+        self._listeners.clear()
+        self._last_dir_mtime = None
+        self._last_full_scan_monotonic = 0.0
+        self._status = probe_status(self._logs_dir)
 
     def set_tracked_characters(self, names) -> None:
         """Restrict active tailing to these character names (lowercased match).
@@ -330,6 +442,11 @@ class GamelogMonitor:
                 continue
             self.poll_file(path)
         self._maybe_flush_state()
+        # Refresh the diagnostic snapshot from the just-updated in-memory state
+        # (one cheap isdir, no glob). Runs on the poll thread — never the Tk one.
+        self._status = compute_status(self._logs_dir, self._positions,
+                                      self._listeners, self._tracked,
+                                      scanning=True)
 
     def poll_file(self, path):
         """One tailing pass over `path`. UTF-8, NO byte alignment.
