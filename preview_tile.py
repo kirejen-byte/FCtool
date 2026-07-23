@@ -197,17 +197,20 @@ def label_anchor_placement(anchor, pad_frac=0.0):
 
 
 class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRANSPARENT
-    """Real ctypes wrapper for the tile window's tool/no-activate styling and
-    physical-pixel placement. Mirrors eveo_overlay._RealOverlayWin32 but WITHOUT
-    WS_EX_LAYERED / WS_EX_TRANSPARENT (tiles are opaque and clickable)."""
+    """Real ctypes wrapper for the tile window's Alt-Tab-exclusion / no-activate
+    styling and physical-pixel placement. Mirrors eveo_overlay._RealOverlayWin32
+    but WITHOUT WS_EX_LAYERED / WS_EX_TRANSPARENT (tiles are opaque and clickable)."""
 
     GWL_EXSTYLE = -20
     WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_APPWINDOW = 0x00040000
     WS_EX_NOACTIVATE = 0x08000000
     HWND_TOPMOST = -1
     SWP_NOMOVE = 0x0002
     SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
     SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
     GA_ROOT = 2
 
     def __init__(self):
@@ -250,10 +253,23 @@ class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRA
             pass
         return child
 
-    def make_tool_noactivate(self, hwnd: int) -> None:
+    def exclude_from_alt_tab(self, hwnd: int) -> None:
+        """Keep this OWN top-level window out of the Alt-Tab switcher (and off the
+        taskbar): set WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE, clear WS_EX_APPWINDOW.
+        Idempotent — a no-op (no restyle, no frame-change) when the bits are
+        already correct, so it is safe to re-assert on every set_alpha. A real
+        change is followed by SetWindowPos(SWP_FRAMECHANGED) so the OS
+        re-evaluates the window's Alt-Tab membership immediately."""
         ex = int(self._get(hwnd, self.GWL_EXSTYLE))
-        ex |= (self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
-        self._set(hwnd, self.GWL_EXSTYLE, ex)
+        want = ((ex | self.WS_EX_TOOLWINDOW | self.WS_EX_NOACTIVATE)
+                & ~self.WS_EX_APPWINDOW)
+        if want == ex:
+            return
+        self._set(hwnd, self.GWL_EXSTYLE, want)
+        self._user32.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0,
+            self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOZORDER
+            | self.SWP_NOACTIVATE | self.SWP_FRAMECHANGED)
 
     def set_window_pos(self, hwnd: int, x: int, y: int, w: int, h: int) -> None:
         self._user32.SetWindowPos(hwnd, self.HWND_TOPMOST, x, y, w, h,
@@ -450,7 +466,7 @@ class TileWindow:
 
         self.top.update_idletasks()
         self._hwnd = self._win32.get_root_hwnd(self.top.winfo_id())
-        self._win32.make_tool_noactivate(self._hwnd)   # BEFORE first map
+        self._exclude_from_alt_tab()   # keep tiles out of Alt-Tab (BEFORE first map)
 
         self._bind_mouse()
         # Enter/Leave on the toplevel — child widgets fire their own Enter/Leave,
@@ -853,6 +869,7 @@ class TileWindow:
         try:
             self.top.deiconify()
             self.top.update_idletasks()
+            self._exclude_from_alt_tab()   # re-assert on re-show (defense-in-depth)
             self._win32.set_window_pos(self._hwnd, self._pos[0], self._pos[1],
                                        self._w, self._body_h + STRIP_H)
             self._push_thumb_rect()
@@ -913,12 +930,28 @@ class TileWindow:
     def retop(self):
         self._win32.retop(self._hwnd)
 
+    def _exclude_from_alt_tab(self):
+        """Keep this tile out of the Windows Alt-Tab switcher (and off the
+        taskbar) by re-asserting WS_EX_TOOLWINDOW / clearing WS_EX_APPWINDOW on
+        our OWN top-level hwnd. MUST run again after set_alpha: Tk's
+        `attributes('-alpha')` REWRITES the extended-style word on the
+        opaque→layered transition, wiping the toolwindow bit — without this the
+        first hover-opacity push drops the tile straight back into Alt-Tab
+        (proven on Win11). The backend is idempotent, so re-asserting is cheap."""
+        try:
+            self._win32.exclude_from_alt_tab(self._hwnd)
+        except Exception:
+            pass
+
     def set_alpha(self, a):
         self._alpha = a
         try:
             self.top.attributes("-alpha", a)
         except tk.TclError:
             pass
+        # Tk's -alpha rewrites GWL_EXSTYLE on the opaque↔layered transition,
+        # wiping WS_EX_TOOLWINDOW → re-assert the Alt-Tab exclusion every time.
+        self._exclude_from_alt_tab()
 
     def current_alpha(self):
         """Last requested window alpha (mirror for tests / logging)."""
