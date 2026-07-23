@@ -10272,7 +10272,11 @@ class FCToolGUI:
             ("tag_line", {"tag": "DPS"}, "Tag line: DPS", "line"),
             ("tag_line", {"tag": "Logi"}, "Tag line: Logi", "line"),
             ("tag_line", {"tag": "Links"}, "Tag line: Links", "line"),
-            ("channel_line", {"label": "Logi", "name": ""}, "Channel line", "line"),
+            # Owner amendment 2026-07-22 (spec §4.2): default label "Channel", not
+            # "Logi" — "Logi:" visually collided with the "Tag line: Logi" fits
+            # line right above it. See motd_doc.CHANNEL_LINE_DEFAULT_LABEL.
+            ("channel_line", {"label": motd_doc.CHANNEL_LINE_DEFAULT_LABEL, "name": ""},
+             "Channel line", "line"),
             ("doctrine_block", {}, "Doctrine block", "block"),
         ]
         return [motd_palette.PaletteItem(kind=k, params=dict(p), label=lbl,

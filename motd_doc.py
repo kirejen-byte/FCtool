@@ -125,6 +125,14 @@ _LINE_KINDS = frozenset({"fc_line", "staging_line", "doctrine_line", "tag_line",
 _FC_WARN = "FC pill unresolved — its line was omitted"
 _DOCTRINE_WARN = "Doctrine pill unresolved — its line was omitted"
 
+# Owner amendment 2026-07-22 (spec §4.2): a channel_line's default label is
+# "Channel" for every NEW creation (Lines & blocks palette item, fresh-insert
+# channel prompt, default_doc) — "Logi:" visually collided with the "Logi:"
+# fits tag_line rendered just above it. EXCEPTION: ``from_legacy_fields`` KEEPS
+# emitting the literal "Logi" so v1 templates render byte-identically to what
+# they always produced; it does not read this constant (see its docstring).
+CHANNEL_LINE_DEFAULT_LABEL = "Channel"
+
 
 # --- fit finalisation (canonical DNA + delta lookup) ----------------------
 
@@ -221,7 +229,7 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
         name = p.get("name", "")
         if not name:
             return "", [], 0  # omit silently (matches today's ``if channel:`` guard)
-        label = p.get("label", "Logi")
+        label = p.get("label", CHANNEL_LINE_DEFAULT_LABEL)
         return f"{_escape(label)}: {channel_text(name, ctx.resolve_channel_id(name))}", [], 0
 
     if kind == "doctrine_block":
@@ -413,7 +421,7 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         return TokenLabel(_ellip(text), ok, tip, net)
 
     if kind == "channel_line":
-        label, name = p.get("label", "Logi"), p.get("name", "")
+        label, name = p.get("label", CHANNEL_LINE_DEFAULT_LABEL), p.get("name", "")
         ok = bool(name)
         text = f"{label}: {name}" if ok else label
         tip = f"resolves to: {label}: {name}" if ok else "channel has no name — line omitted"
@@ -443,11 +451,15 @@ def _interleave_newlines(units: list) -> Doc:
 
 def default_doc(staging_name: str = "", channel: str = "",
                 default_tags: tuple = ("DPS", "Logi", "Links")) -> Doc:
-    """The fresh-tab document — resolves byte-identical to today's ``build_motd``.
+    """The fresh-tab document — resolves byte-identical to today's ``build_motd``,
+    EXCEPT the channel_line label (owner amendment 2026-07-22, spec §4.2: default
+    "Channel", was "Logi" — collided with the "Logi:" fits line; see
+    :data:`CHANNEL_LINE_DEFAULT_LABEL` and the §4.4 parity test's documented
+    single-substitution transform).
 
     Lines (each on its own line): ``fc_line(selected)`` · ``staging_line`` iff a
     staging name is given · ``doctrine_line`` · one ``tag_line`` per default tag ·
-    ``channel_line("Logi", …)`` iff a channel is remembered.
+    ``channel_line(CHANNEL_LINE_DEFAULT_LABEL, …)`` iff a channel is remembered.
     """
     units: list = [[TokenRun("fc_line", {"source": "selected"})]]
     if staging_name:
@@ -456,7 +468,8 @@ def default_doc(staging_name: str = "", channel: str = "",
     for tag in default_tags:
         units.append([TokenRun("tag_line", {"tag": tag})])
     if channel:
-        units.append([TokenRun("channel_line", {"label": "Logi", "name": channel})])
+        units.append([TokenRun("channel_line",
+                                {"label": CHANNEL_LINE_DEFAULT_LABEL, "name": channel})])
     return _interleave_newlines(units)
 
 
@@ -516,9 +529,14 @@ def from_legacy_fields(saved: dict, tag_renames: dict | None = None) -> Doc:
     Order mirrors ``build_motd``'s line list: header runs · ``fc_line(selected)``
     (the wiring sets the FC combo from ``saved['fc']``) · ``staging_line`` iff
     enabled + named · ``doctrine_line`` · a ``tag_line`` per saved tag ·
-    ``channel_line("Logi", …)`` iff a channel · footer runs. Header/footer link
-    markup migrates losslessly to pills (a hand-pasted fit/char/system/channel
-    link becomes its live token) via :func:`_runs_from_markup`. The saved ``fits``
+    ``channel_line("Logi", …)`` iff a channel · footer runs. Kept as "Logi"
+    deliberately — the 2026-07-22 amendment that changed the default label to
+    :data:`CHANNEL_LINE_DEFAULT_LABEL` ("Channel") applies to NEW creations only;
+    this migration path keeps "Logi" so v1 templates render byte-identically to
+    what they always produced (see the §4.4 parity test's documented exception).
+    Header/footer link markup migrates losslessly to pills (a hand-pasted
+    fit/char/system/channel link becomes its live token) via
+    :func:`_runs_from_markup`. The saved ``fits``
     fallback pairs are carried separately (as ``ctx.legacy_fits``) and only fire
     when every tag_line resolves empty (see :func:`resolve`); a tag-less template
     that still has saved fits gets one synthetic ``Fits`` tag_line so that
@@ -557,6 +575,9 @@ def from_legacy_fields(saved: dict, tag_renames: dict | None = None) -> Doc:
         units.append([TokenRun("tag_line", {"tag": "Fits"})])
     channel = saved.get("channel") or ""
     if channel:
+        # Literal "Logi" — NOT CHANNEL_LINE_DEFAULT_LABEL. Deliberate v1
+        # byte-parity exception (spec §4.2 amendment, 2026-07-22): migrated
+        # templates must keep rendering exactly what they always rendered.
         units.append([TokenRun("channel_line", {"label": "Logi", "name": channel})])
     footer = _runs_from_markup(saved.get("footer", "") or "")
     if footer:
