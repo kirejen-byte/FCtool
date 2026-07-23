@@ -793,6 +793,13 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
 _NAV_KEYS = {"Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R",
              "Control_L", "Control_R", "Alt_L", "Alt_R"}
 
+#: Dim placeholder text shown in the search bar when it is EMPTY and
+#: UNFOCUSED (classic Tk Entry placeholder). It is real Entry content, but
+#: every query consumer reads through :meth:`MotdPalette._entry_text`, which
+#: reports "" while it is displayed — never mistaken for a search query by
+#: the dropdown/ranking/ESI paths.
+SEARCH_PLACEHOLDER = "Add anything to MOTD…"
+
 
 class MotdPalette(tk.Frame):
     """Search bar + grouped autocomplete dropdown + Quick-Add tray.
@@ -860,6 +867,11 @@ class MotdPalette(tk.Frame):
         )
 
         # widgets ----------------------------------------------------------- #
+        #: True while the search bar displays the dim placeholder in place of
+        #: real text (empty + unfocused). Every query consumer must read
+        #: through ``_entry_text()`` — never ``self.entry.get()`` directly —
+        #: so the placeholder string can never be treated as a search query.
+        self._placeholder_active = False
         self.entry = tk.Entry(self, font=("Consolas", 11), bg=BG_ENTRY,
                               fg=FG_TEXT, insertbackground=FG_TEXT,
                               relief=tk.FLAT)
@@ -872,6 +884,7 @@ class MotdPalette(tk.Frame):
         self.entry.bind("<Escape>", lambda e: (self.close_dropdown(), "break")[1])
         self.entry.bind("<FocusIn>", self._on_focus_in)
         self.entry.bind("<FocusOut>", self._on_focus_out)
+        self._show_placeholder()          # starts empty & unfocused
 
         self.tray = QuickAddTray(self, providers, on_insert=self._do_insert,
                                  on_drag=self._on_drag_ext, on_more=self._tray_more)
@@ -977,10 +990,42 @@ class MotdPalette(tk.Frame):
     # ==================================================================== #
     # bar-mode entry handlers                                              #
     # ==================================================================== #
+    def _show_placeholder(self) -> None:
+        """Display the dim hint text (classic Tk Entry placeholder). The
+        placeholder is real Entry content, but every query consumer reads
+        through :meth:`_entry_text`, which reports "" while it is showing —
+        it can never be mistaken for a search query."""
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, SEARCH_PLACEHOLDER)
+        self.entry.configure(fg=FG_DIM)
+        self._placeholder_active = True
+
+    def _clear_placeholder(self) -> None:
+        """Empty the bar and restore the normal text colour. A no-op if the
+        placeholder isn't currently showing (real typed text is left alone)."""
+        if not self._placeholder_active:
+            return
+        self.entry.delete(0, tk.END)
+        self.entry.configure(fg=FG_TEXT)
+        self._placeholder_active = False
+
+    def _entry_text(self) -> str:
+        """The bar's real query text: "" while the placeholder is displayed,
+        the literal Entry content otherwise. The ONE seam every query
+        consumer (ranking/ESI included) must read through — never
+        ``self.entry.get()`` directly — so the placeholder string is never
+        treated as a query."""
+        if self._placeholder_active:
+            return ""
+        return self.entry.get()
+
     def _on_focus_in(self, _e=None):
+        self._clear_placeholder()
         self._open("bar", "", caret=False)
 
     def _on_focus_out(self, _e=None):
+        if not self.entry.get():
+            self._show_placeholder()
         # Delay so a click on a dropdown row lands before we tear the dropdown
         # down (autocomplete's convention).
         self._focus_after = self.after(150, self.close_dropdown)
@@ -988,7 +1033,7 @@ class MotdPalette(tk.Frame):
     def _on_key_release(self, e):
         if e.keysym in _NAV_KEYS:
             return
-        self._on_query_change(self.entry.get())
+        self._on_query_change(self._entry_text())
 
     def _on_query_change(self, query: str) -> None:
         self._cancel_after("_local_after")
