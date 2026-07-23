@@ -320,6 +320,30 @@ class FittingsStore:
                     m for m in doctrine.members if m.fit_id != fit_id
                 ]
 
+    def delete_fits(self, fit_ids) -> None:
+        """Delete several fits in ONE atomic batch, then persist ONCE.
+
+        Each id is removed and cascaded out of every doctrine's member list
+        exactly as ``delete_fit`` does — this method calls it per id — so
+        doctrine-membership cleanup is byte-for-byte identical to a single
+        delete, just applied N times under a single lock hold followed by ONE
+        ``save()`` (never N saves; matches the GUI's per-fit single-delete
+        semantics, batched). An empty or ``None`` iterable is a true no-op:
+        nothing is mutated and the library is NOT re-written (no revision bump).
+
+        The whole batch runs under ``self._lock`` (the same RLock ``delete_fit``
+        and ``save`` re-enter), so a concurrent reader can never observe a
+        half-applied batch. Unknown ids are tolerated (``delete_fit`` pops with
+        a default), mirroring the single-delete contract.
+        """
+        ids = list(fit_ids or [])
+        if not ids:
+            return
+        with self._lock:
+            for fit_id in ids:
+                self.delete_fit(fit_id)
+            self.save()
+
     def get_fit(self, fit_id: str) -> Fit | None:
         with self._lock:
             return self._fits.get(fit_id)
