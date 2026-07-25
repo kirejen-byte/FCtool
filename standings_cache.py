@@ -19,6 +19,10 @@ from app_log import get_logger
 log = get_logger(__name__)
 
 
+class StandingsRefreshError(RuntimeError):
+    """refresh() could not establish the owner's own corp/alliance affiliations."""
+
+
 def is_friendly(
     char_id: int | None,
     corp_id: int | None,
@@ -98,6 +102,12 @@ class StandingsCache:
         because EVE's contact endpoints don't list "yourself" -- your own
         affiliations aren't entities you have standings toward, so without this
         explicit handling alliance-mates would silently bucket as hostile.
+
+        Raises:
+            StandingsRefreshError: the owner's own corp/alliance could not be
+                established (no character id, the /characters/{id}/ GET failed
+                or returned something malformed). Nothing is mutated and
+                nothing is saved in that case -- see the guard below.
         """
         friendly: set[int] = set()
         hostile: set[int] = set()
@@ -108,49 +118,62 @@ class StandingsCache:
         )
         own_corp_id = None
         own_alliance_id = None
-        info_ok = False
         if own_char_id:
             try:
                 info = auth.esi_get(f"/characters/{own_char_id}/")
             except Exception:
                 info = None
             if isinstance(info, dict):
-                info_ok = True
                 own_corp_id = info.get("corporation_id")
                 own_alliance_id = info.get("alliance_id")
-                if own_corp_id:
-                    friendly.add(int(own_corp_id))
-                if own_alliance_id:
-                    friendly.add(int(own_alliance_id))
 
-        # Build the contact getters. When the character sheet fetched above
-        # succeeded we already know the corp/alliance ids, so pass them through
-        # to skip the redundant /characters/{id}/ GETs that get_corp_contacts /
-        # get_alliance_contacts would otherwise perform to rediscover the same
-        # ids -- one /characters/{id}/ GET per refresh instead of three. A
-        # character with no alliance simply omits the alliance getter (today's
-        # get_alliance_contacts returns an empty list for that case, so the
-        # contribution is identical). When the character sheet fetch failed
-        # (info_ok False) we fall back to the no-arg self-resolving calls,
-        # byte-identical to the pre-optimization behaviour.
+        # Bail out rather than build a half-cache. This single guard covers all
+        # three degraded cases -- no character id, the GET raising / returning a
+        # non-dict, and a dict that came back without a corporation_id (every
+        # EVE character belongs to a corporation, NPC starter corps included, so
+        # a sheet missing it is malformed and must not be trusted). All three
+        # leave the owner's OWN corp/alliance out of the friendly set, and
+        # saving that would stamp fetched_at = now, making is_stale() report an
+        # affiliation-less cache as fresh for 24h -- during which is_friendly()
+        # returns False for the owner's own alliance-mates (own-fleet capitals
+        # counted as hostile). Bailing BEFORE the contact GETs also avoids
+        # spending ESI calls (and error budget) on a result we would discard.
+        # Leaving friendly_ids / hostile_ids / fetched_at / source_character_id
+        # untouched means a previously-good cache survives in memory and on
+        # disk, and is_stale() keeps driving the retry (next launch).
+        if not own_corp_id:
+            log.warning(
+                "standings refresh aborted: could not resolve own corporation "
+                "for character_id=%r; cache left untouched",
+                own_char_id,
+            )
+            raise StandingsRefreshError(
+                "could not resolve the owner's own corporation "
+                f"(character_id={own_char_id!r})"
+            )
+
+        friendly.add(int(own_corp_id))
+        if own_alliance_id:
+            friendly.add(int(own_alliance_id))
+
+        # Build the contact getters. The corp/alliance ids are known by now, so
+        # pass them through to skip the redundant /characters/{id}/ GETs that
+        # get_corp_contacts / get_alliance_contacts would otherwise perform to
+        # rediscover the same ids -- one /characters/{id}/ GET per refresh
+        # instead of three. A character with no alliance simply omits the
+        # alliance getter (today's get_alliance_contacts returns an empty list
+        # for that case, so the contribution is identical).
         getters: list = [("get_personal_contacts", auth.get_personal_contacts)]
-        if info_ok:
-            if own_corp_id:
-                getters.append(
-                    ("get_corp_contacts",
-                     lambda cid=own_corp_id: auth.get_corp_contacts(cid))
-                )
-            else:
-                getters.append(("get_corp_contacts", auth.get_corp_contacts))
-            if own_alliance_id:
-                getters.append(
-                    ("get_alliance_contacts",
-                     lambda aid=own_alliance_id: auth.get_alliance_contacts(aid))
-                )
-            # else: character has no alliance -> skip the call entirely.
-        else:
-            getters.append(("get_corp_contacts", auth.get_corp_contacts))
-            getters.append(("get_alliance_contacts", auth.get_alliance_contacts))
+        getters.append(
+            ("get_corp_contacts",
+             lambda cid=own_corp_id: auth.get_corp_contacts(cid))
+        )
+        if own_alliance_id:
+            getters.append(
+                ("get_alliance_contacts",
+                 lambda aid=own_alliance_id: auth.get_alliance_contacts(aid))
+            )
+        # else: character has no alliance -> skip the call entirely.
 
         for name, getter in getters:
             try:
