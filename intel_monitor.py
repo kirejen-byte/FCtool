@@ -840,22 +840,34 @@ _standings_loaded: bool = False
 def load_standings(esi_auth) -> tuple[set[int], set[int]]:
     """Load (friendly, hostile) entity-id sets from ESI contacts for the
     authenticated character's personal, corp, and alliance contact lists.
-    friendly = standing > 0 (plus own alliance); hostile = standing < 0.
-    Caches both sets at module level (session lifetime)."""
+    friendly = standing > 0 (plus the owner's own corp and alliance);
+    hostile = standing < 0.
+
+    The session-lifetime latch is armed ONLY on a complete load — the owner's
+    corp resolved and the alliance question was answered definitively (a corp
+    with no alliance counts as complete). A degraded load (no auth yet, no
+    character id, an ESI failure, an unusable character/corp sheet) is retried
+    on the next call. The caller always gets whatever was gathered, but the
+    module-level sets are republished only from the tail, and only when this
+    load is complete or nothing has latched yet: the two guard clauses return
+    without touching them, and a degraded load racing behind a latched good
+    result neither overwrites nor un-latches it."""
     global _standings_whitelist, _standings_hostile, _standings_loaded
     if _standings_loaded:
         return _standings_whitelist, _standings_hostile
 
     friendly: set[int] = set()
     hostile: set[int] = set()
+    complete = False
     if not esi_auth or not hasattr(esi_auth, "esi_get"):
-        _standings_loaded = True
+        # No usable auth: leave the module sets untouched and DON'T latch, so
+        # the next call (post-login) actually loads.
         return friendly, hostile
 
     try:
         char_id = getattr(esi_auth, "_character_id", None)
         if not char_id:
-            _standings_loaded = True
+            # Intel started before SSO finished — same deal, retry next call.
             return friendly, hostile
 
         def _bucket(rows):
@@ -873,24 +885,52 @@ def load_standings(esi_auth) -> tuple[set[int], set[int]]:
 
         corp_id = None
         char_info = esi_auth.esi_get(f"/characters/{char_id}/")
-        if char_info:
+        if isinstance(char_info, dict):
             corp_id = char_info.get("corporation_id")
         if corp_id:
+            friendly.add(corp_id)  # own corp implicitly friendly
             _bucket(esi_auth.esi_get(f"/corporations/{corp_id}/contacts/"))
             corp_info = esi_auth.esi_get(f"/corporations/{corp_id}/")
-            if corp_info:
+            if isinstance(corp_info, dict):
                 alliance_id = corp_info.get("alliance_id")
                 if alliance_id:
                     friendly.add(alliance_id)  # own alliance implicitly friendly
                     _bucket(esi_auth.esi_get(f"/alliances/{alliance_id}/contacts/"))
+                # The alliance question is answered: either the corp has one
+                # (added above) or it legitimately has none. Both are complete.
+                complete = True
     except Exception as e:
-        print(f"[Intel] Error loading standings: {e}")
+        log.warning("Error loading standings: %s", e)
+        log.debug("load_standings failure detail", exc_info=True)
 
-    _standings_whitelist = friendly
-    _standings_hostile = hostile
-    _standings_loaded = True
-    print(f"[Intel] Loaded standings: {len(friendly)} friendly, "
-          f"{len(hostile)} hostile")
+    # Intel can be restarted while a load is still in flight — each start
+    # spawns its own daemon thread and stopping neither joins nor cancels it —
+    # so two bodies can sit past the top-of-function flag check at once. A
+    # degraded straggler must not overwrite, nor un-latch, a good result a
+    # concurrent load already published. Plain unlocked read of the flag: this
+    # module has no lock, and the guard narrows the window rather than closing
+    # it (the last writer still wins between two loads of equal completeness,
+    # which is harmless).
+    published = complete or not _standings_loaded
+    if published:
+        _standings_whitelist = friendly
+        _standings_hostile = hostile
+        _standings_loaded = complete
+    if complete:
+        log.info("Loaded standings: %d friendly, %d hostile",
+                 len(friendly), len(hostile))
+    elif published:
+        # ASCII only in the emitted text: the console sink re-encodes, and a
+        # non-ASCII dash lands as a replacement char on this box.
+        log.warning(
+            "Standings load INCOMPLETE (%d friendly, %d hostile) -- using "
+            "partial data; not latched, will retry on the next load",
+            len(friendly), len(hostile))
+    else:
+        log.warning(
+            "Standings load INCOMPLETE (%d friendly, %d hostile) -- discarded, "
+            "a concurrent complete load is already cached",
+            len(friendly), len(hostile))
     return friendly, hostile
 
 
