@@ -94,6 +94,14 @@ def get_region_id(system_id: int) -> int | None:
     return _region_of.get(system_id)
 
 
+def get_security(system_id: int) -> float | None:
+    """Return the full-precision true-sec for a system from the bundled table,
+    or None when the system isn't in the table (e.g. J-space wormholes, or no
+    table shipped)."""
+    _load()
+    return _security_of.get(system_id)
+
+
 def get_kspace_name_to_id() -> dict[str, int]:
     """{canonical_name: system_id} for every K-space system in the bundled table.
 

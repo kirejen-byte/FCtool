@@ -22,6 +22,10 @@ depend on these exact shapes)::
             "corporations": [ {"id": int, "name": str}, ... ],
             "coalitions":   [ "<coalition name>", ... ],
         },
+        "security": {
+            "highsec": bool,   # default True when absent
+            "lowsec": bool,    # default True when absent
+        },
     }
 
     config["coalitions"] = {
@@ -37,11 +41,15 @@ Empty-group semantics (important, and applied uniformly):
     location/parties section is *not* set to its "match-all" flag yet also
     lists nothing to match against, it is treated as "no constraint" and
     matches everything. This keeps a half-configured filter from hiding all
-    alerts. See ``location_matches`` / ``parties_match``.
+    alerts. See ``location_matches`` / ``parties_match``. ``security_matches``
+    applies the analogous rule: if both the highsec and lowsec flags are off,
+    that is "no constraint" too, not "block everything".
 
 Scope note: matching here covers only location + parties. The min-pilots and
 max-jumps thresholds are intentionally *not* applied by ``matches`` — callers
-layer those on separately.
+layer those on separately. The highsec/lowsec security band is a *display*
+gate layered on by the caller too (see ``security_band`` /
+``security_matches``); nullsec is never gated by it.
 """
 
 from __future__ import annotations
@@ -54,6 +62,8 @@ __all__ = [
     "location_matches",
     "parties_match",
     "matches",
+    "security_band",
+    "security_matches",
     "DEFAULT_COALITIONS_SEED",
     "build_default_coalitions",
 ]
@@ -295,6 +305,85 @@ def matches(
     if combine == "OR":
         return loc or par
     return loc and par
+
+
+def security_band(true_sec: Optional[float]) -> Optional[str]:
+    """Classify a true-sec float into ``"hs"``, ``"ls"``, or ``"ns"``.
+
+    Uses explicit comparisons against the raw float, never ``round()``::
+
+        true_sec >= 0.45  -> "hs"   (in-game display 0.5 - 1.0)
+        true_sec >  0.0   -> "ls"   (in-game display 0.1 - 0.4, plus 13
+                                      systems that display 0.0 in-game but
+                                      sit in empire lowsec regions)
+        otherwise         -> "ns"   (true_sec <= 0.0)
+
+    Rounding first is a real hazard here, not just a style preference: decimal
+    literals like 0.45 are not exactly representable in binary floating point
+    (the actual stored value sits a hair to one side or the other of the
+    "true" decimal), and Python's ``round()`` breaks exact ties to even --
+    "banker's rounding", e.g. ``round(0.5) == 0``. Either effect can push a
+    value that belongs in one bucket into the bucket next door. Comparing the
+    raw float directly against the threshold sidesteps the whole hazard class.
+
+    The lowsec floor is 0.0 EXCLUSIVE (owner directive 2026-07-25, replacing
+    an earlier 0.05 floor). Exactly 13 systems in the bundled table have
+    true-sec in ``[0.0, 0.05)`` -- Espigoure, Pemsah, Karan, Yekh, Balas,
+    Vestouve, Sakht, Anath, Yiratal, Feshur, Egbinger, Naga, Hophib -- and
+    every one of them sits in an empire lowsec region: 10000048 Placid,
+    10000054 Aridia, or 10000028 Molden Heath. None is NPC nullsec, so these
+    13 systems are lowsec in every operational sense, and there are zero
+    nullsec-region systems with true-sec in ``(0.0, 0.05)`` -- a ``> 0.0``
+    floor misclassifies nothing. This also matches ``map_render.py``'s
+    existing lowsec test (``sec > 0.0``, see ``sec_color``/``_sec_idx``), so
+    the app no longer carries two different definitions of lowsec.
+
+    ``true_sec is None`` (system unknown to the caller) returns ``None``.
+    """
+    if true_sec is None:
+        return None
+    if true_sec >= 0.45:
+        return "hs"
+    if true_sec > 0.0:
+        return "ls"
+    return "ns"
+
+
+def security_matches(true_sec: Optional[float], security_cfg: dict) -> bool:
+    """Return whether a system's true-sec passes the highsec/lowsec display gate.
+
+    Nullsec is **never** gated: an ``"ns"`` band, or an unknown system (where
+    :func:`security_band` returns ``None``), always passes regardless of
+    ``security_cfg``.
+
+    For ``"hs"``/``"ls"`` bands, passes iff the corresponding flag
+    (``security_cfg["highsec"]`` / ``security_cfg["lowsec"]``) is truthy;
+    a missing flag defaults to ``True`` (both-on reproduces pre-filter
+    behaviour for configs that predate this feature).
+
+    Empty-group semantics (mirrors ``location_matches`` / ``parties_match``):
+    if BOTH flags are falsy, that is treated as "no constraint" rather than
+    "block everything" -- a half-configured filter must never silently drop
+    every alert.
+
+    Never raises on malformed input; a non-Mapping ``security_cfg`` is
+    treated as "no constraint" (True), same as a non-dict ``location``/
+    ``parties`` elsewhere in this module.
+    """
+    band = security_band(true_sec)
+    if band is None or band == "ns":
+        return True
+
+    if not isinstance(security_cfg, Mapping):
+        return True
+
+    highsec_on = bool(security_cfg.get("highsec", True))
+    lowsec_on = bool(security_cfg.get("lowsec", True))
+    if not highsec_on and not lowsec_on:
+        # Both off -> no constraint configured -> do not drop everything.
+        return True
+
+    return highsec_on if band == "hs" else lowsec_on
 
 
 # ──────────────────────────────────────────────────────────────────────────
