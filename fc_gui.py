@@ -2182,8 +2182,73 @@ class FCToolGUI:
         tk.Label(comp_header, text="Ship Type", font=("Consolas", 8),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
 
-        self._fleet_comp_frame = tk.Frame(comp_left, bg=BG_PANEL)
-        self._fleet_comp_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        # Scrollable container for fleet composition rows (up to 10 ship rows
+        # can exceed the panel's height at the app's minsize — mirrors the
+        # Specialized Roles canvas below, plus the role tracker's inner-frame
+        # width-sync trick above so rows fill the panel width).
+        comp_scroll_outer = tk.Frame(comp_left, bg=BG_PANEL)
+        comp_scroll_outer.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        # width/height=1 is load-bearing: a tk.Canvas with no explicit size
+        # requests 10c x 7c (~378x265px), which inflates comp_left's requested
+        # height and steals the cavity the X-Up Log drawer is packed into --
+        # the drawer stops being mapped at the app's own default 1200x900.
+        # fill=BOTH/expand=True supplies the real size, so a zero request costs
+        # nothing.
+        self._fleet_comp_canvas = tk.Canvas(comp_scroll_outer, bg=BG_PANEL,
+                                             highlightthickness=0,
+                                             width=1, height=1)
+        comp_scrollbar = ttk.Scrollbar(comp_scroll_outer, orient=tk.VERTICAL,
+                                        command=self._fleet_comp_canvas.yview)
+        self._fleet_comp_frame = tk.Frame(self._fleet_comp_canvas, bg=BG_PANEL)
+
+        def _sync_comp_scrollregion(_event=None):
+            """Keep the scrollregion on the rebuilt rows, and clamp the view
+            when the content SHRINKS.
+
+            Tk re-clamps the view only on an explicit xview/yview call, never on
+            a -scrollregion change. Without this, a list scrolled to the bottom
+            of 10 rows that is then rebuilt with 2 rows (or the "No fleet data"
+            label, which _refresh_fleet_locations fires on every de-auth /
+            fleet-leave) leaves the origin past the new content bottom and the
+            panel renders BLANK. The clamp is CONDITIONAL -- it fires only when
+            the current origin is already past the new bottom and is a no-op
+            otherwise -- so a steady fleet never has its scroll position yanked
+            on a routine poll.
+
+            NOTE: <Configure> alone is NOT a sufficient trigger (measured). When
+            the rebuilt content falls entirely above the scrolled viewport the
+            canvas UNMAPS the window item instead of resizing it, so no
+            <Configure> ever arrives -- exactly the blank-panel case. That is why
+            _update_fleet_composition calls this explicitly after every rebuild."""
+            canvas = self._fleet_comp_canvas
+            bbox = canvas.bbox("all")
+            canvas.configure(scrollregion=bbox)
+            if bbox:
+                content_h = bbox[3] - bbox[1]
+                view_h = canvas.winfo_height()
+                max_top = max(0, content_h - view_h)
+                if content_h > 0 and (canvas.canvasy(0) - bbox[1]) > max_top:
+                    canvas.yview_moveto(max_top / content_h)
+
+        self._sync_fleet_comp_scroll = _sync_comp_scrollregion
+        self._fleet_comp_frame.bind("<Configure>", _sync_comp_scrollregion)
+        comp_canvas_window = self._fleet_comp_canvas.create_window(
+            (0, 0), window=self._fleet_comp_frame, anchor=tk.NW,
+        )
+        # Keep inner frame width equal to canvas width so rows fill the panel
+        self._fleet_comp_canvas.bind(
+            "<Configure>",
+            lambda e: self._fleet_comp_canvas.itemconfig(
+                comp_canvas_window, width=e.width
+            ),
+        )
+        self._fleet_comp_canvas.configure(yscrollcommand=comp_scrollbar.set)
+        self._fleet_comp_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        comp_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Mouse-wheel scrolling handled by the global router.
+        self._register_scroll_canvas(self._fleet_comp_canvas)
+
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
 
@@ -4473,6 +4538,17 @@ class FCToolGUI:
             tk.Label(self._fleet_comp_frame, text="  No fleet data",
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
+
+        # Re-sync the scrollregion and clamp the view onto the rebuilt content.
+        # The idle pump is required: the packer recomputes the inner frame's
+        # requested height at idle time, so without it bbox("all") still reports
+        # the OLD content height. This only runs when the data actually changed
+        # (the flicker-prevention early-return above covers steady polls).
+        try:
+            self._fleet_comp_frame.update_idletasks()
+            self._sync_fleet_comp_scroll()
+        except (AttributeError, tk.TclError):
+            pass
 
     def _update_specialized_roles(self, members: list[dict], ship_counts: dict[int, int], total: int):
         """Update all collapsible specialized role sections."""
