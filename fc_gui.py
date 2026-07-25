@@ -64,14 +64,23 @@ import os as _os
 from app_path import app_dir as _app_dir
 from datetime import timezone, timedelta
 from xup_counter import XUpCounter, XUpState
-from zkill_monitor import ZKillMonitor, KillAlert
+from zkill_monitor import (ZKillMonitor, KillAlert, KillmailFanout,
+                           resolve_name as _zk_resolve_name)
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
 from wh_route import find_wh_route, fetch_connections, WHRoute
 from autocomplete import AutocompleteEntry
 import system_cache
 from system_cache import get_system_names, get_region_map
-from esi_auth import ESIAuth, load_all_tokens
+from esi_auth import ESIAuth, load_all_tokens, IMPLANTS_SCOPE as _IMPLANTS_SCOPE
 from loss_tracker import FleetLossTracker
+import loss_reconciler
+from loss_reconciler import SOURCE_ESI as _LOSS_SOURCE_ESI, SOURCE_ZKILL as _LOSS_SOURCE_ZKILL
+# Battle ledger (Fleet Management tab): ships + ISK lost per side for a fight
+# this install is actually in. Engine is Tk-free/network-free; the panel owns
+# its own widgets. fc_gui holds only the seams below — the killmail fan-out,
+# the presence/roster/standings feeds and the 1 Hz Tk tick.
+import battle_ledger
+from battle_ledger_panel import BattleLedgerPanel
 from cyno_check import analyze_character as cyno_analyze_character
 from eve_paths import resolve_eve_logs_path, gamelogs_dir_for
 from default_config import DEFAULT_CONFIG
@@ -108,6 +117,11 @@ import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
 from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
+# Implant-removal reminder: pure trigger/state engine + the transient over-client
+# toast. Both are self-contained (implant_reminder is Tk-free, client_toast
+# imports no fc_gui); wiring is the poller hook + _implant_show_toast below.
+import implant_reminder
+import client_toast
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -127,6 +141,13 @@ log = get_logger(__name__)
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
+
+# Off-boss, ESI 403s /fleets/{id}/members/, so the ONLY character ids this
+# client can PROVE are ours are its own authenticated ones. A loss count taken
+# there is therefore NOT the fleet's — it is this install's characters, and the
+# label has to say so or an FC reads a ganked mining alt as a fleet loss. Named
+# once here so the label and its tooltip can never drift apart.
+_LOSS_NONBOSS_SCOPE = "zKill, own chars — not fleet boss"
 
 
 # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo-handle value -4.
@@ -813,6 +834,33 @@ class FCToolGUI:
         self._sound_enabled = self.config.get("sound_on_ready", False)
         # Fleet loss tracker
         self._loss_tracker = FleetLossTracker()
+        # zKillboard reconciliation (config loss_tracking.source: esi/zkill/
+        # hybrid). from_config owns ALL the defaulting — an upgraded install has
+        # no block at all, since config.json is never deep-merged. In "esi" mode
+        # the hook is never attached and this object simply never runs.
+        # resolve_name turns a zKill-only loss from "7 (17738) in 30000142" into
+        # real names. Safe to inject now: the engine drops its lock across every
+        # injected callable and a publication barrier keeps the half-resolved
+        # record invisible until the names land (loss_reconciler._resolve_
+        # deferred / _publish_locked) — the 1.15s Tk-thread stall that made this
+        # unsafe is gone.
+        self._loss_reconciler = loss_reconciler.from_config(
+            self.config, resolve_name=_zk_resolve_name)
+        self._loss_zkill_logged = 0     # watermark: zKill-only deaths already logged
+        # Battle ledger. Pure engine + injected seams only; see _killmail_hook
+        # (feed), _own_presence_system_ids (condition B) and
+        # _battle_ledger_refresh (the 1 Hz Tk tick). System names resolve from
+        # the BUNDLED SDE table, not ESI — render_model runs on the Tk thread
+        # and zkill_monitor.resolve_name would do an HTTP GET on a cache miss.
+        self._battle_ledger = battle_ledger.from_config(
+            self.config,
+            presence_provider=self._own_presence_system_ids,
+            resolve_system_name=system_coords.get_name)
+        self._battle_ledger_panel = None     # built by _build_xup_tab
+        self._battle_ledger_broke = False    # first tick failure disables the tick
+        self._own_location_sid = None        # primary char (_refresh_current_system)
+        self._own_location_mono = 0.0
+        self._push_standings_to_battle_ledger()   # whatever the cache already holds
         self._loss_audio_enabled = self.config.get("loss_audio_enabled", True)
         self._ansiblex_connections: list[str] = []  # "id1|id2" strings for ESI route
         # Maps (id1, id2) -> (name1, name2) for identifying Ansiblex jumps in routes
@@ -896,6 +944,9 @@ class FCToolGUI:
         # Monitor pinning injectable backends (None → lazy real singletons).
         self._preview_monitor_win32 = None     # monitor enumeration (monitor_pin)
         self._preview_move_win32 = None        # window-move backend (window_activator)
+        # ── Implant-removal reminder (default OFF; see implant_reminder.py) ──
+        self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
+        self._implant_toast = None             # the single live ClientToast, if any
         # ── Active highlight / cycle exclusion / switch-external (Task C4) ────
         self._preview_excluded = set()         # session-only cycle-exclusion char keys
         self._preview_last_external_hwnd = None  # last non-EVE, non-ours foreground hwnd
@@ -1930,6 +1981,10 @@ class FCToolGUI:
             self._eve_clock.config(text=now.strftime("EVE  %Y.%m.%d  %H:%M:%S"))
         except tk.TclError:
             return  # widget gone (app closing)
+        # The battle ledger rides this beat rather than opening a timer of its
+        # own: 1 Hz is exactly the cadence battle_ledger_panel asks for, and
+        # this is the one Tk loop guaranteed to be running on every tab.
+        self._battle_ledger_refresh()
         try:
             self.root.after(1000, self._update_eve_clock)
         except (tk.TclError, RuntimeError):
@@ -2112,17 +2167,19 @@ class FCToolGUI:
             font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow",
         )
         self._loss_status_label.pack(side=tk.LEFT, padx=(0, 10))
-        _loss_tip = (
+        # Static copy covering every scope the label can show — the shared
+        # leak-proof helper, never a bespoke tooltip Toplevel.
+        attach_tooltip(self._loss_status_label, (
             "Mainline Fleet: tackle losses (frigs, dessies, ceptors, AFs, EAFs, T3Ds)\n"
             "are ignored — only major ship losses count toward alerts.\n"
-            "Support Fleet: all losses count. Mode is auto-detected from fleet comp."
-        )
-        self._loss_status_label.bind(
-            "<Enter>", lambda e, t=_loss_tip: self._show_tooltip(e, t)
-        )
-        self._loss_status_label.bind(
-            "<Leave>", lambda e: self._hide_tooltip()
-        )
+            "Support Fleet: all losses count. Mode is auto-detected from fleet comp.\n"
+            "\n"
+            f"[{_LOSS_NONBOSS_SCOPE}]: ESI only lets the FLEET BOSS read a fleet's\n"
+            "member list, so off-boss FCTool has no fleet roster at all. That count\n"
+            "covers ONLY the characters authenticated in FCTool — it is NOT the whole\n"
+            "fleet's losses, and a loss anywhere else in New Eden by one of your own\n"
+            "characters lands in it too."
+        ))
 
         self._loss_audio_var = tk.BooleanVar(value=self._loss_audio_enabled)
 
@@ -2138,6 +2195,28 @@ class FCToolGUI:
                        activeforeground=FG_YELLOW,
                        command=_on_loss_audio_toggle,
                        ).pack(side=tk.LEFT)
+
+        # Loss source (config loss_tracking.source). Persists immediately,
+        # mirroring the Audio toggle above — no Save-Settings round trip.
+        tk.Label(self._loss_section, text="Source:", font=("Consolas", 9),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 2))
+        self._loss_source_var = tk.StringVar(value=self._loss_reconciler.source)
+        _loss_src_combo = ttk.Combobox(
+            self._loss_section, textvariable=self._loss_source_var,
+            state="readonly", values=list(loss_reconciler.SOURCE_MODES),
+            width=7, font=("Consolas", 9))
+        _loss_src_combo.pack(side=tk.LEFT)
+        _loss_src_combo.bind("<<ComboboxSelected>>",
+                             lambda e: self._on_loss_source_change())
+        _loss_src_tip = (
+            "esi: capsule transitions — fast (~30s), but blind to podded pilots\n"
+            "and dead entirely when you are not fleet boss.\n"
+            "zkill: killmail-derived losses drive the display (~2 min behind).\n"
+            "hybrid: ESI still drives the alerts; zKill reconciles behind them."
+        )
+        _loss_src_combo.bind(
+            "<Enter>", lambda e, t=_loss_src_tip: self._show_tooltip(e, t))
+        _loss_src_combo.bind("<Leave>", lambda e: self._hide_tooltip())
 
         # ── Fleet Composition & Specialized Roles ────────────────────────────
         comp_outer = tk.Frame(tab, bg=BG_DARK)
@@ -2252,13 +2331,53 @@ class FCToolGUI:
         self._fleet_comp_labels: list[tk.Label] = []
         self._fleet_comp_prev: list[tuple[str, int]] = []  # for flicker prevention
 
+        # Battle ledger column — a RIGHT-side sibling of the ship list INSIDE
+        # comp_left. Measured at ZERO px off Specialized Roles at the app
+        # default (1200x900) and at its minsize (1000x700): comp_left already
+        # requests 336px for the Doctrine row, so a <=300px column disappears
+        # into it (tests/test_fleet_xup_comp_scroll.py). comp_scroll_outer is
+        # re-packed side=LEFT so both share one cavity — packed TOP it takes the
+        # full width and the ledger lands underneath. The panel is a SIBLING of
+        # self._fleet_comp_frame, so _update_fleet_composition's per-poll
+        # winfo_children() wipe cannot touch it.
+        comp_scroll_outer.pack_forget()
+        self._battle_ledger_panel = BattleLedgerPanel(
+            comp_left,
+            pack_opts=dict(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=(0, 4)),
+            register_scroll_canvas=self._register_scroll_canvas,
+            isk_format=self._market_price_short,       # keep ONE ISK formatter
+            on_dismiss=self._battle_ledger_dismiss)
+        comp_scroll_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                               padx=8, pady=(0, 4))
+
         # Right panel: Specialized Roles (collapsible sections)
         comp_right_outer = tk.Frame(comp_outer, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                      highlightbackground=BORDER_COLOR, highlightthickness=1)
         comp_right_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
 
-        tk.Label(comp_right_outer, text="Specialized Roles", font=("Consolas", 10, "bold"),
-                 fg=FG_ACCENT, bg=BG_PANEL).pack(anchor=tk.W, padx=8, pady=(4, 2))
+        # Header row: title + a "ⓘ" hover-help indicator explaining how charge
+        # reading works (owner request 2026-07-25) -- kept to one glance, not a
+        # banner. The one-line blurb below is the always-visible reminder; the
+        # tooltip (shared D9 helper) carries the "replaces, not adds" detail.
+        spec_header_row = tk.Frame(comp_right_outer, bg=BG_PANEL)
+        spec_header_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(4, 0))
+        tk.Label(spec_header_row, text="Specialized Roles", font=("Consolas", 10, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT)
+        self._spec_roles_help_icon = tk.Label(
+            spec_header_row, text="ⓘ", font=("Consolas", 9, "bold"),
+            fg=FG_DIM, bg=BG_PANEL, cursor="hand2")
+        self._spec_roles_help_icon.pack(side=tk.LEFT, padx=(5, 0))
+        attach_tooltip(
+            self._spec_roles_help_icon,
+            "FCTool reads command-burst charges from fleet chat by name. Each "
+            "new message REPLACES that pilot's previous set — charges split "
+            "across two messages lose the first one. Drag all of a pilot's "
+            "charges into a single message. Max 3 per pilot.")
+        self._spec_roles_blurb = tk.Label(
+            comp_right_outer,
+            text="Pilots drag burst charges into fleet chat — all in one message.",
+            font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL)
+        self._spec_roles_blurb.pack(anchor=tk.W, padx=8, pady=(0, 2))
 
         # Scrollable container for specialized roles
         spec_canvas = tk.Canvas(comp_right_outer, bg=BG_PANEL, highlightthickness=0)
@@ -5423,6 +5542,8 @@ class FCToolGUI:
         # Reset loss tracker — new FC = new fleet context
         try:
             self._loss_tracker.reset()
+            self._loss_reconciler.reset()
+            self._loss_zkill_logged = 0
         except Exception:
             pass
 
@@ -16483,19 +16604,38 @@ class FCToolGUI:
         sys_id = prior_sys_id
         sys_name = prior.system_name if prior else ""
         docked = prior.docked if prior else False
+        station_id = prior.station_id if prior else 0
+        structure_id = prior.structure_id if prior else 0
         online = prior.online if prior else None
 
+        loc = {}
         try:
             loc = auth.get_location() or {}
             if loc:
                 sys_id = loc.get("solar_system_id")
-                docked = bool(loc.get("station_id") or loc.get("structure_id"))
+                # Keep the ids, don't just collapse them to a bool: the
+                # implant-removal reminder needs to know WHICH station/structure
+                # the character docked in, and re-polling /location for that
+                # would be a second call for data already in hand.
+                station_id = int(loc.get("station_id") or 0)
+                structure_id = int(loc.get("structure_id") or 0)
+                docked = bool(station_id or structure_id)
                 if sys_id:
                     info = get_system_info(sys_id)
                     if info and info.get("name"):
                         sys_name = info["name"]
         except Exception:
             pass
+
+        # Implant-removal reminder: fed the SAME location payload (no second
+        # ESI call). Deliberately outside the block above so a reminder fault
+        # can never swallow the system-name resolution, and getattr-guarded
+        # because the unit tests bind this builder onto bare SimpleNamespace
+        # hosts (house pattern -- see _preview_tick's gamelog-status hook).
+        if loc:
+            _ir = getattr(self, "_implant_reminder_observe", None)
+            if _ir is not None:
+                _ir(auth, name, loc)
 
         if force_ship or prior is None or sys_id != prior_sys_id:
             try:
@@ -16536,7 +16676,97 @@ class FCToolGUI:
             online=online, ship_type_id=ship_type_id,
             ship_type_name=ship_type_name,
             ship_group=ship_group, is_capital=is_cap, solar_system_id=sys_id,
-            system_name=sys_name, docked=docked)
+            system_name=sys_name, docked=docked,
+            station_id=station_id, structure_id=structure_id)
+
+    # ── Implant-removal reminder wiring (default OFF) ───────────────────────
+    # The feature itself lives in implant_reminder.py (pure trigger/state engine,
+    # Tk-free) and client_toast.py (the transient over-client window). fc_gui owns
+    # only the two seams that must touch app state: the poller-thread hook below
+    # -- called from _overlay_build_state with the /location payload already in
+    # hand, so dock detection costs ZERO extra ESI -- and the Tk-thread toast
+    # raise it marshals to via _post_ui.
+
+    def _implant_reminder_observe(self, auth, name, loc):
+        """Poller-thread hook: advance the reminder for ONE character.
+
+        Runs on the ESI poll thread and touches no Tk (the engine's on_remind
+        callback is a _post_ui marshal). Fully inert -- and never even builds the
+        engine -- while config['implant_reminder']['enabled'] is False, so an off
+        feature costs one dict lookup per poll and no ESI call at all. A token
+        without esi-clones.read_implants.v1 is skipped outright rather than left
+        to 403 (a 403 costs 5 of the 100/60s error budget)."""
+        try:
+            cfg = self.config.get("implant_reminder")
+            if not (isinstance(cfg, dict) and cfg.get("enabled")):
+                return
+            if not auth.has_scope(_IMPLANTS_SCOPE):
+                return
+            rem = self._implant_reminder
+            if rem is None:
+                rem = self._implant_reminder = implant_reminder.ImplantReminder(
+                    config_provider=lambda: self.config,
+                    implants_provider=lambda a: a.get_implants(),
+                    on_remind=lambda k, n, names: self._post_ui(
+                        self._implant_show_toast, k, n, names),
+                    resolve_system_name=system_coords.resolve_name)
+            rem.observe((name or "").strip().lower(), name, loc, auth)
+        except Exception:
+            log.exception("[implant] reminder hook failed")
+
+    def _implant_client_rect(self, key):
+        """(left, top, right, bottom) physical-px EDGES of the EVE client whose
+        char key is `key`, or None when it isn't on screen.
+
+        Prefers the preview tracker's last snapshot (free); falls back to ONE
+        window enumeration so the reminder still works with previews off. Purely
+        read-only -- window_activator remains the only module that changes a real
+        client window's state."""
+        k = str(key or "").strip().lower()
+        for c in (self._preview_clients or {}).values():
+            if c.key == k and not c.is_iconic:
+                return tuple(c.rect)
+        try:
+            for c in self._preview_find_clients():
+                if c.key == k and not c.is_iconic:
+                    return tuple(c.rect)
+        except Exception:
+            log.exception("[implant] client enumeration failed")
+        return None
+
+    def _implant_show_toast(self, key, char_name, names):
+        """Tk-thread: raise the transient over-client toast for ONE character.
+
+        DELIBERATE DIVERGENCE from _preview_on_decloak: there is NO
+        foreground-suppression here. The decloak alert suppresses when the
+        character's own client is focused because the pilot is already looking at
+        it; for a dock reminder that is exactly the moment it must be seen. Do
+        not "fix" this into a focus check.
+
+        One toast at a time (a newer one replaces the older). With no client rect
+        there is nothing sensible to sit over, so the toast is skipped rather
+        than parked at a guessed screen position."""
+        try:
+            prev = self._implant_toast
+            if prev is not None:
+                prev.dismiss()
+                self._implant_toast = None
+            rect = self._implant_client_rect(key)
+            if rect is None:
+                return
+            cfg = implant_reminder.normalize_config(
+                self.config.get("implant_reminder"))
+            rem = self._implant_reminder
+            toast = client_toast.ClientToast(
+                self.root, implant_reminder.TOAST_TITLE,
+                implant_reminder.toast_body(char_name, names),
+                seconds=cfg.get("toast_seconds", 12.0),
+                on_dismiss=lambda: setattr(self, "_implant_toast", None),
+                on_snooze=(lambda: rem.snooze(key)) if rem is not None else None)
+            self._implant_toast = toast
+            toast.show(rect)
+        except Exception:
+            log.exception("[implant] toast failed for %s", key)
 
     def _overlay_start_poller(self):
         """Start the daemon poller if not already running."""
@@ -21070,6 +21300,15 @@ class FCToolGUI:
 
         # zKillboard
         zk_cfg = self.config.get("zkillboard", {})
+        # Re-read the loss source: _setup_modules also runs on Save Settings, and
+        # the hook below must reflect the CURRENT mode.
+        self._loss_reconciler.set_source(
+            loss_reconciler.source_from_config(self.config))
+        # ...and so must the combobox. Without this a hand-edited config.json
+        # plus a Save Settings left the control showing the mode the user last
+        # PICKED while a different one was actually in force.
+        if hasattr(self, "_loss_source_var"):
+            self._loss_source_var.set(self._loss_reconciler.source)
         if zk_cfg.get("enabled"):
             # Monitor runs with watch_all=True and min_pilots=1 to capture
             # everything; GUI-only filters (All K-Space, min pilots, max jumps)
@@ -21083,6 +21322,9 @@ class FCToolGUI:
                 min_pilots_involved=1,
                 alert_window_seconds=zk_cfg.get("alert_window_seconds", 300),
                 on_alert=self._on_zkill_alert,
+                # Raw per-killmail seam (poll thread; every subscriber is an
+                # internally-locked, Tk-free engine method). See _killmail_hook.
+                on_killmail=self._killmail_hook(),
                 watch_all=True,
                 friendly_ids=set(self._standings_cache.friendly_ids),
             )
@@ -21090,6 +21332,9 @@ class FCToolGUI:
         else:
             self.zkill_monitor = None
             self._zkill_status.config(text="ZKILL: OFF", fg=FG_DIM)
+        # No monitor => no killmails at all. The ledger must SAY so, not render
+        # an empty table that reads as "no losses".
+        self._battle_ledger.set_feed_enabled(self.zkill_monitor is not None)
 
         # Jump Range
         jr_cfg = self.config.get("jump_range", {})
@@ -21107,6 +21352,11 @@ class FCToolGUI:
             self._chat_thread = threading.Thread(target=self._chat_poll_loop, daemon=True)
             self._chat_thread.start()
         if self.zkill_monitor:
+            # A starting monitor replays ~200 sequences (~30 min) of backlog, so
+            # move both engines' replay cutoffs to NOW — that history is not
+            # this session's fleet losses, and it must not ARM a phantom fight.
+            self._loss_reconciler.set_started_at()
+            self._battle_ledger.set_started_at()
             self.zkill_monitor.start()
 
     def _stop_monitoring(self):
@@ -22234,6 +22484,9 @@ class FCToolGUI:
                     self._no_fleet_misses = 0
                     self._booster_roster = {}        # hulls unverified; charges kept
                     self._schedule_booster_refresh()
+                    # The capsule tracker is dead here (no member list), but the
+                    # zKill side can still work — see _process_nonboss_losses.
+                    self._post_ui(self._process_nonboss_losses, fleet_id)
                     self._post_ui_after(60000, self._refresh_fleet_locations)
                     return
                 else:
@@ -22283,6 +22536,10 @@ class FCToolGUI:
                     sys_id = loc.get("solar_system_id")
                     if sys_id:
                         own_sid = sys_id             # ESI id == map system id
+                        # Battle-ledger presence (condition B), off this SAME
+                        # poll — zero extra ESI. See _own_presence_system_ids.
+                        self._own_location_sid = sys_id
+                        self._own_location_mono = time.monotonic()
                         sys_info = get_system_info(sys_id)
                         sys_name = sys_info.get("name", "???") if sys_info else "???"
                         region_name = ""
@@ -22329,6 +22586,8 @@ class FCToolGUI:
     def _reset_loss_tracker(self):
         """Manually reset the fleet loss tracker."""
         self._loss_tracker.reset()
+        self._loss_reconciler.reset()
+        self._loss_zkill_logged = 0
         if hasattr(self, "_loss_status_label"):
             self._loss_status_label.config(
                 text="Losses: (reset — waiting for next poll)", fg=FG_DIM
@@ -22342,8 +22601,35 @@ class FCToolGUI:
 
         new_deaths, highest_threshold, fc_docked = self._loss_tracker.update(members)
 
+        # The battle ledger reads the SAME roster (its condition-A roster test
+        # and its Ours bucket) off this one poll — never a second one. Fed
+        # regardless of loss source: the ledger is a fight report, not a loss
+        # count. getattr-guarded because the wiring tests bind this method onto
+        # bare SimpleNamespace hosts (house pattern).
+        _ledger = getattr(self, "_battle_ledger", None)
+        if _ledger is not None:
+            _ledger.set_fleet_roster(m.get("character_id") for m in members)
+
+        # zKill reconciliation. Inert in "esi" mode (the hook is not attached).
+        # set_fleet_id FIRST — it resets the ledger on a fleet change, which
+        # would otherwise wipe the roster we are about to hand it.
+        rec = self._loss_reconciler
+        if rec.source != _LOSS_SOURCE_ESI:
+            rec.set_fleet_id(fleet_id)
+            rec.set_fleet_roster(m.get("character_id") for m in members)
+            rec.note_esi_deaths(new_deaths)
+
         # Update UI display
-        if hasattr(self, "_loss_status_label"):
+        if hasattr(self, "_loss_status_label") and rec.source == _LOSS_SOURCE_ZKILL:
+            # zKill DRIVES the display in this mode: the ESI inference is the
+            # very thing the user opted out of. Thresholds are untouched — they
+            # stay the tracker's below and the reconciler never fires one.
+            zk_lost = rec.death_count
+            self._loss_status_label.config(
+                text=f"Losses: {zk_lost} [zKill]{self._loss_recon_summary()}",
+                fg=FG_RED if zk_lost else FG_DIM,
+            )
+        elif hasattr(self, "_loss_status_label"):
             pct = self._loss_tracker.loss_percentage
             relevant = self._loss_tracker.relevant_deaths_count
             total_deaths = self._loss_tracker.deaths_count
@@ -22366,11 +22652,15 @@ class FCToolGUI:
                             f"[{mode_label}] (+{extra} tackle)")
                 else:
                     text = f"Losses: {relevant} / {baseline} ({pct:.1f}%) [{mode_label}]"
-                self._loss_status_label.config(text=text, fg=color)
+                self._loss_status_label.config(
+                    text=text + self._loss_recon_summary(), fg=color)
             else:
                 self._loss_status_label.config(
-                    text="Losses: (waiting for fleet)", fg=FG_DIM
+                    text="Losses: (waiting for fleet)" + self._loss_recon_summary(),
+                    fg=FG_DIM,
                 )
+
+        self._log_zkill_only_losses()
 
         # Log individual deaths (tackle deaths tagged differently)
         for death in new_deaths:
@@ -22410,6 +22700,223 @@ class FCToolGUI:
                     else:
                         phrase = f"{pct_int} percent of fleet lost"
                     tts_helper.speak(phrase)
+
+    def _on_loss_source_change(self):
+        """Persist + apply the loss-source selection immediately (Tk thread)."""
+        source = loss_reconciler.normalize_source(self._loss_source_var.get())
+        self._loss_source_var.set(source)
+        block = self.config.get("loss_tracking")
+        if not isinstance(block, dict):
+            block = self.config["loss_tracking"] = {}
+        block["source"] = source
+        self._save_config()
+        self._loss_reconciler.set_source(source)
+        # Re-attach the raw killmail hook so "esi" really is ZERO added work for
+        # reconciliation. Rebuilt rather than mutated: _killmail_hook is the one
+        # place that decides who rides the feed.
+        if getattr(self, "zkill_monitor", None):
+            self.zkill_monitor.on_killmail = self._killmail_hook()
+        elif source != _LOSS_SOURCE_ESI:
+            # Degrade VISIBLY, not silently: with zkillboard.enabled off there is
+            # no killmail feed, so this source can never produce anything.
+            self._append_xup_log(
+                "[Loss Tracker] zKill monitoring is OFF — this source needs it "
+                "(Settings ▸ zKillboard).\n", "dim")
+
+    # ── Raw killmail feed: one hook, several engines ───────────────────────
+
+    def _killmail_hook(self):
+        """Build ZKillMonitor.on_killmail for the current mode, or None.
+
+        TWO engines ride the raw feed, so the hook is a pure, Tk-free
+        zkill_monitor.KillmailFanout over both — which is what keeps every
+        subscriber an internally-locked ENGINE method on the poll thread rather
+        than an fc_gui method, and keeps one raiser from starving the other
+        (drift-guarded by tests/test_loss_source_wiring.py).
+
+        Loss reconciliation rides it in every mode EXCEPT "esi", where the user
+        opted out and the feed must do exactly what it did before that feature
+        existed. The battle ledger rides it whenever it exists AND is enabled: it
+        is a fight report, not a loss count, so the loss-source setting does not
+        govern it — but its own off switch (`config["battle_ledger"]["enabled"]`)
+        does, and unsubscribing here is what makes "off" cost literally nothing.
+        None when nothing subscribes, preserving the monitor's
+        `if self.on_killmail is not None` zero-work path.
+        """
+        subscribers = []
+        if self._loss_reconciler.source != _LOSS_SOURCE_ESI:
+            subscribers.append(self._loss_reconciler.ingest)
+        ledger = getattr(self, "_battle_ledger", None)
+        if ledger is not None and ledger.enabled:
+            subscribers.append(ledger.ingest)
+        return KillmailFanout(*subscribers) if subscribers else None
+
+    # ── Battle ledger seams ────────────────────────────────────────────────
+
+    def _own_presence_system_ids(self):
+        """System ids one of THIS install's own characters is currently in.
+
+        The battle ledger's condition B ("are we actually in this fight"). Reads
+        ONLY state other polls already fetched, so the ledger's marginal network
+        cost stays zero:
+
+          * `_overlay_states` / `_overlay_state_ts` — the preview/overlay ESI
+            poller's per-character /location sweep (the same payload the
+            implant reminder rides). Native/eveo preview modes only.
+          * `_own_location_sid` / `_own_location_mono` — the primary character's
+            /location from `_refresh_current_system` (15 s), which always runs.
+
+        Anything older than battle_ledger.PRESENCE_TTL_S is dropped: a stale
+        entry must never arm a ledger in a system you have already left.
+
+        WORKER-SAFE — `BattleLedger.ingest` calls it on the zKill poll thread as
+        well as the 1 Hz Tk tick, so it touches no widget and takes no lock
+        (plain reads of single-writer state, as `_map_live_ship_tid` does).
+        """
+        cutoff = time.monotonic() - battle_ledger.PRESENCE_TTL_S
+        systems = set()
+        try:
+            stamps = self._overlay_state_ts
+            for key, state in list(self._overlay_states.items()):
+                sid = getattr(state, "solar_system_id", None)
+                if sid and stamps.get(key, 0.0) >= cutoff:
+                    systems.add(int(sid))
+        except Exception:
+            pass
+        if self._own_location_sid and self._own_location_mono >= cutoff:
+            systems.add(int(self._own_location_sid))
+        return systems
+
+    def _push_standings_to_battle_ledger(self):
+        """Hand the ledger standings_cache's v2 ours/allies split.
+
+        `own_identity_known` is load-bearing, not cosmetic: while it is False
+        `ally_ids == friendly_ids`, so the ledger SUPPRESSES the contaminated
+        rows instead of showing an alliance-mate's loss as an ally's.
+
+        Safe off-thread (the engine is internally locked and touches no Tk) —
+        the same argument the adjacent `zkill_monitor.set_friendly_ids` push
+        already makes on the background standings refresh.
+        """
+        ledger = getattr(self, "_battle_ledger", None)
+        if ledger is None:
+            return
+        cache = self._standings_cache
+        ledger.set_standings(own_ids=cache.own_ids, ally_ids=cache.ally_ids,
+                             identity_known=cache.own_identity_known)
+
+    def _battle_ledger_refresh(self):
+        """Advance the ledger's timers and repaint. TK THREAD ONLY, <= 1 Hz.
+
+        `tick()` THEN `update_view(...)`, unconditionally — never
+        `if ledger.tick(): ...`. tick() reports only the timer-driven changes IT
+        made, so an ingest between two ticks would never reach the screen, and
+        the stamp's "(2m 05s behind)" figure has to keep counting up while the
+        counts sit still. `update_view` is the thing that short-circuits (it
+        diffs the whole immutable view).
+
+        Rides `_update_eve_clock`'s 1 Hz beat, so a fault here must never stop
+        that reschedule — hence the catch, which fires once, HIDES the panel and
+        stands down instead of spamming a log line every second. Hiding is not
+        tidiness: a latched tick leaves a frozen ledger whose staleness figure
+        stops counting up, and a stuck ledger reads as a live one.
+        """
+        panel = self._battle_ledger_panel
+        if panel is None or self._battle_ledger_broke:
+            return
+        try:
+            self._battle_ledger.tick()
+            panel.update_view(self._battle_ledger.render_model())
+        except tk.TclError:
+            pass                      # widgets gone (app closing)
+        except Exception:
+            self._battle_ledger_broke = True
+            log.exception("[battle ledger] refresh failed; tick disabled")
+            # ...and take the column DOWN. A latched-broken tick would otherwise
+            # leave a frozen ledger on screen whose "(2m 05s behind)" figure
+            # stops counting up — a stuck ledger reads as a live one, which is
+            # precisely the confusion this feature exists to prevent. Better no
+            # panel than a lying one.
+            try:
+                panel.hide()
+            except Exception:
+                log.debug("[battle ledger] panel hide after fault failed",
+                          exc_info=True)
+
+    def _battle_ledger_dismiss(self):
+        """The panel's ✕ — drop the current ledger (Tk thread)."""
+        self._battle_ledger.dismiss()
+        self._battle_ledger_refresh()
+
+    def _log_zkill_only_losses(self):
+        """Log the zKill-only losses (the ones ESI is structurally blind to)
+        that arrived since the last poll. TK THREAD ONLY.
+
+        Shared by the boss and non-boss paths deliberately: off-boss the
+        reconciler is the ONLY loss source running, so leaving the log to
+        `_process_loss_tracking` alone made it the one mode where a loss was
+        counted but never written down.
+
+        The ledger only grows within a fleet, so a count watermark is enough; a
+        reset shrinks it and the min() re-syncs. The engine guarantees the list
+        grows only at its end (`LossReconciler._publish_locked`), which is what
+        makes an index watermark safe.
+        """
+        zkill_only = self._loss_reconciler.zkill_only_deaths
+        self._loss_zkill_logged = min(self._loss_zkill_logged, len(zkill_only))
+        for death in zkill_only[self._loss_zkill_logged:]:
+            loc = f" in {death.system_name}" if death.system_name else ""
+            self._append_xup_log(
+                f"[LOSS-zkill] {death.character_name} ({death.ship_name}){loc}\n",
+                "fire")
+        self._loss_zkill_logged = len(zkill_only)
+
+    def _loss_recon_summary(self, *, zkill_headline: bool = False) -> str:
+        """Reconciled-loss segment for the status label. TK THREAD ONLY — reads
+        the (internally locked) reconciler; the zKill poll thread never touches
+        a widget, it only calls `LossReconciler.ingest`. Additive in "hybrid":
+        the ESI-driven text and its threshold alerts stay untouched.
+
+        Pass `zkill_headline=True` when the label this is appended to already
+        shows the reconciler's own ledger under a zKill heading — it drops both
+        the redundant "zKill" word and the "+N unseen" count (see
+        `loss_reconciler.status_summary`)."""
+        return loss_reconciler.status_summary(
+            self._loss_reconciler, self._market_price_short,
+            zkill_headline=zkill_headline)
+
+    def _process_nonboss_losses(self, fleet_id):
+        """Fleet poll on a NON-boss client. TK THREAD (the caller marshals).
+
+        ESI 403s /fleets/{id}/members/ for anyone but the boss, so the capsule
+        tracker has no roster and does not run at all — today's behaviour, kept.
+        zKill still sees every killmail, so keep the reconciler alive on the only
+        character ids this client can PROVE are ours: its own authenticated
+        characters (the multiboxing case).
+
+        The label names that scope out loud. It is NOT a fleet loss count — a
+        mining alt ganked three regions away lands in it while the fleet stands
+        intact, and it says nothing at all about fleet members this install is
+        not logged in as. The label is written on EVERY poll, including at zero:
+        `is_boss` flaps, and leaving the previous ESI-derived "3 / 12 (25%)
+        [Mainline Fleet]" text on screen would keep asserting a number nothing
+        is updating any more.
+        """
+        rec = self._loss_reconciler
+        if rec.source == _LOSS_SOURCE_ESI:
+            return
+        rec.set_fleet_id(fleet_id)          # resets the ledger on a fleet change
+        if not rec.fleet_roster:
+            # Never OVERWRITE a real boss-supplied roster — is_boss can flap.
+            rec.set_fleet_roster(
+                a.character_id for a in self.esi_accounts if a.character_id)
+        lost = rec.death_count
+        if hasattr(self, "_loss_status_label"):
+            self._loss_status_label.config(
+                text=f"Losses: {lost} [{_LOSS_NONBOSS_SCOPE}]"
+                     f"{self._loss_recon_summary(zkill_headline=True)}",
+                fg=FG_RED if lost else FG_DIM)
+        self._log_zkill_only_losses()
 
     def _apply_fleet_locations(self, locations: dict[str, tuple[str, str, str]]):
         """Update location labels for all role tracker members."""
@@ -23675,6 +24182,7 @@ $bmp.Dispose()
         if self.zkill_monitor:
             self.zkill_monitor.set_friendly_ids(
                 set(self._standings_cache.friendly_ids))
+        self._push_standings_to_battle_ledger()
         self._update_standings_label()
         msg = (
             f"Standings refreshed. {len(self._standings_cache.friendly_ids)} "
@@ -23715,6 +24223,8 @@ $bmp.Dispose()
                     if self.zkill_monitor:
                         self.zkill_monitor.set_friendly_ids(
                             set(self._standings_cache.friendly_ids))
+                    # Same argument for the battle ledger's ours/allies split.
+                    self._push_standings_to_battle_ledger()
                     # Update label on the Tk thread (FCToolGUI uses self.root,
                     # not subclass-style self).
                     if hasattr(self, "_paste_standings_age"):

@@ -84,6 +84,20 @@ def resolve_name(name: str) -> int | None:
     return _id_of_name.get(name.lower())
 
 
+def get_name(system_id: int) -> str | None:
+    """Return the canonical system name from the bundled table, or None.
+
+    The reverse of `resolve_name`, and the local/offline alternative to
+    `zkill_monitor.resolve_name(sid, "solar_system")` / `jump_range.
+    get_system_info`, both of which do a rate-limited HTTP GET on a cache miss.
+    That matters wherever a name is needed ON THE TK THREAD (the battle
+    ledger's per-second render is the current caller): a pure in-memory read
+    cannot stall the UI. None for J-space or when no table shipped — callers
+    fall back to str(id) or to ESI."""
+    _load()
+    return _name_of.get(system_id)
+
+
 def get_region_id(system_id: int) -> int | None:
     """Return the region_id for a system from the bundled table, or None when the
     system isn't in the table (e.g. J-space wormholes, or no table shipped).

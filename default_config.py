@@ -145,6 +145,75 @@ DEFAULT_CONFIG = {
         # migration path (OPTIMIZATION_REVIEW.md F2).
         "auto_scan_on_start": False,
     },
+    # Implant-removal reminder (spike 2026-07-25-implant-reminder). A small
+    # transient toast over the docked client reminding a pilot carrying expensive
+    # implants to pull them after docking back at staging following a fleet.
+    #
+    # DEFAULT OFF, and that is load-bearing: it needs esi-clones.read_implants.v1,
+    # which every pre-existing character token lacks until the owner re-consents,
+    # so a nag defaulting ON would misfire for every install on upgrade day.
+    # While `enabled` is False NO worker runs, NO ESI implant call is made and the
+    # scope is never exercised — the poller hook returns before touching anything.
+    #
+    # Trigger = docked at staging AND known to be carrying implants worth pulling.
+    # The staging SYSTEM comes from zkillboard.staging_system — the FC-facing
+    # staging, the same key that drives route-from-staging on kill alerts and the
+    # MOTD leave-staging guard. market.staging_* is the MARKET/seeding citadel and
+    # is frequently a DIFFERENT system, so it is only borrowed for exact-dock
+    # precision when market.staging_system_id agrees; the two override keys below
+    # win over both. See implant_reminder.resolve_staging. With nothing set the
+    # feature stays inert rather than firing on every dock anywhere — and says so
+    # once in the log, so it can never be an undiagnosable no-op.
+    "implant_reminder": {
+        "enabled": False,           # MASTER GATE
+        "toast_seconds": 12,        # hold before the fade (clamped 3..60)
+        # "valuable" (default) = the High-/Mid-/Low-grade SET implants, the +5
+        # ("- Improved") attribute implants, and top-tier + named hardwirings;
+        # never boosters and never the +4-and-below attribute implants pilots fly
+        # permanently. "any" = every implant. "custom" = substring match against
+        # match_names below (an EMPTY match_names falls back to "valuable" — a
+        # mode that can never fire is a silent no-op, not a feature).
+        "match_mode": "valuable",
+        "match_names": [],          # only consulted when match_mode == "custom"
+        "min_hardwiring_grade": 5,  # 1..6; the trailing digit of e.g. "SU-606"
+        # "ladder" (default, full fall-through) | "structure" (exact dock only)
+        # | "system" (docked anywhere in the staging system).
+        "staging_scope": "ladder",
+        # Explicit staging OVERRIDE — either one set wins over market/zkillboard
+        # outright. Use when FC staging is neither the market citadel nor
+        # zkillboard.staging_system. 0 / "" = unset (the normal case).
+        "staging_structure_id": 0,  # exact citadel/structure id
+        "staging_system": "",       # system NAME, e.g. "SVM-3K"
+        # Show-oriented UX, disabled-oriented storage (mirrors
+        # preview.disabled_chars): a brand-new character defaults to reminded.
+        "disabled_chars": [],
+    },
+    # Fleet loss tracking source (spike 2026-07-25-zkill-loss-source). The
+    # capsule-transition detector in loss_tracker.py is FAST (~20-35s) but blind
+    # to podded pilots (measured 26-43% of PvP ship losses) and does not run at
+    # all when the user is not fleet boss (ESI 403s the member list). zKillboard
+    # is ground truth but ~2 min behind (median 120s, p90 267s), which is far too
+    # late for the 10/25/50% threshold alerts.
+    #   "esi"    — today's behaviour EXACTLY; the reconciler is never attached,
+    #              so the zKill feed does no extra work at all.
+    #   "zkill"  — killmail-derived losses drive the display (the non-boss case).
+    #   "hybrid" — DEFAULT. ESI keeps driving the live threshold alerts
+    #              UNCHANGED; zKill reconciles behind them for real ISK and the
+    #              losses ESI structurally cannot see.
+    # config.json is never deep-merged, so an upgraded install has no block at
+    # all: every key is read with a fallback and an unknown "source" normalizes
+    # to the default (loss_reconciler.from_config / .source_from_config).
+    # NOTE: the audio toggle stays the bare top-level "loss_audio_enabled" key —
+    # relocating it here would silently reset every existing user's preference.
+    "loss_tracking": {
+        "source": "hybrid",
+        # Asymmetric reconcile window, in seconds: a killmail's time is the TRUE
+        # death instant while the ESI inference fires 15-45s AFTER it, so an
+        # inferred death may TRAIL the killmail by match_window_s and LEAD it by
+        # match_lead_s (clock skew / an early poll).
+        "match_window_s": 300,
+        "match_lead_s": 30,
+    },
     "overview": {
         # Hidden by default (feature in progress); set true to show the Overview tab.
         "tab_enabled": False,

@@ -24,6 +24,13 @@ class CharState:
     solar_system_id: int | None = None
     system_name: str = ""
     docked: bool = False                 # station_id or structure_id present
+    # The ids `docked` was collapsed from, kept so consumers that need to know
+    # WHERE the character docked (the implant-removal reminder's staging match)
+    # don't have to poll /location a second time. 0 = absent (in space, or the
+    # other kind of dock). NPC station -> station_id; player structure ->
+    # structure_id; never both.
+    station_id: int = 0
+    structure_id: int = 0
 
 
 @dataclass

@@ -5,7 +5,7 @@ across ESI fleet polls. Fires threshold notifications at 10%, 25%, 50% loss.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 # EVE capsule ship type IDs
 CAPSULE_TYPE_IDS = {
@@ -16,17 +16,36 @@ CAPSULE_TYPE_IDS = {
 # Loss thresholds (as fractions of initial fleet size)
 LOSS_THRESHOLDS = (0.10, 0.25, 0.50)
 
+# Provenance of a DeathEvent. "esi" = inferred here from a ship->capsule
+# transition; "zkill" = supplied by loss_reconciler from a zKillboard killmail.
+# loss_reconciler imports these rather than re-typing the literals (they are
+# also the config selector's mode names — see loss_reconciler.SOURCE_*).
+DEATH_SOURCE_ESI = "esi"
+DEATH_SOURCE_ZKILL = "zkill"
+
 
 @dataclass
 class DeathEvent:
-    """A detected fleet member death."""
+    """A detected fleet member death.
+
+    Fields after `timestamp` are optional and only ever populated by
+    `loss_reconciler` (zKillboard reconciliation); the ESI capsule-transition
+    path leaves them at their defaults.
+    """
     character_id: int
     character_name: str
     ship_type_id: int
     ship_name: str
     system_id: int
     system_name: str
+    # AWARE UTC. See the `datetime.now(timezone.utc)` call below for why.
     timestamp: datetime
+    # zKillboard reconciliation (loss_reconciler). A non-None killmail_id means
+    # "a real killmail was matched to this death".
+    killmail_id: int | None = None
+    isk_value: float = 0.0          # zkb.totalValue of the SHIP killmail
+    podded: bool = False            # a capsule killmail followed this loss
+    source: str = DEATH_SOURCE_ESI
 
 
 @dataclass
@@ -202,7 +221,14 @@ class FleetLossTracker:
                         ship_name=snap.ship_name,
                         system_id=snap.system_id,
                         system_name=snap.system_name,
-                        timestamp=datetime.now(),
+                        # AWARE UTC, deliberately — this used to be a naive
+                        # datetime.now(). zKillboard's killmail_time is
+                        # tz-aware UTC, so reconciliation
+                        # (loss_reconciler) could not subtract the two
+                        # without TypeError: "can't subtract offset-naive
+                        # and offset-aware datetimes". Nothing outside this
+                        # module read the field before the change.
+                        timestamp=datetime.now(timezone.utc),
                     )
                     setattr(death, "_was_tackle", snap.is_tackle)
                     new_deaths.append(death)

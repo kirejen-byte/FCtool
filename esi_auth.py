@@ -74,7 +74,21 @@ SCOPES = [
     "esi-markets.structure_markets.v1",  # citadel market pull
     "esi-contracts.read_character_contracts.v1",  # personal/alliance contract visibility
     "esi-contracts.read_corporation_contracts.v1",  # corp/alliance contracts
+    # Implant-removal reminder (spike 2026-07-25-implant-reminder). Registered on
+    # the EVE developer application by the owner 2026-07-25 BEFORE this line was
+    # added — SSO rejects unregistered scopes at login, so that ordering is the
+    # project rule. Adding it makes missing_scopes() report it for every EXISTING
+    # token (scopes are granted only at login), so every character shows the ⚠ /
+    # Re-authorize state until re-consented; that is why the reminder itself
+    # defaults OFF. read_implants = the ACTIVE clone. Deliberately NOT
+    # esi-clones.read_clones.v1, which returns JUMP-clone implants (the ones
+    # explicitly NOT plugged in) and answers the wrong question.
+    "esi-clones.read_implants.v1",  # active-clone implants (removal reminder)
 ]
+
+#: Scope backing the implant-removal reminder. Module constant so the GUI and
+#: the reminder engine gate on the same string (mirrors MARKET_STRUCTURE_SCOPE).
+IMPLANTS_SCOPE = "esi-clones.read_implants.v1"
 
 # Market Scanner scope groups, for has_scope gating helpers (design §6.3). Kept
 # as module constants so the GUI and any worker gate features on the same names.
@@ -192,6 +206,10 @@ class ESIAuth:
         # is retried on the very next call instead of being cached.
         self._loc_memo: "tuple[float, dict] | None" = None
         self._ship_memo: "tuple[float, dict] | None" = None
+        # Same shape for get_implants(), but on its OWN (much longer) TTL: the
+        # /implants/ endpoint's server-side cache is 120 s, so a shorter memo
+        # would just re-ask for a body ESI will not have changed.
+        self._implants_memo: "tuple[float, list] | None" = None
 
         # Per-instance ETag cache for esi_get_ex (B2): key (path + folded params)
         # -> (etag, parsed_body). On a repeat GET we send If-None-Match; a 304
@@ -935,6 +953,40 @@ class ESIAuth:
         if value is not None:
             self._ship_memo = (now, value)
         return value
+
+    # ESI's own server-side cache on /implants/ is 120 s; matching it means a
+    # memo hit is never staler than a fresh call would have been, and CCP's best
+    # practices are blunt that circumventing the cache can get an app banned.
+    _IMPLANT_MEMO_TTL_S = 120.0
+
+    def get_implants(self) -> list | None:
+        """Implant type ids plugged into the character's ACTIVE clone.
+
+        ``GET /characters/{id}/location`` tells you where a pilot is;
+        ``/implants/`` tells you what is in their head right now. Returns a list
+        of type ids (possibly empty — a clean clone), or ``None`` when the call
+        fails or the token lacks ``esi-clones.read_implants.v1``.
+
+        Memoized for ``_IMPLANT_MEMO_TTL_S`` (see ``_implants_memo``); the
+        ETag/conditional-GET layer in ``esi_get_ex`` sits underneath. Rate-limit
+        group ``char-detail`` (600 tokens / 15 min, keyed PER CHARACTER) — a
+        bucket no other FCTool call touches today.
+
+        An empty list is cached like any other success: "nothing plugged in" is
+        a real answer, and re-asking every poll would waste the budget."""
+        if not self._character_id:
+            return None
+        now = time.monotonic()
+        if self._implants_memo is not None:
+            ts, value = self._implants_memo
+            if now - ts < self._IMPLANT_MEMO_TTL_S:
+                return value
+        value = self.esi_get(f"/characters/{self._character_id}/implants/")
+        if isinstance(value, list):
+            out = [int(v) for v in value if isinstance(v, (int, float))]
+            self._implants_memo = (now, out)
+            return out
+        return None
 
     def set_waypoint(self, destination_id: int, clear_other: bool = False,
                      add_to_beginning: bool = False) -> bool:

@@ -23,6 +23,43 @@ log = get_logger(__name__)
 
 R2Z2_BASE = "https://r2z2.zkillboard.com/ephemeral"
 
+# Kills older than this are rejected. zKillboard accepts manually-posted
+# HISTORICAL killmails and they enter the live R2Z2 stream exactly like fresh
+# ones (measured: backfills of 6, 29, 41 and 58 days), so every consumer of the
+# feed must gate on age or it will report an ancient loss as a fresh one. The
+# 30-minute allowance is deliberate: it lets a restarted client catch up on the
+# ~30 minutes of history the poll loop's 200-sequence lookback replays.
+MAX_KILL_AGE = timedelta(minutes=30)
+
+
+def is_kill_stale(km: dict, max_age: timedelta = MAX_KILL_AGE,
+                  now: datetime | None = None) -> bool:
+    """True when `km` carries a parseable `killmail_time` older than `max_age`.
+
+    `km` is the INNER killmail dict (the one holding `killmail_time`), not the
+    `{"killmail": ..., "zkb": ...}` wrapper.
+
+    An absent or unparseable time returns False ("treat as fresh, let it
+    through") — a deliberate transcription of the original inline checks in
+    `ZKillMonitor._matches_filters` and `EngagementTracker.add_kill`, which
+    both swallowed the parse/compare error and continued. Note that an
+    offset-less timestamp string parses to a NAIVE datetime, so the
+    subtraction below raises TypeError and the kill is treated as fresh; that
+    is pre-existing behaviour and is preserved here on purpose.
+
+    `now` is injectable for deterministic tests; production callers omit it.
+    """
+    kill_time_str = km.get("killmail_time", "")
+    if not kill_time_str:
+        return False
+    try:
+        kill_time = datetime.fromisoformat(kill_time_str.replace("Z", "+00:00"))
+        reference = now if now is not None else datetime.now(timezone.utc)
+        return reference - kill_time > max_age
+    except Exception:
+        return False
+
+
 # Capital ship type IDs grouped by class for breakdown display
 CAPITAL_CLASSES: dict[str, set[int]] = {
     "Dreads": {19720, 19722, 19724, 19726, 42241, 42243, 45647, 52907},
@@ -200,22 +237,16 @@ class EngagementTracker:
         if not system_id:
             return None
 
-        # Cheap, ESI-free staleness gate FIRST — mirrors the 30-minute cutoff in
-        # ZKillMonitor._matches_filters. A stale kill does zero aggregation and
-        # zero name/region resolution (the only calls that touch ESI). This is
-        # behaviour-preserving in production because _process_kill already ran
-        # _matches_filters (which rejects >30-minute-old kills) before reaching
-        # here. If killmail_time is absent or unparseable we treat the kill as
-        # NOT stale and proceed (test killmails carry no killmail_time).
-        kill_time_str = km.get("killmail_time", "")
-        if kill_time_str:
-            try:
-                kill_time = datetime.fromisoformat(
-                    kill_time_str.replace("Z", "+00:00"))
-                if datetime.now(timezone.utc) - kill_time > timedelta(minutes=30):
-                    return None
-            except Exception:
-                pass  # Unparseable time -> treat as fresh, let it through.
+        # Cheap, ESI-free staleness gate FIRST — the SAME predicate
+        # ZKillMonitor._matches_filters uses (module-level `is_kill_stale`). A
+        # stale kill does zero aggregation and zero name/region resolution (the
+        # only calls that touch ESI). This is behaviour-preserving in
+        # production because _process_kill already ran _matches_filters (which
+        # rejects >30-minute-old kills) before reaching here. If killmail_time
+        # is absent or unparseable the kill counts as NOT stale and proceeds
+        # (test killmails carry no killmail_time).
+        if is_kill_stale(km):
+            return None
 
         now = datetime.now(timezone.utc)
 
@@ -351,6 +382,71 @@ class EngagementTracker:
         return None
 
 
+class KillmailFanout:
+    """Deliver every raw killmail to SEVERAL subscribers behind one hook.
+
+    ``ZKillMonitor.on_killmail`` is a single callable, and more than one engine
+    now needs the raw feed (loss reconciliation and the battle ledger). This is
+    the seam that lets both ride it WITHOUT the hook target becoming a GUI
+    method: it is pure — no Tk, no fc_gui import, no state beyond the
+    subscriber tuple — so every subscriber stays a lock-protected, Tk-free
+    engine method running on the poll thread. That property is asserted by
+    tests/test_loss_source_wiring.py.
+
+    ISOLATION IS PER-SUBSCRIBER, and that is the whole point of this class
+    rather than a bare list comprehension. ``_process_kill`` already wraps
+    ``on_killmail`` in a try/except so a misbehaving consumer cannot cost the
+    intel tab its alert for that killmail — but that outer net catches the
+    FIRST raiser and abandons every subscriber behind it. Each subscriber
+    therefore gets its own try/except here; the monitor's net stays as the
+    backstop for anything this class itself could get wrong.
+
+    Thread-safety: ``add``/``remove`` rebind an immutable tuple under a lock,
+    and ``__call__`` reads that tuple exactly once, so the Tk thread may
+    re-subscribe while the poll thread is mid-fan-out.
+    """
+
+    def __init__(self, *subscribers):
+        self._lock = threading.Lock()
+        self._subscribers: tuple = tuple(s for s in subscribers if callable(s))
+
+    @property
+    def subscribers(self) -> tuple:
+        """The current subscribers, as an immutable snapshot."""
+        return self._subscribers
+
+    def add(self, subscriber) -> bool:
+        """Subscribe `subscriber` unless it is already subscribed."""
+        if not callable(subscriber):
+            return False
+        with self._lock:
+            if subscriber in self._subscribers:
+                return False
+            self._subscribers = self._subscribers + (subscriber,)
+        return True
+
+    def remove(self, subscriber) -> bool:
+        with self._lock:
+            kept = tuple(s for s in self._subscribers if s != subscriber)
+            changed = len(kept) != len(self._subscribers)
+            self._subscribers = kept
+        return changed
+
+    def __len__(self) -> int:
+        return len(self._subscribers)
+
+    def __call__(self, kill_data: dict):
+        # Read the tuple ONCE: a concurrent add/remove rebinds it, and iterating
+        # the attribute would be iterating a moving target.
+        for subscriber in self._subscribers:
+            try:
+                subscriber(kill_data)
+            except Exception:
+                log.exception(
+                    "on_killmail subscriber %r raised; continuing with the rest",
+                    getattr(subscriber, "__qualname__", subscriber))
+
+
 # How long _fetch_kill waits before its single retry on a transient network
 # failure (requests.RequestException — e.g. an SSLError CDN blip). Module-level
 # so tests can patch zkill_monitor.time.sleep instead of waiting for real.
@@ -371,7 +467,8 @@ class ZKillMonitor:
                  alert_window_seconds: int = 300,
                  on_alert: Callable[[KillAlert], None] | None = None,
                  watch_all: bool = False,
-                 friendly_ids: set[int] | None = None):
+                 friendly_ids: set[int] | None = None,
+                 on_killmail: Callable[[dict], None] | None = None):
         self.watch_regions = set(watch_regions or [])
         self.watch_alliances = set(watch_alliances or [])
         self.watch_systems = set(watch_systems or [])
@@ -379,6 +476,19 @@ class ZKillMonitor:
         self.min_kill_value = min_kill_value_millions
         self.min_pilots = min_pilots_involved
         self.on_alert = on_alert
+        # RAW per-killmail seam: called with EVERY filter-passing killmail, in
+        # the normalized {"killmail": ..., "zkb": ...} shape, BEFORE engagement
+        # aggregation. Distinct from `on_alert`, which only fires when the
+        # EngagementTracker returns an alert (>= min_pilots or hostile capitals
+        # present) — so a lone fleet member dying in a small skirmish produces
+        # no alert at all and is invisible on the on_alert path. A per-loss
+        # consumer (loss_reconciler) must ride THIS hook. Plain public
+        # attribute, like on_alert: assignable after construction.
+        # Defaults to None => a single `is not None` check per kill and
+        # byte-identical behaviour when nothing is wired. It is ONE callable but
+        # several engines need the feed: wire a KillmailFanout (above) rather
+        # than chaining, so one raiser cannot starve the others.
+        self.on_killmail = on_killmail
         # Friendly (blue/own) corp/alliance ids for capital friend/foe filtering.
         self._friendly_ids = set(friendly_ids or [])
         self._tracker = EngagementTracker(alert_window_seconds, min_pilots_involved,
@@ -413,16 +523,10 @@ class ZKillMonitor:
         """Check if a kill matches any of our watch filters."""
         km = kill_data.get("killmail", kill_data)
 
-        # Reject stale kills (older than 30 minutes — allows catchup after restarts)
-        kill_time_str = km.get("killmail_time", "")
-        if kill_time_str:
-            try:
-                kill_time = datetime.fromisoformat(kill_time_str.replace("Z", "+00:00"))
-                age = datetime.now(timezone.utc) - kill_time
-                if age > timedelta(minutes=30):
-                    return False
-            except Exception:
-                pass  # If we can't parse the time, let it through
+        # Reject stale kills (older than 30 minutes — allows catchup after
+        # restarts). Shared module-level predicate; see is_kill_stale.
+        if is_kill_stale(km):
+            return False
 
         # Watch-all mode: accept every kill in K-space
         if self.watch_all:
@@ -490,6 +594,18 @@ class ZKillMonitor:
         kill_data = self._normalize_kill(kill_data)
         if not self._matches_filters(kill_data):
             return
+
+        # Raw per-killmail seam — see the on_killmail docs in __init__. It runs
+        # BEFORE engagement aggregation so a consumer sees every filter-passing
+        # kill, not just the ones that reach the alert threshold. Exceptions are
+        # contained here: a misbehaving consumer must never cost the intel tab
+        # its alert for this kill (the poll loop's own catch-all would abort the
+        # rest of this call and then sleep 5s).
+        if self.on_killmail is not None:
+            try:
+                self.on_killmail(kill_data)
+            except Exception:
+                log.exception("on_killmail hook raised; continuing with alerts")
 
         alert = self._tracker.add_kill(kill_data)
         if alert and self.on_alert:
