@@ -1559,6 +1559,7 @@ class FCToolGUI:
                 "min_pilots": seed_min,
                 "max_jumps": 0,
                 "capitals": {"alert": True, "bypass_filter": False},
+                "security": {"highsec": True, "lowsec": True},
             }
             changed = True
 
@@ -1578,6 +1579,25 @@ class FCToolGUI:
             changed = True
         if "bypass_filter" not in caps:
             caps["bypass_filter"] = False
+            changed = True
+
+        # Backfill the security (Empire kills highsec/lowsec) settings for
+        # EXISTING configs that have an intel_filter but predate the
+        # security-band feature. Never clobber an already-present security
+        # dict — only fill in missing keys. Mirrors the capitals backfill
+        # above: a malformed value (e.g. "security": null from a hand-edited
+        # or corrupted config.json) must not raise deep inside the intel
+        # filter panel / toggle handler, which both assume a dict.
+        sec = self._intel_filter.get("security")
+        if not isinstance(sec, dict):
+            sec = {"highsec": True, "lowsec": True}
+            self._intel_filter["security"] = sec
+            changed = True
+        if "highsec" not in sec:
+            sec["highsec"] = True
+            changed = True
+        if "lowsec" not in sec:
+            sec["lowsec"] = True
             changed = True
 
         if changed:
@@ -2495,6 +2515,36 @@ class FCToolGUI:
             font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
         ).pack(anchor="w", padx=12, pady=(0, 2))
 
+        # ── Empire kills row: highsec/lowsec security-band display filter ──
+        # Nullsec is never gated by this (see intel_filter.security_matches);
+        # it only ever narrows highsec/lowsec kills, e.g. watching a mixed
+        # region like Placid for lowsec fights only.
+        sec_cfg = flt.setdefault(
+            "security", {"highsec": True, "lowsec": True})
+        sec_row = tk.Frame(self._intel_filter_body, bg=BG_PANEL)
+        sec_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Label(sec_row, text="Empire kills:", font=("Consolas", 9, "bold"),
+                 fg=FG_ACCENT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 6))
+
+        self._sec_highsec_var = tk.BooleanVar(
+            value=bool(sec_cfg.get("highsec", True)))
+        tk.Checkbutton(
+            sec_row, text="Highsec", variable=self._sec_highsec_var,
+            font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_ORANGE, command=self._on_security_toggle,
+        ).pack(side=tk.LEFT)
+
+        self._sec_lowsec_var = tk.BooleanVar(
+            value=bool(sec_cfg.get("lowsec", True)))
+        tk.Checkbutton(
+            sec_row, text="Lowsec", variable=self._sec_lowsec_var,
+            font=("Consolas", 9), fg=FG_ORANGE, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_ORANGE, command=self._on_security_toggle,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+
         # ── Two side-by-side group panels ──────────────────────────────────
         groups = tk.Frame(self._intel_filter_body, bg=BG_PANEL)
         groups.pack(fill=tk.X, padx=10, pady=(0, 6))
@@ -2685,6 +2735,15 @@ class FCToolGUI:
         caps = self._intel_filter.setdefault(
             "capitals", {"alert": True, "bypass_filter": False})
         caps["bypass_filter"] = bool(self._cap_bypass_var.get())
+        self._save_intel_filter()
+
+    # ---- Empire security-band (highsec/lowsec) toggles ----
+
+    def _on_security_toggle(self):
+        sec = self._intel_filter.setdefault(
+            "security", {"highsec": True, "lowsec": True})
+        sec["highsec"] = bool(self._sec_highsec_var.get())
+        sec["lowsec"] = bool(self._sec_lowsec_var.get())
         self._save_intel_filter()
 
     # ---- Anywhere / Anyone toggles ----
@@ -5848,12 +5907,13 @@ class FCToolGUI:
         layer (Task 36) -- the red radar burst, plus the extra hostile-capital
         ring drawn inside add_kill_ping via capital=. Called DIRECTLY from
         _show_zkill_alert AFTER every display gate (min-pilots, location/parties
-        criteria, max-jumps) passes, so a ping is emitted for EXACTLY the alerts
-        that produce a rendered Intelligence report -- the two can never diverge
-        again (owner bug: the ping used to ride the broad pre-gate feed, giving 4
-        pings for 1 report). _show_zkill_alert already runs on the MAIN thread
-        (marshaled via _post_ui in _on_zkill_alert), so no extra hop is needed;
-        guarded so a missing/erroring map tab never breaks report rendering.
+        criteria, security-band, max-jumps) passes, so a ping is emitted for
+        EXACTLY the alerts that produce a rendered Intelligence report -- the
+        two can never diverge again (owner bug: the ping used to ride the
+        broad pre-gate feed, giving 4 pings for 1 report). _show_zkill_alert
+        already runs on the MAIN thread (marshaled via _post_ui in
+        _on_zkill_alert), so no extra hop is needed; guarded so a
+        missing/erroring map tab never breaks report rendering.
         KillAlert fields used: system_id, capitals_involved, kill_count."""
         tab = getattr(self, "map_tab", None)
         if tab is None:
@@ -22825,7 +22885,30 @@ $bmp.Dispose()
         if not ok and not (alert.capitals_involved and cap_alert and cap_bypass):
             return  # Does not match the configured location/parties criteria
 
-        # (c) Max-jumps gate — drop if route distance exceeds the limit.
+        # (c) Security-band gate — highsec/lowsec display filter (owner ask
+        # 2026-07-25, so watching a mixed region like Placid can show lowsec
+        # kills only). Nullsec is NEVER gated (security_matches always passes
+        # "ns"/unknown bands). Zero-ESI: resolved from the bundled
+        # system_coords table, not a network call.
+        #
+        # Hostile capitals BYPASS this gate (owner reversal 2026-07-25 of the
+        # original "absolute, no bypass" design): unchecking Lowsec silently
+        # dropped every lowsec hostile-capital alert, and capitals genuinely
+        # operate in lowsec (they just can't enter highsec), so a band filter
+        # meant to mute gank spam was also muting capital escalations. Keys
+        # on cap_alert ALONE, mirroring gate (a) above -- NOT cap_bypass:
+        # cap_bypass (intel_filter.capitals.bypass_filter) defaults False, so
+        # requiring it here would make this bypass a no-op for almost every
+        # user, the opposite of the owner's intent. (Gate (b) is the one that
+        # additionally requires cap_bypass.) When cap_alert is off, this
+        # bypass never engages and the band gate applies normally.
+        true_sec = system_coords.get_security(alert.system_id)
+        security_cfg = self.config.get("intel_filter", {}).get("security", {})
+        if (not intel_filter.security_matches(true_sec, security_cfg)
+                and not (alert.capitals_involved and cap_alert)):
+            return  # Wrong security band for the configured Empire-kills filter
+
+        # (d) Max-jumps gate — drop if route distance exceeds the limit.
         try:
             max_jumps = int(self._zkill_max_jumps_var.get())
         except (ValueError, AttributeError):
