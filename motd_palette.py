@@ -75,6 +75,7 @@ class PaletteProviders:
     channels: Callable[[str], list]          # query -> [PaletteItem] (recents-first)
     doctrines: Callable[[str], list]         # query -> [action:switch_doctrine items]
     lines_blocks: Callable[[], list]         # static line/block PaletteItems
+    roles: Callable[[], list]                # one tag_line PaletteItem per live tag
     recents: Callable[[], list]              # MRU [PaletteItem]
     esi_char_search: Callable[[str], list]   # BLOCKING -> [{"id","name","category"}]
     ui_post: Callable[[Callable], None]      # marshal worker result to the Tk thread
@@ -84,19 +85,40 @@ class PaletteProviders:
     save_collapsed: Callable[[list], None] = lambda groups: None  # persist the set
 
 
+#: Canonical group ordering. "Roles" (the per-tag ``tag_line`` building blocks)
+#: sits directly AFTER "Lines & blocks" — the two structural groups stay adjacent
+#: and ahead of the entity groups, and the pair reads in document order (the FC /
+#: staging / doctrine scaffolding first, then the per-role fit lines under it).
+#: Owner decision 2026-07-26: the role tag lines were split OUT of "Lines & blocks"
+#: because a 13-item group behind a zero-state cap of 2 hid every role (the
+#: "no tagline for EWAR or tackle" report).
 GROUP_ORDER = (
-    "Recent", "Doctrine fits", "Lines & blocks", "Fittings",
+    "Recent", "Doctrine fits", "Lines & blocks", "Roles", "Fittings",
     "Characters", "Systems", "Channels", "Doctrines",
 )
 
 #: Groups shown when the bar is focused with an empty query (§6 zero-state).
-ZERO_STATE_GROUPS = ("Recent", "Doctrine fits", "Lines & blocks", "Channels")
+ZERO_STATE_GROUPS = ("Recent", "Doctrine fits", "Lines & blocks", "Roles",
+                     "Channels")
 
 #: Per-group row caps in zero-state (owner rule): every group always renders —
 #: there is NO shared total budget that could drop a later group — so recent
 #: channels + doctrine fits are visible without searching.
+#:
+#: "Roles" is capped at 5 (owner decision): DPS / Logi / Links / EWAR / Tackle —
+#: the five an FC reaches for most, and exactly the two that were reported
+#: missing — with Webs/Defenders/Special (and any custom tag) behind the
+#: ``+N more…`` expander.
+#:
+#: "Lines & blocks" went 2 -> 5 with the split: the group is now a FIXED five
+#: items (FC / Staging / Doctrine / Channel line + Doctrine block) with no
+#: vocabulary-driven growth, and the ``+N more…`` row costs a row of its own —
+#: so any cap of 4 renders the same five rows as a cap of 5 while hiding
+#: content. 5 shows the whole structural vocabulary with no expander, for two
+#: rows more than the old cap of 2.
 ZERO_STATE_CAPS = {
-    "Recent": 3, "Doctrine fits": 3, "Lines & blocks": 2, "Channels": 2,
+    "Recent": 3, "Doctrine fits": 3, "Lines & blocks": 5, "Roles": 5,
+    "Channels": 2,
 }
 
 # action kinds -------------------------------------------------------------- #
@@ -235,8 +257,10 @@ def zero_state_slice(groups: list, caps: dict | None = None) -> list:
     """Zero-state slicing (owner rule): each group is capped by its OWN per-group
     cap (:data:`ZERO_STATE_CAPS`) with NO shared total budget, so every non-empty
     group always renders — a busy Recent/Doctrine fits can no longer starve
-    Channels. A truncated group still gets an ``action:more`` row (last) carrying
-    its ``hidden_count``. Returns ``[(name, shown_items, hidden_count)]``."""
+    Channels (or Roles). The rule is count-independent: adding a group can never
+    starve an existing one, because nothing here is spent. A truncated group
+    still gets an ``action:more`` row (last) carrying its ``hidden_count``.
+    Returns ``[(name, shown_items, hidden_count)]``."""
     caps = caps if caps is not None else ZERO_STATE_CAPS
     out = []
     for name, items in groups:
@@ -255,12 +279,17 @@ def group_order_for_mode(mode: str) -> list:
     """The group ordering for a dropdown ``mode``:
 
     * ``"entity"`` (@ trigger): Characters, Fittings, Systems, Channels first.
-    * ``"block"`` (/ trigger): Lines & blocks first.
+    * ``"block"`` (/ trigger): Lines & blocks, then Roles.
     * anything else (``"bar"``): the canonical :data:`GROUP_ORDER`.
+
+    Roles rides the ``/`` priority with Lines & blocks: a role row IS a
+    structural line token (``tag_line`` — same ☰ glyph, same ``line`` meta) and
+    lived inside Lines & blocks until the 2026-07-26 split, so leaving it out
+    would make ``/ewar`` rank WORSE than it did before the split.
     """
     base = list(GROUP_ORDER)
     if mode == "block":
-        pri = ["Lines & blocks"]
+        pri = ["Lines & blocks", "Roles"]
     elif mode == "entity":
         pri = ["Characters", "Fittings", "Systems", "Channels"]
     else:
@@ -793,6 +822,19 @@ def _bind_chip_dnd(widget, item, on_click, on_drag):
 _NAV_KEYS = {"Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R",
              "Control_L", "Control_R", "Alt_L", "Alt_R"}
 
+#: Drag phases that END a gesture. Either way the drag is over, so the dropdown
+#: that spawned it has done its job and closes (see
+#: :meth:`MotdPalette._drag_from_palette`).
+_DRAG_END_PHASES = ("drop", "cancel")
+
+#: How long to wait, after the dropdown Toplevel loses the input focus, before
+#: asking whether the WHOLE APPLICATION lost it (§B). Windows hands the focus
+#: over in two steps — the old window is defocused BEFORE the new one is focused
+#: — so an immediate probe can read "nothing focused" during a purely in-app
+#: hand-off (dropdown -> search bar). Invisible to the user; it only re-bands an
+#: already-drawn window.
+_APP_FOCUS_SETTLE_MS = 200
+
 #: Dim placeholder text shown in the search bar when it is EMPTY and
 #: UNFOCUSED (classic Tk Entry placeholder). It is real Entry content, but
 #: every query consumer reads through :meth:`MotdPalette._entry_text`, which
@@ -854,6 +896,11 @@ class MotdPalette(tk.Frame):
         self._local_after = None
         self._esi_after = None
         self._focus_after = None
+        self._topmost_after = None
+
+        #: Last ``-topmost`` value pushed onto the live dropdown (None = unknown
+        #: / no dropdown). Compare-before-set so a re-assert costs no SetWindowPos.
+        self._dd_topmost = None
 
         # ESI streaming ----------------------------------------------------- #
         self._esi_min_chars = 3
@@ -886,9 +933,32 @@ class MotdPalette(tk.Frame):
         self.entry.bind("<FocusOut>", self._on_focus_out)
         self._show_placeholder()          # starts empty & unfocused
 
+        # Tray chips drag through the SAME seam as dropdown rows so a completed
+        # drag always ends the menu, whichever affordance it came from (a tray
+        # click already closes it via _do_insert).
         self.tray = QuickAddTray(self, providers, on_insert=self._do_insert,
-                                 on_drag=self._on_drag_ext, on_more=self._tray_more)
+                                 on_drag=self._drag_from_palette,
+                                 on_more=self._tray_more)
         self.tray.pack(fill=tk.X, padx=2, pady=(1, 2))
+
+        # App-level focus tracking (topmost re-sync) ------------------------ #
+        # `_on_focus_in` (entry) and `_on_dropdown_focus_in` (the dropdown
+        # Toplevel) each re-band -topmost, but neither fires when the user
+        # returns to FCTool by clicking a THIRD widget — e.g. after a
+        # `+N more`/header click left the dropdown open-and-focused (see
+        # `_expand_group`), an app switch correctly releases the band via
+        # `_sync_topmost`, and the user comes back via some other widget in
+        # the main window. The toplevel is an ancestor of every widget inside
+        # it, so it receives a real <FocusIn> whenever ANY of them gains OS
+        # focus (verified empirically: <FocusIn> propagates to every ancestor
+        # between the toplevel and the newly-focused widget) — the one path
+        # that reliably covers the gap. Bound with add="+" (this toplevel is
+        # shared app-wide) and torn down on our own <Destroy> so a rebuilt
+        # composer never accumulates stale bindings on it.
+        self._app_toplevel = self.winfo_toplevel()
+        self._app_focus_in_id = self._app_toplevel.bind(
+            "<FocusIn>", self._on_app_focus_in, add="+")
+        self.bind("<Destroy>", self._on_palette_destroy, add="+")
 
     # ==================================================================== #
     # public API                                                           #
@@ -902,12 +972,14 @@ class MotdPalette(tk.Frame):
     def close_dropdown(self) -> None:
         self._cancel_after("_local_after")
         self._cancel_after("_esi_after")
+        self._cancel_after("_topmost_after")
         if self._dd is not None:
             try:
                 self._dd.destroy()
             except tk.TclError:
                 pass
         self._dd = None
+        self._dd_topmost = None
         self._dd_body = None
         self._nav = []
         self._rendered = []
@@ -1073,21 +1145,117 @@ class MotdPalette(tk.Frame):
         self._render()
 
     def _ensure_dropdown(self) -> None:
+        """Create (or re-assert) the borderless dropdown Toplevel.
+
+        ``-topmost`` is LOAD-BEARING for in-app stacking, not decoration: the
+        dropdown is an unowned, undecorated Toplevel that overlaps the main
+        window's client area, and while the user types the MAIN window is the
+        active one — without the topmost band Windows would stack it over the
+        menu. It is re-asserted on every ``_open`` (not only at creation) so a
+        dropdown that released the band while the user was in another app comes
+        back on top when they click the search bar again — and
+        :meth:`_on_app_focus_in` covers the same return via any OTHER widget in
+        the main window, so recovery never depends on the user finding the
+        entry specifically.
+
+        The flip side is that ``-topmost`` also outranks OTHER applications, so
+        the band is released whenever the application itself loses focus — see
+        :meth:`_sync_topmost`. Tk delivers ``<FocusOut>``/``<FocusIn>`` to this
+        Toplevel when it is the focused window (verified on Windows; ``<Activate>``
+        / ``<Deactivate>`` are NOT delivered here, so focus is the only signal),
+        and after a row press this Toplevel IS the focused window."""
         if self._dd is not None:
+            self._apply_topmost(True)
             return
         self._dd = tk.Toplevel(self)
         self._dd.wm_overrideredirect(True)
+        self._dd_topmost = None
+        self._apply_topmost(True)
+        self._dd.configure(bg=BORDER_COLOR)
+        self._dd.bind("<FocusOut>", self._on_dropdown_focus_out, add="+")
+        self._dd.bind("<FocusIn>", self._on_dropdown_focus_in, add="+")
+
+    # -- topmost banding (never outrank other applications) ---------------- #
+    def _apply_topmost(self, want: bool) -> None:
+        """Push ``want`` onto the live dropdown's ``-topmost`` band, skipping the
+        call when it already holds that value (no needless SetWindowPos)."""
+        want = bool(want)
+        if self._dd is None or want == self._dd_topmost:
+            return
         try:
-            self._dd.attributes("-topmost", True)
+            self._dd.attributes("-topmost", want)
+        except tk.TclError:
+            return
+        self._dd_topmost = want
+
+    def _app_has_focus(self) -> bool:
+        """True while SOME window of THIS application holds the input focus.
+
+        Tcl's ``focus -displayof`` reports an empty string when no window of the
+        application has the focus — i.e. the user is in a different app
+        (verified cross-process on Windows). Anything unexpected reports True:
+        a wrong "active" only preserves the old behaviour, whereas a wrong
+        "inactive" would drop the menu behind the composer."""
+        try:
+            name = str(self.tk.call("focus", "-displayof", self._w))
+        except tk.TclError:
+            return True
+        return bool(name) and name != "none"
+
+    def _on_dropdown_focus_in(self, _e=None) -> None:
+        # Our own popup holds the focus, so the application is demonstrably
+        # active: re-band immediately and drop any pending re-check.
+        self._cancel_after("_topmost_after")
+        self._apply_topmost(True)
+
+    def _on_dropdown_focus_out(self, _e=None) -> None:
+        # The focus may simply be moving back to the search bar (same app), so
+        # re-check once the hand-off has settled instead of deciding here.
+        self._cancel_after("_topmost_after")
+        try:
+            self._topmost_after = self.after(_APP_FOCUS_SETTLE_MS,
+                                             self._sync_topmost)
+        except tk.TclError:
+            self._topmost_after = None
+
+    def _sync_topmost(self) -> None:
+        """Re-band the open dropdown against the application's focus state: on
+        top while FCTool is active, an ordinary window once it is not."""
+        self._topmost_after = None
+        if self._dd is None:
+            return
+        self._apply_topmost(self._app_has_focus())
+
+    def _on_app_focus_in(self, _e=None) -> None:
+        """Fires whenever ANY window of this application regains real OS
+        input focus (the toplevel is an ancestor of every widget in the main
+        window, so this reaches us even when the user returns by clicking a
+        widget that is neither the entry nor the dropdown — the gap
+        ``_on_focus_in``/``_on_dropdown_focus_in`` leave open; see the binding
+        note in ``__init__``). An unambiguous "active" signal, mirroring
+        ``_on_dropdown_focus_in``."""
+        self._cancel_after("_topmost_after")
+        self._apply_topmost(True)
+
+    def _on_palette_destroy(self, _e=None) -> None:
+        """Undo the ``__init__``-time bind on the (shared, longer-lived)
+        toplevel so a destroyed palette's handler does not linger on it."""
+        try:
+            self._app_toplevel.unbind("<FocusIn>", self._app_focus_in_id)
         except tk.TclError:
             pass
-        self._dd.configure(bg=BORDER_COLOR)
 
     def _total_for_mode(self) -> int:
         return 8 if self._caret_mode else 10
 
     def _compute_groups(self, query: str, mode: str) -> list:
-        """Base groups (name, [items]) before ESI injection / rescan / capping."""
+        """Base groups (name, [items]) before ESI injection / rescan / capping.
+
+        The zero-query branch's group names mirror :data:`ZERO_STATE_GROUPS` (each
+        needs its own provider expression, so the list is spelled out rather than
+        derived); the query branch must supply an entry for EVERY name in
+        :data:`GROUP_ORDER`, since the return comprehension indexes ``by_name`` by
+        the ordering. Both are drift-guarded by tests."""
         p = self.providers
         if not query:
             # Zero-state Channels follows the same used-only rule as the tray:
@@ -1098,12 +1266,14 @@ class MotdPalette(tk.Frame):
                 ("Recent", list(p.recents() or [])),
                 ("Doctrine fits", list(p.doctrine_fits() or [])),
                 ("Lines & blocks", list(p.lines_blocks() or [])),
+                ("Roles", list(p.roles() or [])),
                 ("Channels", used_channel_items(list(p.recents() or []))),
             ]
         by_name = {
             "Recent": rank_group(query, list(p.recents() or [])),
             "Doctrine fits": rank_group(query, list(p.doctrine_fits() or [])),
             "Lines & blocks": rank_group(query, list(p.lines_blocks() or [])),
+            "Roles": rank_group(query, list(p.roles() or [])),
             "Fittings": list(p.library_fits(query) or []),
             "Characters": list(p.characters_local(query) or []),
             "Systems": list(p.systems(query) or []),
@@ -1200,7 +1370,7 @@ class MotdPalette(tk.Frame):
             return
         base = self._compute_groups(self._query, self._mode)
         if not self._query:
-            sliced = zero_state_slice(base)          # all four groups always render
+            sliced = zero_state_slice(base)      # fixed caps: EVERY group renders
         else:
             sliced = visible_slice(base, per_group=4, total=self._total_for_mode())
         if self._expanded:
@@ -1365,11 +1535,57 @@ class MotdPalette(tk.Frame):
                        lambda _e=None: self._begin_row_gesture(), add="+")
                 w.bind("<ButtonRelease-1>",
                        lambda _e=None: self._end_row_gesture(), add="+")
-            _bind_chip_dnd(inner, item, self._accept, self._on_drag_ext)
-            _bind_chip_dnd(glyph_label, item, self._accept, self._on_drag_ext)
-            _bind_chip_dnd(prefix_label, item, self._accept, self._on_drag_ext)
-            _bind_chip_dnd(tail_label, item, self._accept, self._on_drag_ext)
-            _bind_chip_dnd(meta_label, item, self._accept, self._on_drag_ext)
+            _bind_chip_dnd(inner, item, self._accept, self._drag_from_palette)
+            _bind_chip_dnd(glyph_label, item, self._accept, self._drag_from_palette)
+            _bind_chip_dnd(prefix_label, item, self._accept, self._drag_from_palette)
+            _bind_chip_dnd(tail_label, item, self._accept, self._drag_from_palette)
+            _bind_chip_dnd(meta_label, item, self._accept, self._drag_from_palette)
+
+    def _drag_from_palette(self, item: PaletteItem, x_root, y_root,
+                           phase: str) -> None:
+        """The palette's own ``on_drag``: forward the phase to the wiring, then —
+        once the gesture ENDS (drop OR cancel) — close the dropdown.
+
+        Dragging a row out of the menu completes the interaction, but nothing
+        used to end it: :meth:`_begin_row_gesture` deliberately cancels the armed
+        focus-out close (a slow release must not be swallowed) and the press has
+        already moved the focus off the entry onto the dropdown Toplevel, so no
+        further ``<FocusOut>`` can ever re-arm it. The menu stayed open
+        indefinitely — and, being ``-topmost``, over other applications (owner
+        report 2026-07-26).
+
+        The close is deferred through ``after_idle`` for exactly the reason
+        :meth:`_end_row_gesture` defers its render: we are INSIDE the release
+        dispatch, and destroying the dropdown inline would tear down the pressed
+        row mid-dispatch. The phase is forwarded FIRST and the close merely
+        scheduled, so the insert this drop performs can never be swallowed.
+        ``finally`` because a wiring that blows up must not strand the menu on
+        top of everything."""
+        try:
+            self._on_drag_ext(item, x_root, y_root, phase)
+        finally:
+            if phase in _DRAG_END_PHASES:
+                self._close_after_gesture()
+
+    def _close_after_gesture(self) -> None:
+        """Schedule the post-drag close for the next idle moment (see
+        :meth:`_drag_from_palette` for why it is never inline)."""
+        try:
+            self.after_idle(self._close_dropdown_if_alive)
+        except tk.TclError:
+            pass
+
+    def _close_dropdown_if_alive(self) -> None:
+        """``close_dropdown`` from an idle callback — the palette may have been
+        destroyed in between. Called through ``self`` deliberately: the host
+        wraps ``close_dropdown`` on the INSTANCE (to clear its inline-trigger
+        range), and that wrapper is exactly the one that must run."""
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self.close_dropdown()
 
     def _begin_row_gesture(self) -> None:
         """A dropdown row was pressed — mark a gesture in flight so an async ESI
@@ -1471,19 +1687,56 @@ class MotdPalette(tk.Frame):
     # ==================================================================== #
     # positioning                                                          #
     # ==================================================================== #
+    def _screen_edges(self) -> tuple:
+        """The usable screen area as EDGES ``(x0, y0, x1, y1)`` — this
+        module's own convention: NOT the app's ``_virtual_screen_bounds()``
+        (also edges, but ctypes-backed and fc_gui-only) and NOT
+        ``preview_layout``'s ``(x, y, w, h)`` — do not mix the three up.
+
+        Backed by Tk's own virtual-root query, which (verified empirically on
+        this box's dual-monitor desktop) reports the FULL multi-monitor area
+        rather than just the primary screen: ``winfo_screenwidth/height``
+        alone would clamp a dropdown anchored on a secondary monitor into the
+        PRIMARY monitor's coordinate space. Deliberately self-contained (no
+        ctypes, no fc_gui coupling) — queried off ``self`` (not ``self._dd``)
+        so it works whether or not a dropdown is currently open, and is a
+        test seam: override on the instance to simulate a small/offset screen
+        deterministically."""
+        x0 = self.winfo_vrootx()
+        y0 = self.winfo_vrooty()
+        x1 = x0 + self.winfo_vrootwidth()
+        y1 = y0 + self.winfo_vrootheight()
+        return (x0, y0, x1, y1)
+
     def _position_dropdown(self) -> None:
         if self._dd is None:
             return
         try:
             if self._caret_mode and self._anchor_xy is not None:
                 x, y = self._anchor_xy
+                top_ref = y
             else:
                 x = self.entry.winfo_rootx()
-                y = self.entry.winfo_rooty() + self.entry.winfo_height()
+                top_ref = self.entry.winfo_rooty()
+                y = top_ref + self.entry.winfo_height()
             w = max(self.entry.winfo_width(), 360)
             self._dd.geometry(f"{w}x1+{int(x)}+{int(y)}")
             self._dd.update_idletasks()
             self._dd.geometry("")          # let it size to content
+            self._dd.update_idletasks()    # flush the natural size before clamping
+            width = self._dd.winfo_width()
+            height = self._dd.winfo_height()
+            x0, y0, x1, y1 = self._screen_edges()
+            # Flip above the anchor when it would otherwise run off the bottom
+            # of the screen AND flipping actually fits above — a growing
+            # zero-state (Roles + the raised Lines & blocks cap) can now run
+            # ~18 item rows + up to 5 "+N more" rows deep with no clamp at all
+            # (pre-existing gap this newly exercises). Falls through to the
+            # position clamp below when there is no room in either direction.
+            if y + height > y1 and top_ref - height >= y0:
+                y = top_ref - height
+            x = max(x0, min(x, x1 - width))
+            y = max(y0, min(y, y1 - height))
             self._dd.geometry(f"+{int(x)}+{int(y)}")
         except tk.TclError:
             pass

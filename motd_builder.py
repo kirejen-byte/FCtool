@@ -46,9 +46,13 @@ LINE_BREAK = "<br>"
 CHANNEL_LINK_COMPOUND = True
 
 # Tags are emitted in this stable priority; any tag not listed follows in the
-# caller's iteration order. Keeps DPS/Logi/Links at the top regardless of
-# how ``fits_by_tag`` happens to be ordered.
-TAG_PRIORITY = ("DPS", "Logi", "Links")
+# caller's iteration order. Covers the whole default role vocabulary
+# (``fit_models.DEFAULT_TAGS``) in the owner's chosen reading order, so an
+# EWAR/Tackle doctrine renders in a predictable shape regardless of how
+# ``fits_by_tag`` happens to be ordered. Custom (user-added) tags are NOT listed
+# and keep today's fallback: they follow the known ones, in the caller's order.
+TAG_PRIORITY = ("DPS", "Logi", "Links", "EWAR", "Tackle", "Webs", "Defenders",
+                "Special")
 
 
 def _escape(text: str) -> str:

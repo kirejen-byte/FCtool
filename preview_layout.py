@@ -65,8 +65,9 @@ def _overlaps(a, alen, b, blen):
     return a < b + blen and b < a + alen
 
 
-def snap_rect(rect, others, threshold=SNAP_THRESHOLD_PX):
-    """Magnetically snap a moving tile's top-left to nearby OTHER tiles' edges.
+def snap_rect(rect, others, threshold=SNAP_THRESHOLD_PX, screens=()):
+    """Magnetically snap a moving tile's top-left to nearby OTHER tiles' edges
+    and to the DESKTOP borders.
 
     `rect` and each of `others` are (x, y, w, h). Returns the snapped (x, y).
     The two axes are handled INDEPENDENTLY; on each axis the candidate whose
@@ -84,12 +85,37 @@ def snap_rect(rect, others, threshold=SNAP_THRESHOLD_PX):
          align top↔top     -> y = oy
          align bottom↔bot. -> y = oy + oh - h
 
+    `screens` are DESKTOP rects — one per monitor, or a single virtual-desktop
+    rect — in this module's usual (x, y, w, h) convention, NOT the
+    (x0, y0, x1, y1) EDGES the win32 _virtual_screen_bounds() hook returns
+    (callers convert, exactly as clamp_visible already demands). Each screen
+    contributes flush-to-border candidates:
+      X: flush left -> x = sx        flush right  -> x = sx + sw - w
+      Y: flush top  -> y = sy        flush bottom -> y = sy + sh - h
+    They are weighed FIRST, so an exact tie between a desktop border and a
+    neighbour edge resolves to the BORDER. Without them, a neighbour parked a
+    few px inside a border owns that border's whole catch band and the border
+    itself becomes UNREACHABLE while snapping is on — with the grid-arrange
+    origin at (10, 10) and a 12 px threshold that is exactly what happened to
+    the top and left of the desktop. A screen's top is NOT assumed to be 0: a
+    display stacked above the primary has a negative one.
+
     Pure (no Tk / Win32). `others` must ALREADY exclude the moving rect — this
     function does not self-exclude (a caller that leaves the moving rect in
     `others` gets a harmless self-alignment no-op, never a crash)."""
     x, y, w, h = rect
     best_x, best_dx = x, threshold + 1
     best_y, best_dy = y, threshold + 1
+    for s in screens:
+        sx, sy, sw, sh = s
+        for cand in (sx, sx + sw - w):                  # x: flush left / right
+            d = abs(x - cand)
+            if d <= threshold and d < best_dx:
+                best_dx, best_x = d, cand
+        for cand in (sy, sy + sh - h):                  # y: flush top / bottom
+            d = abs(y - cand)
+            if d <= threshold and d < best_dy:
+                best_dy, best_y = d, cand
     for o in others:
         ox, oy, ow, oh = o
         for cand in (ox + ow, ox - w, ox, ox + ow - w):     # x: butt, butt, align, align

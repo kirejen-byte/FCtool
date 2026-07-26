@@ -9813,8 +9813,12 @@ class FCToolGUI:
 
     # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
 
-    # Tags pre-checked by default on a fresh MOTD (the common doctrine roles).
-    _MOTD_DEFAULT_TAGS = ("DPS", "Logi", "Links")
+    # NOTE 2026-07-26: the old `_MOTD_DEFAULT_TAGS = ("DPS", "Logi", "Links")`
+    # constant lived here — a dead leftover of the removed tag-checkbox UI (zero
+    # readers) and a fourth copy of the hardcoded triple. A fresh document's tag
+    # lines now come from the selected doctrine's real roles
+    # (`_motd_default_tags`), with `motd_doc.DEFAULT_TAG_LINES` as the ONE
+    # fallback constant. Do not reintroduce a local copy.
     # Debounce window (ms) for live preview rebuilds while typing/toggling.
     _MOTD_PREVIEW_DEBOUNCE_MS = 250
     # Per-attribute soft limit for a single <url=fitting:...> link (spec §3.5,
@@ -10157,13 +10161,50 @@ class FCToolGUI:
 
     # ── MOTD: pill-canvas composer wiring (Task 4) ────────────────────────────
 
+    def _motd_tag_vocabulary(self):
+        """The LIVE, user-extensible fit-tag vocabulary (``FittingsStore.tags``),
+        ordered for tag_line emission.
+
+        Drives the palette's "Tag line: X" building blocks, so EWAR/Tackle/Webs/
+        Defenders/Special — and any custom tag the owner adds to the library —
+        appear with no further code change. The store migrates legacy names
+        ("Support - EWAR" -> "EWAR") at load, so these are the MIGRATED names.
+        Degrades to ``fit_models.DEFAULT_TAGS`` when the store is unavailable or
+        its vocabulary is empty."""
+        tags = None
+        store = getattr(self, "fittings", None)
+        if store is not None:
+            try:
+                tags = list(store.tags or [])
+            except Exception:
+                tags = None
+        return list(motd_doc.ordered_tag_lines(
+            tags or [], fallback=tuple(fit_models.DEFAULT_TAGS)))
+
+    def _motd_default_tags(self):
+        """The tag_lines a FRESH document starts with: the roles the SELECTED
+        doctrine actually uses (its members' tags), priority-ordered.
+
+        Keys on the COMPOSER's doctrine (``_motd_selected_doctrine``) — the one
+        every tag_line in this document resolves against — so the default lines
+        are exactly the ones that will render fits. No doctrine (or an untagged
+        one) falls back to ``motd_doc.DEFAULT_TAG_LINES`` (DPS/Logi/Links), i.e.
+        the pre-2026-07-26 behaviour a fresh install sees."""
+        try:
+            doctrine = self._motd_selected_doctrine()
+        except Exception:
+            doctrine = None
+        return motd_doc.doctrine_tag_lines(doctrine)
+
     def _motd_default_doc(self):
         """The fresh-tab document: staging default from config, remembered logi
-        channel from config (both may be empty)."""
+        channel from config (both may be empty), and one tag_line per role the
+        selected doctrine actually uses (see :meth:`_motd_default_tags`)."""
         staging = (self.config.get("zkillboard", {})
                    .get("staging_system", "") or "")
         channel = (self.config.get("fittings", {}).get("logi_channel", "") or "")
-        return motd_doc.default_doc(staging_name=staging, channel=channel)
+        return motd_doc.default_doc(staging_name=staging, channel=channel,
+                                    default_tags=self._motd_default_tags())
 
     def _motd_channel_completions(self):
         """Channel names for the pill param editors — the shared discovered cache."""
@@ -10470,6 +10511,7 @@ class FCToolGUI:
             channels=self._motd_palette_channels,
             doctrines=self._motd_palette_doctrines,
             lines_blocks=self._motd_palette_lines_blocks,
+            roles=self._motd_palette_roles,
             recents=self._motd_palette_recents,
             esi_char_search=self._motd_palette_esi_char_search,
             ui_post=self._post_ui,
@@ -10598,13 +10640,16 @@ class FCToolGUI:
         return out
 
     def _motd_palette_lines_blocks(self):
+        """The "Lines & blocks" palette group: the FIVE structural building
+        blocks that are not per-role.
+
+        The per-role ``tag_line`` blocks live in their OWN "Roles" group now
+        (:meth:`_motd_palette_roles`, owner decision 2026-07-26) — a 13-item
+        group behind the zero-state cap showed no role at all."""
         defs = [
             ("fc_line", {"source": "selected"}, "FC line", "line"),
             ("staging_line", {"name": ""}, "Staging line", "line"),
             ("doctrine_line", {}, "Doctrine line", "line"),
-            ("tag_line", {"tag": "DPS"}, "Tag line: DPS", "line"),
-            ("tag_line", {"tag": "Logi"}, "Tag line: Logi", "line"),
-            ("tag_line", {"tag": "Links"}, "Tag line: Links", "line"),
             # Owner amendment 2026-07-22 (spec §4.2): default label "Channel", not
             # "Logi" — "Logi:" visually collided with the "Tag line: Logi" fits
             # line right above it. See motd_doc.CHANNEL_LINE_DEFAULT_LABEL.
@@ -10615,6 +10660,21 @@ class FCToolGUI:
         return [motd_palette.PaletteItem(kind=k, params=dict(p), label=lbl,
                                          meta=meta, group="Lines & blocks")
                 for k, p, lbl, meta in defs]
+
+    def _motd_palette_roles(self):
+        """The "Roles" palette group: one ``Tag line: X`` block per tag in the
+        LIVE library vocabulary (:meth:`_motd_tag_vocabulary`) — never a
+        hardcoded triple, so a tag the owner adds to the library appears here
+        with no code change.
+
+        Split out of "Lines & blocks" on 2026-07-26 (owner report: "no tagline
+        for EWAR or tackle as an option"). Its own group means its own
+        zero-state cap, so the roles an FC actually uses are visible without
+        typing or expanding."""
+        return [motd_palette.PaletteItem(
+                    kind="tag_line", params={"tag": tag},
+                    label=f"Tag line: {tag}", meta="line", group="Roles")
+                for tag in self._motd_tag_vocabulary()]
 
     def _motd_palette_recents(self):
         out = []
@@ -12451,18 +12511,24 @@ class FCToolGUI:
     def _clear_motd_builder(self):
         """Reset the composer to the default document.
 
-        Loads the default doc onto the canvas, deselects the doctrine + linked
-        template, drops any explicit loaded-fits fallback, clears the dirty flag,
+        Deselects the doctrine + linked template, loads the default doc onto the
+        canvas, drops any explicit loaded-fits fallback, clears the dirty flag,
         and rebuilds the preview. Used by 'Clear MOTD' and by the import path (so
-        an imported MOTD replaces, rather than appends to, the current builder)."""
+        an imported MOTD replaces, rather than appends to, the current builder).
+
+        ORDER IS LOAD-BEARING: the doctrine is cleared BEFORE the default doc is
+        built. ``_motd_default_doc`` now derives its tag_lines from the selected
+        doctrine, so building first would seed the cleared composer with the
+        outgoing doctrine's roles — every one of them instantly stale."""
         self._motd_loaded_fits = None
+        if getattr(self, "_motd_doctrine_var", None) is not None:
+            self._motd_doctrine_var.set("")
+            self._motd_doctrine_prev = ""
+
         cv = getattr(self, "_motd_canvas", None)
         if cv is not None:
             cv.set_doc(self._motd_default_doc())     # silent (no on_change)
 
-        if getattr(self, "_motd_doctrine_var", None) is not None:
-            self._motd_doctrine_var.set("")
-            self._motd_doctrine_prev = ""
         if getattr(self, "_motd_saved_var", None) is not None:
             self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
         self._motd_refresh_saved_dropdown()
@@ -15142,10 +15208,49 @@ class FCToolGUI:
             # full window height before snapping.
             on_snap_others=(lambda h=src_hwnd: [
                 r for k, r in self._preview_tile_rects.items() if k != h]),
+            # Snap-to-desktop-border provider: without it a neighbour parked at
+            # the arrange origin (10 px in, inside the 12 px threshold) owns the
+            # border's catch band and the screen edge is unreachable.
+            on_snap_screens=self._preview_snap_screens,
             lock_layout=bool(self._preview_cfg().get("lock_layout", False)),
         )
         tile.place(x, y, w, body_h)
         return tile
+
+    def _preview_snap_screens(self):
+        """Desktop rects for edge-snapping as preview_layout (x, y, w, h) — the
+        full bounds AND the work area (taskbar excluded) of every monitor, so a
+        tile can flush against either. Read-only: enumeration only, no client
+        window is touched.
+
+        CACHED: a tile calls this on every drag-motion event, so the monitor
+        enumeration must not run per mouse move. The TTL keeps a whole drag on
+        one snapshot while still noticing a display hot-plug within a couple of
+        seconds. Falls back to the single virtual-desktop rect when enumeration
+        yields nothing (headless / non-Windows)."""
+        ttl_s = 2.0
+        now = time.time()
+        cached = getattr(self, "_preview_snap_screens_cache", None)
+        if cached is not None and 0 <= now - cached[0] < ttl_s:
+            return cached[1]
+        rects = []
+        try:
+            for mon in monitor_pin.list_monitors():
+                for edges in (mon.rect, mon.work):
+                    try:
+                        left, top, right, bottom = edges
+                        rect = (int(left), int(top),
+                                int(right) - int(left), int(bottom) - int(top))
+                    except (TypeError, ValueError):
+                        continue
+                    if rect[2] > 0 and rect[3] > 0 and rect not in rects:
+                        rects.append(rect)
+        except Exception:
+            rects = []
+        if not rects:
+            rects = [self._preview_virtual_bounds_xywh()]
+        self._preview_snap_screens_cache = (now, rects)
+        return rects
 
     def _preview_virtual_bounds_xywh(self):
         """(bx, by, bw, bh) form of _virtual_screen_bounds(), for preview_layout's
@@ -15482,7 +15587,13 @@ class FCToolGUI:
           - False: write ONLY cfg['sizes'][key] = [w, body_h]; the global size and
             every other tile are untouched.
         The char's saved layout rect (x,y,w,body_h) is updated in both cases so a
-        respawn restores at the resized dimensions."""
+        respawn restores at the resized dimensions.
+
+        Under uniform_size this is the SECOND writer of cfg['tile_w'] — the
+        Settings "Tile w" spinbox mirrors the same key — so it pushes the new width
+        back into that mirror, which is what makes an on-screen resize show up in
+        Settings in real time. Tk-thread only (the resize chain runs entirely on
+        Tk), so no _post_ui marshalling is needed."""
         if not key:
             return
         cfg = self._preview_cfg()
@@ -15490,6 +15601,20 @@ class FCToolGUI:
         if cfg.get("uniform_size", True):
             cfg["tile_w"] = w
             cfg["tile_body_h"] = body_h
+            # Keep the Settings mirror + its apply-shadow on the live value. NOT
+            # done when uniform_size is off: the resize went to a per-character
+            # override there and the single global spinbox still represents the
+            # global default. Guarded — pure test hosts have no Tk vars, and the
+            # settings section may not be built yet.
+            var = getattr(self, "_preview_tilew_var", None)
+            if var is not None:
+                try:
+                    var.set(w)
+                    shadow = getattr(self, "_preview_var_shadow", None)
+                    if shadow is not None:
+                        shadow["_preview_tilew_var"] = w
+                except tk.TclError:
+                    pass
         else:
             cfg.setdefault("sizes", {})[key] = [w, body_h]
         layouts = cfg.setdefault("layouts", {})
@@ -17514,6 +17639,12 @@ class FCToolGUI:
         self._preview_refresh_mode_buttons()
         self._preview_sync_native_widgets()
         self._preview_sync_anchor_enabled()
+        # Baseline every native-row var so _preview_apply_native_state can tell a
+        # control the user moved from one that merely mirrors config (see its
+        # docstring — this is what stops a stale mirror stomping a live value).
+        # Inlined rather than a bound method so the settings test harnesses do not
+        # need a new entry in their _build_preview_section bind lists.
+        FCToolGUI._preview_snapshot_native_vars(self)
         # Seed the Gamelogs source line + effective-path entry (one-time probe).
         self._preview_update_gamelog_status(refresh_path=True)
 
@@ -17683,50 +17814,113 @@ class FCToolGUI:
         self._preview_sync_native_widgets()
         self._preview_sync_anchor_enabled()
 
+    # (var attribute, config key, cast) for every native-row control the settings
+    # panel persists. Walked by BOTH _preview_apply_native_state and the build-time
+    # shadow snapshot (_preview_snapshot_native_vars), so the two cannot drift.
+    _PREVIEW_NATIVE_VARS = (
+        ("_preview_tilew_var", "tile_w", int),
+        ("_preview_uniform_var", "uniform_size", bool),
+        ("_preview_opacity_var", "opacity_inactive", float),
+        ("_preview_captions_var", "captions", bool),
+        ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
+        ("_preview_labels_on_video_var", "labels_on_video", bool),
+        ("_preview_show_location_var", "show_location", bool),
+        ("_preview_highlight_var", "highlight_active", bool),
+        ("_preview_lock_var", "lock_layout", bool),
+        ("_preview_snap_var", "snap_enabled", bool),
+        ("_preview_intel_flash_var", "intel_flash", bool),
+        ("_preview_minimize_inactive_var", "minimize_inactive", bool),
+        ("_preview_hide_active_var", "hide_active", bool),
+        ("_preview_hide_login_var", "hide_login", bool),
+        ("_preview_hide_lost_focus_var", "hide_on_lost_focus", bool),
+        ("_preview_damage_flash_var", "damage_flash", bool),
+        ("_preview_dmg_pct_var", "damage_flash_pct", int),
+        ("_preview_dmg_window_var", "damage_flash_window_s", int),
+        ("_preview_dmg_cooldown_var", "damage_flash_cooldown_s", int),
+        ("_preview_dmg_ref_var", "damage_flash_reference", str),
+        ("_preview_decloak_flash_var", "decloak_flash", bool),
+        ("_preview_decloak_audio_var", "decloak_audio", bool),
+    )
+
+    def _preview_snapshot_native_vars(self):
+        """Record every native-row var's CURRENT value in `_preview_var_shadow`.
+
+        The shadow is the baseline `_preview_apply_native_state` diffs against to
+        tell "the user moved this control" from "this control has not been touched
+        since it was seeded". Called once when the section is built, and refreshed
+        per key by the apply itself and by any config->var push."""
+        shadow = {}
+        for attr, _key, cast in FCToolGUI._PREVIEW_NATIVE_VARS:
+            v = getattr(self, attr, None)
+            if v is None:
+                continue
+            try:
+                shadow[attr] = cast(v.get())
+            except (tk.TclError, ValueError):
+                continue
+        # damage_flash_mode lives outside the map (its StringVar holds a human
+        # label, not the stored value) — baseline the RESOLVED value so it gets
+        # the same guard.
+        mode = FCToolGUI._preview_dmg_mode_value(self)
+        if mode is not None:
+            shadow["_preview_dmg_mode_var"] = mode
+        self._preview_var_shadow = shadow
+
+    def _preview_dmg_mode_value(self):
+        """The stored damage_flash_mode ('any' | 'threshold') the mode combo is
+        currently showing, or None when the combo does not exist / cannot be read.
+        The StringVar holds a human label; unknown labels resolve to 'any'."""
+        mode_var = getattr(self, "_preview_dmg_mode_var", None)
+        if mode_var is None:
+            return None
+        try:
+            label = mode_var.get()
+        except tk.TclError:
+            return None
+        return getattr(self, "_preview_dmg_mode_from_label", {}).get(label, "any")
+
     def _preview_apply_native_state(self):
-        """Persist the native-row control values live. No path clears saved data."""
+        """Persist the native-row control values live. No path clears saved data.
+
+        A key is written only when its var has MOVED since the last snapshot (build
+        time, or the previous apply/push). That skip is LOAD-BEARING, not an
+        optimization: these vars are one-way mirrors of config, and a config key can
+        have a SECOND writer outside this panel — cfg['tile_w'] is rewritten by
+        every tile corner-resize (_preview_on_tile_resize_end). Without the skip,
+        toggling ANY control here bulk-pushes all 22 stale mirrors, shoving the
+        app-start width over the hand-dragged one, and the next tick's
+        _preview_apply_tile_size physically re-places every tile at it. Diffing
+        against the shadow makes a control the user never touched incapable of
+        mutating its config key — for every key in the map, present and future."""
         cfg = self._preview_cfg()
-        for var, key, cast in (
-            ("_preview_tilew_var", "tile_w", int),
-            ("_preview_uniform_var", "uniform_size", bool),
-            ("_preview_opacity_var", "opacity_inactive", float),
-            ("_preview_captions_var", "captions", bool),
-            ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
-            ("_preview_labels_on_video_var", "labels_on_video", bool),
-            ("_preview_show_location_var", "show_location", bool),
-            ("_preview_highlight_var", "highlight_active", bool),
-            ("_preview_lock_var", "lock_layout", bool),
-            ("_preview_snap_var", "snap_enabled", bool),
-            ("_preview_intel_flash_var", "intel_flash", bool),
-            ("_preview_minimize_inactive_var", "minimize_inactive", bool),
-            ("_preview_hide_active_var", "hide_active", bool),
-            ("_preview_hide_login_var", "hide_login", bool),
-            ("_preview_hide_lost_focus_var", "hide_on_lost_focus", bool),
-            ("_preview_damage_flash_var", "damage_flash", bool),
-            ("_preview_dmg_pct_var", "damage_flash_pct", int),
-            ("_preview_dmg_window_var", "damage_flash_window_s", int),
-            ("_preview_dmg_cooldown_var", "damage_flash_cooldown_s", int),
-            ("_preview_dmg_ref_var", "damage_flash_reference", str),
-            ("_preview_decloak_flash_var", "decloak_flash", bool),
-            ("_preview_decloak_audio_var", "decloak_audio", bool),
-        ):
+        shadow = getattr(self, "_preview_var_shadow", None)
+
+        def _put(attr, key, value):
+            """Write cfg[key] unless `attr`'s control has not moved since the
+            snapshot. ONE implementation of the skip rule, shared by every control
+            this method persists — including the ones outside the var map."""
+            if (shadow is not None and key in cfg
+                    and attr in shadow and shadow[attr] == value):
+                return                      # untouched control → hands off cfg[key]
+            cfg[key] = value
+            if shadow is not None:
+                shadow[attr] = value
+
+        for var, key, cast in FCToolGUI._PREVIEW_NATIVE_VARS:
             v = getattr(self, var, None)
             if v is None:
                 continue
             try:
-                cfg[key] = cast(v.get())
+                value = cast(v.get())
             except (tk.TclError, ValueError):
-                pass
-        # damage_flash_mode: the StringVar holds a human label; map it back to the
-        # stored value ('any' | 'threshold'). Absent/unknown label → 'any'.
-        mode_var = getattr(self, "_preview_dmg_mode_var", None)
-        if mode_var is not None:
-            try:
-                label = mode_var.get()
-                cfg["damage_flash_mode"] = getattr(
-                    self, "_preview_dmg_mode_from_label", {}).get(label, "any")
-            except tk.TclError:
-                pass
+                continue
+            _put(var, key, value)
+        # damage_flash_mode: the StringVar holds a human label, so it cannot ride
+        # the (attr, key, cast) map — resolve it to the stored value and apply the
+        # same rule ('any' | 'threshold'; absent/unknown label → 'any').
+        mode = FCToolGUI._preview_dmg_mode_value(self)
+        if mode is not None:
+            _put("_preview_dmg_mode_var", "damage_flash_mode", mode)
         self._save_config()
 
     def _preview_apply_dmg_mode_visibility(self):

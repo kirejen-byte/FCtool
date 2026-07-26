@@ -297,7 +297,7 @@ class TileWindow:
     def __init__(self, root, char_key, palette, win32=None, dwm=None,
                  on_activate=None, on_minimize=None, on_move_end=None,
                  on_resize_end=None, on_exclude=None, on_switch_external=None,
-                 on_snap_others=None, lock_layout=False):
+                 on_snap_others=None, on_snap_screens=None, lock_layout=False):
         self._win32 = win32 or _real_tile_win32()
         self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
@@ -312,6 +312,11 @@ class TileWindow:
         # Snap-to-neighbours: provider returns OTHER tiles' rects (x, y, w, body_h)
         # from the host's hwnd-keyed _preview_tile_rects, self already excluded.
         self._on_snap_others = on_snap_others
+        # Snap-to-desktop-borders: provider returns the monitors' (x, y, w, h)
+        # rects. Without it, a neighbour sitting a few px inside a border steals
+        # the whole border band and the screen edge cannot be reached with
+        # snapping on (see preview_layout.snap_rect). None → borders ignored.
+        self._on_snap_screens = on_snap_screens
         self._snap_enabled = False        # pushed live via configure_snap
         self._snap_threshold = preview_layout.SNAP_THRESHOLD_PX
         self._excluded = False        # session-only cycle-exclusion flag (C4)
@@ -365,6 +370,7 @@ class TileWindow:
         self._corner_anchor = None     # (ax, ay) opposite corner, fixed (physical)
         self._corner_press_root = None # (x_root, y_root) at the corner press
         self._corner_press_size = None # (w, body_h) at the corner press
+        self._corner_press_pos = None  # (x, y) top-left at the corner press
 
         bg_panel = palette.get("BG_PANEL", "#16213e")
         bg_dark = palette.get("BG_DARK", "#1a1a2e")
@@ -567,34 +573,56 @@ class TileWindow:
                 pass
 
     def _maybe_snap(self, x, y):
-        """Snap a candidate drag position (x, y) to nearby OTHER tiles' edges when
-        snapping is enabled, else return it unchanged.
+        """Snap a candidate drag position (x, y) to nearby OTHER tiles' edges and
+        to the desktop borders when snapping is enabled, else return it unchanged.
 
         Neighbour rects come from the injected on_snap_others provider — the
         host's _preview_tile_rects snapshot, which stores (x, y, w, BODY_H) with
         self already excluded. Both the moving rect and every neighbour are
         converted to FULL window height (body_h + STRIP_H) before snapping, so a
         top/bottom butt sticks to the tile's VISIBLE edge (the strip edge) with
-        zero gap — using body_h alone would leave a STRIP_H gap/overlap. Pure
-        position math; the caller applies the result via set_window_pos /
+        zero gap — using body_h alone would leave a STRIP_H gap/overlap.
+
+        Desktop rects come from the injected on_snap_screens provider, already in
+        preview_layout's (x, y, w, h) convention. They are what makes the screen
+        borders reachable: a neighbour parked inside a border (the grid-arrange
+        origin is only 10 px in, under the 12 px threshold) otherwise owns the
+        border's whole catch band. Each provider is optional and independent — a
+        raising or malformed one degrades to the other, never out of the drag.
+
+        Pure position math; the caller applies the result via set_window_pos /
         on_move_end."""
-        if not self._snap_enabled or self._on_snap_others is None:
-            return x, y
-        try:
-            others = self._on_snap_others() or []
-        except Exception:
+        if not self._snap_enabled:
             return x, y
         full = []
-        for o in others:
-            try:
-                ox, oy, ow, oh = o
-            except (TypeError, ValueError):
-                continue
-            full.append((int(ox), int(oy), int(ow), int(oh) + STRIP_H))
-        if not full:
+        for o in self._snap_provider_rects(self._on_snap_others):
+            full.append((o[0], o[1], o[2], o[3] + STRIP_H))
+        screens = self._snap_provider_rects(self._on_snap_screens)
+        if not full and not screens:
             return x, y
         moving = (x, y, self._w, self._body_h + STRIP_H)
-        return preview_layout.snap_rect(moving, full, self._snap_threshold)
+        return preview_layout.snap_rect(moving, full, self._snap_threshold,
+                                        screens=screens)
+
+    @staticmethod
+    def _snap_provider_rects(provider):
+        """Call an optional snap-rect provider and return its well-formed rects
+        as int 4-tuples. A missing/raising provider yields []; an individual
+        malformed rect is skipped rather than poisoning the whole drag."""
+        if provider is None:
+            return []
+        try:
+            raw = provider() or []
+        except Exception:
+            return []
+        out = []
+        for r in raw:
+            try:
+                a, b, c, d = r
+                out.append((int(a), int(b), int(c), int(d)))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def _on_strip_b1_press(self, event):
         # A press on an armed corner starts a resize, not a strip-move. Consume it
@@ -730,6 +758,10 @@ class TileWindow:
         self._corner_anchor = (ax, ay)
         self._corner_press_root = (event.x_root, event.y_root)
         self._corner_press_size = (self._w, self._body_h)
+        # Origin at press time. nw/ne/sw grabs drag it (the opposite corner is the
+        # anchor), so _corner_release compares against this to decide whether the
+        # move has to be committed as well as the size.
+        self._corner_press_pos = self._pos
         self._corner_resizing = True
 
     def _corner_motion(self, event):
@@ -766,8 +798,32 @@ class TileWindow:
         self._corner_anchor = None
         self._corner_press_root = None
         self._corner_press_size = None
+        press_pos = self._corner_press_pos
+        self._corner_press_pos = None
         if self._lock_layout:
             return
+        # A nw/ne/sw grab anchors the OPPOSITE corner, so _corner_motion rewrote
+        # self._pos — the tile's top-left MOVED and has to be committed too, or the
+        # controller re-persists the PRE-resize origin (poisoning the snap-neighbour
+        # rects and yanking the tile back on the next re-place). Commit it through
+        # the SAME on_move_end write-back every move gesture uses — the sole write
+        # path: it persists layouts[key] AND mirrors the controller's
+        # _preview_tile_rects snapshot, taking w/body_h live off this tile so origin
+        # and size land together. Runs BEFORE on_resize_end — but NOT because
+        # on_resize_end depends on the corrected origin being there first: its own
+        # w/body_h come straight from THIS call's args (this tile's live
+        # self._w/_body_h), so it overwrites layouts[key]'s size unconditionally and
+        # reversing the order still converges in the normal case. The real reason to
+        # move first: on_move_end's OWN w/body_h come from a
+        # _preview_tiles/_preview_clients lookup that falls back to the GLOBAL
+        # tile_w/tile_body_h when it misses — wrong under uniform_size: False. Moving
+        # first lets on_resize_end's always-correct, parameter-sourced write land
+        # LAST and correct any bad fallback; reversed, that bad fallback would be the
+        # final word. Skipped when the origin did not actually move (an se grab
+        # anchors the top-left) — a corner gesture that moved nothing must not
+        # report a move.
+        if press_pos is not None and self._pos != press_pos:
+            self._on_move_end(self._key, self._pos[0], self._pos[1])
         # Persist through the SAME resize-end path the legacy Ctrl/L+R resize uses;
         # the controller branches on uniform_size to route the new size.
         self._on_resize_end(self._key, self._w, self._body_h)

@@ -133,6 +133,13 @@ _DOCTRINE_WARN = "Doctrine pill unresolved — its line was omitted"
 # they always produced; it does not read this constant (see its docstring).
 CHANNEL_LINE_DEFAULT_LABEL = "Channel"
 
+# The tag_lines a fresh document falls back to when there is nothing better to go
+# on (no doctrine selected, or a doctrine with no tagged members). Deliberately
+# the pre-2026-07-26 hardcoded triple, so a fresh install's default MOTD is
+# unchanged; a doctrine that DOES carry role tags supplies its own set instead
+# (see :func:`doctrine_tag_lines` and ``default_doc``'s ``default_tags``).
+DEFAULT_TAG_LINES = ("DPS", "Logi", "Links")
+
 
 # --- fit finalisation (canonical DNA + delta lookup) ----------------------
 
@@ -449,8 +456,52 @@ def _interleave_newlines(units: list) -> Doc:
     return runs
 
 
+def ordered_tag_lines(tags, fallback: tuple = DEFAULT_TAG_LINES) -> tuple:
+    """Order an arbitrary tag list for tag_line emission, de-duped.
+
+    Order-preserving de-dupe, then :func:`motd_builder._ordered_tags`: every tag
+    in :data:`motd_builder.TAG_PRIORITY` first (in priority order), then the
+    unknown/custom ones in the caller's order — the SAME rule ``build_motd`` and
+    ``doctrine_block`` render by, so a tag_line list and the markup it produces
+    read in the same sequence. Empty/all-blank input returns ``fallback``.
+
+    Pure: ``tags`` may be any iterable of strings (a store vocabulary, a
+    doctrine's member tags). It is the CALLER's job to hand over MIGRATED tag
+    names — ``FittingsStore`` rewrites legacy names (``"Support - EWAR"`` →
+    ``"EWAR"``) at load, so anything read off a loaded store already is.
+    """
+    seen: list = []
+    for t in (tags or []):
+        if t and t not in seen:
+            seen.append(t)
+    if not seen:
+        return tuple(fallback)
+    return tuple(_ordered_tags(seen))
+
+
+def doctrine_tag_lines(doctrine, fallback: tuple = DEFAULT_TAG_LINES) -> tuple:
+    """The role tags ``doctrine`` actually uses, ordered for tag_line emission.
+
+    Walks the doctrine's members (duck-typed — ``.members`` each with ``.tags``,
+    so this module stays free of a ``fit_models``/``fittings_store`` import) and
+    collects the union of their tags, ordered via :func:`ordered_tag_lines`. An
+    armor doctrine tagging ewar + tackle therefore starts a fresh document with
+    DPS/Logi/Links/EWAR/Tackle lines, and a doctrine using none of those gets no
+    empty lines for them.
+
+    ``None`` (no doctrine selected) or a doctrine with no tagged members returns
+    ``fallback`` — :data:`DEFAULT_TAG_LINES`, i.e. today's fixed triple, so a
+    fresh install with an empty library behaves exactly as it always has.
+    """
+    tags: list = []
+    for member in (getattr(doctrine, "members", None) or []):
+        for tag in (getattr(member, "tags", None) or []):
+            tags.append(tag)
+    return ordered_tag_lines(tags, fallback)
+
+
 def default_doc(staging_name: str = "", channel: str = "",
-                default_tags: tuple = ("DPS", "Logi", "Links")) -> Doc:
+                default_tags: tuple = DEFAULT_TAG_LINES) -> Doc:
     """The fresh-tab document — resolves byte-identical to today's ``build_motd``,
     EXCEPT the channel_line label (owner amendment 2026-07-22, spec §4.2: default
     "Channel", was "Logi" — collided with the "Logi:" fits line; see
@@ -460,6 +511,12 @@ def default_doc(staging_name: str = "", channel: str = "",
     Lines (each on its own line): ``fc_line(selected)`` · ``staging_line`` iff a
     staging name is given · ``doctrine_line`` · one ``tag_line`` per default tag ·
     ``channel_line(CHANNEL_LINE_DEFAULT_LABEL, …)`` iff a channel is remembered.
+
+    ``default_tags`` defaults to :data:`DEFAULT_TAG_LINES` (the historical
+    DPS/Logi/Links triple) so every existing caller is unaffected. The wiring
+    passes the SELECTED doctrine's real roles instead — build that tuple with
+    :func:`doctrine_tag_lines`, which already applies the priority ordering and
+    falls back to the triple when there is no doctrine.
     """
     units: list = [[TokenRun("fc_line", {"source": "selected"})]]
     if staging_name:
