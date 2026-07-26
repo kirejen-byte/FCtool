@@ -2457,7 +2457,32 @@ class FCToolGUI:
         self._xup_log_drawer_frame = tk.Frame(
             tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
             highlightbackground=BORDER_COLOR, highlightthickness=1)
-        self._xup_log_drawer_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        # `before=comp_outer` is LOAD-BEARING, not cosmetic. pack walks the
+        # master's slaves in PACKING ORDER and starves whatever is left when the
+        # cavity runs out, so the last-packed slave is the first casualty. At the
+        # app's minsize (root.minsize(1000, 700)) this tab's slaves request 803px
+        # against a 614px cavity, and this drawer -- packed last -- was allocated
+        # 1px of its 33px request: the X-Up Log became invisible and unreachable,
+        # with no scrollbar to hint that anything was missing (measured; 33/33 at
+        # the 1200x900 default, 1/33 at minsize).
+        #
+        # The rule, and the reason this is ordering rather than a per-widget size
+        # request: in an over-committed pack cavity the loser must be a slave that
+        # can SHOW its overflow. comp_outer's two panels both own scroll canvases,
+        # so squeezing them costs a scroll gesture; this drawer has no scrollbar,
+        # so squeezing it costs the whole feature. Packing the un-scrollable
+        # chrome BEFORE the expanding scroll host makes that outcome structural
+        # instead of a function of who happens to request how much. side=BOTTOM
+        # keeps the on-screen position identical (comp_outer still expands into
+        # the middle) -- only the allocation priority changes.
+        #
+        # Trimming requests instead was measured and is NOT sufficient: zeroing
+        # the Specialized Roles canvas's phantom 378x265 default request (the
+        # untouched twin of the width=1/height=1 fix on the comp canvas above)
+        # drops the tab's request 803 -> 640, still over the 614px cavity, and the
+        # drawer still starves at 7/33.
+        self._xup_log_drawer_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10,
+                                        pady=(0, 10), before=comp_outer)
 
         xup_log_header = tk.Frame(self._xup_log_drawer_frame, bg=BG_PANEL)
         xup_log_header.pack(fill=tk.X, padx=10, pady=4)
