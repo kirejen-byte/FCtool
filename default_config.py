@@ -156,14 +156,17 @@ DEFAULT_CONFIG = {
     # scope is never exercised — the poller hook returns before touching anything.
     #
     # Trigger = docked at staging AND known to be carrying implants worth pulling.
-    # The staging SYSTEM comes from zkillboard.staging_system — the FC-facing
-    # staging, the same key that drives route-from-staging on kill alerts and the
-    # MOTD leave-staging guard. market.staging_* is the MARKET/seeding citadel and
-    # is frequently a DIFFERENT system, so it is only borrowed for exact-dock
-    # precision when market.staging_system_id agrees; the two override keys below
-    # win over both. See implant_reminder.resolve_staging. With nothing set the
-    # feature stays inert rather than firing on every dock anywhere — and says so
-    # once in the log, so it can never be an undiagnosable no-op.
+    # "Staging" is whatever system sits under Settings > Staging System
+    # (zkillboard.staging_system) — the SAME key that drives route-from-staging
+    # on kill alerts and the MOTD leave-staging guard. Docked at ANY structure or
+    # station in that system counts (owner correction, 2026-07-25): this is
+    # deliberately NOT narrowed down to one exact citadel, and it deliberately
+    # never reads the separate market/seeding-citadel config block, even when
+    # that block happens to name a structure in the same system — see
+    # implant_reminder.resolve_staging. The two override keys below win outright
+    # over the normal resolution. With nothing set the feature stays inert
+    # rather than firing on every dock anywhere — and says so once in the log,
+    # so it can never be an undiagnosable no-op.
     "implant_reminder": {
         "enabled": False,           # MASTER GATE
         "toast_seconds": 12,        # hold before the fade (clamped 3..60)
@@ -176,12 +179,17 @@ DEFAULT_CONFIG = {
         "match_mode": "valuable",
         "match_names": [],          # only consulted when match_mode == "custom"
         "min_hardwiring_grade": 5,  # 1..6; the trailing digit of e.g. "SU-606"
-        # "ladder" (default, full fall-through) | "structure" (exact dock only)
-        # | "system" (docked anywhere in the staging system).
+        # "ladder" (default) = the override below if set, else the normal
+        # Settings > Staging System resolution. "structure" = exact-dock only —
+        # the ONLY source of an exact dock is now the staging_structure_id
+        # override below, so this scope can never be satisfied any other way.
+        # "system" = docked anywhere in the staging system (same as "ladder"
+        # minus honoring an exact-structure override).
         "staging_scope": "ladder",
-        # Explicit staging OVERRIDE — either one set wins over market/zkillboard
-        # outright. Use when FC staging is neither the market citadel nor
-        # zkillboard.staging_system. 0 / "" = unset (the normal case).
+        # Explicit staging OVERRIDE — either one set wins outright over the
+        # normal zkillboard.staging_system resolution. Use when this reminder's
+        # staging should differ from Settings > Staging System (e.g. a second
+        # staging, or testing). 0 / "" = unset (the normal case).
         "staging_structure_id": 0,  # exact citadel/structure id
         "staging_system": "",       # system NAME, e.g. "SVM-3K"
         # Show-oriented UX, disabled-oriented storage (mirrors

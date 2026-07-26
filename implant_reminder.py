@@ -37,13 +37,20 @@ Design notes that are load-bearing:
   already looking at it. Here that is inverted: the docked character's client
   being foreground is the normal case and exactly when the pilot must see the
   toast.
-* **``zkillboard.staging_system`` is the FC staging; ``market.staging_*`` is the
-  MARKET/seeding citadel, and on a real install they are DIFFERENT systems.**
-  (This box: market = 3-FKCZ, zkill = SVM-3K.) Preferring the market block —
-  as the first cut did — silently pointed the whole feature at the seeding
-  citadel and made it a permanent no-op. ``resolve_staging`` now takes the
-  SYSTEM from the FC-facing key and only borrows the market structure id for
-  extra precision when both agree on the system. See its docstring.
+* **The staging is whatever system sits under Settings > Staging System**
+  (``zkillboard.staging_system`` — the same key that drives route-from-staging
+  on kill alerts and the MOTD leave-staging guard). Docked at ANY structure or
+  station inside that system counts; the reminder is deliberately NOT narrowed
+  down to one exact citadel within it. The market/seeding-citadel config lives
+  in a wholly separate block and, on a real install, frequently names a
+  DIFFERENT system (owner correction, 2026-07-25). Two earlier cuts both
+  leaned on that other block anyway — first outright, then as a same-system
+  "precision" borrow — and both were silently wrong the moment it named a
+  different system: either one narrows "docked anywhere in staging" down to
+  "docked in that one structure", which is not what the Settings field
+  promises. ``resolve_staging`` reads nothing from that other block at all any
+  more — see ``test_module_reads_no_market_config_key`` for the drift guard —
+  and its own docstring for the (now much shorter) rung order.
 * **A resolved staging target is logged exactly once** (``ImplantReminder``,
   INFO). The failure above was undiagnosable precisely because nothing was ever
   logged; an unconfigured/never-fires resolution must always leave a trace.
@@ -159,25 +166,25 @@ def normalize_config(raw) -> dict:
 RUNG_NONE = "nothing configured"
 RUNG_OVERRIDE_STRUCTURE = "implant_reminder.staging_structure_id (override)"
 RUNG_OVERRIDE_SYSTEM = "implant_reminder.staging_system (override)"
-RUNG_FC_STRUCTURE = "market.staging_structure_id (same system as zkillboard.staging_system)"
-RUNG_FC_STATION = "market.staging_station_id (same system as zkillboard.staging_system)"
-RUNG_FC_SYSTEM = "zkillboard.staging_system"
-RUNG_MARKET_STRUCTURE = "market.staging_structure_id (no FC staging system set)"
-RUNG_MARKET_STATION = "market.staging_station_id (no FC staging system set)"
-RUNG_MARKET_SYSTEM = "market.staging_system_id (no FC staging system set)"
+RUNG_FC_SYSTEM = "zkillboard.staging_system (Settings > Staging System)"
 
 
 @dataclass(frozen=True)
 class StagingTarget:
     """What "docked at staging" resolves to for the current config.
 
-    ``kind`` is ``"structure"`` | ``"station"`` | ``"system"`` | ``"none"``.
-    ``"none"`` means nothing is configured — the feature stays inert rather than
-    firing on every dock anywhere. ``rung`` names the config key it came from
-    and is diagnostic only — never compare on it."""
+    ``kind`` is ``"structure"`` | ``"system"`` | ``"none"`` (``at_staging`` also
+    understands a ``"station"`` kind for a hand-built target, but
+    ``resolve_staging`` itself never produces one — the only exact-dock source
+    left is the structure override). ``"none"`` means nothing is configured —
+    the feature stays inert rather than firing on every dock anywhere. ``rung``
+    names the config key it came from and is diagnostic only — never compare
+    on it. ``label`` is the human system name when the target came from one
+    (both staging-system rungs do); it exists purely for the log line."""
     kind: str = "none"
     value: int = 0
     rung: str = RUNG_NONE
+    label: str = ""
 
     @property
     def configured(self) -> bool:
@@ -187,7 +194,8 @@ class StagingTarget:
         """One-line human summary for the log."""
         if not self.configured:
             return "NOT CONFIGURED — the reminder can never fire"
-        return f"{self.kind} {self.value} (via {self.rung})"
+        ident = f"{self.label} ({self.value})" if self.label else str(self.value)
+        return f"{self.kind} {ident} via {self.rung}"
 
 
 def _int_or_zero(value) -> int:
@@ -213,42 +221,45 @@ def resolve_staging(config, resolve_system_name=None,
                     scope: str = "ladder") -> StagingTarget:
     """Resolve the staging identity from the app config.
 
-    **The system comes from the FC-facing key, not the market block.**
-    ``zkillboard.staging_system`` is the FC staging (it already drives
-    route-from-staging on kill alerts and the MOTD leave-staging guard);
-    ``market.staging_structure_id`` is the market/seeding citadel and on a real
-    install lives in a DIFFERENT system. Preferring the market block pointed the
-    whole feature at the wrong system and made it a silent no-op.
+    **The staging is the system named in Settings > Staging System
+    (``zkillboard.staging_system``) — nothing else.** Docked at ANY structure
+    or station inside that system counts as "at staging"; the reminder is
+    deliberately NOT narrowed down to one exact citadel within it, even when
+    one happens to be configured elsewhere (owner correction, 2026-07-25). Two
+    earlier cuts both leaned on the separate market/seeding-citadel config
+    block instead — first outright, then as a same-system "precision" borrow —
+    and both were silently wrong the moment that other block named a different
+    system, which it frequently does. This function reads nothing from that
+    other block at all any more (drift-guarded by
+    ``test_module_reads_no_market_config_key``).
 
     Rungs, in order:
 
     1. **Explicit override** — ``implant_reminder.staging_structure_id`` (exact
        dock) or ``implant_reminder.staging_system`` (a NAME). Either one set
-       means the owner has stated the answer: only override keys are consulted
-       from then on, and the market/zkill blocks are ignored outright. If the
-       chosen ``scope`` cannot express the override that IS set, the result is
-       unconfigured rather than a fall-through to some other staging. A system
-       NAME the resolver cannot resolve counts as UNSET, so a typo degrades to
-       the normal resolution instead of stranding the feature.
-    2. **FC staging system** — ``zkillboard.staging_system`` resolved through
-       ``resolve_system_name``. With it set:
+       means the owner has stated the answer outright: the normal resolution
+       below is skipped entirely. If the chosen ``scope`` cannot express the
+       override that IS set, the result is unconfigured rather than a
+       fall-through to the normal system — once an override is set it IS the
+       staging. A system NAME the resolver cannot resolve counts as UNSET, so a
+       typo degrades to the normal resolution instead of stranding the
+       feature.
+    2. **Settings > Staging System, system-wide** —
+       ``zkillboard.staging_system`` resolved through ``resolve_system_name``.
+       Nothing narrows it further: any structure or station dock inside that
+       system satisfies it (see ``at_staging``).
 
-       * ``market.staging_structure_id`` / ``staging_station_id`` are borrowed
-         for exact-dock precision ONLY when ``market.staging_system_id`` equals
-         that same system. Disagreement means the market structure belongs to a
-         DIFFERENT staging, so it is ignored;
-       * otherwise the target is system-wide on the FC system — "docked anywhere
-         in staging", which is what a fleet docking into the Fortizar next door
-         wants anyway.
-    3. **No FC staging system at all** — fall back to the original market ladder
-       (structure -> station -> system) so an install configured the other way
-       round does not regress.
+    With nothing configured at all (no override, and ``zkillboard.staging_system``
+    empty or unresolvable), the result is unconfigured — never a fallback to
+    any other staging-shaped config block.
 
-    ``scope`` narrows every rung: ``"structure"`` accepts only exact
-    structure/station targets, ``"system"`` only system-wide ones. Pure apart
-    from the injected name resolver; never raises."""
+    ``scope`` narrows what the override rung may express: ``"structure"``
+    accepts only an exact-structure override (and, since rung 2 is system-only,
+    can therefore NEVER be satisfied by the normal resolution); ``"system"``
+    accepts only a system override or the normal resolution. ``"ladder"`` (the
+    default) accepts whichever the override actually is, then falls through to
+    rung 2. Pure apart from the injected name resolver; never raises."""
     cfg = config if isinstance(config, dict) else {}
-    market = cfg.get("market") if isinstance(cfg.get("market"), dict) else {}
     zkill = cfg.get("zkillboard") if isinstance(cfg.get("zkillboard"), dict) else {}
     own = cfg.get("implant_reminder") if isinstance(cfg.get("implant_reminder"), dict) else {}
     scope = scope if scope in _STAGING_SCOPES else "ladder"
@@ -257,41 +268,23 @@ def resolve_staging(config, resolve_system_name=None,
 
     # 1 ── an explicit override wins outright.
     own_structure = _int_or_zero(own.get("staging_structure_id"))
-    own_system = _system_id_of(own.get("staging_system"), resolve_system_name)
+    own_system_name = str(own.get("staging_system") or "").strip()
+    own_system = _system_id_of(own_system_name, resolve_system_name)
     if own_structure or own_system:
         if own_structure and want_exact:
             return StagingTarget("structure", own_structure, RUNG_OVERRIDE_STRUCTURE)
         if own_system and want_system:
-            return StagingTarget("system", own_system, RUNG_OVERRIDE_SYSTEM)
+            return StagingTarget("system", own_system, RUNG_OVERRIDE_SYSTEM,
+                                 own_system_name)
         return StagingTarget()
 
-    # 2 ── the FC staging system, with the market structure only as precision.
-    fc_system = _system_id_of(zkill.get("staging_system"), resolve_system_name)
-    if fc_system:
-        if want_exact and _int_or_zero(market.get("staging_system_id")) == fc_system:
-            sid = _int_or_zero(market.get("staging_structure_id"))
-            if sid:
-                return StagingTarget("structure", sid, RUNG_FC_STRUCTURE)
-            sid = _int_or_zero(market.get("staging_station_id"))
-            if sid:
-                return StagingTarget("station", sid, RUNG_FC_STATION)
-        if want_system:
-            return StagingTarget("system", fc_system, RUNG_FC_SYSTEM)
-        return StagingTarget()
-
-    # 3 ── no FC staging system: the original market ladder, unchanged.
-    if want_exact:
-        sid = _int_or_zero(market.get("staging_structure_id"))
-        if sid:
-            return StagingTarget("structure", sid, RUNG_MARKET_STRUCTURE)
-        sid = _int_or_zero(market.get("staging_station_id"))
-        if sid:
-            return StagingTarget("station", sid, RUNG_MARKET_STATION)
-        if not want_system:
-            return StagingTarget()
-    sid = _int_or_zero(market.get("staging_system_id"))
-    if sid:
-        return StagingTarget("system", sid, RUNG_MARKET_SYSTEM)
+    # 2 ── Settings > Staging System, system-wide. No other config block is
+    # ever consulted here (see the docstring above).
+    if want_system:
+        fc_name = str(zkill.get("staging_system") or "").strip()
+        fc_system = _system_id_of(fc_name, resolve_system_name)
+        if fc_system:
+            return StagingTarget("system", fc_system, RUNG_FC_SYSTEM, fc_name)
     return StagingTarget()
 
 
@@ -765,10 +758,11 @@ class ImplantReminder:
         if target.configured:
             log.info("[implant] reminder enabled — staging = %s", target.describe())
         else:
-            log.info("[implant] reminder enabled but staging is %s. Set "
-                     "implant_reminder.staging_system (or staging_structure_id) "
-                     "to name it explicitly; otherwise it comes from "
-                     "zkillboard.staging_system.", target.describe())
+            log.info("[implant] reminder enabled but staging is %s. Set the "
+                     "Settings > Staging System field (zkillboard.staging_system) "
+                     "— or implant_reminder.staging_system / "
+                     "staging_structure_id to override it explicitly.",
+                     target.describe())
         return True
 
     # -- the poller hook ---------------------------------------------------

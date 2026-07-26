@@ -798,7 +798,7 @@ _NAV_KEYS = {"Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R",
 #: every query consumer reads through :meth:`MotdPalette._entry_text`, which
 #: reports "" while it is displayed — never mistaken for a search query by
 #: the dropdown/ranking/ESI paths.
-SEARCH_PLACEHOLDER = "Add anything to MOTD…"
+SEARCH_PLACEHOLDER = "Add anything to MOTD… (drag and drop)"
 
 
 class MotdPalette(tk.Frame):
