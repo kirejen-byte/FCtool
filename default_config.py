@@ -149,11 +149,15 @@ DEFAULT_CONFIG = {
     # transient toast over the docked client reminding a pilot carrying expensive
     # implants to pull them after docking back at staging following a fleet.
     #
-    # DEFAULT OFF, and that is load-bearing: it needs esi-clones.read_implants.v1,
-    # which every pre-existing character token lacks until the owner re-consents,
-    # so a nag defaulting ON would misfire for every install on upgrade day.
-    # While `enabled` is False NO worker runs, NO ESI implant call is made and the
-    # scope is never exercised — the poller hook returns before touching anything.
+    # DEFAULT ON (flipped 2026-07-26 by owner request, after the toast was
+    # confirmed working over a live client). Defaulting on is safe rather than
+    # merely convenient: it needs esi-clones.read_implants.v1, which every
+    # pre-existing character token lacks until the owner re-consents in
+    # Settings, so an upgrading install gets the feature "on" but genuinely
+    # inert per character until that re-auth happens — no ESI call, no toast,
+    # nothing logged. While `enabled` is explicitly False NO worker runs, NO
+    # ESI implant call is made and the scope is never exercised — the poller
+    # hook returns before touching anything.
     #
     # Trigger = docked at staging AND known to be carrying implants worth pulling.
     # "Staging" is whatever system sits under Settings > Staging System
@@ -168,7 +172,7 @@ DEFAULT_CONFIG = {
     # rather than firing on every dock anywhere — and says so once in the log,
     # so it can never be an undiagnosable no-op.
     "implant_reminder": {
-        "enabled": False,           # MASTER GATE
+        "enabled": True,            # MASTER GATE (default ON since 2026-07-26)
         "toast_seconds": 12,        # hold before the fade (clamped 3..60)
         # "valuable" (default) = the High-/Mid-/Low-grade SET implants, the +5
         # ("- Improved") attribute implants, and top-tier + named hardwirings;

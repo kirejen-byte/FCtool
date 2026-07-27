@@ -4,9 +4,16 @@ Research: ``docs/superpowers/spikes/2026-07-25-implant-reminder/RESEARCH.md``.
 
 The feature reminds a pilot who is carrying expensive implants to pull them
 after docking back at the staging structure following a fleet. It is
-**default OFF** (``config['implant_reminder']['enabled']``): while off nothing
-in here runs, no ESI call is made and the ``esi-clones.read_implants.v1`` scope
-is never exercised.
+**default ON** (``config['implant_reminder']['enabled']``; flipped from OFF to
+ON 2026-07-26 by owner request, now that the toast has been seen working over
+a live client). Defaulting on is safe rather than merely convenient: the
+feature needs ``esi-clones.read_implants.v1``, a scope no pre-existing
+character token carries until the owner re-authorises it in Settings, so on
+an upgrading install the reminder is "on" but genuinely inert for every
+not-yet-reauthorised character — no ESI call, no toast, nothing logged (see
+the scope check in the poller hook). While ``enabled`` is explicitly
+``False`` — still the one master gate — nothing in here runs at all, no ESI
+call is made and the scope is never exercised.
 
 Split of responsibility:
 
@@ -78,7 +85,7 @@ log = get_logger(__name__)
 #: ``default_config.DEFAULT_CONFIG``; kept here too so the engine self-heals a
 #: partially-written block (house per-key defaulting, never a deep merge).
 DEFAULTS = {
-    "enabled": False,            # MASTER GATE — off = fully inert, zero ESI
+    "enabled": True,             # MASTER GATE (default ON since 2026-07-26) — explicit False = fully inert, zero ESI
     "toast_seconds": 12.0,       # auto-dismiss hold before the fade
     "match_mode": "valuable",    # "valuable" | "any" | "custom"
     "match_names": [],           # substrings, used when match_mode == "custom"
@@ -96,6 +103,36 @@ _STAGING_SCOPES = ("ladder", "structure", "system")
 #: the toast for 0 s nor leave it pinned over the client forever.
 TOAST_SECONDS_MIN = 3.0
 TOAST_SECONDS_MAX = 60.0
+
+
+def is_enabled(block) -> bool:
+    """Is the reminder switched on, given a RAW ``config['implant_reminder']``?
+
+    **The single answer to the master-gate question.** Every caller — the
+    Characters-tab tick, the poller hook that decides whether to build the
+    engine at all, and ``normalize_config`` itself — routes through here, so
+    the UI and the engine can never disagree about whether the feature is on.
+    They once did: the tick read ``normalize_config(...)["enabled"]`` (which
+    inherits ``DEFAULTS["enabled"]`` for an unspecified block) while the poller
+    gate did its own raw ``isinstance(cfg, dict) and cfg.get("enabled")``. The
+    moment the default flipped to True, an install whose config.json carries no
+    ``implant_reminder`` block at all — the ordinary upgrade case — showed a
+    ticked box over a reminder that could never fire. Two independent
+    implementations of one predicate is the bug; one is the fix.
+
+    Absent / ``None`` / malformed (a string, a list, an int) and a dict with no
+    ``enabled`` key all inherit ``DEFAULTS["enabled"]``; only an explicit,
+    falsy ``enabled`` turns it off. Never raises.
+
+    **Cheap by requirement.** This runs on the ESI poller thread for EVERY
+    character on EVERY poll, and while the feature is off it is the whole of
+    the work done — one isinstance, one dict lookup on ``DEFAULTS`` and one
+    ``dict.get``, no allocation. It is deliberately NOT ``normalize_config``,
+    which copies a dict, rebuilds two lists and runs ten coercions to answer a
+    question that is one lookup wide."""
+    if not isinstance(block, dict):
+        return bool(DEFAULTS["enabled"])
+    return bool(block.get("enabled", DEFAULTS["enabled"]))
 
 
 def normalize_config(raw) -> dict:
@@ -119,7 +156,10 @@ def normalize_config(raw) -> dict:
     out["match_names"] = []
     out["disabled_chars"] = []
 
-    out["enabled"] = bool(src.get("enabled", DEFAULTS["enabled"]))
+    # Delegated, not duplicated: is_enabled is THE master-gate predicate and the
+    # poller's cheap gate calls it directly (see its docstring for the
+    # UI-says-on/engine-says-off bug that two implementations caused).
+    out["enabled"] = is_enabled(src)
 
     try:
         secs = float(src.get("toast_seconds", DEFAULTS["toast_seconds"]))

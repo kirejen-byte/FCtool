@@ -944,7 +944,7 @@ class FCToolGUI:
         # Monitor pinning injectable backends (None → lazy real singletons).
         self._preview_monitor_win32 = None     # monitor enumeration (monitor_pin)
         self._preview_move_win32 = None        # window-move backend (window_activator)
-        # ── Implant-removal reminder (default OFF; see implant_reminder.py) ──
+        # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
         self._implant_toast = None             # the single live ClientToast, if any
         # ── Active highlight / cycle exclusion / switch-external (Task C4) ────
@@ -7117,19 +7117,8 @@ class FCToolGUI:
         self._implant_help_icon.pack(side=tk.LEFT, padx=(0, 12), pady=5)
         attach_tooltip(
             self._implant_help_icon,
-            "Pops a small toast over the EVE client when you dock in your "
-            "staging system with valuable implants still plugged in — the "
-            "\"pull them before the next fleet\" nudge. Left-click the toast to "
-            "dismiss it, right-click to silence that character for the "
-            "session.\n\n"
-            "Needs the esi-clones.read_implants.v1 scope: characters connected "
-            "before this existed must be re-authorised in Settings before it "
-            "can see what is in their head.\n\n"
-            "Counts as valuable: the named High-/Mid-/Low-grade sets (Snake, "
-            "Crystal, Amulet, Halo, Talisman, Asklepian, Ascendancy, …), "
-            "hardwirings of grade 5 and up, Mindlinks and the other named "
-            "rares, and +5 attribute implants. Ignored: boosters, cheap "
-            "hardwirings, and +1..+4 attribute implants.")
+            "Pops up a brief message over the EVE client reminding you to "
+            "remove your implants when you dock at your staging system.")
 
         self._implant_staging_label = tk.Label(
             implant_frame, text="", font=("Consolas", 9), fg=FG_DIM,
@@ -7232,14 +7221,22 @@ class FCToolGUI:
     def _implant_reminder_enabled(self) -> bool:
         """Initial state of the "Save my implants" tick.
 
+        ``implant_reminder.is_enabled`` is THE master-gate predicate and is the
+        same call the poller hook gates on (``_implant_reminder_observe``), so
+        the tick cannot claim the feature is on while the engine treats it as
+        off. It once could: this read ``normalize_config(...)["enabled"]`` while
+        the hook did its own raw dict check, and the day the default flipped to
+        ON every install without an ``implant_reminder`` block showed a ticked
+        box over a reminder that never fired.
+
         Tolerant by requirement, not by habit: config.json ships with NO
         ``implant_reminder`` block at all, so "absent" is the ordinary case on an
         existing install rather than an error — and a malformed or ``None`` block
         must not raise either, because this runs inside the UNGUARDED Characters
         tab builder, where anything thrown takes the whole tab down."""
         try:
-            return bool(implant_reminder.normalize_config(
-                self.config.get("implant_reminder")).get("enabled"))
+            return implant_reminder.is_enabled(
+                self.config.get("implant_reminder"))
         except Exception:
             log.exception("[implant] could not read the reminder config")
             return False
@@ -17003,7 +17000,7 @@ class FCToolGUI:
             system_name=sys_name, docked=docked,
             station_id=station_id, structure_id=structure_id)
 
-    # ── Implant-removal reminder wiring (default OFF) ───────────────────────
+    # ── Implant-removal reminder wiring (default ON) ────────────────────────
     # The feature itself lives in implant_reminder.py (pure trigger/state engine,
     # Tk-free) and client_toast.py (the transient over-client window). fc_gui owns
     # only the two seams that must touch app state: the poller-thread hook below
@@ -17017,12 +17014,20 @@ class FCToolGUI:
         Runs on the ESI poll thread and touches no Tk (the engine's on_remind
         callback is a _post_ui marshal). Fully inert -- and never even builds the
         engine -- while config['implant_reminder']['enabled'] is False, so an off
-        feature costs one dict lookup per poll and no ESI call at all. A token
+        feature costs one predicate call per poll and no ESI call at all. A token
         without esi-clones.read_implants.v1 is skipped outright rather than left
-        to 403 (a 403 costs 5 of the 100/60s error budget)."""
+        to 403 (a 403 costs 5 of the 100/60s error budget).
+
+        The gate is implant_reminder.is_enabled -- the SAME predicate the
+        Characters-tab tick reads (_implant_reminder_enabled) and the same one
+        normalize_config delegates to. It replaced a hand-rolled raw dict check
+        here that silently disagreed with the tick for every config shape except
+        an explicit enabled:True/False, most importantly the absent block that is
+        the ordinary upgrade case: box ticked, reminder dead. It stays a cheap
+        predicate on purpose -- this runs per character per poll."""
         try:
-            cfg = self.config.get("implant_reminder")
-            if not (isinstance(cfg, dict) and cfg.get("enabled")):
+            if not implant_reminder.is_enabled(
+                    self.config.get("implant_reminder")):
                 return
             if not auth.has_scope(_IMPLANTS_SCOPE):
                 return

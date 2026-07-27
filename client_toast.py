@@ -46,8 +46,6 @@ from ui_theme import BG_PANEL, FG_DIM, FG_TEXT, FG_YELLOW
 #: implant names, short enough to stay out of the way of the client's HUD.
 DEFAULT_W = 430
 DEFAULT_H = 78
-#: Inset from the top edge of the client rect (physical px).
-DEFAULT_TOP_MARGIN = 48
 #: One re-assert of the topmost band, ~1 s after showing, in case another
 #: topmost window was inserted right behind us. NOT a tick — see the module
 #: docstring on why coverage, not cadence, is what costs frames.
@@ -59,15 +57,14 @@ FADE_STEPS = 10
 ALPHA = 0.94
 
 
-def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H,
-               top_margin=DEFAULT_TOP_MARGIN):
+def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H):
     """Top-left corner (physical px) for a ``w`` x ``h`` toast over ``client_rect``.
 
     ``client_rect`` is ``(left, top, right, bottom)`` EDGES, matching
     ``eve_client_tracker.get_rect`` (and the ``monitor_pin`` convention) — NOT
-    x/y/w/h. The toast is centred horizontally and inset ``top_margin`` from the
-    top edge, then clamped so it can never sit outside the client on either axis
-    (a client narrower/shorter than the toast pins it to the client's top-left).
+    x/y/w/h. The toast is centred on BOTH axes over the client, then clamped so
+    it can never sit outside the client on either axis (a client narrower or
+    shorter than the toast pins it to the client's top-left corner).
 
     Returns ``None`` for a missing or degenerate rect, so the caller can decide
     on its own fallback rather than guessing a screen position here. Pure."""
@@ -81,7 +78,7 @@ def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H,
     w = max(1, int(w))
     h = max(1, int(h))
     x = left + (cw - w) // 2
-    y = top + int(top_margin)
+    y = top + (ch - h) // 2
     # Clamp inside the client rect (never past the right/bottom edge, never
     # before the left/top edge — the max() runs last so a too-small client
     # still yields the client's own origin).
