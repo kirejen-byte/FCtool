@@ -33,9 +33,15 @@ Design notes that are load-bearing:
   ``structure_id``; the poller used to collapse them into a bool. Keeping the
   ids is the whole trigger. Marginal ESI cost of dock detection: zero.
 * **Fire once per dock.** ``ReminderState`` latches per character on the
-  undocked→docked-at-staging edge and only re-arms when a later poll shows the
-  character undocked. That is also what stops the 120 s ``/implants`` server
-  cache from re-nagging a pilot who just pulled their implants.
+  undocked→docked-at-staging edge. That is also what stops the 120 s
+  ``/implants`` server cache from re-nagging a pilot who just pulled their
+  implants. The latch re-arms on an observed undock — but NOT only on that:
+  it also re-arms on a poll showing a different dock, and on a poll arriving
+  after a blackout longer than ``ReminderState.blind_gap_s``. The dock signal
+  is sampled every ~10 s, and requiring the poller to catch the undocked
+  moment silently ate reminders whenever it did not (owner report,
+  2026-07-26). See ``ReminderState``'s docstring for the full account,
+  including the one case that remains undetectable.
 * **A character seen for the FIRST TIME while already docked is primed, not
   fired.** Otherwise starting FCTool while parked in staging would nag
   immediately, which is not "you just got back from a fleet".
@@ -71,6 +77,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 
 from app_log import get_logger
@@ -357,6 +364,18 @@ def dock_state(loc) -> DockState:
     )
 
 
+def dock_identity(state) -> tuple:
+    """The identity of the dock in ``state``, or ``()`` when it is not known.
+
+    ``()`` means "no information" — an in-space state, a caller that passed no
+    ``DockState`` at all — and is deliberately never equal to a real identity
+    AND never *unequal* in a way the latch acts on (see ``ReminderState.observe``).
+    Pure."""
+    if not isinstance(state, DockState) or not state.docked:
+        return ()
+    return (state.solar_system_id, state.station_id, state.structure_id)
+
+
 def at_staging(state: DockState, target: StagingTarget) -> bool:
     """True only when the character is DOCKED and that dock matches ``target``.
 
@@ -591,23 +610,64 @@ SUPPRESSED = "suppressed"  # snoozed / per-character disabled
 class _CharLatch:
     latched: bool = False
     attempts: int = 0
+    #: The dock identity the latch was set at (``dock_identity``), and the
+    #: ``now`` of the most recent observation. Together they are what lets the
+    #: latch say "this is still the SAME unbroken dock" instead of merely "I
+    #: have not seen an undock" — see ``ReminderState.observe``.
+    dock: tuple = ()
+    seen: float = 0.0
 
 
 @dataclass
 class ReminderState:
     """Latch/snooze bookkeeping for every tracked character. Pure + Tk-free.
 
-    ``observe`` is edge-detecting BY CONSTRUCTION: it is called on every poll
-    with the current at-staging answer and only returns ``FIRE`` on the
-    False→True transition, because the latch it sets survives until a poll
-    reports the character away from staging. That is what makes a restart, a
-    dropped poll or a missing prior state harmless — there is no prior/current
-    diff to lose."""
+    ``observe`` is edge-detecting: it is called on every poll with the current
+    at-staging answer and returns ``FIRE`` only when the poll is evidence of a
+    NEW dock. It is not, however, a pure False→True edge — that was the
+    2026-07-26 defect, and it is worth stating plainly because the docstring
+    here used to claim the opposite ("a restart, a dropped poll or a missing
+    prior state [is] harmless"):
+
+    **The dock signal is SAMPLED, not streamed.** fc_gui's ESI poller reads
+    ``/location`` once per ``FCToolGUI._OVERLAY_LOCSHIP_EVERY`` (10 s) per
+    character, and the round-robin over a dozen characters stretches the gap to
+    ~11-14 s. A latch that is released only by a poll which literally *sees*
+    the character away from staging therefore loses every undock that fits
+    between two samples — and an undock → re-dock round trip at a citadel fits
+    easily. The pilot got no toast and no log line; the failure was invisible.
+    The same thing happens over a much longer window whenever the engine is not
+    called at all: the box switched off, a token still missing
+    ``esi-clones.read_implants.v1``, an unresolvable staging, an empty
+    ``/location`` payload, an untracked client.
+
+    So the latch records **what** it latched on (``dock_identity``) and **when**
+    it was last confirmed, and releases when either stops vouching for it:
+
+    * a poll that sees the character away from staging — the original edge;
+    * a poll that sees a DIFFERENT dock — they cannot have moved between
+      structures without undocking, whether or not anyone watched;
+    * a poll that arrives after a gap longer than ``blind_gap_s`` — over a
+      blackout the engine learned nothing, and a latch cannot vouch for a
+      window it never saw.
+
+    What it deliberately still cannot detect: a re-dock into the SAME structure
+    where every intervening poll was missed. Nothing in ESI distinguishes that
+    from never having undocked, so the only lever is the sampling rate."""
 
     #: Hard cap on FIRE retries per dock when the implant fetch itself fails
     #: (a None from ESI). Without it a broken token would re-fetch every poll
     #: for as long as the pilot stays docked.
     max_fetch_attempts: int = 3
+
+    #: How long the engine may go without observing a character before its
+    #: latch stops being trustworthy. Chosen at ~6x the 10 s poll cadence: poll
+    #: jitter, a slow round-robin and a couple of dropped location payloads all
+    #: stay well inside it, so reaching it means the engine was genuinely not
+    #: running (feature off, scope missing, client gone). The error direction is
+    #: deliberate and is the one the owner asked for — at worst ONE extra toast
+    #: after a minute-long blackout, against a silently-eaten reminder.
+    blind_gap_s: float = 60.0
 
     _latches: dict = field(default_factory=dict)
     _snoozed: set = field(default_factory=set)
@@ -630,40 +690,64 @@ class ReminderState:
         self._latches.pop(str(key or "").strip().lower(), None)
 
     # -- the machine --------------------------------------------------------
-    def observe(self, key: str, staging: bool, disabled=()) -> str:
+    def observe(self, key: str, staging: bool, disabled=(), dock=None,
+                now=None) -> str:
         """Advance one character by one poll; returns one of the module verbs.
 
         ``disabled`` is the config's per-character opt-out list (show-oriented
         UX, disabled-oriented storage — a brand-new character defaults to ON,
-        matching ``preview.disabled_chars``)."""
+        matching ``preview.disabled_chars``).
+
+        ``dock`` is this poll's ``DockState`` and ``now`` its monotonic
+        timestamp; both are optional and both only ever RELEASE a latch, never
+        set one, so a caller that omits them gets exactly the pre-2026-07-26
+        behaviour (see the class docstring for why the caller should not)."""
         k = str(key or "").strip().lower()
         if not k:
             return CLEAR
+        ts = time.monotonic() if now is None else float(now)
+        ident = dock_identity(dock)
         off = {str(d).strip().lower() for d in (disabled or ())}
         first_sighting = k not in self._latches
         latch = self._latches.setdefault(k, _CharLatch())
+        gap = ts - latch.seen
+        latch.seen = ts
 
         if not staging:
             latch.latched = False
             latch.attempts = 0
+            latch.dock = ()
             return CLEAR
         if k in off or k in self._snoozed:
             # Still latch so un-snoozing mid-dock doesn't fire retroactively.
             latch.latched = True
+            latch.dock = ident
             return SUPPRESSED
         if first_sighting:
             # Already parked at staging when we first saw this character —
             # that is not "just got back from a fleet".
             latch.latched = True
+            latch.dock = ident
             return PRIMED
         if latch.latched:
-            return HOLD
+            # A latch only holds while it can still vouch for the dock it was
+            # set at. A different structure/station means they undocked whether
+            # or not a poll caught it; a gap longer than blind_gap_s means the
+            # engine was not watching and cannot claim they stayed put.
+            moved = bool(ident) and bool(latch.dock) and ident != latch.dock
+            if not (moved or gap > self.blind_gap_s):
+                return HOLD
+            # A genuinely new dock cycle, so the fetch-retry budget resets with
+            # it — exactly as the CLEAR branch above does for the observed edge.
+            latch.attempts = 0
         latch.latched = True
+        latch.dock = ident
         # INCREMENT, never reset: retry_fetch re-arms the latch after a failed
         # implant fetch, so the next FIRE is attempt N+1 of the SAME dock. A
         # reset here would make max_fetch_attempts unreachable and re-poll ESI
         # every 10 s for as long as the pilot stayed docked. The counter is
-        # cleared only by CLEAR (i.e. a genuinely new dock cycle).
+        # cleared only when the dock cycle genuinely ends (CLEAR, or the
+        # re-arm above).
         latch.attempts += 1
         return FIRE
 
@@ -685,20 +769,127 @@ class ReminderState:
 # ── toast copy ───────────────────────────────────────────────────────────────
 
 TOAST_TITLE = "Implants still plugged in"
-_MAX_LISTED = 3
+
+#: A group-300 set member, e.g. "Mid-grade Amulet Delta". Read off the bundled
+#: SDE rather than assumed: all 330 category-20 group-300 types are exactly
+#: ``<High|Mid|Low>-grade <Family> <Greek>`` across 55 grade/family sets, with
+#: zero exceptions — so the set NAME the owner asked for ("Mid-grade Amulets")
+#: is derivable from the type name alone, with no extra table lookup and no
+#: hand-written list of set names to go stale when CCP adds one.
+#: ``test_the_every_set_family_in_the_bundle_parses_into_a_set_label`` is the
+#: drift guard against the SDE itself.
+_SET_NAME = re.compile(r"^(high|mid|low)-grade\s+(.+?)\s+"
+                       r"(alpha|beta|gamma|delta|epsilon|omega)$", re.IGNORECASE)
+
+#: The five "Cyber Learning" attribute families. Matched on the name because
+#: ``toast_body`` is handed NAMES only — it never sees the group ids ``classify``
+#: worked from. The quoted-infix strip below is what lets the two group-1730
+#: oddities ("Neural 'Source' Boost", "Cybernetic 'Source' Subprocessor") land
+#: in the same bucket as their plain siblings.
+_ATTRIBUTE_FAMILIES = ("ocular filter", "memory augmentation", "neural boost",
+                       "cybernetic subprocessor", "social adaptation chip")
+_QUOTED_INFIX = re.compile(r"'[^']*'")
+
+#: Plural pairs for the non-set buckets. Sets pluralise structurally instead
+#: ("Mid-grade Amulet" -> "Mid-grade Amulets").
+_BUCKET_NOUNS = {
+    "mindlink": ("Mindlink", "Mindlinks"),
+    "attribute": ("attribute implant", "attribute implants"),
+    "hardwiring": ("hardwiring", "hardwirings"),
+    "other": ("implant", "implants"),
+}
+_GRADE_RANK = {"high": 3, "mid": 2, "low": 1}
+
+
+def _set_of(name):
+    """``(Grade, Family)`` for a High-/Mid-/Low-grade set member, else None. Pure."""
+    m = _SET_NAME.match(str(name or "").strip())
+    if not m:
+        return None
+    return (m.group(1).capitalize(), m.group(2).strip())
+
+
+def _is_attribute_implant(name) -> bool:
+    plain = " ".join(_QUOTED_INFIX.sub(" ", str(name or "")).split()).casefold()
+    return any(fam in plain for fam in _ATTRIBUTE_FAMILIES)
+
+
+def _bucket_of(name) -> tuple:
+    """Which kind of thing this implant is, as a hashable bucket key. Pure.
+
+    Order matters: a set member is a set even though it has no code, and an
+    attribute implant must be claimed before the code-less fall-through so it
+    is not reported as a generic "implant"."""
+    grade_family = _set_of(name)
+    if grade_family:
+        return ("set",) + grade_family
+    text = str(name or "").strip()
+    if text.casefold().endswith("mindlink"):
+        return ("mindlink",)
+    if _is_attribute_implant(text):
+        return ("attribute",)
+    if grade_of(text) is not None:
+        return ("hardwiring",)
+    return ("other",)
+
+
+def _bucket_label(key: tuple, count: int) -> str:
+    if key[0] == "set":
+        return f"{key[1]}-grade {key[2]}" + ("s" if count > 1 else "")
+    one, many = _BUCKET_NOUNS[key[0]]
+    return f"{count} {one if count == 1 else many}"
 
 
 def toast_body(char_name: str, names) -> str:
-    """One-line body for the toast: who, and what is in their head.
+    """One-line body for the toast: who, and the SET most of it belongs to.
 
-    Lists at most three implants and summarises the rest, so a full set of ten
-    does not produce a wall of text over the client. Pure."""
-    listed = [str(n) for n in (names or ()) if str(n).strip()]
+    Owner ask, 2026-07-26: name the dominant set ("Mid-grade Amulets") rather
+    than listing implants. Listing three names plus "+7 more" was a wall of
+    text over the client and buried the one fact that matters — which pod
+    you are about to lose.
+
+    The rule, in order:
+
+    * nothing to report -> the plain "remember to unplug" nudge;
+    * exactly one implant -> name it outright (it is already short, and the
+      exact name is the useful thing for a lone Mindlink or a named rare);
+    * any High-/Mid-/Low-grade SET present -> the dominant set names the
+      toast, even when hardwirings outnumber it. A set is why this feature
+      exists; the count should not let five cheap hardwirings outvote a
+      Talisman set;
+    * otherwise -> the largest remaining bucket, counted rather than listed
+      ("4 hardwirings", "2 Mindlinks", "3 attribute implants", "6 implants").
+
+    Anything outside the named bucket is summarised as "+N more", so the copy
+    stays honest about how full the head is without listing it.
+
+    Tie-break, so the copy is stable for a given clone instead of dictionary
+    order: most members, then the higher grade (High > Mid > Low), then the one
+    that appears first in ``names`` (i.e. the pilot's own implant-slot order).
+
+    Pure."""
+    listed = [str(n).strip() for n in (names or ()) if str(n or "").strip()]
     who = str(char_name or "").strip() or "This character"
     if not listed:
         return f"{who} — remember to unplug before the next fleet."
-    head = ", ".join(listed[:_MAX_LISTED])
-    extra = len(listed) - _MAX_LISTED
+    if len(listed) == 1:
+        return f"{who} — {listed[0]}"
+
+    counts: dict = {}
+    first_seen: dict = {}
+    for index, name in enumerate(listed):
+        key = _bucket_of(name)
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, index)
+
+    sets = [k for k in counts if k[0] == "set"]
+    pool = sets or list(counts)
+    best = max(pool, key=lambda k: (counts[k],
+                                    _GRADE_RANK.get(k[1].casefold(), 0)
+                                    if k[0] == "set" else 0,
+                                    -first_seen[k]))
+    head = _bucket_label(best, counts[best])
+    extra = len(listed) - counts[best]
     if extra > 0:
         head = f"{head} +{extra} more"
     return f"{who} — {head}"
@@ -723,12 +914,15 @@ class ImplantReminder:
     ``observe`` is the only method the poller calls, and it never raises."""
 
     def __init__(self, config_provider, implants_provider, on_remind,
-                 resolve_system_name=None, table=None):
+                 resolve_system_name=None, table=None, clock=None):
         self._config_provider = config_provider
         self._implants_provider = implants_provider
         self._on_remind = on_remind
         self._resolve_system_name = resolve_system_name
         self._table = table                 # None -> lazily loaded from the SDE
+        # Monotonic source for the latch's blackout check. Injectable so the
+        # tests can run a poll timeline without sleeping; never wall clock.
+        self._clock = clock or time.monotonic
         self._state = ReminderState()
         self._lock = threading.Lock()       # guards snooze across Tk/poller
         # Last staging resolution announced to the log, as (kind, value, rung).
@@ -823,10 +1017,12 @@ class ImplantReminder:
             self._log_target_once(target)
             if not target.configured:
                 return CLEAR
-            staging = at_staging(dock_state(loc), target)
+            state = dock_state(loc)
+            staging = at_staging(state, target)
             with self._lock:
                 verb = self._state.observe(char_key, staging,
-                                           cfg.get("disabled_chars", ()))
+                                           cfg.get("disabled_chars", ()),
+                                           dock=state, now=self._clock())
             if verb != FIRE:
                 return verb
 
@@ -844,6 +1040,12 @@ class ImplantReminder:
             if not names:
                 return HOLD          # nothing worth pulling; stay latched
             self._last_names[str(char_key or "").strip().lower()] = list(names)
+            # One line per dock, not per poll. "It did not fire" was
+            # unfalsifiable while the only thing this module ever logged was
+            # the staging resolution; a fire that reached the toast layer must
+            # leave a trace. ASCII only -- this box's console is cp1252.
+            log.info("[implant] reminding %s: %d implant(s) worth pulling",
+                     char_key, len(names))
             self._on_remind(char_key, char_name, names)
             return FIRE
         except Exception:

@@ -17082,6 +17082,12 @@ class FCToolGUI:
                 self._implant_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
+                # The other way this feature can "not fire": the engine did its
+                # job and the toast had nowhere to sit. Silent before; the
+                # owner's 2026-07-26 report could not distinguish it from a
+                # missed dock edge. ASCII only (cp1252 console).
+                log.warning("[implant] no on-screen EVE client for %s - "
+                            "toast skipped", key)
                 return
             cfg = implant_reminder.normalize_config(
                 self.config.get("implant_reminder"))
