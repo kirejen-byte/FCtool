@@ -7086,6 +7086,57 @@ class FCToolGUI:
         )
         self._char_refresh_status.pack(side=tk.RIGHT, padx=10)
 
+        # ── "Save my implants" — the implant-removal reminder switch ─────────
+        # The feature itself lives in implant_reminder.py + client_toast.py and
+        # shipped config-only: config.json carries NO implant_reminder block at
+        # all (this app never deep-merges default_config into a loaded config),
+        # so before this box the only way to switch it on was hand-editing JSON.
+        # The status line under the tick is the POINT of the box, not decoration:
+        # a reminder resolving the wrong staging — or none — is otherwise a
+        # totally silent no-op, which is exactly how the wrong-staging bug in
+        # this feature stayed undiagnosable.
+        implant_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+                                 highlightbackground=BORDER_COLOR,
+                                 highlightthickness=1)
+        implant_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        self._implant_enabled_var = tk.BooleanVar(
+            value=self._implant_reminder_enabled())
+        tk.Checkbutton(
+            implant_frame, text="Save my implants",
+            variable=self._implant_enabled_var,
+            font=("Consolas", 10, "bold"), fg=FG_TEXT, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_YELLOW,
+            command=self._on_implant_reminder_toggle,
+        ).pack(side=tk.LEFT, padx=(10, 2), pady=5)
+
+        self._implant_help_icon = tk.Label(
+            implant_frame, text="ⓘ", font=("Consolas", 9, "bold"),
+            fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow")
+        self._implant_help_icon.pack(side=tk.LEFT, padx=(0, 12), pady=5)
+        attach_tooltip(
+            self._implant_help_icon,
+            "Pops a small toast over the EVE client when you dock in your "
+            "staging system with valuable implants still plugged in — the "
+            "\"pull them before the next fleet\" nudge. Left-click the toast to "
+            "dismiss it, right-click to silence that character for the "
+            "session.\n\n"
+            "Needs the esi-clones.read_implants.v1 scope: characters connected "
+            "before this existed must be re-authorised in Settings before it "
+            "can see what is in their head.\n\n"
+            "Counts as valuable: the named High-/Mid-/Low-grade sets (Snake, "
+            "Crystal, Amulet, Halo, Talisman, Asklepian, Ascendancy, …), "
+            "hardwirings of grade 5 and up, Mindlinks and the other named "
+            "rares, and +5 attribute implants. Ignored: boosters, cheap "
+            "hardwirings, and +1..+4 attribute implants.")
+
+        self._implant_staging_label = tk.Label(
+            implant_frame, text="", font=("Consolas", 9), fg=FG_DIM,
+            bg=BG_PANEL, anchor=tk.W)
+        self._implant_staging_label.pack(side=tk.LEFT, padx=(0, 10), pady=5)
+        self._refresh_implant_staging_label()
+
         # Filter bar
         filter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                 highlightbackground=BORDER_COLOR, highlightthickness=1)
@@ -7173,6 +7224,87 @@ class FCToolGUI:
         self._load_char_disk_cache()
         self._populate_character_panels()
 
+    # ── "Save my implants" box wiring (Characters tab) ──────────────────────
+    # Wiring only: every default, every coercion and the whole staging ladder
+    # belong to implant_reminder.py. Nothing here re-types a default value, so
+    # fc_gui cannot drift from the module that owns the shape.
+
+    def _implant_reminder_enabled(self) -> bool:
+        """Initial state of the "Save my implants" tick.
+
+        Tolerant by requirement, not by habit: config.json ships with NO
+        ``implant_reminder`` block at all, so "absent" is the ordinary case on an
+        existing install rather than an error — and a malformed or ``None`` block
+        must not raise either, because this runs inside the UNGUARDED Characters
+        tab builder, where anything thrown takes the whole tab down."""
+        try:
+            return bool(implant_reminder.normalize_config(
+                self.config.get("implant_reminder")).get("enabled"))
+        except Exception:
+            log.exception("[implant] could not read the reminder config")
+            return False
+
+    def _on_implant_reminder_toggle(self):
+        """Persist the tick immediately — no Save-Settings round trip (mirrors
+        _on_capital_alert_toggle / _save_intel_filter).
+
+        Creates the config block lazily on first use, seeded from
+        ``implant_reminder.DEFAULTS`` via ``normalize_config`` so every key is
+        present and sane without fc_gui naming a single default value. An
+        EXISTING block is otherwise left alone: only ``enabled`` is written.
+        Re-normalising a block the owner hand-edited would silently rewrite it
+        (a clamped toast_seconds, a downgraded match_mode), and the module is
+        explicit that its coercions are effective-only — the stored config is
+        not the engine's to rewrite."""
+        block = self.config.setdefault(
+            "implant_reminder", implant_reminder.normalize_config(None))
+        if not isinstance(block, dict):
+            block = implant_reminder.normalize_config(None)
+            self.config["implant_reminder"] = block
+        block["enabled"] = bool(self._implant_enabled_var.get())
+        self._save_config()
+
+    def _implant_staging_status(self):
+        """``(text, colour)`` for the staging status line under the tick.
+
+        Resolution goes through ``implant_reminder.resolve_staging`` — the single
+        source of truth for the override -> Settings > Staging System ladder —
+        never re-derived from config here. The name resolver is the OFFLINE
+        bundled-SDE lookup (``system_coords.resolve_name``), so this costs no
+        network call on the Tk thread."""
+        try:
+            cfg = implant_reminder.normalize_config(
+                self.config.get("implant_reminder"))
+            target = implant_reminder.resolve_staging(
+                self.config, system_coords.resolve_name,
+                cfg.get("staging_scope", "ladder"))
+        except Exception:
+            log.exception("[implant] staging resolution failed")
+            target = implant_reminder.StagingTarget()
+        if not target.configured:
+            return ("No staging system set — Settings > Staging System",
+                    FG_ORANGE)
+        # label is the human system name for both system rungs; a structure
+        # override has only an id. rung names the config key that won, so a
+        # surprising answer says WHERE it came from.
+        where = target.label or f"structure {target.value}"
+        return (f"Fires when you dock in {where} — {target.rung}", FG_DIM)
+
+    def _refresh_implant_staging_label(self):
+        """Re-render the staging status line from live config.
+
+        Cheap (one config read + an in-memory SDE lookup) and safe to call
+        before the tab exists, so it can ride the tab's own refresh path and
+        never go stale after a Settings > Staging System edit."""
+        label = getattr(self, "_implant_staging_label", None)
+        if label is None:
+            return
+        text, colour = self._implant_staging_status()
+        try:
+            label.config(text=text, fg=colour)
+        except tk.TclError:
+            pass
+
     def _populate_character_panels(self):
         """Build the character panels from scratch (static layout, no ESI calls)."""
         for w in self._char_tab_content.winfo_children():
@@ -7251,6 +7383,11 @@ class FCToolGUI:
         """Refresh all character panels with ESI data (runs in background).
         Skips if refreshed within the last 60 seconds unless force=True.
         force=True also bypasses the asset cache TTL so a full re-poll happens."""
+        # Main thread, ahead of every early return and the 60s cooldown: the
+        # "Save my implants" staging line must never survive a Settings >
+        # Staging System edit stale, and this is the one seam both the tab-show
+        # (_on_tab_changed) and the Refresh All button already run through.
+        self._refresh_implant_staging_label()
         if not self.esi_accounts:
             self._populate_character_panels()
             return
