@@ -6,6 +6,13 @@ EDGE_SNAP_MIN = 20          # EVE-O parity: max(20, w // 10)
 LOGIN_STACK_STEP = 24
 CLAMP_MIN_VISIBLE_PX = 40   # clamp_visible: min on-desktop overlap (both axes) to leave a rect alone
 SNAP_THRESHOLD_PX = 12      # snap_rect: max px gap at which an edge sticks to a neighbour's edge
+# clamp_size: the tile-size floor. THE single definition for the whole FCPreview
+# subsystem — preview_tile's drag paths and every fc_gui controller path both
+# read it from here. It used to live only in preview_tile, so the controller
+# (settings spinbox, per-char size map, saved layout rects) could drive a tile
+# to 0 px while the drag paths were correctly floored.
+MIN_TILE_W = 120            # min tile WIDTH in physical px
+MIN_TILE_BODY_H = 68        # min tile BODY height in physical px (strip is extra)
 
 
 def clamp_rect(rect, bounds):
@@ -38,6 +45,100 @@ def clamp_visible(x, y, w, h, bounds, min_px=CLAMP_MIN_VISIBLE_PX):
         return (x, y)
     cx, cy, _, _ = clamp_rect((x, y, w, h), bounds)
     return (cx, cy)
+
+
+def _floor_int(value, floor):
+    """`value` as an int, never below `floor`. Junk — None, "", NaN, inf, a
+    non-numeric string — resolves to `floor` rather than raising: this runs on
+    the config-load path, where a hand-edited or foreign value is exactly what
+    is being defended against. Shared by clamp_size and heal_preview_sizes so
+    they cannot drift apart."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return floor
+    return floor if v < floor else v
+
+
+def clamp_size(w, body_h, min_w=MIN_TILE_W, min_body_h=MIN_TILE_BODY_H):
+    """Floor a tile's (w, body_h) so it can never be shrunk into invisibility —
+    the SIZE companion to clamp_visible's POSITION guard.
+
+    `body_h` EXCLUDES the caption strip (preview_tile.STRIP_H), like every other
+    body_h in the subsystem, so the floor is a 120 x (68 + 20) = 120x88 window.
+    At that size the caption strip still renders ~11 glyphs of the pilot name
+    (120 px minus 39 px of dot/chip/exclusion reserve = 81 px, at ~7 px/glyph
+    for Consolas 9 bold) and leaves a 96 x 7 px band of strip outside the two
+    12 px corner-resize zones to left-drag by — right-drag-to-move works
+    anywhere on the tile — so a floored tile stays both identifiable and
+    grabbable. The whole window is also >= 2x clamp_visible's 40 px
+    "usably visible" threshold on both axes.
+
+    Idempotent: clamping an already-clamped pair is a no-op, so a value that
+    passes through two clamped paths is not clamped twice into something else.
+
+    Returns (w, body_h) as ints."""
+    return _floor_int(w, min_w), _floor_int(body_h, min_body_h)
+
+
+def heal_preview_sizes(cfg):
+    """Floor every PERSISTED tile size in a preview config dict, IN PLACE.
+
+    The self-heal companion to clamp_size, mirroring how clamp_visible's callers
+    rescue a stranded saved POSITION: a user whose config already carries a
+    sub-minimum size — hand-edited, or written by a build that did not enforce
+    the floor on the settings/import paths — must be rescued on next launch, not
+    left with an invisible tile they cannot grab in order to fix it.
+
+    Three size-bearing shapes, all optional:
+        cfg['tile_w'] / cfg['tile_body_h']            global size (scalars)
+        cfg['sizes'][key]   = [w, body_h]             per-character override
+        cfg['layouts'][key] = [x, y, w, body_h]       saved rect (x/y untouched)
+
+    Returns True IFF something actually changed, so the caller writes config
+    only on a real correction and never per tick. IDEMPOTENT — a second call on
+    a healed dict returns False and touches nothing (the fixpoint property the
+    clamp_visible write-back already relies on). An ABSENT global key is left
+    absent (the caller's own per-key defaulting owns it — healing a missing
+    tile_w to the floor would silently demote it from the 384 default). A
+    malformed entry is SKIPPED, not repaired: rewriting it here would hide a
+    real fault somewhere else.
+
+    Tk-free and Win32-free; mutates only the dict it is handed."""
+    if not isinstance(cfg, dict):
+        return False
+    changed = False
+    for key, floor in (("tile_w", MIN_TILE_W), ("tile_body_h", MIN_TILE_BODY_H)):
+        if key not in cfg:
+            continue
+        healed = _floor_int(cfg[key], floor)
+        if cfg[key] != healed:
+            cfg[key] = healed
+            changed = True
+    sizes = cfg.get("sizes")
+    if isinstance(sizes, dict):
+        for key, val in list(sizes.items()):
+            try:
+                w, body_h = int(val[0]), int(val[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            healed = clamp_size(w, body_h)
+            if healed != (w, body_h):
+                sizes[key] = [healed[0], healed[1]]
+                changed = True
+    layouts = cfg.get("layouts")
+    if isinstance(layouts, dict):
+        for key, val in list(layouts.items()):
+            try:
+                x, y = int(val[0]), int(val[1])
+                w, body_h = int(val[2]), int(val[3])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            healed = clamp_size(w, body_h)
+            if healed != (w, body_h):
+                layouts[key] = [x, y, healed[0], healed[1]]
+                changed = True
+    return changed
 
 
 def snap_to_grid(x, y, grid_w, grid_h):

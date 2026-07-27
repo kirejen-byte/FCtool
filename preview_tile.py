@@ -29,8 +29,14 @@ from dwm_thumbs import Thumbnail, aspect_fit
 STRIP_H = 20
 _MOVE_JITTER = 4          # left-release within this many px still counts as a click
 _CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
-_MIN_W = 120              # min tile width (physical px)
-_MIN_BODY_H = 68          # min body height (physical px); strip height is constant
+# Minimum tile geometry is OWNED BY preview_layout (preview_layout.clamp_size)
+# — one definition shared with the fc_gui controller paths, which resolve and
+# apply sizes this module never sees. Aliased under the historical private names
+# so existing call sites read the same; NEVER re-type the numbers here. Two
+# modules disagreeing about who owns the minimum is exactly how a controller
+# path came to drive a tile to 0 px wide while these drag paths stayed floored.
+_MIN_W = preview_layout.MIN_TILE_W            # min tile width (physical px)
+_MIN_BODY_H = preview_layout.MIN_TILE_BODY_H  # min body height; strip is extra
 
 # Tk diagonal-resize cursor names (Windows): NW/SE share one, NE/SW the other.
 _CORNER_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
@@ -780,8 +786,7 @@ class TileWindow:
             body_h = body0 - dy
         else:
             body_h = body0 + dy
-        w = max(_MIN_W, int(w))
-        body_h = max(_MIN_BODY_H, int(body_h))
+        w, body_h = preview_layout.clamp_size(w, body_h)
         ax, ay = self._corner_anchor
         # Left edge = anchor_x for E-anchored (ne/se) grabs; else anchor_x - w.
         x = ax if self._corner in ("ne", "se") else ax - w
@@ -845,8 +850,8 @@ class TileWindow:
         dx = event.x_root - self._press_root[0]
         dy = event.y_root - self._press_root[1]
         if self._mode == "resize":
-            w = max(_MIN_W, self._press_size[0] + dx)
-            body_h = max(_MIN_BODY_H, self._press_size[1] + dy)
+            w, body_h = preview_layout.clamp_size(self._press_size[0] + dx,
+                                                  self._press_size[1] + dy)
             self._w, self._body_h = w, body_h
             self._win32.set_window_pos(self._hwnd, self._press_pos[0],
                                        self._press_pos[1], w, body_h + STRIP_H)

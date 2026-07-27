@@ -15291,19 +15291,26 @@ class FCToolGUI:
         return bx, by, bw, bh
 
     def _preview_clamp_saved_rect(self, rect):
-        """Clamp a SAVED layout rect onto the currently visible desktop so a
-        restored tile never lands stranded on a disconnected/reconfigured
-        monitor (preventive companion to the "Reset previews" button). Shared
-        by every consumer that resolves a persisted position for placement —
+        """Clamp a SAVED layout rect back into usability — onto the currently
+        visible desktop so a restored tile never lands stranded on a
+        disconnected/reconfigured monitor (preventive companion to the "Reset
+        previews" button), AND up to the minimum tile size so a sub-minimum
+        stored w/body_h never spawns a tile too small to see or grab. Shared by
+        every consumer that resolves a persisted rect for placement —
         _preview_tile_rect's saved-layout branch (spawn) and
-        _preview_rekey_tile (retitle). Returns (clamped_rect, moved); `moved`
-        is True only when clamping actually changed (x, y), so callers gate a
-        config write-back + save on a real correction, not on every
-        placement — clamping is a rare recovery event, not a routine rewrite."""
+        _preview_rekey_tile (retitle).
+
+        Returns (clamped_rect, changed); `changed` is True only when clamping
+        actually altered the rect (position OR size), so callers gate a config
+        write-back + save on a real correction, not on every placement —
+        clamping is a rare recovery event, not a routine rewrite. The size is
+        floored FIRST because clamp_visible's fallback pins by the rect's own
+        w/h, so it must see the size the tile will really be."""
         x, y, w, h = rect
+        cw, ch = preview_layout.clamp_size(w, h)
         cx, cy = preview_layout.clamp_visible(
-            x, y, w, h, self._preview_virtual_bounds_xywh())
-        return (cx, cy, w, h), (cx, cy) != (x, y)
+            x, y, cw, ch, self._preview_virtual_bounds_xywh())
+        return (cx, cy, cw, ch), (cx, cy, cw, ch) != (x, y, w, h)
 
     def _preview_tile_rect(self, client, cfg):
         """Resolve (x, y, w, body_h) for a NEW tile: saved layout for the char,
@@ -15562,6 +15569,11 @@ class FCToolGUI:
         if tile is not None:
             w = getattr(tile, "_w", w) or w
             body_h = getattr(tile, "_body_h", body_h) or body_h
+        # Floor the size this write-back records. The move itself never changes
+        # the size, but the value here is sourced from a tile mirror OR the cfg
+        # fallback above, so flooring keeps the saved rect legal without adding
+        # a second write path (this remains the ONE move write-back).
+        w, body_h = preview_layout.clamp_size(w, body_h)
         cfg.setdefault("layouts", {})[key] = [int(x), int(y), int(w), int(body_h)]
         if hwnd is not None:
             self._preview_tile_rects[hwnd] = (int(x), int(y), int(w), int(body_h))
@@ -15592,15 +15604,23 @@ class FCToolGUI:
         """Resolve (w, body_h) for a char's tile. When uniform_size is True (EVE-O
         parity) every tile uses the GLOBAL tile_w/tile_body_h; when False, a
         per-char cfg['sizes'][key] override wins if present, else the global size.
-        Never mutates cfg."""
+        Never mutates cfg.
+
+        THE size choke-point: every consumer that turns config into a tile's
+        (w, body_h) — _preview_apply_tile_size's per-tick re-place, the spawn
+        path in _preview_tile_rect, the reset button's login re-stack — comes
+        through here, so flooring the result via preview_layout.clamp_size
+        (the ONE definition, shared with preview_tile's drag paths) is what
+        makes a sub-minimum stored size unable to reach a window. Clamping is
+        idempotent, so a value that is already legal is returned untouched."""
         gw = int(cfg.get("tile_w", 384))
         gh = int(cfg.get("tile_body_h", 216))
         if cfg.get("uniform_size", True):
-            return gw, gh
+            return preview_layout.clamp_size(gw, gh)
         override = (cfg.get("sizes", {}) or {}).get(key)
         if override and len(override) >= 2:
-            return int(override[0]), int(override[1])
-        return gw, gh
+            return preview_layout.clamp_size(override[0], override[1])
+        return preview_layout.clamp_size(gw, gh)
 
     def _preview_on_tile_resize_end(self, key, w, body_h):
         """Persist a finished tile resize (corner-hover OR the legacy Ctrl/L+R
@@ -15622,7 +15642,12 @@ class FCToolGUI:
         if not key:
             return
         cfg = self._preview_cfg()
-        w, body_h = int(w), int(body_h)
+        # Floor at the persistence boundary too. preview_tile's drag paths
+        # already clamp through the same preview_layout.clamp_size, so this is
+        # a no-op for a real gesture — but this method is the ONLY writer of
+        # cfg['sizes'] and a co-writer of cfg['tile_w'], and neither may ever
+        # receive a size a tile could not be seen at.
+        w, body_h = preview_layout.clamp_size(w, body_h)
         if cfg.get("uniform_size", True):
             cfg["tile_w"] = w
             cfg["tile_body_h"] = body_h
@@ -16599,6 +16624,18 @@ class FCToolGUI:
 
     def _preview_enable_native(self):
         self._preview_disabled_session = False
+        # SELF-HEAL: rescue any already-stored sub-minimum tile size before a
+        # single tile is spawned. Same shape as the clamp_visible write-back for
+        # stranded POSITIONS — the pure helper reports whether it corrected
+        # anything and we persist only then, so a healthy config is never
+        # rewritten (and the helper is a fixpoint, so this can only fire once).
+        # Boot, not tick: a user who cannot see or grab a tile also cannot fix
+        # it, so the rescue has to happen without them doing anything.
+        if preview_layout.heal_preview_sizes(self._preview_cfg()):
+            log.info("[preview] healed sub-minimum saved tile size(s) to the "
+                     "%dx%d floor", preview_layout.MIN_TILE_W,
+                     preview_layout.MIN_TILE_BODY_H)
+            self._save_config()
         # Native captions consume the SAME overlay.rules list as the Eve-O label
         # overlay — a native-only fresh user must get the seed rules too (same
         # condition _overlay_enable uses).
@@ -17946,6 +17983,14 @@ class FCToolGUI:
         mode = FCToolGUI._preview_dmg_mode_value(self)
         if mode is not None:
             _put("_preview_dmg_mode_var", "damage_flash_mode", mode)
+        # The "Tile w" Spinbox's from_=160 constrains its ARROWS only — Tk does
+        # not validate typed text — so the user can type 2 (or 0) and every tile
+        # is re-placed at that width on the next tick. Floor what actually gets
+        # STORED, using the same helper the boot-time heal uses. The widget's own
+        # text is deliberately left alone: this runs on <KeyRelease>, so
+        # rewriting the entry would fight someone typing "200" one digit at a
+        # time. The _put shadow keeps the raw var value, so nothing oscillates.
+        preview_layout.heal_preview_sizes(cfg)
         self._save_config()
 
     def _preview_apply_dmg_mode_visibility(self):
@@ -18011,8 +18056,11 @@ class FCToolGUI:
         if not ordered_live:
             return
         cfg = self._preview_cfg()
-        tile_w = int(cfg.get("tile_w", 384))
-        body_h = int(cfg.get("tile_body_h", 216))
+        # Arrange always uses the GLOBAL size (not _preview_resolve_size, which
+        # is per-key), so it needs its own floor — otherwise a sub-minimum
+        # global would be stamped into every char's saved layout rect.
+        tile_w, body_h = preview_layout.clamp_size(cfg.get("tile_w", 384),
+                                                   cfg.get("tile_body_h", 216))
         # C5: arrange across the full virtual desktop (all monitors), not just
         # the primary screen. _virtual_screen_bounds() wraps the SM_*VIRTUALSCREEN
         # GetSystemMetrics (read-only) and falls back to Tk's primary screen.
@@ -18248,8 +18296,10 @@ class FCToolGUI:
         overwrites an existing FCTool layout/hotkey/cycle entry (the whole point
         of a one-time import). Returns a small {added_*: n} summary."""
         cfg = self._preview_cfg()
-        tile_w = int(cfg.get("tile_w", 384))
-        body_h = int(cfg.get("tile_body_h", 216))
+        # Imported EVE-O entries carry a position only; the size comes from the
+        # global keys, so floor it (same reason as _preview_arrange_ordered).
+        tile_w, body_h = preview_layout.clamp_size(cfg.get("tile_w", 384),
+                                                   cfg.get("tile_body_h", 216))
         layouts = cfg.setdefault("layouts", {})
         added_layouts = 0
         for key, (x, y) in parsed["layouts"].items():
