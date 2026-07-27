@@ -19,7 +19,35 @@ DEFENDER_TAG = "Defenders"
 
 # Composition roles resolved per-fit, in priority order. "Defenders" is NOT here —
 # it is an additive fleet-wide overlay (see compute_fleet_guidance).
-COMPOSITION_ROLE_ORDER = ("DPS", "Logi", "Links", "Webs", "Tackle")
+#
+# _composition_role is FIRST-MATCH-WINS, so a new role must be APPENDED: inserting
+# one earlier silently re-classifies existing multi-tagged fits (an EWAR+Tackle
+# Lachesis would flip from Tackle to EWAR). Appending is purely additive — only
+# fits that currently resolve to None can change. Every deliberate omission is
+# named with its reason in NON_COMPOSITION_TAGS below.
+COMPOSITION_ROLE_ORDER = ("DPS", "Logi", "Links", "Webs", "Tackle", "EWAR")
+
+# Tags in the default vocabulary that are deliberately NOT composition roles,
+# mapped to why. Together with COMPOSITION_ROLE_ORDER this must account for every
+# tag in fit_models.DEFAULT_TAGS; the drift guard
+# tests/test_fleet_guidance.py::test_default_tags_are_all_roles_or_documented_exclusions
+# fails when a new default tag belongs to neither set. (This bug class has shipped
+# three times — MOTD tag lines, then the MOTD palette, then EWAR ideals silently
+# resolving to None — always a hardcoded subset of DEFAULT_TAGS.)
+NON_COMPOSITION_TAGS: dict[str, str] = {
+    "Defenders": (
+        "an additive fleet-wide overlay, not a composition role: every "
+        "Defenders-tagged hull counts toward one flat fleet target regardless of "
+        "the role it also carries (see _defenders_overlay)."
+    ),
+    "Special": (
+        "the vocabulary's catch-all bucket for miscellaneous hulls. Composition "
+        "ideals are ROLE-level (one target over the SUM of the role's hulls), so "
+        "making the catch-all a role would let an ideal set for one odd hull "
+        "silently govern every other odd hull tagged Special. Tag such a fit with "
+        "a real role, or set its ideal there."
+    ),
+}
 
 # ── Ideal-% exemptions ───────────────────────────────────────────────────────
 # Ships exempted by default from the fleet-% denominator (they inflate the fleet
