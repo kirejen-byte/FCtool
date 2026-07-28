@@ -5567,6 +5567,13 @@ class FCToolGUI:
     def _esi_set_primary(self, acct: ESIAuth):
         """Set a character as the primary ESI account."""
         self.esi_auth = acct
+        # Stale-location guard: _own_location_sid/_mono are stamped for
+        # whichever character WAS self.esi_auth by _refresh_current_system's
+        # 15 s poll (see _range_check_own_location). Left uncleared here, the
+        # old primary's system id would be reported as the NEW primary's for
+        # up to _OVERLAY_STALE_SECS, until the next poll re-stamps the pair.
+        self._own_location_sid = None
+        self._own_location_mono = 0.0
         # Persist so the choice survives app restarts
         if acct.character_id:
             self.config["primary_character_id"] = acct.character_id
@@ -5683,6 +5690,11 @@ class FCToolGUI:
             self.esi_accounts.remove(acct)
         if self.esi_auth is acct:
             self.esi_auth = self.esi_accounts[0] if self.esi_accounts else None
+            # Stale-location guard -- see _esi_set_primary. The departing
+            # primary's stamped system must not be attributed to whatever
+            # esi_auth is now (another account, or None).
+            self._own_location_sid = None
+            self._own_location_mono = 0.0
             # Persist the new primary choice
             if self.esi_auth and self.esi_auth.character_id:
                 self.config["primary_character_id"] = self.esi_auth.character_id
@@ -15077,9 +15089,9 @@ class FCToolGUI:
             "message replaces the staging list for that check.\n\n"
             "NEEDS FCPreview or the Eve-O overlay for full coverage: only "
             "those poll every logged-in character's location. With previews "
-            "OFF (the default) just the tracked character's own location is "
-            "known, so a check typed by any other character answers "
-            "\"Location unknown\" instead of a range table.\n\n"
+            "OFF (the default) just the signed-in PRIMARY character's own "
+            "location is known, so a check typed by any other character "
+            "answers \"Location unknown\" instead of a range table.\n\n"
             "A BLANK keyword below also switches it off — a ticked box over an "
             "empty keyword field matches nothing and does nothing.")
 
@@ -17545,9 +17557,10 @@ class FCToolGUI:
 
         build_report calls the distance function once per source row, and
         calculate_ly_distance falls back to an ESI universe lookup for any
-        system missing from the bundled coordinate table (wormholes, Pochven,
-        Zarzakh). That lookup caches SUCCESSES only -- there is no negative
-        cache -- so an off-table system plus an unreachable ESI costs a fresh
+        system missing from the bundled coordinate table (J-space wormholes
+        -- Pochven and Zarzakh ARE covered). That lookup caches SUCCESSES
+        only -- there is no negative cache -- so an off-table system plus an
+        unreachable ESI costs a fresh
         10 s timeout on EVERY call. The chat poll is serial, so five sources
         meant ~50 s during which the following fleet lines (x-ups!) waited.
 
