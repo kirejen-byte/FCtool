@@ -28,6 +28,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from collections import OrderedDict
 from dataclasses import dataclass
+from tkinter import ttk
 from typing import Callable
 
 from ui_helpers import attach_tooltip
@@ -835,6 +836,23 @@ _DRAG_END_PHASES = ("drop", "cancel")
 #: already-drawn window.
 _APP_FOCUS_SETTLE_MS = 200
 
+#: Fraction of the USABLE screen height (``_screen_edges``) the dropdown may
+#: occupy before its body starts scrolling. The owner report was "the dropdown
+#: covers the entire screen": a zero-state can run ~18 item rows + 5 "+N more"
+#: rows, and an ``action:more`` click uncaps a group to its provider's FULL list
+#: — so content height is unbounded by construction and MUST be clamped here.
+_MAX_HEIGHT_FRACTION = 0.45
+
+#: Absolute floor (px) for that clamp so a short work area (or an anchor near
+#: the bottom edge) still leaves a few usable rows rather than a sliver. Never
+#: allowed to exceed the usable height itself.
+_MIN_DROPDOWN_HEIGHT = 140
+
+#: The 1 px inset the body carries on every side — it is what makes the
+#: Toplevel's ``BORDER_COLOR`` background read as a hairline border. Counted
+#: twice (top + bottom) when converting a Toplevel height cap into a body cap.
+_DD_BORDER_PAD = 1
+
 #: Dim placeholder text shown in the search bar when it is EMPTY and
 #: UNFOCUSED (classic Tk Entry placeholder). It is real Entry content, but
 #: every query consumer reads through :meth:`MotdPalette._entry_text`, which
@@ -866,6 +884,11 @@ class MotdPalette(tk.Frame):
 
         # dropdown state ---------------------------------------------------- #
         self._dd = None          # the Toplevel
+        self._dd_host = None      # scroll host (canvas + scrollbar), per render
+        self._dd_canvas = None    # the scrolling viewport
+        self._dd_scroll = None    # its vertical scrollbar (packed only if needed)
+        self._dd_window = None    # the canvas window-item id holding _dd_body
+        self._dd_scrollable = False   # True once the body outgrew the cap
         self._dd_body = None      # the container Frame rebuilt each render
         self._mode = "bar"
         self._caret_mode = False
@@ -980,6 +1003,11 @@ class MotdPalette(tk.Frame):
                 pass
         self._dd = None
         self._dd_topmost = None
+        self._dd_host = None
+        self._dd_canvas = None
+        self._dd_scroll = None
+        self._dd_window = None
+        self._dd_scrollable = False
         self._dd_body = None
         self._nav = []
         self._rendered = []
@@ -1174,6 +1202,19 @@ class MotdPalette(tk.Frame):
         self._dd.configure(bg=BORDER_COLOR)
         self._dd.bind("<FocusOut>", self._on_dropdown_focus_out, add="+")
         self._dd.bind("<FocusIn>", self._on_dropdown_focus_in, add="+")
+        # Wheel scrolling for the capped body. Bound on THIS Toplevel (and, in
+        # _build_rows, on the canvas + body themselves) and nowhere else — the
+        # app's global canvas router lives in fc_gui and this module is
+        # fc_gui-free by design. The Toplevel binding is what reaches the rows:
+        # every row widget is a plain tk.Frame / tk.Label, and NEITHER carries a
+        # <MouseWheel> CLASS binding, so the toplevel bindtag (index 2) is
+        # reached unopposed. Were a row ever rebuilt out of a ttk widget — or a
+        # Text/Listbox/Treeview — its class binding at index 1 would win and it
+        # would need its own WIDGET-level binding, the only tag that precedes a
+        # class tag. Vertical only, deliberately: the body has no horizontal
+        # scroll, so <Shift-MouseWheel> is left entirely alone rather than being
+        # swallowed by a modifier-subset match.
+        self._dd.bind("<MouseWheel>", self._on_body_wheel, add="+")
 
     # -- topmost banding (never outrank other applications) ---------------- #
     def _apply_topmost(self, want: bool) -> None:
@@ -1433,15 +1474,60 @@ class MotdPalette(tk.Frame):
     # ==================================================================== #
     # row building + selection                                             #
     # ==================================================================== #
+    def _build_scroll_host(self) -> tk.Frame:
+        """(Re)create the dropdown's scroll host and return the rows' parent.
+
+        Layout is the house Canvas + window-item + Scrollbar pattern
+        (``market_gap_dialog`` / ``fc_gui``'s scrolled panels)::
+
+            _dd (Toplevel, BORDER_COLOR bg)
+              └ _dd_host  Frame, 1 px inset -> the hairline border
+                  ├ _dd_canvas  Canvas  (viewport; EXPLICIT width/height)
+                  │    └ window item -> _dd_body  Frame  (the rows)
+                  └ _dd_scroll  ttk.Scrollbar (packed ONLY past the cap)
+
+        Three Tk traps are designed around rather than worked around:
+
+        * a default ``tk.Canvas`` requests **10c x 7c** — a fat, content-blind
+          size that would set the dropdown's floor. Both axes are therefore set
+          explicitly here and re-set from the measured content in
+          :meth:`_fit_body`;
+        * an out-of-view canvas window item is **UNMAPPED, not resized**, so its
+          ``<Configure>`` never fires — nothing here depends on one. The
+          scrollregion and the item's width/height are computed from
+          ``winfo_req*`` and pushed imperatively;
+        * changing ``-scrollregion`` **never re-clamps the view** — see the
+          explicit ``yview_moveto`` in :meth:`_fit_body`.
+        """
+        host = tk.Frame(self._dd, bg=BG_PANEL)
+        host.pack(fill=tk.BOTH, expand=True,
+                  padx=_DD_BORDER_PAD, pady=_DD_BORDER_PAD)
+        canvas = tk.Canvas(host, bg=BG_PANEL, highlightthickness=0,
+                           borderwidth=0, width=1, height=1)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(host, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        body = tk.Frame(canvas, bg=BG_PANEL)
+        window = canvas.create_window((0, 0), window=body, anchor="nw")
+        # Widget-level wheel bindings for the two containers the pointer can sit
+        # over between rows (defence in depth beside the Toplevel binding).
+        canvas.bind("<MouseWheel>", self._on_body_wheel, add="+")
+        body.bind("<MouseWheel>", self._on_body_wheel, add="+")
+        self._dd_host = host
+        self._dd_canvas = canvas
+        self._dd_scroll = scroll
+        self._dd_window = window
+        self._dd_body = body
+        self._dd_scrollable = False
+        return body
+
     def _build_rows(self, sliced: list) -> None:
-        if self._dd_body is not None:
+        if self._dd_host is not None:
             try:
-                self._dd_body.destroy()
+                self._dd_host.destroy()
             except tk.TclError:
                 pass
-        body = tk.Frame(self._dd, bg=BG_PANEL)
-        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-        self._dd_body = body
+        body = self._build_scroll_host()
         self._nav = []
         self._rendered = []
         self._rendered_counts = {}
@@ -1631,6 +1717,7 @@ class MotdPalette(tk.Frame):
         if self._nav:
             self._sel = (self._sel + delta) % len(self._nav)
             self._restyle_selection()
+            self._scroll_selection_into_view()
         return "break"
 
     def _restyle_selection(self) -> None:
@@ -1708,6 +1795,168 @@ class MotdPalette(tk.Frame):
         y1 = y0 + self.winfo_vrootheight()
         return (x0, y0, x1, y1)
 
+    # -- height cap + scrolling body --------------------------------------- #
+    def _max_dropdown_height(self, top_ref=None, y_below=None) -> int:
+        """The tallest the dropdown TOPLEVEL may be, in px.
+
+        ``min(_MAX_HEIGHT_FRACTION of the usable screen height, the room the
+        anchor actually leaves)`` — where "room" is the better of below the
+        anchor and above it, because :meth:`_position_dropdown` will flip the
+        menu above when below does not fit. Floored at
+        ``min(_MIN_DROPDOWN_HEIGHT, usable)`` so a cramped anchor still yields a
+        few readable rows instead of a sliver, and never exceeds the usable
+        height itself.
+
+        ``top_ref`` / ``y_below`` default to the bar-mode anchor so the method is
+        callable (and testable) without a live dropdown."""
+        x0, y0, x1, y1 = self._screen_edges()
+        usable = max(1, y1 - y0)
+        if top_ref is None or y_below is None:
+            top_ref = self.entry.winfo_rooty()
+            y_below = top_ref + self.entry.winfo_height()
+        cap = int(usable * _MAX_HEIGHT_FRACTION)
+        room = max(y1 - y_below, top_ref - y0)
+        if room > 0:
+            cap = min(cap, room)
+        return max(1, min(usable, max(cap, min(_MIN_DROPDOWN_HEIGHT, usable))))
+
+    def _fit_body(self, max_height: int) -> None:
+        """Size the viewport to the rows, clamped to ``max_height`` (a TOPLEVEL
+        height), showing the scrollbar only once the rows outgrow it.
+
+        Under the cap this is byte-for-byte the old behaviour: the canvas takes
+        the body's exact requested size, no scrollbar is packed, and the
+        Toplevel's natural size is content height + the 1 px inset — so a small
+        result set renders exactly as it did before the cap existed."""
+        body, canvas = self._dd_body, self._dd_canvas
+        if body is None or canvas is None:
+            return
+        try:
+            body.update_idletasks()
+            req_h = max(1, body.winfo_reqheight())
+            req_w = max(1, body.winfo_reqwidth())
+            cap = max(1, int(max_height) - 2 * _DD_BORDER_PAD)
+            need = req_h > cap
+            if need and not self._dd_scrollable:
+                self._dd_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            elif not need and self._dd_scrollable:
+                self._dd_scroll.pack_forget()
+            self._dd_scrollable = need
+            canvas.configure(width=req_w, height=(cap if need else req_h),
+                             scrollregion=(0, 0, req_w, req_h))
+            # The window item is sized IMPERATIVELY: an out-of-view canvas
+            # window is unmapped rather than resized, so its <Configure> never
+            # fires and a binding-driven sync would silently never run.
+            canvas.itemconfigure(self._dd_window, width=req_w, height=req_h)
+            # Changing -scrollregion does NOT re-clamp the current view: a
+            # re-render that shrinks the body would otherwise leave the canvas
+            # parked past the new content, showing blank space. Park at the top.
+            canvas.yview_moveto(0.0)
+        except tk.TclError:
+            pass
+
+    def _scroll_selection_into_view(self) -> None:
+        """Keep the keyboard selection visible inside the capped body.
+
+        A no-op while the body fits (nothing scrolls) or when the selected row
+        is already fully within the viewport; otherwise the view moves the
+        minimum distance that brings the row's top (scrolling up) or bottom
+        (scrolling down) into it.
+
+        Selecting the FIRST row parks the view at the very top rather than at
+        that row's own y: everything above it is its group header, and a
+        selection sitting under a clipped header reads as a scroll bug (this is
+        the wrap-around case — Down from the last row returns to row 0)."""
+        canvas = self._dd_canvas
+        if canvas is None or not self._dd_scrollable:
+            return
+        if not (0 <= self._sel < len(self._nav)):
+            return
+        if self._sel == 0:
+            try:
+                canvas.yview_moveto(0.0)
+            except tk.TclError:
+                pass
+            return
+        frame = self._nav[self._sel].get("frame")
+        if frame is None:
+            return
+        try:
+            canvas.update_idletasks()
+            top = frame.winfo_y()               # body coords == canvas coords
+            row_h = max(1, frame.winfo_height())
+            view_h = max(1, canvas.winfo_height())
+            total = max(1, self._dd_body.winfo_reqheight())
+            if total <= view_h:
+                return
+            cur = canvas.canvasy(0)
+            if top < cur:
+                new = top
+            elif top + row_h > cur + view_h:
+                new = top + row_h - view_h
+            else:
+                return
+            new = max(0, min(new, total - view_h))
+            canvas.yview_moveto(new / float(total))
+        except (tk.TclError, ZeroDivisionError):
+            pass
+
+    def _wheel_targets_body(self, event) -> bool:
+        """True when a ``<MouseWheel>`` gesture belongs to this dropdown.
+
+        The POINTER decides, not the focus: whether Windows routes a real
+        ``WM_MOUSEWHEEL`` by focus or by cursor is an open question in this
+        codebase, and the dropdown is frequently open while the SEARCH BAR holds
+        the focus — so a focus-only rule would scroll the wrong thing under one
+        answer and nothing at all under the other. ``winfo_containing`` returns
+        the deepest widget, hence the walk up the ``master`` chain. It reports
+        None when the pointer is over no window of this application (or cannot
+        be resolved); only then does the event's own widget stand in, which is
+        exactly the synthetic-event case."""
+        dd = self._dd
+        if dd is None:
+            return False
+        w = None
+        try:
+            w = dd.winfo_containing(int(getattr(event, "x_root", 0)),
+                                    int(getattr(event, "y_root", 0)))
+        except (tk.TclError, TypeError, ValueError):
+            w = None
+        if w is None:
+            w = getattr(event, "widget", None)
+        while w is not None:
+            if w is dd:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _on_body_wheel(self, event=None):
+        """Scroll the capped body under the pointer; suppress anything else.
+
+        Returns ``"break"`` whenever the gesture was aimed at the dropdown —
+        including when there is nothing to scroll — so a wheel over the menu can
+        never fall through and scroll the composer underneath it. A gesture
+        aimed elsewhere returns None and is left entirely alone."""
+        canvas = self._dd_canvas
+        if canvas is None or event is None:
+            return None
+        if not self._wheel_targets_body(event):
+            return None
+        if not self._dd_scrollable:
+            return "break"                  # over the menu, nothing to scroll
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+        except (TypeError, ValueError):
+            delta = 0
+        if not delta:
+            return "break"
+        amount = -int(delta / 120) or (-1 if delta > 0 else 1)
+        try:
+            canvas.yview_scroll(amount, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
     def _position_dropdown(self) -> None:
         if self._dd is None:
             return
@@ -1719,20 +1968,24 @@ class MotdPalette(tk.Frame):
                 x = self.entry.winfo_rootx()
                 top_ref = self.entry.winfo_rooty()
                 y = top_ref + self.entry.winfo_height()
+            x0, y0, x1, y1 = self._screen_edges()
+            # Clamp the CONTENT before measuring: past the cap the body scrolls
+            # rather than growing, so the natural size read below is already
+            # bounded and the flip/clamp math works on a height that fits.
+            self._fit_body(self._max_dropdown_height(top_ref, y))
             w = max(self.entry.winfo_width(), 360)
             self._dd.geometry(f"{w}x1+{int(x)}+{int(y)}")
             self._dd.update_idletasks()
-            self._dd.geometry("")          # let it size to content
+            self._dd.geometry("")          # let it size to (capped) content
             self._dd.update_idletasks()    # flush the natural size before clamping
             width = self._dd.winfo_width()
             height = self._dd.winfo_height()
-            x0, y0, x1, y1 = self._screen_edges()
             # Flip above the anchor when it would otherwise run off the bottom
             # of the screen AND flipping actually fits above — a growing
             # zero-state (Roles + the raised Lines & blocks cap) can now run
-            # ~18 item rows + up to 5 "+N more" rows deep with no clamp at all
-            # (pre-existing gap this newly exercises). Falls through to the
-            # position clamp below when there is no room in either direction.
+            # ~18 item rows + up to 5 "+N more" rows deep, and an action:more
+            # click uncaps a group to its provider's FULL list. Falls through to
+            # the position clamp below when there is no room in either direction.
             if y + height > y1 and top_ref - height >= y0:
                 y = top_ref - height
             x = max(x0, min(x, x1 - width))
