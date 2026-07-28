@@ -10821,7 +10821,19 @@ class FCToolGUI:
 
         The combined pool is deduped case-insensitively, first occurrence
         wins, so recents keep their position ahead of cached_discovered and
-        cached_discovered keeps its position ahead of the on-disk pool."""
+        cached_discovered keeps its position ahead of the on-disk pool.
+
+        The result is HARD-CAPPED at 20 matches, exactly as
+        :meth:`_motd_palette_systems` and :meth:`_motd_palette_library_fits`
+        cap theirs. This is load-bearing, not tidiness: the palette's
+        ``+N more…`` row (``motd_palette._apply_expansions``) uncaps a group to
+        its FULL provider list, and the dropdown body is a plain Frame with no
+        scrollbar and no height clamp. Measured against the owner's real
+        all-time pool (1,073 channels), typing ``ch`` matched 911, and one
+        click on ``+907 more…`` froze the GUI for 12.9s to build a 21,913px
+        dropdown of which ~45 rows fit on screen — ~867 rows unreachable. The
+        cap is applied AFTER the recents-first ordering above, so the rows that
+        survive it are the most relevant ones."""
         q = (query or "").lower()
         recent_names = []
         for tok in (self.config.get("fittings", {})
@@ -10851,6 +10863,8 @@ class FCToolGUI:
             out.append(motd_palette.PaletteItem(
                 kind="channel", params={"name": name},
                 label=name, meta="", group="Channels"))
+            if len(out) >= 20:
+                break
         return out
 
     def _motd_disk_channel_names(self):
