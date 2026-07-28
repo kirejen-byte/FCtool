@@ -959,9 +959,13 @@ class FCToolGUI:
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
         self._implant_toast = None             # the single live ClientToast, if any
         # ── Fleet-chat range check (default OFF; see range_check.py) ─────────
-        # ONE trigger for the whole app: its per-sender cooldown is what absorbs
-        # the same fleet line arriving once per tailed log file (one per
-        # logged-in character), so a second instance would defeat it.
+        # ONE trigger for the whole app so its per-sender cooldown outlives the
+        # line that created it -- a per-call trigger would forget every stamp
+        # and the cooldown would be a no-op. The cooldown is for a genuinely
+        # REPEATED keyword: ChatMonitor already drops duplicate
+        # (channel, ts, sender, body-hash) messages inside _poll_once, BEFORE
+        # the callback, so one fleet line reaches _on_chat_message once however
+        # many character logs are being tailed.
         self._range_check_trigger = None       # RangeCheckTrigger (lazy, gated on config)
         self._range_check_toast = None         # the single live RangeToast, if any
         self._range_check_no_client = set()    # keys already logged as off-screen
@@ -15070,7 +15074,14 @@ class FCToolGUI:
             "systems are in Titan and Capital jump range of them (JDC 5).\n\n"
             "Only YOUR OWN logged-in characters can trigger it — a fleet "
             "member saying the keyword is ignored. Naming systems in the "
-            "message replaces the staging list for that check.")
+            "message replaces the staging list for that check.\n\n"
+            "NEEDS FCPreview or the Eve-O overlay for full coverage: only "
+            "those poll every logged-in character's location. With previews "
+            "OFF (the default) just the tracked character's own location is "
+            "known, so a check typed by any other character answers "
+            "\"Location unknown\" instead of a range table.\n\n"
+            "A BLANK keyword below also switches it off — a ticked box over an "
+            "empty keyword field matches nothing and does nothing.")
 
         rc_kw_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         rc_kw_frame.pack(fill=tk.X, padx=20, pady=2)
@@ -15085,6 +15096,14 @@ class FCToolGUI:
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, width=40, borderwidth=1, relief=tk.RIDGE)
         self._range_check_keyword_entry.pack(side=tk.LEFT, padx=5)
+        # The dim tell for the OTHER off switch. A ticked box over a blank
+        # keyword is a dead feature and the checkbox cannot show that; the
+        # keyword tooltip says so but a tooltip has to be hovered to be read.
+        # Same idiom as the "(blank = all accounts)" hint further up this tab.
+        self._range_check_hint = tk.Label(
+            rc_kw_frame, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
+        self._range_check_hint.pack(side=tk.LEFT, padx=5)
+        self._refresh_range_check_hint()
         # Autosave on leaving the field / pressing Enter, the same instant-apply
         # the Staging System entry uses (_autosave_staging_system). Save Settings
         # collects it too, so a value still being typed is never lost.
@@ -17334,12 +17353,10 @@ class FCToolGUI:
         Runs on the chat poll thread (see _chat_poll_loop) and touches no Tk --
         only the finished report and the client rect cross to the main thread,
         via the dispatcher queue. That split is load-bearing rather than
-        stylistic: build_report's distance function is
-        jump_range.calculate_ly_distance, which falls back to an ESI
-        get_system_info for any system missing from the bundled coordinate table
-        (wormholes, Pochven, Zarzakh), so it can block on the network. Doing that
-        work here costs a delayed chat poll; doing it on the Tk thread would
-        freeze the whole app.
+        stylistic: the distance function can block on the network for a system
+        missing from the bundled coordinate table (see
+        _range_check_distance_fn). Doing that work here costs a delayed chat
+        poll; doing it on the Tk thread would freeze the whole app.
 
         Rides the EXISTING fleet tail -- self.chat_monitor, already filtered to
         the fleet channel by channel_filter -- rather than a second ChatMonitor
@@ -17353,19 +17370,25 @@ class FCToolGUI:
            the Settings tick reads. Nothing here re-derives it: an independently
            derived gate is how the implant reminder once shipped a ticked box
            over a feature that could not fire.
-        2. The keyword. Checked here as a pre-filter and again inside
+        2. The keyword, as a pre-filter (it is checked again inside
            trigger.consider -- the same pure function on the same two values, so
-           the two cannot disagree; it exists only so an ORDINARY chat line
-           never pays for the client-window read below. One fleet message
-           arrives once per tailed log file, i.e. once per logged-in character,
-           so an ungated read would run N times per line.
-        3. The trigger, which owns the own-character gate AND the per-sender
-           cooldown. The cooldown is what collapses those N duplicate deliveries
-           into ONE toast, so the single shared instance in __init__ is part of
-           the design, not a cache.
-        4. An on-screen client for the sender. Checked BEFORE the distances are
-           computed: with nowhere to put the window there is no point paying for
-           the answer, and a toast over an unrelated window is worse than none.
+           the two cannot disagree). It exists so an ORDINARY chat line never
+           pays for the client-window read below, which on a previews-off box --
+           the default -- is a full window enumeration.
+        3. The sender must own one of those client windows. That list is the
+           own-character gate AND the source of the toast's rect, so the two can
+           never disagree about who counts.
+        4. That window must not be minimized: with nowhere to put the toast
+           there is no point paying for the distances, and a toast over an
+           unrelated window is worse than none.
+        5. The trigger, which owns the per-sender cooldown and stamps it.
+           Consulted LAST, deliberately: stamping before gate 4 meant a line
+           skipped for a minimized client burned the cooldown, so restoring the
+           client and retyping inside the window did nothing at all. The
+           cooldown is for a genuinely REPEATED keyword -- ChatMonitor already
+           drops duplicate (channel, ts, sender, body-hash) messages inside
+           _poll_once, so one fleet line arrives here once however many
+           character logs are being tailed.
 
         Never raises into the poll loop."""
         try:
@@ -17377,6 +17400,21 @@ class FCToolGUI:
             body = getattr(msg, "message", "") or ""
             if not range_check.matches_keyword(body, keyword):
                 return
+            key = range_check.own_key(sender)
+            clients = {c.key: c for c in self._range_check_clients(key) if c.key}
+            client = clients.get(key)
+            if client is None:
+                return          # not one of the owner's characters: no-op
+            if client.is_iconic:
+                # The one way every gate passes and nothing appears: the sender
+                # is ours and their window is minimized, so the toast has
+                # nowhere to sit. Once per character, so a repeat cannot spam
+                # the log. ASCII only -- this box's console is cp1252.
+                if key not in self._range_check_no_client:
+                    self._range_check_no_client.add(key)
+                    log.warning("[range] no on-screen EVE client for %s - "
+                                "range check skipped", key)
+                return
             trigger = self._range_check_trigger
             if trigger is None:
                 trigger = self._range_check_trigger = \
@@ -17385,62 +17423,66 @@ class FCToolGUI:
             # a long-lived trigger. Re-point it rather than rebuilding: a fresh
             # trigger would drop every cooldown stamp with it.
             trigger.keyword = keyword
-            clients = {c.key: c for c in self._range_check_clients() if c.key}
             if not trigger.consider(sender, body, clients.keys()):
-                return
-            key = range_check.own_key(sender)
-            client = clients.get(key)
-            rect = None
-            if client is not None and not client.is_iconic:
-                rect = tuple(client.rect)
-            if rect is None:
-                # The other way this feature can "not fire": every gate passed
-                # and the toast had nowhere to sit (client minimized, or the
-                # sender is one of ours but that window has gone). Once per
-                # character, so a repeat cannot spam the log. ASCII only -- this
-                # box's console is cp1252.
-                if key not in self._range_check_no_client:
-                    self._range_check_no_client.add(key)
-                    log.warning("[range] no on-screen EVE client for %s - "
-                                "range check skipped", key)
                 return
             report = range_check.build_report(
                 self._range_check_target(key),
                 range_check.extract_systems(body),
                 sources=range_check.resolve_sources(self.config),
-                distance_fn=jump_range.calculate_ly_distance)
-            self._post_ui(self._range_check_show_toast, report, rect)
+                distance_fn=self._range_check_distance_fn())
+            self._post_ui(self._range_check_show_toast, report,
+                          tuple(client.rect))
         except Exception:
             log.exception("[range] chat hook failed")
 
-    def _range_check_clients(self):
+    def _range_check_clients(self, key=None):
         """Live EVE client windows -- the source of BOTH the own-character gate
         and the toast's rect, so the two can never disagree about who counts.
 
         Prefers the preview tracker's last snapshot (free: the native tick
-        refreshes it every ~250 ms); falls back to ONE window enumeration so the
-        feature still works with previews switched off. Same two-step
-        _implant_client_rect uses. The caller keyword-gates first, so the
-        fallback costs one enumeration per keyword-matching line, never per chat
-        line. Read-only -- window_activator remains the only module allowed to
-        change a real client window's state."""
+        refreshes it every ~250 ms) and falls through to ONE window enumeration
+        when that snapshot cannot answer -- the same two-step
+        _implant_client_rect uses.
+
+        ``key`` is what makes the second step real rather than decorative. The
+        snapshot EXCLUDES preview.disabled_chars, so a character the owner
+        unticked in the Previews checklist has a live window and no snapshot
+        entry: under the old "a non-empty snapshot always wins" shape that
+        character's keyword was a permanent silent no-op. An absent key
+        therefore falls through and enumerates -- the enumeration is a superset
+        of the snapshot, never a smaller answer. Passing no key keeps the plain
+        snapshot-first preference.
+
+        The caller keyword-gates first, so the fallback costs one enumeration
+        per keyword-matching line, never per chat line. Read-only --
+        window_activator remains the only module allowed to change a real
+        client window's state."""
         snapshot = list((self._preview_clients or {}).values())
-        if snapshot:
+        if snapshot and (not key or any(c.key == key for c in snapshot)):
             return snapshot
         try:
-            return list(self._preview_find_clients())
+            found = list(self._preview_find_clients())
         except Exception:
             log.exception("[range] client enumeration failed")
-            return []
+            return snapshot
+        return found or snapshot
 
     def _range_check_target(self, key):
         """The posting character's current solar_system_id, or None.
 
-        Reads ONLY state the ESI location poller already fetched, through the
-        shipped _preview_state_for helper -- so this adds no ESI call of its own
-        AND inherits the one staleness rule (_OVERLAY_STALE_SECS) rather than
-        re-typing a second one. A plain read of single-writer poller state, the
-        same off-thread discipline _own_presence_system_ids uses.
+        Reads ONLY location state that some other poll already fetched, so this
+        adds no ESI call of its own. Two sources, in order:
+
+        1. _preview_state_for -- the preview/overlay ESI poller's per-character
+           sweep. It covers EVERY logged-in character, and carries the one
+           staleness rule (_OVERLAY_STALE_SECS) rather than a second copy of it.
+        2. _range_check_own_location -- the primary character's own /location,
+           for when that sweep is not running at all.
+
+        Step 2 is not a nicety. The sweep starts only from _overlay_enable /
+        _preview_enable_native and the preview mode defaults to "off", so on a
+        stock config step 1 answers None for everybody and this feature could
+        never give a range answer to anyone, forever.
 
         None is a first-class answer, not a failure to paper over: build_report
         turns it into a report that SAYS the location is unknown. For a feature
@@ -17449,12 +17491,111 @@ class FCToolGUI:
         try:
             state = self._preview_state_for(key)
             sid = int(getattr(state, "solar_system_id", None) or 0)
+            if sid > 0:
+                return sid
         except (AttributeError, TypeError, ValueError):
-            return None
+            pass
         except Exception:
             log.exception("[range] location lookup failed for %s", key)
             return None
-        return sid if sid > 0 else None
+        return self._range_check_own_location(key)
+
+    def _range_check_own_location(self, key):
+        """The PRIMARY character's own polled system id when ``key`` IS that
+        character; None otherwise.
+
+        The previews-off path. _refresh_current_system polls self.esi_auth's
+        /location every 15 s whatever the preview mode is and stamps
+        _own_location_sid / _own_location_mono; _own_presence_system_ids
+        already reads that same pair from a worker thread, which is the
+        precedent that makes reading it here safe (plain reads of
+        single-writer state, no lock, no widget).
+
+        Two refusals, both load-bearing:
+
+        * Identity. That id belongs to ONE character -- the primary
+          self.esi_auth, resolved at startup from primary_character_id then
+          tracked_character -- so answering any other sender with it would
+          report a range check about the wrong pilot's system. Silence beats a
+          plausible wrong answer.
+        * Age, on the SAME _OVERLAY_STALE_SECS budget the poller path uses, so
+          "too old to trust" means one thing across this feature. The poll is
+          15 s, so a stamp past that budget means it has been failing long
+          enough for the pilot to be a great many jumps away."""
+        try:
+            auth = self.esi_auth
+            name = getattr(auth, "character_name", "") if auth else ""
+            if not name or range_check.own_key(name) != key:
+                return None
+            sid = int(self._own_location_sid or 0)
+            if sid <= 0:
+                return None
+            budget = getattr(self, "_OVERLAY_STALE_SECS",
+                             FCToolGUI._OVERLAY_STALE_SECS)
+            age = time.monotonic() - float(self._own_location_mono or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        except Exception:
+            log.exception("[range] own-location fallback failed for %s", key)
+            return None
+        return sid if age <= budget else None
+
+    def _range_check_distance_fn(self):
+        """A per-report memo wrapping jump_range.calculate_ly_distance.
+
+        build_report calls the distance function once per source row, and
+        calculate_ly_distance falls back to an ESI universe lookup for any
+        system missing from the bundled coordinate table (wormholes, Pochven,
+        Zarzakh). That lookup caches SUCCESSES only -- there is no negative
+        cache -- so an off-table system plus an unreachable ESI costs a fresh
+        10 s timeout on EVERY call. The chat poll is serial, so five sources
+        meant ~50 s during which the following fleet lines (x-ups!) waited.
+
+        Two collapses, and the second is the one that matters:
+
+        * a plain (origin, destination) memo, so a repeated pair is paid for
+          once however the source list was assembled; and
+        * ONE probe of the DESTINATION, which is constant across every row of a
+          report. The pair memo alone cannot help there -- each row is a
+          different origin, so every pair is distinct. If the bundled table
+          cannot place the destination the probe pays the single lookup itself:
+          a success warms the underlying disk cache so the rows below it are
+          free, and a failure means every row's distance would have been None
+          anyway, so those rows are answered None without asking again. That is
+          what turns N timeouts into one.
+
+        The origin half is deliberately NOT collapsed -- each source really is a
+        different system, so its lookups are genuinely different work.
+
+        Per report by design: this is a stall guard, not a cache. A
+        process-lifetime one would pin a wrong "no distance" long after the
+        network recovered. Returns a plain callable and touches no widget; both
+        it and the closure run on the chat poll thread."""
+        distance_fn = jump_range.calculate_ly_distance
+        distances: dict = {}
+        placeable: dict = {}
+
+        def _can_place(system_id):
+            if system_coords.get_position(system_id) is not None:
+                return True
+            return get_system_info(system_id) is not None
+
+        def _memoized(origin_id, destination_id):
+            pair = (origin_id, destination_id)
+            if pair in distances:
+                return distances[pair]
+            known = placeable.get(destination_id)
+            if known is None:
+                try:
+                    known = _can_place(destination_id)
+                except Exception:
+                    known = False
+                placeable[destination_id] = known
+            value = distance_fn(origin_id, destination_id) if known else None
+            distances[pair] = value
+            return value
+
+        return _memoized
 
     def _range_check_show_toast(self, report, rect):
         """Tk thread: raise the range summary over the posting client's window.
@@ -17507,12 +17648,37 @@ class FCToolGUI:
         """Fold the keyword entry into config WITHOUT saving, so Save Settings
         can persist it in its own single write. Returns whether there was
         anything to fold: the Settings tab may never have been built, and a
-        config write with no field behind it must not create a block."""
+        config write with no field behind it must not create a block.
+
+        Also refreshes the dim blank-keyword tell, because this is the ONE place
+        the entry is folded into config -- both the autosave and Save Settings
+        route through here, so neither can leave the hint contradicting the
+        field. Tk-thread only, as both callers are."""
         var = getattr(self, "_range_check_keyword_var", None)
         if var is None:
             return False
         self._range_check_config()["keyword"] = (var.get() or "").strip()
+        self._refresh_range_check_hint()
         return True
+
+    def _refresh_range_check_hint(self):
+        """Show or clear the dim "(blank = feature off)" tell beside the keyword
+        field. Idempotent, Tk-thread only, and a no-op before the Settings tab
+        exists.
+
+        The feature has TWO off switches and the checkbox shows only one of
+        them: a ticked box over an empty keyword matches nothing, which is a
+        dead feature with no tell at all on the controls. The tooltips say so,
+        but a tooltip has to be hovered to be read."""
+        label = getattr(self, "_range_check_hint", None)
+        var = getattr(self, "_range_check_keyword_var", None)
+        if label is None or var is None:
+            return
+        blank = not (var.get() or "").strip()
+        try:
+            label.config(text="(blank = feature off)" if blank else "")
+        except tk.TclError:
+            pass
 
     def _autosave_range_check_keyword(self, *_args):
         """Persist the keyword the moment the field is left or Enter is pressed
