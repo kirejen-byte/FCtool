@@ -1414,6 +1414,10 @@ class MarketScanner:
         across fits; ``available`` = current market sell qty; ``short`` =
         ``max(0, needed - available)``. Only short items appear.
 
+        **Members are de-duplicated by ``fit_id`` (first occurrence wins)** — a
+        doctrine that lists the same fit twice is seeded once, so the list can
+        never ask for more than ``target_desc`` claims.
+
         **Per-fit seed targets.** ``target_fits`` is the doctrine-wide fallback.
         ``per_fit_targets`` (optional) is a ``fit_id -> target`` mapping consulted
         first for each member, falling back to ``target_fits`` for any fit not
@@ -1442,12 +1446,27 @@ class MarketScanner:
         # Distinct targets actually applied to fits that resolved (drives the
         # honest "varies" summary): a single value → "Nx"; two+ → per-fit.
         applied_targets: set[int] = set()
+        seen_fit_ids: set = set()
 
         for member in getattr(doctrine, "members", []):
+            # A doctrine can list the SAME fit twice — neither
+            # ``fittings_store.add_fit_to_doctrine`` nor the MOTD→doctrine import
+            # guards against it — and a naive walk then adds that fit's whole BoM
+            # twice while ``target_desc`` still names a single target: the
+            # shopping list asks for double what its own summary claims.
+            # Collapse by fit_id, FIRST occurrence wins — the same rule
+            # ``market_gap_dialog.GapSelection`` applies to the dialog's picks,
+            # so the backend and the picker agree on which row is live. It is the
+            # SAME key the target below resolves on, so one row means one target.
+            fid = getattr(member, "fit_id", None)
+            if fid is not None:
+                if fid in seen_fit_ids:
+                    continue
+                seen_fit_ids.add(fid)
             fit = store.get_fit(member.fit_id) if store is not None else None
             if fit is None:
                 continue
-            fit_target = overrides.get(getattr(member, "fit_id", None), target_fits)
+            fit_target = overrides.get(fid, target_fits)
             try:
                 fit_target = int(fit_target)
             except (TypeError, ValueError):
