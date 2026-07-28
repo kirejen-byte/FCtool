@@ -1203,18 +1203,45 @@ class MotdPalette(tk.Frame):
         self._dd.bind("<FocusOut>", self._on_dropdown_focus_out, add="+")
         self._dd.bind("<FocusIn>", self._on_dropdown_focus_in, add="+")
         # Wheel scrolling for the capped body. Bound on THIS Toplevel (and, in
-        # _build_rows, on the canvas + body themselves) and nowhere else — the
-        # app's global canvas router lives in fc_gui and this module is
-        # fc_gui-free by design. The Toplevel binding is what reaches the rows:
-        # every row widget is a plain tk.Frame / tk.Label, and NEITHER carries a
-        # <MouseWheel> CLASS binding, so the toplevel bindtag (index 2) is
-        # reached unopposed. Were a row ever rebuilt out of a ttk widget — or a
-        # Text/Listbox/Treeview — its class binding at index 1 would win and it
-        # would need its own WIDGET-level binding, the only tag that precedes a
-        # class tag. Vertical only, deliberately: the body has no horizontal
-        # scroll, so <Shift-MouseWheel> is left entirely alone rather than being
+        # _build_scroll_host, on the canvas, the body and the scrollbar) and
+        # nowhere else — the app's global canvas router lives in fc_gui and this
+        # module is fc_gui-free by design. The Toplevel binding is what reaches
+        # the rows: every row widget is a plain tk.Frame / tk.Label, and NEITHER
+        # carries a <MouseWheel> CLASS binding, so the toplevel bindtag (index 2)
+        # is reached unopposed. A ttk widget is the exception — its class binding
+        # at index 1 wins and a toplevel handler's "break" comes too late — and
+        # the scroll host holds exactly one (ttk.Scrollbar); see
+        # :meth:`_on_scrollbar_wheel` for the WIDGET-level binding that case
+        # needs. Vertical only, deliberately: the body has no horizontal scroll,
+        # so <Shift-MouseWheel> is left entirely alone rather than being
         # swallowed by a modifier-subset match.
         self._dd.bind("<MouseWheel>", self._on_body_wheel, add="+")
+        # A press ANYWHERE inside the dropdown cancels the armed focus-out close
+        # — see :meth:`_on_dropdown_press`. Bound on the Toplevel so it covers
+        # every descendant by construction, including ones added later.
+        self._dd.bind("<ButtonPress-1>", self._on_dropdown_press, add="+")
+
+    def _on_dropdown_press(self, _e=None) -> None:
+        """A press landed somewhere inside the dropdown: cancel the pending
+        focus-out close.
+
+        The dropdown is an unowned ``overrideredirect`` Toplevel, so a press
+        anywhere in it moves the real OS focus off the search bar — and the
+        entry's ``<FocusOut>`` has already armed ``after(150, close_dropdown)``.
+        Row widgets cancel that timer themselves (:meth:`_begin_row_gesture`),
+        but a press on any OTHER surface did not, so the menu tore itself down
+        ~150 ms later: the scrollbar was destroyed under the cursor mid-drag,
+        making the height cap's own primary affordance self-cancelling.
+
+        Bound on the TOPLEVEL rather than on an enumerated widget list: the
+        toplevel is a bindtag of every descendant, so the canvas gutter, the
+        group headers, the scrollbar and anything added later are all covered
+        without a second place to remember. Deliberately does NOT set
+        ``_row_gesture_active`` (that is a row-press concept) and returns None so
+        the pressed widget's own class binding — ttk's scrollbar drag/page
+        handling — still runs. Presses OUTSIDE the dropdown never reach it, so
+        dismiss-on-click-away is untouched."""
+        self._cancel_after("_focus_after")
 
     # -- topmost banding (never outrank other applications) ---------------- #
     def _apply_topmost(self, want: bool) -> None:
@@ -1486,16 +1513,19 @@ class MotdPalette(tk.Frame):
                   │    └ window item -> _dd_body  Frame  (the rows)
                   └ _dd_scroll  ttk.Scrollbar (packed ONLY past the cap)
 
-        Three Tk traps are designed around rather than worked around:
+        Three Tk traps are designed around rather than worked around — all
+        three are actually DEFUSED by :meth:`_fit_body`, which re-sets both
+        canvas axes, the window item and the view from the measured content
+        before any geometry is read; what is done here is defence in depth so
+        an unmeasured canvas can never leak a bad size:
 
         * a default ``tk.Canvas`` requests **10c x 7c** — a fat, content-blind
-          size that would set the dropdown's floor. Both axes are therefore set
-          explicitly here and re-set from the measured content in
-          :meth:`_fit_body`;
+          size that would set the dropdown's floor — hence the explicit
+          ``width``/``height`` below;
         * an out-of-view canvas window item is **UNMAPPED, not resized**, so its
           ``<Configure>`` never fires — nothing here depends on one. The
-          scrollregion and the item's width/height are computed from
-          ``winfo_req*`` and pushed imperatively;
+          scrollregion and the item's width/height are pushed imperatively from
+          ``winfo_req*`` instead;
         * changing ``-scrollregion`` **never re-clamps the view** — see the
           explicit ``yview_moveto`` in :meth:`_fit_body`.
         """
@@ -1513,6 +1543,9 @@ class MotdPalette(tk.Frame):
         # over between rows (defence in depth beside the Toplevel binding).
         canvas.bind("<MouseWheel>", self._on_body_wheel, add="+")
         body.bind("<MouseWheel>", self._on_body_wheel, add="+")
+        # The scrollbar is the ONE ttk widget in here and therefore the one
+        # surface a toplevel binding cannot serve — see _on_scrollbar_wheel.
+        scroll.bind("<MouseWheel>", self._on_scrollbar_wheel, add="+")
         self._dd_host = host
         self._dd_canvas = canvas
         self._dd_scroll = scroll
@@ -1808,7 +1841,15 @@ class MotdPalette(tk.Frame):
         height itself.
 
         ``top_ref`` / ``y_below`` default to the bar-mode anchor so the method is
-        callable (and testable) without a live dropdown."""
+        callable (and testable) without a live dropdown.
+
+        KNOWN LIMIT: :meth:`_screen_edges` reports the VIRTUAL desktop, so the
+        fraction term is taken against the full multi-monitor height. On a
+        side-by-side desktop that is one monitor's height and the cap is exact;
+        on a VERTICALLY stacked one it is the stack total, and the fraction can
+        exceed a single physical monitor unless the anchor-room term bounds it.
+        Deliberate trade: monitor-exact bounds would mean ctypes or an fc_gui
+        coupling, and this module is free of both."""
         x0, y0, x1, y1 = self._screen_edges()
         usable = max(1, y1 - y0)
         if top_ref is None or y_below is None:
@@ -1846,11 +1887,22 @@ class MotdPalette(tk.Frame):
                              scrollregion=(0, 0, req_w, req_h))
             # The window item is sized IMPERATIVELY: an out-of-view canvas
             # window is unmapped rather than resized, so its <Configure> never
-            # fires and a binding-driven sync would silently never run.
+            # fires and a binding-driven sync would silently never run. (These
+            # are the body's own winfo_req* — the same size an unconfigured item
+            # already takes — so this is belt-and-braces against a future item
+            # that is NOT created at the body's natural size.)
             canvas.itemconfigure(self._dd_window, width=req_w, height=req_h)
-            # Changing -scrollregion does NOT re-clamp the current view: a
-            # re-render that shrinks the body would otherwise leave the canvas
-            # parked past the new content, showing blank space. Park at the top.
+            # Changing -scrollregion does NOT re-clamp the current view. Tk
+            # clamps the pixel offset to the NEW region's bottom (measured), so
+            # a shrink never shows blank space — but it does leave the view
+            # parked partway down a body the user has just re-queried.
+            # UNREACHABLE on today's render path and deliberately kept: the only
+            # caller is _position_dropdown, itself only called at the tail of
+            # _build_rows, which has just minted a FRESH canvas via
+            # _build_scroll_host — so the view is already at the top by
+            # construction. This is the guard for any future in-place re-fit
+            # (a resize handler, a partial re-render) that would inherit a live,
+            # scrolled canvas instead.
             canvas.yview_moveto(0.0)
         except tk.TclError:
             pass
@@ -1957,6 +2009,54 @@ class MotdPalette(tk.Frame):
             return None
         return "break"
 
+    def _on_scrollbar_wheel(self, event=None):
+        """Wheel gestures over the SCROLLBAR itself — the one surface the
+        Toplevel binding cannot serve.
+
+        ``ttk.Scrollbar``'s class ``TScrollbar`` carries its OWN ``<MouseWheel>``
+        binding at bindtag index 1 (``tk::ScrollByUnits`` — 4 units for a 120
+        delta), and a Toplevel handler sits at index 2, so it cannot suppress
+        it: a notch over the scrollbar scrolled 4 units through the class
+        binding PLUS 1 through :meth:`_on_body_wheel`, i.e. five times as far as
+        the same notch anywhere else in the menu (measured 241 px vs 48 px).
+        Only a WIDGET-level binding precedes the class tag, which is what this
+        is.
+
+        Always ``"break"``: the pointer is demonstrably over our own scrollbar,
+        so the class binding must be shut out and nothing may fall through to
+        the composer underneath — including the delta-less and nothing-to-scroll
+        cases. ``<Shift-MouseWheel>`` matches this binding too (Tk matches a
+        binding whose modifiers are a SUBSET of the event's) and therefore
+        behaves exactly as it does over a row: one vertical notch. Nothing is
+        lost — ``tk::ScrollByUnits`` refuses a horizontal request on a vertical
+        scrollbar, so the class binding it displaces was already a no-op."""
+        self._on_body_wheel(event)
+        return "break"
+
+    def _dropdown_size(self) -> tuple:
+        """The Toplevel's ``(width, height)`` in px, derived from what
+        :meth:`_fit_body` has just measured: the viewport's own size, the
+        scrollbar's width when one is packed, and the 1 px hairline inset on
+        each side.
+
+        Computing the size lets :meth:`_position_dropdown` set the geometry
+        outright instead of the old ``"{w}x1"`` -> flush -> ``""`` -> flush
+        dance, which cost two synchronous layout passes on every render — and
+        the palette re-renders on the 150 ms typing debounce and on every ESI
+        result, so both were paid on the COMMON small case. Verified to produce
+        byte-identical geometry to the dance, with and without the scrollbar."""
+        canvas = self._dd_canvas
+        if canvas is None:
+            return (0, 0)
+        try:
+            width = int(canvas.cget("width"))
+            height = int(canvas.cget("height"))
+            if self._dd_scrollable and self._dd_scroll is not None:
+                width += self._dd_scroll.winfo_reqwidth()
+        except (tk.TclError, TypeError, ValueError):
+            return (0, 0)
+        return (width + 2 * _DD_BORDER_PAD, height + 2 * _DD_BORDER_PAD)
+
     def _position_dropdown(self) -> None:
         if self._dd is None:
             return
@@ -1969,17 +2069,15 @@ class MotdPalette(tk.Frame):
                 top_ref = self.entry.winfo_rooty()
                 y = top_ref + self.entry.winfo_height()
             x0, y0, x1, y1 = self._screen_edges()
-            # Clamp the CONTENT before measuring: past the cap the body scrolls
-            # rather than growing, so the natural size read below is already
-            # bounded and the flip/clamp math works on a height that fits.
+            # Clamp the CONTENT first: past the cap the body scrolls rather than
+            # growing, so the size _dropdown_size() derives from it below is
+            # already bounded and the flip/clamp math works on a height that fits.
             self._fit_body(self._max_dropdown_height(top_ref, y))
-            w = max(self.entry.winfo_width(), 360)
-            self._dd.geometry(f"{w}x1+{int(x)}+{int(y)}")
-            self._dd.update_idletasks()
-            self._dd.geometry("")          # let it size to (capped) content
-            self._dd.update_idletasks()    # flush the natural size before clamping
-            width = self._dd.winfo_width()
-            height = self._dd.winfo_height()
+            if self._dd is None:
+                # _fit_body flushes idle work, which runs pending after_idle
+                # callbacks — one of which may be the post-drag close.
+                return
+            width, height = self._dropdown_size()
             # Flip above the anchor when it would otherwise run off the bottom
             # of the screen AND flipping actually fits above — a growing
             # zero-state (Roles + the raised Lines & blocks cap) can now run
@@ -1990,6 +2088,6 @@ class MotdPalette(tk.Frame):
                 y = top_ref - height
             x = max(x0, min(x, x1 - width))
             y = max(y0, min(y, y1 - height))
-            self._dd.geometry(f"+{int(x)}+{int(y)}")
+            self._dd.geometry(f"{int(width)}x{int(height)}+{int(x)}+{int(y)}")
         except tk.TclError:
             pass
