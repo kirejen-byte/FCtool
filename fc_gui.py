@@ -925,6 +925,11 @@ class FCToolGUI:
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
         self._preview_hotkey_map = {}          # hk_id -> action tuple
         self._preview_after_id = None
+        self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
+        # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
+        # switch, while the foreground probe has not caught up yet. Read only by
+        # _preview_anchor_key; written only by _preview_hotkey_switch_to.
+        self._preview_pending_switch = None
         self._preview_intel = {}               # system_id -> (ts, kind)
         self._preview_disabled_session = False
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
@@ -15263,6 +15268,26 @@ class FCToolGUI:
     # on a character's first pass (no prior state yet).
     _OVERLAY_SHIP_EVERY_N = 3        # fetch ship every Nth locship pass
 
+    # ── Native preview hotkey responsiveness ───────────────────────────────
+    # The native tick (250 ms with tiles, 2 s idle-probe) is far too coarse to
+    # be a hotkey's only consumer: a press landed just after a drain waited a
+    # whole period, so cycle latency was uniform [0, ~300 ms] (mean ~150 ms) and
+    # a degenerate 2 s in the tiles-empty/clients-live case. A dedicated
+    # lightweight drain loop runs at this cadence off the SAME published
+    # `_preview_clients` snapshot (staleness bound: one tick — exactly what tile
+    # clicks already tolerate). The tick-tail drain stays where it is.
+    _PREVIEW_FAST_DRAIN_MS = 40
+    # How long a hotkey-driven switch stays "pending" (unconfirmed by the
+    # foreground probe) and outranks that probe as the cycle anchor. Windows
+    # applies SetForegroundWindow asynchronously — and outright denies it under
+    # the foreground lock, where window_activator falls through to
+    # SwitchToThisWindow — so GetForegroundWindow can keep naming the client we
+    # just switched AWAY from. Anchoring on that stale reading re-targets the
+    # same client and the press becomes a visible no-op. Long enough to cover a
+    # denied/slow switch, short enough that a genuinely stuck one resolves back
+    # to the shipped foreground-first behaviour within a beat.
+    _PREVIEW_PENDING_SWITCH_S = 1.5
+
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
         "mode": "off",              # "off" | "eveo_labels" | "native"
@@ -16103,6 +16128,19 @@ class FCToolGUI:
                 break
         self._save_config()
 
+    def _preview_probe_foreground(self):
+        """The raw foreground hwnd via the injectable `_preview_foreground_hwnd`
+        seam, or None when the hook is missing or the probe raises. Shared by the
+        anchor and the pending-switch record so both read the SAME seam (a test
+        host that fakes one automatically fakes the other)."""
+        hook = getattr(self, "_preview_foreground_hwnd", None)
+        if not callable(hook):
+            return None
+        try:
+            return hook()
+        except Exception:
+            return None
+
     def _preview_anchor_key(self, by_key):
         """The char key a cycle press should start *from*.
 
@@ -16110,22 +16148,67 @@ class FCToolGUI:
         the tracked non-login clients in `by_key` — the user may have alt-tabbed
         between clients manually, moving focus out from under `_preview_last_key`
         (spec §3.3). Fall back to `_preview_last_key` when the foreground is
-        unknown / 0 or is not a tracked client. The foreground probe reuses the
-        injectable `_preview_foreground_hwnd` seam (the same win32 backend the
-        C2/C4 tick uses for hide-on-lost-focus); a missing hook or a raising
-        probe both resolve to the last-activated key, so pure test hosts and
-        errored probes never crash the drain."""
-        hook = getattr(self, "_preview_foreground_hwnd", None)
-        if callable(hook):
-            try:
-                fg = hook()
-            except Exception:
-                fg = None
-            if fg:
-                for key, client in by_key.items():
-                    if getattr(client, "hwnd", None) == fg:
-                        return key
+        unknown / 0 or is not a tracked client. A missing hook or a raising probe
+        both resolve to the last-activated key, so pure test hosts and errored
+        probes never crash the drain.
+
+        DEBOUNCE (the "sometimes ignores a cycle" bug): the foreground probe is
+        not a reliable answer immediately after WE asked for a switch. Windows
+        applies SetForegroundWindow asynchronously, and under the foreground lock
+        it denies it outright — window_activator then falls through to
+        SwitchToThisWindow, which may land late or not at all. So a second cycle
+        press arriving in the same drain batch (or the next tick) can still probe
+        the client we switched AWAY from, re-anchor on it, and re-target the
+        client we already picked: a press that visibly does nothing.
+
+        So a hotkey-driven switch leaves a PENDING record — (key, the foreground
+        hwnd as it read when we issued the switch, timestamp) — and that key
+        outranks the probe while ALL of:
+          * the record is younger than `_PREVIEW_PENDING_SWITCH_S`;
+          * the probe still reads *exactly* what it read then (i.e. nothing has
+            moved yet — neither our switch nor the user);
+          * the switched-to client is still live.
+        The moment the foreground reads ANYTHING else — our switch landing, or
+        the user alt-tabbing somewhere of their own accord — the record is
+        dropped and the shipped foreground-first behaviour resumes unchanged.
+        That is the §3.3 guarantee: manual alt-tabs are never overridden, because
+        an alt-tab necessarily moves the probe off the recorded value."""
+        fg = self._preview_probe_foreground()
+        fg_key = None
+        if fg:
+            for key, client in by_key.items():
+                if getattr(client, "hwnd", None) == fg:
+                    fg_key = key
+                    break
+        pending = getattr(self, "_preview_pending_switch", None)
+        if pending is not None:
+            p_key, p_fg, p_ts = pending
+            cap = getattr(self, "_PREVIEW_PENDING_SWITCH_S",
+                          FCToolGUI._PREVIEW_PENDING_SWITCH_S)
+            if (time.monotonic() - p_ts) <= cap and fg == p_fg and p_key in by_key:
+                return p_key            # our switch is still in flight — trust it
+            # Confirmed, superseded by the user, expired, or its client died.
+            self._preview_pending_switch = None
+        if fg_key is not None:
+            return fg_key
         return getattr(self, "_preview_last_key", "")
+
+    def _preview_hotkey_switch_to(self, client):
+        """`_preview_switch_to` for the HOTKEY paths only, plus the pending-switch
+        record the cycle anchor debounces on (see _preview_anchor_key).
+
+        The single writer of `_preview_pending_switch`. Deliberately NOT folded
+        into `_preview_switch_to`: a tile click is a mouse gesture the user can
+        see land, and the shipped foreground-first anchor stays authoritative for
+        it — only a keyboard press can outrun the foreground probe. The
+        foreground is sampled BEFORE the switch is issued so the record holds the
+        value a subsequent stale read would return; a login client (key "") gets
+        no record, mirroring `_preview_switch_to` not clobbering the anchor."""
+        key = getattr(client, "key", "")
+        self._preview_pending_switch = (
+            (key, self._preview_probe_foreground(), time.monotonic())
+            if key else None)
+        self._preview_switch_to(client)
 
     def _preview_drain_hotkeys(self):
         """Drain the hotkey worker queue and act on each event. Focus APIs only —
@@ -16148,7 +16231,10 @@ class FCToolGUI:
             if kind == "focus":
                 c = by_key.get(action[1])
                 if c is not None:
-                    self._preview_switch_to(c)          # C3: minimize-inactive aware
+                    # Hotkey path → records the pending switch so an immediately
+                    # following cycle press anchors on where we are GOING, not on
+                    # a foreground probe that has not caught up.
+                    self._preview_hotkey_switch_to(c)   # C3: minimize-inactive aware
             elif kind == "cycle":
                 _, group, direction = action
                 cfg = self._preview_cfg()
@@ -16160,6 +16246,8 @@ class FCToolGUI:
                 live_keys = set(by_key) - self._preview_excluded
                 # Anchor on the REAL foreground client (manual alt-tabs move focus
                 # out from under _preview_last_key); fall back to the last switch.
+                # Debounced against a still-in-flight hotkey switch of our own —
+                # see _preview_anchor_key.
                 anchor = self._preview_anchor_key(by_key)
                 members = [str(m).strip().lower()
                            for m in g.get("members", []) if str(m).strip()]
@@ -16174,13 +16262,67 @@ class FCToolGUI:
                         order, anchor, live_keys, direction)
                 c = by_key.get(nxt)
                 if c is not None:
-                    self._preview_switch_to(c)          # C3: minimize-inactive aware
+                    self._preview_hotkey_switch_to(c)   # C3: minimize-inactive aware
             elif kind == "minall":
                 cfg = self._preview_cfg()
                 never = set(cfg.get("never_minimize", []))
                 for c in by_key.values():
                     if c.key not in never:
                         window_activator.minimize(c.hwnd)
+
+    def _preview_arm_fast_drain(self):
+        """Arm the dedicated low-latency hotkey drain loop (idempotent).
+
+        The tick-tail drain is NOT moved or removed — it must stay after the
+        `self._preview_clients = cur` publish, because activation by key needs
+        the just-diffed client set. This is a SECOND consumer of the same
+        `HotkeyService.events` queue, which is exactly what a Queue is for: each
+        event is handed to whichever consumer calls `get_nowait()` first, so a
+        press is acted on once and once only, whoever gets there.
+
+        Idempotent by construction (an already-armed loop returns immediately),
+        so a re-enable or a repeated mode-set can never stack two loops."""
+        if getattr(self, "_preview_fast_drain_after_id", None) is not None:
+            return
+        ms = getattr(self, "_PREVIEW_FAST_DRAIN_MS",
+                     FCToolGUI._PREVIEW_FAST_DRAIN_MS)
+        try:
+            self._preview_fast_drain_after_id = self.root.after(
+                ms, self._preview_fast_drain_tick)
+        except Exception:
+            log.exception("[preview] could not arm the fast hotkey drain")
+            self._preview_fast_drain_after_id = None
+
+    def _preview_fast_drain_tick(self):
+        """One pass of the fast drain loop: drain the hotkey queue, re-arm.
+
+        Native mode only — `off` / `eveo_labels` (and a session disabled by
+        repeated tick failures) return WITHOUT re-arming, so the loop dies with
+        the mode even if a teardown ever failed to cancel it.
+
+        Exception-guarded for BUG A parity: a drain that throws must cost one
+        pass, never the loop. Losing the loop would silently strand every hotkey
+        on the 250 ms/2 s tick cadence for the rest of the session."""
+        self._preview_fast_drain_after_id = None
+        if (self._preview_cfg().get("mode") != "native"
+                or self._preview_disabled_session):
+            return
+        try:
+            self._preview_drain_hotkeys()
+        except Exception:
+            log.exception("[preview] fast hotkey drain pass failed")
+        self._preview_arm_fast_drain()
+
+    def _preview_cancel_fast_drain(self):
+        """Stop the fast drain loop (teardown / mode switch). Safe to call when
+        it was never armed."""
+        after_id = getattr(self, "_preview_fast_drain_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._preview_fast_drain_after_id = None
 
     @staticmethod
     def _preview_hotkey_bindings(hotkeys, live_keys):
@@ -17078,6 +17220,12 @@ class FCToolGUI:
             self._preview_restart_hotkeys()   # lazy service create + register
         except Exception:
             log.exception("[preview] hotkey registration failed on enable")
+        # Presses land in the service queue instantly; give them a consumer that
+        # runs on their own timescale instead of the 250 ms/2 s controller tick.
+        # Armed unconditionally (not gated on the service existing) so a hotkey
+        # service created later — the settings dialog's re-register path — is
+        # picked up without a mode bounce; the drain no-ops while there is none.
+        self._preview_arm_fast_drain()
         self._preview_start_gamelog()         # B6: damage-flash source
         # ESI poller: the single writer of _overlay_states / _overlay_state_ts /
         # _preview_layer_hp. In native mode _preview_tracked_names routes it to
@@ -17104,6 +17252,10 @@ class FCToolGUI:
             except Exception:
                 pass
             self._preview_after_id = None
+        self._preview_cancel_fast_drain()     # the second hotkey-queue consumer
+        # A pending hotkey switch is session state, not config: a mode bounce must
+        # not leave the next session's first cycle press anchored on a dead key.
+        self._preview_pending_switch = None
         self._preview_retire_all_tiles()
         self._preview_clients = {}
         self._preview_stop_gamelog()          # B6: stop the damage-flash source
