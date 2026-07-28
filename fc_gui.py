@@ -26537,7 +26537,7 @@ $bmp.Dispose()
         except Exception:
             log.exception("[market] fit refresh after scan failed")
 
-    def _market_doctrine_scan_type_ids(self, doctrine):
+    def _market_doctrine_scan_type_ids(self, doctrine, members=None):
         """The set of type_ids a doctrine-TARGETED market scan pulls: the UNION of
         every member fit's FULL bill-of-materials (hull + modules + subsystems +
         charges + drones + cargo).
@@ -26547,7 +26547,13 @@ $bmp.Dispose()
         all for the marks to be honest. Doubles as the coverage set consumers test
         a cached snapshot's scope against. Empty set when nothing resolves;
         defensive throughout (a missing store/catalog or an unparsable fit yields
-        an empty set, so the caller falls back to a full scan / renders nothing)."""
+        an empty set, so the caller falls back to a full scan / renders nothing).
+
+        ``members`` optionally narrows the walk to a SUBSET of the doctrine's
+        members (the gap dialog's per-ship selection). ``None`` (default) walks
+        every member — identical to the original no-argument behaviour. An EMPTY
+        subset is meaningful, not a synonym for None: it yields an empty set, so
+        a coverage gate built on it stands down."""
         out: set[int] = set()
         if doctrine is None:
             return out
@@ -26559,7 +26565,8 @@ $bmp.Dispose()
         except Exception:
             return out
         catalog = getattr(self, "type_catalog", None)
-        for mem in getattr(doctrine, "members", []):
+        walk = getattr(doctrine, "members", []) if members is None else members
+        for mem in walk:
             fid = getattr(mem, "fit_id", None)
             if fid is None:
                 continue
@@ -26911,7 +26918,8 @@ $bmp.Dispose()
         noun = "item" if n == 1 else "items"
         return f"{n} {noun} short for {target}"
 
-    def _market_build_gap_list(self, doctrine):
+    def _market_build_gap_list(self, doctrine, *, per_fit_targets=None,
+                               components=None):
         """Lazily build the GapList for ``doctrine`` off the current snapshot.
 
         Returns ``(gap, error)``: ``gap`` is a market_scanner.GapList (or None on
@@ -26924,7 +26932,18 @@ $bmp.Dispose()
         that fallback to their own resolved target — so the shopping list seeds
         e.g. 50 stabbers / 20 scythes / 10 bifrosts, matching each row's colour
         bar. When no member overrides, no mapping is passed (identical to the
-        prior single-target behaviour)."""
+        prior single-target behaviour).
+
+        ``per_fit_targets`` (keyword) overrides that resolution wholesale: the
+        caller's map is passed STRAIGHT THROUGH and the saved seed targets are
+        never consulted for a listed fit — the Gaps dialog's scratch per-ship
+        selection, which must not read (or write) the persisted targets. A
+        supplied map also NARROWS the scope-coverage gate to the INCLUDED fits
+        (target > 0), so asking for gaps on only the hulls that WERE scanned is
+        no longer refused. ``components`` forwards verbatim (None = full BoM).
+
+        Every error path (structure-blocked, no snapshot, scope mismatch,
+        scanner unavailable) is unchanged and still returns ``(None, message)``."""
         # A gap list built from a forbidden-empty structure book would tell the
         # owner to buy EVERYTHING — suppress it with the re-auth message instead.
         if self._market_structure_blocked():
@@ -26932,33 +26951,54 @@ $bmp.Dispose()
         snap = self._market_snapshot
         if snap is None:
             return None, "No market snapshot yet — click ⟳ Market first."
+        doctrine_target = self._market_seed_target(doctrine)
         # Scope honesty: a doctrine-scoped snapshot scanned for a DIFFERENT
         # doctrine would tell the owner to "buy everything" for types it never
-        # scanned — suppress with an honest rescan message instead.
-        bom_ids = self._market_doctrine_scan_type_ids(doctrine)
+        # scanned — suppress with an honest rescan message instead. An explicit
+        # selection narrows the gate to the fits actually being seeded, so
+        # asking for only the hulls that WERE scanned is no longer refused.
+        scope_members = None
+        if per_fit_targets is not None:
+            def _seeded(mem):
+                """Mirror gap_list's OWN per-member target resolution so the
+                gate and the build can never disagree: an absent (or junk) entry
+                falls back to the doctrine target there, so it must stay INSIDE
+                the coverage set — only an explicit 0 narrows the gate."""
+                raw = per_fit_targets.get(getattr(mem, "fit_id", None),
+                                          doctrine_target)
+                try:
+                    return int(raw) > 0
+                except (TypeError, ValueError):
+                    return doctrine_target > 0
+            scope_members = [m for m in getattr(doctrine, "members", [])
+                             if _seeded(m)]
+        bom_ids = self._market_doctrine_scan_type_ids(doctrine, scope_members)
         if bom_ids and not self._market_snapshot_covers(bom_ids):
             return None, self._market_scope_mismatch_message(doctrine)
         scanner = self._get_market_scanner()
         if scanner is None:
             return None, "Market scanner unavailable."
-        doctrine_target = self._market_seed_target(doctrine)
-        # Sparse per-fit override map: only members whose resolved target differs
-        # from the doctrine fallback. An empty map → the flat doctrine target for
-        # every fit (so target_desc stays "Nx <doctrine>" and the call is
-        # byte-identical to the pre-per-fit behaviour).
-        per_fit: dict[str, int] = {}
-        for m in getattr(doctrine, "members", []):
-            fid = getattr(m, "fit_id", None)
-            if fid is None:
-                continue
-            resolved = self._market_seed_target(doctrine, m)
-            if resolved != doctrine_target:
-                per_fit[fid] = resolved
+        if per_fit_targets is None:
+            # Sparse per-fit override map: only members whose resolved target
+            # differs from the doctrine fallback. An empty map → the flat
+            # doctrine target for every fit (so target_desc stays "Nx
+            # <doctrine>" and the call is byte-identical to the pre-per-fit
+            # behaviour).
+            per_fit: dict[str, int] = {}
+            for m in getattr(doctrine, "members", []):
+                fid = getattr(m, "fit_id", None)
+                if fid is None:
+                    continue
+                resolved = self._market_seed_target(doctrine, m)
+                if resolved != doctrine_target:
+                    per_fit[fid] = resolved
+            per_fit_targets = per_fit or None
         try:
             gap = scanner.gap_list(
                 doctrine, self.fittings, snap,
                 target_fits=doctrine_target,
-                per_fit_targets=(per_fit or None))
+                components=components,
+                per_fit_targets=per_fit_targets)
         except Exception:
             log.exception("[market] gap_list failed")
             return None, "Could not build the gap list (see log)."
