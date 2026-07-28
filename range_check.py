@@ -72,6 +72,18 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   staging override (that override belongs to that feature, not this one).
 * Distances are compared RAW and only rounded for display — never compare a
   rounded float (the security-band lesson).
+* **A source system that IS the target's system renders a caution, never a
+  green in-range row.** A capital cannot jump within its own system, and the
+  previews-off fallback attributes the target to the FC's OWN system — so "the
+  FC is sitting in staging" is the common case this must get right, not an
+  edge case. ``ROW_SAME_SYSTEM`` is detected by ``system_id`` equality BEFORE
+  ``distance_fn`` is ever called (so a distance function that answers 0.0 for
+  a same-system pair cannot silently undo the fix), carries the real 0.0
+  distance rather than suppressing it, and sorts in the same degraded tier as
+  an unresolved/no-distance row — it must never rank as the group's nearest,
+  best answer the way a genuine 0.0 ly in-range row would. Red/green stay
+  reserved for actual out-of-range/in-range verdicts; this is yellow, and
+  yellow means caution only.
 
 Threading: the chat tail runs on a worker thread. Everything in the engine is
 safe there; ``RangeToast`` is Tk-thread only, so the caller marshals the show
@@ -798,9 +810,13 @@ def hull_range_ly(hull) -> float:
 ROW_OK = "ok"
 ROW_UNRESOLVED = "unresolved"       # the NAME never resolved to a system
 ROW_NO_DISTANCE = "no distance"     # resolved, but no distance was available
+ROW_SAME_SYSTEM = "same system"     # source IS the target: cannot jump in-system
 
 NOTE_TARGET_UNKNOWN = "Location unknown - no range answer."
 NOTE_NO_SOURCES = "No staging systems configured."
+#: The same-system row's note. Plain ASCII (log-safe, see the module docstring)
+#: even though it only ever renders in the Tk toast today.
+NOTE_SAME_SYSTEM = "same system - cannot jump within a system"
 #: Non-blocking warning for the default-sources path with no primary staging.
 #: ``zkillboard.staging_system`` defaults to "", and the primary is the ONLY
 #: friendly default source — so an unset field plus a configured hostile list
@@ -946,13 +962,15 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
     accepted systems discloses the refused ones for free, and the two halves
     can never be computed from different chat lines. Pass it to override.
 
-    Honesty rules, all three tested: an unknown target produces a report that
-    SAYS the location is unknown rather than a plausible wrong answer; a source
+    Honesty rules, all tested: an unknown target produces a report that SAYS
+    the location is unknown rather than a plausible wrong answer; a source
     name that never resolved becomes an unresolved row; a resolved source with
-    no available distance becomes a no-distance row. Rows are ordered
-    hostiles-then-friendlies-then-linked, nearest first inside each group, with
-    degraded rows last so they read as exceptions rather than as zero-distance.
-    Pure."""
+    no available distance becomes a no-distance row; a source that IS the
+    target's own system becomes a ``ROW_SAME_SYSTEM`` caution row rather than a
+    green 0.00 ly in-range answer (a capital cannot jump within its own
+    system). Rows are ordered hostiles-then-friendlies-then-linked, nearest
+    first inside each group, with degraded (and same-system) rows last so they
+    read as exceptions rather than as zero-distance. Pure."""
     srcs = sources if isinstance(sources, SourceLists) else SourceLists()
     notes = list(srcs.problems)
     target_ref = _as_ref(target, resolve)
@@ -1008,6 +1026,16 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
             rows.append(RangeRow(group, ref.name, None, None, False, False,
                                  ROW_UNRESOLVED))
             continue
+        if ref.system_id == target_ref.system_id:
+            # Checked by id BEFORE distance_fn is ever called: a capital
+            # cannot jump within its own system, and that fact is knowable
+            # from identity alone. Deciding it this way means a distance_fn
+            # that happens to answer 0.0 for a same-system pair can never
+            # silently reintroduce the green zero-distance row this exists
+            # to prevent.
+            rows.append(RangeRow(group, ref.name, ref.system_id, 0.0,
+                                 False, False, ROW_SAME_SYSTEM))
+            continue
         dist = _distance(distance_fn, ref.system_id, target_ref.system_id)
         if dist is None:
             rows.append(RangeRow(group, ref.name, ref.system_id, None,
@@ -1030,12 +1058,21 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
 #: GUI text only — these are not cp1252 and MUST never reach ``log.*``.
 MARK_IN = "✓"       # check mark
 MARK_OUT = "✕"      # multiplication x
+MARK_CAUTION = "⚠"  # same-system: cannot jump, not an out/in-range verdict
 
 
 def hull_cell(label, in_range) -> str:
     """``"Titan ✓"`` / ``"Titan ✕"``. The glyph carries the answer as well as
     the colour, so the toast is readable without relying on red/green alone."""
     return f"{label} {MARK_IN if in_range else MARK_OUT}"
+
+
+def same_system_cell(label) -> str:
+    """``"Titan ⚠"`` — the ``ROW_SAME_SYSTEM`` cell. Deliberately neither
+    ``MARK_IN`` nor ``MARK_OUT``: a capital cannot jump within its own system,
+    which is neither an in-range nor an out-of-range verdict, and red/green
+    stay reserved for those two answers alone."""
+    return f"{label} {MARK_CAUTION}"
 
 
 def format_distance(distance_ly) -> str:
@@ -1052,6 +1089,8 @@ def row_note(row) -> str:
         return "unknown system"
     if row.status == ROW_NO_DISTANCE:
         return "no distance"
+    if row.status == ROW_SAME_SYSTEM:
+        return NOTE_SAME_SYSTEM
     return ""
 
 
@@ -1336,7 +1375,16 @@ class RangeToast:
     def _grid_row(self, body, line, row):
         self._label(body, row.name, FG_TEXT).grid(
             row=line, column=0, sticky="w", padx=(6, 10))
-        if row.ok:
+        if row.status == ROW_SAME_SYSTEM:
+            # Caution, not a verdict: a capital cannot jump within its own
+            # system, so both hull cells carry the same yellow warning
+            # instead of a red/green answer that would say the opposite.
+            for col, (label, _hull) in enumerate(HULL_COLUMNS, start=1):
+                self._label(body, same_system_cell(label), FG_YELLOW).grid(
+                    row=line, column=col, sticky="w", padx=(0, 10))
+            self._label(body, row_note(row), FG_DIM).grid(
+                row=line, column=3, sticky="w")
+        elif row.ok:
             for col, (label, hull) in enumerate(HULL_COLUMNS, start=1):
                 good = row.in_range(hull)
                 self._label(body, hull_cell(label, good),
