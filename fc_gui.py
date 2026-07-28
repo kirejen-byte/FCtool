@@ -8922,9 +8922,13 @@ class FCToolGUI:
             # uncovered doctrine shows the rescan message until the unscanned
             # ships are unticked. Name that escape hatch — it is the whole
             # reason the button is no longer disabled here.
+            # `scope_note` is non-None here by construction: this branch needs
+            # `not blocked and snapshot is not None and not scope_covered`,
+            # which is EXACTLY the condition that set it above (and
+            # `_market_scope_mismatch_message` always returns a non-empty
+            # f-string). No `or` fallback — it would be unreachable.
             gaps_tip = (
-                (scope_note or "Market was scanned for a different doctrine — "
-                               "click ⟳ Market to scan this one.")
+                scope_note
                 + "  Opens anyway: untick the ships that weren't scanned and "
                   "the shopping list builds for the rest.")
         else:

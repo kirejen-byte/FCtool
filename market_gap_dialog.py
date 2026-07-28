@@ -543,47 +543,6 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     ships_canvas.bind("<Configure>", lambda e: ships_canvas.itemconfig(
         _rows_win, width=e.width))
 
-    def _on_mousewheel(evt):
-        """Wheel-scroll the ship picker when the pointer is over it.
-
-        Tk does NOT deliver ``<MouseWheel>`` to the hovered widget (it goes to
-        the focused one), so — like ``fc_gui._on_global_mousewheel`` — the bind
-        lives on the TOPLEVEL and the target is found with ``winfo_containing``,
-        then walked up its ``master`` chain. Bound on the dialog rather than
-        registered with the app's global router because that router only serves
-        canvases passed to ``FCToolGUI._register_scroll_canvas``, which this
-        module must not reach (it is fc_gui-free by design); the toplevel's
-        bindtag runs before ``all``, so this wins, and the ``"break"`` stops the
-        router from scrolling anything else on the same turn. Pointer anywhere
-        else (the gap Treeview, which has its own ttk class binding) → return
-        None and stand down.
-        """
-        if n_picks <= _SHIP_ROWS_VISIBLE:
-            return None                  # nothing to scroll; don't jitter rows
-        try:
-            w = dlg.winfo_containing(evt.x_root, evt.y_root)
-        except Exception:
-            return None
-        while w is not None:
-            if w is rows_host:
-                break
-            w = getattr(w, "master", None)
-        if w is None:
-            return None
-        delta = _as_int(getattr(evt, "delta", 0), 0)
-        amount = -1 * int(delta / 120)
-        if amount == 0:
-            if not delta:
-                return None
-            amount = -1 if delta > 0 else 1
-        try:
-            ships_canvas.yview_scroll(amount, "units")
-        except tk.TclError:
-            return None
-        return "break"
-
-    dlg.bind("<MouseWheel>", _on_mousewheel)
-
     def _on_include(fit_id):
         sel.set_include(fit_id, bool(include_vars[fit_id].get()))
         _sync_row(fit_id)
@@ -809,6 +768,75 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     tree.bind("<Button-3>", _on_right_click)
     tree.bind("<Delete>", _hide_selected)
     hidden_lbl.bind("<Button-1>", _restore_all)
+
+    # ── wheel routing ────────────────────────────────────────────────────────
+    # ONE rule for the whole dialog: **the POINTER picks the scroll target, not
+    # the focus.** Windows delivers <MouseWheel> to the FOCUSED widget, so
+    # without this the wrong thing scrolls — and because ``ttk::treeview::Press``
+    # starts with ``focus $w``, clicking any gap row is enough to make the table
+    # the focused widget for every later gesture, including ones aimed at the
+    # ship picker.
+    def _wheel_target(evt):
+        """The scrollable the pointer is over: ``ships_canvas``, ``tree``,
+        ``dlg`` (inside the dialog but over nothing scrollable) or None (not
+        this dialog at all). ``winfo_containing`` returns the deepest widget, so
+        walk up the ``master`` chain — the pointer is realistically over a
+        checkbutton, a qty entry or a tree row, never a container."""
+        try:
+            w = dlg.winfo_containing(evt.x_root, evt.y_root)
+        except Exception:
+            return None
+        while w is not None:
+            if w is rows_host:
+                return ships_canvas
+            if w is tree_wrap:
+                return tree
+            if w is dlg:
+                return dlg
+            w = getattr(w, "master", None)
+        return None
+
+    def _on_mousewheel(evt):
+        """Scroll whatever the pointer is over; suppress everything else.
+
+        Bound BOTH on the toplevel and on the Treeview, and that pair is
+        load-bearing. ``tree.bindtags()`` is ``(widget, "Treeview", toplevel,
+        "all")``: ttk's own class binding sits at index 1, AHEAD of the toplevel
+        at index 2, so a toplevel-only handler's ``"break"`` cannot suppress it —
+        wheeling over the picker while the table held focus scrolled BOTH. A
+        widget-level binding precedes the class tag, so the ``"break"`` below is
+        what actually stands ttk down. The same routing then also fixes the
+        mirror-image gap: the table used to be wheel-scrollable ONLY while it
+        happened to hold focus, because nothing else ever scrolled it.
+
+        The dialog owns its wheel rather than registering with the app's global
+        router, which only serves canvases passed to
+        ``FCToolGUI._register_scroll_canvas`` — unreachable from here by design
+        (this module is fc_gui-free).
+        """
+        target = _wheel_target(evt)
+        if target is None:
+            return None                  # not this dialog — stand down
+        if target is ships_canvas and n_picks <= _SHIP_ROWS_VISIBLE:
+            target = dlg                 # nothing to scroll; don't jitter rows
+        if target is dlg:
+            # Over the dialog but not over a scrollable: scroll NOTHING, and say
+            # so, or ttk/the global router scroll the focused widget instead.
+            return "break"
+        delta = _as_int(getattr(evt, "delta", 0), 0)
+        amount = -1 * int(delta / 120)
+        if amount == 0:
+            if not delta:
+                return None
+            amount = -1 if delta > 0 else 1
+        try:
+            target.yview_scroll(amount, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
+    dlg.bind("<MouseWheel>", _on_mousewheel)
+    tree.bind("<MouseWheel>", _on_mousewheel)
 
     status = tk.Label(body, text="", font=("Consolas", 9), fg=FG_GREEN,
                       bg=BG_DARK, anchor=tk.W)
