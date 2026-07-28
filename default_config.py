@@ -200,6 +200,27 @@ DEFAULT_CONFIG = {
         # preview.disabled_chars): a brand-new character defaults to reminded.
         "disabled_chars": [],
     },
+    # Fleet-chat "range check" (range_check.py). Typing the keyword in Fleet
+    # chat pops a short-lived window over the EVE client that posted it,
+    # summarising who can reach that character's system (Titan / Capital, at
+    # JDC 5). Only the owner's OWN logged-in characters can trigger it, so no
+    # fleet member can put a window on the owner's screen.
+    #
+    # DEFAULT OFF, deliberately: it reacts to chat and draws over a live client,
+    # which is exactly the kind of surprise a user should opt into. While
+    # `enabled` is False the chat hook returns after ONE predicate call — no
+    # engine is built, no window is enumerated and no distance is computed.
+    #
+    # A BLANK keyword disables the feature rather than matching every line, so
+    # clearing the Settings field is a second, equivalent off switch. This block
+    # is a key-for-key mirror of range_check.DEFAULTS (guarded by
+    # tests/test_default_config.py) — fc_gui never names a default value itself,
+    # and an existing config.json (never deep-merged) simply has no block, which
+    # range_check.is_enabled reads as "off".
+    "range_check": {
+        "enabled": False,           # MASTER GATE (opt-in)
+        "keyword": "range check",   # case-insensitive substring; BLANK = off
+    },
     # Fleet loss tracking source (spike 2026-07-25-zkill-loss-source). The
     # capsule-transition detector in loss_tracker.py is FAST (~20-35s) but blind
     # to podded pilots (measured 26-43% of PvP ship losses) and does not run at

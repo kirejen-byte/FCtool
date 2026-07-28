@@ -122,6 +122,13 @@ from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
 # imports no fc_gui); wiring is the poller hook + _implant_show_toast below.
 import implant_reminder
 import client_toast
+# Fleet-chat "range check" (default OFF): pure trigger/report engine plus its own
+# over-client toast. Everything above RangeToast is Tk-free and it imports no
+# fc_gui; wiring is the chat-tail hook + _range_check_show_toast below.
+import range_check
+# The module, alongside the `from jump_range import ...` names above: the range
+# check injects jump_range.calculate_ly_distance as its distance function.
+import jump_range
 # Market "Gaps…" shopping-list window (ship picker + category filter + per-item
 # removal). Self-contained: tkinter + ui_theme/ui_helpers only, everything else
 # arrives through injected providers — see _open_market_gaps_dialog.
@@ -951,6 +958,13 @@ class FCToolGUI:
         # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
         self._implant_toast = None             # the single live ClientToast, if any
+        # ── Fleet-chat range check (default OFF; see range_check.py) ─────────
+        # ONE trigger for the whole app: its per-sender cooldown is what absorbs
+        # the same fleet line arriving once per tailed log file (one per
+        # logged-in character), so a second instance would defeat it.
+        self._range_check_trigger = None       # RangeCheckTrigger (lazy, gated on config)
+        self._range_check_toast = None         # the single live RangeToast, if any
+        self._range_check_no_client = set()    # keys already logged as off-screen
         # ── Active highlight / cycle exclusion / switch-external (Task C4) ────
         self._preview_excluded = set()         # session-only cycle-exclusion char keys
         self._preview_last_external_hwnd = None  # last non-EVE, non-ours foreground hwnd
@@ -15017,6 +15031,61 @@ class FCToolGUI:
         self._add_setting(scroll_frame, "Channel Name", "xup_channel",
                           xup.get("channel_name", "Fleet"))
 
+        # ── Fleet-chat range check (range_check.py; default OFF) ─────────────
+        # Both controls read their initial state through the module: is_enabled
+        # is THE master gate (the chat hook gates on the same call, so a ticked
+        # box can never sit over a feature that cannot fire) and normalize_config
+        # owns the keyword default. No default value is typed here.
+        _rc_block = self.config.get("range_check")
+        self._range_check_enabled_var = tk.BooleanVar(
+            value=range_check.is_enabled(_rc_block))
+        rc_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        rc_frame.pack(fill=tk.X, padx=20, pady=2)
+        rc_check = tk.Checkbutton(
+            rc_frame, text="Range check on fleet chat",
+            variable=self._range_check_enabled_var,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT,
+            command=self._on_range_check_toggle)
+        rc_check.pack(side=tk.LEFT)
+        attach_tooltip(
+            rc_check,
+            "Type the keyword below in Fleet chat and a short-lived window "
+            "pops up over that character's EVE client, showing which staging "
+            "systems are in Titan and Capital jump range of them (JDC 5).\n\n"
+            "Only YOUR OWN logged-in characters can trigger it — a fleet "
+            "member saying the keyword is ignored. Naming systems in the "
+            "message replaces the staging list for that check.")
+
+        rc_kw_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        rc_kw_frame.pack(fill=tk.X, padx=20, pady=2)
+        rc_kw_label = tk.Label(rc_kw_frame, text="Range check keyword:",
+                               font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                               width=28, anchor=tk.W)
+        rc_kw_label.pack(side=tk.LEFT)
+        self._range_check_keyword_var = tk.StringVar(
+            value=range_check.normalize_config(_rc_block).get("keyword", ""))
+        self._range_check_keyword_entry = tk.Entry(
+            rc_kw_frame, textvariable=self._range_check_keyword_var,
+            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+            insertbackground=FG_WHITE, width=40, borderwidth=1, relief=tk.RIDGE)
+        self._range_check_keyword_entry.pack(side=tk.LEFT, padx=5)
+        # Autosave on leaving the field / pressing Enter, the same instant-apply
+        # the Staging System entry uses (_autosave_staging_system). Save Settings
+        # collects it too, so a value still being typed is never lost.
+        self._range_check_keyword_entry.bind(
+            "<FocusOut>", self._autosave_range_check_keyword, add="+")
+        self._range_check_keyword_entry.bind(
+            "<Return>", self._autosave_range_check_keyword, add="+")
+        for _w in (rc_kw_label, self._range_check_keyword_entry):
+            attach_tooltip(
+                _w,
+                "Case-insensitive; matches anywhere in the message, so "
+                "\"range check on me\" fires too.\n\n"
+                "Leave it BLANK to switch the feature off — a blank keyword "
+                "matches nothing rather than every line.")
+
         # ── zKillboard Settings ──────────────────────────────────────────────
         self._add_section(scroll_frame, "zKillboard", toc_title="zKillboard")
         zk = self.config.get("zkillboard", {})
@@ -17236,6 +17305,208 @@ class FCToolGUI:
             toast.show(rect)
         except Exception:
             log.exception("[implant] toast failed for %s", key)
+
+    # ── Fleet-chat range check wiring (default OFF) ─────────────────────────
+    # The feature itself lives in range_check.py: a pure Tk-free engine (keyword
+    # gate, per-sender cooldown, system extraction, source resolution, the range
+    # maths) plus RangeToast, its own over-client window. fc_gui owns three
+    # seams and no policy -- the chat-tail hook below, which runs on the chat
+    # poll thread; the two read-only state lookups it feeds from; and the
+    # Tk-thread toast raise it marshals to. No default value is re-typed here.
+
+    def _range_check_observe(self, msg):
+        """Chat-tail hook: consider ONE fleet message for a range check.
+
+        Runs on the chat poll thread (see _chat_poll_loop) and touches no Tk --
+        only the finished report and the client rect cross to the main thread,
+        via the dispatcher queue. That split is load-bearing rather than
+        stylistic: build_report's distance function is
+        jump_range.calculate_ly_distance, which falls back to an ESI
+        get_system_info for any system missing from the bundled coordinate table
+        (wormholes, Pochven, Zarzakh), so it can block on the network. Doing that
+        work here costs a delayed chat poll; doing it on the Tk thread would
+        freeze the whole app.
+
+        Rides the EXISTING fleet tail -- self.chat_monitor, already filtered to
+        the fleet channel by channel_filter -- rather than a second ChatMonitor
+        over the same directory, which would be a second per-poll glob of the
+        chat-log folder (the invariant that says no monitor may do that).
+
+        Gate order, cheapest first, and every one of them a place this feature
+        must NOT fire:
+
+        1. range_check.is_enabled -- THE master-gate predicate, the same call
+           the Settings tick reads. Nothing here re-derives it: an independently
+           derived gate is how the implant reminder once shipped a ticked box
+           over a feature that could not fire.
+        2. The keyword. Checked here as a pre-filter and again inside
+           trigger.consider -- the same pure function on the same two values, so
+           the two cannot disagree; it exists only so an ORDINARY chat line
+           never pays for the client-window read below. One fleet message
+           arrives once per tailed log file, i.e. once per logged-in character,
+           so an ungated read would run N times per line.
+        3. The trigger, which owns the own-character gate AND the per-sender
+           cooldown. The cooldown is what collapses those N duplicate deliveries
+           into ONE toast, so the single shared instance in __init__ is part of
+           the design, not a cache.
+        4. An on-screen client for the sender. Checked BEFORE the distances are
+           computed: with nowhere to put the window there is no point paying for
+           the answer, and a toast over an unrelated window is worse than none.
+
+        Never raises into the poll loop."""
+        try:
+            block = self.config.get("range_check")
+            if not range_check.is_enabled(block):
+                return
+            keyword = range_check.normalize_config(block).get("keyword", "")
+            sender = getattr(msg, "sender", "") or ""
+            body = getattr(msg, "message", "") or ""
+            if not range_check.matches_keyword(body, keyword):
+                return
+            trigger = self._range_check_trigger
+            if trigger is None:
+                trigger = self._range_check_trigger = \
+                    range_check.RangeCheckTrigger(keyword)
+            # The Settings entry autosaves, so the live keyword can change under
+            # a long-lived trigger. Re-point it rather than rebuilding: a fresh
+            # trigger would drop every cooldown stamp with it.
+            trigger.keyword = keyword
+            clients = {c.key: c for c in self._range_check_clients() if c.key}
+            if not trigger.consider(sender, body, clients.keys()):
+                return
+            key = range_check.own_key(sender)
+            client = clients.get(key)
+            rect = None
+            if client is not None and not client.is_iconic:
+                rect = tuple(client.rect)
+            if rect is None:
+                # The other way this feature can "not fire": every gate passed
+                # and the toast had nowhere to sit (client minimized, or the
+                # sender is one of ours but that window has gone). Once per
+                # character, so a repeat cannot spam the log. ASCII only -- this
+                # box's console is cp1252.
+                if key not in self._range_check_no_client:
+                    self._range_check_no_client.add(key)
+                    log.warning("[range] no on-screen EVE client for %s - "
+                                "range check skipped", key)
+                return
+            report = range_check.build_report(
+                self._range_check_target(key),
+                range_check.extract_systems(body),
+                sources=range_check.resolve_sources(self.config),
+                distance_fn=jump_range.calculate_ly_distance)
+            self._post_ui(self._range_check_show_toast, report, rect)
+        except Exception:
+            log.exception("[range] chat hook failed")
+
+    def _range_check_clients(self):
+        """Live EVE client windows -- the source of BOTH the own-character gate
+        and the toast's rect, so the two can never disagree about who counts.
+
+        Prefers the preview tracker's last snapshot (free: the native tick
+        refreshes it every ~250 ms); falls back to ONE window enumeration so the
+        feature still works with previews switched off. Same two-step
+        _implant_client_rect uses. The caller keyword-gates first, so the
+        fallback costs one enumeration per keyword-matching line, never per chat
+        line. Read-only -- window_activator remains the only module allowed to
+        change a real client window's state."""
+        snapshot = list((self._preview_clients or {}).values())
+        if snapshot:
+            return snapshot
+        try:
+            return list(self._preview_find_clients())
+        except Exception:
+            log.exception("[range] client enumeration failed")
+            return []
+
+    def _range_check_target(self, key):
+        """The posting character's current solar_system_id, or None.
+
+        Reads ONLY state the ESI location poller already fetched, through the
+        shipped _preview_state_for helper -- so this adds no ESI call of its own
+        AND inherits the one staleness rule (_OVERLAY_STALE_SECS) rather than
+        re-typing a second one. A plain read of single-writer poller state, the
+        same off-thread discipline _own_presence_system_ids uses.
+
+        None is a first-class answer, not a failure to paper over: build_report
+        turns it into a report that SAYS the location is unknown. For a feature
+        whose whole job is telling you who can reach you, a plausible wrong
+        answer is the one unacceptable output."""
+        try:
+            state = self._preview_state_for(key)
+            sid = int(getattr(state, "solar_system_id", None) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        except Exception:
+            log.exception("[range] location lookup failed for %s", key)
+            return None
+        return sid if sid > 0 else None
+
+    def _range_check_show_toast(self, report, rect):
+        """Tk thread: raise the range summary over the posting client's window.
+
+        One toast at a time -- a newer range check replaces an older one rather
+        than stacking, the same rule _implant_show_toast follows. No fallback
+        position is offered: the hook already refused to get this far without a
+        client rect, and parking the window over something else is worse than
+        showing nothing."""
+        try:
+            prev = self._range_check_toast
+            if prev is not None:
+                prev.dismiss()
+                self._range_check_toast = None
+            toast = range_check.RangeToast(
+                self.root, report,
+                on_dismiss=lambda: setattr(self, "_range_check_toast", None))
+            self._range_check_toast = toast
+            toast.show(rect)
+        except Exception:
+            log.exception("[range] toast failed")
+
+    # ── Range-check config (Settings > Fleet Management) ────────────────────
+
+    def _range_check_config(self) -> dict:
+        """The live ``config['range_check']`` block, created lazily.
+
+        Seeded from ``range_check.DEFAULTS`` via ``normalize_config`` so fc_gui
+        names no default value of its own. isinstance-guarded because
+        config.json is never deep-merged: an existing install has no block at
+        all, and a hand-edited one can be ``null`` -- neither may raise out of a
+        Settings callback. Mirrors _on_implant_reminder_toggle."""
+        block = self.config.setdefault(
+            "range_check", range_check.normalize_config(None))
+        if not isinstance(block, dict):
+            block = range_check.normalize_config(None)
+            self.config["range_check"] = block
+        return block
+
+    def _on_range_check_toggle(self):
+        """Persist the master gate immediately -- no Save-Settings round trip
+        (mirrors _on_implant_reminder_toggle / _on_capital_alert_toggle). Only
+        ``enabled`` is written; an existing block is otherwise left exactly as
+        the owner left it."""
+        self._range_check_config()["enabled"] = bool(
+            self._range_check_enabled_var.get())
+        self._save_config()
+
+    def _collect_range_check_settings(self) -> bool:
+        """Fold the keyword entry into config WITHOUT saving, so Save Settings
+        can persist it in its own single write. Returns whether there was
+        anything to fold: the Settings tab may never have been built, and a
+        config write with no field behind it must not create a block."""
+        var = getattr(self, "_range_check_keyword_var", None)
+        if var is None:
+            return False
+        self._range_check_config()["keyword"] = (var.get() or "").strip()
+        return True
+
+    def _autosave_range_check_keyword(self, *_args):
+        """Persist the keyword the moment the field is left or Enter is pressed
+        (mirrors _autosave_staging_system). A BLANK keyword is stored blank and
+        stays blank -- that is the module's second off switch, so silently
+        restoring the default here would re-arm a feature the owner disarmed."""
+        if self._collect_range_check_settings():
+            self._save_config()
 
     def _overlay_start_poller(self):
         """Start the daemon poller if not already running."""
@@ -21721,6 +21992,12 @@ class FCToolGUI:
         # Threshold is controlled from the Fleet Management tab spinbox only
         self.config["xup"]["threshold"] = self.config.get("xup", {}).get("threshold", 50)
 
+        # Range-check keyword. It already autosaves on focus-out/Return, but the
+        # Save button sits at the TOP of the tab, so a keyword typed and saved
+        # without leaving the field would otherwise be dropped by the config
+        # reload below. Guarded — the section may never have been built.
+        self._collect_range_check_settings()
+
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
         # min_pilots_involved is no longer edited here; the Intelligence-tab
@@ -21953,6 +22230,12 @@ class FCToolGUI:
             self._schedule_booster_refresh()
         # Check role tracker letters (must run on main thread for UI updates)
         self._post_ui(self._check_role_letters, msg)
+        # Fleet-chat range check (default OFF), riding the SAME tail rather than
+        # a second ChatMonitor on the same directory — the glob-guard invariant.
+        # LAST on purpose: it is the only consumer here that can do real work
+        # (a window read, then LY distances), and nothing above it may wait on
+        # that. Inert in one predicate call while the feature is switched off.
+        self._range_check_observe(msg)
 
     def _on_xup_update(self, state: XUpState):
         self._post_ui(self._update_xup_display, state)
