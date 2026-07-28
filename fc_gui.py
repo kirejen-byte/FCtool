@@ -934,8 +934,15 @@ class FCToolGUI:
         self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
         # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
         # switch, while the foreground probe has not caught up yet. Read only by
-        # _preview_anchor_key; written only by _preview_hotkey_switch_to.
+        # _preview_anchor_key; ARMED only by the hotkey path
+        # (_preview_hotkey_switch_to) and CLEARED by every other switch —
+        # _preview_switch_to (so a tile click always outranks it), the anchor
+        # itself once the record is spent, and _preview_teardown.
         self._preview_pending_switch = None
+        # Monotonic ts of the last LOGGED fast-drain failure (None = the next one
+        # gets a full traceback). Throttles the ~22/s log flood a permanently
+        # throwing drain produced; a healthy pass re-arms the full report.
+        self._preview_fast_drain_logged_at = None
         # hwnd -> (attempts_so_far, tick_count the next attempt is due) for a
         # client whose tile could not be attached. Without it that client is
         # orphaned for the session: the failed spawn leaves it in the published
@@ -15288,6 +15295,11 @@ class FCToolGUI:
     # `_preview_clients` snapshot (staleness bound: one tick — exactly what tile
     # clicks already tolerate). The tick-tail drain stays where it is.
     _PREVIEW_FAST_DRAIN_MS = 40
+    # A drain that throws throws EVERY pass — at 40 ms that is ~22 tracebacks a
+    # second, which buries the log it is trying to inform. First failure gets the
+    # whole traceback; after that one terse line at most this often while the
+    # fault persists. A healthy pass re-arms the full report.
+    _PREVIEW_FAST_DRAIN_LOG_EVERY_S = 10.0
     # How long a hotkey-driven switch stays "pending" (unconfirmed by the
     # foreground probe) and outranks that probe as the cycle anchor. Windows
     # applies SetForegroundWindow asynchronously — and outright denies it under
@@ -15887,10 +15899,14 @@ class FCToolGUI:
     def _preview_note_stranded(self, client):
         """Book a client whose tile could not be created for a later attempt.
 
-        The single writer of `_preview_spawn_retry`. Counts the attempt, schedules
-        the next one `_PREVIEW_SPAWN_RETRY_EVERY` ticks out, and drops the record
-        with ONE log line once `_PREVIEW_SPAWN_RETRY_MAX` attempts are spent — a
-        window that is genuinely gone must not be chased forever."""
+        The only path that BOOKS a client into `_preview_spawn_retry`; every
+        other writer only removes (`_preview_spawn_tile` pops on a successful
+        attach, `_preview_retry_stranded_tiles` drops entries whose client went
+        away or healed, `_preview_teardown` empties the book). Counts the
+        attempt, schedules the next one `_PREVIEW_SPAWN_RETRY_EVERY` ticks out,
+        and drops the record with ONE log line once `_PREVIEW_SPAWN_RETRY_MAX`
+        attempts are spent — a window that is genuinely gone must not be chased
+        forever."""
         retry = getattr(self, "_preview_spawn_retry", None)
         if retry is None:
             retry = self._preview_spawn_retry = {}
@@ -15991,7 +16007,16 @@ class FCToolGUI:
         it only if it is a DIFFERENT, still-live client whose key is not in
         `never_minimize` (EVE-O PriorityClients parity). Activation itself is
         always via window_activator (the compliance choke-point) — focus APIs
-        only, nothing injected into any EVE client (spec §4)."""
+        only, nothing injected into any EVE client (spec §4).
+
+        Clears any pending hotkey-switch record: every switch arriving here
+        SUPERSEDES it. A tile click is a mouse gesture the user watched land, so
+        a keyboard record armed up to `_PREVIEW_PENDING_SWITCH_S` ago must not
+        outrank it — that made the following cycle press a visible no-op (it
+        re-targeted the client the keyboard had picked, ignoring the click).
+        The hotkey path re-arms the record AFTER calling this, which is why the
+        order in `_preview_hotkey_switch_to` is load-bearing."""
+        self._preview_pending_switch = None
         cfg = self._preview_cfg()
         prev_key = self._preview_last_key
         if (cfg.get("minimize_inactive", False)
@@ -16239,14 +16264,21 @@ class FCToolGUI:
         hwnd as it read when we issued the switch, timestamp) — and that key
         outranks the probe while ALL of:
           * the record is younger than `_PREVIEW_PENDING_SWITCH_S`;
-          * the probe still reads *exactly* what it read then (i.e. nothing has
-            moved yet — neither our switch nor the user);
+          * the probe answers at all, and still reads *exactly* what it read
+            then (i.e. nothing has moved yet — neither our switch nor the user);
           * the switched-to client is still live.
         The moment the foreground reads ANYTHING else — our switch landing, or
         the user alt-tabbing somewhere of their own accord — the record is
         dropped and the shipped foreground-first behaviour resumes unchanged.
         That is the §3.3 guarantee: manual alt-tabs are never overridden, because
-        an alt-tab necessarily moves the probe off the recorded value."""
+        an alt-tab necessarily moves the probe off the recorded value.
+
+        An UNAVAILABLE probe (no win32 backend yet, or it raised) reads as
+        "unknown", never as "unchanged" — hence the explicit `fg is not None`.
+        Without it both reads are None, `None == None` is True, and the record
+        would win the whole window on such a host even when the switch landed
+        perfectly: a regression against the shipped last-key fallback rather
+        than a fix for it."""
         fg = self._preview_probe_foreground()
         fg_key = None
         if fg:
@@ -16259,7 +16291,11 @@ class FCToolGUI:
             p_key, p_fg, p_ts = pending
             cap = getattr(self, "_PREVIEW_PENDING_SWITCH_S",
                           FCToolGUI._PREVIEW_PENDING_SWITCH_S)
-            if (time.monotonic() - p_ts) <= cap and fg == p_fg and p_key in by_key:
+            # ACCEPTED LIMIT: `fg == p_fg` cannot tell "our denied switch never
+            # landed" from "the user alt-tabbed away and back to the same window
+            # inside the cap" — both read as unchanged. Bounded by the cap.
+            if ((time.monotonic() - p_ts) <= cap
+                    and fg is not None and fg == p_fg and p_key in by_key):
                 return p_key            # our switch is still in flight — trust it
             # Confirmed, superseded by the user, expired, or its client died.
             self._preview_pending_switch = None
@@ -16271,18 +16307,23 @@ class FCToolGUI:
         """`_preview_switch_to` for the HOTKEY paths only, plus the pending-switch
         record the cycle anchor debounces on (see _preview_anchor_key).
 
-        The single writer of `_preview_pending_switch`. Deliberately NOT folded
-        into `_preview_switch_to`: a tile click is a mouse gesture the user can
-        see land, and the shipped foreground-first anchor stays authoritative for
-        it — only a keyboard press can outrun the foreground probe. The
-        foreground is sampled BEFORE the switch is issued so the record holds the
-        value a subsequent stale read would return; a login client (key "") gets
-        no record, mirroring `_preview_switch_to` not clobbering the anchor."""
+        The only path that ARMS `_preview_pending_switch` (every other switch
+        CLEARS it — see _preview_switch_to). Deliberately NOT folded into
+        `_preview_switch_to`: a tile click is a mouse gesture the user can see
+        land, and the shipped foreground-first anchor stays authoritative for
+        it — only a keyboard press can outrun the foreground probe.
+
+        ORDER IS LOAD-BEARING: sample the foreground FIRST (the record must hold
+        the value a subsequent stale read would return, i.e. the pre-switch one),
+        then switch — which clears whatever record was there — and only then
+        arm the new one. Arming before the switch would have the clear eat it.
+        A login client (key "") gets no record, mirroring `_preview_switch_to`
+        not clobbering the anchor."""
         key = getattr(client, "key", "")
-        self._preview_pending_switch = (
-            (key, self._preview_probe_foreground(), time.monotonic())
-            if key else None)
+        fg_before = self._preview_probe_foreground()
         self._preview_switch_to(client)
+        self._preview_pending_switch = (
+            (key, fg_before, time.monotonic()) if key else None)
 
     def _preview_drain_hotkeys(self):
         """Drain the hotkey worker queue and act on each event. Focus APIs only —
@@ -16376,15 +16417,34 @@ class FCToolGUI:
 
         Exception-guarded for BUG A parity: a drain that throws must cost one
         pass, never the loop. Losing the loop would silently strand every hotkey
-        on the 250 ms/2 s tick cadence for the rest of the session."""
+        on the 250 ms/2 s tick cadence for the rest of the session.
+
+        DELIBERATE: a queue-dependent fault absorbed here does NOT increment
+        `_preview_tick_fails` (that counter belongs to the controller tick, whose
+        own tail drain would see the same fault) — this loop logs instead, so a
+        broken drain can never trip `_preview_disable_session` from here.
+        Logging is throttled: the first failure carries the traceback, then one
+        line per `_PREVIEW_FAST_DRAIN_LOG_EVERY_S` while it persists (~22 passes
+        a second would otherwise flood the log); a healthy pass resets that."""
         self._preview_fast_drain_after_id = None
         if (self._preview_cfg().get("mode") != "native"
                 or self._preview_disabled_session):
             return
         try:
             self._preview_drain_hotkeys()
-        except Exception:
-            log.exception("[preview] fast hotkey drain pass failed")
+        except Exception as exc:
+            now = time.monotonic()
+            last = getattr(self, "_preview_fast_drain_logged_at", None)
+            every = getattr(self, "_PREVIEW_FAST_DRAIN_LOG_EVERY_S",
+                            FCToolGUI._PREVIEW_FAST_DRAIN_LOG_EVERY_S)
+            if last is None:
+                log.exception("[preview] fast hotkey drain pass failed")
+                self._preview_fast_drain_logged_at = now
+            elif (now - last) >= every:
+                log.warning("[preview] fast hotkey drain still failing: %s", exc)
+                self._preview_fast_drain_logged_at = now
+        else:
+            self._preview_fast_drain_logged_at = None   # healthy -> re-arm the report
         self._preview_arm_fast_drain()
 
     def _preview_cancel_fast_drain(self):
@@ -16951,8 +17011,12 @@ class FCToolGUI:
         decloak-alert suppression check (see _preview_on_decloak).
 
         Uses the same hwnd-equality semantics as _preview_foreground_info's
-        `fg in cur` check (no GA_ROOT/ancestor walk anywhere in this codebase's
-        win32 layer — see eve_client_tracker._RealWin32.get_foreground). Reads
+        `fg in cur` check: no GA_ROOT/ancestor walk on THIS path — plain hwnd
+        equality against the tracked client set (see
+        eve_client_tracker._RealWin32.get_foreground). `window_activator` does
+        resolve GA_ROOT (`_root_of`) when confirming its own activation, but
+        that is its comparison, not this one; EVE client hwnds arrive from
+        EnumWindows and are already top-level either way. Reads
         `self._preview_clients` (hwnd -> ClientWindow, populated by the last
         tick) rather than re-enumerating windows, since this fires off the
         GamelogMonitor edge, not the tick.
