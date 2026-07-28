@@ -34,6 +34,16 @@ Two helpers:
     from ``ui_theme`` (dark panel bg, light text — never the stray light-yellow
     ``#ffffe0`` that one bespoke copy rendered). The copy is also stashed on the
     widget as ``_tooltip_text`` so tests can assert it without simulating a hover.
+
+``update_tooltip(widget, text)``
+    Change the copy of an ALREADY-attached tooltip. It exists because
+    ``attach_tooltip``'s binds use ``add="+"``: calling it again on the same
+    widget stacks a second set of ``<Enter>``/``<Leave>``/``<Destroy>``
+    handlers, so a panel that re-attached on every repaint would accumulate
+    binds for the life of the app. ``_show`` therefore reads
+    ``widget._tooltip_text`` LIVE at hover time rather than closing over the
+    string it was attached with, and this helper is simply the supported way to
+    re-stash it — bind ONCE, re-stash as often as the data changes.
 """
 from __future__ import annotations
 
@@ -86,7 +96,10 @@ def attach_tooltip(widget, text):
     clobber an existing binding on the widget.
 
     The tooltip copy is stashed on the widget as ``_tooltip_text`` so it is
-    assertable in tests without delivering a synthetic hover event.
+    assertable in tests without delivering a synthetic hover event — and
+    ``_show`` READS it back from there rather than closing over ``text``, so
+    ``update_tooltip`` can change the copy later without re-binding (see the
+    module docstring: re-attaching stacks ``add="+"`` handlers).
     """
     widget._tooltip_text = text
     state = {"tip": None}
@@ -102,10 +115,16 @@ def attach_tooltip(widget, text):
 
     def _show(_e=None):
         _hide()
+        # Read the copy LIVE, not from the closure: update_tooltip re-stashes
+        # `_tooltip_text` on the widget, and a tooltip whose text is empty has
+        # nothing to say — draw no empty box.
+        copy = getattr(widget, "_tooltip_text", text)
+        if not copy:
+            return
         try:
             tip = tk.Toplevel(widget)
             tip.wm_overrideredirect(True)
-            tk.Label(tip, text=text, font=_TOOLTIP_FONT,
+            tk.Label(tip, text=copy, font=_TOOLTIP_FONT,
                      fg=ui_theme.FG_TEXT, bg=ui_theme.BG_PANEL,
                      borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
                      wraplength=340, padx=5, pady=3).pack()
@@ -119,4 +138,20 @@ def attach_tooltip(widget, text):
     widget.bind("<Enter>", _show, add="+")
     widget.bind("<Leave>", _hide, add="+")
     widget.bind("<Destroy>", _hide, add="+")
+    return widget
+
+
+def update_tooltip(widget, text):
+    """Re-stash an already-attached tooltip's copy and return ``widget``.
+
+    The supported way to give a repainting widget a tooltip whose text follows
+    its data. **Never call ``attach_tooltip`` again for that** — its three binds
+    use ``add="+"``, so re-attaching stacks a fresh ``<Enter>``/``<Leave>``/
+    ``<Destroy>`` handler set on every repaint and leaks one per call for the
+    life of the widget. This only writes the attribute ``_show`` reads.
+
+    Safe on a widget that never had a tooltip attached (it just stashes the
+    string, which no handler will read) — so a caller need not branch.
+    """
+    widget._tooltip_text = text
     return widget

@@ -18,8 +18,14 @@ to the renderer):
     as ``confirmed through 14:32:10 (2m 05s behind)``. There is no code path
     that produces an "updated Ns ago" string.
  2. Never label it live. The state is IDLE / FILLING / SETTLED and every count
-    is a FLOOR (``BattleLedgerView.floor_prefix`` == ">=") because counts only
-    ever go up. ``assert_no_live_language`` runs over every LAGGED string the
+    is a FLOOR, because counts only ever go up. The floor is stated in WORDS
+    (the ``NOTE_LAG`` note, the panel's state tooltip) rather than by prefixing
+    every number: ``BattleLedgerView.floor_prefix`` is "" as of 2026-07-28 —
+    owner directive, a ">=" on every row read as visual noise. The MEANING is
+    unchanged and still machine-checked (``counts_are_floors`` stays True and
+    ``NOTE_LAG`` is always emitted); only the glyph went. The seam is kept so a
+    renderer still asks the engine rather than typing a prefix of its own.
+    ``assert_no_live_language`` runs over every LAGGED string the
     view carries — ``title``, ``stamp_line``, ``state_label``, ``lag_line``,
     ``killed_note``, every row ``label``/``qualifier`` and every note — so a
     future edit that types "live", "updated" or "fresh" raises instead of
@@ -46,8 +52,9 @@ to the renderer):
 Purity: no Tk, no fc_gui import, no network, no app state. Everything the
 engine needs from the app arrives through injected callables/setters
 (``presence_provider``, ``set_fleet_roster``, ``set_standings``,
-``resolve_system_name``), so the wiring bite is a handful of lines. The Tk
-panel lives in the sibling ``battle_ledger_panel`` module.
+``resolve_system_name``, ``resolve_ship_group``), so the wiring bite is a
+handful of lines. The Tk panel lives in the sibling ``battle_ledger_panel``
+module.
 
 Threading: ``ZKillMonitor`` calls ``ingest`` on its poll thread while the Tk
 thread calls ``tick``/``render_model``, so every public method takes an
@@ -61,7 +68,8 @@ from __future__ import annotations
 import re
 import threading
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable
 
@@ -226,6 +234,17 @@ _NOTE_TEXT = {
         "No fleet roster and no standings — nothing can be attributed to a side."),
 }
 
+# ── The floor marker (honesty rule 2, as a glyph) ───────────────────────────
+# Prefixed to every count a renderer draws. EMPTY since 2026-07-28 by owner
+# directive: a ">=" in front of all three rows read as noise on a panel whose
+# every other line already says the same thing. Deliberately still a seam
+# rather than a deletion — `NOTE_LAG` ("Counts are floors — ... numbers only
+# ever go up") is emitted on EVERY render and the panel's state tooltip repeats
+# it, so the claim is carried in words, where it is also machine-checkable.
+# Restoring the glyph is a one-character edit here, in ONE place, and the panel
+# picks it up without a change.
+FLOOR_PREFIX = ""
+
 
 # ── Live-language guard (honesty rule 2) ────────────────────────────────────
 # Applied to every LAGGED string render_model puts in the view (title,
@@ -332,6 +351,98 @@ def format_isk(value: float | None) -> str:
     if amount >= 1_000:
         return f"{amount / 1_000:.1f}K"
     return f"{amount:.0f}"
+
+
+# ── Composition (what the ships in a bucket actually were) ──────────────────
+# "3 Battleship, 2 Logistics, 1 Dreadnought" — the answer to the question the
+# bare ship count cannot answer ("we lost 6" vs "we lost 6 logi"). Capped
+# because a 60-hull brawl would otherwise produce a tooltip taller than the
+# screen; the tail is SUMMARISED, never silently dropped.
+COMPOSITION_MAX_ENTRIES = 5
+
+
+@dataclass(frozen=True)
+class CompositionEntry:
+    """One class of hull inside a bucket.
+
+    `name` is the SDE ship-GROUP name ("Battleship", "Logistics") as returned
+    by the injected `resolve_ship_group`, or "" when the group could not be
+    resolved — an empty name is honest, not a bug: an unmapped or brand-new
+    hull is still a ship that died, and dropping it would understate the count
+    the row already shows. `format_composition` renders it as plain "N ships".
+    """
+    name: str
+    count: int
+
+
+def _composition_sort_key(entry: CompositionEntry):
+    """Descending by count, then alphabetical; the UNNAMED entry always last.
+
+    Sorting lives with the formatter as well as the builder so the cap can
+    never drop the biggest group just because a caller handed over an unsorted
+    tuple.
+    """
+    return (1 if not entry.name else 0, -entry.count, entry.name)
+
+
+def _ships_phrase(count: int) -> str:
+    return f"{count} ship{'s' if count != 1 else ''}"
+
+
+def format_composition(entries: Iterable[CompositionEntry],
+                       *, max_entries: int = COMPOSITION_MAX_ENTRIES) -> str:
+    """`3 Battleship, 2 Logistics, 1 Dreadnought`, or "" for nothing at all.
+
+    ASCII only (this string reaches a Tk tooltip AND, via the same wording, the
+    log — see the cp1252 rule). Descending by count. Past `max_entries` the
+    remainder collapses to `+N more ships`, so the number of hulls named in the
+    line always reconciles with the bucket's own count.
+    """
+    items = sorted((e for e in (entries or ()) if e.count > 0),
+                   key=_composition_sort_key)
+    if not items:
+        return ""
+    limit = max(1, int(max_entries))
+    shown, rest = items[:limit], items[limit:]
+    parts = [f"{e.count} {e.name}" if e.name else _ships_phrase(e.count)
+             for e in shown]
+    remainder = sum(e.count for e in rest)
+    if remainder:
+        # "+7 more ships", not a bare "+7": every other number on this line is
+        # a hull count, and the tail has to read as one too.
+        parts.append(f"+{remainder} more ship{'s' if remainder != 1 else ''}")
+    return ", ".join(parts)
+
+
+# ── Battle report link ──────────────────────────────────────────────────────
+# Same pattern zkill_monitor.py already posts in its alerts, kept as a pure
+# string builder here so the engine stays network-free and the panel stays
+# browser-free (it takes an injected `on_open_url`).
+WARBEACON_BR_URL = "https://warbeacon.net/br/related/{system_id}/{stamp}/"
+
+
+def warbeacon_url(system_id, when: datetime | None) -> str:
+    """WarBeacon's related-kills battle report for `system_id` at `when`.
+
+    `when` is the DATA clock — the fight's FIRST killmail_time — never
+    `datetime.now()`. The stamp selects the window the report covers, so
+    anchoring it on the wall clock would open a report that starts partway
+    through a long fight (and, on a SETTLED ledger the FC is reading ten
+    minutes later, one that starts after it ended). Normalised to UTC first:
+    the project carries MIXED aware/naive timestamps.
+
+    Returns "" — never a half-built URL — when there is no system or no clock
+    to stamp, so a caller can treat truthiness as "there is a report to open".
+    """
+    try:
+        sid = int(system_id)
+    except (TypeError, ValueError):
+        return ""
+    stamped = to_utc(when)
+    if not sid or stamped is None:
+        return ""
+    return WARBEACON_BR_URL.format(system_id=sid,
+                                   stamp=stamped.strftime("%Y%m%d%H%M"))
 
 
 def format_stamp_line(confirmed_through: datetime | None,
@@ -533,6 +644,15 @@ class LedgerRow:
     pods: int | None
     provenance: str = PROVENANCE_ZKILL
     qualifier: str = ""      # e.g. "roster only" — why this row is narrower
+    # WHAT the ships were, already resolved to group names: a tuple of
+    # CompositionEntry, descending, unnamed last. A tuple rather than a
+    # Counter/dict on purpose — LedgerRow is a frozen dataclass whose `==` the
+    # panel diffs on every repaint, and an unhashable field would also break
+    # the generated __hash__. Empty for a suppressed bucket: a row that cannot
+    # be attributed has no composition either (honesty rule 5 extends here —
+    # naming hulls under a blanked row would leak exactly the number the row
+    # is refusing to state).
+    composition: tuple = ()
 
     @property
     def suppressed(self) -> bool:
@@ -584,11 +704,21 @@ class BattleLedgerView:
     fast: FastStrip | None
     killed_note: str
     revision: int
+    # The WarBeacon battle report for this fight, or "" when there is nothing
+    # to link. Built here (from the fight's FIRST killmail_time) rather than in
+    # the panel so the panel needs no clock and no URL grammar of its own.
+    battle_report_url: str = ""
 
     @property
     def counts_are_floors(self) -> bool:
-        """Always True. Counts only ever go up: a bucket's number is the number
-        of kills that have ARRIVED, never the number that happened."""
+        """Always True — and STILL true now that `floor_prefix` is "".
+
+        Counts only ever go up: a bucket's number is the number of kills that
+        have ARRIVED, never the number that happened. Dropping the ">=" glyph
+        (owner directive 2026-07-28) changed how the floor is SAID, not whether
+        it holds; the NOTE_LAG note and the state tooltip say it in words on
+        every render.
+        """
         return True
 
     def row(self, bucket: str) -> LedgerRow | None:
@@ -608,6 +738,12 @@ class _Totals:
     pod_isk: float = 0.0
     structures: int = 0
     structure_isk: float = 0.0
+    # victim ship_type_id -> how many died. Ships ONLY: pods and structures
+    # keep their own counters (and their own lines), so the composition always
+    # reconciles with `ships` and never claims a capsule was a hull. Resolution
+    # to group names is deferred to render time — the type id is what the
+    # killmail carries, and the resolver is injected.
+    ship_types: Counter = field(default_factory=Counter)
 
 
 @dataclass
@@ -632,6 +768,7 @@ class BattleLedger:
             self.config,
             presence_provider=self._own_presence_system_ids,
             resolve_system_name=system_coords.get_name,   # OFFLINE, see below
+            resolve_ship_group=self._ledger_ship_group,   # OFFLINE, see below
         )
         zkill_monitor.on_killmail = ledger.ingest        # zKill poll thread
         ...
@@ -664,8 +801,10 @@ class BattleLedger:
     `rate_limit("esi")` + `requests.get(timeout=5)` on a cache miss: that
     reproduces the 1.15 s Tk-thread stall class `system_coords.get_name` was
     adopted to prevent, and stalls the poll thread along with it. The same rule
-    binds `presence_provider` (a local dict read — see `_presence_systems`) and
-    the `isk_format` the panel takes.
+    binds `presence_provider` (a local dict read — see `_presence_systems`),
+    `resolve_ship_group` (a bundled-table dict read, and it is called once per
+    DISTINCT hull type per render, so a wire call there costs one stall per
+    ship class in the fight) and the `isk_format` the panel takes.
 
     TWO CLOCKS, deliberately kept apart:
       * the DATA clock (killmail_time, aware UTC) drives `confirmed_through`
@@ -681,6 +820,7 @@ class BattleLedger:
     def __init__(self, *,
                  presence_provider: Callable[[], Iterable[int]] | None = None,
                  resolve_system_name: Callable[[int], str] | None = None,
+                 resolve_ship_group: Callable[[int], str | None] | None = None,
                  quiet_s: float = QUIET_S,
                  arm_window_s: float = ARM_WINDOW_S,
                  arm_min_attackers: int = ARM_MIN_ATTACKERS,
@@ -699,14 +839,20 @@ class BattleLedger:
                  utcnow: Callable[[], datetime] | None = None,
                  monotonic: Callable[[], float] | None = None):
         self._lock = threading.RLock()
-        # NON-BLOCKING CONTRACT (see the class docstring): both of these are
-        # invoked with `self._lock` HELD — `presence_provider` from `ingest` on
-        # the zKill poll thread, `resolve_system_name` from `render_model` on the
-        # Tk thread at 1 Hz. Anything that can do network I/O here stalls the UI
-        # and the poll thread together. Pass `system_coords.get_name`, never an
-        # ESI resolver.
+        # NON-BLOCKING CONTRACT (see the class docstring): all three of these
+        # are invoked with `self._lock` HELD — `presence_provider` from `ingest`
+        # on the zKill poll thread, `resolve_system_name` and
+        # `resolve_ship_group` from `render_model` on the Tk thread at 1 Hz.
+        # Anything that can do network I/O here stalls the UI and the poll
+        # thread together. Pass `system_coords.get_name`, never an ESI resolver;
+        # and for the ship group pass an OFFLINE lookup over the bundled type
+        # table (`type_catalog.SHIP_GROUP_NAMES` keyed off the bundled
+        # fit_types entry's group id) with the TypeCatalog ESI fallback
+        # DISABLED — an unmapped hull must degrade to "" and be rendered as a
+        # plain "N ships", never reach for the wire under the lock.
         self._presence_provider = presence_provider
         self._resolve_system_name = resolve_system_name
+        self._resolve_ship_group = resolve_ship_group
         self._quiet_s = float(quiet_s)
         self._arm_window = timedelta(seconds=arm_window_s)
         self._arm_min_attackers = int(arm_min_attackers)
@@ -1153,6 +1299,11 @@ class BattleLedger:
         else:
             totals.ships += 1
             totals.isk += facts.isk_value
+            # Composition, ships only — deliberately inside the SAME branch
+            # that increments `ships`, so the two can never disagree about
+            # what a hull is (a capsule counted as a Capsule class would put
+            # the pod back in the row it was just dedup'd out of).
+            totals.ship_types[facts.victim_ship_type_id] += 1
 
         if facts.killmail_id is not None:
             self._counted_ids.add(facts.killmail_id)
@@ -1231,8 +1382,10 @@ class BattleLedger:
 
           * one shared `confirmed_through` and one `stamp_line` off the DATA
             clock, for all three buckets (rule 1);
-          * `state_label` is FILLING/SETTLED and `floor_prefix` is ">=" — never
-            a "LIVE" chip (rule 2), machine-checked by assert_no_live_language;
+          * `state_label` is FILLING/SETTLED — never a "LIVE" chip (rule 2),
+            machine-checked by assert_no_live_language — and the floor is
+            stated in words by the always-present NOTE_LAG note (see
+            FLOOR_PREFIX for why the ">=" glyph itself is gone);
           * no event/flash field exists to animate (rule 3);
           * `fast` is a separate type in a separate field, and every row is
             asserted to share ONE provenance (rule 4);
@@ -1299,6 +1452,7 @@ class BattleLedger:
                     pods=None if suppressed else totals.pods,
                     provenance=PROVENANCE_ZKILL,
                     qualifier=qualifier,
+                    composition=() if suppressed else self._composition(totals),
                 ))
 
             pods = sum(t.pods for t in self._totals.values())
@@ -1335,8 +1489,9 @@ class BattleLedger:
         return BattleLedgerView(
             visible=False, state=STATE_IDLE, state_label=STATE_LABELS[STATE_IDLE],
             title="", system_id=None, system_name="", confirmed_through=None,
-            stamp_line="", lag_line="", floor_prefix=">=", rows=(), notes=(),
-            fast=self._fast, killed_note="", revision=self._revision,
+            stamp_line="", lag_line="", floor_prefix=FLOOR_PREFIX, rows=(),
+            notes=(), fast=self._fast, killed_note="",
+            revision=self._revision, battle_report_url="",
         )
 
     def _blind_view(self, kind: str, reference: datetime) -> BattleLedgerView:
@@ -1397,13 +1552,59 @@ class BattleLedger:
             confirmed_through=self._confirmed_through,
             stamp_line=stamp_line,
             lag_line=lag_line,
-            floor_prefix=">=",
+            floor_prefix=FLOOR_PREFIX,
             rows=rows,
             notes=notes,
             fast=self._fast,
             killed_note=killed_note,
             revision=self._revision,
+            # The fight's OWN start, off the passed system id — `_blind_view`
+            # passes None there while `self._system_id` may still hold a value,
+            # and a blind view must not offer a report for a fight it is
+            # refusing to state numbers for.
+            battle_report_url=warbeacon_url(system_id, self._fight_started_at),
         )
+
+    def _composition(self, totals: _Totals) -> tuple:
+        """This bucket's hulls as resolved `CompositionEntry` items.
+
+        CALLED WITH `self._lock` HELD, on the Tk thread, at 1 Hz, once per
+        DISTINCT type id — so `resolve_ship_group` is bound by the same
+        non-blocking contract as `resolve_system_name` (see the class
+        docstring). Everything it cannot name collapses into ONE unnamed entry
+        rather than N mystery rows: the total still reconciles with the bucket's
+        ship count, which is the property that makes the tooltip trustworthy.
+        """
+        named: Counter = Counter()
+        unnamed = 0
+        for type_id, count in totals.ship_types.items():
+            name = self._ship_group_name(type_id)
+            if name:
+                named[name] += count
+            else:
+                unnamed += count
+        entries = [CompositionEntry(name, count)
+                   for name, count in named.items()]
+        if unnamed:
+            entries.append(CompositionEntry("", unnamed))
+        return tuple(sorted(entries, key=_composition_sort_key))
+
+    def _ship_group_name(self, type_id: int) -> str:
+        """A hull's ship-group name, or "" when it cannot be resolved offline.
+
+        Never raises: a broken/absent resolver degrades to the unnamed bucket,
+        which renders as a plain "N ships". That is the honest failure — the
+        ship count itself is unaffected.
+        """
+        if not type_id or self._resolve_ship_group is None:
+            return ""
+        try:
+            resolved = self._resolve_ship_group(type_id)
+        except Exception:
+            return ""
+        if isinstance(resolved, str) and resolved.strip():
+            return resolved.strip()
+        return ""
 
     def _system_name(self, system_id: int | None) -> str:
         """Resolve the fight's system name. CALLED WITH `self._lock` HELD, on the

@@ -51,7 +51,14 @@ properties of this file are what make that true and must not be undone:
 
 Colours come from `ui_theme` by import (never a re-typed hex literal — the
 palette guard asserts import IDENTITY). Tooltips use `ui_helpers.attach_tooltip`
-(the only implementation with the `<Destroy>` cleanup).
+(the only implementation with the `<Destroy>` cleanup) — attached ONCE per
+widget, then re-worded through `ui_helpers.update_tooltip`. Re-attaching is the
+trap: all three of attach_tooltip's binds use `add="+"`, so a panel that
+re-attached the per-row composition tip on every 1 Hz repaint would leak a
+handler set per second for the life of the app.
+
+The battle report link and the per-row composition tooltips both add height to
+the numbers above, which is one more reason the scroll canvas is not optional.
 """
 
 from __future__ import annotations
@@ -60,13 +67,14 @@ import tkinter as tk
 from tkinter import ttk
 
 import battle_ledger as bl
-from ui_helpers import attach_tooltip
+from ui_helpers import attach_tooltip, update_tooltip
 from ui_theme import (
     BG_PANEL,
     BORDER_COLOR,
     FG_ACCENT,
     FG_DIM,
     FG_GREEN,
+    FG_MAGENTA,
     FG_ORANGE,
     FG_RED,
     FG_TEXT,
@@ -125,6 +133,21 @@ _FAST_TIP = (
     "a 2-minute Enemies number invites a comparison that is false."
 )
 _DISMISS_TIP = "Dismiss this battle ledger."
+# The per-row composition tooltip: WHAT the bucket's ships were. The head is
+# static copy; the line under it is DATA (battle_ledger.format_composition), so
+# only the head goes through the import-time guard.
+_COMPOSITION_TIP_HEAD = "Ships counted for this side, by class:"
+_COMPOSITION_TIP_EMPTY = "No ships counted for this side."
+_COMPOSITION_TIP_BLANK = (
+    "This row cannot be attributed to a side, so there is nothing to break "
+    "down — see the notes below.")
+_BR_TIP = (
+    "Open WarBeacon's battle report for this fight in a browser. It is stamped "
+    "from the fight's FIRST killmail, so the report covers the whole "
+    "engagement rather than starting part way through it.")
+# The link's own label. Not a *_TIP, but it is rendered copy all the same, so
+# it goes through the guard with the rest.
+BR_LINK_TEXT = "WarBeacon battle report"
 
 # EVERY static string this panel types is held to the same rule the engine holds
 # itself to (battle_ledger.assert_no_live_language) — the tooltips included,
@@ -134,12 +157,24 @@ _DISMISS_TIP = "Dismiss this battle ledger."
 # that exemption is named in battle_ledger._LIVE_LANGUAGE rather than left to
 # omission here.
 for _copy, _where in ((_STATE_TIP, "state tip"), (_STAMP_TIP, "stamp tip"),
-                      (_FAST_TIP, "fast tip"), (_DISMISS_TIP, "dismiss tip")):
+                      (_FAST_TIP, "fast tip"), (_DISMISS_TIP, "dismiss tip"),
+                      (_COMPOSITION_TIP_HEAD, "composition tip head"),
+                      (_COMPOSITION_TIP_EMPTY, "composition tip empty"),
+                      (_COMPOSITION_TIP_BLANK, "composition tip blank"),
+                      (_BR_TIP, "battle report tip"),
+                      (BR_LINK_TEXT, "battle report link")):
     bl.assert_no_live_language(_copy, _where)
 
 
-def format_row(row, isk_format=bl.format_isk, floor_prefix=">=") -> str:
-    """One bucket line, monospace-aligned: `Ours     >=6    1.2B`.
+def format_row(row, isk_format=bl.format_isk,
+               floor_prefix=bl.FLOOR_PREFIX) -> str:
+    """One bucket line, monospace-aligned: `Ours       6    1.2B`.
+
+    `floor_prefix` comes from the engine (`BattleLedgerView.floor_prefix`) and
+    is "" as of 2026-07-28 — the owner found a ">=" on every row distracting.
+    The default is the engine's constant rather than a literal so the two can
+    never disagree, and the claim itself has not gone anywhere: it is in the
+    always-present lag note and in the state tooltip.
 
     A suppressed bucket renders the blank marker, never `0` — the engine
     already made that impossible by handing over None, and this is the other
@@ -154,6 +189,28 @@ def format_row(row, isk_format=bl.format_isk, floor_prefix=">=") -> str:
     return f"{row.label:<8}{ships} {isk:>8}"
 
 
+def composition_tip(row) -> str:
+    """The hover copy for one bucket row: what that side's ships actually were.
+
+    `Ships counted for this side, by class:\\n3 Battleship, 2 Logistics`.
+
+    Pure, so the wording is testable without a display. Three honest outcomes,
+    never a fourth that invents one:
+      * a SUPPRESSED row (`ships is None`) says it cannot be broken down — the
+        row is refusing to state a number, so naming its hulls would leak
+        exactly what it withheld (honesty rule 5);
+      * a row with no ships yet says so plainly;
+      * otherwise the head plus the composition line, which reconciles with the
+        count on the row (pods and structures are excluded on BOTH sides).
+    """
+    if row is None or row.suppressed:
+        return _COMPOSITION_TIP_BLANK
+    line = bl.format_composition(row.composition)
+    if not line:
+        return _COMPOSITION_TIP_EMPTY
+    return f"{_COMPOSITION_TIP_HEAD}\n{line}"
+
+
 class BattleLedgerPanel:
     """The Fleet Management tab's battle-ledger column.
 
@@ -164,20 +221,29 @@ class BattleLedgerPanel:
             pack_opts=dict(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=(0, 4)),
             register_scroll_canvas=self._register_scroll_canvas,
             isk_format=self._market_price_short,
+            on_open_url=webbrowser.open,          # the ONLY browser seam
         )
 
     then re-packs `comp_scroll_outer` after it (so the ship list takes the
     remaining cavity) and calls `update_view` from the UI thread.
+
+    `on_open_url` is injected for the same reason `isk_format` is: this module
+    imports tkinter, `battle_ledger` and `ui_theme`/`ui_helpers` and nothing
+    else. It never opens a browser itself, and with no host wiring the battle
+    report link simply does not exist.
     """
 
     def __init__(self, parent, *, width: int = DEFAULT_WIDTH,
                  pack_opts: dict | None = None,
                  register_scroll_canvas=None,
                  isk_format=None,
-                 on_dismiss=None):
+                 on_dismiss=None,
+                 on_open_url=None):
         self._pack_opts = dict(pack_opts or dict(side=tk.RIGHT, fill=tk.Y))
         self._isk_format = isk_format or bl.format_isk
         self._on_dismiss = on_dismiss
+        self._on_open_url = on_open_url
+        self._br_url = ""
         self._visible = False
         self._last_view = None
         # Wrap inside the canvas, not the frame: the vertical scrollbar eats
@@ -275,6 +341,12 @@ class BattleLedgerPanel:
             label = tk.Label(body, text="", font=_FONT_ROW,
                              fg=_ROW_FG[bucket], bg=BG_PANEL, anchor=tk.W)
             label.pack(fill=tk.X)
+            # ONE attach, here, for the life of the panel. `update_view` then
+            # re-stashes the copy through `update_tooltip` — re-attaching would
+            # stack a fresh <Enter>/<Leave>/<Destroy> set on every repaint
+            # (attach_tooltip binds with add="+"), i.e. one leaked handler per
+            # second for as long as FCTool runs.
+            attach_tooltip(label, _COMPOSITION_TIP_EMPTY)
             self._rows[bucket] = label
 
         self._killed = tk.Label(body, text="", font=_FONT_SMALL, fg=FG_DIM,
@@ -282,12 +354,36 @@ class BattleLedgerPanel:
                                 wraplength=self._wrap)
         self._killed.pack(fill=tk.X, pady=(2, 0))
 
+        # -- battle report link (only when the host wired a URL opener) ------
+        # Built but NOT packed: `update_view` packs it `before=self._notes`
+        # once the view actually carries a report to open, so a fight with no
+        # system or no clock shows no dead link.
+        self._br_link = None
+        if callable(self._on_open_url):
+            self._br_link = tk.Label(body, text=BR_LINK_TEXT, font=_FONT_SMALL,
+                                     fg=FG_MAGENTA, bg=BG_PANEL, anchor=tk.W,
+                                     cursor="hand2")
+            self._br_link.bind("<Button-1>", self._open_battle_report)
+            attach_tooltip(self._br_link, _BR_TIP)
+
         # -- named blind spots (rule 5). ONE wrapping label: a variable number
         #    of note widgets would mean packing/forgetting on every repaint.
         self._notes = tk.Label(body, text="", font=_FONT_SMALL, fg=FG_ORANGE,
                                bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
                                wraplength=self._wrap)
         self._notes.pack(fill=tk.X, pady=(2, 0))
+
+    def _open_battle_report(self, _event=None):
+        """Hand the CURRENT report URL to the host's opener.
+
+        Reads `self._br_url` at click time rather than closing over a URL at
+        build time: the link is one persistent widget and the fight under it
+        changes (a new engagement arms in another system and the stamp moves).
+        A blank URL is a no-op — the label is unpacked in that state anyway,
+        and this is the belt to that braces.
+        """
+        if self._br_url and callable(self._on_open_url):
+            self._on_open_url(self._br_url)
 
     def _sync_scrollregion(self, _event=None):
         """Keep the scrollregion on the content, and clamp the view when the
@@ -347,6 +443,11 @@ class BattleLedgerPanel:
         if not view.visible:
             self.hide()
             self._last_view = view
+            # No fight, no report. Dropped here rather than left to rot behind
+            # a hidden frame: the label goes down with its parent, but the URL
+            # is the thing a click would use and it must not outlive the ledger
+            # that produced it.
+            self._br_url = ""
             return False
 
         redraw = view != self._last_view or not self._visible
@@ -362,6 +463,10 @@ class BattleLedgerPanel:
 
         for bucket, label in self._rows.items():
             row = view.row(bucket)
+            # The composition rides the SAME row object the numbers came from,
+            # so the tooltip can never describe a different repaint than the
+            # line it hangs off.
+            update_tooltip(label, composition_tip(row))
             if row is None:
                 label.config(text="", fg=FG_DIM)
                 continue
@@ -373,6 +478,17 @@ class BattleLedgerPanel:
 
         self._killed.config(text=view.killed_note)
         self._notes.config(text="\n".join(note.text for note in view.notes))
+
+        self._br_url = getattr(view, "battle_report_url", "") or ""
+        if self._br_link is not None:
+            if self._br_url:
+                # `before=self._notes` for the same reason the fast strip pins
+                # itself: a bare pack() APPENDS, so a link that first appears
+                # once a fight arms would otherwise land under the blind-spot
+                # notes instead of under the table it belongs to.
+                self._br_link.pack(fill=tk.X, pady=(2, 0), before=self._notes)
+            else:
+                self._br_link.pack_forget()
 
         # The fast lane is packed/unpacked as a unit ABOVE its own rule, above
         # the header, so it can never be mistaken for a fourth table row.
