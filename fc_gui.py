@@ -924,12 +924,23 @@ class FCToolGUI:
         self._preview_clients = {}             # hwnd -> ClientWindow
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
         self._preview_hotkey_map = {}          # hk_id -> action tuple
+        # Problems from the LAST (re)registration — RegisterHotKey collisions
+        # (1409 = another app already owns the combo) and bindings the parser
+        # rejected. Held here so a problem found before the settings section is
+        # built still reaches its status line when that line appears.
+        self._preview_hotkey_status = ""
+        self._preview_hotkey_status_lbl = None
         self._preview_after_id = None
         self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
         # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
         # switch, while the foreground probe has not caught up yet. Read only by
         # _preview_anchor_key; written only by _preview_hotkey_switch_to.
         self._preview_pending_switch = None
+        # hwnd -> (attempts_so_far, tick_count the next attempt is due) for a
+        # client whose tile could not be attached. Without it that client is
+        # orphaned for the session: the failed spawn leaves it in the published
+        # client set, so the tick diff never reports it as `added` again.
+        self._preview_spawn_retry = {}
         self._preview_intel = {}               # system_id -> (ts, kind)
         self._preview_disabled_session = False
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
@@ -15288,6 +15299,18 @@ class FCToolGUI:
     # to the shipped foreground-first behaviour within a beat.
     _PREVIEW_PENDING_SWITCH_S = 1.5
 
+    # ── Stranded-tile respawn ──────────────────────────────────────────────
+    # A tile whose DWM attach raised (source window died between enumerate and
+    # attach) is destroyed, and NOTHING used to bring it back: the client is
+    # published into `_preview_clients` regardless, so `diff_clients` reports it
+    # as `added` exactly once, ever. One transient failure therefore cost that
+    # pilot their preview for the whole session — and if it hit every client the
+    # controller sat on its 2 s idle-probe cadence with no tiles to speed it up.
+    # The retry rides the existing tick (no second timer), spaced and bounded so
+    # a genuinely dead window costs a handful of cheap attempts, not a spin.
+    _PREVIEW_SPAWN_RETRY_EVERY = 4      # ticks between attempts (~1 s at 250 ms)
+    _PREVIEW_SPAWN_RETRY_MAX = 3        # attempts before we give up on that hwnd
+
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
         "mode": "off",              # "off" | "eveo_labels" | "native"
@@ -15844,16 +15867,67 @@ class FCToolGUI:
         try:
             tile.attach_source(client.hwnd)
         except OSError:
-            # source vanished between enumerate and attach — drop the tile;
-            # the next tick respawns it if the client is still around.
+            # Source vanished between enumerate and attach — drop the tile. The
+            # tick will NOT bring it back on its own (the client is published
+            # into _preview_clients either way, so it is never `added` again),
+            # so book it for the bounded retry sweep instead.
             try:
                 tile.destroy()
             except Exception:
                 pass
+            self._preview_note_stranded(client)
             return
         self._preview_tiles[client.hwnd] = tile
         self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
+        retry = getattr(self, "_preview_spawn_retry", None)
+        if retry:
+            retry.pop(client.hwnd, None)               # attached → healthy again
         self._preview_style_tile(tile, client.key, cfg)
+
+    def _preview_note_stranded(self, client):
+        """Book a client whose tile could not be created for a later attempt.
+
+        The single writer of `_preview_spawn_retry`. Counts the attempt, schedules
+        the next one `_PREVIEW_SPAWN_RETRY_EVERY` ticks out, and drops the record
+        with ONE log line once `_PREVIEW_SPAWN_RETRY_MAX` attempts are spent — a
+        window that is genuinely gone must not be chased forever."""
+        retry = getattr(self, "_preview_spawn_retry", None)
+        if retry is None:
+            retry = self._preview_spawn_retry = {}
+        hwnd = getattr(client, "hwnd", None)
+        if hwnd is None:
+            return
+        tries = retry.get(hwnd, (0, 0))[0] + 1
+        limit = getattr(self, "_PREVIEW_SPAWN_RETRY_MAX",
+                        FCToolGUI._PREVIEW_SPAWN_RETRY_MAX)
+        if tries >= limit:
+            retry.pop(hwnd, None)
+            log.warning("[preview] no tile for %s after %d attempts - giving up "
+                        "until it relaunches",
+                        getattr(client, "key", "") or "login window", tries)
+            return
+        every = getattr(self, "_PREVIEW_SPAWN_RETRY_EVERY",
+                        FCToolGUI._PREVIEW_SPAWN_RETRY_EVERY)
+        retry[hwnd] = (tries, self._preview_tick_count + every)
+
+    def _preview_retry_stranded_tiles(self, cur):
+        """Re-attempt the spawn for clients booked by `_preview_note_stranded`.
+
+        Rides the controller tick — no second timer. Entries for clients that
+        went away, or that got a tile by some other route, are dropped; a
+        successful spawn clears its own record."""
+        retry = getattr(self, "_preview_spawn_retry", None)
+        if not retry:
+            return
+        for hwnd in list(retry):
+            client = cur.get(hwnd)
+            if client is None or hwnd in self._preview_tiles:
+                retry.pop(hwnd, None)                  # gone, or healed already
+                continue
+            _tries, due = retry[hwnd]
+            if self._preview_tick_count < due:
+                continue                               # backing off
+            self._preview_spawn_tile(client)           # clears or re-books it
 
     def _preview_rekey_tile(self, old, new):
         """Same hwnd, changed title (login<->char or char rename). Re-key the tile
@@ -16380,7 +16454,7 @@ class FCToolGUI:
         service so the settings modal can read .failures for conflict display."""
         cfg = self._preview_cfg()
         live_keys = {c.key for c in self._preview_clients.values() if not c.is_login}
-        bindings, actions, _errors = self._preview_hotkey_bindings(
+        bindings, actions, errors = self._preview_hotkey_bindings(
             cfg.get("hotkeys", {}), live_keys)
         self._preview_hotkey_map = actions
         svc = self._preview_hotkeys
@@ -16390,7 +16464,73 @@ class FCToolGUI:
             svc.start(bindings)
         else:
             svc.restart(bindings)
+        # Every registration path reports its own failures. This used to happen
+        # only in the two settings dialogs' OK handlers, so the plain enable path
+        # and the one-click preset threw `.failures` (and these parse errors)
+        # away — a key that never registered stayed dead for the whole session
+        # with nothing said in the log or the UI.
+        self._preview_surface_hotkey_problems(svc, errors)
         return svc
+
+    def _preview_describe_hotkey_action(self, action):
+        """One short ASCII label for a bound hotkey action.
+
+        Feeds the log line and the settings status line, so it must stay plain
+        ASCII (this box's console is cp1252 — a fancy dash in a log string prints
+        a UnicodeEncodeError traceback). The two hotkey dialogs keep their own
+        describers: they name groups out of their un-committed working copy,
+        this one reads the persisted config."""
+        if not action:
+            return "hotkey"
+        kind = action[0]
+        if kind == "focus":
+            return "focus %s" % (action[1],)
+        if kind == "cycle":
+            gi = action[1]
+            groups = (self._preview_cfg().get("hotkeys", {}) or {}).get(
+                "groups", []) or []
+            name = None
+            if 0 <= gi < len(groups):
+                name = (groups[gi] or {}).get("name")
+            return "cycle %s - %s" % ("next" if action[2] > 0 else "prev",
+                                      name or "Group %d" % (gi + 1))
+        if kind == "minall":
+            return "minimize all"
+        return "hotkey"
+
+    def _preview_surface_hotkey_problems(self, svc, errors=()):
+        """Log + show whatever went wrong registering the current bindings.
+
+        Two sources, both previously silent outside the dialogs: `svc.failures`
+        (RegisterHotKey said no — 1409 means another application already owns
+        that combination) and the binding builder's rejected strings. Returns the
+        message list so callers/tests need not re-derive it."""
+        msgs = [str(e) for e in (errors or [])]
+        failures = dict(getattr(svc, "failures", {}) or {})
+        amap = getattr(self, "_preview_hotkey_map", {}) or {}
+        for hk_id, code in failures.items():
+            msgs.append("%s: %s" % (self._preview_describe_hotkey_action(
+                amap.get(hk_id)), hotkey_service.format_error(code)))
+        if msgs:
+            log.warning("[preview] hotkey problems: %s", "; ".join(msgs))
+        self._preview_set_hotkey_status(
+            ("Hotkey problems - " + "  |  ".join(msgs)) if msgs else "")
+        return msgs
+
+    def _preview_set_hotkey_status(self, text):
+        """Paint the hotkey diagnostic line under the hotkey buttons (same idiom
+        as the Gamelogs source line). The text is retained on the instance so a
+        problem found before the settings section exists still shows up when it
+        is built; a no-op label is fine on hosts that never build the UI."""
+        self._preview_hotkey_status = text or ""
+        lbl = getattr(self, "_preview_hotkey_status_lbl", None)
+        if lbl is None:
+            return
+        try:
+            lbl.config(text=self._preview_hotkey_status,
+                       fg=FG_ORANGE if self._preview_hotkey_status else FG_DIM)
+        except tk.TclError:
+            pass
 
     def _preview_state_for(self, key):
         """Staleness-checked CharState for a client key (lowercased char name),
@@ -16886,6 +17026,10 @@ class FCToolGUI:
                 self._preview_rekey_tile(old, new)                  # login→char and back
             for client in added:
                 self._preview_spawn_tile(client)                    # saved | login stack | spawn
+            # `added` fires ONCE per client, so a client whose tile failed to
+            # spawn (or was retired mid-tick) is invisible to the diff from then
+            # on. The bounded sweep is the only thing that gives it another go.
+            self._preview_retry_stranded_tiles(cur)
             # C2 hide rules: withdraw (never destroy) tiles the rules hide this
             # tick — hide-active / hide-login / hide-on-lost-focus. Layouts and
             # DWM registrations survive; the tile is just unmapped, so re-showing
@@ -17013,11 +17157,14 @@ class FCToolGUI:
                     # op after a foreground change, a client that died mid-tick).
                     # Retire THIS tile ONLY and keep iterating the remaining
                     # clients — a single tile throwing must never nuke every tile
-                    # or cancel the loop (BUG A). The client is still in `cur`, so
-                    # the next tick respawns it with a fresh registration.
+                    # or cancel the loop (BUG A). The client stays in `cur` and is
+                    # published, which means the diff will NEVER call it `added`
+                    # again — so book it for the bounded respawn sweep, which is
+                    # what actually brings the tile back a few ticks from now.
                     log.exception("[preview] tile %r failed this tick; retiring it",
                                   hwnd)
                     self._preview_retire_tile(hwnd)
+                    self._preview_note_stranded(client)
             for hwnd, tile in self._preview_tiles.items():
                 if hwnd in hidden:
                     continue                                        # withdrawn — nothing to retop
@@ -17219,7 +17366,11 @@ class FCToolGUI:
         try:
             self._preview_restart_hotkeys()   # lazy service create + register
         except Exception:
+            # Registration itself blew up, so _preview_surface_hotkey_problems
+            # never ran — say so here or every hotkey is dead in silence.
             log.exception("[preview] hotkey registration failed on enable")
+            self._preview_set_hotkey_status(
+                "Global hotkeys could not be registered - see the log.")
         # Presses land in the service queue instantly; give them a consumer that
         # runs on their own timescale instead of the 250 ms/2 s controller tick.
         # Armed unconditionally (not gated on the service existing) so a hotkey
@@ -17241,9 +17392,21 @@ class FCToolGUI:
 
     def _preview_disable_session(self):
         """A tracker/Win32 failure disables native previews for THIS session only
-        (the config mode is untouched); a single log line was already emitted."""
+        (the config mode is untouched).
+
+        LOUD on purpose. The teardown it runs also STOPS THE HOTKEY SERVICE, so
+        every global cycle/focus key goes dead here — and the only trace used to
+        be the per-tick exception traceback, which names the tick, not the
+        consequence. Says so in the log AND on the hotkey status line so a user
+        whose keys stopped working can find out why."""
         self._preview_disabled_session = True
+        log.warning("[preview] native previews disabled for this session after "
+                    "repeated tick failures - global hotkeys are off until "
+                    "FCPreview is re-enabled")
         self._preview_teardown()
+        self._preview_set_hotkey_status(
+            "FCPreview stopped after repeated errors - global hotkeys are off "
+            "until you switch it back on. See the log for what failed.")
 
     def _preview_teardown(self):
         if self._preview_after_id is not None:
@@ -17256,6 +17419,9 @@ class FCToolGUI:
         # A pending hotkey switch is session state, not config: a mode bounce must
         # not leave the next session's first cycle press anchored on a dead key.
         self._preview_pending_switch = None
+        # Same for the stranded-tile book: hwnds do not survive a mode bounce,
+        # and the next enable spawns everything fresh anyway.
+        self._preview_spawn_retry = {}
         self._preview_retire_all_tiles()
         self._preview_clients = {}
         self._preview_stop_gamelog()          # B6: stop the damage-flash source
@@ -18619,6 +18785,22 @@ class FCToolGUI:
                    "positions and per-window size overrides. Use this if "
                    "previews were dragged off-screen or a monitor was "
                    "disconnected.")
+
+        # Hotkey diagnostics line (same idiom as the Gamelogs source line): a key
+        # RegisterHotKey refused used to be reported only inside the two hotkey
+        # dialogs, so a collision hit on the enable path left a dead key with
+        # nothing said anywhere. Seeded from whatever the last registration found
+        # — that may well have happened before this section existed.
+        _hk_status = getattr(self, "_preview_hotkey_status", "") or ""
+        self._preview_hotkey_status_lbl = tk.Label(
+            rowN4, text=_hk_status, font=("Consolas", 9),
+            fg=FG_ORANGE if _hk_status else FG_DIM, bg=BG_DARK,
+            anchor=tk.W, justify=tk.LEFT, wraplength=760)
+        self._preview_hotkey_status_lbl.grid(row=1, column=0, columnspan=7,
+                                             pady=(2, 0), sticky=tk.W)
+        _tip(self._preview_hotkey_status_lbl,
+             "Warnings about global hotkeys that could not be registered - "
+             "usually another application already owns that key combination.")
 
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
