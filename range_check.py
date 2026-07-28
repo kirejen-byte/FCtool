@@ -34,12 +34,18 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   ``test_range_check.py::test_the_module_reads_no_per_hull_range_config_key``.)
 * **Linked systems REPLACE the source list, never the target.** A message naming
   systems is the FC asking "range from THESE", so the configured stagings step
-  aside entirely.
+  aside entirely. That makes a FALSE system match expensive rather than
+  cosmetic — it deletes every hostile row — so two defences sit either side of
+  it: ``plain_phrase_is_a_reference`` refuses letters-only words that read as
+  English rather than as a link, and ``provenance_line`` always tells the FC
+  which systems the message overrode the sources with.
 * **A name that will not resolve becomes an unresolved ROW, never a dropped
   one.** A missing row reads as "nothing there", which is the dangerous failure
   direction for a feature whose whole job is telling you who can reach you. Same
-  for a distance the injected function cannot supply, and same for an unknown
-  target: the report says so instead of answering.
+  for a distance the injected function cannot supply, same for a configured
+  staging list the app cannot read (that becomes a visible warning, not
+  silence), and same for an unknown target: the report says so instead of
+  answering.
 * **Allegiance is never guessed.** A linked system is FRIENDLY or HOSTILE only
   by membership in the configured lists; anything else lands in its own LINKED
   group. A system configured into BOTH lists resolves as HOSTILE — the safe
@@ -57,6 +63,7 @@ through ``FCToolGUI._post_ui``.
 """
 from __future__ import annotations
 
+import re
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -186,7 +193,14 @@ def should_fire(sender, body, *, keyword, own_keys, last_fired=None,
     that is one of the owner's OWN characters, and no fire from that same
     character within ``cooldown_s``. ``last_fired`` is a read-only mapping of
     sender key -> last fire timestamp (same clock as ``now``); the caller stamps
-    it (or uses ``RangeCheckTrigger``, which owns the stamping)."""
+    it (or uses ``RangeCheckTrigger``, which owns the stamping).
+
+    The default clock is ``time.monotonic``, never ``time.time``: a wall clock
+    steps BACKWARDS under an NTP correction, and a backwards step makes
+    ``now - previous`` negative, which suppresses the feature for the length of
+    the jump. Monotonic time cannot go backwards and its epoch is irrelevant
+    here because nothing outlives the process. ``now`` stays injectable so the
+    cooldown is testable without sleeping."""
     if not matches_keyword(body, keyword):
         return False
     key = own_key(sender)
@@ -198,7 +212,7 @@ def should_fire(sender, body, *, keyword, own_keys, last_fired=None,
         previous = float(last_fired.get(key))
     except (AttributeError, TypeError, ValueError):
         return True
-    stamp = time.time() if now is None else float(now)
+    stamp = time.monotonic() if now is None else float(now)
     try:
         window = float(cooldown_s)
     except (TypeError, ValueError):
@@ -225,8 +239,12 @@ class RangeCheckTrigger:
         self._last_fired: dict[str, float] = {}
 
     def consider(self, sender, body, own_keys, now=None) -> bool:
-        """True (and the cooldown is stamped) iff this line should fire."""
-        stamp = time.time() if now is None else float(now)
+        """True (and the cooldown is stamped) iff this line should fire.
+
+        Clock is ``time.monotonic`` — the stamps it writes are only ever
+        compared against each other, and a wall clock stepping backwards under
+        NTP would suppress the feature for the length of the step."""
+        stamp = time.monotonic() if now is None else float(now)
         if not should_fire(sender, body, keyword=self.keyword,
                            own_keys=own_keys, last_fired=self._last_fired,
                            now=stamp, cooldown_s=self.cooldown_s):
@@ -271,13 +289,45 @@ def _is_id(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _as_ref(value) -> SystemRef | None:
-    """Accept a ``SystemRef``, a bare system id, or a ``(name, id)`` pair.
+def _resolve_id(name, resolve):
+    """``resolve(name)`` hardened to "a positive int, or None".
+
+    ``resolve=None`` means "no resolver was supplied", which is itself an
+    answer: unresolved. Every failure mode — a raising resolver, a None, a
+    string, a zero — lands on the same unresolved verdict, because an
+    unresolved ref is a first-class visible state here, not an error."""
+    if resolve is None:
+        return None
+    try:
+        sid = resolve(str(name))
+    except Exception:
+        return None
+    try:
+        sid = int(sid)
+    except (TypeError, ValueError):
+        return None
+    return sid if sid > 0 else None
+
+
+def _as_ref(value, resolve=None) -> SystemRef | None:
+    """Accept a ``SystemRef``, a bare system id, a NAME, or a ``(name, id)`` pair.
 
     The bare-id form names itself off the bundled offline table
     (``system_coords.get_name``) so a caller holding only the ESI poller's
     ``solar_system_id`` still gets "Range to J5A-IX" rather than a raw number.
-    That is an in-memory read of shipped data — never a network call."""
+    That is an in-memory read of shipped data — never a network call.
+
+    A NAME string is resolved the same offline way (``resolve``, default
+    ``system_coords.resolve_name``). It used to become a permanently unresolved
+    ref, so ``build_report("Jita", ...)`` reported "location unknown" forever —
+    a silent, permanent degradation a mis-wired caller had no way to notice.
+    Silent degradation is the one wrong answer for this module; resolving is the
+    honest fix, and it costs a dict lookup.
+
+    A ``SystemRef`` still passes through UNTOUCHED, unresolved id and all: that
+    is how the engine represents a name it already tried and could not place
+    (``resolve_sources``), and re-resolving it here would paper over exactly the
+    state the unresolved row exists to show."""
     if value is None:
         return None
     if isinstance(value, SystemRef):
@@ -287,7 +337,11 @@ def _as_ref(value) -> SystemRef | None:
             return None
         return SystemRef(system_coords.get_name(value) or "", value)
     if isinstance(value, str):
-        return SystemRef(value.strip()) if value.strip() else None
+        text = value.strip()
+        if not text:
+            return None
+        resolver = system_coords.resolve_name if resolve is None else resolve
+        return SystemRef(text, _resolve_id(text, resolver))
     try:
         name, sid = value
     except (TypeError, ValueError):
@@ -304,6 +358,70 @@ def _same_system(a: SystemRef | None, b: SystemRef | None) -> bool:
     return bool(a.key) and a.key == b.key
 
 
+#: A phrase carrying a DIGIT or a DASH is system-SHAPED: ``1DH-SX``, ``SVM-3K``,
+#: ``J5A-IX``, ``4-2UXV``. No English word looks like that, so such a phrase
+#: needs no further evidence that it was meant as a system.
+_SYSTEM_SHAPED_RE = re.compile(r"[0-9-]")
+#: Shortest letters-only phrase taken out of a chat line as a system reference.
+#: 44 real systems have three-letter letters-only names (``Cat``, ``Ham``,
+#: ``Jan``, ``Mod``, ``Usi``, ``Hek``) and three-letter English words outnumber
+#: them by orders of magnitude — ``Jan`` alone was 1,748 of 21,008 matches over
+#: the owner's 304k-message Fleet history, every one of them a date.
+MIN_PLAIN_NAME_LEN = 4
+#: What ends a sentence, so English capitalises the NEXT word whatever it is.
+_SENTENCE_END_RE = re.compile(r"[.!?\n\r]")
+
+
+def is_system_shaped(phrase) -> bool:
+    """Does the phrase carry a digit or a dash — the shape of a null/lowsec
+    system name? Those are accepted on sight; nothing in English collides."""
+    return bool(_SYSTEM_SHAPED_RE.search(str(phrase or "")))
+
+
+def plain_phrase_is_a_reference(phrase, *, sentence_initial,
+                                canonical=None) -> bool:
+    """Was this letters-only phrase written as a SYSTEM, or is it just a word?
+
+    1,952 systems have letters-only names and plenty of them are ordinary
+    English: ``Toon``, ``Exit``, ``Half``, ``Odin``, ``Usi``, ``Reset``,
+    ``Jan``, ``Mod``, ``Access``, and the phrase ``Dead End``, are all real
+    systems. Taking one out of a chat line is not a cosmetic error — a linked
+    system REPLACES the source list, so ``"range check on my toon"`` collapses
+    the whole report to a single LINKED row and every HOSTILE row disappears.
+
+    Three pieces of evidence, none of them a word list to maintain:
+
+    * **Length** — below ``MIN_PLAIN_NAME_LEN`` the English words swamp the
+      systems (the measurement is on that constant).
+    * **Casing** — a system pasted from the game, or typed as the proper noun it
+      is, carries the game's own spelling; chat prose does not (``toon`` vs
+      ``Toon``). An all-lowercase phrase is prose. When the bundled table can
+      spell the name (``canonical``), the match must be EXACT, so a shouted
+      ``EXIT`` is refused as well as a muttered ``exit``.
+    * **Position** — English capitalises the first word of a sentence whatever
+      it is, so at a sentence start the casing evidence above is worth nothing
+      and the phrase is refused rather than believed on no evidence.
+
+    System-SHAPED phrases never come here — they are accepted on sight, which is
+    why ``1DH-SX``, ``svm-3k`` and a line-leading ``4-2UXV`` all still work.
+
+    Deliberately imperfect: a mid-sentence ``Toon`` still reads as the system.
+    Perfect separation would need a dictionary, and the backstop is cheaper and
+    more honest — ``provenance_line`` always names the systems the message
+    overrode the sources with, so a surprising report explains itself."""
+    text = str(phrase or "")
+    if len(text) < MIN_PLAIN_NAME_LEN:
+        return False
+    if text == text.lower():
+        return False
+    if sentence_initial:
+        return False
+    canon = str(canonical or "")
+    if canon and canon.lower() == text.lower():
+        return text == canon
+    return True
+
+
 def extract_systems(body, resolve=None) -> list[SystemRef]:
     """System names mentioned in a chat body, in order of first appearance.
 
@@ -316,22 +434,27 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
     matcher, because a fuzzy hit here would silently answer about the wrong
     system.
 
+    One thing this does NOT share with the intel stream: a letters-only window
+    must additionally pass ``plain_phrase_is_a_reference``. The intel stream
+    highlights a word it got wrong; here a wrong word REPLACES the source list
+    and deletes every hostile row, so the two features cannot afford the same
+    false-positive rate. The extra gate is applied BEFORE the resolver wherever
+    it can be (length, casing, position need no lookup) so an injected
+    ESI-backed resolver is not asked about every English word on the line.
+
     A linked system renders in the log as its BARE NAME (verified against the
     owner's real Fleet logs, 2026-07-27) — there is no markup to strip. Results
     are de-duplicated by system id."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
 
-    def _resolve(phrase):
-        try:
-            sid = resolver(phrase)
-        except Exception:
-            return None
-        try:
-            sid = int(sid)
-        except (TypeError, ValueError):
-            return None
-        return sid if sid > 0 else None
+    def _sentence_initial(index):
+        """Does English force a capital on ``words[index]`` regardless of what
+        it is? True at the start of the line and after ``. ! ?``."""
+        if index <= 0:
+            return True
+        return bool(_SENTENCE_END_RE.search(
+            text[words[index - 1][2]:words[index][1]]))
 
     words = [(m.group(0), m.start(), m.end())
              for m in SYSTEM_TOKEN_RE.finditer(text)]
@@ -346,14 +469,27 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
             phrase = " ".join(w for w, _s, _e in words[i:i + size])
             if size == 1 and len(phrase) < 3:
                 continue
-            sid = _resolve(phrase)
-            if sid is not None:
-                hit = (phrase, sid, size)
-                break
+            plain = not is_system_shaped(phrase)
+            initial = _sentence_initial(i)
+            # Cheap half of the plain-phrase gate first: length, casing and
+            # position are decidable with no lookup at all.
+            if plain and not plain_phrase_is_a_reference(
+                    phrase, sentence_initial=initial):
+                continue
+            sid = _resolve_id(phrase, resolver)
+            if sid is None:
+                continue
+            canon = system_coords.get_name(sid)
+            # ...and the half that needs the id: the game's own spelling.
+            if plain and not plain_phrase_is_a_reference(
+                    phrase, sentence_initial=initial, canonical=canon):
+                continue
+            hit = (phrase, sid, size, canon)
+            break
         if hit is None:
             i += 1
             continue
-        phrase, sid, size = hit
+        phrase, sid, size, canon = hit
         i += size
         if sid in seen:
             continue
@@ -363,7 +499,6 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
         # name than the one matched — an injected resolver's id is its own
         # business, and quietly relabelling a row is how a range answer ends up
         # attributed to the wrong system.
-        canon = system_coords.get_name(sid)
         name = canon if (canon and canon.lower() == phrase.lower()) else phrase
         out.append(SystemRef(name, sid))
     return out
@@ -382,10 +517,15 @@ GROUP_ORDER = (GROUP_HOSTILE, GROUP_FRIENDLY, GROUP_LINKED)
 class SourceLists:
     """The configured staging picture: the primary friendly staging plus both
     configured lists. The lists are what GROUPS a linked system; the primary is
-    the only friendly source used when nothing is linked."""
+    the only friendly source used when nothing is linked.
+
+    ``problems`` carries plain-ASCII complaints about config the app could not
+    read, so a list it had to discard becomes a visible warning on the report
+    instead of an empty table (see ``_names_in``)."""
     primary: SystemRef | None = None
     friendly: tuple = ()
     hostile: tuple = ()
+    problems: tuple = ()
 
     @property
     def configured(self) -> bool:
@@ -420,15 +560,40 @@ def _ref_of_name(name, resolve) -> SystemRef | None:
     text = str(name or "").strip()
     if not text:
         return None
+    return SystemRef(text, _resolve_id(text, resolve))
+
+
+#: Human labels for the two configured lists, used in ``NOTE_BAD_LIST``.
+_LIST_LABELS = {
+    "hostile_staging_systems": "Hostile staging list",
+    "friendly_staging_systems": "Friendly staging list",
+}
+#: Warning for a configured list the app could not read. Plain ASCII — every
+#: note in this module can reach ``log.*``, and this box's console is cp1252.
+NOTE_BAD_LIST = "{} is unreadable - check Settings."
+
+
+def _names_in(raw):
+    """Names out of a configured staging list, or **None** when the value is
+    present but unusable.
+
+    Accepts any non-text, non-mapping iterable — list, tuple, set, generator —
+    because the shape of the container was never the point; the names are.
+    A bare STRING or a DICT is the dangerous case and is refused rather than
+    coerced: iterating a string yields characters and a dict yields keys, so
+    "helpfully" accepting either invents a staging list nobody configured. The
+    refusal is loud (the caller turns None into a visible warning) because the
+    old behaviour — quietly returning no names — dropped every hostile row and
+    left an empty note, which is precisely the "a missing row reads as nothing
+    there" failure this module exists to prevent."""
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes, bytearray, dict)):
+        return None
     try:
-        sid = resolve(text) if resolve is not None else None
-    except Exception:
-        sid = None
-    try:
-        sid = int(sid)
-    except (TypeError, ValueError):
-        sid = None
-    return SystemRef(text, sid if (sid or 0) > 0 else None)
+        return list(raw)
+    except TypeError:
+        return None
 
 
 def resolve_sources(config, resolve=None) -> SourceLists:
@@ -444,25 +609,32 @@ def resolve_sources(config, resolve=None) -> SourceLists:
       ``hostile_staging_systems`` — the same lists the Jump Range tab edits.
 
     A name the resolver cannot place still comes back as an UNRESOLVED ref, so
-    it can be rendered as a visible unresolved row rather than vanishing."""
+    it can be rendered as a visible unresolved row rather than vanishing. A
+    LIST the app cannot read at all becomes a ``problems`` entry for the same
+    reason — silence is the one answer this module may not give."""
     cfg = config if isinstance(config, dict) else {}
     zk = cfg.get("zkillboard")
     zk = zk if isinstance(zk, dict) else {}
     jr = cfg.get("jump_range")
     jr = jr if isinstance(jr, dict) else {}
     resolver = system_coords.resolve_name if resolve is None else resolve
+    problems: list[str] = []
 
     def _list(key):
-        raw = jr.get(key)
-        if not isinstance(raw, (list, tuple)):
+        names = _names_in(jr.get(key))
+        if names is None:
+            problems.append(NOTE_BAD_LIST.format(_LIST_LABELS[key]))
             return ()
-        refs = [_ref_of_name(n, resolver) for n in raw]
+        refs = [_ref_of_name(n, resolver) for n in names]
         return tuple(r for r in refs if r is not None)
 
     return SourceLists(
         primary=_ref_of_name(zk.get("staging_system"), resolver),
-        friendly=_list("friendly_staging_systems"),
+        # Hostiles first so a config carrying BOTH problems reads threat-first,
+        # the same order everything else in this module uses.
         hostile=_list("hostile_staging_systems"),
+        friendly=_list("friendly_staging_systems"),
+        problems=tuple(problems),
     )
 
 
@@ -528,17 +700,33 @@ class RangeRow:
 
 @dataclass(frozen=True)
 class RangeReport:
-    """What the toast renders. ``note`` is non-empty exactly when the answer is
-    degraded, and is always plain ASCII (log-safe: this box's console is cp1252
-    and a fancy glyph in a log line raises inside the stream handler)."""
+    """What the toast renders.
+
+    ``note`` is non-empty exactly when the answer is BLOCKED (no rows at all);
+    ``warnings`` are non-blocking complaints that render ALONGSIDE the rows.
+    Both are always plain ASCII (log-safe: this box's console is cp1252 and a
+    fancy glyph in a log line raises inside the stream handler).
+
+    ``linked`` holds the systems the MESSAGE named, and is the single source of
+    truth for ``linked_used`` — the two cannot drift, and the toast can always
+    say WHICH systems replaced the configured sources."""
     target: SystemRef | None = None
     rows: tuple = ()
-    linked_used: bool = False
+    linked: tuple = ()
     note: str = ""
+    warnings: tuple = ()
 
     @property
     def target_known(self) -> bool:
         return self.target is not None and self.target.resolved
+
+    @property
+    def linked_used(self) -> bool:
+        """Did the message override the configured sources? Derived, never
+        stored: a stored flag beside the list is a flag that can disagree with
+        it, and this one decides whether the FC is shown WHY the report looks
+        the way it does."""
+        return bool(self.linked)
 
     @property
     def title(self) -> str:
@@ -577,16 +765,19 @@ def _distance(distance_fn, a_id, b_id):
     return value
 
 
-def build_report(target, linked=(), *, sources=None, distance_fn=None) -> RangeReport:
+def build_report(target, linked=(), *, sources=None, distance_fn=None,
+                 resolve=None) -> RangeReport:
     """Compute the range summary.
 
     ``target`` is the posting character's current system (a ``SystemRef``, a
-    bare system id, or None when the location is unknown). ``linked`` is
+    bare system id, a NAME, or None when the location is unknown). ``linked`` is
     whatever ``extract_systems`` found in the message: **a non-empty ``linked``
     REPLACES the configured sources entirely** — the FC named the systems they
-    want the answer for. ``sources`` is a ``SourceLists`` (from
-    ``resolve_sources``); ``distance_fn(a_id, b_id) -> ly`` is injected
-    (``jump_range.calculate_ly_distance`` in the app).
+    want the answer for, and ``provenance_line`` says so on the face of the
+    report so that replacement is never a silent one. ``sources`` is a
+    ``SourceLists`` (from ``resolve_sources``); ``distance_fn(a_id, b_id) -> ly``
+    is injected (``jump_range.calculate_ly_distance`` in the app); ``resolve``
+    names bare-string targets (default ``system_coords.resolve_name``).
 
     Honesty rules, all three tested: an unknown target produces a report that
     SAYS the location is unknown rather than a plausible wrong answer; a source
@@ -596,18 +787,19 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None) -> RangeR
     degraded rows last so they read as exceptions rather than as zero-distance.
     Pure."""
     srcs = sources if isinstance(sources, SourceLists) else SourceLists()
-    target_ref = _as_ref(target)
+    warnings = tuple(srcs.problems)
+    target_ref = _as_ref(target, resolve)
 
     linked_refs = []
     for item in (linked or ()):
-        ref = _as_ref(item)
+        ref = _as_ref(item, resolve)
         if ref is None or not (ref.name or ref.resolved):
             continue
         if not any(_same_system(ref, seen) for seen in linked_refs):
             linked_refs.append(ref)
-    linked_used = bool(linked_refs)
+    linked_tuple = tuple(linked_refs)
 
-    if linked_used:
+    if linked_refs:
         picked = [(ref, srcs.group_of(ref)) for ref in linked_refs]
     else:
         picked = []
@@ -616,12 +808,15 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None) -> RangeR
                 continue
             picked.append((ref, group))
 
+    # A degraded report still carries ``linked`` and ``warnings``: those are the
+    # two lines that explain WHY it is degraded, and dropping them here is how
+    # "your message replaced the sources" becomes "nothing can reach us".
     if target_ref is None or not target_ref.resolved:
-        return RangeReport(target=target_ref, rows=(), linked_used=linked_used,
-                           note=NOTE_TARGET_UNKNOWN)
+        return RangeReport(target=target_ref, rows=(), linked=linked_tuple,
+                           note=NOTE_TARGET_UNKNOWN, warnings=warnings)
     if not picked:
-        return RangeReport(target=target_ref, rows=(), linked_used=linked_used,
-                           note=NOTE_NO_SOURCES)
+        return RangeReport(target=target_ref, rows=(), linked=linked_tuple,
+                           note=NOTE_NO_SOURCES, warnings=warnings)
 
     titan_ly = hull_range_ly(HULL_TITAN)
     capital_ly = hull_range_ly(HULL_CAPITAL)
@@ -645,7 +840,7 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None) -> RangeR
                              0 if r.ok else 1,
                              r.distance_ly if r.distance_ly is not None else 0.0))
     return RangeReport(target=target_ref, rows=tuple(rows),
-                       linked_used=linked_used, note="")
+                       linked=linked_tuple, note="", warnings=warnings)
 
 
 # ── render helpers (pure) ────────────────────────────────────────────────────
@@ -678,6 +873,80 @@ def row_note(row) -> str:
     return ""
 
 
+#: Lead-in for the provenance line. Plain ASCII: it can reach ``log.*``.
+PROVENANCE_PREFIX = "sources from message: "
+#: How many linked names are spelled out before the line summarises the rest.
+MAX_PROVENANCE_NAMES = 6
+
+
+def provenance_line(report) -> str:
+    """Where this report's sources came from — "" unless the MESSAGE set them.
+
+    LOAD-BEARING honesty, not decoration. A linked system replaces the
+    configured stagings outright, so one word the parser took for a system name
+    turns "who can reach me" into a one-row report with no HOSTILE group in it
+    at all. Without this line an FC cannot tell that apart from "nothing can
+    reach us" — the difference between "that misparsed, retype it" and "we are
+    safe, dock up". It renders on a DEGRADED report too, where it is the only
+    surviving evidence of what happened.
+
+    A linked ref with no name (possible: an id-only ref) still gets counted, so
+    the line is never empty while the override is in force."""
+    names = []
+    for ref in getattr(report, "linked", ()) or ():
+        text = str(getattr(ref, "name", "") or "").strip()
+        if not text:
+            sid = getattr(ref, "system_id", None)
+            text = f"system {sid}" if sid else ""
+        if text:
+            names.append(text)
+    if not names:
+        return ""
+    shown = names[:MAX_PROVENANCE_NAMES]
+    extra = len(names) - len(shown)
+    text = PROVENANCE_PREFIX + ", ".join(shown)
+    return f"{text} (+{extra} more)" if extra else text
+
+
+def row_budget(group_sizes, cap) -> list:
+    """How many rows each group may render under ``cap``, in render order.
+
+    Every non-empty group gets its FIRST row — and therefore its header —
+    before any group takes surplus. Filling greedily in group order, which is
+    what this used to do, meant twelve hostile stagings pushed the entire
+    FRIENDLY group into "+N more": the owner's own staging row, the one that
+    answers "can WE still get there", was the first thing to disappear from a
+    window whose whole subject is reach. Surplus still goes hostiles-first,
+    because "who can reach me" is the threat question.
+
+    Pure and Tk-free so the starvation is testable without a display."""
+    try:
+        room = max(0, int(cap))
+    except (TypeError, ValueError):
+        room = MAX_ROWS
+    sizes = []
+    for size in group_sizes or ():
+        try:
+            sizes.append(max(0, int(size)))
+        except (TypeError, ValueError):
+            sizes.append(0)
+    take = [0] * len(sizes)
+    for i, size in enumerate(sizes):          # guarantee pass
+        if room <= 0:
+            break
+        if size > 0:
+            take[i] = 1
+            room -= 1
+    for i, size in enumerate(sizes):          # surplus pass, in render order
+        if room <= 0:
+            break
+        extra = min(room, size - take[i])
+        if extra > 0:
+            take[i] += extra
+            room -= extra
+    return take
+
+
 # ── the toast ────────────────────────────────────────────────────────────────
 
 #: Group header colours. Deliberately NOT red/green: in this window red and
@@ -689,6 +958,9 @@ GROUP_COLORS = {
 }
 #: Row cap, so a long staging list cannot grow a screen-tall window.
 MAX_ROWS = 12
+#: Config warnings rendered before the rest are folded away. There are only two
+#: configured lists, so two is the whole surface.
+MAX_WARNINGS = 2
 #: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit).
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
@@ -767,44 +1039,63 @@ class RangeToast:
         rule.pack(fill="x", padx=8)
         self._clickable.append(rule)
 
+        # Directly under the title, because it explains the table below it: a
+        # report whose sources came from the message must SAY so, degraded or
+        # not (see ``provenance_line``).
+        provenance = provenance_line(report)
+        if provenance:
+            self._label(inner, provenance, FG_DIM, size=7).pack(
+                fill="x", padx=8, pady=(3, 0))
+
         body = tk.Frame(inner, bg=BG_PANEL)
         body.pack(fill="both", expand=True, padx=8, pady=(4, 0))
         self._clickable.append(body)
 
+        line = 0
         if report.note:
             self._label(body, report.note, FG_YELLOW).grid(
-                row=0, column=0, columnspan=4, sticky="w")
+                row=line, column=0, columnspan=4, sticky="w")
+            line += 1
         else:
-            self._fill_rows(body, max_rows)
+            line = self._fill_rows(body, max_rows)
+        # Warnings render ALONGSIDE the rows, never instead of them: an
+        # unreadable staging list must not be able to look like a clean answer.
+        for warning in (report.warnings or ())[:MAX_WARNINGS]:
+            self._label(body, warning, FG_YELLOW).grid(
+                row=line, column=0, columnspan=4, sticky="w", pady=(2, 0))
+            line += 1
 
         self._label(inner, "click to dismiss", FG_DIM, size=7).pack(
             fill="x", padx=8, pady=(3, 4))
 
     def _fill_rows(self, body, max_rows):
+        """Grid the grouped rows; returns the next free grid row so ``_build``
+        can put the config warnings UNDER them rather than over them."""
         try:
             cap = max(1, int(max_rows))
         except (TypeError, ValueError):
             cap = MAX_ROWS
-        shown = 0
+        groups = self.report.groups()
+        budget = row_budget([len(rows) for _g, rows in groups], cap)
         line = 0
         hidden = 0
-        for group, rows in self.report.groups():
-            room = cap - shown
-            if room <= 0:
+        for (group, rows), take in zip(groups, budget):
+            if take <= 0:
                 hidden += len(rows)
                 continue
             self._label(body, group, GROUP_COLORS.get(group, FG_DIM),
                         bold=True).grid(row=line, column=0, columnspan=4,
                                         sticky="w", pady=(2, 0))
             line += 1
-            for row in rows[:room]:
+            for row in rows[:take]:
                 self._grid_row(body, line, row)
                 line += 1
-                shown += 1
-            hidden += max(0, len(rows) - room)
+            hidden += max(0, len(rows) - take)
         if hidden:
             self._label(body, f"+{hidden} more", FG_DIM, size=7).grid(
                 row=line, column=0, columnspan=4, sticky="w")
+            line += 1
+        return line
 
     def _grid_row(self, body, line, row):
         self._label(body, row.name, FG_TEXT).grid(
