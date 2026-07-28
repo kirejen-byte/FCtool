@@ -8894,12 +8894,17 @@ class FCToolGUI:
         # the rows with per-fit availability. Manual only — no polling.
         ttk.Button(add_row, text="⟳ Market", style="Dark.TButton",
                    command=self._market_scan_now).pack(side=tk.LEFT, padx=(10, 2))
-        # Gaps shopping-list export — only meaningful once a snapshot that COVERS
-        # this doctrine exists (the same gate the availability marks use). Shown
-        # disabled with an explanatory tip otherwise so the affordance stays
-        # discoverable (blocked, no snapshot, or scanned for another doctrine).
+        # Gaps shopping-list export — needs a snapshot and an unblocked market,
+        # and NOTHING MORE. It deliberately does NOT require scope_covered: a
+        # partially-covering snapshot is exactly the state the dialog's narrowed
+        # coverage gate exists to rescue (untick the ships that weren't scanned
+        # and the list builds for the rest), and gating the button on full
+        # coverage made that unreachable. The dialog re-evaluates coverage on
+        # every rebuild and opens on the honest rescan message, so an owner who
+        # narrows nothing sees the same refusal the button used to bake in —
+        # never a shopping list for types that were never scanned.
         gaps_state = (tk.NORMAL if (self._market_snapshot is not None
-                                    and not blocked and scope_covered)
+                                    and not blocked)
                       else tk.DISABLED)
         gaps_btn = ttk.Button(
             add_row, text="Gaps…", style="Dark.TButton", state=gaps_state,
@@ -8913,9 +8918,15 @@ class FCToolGUI:
                 "copy for Janice or in-game Multibuy. Click ⟳ Market first to "
                 "load market stock.")
         elif not scope_covered:
-            gaps_tip = (scope_note or
-                        "Market was scanned for a different doctrine — click "
-                        "⟳ Market to scan this one, then export its gaps.")
+            # Enabled, but honest about what it will say: opening it on an
+            # uncovered doctrine shows the rescan message until the unscanned
+            # ships are unticked. Name that escape hatch — it is the whole
+            # reason the button is no longer disabled here.
+            gaps_tip = (
+                (scope_note or "Market was scanned for a different doctrine — "
+                               "click ⟳ Market to scan this one.")
+                + "  Opens anyway: untick the ships that weren't scanned and "
+                  "the shopping list builds for the rest.")
         else:
             gaps_tip = (
                 "Shopping list of items short of this doctrine's seed target — "

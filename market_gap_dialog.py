@@ -160,7 +160,22 @@ class GapSelection:
 
     def __init__(self, picks, *, doctrine_name="", default_qty=20,
                  categories=None, hidden=None):
-        self._picks = [p for p in (picks or ()) if p is not None]
+        # De-duplicate by fit_id, keeping the FIRST occurrence (display order =
+        # doctrine member order). Duplicates are representable — neither
+        # ``fittings_store.add_fit_to_doctrine`` nor the MOTD→doctrine import
+        # guards against adding the same fit twice — and EVERYTHING downstream
+        # here is keyed by fit_id: ``pick()`` resolves to the first match while
+        # ``per_fit_targets()``'s comprehension lets the last one win, so a
+        # shadowed row's checkbox silently stopped changing anything. Collapsing
+        # on the way in costs nothing: ``gap_list`` reads one target per fit_id
+        # for every member carrying it, so one row means the same shopping list.
+        self._picks = []
+        seen = set()
+        for p in (picks or ()):
+            if p is None or p.fit_id in seen:
+                continue
+            seen.add(p.fit_id)
+            self._picks.append(p)
         self.doctrine_name = str(doctrine_name or "doctrine")
         self.default_qty = max(0, _as_int(default_qty, 20))
         if categories is None:
@@ -459,7 +474,8 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     ``gap_error_text()``, ``gap_include_vars``, ``gap_qty_vars``,
     ``gap_category_vars``, ``gap_copy_buttons``, ``gap_hide_selected()``,
     ``gap_restore_all()``, ``gap_build_menu()``, ``gap_status_text()``,
-    ``gap_toggle_include()``, ``gap_toggle_category()``, ``gap_click()``.
+    ``gap_toggle_include()``, ``gap_toggle_category()``, ``gap_click()``,
+    ``gap_wheel()``, ``gap_ships_canvas``, ``gap_ships_rows``.
     """
     dname = str(doctrine_name or "doctrine")
     sel = GapSelection(list(picks or ()), doctrine_name=dname,
@@ -527,6 +543,47 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     ships_canvas.bind("<Configure>", lambda e: ships_canvas.itemconfig(
         _rows_win, width=e.width))
 
+    def _on_mousewheel(evt):
+        """Wheel-scroll the ship picker when the pointer is over it.
+
+        Tk does NOT deliver ``<MouseWheel>`` to the hovered widget (it goes to
+        the focused one), so — like ``fc_gui._on_global_mousewheel`` — the bind
+        lives on the TOPLEVEL and the target is found with ``winfo_containing``,
+        then walked up its ``master`` chain. Bound on the dialog rather than
+        registered with the app's global router because that router only serves
+        canvases passed to ``FCToolGUI._register_scroll_canvas``, which this
+        module must not reach (it is fc_gui-free by design); the toplevel's
+        bindtag runs before ``all``, so this wins, and the ``"break"`` stops the
+        router from scrolling anything else on the same turn. Pointer anywhere
+        else (the gap Treeview, which has its own ttk class binding) → return
+        None and stand down.
+        """
+        if n_picks <= _SHIP_ROWS_VISIBLE:
+            return None                  # nothing to scroll; don't jitter rows
+        try:
+            w = dlg.winfo_containing(evt.x_root, evt.y_root)
+        except Exception:
+            return None
+        while w is not None:
+            if w is rows_host:
+                break
+            w = getattr(w, "master", None)
+        if w is None:
+            return None
+        delta = _as_int(getattr(evt, "delta", 0), 0)
+        amount = -1 * int(delta / 120)
+        if amount == 0:
+            if not delta:
+                return None
+            amount = -1 if delta > 0 else 1
+        try:
+            ships_canvas.yview_scroll(amount, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
+    dlg.bind("<MouseWheel>", _on_mousewheel)
+
     def _on_include(fit_id):
         sel.set_include(fit_id, bool(include_vars[fit_id].get()))
         _sync_row(fit_id)
@@ -571,7 +628,11 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
         fid = pick.fit_id
         row = tk.Frame(rows_inner, bg=BG_PANEL)
         row.pack(fill=tk.X, pady=1)
-        ivar = tk.BooleanVar(value=bool(pick.include))
+        # Every Tk variable here is MASTERED ON THE DIALOG. With no master they
+        # bind to tkinter._default_root — the wrong interpreter the moment the
+        # app's root is not the default root, and a lifetime that outlives the
+        # window (the intermittent "main thread is not in main loop" unraisable).
+        ivar = tk.BooleanVar(master=dlg, value=bool(pick.include))
         include_vars[fid] = ivar
         tk.Checkbutton(
             row, text=(pick.label or fid), variable=ivar,
@@ -583,7 +644,7 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
         tk.Label(row, text=(f"({pick.hull})" if pick.hull else ""),
                  font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL).pack(
                      side=tk.LEFT, padx=(4, 0))
-        qvar = tk.StringVar(value=str(int(pick.qty)))
+        qvar = tk.StringVar(master=dlg, value=str(int(pick.qty)))
         qty_vars[fid] = qvar
         # Packed right-to-left: the "off" marker sits rightmost, then the entry.
         off = tk.Label(row, text=("" if pick.include else "off"),
@@ -639,7 +700,7 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
         rebuild()
 
     for role in CATEGORY_ORDER:
-        cvar = tk.BooleanVar(value=sel.is_category_on(role))
+        cvar = tk.BooleanVar(master=dlg, value=sel.is_category_on(role))
         category_vars[role] = cvar
         tk.Checkbutton(
             cat_row, text=CATEGORY_LABELS[role], variable=cvar,
@@ -753,6 +814,12 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
                       bg=BG_DARK, anchor=tk.W)
     status.pack(fill=tk.X, pady=(8, 0))
 
+    def _set_status(text, fg=FG_GREEN):
+        try:
+            status.config(text=text, fg=fg)
+        except tk.TclError:
+            pass
+
     # ── exports + buttons ────────────────────────────────────────────────────
     def _export(kind):
         vis = state.get("vis")
@@ -772,14 +839,10 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
             ok = bool(copy_text(text))
         except Exception:
             log.exception("[gaps] clipboard copy failed")
-        try:
-            if ok:
-                status.config(text=f"Copied {label} list ✓", fg=FG_GREEN)
-            else:
-                status.config(text="Copy failed — clipboard unavailable.",
-                              fg=FG_RED)
-        except tk.TclError:
-            pass
+        if ok:
+            _set_status(f"Copied {label} list ✓", FG_GREEN)
+        else:
+            _set_status("Copy failed — clipboard unavailable.", FG_RED)
 
     btn_row = tk.Frame(body, bg=BG_DARK)
     btn_row.pack(fill=tk.X, pady=(12, 0))
@@ -800,6 +863,12 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
         """Re-run the injected builder and repaint. Honesty guards short-circuit
         BEFORE ``build_gap`` — an empty selection or empty category set would
         otherwise come back as an empty gap list and render as "No gaps"."""
+        # "Copied Janice list ✓" describes the list AS IT WAS WHEN COPIED. Every
+        # rebuild changes the list out from under it, so leaving the tick up
+        # claims a clipboard that no longer matches the window — the same class
+        # of lie the honesty guards exist to prevent. (The no-op qty commit
+        # deliberately does not rebuild, so it does not erase the receipt.)
+        _set_status("")
         guard = sel.guard_message()
         if guard is not None:
             gap, error = None, guard
@@ -849,6 +918,9 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     # ── test/host surface ────────────────────────────────────────────────────
     dlg.gap_selection = sel
     dlg.gap_tree = tree
+    dlg.gap_ships_canvas = ships_canvas
+    dlg.gap_ships_rows = rows_host
+    dlg.gap_wheel = _on_mousewheel
     dlg.gap_rebuild = rebuild
     dlg.gap_export = _export
     dlg.gap_copy = _copy
