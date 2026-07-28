@@ -39,6 +39,15 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   it: ``plain_phrase_is_a_reference`` refuses letters-only words that read as
   English rather than as a link, and ``provenance_line`` always tells the FC
   which systems the message overrode the sources with.
+* **The gate discloses in BOTH directions.** ``provenance_line`` covers what
+  the message took; ``ignored_line`` covers what it refused. The gate refuses
+  quietly, and quietly is the one thing this module may not be: ``range check
+  Jita`` gave a LINKED row while ``range check jita`` gave the default report,
+  byte-for-byte the shape of "you named nothing". Measured on the owner's 304k
+  Fleet messages the gate refuses 27.3% of mid-sentence real-name mentions
+  (mostly lowercase typing). The mirror is advisory and dim — it does NOT
+  weaken the gate, and it names refusals no retyping can fix without pretending
+  otherwise (see ``_retype_hint``).
 * **A name that will not resolve becomes an unresolved ROW, never a dropped
   one.** A missing row reads as "nothing there", which is the dangerous failure
   direction for a feature whose whole job is telling you who can reach you. Same
@@ -49,7 +58,14 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
 * **Allegiance is never guessed.** A linked system is FRIENDLY or HOSTILE only
   by membership in the configured lists; anything else lands in its own LINKED
   group. A system configured into BOTH lists resolves as HOSTILE — the safe
-  error direction for a config the owner has contradicted.
+  error direction for a config the owner has contradicted — and the DEFAULT
+  source grouping routes through the same ``group_of``, so the answer cannot
+  depend on whether the FC happened to name the system in the message.
+* **A group that is absent for a CONFIG reason says so.** The primary staging
+  is the only friendly default source, so an unset Settings > Staging System
+  renders hostile rows under no FRIENDLY header — which reads exactly like
+  "no friendly staging is in range". ``NOTE_NO_FRIENDLY`` is that group's
+  missing-row note.
 * **The staging is Settings > Staging System** (``zkillboard.staging_system``),
   system-wide, mirroring ``implant_reminder.resolve_staging``'s rung 2. No
   ``market.*`` key is read here, and neither is the implant reminder's own
@@ -422,7 +438,80 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     return True
 
 
-def extract_systems(body, resolve=None) -> list[SystemRef]:
+@dataclass(frozen=True)
+class IgnoredRef:
+    """A letters-only phrase the gate REFUSED that names a real system anyway.
+
+    The mirror image of a ``SystemRef`` out of ``extract_systems``: same sweep,
+    opposite verdict. ``retype`` is the spelling that WOULD have been taken, or
+    "" when no retyping helps at all — a three-letter name is refused however it
+    is spelled and so is a sentence-initial one, so advising a fix there would
+    be a lie, and this module does not get to lie about its own rules."""
+    phrase: str
+    system_id: int | None = None
+    retype: str = ""
+
+
+class SystemMentions(list):
+    """The systems ``extract_systems`` TOOK, carrying what it refused.
+
+    A plain ``list`` of ``SystemRef`` for every existing caller and every
+    ``== []`` comparison, plus ``.ignored``: the refused-but-real phrases from
+    the SAME sweep. They travel together deliberately. Accepted and refused are
+    two views of one scan, and ``build_report`` reads ``.ignored`` off the list
+    it is already handed — so a wiring that reports which systems it USED cannot
+    quietly stop reporting which ones it DROPPED, and the two halves can never
+    end up computed from different chat lines. A caller who slices or copies the
+    list gets a plain list and loses the tail; pass ``ignored=`` explicitly if
+    you need to."""
+
+    def __init__(self, systems=(), ignored=()):
+        super().__init__(systems)
+        self.ignored = tuple(ignored)
+
+
+def _retype_hint(phrase, canonical, *, sentence_initial) -> str:
+    """The spelling that would have been TAKEN, or "" when none would be.
+
+    The honesty gate on the advice half of the ignored line. ``jan`` is refused
+    for LENGTH, so "type it as Jan" would send the FC round a loop that cannot
+    terminate; a sentence-initial word is refused whatever its casing, for the
+    same reason. Only a difference the gate would actually accept is worth
+    suggesting — everything else is named without advice."""
+    text = str(phrase or "")
+    canon = str(canonical or "")
+    if not canon or canon == text:
+        return ""
+    if not plain_phrase_is_a_reference(canon, sentence_initial=sentence_initial,
+                                       canonical=canon):
+        return ""
+    return canon
+
+
+def _refused_ref(phrase, *, sentence_initial) -> IgnoredRef | None:
+    """``IgnoredRef`` for a refused phrase the BUNDLED table names; else None.
+
+    Deliberately ``system_coords.resolve_name`` and never the injected resolver.
+    The gate's whole point is that an injected (possibly ESI-backed) resolver is
+    never asked about an English word, and buying the disclosure at the price of
+    that guarantee would be a bad trade — the bundled table is an in-memory read
+    of shipped data, so the mirror costs a dict lookup and the guarantee stands
+    (``test_the_gate_runs_before_the_resolver_is_ever_asked``).
+
+    The consequence, stated so nobody has to rediscover it: a caller injecting a
+    resolver that knows MORE systems than the bundled table gets the accepted
+    half from their resolver and the refused half from the table. Under-
+    disclosure, which is the safe direction for a dim advisory line."""
+    sid = _resolve_id(phrase, system_coords.resolve_name)
+    if sid is None:
+        return None
+    canon = system_coords.get_name(sid) or ""
+    return IgnoredRef(str(phrase), sid,
+                      _retype_hint(phrase, canon,
+                                   sentence_initial=sentence_initial))
+
+
+def extract_systems(body, resolve=None) -> SystemMentions:
     """System names mentioned in a chat body, in order of first appearance.
 
     Same shape as the shipped intel detection (``intel_stream._system_spans``):
@@ -444,7 +533,16 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
 
     A linked system renders in the log as its BARE NAME (verified against the
     owner's real Fleet logs, 2026-07-27) — there is no markup to strip. Results
-    are de-duplicated by system id."""
+    are de-duplicated by system id.
+
+    **The refusals come back too**, on ``.ignored`` of the returned
+    ``SystemMentions``. The gate above refuses QUIETLY, and measured against the
+    owner's 304k-message Fleet history it refuses 27.3% of mid-sentence real-name
+    mentions (mostly lowercase typing) — so ``range check jita`` produced a report
+    byte-for-byte the shape of "you named nothing", with no tell whatsoever. That
+    is the silence this module is not allowed to give, in the one direction it was
+    still giving it. ``ignored_line`` renders the mirror; see ``_refused_ref`` for
+    why the disclosure never costs the injected resolver its guarantee."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
 
@@ -459,10 +557,13 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
     words = [(m.group(0), m.start(), m.end())
              for m in SYSTEM_TOKEN_RE.finditer(text)]
     out: list[SystemRef] = []
+    ignored: list[IgnoredRef] = []
     seen: set[int] = set()
+    refused: set[int] = set()
     i, n = 0, len(words)
     while i < n:
         hit = None
+        miss = None                 # longest refused-but-real phrase here
         for size in (3, 2, 1):
             if i + size > n:
                 continue
@@ -475,6 +576,8 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
             # position are decidable with no lookup at all.
             if plain and not plain_phrase_is_a_reference(
                     phrase, sentence_initial=initial):
+                if miss is None:
+                    miss = _refused_ref(phrase, sentence_initial=initial)
                 continue
             sid = _resolve_id(phrase, resolver)
             if sid is None:
@@ -483,10 +586,19 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
             # ...and the half that needs the id: the game's own spelling.
             if plain and not plain_phrase_is_a_reference(
                     phrase, sentence_initial=initial, canonical=canon):
+                if miss is None:
+                    miss = IgnoredRef(phrase, sid, _retype_hint(
+                        phrase, canon, sentence_initial=initial))
                 continue
             hit = (phrase, sid, size, canon)
             break
         if hit is None:
+            # Nothing was taken at this index, so a refusal here is a real drop
+            # and the FC gets told. A refusal UNDER an accepted shorter window
+            # is not a drop — something from this position was used.
+            if miss is not None and miss.system_id not in refused:
+                refused.add(miss.system_id)
+                ignored.append(miss)
             i += 1
             continue
         phrase, sid, size, canon = hit
@@ -501,7 +613,10 @@ def extract_systems(body, resolve=None) -> list[SystemRef]:
         # attributed to the wrong system.
         name = canon if (canon and canon.lower() == phrase.lower()) else phrase
         out.append(SystemRef(name, sid))
-    return out
+    # A system the message DID link is not an ignored one, however it was
+    # spelled elsewhere on the line — the provenance line already names it, and
+    # the two lines contradicting each other is worse than either being terse.
+    return SystemMentions(out, [r for r in ignored if r.system_id not in seen])
 
 
 # ── sources (the staging list) ───────────────────────────────────────────────
@@ -534,13 +649,24 @@ class SourceLists:
     def default_sources(self) -> list:
         """``[(ref, group)]`` — primary friendly staging + every hostile staging.
 
-        Grouped by CONSTRUCTION, not by ``group_of``: an owner whose staging
-        system is not also listed under the friendly stagings would otherwise
-        see their own staging rendered as an unaligned LINKED row."""
+        Grouped THROUGH ``group_of``, so the two groupings cannot disagree.
+        This used to construct the groups by hand (primary -> FRIENDLY, hostile
+        list -> HOSTILE), which reads the same for every sane config and then
+        diverges on the one config where the answer matters: a staging system
+        ALSO listed as hostile rendered FRIENDLY here while ``group_of`` — the
+        rule the LINKED path uses — called it HOSTILE. The same contradicted
+        config answering "friend" or "foe" depending on whether the FC happened
+        to name the system in the message is the worst shape that disagreement
+        could take. HOSTILE is the safe direction, and now it is the only one.
+
+        ``group_of`` still special-cases the primary as FRIENDLY, so an owner
+        whose staging system is not also listed under the friendly stagings does
+        NOT see their own staging rendered as an unaligned LINKED row — that was
+        the original reason for constructing the groups here, and it survives."""
         out: list = []
         if self.primary is not None:
-            out.append((self.primary, GROUP_FRIENDLY))
-        out.extend((r, GROUP_HOSTILE) for r in self.hostile)
+            out.append((self.primary, self.group_of(self.primary)))
+        out.extend((r, self.group_of(r)) for r in self.hostile)
         return out
 
     def group_of(self, ref) -> str:
@@ -675,6 +801,13 @@ ROW_NO_DISTANCE = "no distance"     # resolved, but no distance was available
 
 NOTE_TARGET_UNKNOWN = "Location unknown - no range answer."
 NOTE_NO_SOURCES = "No staging systems configured."
+#: Non-blocking warning for the default-sources path with no primary staging.
+#: ``zkillboard.staging_system`` defaults to "", and the primary is the ONLY
+#: friendly default source — so an unset field plus a configured hostile list
+#: renders hostile rows and no FRIENDLY group at all. Absent config explaining
+#: an absent group is the same silence as an absent row: the FC reads "nobody
+#: friendly is in range" off a report that never asked the question.
+NOTE_NO_FRIENDLY = "No friendly staging configured - check Settings."
 TITLE_FALLBACK = "Range check"
 
 
@@ -709,12 +842,15 @@ class RangeReport:
 
     ``linked`` holds the systems the MESSAGE named, and is the single source of
     truth for ``linked_used`` — the two cannot drift, and the toast can always
-    say WHICH systems replaced the configured sources."""
+    say WHICH systems replaced the configured sources. ``ignored`` is its
+    mirror: the phrases the message named that the gate REFUSED, so the other
+    direction of that same decision is visible too (see ``ignored_line``)."""
     target: SystemRef | None = None
     rows: tuple = ()
     linked: tuple = ()
     note: str = ""
     warnings: tuple = ()
+    ignored: tuple = ()
 
     @property
     def target_known(self) -> bool:
@@ -765,8 +901,33 @@ def _distance(distance_fn, a_id, b_id):
     return value
 
 
-def build_report(target, linked=(), *, sources=None, distance_fn=None,
-                 resolve=None) -> RangeReport:
+def _ignored_refs(raw, linked_refs) -> tuple:
+    """Normalize refused phrases, dropping any system the message actually used.
+
+    Accepted and ignored are mutually exclusive HERE as well as in
+    ``extract_systems``, so a caller assembling a report by hand cannot produce
+    one that claims to have both used and dropped the same system. De-duplicated
+    by system id; a phrase-less entry is not a disclosure and is dropped."""
+    used = {r.system_id for r in linked_refs if r.resolved}
+    out: list[IgnoredRef] = []
+    seen: set = set()
+    for item in (raw or ()):
+        phrase = str(getattr(item, "phrase", "") or "").strip()
+        if not phrase:
+            continue
+        sid = getattr(item, "system_id", None)
+        sid = sid if _is_id(sid) else None
+        if sid is not None and (sid in used or sid in seen):
+            continue
+        if sid is not None:
+            seen.add(sid)
+        out.append(item if isinstance(item, IgnoredRef) else IgnoredRef(
+            phrase, sid, str(getattr(item, "retype", "") or "")))
+    return tuple(out)
+
+
+def build_report(target, linked=(), *, ignored=None, sources=None,
+                 distance_fn=None, resolve=None) -> RangeReport:
     """Compute the range summary.
 
     ``target`` is the posting character's current system (a ``SystemRef``, a
@@ -779,6 +940,12 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None,
     is injected (``jump_range.calculate_ly_distance`` in the app); ``resolve``
     names bare-string targets (default ``system_coords.resolve_name``).
 
+    ``ignored`` is the REFUSED half of the same extraction. It defaults to
+    reading ``linked.ignored`` — ``extract_systems`` returns a
+    ``SystemMentions`` carrying it — so a wiring that already passes the
+    accepted systems discloses the refused ones for free, and the two halves
+    can never be computed from different chat lines. Pass it to override.
+
     Honesty rules, all three tested: an unknown target produces a report that
     SAYS the location is unknown rather than a plausible wrong answer; a source
     name that never resolved becomes an unresolved row; a resolved source with
@@ -787,7 +954,7 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None,
     degraded rows last so they read as exceptions rather than as zero-distance.
     Pure."""
     srcs = sources if isinstance(sources, SourceLists) else SourceLists()
-    warnings = tuple(srcs.problems)
+    notes = list(srcs.problems)
     target_ref = _as_ref(target, resolve)
 
     linked_refs = []
@@ -798,6 +965,9 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None,
         if not any(_same_system(ref, seen) for seen in linked_refs):
             linked_refs.append(ref)
     linked_tuple = tuple(linked_refs)
+    ignored_tuple = _ignored_refs(
+        getattr(linked, "ignored", ()) if ignored is None else ignored,
+        linked_refs)
 
     if linked_refs:
         picked = [(ref, srcs.group_of(ref)) for ref in linked_refs]
@@ -807,16 +977,27 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None,
             if any(_same_system(ref, prev) for prev, _g in picked):
                 continue
             picked.append((ref, group))
+        # The primary staging is the ONLY friendly default source, so an unset
+        # Settings > Staging System renders hostile rows under no FRIENDLY
+        # header — indistinguishable from "no friendly staging is in range".
+        # An unresolvable one is NOT this case: that becomes a visible
+        # unresolved row, which explains itself already.
+        if srcs.primary is None and srcs.hostile:
+            notes.append(NOTE_NO_FRIENDLY)
+    warnings = tuple(notes)
 
-    # A degraded report still carries ``linked`` and ``warnings``: those are the
-    # two lines that explain WHY it is degraded, and dropping them here is how
-    # "your message replaced the sources" becomes "nothing can reach us".
+    # A degraded report still carries ``linked``, ``ignored`` and ``warnings``:
+    # those are the lines that explain WHY it is degraded, and dropping them
+    # here is how "your message replaced the sources" — or "your message named
+    # a system I refused" — becomes "nothing can reach us".
     if target_ref is None or not target_ref.resolved:
         return RangeReport(target=target_ref, rows=(), linked=linked_tuple,
-                           note=NOTE_TARGET_UNKNOWN, warnings=warnings)
+                           note=NOTE_TARGET_UNKNOWN, warnings=warnings,
+                           ignored=ignored_tuple)
     if not picked:
         return RangeReport(target=target_ref, rows=(), linked=linked_tuple,
-                           note=NOTE_NO_SOURCES, warnings=warnings)
+                           note=NOTE_NO_SOURCES, warnings=warnings,
+                           ignored=ignored_tuple)
 
     titan_ly = hull_range_ly(HULL_TITAN)
     capital_ly = hull_range_ly(HULL_CAPITAL)
@@ -840,7 +1021,8 @@ def build_report(target, linked=(), *, sources=None, distance_fn=None,
                              0 if r.ok else 1,
                              r.distance_ly if r.distance_ly is not None else 0.0))
     return RangeReport(target=target_ref, rows=tuple(rows),
-                       linked=linked_tuple, note="", warnings=warnings)
+                       linked=linked_tuple, note="", warnings=warnings,
+                       ignored=ignored_tuple)
 
 
 # ── render helpers (pure) ────────────────────────────────────────────────────
@@ -908,6 +1090,51 @@ def provenance_line(report) -> str:
     return f"{text} (+{extra} more)" if extra else text
 
 
+#: Lead-in for the ignored line. Plain ASCII: it can reach ``log.*``.
+IGNORED_PREFIX = "ignored in message: "
+#: How the line advises a fix, when one exists (see ``_retype_hint``).
+RETYPE_HINT = "{} (type it as {})"
+#: How many refused phrases are spelled out. Deliberately below the provenance
+#: cap: each entry can carry a "(type it as X)" tail, so three is already a
+#: long line on a window that must stay glanceable.
+MAX_IGNORED_NAMES = 3
+
+
+def ignored_line(report) -> str:
+    """What the message named and the gate REFUSED — "" when it refused nothing.
+
+    The mirror of ``provenance_line``, and load-bearing for the same reason
+    read the other way round. The plain-phrase gate refuses SILENTLY, so
+    ``range check jita`` produced the configured-sources report — byte-for-byte
+    the shape of "you named no systems" — while ``range check Jita`` produced a
+    single LINKED row. Measured on the owner's 304k-message Fleet history the
+    gate refuses 27.3% of mid-sentence real-name mentions and 58.6% across all
+    positions, overwhelmingly lowercase typing. An FC who typed a system name
+    and got the default report had no way at all to tell "I refused that word"
+    from "you did not name anything" — and "silence is the one answer this
+    module may not give" has to hold in the refusal direction too.
+
+    Deliberately advisory, not corrective: it does not weaken the gate, and it
+    renders dim and secondary. It also names refusals no retyping can fix (a
+    three-letter name, a sentence-initial one) WITHOUT advice, because naming
+    what was dropped is the point and a fix that does not work is worse than
+    none. The cost is the honest one — ``"range check on my toon"`` now says it
+    ignored ``toon``, which is exactly what it did."""
+    items = []
+    for entry in getattr(report, "ignored", ()) or ():
+        phrase = str(getattr(entry, "phrase", "") or "").strip()
+        if not phrase:
+            continue
+        retype = str(getattr(entry, "retype", "") or "").strip()
+        items.append(RETYPE_HINT.format(phrase, retype) if retype else phrase)
+    if not items:
+        return ""
+    shown = items[:MAX_IGNORED_NAMES]
+    extra = len(items) - len(shown)
+    text = IGNORED_PREFIX + ", ".join(shown)
+    return f"{text} (+{extra} more)" if extra else text
+
+
 def row_budget(group_sizes, cap) -> list:
     """How many rows each group may render under ``cap``, in render order.
 
@@ -958,9 +1185,10 @@ GROUP_COLORS = {
 }
 #: Row cap, so a long staging list cannot grow a screen-tall window.
 MAX_ROWS = 12
-#: Config warnings rendered before the rest are folded away. There are only two
-#: configured lists, so two is the whole surface.
-MAX_WARNINGS = 2
+#: Config warnings rendered before the rest are folded away. Two unreadable
+#: staging lists plus the missing-primary note is the whole surface, so three
+#: shows all of it — raise this in step with any new warning.
+MAX_WARNINGS = 3
 #: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit).
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
@@ -1045,6 +1273,14 @@ class RangeToast:
         provenance = provenance_line(report)
         if provenance:
             self._label(inner, provenance, FG_DIM, size=7).pack(
+                fill="x", padx=8, pady=(3, 0))
+        # Its mirror, same dim treatment and the same header slot, so it
+        # survives a degraded report: what the message named and the gate
+        # refused. Never red/green — in this window those two colours mean
+        # out-of-range / in-range and nothing else, and this is an advisory.
+        ignored = ignored_line(report)
+        if ignored:
+            self._label(inner, ignored, FG_DIM, size=7).pack(
                 fill="x", padx=8, pady=(3, 0))
 
         body = tk.Frame(inner, bg=BG_PANEL)
