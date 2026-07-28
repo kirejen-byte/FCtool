@@ -12,6 +12,7 @@ import threading
 from app_path import resolve_data_file
 
 _COORDS_FILENAME = "system_coords.json"
+_JUMPS_FILENAME = "stargate_jumps.json"
 
 # In-memory tables, built once by _load().
 _coords: dict[int, tuple[float, float, float]] = {}   # id -> (x, y, z) meters
@@ -21,6 +22,13 @@ _name_of: dict[int, str] = {}                          # id -> canonical name
 _id_of_name: dict[str, int] = {}                       # lowercased name -> id
 _loaded = False
 _lock = threading.Lock()
+
+# Region adjacency, built lazily by _load_region_adjacency() from the bundled
+# stargate table. Its own flag/lock: most callers never ask for it, so the join
+# is only paid for on demand, and it must not serialize behind _load()'s lock.
+_region_adj: dict[int, set[int]] = {}                  # region_id -> {region_id}
+_region_adj_loaded = False
+_region_adj_lock = threading.Lock()
 
 # --- Jump-drive legality (verified IDs; see plan) ----------------------------
 EXCLUDED_REGION_IDS = {
@@ -174,3 +182,89 @@ def systems_within_range(origin_id: int, range_ly: float,
         out.append((sid, (d_sq ** 0.5) / LY_IN_METERS))
     out.sort(key=lambda t: t[1])
     return out
+
+
+# --- Offline region adjacency ------------------------------------------------
+# stargate_jumps.json ({system_id_str: [neighbour_ids]}, bundled with the app)
+# carries no region information, so gate edges are joined through _region_of:
+# an edge whose two endpoints sit in different regions makes those regions
+# neighbours. Pure local read -- no ESI, no network. Read directly rather than
+# through jump_range: this module is deliberately project-import-free apart
+# from app_path (jump_range imports requests and does HTTP).
+
+
+def _load_region_adjacency() -> None:
+    """Build the region -> {gate-adjacent regions} table once, lazily.
+
+    A missing or unreadable stargate table leaves the adjacency EMPTY, so every
+    lookup simply answers "no neighbours". It never raises: callers of an
+    offline convenience helper must not have to guard a packaging accident."""
+    global _region_adj_loaded
+    if _region_adj_loaded:
+        return
+    # Region table first, and OUTSIDE our lock -- _load() takes _lock, and
+    # taking them in a fixed order here keeps the two independent.
+    _load()
+    with _region_adj_lock:
+        if _region_adj_loaded:
+            return
+        path = resolve_data_file(_JUMPS_FILENAME, prefer="writable")
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                for sid_str, neighbours in raw.items():
+                    a = _region_of.get(int(sid_str))
+                    if a is None:
+                        continue          # J-space / absent from the coord table
+                    for nid in neighbours:
+                        b = _region_of.get(int(nid))
+                        if b is None or b == a:
+                            continue
+                        # Recorded in BOTH directions: the SDE lists each edge
+                        # twice, but a one-sided edge must not yield a one-sided
+                        # adjacency (neighbourliness is symmetric).
+                        _region_adj.setdefault(a, set()).add(b)
+                        _region_adj.setdefault(b, set()).add(a)
+            except Exception as e:  # corrupt/partial file: degrade, don't crash
+                _region_adj.clear()     # half a graph is worse than none
+                print(f"[Coords] Failed to load {path}: {e}")
+        _region_adj_loaded = True
+
+
+def region_neighbours(region_id: int) -> set[int]:
+    """Regions reachable from ``region_id`` over a single stargate, as a NEW set
+    (callers may mutate it; the cached table is never handed out).
+
+    Jump-drive-excluded regions (Pochven, the Jove regions, Zarzakh's Yasna
+    Zakh) are filtered out of the RESULT -- they are never sane to propose.
+    Asking ABOUT an excluded region still works and returns its real
+    neighbours. Empty for an unknown region, or when no stargate table
+    shipped."""
+    _load_region_adjacency()
+    return {r for r in _region_adj.get(region_id, ())
+            if r not in EXCLUDED_REGION_IDS}
+
+
+def default_scan_regions(staging_name: str) -> list[int]:
+    """``[staging's region] + sorted(gate-adjacent regions)`` for a staging
+    system NAME -- the default region scope for a staging-centred scan.
+
+    Returns [] (never raises) when the name is blank, doesn't resolve, or the
+    system carries no region (J-space, or no table shipped).
+
+    The staging's OWN region is kept even when it is in EXCLUDED_REGION_IDS:
+    scanning where you actually live is always sane, and that list is about
+    jump-drive legality, not about what is worth looking at. Only the
+    NEIGHBOURS are filtered."""
+    if not isinstance(staging_name, str) or not staging_name.strip():
+        return []
+    sid = resolve_name(staging_name.strip())
+    if sid is None:
+        return []
+    region = get_region_id(sid)
+    if region is None:
+        return []
+    neighbours = region_neighbours(region)
+    neighbours.discard(region)          # defensive: self-edges are skipped above
+    return [region] + sorted(neighbours)
