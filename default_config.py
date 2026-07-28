@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
         # selectable, and is also the never-silent fallback when a clip or the
         # audio device is unavailable. An unknown/missing value reads as the
         # default below (config is never deep-merged, so an existing config.json
-        # simply has no key). Mirror guard: tests/test_default_config.py.
+        # simply has no key). Mirror guard: tests/test_zkill_alert_sound.py.
         "alert_sound": "sonar",
     },
     "esi": {

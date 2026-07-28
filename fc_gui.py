@@ -15173,9 +15173,9 @@ class FCToolGUI:
             command=self._preview_zkill_alert_sound)
         _snd_preview_btn.pack(side=tk.LEFT, padx=5)
         _snd_tip = (
-            "Sound played when a kill alert lands on the zKillboard tab "
-            "(and on the Intelligence stream), replacing the old Windows "
-            "default ding — that ding is indistinguishable from every other "
+            "Sound played when a kill alert lands in the zKillboard pane "
+            "of the Intelligence tab, replacing the old Windows default "
+            "ding — that ding is indistinguishable from every other "
             "app's notification.\n\n"
             "Applies the moment you pick it; no Save Settings needed. The "
             "Intel MUTE toggle still silences it, and \"Windows default\" "
