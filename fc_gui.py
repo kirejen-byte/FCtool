@@ -122,6 +122,10 @@ from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
 # imports no fc_gui); wiring is the poller hook + _implant_show_toast below.
 import implant_reminder
 import client_toast
+# Market "Gaps…" shopping-list window (ship picker + category filter + per-item
+# removal). Self-contained: tkinter + ui_theme/ui_helpers only, everything else
+# arrives through injected providers — see _open_market_gaps_dialog.
+import market_gap_dialog
 from app_io import atomic_write_json
 from app_log import get_logger
 from rate_limiter import rate_limit
@@ -26875,48 +26879,15 @@ $bmp.Dispose()
         return {a.fit_id: a for a in avails}
 
     # ── Gap list (shopping list) dialog + exports ─────────────────────────────
-
-    @staticmethod
-    def _market_gap_rows(gap):
-        """Pure formatter: a market_scanner.GapList → aligned monospace table
-        lines ``Item | needed | available | short`` (a header + one row per short
-        item). ``gap.items`` only carries shortfalls (short > 0), so every row is
-        a real gap. Column widths adapt to the longest item name so the table
-        stays readable in the fixed-width dialog. Returns ``[]`` for no items (the
-        caller shows the 'no gaps' message instead of an empty grid)."""
-        items = list(getattr(gap, "items", []) or [])
-        if not items:
-            return []
-        name_w = max(4, max(len(it.name) for it in items))
-        need_w = max(len("needed"), max(len(f"{it.needed:,}") for it in items))
-        avail_w = max(len("available"), max(len(f"{it.available:,}") for it in items))
-        short_w = max(len("short"), max(len(f"{it.short:,}") for it in items))
-        rows = [
-            f"{'Item':<{name_w}}  {'needed':>{need_w}}  "
-            f"{'available':>{avail_w}}  {'short':>{short_w}}"
-        ]
-        for it in items:
-            rows.append(
-                f"{it.name:<{name_w}}  {it.needed:>{need_w},}  "
-                f"{it.available:>{avail_w},}  {it.short:>{short_w},}"
-            )
-        return rows
-
-    @staticmethod
-    def _market_gap_summary(gap):
-        """Pure formatter: the one-line summary above the gap table.
-
-        ``N item(s) short for <target basis>`` where the basis is the GapList's
-        own ``target_desc`` (e.g. "20x Onyx"). Empty items → a 'covered' line
-        naming the same basis so the dialog reads sensibly when nothing is
-        short."""
-        items = list(getattr(gap, "items", []) or [])
-        target = str(getattr(gap, "target_desc", "") or "the seed target")
-        n = len(items)
-        if n == 0:
-            return f"No gaps — the market covers {target} ✓"
-        noun = "item" if n == 1 else "items"
-        return f"{n} {noun} short for {target}"
+    #
+    # The window itself lives in ``market_gap_dialog`` (ship picker, category
+    # filter, gap table, per-item ✕, both exports). fc_gui keeps only the data
+    # path below plus the thin ``_open_market_gaps_dialog`` wiring. The old
+    # monospace aligner (``_market_gap_rows``) and summary formatter
+    # (``_market_gap_summary``) were retired with it — the Treeview replaced the
+    # aligner, and ``market_gap_dialog.summary_line`` is the SINGLE owner of the
+    # summary wording (two copies of that string with no guard is exactly the
+    # "fix one, miss the twin" shape).
 
     def _market_build_gap_list(self, doctrine, *, per_fit_targets=None,
                                components=None):
@@ -26926,13 +26897,13 @@ $bmp.Dispose()
         failure), ``error`` a short user-facing string (or None on success). No
         snapshot → a clear "scan first" error, never a crash.
 
-        Seed-target resolution is per-fit: ``target_fits`` carries the doctrine-
+        **When ``per_fit_targets`` is None (the default)** seed-target resolution
+        is per-fit off the SAVED targets: ``target_fits`` carries the doctrine-
         level bar (per-doctrine override, else the global default) as the fallback,
-        and ``per_fit_targets`` maps the fit_ids whose per-fit override differs from
-        that fallback to their own resolved target — so the shopping list seeds
-        e.g. 50 stabbers / 20 scythes / 10 bifrosts, matching each row's colour
-        bar. When no member overrides, no mapping is passed (identical to the
-        prior single-target behaviour).
+        and the built mapping names the fit_ids whose per-fit override differs from
+        that fallback — so the shopping list seeds e.g. 50 stabbers / 20 scythes /
+        10 bifrosts, matching each row's colour bar. When no member overrides, no
+        mapping is passed (identical to the prior single-target behaviour).
 
         ``per_fit_targets`` (keyword) overrides that resolution wholesale: the
         caller's map is passed STRAIGHT THROUGH and the saved seed targets are
@@ -26963,12 +26934,17 @@ $bmp.Dispose()
                 """Mirror gap_list's OWN per-member target resolution so the
                 gate and the build can never disagree: an absent (or junk) entry
                 falls back to the doctrine target there, so it must stay INSIDE
-                the coverage set — only an explicit 0 narrows the gate."""
+                the coverage set — only an explicit 0 narrows the gate.
+
+                ``OverflowError`` is caught alongside the two gap_list itself
+                names: ``int(float("inf"))`` raises it, and an escape here would
+                leave the ONE caller-visible contract of this method (always
+                ``(gap, error)``, never a raise) broken for that input."""
                 raw = per_fit_targets.get(getattr(mem, "fit_id", None),
                                           doctrine_target)
                 try:
                     return int(raw) > 0
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return doctrine_target > 0
             scope_members = [m for m in getattr(doctrine, "members", [])
                              if _seeded(m)]
@@ -27016,117 +26992,43 @@ $bmp.Dispose()
             return False
 
     def _open_market_gaps_dialog(self, doctrine):
-        """Open the market-gaps shopping-list dialog for ``doctrine``.
+        """Open the market-gaps shopping-list dialog for ``doctrine``; returns
+        the ``Toplevel``.
 
-        Builds the GapList lazily (per-doctrine seed target), renders the short
-        items in a monospace table with a summary line, and offers two
-        clipboard exports: "Copy for Janice" (``gap.janice()``) and "Copy for
-        Multibuy" (``gap.multibuy()``). Everything-stocked → a 'no gaps' message
-        instead of an empty grid. Build/scan errors surface as dialog status
-        text, never a crash."""
-        gap, error = self._market_build_gap_list(doctrine)
+        Wiring only — the window lives in ``market_gap_dialog``. This builds the
+        ship-picker state from the doctrine's members (labels/hull from the
+        fittings store, quantity from the SAVED per-fit seed target via
+        ``_market_seed_target``) and injects the two providers the module needs:
+        ``build_gap`` → ``_market_build_gap_list`` (already ``(gap, error)``
+        shaped, and it takes the picker's scratch map + category filter straight
+        through), ``copy_text`` → ``_market_copy_text``.
+
+        **The pick list is rebuilt FRESH on every open and never cached.** The
+        dialog keeps these exact ``ShipPick`` objects as its scratch state and
+        MUTATES them in place, so a reused list would leak one window's
+        quantities into the next — breaking the owner-approved "edits are
+        forgotten on close" guarantee (design §2)."""
         dname = getattr(doctrine, "name", "") or "doctrine"
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title(f"Market gaps — {dname}")
-        dlg.configure(bg=BG_DARK)
-        dlg.transient(self.root)
-
-        body = tk.Frame(dlg, bg=BG_DARK, padx=18, pady=16,
-                        highlightbackground=BORDER_COLOR, highlightthickness=1)
-        body.pack(fill=tk.BOTH, expand=True)
-        tk.Label(body, text=f"Market gaps — {dname}",
-                 font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK,
-                 anchor=tk.W).pack(fill=tk.X, pady=(0, 8))
-
-        if error is not None:
-            tk.Label(body, text=error, font=("Consolas", 10), fg=FG_ORANGE,
-                     bg=BG_DARK, justify=tk.LEFT, wraplength=440,
-                     anchor=tk.W).pack(fill=tk.X)
-            btn_row = tk.Frame(body, bg=BG_DARK)
-            btn_row.pack(fill=tk.X, pady=(16, 0))
-            ttk.Button(btn_row, text="Close", style="Dark.TButton",
-                       command=dlg.destroy).pack(side=tk.RIGHT)
-            self._finalize_modal_dialog(dlg)
-            return
-
-        rows = self._market_gap_rows(gap)
-        tk.Label(body, text=self._market_gap_summary(gap),
-                 font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-                 justify=tk.LEFT, wraplength=520, anchor=tk.W).pack(fill=tk.X)
-
-        if not rows:
-            # Everything stocked — no table, just the covered message + Close.
-            btn_row = tk.Frame(body, bg=BG_DARK)
-            btn_row.pack(fill=tk.X, pady=(16, 0))
-            ttk.Button(btn_row, text="Close", style="Dark.TButton",
-                       command=dlg.destroy).pack(side=tk.RIGHT)
-            self._finalize_modal_dialog(dlg)
-            return
-
-        # Monospace gap table (header + rows) in a bordered, scrollable listbox.
-        list_wrap = tk.Frame(body, bg=BG_DARK)
-        list_wrap.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        lb = tk.Listbox(
-            list_wrap, height=min(14, max(3, len(rows))),
-            width=max(28, max(len(r) for r in rows)),
-            bg=BG_ENTRY, fg=FG_TEXT, font=("Consolas", 9),
-            selectbackground=BG_PANEL, selectforeground=FG_TEXT,
-            highlightthickness=1, highlightbackground=BORDER_COLOR,
-            activestyle="none", borderwidth=0)
-        for r in rows:
-            lb.insert(tk.END, r)
-        if len(rows) > 14:
-            sb = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=lb.yview)
-            lb.configure(yscrollcommand=sb.set)
-            sb.pack(side=tk.RIGHT, fill=tk.Y)
-        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        status = tk.Label(body, text="", font=("Consolas", 9), fg=FG_GREEN,
-                          bg=BG_DARK, anchor=tk.W)
-        status.pack(fill=tk.X, pady=(8, 0))
-
-        def _copy(kind):
-            text = gap.janice() if kind == "janice" else gap.multibuy()
-            ok = self._market_copy_text(text)
-            label = "Janice" if kind == "janice" else "Multibuy"
-            try:
-                if ok:
-                    status.config(text=f"Copied {label} list ✓", fg=FG_GREEN)
-                else:
-                    status.config(text="Copy failed — clipboard unavailable.",
-                                  fg=FG_RED)
-            except tk.TclError:
-                pass
-
-        btn_row = tk.Frame(body, bg=BG_DARK)
-        btn_row.pack(fill=tk.X, pady=(16, 0))
-        # Packed right-to-left: Close rightmost, then the two copy buttons.
-        ttk.Button(btn_row, text="Close", style="Dark.TButton",
-                   command=dlg.destroy).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btn_row, text="Copy for Multibuy", style="Dark.TButton",
-                   command=lambda: _copy("multibuy")).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(btn_row, text="Copy for Janice", style="Green.TButton",
-                   command=lambda: _copy("janice")).pack(side=tk.RIGHT, padx=(6, 0))
-
-        self._finalize_modal_dialog(dlg)
-
-    def _finalize_modal_dialog(self, dlg):
-        """Center a Toplevel over the app and give it a close/escape binding.
-
-        Shared tail for the app's custom (non-``_themed_modal``) dialogs. Guarded
-        against a headless root (winfo_* raising) so tests that new up a dialog
-        don't blow up on geometry."""
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
-        try:
-            dlg.update_idletasks()
-            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
-            rw, rh = self.root.winfo_width(), self.root.winfo_height()
-            w, h = dlg.winfo_width(), dlg.winfo_height()
-            dlg.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 3)}")
-        except Exception:
-            pass
+        doctrine_target = self._market_seed_target(doctrine)
+        store = getattr(self, "fittings", None)
+        # from_members owns the tolerant label/target resolution (and degrades to
+        # blank labels rather than a broken dialog if the store raises).
+        picks = market_gap_dialog.GapSelection.from_members(
+            getattr(doctrine, "members", None) or [],
+            resolve_target=lambda mem: self._market_seed_target(doctrine, mem),
+            fit_info=(getattr(store, "get_fit", None) if store is not None
+                      else None),
+            doctrine_name=dname, doctrine_target=doctrine_target).picks
+        return market_gap_dialog.open_gap_dialog(
+            self.root,
+            doctrine_name=dname,
+            picks=picks,
+            doctrine_target=doctrine_target,
+            build_gap=lambda per_fit_targets, components:
+                self._market_build_gap_list(doctrine,
+                                            per_fit_targets=per_fit_targets,
+                                            components=components),
+            copy_text=self._market_copy_text)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
