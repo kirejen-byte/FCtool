@@ -60,6 +60,11 @@ from intel_paste import (
 from intel_session import IntelSession
 from standings_cache import StandingsCache
 import intel_analyzer
+# Tagged chat-channel registry (Settings > Channels). Pure/Tk-free: it owns the
+# config["channels"] block, the Intel-tagged view Intelligence Fusion tracks and
+# the pool the MOTD palette's channel search offers. It is the ONLY writer of
+# that block — fc_gui mutates through a Registry, never by hand.
+import channel_store
 import os as _os
 from app_path import app_dir as _app_dir
 from datetime import timezone, timedelta
@@ -784,12 +789,15 @@ class FCToolGUI:
             _jr_cfg.get("friendly_staging_systems", []) or [])
         self._hostile_staging: list[str] = list(
             _jr_cfg.get("hostile_staging_systems", []) or [])
-        # User-editable, persisted intel channels (shared with the web UI via
-        # config["intel_channels"]["tracked"]). On first run the key is seeded
-        # from the hard-coded INTEL_CHANNELS so existing users keep today's
-        # channels, then persisted. A missing/empty list falls back to the seed
-        # for safety. cached_discovered backs the Settings picker's suggestions.
-        self._tracked_intel_channels: list[str] = self._load_tracked_intel_channels()
+        # The tagged channel registry (Settings > Channels), loaded from
+        # config["channels"]["registry"]. On a config that has never seen it,
+        # channel_store MIGRATES in memory from the legacy
+        # config["intel_channels"]["tracked"] with the Intel tag, so
+        # self._tracked_intel_channels (below, a derived property) returns
+        # exactly what Intelligence Fusion tracked before the upgrade. Nothing
+        # is written until the owner actually edits a channel.
+        # cached_discovered still backs the Settings picker's suggestions.
+        self._channels: channel_store.Registry = channel_store.load(self.config)
         self.chat_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
         # Re-entry guard for the "Import from EVE" (ESI in-game fittings) flow.
@@ -1574,34 +1582,41 @@ class FCToolGUI:
         self._save_config()
         self._push_staging_to_map()      # keep the map staging overlay in sync
 
-    def _load_tracked_intel_channels(self) -> list[str]:
-        """Return the tracked intel channels from config, seeding on first run.
+    # ── Channel registry seam (Settings > Channels) ───────────────────────────
 
-        Reads ``config["intel_channels"]["tracked"]``. If that key is missing or
-        empty, it is SEEDED from ``sorted(INTEL_CHANNELS)`` (empty by default)
-        and persisted to config.json. The returned list is normalized
-        (whitespace-stripped, case-insensitively de-duped); a normalized list
-        that round-trips to a different value is written back so config stays
-        clean.
-        """
-        seed = sorted(INTEL_CHANNELS)
-        ic = self.config.setdefault("intel_channels", {})
-        raw = ic.get("tracked")
-        tracked = normalize_tracked_channels(raw, seed=seed)
-        # Persist when seeding (key absent/empty) or when normalization changed
-        # the stored value, so the on-disk config matches what we use in memory.
-        if not raw or list(raw) != tracked:
-            ic["tracked"] = list(tracked)
-            self._save_config()
-        return tracked
+    def _channel_registry(self) -> "channel_store.Registry":
+        """The live :class:`channel_store.Registry` for this session.
 
-    def _save_tracked_intel_channels(self):
-        """Persist the tracked intel channels into config["intel_channels"]
-        and write config.json immediately. Lightweight config write only — does
-        not restart modules (mirrors _save_staging_systems)."""
-        ic = self.config.setdefault("intel_channels", {})
-        ic["tracked"] = list(self._tracked_intel_channels)
+        Built once from ``self.config`` and then MUTATED IN PLACE — it is the
+        single writer of ``config["channels"]``. Rebuilt only where the config
+        object itself is replaced (``_save_settings``' reload). Lazily created
+        so the palette provider can be exercised on a bare host in tests, and so
+        an early caller never depends on __init__ ordering."""
+        reg = getattr(self, "_channels", None)
+        if reg is None:
+            reg = channel_store.load(self.config)
+            self._channels = reg
+        return reg
+
+    def _save_channels(self):
+        """Persist the registry into config["channels"] and write config.json.
+
+        Lightweight config write only — does not restart modules (mirrors
+        ``_save_staging_systems``). Every Settings > Channels edit calls this;
+        there is no Save-button parse-back, so the section autosaves."""
+        channel_store.save(self.config, self._channel_registry())
         self._save_config()
+
+    @property
+    def _tracked_intel_channels(self) -> list[str]:
+        """The channels Intelligence Fusion tracks: the Intel-TAGGED subset.
+
+        Derived, never stored — the registry is the one source of truth, so a
+        tag toggle in Settings is visible to every reader immediately and no
+        second list can drift. On a config the owner has not touched, this is
+        byte-for-byte the old ``config["intel_channels"]["tracked"]`` list (see
+        :func:`channel_store.load`'s migration)."""
+        return self._channel_registry().names(channel_store.TAG_INTEL)
 
     # ── Intel filter config (migration + persistence) ─────────────────────────
 
@@ -3973,7 +3988,8 @@ class FCToolGUI:
             "and parses each report — system, pilot count, d-scan link, "
             "cyno/camp flags — surfacing it in the live feed below, "
             "cross-referenced with zKillboard activity. "
-            "Pick which channels to watch in Settings → Intel Channels."
+            "Pick which channels to watch in Settings → Channels "
+            "(tag them Intel)."
         )
         self._intel_fusion_btn.bind(
             "<Enter>", lambda e, t=_fusion_tip: self._show_tooltip(e, t))
@@ -4038,7 +4054,8 @@ class FCToolGUI:
         self._intel_find_var = tk.StringVar(value="")
 
         # One checkbox per tracked intel channel (user-configurable, sourced
-        # from config["intel_channels"]["tracked"] via self._tracked_intel_channels).
+        # from the Intel-TAGGED subset of config["channels"] via the derived
+        # self._tracked_intel_channels).
         self._intel_channel_vars: dict[str, tk.BooleanVar] = {}
         self._rebuild_intel_channel_checkboxes()
 
@@ -10846,53 +10863,58 @@ class FCToolGUI:
         return out
 
     def _motd_palette_channels(self, query):
-        """Channel rows, recents-first (recent MOTD channel tokens ahead of the
-        rest of the discovered-channel cache), then — for a non-empty query
-        ONLY — every channel with a log file on disk, all time.
+        """Channel rows: the Settings > Channels REGISTRY, recents-first.
+
+        The pool is exactly what the owner curated (owner directive) — not the
+        discovered-channel cache and not the on-disk log sweep, both of which
+        offered hundreds of auto-joined and long-dead channels. Ordering keeps
+        the channels the FC has actually used at the top: recent MOTD channel
+        tokens first (in MRU order, and only those still in the registry), then
+        the rest of the registry in its own order. Registry casing wins — it is
+        the curated spelling, and a channel name is matched against a chat-log
+        filename.
+
+        ESCAPE HATCH: a non-empty query that is not an EXACT (case-insensitive)
+        registry name appends one extra ``use "<query>"`` row, which inserts a
+        channel pill with exactly the typed name. Curating the pool must never
+        cost the FC the ability to name a channel that is not in it.
 
         The zero-state dropdown and Quick-Add tray stay used-channels-only
         (``used_channel_items``, owner directive — see the MOTD palette
         invariant in the codebase map); they never call this method with an
-        empty query. Widening only inside ``if q:`` keeps that guarantee true
-        even if a future caller passes "" directly, and keeps a query-less
-        call from ever consulting :meth:`_motd_disk_channel_names` (which on a
-        cold cache would kick a background rescan nobody asked for).
+        empty query, and an empty query here is a plain unfiltered listing with
+        no escape row.
 
-        The combined pool is deduped case-insensitively, first occurrence
-        wins, so recents keep their position ahead of cached_discovered and
-        cached_discovered keeps its position ahead of the on-disk pool.
-
-        The result is HARD-CAPPED at 20 matches, exactly as
-        :meth:`_motd_palette_systems` and :meth:`_motd_palette_library_fits`
-        cap theirs. This is load-bearing, not tidiness: the palette's
-        ``+N more…`` row (``motd_palette._apply_expansions``) uncaps a group to
-        its FULL provider list, and the dropdown body is a plain Frame with no
-        scrollbar and no height clamp. Measured against the owner's real
-        all-time pool (1,073 channels), typing ``ch`` matched 911, and one
-        click on ``+907 more…`` froze the GUI for 12.9s to build a 21,913px
-        dropdown of which ~45 rows fit on screen — ~867 rows unreachable. The
-        cap is applied AFTER the recents-first ordering above, so the rows that
-        survive it are the most relevant ones."""
-        q = (query or "").lower()
-        recent_names = []
-        for tok in (self.config.get("fittings", {})
-                    .get("motd_recent_tokens", []) or []):
-            if tok.get("kind") in ("channel", "channel_line"):
-                nm = (tok.get("params") or {}).get("name")
-                if nm and nm not in recent_names:
-                    recent_names.append(nm)
-        cached = list(self.config.get("intel_channels", {})
-                      .get("cached_discovered", []) or [])
-        pools = [recent_names, cached]
-        if q:
-            pools.append(self._motd_disk_channel_names())
+        Matches are HARD-CAPPED at 20, exactly as :meth:`_motd_palette_systems`
+        and :meth:`_motd_palette_library_fits` cap theirs. This is load-bearing,
+        not tidiness: the palette's ``+N more…`` row
+        (``motd_palette._apply_expansions``) uncaps a group to its FULL provider
+        list, and the dropdown body is a plain Frame with no scrollbar and no
+        height clamp — an uncapped provider once turned one click into a 12.9s
+        freeze and a 21,913px dropdown. The cap is applied AFTER the
+        recents-first ordering, so the rows that survive it are the most
+        relevant ones; the escape row is appended after the cap so it can never
+        be crowded out."""
+        raw = query or ""
+        q = raw.strip().lower()
+        reg = self._channel_registry()
+        by_key = {n.lower(): n for n in reg.names()}
         ordered = []
         seen_lower = set()
-        for pool in pools:
-            for name in pool:
-                key = name.lower()
-                if key in seen_lower:
-                    continue
+        for tok in (self.config.get("fittings", {})
+                    .get("motd_recent_tokens", []) or []):
+            if tok.get("kind") not in ("channel", "channel_line"):
+                continue
+            nm = (tok.get("params") or {}).get("name")
+            key = (nm or "").lower()
+            # A recent that is no longer in the registry is NOT offered — the
+            # registry is the pool. It stays reachable via the escape hatch.
+            if key in by_key and key not in seen_lower:
+                seen_lower.add(key)
+                ordered.append(by_key[key])
+        for name in reg.names():
+            key = name.lower()
+            if key not in seen_lower:
                 seen_lower.add(key)
                 ordered.append(name)
         out = []
@@ -10904,15 +10926,26 @@ class FCToolGUI:
                 label=name, meta="", group="Channels"))
             if len(out) >= 20:
                 break
+        if raw.strip() and not reg.has(raw):
+            out.append(motd_palette.PaletteItem(
+                kind="channel", params={"name": raw},
+                label=f'use "{raw}"', meta="not in your channel list",
+                group="Channels"))
         return out
 
     def _motd_disk_channel_names(self):
-        """Every channel with a log file on disk (ALL TIME), for the palette's
-        typed-query Channels search (spec:
-        2026-07-27-range-check-and-channel-search, §1).
+        """Every channel with a log file on disk (ALL TIME).
 
-        **This method NEVER enumerates the logs folder.** The palette provider
-        (:meth:`_motd_palette_channels`) runs on the Tk thread on every
+        **No production consumer today.** It backed the MOTD palette's
+        typed-query tier until the palette moved to the curated Settings >
+        Channels registry (owner directive: the search offers registry channels
+        only, plus the ``use "<query>"`` escape hatch). The cache it reads is
+        still maintained by :meth:`_motd_scan_channels`, so this stays as the
+        one accessor for it rather than leaving a written-but-unreadable field;
+        retiring the all-time window entirely is a separate decision.
+
+        **This method NEVER enumerates the logs folder.** A palette provider
+        runs on the Tk thread on every
         keystroke, so a cold cache returns an EMPTY list immediately and kicks
         the existing background scan (:meth:`_motd_scan_channels`, which owns
         the in-flight guard and costs at most one ``isdir`` probe before
@@ -15063,8 +15096,8 @@ class FCToolGUI:
             if len(pair) == 2:
                 self._ansiblex_text.insert(tk.END, f"{pair[0]}, {pair[1]}\n")
 
-        # ── Intel Channels ────────────────────────────────────────────────
-        self._build_intel_channels_settings(scroll_frame)
+        # ── Channels (tagged registry) ────────────────────────────────────
+        self._build_channels_settings(scroll_frame)
 
         # ── X-Up Settings ────────────────────────────────────────────────────
         self._add_section(scroll_frame, "Fleet Management", toc_title="Fleet Mgmt")
@@ -22175,21 +22208,30 @@ class FCToolGUI:
             return
         self._scan_characters_worker(logs_path)
 
-    # ── Intel Channels settings (curation UI) ──────────────────────────────
+    # ── Channels settings (tagged registry curation UI) ─────────────────────
 
-    def _build_intel_channels_settings(self, parent):
-        """Build the Settings-tab 'Intel Channels' curation section.
+    def _build_channels_settings(self, parent):
+        """Build the Settings-tab 'Channels' curation section.
 
-        Lets the user view/add/remove the tracked intel channels (shared with
-        the web UI via config["intel_channels"]["tracked"]). The AutocompleteEntry
-        suggests discovered channel names (noise-filtered); the user may still
-        free-type any name. 'Scan Channels' discovers channels from the logs dir
-        and caches them into config["intel_channels"]["cached_discovered"].
+        One list of the chat channels FCTool knows about, each carrying zero or
+        more TAGS (channel_store.PRELOADED_TAGS). Tags are what consumers key
+        on: the Intel-tagged subset is what Intelligence Fusion tracks, and the
+        whole list is the pool the MOTD composer's channel search offers.
+
+        Every edit here writes straight through :meth:`_save_channels` — this
+        section autosaves and is deliberately NOT collected by the Save button
+        (there is exactly one writer of config["channels"]).
+
+        The AutocompleteEntry suggests discovered channel names (noise-filtered);
+        the user may still free-type any name. 'Scan Channels' discovers channels
+        from the logs dir and caches them into
+        config["intel_channels"]["cached_discovered"], which also feeds the
+        Suggested panel on the right.
         """
-        self._add_section(parent, "Intel Channels", toc_title="Intel Channels")
+        self._add_section(parent, "Channels", toc_title="Channels")
         tk.Label(parent,
-                 text="Channels tracked for Intelligence Fusion "
-                      "(shared with the web UI).",
+                 text="Chat channels FCTool knows about. Tag one to say what it "
+                      "is — Intel-tagged channels feed Intelligence Fusion.",
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK
                  ).pack(anchor=tk.W, padx=20)
 
@@ -22197,10 +22239,13 @@ class FCToolGUI:
         ic_cfg = self.config.get("intel_channels", {})
         cached = ic_cfg.get("cached_discovered", []) or []
         self._intel_channel_suggestions: list[str] = filter_suggestion_channels(cached)
-        # Seed the Suggested-panel pool (intel/intelligence-named, not tracked)
-        # from the same cached discovery so the panel is useful before a scan.
+        # Seed the Suggested-panel pool (intel/intelligence-named, not already
+        # listed) from the same cached discovery so the panel is useful before a
+        # scan. The exclusion set is EVERY registry channel, not just the
+        # Intel-tagged ones: a channel that is already listed (however tagged)
+        # must not be offered again, or its "+ Add" would be a no-op.
         self._intel_suggested_channels: list[str] = compute_intel_channel_suggestions(
-            cached, self._tracked_intel_channels)
+            cached, self._channel_registry().names())
 
         # Split the curation area: existing add/scan/list controls on the left,
         # the 1-click Suggested panel on the right.
@@ -22224,9 +22269,9 @@ class FCToolGUI:
         )
         self._intel_channel_entry.pack(side=tk.LEFT, padx=5)
         self._intel_channel_entry.bind("<Return>",
-                                       lambda e: self._add_intel_channel())
+                                       lambda e: self._add_channel())
         ttk.Button(add_row, text="Add", style="Green.TButton",
-                   command=self._add_intel_channel).pack(side=tk.LEFT, padx=5)
+                   command=self._add_channel).pack(side=tk.LEFT, padx=5)
         ttk.Button(add_row, text="Scan Channels", style="Dark.TButton",
                    command=self._scan_intel_channels).pack(side=tk.LEFT, padx=5)
         self._intel_channels_status = tk.Label(
@@ -22234,23 +22279,14 @@ class FCToolGUI:
         )
         self._intel_channels_status.pack(side=tk.LEFT, padx=10)
 
-        # Tracked-channel listbox (dark look, matches staging manager).
-        list_row = tk.Frame(left_col, bg=BG_DARK)
-        list_row.pack(fill=tk.X, pady=2)
-        self._intel_channels_listbox = tk.Listbox(
-            list_row, height=5, font=("Consolas", 10),
-            bg=BG_ENTRY, fg=FG_MAGENTA, selectbackground="#1a5a90",
-            selectforeground=FG_WHITE, highlightthickness=1,
-            highlightbackground=BORDER_COLOR, borderwidth=1, relief=tk.RIDGE,
-            activestyle="none", exportselection=False,
+        # One row per channel: its name, a checkbox per preloaded tag, Remove.
+        # Rebuilt wholesale by _refresh_channel_rows (the registry is small —
+        # a dozen or so channels — so a full redraw is simpler than diffing).
+        self._channel_rows_frame = tk.Frame(
+            left_col, bg=BG_DARK, highlightthickness=1,
+            highlightbackground=BORDER_COLOR, borderwidth=0,
         )
-        self._intel_channels_listbox.pack(side=tk.LEFT, fill=tk.BOTH,
-                                          expand=True, pady=(2, 2))
-        self._intel_channels_listbox.bind(
-            "<Double-Button-1>", lambda e: self._remove_intel_channel())
-        ttk.Button(list_row, text="Remove Selected", style="Dark.TButton",
-                   command=self._remove_intel_channel
-                   ).pack(side=tk.LEFT, padx=(6, 0), anchor=tk.N)
+        self._channel_rows_frame.pack(fill=tk.X, pady=(4, 2))
 
         # Suggested panel: discovered intel-named channels not yet tracked,
         # each addable in one click. Populated/rebuilt by
@@ -22264,27 +22300,29 @@ class FCToolGUI:
         )
         self._intel_suggested_frame.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
 
-        self._refresh_intel_channels_listbox()
+        self._refresh_channel_rows()
         self._refresh_intel_channel_suggestions()
 
     def _refresh_intel_channel_suggestions(self, discovered=None):
         """(Re)draw the Suggested intel-channels panel.
 
-        Recomputes the suggestion list (intel/intelligence-named, minus the
-        currently tracked set, deduped) and rebuilds one row per suggestion with
-        a 1-click '+ Add' button. When ``discovered`` is provided it becomes the
-        new candidate pool (e.g. a fresh scan); otherwise the cached
-        ``self._intel_suggested_channels`` pool is recomputed against the
-        current tracked list. Shows a dim placeholder when empty. Safe to call
+        Recomputes the suggestion list (intel/intelligence-named, minus every
+        channel already in the registry, deduped) and rebuilds one row per
+        suggestion with a 1-click '+ Add' button. When ``discovered`` is provided
+        it becomes the new candidate pool (e.g. a fresh scan); otherwise the
+        cached ``self._intel_suggested_channels`` pool is recomputed against the
+        current registry. Shows a dim placeholder when empty. Safe to call
         before the panel exists (no-op) and idempotent."""
         if discovered is not None:
             pool = list(discovered)
         else:
-            # Recompute from the last known pool so newly-tracked channels drop
+            # Recompute from the last known pool so newly-listed channels drop
             # out without needing a rescan.
             pool = list(getattr(self, "_intel_suggested_channels", []))
+        # Exclude EVERY listed channel, not only the Intel-tagged ones: a
+        # channel that is already in the registry cannot be "added" again.
         self._intel_suggested_channels = compute_intel_channel_suggestions(
-            pool, self._tracked_intel_channels)
+            pool, self._channel_registry().names())
 
         frame = getattr(self, "_intel_suggested_frame", None)
         if frame is None:
@@ -22302,79 +22340,143 @@ class FCToolGUI:
             row = tk.Frame(frame, bg=BG_DARK)
             row.pack(fill=tk.X, padx=4, pady=1)
             ttk.Button(row, text="+ Add", style="Green.TButton", width=6,
-                       command=lambda n=name: self._add_intel_channel_by_name(n)
+                       command=lambda n=name: self._add_channel_by_name(
+                           n, tags=(channel_store.TAG_INTEL,))
                        ).pack(side=tk.LEFT)
             tk.Label(row, text=name, font=("Consolas", 10),
                      fg=FG_MAGENTA, bg=BG_DARK, anchor=tk.W,
                      ).pack(side=tk.LEFT, padx=(6, 0))
 
-    def _refresh_intel_channels_listbox(self):
-        """Redraw the tracked-channel listbox from self._tracked_intel_channels."""
-        box = getattr(self, "_intel_channels_listbox", None)
-        if box is None:
+    def _refresh_channel_rows(self):
+        """Redraw the Channels rows (name + tag checkboxes + Remove) from the
+        registry. Safe to call before the section exists (no-op)."""
+        frame = getattr(self, "_channel_rows_frame", None)
+        if frame is None:
             return
-        box.delete(0, tk.END)
-        for name in self._tracked_intel_channels:
-            box.insert(tk.END, name)
+        for child in frame.winfo_children():
+            child.destroy()
+        self._channel_tag_vars = {}
 
-    def _add_intel_channel(self):
-        """Add the channel typed/selected in the entry to the tracked list.
+        channels = self._channel_registry().channels()
+        if not channels:
+            tk.Label(frame, text="(no channels yet — add one above)",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+                     ).pack(anchor=tk.W, padx=6, pady=4)
+            return
 
-        Thin wrapper over :meth:`_add_intel_channel_by_name`; clears the entry
-        on a successful (non-blank) add. Free-typed names are accepted (a
-        channel may have no recent log)."""
+        for chan in channels:
+            row = tk.Frame(frame, bg=BG_DARK)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            ttk.Button(row, text="Remove", style="Dark.TButton", width=8,
+                       command=lambda n=chan.name: self._remove_channel(n)
+                       ).pack(side=tk.LEFT)
+            tk.Label(row, text=chan.name, font=("Consolas", 10), width=24,
+                     fg=FG_MAGENTA, bg=BG_DARK, anchor=tk.W,
+                     ).pack(side=tk.LEFT, padx=(6, 0))
+            for tag in channel_store.PRELOADED_TAGS:
+                var = tk.BooleanVar(value=chan.has_tag(tag))
+                self._channel_tag_vars[(chan.name, tag)] = var
+                tk.Checkbutton(
+                    row, text=tag, variable=var, font=("Consolas", 9),
+                    fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY,
+                    activebackground=BG_DARK, activeforeground=FG_MAGENTA,
+                    command=(lambda n=chan.name, t=tag, v=var:
+                             self._on_channel_tag_toggle(n, t, v)),
+                ).pack(side=tk.LEFT, padx=(6, 0))
+            # Tags the owner (or a hand-edited config) invented are shown but
+            # not editable here — the four preloaded ones are the offer list,
+            # not a closed enum, and a toggle must never drop the others.
+            extra = [t for t in chan.tags
+                     if t.casefold() not in {p.casefold()
+                                             for p in channel_store.PRELOADED_TAGS}]
+            if extra:
+                tk.Label(row, text="+ " + ", ".join(extra), font=("Consolas", 9),
+                         fg=FG_DIM, bg=BG_DARK, anchor=tk.W,
+                         ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _on_channel_tag_toggle(self, name: str, tag: str, var):
+        """Persist one tag checkbox. The registry is the only writer.
+
+        Tags the row does not render (anything outside PRELOADED_TAGS) survive
+        untouched: the new tag list is the CURRENT one with ``tag`` added or
+        removed, never a rebuild from the four checkboxes."""
+        reg = self._channel_registry()
+        chan = reg.get(name)
+        if chan is None:
+            return
+        want_on = bool(var.get())
+        if want_on:
+            tags = list(chan.tags) + [tag]
+        else:
+            key = tag.casefold()
+            tags = [t for t in chan.tags if t.casefold() != key]
+        reg.set_tags(chan.name, tags)
+        self._save_channels()
+        # Intel membership may have just changed — the Intelligence panel's
+        # checkbox strip is derived from the Intel-tagged view.
+        self._rebuild_intel_channel_checkboxes()
+        self._set_intel_channels_status(
+            f"{chan.name}: {tag} {'on' if want_on else 'off'}",
+            FG_GREEN if want_on else FG_DIM)
+
+    def _add_channel(self):
+        """Add the channel typed/selected in the entry to the registry.
+
+        Thin wrapper over :meth:`_add_channel_by_name`; clears the entry on a
+        successful (non-blank) add. Free-typed names are accepted (a channel may
+        have no recent log). A manually added channel starts with NO tags — the
+        owner ticks what it is on its row. Only the Suggested panel, which is
+        explicitly the intel-named discovery flow, pre-tags with Intel."""
         name = self._intel_channel_entry.get().strip()
         if not name:
             return
         self._intel_channel_entry.delete(0, tk.END)
-        self._add_intel_channel_by_name(name)
+        self._add_channel_by_name(name)
 
-    def _add_intel_channel_by_name(self, name: str):
+    def _add_channel_by_name(self, name: str, tags=()):
         """Core add path shared by the Add button and the Suggested chips.
 
-        Normalizes (de-dupes case-insensitively) the tracked list with ``name``
-        appended. If the list is unchanged (already tracked, or blank), it is a
-        no-op with an inline notice. Otherwise it persists, refreshes the
-        listbox + Intel-panel checkboxes, refreshes the Suggested panel (so the
-        just-added channel drops out of suggestions), and sets a status."""
+        ``tags`` is what the channel starts with — ``()`` for a manual add, and
+        ``("Intel",)`` from the Suggested panel. An EXISTING channel is never
+        re-created (channel_store: first occurrence wins); the requested tags are
+        merged onto it instead, so a Suggested "+ Add" for a channel the owner
+        already listed untagged does the useful thing rather than nothing. With
+        nothing left to merge it is a no-op with an inline notice."""
         name = (name or "").strip()
         if not name:
             return
-        before = len(self._tracked_intel_channels)
-        self._tracked_intel_channels = normalize_tracked_channels(
-            self._tracked_intel_channels + [name]
-        )
-        if len(self._tracked_intel_channels) == before:
-            self._intel_channels_status.config(
-                text=f"{name} already tracked", fg=FG_YELLOW)
-            return
-        self._save_tracked_intel_channels()
-        self._refresh_intel_channels_listbox()
+        reg = self._channel_registry()
+        existing = reg.get(name)
+        if existing is not None:
+            wanted = [t for t in channel_store.normalize_tags(tags)
+                      if not existing.has_tag(t)]
+            if not wanted:
+                self._set_intel_channels_status(
+                    f"{name} already listed", FG_YELLOW)
+                return
+            reg.set_tags(existing.name, list(existing.tags) + wanted)
+            status = f"Tagged {existing.name}: {', '.join(wanted)}"
+        else:
+            reg.add(name, tags)
+            status = f"Added {name}"
+        self._save_channels()
+        self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
         self._refresh_intel_channel_suggestions()
-        self._intel_channels_status.config(text=f"Added {name}", fg=FG_GREEN)
+        self._set_intel_channels_status(status, FG_GREEN)
 
-    def _remove_intel_channel(self):
-        """Remove the selected channel from the tracked list, persist, and
-        refresh the listbox + Intel-panel checkboxes."""
-        box = getattr(self, "_intel_channels_listbox", None)
-        if box is None:
+    def _remove_channel(self, name: str):
+        """Remove a channel from the registry, persist, and refresh the rows,
+        the Intel-panel checkboxes and the Suggested panel (an intel-named
+        channel still in the discovered pool re-appears there)."""
+        reg = self._channel_registry()
+        if not reg.remove(name):
             return
-        sel = box.curselection()
-        if not sel:
-            return
-        name = box.get(sel[0])
-        self._tracked_intel_channels = [
-            c for c in self._tracked_intel_channels
-            if c.strip().lower() != name.strip().lower()
-        ]
-        self._save_tracked_intel_channels()
-        self._refresh_intel_channels_listbox()
+        self._save_channels()
+        self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
-        # If the removed channel is an intel-named one still in the discovered
-        # pool, it re-appears as a suggestion.
         self._refresh_intel_channel_suggestions()
-        self._intel_channels_status.config(text=f"Removed {name}", fg=FG_DIM)
+        self._set_intel_channels_status(f"Removed {name}", FG_DIM)
 
     def _set_intel_channels_status(self, text, fg):
         """Set the Intel-Channels status label if it exists.
@@ -22609,16 +22711,12 @@ class FCToolGUI:
         # Re-resolve Ansiblex IDs
         self._resolve_ansiblex_async()
 
-        # Intel channels — gather the tracked-channel listbox (mirrors the
-        # ansiblex parse-back). The listbox is kept in sync with
-        # self._tracked_intel_channels on every add/remove, but reading it here
-        # guards against drift. cached_discovered is preserved as-is.
-        ic_box = getattr(self, "_intel_channels_listbox", None)
-        if ic_box is not None:
-            listed = [ic_box.get(i) for i in range(ic_box.size())]
-            self._tracked_intel_channels = normalize_tracked_channels(listed)
-        ic_cfg = self.config.setdefault("intel_channels", {})
-        ic_cfg["tracked"] = list(self._tracked_intel_channels)
+        # Channels are deliberately NOT collected here. The Settings > Channels
+        # section writes config["channels"] through channel_store on every edit
+        # (add / remove / tag toggle), so a parse-back would be a SECOND writer
+        # racing the registry — and the legacy intel_channels.tracked key is no
+        # longer read by anything (channel_store consults it only for the
+        # one-time in-memory migration).
 
         self.config.setdefault("xup", {})
         self.config["xup"]["trigger_word"] = self._setting_entries["xup_trigger"].get()
@@ -22657,14 +22755,15 @@ class FCToolGUI:
         # Restart modules
         self._stop_monitoring()
         self.config = self._load_config()
-        # Re-sync tracked intel channels from the reloaded config and rebuild
-        # the Intel-panel checkboxes so the panel reflects edits without an app
-        # restart. (If intel fusion is currently running, the new channel_filters
-        # apply on the next fusion toggle; the checkboxes/tracked set update now.)
-        self._tracked_intel_channels = normalize_tracked_channels(
-            self.config.get("intel_channels", {}).get("tracked"),
-            seed=sorted(INTEL_CHANNELS),
-        )
+        # The config OBJECT was just replaced, so the registry must be rebuilt
+        # against the new dict — otherwise every later _save_channels() would
+        # write into the discarded one. Then redraw both views of it: the
+        # Settings rows and the Intel-panel checkboxes (the latter is derived
+        # from the Intel-tagged subset, so it reflects tag edits without an app
+        # restart; a running fusion session picks up new channel_filters on its
+        # next toggle).
+        self._channels = channel_store.load(self.config)
+        self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
         self._start_monitoring()
