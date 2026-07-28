@@ -10031,10 +10031,16 @@ class FCToolGUI:
         # populated read-only from the last fleet poll (no new polling); empty
         # when stale. Each entry is {"name": str, "id": int}.
         self._motd_fleet_members_cache = []
-        # Lazily-discovered "every channel with a log file on disk" cache for
-        # the palette's typed-query Channels search — None until first use;
-        # see _motd_disk_channel_names / _apply_motd_scanned_channels.
+        # "Every channel with a log file on disk, ALL TIME" cache for the
+        # palette's typed-query Channels search — None until a background scan
+        # has landed; see _motd_disk_channel_names / _apply_motd_scanned_channels.
+        # Deliberately a WIDER window than config["intel_channels"]
+        # ["cached_discovered"] (30 days): a dormant op channel is exactly what
+        # the typed search exists to find.
         self._motd_disk_channels_cache = None
+        # In-flight guard for _motd_scan_channels so the per-keystroke palette
+        # provider cannot stack scan threads. Tk-thread-only state.
+        self._motd_channel_scan_inflight = False
         # Template dirty tracking (composer state vs the loaded/saved snapshot).
         self._motd_template_dirty = False
         self._motd_loaded_template_snapshot = None
@@ -10789,15 +10795,15 @@ class FCToolGUI:
     def _motd_palette_channels(self, query):
         """Channel rows, recents-first (recent MOTD channel tokens ahead of the
         rest of the discovered-channel cache), then — for a non-empty query
-        ONLY — every channel with a log file on disk.
+        ONLY — every channel with a log file on disk, all time.
 
         The zero-state dropdown and Quick-Add tray stay used-channels-only
         (``used_channel_items``, owner directive — see the MOTD palette
         invariant in the codebase map); they never call this method with an
         empty query. Widening only inside ``if q:`` keeps that guarantee true
-        even if a future caller passes "" directly, and avoids ever touching
-        :meth:`_motd_disk_channel_names` (and thus the filesystem) for a
-        query-less call.
+        even if a future caller passes "" directly, and keeps a query-less
+        call from ever consulting :meth:`_motd_disk_channel_names` (which on a
+        cold cache would kick a background rescan nobody asked for).
 
         The combined pool is deduped case-insensitively, first occurrence
         wins, so recents keep their position ahead of cached_discovered and
@@ -10834,40 +10840,40 @@ class FCToolGUI:
         return out
 
     def _motd_disk_channel_names(self):
-        """Every channel with a log file on disk, for the palette's typed-query
-        Channels search (spec: 2026-07-27-range-check-and-channel-search, §1).
+        """Every channel with a log file on disk (ALL TIME), for the palette's
+        typed-query Channels search (spec:
+        2026-07-27-range-check-and-channel-search, §1).
 
-        The palette provider (:meth:`_motd_palette_channels`) runs on every
-        keystroke, so this must never touch the filesystem inline: the result
-        is cached lazily on the instance on first use (``None`` = not yet
-        discovered this session) and refreshed — not merely dropped — by
-        :meth:`_apply_motd_scanned_channels`, the completion handler for both
-        the palette's "Rescan channels..." action and the startup auto-scan
-        (both go through :meth:`_motd_scan_channels`), since that handler
-        already holds a fresh ``discover_channels()`` result computed with the
-        same arguments.
+        **This method NEVER enumerates the logs folder.** The palette provider
+        (:meth:`_motd_palette_channels`) runs on the Tk thread on every
+        keystroke, so a cold cache returns an EMPTY list immediately and kicks
+        the existing background scan (:meth:`_motd_scan_channels`, which owns
+        the in-flight guard and costs at most one ``isdir`` probe before
+        handing the work to a thread); the next keystroke after that worker
+        lands is warm. Typed results are simply narrower for a beat — the
+        alternative was a measured 15.4s frozen GUI on the first keystroke. The
+        invariant is "no filesystem work on the Tk thread", not "fast
+        filesystem work": the scan is ~0.25s on this box but another user's
+        logs folder can be far worse.
 
-        Mirrors :meth:`_motd_scan_channels`'s own logs-path resolution
-        (``resolve_eve_logs_path`` over the raw config value) and its
-        ``max_age_days=30`` bound, rather than re-deriving either."""
+        The cache is filled (and later refreshed) only by
+        :meth:`_apply_motd_scanned_channels`, the completion handler for the
+        startup auto-scan, the palette's "Rescan channels..." action and the
+        Settings-save re-arm. ``None`` means "no scan has landed yet".
+
+        Window: ALL TIME (``max_age_days=None``), deliberately wider than
+        ``config["intel_channels"]["cached_discovered"]``'s 30 days — a channel
+        with no log file in the last month is precisely the dormant op channel
+        this search exists to surface. Affordable because
+        ``intel_monitor.discover_channels`` enumerates via ``os.scandir``."""
         cached = getattr(self, "_motd_disk_channels_cache", None)
         if cached is not None:
             return cached
         try:
-            logs_path = resolve_eve_logs_path(
-                self.config.get("eve_logs_path", ""))
+            self._motd_scan_channels()
         except Exception:
-            logs_path = self.config.get("eve_logs_path", "")
-        names = []
-        if logs_path and os.path.isdir(logs_path):
-            try:
-                found = discover_channels(logs_path, tracked_character=None,
-                                          max_age_days=30)
-                names = [d["name"] for d in found]
-            except Exception:
-                names = []
-        self._motd_disk_channels_cache = names
-        return names
+            pass
+        return []
 
     def _motd_palette_doctrines(self, query):
         q = (query or "").lower()
@@ -11843,10 +11849,28 @@ class FCToolGUI:
 
     def _motd_scan_channels(self):
         """Discover chat channels (off the Tk thread) to seed the channel
-        AutocompleteEntry, mirroring :meth:`_scan_intel_channels`.
+        AutocompleteEntry and the palette's typed-query pool, mirroring
+        :meth:`_scan_intel_channels`.
 
         discover_channels() does directory + header I/O, so it runs on a worker
-        thread; the resulting names are applied back on the Tk main thread."""
+        thread; the resulting names are applied back on the Tk main thread.
+
+        The worker computes BOTH windows in one trip because the two caches
+        deliberately differ: ``max_age_days=30`` feeds
+        ``config["intel_channels"]["cached_discovered"]`` (unchanged — it also
+        drives the intel autocomplete and Suggested panel) while the ALL-TIME
+        pass feeds the palette's typed-query cache. Never reuse one result for
+        the other; a 30-day list in the all-time cache silently re-hides every
+        dormant channel the search was widened to find.
+
+        Callers: the startup auto-scan, the palette's "Rescan channels..."
+        action, a Settings save, and — on a cold cache — the palette's channel
+        provider itself, which can fire on any keystroke. The in-flight flag is
+        checked FIRST, before any path resolution, so a repeat call while a
+        scan is running costs nothing at all (not even a stat). It is cleared
+        on the Tk thread by :meth:`_apply_motd_scanned_channels`."""
+        if getattr(self, "_motd_channel_scan_inflight", False):
+            return
         try:
             logs_path = resolve_eve_logs_path(
                 self.config.get("eve_logs_path", ""))
@@ -11862,23 +11886,43 @@ class FCToolGUI:
                 names = [d["name"] for d in found]
             except Exception:
                 names = []
-            self._post_ui(self._apply_motd_scanned_channels, names)
+            try:
+                found_all = discover_channels(logs_path, tracked_character=None,
+                                              max_age_days=None)
+                all_names = [d["name"] for d in found_all]
+            except Exception:
+                all_names = []
+            self._post_ui(self._apply_motd_scanned_channels, names, all_names)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._motd_channel_scan_inflight = True
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            # A thread that never started will never clear the flag.
+            self._motd_channel_scan_inflight = False
+            raise
 
-    def _apply_motd_scanned_channels(self, names):
+    def _apply_motd_scanned_channels(self, names, all_names=None):
         """Apply channel-scan results on the Tk thread: cache the discovered names
         (shared with the intel cache) and refresh the palette's channel chips.
 
-        Also refreshes (not just invalidates) the palette's on-disk-channel
-        cache (:meth:`_motd_disk_channel_names`) with this SAME discovery
-        result, since it was already computed with identical arguments — the
-        next typed-query keystroke reads the fresh list without a redundant
-        re-scan."""
+        Args:
+            names: The ``max_age_days=30`` discovery — the recent-channel set,
+                stored in ``config["intel_channels"]["cached_discovered"]``.
+            all_names: The ALL-TIME discovery, which fills the palette's
+                typed-query cache (:meth:`_motd_disk_channel_names`). ``None``
+                means the caller had no all-time result, and the all-time cache
+                is then left ALONE rather than being narrowed to ``names`` —
+                the two windows must stay honest.
+
+        Always clears the scan's in-flight flag, so a failed/empty scan cannot
+        wedge the guard shut."""
+        self._motd_channel_scan_inflight = False
         ic = self.config.setdefault("intel_channels", {})
         ic["cached_discovered"] = list(names)
         self._save_config()
-        self._motd_disk_channels_cache = list(names)
+        if all_names is not None:
+            self._motd_disk_channels_cache = list(all_names)
         pal = getattr(self, "_motd_palette", None)
         if pal is not None:
             try:
@@ -21722,6 +21766,17 @@ class FCToolGUI:
         # cached never re-scans.
         self._auto_scan_characters_if_needed()
         self._auto_scan_intel_channels_if_needed()
+        # Re-arm the MOTD channel scan against the JUST-SAVED logs path. Without
+        # this, a launch with an invalid/unset path leaves the palette's
+        # all-time channel cache cold forever: the startup scan bailed early and
+        # the two intel auto-scans above (a) only fire while their own caches
+        # are empty and (b) write cached_discovered, never the all-time cache.
+        # Deliberately re-arms _motd_scan_channels rather than reusing the intel
+        # scan's result — that worker reads its path from the UNSAVED
+        # _logs_path_var and can therefore describe a different directory. Safe
+        # to call unconditionally: it no-ops on an invalid path and on an
+        # in-flight scan, and self.config was reloaded from disk just above.
+        self._motd_scan_channels()
 
     def _autosave_staging_system(self, *args):
         val = self._staging_entry.get().strip()
