@@ -120,12 +120,22 @@ class InfraManagerDialog(tk.Toplevel):
                      cascade use. None (default) => plain names, so the dialog
                      still works standalone / in tests. Appended last / backwards
                      compatible.
+    default_regions_fn optional ZERO-ARG callable returning the default scan
+                     scope as a list of region IDs — fc_gui passes a closure over
+                     ``system_coords.default_scan_regions`` + its staging system,
+                     because this module may import neither. Drives the
+                     "Default: staging + adjacent" button, which is DISABLED with
+                     an explanatory tooltip when this is None (the host's way of
+                     saying "no staging system is configured"). Called on PRESS
+                     only, so the host's lookup stays lazy. Appended last /
+                     backwards compatible.
     """
 
     def __init__(self, parent, store, scanner, regions_catalog, system_names,
                  clipboard_get, import_clipboard, import_manual,
                  on_changed, initial_system_id=None,
-                 type_name_fn=None, autocomplete_cls=None, ticker_fn=None):
+                 type_name_fn=None, autocomplete_cls=None, ticker_fn=None,
+                 default_regions_fn=None):
         super().__init__(parent)
         self.store = store
         self.scanner = scanner
@@ -140,6 +150,8 @@ class InfraManagerDialog(tk.Toplevel):
         self._type_name_fn = type_name_fn if callable(type_name_fn) else None
         self._autocomplete_cls = autocomplete_cls
         self._ticker_fn = ticker_fn if callable(ticker_fn) else None
+        self._default_regions_fn = (default_regions_fn
+                                    if callable(default_regions_fn) else None)
 
         self._sort_col = None
         self._sort_reverse = False
@@ -258,6 +270,22 @@ class InfraManagerDialog(tk.Toplevel):
                    command=self._on_add_region).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(btns, text="Remove", style="Dark.TButton",
                    command=self._on_remove_region).pack(side=tk.LEFT)
+
+        # One-press default scope. Kept on its own row: the label is long and
+        # would squeeze Add/Remove out of the 240px panel.
+        self._default_regions_btn = ttk.Button(
+            panel, text="Default: staging + adjacent", style="Dark.TButton",
+            command=self._on_default_regions)
+        self._default_regions_btn.pack(fill=tk.X, padx=6, pady=(0, 6))
+        if self._default_regions_fn is None:
+            self._default_regions_btn.config(state="disabled")
+            attach_tooltip(self._default_regions_btn,
+                           "Set a staging system in Settings to use the "
+                           "default scan scope (its region + adjacent).")
+        else:
+            attach_tooltip(self._default_regions_btn,
+                           "Adds your staging system's region and every "
+                           "gate-adjacent one. Existing regions are kept.")
 
         self._region_rows = []             # listbox index -> region_id
 
@@ -828,6 +856,40 @@ class InfraManagerDialog(tk.Toplevel):
             self.store.set_regions(current)
         self._refresh_regions()
         self._set_status(f"Added scan region: {name}")
+
+    def _on_default_regions(self):
+        """Fill the scan-region list from the injected default-scope provider.
+
+        ADDITIVE, deliberately: a user who curated regions presses this to top
+        up their scope, not to have it replaced. That also makes the common case
+        (an empty list) identical to a replace. Order is preserved — the
+        provider puts the staging's OWN region first, and it stays first.
+        """
+        if self._default_regions_fn is None:
+            self._set_status("No staging system set — configure one in Settings.")
+            return
+        try:
+            defaults = list(self._default_regions_fn() or [])
+        except Exception as exc:
+            log.warning("infra default scan regions failed: %s", exc)
+            self._set_status("Could not work out the default scan regions.")
+            return
+        if not defaults:
+            self._set_status(
+                "No staging system set (or it has no region) — "
+                "configure one in Settings.")
+            return
+        current = list(self.store.get_regions())
+        added = [rid for rid in defaults if rid not in current]
+        if added:
+            self.store.set_regions(current + added)
+        self._refresh_regions()
+        if added:
+            names = ", ".join(self._region_name.get(int(rid), f"Region {rid}")
+                              for rid in added)
+            self._set_status(f"Added {len(added)} scan region(s): {names}")
+        else:
+            self._set_status("Scan regions already cover the staging default.")
 
     def _on_remove_region(self):
         sel = self._region_list.curselection()

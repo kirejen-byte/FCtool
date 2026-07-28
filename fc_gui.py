@@ -874,7 +874,8 @@ class FCToolGUI:
         self._battle_ledger = battle_ledger.from_config(
             self.config,
             presence_provider=self._own_presence_system_ids,
-            resolve_system_name=system_coords.get_name)
+            resolve_system_name=system_coords.get_name,
+            resolve_ship_group=self._ledger_ship_group)
         self._battle_ledger_panel = None     # built by _build_xup_tab
         self._battle_ledger_broke = False    # first tick failure disables the tick
         self._own_location_sid = None        # primary char (_refresh_current_system)
@@ -1456,6 +1457,39 @@ class FCToolGUI:
                     kept.append(conn)
             resolved = kept
         return resolved or None
+
+    # One line per minute is enough to diagnose a field report without flooding
+    # the log during a busy fight (a fleet fight delivers alerts far faster).
+    _GATELESS_LOG_EVERY_S = 60.0
+
+    def _route_connections_or_gateless(self, where: str):
+        """Ansiblex connections for a route lookup, or ``None`` = route GATELESS.
+
+        v3.8.1 invariant, restated: a route computation must DEGRADE, never
+        abort. The bridge list is an ENRICHMENT — ``get_stargate_route(o, d,
+        connections=None)`` still returns a real gate-only jump count — so a
+        raising bridge source must cost the shortcut, not the whole route. Two
+        alert paths used to acquire connections INSIDE the same ``try`` that
+        wrapped the routing call, so one raise there yielded no route at all and
+        the FC's "fight detected" notification silently lost its jump count.
+
+        Never raises. Logs ASCII (the console is cp1252) and throttles to one
+        line per ``_GATELESS_LOG_EVERY_S`` so the degradation stays diagnosable
+        from a user's log. Worker-thread safe: touches no Tk, marshals nothing.
+        """
+        try:
+            return self._get_ansiblex_connections()
+        except Exception as exc:
+            now = time.monotonic()
+            last = getattr(self, "_gateless_route_logged_at", None)
+            every = getattr(self, "_GATELESS_LOG_EVERY_S",
+                            FCToolGUI._GATELESS_LOG_EVERY_S)
+            if last is None or (now - last) >= every:
+                log.warning(
+                    "[route] %s: Ansiblex connections unavailable (%s) - "
+                    "routing gateless; jump counts ignore bridges", where, exc)
+                self._gateless_route_logged_at = now
+            return None
 
     def _prewarm_cache_async(self):
         """Pre-resolve the user's own staging systems in background so the first
@@ -2406,7 +2440,11 @@ class FCToolGUI:
             pack_opts=dict(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=(0, 4)),
             register_scroll_canvas=self._register_scroll_canvas,
             isk_format=self._market_price_short,       # keep ONE ISK formatter
-            on_dismiss=self._battle_ledger_dismiss)
+            on_dismiss=self._battle_ledger_dismiss,
+            # The panel imports no browser: with no seam wired the battle-report
+            # link simply does not exist. Same opener every other link button in
+            # the app uses.
+            on_open_url=self._open_url)
         comp_scroll_outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
                                padx=8, pady=(0, 4))
 
@@ -7084,7 +7122,18 @@ class FCToolGUI:
                 # than captured, so owners resolved after the dialog opened light
                 # up on the next reload (_apply_owner_tickers nudges it).
                 ticker_fn=lambda oid: (
-                    getattr(self, "_owner_ticker_cache", None) or {}).get(oid))
+                    getattr(self, "_owner_ticker_cache", None) or {}).get(oid),
+                # "Default: staging + adjacent" seam. The dialog imports neither
+                # fc_gui nor system_coords (§2 isolation), so the whole scope
+                # decision arrives as one zero-arg closure returning region IDS.
+                # Passed ONLY when a staging system is configured — a None here
+                # is what disables + tooltips the button, and it also keeps the
+                # (lazy, cached) region-adjacency join off the dialog-open path
+                # for users who have no staging to centre it on. The closure
+                # still re-reads the staging at PRESS time, so a value set while
+                # the dialog is open is honoured.
+                default_regions_fn=self._infra_default_regions
+                if self._get_staging_system() else None)
         except Exception as exc:
             print(f"[INFRA] manager dialog failed to open: {exc}")
             return
@@ -7102,15 +7151,48 @@ class FCToolGUI:
         except Exception:
             pass
 
+    def _infra_default_regions(self):
+        """Region IDs for the infra dialog's "Default: staging + adjacent"
+        button: the staging system's own region plus its gate-adjacent ones.
+
+        The dialog's injected provider (§2 isolation — infra_dialog imports
+        tkinter only, so it can reach neither `system_coords` nor this class).
+        Returns [] — never raises, never None — when no staging is configured or
+        it does not resolve to a region (blank, typo, J-space); the dialog turns
+        that into a status line rather than a silent no-op. Offline and cheap on
+        every call after the first (`system_coords` caches the adjacency join),
+        so it is safe on the Tk thread.
+        """
+        staging = self._get_staging_system()
+        if not staging:
+            return []
+        try:
+            return system_coords.default_scan_regions(staging)
+        except Exception as exc:
+            print(f"[INFRA] default scan regions failed: {exc}")
+            return []
+
     def _auto_infra_scan_if_needed(self):
         """Startup infra region auto-scan (mirrors _auto_market_rescan_if_needed).
         Silent no-op unless ALL of: config["infra"]["auto_scan_on_start"] is
-        truthy; a character is authenticated; and ≥1 scan region is configured.
+        truthy; a character is authenticated; and a scan scope can be resolved.
         The scanner's own per-system RESCAN_GATE_S (server search cache) skips
         systems searched within the last hour, so re-kicking a fresh region does
         no ESI work — that is the effective staleness gate (the store tracks
         per-SYSTEM, not per-region, scan times). getattr-guarded so a bare /
-        headless host never raises."""
+        headless host never raises.
+
+        SEEDING (2026-07-28): an empty region list used to end the feature here
+        — auto-scan was ON, nothing was configured, and nothing happened, with
+        no way for the owner to know why. When no region is configured AND a
+        staging system is, the scope defaults to `system_coords
+        .default_scan_regions(staging)` (staging's own region + its gate-adjacent
+        ones), which is PERSISTED via `store.set_regions` so the dialog shows the
+        same list the scan used. Seeding happens only on a genuinely empty list,
+        so a user who curated their regions — or deliberately emptied them while
+        staging stays set — is never overruled twice: the first seed makes the
+        list non-empty and this branch never runs again. An unresolvable staging
+        (blank, J-space, typo) yields [] and the old no-op stands."""
         cfg = self.config.get("infra", {}) or {}
         if not bool(cfg.get("auto_scan_on_start", False)):
             return
@@ -7121,7 +7203,23 @@ class FCToolGUI:
             return
         regions = store.get_regions()
         if not regions:
-            return
+            staging = self._get_staging_system()
+            if not staging:
+                return
+            try:
+                regions = system_coords.default_scan_regions(staging)
+            except Exception as exc:
+                print(f"[INFRA] default scan regions failed: {exc}")
+                return
+            if not regions:
+                return
+            try:
+                store.set_regions(regions)
+            except Exception as exc:
+                print(f"[INFRA] seeding default scan regions failed: {exc}")
+                return
+            print(f"[INFRA] No scan regions configured - seeded {len(regions)} "
+                  f"from staging '{staging}' (own region + adjacent)")
         try:
             scanner.scan_regions(regions)
         except Exception as exc:
@@ -23292,11 +23390,16 @@ class FCToolGUI:
         staging = self.config.get("zkillboard", {}).get("staging_system", "")
         route_info = ""
         if staging:
+            # Bridge list FIRST and in its OWN guard (_route_connections_or_gateless
+            # never raises): it used to sit inside the try below, so any fault
+            # there — a store read, a name resolution — aborted the whole
+            # computation and the alert rendered with NO route line at all. A
+            # gateless route is a worse route, not no route.
+            conns = self._route_connections_or_gateless("zkill alert")
             try:
                 from jump_range import search_system as _ss, get_stargate_route as _gr
                 o = _ss(staging)
                 d = _ss(alert.system_name)
-                conns = self._get_ansiblex_connections()
                 if o and d:
                     r = _gr(o, d, connections=conns)
                     if r:
@@ -24511,6 +24614,41 @@ class FCToolGUI:
         ledger.set_standings(own_ids=cache.own_ids, ally_ids=cache.ally_ids,
                              identity_known=cache.own_identity_known)
 
+    def _ledger_ship_group(self, type_id):
+        """Ship-GROUP name for a hull type id, or None. PURE OFFLINE by contract.
+
+        `battle_ledger._composition` calls this with the engine's lock HELD, on
+        the Tk thread, at 1 Hz, once per DISTINCT hull in the fight — so it must
+        never touch the network or Tk (the engine docstring's non-blocking
+        contract; a wire call here stalls the UI AND the zKill poll thread
+        together, the 1.15 s class of bug).
+
+        That is why this does NOT call `TypeCatalog.group_of`: on a miss that
+        method falls through to `_resolve_unknown`, which does `rate_limit("esi")`
+        + an HTTP GET. The bundled/cached table is read DIRECTLY instead, so an
+        unmapped hull answers None and the engine renders it as a plain
+        "N ships". Every step is getattr/isinstance-guarded — this runs during
+        __init__ (before `self.type_catalog` exists) and a resolver that raises
+        would silently blank every composition tooltip.
+        """
+        catalog = getattr(self, "type_catalog", None)
+        if catalog is None or not type_id:
+            return None
+        # `_by_id` is the merged bundled-SDE + ESI-resolved-cache table. Reached
+        # directly (guarded) because TypeCatalog exposes no offline accessor;
+        # if one is ever added, prefer it.
+        by_id = getattr(catalog, "_by_id", None)
+        if not isinstance(by_id, dict):
+            return None
+        entry = by_id.get(type_id)
+        if not isinstance(entry, dict):
+            return None
+        group_id = entry.get("g")
+        if not isinstance(group_id, int):
+            return None
+        from type_catalog import SHIP_GROUP_NAMES
+        return SHIP_GROUP_NAMES.get(group_id)
+
     def _battle_ledger_refresh(self):
         """Advance the ledger's timers and repaint. TK THREAD ONLY, <= 1 Hz.
 
@@ -25289,6 +25427,21 @@ $bmp.Dispose()
                 command=lambda s=alert.system_name: self._navigate_jump_range(s),
             )
             self._zkill_log.window_create("alert_ins", window=range_btn)
+        else:
+            # Staging blank: both buttons above are staging-gated and used to
+            # just VANISH, which reads as "this build lost its Navigate button"
+            # rather than "you never told me where home is" — the likelier root
+            # cause of the field report that the fight-detected notification
+            # stopped offering a route. Say so, in their place.
+            hint = tk.Label(
+                self._zkill_log,
+                text="Set a staging system in Settings for Navigate / route",
+                font=("Consolas", 8), fg=FG_DIM, bg=BG_ENTRY)
+            self._tip_widget(
+                hint,
+                "Settings > zKillboard > Staging system.\n"
+                "It also supplies the jump count on the Route line.")
+            self._zkill_log.window_create("alert_ins", window=hint)
 
         self._zkill_log.insert("alert_ins", "\n\n")
         self._end_alert_block()
@@ -26268,11 +26421,14 @@ $bmp.Dispose()
         if report is not None and report.system_id:
             staging = self._get_staging_system()
             if staging:
+                # Same degrade-don't-abort restructure as _on_zkill_alert: the
+                # bridge list is acquired in its own never-raising guard so a
+                # fault there costs the shortcut, not the intel report's route.
+                conns = self._route_connections_or_gateless("intel report")
                 try:
                     from jump_range import get_stargate_route as _gr
                     o = search_system(staging)
                     if o:
-                        conns = self._get_ansiblex_connections()
                         r = _gr(o, report.system_id, connections=conns)
                         if r:
                             report.route_from_staging = (
