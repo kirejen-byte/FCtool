@@ -15144,6 +15144,50 @@ class FCToolGUI:
                        selectcolor=BG_ENTRY, activebackground=BG_DARK,
                        activeforeground=FG_TEXT).pack(anchor=tk.W)
 
+        # ── Alert sound (config zkillboard.alert_sound) ──────────────────────
+        # Persists on pick, the same instant-apply the Staging System entry and
+        # the loss-source selector use — no Save Settings round trip, so the
+        # next alert already uses the new sound. state="readonly" like every
+        # other picker in this tab (typing a label that isn't in the catalogue
+        # would just fall back to the default).
+        snd_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        snd_frame.pack(fill=tk.X, padx=20, pady=2)
+        snd_label = tk.Label(snd_frame, text="zKill alert sound:",
+                             font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                             width=28, anchor=tk.W)
+        snd_label.pack(side=tk.LEFT)
+        _snd_key = self._zkill_alert_sound_key()
+        self._zkill_alert_sound_var = tk.StringVar(
+            value=FCToolGUI._ZKILL_ALERT_SOUNDS[_snd_key][0])
+        self._zkill_alert_sound_combo = ttk.Combobox(
+            snd_frame, textvariable=self._zkill_alert_sound_var,
+            state="readonly",
+            values=[lbl for lbl, _fn in FCToolGUI._ZKILL_ALERT_SOUNDS.values()],
+            width=17, font=("Consolas", 10))
+        self._zkill_alert_sound_combo.pack(side=tk.LEFT, padx=5)
+        self._zkill_alert_sound_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_zkill_alert_sound_change())
+        _snd_preview_btn = ttk.Button(
+            snd_frame, text="▶ Preview", style="Dark.TButton",
+            command=self._preview_zkill_alert_sound)
+        _snd_preview_btn.pack(side=tk.LEFT, padx=5)
+        _snd_tip = (
+            "Sound played when a kill alert lands on the zKillboard tab "
+            "(and on the Intelligence stream), replacing the old Windows "
+            "default ding — that ding is indistinguishable from every other "
+            "app's notification.\n\n"
+            "Applies the moment you pick it; no Save Settings needed. The "
+            "Intel MUTE toggle still silences it, and \"Windows default\" "
+            "restores the previous behaviour.")
+        attach_tooltip(snd_label, _snd_tip)
+        attach_tooltip(self._zkill_alert_sound_combo, _snd_tip)
+        attach_tooltip(
+            _snd_preview_btn,
+            "Play the sound currently selected in the dropdown, through the "
+            "exact code path a real kill alert uses — so what you hear here "
+            "is what you will hear in a fight.")
+
         # Min-pilots gate lives on the Intelligence tab's filter panel
         # (config["intel_filter"]["min_pilots"]) — the single source of truth.
         # Region/alliance filters are now on the zKill tab inline filter panel
@@ -22253,6 +22297,26 @@ class FCToolGUI:
         self.config.setdefault("zkillboard", {})["staging_system"] = val
         self._save_config()
 
+    def _on_zkill_alert_sound_change(self, *args):
+        """Persist the kill-alert sound pick immediately (mirrors
+        _autosave_staging_system and the loss-source selector).
+
+        The combobox shows display labels; config stores the stable key, so an
+        unrecognised label falls back to the default rather than writing junk
+        that would later read as "no sound configured"."""
+        key = FCToolGUI._zkill_alert_sound_key_for_label(
+            self._zkill_alert_sound_var.get())
+        self.config.setdefault("zkillboard", {})["alert_sound"] = key
+        self._save_config()
+
+    def _preview_zkill_alert_sound(self, *args):
+        """Play whatever the dropdown currently shows, through the SAME helper
+        the live alert uses — including "Windows default". A preview on its own
+        code path could not prove the real alert works."""
+        self._play_zkill_alert(
+            FCToolGUI._zkill_alert_sound_key_for_label(
+                self._zkill_alert_sound_var.get()))
+
     def _collect_market_settings(self):
         """Collect the Market Scanner Settings fields into config["market"].
 
@@ -22827,6 +22891,113 @@ class FCToolGUI:
             except Exception:
                 if HAS_WINSOUND:
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        threading.Thread(target=_play, daemon=True).start()
+
+    # ── zKill kill-alert sound ────────────────────────────────────────────
+    # Catalogue: key -> (display label, bundled filename). The key is what
+    # config["zkillboard"]["alert_sound"] stores; the label is what the Settings
+    # combobox shows. "bell" is the pre-2026-07-28 behaviour — the bare
+    # self.root.bell() this alert used to fire, i.e. the generic Windows ding
+    # that is indistinguishable from every other app's notification. It is kept
+    # selectable (so the old sound can be restored) and doubles as the
+    # never-silent fallback, so it has no file of its own.
+    #
+    # The clips live in assets/alerts/ and are listed in FCTool.spec's `datas`
+    # so the frozen exe carries them (assets/tts/*.mp3 precedent).
+    _ZKILL_ALERT_SOUNDS = {
+        "sonar":  ("Sonar ping",      "zkill_sonar.mp3"),
+        "klaxon": ("Klaxon",          "zkill_klaxon.mp3"),
+        "blip":   ("Triple blip",     "zkill_blip.mp3"),
+        "horn":   ("Warning horn",    "zkill_horn.mp3"),
+        "comms":  ("Comms chime",     "zkill_comms.mp3"),
+        "bell":   ("Windows default", None),
+    }
+    # Must equal DEFAULT_CONFIG["zkillboard"]["alert_sound"] (mirror-guarded by
+    # tests/test_zkill_alert_sound.py) — fc_gui never names a second default.
+    _ZKILL_ALERT_SOUND_DEFAULT = "sonar"
+
+    def _zkill_alert_sound_key(self) -> str:
+        """The configured alert-sound key, defensively validated.
+
+        Config is never deep-merged (house rule), so a missing block, a missing
+        key, a non-string value, or a key from a different build all read as the
+        default rather than silencing the alert."""
+        block = self.config.get("zkillboard")
+        raw = block.get("alert_sound") if isinstance(block, dict) else None
+        if not isinstance(raw, str):
+            return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+        key = raw.strip().lower()
+        if key not in FCToolGUI._ZKILL_ALERT_SOUNDS:
+            return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+        return key
+
+    @staticmethod
+    def _zkill_alert_sound_key_for_label(label: str) -> str:
+        """Reverse of the catalogue's display label -> key (the Settings
+        combobox shows labels; config stores the stable key)."""
+        for key, (lbl, _fn) in FCToolGUI._ZKILL_ALERT_SOUNDS.items():
+            if lbl == label:
+                return key
+        return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+
+    @staticmethod
+    def _zkill_alert_sound_path(key: str):
+        """On-disk path to the clip for ``key``, or None for "bell", an unknown
+        key, or a missing/empty file.
+
+        Same two-step resolution fire_alert.mp3 and the bundled TTS clips use:
+        the writable app dir first, then the read-only bundle dir (sys._MEIPASS
+        in the frozen onefile exe)."""
+        from app_path import bundle_dir
+        entry = FCToolGUI._ZKILL_ALERT_SOUNDS.get(key)
+        filename = entry[1] if entry else None
+        if not filename:
+            return None
+        for base in (app_dir(), bundle_dir()):
+            cand = os.path.join(base, "assets", "alerts", filename)
+            try:
+                if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                    return cand
+            except OSError:
+                continue
+        return None
+
+    def _zkill_alert_bell(self):
+        """The pre-2026-07-28 alert: the generic Windows ding. Both a selectable
+        option and the fallback — a kill alert must never be silent."""
+        try:
+            self.root.bell()
+        except Exception:
+            pass
+
+    def _play_zkill_alert(self, key: str = None):
+        """Play the zKill kill-alert sound (assets/alerts/*.mp3) via pygame.
+
+        Mirrors _play_fire_alert. ``key`` defaults to the configured selection;
+        the Settings preview button passes the combobox's live pick so preview
+        and reality are the SAME code path, bell option included.
+
+        Degrades to _zkill_alert_bell on any failure (missing clip, no pygame,
+        no audio device) and never raises into the caller. The clip is decoded
+        on a worker thread, so the failure path marshals the Tk bell back
+        through the dispatcher rather than touching Tk off-main."""
+        if key is None:
+            key = self._zkill_alert_sound_key()
+        path = None if key == "bell" else self._zkill_alert_sound_path(key)
+        if not path:
+            self._zkill_alert_bell()
+            return
+
+        def _play():
+            try:
+                import pygame
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init()
+                # A Sound (not mixer.music) so a kill alert never cuts off the
+                # fire alert / TTS cue that may already be playing.
+                pygame.mixer.Sound(path).play()
+            except Exception:
+                self._post_ui(self._zkill_alert_bell)
         threading.Thread(target=_play, daemon=True).start()
 
     def _flash_title(self, count):
@@ -24638,7 +24809,12 @@ $bmp.Dispose()
             self._zkill_log.config(state=tk.DISABLED)
 
         if not self._intel_mute_var.get():
-            self.root.bell()
+            # Was a bare self.root.bell() until 2026-07-28 — the generic Windows
+            # ding, indistinguishable from any other app's notification. The
+            # sound is now config["zkillboard"]["alert_sound"] (Settings ▸
+            # zKillboard); the "bell" option restores the old behaviour and is
+            # also what _play_zkill_alert falls back to. Mute gate unchanged.
+            self._play_zkill_alert()
         self._notify_zkill_tab()
 
     # ── Paste Intel drawer ─────────────────────────────────────────────────

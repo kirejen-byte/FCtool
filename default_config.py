@@ -34,6 +34,15 @@ DEFAULT_CONFIG = {
         "min_pilots_involved": 25,
         "alert_window_seconds": 300,
         "staging_system": "",
+        # Sound played when a kill alert renders (and the intel mute is off).
+        # Key into FCToolGUI._ZKILL_ALERT_SOUNDS — one of sonar | klaxon | blip |
+        # horn | comms | bell; the clips ship in assets/alerts/. "bell" is the
+        # pre-2026-07-28 behaviour (root.bell(), the generic Windows ding) kept
+        # selectable, and is also the never-silent fallback when a clip or the
+        # audio device is unavailable. An unknown/missing value reads as the
+        # default below (config is never deep-merged, so an existing config.json
+        # simply has no key). Mirror guard: tests/test_default_config.py.
+        "alert_sound": "sonar",
     },
     "esi": {
         "client_id": "5373b3f588614a7eae20f409c5adbdc4",
