@@ -211,9 +211,9 @@ DEFAULT_CONFIG = {
     },
     # Fleet-chat "range check" (range_check.py). Typing the keyword in Fleet
     # chat pops a short-lived window over the EVE client that posted it,
-    # summarising who can reach that character's system (Titan / Capital, at
-    # JDC 5). Only the owner's OWN logged-in characters can trigger it, so no
-    # fleet member can put a window on the owner's screen.
+    # summarising who can reach that character's system (Titan / Capital /
+    # Blops, at JDC 5). Only the owner's OWN logged-in characters can trigger
+    # it, so no fleet member can put a window on the owner's screen.
     #
     # DEFAULT OFF, deliberately: it reacts to chat and draws over a live client,
     # which is exactly the kind of surprise a user should opt into. While

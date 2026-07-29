@@ -15273,7 +15273,8 @@ class FCToolGUI:
             rc_check,
             "Type the keyword below in Fleet chat and a short-lived window "
             "pops up over that character's EVE client, showing which staging "
-            "systems are in Titan and Capital jump range of them (JDC 5).\n\n"
+            "systems are in Titan, Capital and Blops jump range of them "
+            "(JDC 5).\n\n"
             "Only YOUR OWN logged-in characters can trigger it — a fleet "
             "member saying the keyword is ignored. Naming systems in the "
             "message replaces the staging list for that check.\n\n"
