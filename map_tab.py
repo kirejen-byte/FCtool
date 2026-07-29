@@ -532,7 +532,10 @@ class MapTabState:
         # result queue. Both feed KillHeat.merge_ambient at request-build time to
         # produce the 0..1 heat the renderer draws as a red-orange under-glow.
         self.kill_heat = mo.KillHeat()
-        self.ambient_heat: dict[int, int] = {}
+        # ambient_heat is a PROPERTY (see below): assigning it drops the memoized
+        # canonical band tuple (MP8). Seed the backing field + memo directly.
+        self._ambient_heat: dict[int, int] = {}
+        self._ambient_canon: tuple | None = None
         # --- intel pulse layer (Task 31) ---
         # Systems named in tracked intel channels. note()d on the MAIN thread
         # (fc_gui marshals the intel stream through _post_ui before the push), read
@@ -552,7 +555,10 @@ class MapTabState:
         # legend + right-click info row, bulk-resolved via /universe/names/. Both
         # stay empty until the layer is first enabled (OFF by default -> zero
         # network until then).
-        self.sov_map: dict[int, int] = {}
+        # sov_map is a PROPERTY (see below): assigning it drops the memoized
+        # canonical tuple (MP8). Seed the backing field + memo directly.
+        self._sov_map: dict[int, int] = {}
+        self._sov_canon: tuple | None = None
         self.sov_names: dict[int, str] = {}
         # --- infrastructure overlay layer (Task 5) ---
         # infra: PRE-COMPUTED badges {system_id: {"total", "counts", "top",
@@ -575,6 +581,73 @@ class MapTabState:
         # fleet) -- NOT part of the render request/sig; _redraw_overlays paints a
         # magenta square per occupied system. Empty until the first poll drains.
         self.chars: dict[int, list] = {}
+
+    # -- hourly canonical memos (MP8) -----------------------------------------
+    # Both the sov map and the ambient-heat counts change roughly ONCE AN HOUR
+    # (one ESI fetch each), yet every crisp request re-derived their canonical
+    # request tuples from scratch: canonical_sov sorted ~4,200 pairs (1.12 ms) and
+    # merge_ambient walked the whole hourly kill dict before canonical_heat sorted
+    # the merged result (1.72 ms). That cost rode on EVERY request -- and MP5's
+    # fight-time push storm plus MP7's un-debounced resize meant a lot of requests.
+    #
+    # The memos below hold the canonical form and are dropped by the PROPERTY
+    # SETTERS, so any assignment invalidates -- product code (_apply_sov /
+    # _apply_ambient) and tests that poke `state.sov_map = {...}` alike. The ONE
+    # way to go stale is mutating the returned dict IN PLACE; nothing does, and
+    # nothing should (assign a fresh dict).
+    #
+    # THREADING: no lock, deliberately. Every writer and every reader is on the Tk
+    # main thread -- the ambient loop and the one-shot sov thread only `put()` onto
+    # _result_q, and _drain_results (Tk thread, from the tick) is what calls
+    # _apply_ambient / _apply_sov; the readers are _heat_request_value /
+    # _sov_request_value / _heat_refresh_due, all reached from _request_crisp and
+    # the tick. The render WORKER never touches MapTabState -- it is handed the
+    # finished request dict by value. (Verified against the map's worker inventory
+    # 2026-07-28; a future worker-thread writer would need _post_ui marshalling
+    # anyway, which lands it back on the Tk thread.)
+
+    @property
+    def ambient_heat(self) -> dict:
+        """Last hourly ESI ambient kill counts, ``{system_id: ship+pod kills}``."""
+        return self._ambient_heat
+
+    @ambient_heat.setter
+    def ambient_heat(self, value: dict) -> None:
+        self._ambient_heat = value
+        self._ambient_canon = None               # hourly memo -> rebuild on demand
+
+    def ambient_canon(self) -> tuple:
+        """Memoized canonical AMBIENT-only heat contribution: the sorted
+        ``((system_id, rounded_intensity), ...)`` tuple the hourly counts alone
+        would produce. Derived by running KillHeat.merge_ambient on a THROWAWAY
+        EMPTY ring -- so the band scaling / skip rules stay literally the shipped
+        ones (no constant is duplicated here) and the result is independent of the
+        clock (an empty ring decays to {} at any ``now``). Rebuilt only when
+        ambient_heat is reassigned, i.e. about once an hour."""
+        canon = self._ambient_canon
+        if canon is None:
+            canon = self._ambient_canon = mo.canonical_heat(
+                mo.KillHeat().merge_ambient(self._ambient_heat, 0.0))
+        return canon
+
+    @property
+    def sov_map(self) -> dict:
+        """``{system_id: alliance_id}`` from ESI /sovereignty/systems."""
+        return self._sov_map
+
+    @sov_map.setter
+    def sov_map(self, value: dict) -> None:
+        self._sov_map = value
+        self._sov_canon = None                   # hourly memo -> rebuild on demand
+
+    def sov_canon(self) -> tuple:
+        """Memoized ``canonical_sov(sov_map)`` -- the exact tuple that travels in
+        the render request and joins _request_sig. Rebuilt only when sov_map is
+        reassigned (one ESI fetch per SOV_REFRESH_S)."""
+        canon = self._sov_canon
+        if canon is None:
+            canon = self._sov_canon = mo.canonical_sov(self._sov_map)
+        return canon
 
     def tint_spec(self):
         import map_render as _mr
@@ -1777,12 +1850,69 @@ class MapTab:
             # own E1 guard for the repaint), so hidden behaviour is unchanged.
             self._schedule_overlay_redraw(crisp=True)
 
-    def _current_heat_dict(self) -> dict:
+    def _current_heat_dict(self, now: float | None = None) -> dict:
         """Merged live+ambient 0..1 heat for NOW (empty dict when no activity).
-        Single source used by both the request builder and the decay-refresh
-        gate so they can never disagree on what heat is live."""
-        return self.state.kill_heat.merge_ambient(self.state.ambient_heat,
-                                                  time.time())
+
+        This is the REFERENCE definition of "what heat is live" -- the shape the
+        request builder used to canonicalize directly. It is no longer on the hot
+        path (see _heat_canon, MP8), but it stays as the thing the fast path is
+        pinned to: test_map_kill_heat asserts
+        ``_heat_canon(now) == canonical_heat(_current_heat_dict(now))``, so the
+        split can never silently drift from the merged truth. ``now`` is injectable
+        purely so that equivalence can be asserted at one instant."""
+        return self.state.kill_heat.merge_ambient(
+            self.state.ambient_heat, time.time() if now is None else now)
+
+    def _heat_canon(self, now: float) -> tuple:
+        """Canonical rounded heat tuple at ``now`` -- the MP8 split of what used to
+        be ``canonical_heat(merge_ambient(...))``.
+
+        The hourly AMBIENT half is memoized on the state (``ambient_canon()``,
+        dropped when ambient_heat is reassigned); only the LIVE decay ring is
+        recomputed here, which is the only component that actually moves between
+        requests. The two halves are already sorted by system id and disjointly
+        rounded, so they combine with a single linear MAX-merge -- no dict build,
+        no re-sort, and the no-live-heat case (the common one: no fight in the last
+        while) returns the memoized tuple with zero work: measured ~0.8 us, i.e.
+        effectively free. That is an IDLE number, not a general one -- when a
+        fight IS on the MAX-merge still has to run: measured 3.96 ms -> 0.78 ms
+        at 3,000 ambient entries + 120 live events (~5x cheaper than the pre-MP8
+        combined sort, not free). Contrast the sov half (``sov_canon()``), which
+        has no live component and so stays ~0.1 us regardless of fight state.
+
+        EQUIVALENCE: the old path rounded AFTER the max; this rounds BEFORE. They
+        agree because round() is monotone non-decreasing, so
+        ``round(max(a, b)) == max(round(a), round(b))``; and both components are
+        >= 0, so an entry survives the ``<= 0`` drop here exactly when it survived
+        it there. Guarded by a drift test against _current_heat_dict."""
+        live = mo.canonical_heat(self.state.kill_heat.heat_at(now))
+        ambient = self.state.ambient_canon()
+        if not live:
+            return ambient
+        if not ambient:
+            return live
+        out = []
+        add = out.append
+        i = j = 0
+        na, nl = len(ambient), len(live)
+        while i < na and j < nl:
+            sa, va = ambient[i]
+            sl, vl = live[j]
+            if sa < sl:
+                add((sa, va))
+                i += 1
+            elif sl < sa:
+                add((sl, vl))
+                j += 1
+            else:
+                add((sa, va if va >= vl else vl))
+                i += 1
+                j += 1
+        if i < na:
+            out.extend(ambient[i:])
+        elif j < nl:
+            out.extend(live[j:])
+        return tuple(out)
 
     def _heat_request_value(self):
         """Canonical hashable heat tuple for the render request + sig, or None
@@ -1791,20 +1921,21 @@ class MapTab:
         pre-heat output and its sig matches, keeping duplicate suppression sound."""
         if not self._layer_on("heat"):
             return None
-        return mo.canonical_heat(self._current_heat_dict()) or None
+        return self._heat_canon(time.time()) or None
 
     def _heat_refresh_due(self, now_ms: float) -> bool:
         """True when the periodic decay refresh should re-request a crisp: the
         heat layer is on, at least HEAT_REFRESH_MS has elapsed since the last
         heat-driven refresh, AND there is currently live heat. The cheap time gate
         is checked FIRST so the (bounded but non-trivial) heat merge runs at most
-        once per HEAT_REFRESH_MS, not every 16 ms tick. Pure/testable (injected
-        clock)."""
+        once per HEAT_REFRESH_MS, not every 16 ms tick. Shares _heat_canon with the
+        request builder, so the gate and the request can never disagree on what
+        heat is live. Pure/testable (injected clock)."""
         if not self._layer_on("heat"):
             return False
         if now_ms - self._last_heat_refresh_ms < HEAT_REFRESH_MS:
             return False
-        return bool(mo.canonical_heat(self._current_heat_dict()))
+        return bool(self._heat_canon(time.time()))
 
     # ---- kill-heat ESI ambient loop (Task 30) ---------------------------------
     def _start_ambient_loop(self) -> None:
@@ -1891,7 +2022,9 @@ class MapTab:
         from the result queue by _drain_results). Stores the {sid: ship+pod}
         counts; when the heat layer is on, force-dirties + re-requests a crisp so
         the low ambient band updates. ``pairs`` is the sorted ((sid, count), ...)
-        tuple the ambient loop posted."""
+        tuple the ambient loop posted. The ASSIGNMENT below is what drops the
+        memoized ambient canonical tuple (MP8) -- it goes through the property
+        setter, so this is the hourly invalidation point."""
         self.state.ambient_heat = {int(sid): int(c) for sid, c in pairs}
         if self._layer_on("heat"):
             self._last_heat_refresh_ms = _now_ms()
@@ -2373,10 +2506,15 @@ class MapTab:
         """Canonical hashable sov tuple for the render request + sig, or None when
         the sov layer is off OR there is no sov data -- both collapse to None so a
         sov-off (or on-but-empty) frame is byte-identical to the pre-sov output and
-        its sig matches, keeping duplicate suppression sound."""
+        its sig matches, keeping duplicate suppression sound.
+
+        MP8: the tuple itself is memoized on the state (sorting ~4,200 pairs cost
+        1.12 ms on EVERY request for data that changes once an hour). The layer
+        gate stays HERE, ahead of the memo, so toggling sov off still yields None
+        without touching the cache."""
         if not self._layer_on("sov"):
             return None
-        return mo.canonical_sov(self.state.sov_map) or None
+        return self.state.sov_canon() or None
 
     def _infra_request_value(self):
         """Canonical hashable infra tuple for the render request + sig, or None
@@ -2469,10 +2607,13 @@ class MapTab:
         A None payload is a failed/empty fetch: clear the flag and leave sov_map
         untouched (map stays untinted); the SPAWN-time freshness stamp
         (_maybe_start_sov_fetch) throttles the next attempt to the hourly gate --
-        silent degrade, no retry storm. A real payload replaces sov_map, re-stamps
-        the fetch time (refreshing the hourly gate) and -- when the layer is on --
-        force-dirties + re-requests a crisp so the tint appears, plus a redraw so
-        the right-click info row reflects it."""
+        silent degrade, no retry storm (and the canonical memo is left alone, which
+        is correct: sov_map did not change). A real payload replaces sov_map,
+        re-stamps the fetch time (refreshing the hourly gate) and -- when the layer
+        is on -- force-dirties + re-requests a crisp so the tint appears, plus a
+        redraw so the right-click info row reflects it. That sov_map assignment
+        goes through the property setter, which is what drops the memoized
+        canonical tuple (MP8) -- this is the hourly invalidation point."""
         self._sov_inflight = False
         if pairs is None:
             return

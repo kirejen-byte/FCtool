@@ -6,6 +6,7 @@ headless; Phase C blits the finished frame into Tk via surface_to_ppm().
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import pygame
@@ -232,6 +233,42 @@ class TintSpec:
 
 
 # --- cached asset factories --------------------------------------------------
+# MP6 (2026-07-28): the two UNBOUNDED render caches. FrameCache was already
+# bounded (it holds exactly one surface); these two grew for the life of the
+# process -- every distinct system name ever labelled (5,485 x ~3.87 KB measured
+# = 21 MB at one band) and every distinct alliance colour ever discked. Worse,
+# that growth is an INPUT to the M4 conservation throttle (map_tab._m4_note_apply
+# arms on dur > STALL_MS AND working-set growth > STALL_WS_KB), so the label
+# cache was feeding the very throttle that measures it. Both are now LRU-capped.
+#
+# Sizing (all measured on this box 2026-07-28, not estimated):
+#  * LABEL_CACHE_MAX -- per-system name labels are drawn ONLY in band "C", and
+#    pick_band() returns "C" only below 300 visible systems, so ONE frame can
+#    request at most 299 distinct name surfaces (the 96x24 declutter grid thins
+#    it further) plus the infra count chips that share the same LOD. The M/U
+#    bands ask for region anchors (~113) + 5 hub names. Worst single frame is
+#    therefore ~500 distinct keys; 1024 is 2x that, so a steady viewport never
+#    evicts anything it is about to re-ask for, and the cache is hard-bounded at
+#    ~3.96 MB instead of ~21 MB. A rebuild costs 42 us, so even a thrashing
+#    frame would be survivable -- but the headroom means it cannot happen.
+#  * DISC_CACHE_MAX -- _draw_sov walks the WHOLE canonical sov tuple every frame
+#    (~4,200 pairs) and culls by screen position, so a fit-universe framing can
+#    legitimately ask for every distinct alliance colour in ONE frame. That set
+#    is provably small: map_overlays.sov_color is a fixed-S/V hue curve whose
+#    codomain is exactly 339 distinct RGB triples (measured by enumerating
+#    500,000 alliance ids -- 339 for every range tried), and SOV_RADIUS is fixed,
+#    so this cache was ALREADY structurally bounded before this constant existed
+#    -- 339 entries, ~6.3 MB, no matter how EVE's alliance count grows. 512 sits
+#    1.5x above that ceiling, so DISC_CACHE_MAX recovers no memory today; it is a
+#    guard against a FUTURE caller that varies the radius, not a memory fix --
+#    unlike LABEL_CACHE_MAX above, which IS this batch's actual memory win
+#    (~21 MB -> <=3.96 MB). Eviction here can only ever be reached by such a
+#    radius-varying caller, and thrash (387 us per disc build, 339 of them =
+#    131 ms/frame) is structurally impossible today.
+LABEL_CACHE_MAX = 1024
+DISC_CACHE_MAX = 512
+
+
 class SpriteFactory:
     """Procedural radial glow sprites, cached by (color, radius).
 
@@ -256,9 +293,19 @@ class SpriteFactory:
     _A_IN, _A_OUT = 70, 6           # inner/outer alpha -- gradient descriptor only
     _RGB_IN, _RGB_OUT = 0.90, 0.05  # inner/outer colour weight -- the ADDITIVE gradient
 
-    def __init__(self) -> None:
+    def __init__(self, disc_max: int = DISC_CACHE_MAX) -> None:
+        # glow(): keyed by (colour, radius) off a fixed set of callers (the three
+        # sec tints, range-green, threat-purple, friendly-blue, per-region nebula
+        # dims) x a handful of bucketed radii -- self-bounding by construction, but
+        # NOT the "small" palette this comment used to claim: measured worst case
+        # across all call sites is <=204 distinct keys, ~10.8 MB ceiling, dominated
+        # by the radius-240 nebula sprites (921 KB each x3 tints x10 radius
+        # buckets). Still bounded, so it stays a plain dict for now -- a future
+        # slimming candidate. Only the sov disc cache needed an LRU bound (MP6).
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
-        self._disc_cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
+        self._disc_cache: "OrderedDict[tuple[tuple[int, int, int], int], pygame.Surface]" \
+            = OrderedDict()
+        self._disc_max = max(1, int(disc_max))
 
     def glow(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
         key = (color, radius)
@@ -300,11 +347,24 @@ class SpriteFactory:
     _DISC_A = 80                    # peak gradient-descriptor alpha (RGB blit ignores it)
 
     def disc(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
+        """Cached soft sov disc. LRU-bounded at ``_disc_max`` (MP6) -- a HIT is a
+        dict get plus one O(1) ``move_to_end`` (measured: plain dict get 110 ns,
+        OrderedDict get+move_to_end 255 ns, i.e. +146 ns/hit). ``_draw_sov`` calls
+        this once per ON-SCREEN SOV SYSTEM (up to ~4,200), not once per distinct
+        colour, so the worst frame pays ~4,200 hits -- ~0.6 ms against a 40-55 ms
+        crisp render (~1%): hits stay cheap, dwarfed by MP8's saving. Eviction
+        only ever runs on the build path. The returned Surface is the SAME object
+        for a repeated key, exactly as before."""
+        cache = self._disc_cache
         key = (color, radius)
-        got = self._disc_cache.get(key)
+        got = cache.get(key)
         if got is None:
             got = self._build_disc(color, radius)
-            self._disc_cache[key] = got
+            cache[key] = got
+            while len(cache) > self._disc_max:
+                cache.popitem(last=False)        # drop the least-recently-used
+        else:
+            cache.move_to_end(key)               # freshen (O(1) linked-list move)
         return got
 
     def _build_disc(self, color: tuple[int, int, int], radius: int) -> pygame.Surface:
@@ -339,11 +399,19 @@ class LabelFactory:
     same outline pays the 2-render + 5-blit build ONCE per distinct (text, px, colour)
     -- the per-frame cost is a single blit of a prebuilt surface, ZERO delta vs the
     un-outlined label. Callers that omit ``outline`` (region + hub labels, infra chips)
-    get the byte-identical plain render they always did."""
+    get the byte-identical plain render they always did.
 
-    def __init__(self) -> None:
+    The surface cache is LRU-bounded (``LABEL_CACHE_MAX``, MP6) -- see that constant
+    for the measured sizing. Nothing about a cache HIT changed: same key, same
+    returned Surface object, one extra O(1) list-node move."""
+
+    def __init__(self, max_entries: int = LABEL_CACHE_MAX) -> None:
+        # _fonts is keyed by pixel size off the three band styles (13 / 15 / the
+        # infra chip px) -- three entries, self-bounding, left a plain dict. The
+        # SURFACE cache is the one that grew without limit (MP6): it is LRU-capped.
         self._fonts: dict[int, pygame.font.Font] = {}
-        self._cache: dict[tuple, pygame.Surface] = {}
+        self._cache: "OrderedDict[tuple, pygame.Surface]" = OrderedDict()
+        self._max_entries = max(1, int(max_entries))
 
     def _font(self, px: int) -> pygame.font.Font:
         f = self._fonts.get(px)
@@ -356,14 +424,26 @@ class LabelFactory:
 
     def label(self, text: str, px: int, color: tuple[int, int, int],
               outline: tuple[int, int, int] | None = None) -> pygame.Surface:
+        """Cached (outlined) text surface. LRU-bounded at ``_max_entries`` (MP6).
+        The HIT path -- which runs per drawn label per frame on the render worker
+        -- is still a single dict get, now plus one O(1) ``move_to_end``: measured
+        146 ns per hit (plain dict get 110 ns, OrderedDict get+move_to_end
+        255 ns), ~44 us across a full 300-label frame against a 40-55 ms render
+        (~0.1%). A repeated key still returns the SAME Surface object, so every
+        caller's blit is byte-identical to before."""
+        cache = self._cache
         key = (text, px, color, outline)
-        got = self._cache.get(key)
+        got = cache.get(key)
         if got is None:
             if outline is None:
                 got = self._font(px).render(text, True, color)
             else:
                 got = self._render_outlined(text, px, color, outline)
-            self._cache[key] = got
+            cache[key] = got
+            while len(cache) > self._max_entries:
+                cache.popitem(last=False)        # drop the least-recently-used
+        else:
+            cache.move_to_end(key)               # freshen (O(1) linked-list move)
         return got
 
     def _render_outlined(self, text: str, px: int, color: tuple[int, int, int],
