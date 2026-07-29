@@ -174,6 +174,37 @@ STAGING_OUTLINE_W = 2
 STAGING_R_FRIENDLY = 8
 STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 
+# --- Tk overlay item set (MP1) ------------------------------------------------
+# EVERY tag _redraw_overlays owns. All eleven are WORLD-ANCHORED: each item is
+# placed from cam.world_to_screen(system.x, system.y) (directly, or at a fixed
+# screen offset from such a point -- the fleet count chip, its plate, and the
+# chars count label), so a pure pan translates the whole set by exactly the drag
+# delta. There is NO screen-anchored overlay item (no legend/HUD/scale bar lives
+# on this canvas; the status label, chars banner and hover tooltip are separate
+# widgets, and the base bitmap is _img_item, moved on its own). That is what
+# licenses the _pan_overlays translate fast path -- a NEW screen-anchored overlay
+# item would have to be excluded from this tuple (and given its own tag) or the
+# pan would drag it off its anchor.
+OVERLAY_TAGS = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
+                "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
+                "ov_killping", "ov_chars")
+# Cull margin (px) around the viewport: _redraw_overlays' `project` draws a system
+# only within [-CULL, vw+CULL] x [-CULL, vh+CULL]. DOUBLES as the pan-translate
+# budget: an item culled at the last rebuild has its CENTER at least this far
+# outside the viewport, and the accumulated translate is capped at that same
+# budget -- a center just beyond -CULL, plus the full +CULL of recovery, still
+# lands short of 0. So CENTERS can never go missing on screen within budget --
+# but that guarantee is centers-only. Item INK has extent: the largest overlay
+# item (the capital kill-ping ring, ~37px radius) can show edge ink at the
+# extreme screen edge while still absent, for at most one rebuild interval
+# (every landed drag frame rebuilds, so it never accumulates) -- an accepted,
+# bounded artifact, not a bug. A future item with extent > ~37px should
+# re-derive this trade: the budget would need to shrink toward CULL - extent
+# to keep ink off screen too. Exceeding the translate budget forces a full
+# rebuild -- which is why both readers must share this one constant (see
+# _pan_overlays).
+OVERLAY_CULL_PX = 40.0
+
 # Layers whose _layer_on() default is FALSE when cfg omits the key (everything
 # else defaults True). Sov is off-by-default AND, unlike range (always gated by a
 # live overlay object), _layer_on("sov") directly controls both the fetch and the
@@ -565,10 +596,21 @@ class MapTabState:
         self._sorted_names = sorted(self._name_to_id)
         self._dirty = True
 
-    def resize(self, vw: int, vh: int) -> None:
+    def resize(self, vw: int, vh: int, now_ms: float | None = None) -> None:
+        """Adopt a new viewport size. MP7: a window drag-resize delivers <Configure>
+        at up to ~54 Hz and this only ever set _dirty, so the tick loop fired a
+        fresh crisp request (worker render + ~3 ms of Tk-thread request
+        canonicalization) on EVERY one of them. Touching the settle tracker -- the
+        same debounce on_drag/on_wheel already use -- collapses a whole drag-resize
+        into one crisp once the user lets go. Only on a REAL size change (a repeat
+        <Configure> at the same size sets no _dirty, so it must not defer a settle
+        either), and only when a clock is supplied, keeping this pure/injected-time
+        for the headless callers that pass none."""
         if vw > 1 and vh > 1 and (vw, vh) != (self.vw, self.vh):
             self.vw, self.vh = vw, vh
             self._dirty = True
+            if now_ms is not None:
+                self.gesture.touch(now_ms)
 
     def restore_camera(self, d: dict) -> None:
         if d and d.get("scale"):
@@ -1240,6 +1282,21 @@ class MapTab:
         self._drag_last: tuple[int, int] | None = None
         self._img_offset = (0.0, 0.0)
         self._last_drag_qf = 0.0        # last drag quick-frame time (throttle, Task 17)
+        # --- MP1 pan-translate budget -----------------------------------------
+        # Screen-space translate applied to the Tk overlay items by _pan_overlays
+        # since the last _redraw_overlays. Zeroed by every rebuild; once |either
+        # axis| exceeds OVERLAY_CULL_PX the motion path rebuilds instead of
+        # translating, so a system culled at the last rebuild can never be missing
+        # while it is actually on screen.
+        self._ov_pan_acc: tuple[float, float] = (0.0, 0.0)
+        # --- MP5 push-burst coalescing ----------------------------------------
+        # External pushes (intel spans, kill pings, kill-heat alerts) set these
+        # instead of rebuilding inline; ONE after_idle flush per burst does the
+        # work. _redraw_after_id is the armed after_idle id (None = not armed),
+        # cancelled on hide.
+        self._redraw_pending = False
+        self._crisp_pending = False
+        self._redraw_after_id: str | None = None
         # Adaptive-pacing state (Task 24, P2). _gesture_inflight is True from the
         # moment a gesture request is enqueued until its result is applied (or
         # coalesced away / dropped) -- both apply paths clear it, so it can never
@@ -1514,6 +1571,9 @@ class MapTab:
         self._stall_sentinel_scheduled = False
         self._stall_sentinel_last_ms = None
         self._stall_sentinel_ws_last = None
+        # MP5: drop any armed push-burst flush for the same reason (and because a
+        # hidden tab must do zero overlay work); on_shown repaints everything.
+        self._cancel_overlay_redraw()
 
     # ---- overlay layers (Phase D) ----------------------------------------------
     # Two strata: range/threat re-tint the base bitmap (settle re-render via
@@ -1687,10 +1747,11 @@ class MapTab:
         the MAIN thread -- fc_gui marshals the zkill worker-thread callback
         (_on_zkill_alert) through _post_ui(_push_kill_heat_to_map, alert), which
         calls this. Stamps the event with wall-clock time (the kill just arrived; zkill
-        is near-real-time). When the heat layer is on, force-dirties + re-requests
-        a crisp so the new hot system lights up promptly, and repaints overlays so
-        a capital marker can appear at once. Guarded/no-throw so a malformed alert
-        never breaks the zkill path.
+        is near-real-time). When the heat layer is on, force-dirties and schedules
+        ONE coalesced crisp request + overlay repaint on the next idle (MP5), so a
+        burst of alerts costs one of each rather than one per alert while the new
+        hot system and any capital marker still light up promptly. Guarded/no-throw
+        so a malformed alert never breaks the zkill path.
 
         E1: the record + force_dirty always land (so a hidden tab's state is
         correct the instant it is shown), but the worker-side crisp request is
@@ -1709,9 +1770,12 @@ class MapTab:
         if self._layer_on("heat"):
             self._last_heat_refresh_ms = _now_ms()   # a fresh crisp resets the decay clock
             self.state.force_dirty()
-            if self._visible:
-                self._request_crisp()
-            self._redraw_overlays()
+            # MP5: a fight arrives as a BURST of alerts -- coalesce the crisp
+            # request AND the overlay rebuild into one idle flush instead of paying
+            # both per alert. _schedule_overlay_redraw carries the same hidden-tab
+            # gate this used to spell out (_visible for the crisp, _redraw_overlays'
+            # own E1 guard for the repaint), so hidden behaviour is unchanged.
+            self._schedule_overlay_redraw(crisp=True)
 
     def _current_heat_dict(self) -> dict:
         """Merged live+ambient 0..1 heat for NOW (empty dict when no activity).
@@ -2035,8 +2099,9 @@ class MapTab:
         model's exact case-insensitive name index; anything unresolvable -> a silent
         no-op). Called on the MAIN thread (fc_gui marshals the intel stream through
         _post_ui before pushing, so no extra hop here). Stamps the mention with
-        wall-clock time; when the layer is on, rebuilds the ring overlay at once so a
-        fresh call lights up immediately (the tick loop then animates it).
+        wall-clock time; when the layer is on, schedules ONE coalesced ring-overlay
+        rebuild on the next idle (MP5 -- a single intel line naming N systems calls
+        this N times), after which the tick loop animates the rings.
         Guarded/no-throw so a malformed push never breaks the intel path."""
         sid = self._resolve_intel_target(system_id_or_name)
         if sid is None:
@@ -2048,7 +2113,10 @@ class MapTab:
             print(f"[MAP] intel pulse note failed: {exc}")
             return
         if self._layer_on("intel"):
-            self._redraw_overlays()          # draw the new ring now
+            # MP5: ONE intel line names several systems, so fc_gui calls this in a
+            # tight run -- coalesce the rings into a single idle rebuild instead of
+            # one identical full rebuild per named system.
+            self._schedule_overlay_redraw()
             self._schedule_tick()            # ensure the tick loop animates it
 
     def _resolve_intel_target(self, system_id_or_name):
@@ -2166,9 +2234,10 @@ class MapTab:
         gates pass, so pings match rendered reports 1:1 (NOT alongside the broad
         kill-heat push, which stays wider by design -- owner's "4 pings, 1 report"
         fix). Stamps the ping with wall-clock time (the alert just fired; zkill is
-        near-real-time). When the layer is on,
-        rebuilds the overlay at once so the burst lights up immediately (the tick
-        loop then animates it). INDEPENDENTLY gated from heat by its own layer
+        near-real-time). When the layer is on, schedules ONE coalesced overlay
+        rebuild on the next idle (MP5 -- a fight arrives as a burst of alerts), so
+        the burst lights up promptly and the tick loop then animates it.
+        INDEPENDENTLY gated from heat by its own layer
         toggle. Guarded/no-throw so a malformed alert never breaks the zkill path."""
         ts = time.time() if now is None else now
         try:
@@ -2178,7 +2247,7 @@ class MapTab:
             print(f"[MAP] kill ping note failed: {exc}")
             return
         if self._layer_on("kill_pings"):
-            self._redraw_overlays()          # draw the new burst now
+            self._schedule_overlay_redraw()  # MP5: one rebuild per alert burst
             self._schedule_tick()            # ensure the tick loop animates it
 
     def focus_kill(self, system_id) -> None:
@@ -2784,7 +2853,10 @@ class MapTab:
         and WITHOUT adding _img_offset -- the live projection already equals the
         on-canvas position of the translated stale bitmap, so adding the offset
         would double-count the drag during the pre-settle window (Task 9 finding
-        #2). Pure Tk; cheap enough to run on every gesture/drag frame.
+        #2). Pure Tk, but NOT cheap: ~11 tag deletes + ~160 item creates, measured
+        6.64 ms / 238 Tcl round-trips on realistic FC state. This is the STRUCTURAL
+        path -- applied gesture/crisp frames, zoom, layer toggles and pushes. The
+        per-motion-event pan path uses _pan_overlays' translate instead (MP1).
 
         Task 25 splits the delete and create phases into ov_delete / ov_create
         stages so the analyzer can tell whether an overlay-carried apply spike sits
@@ -2806,11 +2878,15 @@ class MapTab:
         _c = time.perf_counter if tele is not None else None
         if _c: _o0 = _c()
         canvas = self.canvas
-        _tags = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
-                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
-                 "ov_killping", "ov_chars")
-        for tag in _tags:
+        for tag in OVERLAY_TAGS:
             canvas.delete(tag)
+        # MP1: every item below is re-derived from world coords through the LIVE
+        # camera, so whatever integer translates _pan_overlays applied since the
+        # last rebuild are discarded here -- accumulated float drift can never
+        # survive a rebuild. Zero the budget in lockstep with the deletes (both
+        # remaining exits below are post-delete, so an early return leaves an
+        # EMPTY canvas with a zero budget, which is consistent).
+        self._ov_pan_acc = (0.0, 0.0)
         # Task 31 / Task 36: the ov_intel + ov_killping items were just deleted ->
         # drop their stale ids so the dicts stay in lockstep with the canvas
         # (repopulated in the intel / kill-ping blocks below; left empty on the
@@ -2834,12 +2910,14 @@ class MapTab:
         systems = self.state.model.systems
         st = self.state
 
+        _cull = OVERLAY_CULL_PX          # shared with _pan_overlays' translate budget
+
         def project(sid):
             s = systems.get(sid)
             if s is None:
                 return None
             sx, sy = cam.world_to_screen(s.x, s.y, vw, vh)
-            if sx < -40 or sy < -40 or sx > vw + 40 or sy > vh + 40:
+            if sx < -_cull or sy < -_cull or sx > vw + _cull or sy > vh + _cull:
                 return None
             return sx, sy
 
@@ -3118,6 +3196,107 @@ class MapTab:
             tele.stage("ov_delete", self._tele_ov_del, _now)
             tele.stage("ov_create", self._tele_ov_new, _now)
             tele.stage("ov_total", (_o1 - _o0) * 1000.0, _now)
+
+    def _pan_overlays(self, dx: float, dy: float) -> None:
+        """MP1: the MOTION-path overlay update -- TRANSLATE the existing items by
+        (dx, dy) instead of rebuilding them.
+
+        A pure pan is an exact translation: ``Camera.pan_pixels`` moves the centre
+        by ``-d/scale``, so every ``world_to_screen`` result shifts by exactly
+        ``+d`` px. Every tag in OVERLAY_TAGS is world-anchored (see the constant),
+        so ONE ``canvas.move`` per tag reproduces what a full rebuild would draw --
+        for a measured 1.86 ms against the rebuild's 6.64 ms / 238 Tcl round-trips
+        (which _on_drag_move used to pay on EVERY motion event, ungated).
+
+        THE ONE THING A TRANSLATE CANNOT DO is materialise an item that was CULLED
+        at the last rebuild (`project` drops systems beyond OVERLAY_CULL_PX of the
+        viewport). So the accumulated translate is BUDGETED: a culled item started
+        at least OVERLAY_CULL_PX outside the viewport, hence while |accumulated|
+        stays inside that budget it is still off-screen and its absence is
+        invisible. Exceed the budget on either axis and we fall back to a full
+        rebuild, which re-derives from world coords -- that is also what clears any
+        accumulated float drift (see _redraw_overlays) and resets the budget.
+
+        Structural changes (zoom, new/removed markers, layer toggles, applied
+        gesture/crisp frames) all keep going through _redraw_overlays; this is the
+        motion path only."""
+        if not self._visible:
+            return                       # E1: mirrors _redraw_overlays' hidden gate
+        if self.renderer is None or self.state.model is None:
+            return                       # nothing drawn yet -> nothing to translate
+        ax = self._ov_pan_acc[0] + dx
+        ay = self._ov_pan_acc[1] + dy
+        if abs(ax) > OVERLAY_CULL_PX or abs(ay) > OVERLAY_CULL_PX:
+            self._redraw_overlays()      # budget spent -> rebuild (zeroes _ov_pan_acc)
+            return
+        tele = self._tele
+        _c = time.perf_counter if tele is not None else None
+        if _c: _p0 = _c()
+        self._ov_pan_acc = (ax, ay)
+        canvas = self.canvas
+        for tag in OVERLAY_TAGS:
+            canvas.move(tag, dx, dy)     # no-op for a tag with no items
+        if _c:
+            tele.stage("ov_pan", (_c() - _p0) * 1000.0, tele._ms())
+
+    # ---- burst coalescing (MP5) -------------------------------------------------
+    def _schedule_overlay_redraw(self, crisp: bool = False) -> None:
+        """Coalesce a BURST of external pushes into ONE overlay rebuild (MP5).
+
+        Intel spans, kill pings and kill-heat alerts arrive in tight runs on the Tk
+        thread -- one intel line naming four systems used to fire four identical
+        back-to-back 6.6 ms rebuilds, and the map is heaviest exactly when the FC
+        needs it. Each caller now just marks the work pending; a single
+        ``after_idle`` flush does it once, when the current run of Tk callbacks
+        drains. ``crisp=True`` folds the caller's ``_request_crisp()`` into the same
+        flush (the worker already keeps only the newest request, so N-1 of them were
+        pure Tk-thread cost).
+
+        Hidden tab -> returns immediately: nothing is scheduled and nothing is
+        rebuilt, byte-identical to the E1 gates it replaces (``_redraw_overlays``
+        no-ops while hidden and the crisp request was already ``_visible``-gated).
+        No Tk loop to schedule on (a torn-down frame) -> flush inline so a paint is
+        never silently lost."""
+        if not self._visible:
+            return
+        self._redraw_pending = True
+        if crisp:
+            self._crisp_pending = True
+        if self._redraw_after_id is not None:
+            return                       # a flush is already armed -> coalesce into it
+        try:
+            self._redraw_after_id = self.frame.after_idle(self._flush_overlay_redraw)
+        except Exception:
+            self._redraw_after_id = None
+            self._flush_overlay_redraw()
+
+    def _flush_overlay_redraw(self) -> None:
+        """Idle flush for _schedule_overlay_redraw: at most one crisp request and
+        one overlay rebuild per burst, in the SAME order the individual callers used
+        (crisp first, then the Tk repaint). Clears the pending flags BEFORE doing the
+        work so a push made from inside the rebuild arms a fresh flush rather than
+        being swallowed. Safe to call directly (tests / the no-Tk-loop fallback)."""
+        self._redraw_after_id = None
+        crisp, redraw = self._crisp_pending, self._redraw_pending
+        self._crisp_pending = self._redraw_pending = False
+        if crisp and self._visible:
+            self._request_crisp()
+        if redraw:
+            self._redraw_overlays()      # carries its own _visible / renderer guards
+
+    def _cancel_overlay_redraw(self) -> None:
+        """Drop a pending idle flush (tab hidden / teardown) so it cannot fire
+        against a torn-down root, and clear the flags so a later show starts clean.
+        on_shown's own force_dirty + _request_crisp repaints everything anyway, so
+        discarding the pending burst loses nothing."""
+        if self._redraw_after_id is not None:
+            try:
+                self.frame.after_cancel(self._redraw_after_id)
+            except Exception:
+                pass
+            self._redraw_after_id = None
+        self._redraw_pending = False
+        self._crisp_pending = False
 
     # ---- worker ----------------------------------------------------------------
     def _start_worker(self) -> None:
@@ -3771,7 +3950,14 @@ class MapTab:
                 and now - self._last_drag_qf >= self._effective_gesture_interval(now)):
             self._last_drag_qf = now
             self._request_gesture_frame()
-        self._redraw_overlays()             # keep overlays glued to the live camera
+        # MP1: keep overlays glued to the live camera by TRANSLATING them (a pure
+        # pan is an exact translation -- 1.86 ms) instead of the full 11-tag delete
+        # + ~160-item recreate this used to run UNGATED on every motion event
+        # (6.64 ms / 238 Tcl round-trips, re-firing as fast as it completed).
+        # _pan_overlays falls back to the full rebuild once the accumulated pan
+        # could bring a culled system on screen; applied gesture frames, the settle
+        # crisp, zoom and every structural change still rebuild as before.
+        self._pan_overlays(dx, dy)
         self._schedule_tick()
 
     def _on_drag_end(self, event) -> None:
@@ -4581,7 +4767,10 @@ class MapTab:
         self._recompute_friendly_threat()
 
     def _on_configure(self, event) -> None:
-        self.state.resize(event.width, event.height)
+        # MP7: pass the clock so a size change debounces through the settle tracker
+        # -- a window drag-resize now costs ONE crisp when it stops, not one per
+        # <Configure> (~54 Hz). Same debounce the drag/wheel gestures use.
+        self.state.resize(event.width, event.height, _now_ms())
         self._schedule_tick()
 
     def _wire_completions(self, model) -> None:
