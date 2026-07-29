@@ -15,11 +15,15 @@ Eve-O main window to the tray — in that state neither a thumbnail nor the main
 window is visible, yet the process is still running. list_process_names()
 enumerates running-process basenames via CreateToolhelp32Snapshot (stdlib
 ctypes, no psutil) so we can detect "EVE-O Preview.exe" regardless of window
-visibility.
+visibility. That snapshot is ~12 ms on a normal desktop and preview_running()
+is the FIRST thing the 250 ms native-preview tick does on the Tk thread, so the
+snapshot is time-cached (see _PROCESS_PROBE_INTERVAL_S) while the cheap window
+signals stay on every call.
 """
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass
 
 TITLE_PREFIX = "EVE - "
@@ -238,6 +242,44 @@ def find_thumbs(win32=None) -> list[Thumb]:
 
 PREVIEW_MAIN_TITLE = "EVE-O Preview"   # the app's own main window title
 
+# ── Process-probe cache ──────────────────────────────────────────────────────
+# _preview_process_running walks the FULL process table
+# (CreateToolhelp32Snapshot over ~440 processes): measured 11.89 ms of a
+# 14.55 ms preview_running call, 9.7 ms of 11.9 ms on a re-measure the same
+# day. preview_running is called 4x/s (4 Hz) from the native preview tick
+# while tiles are on screen -- that's the EVE-O-absent hot path this cache
+# cures -- synchronously on the Tk thread, so that walk was ~5.8% of the UI
+# loop delivered as hard hitches. While blocked (EVE-O detected, every tile
+# retired) the tick itself slows to the 2 s idle cadence, i.e. 0.5 Hz, not
+# 4x/s. "Is Eve-O Preview running?" is a session-scale question, so the
+# answer is cached and re-probed at most once per interval.
+# The cheap window signals are NOT cached — Eve-O appearing WITH visible
+# windows is still caught on the very next tick; only the tray/all-hidden case
+# waits for a re-probe. Because that wait rides the slow 2 s idle tick,
+# noticing that Eve-O has exited can lag up to ~7 s worst case (5 s of cache
+# staleness plus one more idle-cadence tick), not just the 5 s interval alone.
+_PROCESS_PROBE_INTERVAL_S = 5.0
+
+_probe_cache_win32 = None      # the win32 wrapper the cached answer came from
+_probe_cache_ts = None         # monotonic stamp of that answer (None = cold)
+_probe_cache_val = False
+
+
+def _now() -> float:
+    """Monotonic clock indirection so tests can drive the probe interval
+    without sleeping."""
+    return time.monotonic()
+
+
+def reset_process_cache() -> None:
+    """Drop the cached process-probe answer so the next call takes a fresh
+    snapshot. Used by tests; also the honest way for any caller that needs an
+    immediate re-probe."""
+    global _probe_cache_win32, _probe_cache_ts, _probe_cache_val
+    _probe_cache_win32 = None
+    _probe_cache_ts = None
+    _probe_cache_val = False
+
 
 def _preview_process_running(win32) -> bool:
     """True iff a process named 'EVE-O Preview.exe' (case-insensitive) is
@@ -283,6 +325,60 @@ def _preview_process_running(win32) -> bool:
     return False
 
 
+def _preview_process_running_cached(win32) -> bool:
+    """`_preview_process_running` behind a monotonic time gate.
+
+    Identity-keyed on the win32 wrapper: production has exactly ONE (the lazy
+    _RealWin32 singleton), so there this is a plain time cache; a test handing
+    in a different fake always gets a fresh probe, so no case can inherit
+    another's cached answer. A COLD cache always probes — Eve-O already running
+    when FCTool starts is detected on the first call, never as a stale
+    'absent'. Semantics are untouched: this only changes how often the answer
+    is recomputed."""
+    global _probe_cache_win32, _probe_cache_ts, _probe_cache_val
+    now = _now()
+    ts = _probe_cache_ts
+    if (ts is not None and _probe_cache_win32 is win32
+            and 0.0 <= (now - ts) < _PROCESS_PROBE_INTERVAL_S):
+        return _probe_cache_val
+    val = _preview_process_running(win32)
+    _probe_cache_win32 = win32
+    _probe_cache_ts = now
+    _probe_cache_val = val
+    return val
+
+
+def _window_signals(win32) -> bool:
+    """Signals 1 and 2 (any Eve-O thumbnail / the Eve-O main window) in ONE
+    EnumWindows pass instead of two, stopping at the first hit.
+
+    Predicates are unchanged — thumb-ness is still decided by `_is_thumb`, the
+    single owner of that rule. Visibility and title are read once per window
+    and used to pre-filter, which cannot hide anything `_is_thumb` would have
+    accepted (it rejects invisible windows and titles without TITLE_PREFIX
+    itself). Never raises."""
+    try:
+        hwnds = win32.enum_windows()
+    except Exception:
+        return False
+    for hwnd in hwnds:
+        try:
+            if not win32.is_visible(hwnd):
+                continue
+            title = win32.get_title(hwnd) or ""
+        except Exception:
+            continue
+        # Signal 2: the Eve-O Preview main window (no clients previewed yet).
+        if title.strip() == PREVIEW_MAIN_TITLE:
+            return True
+        # Signal 1: a thumbnail window. Only "EVE - ..." titles can qualify, so
+        # the full (rect-reading) check runs for a handful of windows at most.
+        if (title.startswith(TITLE_PREFIX)
+                and _is_thumb(win32, hwnd) is not None):
+            return True
+    return False
+
+
 def preview_running(win32=None) -> bool:
     """True iff Eve-O Preview appears to be running via ANY of three signals:
       1. at least one thumbnail window is present, OR
@@ -291,26 +387,19 @@ def preview_running(win32=None) -> bool:
       3. an 'EVE-O Preview.exe' process is running even with every thumbnail
          hidden and the main window minimised to the tray.
 
-    Signals 1-2 use the EnumWindows pass; signal 3 uses a process snapshot
-    (no psutil). Never raises; returns False on any failure."""
+    Signals 1-2 share ONE EnumWindows pass and run on EVERY call, so Eve-O
+    showing any window is detected immediately. Signal 3 needs a full process
+    snapshot (~12 ms, no psutil) and is therefore time-cached — at most one
+    snapshot per _PROCESS_PROBE_INTERVAL_S — because this is called 4x/s
+    (while tiles are on screen; 0.5x/s while blocked/idle) from the native
+    preview tick on the Tk thread while the answer changes at most once or
+    twice a session. Never raises; returns False on any failure."""
     if win32 is None:
         if sys.platform != "win32":
             return False
         win32 = _real_win32()
-    if find_thumbs(win32=win32):
+    if _window_signals(win32):
         return True
-    # Fallback A: the Eve-O Preview main window itself (no thumbnails yet).
-    try:
-        hwnds = win32.enum_windows()
-    except Exception:
-        hwnds = []
-    for hwnd in hwnds:
-        try:
-            if not win32.is_visible(hwnd):
-                continue
-            if (win32.get_title(hwnd) or "").strip() == PREVIEW_MAIN_TITLE:
-                return True
-        except Exception:
-            continue
-    # Fallback B: the process is running even though every window is hidden.
-    return _preview_process_running(win32)
+    # Fallback: the process is running even though every window is hidden
+    # (thumbnails suppressed AND the main window minimised to tray). Cached.
+    return _preview_process_running_cached(win32)

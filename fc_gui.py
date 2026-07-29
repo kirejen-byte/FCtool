@@ -108,7 +108,7 @@ import motd_palette
 import pill_canvas
 import system_coords
 from markup_editor import MarkupEditor
-from eveo_tracker import find_thumbs, preview_running
+from eveo_tracker import find_thumbs, preview_running, reset_process_cache
 from eveo_overlay import OverlayWindow
 import overlay_rules
 import fleet_composer
@@ -17279,6 +17279,8 @@ class FCToolGUI:
 
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
+        # Cheap by design: the window signals run per tick, but the ~12 ms
+        # process snapshot behind them is time-cached inside eveo_tracker (PV1).
         if preview_running():                      # EVE-O still open → refuse to fight it
             self._preview_retire_all_tiles()
             return "○ EVE-O Preview detected — close it to enable native previews"
@@ -17606,6 +17608,12 @@ class FCToolGUI:
             self._preview_gamelog = None
 
     def _preview_enable_native(self):
+        # An explicit "enable native previews" click deserves a fresh probe,
+        # not a stale ≤5 s cached answer — a user who just closed EVE-O
+        # Preview and immediately re-enables would otherwise still get its
+        # refusal for up to 5 s. The tick's cached cadence is fine everywhere
+        # else; this is the one path where the user is watching and acted.
+        reset_process_cache()
         self._preview_disabled_session = False
         # SELF-HEAL: rescue any already-stored sub-minimum tile size before a
         # single tile is spawned. Same shape as the clamp_visible write-back for
