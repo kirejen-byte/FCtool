@@ -28534,7 +28534,67 @@ $bmp.Dispose()
         dialog keeps these exact ``ShipPick`` objects as its scratch state and
         MUTATES them in place, so a reused list would leak one window's
         quantities into the next — breaking the owner-approved "edits are
-        forgotten on close" guarantee (design §2)."""
+        forgotten on close" guarantee (design §2).
+
+        **Single window, PER DOCTRINE (the guard the grab used to provide).**
+        The dialog is deliberately non-grabbing — it is a reference window the
+        FC reads while still flying, and an app-wide Tk grab would deafen the
+        FCPreview tiles (see ``market_gap_dialog.open_gap_dialog``) — so nothing
+        stops a second "Gaps…" click while one is open. What that click does
+        turns on WHICH doctrine it asked for, because this window is a shopping
+        list and the wrong doctrine's shopping list is worse than none at all:
+        only the title and the basis line give it away, and by then the FC has
+        seeded the market for the wrong fleet.
+
+        * SAME doctrine → the live window is RAISED, never rebuilt. That cannot
+          leak scratch state (the picks belong to the window that already owns
+          them) and it keeps the FC's half-typed quantities.
+        * DIFFERENT doctrine → the live window is CLOSED through the module's
+          own ``gap_close`` seam — never a bare ``destroy``, so ``on_close``
+          still fires — and a fresh window with a fresh pick list is built for
+          the doctrine actually requested.
+
+        So "fresh picks per open" still holds for every genuine open; the only
+        thing a raise carries over is the state the owner is already looking at.
+        The handle is cleared through ``open_gap_dialog``'s ``on_close`` seam,
+        which fires exactly once on EVERY close path (Close button, WM_DELETE,
+        ``<Escape>``).
+
+        Identity is ``doctrine.id``, the handle every other doctrine call site
+        keys on (``_rename_doctrine(doctrine.id)`` …). NOT the object:
+        ``_show_doctrine_detail`` re-reads through ``fittings.get_doctrine`` on
+        every render and the store rebuilds all ``Doctrine`` objects on
+        ``load()``, so object identity would miss and needlessly rebuild. NOT
+        ``==`` either: ``Doctrine`` is a plain dataclass, so equality compares
+        the whole member list and an edit made while the window is open would
+        read as a different doctrine. A blank/absent id proves nothing and so
+        never matches — replacing the window costs the FC their scratch
+        quantities, while raising the wrong one costs them the wrong market."""
+        key = str(getattr(doctrine, "id", "") or "")
+        existing = getattr(self, "_market_gaps_dlg", None)
+        if existing is not None:
+            same = bool(key) and key == getattr(self, "_market_gaps_doctrine",
+                                                None)
+            try:
+                if existing.winfo_exists():
+                    if same:
+                        existing.deiconify()
+                        existing.lift()
+                        existing.focus_force()
+                        return existing
+                    # Wrong doctrine on screen: close it through the dialog's
+                    # OWN seam so its on_close → _forget runs (a bare destroy
+                    # would strand the handle), then fall through and build the
+                    # one that was actually asked for.
+                    close = getattr(existing, "gap_close", None)
+                    if callable(close):
+                        close()
+                    else:
+                        existing.destroy()
+            except Exception:
+                pass
+            self._market_gaps_dlg = None
+            self._market_gaps_doctrine = None
         dname = getattr(doctrine, "name", "") or "doctrine"
         doctrine_target = self._market_seed_target(doctrine)
         store = getattr(self, "fittings", None)
@@ -28546,7 +28606,19 @@ $bmp.Dispose()
             fit_info=(getattr(store, "get_fit", None) if store is not None
                       else None),
             doctrine_name=dname, doctrine_target=doctrine_target).picks
-        return market_gap_dialog.open_gap_dialog(
+
+        def _forget():
+            """Drop the singleton handle (and the doctrine it was keyed on) so
+            the NEXT "Gaps…" builds a fresh window — and with it a fresh pick
+            list. A closure rather than a bound method on purpose: the gaps
+            wiring is exercised by SimpleNamespace hosts in tests, and every new
+            ``self.<method>`` this method reads becomes one more harness
+            bind-list entry to keep in sync (the preview suites' standing
+            trap)."""
+            self._market_gaps_dlg = None
+            self._market_gaps_doctrine = None
+
+        dlg = market_gap_dialog.open_gap_dialog(
             self.root,
             doctrine_name=dname,
             picks=picks,
@@ -28555,7 +28627,11 @@ $bmp.Dispose()
                 self._market_build_gap_list(doctrine,
                                             per_fit_targets=per_fit_targets,
                                             components=components),
-            copy_text=self._market_copy_text)
+            copy_text=self._market_copy_text,
+            on_close=_forget)
+        self._market_gaps_dlg = dlg
+        self._market_gaps_doctrine = key
+        return dlg
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

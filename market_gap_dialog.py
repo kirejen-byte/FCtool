@@ -464,10 +464,24 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
     ``on_close``        optional zero-arg callback fired once, on any close path
                         (Close button, WM_DELETE, ``<Escape>``).
 
-    The dialog is TRULY modal (``ui_helpers.make_modal`` adds the grab the old
-    in-``fc_gui`` version lacked) and is centred over ``parent``. Rebuilds are
-    inline on every include toggle / qty commit / category toggle — ``gap_list``
-    is pure and in-memory, so there is no "Recalculate" button.
+    The dialog is deliberately NON-GRABBING: it takes the house modal contract
+    MINUS the input grab (``ui_helpers.make_modal(..., grab=False)``), so it
+    keeps transient + ``<Escape>`` + the themed background and is still centred
+    over ``parent``, but never freezes the rest of the app. This is a shopping
+    list an FC reads while STILL FLYING, and a Tk grab is application-wide: the
+    grab v4.1.0 added here (the docstring used to boast of it as "TRULY modal")
+    also deafened every FCPreview tile — their click-to-switch is a plain
+    ``<Button-1>`` on another Toplevel of this same process — so with this
+    window open the FC could not switch EVE clients at all, while the DWM
+    thumbnails kept animating and hid the cause. Reference window ⇒ no grab.
+    Because nothing then stops a second "Gaps…" click,
+    ``fc_gui._open_market_gaps_dialog`` owns a single-window guard, keyed PER
+    DOCTRINE and cleared via ``on_close``: the SAME doctrine raises the live
+    dialog instead of building another (scratch preserved); a DIFFERENT
+    doctrine closes it through the module's own ``gap_close`` seam and builds
+    a fresh one for the doctrine actually requested.
+    Rebuilds are inline on every include toggle / qty commit / category toggle
+    — ``gap_list`` is pure and in-memory, so there is no "Recalculate" button.
 
     Test surface (attributes on the returned Toplevel): ``gap_selection``,
     ``gap_tree``, ``gap_rebuild()``, ``gap_export(kind)``, ``gap_summary_text()``,
@@ -499,9 +513,13 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
         except tk.TclError:
             pass
 
-    # House modal contract: guarded transient + grab_set + <Escape> → the SAME
-    # close path as the Close button (never a blind destroy).
-    make_modal(dlg, parent, on_cancel=_close)
+    # House modal contract MINUS the grab: guarded transient + <Escape> → the
+    # SAME close path as the Close button (never a blind destroy).
+    # grab=False is LOAD-BEARING, not a preference: a Tk grab is app-wide, so
+    # the grab this line used to take froze every FCPreview tile and left the
+    # FC unable to switch EVE clients while the shopping list was open (see the
+    # docstring). Do not "restore modality" here.
+    make_modal(dlg, parent, on_cancel=_close, grab=False)
     dlg.protocol("WM_DELETE_WINDOW", _close)
 
     body = tk.Frame(dlg, bg=BG_DARK, padx=18, pady=16,

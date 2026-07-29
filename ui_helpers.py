@@ -11,11 +11,15 @@ one app (see OPTIMIZATION_REVIEW.md findings D2, D5, D6, D7, D9).
 
 Two helpers:
 
-``make_modal(win, parent, *, on_cancel=None, base_bg=None)``
+``make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True)``
     The house modal-dialog contract, wired once so every dialog behaves the same:
       * D6 — ``transient(parent)`` and ``grab_set()`` are each guarded against
         ``TclError`` (a withdrawn/unmapped parent, or an unviewable window during
         headless tests, must degrade quietly rather than crash the opener).
+      * ``grab=False`` opts out of the GRAB ONLY (transient, ``<Escape>`` and
+        the themed background still apply) — for the long-lived REFERENCE
+        window class, which must not freeze the app's other Toplevels. See the
+        function docstring for why that class exists.
       * D2 — ``<Escape>`` is bound to ``on_cancel`` (or ``win.destroy`` when no
         cancel handler is given), so muscle-memory dismissal works on EVERY
         modal, not just the ~14 that happened to bind it by hand. Callers pass
@@ -55,7 +59,7 @@ import ui_theme
 _TOOLTIP_FONT = ("Consolas", 8)
 
 
-def make_modal(win, parent, *, on_cancel=None, base_bg=None):
+def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
     """Apply the house modal contract to ``win`` and return it.
 
     ``win``        the dialog Toplevel (already created + titled by the caller).
@@ -64,6 +68,31 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None):
                    dialog's own Cancel/close handler so Escape and the Cancel
                    button share one code path (cleanup, grab_release, etc.).
     ``base_bg``    the window background; defaults to ``ui_theme.BG_DARK``.
+    ``grab``       take the application-wide input grab. **Default True** — the
+                   house behaviour for a DECISION dialog, one the user must
+                   answer before the app can sensibly continue. Pass ``False``
+                   for a long-lived REFERENCE window: one the user is expected
+                   to READ while carrying on working elsewhere in the app.
+                   ``grab=False`` skips ONLY ``grab_set()``; transient,
+                   ``<Escape>`` → cancel and the themed background all still
+                   apply, so the window is otherwise a house dialog.
+
+    **Why the grab opt-out exists (a whole CLASS of window, not one instance).**
+    ``grab_set()`` is an application-wide Tk input grab: while it is held, every
+    OTHER Toplevel this process owns stops receiving pointer and keyboard
+    events. FCTool is not a one-window app — alongside its dialogs it owns the
+    FCPreview client tiles, the star map, the overlay and the toasts, and the
+    tiles in particular are how the FC switches EVE clients mid-fight (a plain
+    ``<Button-1>`` binding on each tile's own Toplevel). So a grabbing window
+    does not merely block input to itself; it silently deafens the FC's client
+    switcher for as long as the window is open, and because the DWM thumbnails
+    keep compositing at the OS level the tiles go on animating while dead to
+    clicks — the symptom reads as "the previews froze", never as "that dialog
+    did it". v4.1.0 shipped exactly this regression by adding a grab to the
+    market gaps window. Any window the FC is meant to read WHILE FLYING belongs
+    in the ``grab=False`` class; anything that must be answered first keeps the
+    default. A non-grabbing window can be opened twice, so its opener owns a
+    single-window guard — the grab was providing that implicitly.
 
     ``transient``/``grab_set`` are each guarded against ``TclError`` so an
     unviewable window or withdrawn parent degrades quietly (D6).
@@ -72,10 +101,11 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None):
         win.transient(parent)
     except tk.TclError:
         pass
-    try:
-        win.grab_set()
-    except tk.TclError:
-        pass
+    if grab:
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
 
     cancel = on_cancel if callable(on_cancel) else win.destroy
     win.bind("<Escape>", lambda _e=None: cancel())
