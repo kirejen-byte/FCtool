@@ -23,15 +23,25 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   blank keyword — only for an ABSENT one.
 * **Ranges come from ``jump_range.JumpRangeChecker.SHIP_RANGES`` — the CLASS
   dict — read live.** Those values are already the JDC-5 (max) ranges: hull base
-  x 2.0, i.e. Titan 6.0, Dreadnought 7.0. This module deliberately does NOT
-  route through ``JumpRangeChecker(custom_ranges=...)`` and reads NO per-hull
-  range out of config: that config key currently drives nothing at all in the
-  app, and a config persisted before v2.8.1 can still carry pre-fix values that
-  would silently override a corrected default and produce a WRONG range answer.
-  Honouring it here would promote a dead key back to live as a side effect of
-  this feature. If per-hull customisation is ever wanted it needs a deliberate
-  config migration. (Drift guard:
+  x 2.0, i.e. Titan 6.0, Dreadnought 7.0, Black Ops 8.0. This module
+  deliberately does NOT route through ``JumpRangeChecker(custom_ranges=...)``
+  and reads NO per-hull range out of config: that config key currently drives
+  nothing at all in the app, and a config persisted before v2.8.1 can still
+  carry pre-fix values that would silently override a corrected default and
+  produce a WRONG range answer. Honouring it here would promote a dead key back
+  to live as a side effect of this feature. If per-hull customisation is ever
+  wanted it needs a deliberate config migration. (Drift guard:
   ``test_range_check.py::test_the_module_reads_no_per_hull_range_config_key``.)
+* **The hull set has ONE definition (``HULL_COLUMNS``) and every per-hull answer
+  is keyed off it.** ``RangeRow.reach`` is a frozen mapping built by
+  ``reach_map``, never one boolean field per hull: parallel booleans is the
+  shape that rots the moment a hull is added, because every producer, consumer
+  and test has to grow a field and the one that does not silently answers for
+  the wrong hull. ``in_range`` is total — a hull the row has no answer for
+  RAISES rather than returning a plausible ``False``. The fallback used when a
+  key vanishes from ``SHIP_RANGES`` is per-hull for the same reason: one shared
+  7.0 silently UNDER-reported the Black Ops' 8.0, and under-reporting is the
+  dangerous direction for a feature answering "who can reach me".
 * **Linked systems REPLACE the source list, never the target.** A message naming
   systems is the FC asking "range from THESE", so the configured stagings step
   aside entirely. That makes a FALSE system match expensive rather than
@@ -95,6 +105,7 @@ import re
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import NamedTuple
 
 import jump_range
@@ -778,31 +789,87 @@ def resolve_sources(config, resolve=None) -> SourceLists:
 
 # ── range maths ──────────────────────────────────────────────────────────────
 
-#: The two hulls the summary answers for. ``Capital`` is the dreadnought range
-#: (7.0 LY at JDC 5) — the hull that reaches where a titan (6.0) falls short,
-#: which is the entire point of showing two columns.
+#: The three hulls the summary answers for, each a different reach at JDC 5 —
+#: which is the entire point of showing a column per hull. ``Capital`` is the
+#: dreadnought range (7.0 LY), the hull that reaches where a titan (6.0) falls
+#: short; ``Blops`` is the Black Ops battleship (8.0 LY — 4.0 base x 2.0), which
+#: out-reaches both, and what it brings when it arrives is a covert bridge for
+#: the rest of its gang — a threat question neither capital column answers.
 HULL_TITAN = "Titan"
 HULL_CAPITAL = "Dreadnought"
+HULL_BLOPS = "Black Ops"
 LABEL_TITAN = "Titan"
 LABEL_CAPITAL = "Capital"
-#: ``(display label, SHIP_RANGES key)`` in render order.
-HULL_COLUMNS = ((LABEL_TITAN, HULL_TITAN), (LABEL_CAPITAL, HULL_CAPITAL))
-#: Fallback if a hull key ever leaves ``SHIP_RANGES`` — never a silent 0 (which
-#: would render "out of range" for everything, the dangerous direction).
-_FALLBACK_RANGE_LY = 7.0
+#: The house's own short form — the Jump Range tab and the map's character
+#: filter both already say "Blops", and the cell has to stay glanceable.
+LABEL_BLOPS = "Blops"
+#: ``(display label, SHIP_RANGES key)`` in render order. THE hull set: the
+#: toast's columns, ``HULLS`` and therefore every ``RangeRow.reach`` mapping are
+#: all derived from this one tuple, so a hull cannot be half-added.
+#:
+#: That covers the DATA layer only — the RENDER layer has a measured ceiling
+#: this tuple cannot see. Toast width scales with column count (measured: 2
+#: cols 616px, 3 cols 690px, 4 cols 760px — exactly ``MAX_W``): each hull
+#: column costs ~70-74px against the ~70px of margin still free at 3 columns,
+#: so a fourth hull would land AT the cap with no slack left, and the
+#: worst-case content in
+#: ``test_the_third_column_still_fits_the_window_it_has_to_stay_readable``
+#: would start clipping. A fourth hull is therefore a deliberate ``MAX_W`` /
+#: layout call, not a free edit of this tuple alone.
+HULL_COLUMNS = ((LABEL_TITAN, HULL_TITAN), (LABEL_CAPITAL, HULL_CAPITAL),
+                (LABEL_BLOPS, HULL_BLOPS))
+#: The ``SHIP_RANGES`` keys of ``HULL_COLUMNS``, in the same order.
+HULLS = tuple(hull for _label, hull in HULL_COLUMNS)
+#: PER-HULL fallback if a hull key ever leaves ``SHIP_RANGES`` — each hull's own
+#: documented JDC-5 max. Never a silent 0 (which would render "out of range" for
+#: everything) and deliberately never ONE number for every hull: the single 7.0
+#: this replaced was correct for a dreadnought, generous for a titan and a
+#: silent UNDER-report for a Black Ops, and under-reporting is the dangerous
+#: direction for a feature answering "who can reach me".
+_FALLBACK_LY = {HULL_TITAN: 6.0, HULL_CAPITAL: 7.0, HULL_BLOPS: 8.0}
+#: For a hull this module does not answer for at all: the widest range it knows,
+#: so an unknown hull over-reports (safe) rather than under-reports. Derived, so
+#: it cannot fall behind the table above.
+_FALLBACK_UNKNOWN_LY = max(_FALLBACK_LY.values())
 
 
 def hull_range_ly(hull) -> float:
     """JDC-5 max jump range for a hull, read LIVE off the CLASS dict
     ``jump_range.JumpRangeChecker.SHIP_RANGES``. Never a per-instance copy, and
     never a config value — see the module docstring for why that config key is
-    deliberately dead here."""
+    deliberately dead here.
+
+    A missing key falls back to that hull's own documented JDC-5 max and says so
+    loudly; only a hull this module does not answer for at all lands on the
+    shared last resort."""
     try:
         return float(jump_range.JumpRangeChecker.SHIP_RANGES[hull])
     except (KeyError, TypeError, ValueError):
+        try:
+            fallback = _FALLBACK_LY[hull]
+        except (KeyError, TypeError):
+            fallback = _FALLBACK_UNKNOWN_LY
         log.warning("range_check: no JDC-5 range for hull %r; using %.1f LY",
-                    hull, _FALLBACK_RANGE_LY)
-        return _FALLBACK_RANGE_LY
+                    hull, fallback)
+        return fallback
+
+
+def reach_map(in_range_hulls=()) -> MappingProxyType:
+    """A frozen ``hull -> in range`` mapping covering EXACTLY ``HULLS``.
+
+    The ONE place a row's per-hull answers are built, so a row can never carry
+    an answer for a hull the report does not render, nor miss one it does —
+    which is what lets ``RangeRow.in_range`` be total. Frozen because a
+    ``RangeRow`` is frozen, and a mutable field inside a frozen row is a frozen
+    row in name only."""
+    wanted = frozenset(in_range_hulls or ())
+    return MappingProxyType({hull: hull in wanted for hull in HULLS})
+
+
+#: The reach of every DEGRADED row — unresolved, no distance, same system. One
+#: shared immutable object, so "we have no answer" is identical everywhere it is
+#: meant, and never a hand-typed row of Falses that can drift a hull short.
+NO_REACH = reach_map()
 
 
 # ── the report ───────────────────────────────────────────────────────────────
@@ -830,13 +897,29 @@ TITLE_FALLBACK = "Range check"
 @dataclass(frozen=True)
 class RangeRow:
     """One source system's answer. ``distance_ly`` is the RAW distance — the
-    in-range flags were computed from it unrounded; round only for display."""
+    reach flags were computed from it unrounded; round only for display.
+
+    ``reach`` is ONE frozen mapping keyed by hull (always built through
+    ``reach_map`` / ``NO_REACH``), never a boolean field per hull. Parallel
+    per-hull booleans is the shape that rots the moment a hull is added: every
+    producer, every consumer and every test has to grow a field, and the one
+    that does not keeps silently answering for the wrong hull.
+
+    Latent limitation: ``frozen=True`` SYNTHESIZES ``__hash__``, so this class
+    LOOKS hashable — but ``hash(row)`` now raises ``TypeError: unhashable
+    type: 'dict'`` (and ``copy.deepcopy(row)`` raises ``TypeError: cannot
+    pickle 'mappingproxy' object``) because of the ``reach`` mapping. Both
+    worked when this row carried two plain bools instead. Nothing in this repo
+    hashes, deep-copies, or ``dataclasses.asdict``s a row today, so this is
+    latent, not broken — but a future ``set(report.rows)`` or ``asdict`` call
+    WILL fail at runtime, not at review. If hashing a row is ever genuinely
+    needed, switch ``reach`` to a tuple of ``(hull, bool)`` pairs rather than
+    reaching for a custom ``__hash__``."""
     group: str
     name: str
     system_id: int | None
     distance_ly: float | None
-    titan_in_range: bool
-    capital_in_range: bool
+    reach: MappingProxyType
     status: str = ROW_OK
 
     @property
@@ -844,7 +927,15 @@ class RangeRow:
         return self.status == ROW_OK
 
     def in_range(self, hull) -> bool:
-        return self.titan_in_range if hull == HULL_TITAN else self.capital_in_range
+        """Total: a hull this row carries no answer for RAISES rather than
+        answering. A silent ``False`` would render "out of range" — a perfectly
+        plausible answer to a question the row cannot answer, and a plausible
+        wrong answer is the one output this module may not produce."""
+        try:
+            return bool(self.reach[hull])
+        except (KeyError, TypeError):
+            raise KeyError(
+                f"range_check: no reach answer for hull {hull!r}") from None
 
 
 @dataclass(frozen=True)
@@ -1017,13 +1108,15 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
                            note=NOTE_NO_SOURCES, warnings=warnings,
                            ignored=ignored_tuple)
 
-    titan_ly = hull_range_ly(HULL_TITAN)
-    capital_ly = hull_range_ly(HULL_CAPITAL)
+    # One live read per hull per report, and only once the report is going to
+    # HAVE rows: a blocked report must not log a fallback warning for an answer
+    # it never gives.
+    ranges = {hull: hull_range_ly(hull) for hull in HULLS}
 
     rows: list[RangeRow] = []
     for ref, group in picked:
         if not ref.resolved:
-            rows.append(RangeRow(group, ref.name, None, None, False, False,
+            rows.append(RangeRow(group, ref.name, None, None, NO_REACH,
                                  ROW_UNRESOLVED))
             continue
         if ref.system_id == target_ref.system_id:
@@ -1034,15 +1127,17 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
             # silently reintroduce the green zero-distance row this exists
             # to prevent.
             rows.append(RangeRow(group, ref.name, ref.system_id, 0.0,
-                                 False, False, ROW_SAME_SYSTEM))
+                                 NO_REACH, ROW_SAME_SYSTEM))
             continue
         dist = _distance(distance_fn, ref.system_id, target_ref.system_id)
         if dist is None:
             rows.append(RangeRow(group, ref.name, ref.system_id, None,
-                                 False, False, ROW_NO_DISTANCE))
+                                 NO_REACH, ROW_NO_DISTANCE))
             continue
-        rows.append(RangeRow(group, ref.name, ref.system_id, dist,
-                             dist <= titan_ly, dist <= capital_ly, ROW_OK))
+        # RAW distance against the raw range, every hull decided the same way.
+        rows.append(RangeRow(
+            group, ref.name, ref.system_id, dist,
+            reach_map(h for h in HULLS if dist <= ranges[h]), ROW_OK))
 
     order = {g: i for i, g in enumerate(GROUP_ORDER)}
     rows.sort(key=lambda r: (order.get(r.group, len(order)),
@@ -1228,7 +1323,16 @@ MAX_ROWS = 12
 #: staging lists plus the missing-primary note is the whole surface, so three
 #: shows all of it — raise this in step with any new warning.
 MAX_WARNINGS = 3
-#: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit).
+#: Row grid: the name in column 0, one column per hull, then the distance/note.
+#: DERIVED from ``HULL_COLUMNS`` rather than typed, so adding a hull cannot
+#: leave the distance column sitting on top of the last hull cell (or a header's
+#: ``columnspan`` stopping short of it).
+_COL_DISTANCE = len(HULL_COLUMNS) + 1
+_GRID_SPAN = _COL_DISTANCE + 1
+#: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit). A 4th
+#: ``HULL_COLUMNS`` entry measures to 760px — this ceiling exactly, zero
+#: slack — see the layout-ceiling note beside ``HULL_COLUMNS`` before adding
+#: one.
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
 _FONT = "Consolas"
@@ -1329,7 +1433,7 @@ class RangeToast:
         line = 0
         if report.note:
             self._label(body, report.note, FG_YELLOW).grid(
-                row=line, column=0, columnspan=4, sticky="w")
+                row=line, column=0, columnspan=_GRID_SPAN, sticky="w")
             line += 1
         else:
             line = self._fill_rows(body, max_rows)
@@ -1337,7 +1441,8 @@ class RangeToast:
         # unreadable staging list must not be able to look like a clean answer.
         for warning in (report.warnings or ())[:MAX_WARNINGS]:
             self._label(body, warning, FG_YELLOW).grid(
-                row=line, column=0, columnspan=4, sticky="w", pady=(2, 0))
+                row=line, column=0, columnspan=_GRID_SPAN, sticky="w",
+                pady=(2, 0))
             line += 1
 
         self._label(inner, "click to dismiss", FG_DIM, size=7).pack(
@@ -1359,7 +1464,8 @@ class RangeToast:
                 hidden += len(rows)
                 continue
             self._label(body, group, GROUP_COLORS.get(group, FG_DIM),
-                        bold=True).grid(row=line, column=0, columnspan=4,
+                        bold=True).grid(row=line, column=0,
+                                        columnspan=_GRID_SPAN,
                                         sticky="w", pady=(2, 0))
             line += 1
             for row in rows[:take]:
@@ -1368,7 +1474,7 @@ class RangeToast:
             hidden += max(0, len(rows) - take)
         if hidden:
             self._label(body, f"+{hidden} more", FG_DIM, size=7).grid(
-                row=line, column=0, columnspan=4, sticky="w")
+                row=line, column=0, columnspan=_GRID_SPAN, sticky="w")
             line += 1
         return line
 
@@ -1376,14 +1482,15 @@ class RangeToast:
         self._label(body, row.name, FG_TEXT).grid(
             row=line, column=0, sticky="w", padx=(6, 10))
         if row.status == ROW_SAME_SYSTEM:
-            # Caution, not a verdict: a capital cannot jump within its own
-            # system, so both hull cells carry the same yellow warning
-            # instead of a red/green answer that would say the opposite.
+            # Caution, not a verdict: no hull jumps within its own system, so
+            # EVERY hull cell carries the same yellow warning instead of a
+            # red/green answer that would say the opposite. Driven off
+            # HULL_COLUMNS, so a new column cannot quietly render a tick here.
             for col, (label, _hull) in enumerate(HULL_COLUMNS, start=1):
                 self._label(body, same_system_cell(label), FG_YELLOW).grid(
                     row=line, column=col, sticky="w", padx=(0, 10))
             self._label(body, row_note(row), FG_DIM).grid(
-                row=line, column=3, sticky="w")
+                row=line, column=_COL_DISTANCE, sticky="w")
         elif row.ok:
             for col, (label, hull) in enumerate(HULL_COLUMNS, start=1):
                 good = row.in_range(hull)
@@ -1391,12 +1498,12 @@ class RangeToast:
                             FG_GREEN if good else FG_RED).grid(
                     row=line, column=col, sticky="w", padx=(0, 10))
             self._label(body, format_distance(row.distance_ly), FG_DIM).grid(
-                row=line, column=3, sticky="w")
+                row=line, column=_COL_DISTANCE, sticky="w")
         else:
             # Never render a flag we do not have: a degraded row says why, so a
             # missing answer can't read as "out of range" (or as "in range").
             self._label(body, row_note(row), FG_YELLOW).grid(
-                row=line, column=1, columnspan=3, sticky="w")
+                row=line, column=1, columnspan=_GRID_SPAN - 1, sticky="w")
 
     def _measure(self):
         """Content size in px, floored/capped.
