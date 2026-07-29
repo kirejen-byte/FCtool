@@ -59,6 +59,12 @@ _LABEL_PAD = 4            # px inset from the chosen body corner
 _LABEL_MIN_SIZE = 8      # sane font floor
 _LABEL_MAX_SIZE = 28     # sane font ceiling (before the body-fraction cap)
 _LABEL_MAX_CHARS = 40    # hard character cap before the width-based ellipsis
+# Hard cap on the per-tile auto-fit memo (_fit_label_text). Label text MUTATES
+# (activity / ship / system change), so the memo must be bounded — an unbounded
+# render cache is a known bug class in this codebase. FIFO eviction; the steady
+# state is 2 live keys per tile (activity label + location line), so nothing is
+# evicted in practice.
+_FIT_MEMO_MAX = 64
 # Rough monospace char-advance as a fraction of font point size. Consolas at N pt
 # advances ~0.6*N px per glyph; used to estimate rendered width Tk-free so the
 # clamp/ellipsis helpers stay pure (no font metrics / no Tk).
@@ -327,6 +333,16 @@ class TileWindow:
         self._snap_threshold = preview_layout.SNAP_THRESHOLD_PX
         self._excluded = False        # session-only cycle-exclusion flag (C4)
 
+        # LAST-APPLIED mirrors (C5-04 / PV3). fc_gui re-pushes the SAME caption,
+        # dot and exclusion badge for every tile on every ~250 ms tick, and an
+        # unchanged Tk `configure` still costs a full Tcl round-trip. These hold
+        # what was actually WRITTEN, so an unchanged push does zero Tk work.
+        # Each is updated only AFTER the write succeeds, so a TclError can never
+        # poison the guard into skipping a real update.
+        self._excl_text = ""          # mirrors _excl_lbl's construction text ("")
+        self._caption_applied = None  # (name, chip) last written to the strip
+        self._dot_color = None        # last fill written to the status dot
+
         self._thumb = None
         self._src_size = (0, 0)
         self._w = 0
@@ -339,6 +355,11 @@ class TileWindow:
         self._label_size = 11
         self._label_anchor = "top-left"
         self._label_text = ""
+        # C5-03: per-tile font + auto-fit caches for the bottom-line labels. Both
+        # are per-INSTANCE on purpose (a tkfont.Font belongs to the interpreter
+        # that made it) and both are bounded — see _label_font / _fit_memo_put.
+        self._label_fonts = {}        # (family, size, weight) -> tkfont.Font
+        self._fit_memo = {}           # (text, base, avail_w) -> (shown, size)
         self._pos = (0, 0)            # last-placed top-left (physical px)
         self._badge = None
         self._hidden = False          # withdrawn by a C2 hide rule (layout kept)
@@ -349,6 +370,10 @@ class TileWindow:
         self._opacity_hover = 1.0
         self._active = False          # last-activated / foreground EVE client tile
         self._hovering = False
+        self._resting_applied = False  # mirror: True only once a resting-alpha
+                                        # write actually succeeded (see
+                                        # _apply_resting_alpha) — never latched
+                                        # on a failed write
         self._zoom_enabled = False
         self._zoom_factor = 2.0
         self._zoom_anchor = "nw"
@@ -1005,11 +1030,40 @@ class TileWindow:
             pass
 
     def set_alpha(self, a):
-        self._alpha = a
+        """Push the window alpha, skipping the write when it has not moved.
+
+        PV3: an UNCHANGED `wm attributes -alpha` write still costs ~330 µs of GDI
+        work, and fc_gui's _preview_style_tile drives this per tile per ~250 ms
+        tick, so the unchanged case must cost nothing.
+
+        DELIBERATE DESIGN (the ex-style heal keeps running on the skip path):
+        Tk rewrites GWL_EXSTYLE only on a REAL opaque↔layered transition, so an
+        alpha that did not change cannot have wiped WS_EX_TOOLWINDOW — the heal
+        is not needed for correctness here. It is kept anyway as the cheap
+        self-heal for EXTERNAL ex-style drift, because it is a compare-only call:
+        one GetWindowLong read (~µs), after which the backend's LOAD-BEARING
+        `want == ex` gate short-circuits and writes nothing.
+
+        NOT "per-tick drift recovery" (an earlier version of this docstring
+        claimed that, and it measured wrong): configure_hover/set_active already
+        self-guard on a real change (or the very first call) before ever calling
+        this, so an UNCHANGED tick never reaches set_alpha in steady state —
+        measured zero _exclude_from_alt_tab calls here across 10 unchanged ticks.
+        What the skip path genuinely buys (measured, kept for this): the post-map
+        FIRST-tick heal for a user whose opacity_inactive == 1.0, where the
+        ctor's _alpha mirror already starts at 1.0 (ctor, ~:368) —
+        configure_hover(1.0, 1.0) on that first tick still fires
+        _apply_resting_alpha -> set_alpha(1.0), lands on the skip path
+        (a == self._alpha), and the heal runs anyway."""
+        if a == self._alpha:
+            self._exclude_from_alt_tab()      # read-only compare; see above
+            return
         try:
             self.top.attributes("-alpha", a)
         except tk.TclError:
-            pass
+            pass                               # never record a failed write
+        else:
+            self._alpha = a                    # latch only AFTER the write succeeds
         # Tk's -alpha rewrites GWL_EXSTYLE on the opaque↔layered transition,
         # wiping WS_EX_TOOLWINDOW → re-assert the Alt-Tab exclusion every time.
         self._exclude_from_alt_tab()
@@ -1020,10 +1074,19 @@ class TileWindow:
 
     # ── opacity / hover / zoom (Task C1) ────────────────────────────────────
     def configure_hover(self, inactive, hover):
-        """Set the inactive/hover opacities and apply the resting opacity now."""
+        """Set the inactive/hover opacities and apply the resting opacity now.
+
+        PV3: re-applies only on a REAL change (or the very first call).
+        _preview_style_tile calls this AND set_active for every tile on every
+        tick; with both guarded, an unchanged tick applies the resting alpha
+        ZERO times instead of twice."""
+        changed = (inactive != self._opacity_inactive
+                   or hover != self._opacity_hover
+                   or not self._resting_applied)
         self._opacity_inactive = inactive
         self._opacity_hover = hover
-        self._apply_resting_alpha()
+        if changed:
+            self._apply_resting_alpha()
 
     def configure_zoom(self, enabled, factor, anchor):
         """Set hover-zoom parameters. Does not zoom until the next <Enter>."""
@@ -1033,16 +1096,30 @@ class TileWindow:
 
     def set_active(self, active):
         """Mark this tile as the active client's (last-activated / foreground).
-        An active tile rests at hover opacity even when not hovered."""
-        self._active = bool(active)
-        self._apply_resting_alpha()
+        An active tile rests at hover opacity even when not hovered.
+
+        PV3: the resting alpha depends only on (_hovering, _active, opacities),
+        and hover transitions apply it themselves, so an unchanged flag means
+        there is nothing to re-apply — see configure_hover."""
+        active = bool(active)
+        changed = (active != self._active) or not self._resting_applied
+        self._active = active
+        if changed:
+            self._apply_resting_alpha()
 
     def _apply_resting_alpha(self):
-        """Alpha when not mid-hover: hover if hovering-or-active, else inactive."""
-        if self._hovering or self._active:
-            self.set_alpha(self._opacity_hover)
-        else:
-            self.set_alpha(self._opacity_inactive)
+        """Alpha when not mid-hover: hover if hovering-or-active, else inactive.
+
+        Latches _resting_applied HONESTLY off the post-call mirror instead of
+        unconditionally before the write: set_alpha only updates self._alpha
+        AFTER a successful Tk write (see set_alpha), so a transient TclError
+        leaves the mirror behind the target and this flag False — the next
+        guarded call in configure_hover/set_active then retries instead of
+        believing a failed write already landed."""
+        target = (self._opacity_hover if (self._hovering or self._active)
+                  else self._opacity_inactive)
+        self.set_alpha(target)
+        self._resting_applied = (self._alpha == target)  # failed write leaves the mirror behind
 
     def _dragging(self):
         return self._press_root is not None or self._mode is not None
@@ -1092,24 +1169,38 @@ class TileWindow:
         self._chip = chip or ""
         self._tag = tag or ""
         self._render_caption()
-        if dot:
+        # C5-04: the dot fill is re-pushed unchanged on every tick — only write
+        # a colour that actually differs from the last one applied.
+        if dot and dot != self._dot_color:
             try:
                 self._dot.itemconfigure(self._dot_item, fill=dot)
             except tk.TclError:
                 pass
+            else:
+                self._dot_color = dot
 
     def _render_caption(self):
         # The strip carries only name + status dot + role chip now; the activity
         # label ('tag') has moved onto the video body (caption-onvideo). Ellipsize
         # the NAME so a long name can't push the chip off the fixed-width row.
+        #
+        # C5-04: fc_gui re-composes and re-pushes the identical caption for every
+        # tile on every ~250 ms tick (set_caption from the compose pass, set_badge
+        # from the tick body), so guard the three Label writes on the last-applied
+        # pair. `_tag_lbl` is a constant "" — folded into the first-write case via
+        # the None sentinel rather than tracked separately.
         shown = self._badge or self._name
         shown = self._ellipsize_name(shown)
+        applied = (shown, self._chip)
+        if applied == self._caption_applied:
+            return
         try:
             self._name_lbl.configure(text=shown)
             self._chip_lbl.configure(text=self._chip)
             self._tag_lbl.configure(text="")     # activity moved on-video
         except tk.TclError:
-            pass
+            return                               # never record a failed write
+        self._caption_applied = applied
 
     def _ellipsize_name(self, name):
         """Truncate the strip name to fit the fixed-width row. Budget = the tile
@@ -1141,12 +1232,20 @@ class TileWindow:
 
     def set_excluded(self, flag):
         """Mark this tile as excluded from hotkey cycling (session-only, C4). Shows
-        a dim dot on the strip while excluded; clears it when re-included."""
+        a dim dot on the strip while excluded; clears it when re-included.
+
+        PV3: _preview_style_tile pushes this for every tile on every tick, and the
+        label write is ~170 µs whether or not the flag moved — so write only when
+        the rendered glyph actually changes."""
         self._excluded = bool(flag)
+        text = "●" if self._excluded else ""
+        if text == self._excl_text:
+            return
         try:
-            self._excl_lbl.configure(text="●" if self._excluded else "")
+            self._excl_lbl.configure(text=text)
         except tk.TclError:
-            pass
+            return                               # never record a failed write
+        self._excl_text = text
 
     def is_excluded(self) -> bool:
         return self._excluded
@@ -1320,6 +1419,37 @@ class TileWindow:
         budget = int(usable // per_char)
         return _ellipsize(text, budget)
 
+    def _label_font(self, size, family="Consolas", weight="bold"):
+        """Cached tkfont.Font for the bottom-line labels (C5-03).
+
+        Creating a Font is a Tcl round-trip; _fit_label_text needed up to ~21 of
+        them PER CALL and runs twice per tile per ~250 ms tick (activity label +
+        location line). Bounded by construction: `size` is clamped to
+        [_LABEL_MIN_SIZE, _LABEL_MAX_SIZE] by every caller and family/weight are
+        fixed. PER-INSTANCE, never module-level: a Font belongs to the
+        interpreter that created it, so a shared cache would hand a destroyed
+        interpreter's font to the next tile (and, in pytest, to the next root)."""
+        import tkinter.font as tkfont
+        key = (family, size, weight)
+        f = self._label_fonts.get(key)
+        if f is None:
+            f = tkfont.Font(root=getattr(self, "top", None), family=family,
+                            size=size, weight=weight)
+            self._label_fonts[key] = f
+        return f
+
+    def _fit_memo_put(self, key, value):
+        """Record one auto-fit result under a HARD CAP (_FIT_MEMO_MAX, FIFO) and
+        return it. The label text mutates with the pilot's ship/system, so this
+        cache must stay bounded — an unbounded render cache is a known bug class
+        here (see the map's label factory). Returns `value` so call sites can
+        `return self._fit_memo_put(...)`."""
+        memo = self._fit_memo
+        if key not in memo and len(memo) >= _FIT_MEMO_MAX:
+            memo.pop(next(iter(memo)), None)     # evict the oldest entry
+        memo[key] = value
+        return value
+
     def _fit_label_text(self, text, base_size):
         """Auto-fit a bottom-line label to the tile width. Returns
         (shown_text, drawn_size):
@@ -1334,7 +1464,13 @@ class TileWindow:
         `avail_w` = the tile width minus the label's L/R pad (4+4). When the width
         is unknown (unplaced) the base size + full text are returned unchanged.
         Font-metric creation is guarded against tk.TclError (headless) — on failure
-        it falls back to the Tk-free char-count estimate (_ellipsize_bottom)."""
+        it falls back to the Tk-free char-count estimate (_ellipsize_bottom).
+
+        C5-03: Fonts come from the per-tile cache (_label_font) and the RESULT is
+        memoised in the bounded _fit_memo. The key (text, base, avail_w) carries
+        every input the result depends on — family and weight are module
+        constants, and a tile resize moves `avail_w` — so a hit is exact, not an
+        approximation."""
         text = text or ""
         try:
             base = int(base_size)
@@ -1345,22 +1481,21 @@ class TileWindow:
         if w <= 0 or not text:
             return text, base
         avail_w = max(0, w - 2 * _LABEL_PAD)
+        memo_key = (text, base, avail_w)
+        hit = self._fit_memo.get(memo_key)
+        if hit is not None:
+            return hit
         try:
-            import tkinter.font as tkfont
-            root = getattr(self, "top", None)
             best = None
             for size in range(base, _LABEL_MIN_SIZE - 1, -1):
-                f = tkfont.Font(root=root, family="Consolas", size=size,
-                                weight="bold")
-                if f.measure(text) <= avail_w:
+                if self._label_font(size).measure(text) <= avail_w:
                     best = size
                     break
             if best is not None:
-                return text, best
+                return self._fit_memo_put(memo_key, (text, best))
             # Still too wide at the floor → ellipsize to fit at the floor size.
             floor = _LABEL_MIN_SIZE
-            f = tkfont.Font(root=root, family="Consolas", size=floor,
-                            weight="bold")
+            f = self._label_font(floor)
             lo, hi = 0, len(text)
             while lo < hi:
                 mid = (lo + hi + 1) // 2
@@ -1369,10 +1504,12 @@ class TileWindow:
                     lo = mid
                 else:
                     hi = mid - 1
-            return _ellipsize(text, lo), floor
+            return self._fit_memo_put(memo_key, (_ellipsize(text, lo), floor))
         except tk.TclError:
             # Headless / no font support: fall back to the char-count estimate at
-            # the base size (never raises, keeps the label bounded).
+            # the base size (never raises, keeps the label bounded). NOT memoised:
+            # the Tk failure can be transient (see the AV-filter trap cured in
+            # tests/conftest.py) and a cached degraded result would stick.
             return self._ellipsize_bottom(text, base), base
 
     # ── location caption strip (its own thin line, below the label strip) ─────

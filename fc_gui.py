@@ -15553,8 +15553,16 @@ class FCToolGUI:
         # a class constant defined at :11141).
         cfg = self.config.setdefault("preview", {})
         migrated = "mode" in cfg
+        # PV4: materialize a default ONLY on an actual miss. `setdefault(key,
+        # json.loads(json.dumps(default)))` deep-copied all 52 defaults on EVERY
+        # call because Python evaluates the argument eagerly — 272 µs/call vs
+        # 5.5 µs, ~45 calls/s (this rides the 40 ms hotkey fast-drain pass), plus
+        # ~2,300 objects/s straight to the GC. Which keys get filled, when, and
+        # with what is UNCHANGED — including the per-key deep copy, so a caller
+        # mutating a returned list/dict can never corrupt _PREVIEW_DEFAULTS.
         for key, default in FCToolGUI._PREVIEW_DEFAULTS.items():
-            cfg.setdefault(key, json.loads(json.dumps(default)))
+            if key not in cfg:
+                cfg[key] = json.loads(json.dumps(default))
         if not migrated and self.config.get("overlay", {}).get("enabled"):
             cfg["mode"] = "eveo_labels"   # one-time legacy migration; sticky thereafter
         return cfg
@@ -16148,6 +16156,10 @@ class FCToolGUI:
     def _preview_retire_tile(self, hwnd):
         """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
         self._preview_tile_rects.pop(hwnd, None)
+        # PV7: _preview_video_labels is hwnd-keyed like the two dicts around it
+        # and was pruned only at teardown, so a retired client's composed label
+        # lingered for the rest of the session (tests read this dict).
+        self._preview_video_labels.pop(hwnd, None)
         tile = self._preview_tiles.pop(hwnd, None)
         if tile is None:
             return
@@ -16499,6 +16511,19 @@ class FCToolGUI:
         svc = self._preview_hotkeys
         if svc is None:
             return
+        # PV6: peek BEFORE building the per-key index. This runs ~25×/s off the
+        # 40 ms fast drain and the overwhelmingly common outcome is "no events",
+        # in which case the index (8 `key` property hits, each strip().lower(),
+        # + 2 containers) is pure waste.
+        #
+        # This cannot add latency to a real keypress: Queue.empty() is a
+        # non-blocking peek, and an event that lands just AFTER the check is
+        # simply picked up by the next pass — exactly the same window as an event
+        # landing just after today's drain loop breaks on queue.Empty. Tolerant
+        # of a service whose events object has no empty() (never skips then).
+        peek_empty = getattr(getattr(svc, "events", None), "empty", None)
+        if peek_empty is not None and peek_empty():
+            return
         live = list(self._preview_clients.values())
         by_key = {c.key: c for c in live if not c.is_login}
         while True:
@@ -16773,7 +16798,7 @@ class FCToolGUI:
                 return st
         return None
 
-    def _preview_caption_parts(self, client, state, rules, overrides,
+    def _preview_caption_parts(self, client, state, rules, overrides_norm,
                                role_chip, tag_index, doctrine_tag_captions):
         """Compose (name, dot_color, chip, tag_text) for one tile's caption.
 
@@ -16784,6 +16809,12 @@ class FCToolGUI:
         - tag_text precedence (caveat #4): manual override > rule label >
           doctrine tag (first, sorted) > "". An empty-string override means
           "hide" and still wins.
+
+        `overrides_norm` is the overlay overrides map with keys ALREADY stripped
+        and lowercased. PV3: that normalization used to run here, i.e. once per
+        tile per tick over the whole override map; it now rides the caption memo
+        bundle in _preview_compose_captions (same invalidation key, so it is
+        rebuilt exactly when the raw overrides can have changed).
         """
         if client.is_login:
             return ("login screen", None, "", "")
@@ -16799,7 +16830,7 @@ class FCToolGUI:
         # tag precedence (caveat #4): manual override > rule label >
         # doctrine tag (first, sorted) > "". An empty-string override = "hide".
         key = client.key
-        norm = {k.strip().lower(): v for k, v in (overrides or {}).items()}
+        norm = overrides_norm or {}
         rule_label = overlay_rules.label_for(state, rules, {}) if state else ""
         hull_tags = (tag_index.get(state.ship_type_id)
                      if (state is not None and tag_index) else None)
@@ -16838,21 +16869,27 @@ class FCToolGUI:
         #   * self._config_rev                  -> catches overlay rule/override
         #     edits (they persist via _save_config) and any other config change.
         # Recompute only when that key changes, not per tick.
+        # PV3: the bundle now carries the overrides ALREADY NORMALIZED (keys
+        # stripped + lowercased) instead of raw. _preview_caption_parts used to
+        # rebuild that dict per tile per tick; it derives purely from the raw
+        # overrides, so it belongs to exactly this memo and inherits its
+        # (unchanged) invalidation key — no second memo, no new staleness class.
         store = getattr(self, "fittings", None)
         frev = store.revision() if store is not None else 0
         bundle_key = (self.config.get("fleet", {}).get("active_doctrine", ""),
                       frev, getattr(self, "_config_rev", 0))
         memo = getattr(self, "_preview_caption_memo", None)
         if memo is not None and memo[0] == bundle_key:
-            doctrine, tag_index, rules, ocfg, overrides = memo[1]
+            doctrine, tag_index, rules, ocfg, overrides_norm = memo[1]
         else:
             doctrine = self._active_doctrine_obj()
             tag_index = fleet_composer.build_tag_index(doctrine, store)
             rules = self._overlay_rules()
             ocfg = self._overlay_cfg()
-            overrides = ocfg.get("overrides", {}) or {}
+            overrides_norm = {str(k).strip().lower(): v for k, v
+                              in (ocfg.get("overrides", {}) or {}).items()}
             self._preview_caption_memo = (
-                bundle_key, (doctrine, tag_index, rules, ocfg, overrides))
+                bundle_key, (doctrine, tag_index, rules, ocfg, overrides_norm))
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
         show_chip = bool(cfg.get("show_role_chip", True))
         # Bottom-strip label style (shared with the eveo overlay): config['overlay']
@@ -16875,7 +16912,7 @@ class FCToolGUI:
             state = None if client.is_login else self._preview_state_for(client.key)
             role_chip = self._preview_role_chip(client) if show_chip else ""
             name, dot, chip, activity = self._preview_caption_parts(
-                client, state, rules, overrides, role_chip, tag_index,
+                client, state, rules, overrides_norm, role_chip, tag_index,
                 doctrine_tag_captions)
             try:
                 if do_strip:
