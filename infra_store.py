@@ -487,6 +487,59 @@ class InfraStore:
             lst.sort(key=lambda e: (e.get("name") or ""))
         return result
 
+    # ── Read views for READ-ONLY consumers (perf findings MP2 + MP4) ──────────
+    #
+    # entries()/by_system() deep-copy so a caller may freely EDIT what it gets
+    # back. That costs 6.17 ms per entries() call on a 481-record store — 5.82 ms
+    # of it pure copy.deepcopy — and it is paid per resolved intel message (intel
+    # worker), per zKill alert, and on the Tk thread per map show / bridge push /
+    # hover tooltip. The *_view accessors below serve consumers that only READ:
+    # same data, same order, same lock discipline, an order of magnitude cheaper
+    # (measured on a 481-record store: entries 8.03 ms -> 0.34 ms, one system's
+    # by_system bucket 7.32 ms -> 0.04 ms).
+
+    def entries_view(self) -> list[dict]:
+        """READ-ONLY shallow snapshot of every record, ordered exactly like
+        :meth:`entries` (by ``system_name`` then ``name``).
+
+        CONTRACT — **the caller must not mutate what it receives.** Each record
+        is a fresh top-level ``dict``, so replacing a key on a returned record
+        still cannot reach the store; what is SHARED with the live store is any
+        NESTED value. ``position`` is the only nested field in the canonical
+        record set, and it is the one that matters:
+        ``view[0]["position"]["x"] = 0`` WOULD corrupt the store. A consumer
+        that edits records — or hands them somewhere that might — must keep
+        using :meth:`entries`.
+
+        Same locking as :meth:`entries`: the list is materialised INSIDE the
+        RLock (never a live iterator over ``_entries``), so the snapshot is
+        stable even while a scan worker mutates the store; the sort then runs
+        outside the lock on data nobody else can see.
+        """
+        with self._lock:
+            out = [dict(entry) for entry in self._entries.values()]
+        out.sort(key=lambda e: ((e.get("system_name") or ""), (e.get("name") or "")))
+        return out
+
+    def by_system_view(self, system_id) -> list[dict]:
+        """READ-ONLY shallow snapshot of the records placed in ONE system —
+        equal to ``by_system().get(system_id) or []`` without copying (or even
+        visiting the buckets of) the rest of the store.
+
+        Same read-only contract and locking as :meth:`entries_view`. ``None`` or
+        an unknown ``system_id`` yields ``[]``, matching ``by_system()``, which
+        omits unplaced records entirely. Sorted by ``name`` like a ``by_system``
+        bucket, and equal names tie-break identically (both iterate ``_entries``
+        in insertion order and sort stably).
+        """
+        if system_id is None:
+            return []
+        with self._lock:
+            out = [dict(entry) for entry in self._entries.values()
+                   if entry.get("system_id") == system_id]
+        out.sort(key=lambda e: (e.get("name") or ""))
+        return out
+
     # ── Scan-region configuration + per-system scan timestamps ────────────────
 
     def get_regions(self) -> list[int]:

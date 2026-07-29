@@ -705,7 +705,7 @@ def build_default_fleet_template(primary_name, primary_id, *, new_id=None):
     return t
 
 
-def _resolve_reinforced_id_pairs(store):
+def _resolve_reinforced_id_pairs(store, entries=None):
     """Unordered ``frozenset({system_id_a, system_id_b})`` for every store gate
     manually flagged ``reinforced``, resolved to system ids the SAME pure/local
     way the Ansiblex bridge union resolves names (``map_overlays.resolve_bridges``
@@ -718,13 +718,23 @@ def _resolve_reinforced_id_pairs(store):
     SYSTEM-ID pairs (not structure ids), so a flagged store gate maps onto the
     config ``ansiblex_connections`` pair it corresponds to purely by resolved
     system id -- collapsing any name/case variance between the two sources. Empty
-    for no store / no flagged gates. Guarded: never raises into the caller."""
+    for no store / no flagged gates. Guarded: never raises into the caller.
+
+    ``entries``: an ALREADY-TAKEN read-only store snapshot (``entries_view()``).
+    Both callers union corroborated gate pairs off a snapshot immediately before
+    asking for the reinforced set, so passing theirs in makes ONE snapshot serve
+    both instead of reading the whole store twice per map show / per intel line
+    (perf finding MP2 -- the double-pay half). Omitted/None => this function
+    takes its own snapshot from ``store``, as before. READ-ONLY here: the
+    entries are only inspected, never edited."""
     try:
-        if store is None:
-            return set()
+        if entries is None:
+            if store is None:
+                return set()
+            entries = store.entries_view()
         import infra_overlay
         import map_overlays as mo
-        names = infra_overlay.reinforced_gate_pairs(store.entries())
+        names = infra_overlay.reinforced_gate_pairs(entries)
         return {frozenset(pair) for pair in mo.resolve_bridges(names)}
     except Exception as exc:
         print(f"[MAP] reinforced pair resolve failed: {exc}")
@@ -1409,7 +1419,8 @@ class FCToolGUI:
         # the routing set on the next call). resolve_bridges gives deduped,
         # unordered id-pairs via the same pure/local resolver the map uses;
         # de-dupe against the config set by unordered id-pair. Cheap + thread-safe
-        # (RLock-guarded store.entries(), no ESI, no Tk) -> callable off-thread.
+        # (RLock-guarded store.entries_view(), no ESI, no Tk) -> callable
+        # off-thread.
         resolved = list(resolved)
         # Ensure the store is available for routing even when the map infra
         # DISPLAY layer is off (owner config) and nothing has built it -- else the
@@ -1418,10 +1429,18 @@ class FCToolGUI:
         # already-built store short-circuits; otherwise build it (cheap + thread-
         # safe + build-once). None only on genuine load failure -> gate-only route.
         store = getattr(self, "_infra_store", None) or self._ensure_infra_store()
+        # ONE read-only snapshot serves the corroborated union below AND the
+        # reinforced filter after it. entries_view() is a shallow (dict(e)) copy
+        # instead of entries()' deepcopy: this runs on the intel worker for every
+        # resolved message and per zKill alert, where the deepcopy was 5.82 ms of
+        # a 6.17 ms call (perf finding MP2). Read-only here -- nothing below
+        # edits a record.
+        snapshot = None
         if store is not None:
             try:
                 import infra_overlay
                 import map_overlays as mo
+                snapshot = store.entries_view()
                 seen = set()
                 for conn in resolved:
                     parts = conn.split("|")
@@ -1430,7 +1449,7 @@ class FCToolGUI:
                     except (ValueError, IndexError):
                         pass
                 for ida, idb in mo.resolve_bridges(
-                        infra_overlay.corroborated_gate_pairs(store.entries())):
+                        infra_overlay.corroborated_gate_pairs(snapshot)):
                     key = frozenset((ida, idb))
                     if key not in seen:
                         seen.add(key)
@@ -1442,8 +1461,12 @@ class FCToolGUI:
         # get_stargate_route cache keys on the sorted connection list, so a changed
         # set (config OR store) routes correctly with no stale cache. Applies to
         # BOTH union sources -- a flagged store gate resolves to the same id-pair
-        # as its config twin. Guarded/no-op when nothing is flagged.
-        reinforced = _resolve_reinforced_id_pairs(getattr(self, "_infra_store", None))
+        # as its config twin. Guarded/no-op when nothing is flagged. Reuses the
+        # snapshot taken above (same store object -- _ensure_infra_store publishes
+        # to self._infra_store) so the store is read ONCE per call, not twice;
+        # None snapshot (no store, or the union raised) -> it takes its own.
+        reinforced = _resolve_reinforced_id_pairs(
+            getattr(self, "_infra_store", None), entries=snapshot)
         if reinforced and resolved:
             kept = []
             for conn in resolved:
@@ -6344,10 +6367,17 @@ class FCToolGUI:
             # already-built store; else build once (cheap, thread-safe). Shared with
             # the routing choke so there is only ever one store.
             store = getattr(self, "_infra_store", None) or self._ensure_infra_store()
+            # ONE read-only snapshot for BOTH the corroborated union here and the
+            # reinforced filter below -- this method used to read the whole store
+            # TWICE per map show / bridge push (12.79 ms on the Tk thread, perf
+            # finding MP2). entries_view() is the shallow read-only accessor;
+            # nothing in this method edits a record.
+            snapshot = None
             if store is not None:
                 try:
                     import infra_overlay
-                    name_pairs += infra_overlay.corroborated_gate_pairs(store.entries())
+                    snapshot = store.entries_view()
+                    name_pairs += infra_overlay.corroborated_gate_pairs(snapshot)
                 except Exception as exc:
                     print(f"[MAP] infra gate-pairs union failed: {exc}")
             resolved = mo.resolve_bridges(name_pairs)
@@ -6357,7 +6387,7 @@ class FCToolGUI:
             # config counterpart, so excluding that id-pair removes the line no
             # matter which source contributed it. Reversible (clear the flag ->
             # the pair returns). Empty set when nothing is flagged -> no-op.
-            reinforced = _resolve_reinforced_id_pairs(store)
+            reinforced = _resolve_reinforced_id_pairs(store, entries=snapshot)
             if reinforced:
                 resolved = tuple(p for p in resolved
                                  if frozenset(p) not in reinforced)
@@ -6620,7 +6650,13 @@ class FCToolGUI:
         try:
             import infra_overlay
             import infra_parser
-            entries = store.by_system().get(system_id) or []
+            # Single-system READ-ONLY view: by_system() deep-copied all 481
+            # records and sorted every bucket to read ONE system's list -- 6.56 ms
+            # on the Tk thread per hover tooltip / right-click (perf finding MP4).
+            # by_system_view returns the same list (same order, same "[]" for an
+            # unknown/None system) without touching the rest of the store; the
+            # records below are only read.
+            entries = store.by_system_view(system_id)
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
             surviving = infra_overlay.filter_entries(entries, filters, now_iso)
             ticker_cache = getattr(self, "_owner_ticker_cache", None) or {}
