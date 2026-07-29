@@ -16,9 +16,23 @@ chat_monitor._discover_files does.
 Scope note (SCAN EVERY PREVIEW CHARACTER, cheaply): the monitor globs the whole
 Gamelogs dir and maps each file to its character via the `Listener:` header, so
 all characters with a live preview tile can be covered. Files whose Listener does
-not resolve to a tracked character are header-read once then skipped until the
+not resolve to a tracked character are header-read ONCE then skipped until the
 tracked set changes (set_tracked_characters). Incremental byte-offset tailing +
 the cheap "(combat)" prefix reject keep N-client scanning sub-millisecond.
+
+Header-read economics (PERF PV2 / QUALITY_AUDIT C2-18, fixed 2026-07-28): a real
+Gamelogs folder is an ARCHIVE, not a working set — 13,544 files on the owner's
+box, of which only ~70 were written in the last week. Two rules keep the poll
+thread off that archive:
+  * a resolved `Listener:` is cached by MEMBERSHIP, so an empty header (~48% of
+    the folder predates the `Listener:` line) is a real answer to the TAILER,
+    never a per-poll miss — but the gated scan still re-asks an empty answer,
+    because a transient open failure and EVE's create-then-write-the-header gap
+    both LOOK like "no header", so a live file self-heals within one backstop;
+  * only a file that could still be live — written inside
+    `_SEED_TAIL_WINDOW_SECONDS`, or already holding unread bytes — pays the 2 KB
+    header read at seed. Older files are registered at EOF with the read
+    DEFERRED and are resolved lazily if they ever show a sign of life.
 
 ENGLISH CLIENT ONLY: the `(combat) … from` keyword match assumes the English
 localization. Localized clients use translated keywords and are out of scope
@@ -172,7 +186,10 @@ def compute_status(logs_dir, positions, listeners, tracked, *,
 
     Does at most one cheap ``os.path.isdir`` stat (NEVER a glob — the mtime-gate
     invariant forbids per-poll globbing) unless ``dir_exists`` is supplied.
-    ``positions`` is ``{path: offset}``; ``listeners`` is ``{path: char}``;
+    ``positions`` is ``{path: offset}``; ``listeners`` is ``{path: char}`` whose
+    value may also be ``""`` (read, no `Listener:` line) or ``None`` (header read
+    DEFERRED at seed) — both are falsy here, so such a file counts toward
+    ``file_count`` but never toward ``active_count`` or ``present``.
     ``tracked`` is the lowercased tracked-char set, or ``None`` (track everything).
     Pure apart from the optional single stat — fully unit-testable."""
     d = logs_dir or ""
@@ -253,7 +270,13 @@ class GamelogMonitor:
         self._positions: dict[str, int] = {}         # path -> byte offset
         self._fingerprints: dict[str, bytes] = {}    # path -> tail bytes
         self._buffers: dict[str, str] = {}           # path -> partial-line text
-        self._listeners: dict[str, str] = {}         # path -> char name
+        # path -> `Listener:` for that file. FOUR states, all load-bearing:
+        #   ABSENT   never registered (only reachable before seed_file runs);
+        #   None     header read DEFERRED at seed (archive file — see seed_file);
+        #   ""       read produced no name. Usually final (~48% of a real folder
+        #            predates the header line) but NOT always — see discover_files;
+        #   "Name"   resolved and authoritative.
+        self._listeners: dict[str, str | None] = {}
         # New-file discovery gate (see discover_files) — mirrors chat_monitor's
         # `_last_dir_mtime` gate verbatim: re-globbing the Gamelogs directory is
         # O(files-in-dir) and, like Chatlogs, it accumulates files indefinitely
@@ -357,6 +380,37 @@ class GamelogMonitor:
                 return m.group(1).strip()
         return ""
 
+    def _listener_for(self, path) -> str:
+        """Cached `Listener:` for `path` — reads the 2 KB header AT MOST ONCE.
+
+        MEMBERSHIP-based on purpose. The shape this replaces,
+        ``self._listeners.get(path) or self._read_listener(path)``, treated a
+        legitimately EMPTY header ("") as a cache MISS, so every headerless file
+        was re-opened and re-parsed on EVERY 1 s poll, forever — ~6,500 files on
+        the owner's folder (~48% of it predates the `Listener:` header line), at
+        0.15–4.45 ms each. That alone kept the poll thread permanently saturated
+        (PERF PV2 / QUALITY_AUDIT C2-18).
+
+        A stored ``None`` means the header read was DEFERRED at seed time (see
+        seed_file): resolving it here is the lazy path, taken only once the file
+        has earned an open by actually having content to tail. A stored ``""`` is
+        returned verbatim — re-asking an empty answer is the gated scan's job
+        alone (discover_files), never the tailer's, or the per-poll re-read this
+        cache exists to kill comes straight back.
+        """
+        cached = self._listeners.get(path)
+        if cached is not None:          # "" is a REAL answer (headerless file)
+            return cached
+        listener = self._read_listener(path)
+        self._listeners[path] = listener
+        return listener
+
+    def _within_tail_window(self, mtime) -> bool:
+        """True when `mtime` is recent enough that EVE could still be appending."""
+        if mtime is None:
+            return False
+        return (time.time() - mtime) <= self._SEED_TAIL_WINDOW_SECONDS
+
     def _is_tracked(self, listener: str) -> bool:
         if self._tracked is None:
             return True
@@ -372,6 +426,69 @@ class GamelogMonitor:
     # _DIR_RESCAN_INTERVAL_SECONDS. 60s bounds worst-case new-file discovery
     # latency while cutting the per-second glob by ~60x on a long session.
     _DIR_RESCAN_INTERVAL_SECONDS = 60.0
+
+    # Live tail window (PERF PV2). A file whose last write is older than this
+    # cannot be one a client still holds open — EVE opens a NEW Gamelog per
+    # session, and a week of silence means that session is long over — so its
+    # `Listener:` header is not worth reading at seed time. Measured file ages in
+    # the owner's 13,544-file folder: 4 within 1 h, 12 within 6 h, 45 within 24 h,
+    # 71 within 7 days. A week therefore header-reads ~0.5% of the folder
+    # (~11–36 ms) instead of all of it (~60 s), while keeping every file the
+    # client could conceivably still be appending to on the EAGER path.
+    _SEED_TAIL_WINDOW_SECONDS = 7 * 24 * 3600.0
+
+    def _dir_stat_index(self, logs_dir):
+        """``{path: os.stat_result}`` for the whole Gamelogs dir, from ONE
+        directory enumeration. ``{}`` on any failure (callers fall back to a
+        direct stat).
+
+        ``os.scandir`` serves size/mtime out of the enumeration itself, whereas
+        ``os.stat``/``getsize`` re-opens each file — which on this directory
+        class (OneDrive-hosted, real-time AV filter) costs 71–85 µs per file and
+        never warms up. Measured on the owner's 13,544-file folder: **62 ms for
+        the whole sweep vs 963 ms of individual stats**. Called ONLY from
+        discover_files' already-gated scan branch (directory-mtime change or the
+        60 s backstop) — never per poll."""
+        index = {}
+        try:
+            with os.scandir(logs_dir) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_file():
+                            continue
+                        # Key exactly as glob.glob builds its results, so the
+                        # index and self._positions share one path spelling.
+                        index[os.path.join(logs_dir, entry.name)] = entry.stat()
+                    except OSError:
+                        continue
+        except OSError:
+            return {}
+        return index
+
+    def _resolve_deferred(self, path, st) -> None:
+        """Promote a file whose listener is not yet a real name — DEFERRED at seed
+        (``None``) or an empty ``""`` that may have been transient (see
+        discover_files) — once it shows a sign of life: unread bytes past our
+        recorded position, or a write inside the live tail window.
+
+        The store is unconditional and lands BEFORE any tail emission this cycle
+        (poll_once runs discover_files first), so a promoted file is attributed
+        from its very next line; a re-read that is still headerless simply stores
+        ``""`` again, harmlessly.
+
+        Runs on discover_files' gated scan, reusing the stat that scan already
+        holds, so a dead archive file costs nothing at all — no open, and no
+        per-poll stat either. Checking growth per POLL instead is not viable at
+        this scale: 13,544 individual stats measure ~0.96 s on this folder class,
+        which would re-saturate exactly the thread PV2 frees. The cost of that
+        choice is bounded promotion latency (one backstop interval, 60 s) for a
+        file the client cannot actually be writing to (see
+        _SEED_TAIL_WINDOW_SECONDS)."""
+        if st is None:
+            return
+        if (st.st_size > self._positions.get(path, 0)
+                or self._within_tail_window(st.st_mtime)):
+            self._listeners[path] = self._read_listener(path)
 
     def discover_files(self):
         """Register any new Gamelog files (seed to EOF). Constant-rotation safe:
@@ -406,16 +523,61 @@ class GamelogMonitor:
             paths = glob.glob(os.path.join(logs_dir, "*.txt"))
         except OSError:
             return
+        # One enumeration feeds BOTH jobs below (seed sizing + deferred
+        # promotion); see _dir_stat_index for why it is not one stat per file.
+        stats = self._dir_stat_index(logs_dir)
         for path in paths:
             if path not in self._positions:
-                self.seed_file(path)
+                self.seed_file(path, st=stats.get(path))
+            elif not self._listeners.get(path):
+                # FALSY listener — retry it here, gated by _resolve_deferred's
+                # "grew OR still inside the tail window" test (PERF PV2). All
+                # three falsy states earn that retry:
+                #   None   → header read DEFERRED at seed (archive file);
+                #   ""     → a read that found no `Listener:`. Usually the real,
+                #            final answer — but _read_listener ALSO returns "" on
+                #            an OSError (this box's real-time AV filter fails
+                #            opens transiently, a documented class) and for a live
+                #            file whose first 2 KB do not hold the header YET:
+                #            creating the file bumps the dir mtime and therefore
+                #            arms the very next gated scan, which races EVE's
+                #            header write. Treating those as authoritative forever
+                #            silently kills damage flash + decloak alerts for that
+                #            character until restart, so the empty answer must
+                #            stay retryable HERE (self-heals within one backstop,
+                #            ≤60 s) even though it is authoritative to the tailer;
+                #   absent → never resolved at all; same treatment.
+                # The archive cost model is unchanged: an out-of-window file that
+                # has not grown fails _resolve_deferred's gate and is never opened
+                # (~6,500 such files on the owner's box), and an in-window empty
+                # header is retried at most once per gated scan (backstop 60 s,
+                # but a dir-mtime bump — e.g. a new gamelog being created — can
+                # arm one sooner) — a few dozen (71 in-window files measured).
+                self._resolve_deferred(path, stats.get(path))
 
-    def seed_file(self, path):
-        """Register a file and set its position to EOF (existing lines not replayed)."""
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
+    def seed_file(self, path, st=None):
+        """Register a file and set its position to EOF (existing lines not replayed).
+
+        `st` is an optional pre-fetched ``os.stat_result`` (see _dir_stat_index);
+        omit it and the file is stat'ed directly.
+
+        HEADER-READ POLICY (PERF PV2): the 2 KB `Listener:` header read is paid
+        only for a file that could still be LIVE — last written inside
+        `_SEED_TAIL_WINDOW_SECONDS`, or already holding unread bytes (a
+        persisted-state resume gap means we are about to tail it anyway). Every
+        older file is registered at EOF with its listener DEFERRED (`None`) and
+        is never opened; `_resolve_deferred` reads its header on a later gated
+        scan if it ever grows, and attribution works from that point on.
+        Before this, enabling previews header-read the whole folder — 13,533
+        files × 4.45 ms ≈ **60 s of blocking I/O**, re-paid on every
+        `set_logs_dir`."""
+        if st is None:
+            try:
+                st = os.stat(path)
+            except OSError:
+                st = None
+        size = st.st_size if st is not None else 0
+        mtime = st.st_mtime if st is not None else None
         # Resume from persisted state when the file is known and hasn't shrunk.
         key = self._state_key(path)
         prior = self._persisted_state.get(key)
@@ -430,14 +592,30 @@ class GamelogMonitor:
         self._positions[path] = resume
         self._fingerprints[path] = b""
         self._buffers[path] = ""
-        self._listeners[path] = self._read_listener(path)
+        eager = resume < size or self._within_tail_window(mtime)
+        self._listeners[path] = self._read_listener(path) if eager else None
 
     def poll_once(self):
         """One cycle: discover new files, then tail each tracked file."""
         self.discover_files()
         for path in list(self._positions):
-            listener = self._listeners.get(path) or self._read_listener(path)
-            self._listeners.setdefault(path, listener)
+            if self._listeners.get(path, "") is None:
+                # DEFERRED (None): the seed skipped the 2 KB header read (archive
+                # file, older than the live tail window). Not opened and not even
+                # stat'ed here — discover_files' gated scan owns EVERY promotion;
+                # this site never re-asks a question that would cost an open.
+                # (That asymmetry with discover_files' `not …` test is deliberate:
+                # the gated scan retries falsy listeners nearly for free off a
+                # stat it already holds, whereas retrying here would be per-poll.)
+                # The "" default is load-bearing — it maps the fourth state,
+                # ABSENT, onto "never resolved" (resolved by _listener_for below)
+                # rather than onto "deferred". The remaining two states fall
+                # through by design: a real name is tailed, and "" reaches
+                # _is_tracked, which rejects it whenever a tracked set exists
+                # (fc_gui always supplies one; `None` = track-everything is only
+                # the pre-first-tick state).
+                continue
+            listener = self._listener_for(path)
             if not self._is_tracked(listener):
                 continue
             self.poll_file(path)
@@ -460,9 +638,15 @@ class GamelogMonitor:
         DamageEvent(timestamp=_ts_of(line), character_name=listener, ...). The
         SAME line is also run through parse_decloak_line() (short-circuited on a
         cheap substring); on a hit a DecloakEvent is emitted via on_decloak.
+
+        The file's `Listener:` is resolved only once there is actually new text
+        to attribute (below), so a pass that finds nothing new never opens the
+        file for its header (PERF PV2). That resolve is DEFENCE IN DEPTH for
+        DIRECT callers only: reached via poll_once, a still-deferred (`None`)
+        file is `continue`d before it ever gets here, so in the running monitor
+        the deferred→resolved promotion always happens on discover_files' gated
+        scan instead. Keep the call — it makes poll_file correct standalone.
         """
-        listener = self._listeners.get(path) or self._read_listener(path)
-        self._listeners.setdefault(path, listener)
         read_start = self._positions.get(path, 0)
         fingerprint = self._fingerprints.get(path, b"")
         try:
@@ -505,6 +689,9 @@ class GamelogMonitor:
         if not raw:
             return
 
+        # There IS new text — now the header is worth resolving (cached after the
+        # first read; a deferred seed resolves here, lazily, exactly once).
+        listener = self._listener_for(path)
         text = self._buffers.get(path, "") + raw.decode("utf-8", errors="replace")
         lines = text.split("\n")
         self._buffers[path] = lines.pop()            # trailing partial line
