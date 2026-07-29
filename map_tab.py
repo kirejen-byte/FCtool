@@ -1662,6 +1662,17 @@ class MapTab:
         self._redraw_overlays()
         self._rebuild_threat_staging_rows()      # keep the drawer's rows in sync
         self._rebuild_friendly_staging_rows()    # ...incl. the friendly-projection rows
+        # The threat/friendly-projection HALO must track the new staging set too --
+        # otherwise it keeps projecting from the OLD set until the user next touches
+        # a drawer toggle (owner-visible gap now that the menu grew add/remove).
+        # Both recomputes self-gate on their own enabled flag (the "threat" layer
+        # var / the friendly master var) and clear via set_threat(None)/
+        # set_friendly_threat(None) when off or empty, so -- same as every other
+        # call site (_on_threat_ship, _on_layer_toggle('threat'), the drawer
+        # toggle/all/none handlers) -- they are invoked unconditionally here.
+        # Ordering/comment mirrors _on_threat_ship: SAME ship class drives both halos.
+        self._recompute_threat()
+        self._recompute_friendly_threat()   # SAME ship class drives both halos
 
     def apply_range_overlay(self, overlay) -> None:
         self.state.range_overlay = overlay          # base-layer change:
@@ -4401,6 +4412,18 @@ class MapTab:
         self._menu_add(menu, "Copy name", "copy", name)
         self._menu_add(menu, "Add to friendly staging", "add_friendly_staging", name)
         self._menu_add(menu, "Add to hostile staging", "add_hostile_staging", name)
+        # Remove items are shown ONLY when this system is already in that list
+        # (owner ask 2026-07-29), mirroring how "Clear range overlay"/"Clear
+        # route" above only appear when there is something to clear -- unlike
+        # the unconditional Add items. state.friendly_staging/hostile_staging
+        # are the system-ID sets set_staging() keeps in sync, so membership is
+        # an exact int check with no name casing/shape concerns at this layer.
+        if sid in self.state.friendly_staging:
+            self._menu_add(menu, "Remove from friendly staging",
+                           "remove_friendly_staging", name)
+        if sid in self.state.hostile_staging:
+            self._menu_add(menu, "Remove from hostile staging",
+                           "remove_hostile_staging", name)
         # Structures here… (Task 5): open the infra manager PRE-FILTERED to this
         # system. NOT routed through _menu_add -- that binds cb(name); the infra
         # manager wants the system ID, so bind a bespoke command passing sid.

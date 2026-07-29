@@ -6033,8 +6033,8 @@ class FCToolGUI:
         # Every handler takes a single system-name string (verified against
         # _intel_system_menu's working invocations), and MapTab calls each as
         # cb(name) — so they wire straight through with no adapters. The staging
-        # adds reuse the Jump Range tab's mutate+persist flow so both tabs (and
-        # the map overlay) stay in sync.
+        # adds/removes reuse the Jump Range tab's mutate+persist flow so both
+        # tabs (and the map overlay) stay in sync.
         callbacks = {
             "set_destination": self._set_destination_or_copy,
             "open_dotlan": open_dotlan,
@@ -6044,6 +6044,10 @@ class FCToolGUI:
             "add_friendly_staging": lambda name: self._add_staging_from_map(
                 name, "friendly"),
             "add_hostile_staging": lambda name: self._add_staging_from_map(
+                name, "hostile"),
+            "remove_friendly_staging": lambda name: self._remove_staging_from_map(
+                name, "friendly"),
+            "remove_hostile_staging": lambda name: self._remove_staging_from_map(
                 name, "hostile"),
             # Resolved Ansiblex bridge id-pairs, refreshed on each tab-show.
             "get_bridges": self._get_map_bridges,
@@ -6442,6 +6446,34 @@ class FCToolGUI:
         self._friendly_staging, self._hostile_staging = mutate_staging_lists(
             self._friendly_staging, self._hostile_staging,
             "add", canonical, target,
+        )
+        try:
+            self._refresh_staging_listboxes()
+        except Exception:
+            pass
+        self._save_staging_systems()          # persists + pushes staging to map
+        try:
+            self._rerun_range_check_if_ready()
+        except Exception:
+            pass
+
+    def _remove_staging_from_map(self, name, target):
+        """Map right-click -> remove a system from a staging list. Mirrors
+        _add_staging_from_map's cascade (mutate_staging_lists ->
+        _refresh_staging_listboxes -> _save_staging_systems -> re-check) with
+        action="remove" instead of "add" -- the exact same shared primitives
+        the Jump Range tab's own _remove_staging_system uses, so the Jump Range
+        tab lists, the threat drawer's staging rows, and the map overlay all
+        stay in sync. No canonicalization against _system_names is needed here
+        (unlike add): mutate_staging_lists already matches case-insensitively
+        and whitespace-stripped against whatever casing the stored entry has,
+        which is the same house comparison _remove_staging_system relies on."""
+        clean = (name or "").strip()
+        if not clean:
+            return
+        self._friendly_staging, self._hostile_staging = mutate_staging_lists(
+            self._friendly_staging, self._hostile_staging,
+            "remove", clean, target,
         )
         try:
             self._refresh_staging_listboxes()
