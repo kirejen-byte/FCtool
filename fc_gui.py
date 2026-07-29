@@ -3932,11 +3932,33 @@ class FCToolGUI:
 
     # ── zKillboard Tab ────────────────────────────────────────────────────────
 
+    # Height the live-feed PanedWindow REQUESTS (pack still stretches it past
+    # this whenever the tab has the room). It is the feed's floor once the tab
+    # starts scrolling, and it is what keeps the conversion from re-flowing the
+    # tab: measured on this box, the chrome above the feed asks for 467px and
+    # the two ScrolledText(height=30) feeds make the PanedWindow ask for 483,
+    # i.e. 996px of content into the 814px cavity the app's OWN default
+    # (1200x900) gives this tab — so an un-floored scroll body would scroll at
+    # the default size with the feed at 483px instead of stretching to fill.
+    # At 200 the body asks for 713px, stays UNDER the default cavity (pinned,
+    # feed still stretches to the same 301px as today), and starts scrolling
+    # only below that — where today the feed is instead crushed (101px at
+    # minsize(1000, 700), and the whole Cyno Check body vanishes at 33 of the
+    # 261px it needs).
+    _INTEL_FEED_MIN_H = 200
+
     def _build_intel_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Intelligence  ")
 
-        header = tk.Frame(tab, bg=BG_DARK)
+        # Whole-tab scroll body. CARE: everything below keeps its own scrolling
+        # (both feeds, the paste/cyno result panes, the filter chip Texts) —
+        # _on_global_mousewheel stops its walk at a self-scrolling widget so the
+        # wheel over a feed never scrolls the tab underneath it as well.
+        (self._intel_scroll_canvas, body,
+         self._sync_intel_scroll) = self._make_scrollable_tab_body(tab)
+
+        header = tk.Frame(body, bg=BG_DARK)
         header.pack(fill=tk.X, padx=10, pady=(10, 2))
         tk.Label(header, text="Live Engagement Feed",
                  font=("Consolas", 13, "bold"), fg=FG_ACCENT, bg=BG_DARK
@@ -3956,11 +3978,11 @@ class FCToolGUI:
                        ).pack(side=tk.LEFT, padx=15)
 
         # ── Config-driven intel filter panel ───────────────────────────────
-        self._build_intel_filter_panel(tab)
+        self._build_intel_filter_panel(body)
 
         # ── Paste Intel drawer (collapsible) ──────────────────────────────
         self._paste_drawer_expanded = False
-        self._paste_drawer_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+        self._paste_drawer_frame = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                              highlightbackground=BORDER_COLOR,
                                              highlightthickness=1)
         self._paste_drawer_frame.pack(fill=tk.X, padx=10, pady=(2, 5))
@@ -4021,7 +4043,7 @@ class FCToolGUI:
         self._paste_result.pack(fill=tk.X, padx=10, pady=(0, 6))
 
         # ── Intelligence Fusion Panel ─────────────────────────────────────
-        intel_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+        intel_frame = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                highlightbackground=BORDER_COLOR, highlightthickness=1)
         intel_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
@@ -4126,11 +4148,14 @@ class FCToolGUI:
         self._current_log = None  # Tracks active log widget for append helpers
 
         # ── Cyno Check drawer (collapsible) ───────────────────────────────
-        self._build_cyno_check_drawer(tab)
+        self._build_cyno_check_drawer(body)
 
         # ── Split pane: zKill (left) | Intel (right) ─────────────────────
-        self._paned = tk.PanedWindow(tab, orient=tk.HORIZONTAL, bg=BG_DARK,
-                                      sashwidth=4, sashrelief=tk.RIDGE)
+        # height= is a REQUEST, not a cap (measured): pack's expand still
+        # stretches it to fill the tab. See _INTEL_FEED_MIN_H.
+        self._paned = tk.PanedWindow(body, orient=tk.HORIZONTAL, bg=BG_DARK,
+                                      sashwidth=4, sashrelief=tk.RIDGE,
+                                      height=self._INTEL_FEED_MIN_H)
         self._paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         # Left pane — zKillboard
@@ -4247,8 +4272,20 @@ class FCToolGUI:
         tab = tk.Frame(self.notebook, bg=BG_DARK)
         self.notebook.add(tab, text="  Jump Range  ")
 
+        # The whole tab body scrolls. Measured on this box: idle the tab asks
+        # for 426px, but a range check against 8 friendly + 8 hostile stagings
+        # takes it to 885px — over the 814px cavity at the app's OWN default
+        # 1200x900, and well over the 614px at its minsize(1000, 700). pack
+        # starves whatever is packed last, so the staging manager (and the tail
+        # of the results table) silently fell off the bottom with no scrollbar
+        # and no other indication. Nothing here re-flows: no child of the body
+        # expands, so with the window large the body is pinned to the viewport
+        # and the layout is identical (see _make_scrollable_tab_body).
+        (self._range_scroll_canvas, body,
+         self._sync_range_scroll) = self._make_scrollable_tab_body(tab)
+
         # Input section
-        input_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+        input_frame = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                 highlightbackground=BORDER_COLOR, highlightthickness=1)
         input_frame.pack(fill=tk.X, padx=10, pady=10)
 
@@ -4309,7 +4346,7 @@ class FCToolGUI:
         self._range_dest.bind("<Return>", lambda e: self._do_range_check())
 
         # Results
-        self._range_result_frame = tk.Frame(tab, bg=BG_DARK)
+        self._range_result_frame = tk.Frame(body, bg=BG_DARK)
         self._range_result_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self._range_result_label = tk.Label(
@@ -4325,11 +4362,11 @@ class FCToolGUI:
         self._range_detail_label.pack(pady=5)
 
         # Secondary range table
-        self._range_secondary_frame = tk.Frame(tab, bg=BG_DARK)
+        self._range_secondary_frame = tk.Frame(body, bg=BG_DARK)
         self._range_secondary_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
 
         # ── Staging-system manager (persisted friendly/hostile lists) ────────
-        staging_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
+        staging_frame = tk.Frame(body, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
                                  highlightbackground=BORDER_COLOR, highlightthickness=1)
         staging_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
@@ -15437,12 +15474,210 @@ class FCToolGUI:
             self._scroll_canvases = set()
         self._scroll_canvases.add(canvas)
 
+    def _make_scrollable_tab_body(self, tab, bg=BG_DARK):
+        """Give a whole notebook tab a scrollable BODY.
+
+        Returns ``(canvas, body, sync)``. Build the tab's widgets into ``body``
+        exactly as they were built into ``tab``; call ``sync()`` from any path
+        that changes the body's content height (the results table, a drawer
+        toggle) — see ``_resync_scroll``.
+
+        The layout is preserved rather than re-flowed, which is the whole
+        difficulty:
+
+        * the window item's WIDTH tracks the canvas, so children packed
+          ``fill=X`` still span the tab instead of shrinking to their natural
+          width (the Characters-tab trick, ``_on_char_canvas_resize``);
+        * its HEIGHT is pinned to the viewport while the content is SHORTER
+          than the viewport, so a child packed ``expand=True`` (the Intel tab's
+          PanedWindow) still stretches to the bottom exactly as it does today,
+          and is released to its natural height (``-height 0``) the moment the
+          content outgrows the viewport — which is precisely when scrolling has
+          to start. Measured: a pinned frame still reports its NATURAL
+          ``winfo_reqheight``, so the pin can be lifted again, and re-applying
+          the same value fires no ``<Configure>`` (no feedback loop).
+
+        The canvas requests 1x1 deliberately: a default ``tk.Canvas`` asks for
+        10c x 7c (~378x265px) it does not need, which is how the X-Up Log
+        drawer got starved (tests/test_fleet_xup_comp_scroll.py). fill/expand
+        supplies the real size. No widget-level ``<MouseWheel>`` binding is
+        added here — the pointer-routed global router owns the wheel, and a
+        plain widget binding would also swallow shift-wheel (map/facts.md).
+        """
+        canvas = tk.Canvas(tab, bg=bg, highlightthickness=0, width=1, height=1)
+        scrollbar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        body = tk.Frame(canvas, bg=bg)
+        window = canvas.create_window((0, 0), window=body, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # One settle pass may be queued at a time (see the tail of sync()); the
+        # list is the closure's mutable flag.
+        pending = []
+
+        def _settle():
+            pending.clear()
+            try:
+                if not canvas.winfo_exists():
+                    return
+                # Flush the packer before re-measuring: it settles the body's
+                # requested height over SEVERAL idle cycles (measured during one
+                # Intel-tab build: 251 -> 350 -> 713px), so a plain after_idle
+                # still reads a stale request and pins a body that should have
+                # been left scrollable.
+                canvas.update_idletasks()
+                sync(settled=True)
+            except tk.TclError:
+                pass
+
+        def sync(_event=None, settled=False):
+            """``settled`` = the packer has been flushed, so what is measured
+            here is final rather than mid-rebuild; such a pass does not queue
+            another one."""
+            view_w = canvas.winfo_width()
+            view_h = canvas.winfo_height()
+            # Before the canvas has been allocated (winfo_* == 1) there is no
+            # geometry to track and pinning to 1px would squash the content;
+            # the <Configure> that follows allocation does the real work.
+            if view_w > 1:
+                req_h = body.winfo_reqheight()
+                canvas.itemconfigure(
+                    window, width=view_w,
+                    height=(view_h if view_h > req_h else 0))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # No explicit re-clamp here: measured on this build, a canvas with
+            # -confine 1 (the DEFAULT, and what these canvases use) re-clamps
+            # its view by itself the moment -scrollregion shrinks under it —
+            # origin 700 -> 200 -> 0 as a 1000px region was cut to 500 then to
+            # 200. So content that shrinks under a scrolled view cannot leave
+            # the tab blank as long as the region is actually updated, which is
+            # what the settle pass and _resync_scroll guarantee. The flip side
+            # is _restore_scroll_origin: confine snapping to the top is exactly
+            # what a mid-rebuild empty frame would trigger.
+            #
+            # The packer recomputes the body's requested height at IDLE time,
+            # so the <Configure> that first allocates the canvas can measure a
+            # request that is still stale — which pins a body that should have
+            # been left scrollable (measured at build time: 713px of content
+            # pinned into a 614px viewport). Re-measure once the packer has
+            # settled. The settle pass never re-schedules and only one is ever
+            # queued, so this cannot become an idle loop.
+            if not settled and not pending:
+                pending.append(True)
+                try:
+                    canvas.after_idle(_settle)
+                except tk.TclError:
+                    pending.clear()
+
+        body.bind("<Configure>", sync)
+        canvas.bind("<Configure>", sync)
+        self._register_scroll_canvas(canvas)
+        return canvas, body, sync
+
+    def _resync_scroll(self, sync):
+        """Re-measure a scrollable tab body after a content rebuild.
+
+        The idle pump is REQUIRED: the packer recomputes the body's requested
+        height at idle time, so calling ``sync()`` straight after building rows
+        still measures the OLD height (the ``_update_fleet_composition``
+        precedent). ``<Configure>`` alone is not a sufficient trigger either —
+        a canvas window item whose content falls entirely outside the viewport
+        is UNMAPPED rather than resized, so no ``<Configure>`` ever arrives.
+        ``sync`` is None until the owning tab is built, so a partial harness
+        no-ops instead of raising."""
+        if sync is None:
+            return
+        try:
+            self.root.update_idletasks()
+            sync(settled=True)
+        except tk.TclError:
+            pass
+
+    def _restore_scroll_origin(self, canvas, origin):
+        """Put a scroll body's view back where the user had left it.
+
+        A rebuild EMPTIES its frame before refilling it, and a canvas re-clamps
+        its own view the instant ``-scrollregion`` shrinks under it (``-confine``
+        is on by default), so re-running a range check would throw a user who
+        had scrolled down to the staging manager back to the top of the tab —
+        even when the new table is LONGER than the old one. Clamped to whatever
+        content actually exists now, so a genuinely shorter result still lands
+        inside it. Call AFTER ``_resync_scroll``."""
+        if canvas is None or not origin:
+            return
+        try:
+            box = canvas.bbox("all")
+            if not box:
+                return
+            content_h = box[3] - box[1]
+            if content_h <= 0:
+                return
+            max_top = max(0, content_h - canvas.winfo_height())
+            canvas.yview_moveto(min(origin - box[1], max_top) / content_h)
+        except tk.TclError:
+            pass
+
+    # Widget classes that carry their OWN <MouseWheel> class binding — measured
+    # on this box, Tk 8.6.15 (the inventory in docs/agents/map/facts.md). Their
+    # class binding sits at bindtag index 1 and runs BEFORE the "all"-tag router
+    # below, but — measured, not assumed — it does NOT return "break", so the
+    # event still reaches the router afterwards. Without the walk-stop in
+    # _widget_owns_the_wheel a wheel over the intel feed would scroll the feed
+    # AND the tab underneath it. tk.Spinbox and Entry are deliberately absent:
+    # they carry no class binding, so the wheel is the enclosing tab's.
+    _SELF_SCROLLING_CLASSES = frozenset({
+        "Text", "Listbox", "Treeview", "TCombobox", "TSpinbox",
+        "Scrollbar", "TScrollbar",
+    })
+
+    @classmethod
+    def _widget_owns_the_wheel(cls, w) -> bool:
+        """True if ``w``'s own class binding already consumed this wheel event.
+
+        A widget that CAN'T scroll (a feed shorter than its viewport, an empty
+        staging list) hands the wheel back to the enclosing tab rather than
+        swallowing it, so hovering an empty panel never traps the gesture."""
+        try:
+            klass = w.winfo_class()
+        except Exception:
+            return False
+        if klass not in cls._SELF_SCROLLING_CLASSES:
+            return False
+        yview = getattr(w, "yview", None)
+        if yview is None:
+            # TCombobox / TSpinbox / Scrollbar: the class binding changes a
+            # VALUE or drives someone else's view. Never chain past it.
+            return True
+        try:
+            first, last = yview()
+        except Exception:
+            return True
+        # Fully visible content -> the class binding was a no-op.
+        return (last - first) < 0.999
+
     def _on_global_mousewheel(self, event):
         """Route the wheel to the scrollable canvas under the pointer.
 
         Tk does not auto-deliver <MouseWheel> to the hovered widget, so we find
         it via winfo_containing and walk up to the nearest registered scroll
-        canvas. Handles Windows/Mac (event.delta) and Linux (Button-4/5)."""
+        canvas. Handles Windows/Mac (event.delta) and Linux (Button-4/5).
+
+        Whether a real WM_MOUSEWHEEL is delivered by CURSOR position or by
+        FOCUS is UNRESOLVED on this box (docs/agents/map/facts.md) -- so
+        "did a self-scrolling widget already consume this via its class
+        binding" is decided from event.widget, never from the pointer-found
+        widget below. event.widget is the one widget whose bindtags Tk
+        actually fired for this real event, so it is the only widget that
+        can honestly answer that question. Under cursor delivery event.widget
+        IS the pointer-deepest widget, so gating on it walks the identical
+        chain as canvas selection below and changes nothing. Under focus
+        delivery the two can differ; gating on event.widget means a
+        self-scrolling widget merely being under the cursor -- CLASS alone,
+        never proven to have run -- can no longer be mistaken for "already
+        handled". That mistake used to strand the gesture: neither the
+        widget under the pointer (its binding never ran) nor the tab under
+        it (the router suppressed itself) would scroll."""
         scroll_canvases = getattr(self, "_scroll_canvases", None)
         if not scroll_canvases:
             return None
@@ -15454,6 +15689,23 @@ class FCToolGUI:
             amount = -1 * int(event.delta / 120)
             if amount == 0 and event.delta:
                 amount = -1 if event.delta > 0 else 1
+
+        # "Already handled?" walks from event.widget -- never the pointer --
+        # up to the nearest registered canvas (see docstring: this is the
+        # only widget whose class binding provably ran for this event).
+        ew = getattr(event, "widget", None)
+        while ew is not None and ew not in scroll_canvases:
+            if self._widget_owns_the_wheel(ew):
+                # event.widget's own class binding (the intel feed, a
+                # staging list, a combobox) runs first and already consumed
+                # this wheel -- it just doesn't return "break". Stop so the
+                # tab does not ALSO scroll underneath it.
+                return None
+            ew = getattr(ew, "master", None)
+
+        # Canvas SELECTION always stays pointer-based: scroll whichever
+        # registered canvas the cursor is actually over, independent of
+        # which widget the real event nominally targeted.
         try:
             w = self.root.winfo_containing(event.x_root, event.y_root)
         except Exception:
@@ -25591,6 +25843,7 @@ $bmp.Dispose()
         else:
             self._paste_toggle_btn.config(text="▶ Paste Intel")
             self._paste_body.pack_forget()
+        self._resync_scroll(getattr(self, "_sync_intel_scroll", None))
 
     # ── Cyno Check drawer ──────────────────────────────────────────────────
 
@@ -25702,6 +25955,7 @@ $bmp.Dispose()
         else:
             self._cyno_toggle_btn.config(text="▶ Cyno Check")
             self._cyno_body.pack_forget()
+        self._resync_scroll(getattr(self, "_sync_intel_scroll", None))
 
     def _toggle_xup_log(self):
         self._xup_log_expanded = not self._xup_log_expanded
@@ -25953,6 +26207,7 @@ $bmp.Dispose()
         else:
             self._intel_filter_header.config(text="▶ Filters")
             self._intel_filter_body.pack_forget()
+        self._resync_scroll(getattr(self, "_sync_intel_scroll", None))
 
     def _on_paste_text_modified(self, event=None):
         # Reset the modified flag so the event fires again next change
@@ -27090,12 +27345,26 @@ $bmp.Dispose()
         return names
 
     def _show_range_result(self, result):
+        # Where the user was reading before this rebuild threw the table away
+        # (restored at the end — see _restore_scroll_origin).
+        canvas = getattr(self, "_range_scroll_canvas", None)
+        origin = canvas.canvasy(0) if canvas is not None else None
+
         # Clear secondary table
         for w in self._range_secondary_frame.winfo_children():
             w.destroy()
+        # pack shrinks a master's requested size as slaves go, but when the LAST
+        # slave goes it never resets it — the emptied frame keeps the height of
+        # the table it used to hold (measured: 442px of nothing). Re-assert a
+        # 1x1 request; pack's propagation takes back over the moment a new row
+        # is packed. Without this a check that returns FEWER rows leaves a hole
+        # (and, now that the tab scrolls, a scrollregion that never shrinks).
+        self._range_secondary_frame.config(width=1, height=1)
 
         if "error" in result:
             self._range_result_label.config(text=result["error"], fg=FG_RED)
+            self._resync_scroll(getattr(self, "_sync_range_scroll", None))
+            self._restore_scroll_origin(canvas, origin)
             return
 
         if result["in_range"]:
@@ -27142,6 +27411,12 @@ $bmp.Dispose()
                 font=("Consolas", 10), fg=FG_DIM, bg=BG_DARK,
                 justify=tk.LEFT, wraplength=900,
             ).pack(anchor=tk.W, pady=(6, 3))
+
+        # The results table just changed height under a fixed viewport: extend
+        # the scrollregion onto it, then put the view back where the user had
+        # it (clamped onto whatever the new table actually is).
+        self._resync_scroll(getattr(self, "_sync_range_scroll", None))
+        self._restore_scroll_origin(canvas, origin)
 
     def _render_range_table(self, destination: str, entries: list[dict],
                             title_suffix: str = "", title_color: str = FG_ACCENT,
