@@ -71,11 +71,22 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   error direction for a config the owner has contradicted — and the DEFAULT
   source grouping routes through the same ``group_of``, so the answer cannot
   depend on whether the FC happened to name the system in the message.
-* **A group that is absent for a CONFIG reason says so.** The primary staging
-  is the only friendly default source, so an unset Settings > Staging System
-  renders hostile rows under no FRIENDLY header — which reads exactly like
-  "no friendly staging is in range". ``NOTE_NO_FRIENDLY`` is that group's
-  missing-row note.
+* **Every configured staging is a SOURCE — both lists and the primary.** The
+  friendly list used to do nothing but GROUP a system that entered the report
+  by another route; it could not put a row on the board at all, while the
+  hostile list from the SAME Settings page contributed one per entry. An owner
+  with three friendly stagings configured therefore got a report that silently
+  dropped all three, and — with a staging system set — not even
+  ``NOTE_NO_FRIENDLY`` fired to explain the absence. That asymmetry was exactly
+  the "a missing row reads as nothing there" failure the rest of this module is
+  built to prevent, so ``default_sources`` now emits all three (through
+  ``group_of``, so a both-listed system still reads HOSTILE) and
+  ``build_report`` de-duplicates them in the ONE place that already did.
+* **A group that is absent for a CONFIG reason says so.** With no friendly
+  source configured AT ALL — no Settings > Staging System *and* an empty
+  friendly staging list — a configured hostile list renders hostile rows under
+  no FRIENDLY header, which reads exactly like "no friendly staging is in
+  range". ``NOTE_NO_FRIENDLY`` is that group's missing-row note.
 * **The staging is Settings > Staging System** (``zkillboard.staging_system``),
   system-wide, mirroring ``implant_reminder.resolve_staging``'s rung 2. No
   ``market.*`` key is read here, and neither is the implant reminder's own
@@ -654,8 +665,10 @@ GROUP_ORDER = (GROUP_HOSTILE, GROUP_FRIENDLY, GROUP_LINKED)
 @dataclass(frozen=True)
 class SourceLists:
     """The configured staging picture: the primary friendly staging plus both
-    configured lists. The lists are what GROUPS a linked system; the primary is
-    the only friendly source used when nothing is linked.
+    configured lists. All three are DEFAULT SOURCES (rows of their own when the
+    message linked nothing) and all three are what GROUPS a linked system —
+    those two jobs are the same three fields on purpose, so a staging the report
+    can classify is always a staging the report can also ask about.
 
     ``problems`` carries plain-ASCII complaints about config the app could not
     read, so a list it had to discard becomes a visible warning on the report
@@ -670,25 +683,48 @@ class SourceLists:
         return bool(self.primary or self.hostile or self.friendly)
 
     def default_sources(self) -> list:
-        """``[(ref, group)]`` — primary friendly staging + every hostile staging.
+        """``[(ref, group)]`` — EVERY configured staging: primary + both lists.
+
+        This used to emit the primary and the hostile list only. ``friendly``
+        was consumed by ``group_of`` alone, so a system in it could be
+        CLASSIFIED but never SOURCED: the owner's three configured friendly
+        stagings produced no rows, and the one note that could have explained
+        the gap (``NOTE_NO_FRIENDLY``) was keyed on the primary, so a set
+        staging system suppressed even that. Reported live, 2026-07-29. Two
+        lists edited side by side on one Settings page, one of which quietly
+        does not answer the question the window exists to answer, is the
+        "a missing row reads as nothing there" failure this module is built to
+        prevent — read in the direction the module had not yet checked.
 
         Grouped THROUGH ``group_of``, so the two groupings cannot disagree.
-        This used to construct the groups by hand (primary -> FRIENDLY, hostile
-        list -> HOSTILE), which reads the same for every sane config and then
-        diverges on the one config where the answer matters: a staging system
-        ALSO listed as hostile rendered FRIENDLY here while ``group_of`` — the
-        rule the LINKED path uses — called it HOSTILE. The same contradicted
-        config answering "friend" or "foe" depending on whether the FC happened
-        to name the system in the message is the worst shape that disagreement
-        could take. HOSTILE is the safe direction, and now it is the only one.
+        Constructing the groups by hand (primary -> FRIENDLY, hostile list ->
+        HOSTILE) reads the same for every sane config and then diverges on the
+        one config where the answer matters: a staging system ALSO listed as
+        hostile rendered FRIENDLY here while ``group_of`` — the rule the LINKED
+        path uses — called it HOSTILE. The same contradicted config answering
+        "friend" or "foe" depending on whether the FC happened to name the
+        system in the message is the worst shape that disagreement could take.
+        HOSTILE is the safe direction, and it is the only one; that now covers
+        a friendly-list entry contradicted by the hostile list too.
 
         ``group_of`` still special-cases the primary as FRIENDLY, so an owner
         whose staging system is not also listed under the friendly stagings does
         NOT see their own staging rendered as an unaligned LINKED row — that was
-        the original reason for constructing the groups here, and it survives."""
+        the original reason for constructing the groups here, and it survives.
+
+        Duplicates are emitted freely (the primary is commonly ALSO in the
+        friendly list, and a contradicted config lists one system twice). They
+        are collapsed by ``build_report``, which already de-duplicated this list
+        with ``_same_system`` — deliberately NOT a second dedup here, because
+        two rules for "same system" is how the two of them start disagreeing.
+        Order therefore decides only which of two identical systems SURVIVES,
+        and the primary leads so the FC's own staging keeps its own ref. The
+        rendered ROW order is not this list's: ``build_report`` sorts by
+        ``GROUP_ORDER`` (hostiles first), then nearest-first, degraded last."""
         out: list = []
         if self.primary is not None:
             out.append((self.primary, self.group_of(self.primary)))
+        out.extend((r, self.group_of(r)) for r in self.friendly)
         out.extend((r, self.group_of(r)) for r in self.hostile)
         return out
 
@@ -884,12 +920,16 @@ NOTE_NO_SOURCES = "No staging systems configured."
 #: The same-system row's note. Plain ASCII (log-safe, see the module docstring)
 #: even though it only ever renders in the Tk toast today.
 NOTE_SAME_SYSTEM = "same system - cannot jump within a system"
-#: Non-blocking warning for the default-sources path with no primary staging.
-#: ``zkillboard.staging_system`` defaults to "", and the primary is the ONLY
-#: friendly default source — so an unset field plus a configured hostile list
-#: renders hostile rows and no FRIENDLY group at all. Absent config explaining
-#: an absent group is the same silence as an absent row: the FC reads "nobody
-#: friendly is in range" off a report that never asked the question.
+#: Non-blocking warning for the default-sources path with NO friendly source of
+#: any kind: no ``zkillboard.staging_system`` (it defaults to "") AND an empty
+#: ``jump_range.friendly_staging_systems``. Either one alone produces FRIENDLY
+#: rows, so neither alone is a missing group. Both absent plus a configured
+#: hostile list renders hostile rows and no FRIENDLY group at all, and absent
+#: config explaining an absent group is the same silence as an absent row: the
+#: FC reads "nobody friendly is in range" off a report that never asked the
+#: question. (It used to key on the primary alone — back when the friendly list
+#: was not a source, that WAS the whole condition; once the list contributes
+#: rows, a primary-only test would fire over a report full of friendly rows.)
 NOTE_NO_FRIENDLY = "No friendly staging configured - check Settings."
 TITLE_FALLBACK = "Range check"
 
@@ -1086,12 +1126,16 @@ def build_report(target, linked=(), *, ignored=None, sources=None,
             if any(_same_system(ref, prev) for prev, _g in picked):
                 continue
             picked.append((ref, group))
-        # The primary staging is the ONLY friendly default source, so an unset
-        # Settings > Staging System renders hostile rows under no FRIENDLY
-        # header — indistinguishable from "no friendly staging is in range".
-        # An unresolvable one is NOT this case: that becomes a visible
-        # unresolved row, which explains itself already.
-        if srcs.primary is None and srcs.hostile:
+        # No friendly SOURCE at all — neither Settings > Staging System nor a
+        # single friendly staging list entry — renders hostile rows under no
+        # FRIENDLY header, indistinguishable from "no friendly staging is in
+        # range". Both halves are tested for PRESENCE, not resolvability: an
+        # unresolvable name is not this case, because it becomes a visible
+        # unresolved FRIENDLY row that explains itself already. An UNREADABLE
+        # friendly list reaches here as an empty tuple and so does warn — and
+        # should: it carries its own NOTE_BAD_LIST saying why, and the pair
+        # reads as cause plus consequence rather than as one thing said twice.
+        if srcs.primary is None and not srcs.friendly and srcs.hostile:
             notes.append(NOTE_NO_FRIENDLY)
     warnings = tuple(notes)
 
