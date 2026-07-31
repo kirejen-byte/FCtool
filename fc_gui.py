@@ -122,6 +122,12 @@ import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
 from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
+# FC HUD info tiles — the preview tiles' content-carrying cousins (own chrome in
+# info_tile.py, engine + settings popup in info_tiles.py). Both modules are
+# fc_gui-free: everything they need arrives through the HudHost seams built in
+# __init__. Deliberately uncoupled from preview_tile, which is why the two
+# STRIP_H conversions between the families live on THIS side of the seam.
+import info_tiles
 # Implant-removal reminder: pure trigger/state engine + the transient over-client
 # toast. Both are self-contained (implant_reminder is Tk-free, client_toast
 # imports no fc_gui); wiring is the poller hook + _implant_show_toast below.
@@ -888,6 +894,12 @@ class FCToolGUI:
             resolve_ship_group=self._ledger_ship_group)
         self._battle_ledger_panel = None     # built by _build_xup_tab
         self._battle_ledger_broke = False    # first tick failure disables the tick
+        # FC HUD: built after _build_ui (it reads the ledger the Fleet
+        # Management tab builds). Named here so the Settings button's command,
+        # the 1 Hz beat and the intel fan-out all find an attribute even if the
+        # construct below never runs.
+        self._info_tiles = None              # InfoTileController
+        self._hud_host = None                # info_tiles.HudHost
         self._own_location_sid = None        # primary char (_refresh_current_system)
         self._own_location_mono = 0.0
         self._push_standings_to_battle_ledger()   # whatever the cache already holds
@@ -1112,6 +1124,7 @@ class FCToolGUI:
         # _post_ui_after and this loop applies it on the main thread. Armed before
         # _start_monitoring so it is running before any worker can enqueue.
         self._drain_ui_q()
+        self._build_info_tiles()
         self._setup_modules()
         self._start_monitoring()
 
@@ -1897,6 +1910,77 @@ class FCToolGUI:
         self.config["intel_filter"] = self._intel_filter
         self._save_config()
 
+    # ── FC HUD (info tiles) ───────────────────────────────────────────────────
+
+    def _build_info_tiles(self):
+        """Wire the always-on-top info tiles. Construction only — every rule the
+        HUD obeys lives in info_tiles.py / info_tile.py.
+
+        Runs AFTER `_build_ui` (the battle-ledger panel the battle tile mirrors
+        is built by `_build_xup_tab`) and AFTER `_drain_ui_q` is armed, so the
+        distance worker's `post_ui` callbacks always have a drain to land in.
+        A failure here costs the HUD and nothing else: the attributes keep their
+        `None` placeholders and every hook site is guarded.
+        """
+        try:
+            if info_tiles.heal_info_tile_layouts(self.config):
+                self._save_config()
+            self._hud_host = info_tiles.HudHost(
+                config=self.config,
+                save_config=self._save_config,
+                post_ui=self._post_ui,
+                ledger_view=lambda: (self._battle_ledger.render_model()
+                                     if self._battle_ledger is not None
+                                     else None),
+                fleet_snapshot=lambda: getattr(self, "_last_specialized_args",
+                                               None),
+                # The members route is fleet-boss-only, so "not boss" is a real
+                # answer the tile states honestly rather than a failed fetch.
+                fleet_state=lambda: (
+                    bool(self.esi_auth and self.esi_auth.is_authenticated()),
+                    getattr(self, "_last_polled_fleet_id", None),
+                    bool(getattr(self, "_last_polled_fleet_is_boss", False))),
+                # READ-ONLY: the stale-attribution guard that clears this pair on
+                # an ESI rebind stays with its owner (_range_check_own_location).
+                own_system_id=lambda: getattr(self, "_own_location_sid", None),
+                # THE staging system is the zkillboard one (market.* is a
+                # different system on a real install) — _get_staging_system is
+                # the single reader.
+                staging_name=self._get_staging_system,
+                # _preview_tile_rects stores (x, y, w, BODY_H); an info tile's
+                # own rects are full window heights, and snap_rect compares the
+                # two directly — so the strip is added HERE. info_tiles imports
+                # no preview module by design and must not re-type the constant.
+                preview_rects=lambda: [
+                    (x, y, w, body_h + preview_tile.STRIP_H)
+                    for (x, y, w, body_h) in self._preview_tile_rects.values()],
+                screen_rects=self._preview_snap_screens,
+                # Called on the resolver's WORKER thread: a module-level pure
+                # function, never an fc_gui method or a lambda closing over one
+                # (that host would owe an entry in WORKER_METHODS).
+                route_fn=jump_range.get_stargate_route,
+                # The app's catalog, so the fleet tile's hull names cost no
+                # second parse of the bundled table.
+                type_catalog=self.type_catalog)
+            self._info_tiles = info_tiles.InfoTileController(self.root,
+                                                             self._hud_host)
+            block = self.config.get("info_tiles")
+            self._info_tiles.set_enabled(
+                bool(block.get("enabled", False))
+                if isinstance(block, dict) else False)
+        except Exception:
+            log.exception("[hud] info tiles could not be wired")
+
+    def _open_hud_settings(self):
+        """Open the module-owned FC HUD settings popup (the "FC HUD..." button's
+        command). Non-modal and singleton-guarded by the module; it must never
+        grab, so nothing here makes it a dialog. Silent no-op when the
+        controller failed to build."""
+        if self._info_tiles is None:
+            return None
+        return info_tiles.open_hud_settings(self.root, self._info_tiles,
+                                            self._hud_host)
+
     # ── UI Construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -2102,6 +2186,13 @@ class FCToolGUI:
         # own: 1 Hz is exactly the cadence battle_ledger_panel asks for, and
         # this is the one Tk loop guaranteed to be running on every tab.
         self._battle_ledger_refresh()
+        # The FC HUD tiles ride the same beat for the same reason. Guarded like
+        # the ledger's own tick: this loop starts before _build_info_tiles runs
+        # (attribute still None) and the tiles' widgets die before the root does.
+        try:
+            self._info_tiles.tick()
+        except (AttributeError, tk.TclError):
+            pass
         try:
             self.root.after(1000, self._update_eve_clock)
         except (tk.TclError, RuntimeError):
@@ -15258,6 +15349,18 @@ class FCToolGUI:
                           toc_title="Previews")
         self._build_preview_section(scroll_frame)
 
+        # FC HUD launcher, directly under the preview block it belongs beside.
+        # Deliberately OUTSIDE _build_preview_section: a `command=` button in
+        # there owes an entry to all three preview host harness bind lists, and
+        # this button needs none of that section's state. The settings window
+        # itself is module-owned (and never grabs — a Tk grab would deafen the
+        # preview tiles), so fc_gui only places the button.
+        self._hud_button_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        self._hud_button_frame.pack(fill=tk.X, padx=20, pady=(2, 4))
+        self._hud_button = info_tiles.build_hud_button(
+            self._hud_button_frame, self._open_hud_settings)
+        self._hud_button.pack(side=tk.LEFT)
+
         # ── Autostart ────────────────────────────────────────────────────
         self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
         auto_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -16165,6 +16268,24 @@ class FCToolGUI:
     def _preview_make_tile(self, char_key, x, y, w, body_h, src_hwnd=None):
         """Construct + place a real TileWindow. Injectable: the unit tests bind a
         recording factory over this name so no Tk/DWM window is ever created."""
+        def _snap_others(h=src_hwnd):
+            # OTHER preview tiles' current rects from the hwnd-keyed
+            # _preview_tile_rects, self (this client's hwnd) excluded.
+            rects = [r for k, r in self._preview_tile_rects.items() if k != h]
+            # FC HUD tiles are snap neighbours too, and the registries stay
+            # SEPARATE — they meet only here. tile_rects() reports FULL window
+            # heights while preview's snap math re-adds its own STRIP_H to every
+            # rect this provider returns, so the strip comes back off here.
+            # Guarded on its own: a HUD fault costs the HUD's rects, never the
+            # preview neighbours (provider isolation).
+            try:
+                rects.extend([(ix, iy, iw, ih - preview_tile.STRIP_H)
+                              for (ix, iy, iw, ih)
+                              in self._info_tiles.tile_rects()])
+            except Exception:
+                pass
+            return rects
+
         tile = TileWindow(
             self.root, char_key, self._preview_palette(),
             on_activate=lambda k, h=src_hwnd: self._preview_on_tile_activate(k, h),
@@ -16173,12 +16294,10 @@ class FCToolGUI:
             on_resize_end=self._preview_on_tile_resize_end,
             on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
             on_switch_external=self._preview_on_tile_switch_external,  # C4: Ctrl+Shift+Left
-            # Snap-to-neighbours provider: OTHER tiles' current rects from the
-            # hwnd-keyed _preview_tile_rects, self (this client's hwnd) excluded.
+            # Snap-to-neighbours provider (see _snap_others above):
             # _preview_tile_rects stores (x, y, w, body_h); the tile converts to
             # full window height before snapping.
-            on_snap_others=(lambda h=src_hwnd: [
-                r for k, r in self._preview_tile_rects.items() if k != h]),
+            on_snap_others=_snap_others,
             # Snap-to-desktop-border provider: without it a neighbour parked at
             # the arrange origin (10 px in, inside the 12 px threshold) owns the
             # border's catch band and the screen edge is unreachable.
@@ -26830,6 +26949,14 @@ $bmp.Dispose()
         """Main thread: append to the ring buffer, render if visible, fire the
         async resolver, and ping on priority lines."""
         self._intel_buffer.append((msg, spans, report, priority))
+        # FC HUD intel tile: a second, read-only consumer of the same line. Same
+        # Tk thread (this method is _post_ui-marshaled) and the same
+        # degrade-don't-abort guard as its neighbours — the controller keeps its
+        # own bounded history and never touches _intel_buffer.
+        try:
+            self._info_tiles.on_intel_line(msg.channel, msg.message)
+        except Exception:
+            pass
         # B3: feed the native-preview intel index (own chat logs only — spec §4).
         # This runs on the Tk thread (root.after-marshalled), so it is a plain
         # write to the single-owner _preview_intel dict.
@@ -28967,6 +29094,15 @@ $bmp.Dispose()
             preview_teardown = getattr(self, "_preview_teardown", None)
             if callable(preview_teardown):
                 preview_teardown()
+        except Exception:
+            pass
+        # Tear down the FC HUD too (stop the distance worker, destroy the
+        # tiles). Guarded like the overlay/preview teardowns above: the
+        # controller may never have been built.
+        try:
+            hud = getattr(self, "_info_tiles", None)
+            if hud is not None:
+                hud.shutdown()
         except Exception:
             pass
         # Cancel the market elapsed-ticker after() if a scan is mid-flight at

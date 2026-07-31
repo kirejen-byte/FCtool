@@ -256,6 +256,34 @@ DEFAULT_CONFIG = {
         "match_window_s": 300,
         "match_lead_s": 30,
     },
+    # FC HUD — always-on-top info tiles (battle ledger / fleet composition /
+    # nearby intel) drawn over the EVE clients. Ships DARK twice over: the
+    # master switch is off AND every tile is off, so a user who flips only the
+    # master still sees nothing until he picks a tile (owner decision
+    # 2026-07-30). This block is a key-for-key mirror of
+    # info_tiles.default_info_tiles_config() — that function is the single
+    # owner of the shape and fc_gui never names a default itself; the mirror is
+    # guarded by tests/test_default_config.py. config.json is never
+    # deep-merged, so an upgraded install simply has no block and every reader
+    # falls back to these values.
+    "info_tiles": {
+        "enabled": False,           # MASTER GATE (opt-in)
+        "lock_layout": False,
+        "snap_enabled": True,
+        "opacity": 0.92,
+        "tiles": {
+            "battle": {"enabled": False},
+            "fleet": {"enabled": False},
+            # reference_system blank = the automatic ladder (own location, then
+            # the zkillboard staging system); a name here overrides it.
+            "intel": {"enabled": False, "max_jumps": 5,
+                      "reference_system": ""},
+        },
+        # tile_key -> [x, y, w, h], written on every move/resize end. Absent
+        # entries are placed on the default grid; garbage is floored at boot by
+        # info_tiles.heal_info_tile_layouts.
+        "layouts": {},
+    },
     "overview": {
         # Hidden by default (feature in progress); set true to show the Overview tab.
         "tab_enabled": False,
