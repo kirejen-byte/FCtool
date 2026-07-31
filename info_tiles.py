@@ -839,6 +839,32 @@ class IntelDistanceResolver:
             return
         self._queue.put(None)
         thread.join(timeout=2.0)
+        self._drain()
+
+    def _drain(self) -> None:
+        """Empty the queue (and the in-flight marks) after the worker is gone.
+
+        LOAD-BEARING FOR RESTART, not housekeeping. The worker has two ways
+        out: it takes the None sentinel, or it takes a BACKLOG item and quits
+        on the stopping flag. Down the second path the sentinel is still
+        sitting in the queue, so the next ``start()`` would hand its fresh
+        thread that None as its very first item and the thread would die on
+        the spot -- silently, because ``start()`` has already returned and
+        nothing else looks. (``stop`` then ``start`` is reachable from the app
+        itself: ``shutdown()`` stops the resolver, and re-enabling the master
+        switch spawns the intel tile, which calls ``start()``.)
+
+        The in-flight marks go with it: a system whose lookup was abandoned
+        with the backlog is no longer coming, and leaving it marked would keep
+        ``request`` from ever re-queueing it -- the row would read ``?j``
+        forever."""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            self._inflight.clear()
 
     # -- state ---------------------------------------------------------------
     def set_reference(self, system_id) -> None:
@@ -859,9 +885,20 @@ class IntelDistanceResolver:
         """The known jump distance, or None for "not answered yet" AND for
         "answered: unreachable". Both mean the same thing to the model (show
         it, badge it ``?j``); ``request`` is what tells them apart, so a dead
-        pair is not re-queued."""
+        pair is not re-queued.
+
+        A READ COUNTS AS A USE. Without the recency bump the cache would be
+        insert-ordered -- FIFO wearing an ``OrderedDict``'s clothes -- and the
+        entries evicted first would be the OLDEST-LEARNED, which in a long
+        fight are exactly the systems the tile has been showing all along.
+        Re-resolving those costs a route lookup each and re-badges live rows
+        ``?j`` while it happens."""
+        key = _as_int(system_id, -1)
         with self._lock:
-            return self._cache.get(_as_int(system_id, -1))
+            if key not in self._cache:
+                return None
+            self._cache.move_to_end(key)
+            return self._cache[key]
 
     def request(self, system_ids, on_resolved) -> None:
         """Queue any unanswered, not-in-flight systems. ``on_resolved()`` is
@@ -876,7 +913,13 @@ class IntelDistanceResolver:
                 system_id = _as_int(raw, 0)
                 if not system_id:
                     continue
-                if system_id in self._cache or system_id in self._inflight:
+                if system_id in self._cache:
+                    # Being ASKED ABOUT is a use too, the same as being read:
+                    # a system the tile keeps requesting must not age out from
+                    # under it just because its answer never changes.
+                    self._cache.move_to_end(system_id)
+                    continue
+                if system_id in self._inflight:
                     continue
                 self._inflight.add(system_id)
                 todo.append(system_id)
@@ -949,6 +992,12 @@ def heal_info_tile_layouts(cfg) -> bool:
         defaults here would silently promote a missing block into a real one;
       * IDEMPOTENT: a second call on a healed dict returns False and touches
         nothing, so the caller writes config exactly once.
+
+    ``OverflowError`` is in the malformed net for a reason that is invisible
+    until it bites: ``json.load`` accepts the non-standard ``Infinity`` /
+    ``NaN`` literals by DEFAULT, so a config carrying one loads cleanly and
+    then makes ``int(float('inf'))`` raise -- and this runs at boot, which
+    would turn a bad rect into a dead app.
     """
     if not isinstance(cfg, dict):
         return False
@@ -963,7 +1012,7 @@ def heal_info_tile_layouts(cfg) -> bool:
         try:
             x, y = int(value[0]), int(value[1])
             w, h = int(value[2]), int(value[3])
-        except (TypeError, ValueError, IndexError, KeyError):
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
             continue
         healed = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
                                            InfoTileWindow.MIN_H)
@@ -1006,7 +1055,24 @@ class HudHost:
     fleet_state: object = _no_fleet      # () -> (auth, fleet_id, is_boss)
     own_system_id: object = _none        # () -> int | None
     staging_name: object = _none         # () -> str
-    preview_rects: object = _empty       # () -> [(x, y, w, h)]
+    #: () -> [(x, y, w, h)] -- the FCPreview tiles' rects, and a CONTRACT the
+    #: host has to honour: h must already be the FULL window height, strip
+    #: INCLUDED, because that is what an info tile's own rects are and
+    #: ``snap_rect`` compares the two directly.
+    #:
+    #: fc_gui's ``_preview_tile_rects`` stores ``(x, y, w, BODY_H)`` --
+    #: preview_tile re-adds its own ``STRIP_H`` inside its snap math -- so the
+    #: wiring lambda adds ``preview_tile.STRIP_H`` there. The conversion lives
+    #: in fc_gui ON PURPOSE and not here: this module imports NEITHER preview
+    #: module (``preview_tile`` is a sibling family, deliberately uncoupled --
+    #: test-asserted), so it cannot read that constant, and re-typing 20 would
+    #: be a second owner for a number preview already owns. Un-converted rects
+    #: do not raise; they snap 20 px off, which reads as "snapping feels
+    #: sloppy" and never points here.
+    #:
+    #: ``_neighbour_rects`` is therefore pass-through: it merges these with
+    #: sibling tiles' rects and does no height maths of its own.
+    preview_rects: object = _empty
     screen_rects: object = _empty        # () -> [(x, y, w, h)]
     route_fn: object = _none             # (origin, dest) -> [ids] | None
     #: The app's own ``TypeCatalog`` (fc_gui's ``self.type_catalog``). Not a
@@ -1193,10 +1259,14 @@ class InfoTileController:
         try:
             x, y = int(rect[0]), int(rect[1])
             w, h = int(rect[2]), int(rect[3])
-        except (TypeError, ValueError, IndexError, KeyError):
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
             # Defaults are computed for the WHOLE registry, not just the live
             # tiles, so a tile's default slot does not move depending on which
             # of its siblings happened to be enabled first.
+            # OverflowError is in the net for the same reason as in
+            # `heal_info_tile_layouts`: JSON's non-standard ``Infinity``
+            # survives ``json.load`` and only dies at ``int()`` -- here that
+            # would take the whole `set_enabled(True)` down with it.
             return self._grid_rects(list(TILE_SPECS))[key]
         w, h = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
                                          InfoTileWindow.MIN_H)
@@ -1393,8 +1463,22 @@ class InfoTileController:
 
         Annotation happens ONCE, here, rather than per repaint. `channel` is
         accepted for symmetry with the fan-out (and for a future per-channel
-        filter); the tile itself does not display it."""
-        if not text:
+        filter); the tile itself does not display it.
+
+        TWO gates, deliberately asymmetric:
+
+        * **master off** (the SHIPPED DEFAULT) returns immediately, BEFORE
+          ``intel_stream.annotate``. Every FC has this feature switched off
+          until he turns it on, and this sits on the intel fan-out -- a
+          firehose during a fight -- so a feature nobody enabled must cost one
+          attribute read per line, not a regex pass over it;
+        * **master on, intel TILE off** keeps COLLECTING. Annotation of one
+          line is cheap next to the beat that is already running, and it buys
+          the tile a full history the instant it is enabled instead of an
+          empty box that fills up over the next minute -- which is precisely
+          when an FC turns it on.
+        """
+        if not text or not self._enabled:
             return
         text = str(text)
         try:
@@ -1424,7 +1508,15 @@ class InfoTileController:
     def tile_rects(self) -> list:
         """Live tile rects, for fc_gui to merge into the PREVIEW snap provider.
         Full window heights, strip included (see info_tile's module note about
-        preview's body-height convention)."""
+        preview's body-height convention).
+
+        The MIRROR of the ``HudHost.preview_rects`` contract, and it runs the
+        other way: preview_tile's snap math ADDS its own ``STRIP_H`` to every
+        rect its provider hands it, so a caller feeding these full-height
+        rects into that provider must SUBTRACT ``preview_tile.STRIP_H`` first
+        or every info tile will look 20 px taller than it is to a preview tile
+        snapping against it. Same reason as on the way in, the arithmetic
+        belongs to fc_gui: this module never imports preview_tile."""
         rects = []
         for tile in self._tiles.values():
             rect = _call(tile.rect)
@@ -1447,10 +1539,23 @@ class InfoTileController:
 
     def reset_layouts(self) -> None:
         """Forget every saved rect, then re-arrange -- the way back from a tile
-        dragged off a monitor that no longer exists."""
+        dragged off a monitor that no longer exists.
+
+        The save is NOT delegated to ``arrange`` alone: with no tile on screen
+        (master off, or every tile closed -- which is exactly the state an
+        owner is in when a saved rect is what he wants gone) ``arrange`` has
+        nothing to place and returns before saving, so the clear would live
+        only in memory and die with the process. Whenever the block actually
+        moved, this writes."""
         block = self._block(create=True)
+        cleared = bool(block.get("layouts"))
         block["layouts"] = {}
+        # `arrange` re-places + re-persists + saves, but only when there is
+        # something live to place; its gate is exactly `self._tiles`.
+        placing = bool(self._tiles)
         self.arrange()
+        if cleared and not placing:
+            self._save()
 
     def shutdown(self) -> None:
         self.resolver.stop()
@@ -1496,9 +1601,11 @@ def _grid_row(parent, row, text, widget, tip):
 
 
 def _check(parent, var, text, tip):
-    """A themed checkbox. No ``command=``: every control in this window applies
-    through its variable's write trace, so a click and a programmatic set take
-    the SAME path (and a control cannot apply twice per click)."""
+    """A themed checkbox. No ``command=``: the boxes apply through their
+    variable's write trace, so a click and a programmatic set take the SAME
+    path (and a control cannot apply twice per click). The typed reference-
+    system field is the one control that is NOT trace-driven -- a trace there
+    fires per KEYSTROKE (see ``apply_reference``)."""
     box = tk.Checkbutton(parent, text=text, variable=var,
                          font=_FONT_ROW, bg=ui_theme.BG_DARK,
                          fg=ui_theme.FG_TEXT, activebackground=ui_theme.BG_DARK,
@@ -1520,7 +1627,10 @@ def open_hud_settings(root, controller, host):
     singleton (a second click raises the live window instead of stacking a
     duplicate whose controls would fight the first's), ``<Escape>`` closes, and
     every control LIVE-APPLIES -- writes config, saves, and calls the
-    controller -- so the effect is visible without an OK button.
+    controller -- so the effect is visible without an OK button. Clicked and
+    spun controls apply on change; the one TYPED field applies when it is left
+    or Enter is pressed (and on close), because a per-keystroke apply here
+    means a per-keystroke config write.
 
     ``ui_helpers.make_modal`` is deliberately not used: its contract grabs by
     default, and this window needs none of the rest of it badly enough to risk
@@ -1553,6 +1663,10 @@ def open_hud_settings(root, controller, host):
 
     def _close(_event=None):
         global _SETTINGS_WINDOW
+        # A reference system still being typed is not lost: Escape and the
+        # Close button can both fire without the entry ever losing focus, and
+        # this window has no OK to press. Guarded + no-op when nothing changed.
+        _call(apply_reference)
         if _SETTINGS_WINDOW is win:
             _SETTINGS_WINDOW = None
         try:
@@ -1636,8 +1750,26 @@ def open_hud_settings(root, controller, host):
     def apply_intel(*_a):
         entry = intel_block()
         entry["max_jumps"] = _clamp_jumps(variables["max_jumps"].get())
-        entry["reference_system"] = str(
-            variables["reference_system"].get()).strip()
+        _call(host.save_config)
+        controller.tick()
+
+    def apply_reference(_event=None):
+        """Persist the reference system on ``<FocusOut>``/``<Return>`` -- the
+        ``fc_gui._autosave_staging_system`` cadence, and deliberately NOT the
+        write trace every other control here uses.
+
+        A system name is TYPED, and each keystroke's trace would cost a full
+        config write (an atomic rewrite + fsync of the whole file) AND, via
+        ``set_reference`` on the next beat, a wipe of every resolved distance
+        -- so typing "P-ZMZV" would be six saves and six cache flushes, five of
+        them for prefixes that name no system. The no-op guard makes a focus
+        pass over an untouched field free, which matters because tabbing
+        through the popup produces one ``<FocusOut>`` per visit."""
+        entry = intel_block()
+        text = str(variables["reference_system"].get()).strip()
+        if entry.get("reference_system") == text:
+            return
+        entry["reference_system"] = text
         _call(host.save_config)
         controller.tick()
 
@@ -1655,11 +1787,16 @@ def open_hud_settings(root, controller, host):
         textvariable=variables["max_jumps"], font=_FONT_ROW,
         bg=ui_theme.BG_ENTRY, fg=ui_theme.FG_TEXT,
         insertbackground=ui_theme.FG_TEXT, highlightthickness=0), _TIP_JUMPS)
-    _grid_row(grid, 1, "Reference system", tk.Entry(
+    reference_entry = _grid_row(grid, 1, "Reference system", tk.Entry(
         grid, width=18, textvariable=variables["reference_system"],
         font=_FONT_ROW, bg=ui_theme.BG_ENTRY, fg=ui_theme.FG_TEXT,
         insertbackground=ui_theme.FG_TEXT, highlightthickness=0),
         _TIP_REFERENCE)
+    reference_entry.bind("<FocusOut>", apply_reference, add="+")
+    reference_entry.bind("<Return>", apply_reference, add="+")
+    #: Exposed like ``hud_vars``: the wiring tests drive the apply cadence
+    #: through the widget, because the cadence IS the widget's bindings.
+    win.hud_reference_entry = reference_entry
     _grid_row(grid, 2, "Opacity", tk.Spinbox(
         grid, from_=MIN_OPACITY, to=1.0, increment=0.02, width=5,
         textvariable=variables["opacity"], font=_FONT_ROW,
@@ -1718,16 +1855,16 @@ def open_hud_settings(root, controller, host):
 
     win.hud_sync = sync_from_config
 
-    # Write traces rather than widget callbacks, for every control: typed text
-    # never fires a command (so a Spinbox/Entry would otherwise apply nothing
-    # until it lost focus), and one mechanism means one code path to reason
-    # about when asking "did this live-apply?".
+    # Write traces for the CLICKED and SPUN controls: a checkbox click and a
+    # spinner step are each one whole edit, so one apply per change is exactly
+    # right. The typed reference-system field is the exception and is bound to
+    # <FocusOut>/<Return> above -- per-keystroke there means per-keystroke
+    # config writes and cache flushes (see `apply_reference`).
     for name, handler in (("enabled", apply_master),
                           ("opacity", apply_chrome),
                           ("snap_enabled", apply_chrome),
                           ("lock_layout", apply_chrome),
-                          ("max_jumps", apply_intel),
-                          ("reference_system", apply_intel)):
+                          ("max_jumps", apply_intel)):
         variables[name].trace_add("write", handler)
     for key in TILE_SPECS:
         variables[f"tile_{key}"].trace_add("write", apply_tile(key))
