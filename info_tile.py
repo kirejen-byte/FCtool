@@ -441,7 +441,7 @@ class InfoTileWindow:
         if threshold is not None:
             try:
                 self._snap_threshold = int(threshold)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 pass
         if neighbor_provider is not None:
             self._neighbor_provider = neighbor_provider
@@ -484,7 +484,7 @@ class InfoTileWindow:
             try:
                 a, b, c, d = r
                 out.append((int(a), int(b), int(c), int(d)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
         return out
 
