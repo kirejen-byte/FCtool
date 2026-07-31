@@ -1965,9 +1965,12 @@ class FCToolGUI:
             self._info_tiles = info_tiles.InfoTileController(self.root,
                                                              self._hud_host)
             block = self.config.get("info_tiles")
+            # Single source of truth for the master-enabled fallback: fc_gui
+            # must not re-type info_tiles's own shipped-dark default.
+            master_default = info_tiles.default_info_tiles_config()["enabled"]
             self._info_tiles.set_enabled(
-                bool(block.get("enabled", False))
-                if isinstance(block, dict) else False)
+                bool(block.get("enabled", master_default))
+                if isinstance(block, dict) else master_default)
         except Exception:
             log.exception("[hud] info tiles could not be wired")
 
@@ -23346,6 +23349,9 @@ class FCToolGUI:
         # restart; a running fusion session picks up new channel_filters on its
         # next toggle).
         self._channels = channel_store.load(self.config)
+        # HudHost holds the same kind of second reference (see comment above).
+        if getattr(self, "_hud_host", None) is not None:
+            self._hud_host.config = self.config
         self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
@@ -26954,7 +26960,8 @@ $bmp.Dispose()
         # degrade-don't-abort guard as its neighbours — the controller keeps its
         # own bounded history and never touches _intel_buffer.
         try:
-            self._info_tiles.on_intel_line(msg.channel, msg.message)
+            self._info_tiles.on_intel_line(msg.channel, msg.message,
+                                           msg.timestamp)
         except Exception:
             pass
         # B3: feed the native-preview intel index (own chat logs only — spec §4).
