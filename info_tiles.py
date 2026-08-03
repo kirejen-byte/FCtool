@@ -1585,12 +1585,17 @@ class InfoTileController:
         than a plain (w, h) pair all make this a safe no-op. A numeric
         answer under the floor is clamped exactly like any other stored
         size, through ``InfoTileWindow``'s OWN (taller) floor -- these are
-        info tiles, not FCPreview tiles.
+        info tiles, not FCPreview tiles. A malformed stored layout (not a
+        proper [x, y, w, h] list -- a hand-edited config, say) is SKIPPED
+        exactly like ``heal_info_tile_layouts``'s own malformed net: not
+        repaired, not zeroed to (0, 0).
 
         Returns True iff at least one tile's stored size actually changed,
         so the popup button (and the tests) can tell "did something" from
         "nothing to resize"; config is saved AT MOST once regardless of how
-        many tiles moved.
+        many tiles moved, and a key whose stored rect already matches the
+        target [x, y, w, h] is left untouched -- a repeat click on an
+        unchanged HUD costs no write.
         """
         raw = _call(self._host.preview_tile_size)
         try:
@@ -1615,9 +1620,12 @@ class InfoTileController:
             else:
                 saved = stored.get(key)
                 try:
-                    x, y = _as_int(saved[0]), _as_int(saved[1])
-                except (TypeError, IndexError, KeyError):
+                    x, y = int(saved[0]), int(saved[1])
+                except (TypeError, ValueError, IndexError, KeyError,
+                        OverflowError):
                     continue      # neither live nor positioned -- nothing to keep
+            if stored.get(key) == [x, y, w, h]:
+                continue          # unchanged -- no redundant persist/write
             self._persist_rect(key, x, y, w, h)
             changed = True
         if changed:
