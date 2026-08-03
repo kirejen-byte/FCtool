@@ -31,6 +31,12 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   ``battle_ledger.assert_no_live_language`` (test-enforced), and the view's
   ``stamp_line`` is deliberately NOT rendered (owner directive 2026-07-30:
   players know killboard data trails a fight; the tile shows the numbers).
+- **The links report is NOT gated by the ESI fleet state.** Command-burst
+  charges are parsed out of FLEET CHAT, so the report is real with no fleet
+  boss and no ESI at all. The fleet tile therefore renders its links section
+  underneath whatever the comp rollup's gate decided -- including "Not in
+  fleet / not fleet boss". Hulls that could not be verified say so, per cell,
+  with a ``?``.
 - **Intel fails OPEN.** A line whose distance is unknown is SHOWN with ``?j``;
   hiding a possibly-adjacent hostile report is the dangerous direction. A line
   naming no system never reaches this tile, and with no reference system the
@@ -53,12 +59,13 @@ import queue
 import threading
 import tkinter as tk
 from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from tkinter import ttk
 
 import battle_ledger as bl
 import battle_ledger_panel as blp
+import command_bursts as cb
 import intel_stream
 import preview_layout
 import system_coords
@@ -259,10 +266,17 @@ class FleetCompModel:
     `hull_breakdown` is ``((hull_name, count), ...)``, also count-descending,
     summing to the row's count. The breakdown feeds the hover tooltip
     (``fleet_group_tip``); plain tuples rather than dicts so the whole model is
-    frozen, hashable and diffable by ``==`` on the render path."""
+    frozen, hashable and diffable by ``==`` on the render path.
+
+    `links` is the command-burst charge report (``LinksVM``) or None when there
+    is nothing tracked -- a separate, nested-frozen component so the renderer's
+    ``==`` diff still covers it, and so a fleet snapshot the ESI gate rejects
+    can still carry one: charge tracking is CHAT-sourced and owes ESI nothing
+    (see ``build_links_model``)."""
     status: str
     total: int
     rows: tuple
+    links: "LinksVM | None" = None
 
 
 _SHARED_CATALOG = None
@@ -420,6 +434,223 @@ def fleet_row_text(row) -> str:
         return f"{row[1]:>4}  {row[0]}"
     except (TypeError, IndexError, KeyError):
         return ""
+
+
+# ── links: the command-burst charge report ──────────────────────────────────
+# The Fleet tab's Specialized Roles report, compacted onto the fleet tile: the
+# fleet-wide coverage strip plus one row per pilot who linked charges, each
+# discipline carrying its verdict glyph and tooltip.
+#
+# THE DATA IS CHAT-SOURCED. ``charge_tracker`` parses fleet chat, so this
+# section is meaningful with no fleet boss and no ESI at all -- which is why it
+# renders INDEPENDENTLY of ``FleetCompModel.status``: a tile can honestly say
+# "Not in fleet / not fleet boss" and still show the links report underneath.
+# Specialized Roles hides its per-pilot rows when not boss; this deliberately
+# does not (the ``?`` glyph already says "hull unverified", and an FC watching a
+# 200 px tile is better served by the names than by an empty box).
+
+#: Verdict -> palette KEY, the same shape as ``_BUCKET_COLOUR``: the composers
+#: stay palette-free and the renderer resolves the key.
+#:
+#: **TWIN of ``fc_gui.VERDICT_COLOR`` (fc_gui:270)** -- the Fleet tab's rows and
+#: this tile must never disagree about what green means. This module cannot
+#: import fc_gui, so the equality guard lives on the fc_gui side
+#: (``tests/test_info_tiles_wiring.py``).
+_VERDICT_COLOUR = {
+    cb.Verdict.BONUSED: "FG_GREEN",
+    cb.Verdict.BONUSED_CONDITIONAL: "FG_GREEN",
+    cb.Verdict.FITS_NO_BONUS: "FG_YELLOW",
+    cb.Verdict.CANT_FIT: "FG_RED",
+    cb.Verdict.UNKNOWN: "FG_DIM",
+}
+
+LINKS_TITLE = "Links"
+#: A short mirror of the Specialized Roles banner ("Ship verification
+#: unavailable (not fleet boss) - charges shown, hulls not checked"), sized for
+#: a tile rather than a tab.
+LINKS_CAVEAT_NOT_BOSS = "hulls not checked (not boss)"
+#: How many pilot rows the tile has widgets for. The MODEL carries every
+#: tracked pilot; the renderer summarises whatever does not fit as a final
+#: "+N more" row rather than dropping it silently.
+LINKS_MAX_PILOTS = 6
+
+
+@dataclass(frozen=True)
+class LinkCoverageVM:
+    """One discipline's fleet-wide coverage: ``Sh`` + full/not, plus the
+    tooltip naming what is missing (or how deep the redundancy runs)."""
+    label: str
+    full: bool
+    tip: str
+
+
+@dataclass(frozen=True)
+class LinkCellVM:
+    """One (discipline, verdict) cell on a pilot's row. `verdict` rides along
+    as the ENUM, not a colour: the renderer owns the palette."""
+    label: str
+    glyph: str
+    verdict: object
+    tip: str
+
+
+@dataclass(frozen=True)
+class LinkPilotVM:
+    """One pilot who linked charges. `over_limit` is the >3-charges flag that
+    reddens the row (a burst ship fits three)."""
+    name: str
+    charge_count: int
+    over_limit: bool
+    cells: tuple = ()
+
+
+@dataclass(frozen=True)
+class LinksVM:
+    """The whole links section. Nested tuples of frozen rows all the way down,
+    so ``FleetCompModel`` stays ``==``-diffable on the render path."""
+    caveat: str
+    coverage: tuple = ()
+    pilots: tuple = ()
+
+
+def _links_ship_name(ship_type_id, ship_names, resolve_type_name) -> str | None:
+    """Hull name for a verdict tooltip, or None (``verdict_text`` then says
+    "ship").
+
+    The host's PRE-RESOLVED map first -- fc_gui resolves hull names off the Tk
+    thread for exactly this reason -- then the OFFLINE bundled table. A name
+    equal to ``str(type_id)`` is ``zkill_monitor.resolve_name``'s UNRESOLVED
+    answer, not a hull called "606", and is rejected at both steps."""
+    if ship_type_id is None:
+        return None
+    mapped = ship_names.get(ship_type_id) if isinstance(ship_names, dict) else None
+    for candidate in (mapped, _call(resolve_type_name, ship_type_id)):
+        name = str(candidate).strip() if candidate else ""
+        if name and name != str(ship_type_id):
+            return name
+    return None
+
+
+def _links_coverage_rows(coverage) -> tuple:
+    """``(LinkCoverageVM, ...)`` in ``DISCIPLINES`` order.
+
+    A discipline the host did not report is OMITTED rather than rendered as a
+    fabricated miss -- "no data" and "nobody linked it" are different claims.
+    Tooltip wording mirrors the Specialized Roles strip
+    (``fc_gui._render_coverage_strip``) so the two surfaces read the same."""
+    statuses = coverage if isinstance(coverage, dict) else {}
+    rows = []
+    for discipline in cb.DISCIPLINES:
+        status = statuses.get(discipline)
+        if status is None:
+            continue
+        label = cb.DISCIPLINE_LABEL[discipline]
+        missing = tuple(getattr(status, "missing", ()) or ())
+        full = bool(getattr(status, "full", False))
+        if full:
+            tip = f"{label} links full (all 3 charges)"
+            redundancy = _as_int(getattr(status, "redundancy", 0), 0)
+            if redundancy >= 2:
+                tip += f" — covered {redundancy}x"
+        elif missing:
+            tip = f"{label} missing: " + ", ".join(str(c) for c in missing)
+        else:
+            tip = f"{label} not covered"
+        rows.append(LinkCoverageVM(label=label[:2], full=full, tip=tip))
+    return tuple(rows)
+
+
+def build_links_model(rows_by_name, coverage, ship_names, is_boss,
+                      resolve_type_name=None) -> "LinksVM | None":
+    """Roll the charge tracker's state up into the tile's links section. Pure.
+
+    `rows_by_name` is fc_gui's pre-indexed ``{lowercased name:
+    command_bursts.PilotRow}``; `coverage` is ``charge_tracker.coverage()``'s
+    ``{discipline: CoverageStatus}``; `ship_names` is its off-thread
+    ``{type_id: hull name | None}`` map.
+
+    Returns **None** -- the section is then absent and the tile stays compact --
+    when nothing is tracked at all: no pilot with charges AND no discipline
+    reporting anything present. Anything less than that is a report worth the
+    rows.
+
+    `is_boss` only decides the CAVEAT. Pilot rows survive a non-boss fleet by
+    design (see the section header above); their verdicts simply come back
+    UNKNOWN, which the ``?`` glyph states outright.
+    """
+    rows = (rows_by_name.values() if isinstance(rows_by_name, dict)
+            else (rows_by_name or ()))
+    # Injectable for testing; the DEFAULT is the offline bundled table, exactly
+    # as build_fleet_comp_model's is and for the same Tk-thread reason.
+    name_of = resolve_type_name or offline_type_name
+    pilots = []
+    for row in rows:
+        cells = []
+        ship_name = _links_ship_name(getattr(row, "ship_type_id", None),
+                                     ship_names, name_of)
+        for cell in getattr(row, "cells", ()) or ():
+            discipline = getattr(cell, "discipline", None)
+            label = cb.DISCIPLINE_LABEL.get(discipline)
+            if not label:
+                continue
+            verdict = getattr(cell, "verdict", cb.Verdict.UNKNOWN)
+            charges = tuple(getattr(cell, "charges", ()) or ())
+            cells.append(LinkCellVM(
+                label=label[:2],
+                glyph=cb.VERDICT_GLYPH.get(verdict, "?"),
+                verdict=verdict,
+                tip=cb.verdict_text(verdict, label, charges, ship_name)))
+        if not cells:
+            continue
+        pilots.append(LinkPilotVM(
+            name=str(getattr(row, "name", "") or "?"),
+            charge_count=_as_int(getattr(row, "charge_count", 0), 0),
+            over_limit=bool(getattr(row, "over_limit", False)),
+            cells=tuple(cells)))
+    # Same order as build_pilot_rows', so a pilot never jumps between the tile
+    # and the Fleet tab's listing.
+    pilots.sort(key=lambda p: p.name.lower())
+
+    coverage_rows = _links_coverage_rows(coverage)
+    statuses = coverage.values() if isinstance(coverage, dict) else ()
+    if not pilots and not any(getattr(s, "present", ()) for s in statuses):
+        return None
+    return LinksVM(caveat="" if is_boss else LINKS_CAVEAT_NOT_BOSS,
+                   coverage=coverage_rows, pilots=tuple(pilots))
+
+
+def links_coverage_text(row) -> str:
+    """``Sh✓`` / ``Ar✗`` -- the strip cell. GUI text only, never logged."""
+    return f"{row.label}{'✓' if row.full else '✗'}"
+
+
+def links_cell_text(cell) -> str:
+    """``Sk⚠`` -- one pilot cell, label then verdict glyph."""
+    return f"{cell.label}{cell.glyph}"
+
+
+def links_pilot_text(pilot) -> str:
+    """``Kirejen 4`` -- who linked, and how many charges."""
+    return f"{pilot.name} {pilot.charge_count}"
+
+
+def links_pilot_rows(pilots, limit: int = LINKS_MAX_PILOTS) -> tuple:
+    """``(visible_rows, hidden_count)`` for a fixed pool of `limit` rows.
+
+    An overflow spends the LAST row on a "+N more" summary rather than showing
+    `limit` pilots and quietly hiding the rest -- a links report that lies about
+    its own length is worse than one that is short."""
+    pilots = tuple(pilots or ())
+    cap = _as_int(limit, 0)
+    if cap <= 0:
+        return (), len(pilots)
+    if len(pilots) <= cap:
+        return pilots, 0
+    return pilots[:cap - 1], len(pilots) - (cap - 1)
+
+
+def links_overflow_text(hidden: int) -> str:
+    return f"+{hidden} more"
 
 
 # ── intel ───────────────────────────────────────────────────────────────────
@@ -636,6 +867,138 @@ class _LabelPool:
                 self._packed[index] = False
 
 
+class _LinkRow:
+    """One links row: a lead label plus a fixed pool of colour-coded cells.
+
+    A cell needs its own WIDGET because each verdict carries its own colour and
+    its own tooltip, and a ``tk.Label`` is single-coloured. Widgets are built
+    once and re-worded thereafter (``attach_tooltip`` binds with ``add="+"``,
+    so a per-repaint re-attach stacks a fresh handler set every time).
+
+    The row does NOT pack its own frame: ``_LinksPanel`` owns section order
+    (see its docstring). Cell packing stays here and is safe, because the
+    packed cells are always the prefix ``[0..n-1]`` -- growth can only append
+    after cells that are already in place."""
+
+    def __init__(self, parent, palette: dict, cells: int, lead_tip=False):
+        self._palette = palette
+        bg = palette.get("BG_DARK", ui_theme.BG_DARK)
+        fg = palette.get("FG_TEXT", ui_theme.FG_TEXT)
+        self.frame = tk.Frame(parent, bg=bg)
+        self.lead = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg, fg=fg,
+                             anchor="w", justify="left")
+        self.lead.pack(side="left")
+        self._lead_tip = bool(lead_tip)
+        if self._lead_tip:
+            attach_tooltip(self.lead, "")
+        self._cells = []
+        self._cells_packed = []
+        for _ in range(max(0, int(cells))):
+            label = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg, fg=fg)
+            attach_tooltip(label, "")
+            self._cells.append(label)
+            self._cells_packed.append(False)
+
+    def _colour(self, key):
+        return self._palette.get(key, self._palette.get("FG_TEXT"))
+
+    def render(self, lead_text, lead_key, lead_tip, cells) -> None:
+        """Configure the row. `cells` is a sequence of ``(text, palette_key,
+        tip)``; anything past the pool's width is clipped, never wrapped."""
+        self.lead.configure(text=lead_text, fg=self._colour(lead_key))
+        if self._lead_tip:
+            update_tooltip(self.lead, lead_tip or "")
+        for index, label in enumerate(self._cells):
+            if index < len(cells):
+                text, colour_key, tip = cells[index]
+                label.configure(text=text, fg=self._colour(colour_key))
+                update_tooltip(label, tip or "")
+                if not self._cells_packed[index]:
+                    label.pack(side="left", padx=(4, 0))
+                    self._cells_packed[index] = True
+            elif self._cells_packed[index]:
+                label.pack_forget()
+                self._cells_packed[index] = False
+
+
+class _LinksPanel:
+    """The links section: its own container, and its own ordering discipline.
+
+    TWO ordering hazards, both of the "``pack`` APPENDS" family:
+
+    * against the comp rows -- ``_LabelPool`` packs a row lazily the first time
+      it has content, so a fleet that grows a group mid-session would append
+      that row UNDER a links section packed earlier. This panel therefore lives
+      in its OWN container frame, packed at construction: growth inside either
+      container can only ever move rows within it;
+    * inside the section -- the caveat line and the coverage strip come and go
+      (boss status flips, a host reports no coverage). Rather than track which
+      widget may follow which, ``_relayout`` re-packs the whole section IN
+      ORDER whenever the packed SET changes, and does nothing at all when it
+      does not. The set changes far less often than the text does.
+    """
+
+    def __init__(self, parent, palette: dict):
+        self._palette = palette
+        bg = palette.get("BG_DARK", ui_theme.BG_DARK)
+        self.frame = tk.Frame(parent, bg=bg)
+        self.frame.pack(fill="x")
+        self._head = tk.Label(self.frame, text=LINKS_TITLE, font=_FONT_HEAD,
+                              bg=bg, fg=palette.get("FG_ACCENT"), anchor="w")
+        self._caveat = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg,
+                                fg=palette.get("FG_DIM"), anchor="w")
+        self._coverage = _LinkRow(self.frame, palette, len(cb.DISCIPLINES))
+        self._pilots = [_LinkRow(self.frame, palette, len(cb.DISCIPLINES),
+                                 lead_tip=True)
+                        for _ in range(LINKS_MAX_PILOTS)]
+        self._layout: list = []
+
+    def render(self, model) -> None:
+        """Draw the section. `model` is a ``LinksVM``, or None = section
+        absent, which leaves the fleet tile exactly as compact as before."""
+        if model is None:
+            self._relayout([])
+            return
+        wanted = [self._head]
+        if model.caveat:
+            self._caveat.configure(text=model.caveat)
+            wanted.append(self._caveat)
+        if model.coverage:
+            self._coverage.render("", "FG_TEXT", "", [
+                (links_coverage_text(row),
+                 "FG_GREEN" if row.full else "FG_RED", row.tip)
+                for row in model.coverage])
+            wanted.append(self._coverage.frame)
+        visible, hidden = links_pilot_rows(model.pilots)
+        for index, pilot in enumerate(visible):
+            row = self._pilots[index]
+            row.render(
+                links_pilot_text(pilot),
+                # over_limit reddens the whole lead (name AND count): a burst
+                # ship fits three charges, so a fourth is a fit worth a look.
+                "FG_RED" if pilot.over_limit else "FG_TEXT",
+                (f"{pilot.charge_count} charges linked — fit may be "
+                 "unusual/bad") if pilot.over_limit else "",
+                [(links_cell_text(cell),
+                  _VERDICT_COLOUR.get(cell.verdict, "FG_DIM"), cell.tip)
+                 for cell in pilot.cells])
+            wanted.append(row.frame)
+        if hidden:
+            row = self._pilots[len(visible)]
+            row.render(links_overflow_text(hidden), "FG_DIM", "", ())
+            wanted.append(row.frame)
+        self._relayout(wanted)
+
+    def _relayout(self, wanted) -> None:
+        if wanted == self._layout:
+            return
+        for widget in self._layout:
+            widget.pack_forget()
+        for widget in wanted:
+            widget.pack(fill="x", padx=4)
+        self._layout = list(wanted)
+
+
 class _TileRenderer:
     """Base: own the widgets inside one tile's body, and write to Tk only when
     the model actually moved.
@@ -710,7 +1073,8 @@ class BattleRenderer(_TileRenderer):
 
 
 class FleetRenderer(_TileRenderer):
-    """Fleet size + inv-group rollup, each row hovering its hull breakdown."""
+    """Fleet size + inv-group rollup, each row hovering its hull breakdown,
+    with the command-burst links report underneath."""
 
     def __init__(self, parent, palette: dict):
         super().__init__(parent, palette)
@@ -719,20 +1083,30 @@ class FleetRenderer(_TileRenderer):
                               fg=self._palette.get("FG_ACCENT"),
                               anchor="w")
         self._head.pack(fill="x", padx=4)
-        self._pool = _LabelPool(self.frame, FLEET_MAX_ROWS + 1, self._palette,
-                                tooltips=True)
+        # Two containers, both packed HERE and in this order, because the row
+        # pool packs lazily and ``pack`` appends -- see ``_LinksPanel``.
+        self._rows_holder = tk.Frame(self.frame,
+                                     bg=self._palette.get("BG_DARK"))
+        self._rows_holder.pack(fill="x")
+        self._pool = _LabelPool(self._rows_holder, FLEET_MAX_ROWS + 1,
+                                self._palette, tooltips=True)
+        self._links = _LinksPanel(self.frame, self._palette)
 
     def _draw(self, model):
         if model.status:
             self._head.configure(text=model.status,
                                  fg=self._palette.get("FG_DIM"))
             self._pool.render([])
-            return
-        self._head.configure(text=f"Total: {model.total}",
-                             fg=self._palette.get("FG_ACCENT"))
-        self._pool.render([(fleet_row_text(row),
-                            "FG_DIM" if row[0] == OTHER_LABEL else "FG_TEXT",
-                            fleet_group_tip(row)) for row in model.rows])
+        else:
+            self._head.configure(text=f"Total: {model.total}",
+                                 fg=self._palette.get("FG_ACCENT"))
+            self._pool.render([
+                (fleet_row_text(row),
+                 "FG_DIM" if row[0] == OTHER_LABEL else "FG_TEXT",
+                 fleet_group_tip(row)) for row in model.rows])
+        # Deliberately OUTSIDE the status branch: the charge report is
+        # chat-sourced, so a tile gated to "not fleet boss" still carries one.
+        self._links.render(getattr(model, "links", None))
 
 
 class IntelRenderer(_TileRenderer):
@@ -773,7 +1147,10 @@ class IntelRenderer(_TileRenderer):
 TILE_SPECS = {
     "battle": {"title": "Battle", "default_size": (260, 150),
                "render": BattleRenderer},
-    "fleet": {"title": "Fleet", "default_size": (240, 200),
+    # The fleet tile carries the comp rollup AND the links report, so its
+    # first-spawn default has to fit both -- a section clipped by the body's
+    # (deliberate) propagation guard is a section the owner never discovers.
+    "fleet": {"title": "Fleet", "default_size": (280, 260),
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
               "render": IntelRenderer},
@@ -1053,6 +1430,15 @@ class HudHost:
     ledger_view: object = _none          # () -> BattleLedgerView | None
     fleet_snapshot: object = _none       # () -> (members, ship_counts, total)
     fleet_state: object = _no_fleet      # () -> (auth, fleet_id, is_boss)
+    #: () -> (rows_by_name, coverage, ship_names, is_boss) -- the command-burst
+    #: charge report fc_gui already computes for the Fleet tab's Specialized
+    #: Roles area (``_apply_booster_compute`` stores all four on the Tk thread).
+    #: Optional and inert: a host that never wires it simply has no links
+    #: section, and the fleet tile stays exactly as compact as before.
+    #:
+    #: This feed is CHAT-sourced, so it is deliberately NOT gated by
+    #: ``fleet_state`` -- see ``build_links_model``.
+    links_snapshot: object = _none
     own_system_id: object = _none        # () -> int | None
     staging_name: object = _none         # () -> str
     #: () -> [(x, y, w, h)] -- the FCPreview tiles' rects, and a CONTRACT the
@@ -1427,10 +1813,28 @@ class InfoTileController:
             except (TypeError, ValueError):
                 members, ship_counts, total = (), None, 0
         catalog = getattr(self._host, "type_catalog", None)
-        return build_fleet_comp_model(
+        model = build_fleet_comp_model(
             members, ship_counts, total, authenticated, fleet_id, is_boss,
             resolve_type_name=lambda tid: offline_type_name(tid, catalog),
             resolve_group_name=lambda tid: offline_group_name(tid, catalog))
+        return replace(model, links=self._links_model(catalog))
+
+    def _links_model(self, catalog):
+        """The command-burst report, or None when nothing is tracked.
+
+        Built from its OWN seam and NOT from ``fleet_state``: charges are read
+        out of fleet chat, so the report is meaningful with no ESI character
+        and no fleet boss (the gate the comp rollup above must respect)."""
+        snapshot = _call(self._host.links_snapshot, default=None)
+        rows_by_name, coverage, ship_names, is_boss = {}, {}, {}, False
+        if snapshot:
+            try:
+                rows_by_name, coverage, ship_names, is_boss = snapshot
+            except (TypeError, ValueError):
+                rows_by_name, coverage, ship_names, is_boss = {}, {}, {}, False
+        return build_links_model(
+            rows_by_name, coverage, ship_names, is_boss,
+            resolve_type_name=lambda tid: offline_type_name(tid, catalog))
 
     def _reference(self):
         return resolve_reference(

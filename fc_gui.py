@@ -845,6 +845,10 @@ class FCToolGUI:
         self._booster_rows_by_name: dict = {}    # lowercased pilot name -> command_bursts.PilotRow
         self._booster_ship_names: dict = {}       # ship_type_id -> resolved hull name (or None)
         self._booster_is_boss: bool = False
+        # Kept (not just passed straight to _render_coverage_strip) because the
+        # FC HUD's fleet tile renders the same coverage report — see the
+        # links_snapshot seam in _build_info_tiles.
+        self._booster_coverage: dict = {}         # discipline -> charge_tracker.CoverageStatus
         # Per-section ship-type expand state, keyed by id(content_frame) -> set of
         # open type_ids. Lets _populate_role_section preserve user expansions
         # across its frequent destroy/recreate rebuilds (every fleet poll and
@@ -1966,6 +1970,16 @@ class FCToolGUI:
                     bool(self.esi_auth and self.esi_auth.is_authenticated),
                     getattr(self, "_last_polled_fleet_id", None),
                     bool(getattr(self, "_last_polled_fleet_is_boss", False))),
+                # The command-burst report the Specialized Roles area already
+                # shows. All four members are Tk-thread-only state written by
+                # _apply_booster_compute; read (never mutated) here, and
+                # getattr-guarded so a beat that lands before the first
+                # booster refresh costs nothing.
+                links_snapshot=lambda: (
+                    getattr(self, "_booster_rows_by_name", {}),
+                    getattr(self, "_booster_coverage", {}),
+                    getattr(self, "_booster_ship_names", {}),
+                    bool(getattr(self, "_booster_is_boss", False))),
                 # READ-ONLY: the stale-attribution guard that clears this pair on
                 # an ESI rebind stays with its owner (_range_check_own_location).
                 own_system_id=lambda: getattr(self, "_own_location_sid", None),
@@ -23709,6 +23723,10 @@ class FCToolGUI:
         """
         self._booster_rows_by_name = rows_by_name
         self._booster_ship_names = ship_names
+        # Stored as well as rendered: the FC HUD's fleet tile reads this
+        # through the links_snapshot seam (it must not recompute coverage —
+        # ChargeTracker.coverage() takes the tracker's lock).
+        self._booster_coverage = coverage
         # Roster is only populated when we can read fleet member ships (fleet
         # boss). Empty roster => hulls can't be verified, so we are treated as
         # non-boss. NOTE: best-effort heuristic — an empty roster also occurs when
