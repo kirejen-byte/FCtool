@@ -64,11 +64,18 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
 - **The HUD follows the EVE clients on/off screen, EDGE-TRIGGERED.** With no
   client running the tiles are WITHDRAWN (never destroyed -- geometry, config
   and content survive) and mapped again when one appears. Only the transition
-  does work: ``show()`` owns the tiles' single retop, so a level-triggered
-  "show every beat" would be exactly the per-tick retop the rule above
-  forbids. The presence seam is FAIL-VISIBLE -- absent, non-callable or
-  raising all read as "clients present", because a HUD hidden by a wiring bug
-  cannot be asked back from the overlay itself.
+  does work: the controller tracks presence itself and calls ``show()``/
+  ``hide()`` only on a change. NOT because a level-triggered "show every
+  beat" would retop -- it would not: ``InfoTileWindow.show()`` already
+  early-returns on ``self._visible``, so a steady-state call is a cheap
+  no-op on its own. Edge-triggering exists so the transition is explicit
+  and independently testable, instead of resting correctness on ``show()``'s
+  idempotence guard staying intact. On the reveal edge each tile is
+  rendered before ``show()`` maps it, so the first frame on screen is
+  already fresh, not whatever was there before the tiles were withdrawn.
+  The presence seam is FAIL-VISIBLE -- absent, non-callable or raising all
+  read as "clients present", because a HUD hidden by a wiring bug cannot be
+  asked back from the overlay itself.
 - **Log strings stay ASCII** (this box's console is cp1252 and a stray glyph
   raises inside logging's StreamHandler). Tile TEXT may use anything -- it is
   never logged.
@@ -1754,11 +1761,16 @@ class InfoTileController:
         """Hide/show every tile on a CHANGE of EVE-client presence. Returns
         True while suspended (i.e. "the caller should stop here").
 
-        EDGE-TRIGGERED, and that is load-bearing rather than tidy: ``show()``
-        owns the tiles' single ``retop()``, and re-topping every tile every
-        beat is the measured DWM-thrash that costs in-game FPS. Steady state
-        -- clients present or clients gone -- therefore issues ZERO ``hide()``
-        / ``show()`` calls; only a transition does work, exactly once."""
+        EDGE-TRIGGERED, and that is load-bearing for clarity, NOT because a
+        level-triggered "call show() every beat" would retop: it would not
+        -- ``InfoTileWindow.show()`` already early-returns on
+        ``self._visible``, so a steady-state call is a cheap no-op by
+        itself. Tracking the transition here instead means correctness does
+        not rest on that guard, and the transition is independently
+        testable (zero ``hide()``/``show()`` calls in steady state, exactly
+        one on a change) rather than inferred from ``show()``'s internals.
+        On the reveal edge each tile is rendered BEFORE ``show()`` maps it,
+        so the first frame on screen is already fresh."""
         present = self._clients_present()
         if present == (not self._suspended):
             return self._suspended            # no transition: do nothing
@@ -1767,6 +1779,7 @@ class InfoTileController:
             for key in TILE_SPECS:
                 tile = self._tiles.get(key)
                 if tile is not None and self._tile_enabled(key):
+                    self._render(key)
                     _call(tile.show)
         else:
             self._suspended = True
@@ -1952,10 +1965,10 @@ class InfoTileController:
 
         The presence check runs FIRST and can end the beat: with no EVE client
         on screen the tiles are withdrawn and this writes NOTHING at all --
-        not a setter, not a render. The reveal is still fresh because the
-        False->True edge shows the tiles and then falls straight through into
-        the render pass below, in the same beat: nothing is painted in
-        between, so no stale frame is ever on screen."""
+        not a setter, not a render. The reveal is still fresh because
+        ``_sync_presence`` renders each tile BEFORE calling ``show()`` on the
+        False->True edge: content is rendered before the window maps, so
+        there is no pre-hide frame left on screen for the map to flash."""
         if not self._enabled:
             return
         if self._sync_presence():

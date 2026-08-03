@@ -2075,6 +2075,7 @@ class FCToolGUI:
         log_every_s = 60.0
         try:
             if getattr(self, "_preview_clients", None):
+                self._hud_clients_probe = (time.monotonic(), True)
                 return True
             now = time.monotonic()
             cached = getattr(self, "_hud_clients_probe", None)
