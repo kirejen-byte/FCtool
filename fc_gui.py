@@ -5371,7 +5371,7 @@ class FCToolGUI:
             warn = tk.Label(rf, text=" ⚠", bg=BG_PANEL, fg=FG_YELLOW,
                             font=("Consolas", 8, "bold"))
             warn.pack(side=tk.LEFT)
-            wt = f"{prow.charge_count} charges linked — fit may be unusual/bad"
+            wt = command_bursts.over_limit_tip(prow.charge_count)
             warn.bind("<Enter>", lambda e, t=wt: self._show_tooltip(e, t))
             warn.bind("<Leave>", lambda e: self._hide_tooltip())
         ship_name = (self._booster_ship_names.get(prow.ship_type_id)
@@ -23767,12 +23767,7 @@ class FCToolGUI:
             if status.full and status.redundancy >= 2:
                 tk.Label(cell, text=f"{status.redundancy}x", bg=BG_PANEL,
                          fg=FG_ACCENT, font=("Consolas", 8, "bold")).pack(side=tk.LEFT)
-            if status.full:
-                tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} links full (all 3 charges)"
-                if status.redundancy >= 2:
-                    tip += f" — covered {status.redundancy}x"
-            else:
-                tip = f"{command_bursts.DISCIPLINE_LABEL[disc]} missing: " + ", ".join(status.missing)
+            tip = command_bursts.coverage_tip(status, command_bursts.DISCIPLINE_LABEL[disc])
             for wdg in (lbl, mark):
                 wdg.bind("<Enter>", lambda e, t=tip: self._show_tooltip(e, t))
                 wdg.bind("<Leave>", lambda e: self._hide_tooltip())

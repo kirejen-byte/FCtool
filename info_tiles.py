@@ -536,7 +536,8 @@ def _links_coverage_rows(coverage) -> tuple:
 
     A discipline the host did not report is OMITTED rather than rendered as a
     fabricated miss -- "no data" and "nobody linked it" are different claims.
-    Tooltip wording mirrors the Specialized Roles strip
+    Tooltip wording comes from ``command_bursts.coverage_tip``, the single
+    source shared with the Specialized Roles strip
     (``fc_gui._render_coverage_strip``) so the two surfaces read the same."""
     statuses = coverage if isinstance(coverage, dict) else {}
     rows = []
@@ -545,18 +546,9 @@ def _links_coverage_rows(coverage) -> tuple:
         if status is None:
             continue
         label = cb.DISCIPLINE_LABEL[discipline]
-        missing = tuple(getattr(status, "missing", ()) or ())
         full = bool(getattr(status, "full", False))
-        if full:
-            tip = f"{label} links full (all 3 charges)"
-            redundancy = _as_int(getattr(status, "redundancy", 0), 0)
-            if redundancy >= 2:
-                tip += f" — covered {redundancy}x"
-        elif missing:
-            tip = f"{label} missing: " + ", ".join(str(c) for c in missing)
-        else:
-            tip = f"{label} not covered"
-        rows.append(LinkCoverageVM(label=label[:2], full=full, tip=tip))
+        rows.append(LinkCoverageVM(label=label[:2], full=full,
+                                   tip=cb.coverage_tip(status, label)))
     return tuple(rows)
 
 
@@ -594,7 +586,10 @@ def build_links_model(rows_by_name, coverage, ship_names, is_boss,
             if not label:
                 continue
             verdict = getattr(cell, "verdict", cb.Verdict.UNKNOWN)
-            charges = tuple(getattr(cell, "charges", ()) or ())
+            # str()-coerced: cb.verdict_text() joins these with ", ", which
+            # raises TypeError into this pure builder on any non-str member
+            # (probed junk-input gap; see test_a_junk_snapshot_never_raises).
+            charges = tuple(str(c) for c in (getattr(cell, "charges", ()) or ()))
             cells.append(LinkCellVM(
                 label=label[:2],
                 glyph=cb.VERDICT_GLYPH.get(verdict, "?"),
@@ -977,8 +972,8 @@ class _LinksPanel:
                 # over_limit reddens the whole lead (name AND count): a burst
                 # ship fits three charges, so a fourth is a fit worth a look.
                 "FG_RED" if pilot.over_limit else "FG_TEXT",
-                (f"{pilot.charge_count} charges linked — fit may be "
-                 "unusual/bad") if pilot.over_limit else "",
+                (cb.over_limit_tip(pilot.charge_count)
+                 if pilot.over_limit else ""),
                 [(links_cell_text(cell),
                   _VERDICT_COLOUR.get(cell.verdict, "FG_DIM"), cell.tip)
                  for cell in pilot.cells])

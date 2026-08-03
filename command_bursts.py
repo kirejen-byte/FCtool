@@ -249,3 +249,47 @@ def verdict_text(verdict: Verdict, discipline_label: str, charges, ship_name=Non
         who = ship_name or "ship"
         return f"{base} — {who} cannot fit a command burst"
     return f"{base} — ship unknown"
+
+
+def coverage_tip(status, label: str) -> str:
+    """Tooltip text for one discipline's fleet-wide coverage-strip cell.
+
+    Single-sources the wording fc_gui's Specialized Roles coverage strip
+    (``_render_coverage_strip``) and the FC HUD tile's coverage rows
+    (``info_tiles._links_coverage_rows``) both render, so a future wording
+    edit can no longer land in one surface and miss its twin. ``status`` is
+    accessed defensively (duck-typed against charge_tracker.CoverageStatus)
+    so a malformed/partial status degrades rather than raising.
+
+    The literal "3" is the fixed per-discipline charge-type count
+    (len(DISCIPLINE_CHARGES[discipline]) -- always 3 today), NOT
+    MAX_CHARGES (a single pilot's own linked-charge budget). The two are
+    equal today only by coincidence of CCP's design symmetry, not by any
+    relation, so MAX_CHARGES is deliberately not reused here.
+    """
+    if bool(getattr(status, "full", False)):
+        tip = f"{label} links full (all 3 charges)"
+        try:
+            redundancy = int(getattr(status, "redundancy", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            redundancy = 0
+        if redundancy >= 2:
+            tip += f" — covered {redundancy}x"
+        return tip
+    missing = getattr(status, "missing", ()) or ()
+    return f"{label} missing: " + ", ".join(str(c) for c in missing)
+
+
+def over_limit_tip(charge_count, max_charges: int = MAX_CHARGES) -> str:
+    """Tooltip text for a pilot whose linked-charge count exceeds
+    ``max_charges``; "" at or under the limit (the same strict '>' compare
+    as ``PilotRow.over_limit`` / ``build_pilot_rows``), so a caller may call
+    this unconditionally instead of re-deriving its own over/under gate.
+
+    Single-sources the wording duplicated at fc_gui's per-pilot Links row
+    and the FC HUD tile's pilot row (both read: "{charge_count} charges
+    linked — fit may be unusual/bad").
+    """
+    if charge_count <= max_charges:
+        return ""
+    return f"{charge_count} charges linked — fit may be unusual/bad"
