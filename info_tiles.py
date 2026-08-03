@@ -1073,6 +1073,19 @@ class HudHost:
     #: ``_neighbour_rects`` is therefore pass-through: it merges these with
     #: sibling tiles' rects and does no height maths of its own.
     preview_rects: object = _empty
+    #: () -> (w, full_h) | None -- the FCPreview tiles' CURRENT uniform size,
+    #: already in THIS module's full-height convention (see ``preview_rects``
+    #: just above for why the strip is added on the fc_gui side and never
+    #: here). Backs the settings popup's one-shot "Match preview size" button
+    #: (``InfoTileController.match_preview_size``) -- nothing calls this seam
+    #: from the render beat. Optional and inert: a host that never wires it,
+    #: or whose preview subsystem answers nothing sane, makes the button a
+    #: safe no-op rather than a raise. The name says SIZE, not RECT:
+    #: FCPreview's tiles share one uniform (w, body_h) only while preview's
+    #: own ``uniform_size`` is on, and even then they share no POSITION, so
+    #: this seam answers a size only -- ``match_preview_size`` places each HUD
+    #: tile at ITS OWN existing (x, y).
+    preview_tile_size: object = _none
     screen_rects: object = _empty        # () -> [(x, y, w, h)]
     route_fn: object = _none             # (origin, dest) -> [ids] | None
     #: The app's own ``TypeCatalog`` (fc_gui's ``self.type_catalog``). Not a
@@ -1557,6 +1570,60 @@ class InfoTileController:
         if cleared and not placing:
             self._save()
 
+    def match_preview_size(self) -> bool:
+        """One-shot: resize every HUD tile -- live or merely saved -- to the
+        FCPreview tiles' current (w, full height), keeping each tile's own
+        (x, y). The popup's "Match preview size" button; NOT a per-tick path
+        -- like ``arrange()``, its ``place()`` calls are one of the
+        sanctioned retop sites (a user-initiated click, never the beat).
+
+        A key that is neither live nor carries a stored layout is SKIPPED:
+        there is no position to keep it at, and inventing one is
+        ``arrange``'s job, not this one's. ``HudHost.preview_tile_size`` is
+        optional and read through the guarded-call helper -- a host that
+        never wired it, one that raises, or one that answers anything other
+        than a plain (w, h) pair all make this a safe no-op. A numeric
+        answer under the floor is clamped exactly like any other stored
+        size, through ``InfoTileWindow``'s OWN (taller) floor -- these are
+        info tiles, not FCPreview tiles.
+
+        Returns True iff at least one tile's stored size actually changed,
+        so the popup button (and the tests) can tell "did something" from
+        "nothing to resize"; config is saved AT MOST once regardless of how
+        many tiles moved.
+        """
+        raw = _call(self._host.preview_tile_size)
+        try:
+            w, h = raw
+            w, h = int(w), int(h)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        w, h = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
+                                         InfoTileWindow.MIN_H)
+        stored = self._block().get("layouts")
+        stored = stored if isinstance(stored, dict) else {}
+        changed = False
+        for key in TILE_SPECS:
+            tile = self._tiles.get(key)
+            if tile is not None:
+                rect = _call(tile.rect)
+                try:
+                    x, y = _as_int(rect[0]), _as_int(rect[1])
+                except (TypeError, IndexError, KeyError):
+                    continue
+                _call(tile.place, x, y, w, h)
+            else:
+                saved = stored.get(key)
+                try:
+                    x, y = _as_int(saved[0]), _as_int(saved[1])
+                except (TypeError, IndexError, KeyError):
+                    continue      # neither live nor positioned -- nothing to keep
+            self._persist_rect(key, x, y, w, h)
+            changed = True
+        if changed:
+            self._save()
+        return changed
+
     def shutdown(self) -> None:
         self.resolver.stop()
         for key in list(self._tiles):
@@ -1583,6 +1650,8 @@ _TIP_SNAP = "Tiles stick to each other, to preview tiles and to screen edges."
 _TIP_LOCK = "Freeze tile positions. The close glyph still works."
 _TIP_ARRANGE = "Re-place the visible tiles on the default grid."
 _TIP_RESET = "Forget saved positions and re-place the tiles."
+_TIP_MATCH_PREVIEW = ("Resize every tile to the FCPreview tiles' current "
+                      "size, keeping each tile's position.")
 
 
 def build_hud_button(parent, open_cmd):
@@ -1818,6 +1887,11 @@ def open_hud_settings(root, controller, host):
                        command=controller.reset_layouts)
     reset.pack(side="left", padx=(6, 0))
     attach_tooltip(reset, _TIP_RESET)
+    match_preview = ttk.Button(buttons, text="Match preview size",
+                               style="Dark.TButton",
+                               command=controller.match_preview_size)
+    match_preview.pack(side="left", padx=(6, 0))
+    attach_tooltip(match_preview, _TIP_MATCH_PREVIEW)
     close = ttk.Button(buttons, text="Close", style="Dark.TButton",
                        command=_close)
     close.pack(side="right")

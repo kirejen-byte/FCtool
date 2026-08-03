@@ -1925,6 +1925,32 @@ class FCToolGUI:
         try:
             if info_tiles.heal_info_tile_layouts(self.config):
                 self._save_config()
+
+            def _hud_preview_tile_size():
+                """The FCPreview tiles' current GLOBAL (uniform) size,
+                converted to this feature's own full-height convention.
+                Backs the settings popup's one-shot "Match preview size"
+                button.
+
+                Mirrors ONLY the global half of ``_preview_resolve_size``'s
+                choke point (fc_gui ~16739) — never a per-char
+                ``cfg['sizes']`` override, even when ``uniform_size`` is
+                False: "the preview tiles" means the one shared size the
+                owner sees on screen, not whichever character's tile
+                happens to differ. Read through ``_preview_cfg()``, the
+                established default-filling accessor for
+                ``self.config['preview']`` that every other ``tile_w`` /
+                ``tile_body_h`` consumer goes through (or is handed as its
+                ``cfg`` parameter) — never a raw ``self.config['preview']``
+                read. Full height adds ``preview_tile.STRIP_H``, the SAME
+                conversion ``preview_rects`` performs on its own seam just
+                below.
+                """
+                pcfg = self._preview_cfg()
+                w, body_h = preview_layout.clamp_size(
+                    pcfg.get("tile_w", 384), pcfg.get("tile_body_h", 216))
+                return (w, body_h + preview_tile.STRIP_H)
+
             self._hud_host = info_tiles.HudHost(
                 config=self.config,
                 save_config=self._save_config,
@@ -1954,6 +1980,10 @@ class FCToolGUI:
                 preview_rects=lambda: [
                     (x, y, w, body_h + preview_tile.STRIP_H)
                     for (x, y, w, body_h) in self._preview_tile_rects.values()],
+                # One-shot "Match preview size" seam
+                # (InfoTileController.match_preview_size) — see
+                # _hud_preview_tile_size above.
+                preview_tile_size=_hud_preview_tile_size,
                 screen_rects=self._preview_snap_screens,
                 # Called on the resolver's WORKER thread: a module-level pure
                 # function, never an fc_gui method or a lambda closing over one
