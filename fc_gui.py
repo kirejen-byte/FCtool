@@ -1937,7 +1937,7 @@ class FCToolGUI:
                 # The members route is fleet-boss-only, so "not boss" is a real
                 # answer the tile states honestly rather than a failed fetch.
                 fleet_state=lambda: (
-                    bool(self.esi_auth and self.esi_auth.is_authenticated()),
+                    bool(self.esi_auth and self.esi_auth.is_authenticated),
                     getattr(self, "_last_polled_fleet_id", None),
                     bool(getattr(self, "_last_polled_fleet_is_boss", False))),
                 # READ-ONLY: the stale-attribution guard that clears this pair on
