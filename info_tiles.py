@@ -31,12 +31,18 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   ``battle_ledger.assert_no_live_language`` (test-enforced), and the view's
   ``stamp_line`` is deliberately NOT rendered (owner directive 2026-07-30:
   players know killboard data trails a fight; the tile shows the numbers).
-- **The links report is NOT gated by the ESI fleet state.** Command-burst
-  charges are parsed out of FLEET CHAT, so the report is real with no fleet
-  boss and no ESI at all. The fleet tile therefore renders its links section
-  underneath whatever the comp rollup's gate decided -- including "Not in
-  fleet / not fleet boss". Hulls that could not be verified say so, per cell,
-  with a ``?``.
+- **The links line is NOT gated by the ESI fleet state.** Command-burst
+  charges are parsed out of FLEET CHAT, so the coverage report is real with no
+  fleet boss and no ESI at all. The fleet tile therefore renders its links
+  line underneath whatever the comp rollup's gate decided -- including "Not in
+  fleet / not fleet boss".
+- **The fleet tile is a GLANCE surface, not the Fleet tab.** It shows
+  abbreviated comp buckets in two columns and fleet-wide burst COVERAGE on one
+  line. The per-pilot charge rows, the not-boss caveat and the overflow
+  summary stay on the Fleet tab's Specialized Roles area, which has the width
+  for them (owner directive 2026-08-02, after live smoke: "for how small the
+  preview window is, there is probably no room to list the individual link
+  pilots").
 - **Intel fails OPEN.** A line whose distance is unknown is SHOWN with ``?j``;
   hiding a possibly-adjacent hostile report is the dangerous direction. A line
   naming no system never reaches this tile, and with no reference system the
@@ -55,6 +61,7 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import tkinter as tk
@@ -70,6 +77,7 @@ import intel_stream
 import preview_layout
 import system_coords
 import ui_theme
+from app_path import bundle_dir
 from info_tile import InfoTileWindow
 from ui_helpers import attach_tooltip, update_tooltip
 
@@ -114,6 +122,10 @@ INTEL_SHOW = 12
 
 FLEET_MAX_ROWS = 8
 OTHER_LABEL = "Other"
+#: The comp rollup renders in this many columns (row-major, heaviest first).
+#: Two, because the tile is as wide as a preview tile and a single column
+#: wasted the right half while pushing the links line off the bottom.
+COMP_COLUMNS = 2
 
 # Honest empty states. Each names the ACTUAL gap: the ESI members route is
 # fleet-boss-only (it 403s otherwise), so "not boss" is a real answer, not a
@@ -252,6 +264,77 @@ def _clock(when=None) -> str:
 
 # ── fleet composition ───────────────────────────────────────────────────────
 
+#: Inventory GROUP name -> the bucket label the tile prints. OWNER-TUNABLE:
+#: this table is the whole contract, it is meant to be edited in place, and an
+#: entry that is missing simply prints the SDE's own group name (identity
+#: fallback) -- so a wrong-looking label is one line away from fixed and a new
+#: CCP group can never crash or blank a row.
+#:
+#: Two entries are deliberate MERGES rather than abbreviations -- several
+#: groups sharing one label, whose counts and hull breakdowns aggregate into a
+#: single bucket:
+#:   * Command Ship + Command Destroyer -> "Links".  An FC counts LINKS, not
+#:     hull classes: three Claymores and two Bifrosts are five link ships, and
+#:     splitting them across two rows of an eight-row tile buys nothing.
+#:   * Combat Recon Ship + Force Recon Ship -> "Recon", for the same reason.
+#: The hull breakdown behind a merged bucket still names every hull (hover it),
+#: so the merge costs no information -- only rows.
+#:
+#: Keys are the exact ``type_catalog.SHIP_GROUP_NAMES`` values; abbreviations
+#: are the widely-used in-game ones (HAC, HIC, T3C, FAX, Blops...), never
+#: invented shorthand -- an FC has to read these at a glance mid-fight.
+SHIP_GROUP_ABBREV = {
+    # -- links + recon (MERGES, see above) --
+    "Command Ship": "Links",
+    "Command Destroyer": "Links",
+    "Combat Recon Ship": "Recon",
+    "Force Recon Ship": "Recon",
+    # -- sub-capital line --
+    "Battleship": "BS",
+    "Battlecruiser": "BC",
+    "Attack Battlecruiser": "Attack BC",
+    "Combat Battlecruiser": "Combat BC",
+    "Heavy Assault Cruiser": "HAC",
+    "Heavy Interdiction Cruiser": "HIC",
+    "Strategic Cruiser": "T3C",
+    "Logistics": "Logi",
+    "Logistics Frigate": "Logi Frig",
+    "Interdictor": "Dictor",
+    "Interceptor": "Ceptor",
+    "Assault Frigate": "AF",
+    "Electronic Attack Ship": "EAF",
+    "Covert Ops": "CovOps",
+    "Stealth Bomber": "Bomber",
+    "Tactical Destroyer": "T3D",
+    "Frigate": "Frig",
+    "Black Ops": "Blops",
+    # -- capitals --
+    "Force Auxiliary": "FAX",
+    "Dreadnought": "Dread",
+    "Lancer Dreadnought": "Lancer",
+    "Supercarrier": "Super",
+    "Command Carrier": "Cmd Carrier",
+    # -- everything else an FC sees on grid --
+    "Capsule": "Pod",
+    "Mining Barge": "Barge",
+    "Jump Freighter": "JF",
+    "Blockade Runner": "BR",
+    "Deep Space Transport": "DST",
+}
+
+
+def bucket_label(group_name) -> str:
+    """The tile's label for one inventory group. Pure, table-driven.
+
+    An unmapped group answers ITSELF: a table that has not caught up with the
+    SDE prints a long name, which is a cosmetic problem. Inventing an
+    abbreviation, or dropping the row, would not be."""
+    name = str(group_name or "").strip()
+    if not name:
+        return OTHER_LABEL
+    return SHIP_GROUP_ABBREV.get(name, name)
+
+
 @dataclass(frozen=True)
 class FleetCompModel:
     """What the fleet tile draws.
@@ -261,18 +344,20 @@ class FleetCompModel:
     `status` is set: a gated tile must not show a fleet size it cannot vouch
     for.
 
-    Each row is ``(group_name, count, hull_breakdown)`` -- count-descending,
-    top 8 plus an ``Other`` row that always sorts last -- where
-    `hull_breakdown` is ``((hull_name, count), ...)``, also count-descending,
-    summing to the row's count. The breakdown feeds the hover tooltip
-    (``fleet_group_tip``); plain tuples rather than dicts so the whole model is
-    frozen, hashable and diffable by ``==`` on the render path.
+    Each row is ``(bucket_label, count, hull_breakdown)`` -- count-descending,
+    top 8 plus an ``Other`` row that always sorts last -- where `bucket_label`
+    is ``SHIP_GROUP_ABBREV``'s compact name for the inventory group (several
+    groups may MERGE into one bucket) and `hull_breakdown` is
+    ``((hull_name, count), ...)``, also count-descending, summing to the row's
+    count. The breakdown feeds the hover tooltip (``fleet_group_tip``); plain
+    tuples rather than dicts so the whole model is frozen, hashable and
+    diffable by ``==`` on the render path.
 
-    `links` is the command-burst charge report (``LinksVM``) or None when there
-    is nothing tracked -- a separate, nested-frozen component so the renderer's
-    ``==`` diff still covers it, and so a fleet snapshot the ESI gate rejects
-    can still carry one: charge tracking is CHAT-sourced and owes ESI nothing
-    (see ``build_links_model``)."""
+    `links` is the command-burst COVERAGE report (``LinksVM``) or None when
+    there is nothing tracked -- a separate, nested-frozen component so the
+    renderer's ``==`` diff still covers it, and so a fleet snapshot the ESI
+    gate rejects can still carry one: charge tracking is CHAT-sourced and owes
+    ESI nothing (see ``build_links_model``)."""
     status: str
     total: int
     rows: tuple
@@ -401,8 +486,16 @@ def build_fleet_comp_model(members, ship_counts, total,
         groups.setdefault(group or OTHER_LABEL, Counter())[
             _hull_name(type_id, name_of)] += n
 
-    other = groups.pop(OTHER_LABEL, Counter())
-    named = sorted(((g, sum(c.values()), c) for g, c in groups.items()),
+    # The merge layer, deliberately AFTER the group rollup and BEFORE the sort:
+    # buckets compete on their MERGED weight, so "Links" (Command Ships +
+    # Command Destroyers together) can out-rank a group that beat either of
+    # them alone -- and the top-8 cut sees the same numbers the tile prints.
+    buckets: dict[str, Counter] = {}
+    for group, counter in groups.items():
+        buckets.setdefault(bucket_label(group), Counter()).update(counter)
+
+    other = buckets.pop(OTHER_LABEL, Counter())
+    named = sorted(((g, sum(c.values()), c) for g, c in buckets.items()),
                    key=lambda row: (-row[1], row[0]))
     for _g, _n, counter in named[FLEET_MAX_ROWS:]:
         other.update(counter)
@@ -416,11 +509,12 @@ def build_fleet_comp_model(members, ship_counts, total,
 
 
 def fleet_group_tip(row) -> str:
-    """Hover copy for one group row: ``75 Machariel, 5 Nestor, 1 Vindicator``.
+    """Hover copy for one bucket row: ``75 Machariel, 5 Nestor, 1 Vindicator``.
 
     Mirrors ``battle_ledger_panel.composition_tip``'s job (what the count was
-    actually made of) in this feature's own row shape. Pure, so the wording is
-    testable without a display."""
+    actually made of) in this feature's own row shape, and it is what makes a
+    MERGED bucket lossless: "Links" hovers "3 Claymore, 2 Bifrost, 1 Vulture".
+    Pure, so the wording is testable without a display."""
     try:
         breakdown = row[2]
     except (TypeError, IndexError, KeyError):
@@ -436,99 +530,91 @@ def fleet_row_text(row) -> str:
         return ""
 
 
-# ── links: the command-burst charge report ──────────────────────────────────
-# The Fleet tab's Specialized Roles report, compacted onto the fleet tile: the
-# fleet-wide coverage strip plus one row per pilot who linked charges, each
-# discipline carrying its verdict glyph and tooltip.
+# ── links: the command-burst COVERAGE line ──────────────────────────────────
+# The Fleet tab's Specialized Roles coverage strip, compacted onto one line of
+# the fleet tile: per discipline, the bundled burst icon and a ✓/✗.
 #
-# THE DATA IS CHAT-SOURCED. ``charge_tracker`` parses fleet chat, so this
-# section is meaningful with no fleet boss and no ESI at all -- which is why it
-# renders INDEPENDENTLY of ``FleetCompModel.status``: a tile can honestly say
-# "Not in fleet / not fleet boss" and still show the links report underneath.
-# Specialized Roles hides its per-pilot rows when not boss; this deliberately
-# does not (the ``?`` glyph already says "hull unverified", and an FC watching a
-# 200 px tile is better served by the names than by an empty box).
-
-#: Verdict -> palette KEY, the same shape as ``_BUCKET_COLOUR``: the composers
-#: stay palette-free and the renderer resolves the key.
-#:
-#: **TWIN of ``fc_gui.VERDICT_COLOR`` (fc_gui:270)** -- the Fleet tab's rows and
-#: this tile must never disagree about what green means. This module cannot
-#: import fc_gui, so the equality guard lives on the fc_gui side
-#: (``tests/test_info_tiles_wiring.py``).
-_VERDICT_COLOUR = {
-    cb.Verdict.BONUSED: "FG_GREEN",
-    cb.Verdict.BONUSED_CONDITIONAL: "FG_GREEN",
-    cb.Verdict.FITS_NO_BONUS: "FG_YELLOW",
-    cb.Verdict.CANT_FIT: "FG_RED",
-    cb.Verdict.UNKNOWN: "FG_DIM",
-}
+# WHAT THIS TILE DELIBERATELY DOES NOT CARRY (owner directive 2026-08-02, after
+# live smoke on a real client): the per-pilot charge rows, the not-boss caveat
+# and the "+N more" overflow. They need width the tile does not have, and the
+# Fleet tab keeps every one of them. The tile answers the glance question --
+# "are my links up?" -- and the tab answers "who is linking what".
+#
+# THE DATA IS CHAT-SOURCED. ``charge_tracker`` parses fleet chat, so this line
+# is meaningful with no fleet boss and no ESI at all -- which is why it renders
+# INDEPENDENTLY of ``FleetCompModel.status``: a tile can honestly say "Not in
+# fleet / not fleet boss" and still show coverage underneath.
 
 LINKS_TITLE = "Links"
-#: A short mirror of the Specialized Roles banner ("Ship verification
-#: unavailable (not fleet boss) - charges shown, hulls not checked"), sized for
-#: a tile rather than a tab.
-LINKS_CAVEAT_NOT_BOSS = "hulls not checked (not boss)"
-#: How many pilot rows the tile has widgets for. The MODEL carries every
-#: tracked pilot; the renderer summarises whatever does not fit as a final
-#: "+N more" row rather than dropping it silently.
-LINKS_MAX_PILOTS = 6
+
+#: full? -> the mark beside a discipline's icon. GUI text only, never logged.
+COVERAGE_GLYPH = {True: "✓", False: "✗"}
+
+#: discipline -> the bundled icon's file stem. The SAME four files fc_gui's
+#: Specialized Roles strip loads (``assets/bursts/<stem>_21.png``, a
+#: pre-rendered LANCZOS downscale of the 64 px master), so the two surfaces
+#: cannot drift into different artwork.
+BURST_ICON_FILES = {
+    cb.SHIELD: "shield",
+    cb.ARMOR: "armor",
+    cb.SKIRMISH: "skirmish",
+    cb.INFORMATION: "info",
+}
+BURST_ICON_PX = 21
+
+
+def load_burst_icons(widget) -> dict:
+    """``{discipline: tk.PhotoImage | None}`` for `widget`'s interpreter.
+
+    PER-INSTANCE, never module-level, and always ``master=widget``: a
+    ``PhotoImage`` belongs to the interpreter that made it, exactly like a
+    ``tkfont.Font`` (see the module-level font note), so a cached one would
+    break across roots -- and the caller must hold the returned dict for the
+    widgets' lifetime or Tk garbage-collects the images out from under them
+    (the classic empty-label trap).
+
+    EVERY load is guarded on its own. A missing asset, a ``TclError`` from a
+    file Tk cannot decode, or a frozen build whose bundle layout moved answers
+    None for that discipline, and the renderer falls back to the two-letter
+    text label -- a tile that renders without pictures beats a tile that does
+    not render."""
+    icons = {}
+    try:
+        base = os.path.join(bundle_dir(), "assets", "bursts")
+    except Exception:
+        log.debug("info tiles: no bundle dir for burst icons", exc_info=True)
+        base = ""
+    for discipline, stem in BURST_ICON_FILES.items():
+        image = None
+        if base:
+            try:
+                image = tk.PhotoImage(
+                    master=widget,
+                    file=os.path.join(base, f"{stem}_{BURST_ICON_PX}.png"))
+            except Exception:
+                log.debug("info tiles: burst icon %s did not load", stem,
+                          exc_info=True)
+                image = None
+        icons[discipline] = image
+    return icons
 
 
 @dataclass(frozen=True)
 class LinkCoverageVM:
-    """One discipline's fleet-wide coverage: ``Sh`` + full/not, plus the
-    tooltip naming what is missing (or how deep the redundancy runs)."""
+    """One discipline's fleet-wide coverage: which discipline (the renderer's
+    icon key), its two-letter text fallback label, full/not, and the tooltip
+    naming what is missing (or how deep the redundancy runs)."""
+    discipline: str
     label: str
     full: bool
     tip: str
 
 
 @dataclass(frozen=True)
-class LinkCellVM:
-    """One (discipline, verdict) cell on a pilot's row. `verdict` rides along
-    as the ENUM, not a colour: the renderer owns the palette."""
-    label: str
-    glyph: str
-    verdict: object
-    tip: str
-
-
-@dataclass(frozen=True)
-class LinkPilotVM:
-    """One pilot who linked charges. `over_limit` is the >3-charges flag that
-    reddens the row (a burst ship fits three)."""
-    name: str
-    charge_count: int
-    over_limit: bool
-    cells: tuple = ()
-
-
-@dataclass(frozen=True)
 class LinksVM:
-    """The whole links section. Nested tuples of frozen rows all the way down,
-    so ``FleetCompModel`` stays ``==``-diffable on the render path."""
-    caveat: str
+    """The whole links line. A tuple of frozen rows, so ``FleetCompModel``
+    stays ``==``-diffable on the render path."""
     coverage: tuple = ()
-    pilots: tuple = ()
-
-
-def _links_ship_name(ship_type_id, ship_names, resolve_type_name) -> str | None:
-    """Hull name for a verdict tooltip, or None (``verdict_text`` then says
-    "ship").
-
-    The host's PRE-RESOLVED map first -- fc_gui resolves hull names off the Tk
-    thread for exactly this reason -- then the OFFLINE bundled table. A name
-    equal to ``str(type_id)`` is ``zkill_monitor.resolve_name``'s UNRESOLVED
-    answer, not a hull called "606", and is rejected at both steps."""
-    if ship_type_id is None:
-        return None
-    mapped = ship_names.get(ship_type_id) if isinstance(ship_names, dict) else None
-    for candidate in (mapped, _call(resolve_type_name, ship_type_id)):
-        name = str(candidate).strip() if candidate else ""
-        if name and name != str(ship_type_id):
-            return name
-    return None
 
 
 def _links_coverage_rows(coverage) -> tuple:
@@ -547,105 +633,31 @@ def _links_coverage_rows(coverage) -> tuple:
             continue
         label = cb.DISCIPLINE_LABEL[discipline]
         full = bool(getattr(status, "full", False))
-        rows.append(LinkCoverageVM(label=label[:2], full=full,
+        rows.append(LinkCoverageVM(discipline=discipline, label=label[:2],
+                                   full=full,
                                    tip=cb.coverage_tip(status, label)))
     return tuple(rows)
 
 
-def build_links_model(rows_by_name, coverage, ship_names, is_boss,
-                      resolve_type_name=None) -> "LinksVM | None":
-    """Roll the charge tracker's state up into the tile's links section. Pure.
+def build_links_model(coverage) -> "LinksVM | None":
+    """Roll the charge tracker's coverage up into the tile's links line. Pure.
 
-    `rows_by_name` is fc_gui's pre-indexed ``{lowercased name:
-    command_bursts.PilotRow}``; `coverage` is ``charge_tracker.coverage()``'s
-    ``{discipline: CoverageStatus}``; `ship_names` is its off-thread
-    ``{type_id: hull name | None}`` map.
+    `coverage` is ``charge_tracker.coverage()``'s ``{discipline:
+    CoverageStatus}``, which fc_gui already computed for the Fleet tab and
+    stores for this seam (recomputing it would take the tracker's lock on the
+    Tk thread).
 
-    Returns **None** -- the section is then absent and the tile stays compact --
-    when nothing is tracked at all: no pilot with charges AND no discipline
-    reporting anything present. Anything less than that is a report worth the
-    rows.
-
-    `is_boss` only decides the CAVEAT. Pilot rows survive a non-boss fleet by
-    design (see the section header above); their verdicts simply come back
-    UNKNOWN, which the ``?`` glyph states outright.
+    Returns **None** -- the line is then absent and the tile stays compact --
+    when NO discipline reports anything present. The host's other three
+    ``links_snapshot`` members (the per-pilot rows, their hull names and the
+    boss flag) are deliberately not taken: the tile stopped rendering pilots,
+    and a builder that accepted arguments it ignores would invite them back.
     """
-    rows = (rows_by_name.values() if isinstance(rows_by_name, dict)
-            else (rows_by_name or ()))
-    # Injectable for testing; the DEFAULT is the offline bundled table, exactly
-    # as build_fleet_comp_model's is and for the same Tk-thread reason.
-    name_of = resolve_type_name or offline_type_name
-    pilots = []
-    for row in rows:
-        cells = []
-        ship_name = _links_ship_name(getattr(row, "ship_type_id", None),
-                                     ship_names, name_of)
-        for cell in getattr(row, "cells", ()) or ():
-            discipline = getattr(cell, "discipline", None)
-            label = cb.DISCIPLINE_LABEL.get(discipline)
-            if not label:
-                continue
-            verdict = getattr(cell, "verdict", cb.Verdict.UNKNOWN)
-            # str()-coerced: cb.verdict_text() joins these with ", ", which
-            # raises TypeError into this pure builder on any non-str member
-            # (probed junk-input gap; see test_a_junk_snapshot_never_raises).
-            charges = tuple(str(c) for c in (getattr(cell, "charges", ()) or ()))
-            cells.append(LinkCellVM(
-                label=label[:2],
-                glyph=cb.VERDICT_GLYPH.get(verdict, "?"),
-                verdict=verdict,
-                tip=cb.verdict_text(verdict, label, charges, ship_name)))
-        if not cells:
-            continue
-        pilots.append(LinkPilotVM(
-            name=str(getattr(row, "name", "") or "?"),
-            charge_count=_as_int(getattr(row, "charge_count", 0), 0),
-            over_limit=bool(getattr(row, "over_limit", False)),
-            cells=tuple(cells)))
-    # Same order as build_pilot_rows', so a pilot never jumps between the tile
-    # and the Fleet tab's listing.
-    pilots.sort(key=lambda p: p.name.lower())
-
-    coverage_rows = _links_coverage_rows(coverage)
+    rows = _links_coverage_rows(coverage)
     statuses = coverage.values() if isinstance(coverage, dict) else ()
-    if not pilots and not any(getattr(s, "present", ()) for s in statuses):
+    if not any(getattr(s, "present", ()) for s in statuses):
         return None
-    return LinksVM(caveat="" if is_boss else LINKS_CAVEAT_NOT_BOSS,
-                   coverage=coverage_rows, pilots=tuple(pilots))
-
-
-def links_coverage_text(row) -> str:
-    """``Sh✓`` / ``Ar✗`` -- the strip cell. GUI text only, never logged."""
-    return f"{row.label}{'✓' if row.full else '✗'}"
-
-
-def links_cell_text(cell) -> str:
-    """``Sk⚠`` -- one pilot cell, label then verdict glyph."""
-    return f"{cell.label}{cell.glyph}"
-
-
-def links_pilot_text(pilot) -> str:
-    """``Kirejen 4`` -- who linked, and how many charges."""
-    return f"{pilot.name} {pilot.charge_count}"
-
-
-def links_pilot_rows(pilots, limit: int = LINKS_MAX_PILOTS) -> tuple:
-    """``(visible_rows, hidden_count)`` for a fixed pool of `limit` rows.
-
-    An overflow spends the LAST row on a "+N more" summary rather than showing
-    `limit` pilots and quietly hiding the rest -- a links report that lies about
-    its own length is worse than one that is short."""
-    pilots = tuple(pilots or ())
-    cap = _as_int(limit, 0)
-    if cap <= 0:
-        return (), len(pilots)
-    if len(pilots) <= cap:
-        return pilots, 0
-    return pilots[:cap - 1], len(pilots) - (cap - 1)
-
-
-def links_overflow_text(hidden: int) -> str:
-    return f"+{hidden} more"
+    return LinksVM(coverage=rows)
 
 
 # ── intel ───────────────────────────────────────────────────────────────────
@@ -825,12 +837,12 @@ class _LabelPool:
 
     Rebuilding widgets per repaint would churn Tk AND force a tooltip
     re-attach, and ``attach_tooltip`` binds with ``add="+"`` -- re-attaching
-    stacks a fresh handler set every time. So the pool attaches ONCE per label
-    at construction and re-words through ``update_tooltip`` afterwards."""
+    stacks a fresh handler set every time. So pools build once and re-word
+    afterwards. (This one carries no tooltips: the surface that needs them is
+    the fleet comp, and it is gridded -- see ``_CompGrid``.)"""
 
-    def __init__(self, parent, size: int, palette: dict, tooltips=False):
+    def __init__(self, parent, size: int, palette: dict):
         self._palette = palette
-        self._tooltips = tooltips
         self._labels = []
         self._packed = []
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
@@ -838,10 +850,73 @@ class _LabelPool:
             label = tk.Label(parent, text="", font=_FONT_ROW, bg=bg,
                              fg=palette.get("FG_TEXT", ui_theme.FG_TEXT),
                              anchor="w", justify="left")
-            if tooltips:
-                attach_tooltip(label, "")
             self._labels.append(label)
             self._packed.append(False)
+
+    def render(self, items) -> None:
+        """`items` is a sequence of ``(text, palette_key)``."""
+        for index, label in enumerate(self._labels):
+            if index < len(items):
+                text, colour_key = items[index]
+                label.configure(
+                    text=text,
+                    fg=self._palette.get(colour_key,
+                                         self._palette.get("FG_TEXT")))
+                if not self._packed[index]:
+                    label.pack(fill="x", padx=4)
+                    self._packed[index] = True
+            elif self._packed[index]:
+                label.pack_forget()
+                self._packed[index] = False
+
+
+class _CompGrid:
+    """The comp rollup's cells: a fixed pool of labels in a `columns`-wide
+    grid, filled ROW-MAJOR so the heaviest bucket reads top-left.
+
+    It owns its own frame, for the same reason ``_LinksPanel`` owns one -- the
+    renderer's containers are packed at construction and content can then only
+    move WITHIN a container (``pack`` appends).
+
+    Two disciplines:
+
+    * **the tooltip attaches ONCE.** ``attach_tooltip`` binds with ``add="+"``,
+      so a pool that re-attached per repaint would stack a fresh handler set
+      every second; cells are re-worded with ``update_tooltip`` instead.
+    * **every ``grid()`` call passes the FULL option set.** Tk RETAINS the
+      options it is not given across a re-grid (``grid_forget`` discards
+      them) -- the stale-columnspan class of bug. A cell's slot here is a pure
+      function of its pool index so it never actually moves, but the rule is
+      cheap to keep and expensive to rediscover.
+
+    Unlike a packed pool, a cell that first gets content LATE still lands in
+    its own slot: grid placement is absolute, so the lazy-first-pack ordering
+    hazard simply cannot arise inside this container."""
+
+    def __init__(self, parent, palette: dict, size: int,
+                 columns: int = COMP_COLUMNS):
+        self._palette = palette
+        self._columns = max(1, int(columns))
+        bg = palette.get("BG_DARK", ui_theme.BG_DARK)
+        self.frame = tk.Frame(parent, bg=bg)
+        for column in range(self._columns):
+            # Equal halves (uniform), so the second column starts at a fixed x
+            # and both columns of counts read down instead of wandering with
+            # whatever the widest label happens to be this second.
+            self.frame.columnconfigure(column, weight=1, uniform="comp")
+        self._labels = []
+        self._shown = []
+        for _ in range(max(0, int(size))):
+            label = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg,
+                             fg=palette.get("FG_TEXT", ui_theme.FG_TEXT),
+                             anchor="w", justify="left")
+            attach_tooltip(label, "")
+            self._labels.append(label)
+            self._shown.append(False)
+
+    def slot(self, index) -> tuple:
+        """``(row, column)`` for pool index `index`. Row-major."""
+        return divmod(int(index), self._columns)
 
     def render(self, items) -> None:
         """`items` is a sequence of ``(text, palette_key, tip_or_None)``."""
@@ -852,146 +927,135 @@ class _LabelPool:
                     text=text,
                     fg=self._palette.get(colour_key,
                                          self._palette.get("FG_TEXT")))
-                if self._tooltips:
-                    update_tooltip(label, tip or "")
-                if not self._packed[index]:
-                    label.pack(fill="x", padx=4)
-                    self._packed[index] = True
-            elif self._packed[index]:
-                label.pack_forget()
-                self._packed[index] = False
+                update_tooltip(label, tip or "")
+                if not self._shown[index]:
+                    row, column = self.slot(index)
+                    label.grid(row=row, column=column, sticky="w",
+                               padx=(4, 2), pady=0)
+                    self._shown[index] = True
+            elif self._shown[index]:
+                label.grid_forget()
+                self._shown[index] = False
 
 
-class _LinkRow:
-    """One links row: a lead label plus a fixed pool of colour-coded cells.
+class _CoverageCell:
+    """One discipline on the links line: its burst icon (or the two-letter
+    text fallback) plus a ✓/✗ mark, both hovering the SAME tooltip.
 
-    A cell needs its own WIDGET because each verdict carries its own colour and
-    its own tooltip, and a ``tk.Label`` is single-coloured. Widgets are built
-    once and re-worded thereafter (``attach_tooltip`` binds with ``add="+"``,
-    so a per-repaint re-attach stacks a fresh handler set every time).
+    Icon-or-text is decided ONCE, at construction, from whatever
+    ``load_burst_icons`` managed to load -- a cell never changes its mind
+    mid-session, so there is no swap path to get wrong. The image reference is
+    held on the instance as well as in the panel's cache: a ``PhotoImage`` that
+    only Tk still points at gets collected, and the label silently goes
+    blank."""
 
-    The row does NOT pack its own frame: ``_LinksPanel`` owns section order
-    (see its docstring). Cell packing stays here and is safe, because the
-    packed cells are always the prefix ``[0..n-1]`` -- growth can only append
-    after cells that are already in place."""
-
-    def __init__(self, parent, palette: dict, cells: int, lead_tip=False):
+    def __init__(self, parent, palette: dict, discipline: str, icon):
         self._palette = palette
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
         fg = palette.get("FG_TEXT", ui_theme.FG_TEXT)
         self.frame = tk.Frame(parent, bg=bg)
-        self.lead = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg, fg=fg,
-                             anchor="w", justify="left")
-        self.lead.pack(side="left")
-        self._lead_tip = bool(lead_tip)
-        if self._lead_tip:
-            attach_tooltip(self.lead, "")
-        self._cells = []
-        self._cells_packed = []
-        for _ in range(max(0, int(cells))):
-            label = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg, fg=fg)
-            attach_tooltip(label, "")
-            self._cells.append(label)
-            self._cells_packed.append(False)
+        self.icon_image = icon              # strong ref -- see the docstring
+        if icon is not None:
+            self.icon = tk.Label(self.frame, image=icon, bg=bg)
+        else:
+            self.icon = tk.Label(self.frame,
+                                 text=cb.DISCIPLINE_LABEL[discipline][:2],
+                                 font=_FONT_HEAD, bg=bg, fg=fg)
+        self.icon.pack(side="left")
+        self.mark = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg,
+                             fg=fg)
+        self.mark.pack(side="left")
+        for widget in (self.icon, self.mark):
+            attach_tooltip(widget, "")
 
-    def _colour(self, key):
-        return self._palette.get(key, self._palette.get("FG_TEXT"))
-
-    def render(self, lead_text, lead_key, lead_tip, cells) -> None:
-        """Configure the row. `cells` is a sequence of ``(text, palette_key,
-        tip)``; anything past the pool's width is clipped, never wrapped."""
-        self.lead.configure(text=lead_text, fg=self._colour(lead_key))
-        if self._lead_tip:
-            update_tooltip(self.lead, lead_tip or "")
-        for index, label in enumerate(self._cells):
-            if index < len(cells):
-                text, colour_key, tip = cells[index]
-                label.configure(text=text, fg=self._colour(colour_key))
-                update_tooltip(label, tip or "")
-                if not self._cells_packed[index]:
-                    label.pack(side="left", padx=(4, 0))
-                    self._cells_packed[index] = True
-            elif self._cells_packed[index]:
-                label.pack_forget()
-                self._cells_packed[index] = False
+    def render(self, row) -> None:
+        self.mark.configure(
+            text=COVERAGE_GLYPH[bool(row.full)],
+            fg=self._palette.get("FG_GREEN" if row.full else "FG_RED"))
+        for widget in (self.icon, self.mark):
+            update_tooltip(widget, row.tip or "")
 
 
 class _LinksPanel:
-    """The links section: its own container, and its own ordering discipline.
+    """The links line: its own container, one row, one cell per discipline.
 
     TWO ordering hazards, both of the "``pack`` APPENDS" family:
 
-    * against the comp rows -- ``_LabelPool`` packs a row lazily the first time
-      it has content, so a fleet that grows a group mid-session would append
-      that row UNDER a links section packed earlier. This panel therefore lives
-      in its OWN container frame, packed at construction: growth inside either
-      container can only ever move rows within it;
-    * inside the section -- the caveat line and the coverage strip come and go
-      (boss status flips, a host reports no coverage). Rather than track which
-      widget may follow which, ``_relayout`` re-packs the whole section IN
-      ORDER whenever the packed SET changes, and does nothing at all when it
-      does not. The set changes far less often than the text does.
+    * against the comp grid -- this panel lives in its OWN container frame,
+      packed at construction, so a comp bucket that first appears mid-session
+      can never land under it;
+    * inside the row -- a discipline the host never reported is omitted (a
+      fabricated ✗ would be a lie), so the cell SET can change. Rather than
+      track which cell may follow which, ``_relayout`` re-packs the row IN
+      ORDER whenever the packed set changes and does nothing at all when it
+      does not. The set changes far less often than the glyphs do.
+
+    The whole row is hidden when no discipline reports anything: a lone
+    "Links" caption over nothing is worse than no line at all.
     """
 
-    def __init__(self, parent, palette: dict):
+    def __init__(self, parent, palette: dict, icons=None):
         self._palette = palette
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
         self.frame = tk.Frame(parent, bg=bg)
         self.frame.pack(fill="x")
-        self._head = tk.Label(self.frame, text=LINKS_TITLE, font=_FONT_HEAD,
+        self.row = tk.Frame(self.frame, bg=bg)
+        self._head = tk.Label(self.row, text=LINKS_TITLE, font=_FONT_HEAD,
                               bg=bg, fg=palette.get("FG_ACCENT"), anchor="w")
-        self._caveat = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg,
-                                fg=palette.get("FG_DIM"), anchor="w")
-        self._coverage = _LinkRow(self.frame, palette, len(cb.DISCIPLINES))
-        self._pilots = [_LinkRow(self.frame, palette, len(cb.DISCIPLINES),
-                                 lead_tip=True)
-                        for _ in range(LINKS_MAX_PILOTS)]
+        self._head.pack(side="left", padx=(0, 6))
+        #: PER-INSTANCE (a PhotoImage belongs to one interpreter) and held for
+        #: the cells' whole lifetime -- see ``load_burst_icons``.
+        self.icons = (load_burst_icons(self.frame) if icons is None
+                      else dict(icons))
+        self._cells = {d: _CoverageCell(self.row, palette, d,
+                                        self.icons.get(d))
+                       for d in cb.DISCIPLINES}
         self._layout: list = []
+        self._packed = False
+        self.frame.bind("<Destroy>", self._release_icons, add="+")
+
+    def _release_icons(self, _event=None) -> None:
+        """Drop the images on the TK THREAD, while the interpreter is alive.
+
+        ``PhotoImage.__del__`` calls back into Tcl (``image delete``) and
+        catches only ``TclError`` -- so an image collected on a WORKER thread
+        raises ``RuntimeError: main thread is not in main loop`` and prints an
+        ignored-exception traceback. This app runs several worker threads and a
+        tile the owner closes mid-fight drops its renderer, which would leave
+        the collection to land on whichever thread allocates next. Releasing
+        the last references from the destroy handler makes it deterministic."""
+        for cell in self._cells.values():
+            cell.icon_image = None
+        self.icons.clear()
 
     def render(self, model) -> None:
-        """Draw the section. `model` is a ``LinksVM``, or None = section
-        absent, which leaves the fleet tile exactly as compact as before."""
-        if model is None:
-            self._relayout([])
-            return
-        wanted = [self._head]
-        if model.caveat:
-            self._caveat.configure(text=model.caveat)
-            wanted.append(self._caveat)
-        if model.coverage:
-            self._coverage.render("", "FG_TEXT", "", [
-                (links_coverage_text(row),
-                 "FG_GREEN" if row.full else "FG_RED", row.tip)
-                for row in model.coverage])
-            wanted.append(self._coverage.frame)
-        visible, hidden = links_pilot_rows(model.pilots)
-        for index, pilot in enumerate(visible):
-            row = self._pilots[index]
-            row.render(
-                links_pilot_text(pilot),
-                # over_limit reddens the whole lead (name AND count): a burst
-                # ship fits three charges, so a fourth is a fit worth a look.
-                "FG_RED" if pilot.over_limit else "FG_TEXT",
-                (cb.over_limit_tip(pilot.charge_count)
-                 if pilot.over_limit else ""),
-                [(links_cell_text(cell),
-                  _VERDICT_COLOUR.get(cell.verdict, "FG_DIM"), cell.tip)
-                 for cell in pilot.cells])
-            wanted.append(row.frame)
-        if hidden:
-            row = self._pilots[len(visible)]
-            row.render(links_overflow_text(hidden), "FG_DIM", "", ())
-            wanted.append(row.frame)
+        """Draw the line. `model` is a ``LinksVM``, or None = line absent,
+        which leaves the fleet tile exactly as compact as before."""
+        rows = (tuple(getattr(model, "coverage", ()) or ())
+                if model is not None else ())
+        wanted = []
+        for row in rows:
+            cell = self._cells.get(getattr(row, "discipline", None))
+            if cell is None:
+                continue
+            cell.render(row)
+            wanted.append(cell.frame)
         self._relayout(wanted)
 
     def _relayout(self, wanted) -> None:
-        if wanted == self._layout:
-            return
-        for widget in self._layout:
-            widget.pack_forget()
-        for widget in wanted:
-            widget.pack(fill="x", padx=4)
-        self._layout = list(wanted)
+        if wanted != self._layout:
+            for widget in self._layout:
+                widget.pack_forget()
+            for widget in wanted:
+                widget.pack(side="left", padx=(0, 8))
+            self._layout = list(wanted)
+        show = bool(wanted)
+        if show != self._packed:
+            if show:
+                self.row.pack(fill="x", padx=4, pady=(2, 0))
+            else:
+                self.row.pack_forget()
+            self._packed = show
 
 
 class _TileRenderer:
@@ -1063,43 +1127,50 @@ class BattleRenderer(_TileRenderer):
                 getattr(view, "fast", None))
 
     def _draw(self, view):
-        self._pool.render([(text, colour, None)
-                           for text, colour in battle_lines(view)])
+        self._pool.render(battle_lines(view))
 
 
 class FleetRenderer(_TileRenderer):
-    """Fleet size + inv-group rollup, each row hovering its hull breakdown,
-    with the command-burst links report underneath."""
+    """Fleet size + abbreviated inv-group buckets in TWO columns, each cell
+    hovering its hull breakdown, with the command-burst coverage line
+    underneath."""
 
     def __init__(self, parent, palette: dict):
         super().__init__(parent, palette)
-        self._head = tk.Label(self.frame, text="", font=_FONT_HEAD,
-                              bg=self._palette.get("BG_DARK"),
-                              fg=self._palette.get("FG_ACCENT"),
-                              anchor="w")
-        self._head.pack(fill="x", padx=4)
-        # Two containers, both packed HERE and in this order, because the row
-        # pool packs lazily and ``pack`` appends -- see ``_LinksPanel``.
-        self._rows_holder = tk.Frame(self.frame,
-                                     bg=self._palette.get("BG_DARK"))
+        bg = self._palette.get("BG_DARK")
+        # Two containers, both packed HERE and in this order, because content
+        # inside either can appear late and ``pack`` appends -- see
+        # ``_LinksPanel``. The head joins the TOP container rather than sitting
+        # loose in the body, for exactly that reason.
+        self._rows_holder = tk.Frame(self.frame, bg=bg)
         self._rows_holder.pack(fill="x")
-        self._pool = _LabelPool(self._rows_holder, FLEET_MAX_ROWS + 1,
-                                self._palette, tooltips=True)
+        self._rows_holder.columnconfigure(0, weight=1)
+        self._head = tk.Label(self._rows_holder, text="", font=_FONT_HEAD,
+                              bg=bg, fg=self._palette.get("FG_ACCENT"),
+                              anchor="w")
+        # columnspan: the total -- and the gate status that replaces it -- is a
+        # caption for BOTH columns of buckets underneath.
+        self._head.grid(row=0, column=0, columnspan=COMP_COLUMNS, sticky="w",
+                        padx=4, pady=(0, 1))
+        self._grid = _CompGrid(self._rows_holder, self._palette,
+                               FLEET_MAX_ROWS + 1)
+        self._grid.frame.grid(row=1, column=0, columnspan=COMP_COLUMNS,
+                              sticky="ew")
         self._links = _LinksPanel(self.frame, self._palette)
 
     def _draw(self, model):
         if model.status:
             self._head.configure(text=model.status,
                                  fg=self._palette.get("FG_DIM"))
-            self._pool.render([])
+            self._grid.render([])
         else:
             self._head.configure(text=f"Total: {model.total}",
                                  fg=self._palette.get("FG_ACCENT"))
-            self._pool.render([
+            self._grid.render([
                 (fleet_row_text(row),
                  "FG_DIM" if row[0] == OTHER_LABEL else "FG_TEXT",
                  fleet_group_tip(row)) for row in model.rows])
-        # Deliberately OUTSIDE the status branch: the charge report is
+        # Deliberately OUTSIDE the status branch: the coverage report is
         # chat-sourced, so a tile gated to "not fleet boss" still carries one.
         self._links.render(getattr(model, "links", None))
 
@@ -1133,7 +1204,7 @@ class IntelRenderer(_TileRenderer):
             self._head.pack_forget()
             self._head_packed = False
         self._pool.render([(intel_row_text(row),
-                            "FG_YELLOW" if row.priority else "FG_TEXT", None)
+                            "FG_YELLOW" if row.priority else "FG_TEXT")
                            for row in model.rows])
 
 
@@ -1142,10 +1213,16 @@ class IntelRenderer(_TileRenderer):
 TILE_SPECS = {
     "battle": {"title": "Battle", "default_size": (260, 150),
                "render": BattleRenderer},
-    # The fleet tile carries the comp rollup AND the links report, so its
+    # The fleet tile carries the comp rollup AND the coverage line, so its
     # first-spawn default has to fit both -- a section clipped by the body's
     # (deliberate) propagation guard is a section the owner never discovers.
-    "fleet": {"title": "Fleet", "default_size": (280, 260),
+    # MEASURED 2026-08-02 against the WORST case (all 8 buckets + Other, two
+    # columns, plus the coverage line): 258x142 of content, i.e. 162 px of
+    # window once info_tile's 20 px strip is added; a realistic six-bucket
+    # fleet is 258x104 (124 px of window). 280x170 carries the worst case with
+    # a little slack -- and is 90 px SHORTER than the single-column,
+    # per-pilot-rows layout it replaces.
+    "fleet": {"title": "Fleet", "default_size": (280, 170),
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
               "render": IntelRenderer},
@@ -1812,24 +1889,27 @@ class InfoTileController:
             members, ship_counts, total, authenticated, fleet_id, is_boss,
             resolve_type_name=lambda tid: offline_type_name(tid, catalog),
             resolve_group_name=lambda tid: offline_group_name(tid, catalog))
-        return replace(model, links=self._links_model(catalog))
+        return replace(model, links=self._links_model())
 
-    def _links_model(self, catalog):
-        """The command-burst report, or None when nothing is tracked.
+    def _links_model(self):
+        """The command-burst coverage line, or None when nothing is tracked.
 
         Built from its OWN seam and NOT from ``fleet_state``: charges are read
         out of fleet chat, so the report is meaningful with no ESI character
-        and no fleet boss (the gate the comp rollup above must respect)."""
+        and no fleet boss (the gate the comp rollup above must respect).
+
+        The seam still answers fc_gui's whole four-tuple -- it feeds the Fleet
+        tab's Specialized Roles area too, and this module does not get to
+        reshape it -- but the TILE consumes only the coverage member: its
+        per-pilot rows moved back to the tab (owner directive 2026-08-02)."""
         snapshot = _call(self._host.links_snapshot, default=None)
-        rows_by_name, coverage, ship_names, is_boss = {}, {}, {}, False
+        coverage = {}
         if snapshot:
             try:
-                rows_by_name, coverage, ship_names, is_boss = snapshot
+                _rows_by_name, coverage, _ship_names, _is_boss = snapshot
             except (TypeError, ValueError):
-                rows_by_name, coverage, ship_names, is_boss = {}, {}, {}, False
-        return build_links_model(
-            rows_by_name, coverage, ship_names, is_boss,
-            resolve_type_name=lambda tid: offline_type_name(tid, catalog))
+                coverage = {}
+        return build_links_model(coverage)
 
     def _reference(self):
         return resolve_reference(
