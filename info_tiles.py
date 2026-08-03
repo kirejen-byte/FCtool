@@ -26,6 +26,13 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
 - **Tooltips attach ONCE per widget and are re-worded with
   ``update_tooltip``.** ``attach_tooltip``'s three binds use ``add="+"``, so a
   panel that re-attached on every repaint would leak a handler set per second.
+  **Every renderer-side attach passes ``topmost=True``** (``_CompGrid``,
+  ``_CoverageCell``) -- the tile that hosts them is ``HWND_TOPMOST``, and a tip
+  with no topmost handling of its own is created BELOW it at the pointer
+  position (owner-reported 2026-08-02: hovering a fleet row showed nothing).
+  Settings-popup attaches (``_grid_row``, ``_check``, the button row) leave the
+  default False -- that window is a normal Toplevel, and an always-topmost tip
+  there would float over OTHER applications too.
 - **The battle tile never claims freshness and carries no delay caption.**
   Every string ``battle_lines`` composes is held to
   ``battle_ledger.assert_no_live_language`` (test-enforced), and the view's
@@ -920,7 +927,10 @@ class _CompGrid:
             label = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg,
                              fg=palette.get("FG_TEXT", ui_theme.FG_TEXT),
                              anchor="w", justify="left")
-            attach_tooltip(label, "")
+            # topmost=True: this cell lives inside a HWND_TOPMOST tile -- a
+            # tip with no topmost handling of its own is stacked BELOW the
+            # tile at the pointer position (created, never seen).
+            attach_tooltip(label, "", topmost=True)
             self._labels.append(label)
             self._shown.append(False)
 
@@ -980,7 +990,8 @@ class _CoverageCell:
                              fg=fg)
         self.mark.pack(side="left")
         for widget in (self.icon, self.mark):
-            attach_tooltip(widget, "")
+            # Same HWND_TOPMOST-tile reasoning as _CompGrid above.
+            attach_tooltip(widget, "", topmost=True)
 
     def render(self, row) -> None:
         if self.icon_image is None:

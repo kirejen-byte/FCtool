@@ -30,7 +30,7 @@ Two helpers:
         (``base_bg`` or the canonical ``ui_theme.BG_DARK``), retiring the
         BG_DARK-vs-BG_PANEL split across dialogs.
 
-``attach_tooltip(widget, text)``
+``attach_tooltip(widget, text, *, topmost=False)``
     The single hover-tooltip implementation (D9). Promoted verbatim-in-spirit
     from ``overview_manager_ui._attach_tooltip`` — the best-in-repo version, the
     only one that bound ``<Destroy>`` and so did not leak an orphaned Toplevel
@@ -38,6 +38,15 @@ Two helpers:
     from ``ui_theme`` (dark panel bg, light text — never the stray light-yellow
     ``#ffffe0`` that one bespoke copy rendered). The copy is also stashed on the
     widget as ``_tooltip_text`` so tests can assert it without simulating a hover.
+    ``topmost=True`` pins the tip's own ``-topmost`` attribute so it stacks
+    above an owner that is itself ``HWND_TOPMOST`` (the FC HUD tiles) — a plain
+    tip has no z-order relationship to a topmost owner and is created BELOW it
+    at the pointer position, i.e. never actually seen (owner-reported
+    2026-08-02: hovering a HUD tile's fleet rows showed no tooltip). Default
+    False: the vast majority of callers attach to widgets inside ordinary
+    windows, where an always-topmost tip would float over OTHER applications
+    too (the same band hazard documented on ``autocomplete.py`` in
+    ``map/facts.md``).
 
 ``update_tooltip(widget, text)``
     Change the copy of an ALREADY-attached tooltip. It exists because
@@ -114,7 +123,7 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
     return win
 
 
-def attach_tooltip(widget, text):
+def attach_tooltip(widget, text, *, topmost=False):
     """Attach a simple hover tooltip to ``widget`` (D9 shared helper) and return
     ``widget``.
 
@@ -130,6 +139,13 @@ def attach_tooltip(widget, text):
     ``_show`` READS it back from there rather than closing over ``text``, so
     ``update_tooltip`` can change the copy later without re-binding (see the
     module docstring: re-attaching stacks ``add="+"`` handlers).
+
+    ``topmost`` (keyword-only, default False): when True, the shown tip also
+    gets its own ``-topmost`` attribute set and is lifted, so it stacks above
+    an owner window that is itself always-on-top. Pass this for tooltips
+    attached inside a ``HWND_TOPMOST`` window (e.g. the FC HUD tiles) — a tip
+    with no topmost handling of its own is stacked BELOW its topmost owner at
+    the pointer position: created, but invisible.
     """
     widget._tooltip_text = text
     state = {"tip": None}
@@ -161,6 +177,15 @@ def attach_tooltip(widget, text):
             tip.wm_geometry(
                 f"+{widget.winfo_rootx() + 12}"
                 f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            if topmost:
+                try:
+                    tip.wm_attributes("-topmost", True)
+                except tk.TclError:
+                    pass
+                try:
+                    tip.lift()
+                except tk.TclError:
+                    pass
             state["tip"] = tip
         except tk.TclError:
             state["tip"] = None
