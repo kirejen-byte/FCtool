@@ -61,6 +61,14 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   ``SetWindowPos(HWND_TOPMOST)`` -- it IS a retop, and a per-tick retop is the
   measured DWM-thrash / in-game FPS bug. Tiles are placed at spawn, on
   ``arrange``/``reset_layouts``, and by their own drags. Nowhere else.
+- **The HUD follows the EVE clients on/off screen, EDGE-TRIGGERED.** With no
+  client running the tiles are WITHDRAWN (never destroyed -- geometry, config
+  and content survive) and mapped again when one appears. Only the transition
+  does work: ``show()`` owns the tiles' single retop, so a level-triggered
+  "show every beat" would be exactly the per-tick retop the rule above
+  forbids. The presence seam is FAIL-VISIBLE -- absent, non-callable or
+  raising all read as "clients present", because a HUD hidden by a wiring bug
+  cannot be asked back from the overlay itself.
 - **Log strings stay ASCII** (this box's console is cp1252 and a stray glyph
   raises inside logging's StreamHandler). Tile TEXT may use anything -- it is
   never logged.
@@ -1511,6 +1519,15 @@ def _no_fleet(*_args, **_kwargs):
     return (False, None, False)
 
 
+def _present(*_args, **_kwargs):
+    """Inert default for ``HudHost.clients_present`` -- see the field.
+
+    True, deliberately: every OTHER seam's inert default is the empty/absent
+    answer, but this one gates VISIBILITY, so its inert answer has to be the
+    one that leaves the tiles on screen."""
+    return True
+
+
 @dataclass
 class HudHost:
     """Every fc_gui seam the HUD needs, injected.
@@ -1570,6 +1587,20 @@ class HudHost:
     #: this seam answers a size only -- ``match_preview_size`` places each HUD
     #: tile at ITS OWN existing (x, y).
     preview_tile_size: object = _none
+    #: () -> bool -- is at least one EVE client window on screen right now?
+    #: Read once per beat; the controller HIDES every tile on the True->False
+    #: edge and SHOWS them again on the False->True one, so the HUD does not
+    #: float over a bare desktop after the last client closes. Login windows
+    #: count as clients (that is the tracker's own semantics, and a login
+    #: screen is exactly when an FC wants his tiles back).
+    #:
+    #: FAIL-VISIBLE, and the ONE seam whose inert default is not the empty
+    #: answer: absent, non-callable or raising all read as PRESENT (see
+    #: ``_present``). A seam fc_gui forgets to wire, or one that breaks,
+    #: must leave the tiles up -- a HUD hidden by a wiring bug looks like a
+    #: dead feature, and there is no way to ask for it back from the overlay
+    #: itself.
+    clients_present: object = _present
     screen_rects: object = _empty        # () -> [(x, y, w, h)]
     route_fn: object = _none             # (origin, dest) -> [ids] | None
     #: The app's own ``TypeCatalog`` (fc_gui's ``self.type_catalog``). Not a
@@ -1593,6 +1624,11 @@ class InfoTileController:
         self._tiles: dict = {}
         self._renderers: dict = {}
         self._enabled = False
+        #: True while every tile is WITHDRAWN because no EVE client is on
+        #: screen (see ``_sync_presence``). Orthogonal to ``_enabled``: the
+        #: tiles still exist, keep their geometry and keep their config, they
+        #: are merely unmapped.
+        self._suspended = False
         #: this controller's OWN bounded history. fc_gui's `_intel_buffer` is
         #: never read and never mutated.
         self.intel_entries = deque(maxlen=INTEL_KEEP)
@@ -1661,6 +1697,11 @@ class InfoTileController:
             return
         self._enabled = flag
         if flag:
+            # Presence BEFORE the first spawn, not after: enabling the HUD with
+            # no client running must spawn the tiles HIDDEN. Deciding it in the
+            # tick below instead would spawn them mapped and withdraw them a
+            # moment later -- a visible flash over the desktop.
+            self._suspended = not self._clients_present()
             for key in TILE_SPECS:
                 if self._tile_enabled(key):
                     self._spawn(key)
@@ -1683,13 +1724,55 @@ class InfoTileController:
         if not self._enabled:
             return
         if flag:
+            # `_spawn` places but does not show while suspended, and rendering
+            # into a withdrawn window is a Tk write nobody can see: the
+            # False->True presence edge shows AND re-renders in the same beat.
             self._spawn(key)
-            self._render(key)
+            if not self._suspended:
+                self._render(key)
         else:
             self._teardown(key)
 
     def _tile_enabled(self, key) -> bool:
         return bool(self._tile_block(key).get("enabled", False))
+
+    # -- EVE-client presence -------------------------------------------------
+    def _clients_present(self) -> bool:
+        """Guarded read of the ``clients_present`` seam. FAIL-VISIBLE: a seam
+        that is absent, not callable or raising answers PRESENT, so a wiring
+        bug can never hide the HUD (see the field's own note)."""
+        seam = getattr(self._host, "clients_present", None)
+        if not callable(seam):
+            return True
+        try:
+            return bool(seam())
+        except Exception:
+            log.debug("info tiles: clients_present seam raised", exc_info=True)
+            return True
+
+    def _sync_presence(self) -> bool:
+        """Hide/show every tile on a CHANGE of EVE-client presence. Returns
+        True while suspended (i.e. "the caller should stop here").
+
+        EDGE-TRIGGERED, and that is load-bearing rather than tidy: ``show()``
+        owns the tiles' single ``retop()``, and re-topping every tile every
+        beat is the measured DWM-thrash that costs in-game FPS. Steady state
+        -- clients present or clients gone -- therefore issues ZERO ``hide()``
+        / ``show()`` calls; only a transition does work, exactly once."""
+        present = self._clients_present()
+        if present == (not self._suspended):
+            return self._suspended            # no transition: do nothing
+        if present:
+            self._suspended = False
+            for key in TILE_SPECS:
+                tile = self._tiles.get(key)
+                if tile is not None and self._tile_enabled(key):
+                    _call(tile.show)
+        else:
+            self._suspended = True
+            for tile in list(self._tiles.values()):
+                _call(tile.hide)
+        return self._suspended
 
     # -- geometry ------------------------------------------------------------
     def _screens(self):
@@ -1821,8 +1904,13 @@ class InfoTileController:
               lambda k=key: self._neighbour_rects(k), self._screens)
         _call(tile.set_alpha, self._opacity())
         # place() records + positions; show() is what MAPS the window and owns
-        # the single retop. Placing without showing leaves an invisible tile.
-        _call(tile.show)
+        # the single retop. Placing without showing leaves an invisible tile --
+        # which is PRECISELY what a spawn under suspension wants: geometry is
+        # always applied (arrange / reset / match-preview-size keep working
+        # with no client running), and the False->True presence edge is the
+        # one thing that maps it.
+        if not self._suspended:
+            _call(tile.show)
         if key == "intel":
             self.resolver.start()
 
@@ -1860,8 +1948,17 @@ class InfoTileController:
 
         Cheap by construction: a no-op while disabled, guarded setters that
         skip unchanged values, and renderers that write nothing when their
-        model has not moved. It NEVER calls ``place()`` -- that is a retop."""
+        model has not moved. It NEVER calls ``place()`` -- that is a retop.
+
+        The presence check runs FIRST and can end the beat: with no EVE client
+        on screen the tiles are withdrawn and this writes NOTHING at all --
+        not a setter, not a render. The reveal is still fresh because the
+        False->True edge shows the tiles and then falls straight through into
+        the render pass below, in the same beat: nothing is painted in
+        between, so no stale frame is ever on screen."""
         if not self._enabled:
+            return
+        if self._sync_presence():
             return
         opacity = self._opacity()
         lock = self._lock_layout()
@@ -1971,8 +2068,9 @@ class InfoTileController:
 
     def _on_distances(self):
         """Marshaled back onto the Tk thread by ``post_ui`` when a distance
-        lands. Tolerates the tile having gone away in the meantime."""
-        if self._enabled and "intel" in self._tiles:
+        lands. Tolerates the tile having gone away -- or having been withdrawn
+        because the last EVE client closed -- in the meantime."""
+        if self._enabled and not self._suspended and "intel" in self._tiles:
             self._render("intel")
 
     # -- intel push ----------------------------------------------------------
@@ -2019,7 +2117,11 @@ class InfoTileController:
         self.intel_entries.append(IntelEntry(ts=_clock(when), text=text,
                                              system_ids=tuple(system_ids),
                                              priority=priority))
-        if self._enabled and "intel" in self._tiles:
+        # Collection continues while the tiles are withdrawn (same reason the
+        # per-tile switch does not gate it: the reveal must land on a full
+        # history, not an empty box), but the REPAINT does not -- writing into
+        # a withdrawn window is a Tk round-trip nobody can see.
+        if self._enabled and not self._suspended and "intel" in self._tiles:
             self._render("intel")
 
     # -- layout commands -----------------------------------------------------

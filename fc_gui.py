@@ -1998,6 +1998,9 @@ class FCToolGUI:
                 # (InfoTileController.match_preview_size) — see
                 # _hud_preview_tile_size above.
                 preview_tile_size=_hud_preview_tile_size,
+                # Presence gate: the controller withdraws every tile while this
+                # answers False. Tk-thread-only, and FAIL-VISIBLE by contract.
+                clients_present=self._hud_clients_present,
                 screen_rects=self._preview_snap_screens,
                 # Called on the resolver's WORKER thread: a module-level pure
                 # function, never an fc_gui method or a lambda closing over one
@@ -2027,6 +2030,71 @@ class FCToolGUI:
             return None
         return info_tiles.open_hud_settings(self.root, self._info_tiles,
                                             self._hud_host)
+
+    def _hud_clients_present(self):
+        """Is at least one EVE client window on screen right now?
+
+        The FC HUD's `clients_present` seam. The controller hides every tile
+        while this answers False and shows them again when it turns True, so
+        the overlay does not float over a bare desktop after the last client
+        closes.
+
+        TK THREAD ONLY. Its single caller is `InfoTileController.tick`, which
+        rides the 1 Hz `_update_eve_clock` beat — an `after` callback — and no
+        worker ever reaches it, so this owes no entry in
+        `tests/test_no_worker_after.py::WORKER_METHODS`.
+
+        Two sources, cheapest first:
+
+        * `self._preview_clients` — the {hwnd: ClientWindow} dict the native
+          FCPreview tick republishes every 250 ms–2 s. A NON-EMPTY dict is
+          proof at the cost of one attribute read. Its empty state is NOT
+          proof and deliberately falls through: previews may be off or in
+          eveo mode (nothing maintains the dict), the tick filters out
+          `disabled_chars` (a client whose preview is switched off is still a
+          client), and the EVE-O refusal path leaves the dict frozen rather
+          than cleared. Reading False out of it would hide the HUD in all
+          three cases;
+        * `eve_client_tracker.find_clients` through the injectable
+          `_preview_find_clients` seam — one window enumeration, CACHED. A
+          login window COUNTS (the tracker gives it `char_name == ""`): EVE is
+          on screen, which is exactly when an FC wants his tiles back.
+
+        CACHED like `_preview_snap_screens`, and for the same reason in
+        reverse: the beat asks once a second, and enumerating every top-level
+        window that often — forever, for anyone running previews Off — is a
+        new standing cost for a feature that only needs to notice a launch or
+        an exit within a few seconds. `time.monotonic` because this is a
+        duration and must not step with the wall clock.
+
+        FAIL-VISIBLE: anything unexpected answers True. A HUD hidden by a
+        wiring or enumeration bug looks like a dead feature and cannot be
+        asked back from the overlay itself, so the safe direction is up.
+        """
+        ttl_s = 3.0
+        log_every_s = 60.0
+        try:
+            if getattr(self, "_preview_clients", None):
+                return True
+            now = time.monotonic()
+            cached = getattr(self, "_hud_clients_probe", None)
+            if cached is not None and 0 <= now - cached[0] < ttl_s:
+                return cached[1]
+            try:
+                present = bool(self._preview_find_clients())
+            except Exception:
+                # Cached like any other answer: a broken enumerator must not be
+                # re-probed at 1 Hz, and True is the visible direction anyway.
+                present = True
+                last = getattr(self, "_hud_clients_log_ts", None)
+                if last is None or now - last >= log_every_s:
+                    self._hud_clients_log_ts = now
+                    log.warning("[hud] EVE client scan failed - keeping the "
+                                "info tiles visible", exc_info=True)
+            self._hud_clients_probe = (now, present)
+            return present
+        except Exception:
+            return True
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
