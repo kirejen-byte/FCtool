@@ -320,6 +320,16 @@ SHIP_GROUP_ABBREV = {
     "Jump Freighter": "JF",
     "Blockade Runner": "BR",
     "Deep Space Transport": "DST",
+    # -- long identity-fallback names that clip the 280px tile (>=22 chars;
+    # verified against the bundled SDE, fit_types.json, which hull(s) each
+    # group actually holds): singleton groups take the hull's own in-game
+    # name, same as an FC would say it, rather than an invented abbreviation
+    # nobody uses; multi-hull groups keep a short generic tag --
+    "Capital Industrial Ship": "Rorqual",          # sole member: Rorqual
+    "Industrial Command Ship": "Ind Cmd",          # Orca, Porpoise
+    "Expedition Command Ship": "Odysseus",         # sole member: Odysseus
+    "Prototype Exploration Ship": "Zephyr",        # sole member: Zephyr
+    "Special Edition Yachts": "Yacht",             # five named yacht hulls
 }
 
 
@@ -944,12 +954,17 @@ class _CoverageCell:
 
     Icon-or-text is decided ONCE, at construction, from whatever
     ``load_burst_icons`` managed to load -- a cell never changes its mind
-    mid-session, so there is no swap path to get wrong. The image reference is
-    held on the instance as well as in the panel's cache: a ``PhotoImage`` that
-    only Tk still points at gets collected, and the label silently goes
-    blank."""
+    mid-session, so there is no swap path to get wrong. When there is no
+    icon, the fallback text comes from ``LinkCoverageVM.label`` at render
+    time -- the VM is already the single source for that two-letter code
+    (``_links_coverage_rows`` derives it from ``command_bursts.
+    DISCIPLINE_LABEL`` once); re-deriving it here a second time from the
+    discipline this cell happens to be built for is exactly the drift a
+    single-source field exists to prevent. The image reference is held on
+    the instance as well as in the panel's cache: a ``PhotoImage`` that only
+    Tk still points at gets collected, and the label silently goes blank."""
 
-    def __init__(self, parent, palette: dict, discipline: str, icon):
+    def __init__(self, parent, palette: dict, icon):
         self._palette = palette
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
         fg = palette.get("FG_TEXT", ui_theme.FG_TEXT)
@@ -958,9 +973,8 @@ class _CoverageCell:
         if icon is not None:
             self.icon = tk.Label(self.frame, image=icon, bg=bg)
         else:
-            self.icon = tk.Label(self.frame,
-                                 text=cb.DISCIPLINE_LABEL[discipline][:2],
-                                 font=_FONT_HEAD, bg=bg, fg=fg)
+            self.icon = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg,
+                                 fg=fg)
         self.icon.pack(side="left")
         self.mark = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg,
                              fg=fg)
@@ -969,6 +983,8 @@ class _CoverageCell:
             attach_tooltip(widget, "")
 
     def render(self, row) -> None:
+        if self.icon_image is None:
+            self.icon.configure(text=row.label)
         self.mark.configure(
             text=COVERAGE_GLYPH[bool(row.full)],
             fg=self._palette.get("FG_GREEN" if row.full else "FG_RED"))
@@ -1007,8 +1023,7 @@ class _LinksPanel:
         #: the cells' whole lifetime -- see ``load_burst_icons``.
         self.icons = (load_burst_icons(self.frame) if icons is None
                       else dict(icons))
-        self._cells = {d: _CoverageCell(self.row, palette, d,
-                                        self.icons.get(d))
+        self._cells = {d: _CoverageCell(self.row, palette, self.icons.get(d))
                        for d in cb.DISCIPLINES}
         self._layout: list = []
         self._packed = False
