@@ -747,6 +747,75 @@ def _resolve_reinforced_id_pairs(store, entries=None):
         return set()
 
 
+# ── FC HUD visibility gate: the foreground probe ─────────────────────────────
+# GetAncestor's "root top-level window of this chain" flag. The FC HUD compares
+# the foreground window against the EVE client hwnds, which arrive from
+# EnumWindows and are therefore already top-level -- resolving the FOREGROUND
+# window's root is the belt-and-braces half, exactly as window_activator does it
+# when confirming its own activation.
+_HUD_GA_ROOT = 2
+
+
+class _HudForegroundWin32:  # pragma: no cover - live only; tests inject a fake
+    """READ-ONLY foreground probes for the FC HUD's visibility gate.
+
+    Three calls, none of which changes any window state: GetForegroundWindow,
+    GetWindowThreadProcessId (whose window is the foreground one), GetAncestor.
+    `window_activator` stays the ONLY module allowed to touch a real client
+    window -- this one just looks.
+
+    Shim shape copied from `eve_client_tracker._RealWin32` / `preview_tile`:
+    ctypes is imported INSIDE __init__ (fc_gui imports it nowhere at module
+    level, and a non-Windows import of fc_gui must stay free), argtypes/restype
+    are declared so the HWND is not truncated on Win64, and the object is built
+    lazily once. Never used in tests -- they inject a fake with this same three
+    method surface."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.GetForegroundWindow.argtypes = []
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                               ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        u.GetAncestor.restype = wintypes.HWND
+        self._u = u
+
+    def get_foreground(self) -> int:
+        """HWND the user is working in right now (0 when there is none)."""
+        return int(self._u.GetForegroundWindow() or 0)
+
+    def get_pid(self, hwnd) -> int:
+        """Owning process id of `hwnd` (0 on failure)."""
+        pid = self._wintypes.DWORD(0)
+        self._u.GetWindowThreadProcessId(hwnd, self._ctypes.byref(pid))
+        return int(pid.value)
+
+    def get_ancestor(self, hwnd, flag) -> int:
+        """GA_* ancestor of `hwnd` (0 when there is none)."""
+        return int(self._u.GetAncestor(hwnd, flag) or 0)
+
+
+_hud_fg_win32_singleton = None
+
+
+def _hud_foreground_win32():
+    """The lazy real foreground backend, built once per process.
+
+    Raises on a non-Windows box (no `ctypes.WinDLL`) or a user32 that will not
+    load -- every caller guards and falls back to FAIL-VISIBLE, so the HUD
+    survives having no probe at all."""
+    global _hud_fg_win32_singleton
+    if _hud_fg_win32_singleton is None:
+        _hud_fg_win32_singleton = _HudForegroundWin32()
+    return _hud_fg_win32_singleton
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -904,6 +973,12 @@ class FCToolGUI:
         # construct below never runs.
         self._info_tiles = None              # InfoTileController
         self._hud_host = None                # info_tiles.HudHost
+        # Foreground-probe backend for the HUD's visibility gate. None => build
+        # the real ctypes singleton on first use; tests inject a fake. Its own
+        # seam and NOT _preview_win32: that one is resolved by
+        # _preview_enable_native, so it stays None for anyone running previews
+        # Off -- and the HUD is a feature of its own.
+        self._hud_fg_win32 = None
         self._own_location_sid = None        # primary char (_refresh_current_system)
         self._own_location_mono = 0.0
         self._push_standings_to_battle_ledger()   # whatever the cache already holds
@@ -1998,9 +2073,11 @@ class FCToolGUI:
                 # (InfoTileController.match_preview_size) — see
                 # _hud_preview_tile_size above.
                 preview_tile_size=_hud_preview_tile_size,
-                # Presence gate: the controller withdraws every tile while this
-                # answers False. Tk-thread-only, and FAIL-VISIBLE by contract.
-                clients_present=self._hud_clients_present,
+                # Visibility gate: the controller withdraws every tile while
+                # this answers False (no EVE client on screen, or the
+                # foreground belongs to neither EVE nor us). Tk-thread-only,
+                # and FAIL-VISIBLE by contract.
+                should_show=self._hud_should_show,
                 screen_rects=self._preview_snap_screens,
                 # Called on the resolver's WORKER thread: a module-level pure
                 # function, never an fc_gui method or a lambda closing over one
@@ -2031,30 +2108,44 @@ class FCToolGUI:
         return info_tiles.open_hud_settings(self.root, self._info_tiles,
                                             self._hud_host)
 
-    def _hud_clients_present(self):
-        """Is at least one EVE client window on screen right now?
+    def _hud_should_show(self):
+        """Should the FC HUD's tiles be on screen right now?
 
-        The FC HUD's `clients_present` seam. The controller hides every tile
-        while this answers False and shows them again when it turns True, so
-        the overlay does not float over a bare desktop after the last client
-        closes.
+        The FC HUD's `should_show` seam. The controller hides every tile while
+        this answers False and shows them again when it turns True. TWO
+        conditions, ANDed:
+
+        1. at least one EVE client window EXISTS — otherwise the overlay
+           floats over a bare desktop after the last client closes;
+        2. the FOREGROUND window belongs to an EVE client or to FCTool itself
+           — otherwise the tiles sit on top of whatever the owner alt-tabbed
+           to (the live-smoke report that added this half). Alt-tabbing back
+           to any client, to the main window or to the HUD's own settings
+           popup brings them straight back, so the tiles can still be arranged
+           while no client has focus.
 
         TK THREAD ONLY. Its single caller is `InfoTileController.tick`, which
         rides the 1 Hz `_update_eve_clock` beat — an `after` callback — and no
         worker ever reaches it, so this owes no entry in
         `tests/test_no_worker_after.py::WORKER_METHODS`.
 
-        Two sources, cheapest first:
+        EXISTENCE has two sources, cheapest first, and both now yield the
+        client HWND SET (not just a bool) because condition 2 needs it:
 
         * `self._preview_clients` — the {hwnd: ClientWindow} dict the native
           FCPreview tick republishes every 250 ms–2 s. A NON-EMPTY dict is
-          proof at the cost of one attribute read. Its empty state is NOT
-          proof and deliberately falls through: previews may be off or in
-          eveo mode (nothing maintains the dict), the tick filters out
-          `disabled_chars` (a client whose preview is switched off is still a
-          client), and the EVE-O refusal path leaves the dict frozen rather
-          than cleared. Reading False out of it would hide the HUD in all
-          three cases;
+          proof at the cost of one attribute read, and its keys ARE the
+          hwnds. Its empty state is NOT proof and deliberately falls through:
+          previews may be off or in eveo mode (nothing maintains the dict),
+          the tick filters out `disabled_chars` (a client whose preview is
+          switched off is still a client), and the EVE-O refusal path leaves
+          the dict frozen rather than cleared. Reading False out of it would
+          hide the HUD in all three cases. Known residual of using its keys
+          for condition 2: a client the owner unchecked in the preview
+          settings is filtered OUT of the dict, so with previews live and
+          that client in front the tiles hide. Narrow (it needs a
+          disabled_chars entry) and it self-corrects the moment the dict
+          empties and the unfiltered tracker scan takes over;
         * `eve_client_tracker.find_clients` through the injectable
           `_preview_find_clients` seam — one window enumeration, CACHED. A
           login window COUNTS (the tracker gives it `char_name == ""`): EVE is
@@ -2065,37 +2156,112 @@ class FCToolGUI:
         window that often — forever, for anyone running previews Off — is a
         new standing cost for a feature that only needs to notice a launch or
         an exit within a few seconds. `time.monotonic` because this is a
-        duration and must not step with the wall clock.
+        duration and must not step with the wall clock. The cache entry is
+        `(ts, hwnds)`, where `None` hwnds mean "the scan broke, we do not
+        know" — held apart from the empty set, which means "no clients".
 
-        FAIL-VISIBLE: anything unexpected answers True. A HUD hidden by a
+        The FOREGROUND probe is NOT cached: it is three read-only win32 calls
+        and the whole point is to notice an app switch on the next beat.
+
+        FAIL-VISIBLE: anything unexpected answers True — a missing probe, a
+        raising enumerator, a cache that will not read. A HUD hidden by a
         wiring or enumeration bug looks like a dead feature and cannot be
-        asked back from the overlay itself, so the safe direction is up.
+        asked back from the overlay itself, so the safe direction is up. The
+        one deliberate False from a WORKING probe is "no foreground window at
+        all" (hwnd 0, e.g. the desktop): that is an answer, not a failure.
         """
         ttl_s = 3.0
         log_every_s = 60.0
         try:
-            if getattr(self, "_preview_clients", None):
-                self._hud_clients_probe = (time.monotonic(), True)
-                return True
-            now = time.monotonic()
-            cached = getattr(self, "_hud_clients_probe", None)
-            if cached is not None and 0 <= now - cached[0] < ttl_s:
-                return cached[1]
-            try:
-                present = bool(self._preview_find_clients())
-            except Exception:
-                # Cached like any other answer: a broken enumerator must not be
-                # re-probed at 1 Hz, and True is the visible direction anyway.
-                present = True
-                last = getattr(self, "_hud_clients_log_ts", None)
-                if last is None or now - last >= log_every_s:
-                    self._hud_clients_log_ts = now
-                    log.warning("[hud] EVE client scan failed - keeping the "
-                                "info tiles visible", exc_info=True)
-            self._hud_clients_probe = (now, present)
-            return present
+            clients = getattr(self, "_preview_clients", None)
+            if clients:
+                # Fast path. It must write the cache too: a client that
+                # appears and then drops out of the dict within the TTL (mode
+                # bounce / char unchecked) would otherwise fall through to a
+                # STALE cached answer instead of this fresh one.
+                hwnds = frozenset(int(h) for h in clients)
+                self._hud_clients_probe = (time.monotonic(), hwnds)
+            else:
+                now = time.monotonic()
+                cached = getattr(self, "_hud_clients_probe", None)
+                if cached is not None and 0 <= now - cached[0] < ttl_s:
+                    hwnds = cached[1]
+                else:
+                    try:
+                        found = list(self._preview_find_clients())
+                        hwnds = frozenset(
+                            int(getattr(c, "hwnd", 0) or 0)
+                            for c in found) - {0}
+                        if found and not hwnds:
+                            # Clients exist but none of them will name an
+                            # hwnd: the set cannot gate anything, so treat it
+                            # as unknown rather than gating on a lie.
+                            hwnds = None
+                    except Exception:
+                        # Cached like any other answer: a broken enumerator
+                        # must not be re-probed at 1 Hz, and "unknown" is the
+                        # visible direction anyway.
+                        hwnds = None
+                        last = getattr(self, "_hud_clients_log_ts", None)
+                        if last is None or now - last >= log_every_s:
+                            self._hud_clients_log_ts = now
+                            log.warning("[hud] EVE client scan failed - "
+                                        "keeping the info tiles visible",
+                                        exc_info=True)
+                    self._hud_clients_probe = (now, hwnds)
+            if hwnds is None:
+                return True                  # unknown clients: FAIL-VISIBLE
+            if not hwnds:
+                return False                 # no EVE client on screen
+            return self._hud_foreground_ok(hwnds)
         except Exception:
             return True
+
+    def _hud_foreground_ok(self, hwnds):
+        """Does the foreground window belong to EVE or to us? (condition 2 of
+        `_hud_should_show`.)
+
+        True when the foreground window is owned by THIS process — the main
+        window, the HUD settings popup, any dialog, and the tiles themselves
+        (they are NOACTIVATE and never take the foreground, so dragging one
+        leaves the client in front and costs no flicker either way) — or when
+        it is one of `hwnds`, the EVE client windows, directly or through its
+        `GetAncestor(GA_ROOT)` root (window_activator's precedent: the
+        comparison must still work if what has focus is a child of the
+        client's top-level).
+
+        Reads the foreground ONCE, so the whole answer describes one instant
+        rather than a torn view of an alt-tab in flight. FAIL-VISIBLE: with no
+        usable backend this answers True and the HUD simply keeps the
+        existence-only behaviour it shipped with. A probe that WORKS and finds
+        hwnd 0 (nobody is foreground / the desktop is) answers False — that is
+        neither EVE nor us."""
+        w = self._hud_fg_backend()
+        if w is None:
+            return True
+        fg = int(w.get_foreground() or 0)
+        if not fg:
+            return False
+        if int(w.get_pid(fg) or 0) == os.getpid():
+            return True
+        if fg in hwnds:
+            return True
+        root = int(w.get_ancestor(fg, _HUD_GA_ROOT) or 0)
+        return bool(root) and root in hwnds
+
+    def _hud_fg_backend(self):
+        """The foreground-probe backend: whatever `_hud_fg_win32` holds, else
+        the lazily-built real ctypes singleton (cached back onto the instance
+        so a box that cannot load user32 is not re-tried at 1 Hz). None means
+        "no probe", and every caller then fails VISIBLE."""
+        w = getattr(self, "_hud_fg_win32", None)
+        if w is None:
+            try:
+                w = _hud_foreground_win32()
+            except Exception:
+                w = False
+            self._hud_fg_win32 = w
+        return w or None
 
     # ── UI Construction ───────────────────────────────────────────────────────
 

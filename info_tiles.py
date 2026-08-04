@@ -61,21 +61,25 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   ``SetWindowPos(HWND_TOPMOST)`` -- it IS a retop, and a per-tick retop is the
   measured DWM-thrash / in-game FPS bug. Tiles are placed at spawn, on
   ``arrange``/``reset_layouts``, and by their own drags. Nowhere else.
-- **The HUD follows the EVE clients on/off screen, EDGE-TRIGGERED.** With no
-  client running the tiles are WITHDRAWN (never destroyed -- geometry, config
-  and content survive) and mapped again when one appears. Only the transition
-  does work: the controller tracks presence itself and calls ``show()``/
-  ``hide()`` only on a change. NOT because a level-triggered "show every
-  beat" would retop -- it would not: ``InfoTileWindow.show()`` already
-  early-returns on ``self._visible``, so a steady-state call is a cheap
-  no-op on its own. Edge-triggering exists so the transition is explicit
-  and independently testable, instead of resting correctness on ``show()``'s
-  idempotence guard staying intact. On the reveal edge each tile is
-  rendered before ``show()`` maps it, so the first frame on screen is
-  already fresh, not whatever was there before the tiles were withdrawn.
-  The presence seam is FAIL-VISIBLE -- absent, non-callable or raising all
-  read as "clients present", because a HUD hidden by a wiring bug cannot be
-  asked back from the overlay itself.
+- **The HUD follows EVE on and off screen, EDGE-TRIGGERED.** The tiles are
+  WITHDRAWN (never destroyed -- geometry, config and content survive) while
+  the host's ``should_show`` seam says no, and mapped again when it says yes.
+  fc_gui owns that predicate and ANDs two conditions -- an EVE client window
+  exists, AND the foreground window belongs to EVE or to FCTool -- so the
+  tiles vanish both when the last client closes and when the owner alt-tabs
+  to another application. Only the transition does work: the controller
+  tracks the answer itself and calls ``show()``/``hide()`` only on a change.
+  NOT because a level-triggered "show every beat" would retop -- it would
+  not: ``InfoTileWindow.show()`` already early-returns on its own
+  ``_visible`` flag, so a steady-state call is a cheap no-op on its own.
+  Edge-triggering exists so the transition is explicit and independently
+  testable, instead of resting correctness on ``show()``'s idempotence guard
+  staying intact. On the reveal edge each tile is rendered before ``show()``
+  maps it, so the first frame on screen is already fresh, not whatever was
+  there before the tiles were withdrawn.
+  The seam is FAIL-VISIBLE -- absent, non-callable or raising all read as
+  "show", because a HUD hidden by a wiring bug cannot be asked back from the
+  overlay itself.
 - **Log strings stay ASCII** (this box's console is cp1252 and a stray glyph
   raises inside logging's StreamHandler). Tile TEXT may use anything -- it is
   never logged.
@@ -1526,8 +1530,8 @@ def _no_fleet(*_args, **_kwargs):
     return (False, None, False)
 
 
-def _present(*_args, **_kwargs):
-    """Inert default for ``HudHost.clients_present`` -- see the field.
+def _always_show(*_args, **_kwargs):
+    """Inert default for ``HudHost.should_show`` -- see the field.
 
     True, deliberately: every OTHER seam's inert default is the empty/absent
     answer, but this one gates VISIBILITY, so its inert answer has to be the
@@ -1594,20 +1598,26 @@ class HudHost:
     #: this seam answers a size only -- ``match_preview_size`` places each HUD
     #: tile at ITS OWN existing (x, y).
     preview_tile_size: object = _none
-    #: () -> bool -- is at least one EVE client window on screen right now?
-    #: Read once per beat; the controller HIDES every tile on the True->False
-    #: edge and SHOWS them again on the False->True one, so the HUD does not
-    #: float over a bare desktop after the last client closes. Login windows
-    #: count as clients (that is the tracker's own semantics, and a login
-    #: screen is exactly when an FC wants his tiles back).
+    #: () -> bool -- should the tiles be on screen right now? Read once per
+    #: beat; the controller HIDES every tile on the True->False edge and SHOWS
+    #: them again on the False->True one.
+    #:
+    #: The HOST owns the predicate, not this module. fc_gui ANDs two
+    #: conditions: at least one EVE client window exists (so the HUD does not
+    #: float over a bare desktop after the last client closes -- login windows
+    #: count, that is the tracker's own semantics and a login screen is
+    #: exactly when an FC wants his tiles back), AND the foreground window
+    #: belongs to an EVE client or to FCTool itself (so alt-tabbing to a
+    #: browser takes the tiles with it, while the main window and this
+    #: module's own settings popup keep them up for arranging).
     #:
     #: FAIL-VISIBLE, and the ONE seam whose inert default is not the empty
-    #: answer: absent, non-callable or raising all read as PRESENT (see
-    #: ``_present``). A seam fc_gui forgets to wire, or one that breaks,
+    #: answer: absent, non-callable or raising all read as SHOW (see
+    #: ``_always_show``). A seam fc_gui forgets to wire, or one that breaks,
     #: must leave the tiles up -- a HUD hidden by a wiring bug looks like a
     #: dead feature, and there is no way to ask for it back from the overlay
     #: itself.
-    clients_present: object = _present
+    should_show: object = _always_show
     screen_rects: object = _empty        # () -> [(x, y, w, h)]
     route_fn: object = _none             # (origin, dest) -> [ids] | None
     #: The app's own ``TypeCatalog`` (fc_gui's ``self.type_catalog``). Not a
@@ -1631,10 +1641,12 @@ class InfoTileController:
         self._tiles: dict = {}
         self._renderers: dict = {}
         self._enabled = False
-        #: True while every tile is WITHDRAWN because no EVE client is on
-        #: screen (see ``_sync_presence``). Orthogonal to ``_enabled``: the
-        #: tiles still exist, keep their geometry and keep their config, they
-        #: are merely unmapped.
+        #: True while every tile is WITHDRAWN because the host's
+        #: ``should_show`` seam says no -- no EVE client on screen, or the
+        #: foreground belongs to neither EVE nor FCTool (see
+        #: ``_sync_presence``). Orthogonal to ``_enabled``: the tiles still
+        #: exist, keep their geometry and keep their config, they are merely
+        #: unmapped.
         self._suspended = False
         #: this controller's OWN bounded history. fc_gui's `_intel_buffer` is
         #: never read and never mutated.
@@ -1704,11 +1716,12 @@ class InfoTileController:
             return
         self._enabled = flag
         if flag:
-            # Presence BEFORE the first spawn, not after: enabling the HUD with
-            # no client running must spawn the tiles HIDDEN. Deciding it in the
-            # tick below instead would spawn them mapped and withdraw them a
-            # moment later -- a visible flash over the desktop.
-            self._suspended = not self._clients_present()
+            # Visibility BEFORE the first spawn, not after: enabling the HUD
+            # with no client running (or with EVE not in front) must spawn
+            # the tiles HIDDEN. Deciding it in the tick below instead would
+            # spawn them mapped and withdraw them a moment later -- a
+            # visible flash over the desktop.
+            self._suspended = not self._should_show()
             for key in TILE_SPECS:
                 if self._tile_enabled(key):
                     self._spawn(key)
@@ -1743,23 +1756,26 @@ class InfoTileController:
     def _tile_enabled(self, key) -> bool:
         return bool(self._tile_block(key).get("enabled", False))
 
-    # -- EVE-client presence -------------------------------------------------
-    def _clients_present(self) -> bool:
-        """Guarded read of the ``clients_present`` seam. FAIL-VISIBLE: a seam
-        that is absent, not callable or raising answers PRESENT, so a wiring
-        bug can never hide the HUD (see the field's own note)."""
-        seam = getattr(self._host, "clients_present", None)
+    # -- presence: should the tiles be on screen? -----------------------------
+    def _should_show(self) -> bool:
+        """Guarded read of the ``should_show`` seam. FAIL-VISIBLE: a seam that
+        is absent, not callable or raising answers SHOW, so a wiring bug can
+        never hide the HUD (see the field's own note). WHAT makes the answer
+        False is entirely the host's business -- no EVE client on screen, or
+        the foreground belonging to neither EVE nor FCTool."""
+        seam = getattr(self._host, "should_show", None)
         if not callable(seam):
             return True
         try:
             return bool(seam())
         except Exception:
-            log.debug("info tiles: clients_present seam raised", exc_info=True)
+            log.debug("info tiles: should_show seam raised", exc_info=True)
             return True
 
     def _sync_presence(self) -> bool:
-        """Hide/show every tile on a CHANGE of EVE-client presence. Returns
-        True while suspended (i.e. "the caller should stop here").
+        """Hide/show every tile on a CHANGE of the host's ``should_show``
+        answer. Returns True while suspended (i.e. "the caller should stop
+        here").
 
         EDGE-TRIGGERED, and that is load-bearing for clarity, NOT because a
         level-triggered "call show() every beat" would retop: it would not
@@ -1771,7 +1787,7 @@ class InfoTileController:
         one on a change) rather than inferred from ``show()``'s internals.
         On the reveal edge each tile is rendered BEFORE ``show()`` maps it,
         so the first frame on screen is already fresh."""
-        present = self._clients_present()
+        present = self._should_show()
         if present == (not self._suspended):
             return self._suspended            # no transition: do nothing
         if present:
@@ -1920,8 +1936,8 @@ class InfoTileController:
         # the single retop. Placing without showing leaves an invisible tile --
         # which is PRECISELY what a spawn under suspension wants: geometry is
         # always applied (arrange / reset / match-preview-size keep working
-        # with no client running), and the False->True presence edge is the
-        # one thing that maps it.
+        # while the tiles are hidden), and the False->True visibility edge is
+        # the one thing that maps it.
         if not self._suspended:
             _call(tile.show)
         if key == "intel":
@@ -1963,12 +1979,13 @@ class InfoTileController:
         skip unchanged values, and renderers that write nothing when their
         model has not moved. It NEVER calls ``place()`` -- that is a retop.
 
-        The presence check runs FIRST and can end the beat: with no EVE client
-        on screen the tiles are withdrawn and this writes NOTHING at all --
-        not a setter, not a render. The reveal is still fresh because
-        ``_sync_presence`` renders each tile BEFORE calling ``show()`` on the
-        False->True edge: content is rendered before the window maps, so
-        there is no pre-hide frame left on screen for the map to flash."""
+        The visibility check runs FIRST and can end the beat: with the tiles
+        withdrawn (no EVE client on screen, or another application in front)
+        this writes NOTHING at all -- not a setter, not a render. The reveal
+        is still fresh because ``_sync_presence`` renders each tile BEFORE
+        calling ``show()`` on the False->True edge: content is rendered before
+        the window maps, so there is no pre-hide frame left on screen for the
+        map to flash."""
         if not self._enabled:
             return
         if self._sync_presence():
@@ -2082,7 +2099,8 @@ class InfoTileController:
     def _on_distances(self):
         """Marshaled back onto the Tk thread by ``post_ui`` when a distance
         lands. Tolerates the tile having gone away -- or having been withdrawn
-        because the last EVE client closed -- in the meantime."""
+        because the last EVE client closed / the owner alt-tabbed away -- in
+        the meantime."""
         if self._enabled and not self._suspended and "intel" in self._tiles:
             self._render("intel")
 
