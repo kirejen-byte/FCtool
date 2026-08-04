@@ -41,8 +41,8 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
 - **The links line is NOT gated by the ESI fleet state.** Command-burst
   charges are parsed out of FLEET CHAT, so the coverage report is real with no
   fleet boss and no ESI at all. The fleet tile therefore renders its links
-  line underneath whatever the comp rollup's gate decided -- including "Not in
-  fleet / not fleet boss".
+  line underneath whatever the comp rollup's gate decided -- including "Not
+  fleet boss".
 - **The fleet tile is a GLANCE surface, not the Fleet tab.** It shows
   abbreviated comp buckets in two columns and fleet-wide burst COVERAGE on one
   line. The per-pilot charge rows, the not-boss caveat and the overflow
@@ -52,10 +52,11 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   pilots").
 - **It is sized to fit a PREVIEW-sized window** -- 160x136, the owner's own
   ``preview.tile_w``/``tile_body_h`` -- with every section present: header,
-  nine buckets, four coverage icons. The arithmetic behind every font and pad
-  is written out under "fleet tile metrics" below and pinned by tests, because
-  the failure mode is silent: a section that does not fit is not drawn small,
-  it is not drawn at all (see ``_LinksPanel``).
+  seven bucket rows (top 6 + Other), four coverage icons. The arithmetic
+  behind every font and pad is written out under "fleet tile metrics" below
+  and pinned by tests, because the failure mode is silent: a section that
+  does not fit is not drawn small, it is not drawn at all (see
+  ``_LinksPanel``).
 - **Intel fails OPEN.** A line whose distance is unknown is SHOWN with ``?j``;
   hiding a possibly-adjacent hostile report is the dangerous direction. A line
   naming no system never reaches this tile, and with no reference system the
@@ -154,40 +155,53 @@ PALETTE = {
 _FONT_ROW = ("Consolas", 8)
 
 # ── fleet tile metrics ──────────────────────────────────────────────────────
-# The fleet tile is the only one that must carry a header, up to nine buckets in
-# two columns AND the four-icon coverage strip inside a window the size of a
-# PREVIEW tile -- the owner runs 160x116+20 (config `preview.tile_w` /
-# `tile_body_h`, uniform), which is what everything below is measured against.
-# It therefore runs one point smaller than battle/intel and with zero label
-# padding, spacing coming from the geometry manager instead.
+# The fleet tile is the only one that must carry a header, up to seven bucket
+# rows (top 6 + Other) in two columns AND the four-icon coverage strip inside
+# a window the size of a PREVIEW tile -- the owner runs 160x116+20 (config
+# `preview.tile_w` / `tile_body_h`, uniform), which is what everything below
+# is measured against.
+#
+# ROUND 5 (owner: "increase the font a bit"): the fleet-scoped font moved back
+# up to the SAME Consolas 8 the battle/intel pool uses -- it is still a
+# SEPARATE named constant (zero label padding, spacing coming from the
+# geometry manager instead), but the point size no longer differs. The fit
+# now comes from a smaller bucket cap (8 -> 6) and a shorter worst-case status
+# string (FLEET_STATUS_NOT_BOSS), not from a smaller font.
 #
 # MEASURED 2026-08-03 (96 dpi / tk scaling 1.333, tight labels: bd=0, padx=0,
 # pady=0, highlightthickness=0):
 #
-#   Consolas 7      -> 5 px per character, 10 px line height
-#   Consolas 8      -> 6 px per character, 13 px line height
+#   Consolas 8      -> 6 px per character, 13 px line height (row AND bold
+#                      head alike -- bold does not widen this font at this
+#                      size)
 #   burst icon      -> 21x21 (25x25 with a default Label's border)
-#   check/cross     -> 11x10 at Consolas 7 bold (19x19 at 8 with the border)
+#   check/cross     -> 13x13 at Consolas 8 bold, tight (19x19 at the old
+#                      Consolas 8 WITH the default label border -- the
+#                      pre-round-4 number this stays well under)
 #
-# HEIGHT, worst case (9 buckets = 5 grid rows), against the 116 px body:
-#   head        10 + 1 pady               = 11
-#   comp grid   5 rows x (10 + 1 pady)    = 55
+# HEIGHT, worst case (6 buckets + Other = 4 grid rows), against the 116 px body:
+#   head        13 + 1 pady               = 14
+#   comp grid   4 rows x (13 + 1 pady)    = 56
 #   links row   21 (icon) + 2 pady        = 23
-#                                    total  89   -> 27 px of slack
-#   The standard 8-bucket board is 4 grid rows: 78 -> 38 px of slack.
+#                                    total  93   -> 23 px of slack
+#   The standard 6-bucket board (no overflow) is 3 grid rows: 79 -> 37 px of
+#   slack.
 #
 # WIDTH, against the 160 px body:
 #   comp cell   80 px column (two uniform halves) - 2 padx = 78 available;
-#               FLEET_ROW_CHARS=15 x 5 px         = 75     ->  3 px of slack
-#   links row   4 x (21 icon + 11 mark + 3 gap)   = 140 in 156 available
-#               (row padx 2)                              -> 16 px of slack
-#   the gate status, the widest string the head can hold, is 29 chars = 145.
-#
-# At Consolas 8 the status line alone is 174 px and the comp+links stack is 107,
-# so 7 is what actually fits; the previous 8 with default label padding needed
-# 258x142 of content and was where the owner's coverage icons went missing.
-_FLEET_FONT_ROW = ("Consolas", 7)
-_FLEET_FONT_HEAD = ("Consolas", 7, "bold")
+#               FLEET_ROW_CHARS=12 x 6 px         = 72     ->  6 px of slack
+#               (13 chars would be 78 -- exactly zero slack; 12 keeps a
+#               margin, same spirit as the rest of this budget)
+#   links row   4 x (21 icon + 13 mark + 3 gap)   = 148 in 156 available
+#               (row padx 2)                              ->  8 px of slack
+#               (measured total strip request 152 against the 160 px body)
+#   the widest status string is now "No fleet data yet" (17 chars) = 102 px.
+#   FLEET_STATUS_NOT_BOSS itself was shortened from 29 to 14 chars ("Not
+#   fleet boss") specifically so the head could move to Consolas 8 -- at 29
+#   chars it would ask for 174 px against ~156 available, which is what held
+#   this font at 7 through round 4.
+_FLEET_FONT_ROW = ("Consolas", 8)
+_FLEET_FONT_HEAD = ("Consolas", 8, "bold")
 #: Zero-padding label options. Spacing is the geometry manager's job here, so
 #: the arithmetic above stays readable -- a Label's own default border (2 px)
 #: and padx/pady (1 px) would add 6 px to EVERY row and 4 px to every icon.
@@ -207,10 +221,11 @@ _LINKS_CELL_GAP = 3
 #: falls on the equal-weight discipline columns and shrinks them together.
 _LINKS_GUTTER_WEIGHT = 1000
 #: One comp cell's character budget (count + space + bucket), sized to the
-#: 78 px available inside a half-column of a 160 px tile at 5 px/char. Longer
-#: bucket names are ellipsized rather than left to be cut off mid-glyph by the
-#: grid -- the count is never the part that gets dropped.
-FLEET_ROW_CHARS = 15
+#: 78 px available inside a half-column of a 160 px tile at 6 px/char (leaves
+#: 6 px of slack -- 13 chars would exactly fill it). Longer bucket names are
+#: ellipsized rather than left to be cut off mid-glyph by the grid -- the
+#: count is never the part that gets dropped.
+FLEET_ROW_CHARS = 12
 #: Right-aligned field for the count. Three digits covers a 256-pilot fleet
 #: several times over; a wider count simply spends the label's budget.
 FLEET_COUNT_CHARS = 3
@@ -231,7 +246,7 @@ MAX_JUMPS_CEILING = 30
 INTEL_KEEP = 50
 INTEL_SHOW = 12
 
-FLEET_MAX_ROWS = 8
+FLEET_MAX_ROWS = 6
 OTHER_LABEL = "Other"
 #: The comp rollup renders in this many columns (row-major, heaviest first).
 #: Two, because the tile is as wide as a preview tile and a single column
@@ -242,7 +257,7 @@ COMP_COLUMNS = 2
 # fleet-boss-only (it 403s otherwise), so "not boss" is a real answer, not a
 # failure to fetch.
 FLEET_STATUS_NO_AUTH = "No ESI character"
-FLEET_STATUS_NOT_BOSS = "Not in fleet / not fleet boss"
+FLEET_STATUS_NOT_BOSS = "Not fleet boss"
 FLEET_STATUS_NO_DATA = "No fleet data yet"
 
 BATTLE_STATUS_NO_LEDGER = "No battle ledger"
@@ -394,7 +409,7 @@ def _clock(when=None) -> str:
 #: single bucket:
 #:   * Command Ship + Command Destroyer -> "Links".  An FC counts LINKS, not
 #:     hull classes: three Claymores and two Bifrosts are five link ships, and
-#:     splitting them across two rows of an eight-row tile buys nothing.
+#:     splitting them across two rows of a six-row tile buys nothing.
 #:   * Combat Recon Ship + Force Recon Ship -> "Recon", for the same reason.
 #: The hull breakdown behind a merged bucket still names every hull (hover it),
 #: so the merge costs no information -- only rows.
@@ -474,7 +489,7 @@ class FleetCompModel:
     for.
 
     Each row is ``(bucket_label, count, hull_breakdown)`` -- count-descending,
-    top 8 plus an ``Other`` row that always sorts last -- where `bucket_label`
+    top 6 plus an ``Other`` row that always sorts last -- where `bucket_label`
     is ``SHIP_GROUP_ABBREV``'s compact name for the inventory group (several
     groups may MERGE into one bucket) and `hull_breakdown` is
     ``((hull_name, count), ...)``, also count-descending, summing to the row's
@@ -618,7 +633,7 @@ def build_fleet_comp_model(members, ship_counts, total,
     # The merge layer, deliberately AFTER the group rollup and BEFORE the sort:
     # buckets compete on their MERGED weight, so "Links" (Command Ships +
     # Command Destroyers together) can out-rank a group that beat either of
-    # them alone -- and the top-8 cut sees the same numbers the tile prints.
+    # them alone -- and the top-6 cut sees the same numbers the tile prints.
     buckets: dict[str, Counter] = {}
     for group, counter in groups.items():
         buckets.setdefault(bucket_label(group), Counter()).update(counter)
@@ -1469,14 +1484,16 @@ TILE_SPECS = {
     # The fleet tile carries the comp rollup AND the coverage strip, so its
     # first-spawn default has to fit both -- a section clipped by the body's
     # (deliberate) propagation guard is a section the owner never discovers.
-    # RE-MEASURED 2026-08-03 against the WORST case (all 8 buckets + Other in
-    # two columns, plus the four-icon coverage strip) with the compact metrics
-    # at the top of this module: 154x89 of content, i.e. 109 px of window once
-    # info_tile's 20 px strip is added -- down from 258x142/162 px, which is
-    # what stopped fitting the owner's 160x136 preview-sized tile. 180x120
-    # carries that worst case with slack in both axes and still lands well
-    # above the floors (MIN_W 120 / MIN_H 90). Stored layouts win over this at
-    # spawn, so an existing 280x170 tile keeps its size.
+    # RE-MEASURED 2026-08-03 (round 5: top-6 buckets, Consolas 8) against the
+    # WORST case (6 buckets + Other in two columns, plus the four-icon
+    # coverage strip) with the compact metrics at the top of this module:
+    # 152x93 of content, i.e. 113 px of window once info_tile's 20 px strip is
+    # added. 180x120 still carries that worst case -- 28 px width slack, 7 px
+    # height slack (tighter than round 4's 26/11: Consolas 8's taller line
+    # more than offsets losing two grid rows, but still clearly positive) --
+    # and still lands well above the floors (MIN_W 120 / MIN_H 90), so the
+    # default did not need to move. Stored layouts win over this at spawn, so
+    # an existing 280x170 tile keeps its size.
     "fleet": {"title": "Fleet", "default_size": (180, 120),
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
