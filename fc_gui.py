@@ -711,6 +711,46 @@ def build_default_fleet_template(primary_name, primary_id, *, new_id=None):
     return t
 
 
+FLEET_POLL_ROSTER = "roster"       # boss + a real roster -> full update
+FLEET_POLL_NOT_BOSS = "not_boss"   # in a fleet we may not read -> keep charges
+FLEET_POLL_MISS = "miss"           # no usable answer -> grace counter / clear
+
+
+def classify_fleet_poll(info, polled_is_boss, members) -> str:
+    """Decide what one ``_refresh_fleet_locations`` poll result means. Pure.
+
+    The load-bearing case is the third one. ``ESIAuth.esi_get`` flattens EVERY
+    failure to ``None`` -- 404 "fleet does not exist", 403, 5xx, a network
+    error, even a missing token -- so a caller cannot tell a disbanded fleet
+    from a transient blip by return shape. That matters because
+    ``/characters/{id}/fleet/`` is cached (and is famously stale after a
+    disband) while ``/fleets/{id}/members/`` 404s the instant the fleet is
+    gone: "I am the boss, and the boss-only roster route answered nothing" is
+    the FIRST honest signal that the fleet died.
+
+    It used to fall into the not-boss branch, which reset the miss counter and
+    kept the last roster -- so for as long as ESI kept serving the stale
+    fleet_id, the Fleet tab and the HUD tile showed a fleet that no longer
+    existed (owner-reported 2026-08-03). It is a MISS instead: the grace
+    counter absorbs a transient failure, and a fleet that really is gone
+    clears once the grace expires.
+
+    ``members`` is the raw ``get_fleet_members`` answer: a non-empty list, or
+    None/[] for "nothing came back". An empty list is a miss too -- a live
+    fleet always contains its boss.
+    """
+    if members:
+        return FLEET_POLL_ROSTER
+    fleet_id = info.get("fleet_id") if isinstance(info, dict) else info
+    if fleet_id and not polled_is_boss:
+        # A real answer about the world: we ARE in a fleet, the members route
+        # is boss-only (guaranteed 403), so the unknown roster is expected and
+        # the chat-fed command-burst charges stay valid. The id must be REAL --
+        # the not-boss branch hands it to _process_nonboss_losses.
+        return FLEET_POLL_NOT_BOSS
+    return FLEET_POLL_MISS
+
+
 def _resolve_reinforced_id_pairs(store, entries=None):
     """Unordered ``frozenset({system_id_a, system_id_b})`` for every store gate
     manually flagged ``reinforced``, resolved to system ids the SAME pure/local
@@ -5430,6 +5470,31 @@ class FCToolGUI:
         # Keep the MOTD +/- deltas current as the live fleet changes.
         if hasattr(self, "_schedule_motd_preview"):
             self._schedule_motd_preview()
+
+    def _clear_fleet_snapshot(self):
+        """Drop every last-fleet artifact after a CONFIRMED no-fleet. Tk thread.
+
+        Called only from the NO_FLEET_GRACE expiry in ``_refresh_fleet_locations``
+        (via ``_post_ui``), beside the composition/loss/booster clears that were
+        already there. It closes the one hole they left: ``_last_specialized_args``
+        was written in exactly one place and cleared nowhere, so the Specialized
+        Roles sections kept the dead fleet's pilots and every snapshot reader --
+        the FC HUD fleet tile (``HudHost.fleet_snapshot``), the MOTD palette's
+        character provider, the MOTD fit deltas, the doctrine re-render -- kept
+        answering from a fleet that no longer exists.
+
+        Re-uses ``_update_specialized_roles`` rather than re-rolling a bespoke
+        teardown: the method that FILLS the sections is the honest way to empty
+        them (empty categories, zero counts, cleared booster roster). It
+        republishes the snapshot as ``([], {}, 0)`` -- a TRUTHY tuple -- so the
+        NULL assignment below must come after it, or every reader's
+        ``if not cached`` guard stays unarmed.
+        """
+        try:
+            self._update_specialized_roles([], {}, 0)
+        except Exception as exc:
+            print(f"[Fleet] clearing specialized roles failed: {exc}")
+        self._last_specialized_args = None
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
@@ -25010,7 +25075,8 @@ class FCToolGUI:
                     members = self.esi_auth.get_fleet_members(fleet_id=fleet_id)
                 else:
                     members = None
-                if members:
+                verdict = classify_fleet_poll(info, polled_is_boss, members)
+                if verdict == FLEET_POLL_ROSTER:
                     # Got a real fleet — reset miss counter
                     self._no_fleet_misses = 0
                     # Derive locations (pass pre-fetched members to avoid duplicate call)
@@ -25055,7 +25121,7 @@ class FCToolGUI:
                     # Push the same enriched roster to the star-map overlay
                     # (marshaled to the main thread — update_fleet touches Tk).
                     self._post_ui(self._push_fleet_to_map, enriched)
-                elif fleet_id:
+                elif verdict == FLEET_POLL_NOT_BOSS:
                     # In a fleet but not boss (can't read members → members is None).
                     # Keep chat-fed command-burst charges; only the hull roster is
                     # unknown. Do NOT run the grace/clear path (that wipes charges).
@@ -25068,12 +25134,21 @@ class FCToolGUI:
                     self._post_ui_after(60000, self._refresh_fleet_locations)
                     return
                 else:
-                    # Genuinely not in a fleet (no fleet_id) — could also be a
-                    # transient ESI error. Only clear state after NO_FLEET_GRACE
-                    # consecutive misses to avoid flicker.
+                    # No usable fleet answer: either ESI says we are in no fleet,
+                    # or we ARE the boss and the boss-only members route gave us
+                    # nothing (a disbanded fleet, once /characters/{id}/fleet/'s
+                    # cached id outlives it — see classify_fleet_poll). Both could
+                    # equally be a transient ESI error, so only clear after
+                    # NO_FLEET_GRACE consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
                         self._post_ui(self._update_fleet_composition, {}, 0)
+                        # The last roster is now CONFIRMED gone — drop it, or the
+                        # HUD fleet tile (which reads the snapshot through
+                        # HudHost.fleet_snapshot) keeps rendering a dead fleet's
+                        # composition for as long as ESI keeps serving the stale
+                        # fleet_id that satisfies its status gate.
+                        self._post_ui(self._clear_fleet_snapshot)
                         self._post_ui(self._process_loss_tracking, None, [])
                         self._clear_booster_state()
                     else:
