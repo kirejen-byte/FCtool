@@ -5489,12 +5489,25 @@ class FCToolGUI:
         republishes the snapshot as ``([], {}, 0)`` -- a TRUTHY tuple -- so the
         NULL assignment below must come after it, or every reader's
         ``if not cached`` guard stays unarmed.
+
+        Also drops ``_last_polled_fleet_id``/``_last_polled_fleet_is_boss`` --
+        the fleet-poll's OWN cache, set only by the ~15s poll above. Left
+        standing, a stale truthy fleet_id survives this clear: the
+        ``fleet_state`` seam (and ``_motd_refresh_fleet_status``'s primary-
+        character seed) both keep reporting the dead fleet, so the HUD fleet
+        tile stays parked on "No fleet data yet" instead of going away and the
+        MOTD tab's Set button keeps enabling itself for a fleet that no longer
+        exists -- both for as long as ESI keeps serving the same cached id.
+        Added AFTER the roles/snapshot clear above, whose own order stays
+        untouched; this pair is independent of it.
         """
         try:
             self._update_specialized_roles([], {}, 0)
         except Exception as exc:
             print(f"[Fleet] clearing specialized roles failed: {exc}")
         self._last_specialized_args = None
+        self._last_polled_fleet_id = None
+        self._last_polled_fleet_is_boss = False
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
