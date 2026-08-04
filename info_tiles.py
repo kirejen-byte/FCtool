@@ -86,6 +86,23 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   The seam is FAIL-VISIBLE -- absent, non-callable or raising all read as
   "show", because a HUD hidden by a wiring bug cannot be asked back from the
   overlay itself.
+- **A tile is also gated on its own SUBJECT being live** (owner request
+  2026-08-03: "the tiles should be persistent ... as long as it makes sense
+  to be there, IE there is a fleet open or an active battle"). The fleet tile
+  is on screen while there IS a fleet, the battle tile while the ledger's own
+  view says a fight is showing, the intel tile always. This is the SECOND
+  visibility layer and it sits UNDER the global one; both are edge-triggered
+  and both are pure screen state -- **relevance NEVER writes config.** The
+  memory the owner asked for is the config the feature already had: a tile
+  the owner enabled stays enabled across restarts, and only its ✕ or its
+  checkbox turns it off. So a fleet tile enabled once comes back by itself
+  the next time a fleet exists, with no click. A relevance-hidden tile keeps
+  COLLECTING (the intel deque, the distance cache) and simply never renders
+  -- a beat that maps to nothing on screen is a beat that writes nothing at
+  all. Same reveal discipline as the global layer: render, THEN ``show()``.
+  Same fail-visible direction too, but only for the "could not ask" case: a
+  seam that RAISES or is not callable reads as relevant, while a seam that
+  ANSWERS "no fleet" / "no ledger" hides -- that answer is the whole feature.
 - **Log strings stay ASCII** (this box's console is cp1252 and a stray glyph
   raises inside logging's StreamHandler). Tile TEXT may use anything -- it is
   never logged.
@@ -281,6 +298,14 @@ def default_info_tiles_config() -> dict:
 
 
 # ── small guards ────────────────────────────────────────────────────────────
+
+#: "the seam could not be asked at all" -- absent, not callable, or it raised.
+#: A sentinel rather than None because None is a perfectly good ANSWER from
+#: several seams (no ledger, no location), and the visibility layers have to
+#: take opposite directions on the two: an answer of "nothing" hides a tile,
+#: an unanswerable seam leaves it up (see ``InfoTileController._relevant``).
+_UNKNOWN = object()
+
 
 def _call(fn, *args, default=None):
     """Call an injected seam, answering `default` if it is missing or raises.
@@ -950,6 +975,75 @@ def battle_lines(view) -> tuple:
         # the live-language rule (it really is fast).
         lines.append((str(fast.text), "FG_ACCENT"))
     return tuple(lines)
+
+
+# ── relevance: is a tile's SUBJECT live right now? ──────────────────────────
+# The lower of the two visibility layers (owner request 2026-08-03). Both
+# predicates below are PURE -- they judge a seam's ANSWER, never call one --
+# so what makes a tile relevant is testable without a controller, a host or a
+# display, and the controller's job shrinks to asking and diffing.
+#
+# Each one answers about the WORLD, and each is deliberately the same source
+# the tile's own content comes from, so "the tile is up" and "the tile has
+# something to say" can never disagree:
+#
+#   fleet   the ESI fleet poll (``fleet_state``) reports a fleet id;
+#   battle  the battle ledger's OWN view says it is showing (``visible``) --
+#           its ARMED/FILLING/SETTLED lifecycle is the authority, and a
+#           dismissed or reset ledger hides the tile with it;
+#   intel   always -- an intel tile is an FC's standing watch, and there is
+#           no "no intel is happening" state to gate on.
+#
+# What they do NOT decide: whether the tile EXISTS. That is config
+# (``tiles.<key>.enabled``), it survives restarts, and only the popup's
+# checkbox or the tile's own ✕ clears it.
+
+def fleet_is_live(state) -> bool:
+    """Is there a fleet, per the ``fleet_state`` seam's ``(authenticated,
+    fleet_id, is_boss)``?
+
+    A fleet id and nothing else. Authentication is IMPLIED -- fc_gui cannot
+    learn a fleet id without a token, so an unauthenticated host answers no
+    fleet and the tile stays down. Boss-ness is deliberately NOT required: an
+    FC who is in someone else's fleet still wants the tile up, where it says
+    honestly that it cannot read the roster and still carries the chat-sourced
+    links coverage line, which owes ESI nothing.
+
+    TRUTHINESS, not ``is not None``, so this agrees exactly with
+    ``build_fleet_comp_model``'s own gate (``if not fleet_id or not is_boss``).
+    A 0 slipping through as "a fleet" would put a tile on screen whose comp
+    half is gated shut for a fleet that does not exist -- the two gates reading
+    the same value differently is the drift this alignment prevents.
+
+    A shape that cannot be unpacked reads as LIVE: that is not the world
+    saying "no fleet", it is nobody being able to say, and the fail-visible
+    direction is up (see ``InfoTileController._relevant``).
+    """
+    try:
+        _authenticated, fleet_id, _is_boss = state
+    except (TypeError, ValueError):
+        return True
+    return bool(fleet_id)
+
+
+def battle_is_live(view) -> bool:
+    """Is a fight showing, per the ledger's own ``BattleLedgerView``?
+
+    ``view.visible`` and nothing else -- the ledger already owns the whole
+    ARMED/FILLING/SETTLED lifecycle, the owner's off switch, the dismiss and
+    the reset, and re-deriving any of that here would be a second opinion
+    about a question that has an answer. It is the same view the tile then
+    renders, so the tile can never be up with nothing in it.
+
+    Note the ONE non-fight case that still counts as showing: the J-space
+    blind-spot notice (``_blind_view``) is ``visible=True`` with no numbers,
+    because a wormhole fight produces no killmails and the ledger names that
+    blind spot rather than hiding it. A tile carrying that notice is the
+    ledger being honest, so it belongs on screen too.
+
+    ``None`` -- the seam's own inert answer, and what a host that never wired
+    a ledger gives -- is a real "there is nothing to show", so it hides."""
+    return bool(getattr(view, "visible", False))
 
 
 # ── renderers ───────────────────────────────────────────────────────────────
@@ -1757,13 +1851,21 @@ class InfoTileController:
         self._tiles: dict = {}
         self._renderers: dict = {}
         self._enabled = False
-        #: True while every tile is WITHDRAWN because the host's
-        #: ``should_show`` seam says no -- no EVE client on screen, or the
-        #: foreground belongs to neither EVE nor FCTool (see
-        #: ``_sync_presence``). Orthogonal to ``_enabled``: the tiles still
+        #: GLOBAL visibility layer. True while every tile is WITHDRAWN because
+        #: the host's ``should_show`` seam says no -- no EVE client on screen,
+        #: or the foreground belongs to neither EVE nor FCTool (see
+        #: ``_sync_visibility``). Orthogonal to ``_enabled``: the tiles still
         #: exist, keep their geometry and keep their config, they are merely
         #: unmapped.
         self._suspended = False
+        #: PER-TILE visibility layer: ``{key: is this tile mapped right now}``,
+        #: one entry per LIVE tile, written only by ``_apply_visible``. It is
+        #: the edge detector for both layers at once -- a tile's mapped state
+        #: is a pure function of (global gate AND its own enabled flag AND its
+        #: relevance), and only a CHANGE of that product touches Tk. Keys
+        #: appear at spawn and leave at teardown, so ``.get(key, False)`` on a
+        #: dead tile is the honest answer rather than a KeyError.
+        self._tile_visible: dict = {}
         #: this controller's OWN bounded history. fc_gui's `_intel_buffer` is
         #: never read and never mutated.
         self.intel_entries = deque(maxlen=INTEL_KEEP)
@@ -1836,7 +1938,10 @@ class InfoTileController:
             # with no client running (or with EVE not in front) must spawn
             # the tiles HIDDEN. Deciding it in the tick below instead would
             # spawn them mapped and withdraw them a moment later -- a
-            # visible flash over the desktop.
+            # visible flash over the desktop. (The per-tile relevance layer
+            # needs no equivalent priming: `_spawn` reads it directly, so a
+            # tile whose subject is not live is never mapped in the first
+            # place.)
             self._suspended = not self._should_show()
             for key in TILE_SPECS:
                 if self._tile_enabled(key):
@@ -1849,7 +1954,16 @@ class InfoTileController:
     def set_tile_enabled(self, key: str, flag: bool) -> None:
         """Per-tile switch. Also the close-glyph path: the tile's strip X and
         the popup's checkbox are the SAME operation, so a tile closed on screen
-        stays closed across a restart."""
+        stays closed across a restart.
+
+        **This flag IS the HUD's memory** (owner request 2026-08-03: tiles
+        "should be persistent ... once the user sets them up, until the option
+        is unchecked or the user closes it with an X"). It is config, it
+        survives restarts, and these two gestures are the ONLY things that
+        clear it -- neither visibility layer ever writes it. That is what lets
+        an FC tick "Fleet" once and have the tile turn up by itself every time
+        he forms up, and it is why a tile going away on its own must never be
+        implemented by flipping this."""
         if key not in TILE_SPECS:
             return
         flag = bool(flag)
@@ -1860,25 +1974,27 @@ class InfoTileController:
         if not self._enabled:
             return
         if flag:
-            # `_spawn` places but does not show while suspended, and rendering
-            # into a withdrawn window is a Tk write nobody can see: the
-            # False->True presence edge shows AND re-renders in the same beat.
+            # `_spawn` always places and shows only when BOTH layers agree --
+            # and when it does show, it renders first. So a tile checked while
+            # the HUD is withdrawn (or while its subject is not live) appears
+            # by itself at the next edge, with a fresh first frame, and this
+            # path owes it no render of its own: rendering into a window
+            # nobody can see is a Tk write nobody can see.
             self._spawn(key)
-            if not self._suspended:
-                self._render(key)
         else:
             self._teardown(key)
 
     def _tile_enabled(self, key) -> bool:
         return bool(self._tile_block(key).get("enabled", False))
 
-    # -- presence: should the tiles be on screen? -----------------------------
+    # -- visibility: should a tile be on screen? ------------------------------
     def _should_show(self) -> bool:
-        """Guarded read of the ``should_show`` seam. FAIL-VISIBLE: a seam that
-        is absent, not callable or raising answers SHOW, so a wiring bug can
-        never hide the HUD (see the field's own note). WHAT makes the answer
-        False is entirely the host's business -- no EVE client on screen, or
-        the foreground belonging to neither EVE nor FCTool."""
+        """Guarded read of the ``should_show`` seam -- the GLOBAL layer.
+        FAIL-VISIBLE: a seam that is absent, not callable or raising answers
+        SHOW, so a wiring bug can never hide the HUD (see the field's own
+        note). WHAT makes the answer False is entirely the host's business --
+        no EVE client on screen, or the foreground belonging to neither EVE
+        nor FCTool."""
         seam = getattr(self._host, "should_show", None)
         if not callable(seam):
             return True
@@ -1888,35 +2004,98 @@ class InfoTileController:
             log.debug("info tiles: should_show seam raised", exc_info=True)
             return True
 
-    def _sync_presence(self) -> bool:
-        """Hide/show every tile on a CHANGE of the host's ``should_show``
-        answer. Returns True while suspended (i.e. "the caller should stop
-        here").
+    def _relevant(self, key) -> bool:
+        """Is `key`'s SUBJECT live -- the PER-TILE layer (owner request
+        2026-08-03).
 
-        EDGE-TRIGGERED, and that is load-bearing for clarity, NOT because a
-        level-triggered "call show() every beat" would retop: it would not
-        -- ``InfoTileWindow.show()`` already early-returns on
-        ``self._visible``, so a steady-state call is a cheap no-op by
-        itself. Tracking the transition here instead means correctness does
-        not rest on that guard, and the transition is independently
-        testable (zero ``hide()``/``show()`` calls in steady state, exactly
-        one on a change) rather than inferred from ``show()``'s internals.
-        On the reveal edge each tile is rendered BEFORE ``show()`` maps it,
-        so the first frame on screen is already fresh."""
-        present = self._should_show()
-        if present == (not self._suspended):
-            return self._suspended            # no transition: do nothing
-        if present:
-            self._suspended = False
-            for key in TILE_SPECS:
-                tile = self._tiles.get(key)
-                if tile is not None and self._tile_enabled(key):
-                    self._render(key)
-                    _call(tile.show)
+        Reads that tile's own seam and hands the ANSWER to the matching pure
+        predicate; the seam being unaskable is a different thing from its
+        answer, and the two go opposite ways:
+
+        * the seam ANSWERED "no fleet" / "no ledger" -> HIDE. That answer is
+          the entire feature -- a fleet tile with no fleet is the clutter the
+          owner asked to be rid of, and it comes back by itself the moment a
+          tracked character opens one;
+        * the seam could not be asked at all -- absent, not callable, raising
+          -- -> SHOW. Same fail-visible reasoning as the global gate: a tile
+          hidden by a wiring bug looks like a dead feature, and the overlay
+          offers no way to ask it back.
+
+        Reads NOTHING and writes NOTHING outside the seam call: relevance is
+        screen state, never config. The tile stays "enabled" throughout, which
+        is what makes the owner's memory work -- see ``set_tile_enabled``.
+
+        Unregistered keys and ``intel`` answer True: an intel tile is a
+        standing watch with no idle state to gate on.
+        """
+        if key == "fleet":
+            state = _call(getattr(self._host, "fleet_state", None),
+                          default=_UNKNOWN)
+            return state is _UNKNOWN or fleet_is_live(state)
+        if key == "battle":
+            view = _call(getattr(self._host, "ledger_view", None),
+                         default=_UNKNOWN)
+            return view is _UNKNOWN or battle_is_live(view)
+        return True
+
+    def _wants_visible(self, key) -> bool:
+        """The whole visibility product for one tile: the global gate AND the
+        tile's own (persistent) enabled flag AND its relevance.
+
+        Short-circuit order is deliberate. While the HUD is globally suspended
+        NO seam is read at all -- a suspended beat costs one ``should_show``
+        call and nothing else, which is what keeps it zero-work as well as
+        zero-write, and what makes a relevance flip that happens while the
+        tiles are withdrawn a non-event until the reveal re-evaluates it."""
+        return (not self._suspended and self._tile_enabled(key)
+                and self._relevant(key))
+
+    def _apply_visible(self, key, want: bool) -> None:
+        """Map or withdraw ONE tile, and only on a CHANGE.
+
+        The single edge detector for both layers -- every show/hide in this
+        module comes through here, so "exactly one call per transition, zero
+        in steady state" is one rule in one place rather than a property of
+        two machines that have to agree.
+
+        Edge-triggering is load-bearing for clarity, NOT because a
+        level-triggered "call show() every beat" would retop: it would not --
+        ``InfoTileWindow.show()`` already early-returns on ``self._visible``,
+        so a steady-state call is a cheap no-op by itself. Tracking the
+        transition here means correctness does not rest on that guard, and the
+        transition is independently testable.
+
+        RENDER BEFORE SHOW on every reveal: ``show()`` maps the window and can
+        flush whatever was last drawn, so content has to be written first for
+        "no stale frame" to actually hold. That is also why a hidden tile is
+        never rendered -- there is nothing on screen to keep fresh, and the
+        reveal always paints."""
+        want = bool(want)
+        if want == self._tile_visible.get(key, False):
+            return                            # no transition: no Tk write
+        tile = self._tiles.get(key)
+        if tile is None:
+            return
+        if want:
+            self._render(key)
+            _call(tile.show)
         else:
-            self._suspended = True
-            for tile in list(self._tiles.values()):
-                _call(tile.hide)
+            _call(tile.hide)
+        self._tile_visible[key] = want
+
+    def _sync_visibility(self) -> bool:
+        """Bring every live tile's mapped state into line with BOTH layers.
+        Returns True while globally suspended ("the caller should stop here").
+
+        One pass, one rule: each tile is shown iff the global gate, its own
+        enabled flag and its relevance all say yes, and only the tiles whose
+        answer MOVED touch Tk. The global layer therefore keeps its old
+        semantics exactly -- one hide per tile when EVE goes away, one show
+        when it comes back -- except that the reveal now shows only the tiles
+        that are ALSO relevant, which is the point of the second layer."""
+        self._suspended = not self._should_show()
+        for key in list(self._tiles):
+            self._apply_visible(key, self._wants_visible(key))
         return self._suspended
 
     # -- geometry ------------------------------------------------------------
@@ -1999,14 +2178,19 @@ class InfoTileController:
         return (x, y, w, h)
 
     def _neighbour_rects(self, key):
-        """Snap candidates for one tile: its SIBLINGS plus the preview family.
-        The two registries stay separate and meet only here (polluting
+        """Snap candidates for one tile: its VISIBLE siblings plus the preview
+        family. The two registries stay separate and meet only here (polluting
         ``_preview_tile_rects`` with non-hwnd keys is a known regression
         class); each source is guarded on its own so a raising one costs only
-        its own candidates."""
+        its own candidates.
+
+        A sibling that is withdrawn -- by either visibility layer -- is not a
+        candidate: it is not on screen, so snapping to its edge would park the
+        dragged tile against nothing the owner can see. Same rule, same
+        reason, as ``tile_rects()`` on the way out."""
         rects = []
         for other_key, tile in self._tiles.items():
-            if other_key == key:
+            if other_key == key or not self._tile_visible.get(other_key, False):
                 continue
             rect = _call(tile.rect)
             if rect:
@@ -2042,6 +2226,7 @@ class InfoTileController:
             return
         self._tiles[key] = tile
         self._renderers[key] = renderer
+        self._tile_visible[key] = False
         x, y, w, h = self._spawn_rect(key)
         _call(tile.place, x, y, w, h)
         _call(tile.set_lock_layout, self._lock_layout())
@@ -2050,18 +2235,19 @@ class InfoTileController:
         _call(tile.set_alpha, self._opacity())
         # place() records + positions; show() is what MAPS the window and owns
         # the single retop. Placing without showing leaves an invisible tile --
-        # which is PRECISELY what a spawn under suspension wants: geometry is
-        # always applied (arrange / reset / match-preview-size keep working
-        # while the tiles are hidden), and the False->True visibility edge is
-        # the one thing that maps it.
-        if not self._suspended:
-            _call(tile.show)
+        # which is PRECISELY what a spawn wants whenever either layer says no:
+        # geometry is always applied (arrange / reset / match-preview-size keep
+        # working while the tiles are hidden), and the visibility edge is the
+        # one thing that maps it. Through `_apply_visible`, so a spawn that
+        # DOES show renders first, exactly like every other reveal.
+        self._apply_visible(key, self._wants_visible(key))
         if key == "intel":
             self.resolver.start()
 
     def _teardown(self, key):
         tile = self._tiles.pop(key, None)
         self._renderers.pop(key, None)
+        self._tile_visible.pop(key, None)
         if tile is not None:
             _call(tile.destroy)
 
@@ -2095,23 +2281,26 @@ class InfoTileController:
         skip unchanged values, and renderers that write nothing when their
         model has not moved. It NEVER calls ``place()`` -- that is a retop.
 
-        The visibility check runs FIRST and can end the beat: with the tiles
-        withdrawn (no EVE client on screen, or another application in front)
-        this writes NOTHING at all -- not a setter, not a render. The reveal
-        is still fresh because ``_sync_presence`` renders each tile BEFORE
-        calling ``show()`` on the False->True edge: content is rendered before
-        the window maps, so there is no pre-hide frame left on screen for the
-        map to flash."""
+        The visibility pass runs FIRST and can end the beat: with the tiles
+        withdrawn globally (no EVE client on screen, or another application in
+        front) this writes NOTHING at all -- not a setter, not a render -- and
+        a tile withdrawn by its own relevance gate is skipped the same way, so
+        an FC not in a fleet pays nothing for an enabled fleet tile. The
+        reveal is still fresh because ``_apply_visible`` renders each tile
+        BEFORE calling ``show()``: content is rendered before the window maps,
+        so there is no pre-hide frame left on screen for the map to flash. A
+        tile revealed by this beat's own sync then falls straight through into
+        the loop below and picks up the current opacity/lock/snap."""
         if not self._enabled:
             return
-        if self._sync_presence():
+        if self._sync_visibility():
             return
         opacity = self._opacity()
         lock = self._lock_layout()
         snap = self._snap_enabled()
         for key in list(self._tiles):
             tile = self._tiles.get(key)
-            if tile is None:
+            if tile is None or not self._tile_visible.get(key, False):
                 continue
             # `configure_snap(flag)` only: None means LEAVE UNCHANGED, so the
             # providers wired at spawn survive every per-toggle push.
@@ -2216,8 +2405,10 @@ class InfoTileController:
         """Marshaled back onto the Tk thread by ``post_ui`` when a distance
         lands. Tolerates the tile having gone away -- or having been withdrawn
         because the last EVE client closed / the owner alt-tabbed away -- in
-        the meantime."""
-        if self._enabled and not self._suspended and "intel" in self._tiles:
+        the meantime. ``_tile_visible`` is read rather than ``_suspended``
+        because it answers for BOTH layers at once, and the next reveal
+        repaints anyway."""
+        if self._enabled and self._tile_visible.get("intel", False):
             self._render("intel")
 
     # -- intel push ----------------------------------------------------------
@@ -2267,15 +2458,25 @@ class InfoTileController:
         # Collection continues while the tiles are withdrawn (same reason the
         # per-tile switch does not gate it: the reveal must land on a full
         # history, not an empty box), but the REPAINT does not -- writing into
-        # a withdrawn window is a Tk round-trip nobody can see.
-        if self._enabled and not self._suspended and "intel" in self._tiles:
+        # a withdrawn window is a Tk round-trip nobody can see. One read of
+        # `_tile_visible` covers both visibility layers.
+        if self._enabled and self._tile_visible.get("intel", False):
             self._render("intel")
 
     # -- layout commands -----------------------------------------------------
     def tile_rects(self) -> list:
-        """Live tile rects, for fc_gui to merge into the PREVIEW snap provider.
-        Full window heights, strip included (see info_tile's module note about
-        preview's body-height convention).
+        """VISIBLE tile rects, for fc_gui to merge into the PREVIEW snap
+        provider. Full window heights, strip included (see info_tile's module
+        note about preview's body-height convention).
+
+        Visible, not merely live (2026-08-03): a tile withdrawn by either
+        visibility layer is not a snap target. An FCPreview tile jumping to
+        the edge of a window that is not on screen -- because the owner has no
+        fleet open, or because the HUD is hidden while he arranges previews
+        with EVE in the background -- reads as a broken snap, not as a
+        feature. The tiles keep their geometry throughout and rejoin the
+        provider the moment they are mapped again, so this costs nothing on
+        the way back.
 
         The MIRROR of the ``HudHost.preview_rects`` contract, and it runs the
         other way: preview_tile's snap math ADDS its own ``STRIP_H`` to every
@@ -2285,7 +2486,9 @@ class InfoTileController:
         snapping against it. Same reason as on the way in, the arithmetic
         belongs to fc_gui: this module never imports preview_tile."""
         rects = []
-        for tile in self._tiles.values():
+        for key, tile in self._tiles.items():
+            if not self._tile_visible.get(key, False):
+                continue
             rect = _call(tile.rect)
             if rect:
                 rects.append(tuple(rect))
