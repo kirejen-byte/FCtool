@@ -50,6 +50,12 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   for them (owner directive 2026-08-02, after live smoke: "for how small the
   preview window is, there is probably no room to list the individual link
   pilots").
+- **It is sized to fit a PREVIEW-sized window** -- 160x136, the owner's own
+  ``preview.tile_w``/``tile_body_h`` -- with every section present: header,
+  nine buckets, four coverage icons. The arithmetic behind every font and pad
+  is written out under "fleet tile metrics" below and pinned by tests, because
+  the failure mode is silent: a section that does not fit is not drawn small,
+  it is not drawn at all (see ``_LinksPanel``).
 - **Intel fails OPEN.** A line whose distance is unknown is SHOWN with ``?j``;
   hiding a possibly-adjacent hostile report is the dangerous direction. A line
   naming no system never reaches this tile, and with no reference system the
@@ -129,7 +135,69 @@ PALETTE = {
 # Fonts are plain tuples, never tkfont.Font objects: a Font belongs to the
 # interpreter that made it, so a module-level one breaks across roots.
 _FONT_ROW = ("Consolas", 8)
-_FONT_HEAD = ("Consolas", 8, "bold")
+
+# ── fleet tile metrics ──────────────────────────────────────────────────────
+# The fleet tile is the only one that must carry a header, up to nine buckets in
+# two columns AND the four-icon coverage strip inside a window the size of a
+# PREVIEW tile -- the owner runs 160x116+20 (config `preview.tile_w` /
+# `tile_body_h`, uniform), which is what everything below is measured against.
+# It therefore runs one point smaller than battle/intel and with zero label
+# padding, spacing coming from the geometry manager instead.
+#
+# MEASURED 2026-08-03 (96 dpi / tk scaling 1.333, tight labels: bd=0, padx=0,
+# pady=0, highlightthickness=0):
+#
+#   Consolas 7      -> 5 px per character, 10 px line height
+#   Consolas 8      -> 6 px per character, 13 px line height
+#   burst icon      -> 21x21 (25x25 with a default Label's border)
+#   check/cross     -> 11x10 at Consolas 7 bold (19x19 at 8 with the border)
+#
+# HEIGHT, worst case (9 buckets = 5 grid rows), against the 116 px body:
+#   head        10 + 1 pady               = 11
+#   comp grid   5 rows x (10 + 1 pady)    = 55
+#   links row   21 (icon) + 2 pady        = 23
+#                                    total  89   -> 27 px of slack
+#   The standard 8-bucket board is 4 grid rows: 78 -> 38 px of slack.
+#
+# WIDTH, against the 160 px body:
+#   comp cell   80 px column (two uniform halves) - 2 padx = 78 available;
+#               FLEET_ROW_CHARS=15 x 5 px         = 75     ->  3 px of slack
+#   links row   4 x (21 icon + 11 mark + 3 gap)   = 140 in 156 available
+#               (row padx 2)                              -> 16 px of slack
+#   the gate status, the widest string the head can hold, is 29 chars = 145.
+#
+# At Consolas 8 the status line alone is 174 px and the comp+links stack is 107,
+# so 7 is what actually fits; the previous 8 with default label padding needed
+# 258x142 of content and was where the owner's coverage icons went missing.
+_FLEET_FONT_ROW = ("Consolas", 7)
+_FLEET_FONT_HEAD = ("Consolas", 7, "bold")
+#: Zero-padding label options. Spacing is the geometry manager's job here, so
+#: the arithmetic above stays readable -- a Label's own default border (2 px)
+#: and padx/pady (1 px) would add 6 px to EVERY row and 4 px to every icon.
+_FLEET_TIGHT = {"bd": 0, "padx": 0, "pady": 0, "highlightthickness": 0}
+#: Comp-cell padding, inside the 80 px half-column.
+_FLEET_CELL_PADX = (2, 0)
+_FLEET_CELL_PADY = (0, 1)
+#: The coverage strip's own inset from the tile edge, and the gap between two
+#: discipline cells.
+_LINKS_ROW_PADX = 2
+_LINKS_ROW_PADY = (2, 0)
+_LINKS_CELL_GAP = 3
+#: Weight of the empty gutter column that follows the discipline cells. It has
+#: no content, so it can only ever take SPARE width -- which keeps the strip a
+#: strip on a wide tile instead of spreading four icons across 380 px -- and it
+#: has nothing to give back when the row is too narrow, so a deficit still
+#: falls on the equal-weight discipline columns and shrinks them together.
+_LINKS_GUTTER_WEIGHT = 1000
+#: One comp cell's character budget (count + space + bucket), sized to the
+#: 78 px available inside a half-column of a 160 px tile at 5 px/char. Longer
+#: bucket names are ellipsized rather than left to be cut off mid-glyph by the
+#: grid -- the count is never the part that gets dropped.
+FLEET_ROW_CHARS = 15
+#: Right-aligned field for the count. Three digits covers a 256-pilot fleet
+#: several times over; a wider count simply spends the label's budget.
+FLEET_COUNT_CHARS = 3
+FLEET_ELLIPSIS = "…"
 
 MIN_TILE_H = InfoTileWindow.MIN_H     # alias; info_tile owns the height floor
 
@@ -559,11 +627,24 @@ def fleet_group_tip(row) -> str:
 
 
 def fleet_row_text(row) -> str:
-    """``  81  Battleship`` -- count right-aligned so the column reads down."""
+    """`` 81 BS`` -- count right-aligned so the column reads down.
+
+    Capped at ``FLEET_ROW_CHARS``, because a comp cell is half of a tile that
+    may be as narrow as a preview window: past that the grid clips the label
+    mid-glyph, which reads as a corrupted name rather than a shortened one. The
+    COUNT is never what gets cut -- it is the number an FC is actually reading
+    -- and the full hull breakdown is one hover away (``fleet_group_tip``)."""
     try:
-        return f"{row[1]:>4}  {row[0]}"
+        prefix = f"{row[1]:>{FLEET_COUNT_CHARS}} "
+        label = str(row[0])
     except (TypeError, IndexError, KeyError):
         return ""
+    room = FLEET_ROW_CHARS - len(prefix)
+    if room < 1:
+        return prefix.rstrip()
+    if len(label) > room:
+        label = label[:room - len(FLEET_ELLIPSIS)] + FLEET_ELLIPSIS
+    return prefix + label
 
 
 # ── links: the command-burst COVERAGE line ──────────────────────────────────
@@ -580,8 +661,13 @@ def fleet_row_text(row) -> str:
 # is meaningful with no fleet boss and no ESI at all -- which is why it renders
 # INDEPENDENTLY of ``FleetCompModel.status``: a tile can honestly say "Not in
 # fleet / not fleet boss" and still show coverage underneath.
-
-LINKS_TITLE = "Links"
+#
+# NOR DOES IT CARRY A CAPTION any more (owner-reported 2026-08-03: "I put in
+# shield links and the only other icon that showed was armor"). A "Links:"
+# caption plus four default-padded cells wanted 250 px of row; at the owner's
+# 160 px tile ``pack`` handed the first two cells their width and the last two
+# ZERO -- skirmish and information were not clipped, they were never laid out,
+# and nothing said so. The icons are the caption now.
 
 #: full? -> the mark beside a discipline's icon. GUI text only, never logged.
 COVERAGE_GLYPH = {True: "✓", False: "✗"}
@@ -930,7 +1016,7 @@ class _CompGrid:
     hazard simply cannot arise inside this container."""
 
     def __init__(self, parent, palette: dict, size: int,
-                 columns: int = COMP_COLUMNS):
+                 columns: int = COMP_COLUMNS, font=_FLEET_FONT_ROW):
         self._palette = palette
         self._columns = max(1, int(columns))
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
@@ -943,9 +1029,11 @@ class _CompGrid:
         self._labels = []
         self._shown = []
         for _ in range(max(0, int(size))):
-            label = tk.Label(self.frame, text="", font=_FONT_ROW, bg=bg,
+            # Zero label padding (see _FLEET_TIGHT): row pitch is set by the
+            # grid's pady, which is the number the height budget is written in.
+            label = tk.Label(self.frame, text="", font=font, bg=bg,
                              fg=palette.get("FG_TEXT", ui_theme.FG_TEXT),
-                             anchor="w", justify="left")
+                             anchor="w", justify="left", **_FLEET_TIGHT)
             # topmost=True: this cell lives inside a HWND_TOPMOST tile -- a
             # tip with no topmost handling of its own is stacked BELOW the
             # tile at the pointer position (created, never seen).
@@ -970,7 +1058,7 @@ class _CompGrid:
                 if not self._shown[index]:
                     row, column = self.slot(index)
                     label.grid(row=row, column=column, sticky="w",
-                               padx=(4, 2), pady=0)
+                               padx=_FLEET_CELL_PADX, pady=_FLEET_CELL_PADY)
                     self._shown[index] = True
             elif self._shown[index]:
                 label.grid_forget()
@@ -999,14 +1087,17 @@ class _CoverageCell:
         fg = palette.get("FG_TEXT", ui_theme.FG_TEXT)
         self.frame = tk.Frame(parent, bg=bg)
         self.icon_image = icon              # strong ref -- see the docstring
+        # _FLEET_TIGHT on both halves: a default Label border alone put 4 px
+        # around each 21 px icon and 8 px around each mark, which is 24 px of a
+        # 160 px row spent on nothing -- and this row had none to spare.
         if icon is not None:
-            self.icon = tk.Label(self.frame, image=icon, bg=bg)
+            self.icon = tk.Label(self.frame, image=icon, bg=bg, **_FLEET_TIGHT)
         else:
-            self.icon = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg,
-                                 fg=fg)
+            self.icon = tk.Label(self.frame, text="", font=_FLEET_FONT_HEAD,
+                                 bg=bg, fg=fg, **_FLEET_TIGHT)
         self.icon.pack(side="left")
-        self.mark = tk.Label(self.frame, text="", font=_FONT_HEAD, bg=bg,
-                             fg=fg)
+        self.mark = tk.Label(self.frame, text="", font=_FLEET_FONT_HEAD, bg=bg,
+                             fg=fg, **_FLEET_TIGHT)
         self.mark.pack(side="left")
         for widget in (self.icon, self.mark):
             # Same HWND_TOPMOST-tile reasoning as _CompGrid above.
@@ -1025,6 +1116,17 @@ class _CoverageCell:
 class _LinksPanel:
     """The links line: its own container, one row, one cell per discipline.
 
+    **The cells are GRIDDED into equal-weight uniform columns, not packed.**
+    That is the fix for the owner-reported missing icons (2026-08-03), and it
+    is structural rather than a matter of having found smaller numbers: when a
+    packed row runs out of cavity the LAST slaves silently get zero width and
+    are never laid out at all, so at 160 px the shield and armor cells looked
+    perfectly healthy while skirmish and information simply did not exist. A
+    grid with equal weights shrinks EVERY column together instead, so a row too
+    narrow for its content loses a few pixels off each mark rather than losing
+    whole disciplines -- and a fifth discipline, if EVE ever grows one, would
+    narrow the four rather than fall off the end.
+
     TWO ordering hazards, both of the "``pack`` APPENDS" family:
 
     * against the comp grid -- this panel lives in its OWN container frame,
@@ -1032,12 +1134,13 @@ class _LinksPanel:
       can never land under it;
     * inside the row -- a discipline the host never reported is omitted (a
       fabricated ✗ would be a lie), so the cell SET can change. Rather than
-      track which cell may follow which, ``_relayout`` re-packs the row IN
-      ORDER whenever the packed set changes and does nothing at all when it
+      track which cell may follow which, ``_relayout`` re-grids the row IN
+      ORDER whenever the laid-out set changes and does nothing at all when it
       does not. The set changes far less often than the glyphs do.
 
-    The whole row is hidden when no discipline reports anything: a lone
-    "Links" caption over nothing is worse than no line at all.
+    The whole row is hidden when no discipline reports anything: an empty strip
+    of nothing is worse than no line at all. There is no caption -- see the
+    section comment above.
     """
 
     def __init__(self, parent, palette: dict, icons=None):
@@ -1046,9 +1149,6 @@ class _LinksPanel:
         self.frame = tk.Frame(parent, bg=bg)
         self.frame.pack(fill="x")
         self.row = tk.Frame(self.frame, bg=bg)
-        self._head = tk.Label(self.row, text=LINKS_TITLE, font=_FONT_HEAD,
-                              bg=bg, fg=palette.get("FG_ACCENT"), anchor="w")
-        self._head.pack(side="left", padx=(0, 6))
         #: PER-INSTANCE (a PhotoImage belongs to one interpreter) and held for
         #: the cells' whole lifetime -- see ``load_burst_icons``.
         self.icons = (load_burst_icons(self.frame) if icons is None
@@ -1090,14 +1190,27 @@ class _LinksPanel:
     def _relayout(self, wanted) -> None:
         if wanted != self._layout:
             for widget in self._layout:
-                widget.pack_forget()
-            for widget in wanted:
-                widget.pack(side="left", padx=(0, 8))
+                widget.grid_forget()
+            for column, widget in enumerate(wanted):
+                # FULL option set on every grid(): Tk RETAINS the options it is
+                # not given across a re-grid (the stale-columnspan class).
+                widget.grid(row=0, column=column, sticky="w",
+                            padx=(0, _LINKS_CELL_GAP), pady=0)
+            for column in range(len(self._cells)):
+                # Equal shares for the columns in use, nothing for the rest --
+                # a stale weight on an empty column would eat width the visible
+                # disciplines need.
+                live = column < len(wanted)
+                self.row.columnconfigure(column, weight=1 if live else 0,
+                                         uniform="cov" if live else "")
+            self.row.columnconfigure(len(self._cells),
+                                     weight=_LINKS_GUTTER_WEIGHT, uniform="")
             self._layout = list(wanted)
         show = bool(wanted)
         if show != self._packed:
             if show:
-                self.row.pack(fill="x", padx=4, pady=(2, 0))
+                self.row.pack(fill="x", padx=_LINKS_ROW_PADX,
+                              pady=_LINKS_ROW_PADY)
             else:
                 self.row.pack_forget()
             self._packed = show
@@ -1190,13 +1303,14 @@ class FleetRenderer(_TileRenderer):
         self._rows_holder = tk.Frame(self.frame, bg=bg)
         self._rows_holder.pack(fill="x")
         self._rows_holder.columnconfigure(0, weight=1)
-        self._head = tk.Label(self._rows_holder, text="", font=_FONT_HEAD,
+        self._head = tk.Label(self._rows_holder, text="", font=_FLEET_FONT_HEAD,
                               bg=bg, fg=self._palette.get("FG_ACCENT"),
-                              anchor="w")
+                              anchor="w", **_FLEET_TIGHT)
         # columnspan: the total -- and the gate status that replaces it -- is a
-        # caption for BOTH columns of buckets underneath.
+        # caption for BOTH columns of buckets underneath. Same padding as a
+        # comp cell, so the header and the first column share a left edge.
         self._head.grid(row=0, column=0, columnspan=COMP_COLUMNS, sticky="w",
-                        padx=4, pady=(0, 1))
+                        padx=_FLEET_CELL_PADX, pady=_FLEET_CELL_PADY)
         self._grid = _CompGrid(self._rows_holder, self._palette,
                                FLEET_MAX_ROWS + 1)
         self._grid.frame.grid(row=1, column=0, columnspan=COMP_COLUMNS,
@@ -1258,16 +1372,18 @@ class IntelRenderer(_TileRenderer):
 TILE_SPECS = {
     "battle": {"title": "Battle", "default_size": (260, 150),
                "render": BattleRenderer},
-    # The fleet tile carries the comp rollup AND the coverage line, so its
+    # The fleet tile carries the comp rollup AND the coverage strip, so its
     # first-spawn default has to fit both -- a section clipped by the body's
     # (deliberate) propagation guard is a section the owner never discovers.
-    # MEASURED 2026-08-02 against the WORST case (all 8 buckets + Other, two
-    # columns, plus the coverage line): 258x142 of content, i.e. 162 px of
-    # window once info_tile's 20 px strip is added; a realistic six-bucket
-    # fleet is 258x104 (124 px of window). 280x170 carries the worst case with
-    # a little slack -- and is 90 px SHORTER than the single-column,
-    # per-pilot-rows layout it replaces.
-    "fleet": {"title": "Fleet", "default_size": (280, 170),
+    # RE-MEASURED 2026-08-03 against the WORST case (all 8 buckets + Other in
+    # two columns, plus the four-icon coverage strip) with the compact metrics
+    # at the top of this module: 154x89 of content, i.e. 109 px of window once
+    # info_tile's 20 px strip is added -- down from 258x142/162 px, which is
+    # what stopped fitting the owner's 160x136 preview-sized tile. 180x120
+    # carries that worst case with slack in both axes and still lands well
+    # above the floors (MIN_W 120 / MIN_H 90). Stored layouts win over this at
+    # spawn, so an existing 280x170 tile keeps its size.
+    "fleet": {"title": "Fleet", "default_size": (180, 120),
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
               "render": IntelRenderer},
