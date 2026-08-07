@@ -27702,8 +27702,10 @@ $bmp.Dispose()
         # hold — so the sweep (unbind, then delete) is what keeps both bounded.
         # It was unconditional inside the trim branch, which meant EVERY line
         # swept once the log sat at its cap: its tag_ranges scan over the tracked
-        # tags then cost ~10 ms of a ~12 ms line. Amortized it is ~0.1 ms/line and
-        # up to INTEL_SWEEP_EVERY_LINES lines' worth of dead tags may linger.
+        # tags then cost ~10 ms of a ~12 ms line.
+        # That cost now concentrates in the one line per N that sweeps (~116 ms
+        # at ~4k tags, ~quadratic in registry size, decays as the backlog
+        # drains) — see INTEL_SWEEP_EVERY_LINES for the measured hitch profile.
         self._intel_lines_since_sweep += 1
         if self._intel_lines_since_sweep >= INTEL_SWEEP_EVERY_LINES:
             self._intel_sweep_dynamic_tags(log)
