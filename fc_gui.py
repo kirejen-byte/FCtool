@@ -26130,9 +26130,11 @@ $bmp.Dispose()
     # inserted at the HEAD, so Tk re-geometry-manages every embedded window on
     # each insert: the cost scales with the number of retained BLOCKS, not with
     # the character count. The old 2000-LINE cap admitted ~250 blocks (~2000
-    # live widgets), which ramped over a busy op into the plateau FCs reported
-    # ~15-20 minutes in and that only a restart cleared. 50 blocks holds it
-    # under ~500 widgets. Alerts are prepended (newest at "1.0"), so the oldest
+    # live widgets), which ramped over a busy op toward an expensive
+    # plateau. One user reported a ~15-20 min slowdown that only a
+    # restart cleared; this pane is a plausible contributor, not a
+    # confirmed diagnosis. 50 blocks holds it under ~500 widgets.
+    # Alerts are prepended (newest at "1.0"), so the oldest
     # blocks sit at the tail and get trimmed there -- see
     # _trim_zkill_alert_blocks, which owns retention.
     _ZKILL_LOG_MAX_ALERTS = 50
@@ -27746,7 +27748,8 @@ $bmp.Dispose()
         mark = f"zk_blk_{self._zkill_block_seq}"
         w.mark_set(mark, "alert_ins")   # still parked at the end of that block
         # LEFT gravity: text later inserted AT this boundary joins the OLDER
-        # block, so it is trimmed with that block instead of escaping the cap.
+        # block, so it is trimmed with that block instead of inflating the
+        # newest block's recorded range.
         w.mark_gravity(mark, tk.LEFT)
         self._zkill_block_marks.appendleft(mark)
         cap = self._ZKILL_LOG_MAX_ALERTS
