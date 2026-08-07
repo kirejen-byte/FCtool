@@ -4569,6 +4569,11 @@ class FCToolGUI:
         self._recent_zkill_systems: dict[str, datetime] = {}
         self._recent_intel_systems: dict[str, datetime] = {}
         self._current_log = None  # Tracks active log widget for append helpers
+        # zKill alert-log retention ledger: one Tk MARK per rendered alert
+        # block, newest first, each parked at that block's END boundary.
+        # See _trim_zkill_alert_blocks.
+        self._zkill_block_marks: "collections.deque[str]" = collections.deque()
+        self._zkill_block_seq = 0
 
         # ── Cyno Check drawer (collapsible) ───────────────────────────────
         self._build_cyno_check_drawer(body)
@@ -26120,11 +26125,17 @@ $bmp.Dispose()
             self._tooltip.destroy()
             self._tooltip = None
 
-    # Cap the zKill alert log so a multi-hour watch_all op cannot grow the
-    # widget (and its embedded live Button widgets / HWNDs) without bound.
-    # Alerts are prepended (newest at "1.0"), so the oldest blocks sit at the
-    # tail and get trimmed there. ~8 lines/alert → ~250 alerts retained.
-    _ZKILL_LOG_MAX_LINES = 2000
+    # Cap the zKill alert log by ALERT BLOCK, not by line. Each block embeds
+    # 6-9 REAL tk.Button children (a live HWND each) and every new alert is
+    # inserted at the HEAD, so Tk re-geometry-manages every embedded window on
+    # each insert: the cost scales with the number of retained BLOCKS, not with
+    # the character count. The old 2000-LINE cap admitted ~250 blocks (~2000
+    # live widgets), which ramped over a busy op into the plateau FCs reported
+    # ~15-20 minutes in and that only a restart cleared. 50 blocks holds it
+    # under ~500 widgets. Alerts are prepended (newest at "1.0"), so the oldest
+    # blocks sit at the tail and get trimmed there -- see
+    # _trim_zkill_alert_blocks, which owns retention.
+    _ZKILL_LOG_MAX_ALERTS = 50
 
     def _show_zkill_alert(self, alert: KillAlert):
         # ── GUI-only filters (applied at display time only) ──
@@ -26318,7 +26329,7 @@ $bmp.Dispose()
 
         # "▸ Map" button (Task 36) -> jump to the star map and ping this system.
         # A REAL embedded button, matching the sibling link/action buttons: this
-        # zkill panel is BOUNDED (_ZKILL_LOG_MAX_LINES) and the tail-trim destroys
+        # zkill panel is BOUNDED (_ZKILL_LOG_MAX_ALERTS) and the tail-trim destroys
         # old blocks' embedded buttons, so there is no window_create leak here (the
         # leak concern only applies to the unbounded intel-fusion stream). Always
         # shown (ungated, unlike Navigate/Titan-Bridge which need a staging system).
@@ -26372,18 +26383,7 @@ $bmp.Dispose()
 
         self._zkill_log.insert("alert_ins", "\n\n")
         self._end_alert_block()
-
-        # Bounded trim: keep at most _ZKILL_LOG_MAX_LINES in the widget. Newest
-        # is at the top, so drop the oldest blocks from the tail. Deleting the
-        # range destroys the live Button widgets embedded in those old blocks
-        # (they are children of self._zkill_log), reclaiming their HWNDs. The
-        # "alert_ins" mark sits at "1.0" and is untouched by tail deletion.
-        cap = self._ZKILL_LOG_MAX_LINES
-        line_count = int(self._zkill_log.index("end-1c").split(".")[0])
-        if line_count > cap:
-            self._zkill_log.config(state=tk.NORMAL)
-            self._zkill_log.delete(f"{cap + 1}.0", tk.END)
-            self._zkill_log.config(state=tk.DISABLED)
+        self._trim_zkill_alert_blocks()
 
         if not self._intel_mute_var.get():
             # Was a bare self.root.bell() until 2026-07-28 — the generic Windows
@@ -27720,11 +27720,56 @@ $bmp.Dispose()
         w.see("1.0")
         w.config(state=tk.DISABLED)
 
+    def _trim_zkill_alert_blocks(self):
+        """Record the alert block just rendered, then drop the oldest blocks
+        past the _ZKILL_LOG_MAX_ALERTS cap.
+
+        The ledger is a deque of Tk MARKS -- one per rendered block, newest
+        first, each parked at that block's END boundary (== the start of the
+        next-older block). Tk maintains mark indices across every edit, so the
+        ledger cannot drift from the widget the way a per-block LINE count
+        would: a stray non-block append (e.g. _start_intel_monitor's "cannot
+        start" line) shifts line numbers but never a mark.
+
+        Blocks are only ever inserted at the head ("1.0") and only ever
+        trimmed at the tail, so deleting from the cap-th mark to END drops
+        exactly the oldest blocks -- and that range delete DESTROYS the
+        tk.Button widgets embedded in them (they are children of the Text),
+        reclaiming their HWNDs. Marks caught inside the deleted range survive
+        at its start, so they are unset here and the mark table stays bounded
+        with the block count.
+
+        Tk thread only (called from _show_zkill_alert, itself marshalled).
+        """
+        w = self._zkill_log
+        self._zkill_block_seq += 1
+        mark = f"zk_blk_{self._zkill_block_seq}"
+        w.mark_set(mark, "alert_ins")   # still parked at the end of that block
+        # LEFT gravity: text later inserted AT this boundary joins the OLDER
+        # block, so it is trimmed with that block instead of escaping the cap.
+        w.mark_gravity(mark, tk.LEFT)
+        self._zkill_block_marks.appendleft(mark)
+        cap = self._ZKILL_LOG_MAX_ALERTS
+        if len(self._zkill_block_marks) <= cap:
+            return
+        cut = self._zkill_block_marks[cap - 1]   # end of the oldest KEPT block
+        w.config(state=tk.NORMAL)
+        w.delete(cut, tk.END)
+        w.config(state=tk.DISABLED)
+        while len(self._zkill_block_marks) > cap:
+            w.mark_unset(self._zkill_block_marks.pop())
+
     def _clear_zkill_log(self):
         """Clear the zKillboard intel pane."""
         self._zkill_log.config(state=tk.NORMAL)
         self._zkill_log.delete("1.0", tk.END)
         self._zkill_log.config(state=tk.DISABLED)
+        # Every block (and its embedded buttons) just went away, so the
+        # retention ledger goes with it -- a deleted range leaves its marks
+        # behind, collapsed onto "1.0", and trimming against those would
+        # delete the NEXT alert instead of an old one.
+        self._zkill_log.mark_unset(*self._zkill_block_marks)
+        self._zkill_block_marks.clear()
 
     def _clear_intel_log(self):
         """Clear the Intel Channels pane."""
