@@ -294,8 +294,13 @@ INTEL_RESOLVE_TAIL_LINES = 200
 # inside the over-cap trim branch, so nothing was reclaimed until the log hit
 # 2,000 lines; then it ran on EVERY line once the cap was reached, and the
 # sweep's ``tag_ranges`` scan over the tracked tags became the dominant per-line
-# cost (~10 ms of a ~12 ms line at cap). Amortized over N lines it is ~0.1 ms,
-# at the price of up to N lines' worth of dead tags lingering (~5% at cap).
+# cost (~10 ms of a ~12 ms line at cap). The sweep's cost concentrates in the
+# one line per N that actually sweeps (~116 ms in that single Tk callback at
+# ~4,000 tracked tags, scaling roughly QUADRATICALLY with registry size —
+# 27/116/257/540 ms measured at 2k/4k/6k/8k tags — then decaying as the warm-up
+# backlog drains). Raising N grows both the lingering-tag count AND that
+# single-callback hitch — if the hitch is ever felt, the follow-up is a
+# per-sweep reclaim budget (N dead tags per pass), never a larger cadence.
 INTEL_SWEEP_EVERY_LINES = 100
 
 
