@@ -289,10 +289,17 @@ VERDICT_COLOR = {
 # 365.8 ms with 8,000), which is why the old "1.0"→"end" rescan-per-line
 # degraded the whole app after ~15-25 min of intel.
 INTEL_RESOLVE_TAIL_LINES = 200
-# Sweep dynamic span tags every N ingested lines even while the log is still
-# below its trim cap. Pre-fix the sweep ran ONLY inside the over-cap trim branch,
-# so nothing was reclaimed until the log hit 2,000 lines.
+# Sweep dynamic span tags once every N RENDERED lines — the single cadence for
+# every sweep the render path takes, trim or no trim. Pre-fix the sweep ran ONLY
+# inside the over-cap trim branch, so nothing was reclaimed until the log hit
+# 2,000 lines; then it ran on EVERY line once the cap was reached, and the
+# sweep's ``tag_ranges`` scan over the tracked tags became the dominant per-line
+# cost (~10 ms of a ~12 ms line at cap). Amortized over N lines it is ~0.1 ms,
+# at the price of up to N lines' worth of dead tags lingering (~5% at cap).
 INTEL_SWEEP_EVERY_LINES = 100
+
+
+# ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
 
 
 def _shift_text_line(index: str, up: int) -> str:
@@ -301,9 +308,6 @@ def _shift_text_line(index: str, up: int) -> str:
     Used after a top-of-widget trim, which renumbers every surviving line."""
     line, _, col = index.partition(".")
     return f"{int(line) - up}.{col}"
-
-
-# ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
 
 
 def high_priority(report, min_reported: int) -> bool:
@@ -916,6 +920,12 @@ class FCToolGUI:
         # them. This is the sole worker->UI channel and keeps Tcl single-threaded
         # even under an update()-pumped host. See the tk-thread-safety audit.
         self._ui_q = queue.Queue()
+        # Identity of the Tk/main thread — captured HERE because __init__ runs on
+        # it, which is what makes it trustworthy. A callback that may be invoked
+        # either synchronously (in its caller's thread) or later from a worker
+        # compares against this to tell the two apart; see the IntelResolver
+        # delivery in _intel_stream_ingest.
+        self._ui_thread_ident = threading.get_ident()
         # Thread-safe mirrors of two Intel-panel Tk Vars that off-main workers
         # would otherwise read directly (Class B data races). The fusion Event
         # gates the intel poll loop; the min-reported int is read by the
@@ -4580,8 +4590,9 @@ class FCToolGUI:
         # for the life of the process. Tracking the pairs also lets a repeated
         # tag name reuse its existing bindings instead of minting new ones.
         self._intel_dynamic_tags: dict[str, list[tuple[str, str]]] = {}
-        # Lines ingested since the last dynamic-tag sweep (cadence counter; the
-        # sweep resets it, so a trim-driven sweep also satisfies the clock).
+        # Lines RENDERED since the last dynamic-tag sweep. Bumped in
+        # _render_line (so both render drivers feed it) and reset by any sweep;
+        # it is the single gate on how often the sweep runs, trim or no trim.
         self._intel_lines_since_sweep = 0
         self._intel_autoscroll_paused = False
         self._intel_new_count = 0
@@ -27585,11 +27596,13 @@ $bmp.Dispose()
                     # it is the one that must never rescan the whole widget.
                     # A late delivery arrives on the resolver's worker thread
                     # instead: it marshals through the dispatcher and repaints
-                    # only the widget's recent tail.
-                    _ui_thread = threading.get_ident()
-
-                    def _on_resolved(d, _rng=rendered_range, _tid=_ui_thread):
-                        if _rng is not None and threading.get_ident() == _tid:
+                    # only the widget's recent tail. The discriminator is the
+                    # Tk-thread identity captured in __init__ (which runs on that
+                    # thread) — not a capture taken here, which would only prove
+                    # the delivery came from whichever thread called ingest.
+                    def _on_resolved(d, _rng=rendered_range):
+                        if (_rng is not None
+                                and threading.get_ident() == self._ui_thread_ident):
                             self._intel_apply_resolutions(d, _rng)
                         else:
                             self._post_ui(self._intel_apply_resolutions, d)
@@ -27597,13 +27610,8 @@ $bmp.Dispose()
                     self._intel_resolver.request(names, _on_resolved)
             except Exception:
                 pass
-        # E2: sweep on a cadence as well as on trim, so dynamic tags and their
-        # bindings are reclaimed even while the log is still below its trim cap
-        # (pre-fix nothing was swept for the first ~2,000 lines). The sweep
-        # resets the counter, so a trim-driven sweep already satisfies the clock.
-        self._intel_lines_since_sweep += 1
-        if self._intel_lines_since_sweep >= INTEL_SWEEP_EVERY_LINES:
-            self._intel_sweep_dynamic_tags(self._intel_log)
+        # (The dynamic-tag sweep cadence is counted per RENDERED line, in
+        # _render_line, so it covers _intel_rerender_from_buffer too.)
         if priority and self._intel_sound_var.get():
             try:
                 self._play_fire_alert()
@@ -27674,17 +27682,26 @@ $bmp.Dispose()
         if line_count > cap:
             removed = line_count - cap
             log.delete("1.0", f"{removed + 1}.0")
-            # E2: the delete drops the trimmed text's tag RANGES but leaves the
-            # per-instance tag definitions registered — and tag_delete on its own
-            # frees NEITHER their bindings' Tcl commands nor the closures those
-            # commands hold. Sweep (unbind, then delete) the ones now covering no
-            # text so neither tags nor funcids accumulate.
-            self._intel_sweep_dynamic_tags(log)
             # The trim renumbered every surviving line, including the one just
             # written. The returned range is what the synchronous resolution
-            # repaint scopes to, so it has to survive the trim.
+            # repaint scopes to, so it has to survive the trim. This is
+            # unconditional — only the SWEEP below rides a cadence.
             start_index = _shift_text_line(start_index, removed)
             end_index = _shift_text_line(end_index, removed)
+
+        # E2: reclaim dynamic tags on ONE cadence, counted here so both render
+        # drivers (_intel_stream_ingest and _intel_rerender_from_buffer) feed it.
+        # A trim/clear drops the removed text's tag RANGES but leaves the
+        # per-instance tag definitions registered, and tag_delete on its own frees
+        # NEITHER their bindings' Tcl commands nor the closures those commands
+        # hold — so the sweep (unbind, then delete) is what keeps both bounded.
+        # It was unconditional inside the trim branch, which meant EVERY line
+        # swept once the log sat at its cap: its tag_ranges scan over the tracked
+        # tags then cost ~10 ms of a ~12 ms line. Amortized it is ~0.1 ms/line and
+        # up to INTEL_SWEEP_EVERY_LINES lines' worth of dead tags may linger.
+        self._intel_lines_since_sweep += 1
+        if self._intel_lines_since_sweep >= INTEL_SWEEP_EVERY_LINES:
+            self._intel_sweep_dynamic_tags(log)
 
         log.config(state=tk.DISABLED)
         if at_bottom and not self._intel_autoscroll_paused:
@@ -27712,7 +27729,8 @@ $bmp.Dispose()
 
         Reused structural tags (chan_/intel_*/name_*) are never registered here,
         so this never touches them. Resets the cadence counter as well: a sweep
-        reached from ANY path restarts the every-N-ingested-lines clock."""
+        reached from ANY path (clear, re-render, the _render_line cadence)
+        restarts the every-N-rendered-lines clock."""
         self._intel_lines_since_sweep = 0
         tracked = self._intel_dynamic_tags
         if not tracked:
@@ -27738,8 +27756,16 @@ $bmp.Dispose()
         ``tag_bind`` on the same tag+sequence registers a FRESH Tcl command and
         orphans the previous one, which is the same leak by another route. The
         caller has already ``tag_add``-ed the new range, which is all a repeat
-        occurrence needs — and every dynamic tag name hashes the values its
-        bindings close over, so an identical name implies identical behaviour."""
+        occurrence needs.
+
+        For ``sysclick_``/``dscan_`` that is exact: the name hashes the very
+        value the bindings close over (system name / URL), so an identical name
+        IS identical behaviour. ``nametip_`` is the one exception — it hashes
+        ``(name, pos)`` while its binding closes over ``tip`` (the pilot's
+        alliance/corp), so a pilot re-resolved with a NEW corp or alliance at the
+        same position keeps the first tip until that span scrolls out and the
+        sweep drops the tag. Accepted: rare, cosmetic, and hover-only; re-binding
+        to refresh it is exactly the leak this dedupe exists to prevent."""
         if tag in self._intel_dynamic_tags:
             return
         self._intel_dynamic_tags[tag] = [
@@ -28007,13 +28033,17 @@ $bmp.Dispose()
     def _clear_intel_log(self):
         """Clear the Intel Channels pane."""
         self._intel_log.config(state=tk.NORMAL)
-        self._intel_log.delete("1.0", tk.END)
-        # E2: after a full delete EVERY dynamic tag's range is empty, so the
-        # sweep reclaims the lot — tags and their registered bindings alike.
-        # Its sibling _intel_rerender_from_buffer has always done this; Clear
-        # did not, so a clear used to strand every span tag it emptied.
-        self._intel_sweep_dynamic_tags(self._intel_log)
-        self._intel_log.config(state=tk.DISABLED)
+        try:
+            self._intel_log.delete("1.0", tk.END)
+            # E2: after a full delete EVERY dynamic tag's range is empty, so the
+            # sweep reclaims the lot — tags and their registered bindings alike.
+            # Its sibling _intel_rerender_from_buffer has always done this; Clear
+            # did not, so a clear used to strand every span tag it emptied.
+            self._intel_sweep_dynamic_tags(self._intel_log)
+        finally:
+            # Same discipline as _intel_apply_resolutions: a raise between the
+            # two config() calls must not leave the log editable.
+            self._intel_log.config(state=tk.DISABLED)
         if hasattr(self, "_intel_buffer"):
             self._intel_buffer.clear()
         self._intel_new_count = 0
