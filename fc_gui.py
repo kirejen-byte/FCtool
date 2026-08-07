@@ -25152,14 +25152,14 @@ class FCToolGUI:
 
         The poll is a self-rescheduling ``after`` chain armed from every arm
         site: startup, its own re-arms (30s not-auth / 15s in-flight / 60s
-        not-boss / 60s miss / 15s normal), and ``_esi_set_primary``'s "poll
-        again now, with the new primary" nudge. None of them stored an id and
-        nothing ever cancelled, so every Set Primary click left the live chain
-        running and started another one beside it — permanently, until
-        restart. Each extra chain costs a full ESI burst per cycle (fleet info
-        + members + locations + three name resolves per member) plus five
-        main-thread applies, so a boss-swapping multiboxer stacked them all
-        session.
+        not-boss / 60s miss / 15s normal / 15s spawn-failure), and
+        ``_esi_set_primary``'s "poll again now, with the new primary" nudge.
+        None of them stored an id and nothing ever cancelled, so every Set
+        Primary click left the live chain running and started another one
+        beside it — permanently, until restart. Each extra chain costs a full
+        ESI burst per cycle (fleet info + members + locations + three name
+        resolves per member) plus five main-thread applies, so a boss-swapping
+        multiboxer stacked them all session.
 
         Routing every arm site through here makes that impossible: the
         previously pending callback is cancelled first, so at most one poll is
@@ -25171,10 +25171,11 @@ class FCToolGUI:
         nudge whenever it lands during an in-flight fetch: the guard's 15s
         re-arm, and then the finishing worker's own 60s one, each simply
         replace it, so "poll now, with the NEW primary" becomes up to a minute
-        of stale data. Clamping instead keeps the poll re-checking until it
-        can spawn. The flag is cleared only by the poll itself (when it spawns
-        the fetch that honors the nudge, or when it finds no auth), never
-        here, so a clamp cannot outlive its nudge.
+        of stale data. Clamping instead keeps the poll re-checking until it can
+        spawn. The flag is cleared only by the poll itself (when it commits to
+        a fetch — even if the spawn then fails, in which case the plain 15 s
+        retry stands — or when it finds no auth), never here, so a clamp cannot
+        outlive its nudge.
 
         Worker threads must NOT call this directly (``root.after`` is a Tcl
         call): marshal it, ``self._post_ui(self._arm_fleet_refresh, 15000)``.
@@ -25346,7 +25347,10 @@ class FCToolGUI:
         # This fetch IS the nudged poll — it runs against the current primary —
         # so the nudge is honored here, at the commit point. Clearing it now
         # means the worker's own re-arm (60s on a miss/not-boss) comes back
-        # through the helper unclamped, as that branch intends.
+        # through the helper unclamped, as that branch intends. If the spawn
+        # below fails, the nudge is deliberately gone with it — retrying at the
+        # clamped 100 ms would hammer thread creation at an OS already refusing
+        # it; the plain 15 s retry stands.
         self._fleet_refresh_asap = False
         try:
             threading.Thread(target=run_fetch, daemon=True).start()
