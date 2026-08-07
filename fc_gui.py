@@ -1242,6 +1242,7 @@ class FCToolGUI:
         # arm site can fork a second permanent chain (see the helper).
         self._fleet_refresh_after_id = None   # pending after() id, or None
         self._fleet_fetch_inflight = False    # True while a fetch worker runs
+        self._fleet_refresh_asap = False      # a Set Primary nudge awaits a fetch
         self._arm_fleet_refresh(5000)
 
         # Start current system refresh loop (ESI character location)
@@ -6216,7 +6217,13 @@ class FCToolGUI:
         # added one more permanent parallel poll chain — each with its own ESI
         # burst (fleet info + members + locations + 3 name resolves per member)
         # and its own five main-thread applies — that only a restart cleared.
+        # The asap flag is what makes the nudge survive a collision with a
+        # fetch that is already in flight (see _arm_fleet_refresh): without it
+        # the guard's 15s re-arm — or the finishing worker's own 60s one —
+        # quietly replaces this 100 ms one and the click buys a minute of
+        # stale data instead of a fresh poll.
         self._no_fleet_misses = 0
+        self._fleet_refresh_asap = True
         self._arm_fleet_refresh(100)
 
     def _set_origin_to_current_system(self, entry_widget):
@@ -25143,23 +25150,37 @@ class FCToolGUI:
     def _arm_fleet_refresh(self, delay_ms):
         """(Re)arm the ONE pending fleet-location poll. MAIN THREAD ONLY.
 
-        The poll is a self-rescheduling ``after`` chain armed from six places:
-        startup, its own four re-arms (30s not-auth / 60s not-boss / 60s miss /
-        15s normal), and ``_esi_set_primary``'s "poll again now, with the new
-        primary" nudge. None of them stored an id and nothing ever cancelled,
-        so every Set Primary click left the live chain running and started
-        another one beside it — permanently, until restart. Each extra chain
-        costs a full ESI burst per cycle (fleet info + members + locations +
-        three name resolves per member) plus five main-thread applies, so a
-        boss-swapping multiboxer stacked them all session.
+        The poll is a self-rescheduling ``after`` chain armed from every arm
+        site: startup, its own re-arms (30s not-auth / 15s in-flight / 60s
+        not-boss / 60s miss / 15s normal), and ``_esi_set_primary``'s "poll
+        again now, with the new primary" nudge. None of them stored an id and
+        nothing ever cancelled, so every Set Primary click left the live chain
+        running and started another one beside it — permanently, until
+        restart. Each extra chain costs a full ESI burst per cycle (fleet info
+        + members + locations + three name resolves per member) plus five
+        main-thread applies, so a boss-swapping multiboxer stacked them all
+        session.
 
         Routing every arm site through here makes that impossible: the
         previously pending callback is cancelled first, so at most one poll is
         ever scheduled. Delays stay per-site — this only owns *how many*.
 
+        One exception to "delays stay per-site": while ``_fleet_refresh_asap``
+        is set — a Set Primary nudge that has not reached a fetch yet — every
+        delay is clamped to 100 ms. Cancel-and-replace otherwise DROPS that
+        nudge whenever it lands during an in-flight fetch: the guard's 15s
+        re-arm, and then the finishing worker's own 60s one, each simply
+        replace it, so "poll now, with the NEW primary" becomes up to a minute
+        of stale data. Clamping instead keeps the poll re-checking until it
+        can spawn. The flag is cleared only by the poll itself (when it spawns
+        the fetch that honors the nudge, or when it finds no auth), never
+        here, so a clamp cannot outlive its nudge.
+
         Worker threads must NOT call this directly (``root.after`` is a Tcl
         call): marshal it, ``self._post_ui(self._arm_fleet_refresh, 15000)``.
         """
+        if getattr(self, "_fleet_refresh_asap", False):
+            delay_ms = min(delay_ms, 100)
         pending = getattr(self, "_fleet_refresh_after_id", None)
         if pending is not None:
             try:
@@ -25175,13 +25196,24 @@ class FCToolGUI:
             # Clear composition display when not authenticated
             self.root.after(0, self._update_fleet_composition, {}, 0)
             self._clear_booster_state()
+            # Drop any pending Set Primary nudge FIRST: there is no fetch to
+            # bring forward while logged out, and leaving it set would clamp
+            # this 30s arm to 100 ms for as long as the user stays that way —
+            # a 10 Hz spin with nothing to poll.
+            self._fleet_refresh_asap = False
             self._arm_fleet_refresh(30000)
             return
 
         # Single-instance guard: the previous entry's fetch worker is still
         # running. A second one would duplicate the whole ESI burst and its
         # five main-thread applies for no new information, so just re-arm at
-        # the normal cadence and let the running worker finish.
+        # the normal cadence and let the running worker finish. A pending Set
+        # Primary nudge is NOT dropped here: `_fleet_refresh_asap` stays set,
+        # so this arm clamps to 100 ms and the poll keeps re-checking (two
+        # attribute reads and a re-arm) until the worker is gone — then the
+        # next entry spawns immediately against the new primary and clears the
+        # flag. That 10 Hz window is bounded by the running fetch, and it is
+        # the whole point: the alternative is silently losing the nudge.
         if getattr(self, "_fleet_fetch_inflight", False):
             self._arm_fleet_refresh(15000)
             return
@@ -25311,13 +25343,21 @@ class FCToolGUI:
                 self._fleet_fetch_inflight = False
 
         self._fleet_fetch_inflight = True
+        # This fetch IS the nudged poll — it runs against the current primary —
+        # so the nudge is honored here, at the commit point. Clearing it now
+        # means the worker's own re-arm (60s on a miss/not-boss) comes back
+        # through the helper unclamped, as that branch intends.
+        self._fleet_refresh_asap = False
         try:
             threading.Thread(target=run_fetch, daemon=True).start()
-        except RuntimeError:
-            # The OS refused a new thread, so run_fetch never runs and its
-            # finally cannot release the guard. Release it here and re-arm —
-            # previously this exception escaped into the after callback and
-            # killed the chain outright.
+        except Exception as exc:
+            # No worker started, so run_fetch's finally cannot release the
+            # guard. Release it here and re-arm — an escaping exception used to
+            # kill the chain outright, and a stuck flag would wedge every later
+            # entry into "in flight" with nothing left to clear it. Broad on
+            # purpose: RuntimeError is the OS refusing a thread, but MemoryError
+            # lands here too and wedges the poll just as permanently.
+            print(f"[Fleet] Could not start fetch worker: {exc}")
             self._fleet_fetch_inflight = False
             self._arm_fleet_refresh(15000)
 
@@ -29673,6 +29713,15 @@ $bmp.Dispose()
             if tick_id is not None:
                 self.root.after_cancel(tick_id)
                 self._market_tick_after_id = None
+        except Exception:
+            pass
+        # Same for the single-instance fleet-location poll: it is always armed
+        # (5s from startup onward), so at shutdown there is always one pending.
+        try:
+            poll_id = getattr(self, "_fleet_refresh_after_id", None)
+            if poll_id is not None:
+                self.root.after_cancel(poll_id)
+                self._fleet_refresh_after_id = None
         except Exception:
             pass
         self.root.destroy()
