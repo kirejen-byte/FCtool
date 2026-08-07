@@ -231,6 +231,11 @@ from ui_helpers import make_modal, attach_tooltip
 # audit: docs/superpowers/specs/2026-07-10-tk-thread-audit.md.
 DRAIN_MS = 50
 
+# Name carried by the fleet-chat poll thread (_chat_poll_loop). Named so a leak
+# is visible in threading.enumerate() / a debugger rather than being one more
+# anonymous "Thread-N" — see _start_monitoring for the restart-safety contract.
+CHAT_POLL_THREAD_NAME = "fctool-chat-poll"
+
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
 # The full TOC panel yields to content when the tab gets too narrow: it collapses
 # to a slim ribbon and the content reclaims the panel's width, so the SSO
@@ -979,6 +984,11 @@ class FCToolGUI:
         self.jump_checker: JumpRangeChecker | None = None
         self._running = False
         self._chat_thread: threading.Thread | None = None
+        # Stop event for the CURRENT chat-poll generation. Replaced (never
+        # cleared) on every spawn, so a thread that outlived its join keeps its
+        # own permanently-set event and cannot be resurrected — see
+        # _start_monitoring / _stop_monitoring / _chat_poll_loop.
+        self._chat_stop: threading.Event = threading.Event()
         self._sound_enabled = self.config.get("sound_on_ready", False)
         # Fleet loss tracker
         self._loss_tracker = FleetLossTracker()
@@ -23888,8 +23898,31 @@ class FCToolGUI:
     def _start_monitoring(self):
         self._running = True
         if self.chat_monitor:
-            self._chat_thread = threading.Thread(target=self._chat_poll_loop, daemon=True)
-            self._chat_thread.start()
+            # Restart-safe spawn (the ZKillMonitor.start / GamelogMonitor.start
+            # shape). _save_settings calls _stop_monitoring() and then this,
+            # milliseconds apart. Before the guard the outgoing poll thread —
+            # parked in a bare time.sleep(poll_interval) — slept straight
+            # through the _running=False window, woke to a re-True flag and
+            # lived FOREVER: every Settings->Save permanently added another 1 Hz
+            # poller, all of them polling the CURRENT self.chat_monitor.
+            prev = self._chat_thread
+            if (prev is not None and prev.is_alive()
+                    and not self._chat_stop.is_set()):
+                # A thread of the CURRENT generation is already polling (a plain
+                # double-start); spawning again would duplicate the poller.
+                log.info("chat poll thread already running; ignoring double-start")
+            else:
+                # Any prior thread still alive HERE is stale by construction: the
+                # only way past the guard above is with its own event already
+                # set, and nothing ever clears an event — the successor gets a
+                # brand-new one — so it exits at its next check even though we
+                # start a replacement now.
+                stop = threading.Event()
+                self._chat_stop = stop
+                self._chat_thread = threading.Thread(
+                    target=self._chat_poll_loop, args=(stop,),
+                    name=CHAT_POLL_THREAD_NAME, daemon=True)
+                self._chat_thread.start()
         if self.zkill_monitor:
             # A starting monitor replays ~200 sequences (~30 min) of backlog, so
             # move both engines' replay cutoffs to NOW — that history is not
@@ -23900,19 +23933,56 @@ class FCToolGUI:
 
     def _stop_monitoring(self):
         self._running = False
+        # Wake the chat poll thread out of its interval wait, then wait for it
+        # to actually exit, so a caller can rely on at most one poller existing
+        # across a restart. Because the loop waits on the event rather than
+        # sleeping, this join normally returns in microseconds despite the 1 s
+        # poll interval; the bound covers a pass wedged mid-poll (a slow log
+        # read). Runs on the Tk thread only on rare user actions (Settings->Save,
+        # shutdown), so a bounded wait is acceptable there.
+        #
+        # If the bound DOES expire, the stale thread is still guaranteed to
+        # exit: this event stays set forever — _start_monitoring hands the
+        # successor a brand-new Event instead of clearing this one — so the
+        # wedged pass ends at its next check.
+        chat_stop = getattr(self, "_chat_stop", None)
+        if chat_stop is not None:
+            chat_stop.set()
+        t = self._chat_thread
+        if (t is not None and t.is_alive()
+                and t is not threading.current_thread()):
+            t.join(timeout=2.0)
         if self.zkill_monitor:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
             self._intel_monitor.stop()
 
-    def _chat_poll_loop(self):
-        while self._running:
+    def _chat_poll_loop(self, stop: threading.Event):
+        """Poll the fleet chat monitor until THIS generation's stop is signalled.
+
+        ``stop`` is handed in per spawn rather than read off ``self`` on
+        purpose: a thread that outlived its join (see _stop_monitoring) keeps
+        its own, permanently-signalled event and so exits at its next check even
+        after _start_monitoring has given a successor a fresh one. Reading a
+        shared attribute instead would let the successor's replacement
+        resurrect the stale thread — which is exactly how a Settings->Save used
+        to leak a poller per save.
+        """
+        while self._running and not stop.is_set():
             try:
-                if self.chat_monitor:
-                    self.chat_monitor.poll()
+                # Re-read every pass: _apply_tracked_character swaps the monitor
+                # in place so a new listener_filter takes effect without a
+                # restart, and it may be None.
+                monitor = self.chat_monitor
+                if monitor:
+                    monitor.poll()
             except Exception:
                 pass
-            time.sleep(self.config.get("poll_interval_seconds", 1.0))
+            # Wait on the event, never time.sleep: a stop wakes the thread
+            # immediately instead of up to poll_interval later. self.config is
+            # re-read here (never cached) because _save_settings REPLACES the
+            # whole dict.
+            stop.wait(self.config.get("poll_interval_seconds", 1.0))
 
     # ── Callbacks (threadsafe via root.after) ─────────────────────────────────
 
