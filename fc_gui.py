@@ -280,6 +280,29 @@ VERDICT_COLOR = {
     command_bursts.Verdict.UNKNOWN: FG_DIM,
 }
 
+# ── Intelligence stream: repaint + dynamic-tag housekeeping bounds ──────────
+# How much of the intel log a LATE (resolver-worker) name resolution may repaint.
+# The synchronous cache-hit path repaints only the line it just rendered; this
+# bounds the async path so a late resolution never rescans the whole widget.
+# ``Text.search`` cost grows with the widget's tag TOGGLE-SEGMENT count, not its
+# text volume (measured over the same 2,000 lines: 1.8 ms with 0 tags vs
+# 365.8 ms with 8,000), which is why the old "1.0"→"end" rescan-per-line
+# degraded the whole app after ~15-25 min of intel.
+INTEL_RESOLVE_TAIL_LINES = 200
+# Sweep dynamic span tags every N ingested lines even while the log is still
+# below its trim cap. Pre-fix the sweep ran ONLY inside the over-cap trim branch,
+# so nothing was reclaimed until the log hit 2,000 lines.
+INTEL_SWEEP_EVERY_LINES = 100
+
+
+def _shift_text_line(index: str, up: int) -> str:
+    """Move a Tk Text ``line.char`` index UP by ``up`` lines.
+
+    Used after a top-of-widget trim, which renumbers every surviving line."""
+    line, _, col = index.partition(".")
+    return f"{int(line) - up}.{col}"
+
+
 # ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
 
 
@@ -4550,10 +4573,16 @@ class FCToolGUI:
         # retires the old masked-24-bit-hash tag names + their collision risk.
         self._intel_chan_tags: dict[str, str] = {}
         # E2: per-instance dynamic tags (sysclick_/dscan_/nametip_) created for
-        # individual spans. Tracked here so the trim path can tag_delete the ones
-        # whose text scrolled out (empty tag_ranges), keeping the widget's tag +
-        # binding count bounded over a long session instead of leaking forever.
-        self._intel_dynamic_tags: set[str] = set()
+        # individual spans, mapped to the (sequence, funcid) pairs their
+        # tag_bind calls registered. The sweep uses those funcids to tag_unbind
+        # (which deletecommands) BEFORE tag_delete — a tag_delete alone frees
+        # neither the Tcl command nor its Python closure, so the bindings leaked
+        # for the life of the process. Tracking the pairs also lets a repeated
+        # tag name reuse its existing bindings instead of minting new ones.
+        self._intel_dynamic_tags: dict[str, list[tuple[str, str]]] = {}
+        # Lines ingested since the last dynamic-tag sweep (cadence counter; the
+        # sweep resets it, so a trim-driven sweep also satisfies the clock).
+        self._intel_lines_since_sweep = 0
         self._intel_autoscroll_paused = False
         self._intel_new_count = 0
         self._intel_new_btn = None
@@ -27539,20 +27568,42 @@ $bmp.Dispose()
                         self._push_intel_to_map(_sid)
         except Exception:
             pass
+        rendered_range = None
         if self._passes_view_filter(msg):
-            self._render_line((msg, spans, report, priority))
+            rendered_range = self._render_line((msg, spans, report, priority))
         # async name resolution
         if self._intel_resolver is not None:
             try:
                 names = intel_stream.candidate_names(msg.message)
                 if names:
-                    self._intel_resolver.request(
-                        names,
-                        lambda d: self._post_ui(
-                            self._intel_apply_resolutions, d),
-                    )
+                    # IntelResolver answers CACHED names SYNCHRONOUSLY, in the
+                    # caller's thread — which here is the Tk thread (this method
+                    # is _post_ui-marshaled). That delivery is therefore applied
+                    # inline and scoped to the line we just rendered: nothing can
+                    # have trimmed or rendered in between, so those indices still
+                    # hold. After warm-up this is the path EVERY line takes, and
+                    # it is the one that must never rescan the whole widget.
+                    # A late delivery arrives on the resolver's worker thread
+                    # instead: it marshals through the dispatcher and repaints
+                    # only the widget's recent tail.
+                    _ui_thread = threading.get_ident()
+
+                    def _on_resolved(d, _rng=rendered_range, _tid=_ui_thread):
+                        if _rng is not None and threading.get_ident() == _tid:
+                            self._intel_apply_resolutions(d, _rng)
+                        else:
+                            self._post_ui(self._intel_apply_resolutions, d)
+
+                    self._intel_resolver.request(names, _on_resolved)
             except Exception:
                 pass
+        # E2: sweep on a cadence as well as on trim, so dynamic tags and their
+        # bindings are reclaimed even while the log is still below its trim cap
+        # (pre-fix nothing was swept for the first ~2,000 lines). The sweep
+        # resets the counter, so a trim-driven sweep already satisfies the clock.
+        self._intel_lines_since_sweep += 1
+        if self._intel_lines_since_sweep >= INTEL_SWEEP_EVERY_LINES:
+            self._intel_sweep_dynamic_tags(self._intel_log)
         if priority and self._intel_sound_var.get():
             try:
                 self._play_fire_alert()
@@ -27562,7 +27613,12 @@ $bmp.Dispose()
     def _render_line(self, entry):
         """Append one verbatim line at the BOTTOM (deliberate change from the
         old newest-at-top prepend) and apply span tags. Autoscroll only when at
-        the bottom; otherwise hold and bump the '▼ N new' counter."""
+        the bottom; otherwise hold and bump the '▼ N new' counter.
+
+        Returns the appended line's ``(start, end)`` Text index pair, already
+        corrected for a trim that may have renumbered the widget in this same
+        call. The ingest path hands that range to the synchronous resolution
+        repaint so it touches this line and nothing else."""
         msg, spans, report, priority = entry
         log = self._intel_log
         log.config(state=tk.NORMAL)
@@ -27616,11 +27672,19 @@ $bmp.Dispose()
         cap = self._intel_buffer.maxlen or 2000
         line_count = int(log.index("end-1c").split(".")[0])
         if line_count > cap:
-            log.delete("1.0", f"{line_count - cap + 1}.0")
+            removed = line_count - cap
+            log.delete("1.0", f"{removed + 1}.0")
             # E2: the delete drops the trimmed text's tag RANGES but leaves the
-            # per-instance tag definitions + their bindings registered forever.
-            # Sweep the ones now covering no text so tags don't accumulate.
+            # per-instance tag definitions registered — and tag_delete on its own
+            # frees NEITHER their bindings' Tcl commands nor the closures those
+            # commands hold. Sweep (unbind, then delete) the ones now covering no
+            # text so neither tags nor funcids accumulate.
             self._intel_sweep_dynamic_tags(log)
+            # The trim renumbered every surviving line, including the one just
+            # written. The returned range is what the synchronous resolution
+            # repaint scopes to, so it has to survive the trim.
+            start_index = _shift_text_line(start_index, removed)
+            end_index = _shift_text_line(end_index, removed)
 
         log.config(state=tk.DISABLED)
         if at_bottom and not self._intel_autoscroll_paused:
@@ -27628,38 +27692,72 @@ $bmp.Dispose()
         else:
             self._intel_new_count += 1
             self._intel_update_new_button()
+        return start_index, end_index
 
     def _intel_sweep_dynamic_tags(self, log):
-        """E2: delete tracked per-instance tags (sysclick_/dscan_/nametip_) whose
-        covered text has been trimmed/cleared away — their ``tag_ranges`` is now
-        empty — which also drops their leaked bindings, and remove them from the
-        tracking set so it stays bounded (roughly one entry per span still on
-        screen). Reused structural tags (chan_/intel_*/name_*) are never tracked
-        here, so this never touches them."""
+        """E2: reclaim tracked per-instance tags (sysclick_/dscan_/nametip_)
+        whose covered text has been trimmed/cleared away — their ``tag_ranges``
+        is now empty — and remove them from the registry so it stays bounded
+        (roughly one entry per span still on screen).
+
+        The UNBIND is the load-bearing half. ``tag_delete`` issues a Tcl ``tag
+        delete`` and nothing else, so every ``tag_bind`` callback stays alive as
+        a registered Tcl command holding its Python closure for the life of the
+        process (``Misc._bind(needcleanup=1)`` → ``_register`` →
+        ``tk.createcommand`` + ``_tclCommands.append``; nothing in the delete
+        path undoes that). ``tag_unbind(tag, seq, funcid)`` routes through
+        ``Misc._unbind``, which ``deletecommand``s the funcid and drops it from
+        ``_tclCommands``. Order matters: unbind BEFORE delete, because touching a
+        binding on a deleted tag re-creates the tag.
+
+        Reused structural tags (chan_/intel_*/name_*) are never registered here,
+        so this never touches them. Resets the cadence counter as well: a sweep
+        reached from ANY path restarts the every-N-ingested-lines clock."""
+        self._intel_lines_since_sweep = 0
         tracked = self._intel_dynamic_tags
         if not tracked:
             return
         dead = [t for t in tracked if not log.tag_ranges(t)]
         for t in dead:
+            for seq, funcid in tracked.pop(t, None) or ():
+                try:
+                    log.tag_unbind(t, seq, funcid)
+                except (tk.TclError, ValueError):
+                    pass
             try:
                 log.tag_delete(t)
             except tk.TclError:
                 pass
-            tracked.discard(t)
+
+    def _intel_register_dynamic_tag(self, log, tag, binds):
+        """Register ``tag`` in the dynamic-tag registry, wiring its bindings ONCE.
+
+        ``binds`` is an iterable of ``(sequence, callable)``; the funcid each
+        ``tag_bind`` returns is stored with the tag so ``_intel_sweep_dynamic_tags``
+        can free it. A tag name already in the registry is NOT re-bound: every
+        ``tag_bind`` on the same tag+sequence registers a FRESH Tcl command and
+        orphans the previous one, which is the same leak by another route. The
+        caller has already ``tag_add``-ed the new range, which is all a repeat
+        occurrence needs — and every dynamic tag name hashes the values its
+        bindings close over, so an identical name implies identical behaviour."""
+        if tag in self._intel_dynamic_tags:
+            return
+        self._intel_dynamic_tags[tag] = [
+            (seq, log.tag_bind(tag, seq, fn)) for seq, fn in binds]
 
     def _bind_system_span(self, log, base_tag, s, e, system_name):
         """Per-instance click + right-click bindings for a system span."""
         click_tag = f"sysclick_{abs(hash((system_name, s))) & 0xffffff}"
         log.tag_add(click_tag, s, e)
-        self._intel_dynamic_tags.add(click_tag)   # E2: track for trim-sweep
-        log.tag_bind(click_tag, "<Button-1>",
-                     lambda ev, n=system_name: self._set_destination_or_copy(n))
-        log.tag_bind(click_tag, "<Button-3>",
-                     lambda ev, n=system_name: self._intel_system_menu(ev, n))
-        log.tag_bind(click_tag, "<Enter>",
-                     lambda ev: log.config(cursor="hand2"))
-        log.tag_bind(click_tag, "<Leave>",
-                     lambda ev: log.config(cursor=""))
+        # E2: track for the sweep and bind once (see _intel_register_dynamic_tag).
+        self._intel_register_dynamic_tag(log, click_tag, (
+            ("<Button-1>",
+             lambda ev, n=system_name: self._set_destination_or_copy(n)),
+            ("<Button-3>",
+             lambda ev, n=system_name: self._intel_system_menu(ev, n)),
+            ("<Enter>", lambda ev: log.config(cursor="hand2")),
+            ("<Leave>", lambda ev: log.config(cursor="")),
+        ))
 
     def _bind_dscan_span(self, log, s, e, url):
         """Per-instance click binding for a D-Scan URL span. Left-click opens
@@ -27669,13 +27767,12 @@ $bmp.Dispose()
             return
         click_tag = f"dscan_{abs(hash((url, s))) & 0xffffff}"
         log.tag_add(click_tag, s, e)
-        self._intel_dynamic_tags.add(click_tag)   # E2: track for trim-sweep
-        log.tag_bind(click_tag, "<Button-1>",
-                     lambda ev, u=url: self._open_url(u))
-        log.tag_bind(click_tag, "<Enter>",
-                     lambda ev: log.config(cursor="hand2"))
-        log.tag_bind(click_tag, "<Leave>",
-                     lambda ev: log.config(cursor=""))
+        # E2: track for the sweep and bind once (see _intel_register_dynamic_tag).
+        self._intel_register_dynamic_tag(log, click_tag, (
+            ("<Button-1>", lambda ev, u=url: self._open_url(u)),
+            ("<Enter>", lambda ev: log.config(cursor="hand2")),
+            ("<Leave>", lambda ev: log.config(cursor="")),
+        ))
 
     def _intel_update_new_button(self):
         if self._intel_new_btn is not None:
@@ -27691,19 +27788,37 @@ $bmp.Dispose()
         "neutral": "name_neutral", "unknown": "name_unknown",
     }
 
-    def _intel_apply_resolutions(self, resolutions: dict):
-        """Main thread: for each resolved name found in the visible text, add a
-        standing-coloured 'name' tag + corp/alliance tooltip. No-op for names
-        that have scrolled out (search returns nothing)."""
+    def _intel_apply_resolutions(self, resolutions: dict, line_range=None):
+        """Main thread: for each resolved name found in the SCOPED region, add a
+        standing-coloured 'name' tag + corp/alliance tooltip.
+
+        ``line_range`` is the ``(start, end)`` index pair of one just-rendered
+        line; the synchronous cache-hit path passes it so the repaint touches
+        exactly that line. Without a range (a late worker delivery, whose
+        indices cannot be trusted) the search is bounded to the last
+        ``INTEL_RESOLVE_TAIL_LINES`` lines. It is NEVER "1.0"→"end" again: that
+        rescan ran per resolved name per intel line and cost 12 ms at 250 log
+        lines rising to 683 ms at the 2,000-line cap, because ``Text.search``
+        degrades with tag toggle segments rather than text volume. No-op for
+        names that are not in the scoped region."""
         log = self._intel_log
+        if line_range is not None:
+            start, stop = line_range
+        else:
+            start, stop = f"end - {INTEL_RESOLVE_TAIL_LINES} lines", "end"
+        try:
+            start = log.index(start)
+            stop = log.index(stop)
+        except tk.TclError:
+            return
         log.config(state=tk.NORMAL)
         try:
             for name, res in resolutions.items():
                 tag = self._STANDING_TAG.get(res.standing, "name_unknown")
                 tip = res.alliance or res.corporation or ""
-                idx = "1.0"
+                idx = start
                 while True:
-                    pos = log.search(name, idx, stopindex="end", nocase=False)
+                    pos = log.search(name, idx, stopindex=stop, nocase=False)
                     if not pos:
                         break
                     end = f"{pos}+{len(name)}c"
@@ -27711,11 +27826,12 @@ $bmp.Dispose()
                     if tip:
                         bind_tag = f"nametip_{abs(hash((name, pos))) & 0xffffff}"
                         log.tag_add(bind_tag, pos, end)
-                        self._intel_dynamic_tags.add(bind_tag)  # E2: trim-sweep
-                        log.tag_bind(bind_tag, "<Enter>",
-                                     lambda e, t=f"[{tip}]": self._show_tooltip(e, t))
-                        log.tag_bind(bind_tag, "<Leave>",
-                                     lambda e: self._hide_tooltip())
+                        # E2: track for the sweep and bind once.
+                        self._intel_register_dynamic_tag(log, bind_tag, (
+                            ("<Enter>",
+                             lambda e, t=f"[{tip}]": self._show_tooltip(e, t)),
+                            ("<Leave>", lambda e: self._hide_tooltip()),
+                        ))
                     idx = end
         finally:
             log.config(state=tk.DISABLED)
@@ -27892,6 +28008,11 @@ $bmp.Dispose()
         """Clear the Intel Channels pane."""
         self._intel_log.config(state=tk.NORMAL)
         self._intel_log.delete("1.0", tk.END)
+        # E2: after a full delete EVERY dynamic tag's range is empty, so the
+        # sweep reclaims the lot — tags and their registered bindings alike.
+        # Its sibling _intel_rerender_from_buffer has always done this; Clear
+        # did not, so a clear used to strand every span tag it emptied.
+        self._intel_sweep_dynamic_tags(self._intel_log)
         self._intel_log.config(state=tk.DISABLED)
         if hasattr(self, "_intel_buffer"):
             self._intel_buffer.clear()
