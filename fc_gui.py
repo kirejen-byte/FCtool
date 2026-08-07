@@ -1236,8 +1236,13 @@ class FCToolGUI:
         if getattr(self, "_coalitions_need_triumvirate", False):
             self._resolve_triumvirate_async()
 
-        # Start fleet location refresh loop (updates role tracker locations)
-        self.root.after(5000, self._refresh_fleet_locations)
+        # Start fleet location refresh loop (updates role tracker locations).
+        # The chain is SINGLE-INSTANCE: `_arm_fleet_refresh` owns the one
+        # pending after-id and `_fleet_fetch_inflight` gates the worker, so no
+        # arm site can fork a second permanent chain (see the helper).
+        self._fleet_refresh_after_id = None   # pending after() id, or None
+        self._fleet_fetch_inflight = False    # True while a fetch worker runs
+        self._arm_fleet_refresh(5000)
 
         # Start current system refresh loop (ESI character location)
         self.root.after(3000, self._refresh_current_system)
@@ -6205,9 +6210,14 @@ class FCToolGUI:
         except Exception:
             pass
 
-        # Flush fleet polling miss counter and force a fresh poll
+        # Flush fleet polling miss counter and bring the next poll forward so
+        # it runs against the NEW primary. Routed through _arm_fleet_refresh:
+        # arming directly here left the RUNNING chain in place, so every click
+        # added one more permanent parallel poll chain — each with its own ESI
+        # burst (fleet info + members + locations + 3 name resolves per member)
+        # and its own five main-thread applies — that only a restart cleared.
         self._no_fleet_misses = 0
-        self.root.after(100, self._refresh_fleet_locations)
+        self._arm_fleet_refresh(100)
 
     def _set_origin_to_current_system(self, entry_widget):
         """Fill an origin field (Jump Range or Navigation) with the primary
@@ -25130,13 +25140,50 @@ class FCToolGUI:
                 pass
         slot["count_label"].config(text=str(count), fg=FG_ACCENT)
 
+    def _arm_fleet_refresh(self, delay_ms):
+        """(Re)arm the ONE pending fleet-location poll. MAIN THREAD ONLY.
+
+        The poll is a self-rescheduling ``after`` chain armed from six places:
+        startup, its own four re-arms (30s not-auth / 60s not-boss / 60s miss /
+        15s normal), and ``_esi_set_primary``'s "poll again now, with the new
+        primary" nudge. None of them stored an id and nothing ever cancelled,
+        so every Set Primary click left the live chain running and started
+        another one beside it — permanently, until restart. Each extra chain
+        costs a full ESI burst per cycle (fleet info + members + locations +
+        three name resolves per member) plus five main-thread applies, so a
+        boss-swapping multiboxer stacked them all session.
+
+        Routing every arm site through here makes that impossible: the
+        previously pending callback is cancelled first, so at most one poll is
+        ever scheduled. Delays stay per-site — this only owns *how many*.
+
+        Worker threads must NOT call this directly (``root.after`` is a Tcl
+        call): marshal it, ``self._post_ui(self._arm_fleet_refresh, 15000)``.
+        """
+        pending = getattr(self, "_fleet_refresh_after_id", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass          # already fired, or a stale/rejected id
+        self._fleet_refresh_after_id = self.root.after(
+            delay_ms, self._refresh_fleet_locations)
+
     def _refresh_fleet_locations(self):
         """Periodically fetch fleet member data and update role tracker + composition."""
         if not self.esi_auth or not self.esi_auth.is_authenticated:
             # Clear composition display when not authenticated
             self.root.after(0, self._update_fleet_composition, {}, 0)
             self._clear_booster_state()
-            self.root.after(30000, self._refresh_fleet_locations)
+            self._arm_fleet_refresh(30000)
+            return
+
+        # Single-instance guard: the previous entry's fetch worker is still
+        # running. A second one would duplicate the whole ESI burst and its
+        # five main-thread applies for no new information, so just re-arm at
+        # the normal cadence and let the running worker finish.
+        if getattr(self, "_fleet_fetch_inflight", False):
+            self._arm_fleet_refresh(15000)
             return
 
         # Track consecutive "no fleet" results so transient ESI errors don't
@@ -25219,7 +25266,7 @@ class FCToolGUI:
                     # The capsule tracker is dead here (no member list), but the
                     # zKill side can still work — see _process_nonboss_losses.
                     self._post_ui(self._process_nonboss_losses, fleet_id)
-                    self._post_ui_after(60000, self._refresh_fleet_locations)
+                    self._post_ui(self._arm_fleet_refresh, 60000)
                     return
                 else:
                     # No usable fleet answer: either ESI says we are in no fleet,
@@ -25243,13 +25290,36 @@ class FCToolGUI:
                         print(f"[Fleet] No fleet data (miss {self._no_fleet_misses}/"
                               f"{NO_FLEET_GRACE}) — keeping previous state")
                     # Use longer backoff to reduce ESI 404 spam
-                    self._post_ui_after(60000, self._refresh_fleet_locations)
+                    self._post_ui(self._arm_fleet_refresh, 60000)
                     return
             except Exception as e:
                 print(f"[Fleet] Location/composition fetch error: {e}")
-            self._post_ui_after(15000, self._refresh_fleet_locations)
+            self._post_ui(self._arm_fleet_refresh, 15000)
 
-        threading.Thread(target=do_fetch, daemon=True).start()
+        def run_fetch():
+            """Thread target: run the fetch, then always release the guard.
+
+            ``_fleet_fetch_inflight`` is a plain bool (no Tk), so clearing it
+            from the worker is safe — and a ``finally`` covers every exit
+            ``do_fetch`` has, including its two early returns and any raise
+            its own handler misses. Leaving it set would wedge the poll: every
+            later entry would see "in flight" and only ever re-arm.
+            """
+            try:
+                do_fetch()
+            finally:
+                self._fleet_fetch_inflight = False
+
+        self._fleet_fetch_inflight = True
+        try:
+            threading.Thread(target=run_fetch, daemon=True).start()
+        except RuntimeError:
+            # The OS refused a new thread, so run_fetch never runs and its
+            # finally cannot release the guard. Release it here and re-arm —
+            # previously this exception escaped into the after callback and
+            # killed the chain outright.
+            self._fleet_fetch_inflight = False
+            self._arm_fleet_refresh(15000)
 
     def _auto_refresh_character_tab(self):
         """Periodically refresh the character tab (location + ship type).
