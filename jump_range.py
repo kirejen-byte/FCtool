@@ -214,6 +214,84 @@ def _bfs_route(origin_id: int, dest_id: int,
     return None
 
 
+# ── Depth-limited gate-jump "ball" (FCPreview intel flash) ──────────────────
+# "Which systems are at most N gate jumps from here?" — the neighbourhood the
+# preview intel flash asks about. DIRECT STARGATES ONLY, deliberately: no
+# Ansiblex / extra-connection support anywhere in this path, because a jump
+# bridge would silently widen the neighbourhood the user calibrated in gates.
+#
+# Memo: balls are keyed (origin, max_jumps) and only ever re-derived when a
+# character changes system or the user retunes the radius, so a bounded
+# clear-on-full dict is plenty (radius <= 7 keeps each ball to a few hundred
+# ids). Guarded by its own lock because the callers are worker threads.
+_BALL_MEMO_MAX = 256
+_ball_memo: dict[tuple[int, int], frozenset[int]] = {}
+_ball_memo_lock = threading.Lock()
+
+
+def _bfs_ball(graph: dict[int, set[int]], origin: int, max_jumps: int,
+              exclude: set[int]) -> frozenset[int]:
+    """Pure breadth-limited BFS: `origin` plus every system reachable from it
+    in at most `max_jumps` gate hops.
+
+    `exclude` is a hard wall — an excluded system is never in the result and is
+    never expanded through (so it cannot bridge two neighbourhoods). An origin
+    that is itself excluded yields the empty set. `max_jumps <= 0` yields just
+    the origin. Takes the graph as an argument: no I/O, no module state, safe
+    to unit-test against a hand-built dict."""
+    if origin in exclude:
+        return frozenset()
+    if max_jumps <= 0:
+        return frozenset({origin})
+    seen = {origin}
+    frontier = [origin]
+    for _ in range(max_jumps):
+        nxt = []
+        for sid in frontier:
+            for neighbor in graph.get(sid, ()):
+                if neighbor in seen or neighbor in exclude:
+                    continue
+                seen.add(neighbor)
+                nxt.append(neighbor)
+        if not nxt:
+            break                       # ball closed early (disconnected/edge)
+        frontier = nxt
+    return frozenset(seen)
+
+
+def systems_within_jumps(origin_id: int, max_jumps: int) -> frozenset[int]:
+    """Every system within `max_jumps` STARGATE jumps of `origin_id` (inclusive).
+
+    Excludes Zarzakh, same as routing. Returns ``frozenset({origin_id})`` for
+    ``max_jumps <= 0`` and an EMPTY frozenset when the stargate graph is
+    unavailable — callers treat empty as "no ball" and fall back rather than
+    concluding "nothing is near me". The unavailable case is deliberately NOT
+    memoized so a later successful load heals it.
+
+    Safe to call from a worker thread — and it should ONLY be called from one:
+    the first call may read a multi-MB file or download the SDE dump."""
+    origin_id = int(origin_id)
+    max_jumps = int(max_jumps)
+    if max_jumps <= 0:
+        return frozenset({origin_id})
+
+    memo_key = (origin_id, max_jumps)
+    with _ball_memo_lock:
+        hit = _ball_memo.get(memo_key)
+    if hit is not None:
+        return hit
+
+    _load_stargate_graph()
+    if not _stargate_graph:
+        return frozenset()
+    ball = _bfs_ball(_stargate_graph, origin_id, max_jumps, {ZARZAKH_ID})
+    with _ball_memo_lock:
+        if len(_ball_memo) >= _BALL_MEMO_MAX:
+            _ball_memo.clear()
+        _ball_memo[memo_key] = ball
+    return ball
+
+
 def get_system_info(system_id: int) -> dict | None:
     """Get system info including position from ESI. Persistently cached to disk."""
     global _cache_dirty

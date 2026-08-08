@@ -898,6 +898,28 @@ def _hud_foreground_win32():
     return _hud_fg_win32_singleton
 
 
+# FCPreview intel flash: how many GATE jumps out the flash reaches. 0 = the
+# pilot's own system only (the pre-radius behaviour); the ceiling keeps the
+# poller's BFS ball small and the alert meaningful.
+_PREVIEW_INTEL_JUMPS_MAX = 7
+_PREVIEW_INTEL_JUMPS_DEFAULT = 2
+
+
+def _preview_intel_radius(cfg) -> int:
+    """The intel-flash gate-jump radius from a preview config, clamped 0..7.
+
+    ONE clamp for every consumer — the Tk-thread predicate, the poller's ball
+    maintenance, and the settings write-back — because a Spinbox's from_/to
+    bounds its ARROWS only (typed text reaches the var verbatim) and
+    config.json is hand-editable. Anything unparseable falls back to the
+    default rather than disabling the feature."""
+    try:
+        radius = int(cfg.get("intel_flash_jumps", _PREVIEW_INTEL_JUMPS_DEFAULT))
+    except (TypeError, ValueError):
+        radius = _PREVIEW_INTEL_JUMPS_DEFAULT
+    return max(0, min(_PREVIEW_INTEL_JUMPS_MAX, radius))
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -1152,6 +1174,10 @@ class FCToolGUI:
         # client set, so the tick diff never reports it as `added` again.
         self._preview_spawn_retry = {}
         self._preview_intel = {}               # system_id -> (ts, kind)
+        # char key -> (system_id, radius, frozenset(system_ids)) — the gate-jump
+        # ball the intel flash fires inside. POLLER-WRITTEN (_overlay_build_state),
+        # Tk-read (the tick), same single-writer discipline as _preview_layer_hp.
+        self._preview_intel_reach = {}
         self._preview_disabled_session = False
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
         self._preview_tick_fails = 0           # consecutive failed ticks (BUG A guard)
@@ -16352,6 +16378,10 @@ class FCToolGUI:
         "show_role_chip": True,
         "intel_flash": False, "intel_flash_color": "#ff3b30",
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
+        # Gate-jump radius the intel flash reaches (direct stargates only —
+        # never Ansiblexes). 0 = the pilot's own system, i.e. the original
+        # behaviour; clamped 0.._PREVIEW_INTEL_JUMPS_MAX at every read.
+        "intel_flash_jumps": _PREVIEW_INTEL_JUMPS_DEFAULT,
         "doctrine_tag_captions": True,       # caveat #4 (Task B1)
         "damage_flash": True,                # caveat #3 / P1 (Task B6)
         # Default mode is 'any' (log-only, no HP/ESI gate): flash on ANY windowed
@@ -17873,12 +17903,22 @@ class FCToolGUI:
         if rtype in selected:
             index[sid] = (now, rtype)
 
-    def _preview_should_flash(self, index, state, cfg, now):
-        """True iff the pilot's system has a fresh intel note and flashing is on.
+    def _preview_should_flash(self, index, state, cfg, now, reach=None):
+        """True iff fresh intel sits within the pilot's calibrated gate radius.
 
         Fresh = the stamped note is at most `intel_flash_secs` old. Requires
-        `cfg["intel_flash"]`, a non-None state with a known solar_system_id that
-        is present in `index`. Pure/side-effect-free."""
+        `cfg["intel_flash"]` and a non-None state with a known solar_system_id.
+        The pilot's OWN system always flashes on a fresh note — exactly as it
+        did before the radius existed.
+
+        Beyond that, `cfg["intel_flash_jumps"]` (clamped 0..7) widens the alert
+        to fresh notes in any system within that many STARGATE jumps. `reach` is
+        the poller-computed ball for THIS character —
+        ``(system_id, radius, frozenset(system_ids))``, handed in by the tick
+        from `_preview_intel_reach`; keeping it an argument keeps this predicate
+        pure. It is honoured only when it matches the state's CURRENT system and
+        the CURRENT radius: an absent, stale, malformed or empty ball degrades
+        to same-system-only, never to a flash for the wrong neighbourhood."""
         if not cfg.get("intel_flash", False):
             return False
         if state is None:
@@ -17886,12 +17926,25 @@ class FCToolGUI:
         sid = getattr(state, "solar_system_id", None)
         if not sid:
             return False
-        entry = index.get(sid)
-        if not entry:
-            return False
-        ts, _kind = entry
         secs = cfg.get("intel_flash_secs", 10)
-        return (now - ts) <= secs
+        entry = index.get(sid)
+        if entry:
+            ts, _kind = entry
+            if (now - ts) <= secs:
+                return True                      # own system — unchanged path
+        radius = _preview_intel_radius(cfg)
+        if radius <= 0 or not reach:
+            return False
+        try:
+            ball_sid, ball_radius, ball = reach
+        except (TypeError, ValueError):
+            return False                         # malformed tuple → fall back
+        if ball_sid != sid or ball_radius != radius or not ball:
+            return False                         # stale/mismatched → fall back
+        for note_sid, (ts, _kind) in index.items():
+            if (now - ts) <= secs and note_sid in ball:
+                return True
+        return False
 
     def _preview_on_damage(self, ev):
         """Tk-thread ingest of a GamelogMonitor DamageEvent (Task B6).
@@ -18256,6 +18309,14 @@ class FCToolGUI:
                             else:
                                 self._preview_decloak_until.pop(key, None)
                                 self._preview_decloak_since.pop(key, None)
+                    # Intel flash reach: the poller keeps THIS char's gate-jump
+                    # ball in _preview_intel_reach, keyed by the same char key
+                    # the state lookup above used; the predicate stays pure by
+                    # taking it as an argument. getattr-guarded (the tick's unit
+                    # hosts are bare SimpleNamespaces) — a missing ball just
+                    # means the flash falls back to same-system-only.
+                    _reach_map = getattr(self, "_preview_intel_reach", None)
+                    _reach = _reach_map.get(key) if _reach_map else None
                     if damaging:
                         peak = cfg.get("damage_flash_color", "#ff3b30")
                         started = self._preview_damage_since.get(key, now)
@@ -18267,7 +18328,7 @@ class FCToolGUI:
                         tile.set_border(preview_tile.pulse_color(
                             peak, now - started, 0.5))     # ~2 Hz soft yellow pulse
                     elif self._preview_should_flash(self._preview_intel, state, cfg,
-                                                    time.monotonic()):
+                                                    time.monotonic(), reach=_reach):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
                     else:
                         tile.set_border(highlight)
@@ -18558,6 +18619,7 @@ class FCToolGUI:
         self._overlay_states = {}
         self._overlay_state_ts = {}
         self._preview_layer_hp = {}
+        self._preview_intel_reach = {}        # poller-written balls die with it
         self._preview_video_labels = {}
         # Clear any native on-video labels off the shared overlay so a mode switch
         # (native → off / eveo_labels) never leaves stale native labels lingering.
@@ -18717,6 +18779,38 @@ class FCToolGUI:
             if ship_type_id and (ship_type_id != prior_ship_type_id
                                  or key not in self._preview_layer_hp):
                 self._preview_layer_hp[key] = ship_classes.get_layer_hp(ship_type_id)
+        except Exception:
+            pass
+        # Intel-flash reach: the set of systems within `intel_flash_jumps` GATE
+        # jumps of this character's current system, so the tick can flash on
+        # hostile intel in the neighbourhood instead of only the pilot's own
+        # system. Poller-thread write into _preview_intel_reach; the tick only
+        # reads it (single-writer, same discipline as _preview_layer_hp above).
+        # It belongs on THIS thread: the first ball may load a multi-MB stargate
+        # graph from disk. The BFS runs only when (system, radius) actually
+        # changes, so an unchanged poll pass does zero graph work. getattr-guarded
+        # because the unit tests bind this builder onto bare SimpleNamespace
+        # hosts (house pattern -- see the implant-reminder hook above), and the
+        # whole block is swallowed: a reach fault degrades to NO ball (the flash
+        # falls back to same-system-only), it never costs us a CharState.
+        try:
+            reach_map = getattr(self, "_preview_intel_reach", None)
+            cfg_fn = getattr(self, "_preview_cfg", None)
+            if reach_map is not None and cfg_fn is not None and sys_id:
+                pcfg = cfg_fn()
+                radius = _preview_intel_radius(pcfg)
+                # An OFF flash (the shipped default) or a 0 radius costs two
+                # dict reads per poll and NEVER touches the graph -- which
+                # matters, because the very first ball has to load the stargate
+                # map, and with no bundled copy that is a download. Enabling the
+                # feature mid-session is picked up on the next poll pass.
+                if pcfg.get("intel_flash", False) and radius > 0:
+                    prior_reach = reach_map.get(key)
+                    if (not prior_reach or prior_reach[0] != sys_id
+                            or prior_reach[1] != radius):
+                        reach_map[key] = (
+                            sys_id, radius,
+                            jump_range.systems_within_jumps(sys_id, radius))
         except Exception:
             pass
         if do_online:
@@ -19555,10 +19649,35 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbi.grid(row=0, column=2, padx=(0, 16))
+        cbi.grid(row=0, column=2, padx=(0, 4))
         w.append(cbi)
-        _tip(cbi, "Flash a preview's border red when that pilot's system gets a "
-                  "fresh hostile intel note from your own chat logs.")
+        _intel_tip = (
+            "Flash a preview's border red when fresh hostile intel is reported "
+            "within N gate jumps of that pilot (direct stargates only — "
+            "Ansiblexes are deliberately NOT counted). 0 = that pilot's own "
+            "system only.")
+        _tip(cbi, _intel_tip)
+
+        # Gate-jump radius for the flash above. Direct stargates only (no
+        # Ansiblex edges, by design). Clamped 0..7 where it is STORED and again
+        # where it is read — a Spinbox's from_/to bounds its ARROWS only.
+        self._preview_intel_jumps_var = tk.IntVar(
+            value=_preview_intel_radius(pcfg))
+        sij = tk.Spinbox(rowN2, from_=0, to=_PREVIEW_INTEL_JUMPS_MAX, width=3,
+                         textvariable=self._preview_intel_jumps_var,
+                         font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
+                         insertbackground=FG_WHITE,
+                         command=self._preview_apply_native_state)
+        sij.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        sij.grid(row=0, column=3, padx=(0, 2))
+        self._preview_intel_jumps_spin = sij
+        w.append(sij)
+        _tip(sij, _intel_tip)
+        _lbl_ij = tk.Label(rowN2, text="jumps", font=("Consolas", 10),
+                           fg=FG_TEXT, bg=BG_DARK)
+        _lbl_ij.grid(row=0, column=4, padx=(0, 16), sticky=tk.W)
+        w.append(_lbl_ij)
+        _tip(_lbl_ij, _intel_tip)
 
         # B6: damage flash — tile border pulses red when windowed incoming
         # damage from your OWN combat Gamelogs crosses a % of base hull HP.
@@ -19570,7 +19689,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbdf.grid(row=0, column=3, padx=(0, 16))
+        cbdf.grid(row=0, column=5, padx=(0, 16))
         w.append(cbdf)
         _tip(cbdf, "Pulse a preview's border red when that character takes "
                    "incoming damage in your own combat logs (tune it in the row "
@@ -19586,14 +19705,14 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbmi.grid(row=0, column=4, padx=(0, 8))
+        cbmi.grid(row=0, column=6, padx=(0, 8))
         w.append(cbmi)
         _tip(cbmi, "When you switch clients, minimize the one you just left "
                    "(except characters on the never-minimize list).")
 
         bnm = ttk.Button(rowN2, text="Never minimize…", style="Dark.TButton",
                          command=self._open_preview_never_minimize_dialog)
-        bnm.grid(row=0, column=5, padx=(0, 6))
+        bnm.grid(row=0, column=7, padx=(0, 6))
         w.append(bnm)
         _tip(bnm, "Pick characters that should stay open and never be minimized "
                   "by 'Minimize inactive'.")
@@ -20140,6 +20259,7 @@ class FCToolGUI:
         ("_preview_lock_var", "lock_layout", bool),
         ("_preview_snap_var", "snap_enabled", bool),
         ("_preview_intel_flash_var", "intel_flash", bool),
+        ("_preview_intel_jumps_var", "intel_flash_jumps", int),
         ("_preview_minimize_inactive_var", "minimize_inactive", bool),
         ("_preview_hide_active_var", "hide_active", bool),
         ("_preview_hide_login_var", "hide_login", bool),
@@ -20240,6 +20360,13 @@ class FCToolGUI:
         # rewriting the entry would fight someone typing "200" one digit at a
         # time. The _put shadow keeps the raw var value, so nothing oscillates.
         preview_layout.heal_preview_sizes(cfg)
+        # Same Tk fact for the intel jump-radius Spinbox: from_/to bounds the
+        # ARROWS, so a typed 99 would otherwise be stored and hand the poller a
+        # 99-jump BFS. Heal only on a REAL change (proven fixpoint) so an
+        # untouched-control apply still writes nothing at all.
+        _radius = _preview_intel_radius(cfg)
+        if "intel_flash_jumps" in cfg and cfg["intel_flash_jumps"] != _radius:
+            cfg["intel_flash_jumps"] = _radius
         self._save_config()
 
     def _preview_apply_dmg_mode_visibility(self):
