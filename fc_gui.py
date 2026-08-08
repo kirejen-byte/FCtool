@@ -17941,8 +17941,15 @@ class FCToolGUI:
             return False                         # malformed tuple → fall back
         if ball_sid != sid or ball_radius != radius or not ball:
             return False                         # stale/mismatched → fall back
-        for note_sid, (ts, _kind) in index.items():
-            if (now - ts) <= secs and note_sid in ball:
+        # Scan the BALL, not the index: |ball| is bounded by the user's radius
+        # (<= 7), while `index` is never pruned — only a "clear" report removes
+        # an entry, so it grows toward the whole cluster over a long session and
+        # this runs per tile per tick. Same reason the intel-log sweep is
+        # bounded (v4.6.1). Indexing `entry[0]` rather than unpacking it also
+        # keeps a malformed index value from raising mid-tick.
+        for near_sid in ball:
+            entry = index.get(near_sid)
+            if entry and (now - entry[0]) <= secs:
                 return True
         return False
 
@@ -18786,8 +18793,9 @@ class FCToolGUI:
         # hostile intel in the neighbourhood instead of only the pilot's own
         # system. Poller-thread write into _preview_intel_reach; the tick only
         # reads it (single-writer, same discipline as _preview_layer_hp above).
-        # It belongs on THIS thread: the first ball may load a multi-MB stargate
-        # graph from disk. The BFS runs only when (system, radius) actually
+        # It belongs on THIS thread because with no cached and no bundled graph
+        # the first ball DOWNLOADS the SDE dump (30 s timeout; the file itself is
+        # only 210 KB). The BFS runs only when (system, radius) actually
         # changes, so an unchanged poll pass does zero graph work. getattr-guarded
         # because the unit tests bind this builder onto bare SimpleNamespace
         # hosts (house pattern -- see the implant-reminder hook above), and the
@@ -18808,6 +18816,11 @@ class FCToolGUI:
                     prior_reach = reach_map.get(key)
                     if (not prior_reach or prior_reach[0] != sys_id
                             or prior_reach[1] != radius):
+                        # Storing the result unconditionally PINS an empty ball
+                        # (graph neither cached nor bundled) until this char's
+                        # system or radius changes -- accepted: the alternative
+                        # is re-attempting a 30 s download every poll pass, and
+                        # an empty ball degrades to today's same-system flash.
                         reach_map[key] = (
                             sys_id, radius,
                             jump_range.systems_within_jumps(sys_id, radius))
@@ -20318,7 +20331,7 @@ class FCToolGUI:
         optimization: these vars are one-way mirrors of config, and a config key can
         have a SECOND writer outside this panel — cfg['tile_w'] is rewritten by
         every tile corner-resize (_preview_on_tile_resize_end). Without the skip,
-        toggling ANY control here bulk-pushes all 22 stale mirrors, shoving the
+        toggling ANY control here bulk-pushes all 23 stale mirrors, shoving the
         app-start width over the hand-dragged one, and the next tick's
         _preview_apply_tile_size physically re-places every tile at it. Diffing
         against the shadow makes a control the user never touched incapable of

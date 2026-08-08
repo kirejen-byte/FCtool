@@ -265,11 +265,16 @@ def systems_within_jumps(origin_id: int, max_jumps: int) -> frozenset[int]:
     Excludes Zarzakh, same as routing. Returns ``frozenset({origin_id})`` for
     ``max_jumps <= 0`` and an EMPTY frozenset when the stargate graph is
     unavailable — callers treat empty as "no ball" and fall back rather than
-    concluding "nothing is near me". The unavailable case is deliberately NOT
-    memoized so a later successful load heals it.
+    concluding "nothing is near me".
+
+    The unavailable case is kept OUT of this module's memo, but that alone does
+    not promise a retry: a caller that caches the returned ball decides how long
+    an empty one lives. fc_gui's per-character reach tuple caches it until the
+    (system, radius) key changes — deliberately, see the note at that store site.
 
     Safe to call from a worker thread — and it should ONLY be called from one:
-    the first call may read a multi-MB file or download the SDE dump."""
+    the graph is 210 KB on disk, but with no cached AND no bundled copy the
+    first call DOWNLOADS the SDE dump (30 s timeout)."""
     origin_id = int(origin_id)
     max_jumps = int(max_jumps)
     if max_jumps <= 0:
