@@ -236,6 +236,11 @@ DRAIN_MS = 50
 # anonymous "Thread-N" — see _start_monitoring for the restart-safety contract.
 CHAT_POLL_THREAD_NAME = "fctool-chat-poll"
 
+# Name carried by the Intelligence-Fusion poll thread (_intel_poll_loop). Same
+# reason as above, and the same restart-safety contract — see
+# _start_intel_monitor.
+INTEL_POLL_THREAD_NAME = "fctool-intel-poll"
+
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
 # The full TOC panel yields to content when the tab gets too narrow: it collapses
 # to a slim ribbon and the content reclaims the panel's width, so the SSO
@@ -4580,6 +4585,9 @@ class FCToolGUI:
         # the (re)build inspects _intel_monitor / _intel_channels_enabled.
         self._intel_monitor: ChatMonitor | None = None
         self._intel_thread: threading.Thread | None = None
+        # This generation's stop signal. Assigned as a PAIR with _intel_thread
+        # (see _start_intel_monitor) and never cleared — replaced.
+        self._intel_stop: threading.Event = threading.Event()
         self._intel_channels_enabled: set[str] = set()
         self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
         self._intel_channel_colors: dict[str, str] = {}
@@ -24022,6 +24030,10 @@ class FCToolGUI:
         if self.zkill_monitor:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
+            # Deliberately NOT _intel_stop: a Settings->Save must not end
+            # Intelligence Fusion (nothing here restarts it — only the user's
+            # toggle does, via _start_intel_monitor). The intel poll thread's
+            # lifecycle belongs to _start/_stop_intel_monitor alone.
             self._intel_monitor.stop()
 
     def _chat_poll_loop(self, stop: threading.Event):
@@ -27400,10 +27412,33 @@ $bmp.Dispose()
             channel_filters=list(self._tracked_intel_channels),
         )
         self._intel_monitor.on_message(self._on_intel_message)
-        self._intel_thread = threading.Thread(
-            target=self._intel_poll_loop, daemon=True
-        )
-        self._intel_thread.start()
+        # Restart-safe spawn (the _start_monitoring / _chat_poll_loop shape).
+        # Toggling Intelligence Fusion off then on inside one poll interval used
+        # to leave the outgoing thread parked in a bare time.sleep: it slept
+        # through the stop, woke to a re-populated _intel_monitor and a re-set
+        # fusion Event, and lived FOREVER — one permanent extra poller per
+        # toggle, all of them polling the CURRENT monitor.
+        prev = self._intel_thread
+        if (prev is not None and prev.is_alive()
+                and not self._intel_stop.is_set()):
+            # A thread of the CURRENT generation is already polling (a plain
+            # double-start); spawning again would duplicate the poller. It
+            # re-reads self._intel_monitor every pass, so it picks up the
+            # monitor built just above without a restart.
+            log.info("intel poll thread already running; ignoring double-start")
+        else:
+            # Any prior thread still alive HERE is stale by construction: the
+            # only way past the guard above is with its own event already set,
+            # and nothing ever clears an event — the successor gets a brand-new
+            # one — so it exits at its next check even though we start a
+            # replacement now.
+            stop = threading.Event()
+            self._intel_stop = stop
+            self._intel_thread = threading.Thread(
+                target=self._intel_poll_loop, args=(stop,),
+                name=INTEL_POLL_THREAD_NAME, daemon=True,
+            )
+            self._intel_thread.start()
 
         active = len(self._intel_channels_enabled)
 
@@ -27419,6 +27454,25 @@ $bmp.Dispose()
 
     def _stop_intel_monitor(self):
         """Stop the intel channel ChatMonitor."""
+        # Wake this generation's poll thread out of its interval wait and wait
+        # for it to actually exit, so a caller can rely on at most one poller
+        # existing across an off->on toggle. Because the loop waits on the event
+        # rather than sleeping, this join normally returns in microseconds
+        # despite the 1 s poll interval; the bound covers a pass wedged mid-poll
+        # (a slow log read). Runs on the Tk thread only on a user toggle, so a
+        # bounded wait is acceptable there.
+        #
+        # If the bound DOES expire, the stale thread is still guaranteed to
+        # exit: this event stays set forever — _start_intel_monitor hands the
+        # successor a brand-new Event instead of clearing this one — so the
+        # wedged pass ends at its next check.
+        intel_stop = getattr(self, "_intel_stop", None)
+        if intel_stop is not None:
+            intel_stop.set()
+        t = getattr(self, "_intel_thread", None)
+        if (t is not None and t.is_alive()
+                and t is not threading.current_thread()):
+            t.join(timeout=2.0)
         if self._intel_monitor:
             self._intel_monitor.stop()
             self._intel_monitor = None
@@ -27441,14 +27495,41 @@ $bmp.Dispose()
         except tk.TclError:
             pass
 
-    def _intel_poll_loop(self):
-        """Background polling loop for intel channels."""
-        while self._intel_monitor and self._intel_fusion_enabled.is_set():
+    def _intel_poll_loop(self, stop: threading.Event):
+        """Background polling loop for intel channels.
+
+        ``stop`` is handed in per spawn rather than read off ``self`` on
+        purpose: a thread that outlived its join (see _stop_intel_monitor) keeps
+        its own, permanently-signalled event and so exits at its next check even
+        after _start_intel_monitor has given a successor a fresh one. Reading a
+        shared attribute instead would let the successor's replacement resurrect
+        the stale thread — which is exactly how a fast Fusion off/on toggle used
+        to leak a poller per toggle.
+
+        The stop event is a THIRD gate, added to — not in place of — the two the
+        loop already had. Both are kept in the while condition so the exit
+        semantics are unchanged: fusion being disabled still ends the loop
+        within one interval even though nothing signalled stop, and a monitor
+        nulled without a stop still ends it at the next pass.
+        """
+        while (not stop.is_set() and self._intel_monitor
+                and self._intel_fusion_enabled.is_set()):
             try:
-                self._intel_monitor.poll()
+                # Re-read per pass into a local: the attribute is nulled by
+                # _stop_intel_monitor and replaced by a start, so this both
+                # follows a swap and removes the None-deref race the
+                # while-check alone leaves open.
+                monitor = self._intel_monitor
+                if monitor is not None:
+                    monitor.poll()
             except Exception:
                 log.exception("Intel poll loop iteration failed; continuing to poll")
-            time.sleep(self.config.get("poll_interval_seconds", 1.0))
+            # Wait on the stop event, never time.sleep: a stop wakes the thread
+            # immediately instead of up to poll_interval later. Deliberately NOT
+            # the fusion Event — disabling fusion keeps taking effect within one
+            # interval, exactly as before. self.config is re-read here (never
+            # cached) because _save_settings REPLACES the whole dict.
+            stop.wait(self.config.get("poll_interval_seconds", 1.0))
 
     def _on_intel_channel_change(self):
         """Called when a channel checkbox is toggled."""
