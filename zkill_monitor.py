@@ -18,6 +18,7 @@ from rate_limiter import rate_limit
 
 from app_log import get_logger
 from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
+import system_coords
 
 log = get_logger(__name__)
 
@@ -100,7 +101,26 @@ _region_cache: dict[int, int] = {}
 
 
 def resolve_name(entity_id: int, category: str = "solar_system") -> str:
-    """Resolve an EVE entity ID to a name via ESI."""
+    """Resolve an EVE entity ID to a name.
+
+    Solar systems are resolved OFFLINE FIRST from the bundled SDE table
+    (``system_coords.get_name``) -- before the cache, before any HTTP. A
+    k-space system name therefore never depends on ESI being up: previously
+    ANY HTTP failure (a 420 error-limit burst, a 5xx blip, a timeout) fell
+    back to str(entity_id) and neg-cached that fallback for _NAME_NEG_TTL
+    seconds, so a single ESI outage poisoned every zKill alert's System and
+    Route line for up to 5 minutes. J-space ids (absent from the bundled
+    table) and every other category fall through to the ESI path below,
+    byte-identical to before.
+    """
+    if category == "solar_system":
+        try:
+            offline = system_coords.get_name(int(entity_id))
+        except Exception:
+            offline = None
+        if offline:
+            _name_cache[(category, entity_id)] = offline
+            return offline
     key = (category, entity_id)
     # Permanent cache (resolved name or definitive-404 fallback) wins outright.
     if key in _name_cache:
@@ -153,7 +173,21 @@ def resolve_name(entity_id: int, category: str = "solar_system") -> str:
 
 
 def get_region_for_system(system_id: int) -> int | None:
-    """Get the region ID for a solar system via ESI."""
+    """Get the region ID for a solar system.
+
+    Resolved OFFLINE FIRST from the bundled SDE table
+    (``system_coords.get_region_id``) -- before the cache, before any HTTP.
+    Off-table systems (J-space, or no table shipped) fall through to the ESI
+    systems->constellation->region traversal below, which remains only a
+    fallback.
+    """
+    try:
+        offline = system_coords.get_region_id(int(system_id))
+    except Exception:
+        offline = None
+    if offline is not None:
+        _region_cache[system_id] = offline
+        return offline
     # The system->region mapping is static; a cached hit is permanently valid
     # and lets us skip both ESI round-trips entirely.
     cached = _region_cache.get(system_id)
@@ -341,7 +375,17 @@ class EngagementTracker:
         if len(pilots) >= self.min_pilots or has_capitals:
             system_name = resolve_name(system_id, "solar_system")
             region_id = get_region_for_system(system_id)
-            region_name = resolve_name(region_id, "region") if region_id else "Unknown"
+            if region_id:
+                region_name = resolve_name(region_id, "region")
+                if region_name == str(region_id):
+                    # resolve_name fell back to the bare id (ESI down/erroring --
+                    # unlike "solar_system", "region" has no offline source).
+                    # KillAlert.region_name is display-only (its sole consumer,
+                    # fc_gui's region_str, renders "" as "no parenthetical"), so
+                    # prefer an honest blank over printing digits.
+                    region_name = ""
+            else:
+                region_name = ""
 
             # Build dotlan URL (uses system name with spaces replaced)
             dotlan_system = system_name.replace(" ", "_")
