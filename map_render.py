@@ -76,6 +76,12 @@ RANGE_GREEN_GLOW = (int(RANGE_GREEN[0] * RANGE_GREEN_DIM),
                     int(RANGE_GREEN[2] * RANGE_GREEN_DIM))   # (32, 145, 79)
 RANGE_GLOW_PAD = 3            # green aura radius = node glow_r + this (tight halo)
 
+# The WASH radius (threat purple / friendly blue / the split overlap blob) --
+# node glow_r + this. Named because the SPLIT blob (below) must land on EXACTLY
+# the same disc as the full washes it replaces: a half sprite at a different
+# radius would read as a seam, not as one disc cut down the middle.
+WASH_GLOW_PAD = 8
+
 # Threat projection wash (owner 2026-07-12): the projected-reach warning under a
 # threatened system, switched from RED to a DIM violet so it is distinguishable from
 # red nullsec nodes, blue Ansiblex bridges, green range, and amber intel (the owner
@@ -99,6 +105,67 @@ THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
 # BLUE channel (~193 each -> clamps at 255) while R/G stay ~185/195 -- readable, never
 # a white-out (verified: a dense worst-case overlap never trips all-3 contribution > 200).
 FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
+
+# --- overlap SEMICIRCLES (owner 2026-08-08) ---------------------------------
+# Two range effects on ONE system used to ADD into a single ambiguous blob (purple
+# + blue -> blue-violet; purple + green accent -> a muddy rim), so the owner could
+# not tell WHICH reaches covered a system. A system carrying TWO of the three
+# effects now draws ONE disc at the wash radius split down its vertical diameter:
+# the LEFT half is always the hostile THREAT_PURPLE, the RIGHT half is the other
+# effect (friendly blue, or the DIMMED range green -- never the raw neon). The two
+# halves come from the SAME sprite at the SAME radius, so they read as one seamless
+# disc, not two lobes.
+#
+# THREE effects cannot be split three ways and still be legible (owner: "showing 2
+# at a time is viable, but 3 are not"), so a triple-overlap system draws the
+# purple|blue split -- NO green anywhere on the blob -- and moves the jump-range
+# signal onto its NAME, which gains a yellow glow (LABEL_GLOW_YELLOW below).
+#
+# Scope note: friendly + range WITHOUT threat (class "FR") is deliberately
+# UNCHANGED -- blue wash plus the tight green accent already read fine, and the
+# owner's ask names threat overlaps only. Splitting it would cost the green accent
+# for no readability win.
+SPLIT_CLASSES = frozenset({"TF", "TR", "TFR"})
+
+# System-name label tints (owner 2026-08-08 readability pass). A system carrying
+# EXACTLY ONE effect tints its NAME in a light variant of that effect's hue, so the
+# name itself says which reach covers it; two effects keep LABEL_COLOR (the split
+# blob already carries that information) and the triple keeps LABEL_COLOR plus the
+# yellow glow. Every variant keeps the dark LABEL_OUTLINE ring, which is what makes
+# them legible over their own wash.
+#
+# Derivation (measured, not eyeballed -- contrast ratios are WCAG relative
+# luminance on this box):
+#   threat   THREAT_PURPLE blended 55% toward white -> #ccb5ed, 10.7:1 vs BG,
+#            2.5:1 vs its own wash peak
+#   friendly FRIENDLY_BLUE blended 55% toward white -> #a8c4ed, 11.1:1 vs BG,
+#            2.4:1 vs its own wash peak
+#   range    RANGE_GREEN desaturated 50% toward its own luminance THEN 12% toward
+#            white -> #88dfac, 12.4:1 vs BG, 2.7:1 vs the dimmed accent. The
+#            desaturation step is the point: the owner explicitly rejected bright
+#            green, and RANGE_GREEN raw (#39ff8c, G=255) is exactly that neon.
+LABEL_TINT_THREAT = (0xcc, 0xb5, 0xed)
+LABEL_TINT_FRIENDLY = (0xa8, 0xc4, 0xed)
+LABEL_TINT_RANGE = (0x88, 0xdf, 0xac)
+
+# Triple-overlap (threat + friendly + range) NAME glow: a warm gold halo painted
+# UNDER the outlined glyphs. Yellow is the one hue not already spoken for by a
+# wash (purple/blue/green) or a marker (red staging, amber intel, cyan/orange/red
+# sec tints), so it cannot be mistaken for one of them.
+LABEL_GLOW_YELLOW = (0xff, 0xd8, 0x4d)
+LABEL_GLOW_PAD = 3                       # halo reach in px on every side
+LABEL_GLOW_RING_ALPHA = (200, 130, 70)   # per-ring alpha, inner -> outer falloff
+
+# System-name label offset from the node centre (owner 2026-08-08: "the text
+# should also be slightly farther from the sphere so the first letter is
+# readable"). Was 7, which parked the first glyph inside the green range accent.
+# Measured at the band-C default framing (px_per_edge 32 -> glow_r 8, core_r 2):
+# the solid white core ends at +2 px and the range accent's added ink reaches 0 by
+# +11 px, so a label surface at +11 puts its first glyph pixel (the outlined
+# composite carries a 1 px ring) at +12 -- clear of both. Band-M hub labels keep
+# their own +7: they are drawn in a band with no per-system labels to crowd, and
+# the owner's ask is scoped to the system-label band.
+LABEL_OFFSET_X = 11
 
 # Infrastructure count chips (Task 5): a small rounded badge per system carrying
 # its structure count, tinted by the DOMINANT category. Drawn in the label pass
@@ -151,6 +218,64 @@ def _sec_idx(sec: float) -> int:
 
 def dim(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
     return (int(color[0] * factor), int(color[1] * factor), int(color[2] * factor))
+
+
+def classify_effects(sid: int, bright, halo, friendly) -> str:
+    """Which of the three range effects cover ``sid``, as a canonical class string.
+
+    Returns one of ``""``, ``"T"``, ``"F"``, ``"R"``, ``"TF"``, ``"TR"``, ``"FR"``,
+    ``"TFR"`` -- letters ALWAYS in threat / friendly / range order, so the class is
+    a stable dict key and a stable test parameter. ``bright``/``halo``/``friendly``
+    are the three ``TintSpec`` sets and may be None (= no such effect this frame).
+    Pure: no rendering state, no side effects.
+
+    T = hostile threat projection (``TintSpec.halo``, purple)
+    F = friendly staging projection (``TintSpec.friendly``, blue)
+    R = jump-range check (``TintSpec.bright``, green)"""
+    cls = ""
+    if halo and sid in halo:
+        cls = "T"
+    if friendly and sid in friendly:
+        cls += "F"
+    if bright and sid in bright:
+        cls += "R"
+    return cls
+
+
+def split_right_color(cls: str) -> tuple[int, int, int] | None:
+    """RIGHT-half hue of the split overlap blob (the LEFT half is always
+    THREAT_PURPLE). Friendly BLUE outranks range green, which is what makes the
+    triple case (``"TFR"``) purple|blue with NO green on the blob -- the jump-range
+    signal moves to the label's yellow glow instead. Returns None for a class that
+    does not split."""
+    if cls not in SPLIT_CLASSES:
+        return None
+    if "F" in cls:
+        return FRIENDLY_BLUE
+    # Wash-brightness parity: the range accent is drawn DIMMED (RANGE_GREEN_GLOW),
+    # so the green half must be too -- raw RANGE_GREEN would out-shout the purple
+    # half and break the "one disc" read.
+    return RANGE_GREEN_GLOW
+
+
+def label_style(cls: str):
+    """``(text_colour, glow_colour_or_None)`` for a system-name label of effect
+    class ``cls``. Pure -- the single source of the label-tint rule:
+
+      * exactly ONE effect -> a readable light variant of that effect's hue
+      * the TRIPLE overlap -> LABEL_COLOR plus the yellow glow (the glow IS the
+        jump-range signal the blob gave up)
+      * anything else (no effect, or a two-effect split blob) -> LABEL_COLOR
+        unchanged; the blob already carries the information."""
+    if cls == "T":
+        return LABEL_TINT_THREAT, None
+    if cls == "F":
+        return LABEL_TINT_FRIENDLY, None
+    if cls == "R":
+        return LABEL_TINT_RANGE, None
+    if cls == "TFR":
+        return LABEL_COLOR, LABEL_GLOW_YELLOW
+    return LABEL_COLOR, None
 
 
 def _declutter(items, cell_w: float, cell_h: float) -> list:
@@ -303,6 +428,12 @@ class SpriteFactory:
         # buckets). Still bounded, so it stays a plain dict for now -- a future
         # slimming candidate. Only the sov disc cache needed an LRU bound (MP6).
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
+        # half_glow(): keyed by (colour, radius, side). Bounded by construction and
+        # far tighter than glow() -- only the overlap-blob call sites reach it, i.e.
+        # THREAT_PURPLE on the left plus FRIENDLY_BLUE / RANGE_GREEN_GLOW on the
+        # right (3 colours) x the same handful of bucketed wash radii x 2 sides.
+        self._half_cache: dict[tuple[tuple[int, int, int], int, str],
+                               pygame.Surface] = {}
         self._disc_cache: "OrderedDict[tuple[tuple[int, int, int], int], pygame.Surface]" \
             = OrderedDict()
         self._disc_max = max(1, int(disc_max))
@@ -331,6 +462,36 @@ class SpriteFactory:
             col = (int(color[0] * w), int(color[1] * w), int(color[2] * w), a)
             pygame.draw.circle(src, col, (c, c), rr)
         return pygame.transform.smoothscale(src, (target, target))
+
+    # --- half glow (overlap semicircles, owner 2026-08-08) -------------------
+    def half_glow(self, color: tuple[int, int, int], radius: int,
+                  side: str) -> pygame.Surface:
+        """One HALF of the cached radial glow, at the FULL sprite footprint.
+
+        ``side`` is ``"L"`` or ``"R"``; the cut is the sprite's vertical diameter at
+        column ``radius``. The left half owns columns ``[0, radius)`` and the right
+        half ``[radius, 2*radius)`` -- exactly complementary, so a left and a right
+        half of the same radius MAX-compose back into the full disc with NO gap
+        column and NO double-painted column. That is what lets two different hues
+        read as one seamless disc cut down the middle instead of two lobes.
+
+        Built by COPYING the full sprite and zeroing the other half (``Surface.fill``
+        writes RGBA directly, it does not blend), so the kept half is byte-identical
+        to the full glow -- same radial falloff, same MAX-compose ceiling. The
+        zeroed half is transparent BLACK, which contributes nothing under either
+        BLEND_RGB_MAX (max(x, 0) = x) or BLEND_RGB_ADD."""
+        key = (color, radius, side)
+        got = self._half_cache.get(key)
+        if got is None:
+            full = self.glow(color, radius)
+            w, h = full.get_size()
+            mid = w // 2
+            got = full.copy()
+            got.fill((0, 0, 0, 0),
+                     pygame.Rect(mid, 0, w - mid, h) if side == "L"
+                     else pygame.Rect(0, 0, mid, h))
+            self._half_cache[key] = got
+        return got
 
     # --- sov disc (Task 33 fix) ---------------------------------------------
     # A SOFT-EDGED disc for the sovereignty wash: a broad flat plateau at full
@@ -423,19 +584,35 @@ class LabelFactory:
         return f
 
     def label(self, text: str, px: int, color: tuple[int, int, int],
-              outline: tuple[int, int, int] | None = None) -> pygame.Surface:
-        """Cached (outlined) text surface. LRU-bounded at ``_max_entries`` (MP6).
-        The HIT path -- which runs per drawn label per frame on the render worker
-        -- is still a single dict get, now plus one O(1) ``move_to_end``: measured
-        146 ns per hit (plain dict get 110 ns, OrderedDict get+move_to_end
-        255 ns), ~44 us across a full 300-label frame against a 40-55 ms render
-        (~0.1%). A repeated key still returns the SAME Surface object, so every
-        caller's blit is byte-identical to before."""
+              outline: tuple[int, int, int] | None = None,
+              glow: tuple[int, int, int] | None = None) -> pygame.Surface:
+        """Cached (outlined, optionally glowing) text surface. LRU-bounded at
+        ``_max_entries`` (MP6). The HIT path -- which runs per drawn label per frame
+        on the render worker -- is still a single dict get, now plus one O(1)
+        ``move_to_end``: measured 146 ns per hit (plain dict get 110 ns,
+        OrderedDict get+move_to_end 255 ns), ~44 us across a full 300-label frame
+        against a 40-55 ms render (~0.1%). A repeated key still returns the SAME
+        Surface object, so every caller's blit is byte-identical to before.
+
+        ``glow`` (owner 2026-08-08) paints a soft halo of that colour UNDER the
+        glyphs -- the triple-overlap system-name treatment. It JOINS THE CACHE KEY,
+        so the glowing and plain variants of one name are separate entries and a
+        caller passing ``glow=None`` still gets the byte-identical surface it always
+        did. Variant count is bounded and small: a band-C frame draws < 300 names,
+        each in exactly ONE of five styles (LABEL_COLOR, the three single-effect
+        tints, or the glow), so the worst frame's working set stays far under
+        LABEL_CACHE_MAX = 1024 and the cache never thrashes.
+
+        NOTE the glowing composite is LABEL_GLOW_PAD px larger on every side; the
+        blit site must subtract that pad horizontally to keep the glyph where the
+        un-glowing label would have sat (vertical centring absorbs it already)."""
         cache = self._cache
-        key = (text, px, color, outline)
+        key = (text, px, color, outline, glow)
         got = cache.get(key)
         if got is None:
-            if outline is None:
+            if glow is not None:
+                got = self._render_glowing(text, px, color, outline, glow)
+            elif outline is None:
                 got = self._font(px).render(text, True, color)
             else:
                 got = self._render_outlined(text, px, color, outline)
@@ -462,6 +639,48 @@ class LabelFactory:
         for dx, dy in ((0, 1), (2, 1), (1, 0), (1, 2)):   # W, E, N, S of (1, 1)
             blit(dark, (dx, dy))
         blit(base, (1, 1))
+        return out
+
+    def _render_glowing(self, text: str, px: int, color: tuple[int, int, int],
+                        outline: tuple[int, int, int] | None,
+                        glow: tuple[int, int, int]) -> pygame.Surface:
+        """Glyphs (outlined as usual) sitting on a soft coloured halo.
+
+        The halo is a DILATION of the text: the same glyphs rendered in the glow
+        hue and stamped at every offset on rings 1..LABEL_GLOW_PAD around the
+        centre, each ring at its own alpha (LABEL_GLOW_RING_ALPHA, inner ->
+        outer) so the halo falls off instead of reading as a hard slab. Two pygame
+        mechanics make this exact rather than muddy:
+          * per-ring alpha comes from ``fill(..., BLEND_RGBA_MULT)`` on a copy --
+            it scales the per-pixel ALPHA and leaves RGB untouched (``set_alpha``
+            is unreliable on a per-pixel-alpha font surface).
+          * the stamps compose with ``BLEND_RGBA_MAX``, so overlapping offsets take
+            the max instead of darkening each other the way an alpha-over blit onto
+            a transparent surface would.
+        The normal outlined glyph goes on LAST with a plain alpha blit, so the dark
+        LABEL_OUTLINE ring still separates the bright text from its own halo.
+
+        The composite is LABEL_GLOW_PAD px larger on every side than the outlined
+        label; the glyph therefore sits at (pad, pad) and the caller compensates
+        horizontally (see ``label``)."""
+        pad = LABEL_GLOW_PAD
+        core = (self._render_outlined(text, px, color, outline)
+                if outline is not None else self._font(px).render(text, True, color))
+        cw, ch = core.get_size()
+        out = pygame.Surface((cw + 2 * pad, ch + 2 * pad), pygame.SRCALPHA)
+        halo = self._font(px).render(text, True, glow)
+        # Glyph origin INSIDE `core`: the outlined composite carries its own 1px
+        # ring, so its glyphs start at (1, 1); a plain render starts at (0, 0).
+        gx = gy = pad + (1 if outline is not None else 0)
+        blit, mx = out.blit, pygame.BLEND_RGBA_MAX
+        for ring, alpha in enumerate(LABEL_GLOW_RING_ALPHA[:pad], start=1):
+            layer = halo.copy()
+            layer.fill((255, 255, 255, alpha), None, pygame.BLEND_RGBA_MULT)
+            for dx in range(-ring, ring + 1):
+                for dy in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) == ring:     # the ring, not its interior
+                        blit(layer, (gx + dx, gy + dy), special_flags=mx)
+        out.blit(core, (pad, pad))
         return out
 
 
@@ -613,7 +832,7 @@ class Renderer:
         # Infra count chips ride the label pass (same st.system_labels zoom LOD);
         # infra=None/() draws nothing, keeping the frame byte-identical to the
         # pre-infra output (determinism, exactly like bridges/heat/sov).
-        self._draw_labels(surf, st, pos, cam, vw, vh, infra)
+        self._draw_labels(surf, st, pos, cam, vw, vh, infra, tint)
         return surf
 
     # -- passes ----------------------------------------------------------------
@@ -709,7 +928,8 @@ class Renderer:
     def _get_scratch(self, size):
         """Return the shared plain-RGB MAX-compose scratch, (re)allocated only on a
         frame-size change. Reused SEQUENTIALLY within a frame by the sov /
-        range-green / threat-purple passes: each fills it black, BLEND_RGB_MAX-
+        range-green / threat-purple / friendly-blue / overlap-split passes: each
+        fills it black, BLEND_RGB_MAX-
         composes its blobs, then does ONE BLEND_RGB_ADD blit to the frame before the
         next pass touches it -- so a steady viewport reuses one buffer with no
         per-frame allocation churn. The sole allocator of the scratch."""
@@ -775,7 +995,7 @@ class Renderer:
                    special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
-    def _draw_range_glow(self, surf, pos, bright, glow_r):
+    def _draw_range_glow(self, surf, pos, bright, glow_r, skip=frozenset()):
         """In-range GREEN accent (owner 2026-07-12): the readability fix for the old
         red-on-red range overlay. Every in-range system (``TintSpec.bright``) gets
         ONE soft green glow at ``glow_r + RANGE_GLOW_PAD`` -- a tight halo that hugs
@@ -791,7 +1011,13 @@ class Renderer:
         per-node loop) so each system's own colour + white core stay bright on top --
         the green is the accent, not a recolour. The sprite is identical for every
         in-range system, so it is built once; only currently-projected systems are
-        in ``pos``, so off-screen in-range systems cost nothing."""
+        in ``pos``, so off-screen in-range systems cost nothing.
+
+        ``skip`` (owner 2026-08-08) holds the sids whose green has moved onto the
+        split overlap blob -- drawn as its RIGHT half for class "TR", or dropped
+        entirely for the triple "TFR" (where the jump-range signal lives on the
+        label's yellow glow instead). Those systems must NOT also take the full
+        accent, or the semicircle would sit inside a complete green ring."""
         size = surf.get_size()
         scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
@@ -799,11 +1025,11 @@ class Renderer:
         off = g.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         for sid, (sx, sy) in pos.items():
-            if sid in bright:
+            if sid in bright and sid not in skip:
                 blit_s(g, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
-    def _draw_threat_glow(self, surf, pos, halo, glow_r):
+    def _draw_threat_glow(self, surf, pos, halo, glow_r, skip=frozenset()):
         """Threat PURPLE under-wash (owner 2026-07-12; replaces the old per-node RED
         additive halo). Every threatened system (``TintSpec.halo``) gets ONE dim
         violet glow at ``glow_r + 8``, MAX-composed onto the shared scratch then
@@ -817,19 +1043,23 @@ class Renderer:
         NOTE: hostile-staging DIAMONDS stay RED (map_tab._draw_diamond, ov_staging)
         -- those are POINT markers of a DIFFERENT semantic (where the hostiles ARE,
         not their projected jump reach), so their red is intentional and untouched
-        here. This purple wash is only the projected-threat sphere."""
+        here. This purple wash is only the projected-threat sphere.
+
+        ``skip`` (owner 2026-08-08) holds every sid drawn as a SPLIT overlap blob.
+        Each split class contains T, so the threat pass skips the whole split set:
+        the purple is still there, as the blob's LEFT half."""
         size = surf.get_size()
         scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
-        g = self.sprites.glow(THREAT_PURPLE, glow_r + 8)
+        g = self.sprites.glow(THREAT_PURPLE, glow_r + WASH_GLOW_PAD)
         off = g.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         for sid, (sx, sy) in pos.items():
-            if sid in halo:
+            if sid in halo and sid not in skip:
                 blit_s(g, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
-    def _draw_friendly_glow(self, surf, pos, friendly, glow_r):
+    def _draw_friendly_glow(self, surf, pos, friendly, glow_r, skip=frozenset()):
         """Friendly-staging PROJECTION wash (owner ask): a SECOND halo beside the
         hostile purple threat, in deep azure BLUE (FRIENDLY_BLUE #3d7dd6). Every
         system inside a FRIENDLY staging's jump/bridge reach (``TintSpec.friendly``)
@@ -845,16 +1075,79 @@ class Renderer:
         (from _draw_systems before its per-node loop, ADJACENT to the threat pass at the
         same layer depth) so cores stay readable on top. Sequential scratch reuse: the
         threat pass already ADD-blitted its scratch to the frame before this fills black
-        again (the _draw_sov / _draw_range_glow / _draw_threat_glow house pattern)."""
+        again (the _draw_sov / _draw_range_glow / _draw_threat_glow house pattern).
+
+        ``skip`` (owner 2026-08-08) holds the sids whose blue has moved onto the split
+        overlap blob as its RIGHT half (classes "TF" and "TFR"); they must not also
+        take the full wash. A friendly system with NO threat is never in ``skip`` --
+        including class "FR" (friendly + range), which is deliberately left alone."""
         size = surf.get_size()
         scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
-        g = self.sprites.glow(FRIENDLY_BLUE, glow_r + 8)
+        g = self.sprites.glow(FRIENDLY_BLUE, glow_r + WASH_GLOW_PAD)
         off = g.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         for sid, (sx, sy) in pos.items():
-            if sid in friendly:
+            if sid in friendly and sid not in skip:
                 blit_s(g, (sx - off, sy - off), special_flags=blit_max)
+        surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _split_map(self, pos, bright, halo, friendly) -> dict:
+        """``{sid: effect_class}`` for the PROJECTED systems that need a split blob.
+
+        Every split class carries T, so the candidate set is the threat set --
+        iterate THAT (bounded by the hostile projection), never the whole projected
+        map, which can hold thousands of systems at universe zoom. Returns {} the
+        moment a split is impossible (no threat, or no second effect), so a
+        single-layer frame pays one truthiness check."""
+        if not halo or not (bright or friendly):
+            return {}
+        out = {}
+        for sid in halo:
+            if sid in pos:
+                cls = classify_effects(sid, bright, halo, friendly)
+                if cls in SPLIT_CLASSES:
+                    out[sid] = cls
+        return out
+
+    def _draw_split_glow(self, surf, pos, splits, glow_r):
+        """The overlap SEMICIRCLE pass (owner 2026-08-08). ``splits`` is
+        ``{sid: effect_class}`` from ``_split_map`` -- systems covered by the hostile
+        threat AND at least one other effect, which used to ADD into one ambiguous
+        blob. Each gets ONE disc at the SAME wash radius (``glow_r +
+        WASH_GLOW_PAD``) as the full washes it replaces, cut down its vertical
+        diameter: LEFT half THREAT_PURPLE (always -- left is hostile, a fixed
+        convention so the map is readable without a legend), RIGHT half whatever
+        ``split_right_color`` says (friendly blue, else the dimmed range green).
+
+        The two halves are complementary column ranges of the same sprite, so they
+        MAX-compose into ONE seamless disc -- no gap column, no doubled column, same
+        radial falloff as a full wash. House compose rule holds: fill the shared
+        scratch black, BLEND_RGB_MAX every half onto it, then ONE BLEND_RGB_ADD blit
+        to the frame -- so any density of overlapping split blobs tops out FLAT and
+        can never brighten toward white. Runs LAST of the four tint passes, adjacent
+        to threat/friendly at the same layer depth, and the systems it draws are
+        excluded from those passes (see their ``skip`` arguments)."""
+        size = surf.get_size()
+        scratch = self._get_scratch(size)
+        scratch.fill((0, 0, 0))
+        half = self.sprites.half_glow
+        radius = glow_r + WASH_GLOW_PAD
+        left = half(THREAT_PURPLE, radius, "L")
+        off = left.get_width() / 2.0
+        blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
+        right_by_class: dict[str, pygame.Surface] = {}
+        get_cls = splits.get
+        for sid, (sx, sy) in pos.items():
+            cls = get_cls(sid)
+            if cls is None:
+                continue
+            right = right_by_class.get(cls)
+            if right is None:
+                right = right_by_class[cls] = half(split_right_color(cls),
+                                                   radius, "R")
+            blit_s(left, (sx - off, sy - off), special_flags=blit_max)
+            blit_s(right, (sx - off, sy - off), special_flags=blit_max)
         surf.blit(scratch, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
 
     def _draw_heat(self, surf, cam, pos, vis_set, vw, vh, heat):
@@ -906,12 +1199,29 @@ class Renderer:
         # pass at the same layer depth; where both fire, purple + blue ADD to a
         # readable blue-violet, never white. See _draw_range_glow / _draw_threat_glow
         # / _draw_friendly_glow.
+        #
+        # OVERLAP (owner 2026-08-08): a system covered by the threat AND another
+        # effect is drawn ONCE as a split disc by _draw_split_glow instead of taking
+        # two full washes that ADD into an ambiguous blob. Each such system is
+        # removed from every full pass whose colour its blob already carries -- the
+        # threat pass always (every split class has T), friendly when the class has
+        # F, range when the class has R (drawn as the right half for "TR",
+        # suppressed for the triple "TFR"). "FR" -- friendly + range, no threat --
+        # is NOT a split class, so it runs both original passes unchanged.
+        splits = self._split_map(pos, bright, halo, friendly)
+        skip_t = skip_f = skip_r = frozenset()
+        if splits:
+            skip_t = frozenset(splits)                      # every split class has T
+            skip_f = frozenset(s for s, c in splits.items() if "F" in c)
+            skip_r = frozenset(s for s, c in splits.items() if "R" in c)
         if bright is not None:
-            self._draw_range_glow(surf, pos, bright, glow_r)
+            self._draw_range_glow(surf, pos, bright, glow_r, skip_r)
         if halo is not None:
-            self._draw_threat_glow(surf, pos, halo, glow_r)
+            self._draw_threat_glow(surf, pos, halo, glow_r, skip_t)
         if friendly is not None:
-            self._draw_friendly_glow(surf, pos, friendly, glow_r)
+            self._draw_friendly_glow(surf, pos, friendly, glow_r, skip_f)
+        if splits:
+            self._draw_split_glow(surf, pos, splits, glow_r)
         hub_r = glow_r + max(3, glow_r // 3)        # was a flat +6; scales with zoom
         ring = st.core_ring and core_r >= 2         # ring around a 1px core = blob
         glow, blit, add = self.sprites.glow, surf.blit, pygame.BLEND_RGB_ADD
@@ -929,8 +1239,17 @@ class Renderer:
             if ring:
                 gfx.aacircle(surf, int(sx), int(sy), core_r, color)
 
-    def _draw_labels(self, surf, st, pos, cam, vw, vh, infra=None):
+    def _draw_labels(self, surf, st, pos, cam, vw, vh, infra=None, tint=None):
         if st.system_labels:
+            # Effect-tinted names (owner 2026-08-08). A name is tinted only when
+            # EXACTLY ONE range effect covers its system, and glows yellow only on
+            # the triple -- label_style owns that rule. Gate the whole thing on an
+            # active tint so a no-overlay frame never pays a classification and
+            # renders byte-identically to before.
+            bright = halo = friendly = None
+            if tint is not None:
+                bright, halo, friendly = tint.bright, tint.halo, tint.friendly
+            tinted = not (bright is None and halo is None and friendly is None)
             # Priority: hubs first, then alphabetical; occupancy grid drops overlaps.
             order = sorted(pos, key=lambda sid: (sid not in HUB_IDS,
                                                  self.model.systems[sid].name))
@@ -941,9 +1260,19 @@ class Renderer:
                 # outlined surface is cached, so this stays one blit of a prebuilt
                 # sprite -- zero per-frame cost delta. Region + hub labels (else branch
                 # below) pass no outline, so the zoomed-out bands are byte-unchanged.
+                color, glow = LABEL_COLOR, None
+                if tinted:
+                    color, glow = label_style(
+                        classify_effects(sid, bright, halo, friendly))
                 lab = self.labels.label(self.model.systems[sid].name, st.label_px,
-                                        LABEL_COLOR, outline=LABEL_OUTLINE)
-                surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
+                                        color, outline=LABEL_OUTLINE, glow=glow)
+                # LABEL_OFFSET_X clears the node core + its range accent (owner
+                # 2026-08-08). The glowing composite is LABEL_GLOW_PAD wider on every
+                # side, so back the blit off by that pad to leave the GLYPH exactly
+                # where an un-glowing label's would sit; the vertical centring below
+                # absorbs the pad on its own.
+                dx = LABEL_OFFSET_X - (LABEL_GLOW_PAD if glow is not None else 0)
+                surf.blit(lab, (sx + dx, sy - lab.get_height() / 2))
             # Infra chips share this zoom LOD (Task 5): drawn AFTER labels so a
             # badge sits over its system's label when they overlap.
             if infra:
@@ -967,6 +1296,9 @@ class Renderer:
                         sx, sy = pos[sid]
                         lab = self.labels.label(self.model.systems[sid].name,
                                                 st.label_px, LABEL_COLOR)
+                        # Band-M hub names keep the original +7: this band draws no
+                        # per-system labels, so nothing crowds them, and the owner's
+                        # 2026-08-08 offset ask is scoped to the system-label band.
                         surf.blit(lab, (sx + 7, sy - lab.get_height() / 2))
 
     def _draw_infra_chips(self, surf, pos, infra):
@@ -1000,9 +1332,12 @@ class Renderer:
             txt = label(str(total), INFRA_CHIP_PX, text_color)
             tw, th = txt.get_width(), txt.get_height()
             cw, ch = tw + 8, th + 4          # 4px horiz / 2px vert padding
-            # Fixed (+7, -9) px offset from the node dot (like the label's +7,
-            # NOT scaled by zoom -- labels don't scale their offset either); the
-            # chip's left edge sits at +7 and its vertical center at -9.
+            # Fixed (+7, -9) px offset from the node dot, NOT scaled by zoom (the
+            # name label doesn't scale its offset either); the chip's left edge sits
+            # at +7 and its vertical center at -9. Deliberately NOT moved with
+            # LABEL_OFFSET_X (owner 2026-08-08): the chip rides ABOVE the name and
+            # its own opaque plate carries its contrast, so the readability ask that
+            # pushed names out to +11 does not apply to it.
             cx = int(p[0]) + 7
             cy = int(p[1]) - 9
             draw_rect(surf, fill, pygame.Rect(cx, cy - ch // 2, cw, ch),
