@@ -100,10 +100,16 @@ THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
 # BRIGHTER blue Ansiblex bridge LINES (#3a86ff) -- this is an area WASH one hue deeper
 # than the bridges so the two blues separate by both form and shade. MAX-composed onto
 # the shared scratch then ONE additive blit, exactly like THREAT_PURPLE, so overlapping
-# friendly blobs top out FLAT (never white). Where a system sits inside BOTH the hostile
-# and friendly reach the purple + blue ADD to a saturated blue-violet: both peak the
-# BLUE channel (~193 each -> clamps at 255) while R/G stay ~185/195 -- readable, never
-# a white-out (verified: a dense worst-case overlap never trips all-3 contribution > 200).
+# friendly blobs top out FLAT (never white). A system inside BOTH the hostile and
+# friendly reach no longer stacks the two washes at all -- since 2026-08-08 it draws
+# ONE split disc instead (see SPLIT_CLASSES below), which is what removed the
+# blue-violet ambiguity this comment used to describe. The white-out guarantee now
+# spans FOUR additive passes (range accent, threat, friendly, split): each MAX-composes
+# on its own scratch and contributes ONE additive blit, and the passes are mutually
+# exclusive per system (a split system is skipped by every full pass whose colour its
+# blob already carries), so no pixel can take more than two of them -- measured on a
+# dense worst-case cluster, the summed contribution never trips all three channels
+# past 200.
 FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
 
 # --- overlap SEMICIRCLES (owner 2026-08-08) ---------------------------------
@@ -156,15 +162,21 @@ LABEL_GLOW_YELLOW = (0xff, 0xd8, 0x4d)
 LABEL_GLOW_PAD = 3                       # halo reach in px on every side
 LABEL_GLOW_RING_ALPHA = (200, 130, 70)   # per-ring alpha, inner -> outer falloff
 
-# System-name label offset from the node centre (owner 2026-08-08: "the text
-# should also be slightly farther from the sphere so the first letter is
-# readable"). Was 7, which parked the first glyph inside the green range accent.
-# Measured at the band-C default framing (px_per_edge 32 -> glow_r 8, core_r 2):
-# the solid white core ends at +2 px and the range accent's added ink reaches 0 by
-# +11 px, so a label surface at +11 puts its first glyph pixel (the outlined
-# composite carries a 1 px ring) at +12 -- clear of both. Band-M hub labels keep
-# their own +7: they are drawn in a band with no per-system labels to crowd, and
-# the owner's ask is scoped to the system-label band.
+# System-name label offset FLOOR, in px from the node centre (owner 2026-08-08:
+# "the text should also be slightly farther from the sphere so the first letter is
+# readable"). Was a flat 7, which parked the first glyph inside the green range
+# accent. Measured at a shallow band-C framing (glow_r 4-6, core_r 1-2): the solid
+# white core ends by +2 px and the range accent's added ink is gone well before
+# +11, so a label surface at +11 puts its first glyph pixel (the outlined composite
+# carries a 1 px ring) at +12 -- clear of both.
+#
+# A FLAT offset is not enough on its own: node_metrics grows glow_r 4 -> 18 with
+# zoom, and the accent sprite grows with it, so at px_per_edge 64+ the accent inks
+# out to ~+20 and a fixed +11 label would sit back inside it -- exactly the overlap
+# the owner complained about, returning at the zoom FCs actually work at. The live
+# offset is therefore computed per frame by label_offset_x() below; this constant is
+# its FLOOR. Band-M hub labels keep their own flat +7: that band draws no per-system
+# labels to crowd them, and the owner's ask is scoped to the system-label band.
 LABEL_OFFSET_X = 11
 
 # Infrastructure count chips (Task 5): a small rounded badge per system carrying
@@ -256,6 +268,20 @@ def split_right_color(cls: str) -> tuple[int, int, int] | None:
     # so the green half must be too -- raw RANGE_GREEN would out-shout the purple
     # half and break the "one disc" read.
     return RANGE_GREEN_GLOW
+
+
+def label_offset_x(glow_r: int) -> int:
+    """Horizontal gap from a system's node centre to its name label, for this
+    frame's node size. Pure -- the SINGLE source of the offset rule, shared by the
+    label pass and its test.
+
+    ``LABEL_OFFSET_X`` is the floor (shallow zoom, where it already clears
+    everything). Past that the offset tracks the node: the green range accent is a
+    sprite of radius ``glow_r + RANGE_GLOW_PAD``, so clearing its rim plus 2 px of
+    breathing room is what keeps the first letter readable at EVERY zoom -- the
+    owner's complaint was about zoomed-in framings, where node_metrics has grown
+    glow_r toward its cap of 18 and a flat offset falls back inside the accent."""
+    return max(LABEL_OFFSET_X, glow_r + RANGE_GLOW_PAD + 2)
 
 
 def label_style(cls: str):
@@ -832,7 +858,7 @@ class Renderer:
         # Infra count chips ride the label pass (same st.system_labels zoom LOD);
         # infra=None/() draws nothing, keeping the frame byte-identical to the
         # pre-infra output (determinism, exactly like bridges/heat/sov).
-        self._draw_labels(surf, st, pos, cam, vw, vh, infra, tint)
+        self._draw_labels(surf, st, pos, cam, vw, vh, infra, tint, glow_r)
         return surf
 
     # -- passes ----------------------------------------------------------------
@@ -1032,8 +1058,8 @@ class Renderer:
     def _draw_threat_glow(self, surf, pos, halo, glow_r, skip=frozenset()):
         """Threat PURPLE under-wash (owner 2026-07-12; replaces the old per-node RED
         additive halo). Every threatened system (``TintSpec.halo``) gets ONE dim
-        violet glow at ``glow_r + 8``, MAX-composed onto the shared scratch then
-        blitted ONCE with BLEND_RGB_ADD -- so overlapping threat blobs top out FLAT
+        violet glow at ``glow_r + WASH_GLOW_PAD``, MAX-composed onto the shared
+        scratch then blitted ONCE with BLEND_RGB_ADD -- so threat blobs top out FLAT
         (never white), exactly like sov/range. Violet (#8e5bd6) reads as a distinct
         background warning wash vs red nullsec nodes, blue Ansiblex bridges, green
         range, and amber intel -- the owner's "hard to distinguish" red is gone.
@@ -1063,8 +1089,8 @@ class Renderer:
         """Friendly-staging PROJECTION wash (owner ask): a SECOND halo beside the
         hostile purple threat, in deep azure BLUE (FRIENDLY_BLUE #3d7dd6). Every
         system inside a FRIENDLY staging's jump/bridge reach (``TintSpec.friendly``)
-        gets ONE dim blue glow at ``glow_r + 8``, MAX-composed onto the shared scratch
-        then blitted ONCE with BLEND_RGB_ADD -- so overlapping friendly blobs top out
+        gets ONE dim blue glow at ``glow_r + WASH_GLOW_PAD``, MAX-composed onto the
+        shared scratch then blitted ONCE with BLEND_RGB_ADD -- so friendly blobs top out
         FLAT (never white), byte-for-byte the same compose as _draw_threat_glow, just
         a different hue. Blue reads distinct from the purple hostile wash (its GREEN
         channel sits above red, purple's RED sits above green), the green range aura,
@@ -1137,11 +1163,12 @@ class Renderer:
         off = left.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         right_by_class: dict[str, pygame.Surface] = {}
-        get_cls = splits.get
-        for sid, (sx, sy) in pos.items():
-            cls = get_cls(sid)
-            if cls is None:
-                continue
+        # Iterate the SPLITS, not pos: _split_map only admits sids it found in pos,
+        # so pos[sid] is a guaranteed hit -- and splits is bounded by the threat
+        # projection while pos can hold every visible system (~5,485 at universe
+        # zoom, measured 243 us/frame when this loop scanned pos instead).
+        for sid, cls in splits.items():
+            sx, sy = pos[sid]
             right = right_by_class.get(cls)
             if right is None:
                 right = right_by_class[cls] = half(split_right_color(cls),
@@ -1239,17 +1266,23 @@ class Renderer:
             if ring:
                 gfx.aacircle(surf, int(sx), int(sy), core_r, color)
 
-    def _draw_labels(self, surf, st, pos, cam, vw, vh, infra=None, tint=None):
+    def _draw_labels(self, surf, st, pos, cam, vw, vh, infra=None, tint=None,
+                     glow_r=0):
         if st.system_labels:
             # Effect-tinted names (owner 2026-08-08). A name is tinted only when
             # EXACTLY ONE range effect covers its system, and glows yellow only on
             # the triple -- label_style owns that rule. Gate the whole thing on an
-            # active tint so a no-overlay frame never pays a classification and
-            # renders byte-identically to before.
+            # active tint so a no-overlay frame pays ZERO classification cost and
+            # every name keeps LABEL_COLOR. (That gate is about the tint work only:
+            # the same readability pass moved the label OFFSET for every frame,
+            # overlay or not, so this branch is NOT byte-identical to the
+            # pre-2026-08-08 renderer -- unlike the region/hub branch below.)
             bright = halo = friendly = None
             if tint is not None:
                 bright, halo, friendly = tint.bright, tint.halo, tint.friendly
             tinted = not (bright is None and halo is None and friendly is None)
+            # Zoom-aware: the accent this offset has to clear grows with glow_r.
+            offset_x = label_offset_x(glow_r)
             # Priority: hubs first, then alphabetical; occupancy grid drops overlaps.
             order = sorted(pos, key=lambda sid: (sid not in HUB_IDS,
                                                  self.model.systems[sid].name))
@@ -1266,12 +1299,12 @@ class Renderer:
                         classify_effects(sid, bright, halo, friendly))
                 lab = self.labels.label(self.model.systems[sid].name, st.label_px,
                                         color, outline=LABEL_OUTLINE, glow=glow)
-                # LABEL_OFFSET_X clears the node core + its range accent (owner
-                # 2026-08-08). The glowing composite is LABEL_GLOW_PAD wider on every
-                # side, so back the blit off by that pad to leave the GLYPH exactly
-                # where an un-glowing label's would sit; the vertical centring below
-                # absorbs the pad on its own.
-                dx = LABEL_OFFSET_X - (LABEL_GLOW_PAD if glow is not None else 0)
+                # offset_x clears the node core + its range accent at THIS zoom
+                # (owner 2026-08-08). The glowing composite is LABEL_GLOW_PAD wider
+                # on every side, so back the blit off by that pad to leave the GLYPH
+                # exactly where an un-glowing label's would sit; the vertical
+                # centring below absorbs the pad on its own.
+                dx = offset_x - (LABEL_GLOW_PAD if glow is not None else 0)
                 surf.blit(lab, (sx + dx, sy - lab.get_height() / 2))
             # Infra chips share this zoom LOD (Task 5): drawn AFTER labels so a
             # badge sits over its system's label when they overlap.
