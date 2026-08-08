@@ -105,11 +105,17 @@ THREAT_PURPLE = (0x8e, 0x5b, 0xd6)
 # ONE split disc instead (see SPLIT_CLASSES below), which is what removed the
 # blue-violet ambiguity this comment used to describe. The white-out guarantee now
 # spans FOUR additive passes (range accent, threat, friendly, split): each MAX-composes
-# on its own scratch and contributes ONE additive blit, and the passes are mutually
-# exclusive per system (a split system is skipped by every full pass whose colour its
-# blob already carries), so no pixel can take more than two of them -- measured on a
-# dense worst-case cluster, the summed contribution never trips all three channels
-# past 200.
+# on its own scratch and contributes ONE additive blit.
+#
+# The pass exclusion is per SYSTEM, NOT per pixel. A split system is skipped by every
+# full pass whose colour its blob already carries, so no SYSTEM ever feeds more than
+# two passes -- but a PIXEL can still take all four, from four different neighbours
+# overlapping it (an R-only, a T-only, an F-only and a TF split system). Measured on a
+# dense 64-system interleaved cluster: 717 pixels genuinely lit by all four passes,
+# worst min-channel 51, worst single channel 221 -- readable, no white-out. So the
+# bound holds because of what the four hues sum to, NOT because the passes cannot
+# co-occur: a FIFTH additive pass would change that arithmetic and must re-derive the
+# bound before it ships.
 FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
 
 # --- overlap SEMICIRCLES (owner 2026-08-08) ---------------------------------
@@ -277,10 +283,14 @@ def label_offset_x(glow_r: int) -> int:
 
     ``LABEL_OFFSET_X`` is the floor (shallow zoom, where it already clears
     everything). Past that the offset tracks the node: the green range accent is a
-    sprite of radius ``glow_r + RANGE_GLOW_PAD``, so clearing its rim plus 2 px of
-    breathing room is what keeps the first letter readable at EVERY zoom -- the
-    owner's complaint was about zoomed-in framings, where node_metrics has grown
-    glow_r toward its cap of 18 and a flat offset falls back inside the accent."""
+    sprite of radius ``r = glow_r + RANGE_GLOW_PAD``, and a 2r-wide sprite centred on
+    the node has its LAST inked column at ``r - 1``, not ``r`` (confirmed by
+    measurement: at glow_r 18, r = 21 and the accent's last added-green column is
+    +20). So ``r + 2`` puts the label 3 px past the last ink, not 2 -- the extra pixel
+    is deliberate generosity, since a hairline gap reads as a touch. That clearance is
+    what keeps the first letter readable at EVERY zoom -- the owner's complaint was
+    about zoomed-in framings, where node_metrics has grown glow_r toward its cap of 18
+    and a flat offset falls back inside the accent."""
     return max(LABEL_OFFSET_X, glow_r + RANGE_GLOW_PAD + 2)
 
 
