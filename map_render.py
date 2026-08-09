@@ -123,10 +123,13 @@ FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
 # + blue -> blue-violet; purple + green accent -> a muddy rim), so the owner could
 # not tell WHICH reaches covered a system. A system carrying TWO of the three
 # effects now draws ONE disc at the wash radius split down its vertical diameter:
-# the LEFT half is always the hostile THREAT_PURPLE, the RIGHT half is the other
-# effect (friendly blue, or the DIMMED range green -- never the raw neon). The two
-# halves come from the SAME sprite at the SAME radius, so they read as one seamless
-# disc, not two lobes.
+# the LEFT half is always hostile purple, the RIGHT half is the other effect
+# (friendly blue, or the DIMMED range green -- never the raw neon). The two
+# halves come from the SAME sprite at the SAME radius, so they read as one disc,
+# not two lobes. (v4.7.0 field-test follow-up, below: the exact left/right hues
+# are now SPLIT-SCOPED constants, not the full-wash THREAT_PURPLE/FRIENDLY_BLUE,
+# and the cut carries a thin seam line -- both requested after the owner found
+# the original pair too similar at wash dimness.)
 #
 # THREE effects cannot be split three ways and still be legible (owner: "showing 2
 # at a time is viable, but 3 are not"), so a triple-overlap system draws the
@@ -138,6 +141,40 @@ FRIENDLY_BLUE = (0x3d, 0x7d, 0xd6)
 # owner's ask names threat overlaps only. Splitting it would cost the green accent
 # for no readability win.
 SPLIT_CLASSES = frozenset({"TF", "TR", "TFR"})
+
+# --- split-hue separation + seam line (owner 2026-08-08, v4.7.0 field-test
+# follow-up) ------------------------------------------------------------------
+# Field feedback on the semicircles above: "the purple and blue look too similar
+# (maybe a line in the middle too?)" at wash dimness, where the two base wash
+# hues (THREAT_PURPLE / FRIENDLY_BLUE) sit only 81 R / 34 G apart. Two
+# independent fixes, SPLIT-SCOPED ONLY -- the full single-effect washes and the
+# label tints keep THREAT_PURPLE/FRIENDLY_BLUE/RANGE_GREEN_GLOW unchanged,
+# because a lone wash has no adjacent second hue to be confused with.
+#
+# (1) Two dedicated split hues, shifted apart on R and G while B stays pinned at
+# the shared 0xd6 -- so the single-sprite peak channel (and the FOUR-pass
+# white-out ceiling above, which is dominated by that shared B) does not move.
+# SPLIT_THREAT_HUE pushes toward MAGENTA (R up, G down -- still unmistakably
+# purple: B > R > G, same channel ordering as THREAT_PURPLE). SPLIT_FRIENDLY_HUE
+# pushes toward AZURE/CYAN (G up, R down -- still unmistakably blue: B > G > R,
+# same ordering as FRIENDLY_BLUE). Separation: 123 R / 75 G apart -- past the
+# ~90 R / ~60 G the owner ask calls for, and well past the base pair's 81 R /
+# 34 G (test_split_hues_are_more_separated_than_the_full_wash_hues). TR's right
+# half is untouched: RANGE_GREEN_GLOW already contrasts against purple, so only
+# the two blue-family hues needed separating.
+SPLIT_THREAT_HUE = (0xa8, 0x4b, 0xd6)
+SPLIT_FRIENDLY_HUE = (0x2d, 0x96, 0xd6)
+
+# (2) A thin un-inked GAP at the split column, on BOTH halves, so the dark map
+# background (BG) shows through as a crisp dividing line -- deliberately DARK,
+# not bright additive ink (extra ink would spend more of the same white-out
+# budget the FOUR-pass ceiling already accounts for; a dark gap spends none).
+# Scales mildly with the wash radius so it stays visible at deep zoom without
+# swallowing the disc at shallow zoom: ~2px total (1px/half) at the smallest
+# wash radius (glow_r 4 -> radius 12), ~4px (2px/half) at the zoom cap (glow_r
+# 18 -> radius 26). half_glow() consumes this; seam_gap() below is the single
+# source, shared with its tests.
+SEAM_GAP_DIVISOR = 12
 
 # System-name label tints (owner 2026-08-08 readability pass). A system carrying
 # EXACTLY ONE effect tints its NAME in a light variant of that effect's hue, so the
@@ -262,18 +299,33 @@ def classify_effects(sid: int, bright, halo, friendly) -> str:
 
 def split_right_color(cls: str) -> tuple[int, int, int] | None:
     """RIGHT-half hue of the split overlap blob (the LEFT half is always
-    THREAT_PURPLE). Friendly BLUE outranks range green, which is what makes the
-    triple case (``"TFR"``) purple|blue with NO green on the blob -- the jump-range
+    SPLIT_THREAT_HUE). Friendly outranks range, which is what makes the triple
+    case (``"TFR"``) purple|blue with NO green on the blob -- the jump-range
     signal moves to the label's yellow glow instead. Returns None for a class that
-    does not split."""
+    does not split.
+
+    The friendly side is SPLIT_FRIENDLY_HUE, not the full-wash FRIENDLY_BLUE
+    (owner v4.7.0 field-test follow-up: the two base wash hues read too close at
+    wash dimness) -- TR's green stays RANGE_GREEN_GLOW untouched, since green
+    already contrasts against purple without needing a shift."""
     if cls not in SPLIT_CLASSES:
         return None
     if "F" in cls:
-        return FRIENDLY_BLUE
+        return SPLIT_FRIENDLY_HUE
     # Wash-brightness parity: the range accent is drawn DIMMED (RANGE_GREEN_GLOW),
     # so the green half must be too -- raw RANGE_GREEN would out-shout the purple
     # half and break the "one disc" read.
     return RANGE_GREEN_GLOW
+
+
+def seam_gap(radius: int) -> int:
+    """Per-half un-inked seam width, in px, for a split disc of this wash
+    ``radius``. Pure -- the single source shared by ``SpriteFactory.half_glow``
+    and its tests. ``max(1, radius // SEAM_GAP_DIVISOR)`` always leaves at least
+    1px per half (2px total) even at the smallest wash radius, and grows only
+    every ``SEAM_GAP_DIVISOR`` px of radius past that -- mild scaling, never
+    enough to swallow the disc."""
+    return max(1, radius // SEAM_GAP_DIVISOR)
 
 
 def label_offset_x(glow_r: int) -> int:
@@ -466,8 +518,8 @@ class SpriteFactory:
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
         # half_glow(): keyed by (colour, radius, side). Bounded by construction and
         # far tighter than glow() -- only the overlap-blob call sites reach it, i.e.
-        # THREAT_PURPLE on the left plus FRIENDLY_BLUE / RANGE_GREEN_GLOW on the
-        # right (3 colours) x the same handful of bucketed wash radii x 2 sides.
+        # SPLIT_THREAT_HUE on the left plus SPLIT_FRIENDLY_HUE / RANGE_GREEN_GLOW on
+        # the right (3 colours) x the same handful of bucketed wash radii x 2 sides.
         self._half_cache: dict[tuple[tuple[int, int, int], int, str],
                                pygame.Surface] = {}
         self._disc_cache: "OrderedDict[tuple[tuple[int, int, int], int], pygame.Surface]" \
@@ -499,33 +551,41 @@ class SpriteFactory:
             pygame.draw.circle(src, col, (c, c), rr)
         return pygame.transform.smoothscale(src, (target, target))
 
-    # --- half glow (overlap semicircles, owner 2026-08-08) -------------------
+    # --- half glow (overlap semicircles, owner 2026-08-08; seam line added in
+    # the v4.7.0 field-test follow-up, same date) ------------------------------
     def half_glow(self, color: tuple[int, int, int], radius: int,
                   side: str) -> pygame.Surface:
-        """One HALF of the cached radial glow, at the FULL sprite footprint.
+        """One HALF of the cached radial glow, at the FULL sprite footprint, with
+        a thin un-inked SEAM GAP at the split edge (see ``seam_gap()``) -- a dark
+        dividing line between the two split hues, requested after the owner found
+        the base semicircle pair too similar at wash dimness.
 
         ``side`` is ``"L"`` or ``"R"``; the cut is the sprite's vertical diameter at
-        column ``radius``. The left half owns columns ``[0, radius)`` and the right
-        half ``[radius, 2*radius)`` -- exactly complementary, so a left and a right
-        half of the same radius MAX-compose back into the full disc with NO gap
-        column and NO double-painted column. That is what lets two different hues
-        read as one seamless disc cut down the middle instead of two lobes.
+        column ``radius``. The left half owns columns ``[0, radius - gap)`` and the
+        right half ``[radius + gap, 2*radius)`` -- complementary MINUS the
+        ``2 * gap``-wide seam neither half paints, so a left and a right half of
+        the same radius MAX-compose back into the full disc EXCEPT that seam
+        (no double-painted column either side of it). The dark map background
+        shows through the seam as a crisp line instead of the two hues touching
+        directly.
 
-        Built by COPYING the full sprite and zeroing the other half (``Surface.fill``
-        writes RGBA directly, it does not blend), so the kept half is byte-identical
-        to the full glow -- same radial falloff, same MAX-compose ceiling. The
-        zeroed half is transparent BLACK, which contributes nothing under either
-        BLEND_RGB_MAX (max(x, 0) = x) or BLEND_RGB_ADD."""
+        Built by COPYING the full sprite and zeroing everything past the kept
+        range (``Surface.fill`` writes RGBA directly, it does not blend), so the
+        kept region is byte-identical to the full glow -- same radial falloff,
+        same MAX-compose ceiling. The zeroed region is transparent BLACK, which
+        contributes nothing under either BLEND_RGB_MAX (max(x, 0) = x) or
+        BLEND_RGB_ADD -- so the seam reads as dark, not as added ink."""
         key = (color, radius, side)
         got = self._half_cache.get(key)
         if got is None:
             full = self.glow(color, radius)
             w, h = full.get_size()
             mid = w // 2
+            gap = seam_gap(radius)
             got = full.copy()
             got.fill((0, 0, 0, 0),
-                     pygame.Rect(mid, 0, w - mid, h) if side == "L"
-                     else pygame.Rect(0, 0, mid, h))
+                     pygame.Rect(mid - gap, 0, w - (mid - gap), h) if side == "L"
+                     else pygame.Rect(0, 0, mid + gap, h))
             self._half_cache[key] = got
         return got
 
@@ -1147,29 +1207,37 @@ class Renderer:
         return out
 
     def _draw_split_glow(self, surf, pos, splits, glow_r):
-        """The overlap SEMICIRCLE pass (owner 2026-08-08). ``splits`` is
+        """The overlap SEMICIRCLE pass (owner 2026-08-08; hue separation + seam
+        line added same date, v4.7.0 field-test follow-up). ``splits`` is
         ``{sid: effect_class}`` from ``_split_map`` -- systems covered by the hostile
         threat AND at least one other effect, which used to ADD into one ambiguous
         blob. Each gets ONE disc at the SAME wash radius (``glow_r +
         WASH_GLOW_PAD``) as the full washes it replaces, cut down its vertical
-        diameter: LEFT half THREAT_PURPLE (always -- left is hostile, a fixed
-        convention so the map is readable without a legend), RIGHT half whatever
-        ``split_right_color`` says (friendly blue, else the dimmed range green).
+        diameter: LEFT half SPLIT_THREAT_HUE (always -- left is hostile, a fixed
+        convention so the map is readable without a legend; a magenta-shifted
+        purple, kept distinct from the full THREAT_PURPLE wash so the two split
+        halves read apart at wash dimness), RIGHT half whatever
+        ``split_right_color`` says (SPLIT_FRIENDLY_HUE, else the dimmed range
+        green).
 
-        The two halves are complementary column ranges of the same sprite, so they
-        MAX-compose into ONE seamless disc -- no gap column, no doubled column, same
-        radial falloff as a full wash. House compose rule holds: fill the shared
+        The two halves are complementary column ranges of the same sprite MINUS a
+        thin un-inked seam at the cut (``SpriteFactory.half_glow`` /
+        ``seam_gap()``), so they MAX-compose into ONE disc with a crisp dark
+        dividing line down the middle -- not a gap-free tile anymore, that is now
+        the deliberate seam. House compose rule still holds: fill the shared
         scratch black, BLEND_RGB_MAX every half onto it, then ONE BLEND_RGB_ADD blit
         to the frame -- so any density of overlapping split blobs tops out FLAT and
-        can never brighten toward white. Runs LAST of the four tint passes, adjacent
-        to threat/friendly at the same layer depth, and the systems it draws are
-        excluded from those passes (see their ``skip`` arguments)."""
+        can never brighten toward white (the seam only REMOVES ink relative to the
+        old gap-free halves, so the white-out ceiling can only improve). Runs LAST
+        of the four tint passes, adjacent to threat/friendly at the same layer
+        depth, and the systems it draws are excluded from those passes (see their
+        ``skip`` arguments)."""
         size = surf.get_size()
         scratch = self._get_scratch(size)
         scratch.fill((0, 0, 0))
         half = self.sprites.half_glow
         radius = glow_r + WASH_GLOW_PAD
-        left = half(THREAT_PURPLE, radius, "L")
+        left = half(SPLIT_THREAT_HUE, radius, "L")
         off = left.get_width() / 2.0
         blit_s, blit_max = scratch.blit, pygame.BLEND_RGB_MAX
         right_by_class: dict[str, pygame.Surface] = {}
