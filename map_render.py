@@ -152,8 +152,15 @@ SPLIT_CLASSES = frozenset({"TF", "TR", "TFR"})
 # because a lone wash has no adjacent second hue to be confused with.
 #
 # (1) Two dedicated split hues, shifted apart on R and G while B stays pinned at
-# the shared 0xd6 -- so the single-sprite peak channel (and the FOUR-pass
-# white-out ceiling above, which is dominated by that shared B) does not move.
+# the shared 0xd6. That pin keeps the single-sprite PEAK channel unchanged (B
+# caps at ~192 either way), but the FOUR-pass white-out ceiling above is a
+# MIN-CHANNEL property, not a peak one: the +26 R (SPLIT_THREAT_HUE) / +25 G
+# (SPLIT_FRIENDLY_HUE) constant shifts raise the measured worst min-channel by
+# up to 5 at mid coincidence spacings. The seam's ink removal more than offsets
+# that, though -- near-white pixel counts strictly FELL in every measured
+# configuration (36 vs 42 coincident @ glow_r 4; 214 vs 231 @ glow_r 18 d=2;
+# 368 vs 384 on the dense cluster), so the net white-out risk is lower than
+# before this change, not higher.
 # SPLIT_THREAT_HUE pushes toward MAGENTA (R up, G down -- still unmistakably
 # purple: B > R > G, same channel ordering as THREAT_PURPLE). SPLIT_FRIENDLY_HUE
 # pushes toward AZURE/CYAN (G up, R down -- still unmistakably blue: B > G > R,
@@ -508,12 +515,16 @@ class SpriteFactory:
 
     def __init__(self, disc_max: int = DISC_CACHE_MAX) -> None:
         # glow(): keyed by (colour, radius) off a fixed set of callers (the three
-        # sec tints, range-green, threat-purple, friendly-blue, per-region nebula
-        # dims) x a handful of bucketed radii -- self-bounding by construction, but
-        # NOT the "small" palette this comment used to claim: measured worst case
-        # across all call sites is <=204 distinct keys, ~10.8 MB ceiling, dominated
-        # by the radius-240 nebula sprites (921 KB each x3 tints x10 radius
-        # buckets). Still bounded, so it stays a plain dict for now -- a future
+        # sec tints, range-green, threat-purple, friendly-blue, split-threat,
+        # split-friendly, per-region nebula dims) x a handful of bucketed radii --
+        # self-bounding by construction, but NOT the "small" palette this comment
+        # used to claim: measured worst case across all call sites is <=234
+        # distinct keys, ~11.0 MB ceiling, dominated by the radius-240 nebula
+        # sprites (921 KB each x3 tints x10 radius buckets) -- the two split-scoped
+        # hues (half_glow()'s SPLIT_THREAT_HUE/SPLIT_FRIENDLY_HUE, which build their
+        # full sprite via THIS cache before slicing it in half) add up to 15 wash
+        # radii each, ~89 KB/colour, a small fraction of the nebula-dominated
+        # total. Still bounded, so it stays a plain dict for now -- a future
         # slimming candidate. Only the sov disc cache needed an LRU bound (MP6).
         self._cache: dict[tuple[tuple[int, int, int], int], pygame.Surface] = {}
         # half_glow(): keyed by (colour, radius, side). Bounded by construction and
