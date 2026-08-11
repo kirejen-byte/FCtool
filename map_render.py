@@ -6,11 +6,30 @@ headless; Phase C blits the finished frame into Tk via surface_to_ppm().
 """
 from __future__ import annotations
 
+import importlib
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
-import pygame
-import pygame.gfxdraw as gfx
+
+def _import_with_retry(name, attempts=4, delay=0.25):
+    """Bounded-retry import: the box's AV filter can transiently fail the
+    site-packages listdir, which FileFinder caches as an EMPTY directory ->
+    spurious ModuleNotFoundError for an installed package. invalidate_caches()
+    drops the poisoned listing so the retry rescans. Genuinely-missing pygame
+    still raises, just ~1s later."""
+    for i in range(attempts):
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            if i == attempts - 1:
+                raise
+            importlib.invalidate_caches()
+            time.sleep(delay)
+
+
+pygame = _import_with_retry("pygame")
+gfx = _import_with_retry("pygame.gfxdraw")
 
 import map_overlays as mo   # pure sov_color hash for the sovereignty tint (Task 33)
 
