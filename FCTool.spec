@@ -31,7 +31,11 @@ a = Analysis(
         ('assets/alerts/zkill_horn.mp3', 'assets/alerts'),
         ('assets/alerts/zkill_comms.mp3', 'assets/alerts'),
     ],
-    hiddenimports=[],
+    # 'pygame.gfxdraw': belt-and-braces. map_render.py imports it statically,
+    # but falls back to importlib.import_module() on a transient ModuleNotFoundError
+    # (AV-poisoned FileFinder cache) — that dynamic path is invisible to the
+    # analyzer, so it needs the hint too, or a frozen build can ship without gfxdraw.pyd.
+    hiddenimports=['pygame.gfxdraw'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

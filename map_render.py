@@ -26,10 +26,15 @@ def _import_with_retry(name, attempts=4, delay=0.25):
                 raise
             importlib.invalidate_caches()
             time.sleep(delay)
+    raise ModuleNotFoundError(name)
 
 
-pygame = _import_with_retry("pygame")
-gfx = _import_with_retry("pygame.gfxdraw")
+try:                              # static form: PyInstaller's analyzer must SEE
+    import pygame                 # pygame.gfxdraw (a .pyd nothing else imports)
+    import pygame.gfxdraw as gfx  # or the frozen exe ships without it
+except ModuleNotFoundError:       # AV-poisoned FileFinder cache -> bounded retry
+    pygame = _import_with_retry("pygame")
+    gfx = _import_with_retry("pygame.gfxdraw")
 
 import map_overlays as mo   # pure sov_color hash for the sovereignty tint (Task 33)
 
