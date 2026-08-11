@@ -280,13 +280,22 @@ def _session_sort_key(filepath: str) -> tuple:
     return (0, mtime, filepath)
 
 
-def _header_listener(filepath: str) -> str:
-    """Listener (character) name from a log's header, or "" if unreadable."""
+def _header_listener(filepath: str) -> str | None:
+    """Listener (character) name from a log's header — three distinct answers.
+
+    ``None`` means the header could not be READ at all (the transient
+    open-failure class this box demonstrably has). ``""`` means it was read
+    fine and simply carries no Listener line. A name means it was read and that
+    is who was listening. The caller MUST keep the first two apart: an
+    unreadable newest candidate is a reason to stop, while a listener-less one
+    is kept (the ``_discover_files`` mirror — the filter can only exclude what
+    it can positively read).
+    """
     try:
         with open(filepath, "rb") as f:
             header_bytes = f.read(4096)
     except OSError:
-        return ""
+        return None
     header = header_bytes.decode("utf-16-le", errors="replace")
     for line in header.split("\n"):
         m = HEADER_LISTENER_PATTERN.search(line)
@@ -305,7 +314,21 @@ def find_current_session_file(logs_path: str, channel_prefix: str,
     character; a file whose header carries no Listener at all is KEPT, exactly
     as ``_discover_files`` does — the filter can only exclude what it can
     positively read.
+
+    Candidates are walked NEWEST-FIRST and the walk stops at the first keeper,
+    so the ordinary case opens exactly one header. That matters: a lived-in
+    Chatlogs folder holds thousands of files for a single channel prefix (4,627
+    ``Fleet*`` in the folder this was measured in — ~2.9 s of header opens if
+    every one is probed), and this runs on the fleet-poll thread.
+
+    Raises OSError when the newest still-eligible candidate's header cannot be
+    read. Walking past it would hand back a PRIOR fleet's log — the one
+    contamination this feature must never produce — and taking it blind would
+    defeat the multi-boxer filter, so neither is an option; failing lets the
+    caller's attempt budget retry, which costs nothing.
     """
+    if not logs_path or not str(logs_path).strip():
+        return None      # unconfigured path: never let os.path.join glob the CWD
     try:
         candidates = glob.glob(os.path.join(logs_path, "*.txt"))
     except OSError:
@@ -315,19 +338,21 @@ def find_current_session_file(logs_path: str, channel_prefix: str,
     if prefix:
         candidates = [fp for fp in candidates
                       if os.path.basename(fp).lower().startswith(prefix)]
-
-    if listener:
-        wanted = listener.strip().lower()
-        kept = []
-        for fp in candidates:
-            found = _header_listener(fp)
-            if not found or found.lower() == wanted:
-                kept.append(fp)
-        candidates = kept
-
     if not candidates:
         return None
-    return max(candidates, key=_session_sort_key)
+
+    candidates.sort(key=_session_sort_key, reverse=True)
+    if not listener:
+        return candidates[0]
+
+    wanted = listener.strip().lower()
+    for fp in candidates:
+        found = _header_listener(fp)
+        if found is None:
+            raise OSError(f"newest candidate header unreadable: {fp}")
+        if not found or found.lower() == wanted:
+            return fp
+    return None
 
 
 def read_full_session(filepath: str) -> list[ChatMessage]:
@@ -335,26 +360,40 @@ def read_full_session(filepath: str) -> list[ChatMessage]:
 
     One ChatLogFile at position 0, read once: header lines do not match
     MESSAGE_PATTERN so they drop out on their own (while still being parsed for
-    the channel name), and ``read_new_lines`` already contains its own OSError.
+    the channel name).
+
+    Raises OSError when the read consumed NOTHING from a non-empty file.
+    ``read_new_lines`` contains its own OSError and returns [], which is
+    otherwise indistinguishable from a genuinely message-less session — and
+    that ambiguity is what let a transient open failure look like success. A
+    header-only file advances the position past its header, so a session where
+    nobody has spoken yet still returns [] rather than raising. (``getsize``
+    raising is the same failure: the log vanished between glob and read.)
     """
     log_file = ChatLogFile(filepath)
     log_file._last_pos = 0
-    return log_file.read_new_lines()
+    messages = log_file.read_new_lines()
+    if not messages and log_file._last_pos == 0 and os.path.getsize(filepath) > 0:
+        raise OSError(f"read consumed nothing from {filepath}")
+    return messages
 
 
 def backfill_current_session(logs_path: str, channel_prefix: str,
                              listener: str | None,
-                             sink: Callable[[ChatMessage], None]) -> int:
+                             sink: Callable[[ChatMessage], None]) -> int | None:
     """Feed every message of the current session's log to ``sink``; return count.
 
     Only the NEWEST session file is read, so a prior session's log is never a
     source — the caller adds the second half of that guarantee by asking only
     while the session it wants is demonstrably the current one.
 
-    IO failures are contained (logged, returns 0): a briefly-locked or vanished
-    log is a transient the caller can retry. An exception raised by ``sink`` is
-    deliberately NOT contained — that is the caller's own bug, and swallowing it
-    would disguise a broken consumer as "there was nothing to backfill".
+    IO failures return None so the caller can retry; 0 means a readable,
+    message-less session and is a final answer. Those two must not be conflated:
+    EVE creates the log at JOIN, so an FC who starts FCTool before anyone speaks
+    meets an empty-but-healthy session as a matter of course, while a briefly
+    unopenable log is exactly the transient a retry cures. An exception raised
+    by ``sink`` is deliberately NOT contained — that is the caller's own bug,
+    and swallowing it would disguise a broken consumer as "nothing to backfill".
     """
     try:
         filepath = find_current_session_file(logs_path, channel_prefix, listener)
@@ -364,7 +403,7 @@ def backfill_current_session(logs_path: str, channel_prefix: str,
     except OSError:
         log.warning("backfill_current_session failed for %s", logs_path,
                     exc_info=True)
-        return 0
+        return None
     for msg in messages:
         sink(msg)
     return len(messages)

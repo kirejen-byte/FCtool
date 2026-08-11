@@ -1013,9 +1013,16 @@ class FCToolGUI:
         # log (see _links_backfill_current_session). Charged when a fleet chat
         # monitor is built (Tk thread), spent by the fleet poller on an in-fleet
         # verdict (worker thread). Lock-free on purpose, like
-        # _booster_refresh_pending above: the worst a race can cost is one
+        # _booster_refresh_pending nearby: the worst a race can cost is one
         # redundant re-read of a log whose ingest is idempotent.
+        # _links_backfill_key is the (logs_path, channel, tracked_char) the
+        # budget was charged FOR. Settings->Save rebuilds the chat monitor even
+        # when none of the three changed, and re-charging there would re-read
+        # the same log and resurrect links the FC deliberately removed
+        # (ChargeTracker.remove_pilot). A different key is a different log
+        # universe, so that one does charge.
         self._links_backfill_attempts = 0
+        self._links_backfill_key = None
         self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
         self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
         self._burst_icons_small: dict[str, object] = {}   # half-size copies for the inline top strip
@@ -23308,7 +23315,12 @@ class FCToolGUI:
                 listener_filter=tracked_char,
             )
             self.chat_monitor.on_message(self._on_chat_message)
-            self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
+            # New listener = a new log universe, so the backfill budget charges
+            # (and records the key, so the Save that may follow does not).
+            key = (logs_path, channel, tracked_char)
+            if key != self._links_backfill_key:
+                self._links_backfill_key = key
+                self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
             char_label = f" ({tracked_char})" if tracked_char else ""
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
 
@@ -24065,11 +24077,22 @@ class FCToolGUI:
                 listener_filter=tracked_char,
             )
             self.chat_monitor.on_message(self._on_chat_message)
-            self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
+            # This method also runs on every Settings->Save, so charge the
+            # one-shot backfill budget only when the log universe actually
+            # changed — see _links_backfill_key in __init__.
+            key = (logs_path, channel, tracked_char)
+            if key != self._links_backfill_key:
+                self._links_backfill_key = key
+                self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
             char_label = f" ({tracked_char})" if tracked_char else ""
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
         else:
             self.chat_monitor = None
+            # No readable logs path: a budget charged by the PREVIOUS config
+            # must not outlive it, or the poller reads a log the settings in
+            # force say nothing about.
+            self._links_backfill_key = None
+            self._links_backfill_attempts = 0
             self._chat_status.config(text="CHAT: NO PATH", fg=FG_ORANGE)
 
         # zKillboard
@@ -24281,9 +24304,12 @@ class FCToolGUI:
                 self._burst_icons[disc] = None  # fall back to Unicode glyph
                 self._burst_icons_small[disc] = None
 
-    # A few tries, not one: the first in-fleet verdict can land while EVE still
-    # holds the log or before the session file exists at all, and a lost
-    # backfill is invisible to the FC.
+    # A few tries, not one: the log can be transiently unopenable — this box's
+    # documented open-failure class, where an external filesystem filter fails
+    # an open on a file that is demonstrably there — and a lost backfill is
+    # invisible to the FC, who just sees a blank coverage grid. Each call spends
+    # one try; only a SIGNALLED failure leaves the rest available, so a healthy
+    # session with nothing said in it still ends the matter.
     _LINKS_BACKFILL_ATTEMPTS = 3
 
     def _links_backfill_current_session(self):
@@ -24294,7 +24320,9 @@ class FCToolGUI:
 
           (a) EVE allows one fleet at a time, so "we are in a fleet now" means
               the newest session log IS this fleet's — a previous fleet's log is
-              structurally excluded and never read.
+              structurally excluded and never read. EVE writes the fleet log at
+              JOIN (verified 2026-08-11: header-only session files exist), which
+              is what makes newest == current sound.
           (b) Overlapping the live tail is harmless. The tail stays EOF-seeded
               (chat_monitor's discovery is untouched) and ChargeTracker.record
               REPLACES a pilot's whole set, so re-seeing a line changes nothing.
@@ -24303,7 +24331,9 @@ class FCToolGUI:
         ChargeTracker is internally locked, and _schedule_booster_refresh is
         safe from any thread. A failure leaves the DECREMENTED counter, so a
         transient file lock retries on the next fleet poll rather than losing
-        the backfill; success zeroes it, making this one-shot.
+        the backfill; success zeroes it, making this one-shot. Failure is what
+        backfill_current_session reports as None — an int (0 included: a
+        readable session nobody has spoken in) is a final answer.
         """
         if self._links_backfill_attempts <= 0:
             return
@@ -24320,10 +24350,14 @@ class FCToolGUI:
             logs_path = self.config.get("eve_logs_path", "")
             channel = self.config.get("xup", {}).get("channel_name", "Fleet")
             tracked_char = self.config.get("tracked_character", "") or None
-            chat_monitor.backfill_current_session(
+            result = chat_monitor.backfill_current_session(
                 logs_path, channel, tracked_char, sink)
         except Exception:
             log.exception("Links startup backfill failed")
+            return
+        if result is None:
+            # Contained IO failure. Leave the counter DECREMENTED, not zeroed:
+            # the next fleet poll retries, which is the whole point of a budget.
             return
         self._links_backfill_attempts = 0
         if changed:
