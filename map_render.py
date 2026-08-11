@@ -17,7 +17,13 @@ def _import_with_retry(name, attempts=4, delay=0.25):
     site-packages listdir, which FileFinder caches as an EMPTY directory ->
     spurious ModuleNotFoundError for an installed package. invalidate_caches()
     drops the poisoned listing so the retry rescans. Genuinely-missing pygame
-    still raises, just ~1s later."""
+    still raises, just ~1s later.
+
+    A miss that survives every retry usually means the WRONG INTERPRETER is
+    running, not a missing install (2026-08-11: a PATH-shadowing agent venv,
+    py3.11, had requests but no pygame). This calls import_module(), so the
+    traceback's importlib frame reveals the running stdlib's path - read it
+    / check sys.executable before reinstalling anything."""
     for i in range(attempts):
         try:
             return importlib.import_module(name)
