@@ -239,6 +239,137 @@ class ChatLogFile:
         return messages
 
 
+# ── Current-session backfill ────────────────────────────────────────────────
+#
+# The live tail deliberately seeds an unknown file at EOF (see
+# ChatMonitor._discover_files) so startup never replays a day of history. That
+# leaves a gap for consumers whose state is built from chat CONTENT rather than
+# events — the command-burst charge tracker being the case in point: charges
+# linked before FCTool started are simply invisible. These helpers read the
+# CURRENT session's log once, from byte 0. They are one-shot startup helpers,
+# never poll-path calls — the no-glob-per-poll rule stands for anything that
+# runs on a timer.
+
+# EVE names a chat log "<Channel>_<YYYYMMDD>_<HHMMSS>_<characterID>.txt"; older
+# logs predate the characterID suffix, so only the stamp itself is required.
+SESSION_STAMP_PATTERN = re.compile(r"_(\d{8})_(\d{6})")
+
+
+def _session_sort_key(filepath: str) -> tuple:
+    """Ordering key for "which of these logs is the current session".
+
+    The filename stamp is authoritative and outranks mtime outright, because
+    mtime records whatever last TOUCHED the file — AV scanners, backup and
+    cloud-sync agents all bump an old log long after EVE stopped writing it.
+    mtime therefore only orders files whose name carries no usable stamp
+    (tier 0); a stamped file always beats an unstamped one and the two scales
+    are never compared against each other. The path is the final tiebreak, so
+    two files claiming the same second still resolve deterministically.
+    """
+    m = SESSION_STAMP_PATTERN.search(os.path.basename(filepath))
+    if m:
+        try:
+            stamp = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+            return (1, stamp, filepath)
+        except ValueError:
+            pass  # stamp-SHAPED but not a real date - fall through to mtime
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        mtime = 0.0
+    return (0, mtime, filepath)
+
+
+def _header_listener(filepath: str) -> str:
+    """Listener (character) name from a log's header, or "" if unreadable."""
+    try:
+        with open(filepath, "rb") as f:
+            header_bytes = f.read(4096)
+    except OSError:
+        return ""
+    header = header_bytes.decode("utf-16-le", errors="replace")
+    for line in header.split("\n"):
+        m = HEADER_LISTENER_PATTERN.search(line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def find_current_session_file(logs_path: str, channel_prefix: str,
+                              listener: str | None = None) -> str | None:
+    """Newest session log for a channel, or None when nothing matches.
+
+    Channel matching is a case-insensitive basename prefix (the
+    ``_discover_files`` rule, so a case-sensitive filesystem behaves like
+    Windows). A listener filter keeps only files whose header Listener is that
+    character; a file whose header carries no Listener at all is KEPT, exactly
+    as ``_discover_files`` does — the filter can only exclude what it can
+    positively read.
+    """
+    try:
+        candidates = glob.glob(os.path.join(logs_path, "*.txt"))
+    except OSError:
+        return None
+
+    prefix = (channel_prefix or "").lower()
+    if prefix:
+        candidates = [fp for fp in candidates
+                      if os.path.basename(fp).lower().startswith(prefix)]
+
+    if listener:
+        wanted = listener.strip().lower()
+        kept = []
+        for fp in candidates:
+            found = _header_listener(fp)
+            if not found or found.lower() == wanted:
+                kept.append(fp)
+        candidates = kept
+
+    if not candidates:
+        return None
+    return max(candidates, key=_session_sort_key)
+
+
+def read_full_session(filepath: str) -> list[ChatMessage]:
+    """Parse a chat log from byte 0 and return every message it holds.
+
+    One ChatLogFile at position 0, read once: header lines do not match
+    MESSAGE_PATTERN so they drop out on their own (while still being parsed for
+    the channel name), and ``read_new_lines`` already contains its own OSError.
+    """
+    log_file = ChatLogFile(filepath)
+    log_file._last_pos = 0
+    return log_file.read_new_lines()
+
+
+def backfill_current_session(logs_path: str, channel_prefix: str,
+                             listener: str | None,
+                             sink: Callable[[ChatMessage], None]) -> int:
+    """Feed every message of the current session's log to ``sink``; return count.
+
+    Only the NEWEST session file is read, so a prior session's log is never a
+    source — the caller adds the second half of that guarantee by asking only
+    while the session it wants is demonstrably the current one.
+
+    IO failures are contained (logged, returns 0): a briefly-locked or vanished
+    log is a transient the caller can retry. An exception raised by ``sink`` is
+    deliberately NOT contained — that is the caller's own bug, and swallowing it
+    would disguise a broken consumer as "there was nothing to backfill".
+    """
+    try:
+        filepath = find_current_session_file(logs_path, channel_prefix, listener)
+        if not filepath:
+            return 0
+        messages = read_full_session(filepath)
+    except OSError:
+        log.warning("backfill_current_session failed for %s", logs_path,
+                    exc_info=True)
+        return 0
+    for msg in messages:
+        sink(msg)
+    return len(messages)
+
+
 class ChatMonitor:
     """
     Monitors the EVE chat logs directory for new messages.
