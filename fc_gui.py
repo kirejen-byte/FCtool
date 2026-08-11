@@ -42,6 +42,7 @@ if sys.platform == "win32":
     else:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import chat_monitor
 import intel_filter
 import intel_monitor
 import intel_stream
@@ -1008,6 +1009,13 @@ class FCToolGUI:
         # ship_type_id (rebuilt each fleet poll) so build_pilot_rows can match
         # charge senders to their booster ships off-thread.
         self.charge_tracker = charge_tracker.ChargeTracker()
+        # Budget for the one-shot startup backfill of the current fleet's chat
+        # log (see _links_backfill_current_session). Charged when a fleet chat
+        # monitor is built (Tk thread), spent by the fleet poller on an in-fleet
+        # verdict (worker thread). Lock-free on purpose, like
+        # _booster_refresh_pending above: the worst a race can cost is one
+        # redundant re-read of a log whose ingest is idempotent.
+        self._links_backfill_attempts = 0
         self._booster_roster: dict[str, int] = {}   # lowercased name -> ship_type_id
         self._burst_icons: dict[str, object] = {}    # discipline -> tk.PhotoImage
         self._burst_icons_small: dict[str, object] = {}   # half-size copies for the inline top strip
@@ -23300,6 +23308,7 @@ class FCToolGUI:
                 listener_filter=tracked_char,
             )
             self.chat_monitor.on_message(self._on_chat_message)
+            self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
             char_label = f" ({tracked_char})" if tracked_char else ""
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
 
@@ -24056,6 +24065,7 @@ class FCToolGUI:
                 listener_filter=tracked_char,
             )
             self.chat_monitor.on_message(self._on_chat_message)
+            self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
             char_label = f" ({tracked_char})" if tracked_char else ""
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
         else:
@@ -24270,6 +24280,54 @@ class FCToolGUI:
             except Exception:
                 self._burst_icons[disc] = None  # fall back to Unicode glyph
                 self._burst_icons_small[disc] = None
+
+    # A few tries, not one: the first in-fleet verdict can land while EVE still
+    # holds the log or before the session file exists at all, and a lost
+    # backfill is invisible to the FC.
+    _LINKS_BACKFILL_ATTEMPTS = 3
+
+    def _links_backfill_current_session(self):
+        """Feed the CURRENT fleet session's chat log to the charge tracker once.
+
+        Runs on the fleet-poll worker thread, called only from an in-fleet ESI
+        verdict. Two invariants make that gate load-bearing:
+
+          (a) EVE allows one fleet at a time, so "we are in a fleet now" means
+              the newest session log IS this fleet's — a previous fleet's log is
+              structurally excluded and never read.
+          (b) Overlapping the live tail is harmless. The tail stays EOF-seeded
+              (chat_monitor's discovery is untouched) and ChargeTracker.record
+              REPLACES a pilot's whole set, so re-seeing a line changes nothing.
+
+        Nothing here needs the Tk thread: the file IO is deliberately off it,
+        ChargeTracker is internally locked, and _schedule_booster_refresh is
+        safe from any thread. A failure leaves the DECREMENTED counter, so a
+        transient file lock retries on the next fleet poll rather than losing
+        the backfill; success zeroes it, making this one-shot.
+        """
+        if self._links_backfill_attempts <= 0:
+            return
+        self._links_backfill_attempts -= 1
+        changed = 0
+
+        def sink(msg):
+            nonlocal changed
+            if self.charge_tracker.record(msg.sender, msg.message):
+                changed += 1
+
+        try:
+            # Resolved exactly as the chat monitor's own construction does.
+            logs_path = self.config.get("eve_logs_path", "")
+            channel = self.config.get("xup", {}).get("channel_name", "Fleet")
+            tracked_char = self.config.get("tracked_character", "") or None
+            chat_monitor.backfill_current_session(
+                logs_path, channel, tracked_char, sink)
+        except Exception:
+            log.exception("Links startup backfill failed")
+            return
+        self._links_backfill_attempts = 0
+        if changed:
+            self._schedule_booster_refresh()
 
     def _schedule_booster_refresh(self):
         """Coalesce refresh requests onto the Tk loop, then compute off-thread."""
@@ -25486,6 +25544,10 @@ class FCToolGUI:
                     # Push the same enriched roster to the star-map overlay
                     # (marshaled to the main thread — update_fleet touches Tk).
                     self._post_ui(self._push_fleet_to_map, enriched)
+                    # An in-fleet verdict is the gate for the one-shot chat-log
+                    # backfill: it is what proves the newest session log belongs
+                    # to THIS fleet. Runs here, on the worker thread, on purpose.
+                    self._links_backfill_current_session()
                 elif verdict == FLEET_POLL_NOT_BOSS:
                     # In a fleet but not boss (can't read members → members is None).
                     # Keep chat-fed command-burst charges; only the hull roster is
@@ -25493,6 +25555,10 @@ class FCToolGUI:
                     self._no_fleet_misses = 0
                     self._booster_roster = {}        # hulls unverified; charges kept
                     self._schedule_booster_refresh()
+                    # Same gate as the roster branch: we ARE in a fleet, so the
+                    # newest session log is this fleet's. Not being boss changes
+                    # nothing about the chat we can read.
+                    self._links_backfill_current_session()
                     # The capsule tracker is dead here (no member list), but the
                     # zKill side can still work — see _process_nonboss_losses.
                     self._post_ui(self._process_nonboss_losses, fleet_id)
