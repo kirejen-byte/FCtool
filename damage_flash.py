@@ -32,15 +32,22 @@ from collections import defaultdict, deque
 # BECAUSE no reader exists yet to have a window opinion.
 #
 # NOT coupled to the Settings "Window s" spinbox's displayed 1..60 range —
-# that Tk from_/to only clamps the spinbox's arrow buttons; a typed/
-# hand-edited value stores unclamped (e.g. 300 stores as 300, see
-# tests/test_preview_settings.py). That is exactly why retention adapts to
-# the reader instead of trusting a UI cap that doesn't actually bind.
+# that Tk from_/to only clamps the spinbox's arrow buttons. The store path
+# itself has no clamp (code inspection: fc_gui's _PREVIEW_NATIVE_VARS int
+# cast writes the value straight into cfg, unranged); tests/test_preview_
+# settings.py proves an out-of-range value parked directly in config (99)
+# survives a save/apply round trip untouched — not that typing 300 into
+# the spinbox does. That is exactly why retention adapts to the reader
+# instead of trusting a UI cap that doesn't actually bind.
 #
-# On a toggle-off -> on transition with a large stored window, the first
-# read(s) only see what this floor retained (up to 120s of history);
-# behavior self-heals within one window span as add() keeps ingesting
-# under the now-stretched retention.
+# Two triggers cause a transient truncated-history read, both self-healing
+# within one window span as add() keeps ingesting under the now-stretched
+# retention:
+#   1. A toggle-off -> on transition with a large stored window: the first
+#      read(s) only see what this floor retained (up to 120s of history).
+#   2. A mid-session window raise of MORE THAN 2x the largest window ever
+#      read: each such raise costs one truncated read episode. Raises
+#      within 2x cost nothing at all — that is what the 2.0 multiplier buys.
 _RETENTION_S = 120.0
 
 # Hard cap on hits retained per character (deque maxlen), independent of the
@@ -120,7 +127,16 @@ class DamageFlashTracker:
         return True
 
     def should_flash(self, char_key, hp, cfg, now: float) -> bool:
-        window_s = cfg.get("damage_flash_window_s", 5)
+        # Coerce defensively: a hand-edited config can carry a non-numeric
+        # value ("5", None, "garbage") for this key. Mirrors fc_gui.py's own
+        # read of this exact key (the preview tile's hold_s). Must happen
+        # BEFORE the stretch below so both it and _windowed_sum see the
+        # coerced value — otherwise a garbage value raises TypeError on
+        # every call, even for a character with no retained hits.
+        try:
+            window_s = float(cfg.get("damage_flash_window_s", 5) or 5)
+        except (TypeError, ValueError):
+            window_s = 5.0
         # Declare this reader's window to add()'s retention prune so it can
         # never undercut a window some reader has actually asked for. The
         # spinbox's 1..60 range binds only its arrow buttons — a typed
