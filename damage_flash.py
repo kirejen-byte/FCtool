@@ -16,6 +16,31 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
+# add()-side retention horizon (seconds), independent of should_flash()'s own
+# per-read window prune. MUST stay >= the largest configurable
+# damage_flash_window_s — the settings spinbox caps that at 60s (fc_gui.py
+# Spinbox(from_=1, to=60)); 120 gives 2x margin. Because _windowed_sum()
+# already discards anything older than window_s on every read, entries
+# beyond this horizon can never influence a flash decision, making this
+# prune semantics-free for should_flash. It exists purely to bound memory
+# when the "Damage flash" toggle is OFF: should_flash() (and therefore
+# _windowed_sum's prune) is then never called, but GamelogMonitor keeps
+# calling add() unconditionally, so nothing else would ever prune _hits. A
+# hand-edited config window > 120s would be silently truncated to 120s of
+# retained history (acceptable, documented here).
+_RETENTION_S = 120.0
+
+# Hard cap on hits retained per character (deque maxlen), independent of the
+# time-based retention above. Storm insurance: a gamelog rotation misdetect
+# can reseed a big file from byte 0 and replay thousands of incoming-damage
+# lines in a single poll, all stamped with the SAME `now` — the retention
+# prune above cannot drop any of those for a full 120s since none are yet
+# "old". This cap bounds that transient. Oldest-first eviction only matters
+# once more than _MAX_HITS hits sit inside a single window, at which point
+# any real damage/HP threshold is already exceeded by orders of magnitude,
+# so no flash decision can be missed by evicting the oldest.
+_MAX_HITS = 8192
+
 
 def _reference_pool(hp: dict, reference: str):
     """Return the base-HP number to take pct% of, or None if unknowable."""
@@ -35,12 +60,20 @@ def _reference_pool(hp: dict, reference: str):
 
 class DamageFlashTracker:
     def __init__(self):
-        self._hits: dict[str, deque] = defaultdict(deque)   # key -> deque[(t, dmg)]
+        # maxlen is the storm cap (_MAX_HITS); the time-based prune in add()
+        # below handles the long-session toggle-off case that maxlen alone
+        # doesn't bound quickly enough.
+        self._hits: dict[str, deque] = defaultdict(lambda: deque(maxlen=_MAX_HITS))  # key -> deque[(t, dmg)]
         self._last_flash: dict[str, float] = {}
 
     def add(self, char_key: str, amount: int, now: float) -> None:
         if amount and amount > 0:
-            self._hits[char_key].append((now, amount))
+            dq = self._hits[char_key]
+            dq.append((now, amount))
+            # Bound memory even when should_flash() is never called (flash
+            # toggle OFF) — see _RETENTION_S above for the horizon rationale.
+            while dq and now - dq[0][0] > _RETENTION_S:
+                dq.popleft()
 
     def _windowed_sum(self, char_key, now, window_s):
         dq = self._hits[char_key]
