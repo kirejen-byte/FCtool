@@ -74,6 +74,10 @@ from zkill_monitor import (ZKillMonitor, KillAlert, KillmailFanout,
                            resolve_name as _zk_resolve_name)
 from jump_range import JumpRangeChecker, search_system, get_stargate_route, get_system_info
 from wh_route import find_wh_route, fetch_connections, WHRoute
+# Pure endpoint/route computation for the star map's wormhole overlay. The HOST
+# owns the EVE-Scout data and the network: this module never fetches, and
+# map_tab holds zero wormhole imports (the set_infrastructure precedent).
+import wh_overlay
 from autocomplete import AutocompleteEntry
 import system_cache
 from system_cache import get_system_names, get_region_map
@@ -1468,10 +1472,14 @@ class FCToolGUI:
         MUST be called from a worker thread — ``fetch_connections()`` does a
         blocking HTTP GET. A failed fetch is swallowed and yields an empty list
         (i.e. no WH names get merged), matching prior behaviour.
+
+        The SAME fetched list also feeds the star map's wormhole endpoint layer,
+        so the overlay costs no second EVE-Scout GET.
         """
         try:
-            return [(c.dest_system_name, c.dest_region_name)
-                    for c in fetch_connections()]
+            conns = fetch_connections()
+            self._wh_overlay_push_endpoints(conns)   # same list — never refetch
+            return [(c.dest_system_name, c.dest_region_name) for c in conns]
         except Exception:
             return []
 
@@ -5207,6 +5215,13 @@ class FCToolGUI:
         self._wh_result_label.config(text="Searching...", fg=FG_DIM)
         self._wh_detail_label.config(text="Fetching EVE Scout data and calculating routes...")
         self._clear_wh_log()
+        # Drop the previously drawn map line NOW (Tk thread): a stale route that
+        # outlives its search is a wrong answer, and this also covers a worker
+        # that dies before it can push a verdict. DIRECT, not marshaled, so it
+        # pairs with the _clear_wh_log above -- the map line mirrors the text
+        # panel exactly (same clear point, same last-writer-wins on completion),
+        # so the two readouts can never report different routes.
+        self._push_wh_route_to_map(None)
         conns = self._get_ansiblex_connections()
         ansiblex_count = len(conns) if conns else 0
         self._append_wh_log(f"Searching route: {origin} -> {dest}\n", "header")
@@ -5273,6 +5288,8 @@ class FCToolGUI:
             # AND corroborated store gates -- instead of the raw config cache.
             self._post_ui(self._show_wh_result, result, all_ansiblex, leg_ansiblex,
                           bool(conns))
+            # …then the star map's copy of the same verdict (None = no shortcut).
+            self._wh_overlay_push_route(result, origin, dest)
 
         threading.Thread(target=do_search, daemon=True).start()
 
@@ -6040,6 +6057,8 @@ class FCToolGUI:
             # already fetched here on the worker thread — never fetch on Tk).
             wh_names = [(c.dest_system_name, c.dest_region_name) for c in conns]
             self._post_ui(self._update_autocomplete_lists, wh_names)
+            # Star-map wormhole endpoints, off the SAME fetch (no second GET).
+            self._wh_overlay_push_endpoints(conns)
 
         threading.Thread(target=do_refresh, daemon=True).start()
 
@@ -6836,6 +6855,69 @@ class FCToolGUI:
             tab.add_intel_pulse(system_id_or_name)
         except Exception as exc:
             print(f"[MAP] intel pulse push failed: {exc}")
+
+    def _push_wh_endpoints_to_map(self, markers):
+        """Forward pre-computed EVE-Scout endpoint markers to the star map's
+        wormhole layer. Runs on the MAIN thread (marshaled from whichever worker
+        already had the connections in hand). Guarded so a missing/erroring map
+        tab never breaks the WH tab."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_wh_endpoints(markers)
+        except Exception as exc:
+            print(f"[MAP] WH endpoint push failed: {exc}")
+
+    def _push_wh_route_to_map(self, spec):
+        """Forward the computed "Find WH Shortcut" route spec to the star map —
+        or None to CLEAR it. The clear matters as much as the set: a route line
+        that outlives its search is a wrong answer, not a missing decoration.
+        Runs on the MAIN thread; guarded like every other map push."""
+        tab = getattr(self, "map_tab", None)
+        if tab is None:
+            return
+        try:
+            tab.set_wh_route(spec)
+        except Exception as exc:
+            print(f"[MAP] WH route push failed: {exc}")
+
+    def _wh_overlay_push_endpoints(self, conns):
+        """WORKER thread: build endpoint markers from an ALREADY-fetched
+        connection list and marshal them to the map.
+
+        Takes the list rather than fetching, deliberately: both callers
+        (_fetch_wh_names, _refresh_wh_connections) already paid for the
+        EVE-Scout GET, so the overlay adds none. An empty list is a legitimate
+        push ({} clears markers whose holes died). Fully swallowed — the WH
+        tab's own output is the feature, the map is decoration."""
+        try:
+            self._post_ui(self._push_wh_endpoints_to_map,
+                          wh_overlay.endpoint_markers(conns))
+        except Exception as exc:
+            print(f"[MAP] WH endpoint markers failed: {exc}")
+
+    def _wh_overlay_push_route(self, result, origin, dest):
+        """WORKER thread: turn a finished WH search into the map's route spec and
+        marshal it. None CLEARS — ``route_spec`` returns None whenever no usable
+        shortcut survived, which is the common answer, not an error.
+
+        Ids resolve HERE because ``search_system`` can hit ESI on a cache miss;
+        find_wh_route just resolved the same two names, so these are cache hits.
+        The two guards are separate ON PURPOSE: a spec that fails to build must
+        still push the None, or the superseded line would stay drawn."""
+        spec = None
+        try:
+            if getattr(result, "entry_connection", None) is not None:
+                spec = wh_overlay.route_spec(result, search_system(origin),
+                                             search_system(dest))
+        except Exception as exc:
+            print(f"[MAP] WH route spec failed: {exc}")
+            spec = None
+        try:
+            self._post_ui(self._push_wh_route_to_map, spec)
+        except Exception as exc:
+            print(f"[MAP] WH route marshal failed: {exc}")
 
     def _on_map_intel_click(self, system_id):
         """Map intel-pulse click (Task 31): focus the Intelligence tab and reveal the
