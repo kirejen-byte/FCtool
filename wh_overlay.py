@@ -222,11 +222,26 @@ def route_spec(wh_route, origin_id=None, dest_id=None) -> dict | None:
     """Normalize a ``WHRoute`` into the drawable overlay spec, or None when the
     route is undrawable.
 
-    Returns None -- draw NOTHING -- when the route is None, when either
-    ``entry_connection``/``exit_connection`` is missing, or when either
-    endpoint's ``dest_system_id`` is falsy/unusable.  ``find_wh_route`` returns a
-    populated ``WHRoute`` with both connections None when no shortcut beats the
-    gate route, so this None is the common case, not an error path.
+    Returns None -- draw NOTHING -- only for STRUCTURAL undrawability: the
+    route is None, either ``entry_connection``/``exit_connection`` is
+    missing, or either endpoint's ``dest_system_id`` is falsy/unusable.
+    Both connections None means EVE-Scout returned nothing usable, or that no
+    entry/exit pairing was routable at all -- it does NOT mean "no shortcut
+    beat the gate route".
+
+    DRAWABLE != WORTH DRAWING -- deliberate, do not "fix" it: ``route_spec``
+    deliberately does NOT judge whether the wormhole route beats the direct
+    gate route.  ``find_wh_route`` (in ``wh_route.py``) picks whichever
+    entry/exit pairing is shortest among ITSELF and returns it
+    unconditionally -- it never compares that total against
+    ``gate_jumps_direct``, so a route that LOSES to going by gate still
+    carries two real connections and still produces a full spec here.
+    Whether a losing route should be drawn is a presentation decision, and it
+    belongs to the caller -- which also owns the text panel's verdict on the
+    same route -- not to this module.  Consequently ``jumps_saved`` can
+    legitimately be zero or NEGATIVE in an otherwise valid spec; it must
+    never be read as a "worth drawing" signal.  A caller that draws every
+    spec it receives WILL draw losing routes.
 
     Otherwise returns exactly::
 
