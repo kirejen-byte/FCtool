@@ -43,13 +43,20 @@ DEFAULT_CONFIG = {
         "alert_window_seconds": 300,
         "staging_system": "",
         # Sound played when a kill alert renders (and the intel mute is off).
-        # Key into FCToolGUI._ZKILL_ALERT_SOUNDS — one of sonar | klaxon | blip |
+        # Key into FCToolGUI._ALERT_SOUNDS — one of sonar | klaxon | blip |
         # horn | comms | bell; the clips ship in assets/alerts/. "bell" is the
         # pre-2026-07-28 behaviour (root.bell(), the generic Windows ding) kept
         # selectable, and is also the never-silent fallback when a clip or the
         # audio device is unavailable. An unknown/missing value reads as the
         # default below (config is never deep-merged, so an existing config.json
         # simply has no key). Mirror guard: tests/test_zkill_alert_sound.py.
+        #
+        # _ALERT_SOUNDS is now SHARED with the intel-stream ping, which keeps
+        # its own separate key and default -- top-level "intel_alert_sound",
+        # defaulting to "sonar" via FCToolGUI._INTEL_ALERT_SOUND_DEFAULT --
+        # and is deliberately NOT represented in DEFAULT_CONFIG. Do not
+        # "helpfully" add it here: the release packaging gates assert this
+        # dict's top-level key set exactly.
         "alert_sound": "sonar",
     },
     "esi": {
