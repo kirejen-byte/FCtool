@@ -15848,7 +15848,9 @@ class FCToolGUI:
         self._hud_button.pack(side=tk.LEFT)
 
         # ── Autostart ────────────────────────────────────────────────────
-        self._autostart_var = tk.BooleanVar(value=self.config.get("autostart", False))
+        # Seeded from the ACTUAL Startup shortcut, not config["autostart"]'s
+        # claim -- see _autostart_is_active.
+        self._autostart_var = tk.BooleanVar(value=self._autostart_is_active())
         auto_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         auto_frame.pack(fill=tk.X, padx=20, pady=2)
         # Autostart + Sound share one un-headered block; anchor "Autostart & Sound".
@@ -23824,15 +23826,36 @@ class FCToolGUI:
                 return
         self._market_scan_now()
 
+    def _autostart_shortcut_path(self) -> str:
+        """Path to the Windows Start Menu Startup shortcut FCTool creates/
+        removes to autostart. Single source of the path literal -- both
+        _set_autostart and _autostart_is_active resolve through here so they
+        can never drift apart."""
+        startup_dir = os.path.join(
+            os.environ.get("APPDATA", ""),
+            "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+        )
+        return os.path.join(startup_dir, "FCTool.lnk")
+
+    def _autostart_is_active(self) -> bool:
+        """Whether FCTool is ACTUALLY hooked into Windows startup right now.
+        The filesystem is the source of truth, not config["autostart"] -- that
+        key is only the last value this app wrote/read, and it can drift from
+        reality: a fresh install ships a claim it never earned, a config that
+        travelled from another machine (this repo lives in OneDrive) names a
+        shortcut that was never created here, or the user deleted the .lnk by
+        hand. A failed probe falls back to the config's claim rather than
+        silently flipping the user's setting."""
+        try:
+            return bool(os.path.exists(self._autostart_shortcut_path()))
+        except Exception:
+            return bool(self.config.get("autostart", False))
+
     def _set_autostart(self, enabled: bool):
         """Add or remove FCTool from Windows startup via Start Menu shortcut."""
         try:
             import subprocess
-            startup_dir = os.path.join(
-                os.environ.get("APPDATA", ""),
-                "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
-            )
-            shortcut_path = os.path.join(startup_dir, "FCTool.lnk")
+            shortcut_path = self._autostart_shortcut_path()
 
             if enabled:
                 # When frozen as EXE, link directly to the executable
@@ -23875,9 +23898,14 @@ class FCToolGUI:
             text=f"Staging: {staging}" if staging else "Staging: --"
         )
 
-        # Handle autostart toggle
+        # Handle autostart toggle. old_autostart reads the ACTUAL Startup
+        # shortcut state (_autostart_is_active), not config["autostart"]'s
+        # claim -- so a config/filesystem divergence (fresh install, a config
+        # carried over from another machine, or a shortcut removed by hand)
+        # self-repairs on this Save instead of the stale claim making the
+        # diff below a permanent no-op.
         new_autostart = self._autostart_var.get()
-        old_autostart = self.config.get("autostart", False)
+        old_autostart = self._autostart_is_active()
         self.config["autostart"] = new_autostart
         if new_autostart != old_autostart:
             self._set_autostart(new_autostart)

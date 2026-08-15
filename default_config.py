@@ -13,7 +13,15 @@ not a secret, so it is safe to ship in source.
 DEFAULT_CONFIG = {
     "eve_logs_path": "",
     "poll_interval_seconds": 1.0,
-    "autostart": True,
+    # Windows Start Menu Startup shortcut (FCToolGUI._set_autostart /
+    # _autostart_is_active). A shipped default of True was never actually
+    # honored in practice -- no shortcut exists until a Save, and the
+    # save-time diff used to compare against this same config claim, making
+    # that a permanent no-op -- so this changes NOTHING in practice; it only
+    # stops a fresh-install config from claiming a Windows-startup hook it
+    # does not have. Autostart stays strictly opt-in, the right default for a
+    # setting that modifies Windows startup.
+    "autostart": False,
     "tracked_character": "",
     "sound_on_ready": True,
     "ansiblex_connections": [],
