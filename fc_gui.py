@@ -4627,6 +4627,44 @@ class FCToolGUI:
             command=self._on_intel_sound_toggle,
         ).pack(side=tk.LEFT, padx=(10, 0))
 
+        # ...and WHICH clip that ping plays (config["intel_alert_sound"]).
+        # Built exactly like the zKill alert-sound picker in Settings: a
+        # readonly combobox over the SHARED catalogue's labels plus a Preview
+        # button, persisting the instant it is picked (no Save Settings round
+        # trip). state="readonly" like every other picker — typing a label that
+        # isn't in the catalogue would just fall back to the default — and no
+        # wheel binding is added (see the MouseWheel invariant in
+        # docs/agents/CODEBASE_MAP.md).
+        _intel_snd_key = self._intel_alert_sound_key()
+        self._intel_alert_sound_var = tk.StringVar(
+            value=FCToolGUI._ALERT_SOUNDS[_intel_snd_key][0])
+        self._intel_alert_sound_combo = ttk.Combobox(
+            intel_row, textvariable=self._intel_alert_sound_var,
+            state="readonly",
+            values=[lbl for lbl, _fn in FCToolGUI._ALERT_SOUNDS.values()],
+            width=17, font=("Consolas", 10))
+        self._intel_alert_sound_combo.pack(side=tk.LEFT, padx=5)
+        self._intel_alert_sound_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._on_intel_alert_sound_change())
+        _intel_snd_preview_btn = ttk.Button(
+            intel_row, text="▶ Preview", style="Dark.TButton",
+            command=self._preview_intel_alert_sound)
+        _intel_snd_preview_btn.pack(side=tk.LEFT, padx=5)
+        _intel_snd_tip = (
+            "Sound played when the Sound box beside it is ticked and a "
+            "high-priority line lands in this feed. It used to be the X-up "
+            "FIRE alert — the loudest clip FCTool owns — which is why it is "
+            "now a choice, defaulting to the quieter sonar ping.\n\n"
+            "Applies the moment you pick it; no Save Settings needed. Shares "
+            "its catalogue with the zKill alert sound in Settings, but keeps "
+            "its own selection.")
+        attach_tooltip(self._intel_alert_sound_combo, _intel_snd_tip)
+        attach_tooltip(
+            _intel_snd_preview_btn,
+            "Play the sound currently selected in the dropdown, through the "
+            "exact code path a real intel ping uses.")
+
         self._intel_channels_frame = tk.Frame(intel_row, bg=BG_PANEL)
         self._intel_channels_frame.pack(side=tk.LEFT, padx=(15, 0))
 
@@ -16173,11 +16211,11 @@ class FCToolGUI:
         snd_label.pack(side=tk.LEFT)
         _snd_key = self._zkill_alert_sound_key()
         self._zkill_alert_sound_var = tk.StringVar(
-            value=FCToolGUI._ZKILL_ALERT_SOUNDS[_snd_key][0])
+            value=FCToolGUI._ALERT_SOUNDS[_snd_key][0])
         self._zkill_alert_sound_combo = ttk.Combobox(
             snd_frame, textvariable=self._zkill_alert_sound_var,
             state="readonly",
-            values=[lbl for lbl, _fn in FCToolGUI._ZKILL_ALERT_SOUNDS.values()],
+            values=[lbl for lbl, _fn in FCToolGUI._ALERT_SOUNDS.values()],
             width=17, font=("Consolas", 10))
         self._zkill_alert_sound_combo.pack(side=tk.LEFT, padx=5)
         self._zkill_alert_sound_combo.bind(
@@ -24198,6 +24236,22 @@ class FCToolGUI:
             FCToolGUI._zkill_alert_sound_key_for_label(
                 self._zkill_alert_sound_var.get()))
 
+    def _on_intel_alert_sound_change(self, *args):
+        """Persist the intel-ping sound pick immediately — the twin of
+        _on_zkill_alert_sound_change, against the top-level
+        config["intel_alert_sound"] instead of the zkillboard block."""
+        key = FCToolGUI._intel_alert_sound_key_for_label(
+            self._intel_alert_sound_var.get())
+        self.config["intel_alert_sound"] = key
+        self._save_config()
+
+    def _preview_intel_alert_sound(self, *args):
+        """Play whatever the intel dropdown currently shows, through the SAME
+        shared player the live ping uses."""
+        self._play_zkill_alert(
+            FCToolGUI._intel_alert_sound_key_for_label(
+                self._intel_alert_sound_var.get()))
+
     def _collect_market_settings(self):
         """Collect the Market Scanner Settings fields into config["market"].
 
@@ -24913,18 +24967,23 @@ class FCToolGUI:
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
         threading.Thread(target=_play, daemon=True).start()
 
-    # ── zKill kill-alert sound ────────────────────────────────────────────
-    # Catalogue: key -> (display label, bundled filename). The key is what
-    # config["zkillboard"]["alert_sound"] stores; the label is what the Settings
-    # combobox shows. "bell" is the pre-2026-07-28 behaviour — the bare
-    # self.root.bell() this alert used to fire, i.e. the generic Windows ding
-    # that is indistinguishable from every other app's notification. It is kept
-    # selectable (so the old sound can be restored) and doubles as the
-    # never-silent fallback, so it has no file of its own.
+    # ── Shared alert-sound catalogue ──────────────────────────────────────
+    # ONE catalogue, TWO consumers: the zKill kill alert
+    # (config["zkillboard"]["alert_sound"]) and the intel-stream ping
+    # (config["intel_alert_sound"]). Each picks its own key out of it and has
+    # its own default; nothing else may name a second sound list.
+    #
+    # key -> (display label, bundled filename). The key is what config stores;
+    # the label is what the picker comboboxes show. "bell" is the
+    # pre-2026-07-28 zKill behaviour — the bare self.root.bell() that alert used
+    # to fire, i.e. the generic Windows ding that is indistinguishable from
+    # every other app's notification. It is kept selectable (so the old sound
+    # can be restored) and doubles as the never-silent fallback, so it has no
+    # file of its own.
     #
     # The clips live in assets/alerts/ and are listed in FCTool.spec's `datas`
     # so the frozen exe carries them (assets/tts/*.mp3 precedent).
-    _ZKILL_ALERT_SOUNDS = {
+    _ALERT_SOUNDS = {
         "sonar":  ("Sonar ping",      "zkill_sonar.mp3"),
         "klaxon": ("Klaxon",          "zkill_klaxon.mp3"),
         "blip":   ("Triple blip",     "zkill_blip.mp3"),
@@ -24935,30 +24994,69 @@ class FCToolGUI:
     # Must equal DEFAULT_CONFIG["zkillboard"]["alert_sound"] (mirror-guarded by
     # tests/test_zkill_alert_sound.py) — fc_gui never names a second default.
     _ZKILL_ALERT_SOUND_DEFAULT = "sonar"
+    # The intel ping's own default. Deliberately NOT in default_config.py:
+    # config["intel_alert_sound"] sits at top level beside intel_sound_enabled
+    # and, like it, self-populates through .get(...) — which keeps the release
+    # packaging gates (they assert the shipped config's exact top-level key set)
+    # untouched. Mirror-guarded by tests/test_intel_alert_sound.py.
+    _INTEL_ALERT_SOUND_DEFAULT = "sonar"
 
-    def _zkill_alert_sound_key(self) -> str:
-        """The configured alert-sound key, defensively validated.
+    @staticmethod
+    def _alert_sound_key_or(raw, default: str) -> str:
+        """Normalise a STORED catalogue key, defensively.
 
-        Config is never deep-merged (house rule), so a missing block, a missing
-        key, a non-string value, or a key from a different build all read as the
-        default rather than silencing the alert."""
-        block = self.config.get("zkillboard")
-        raw = block.get("alert_sound") if isinstance(block, dict) else None
+        Config is never deep-merged (house rule), so a missing key, a non-string
+        value, or a key from a different build all read as ``default`` rather
+        than silencing the sound. Shared by both pickers so neither can drift
+        into its own idea of "valid"."""
         if not isinstance(raw, str):
-            return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+            return default
         key = raw.strip().lower()
-        if key not in FCToolGUI._ZKILL_ALERT_SOUNDS:
-            return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+        if key not in FCToolGUI._ALERT_SOUNDS:
+            return default
         return key
 
     @staticmethod
-    def _zkill_alert_sound_key_for_label(label: str) -> str:
-        """Reverse of the catalogue's display label -> key (the Settings
-        combobox shows labels; config stores the stable key)."""
-        for key, (lbl, _fn) in FCToolGUI._ZKILL_ALERT_SOUNDS.items():
+    def _alert_sound_key_for_label(label: str, default: str) -> str:
+        """Reverse of the shared catalogue's display label -> key (the pickers
+        show labels; config stores the stable key). Unknown label -> ``default``,
+        so a stale label can never persist junk."""
+        for key, (lbl, _fn) in FCToolGUI._ALERT_SOUNDS.items():
             if lbl == label:
                 return key
-        return FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT
+        return default
+
+    def _zkill_alert_sound_key(self) -> str:
+        """The configured kill-alert sound key, defensively validated — a
+        missing zkillboard block included."""
+        block = self.config.get("zkillboard")
+        raw = block.get("alert_sound") if isinstance(block, dict) else None
+        return FCToolGUI._alert_sound_key_or(
+            raw, FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT)
+
+    @staticmethod
+    def _zkill_alert_sound_key_for_label(label: str) -> str:
+        """The Settings combobox's label -> the key config stores."""
+        return FCToolGUI._alert_sound_key_for_label(
+            label, FCToolGUI._ZKILL_ALERT_SOUND_DEFAULT)
+
+    # ── Intel-stream ping sound ───────────────────────────────────────────
+    # Same catalogue, its own top-level key. Until 2026-08-15 the ping was
+    # _play_fire_alert() — the X-up FIRE alert, the loudest clip the app owns —
+    # borrowed for every high-priority intel line; it now defaults to the sonar
+    # ping and is user-selectable. intel_sound_enabled remains the on/off gate;
+    # this only chooses WHICH clip.
+    def _intel_alert_sound_key(self) -> str:
+        """The configured intel-ping sound key, defensively validated."""
+        return FCToolGUI._alert_sound_key_or(
+            self.config.get("intel_alert_sound"),
+            FCToolGUI._INTEL_ALERT_SOUND_DEFAULT)
+
+    @staticmethod
+    def _intel_alert_sound_key_for_label(label: str) -> str:
+        """The intel-row combobox's label -> the key config stores."""
+        return FCToolGUI._alert_sound_key_for_label(
+            label, FCToolGUI._INTEL_ALERT_SOUND_DEFAULT)
 
     @staticmethod
     def _zkill_alert_sound_path(key: str):
@@ -24969,7 +25067,7 @@ class FCToolGUI:
         the writable app dir first, then the read-only bundle dir (sys._MEIPASS
         in the frozen onefile exe)."""
         from app_path import bundle_dir
-        entry = FCToolGUI._ZKILL_ALERT_SOUNDS.get(key)
+        entry = FCToolGUI._ALERT_SOUNDS.get(key)
         filename = entry[1] if entry else None
         if not filename:
             return None
@@ -24991,11 +25089,16 @@ class FCToolGUI:
             pass
 
     def _play_zkill_alert(self, key: str = None):
-        """Play the zKill kill-alert sound (assets/alerts/*.mp3) via pygame.
+        """Play a catalogue alert clip (assets/alerts/*.mp3) via pygame.
 
-        Mirrors _play_fire_alert. ``key`` defaults to the configured selection;
-        the Settings preview button passes the combobox's live pick so preview
-        and reality are the SAME code path, bell option included.
+        THE shared player: the zKill kill alert calls it with no key (its own
+        configured selection), and the intel-stream ping passes
+        _intel_alert_sound_key(). There is deliberately no second player —
+        preview, kill alert and intel ping are all this one code path.
+
+        Mirrors _play_fire_alert. ``key`` defaults to the zKill selection; the
+        preview buttons pass their combobox's live pick so preview and reality
+        are the SAME code path, bell option included.
 
         Degrades to _zkill_alert_bell on any failure (missing clip, no pygame,
         no audio device) and never raises into the caller. The clip is decoded
@@ -28130,9 +28233,13 @@ $bmp.Dispose()
                 pass
         # (The dynamic-tag sweep cadence is counted per RENDERED line, in
         # _render_line, so it covers _intel_rerender_from_buffer too.)
+        # The ping: the Sound checkbox is the on/off gate, the picker beside it
+        # chooses the clip. This was _play_fire_alert() (the X-up FIRE alert)
+        # until 2026-08-15 — an existing user with the ping ON now hears their
+        # selected catalogue clip, sonar by default, instead of that.
         if priority and self._intel_sound_var.get():
             try:
-                self._play_fire_alert()
+                self._play_zkill_alert(self._intel_alert_sound_key())
             except Exception:
                 pass
 
