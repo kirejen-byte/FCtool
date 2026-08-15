@@ -174,8 +174,62 @@ STAGING_OUTLINE_W = 2
 STAGING_R_FRIENDLY = 8
 STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 
+# --- Wormhole overlay (EVE-Scout Thera/Turnur, owner-approved 2026-08-15) ------
+# Owner's chosen design is "endpoints + computed route": every K-space system with
+# a LIVE EVE-Scout connection carries a wormhole MARKER, and the computed route is
+# drawn with the HUB HIDDEN -- the entry system linked DIRECTLY to the exit system
+# by one wormhole hop, plus the two ordinary stargate legs either side.
+#
+# WHY THE HUB IS NEVER DRAWN (structural, not cosmetic): Thera has NO map
+# coordinates -- system_coords/map_data are a K-SPACE table -- so the hub is
+# undrawable and must never be looked up in model.systems. Turnur IS on the map
+# but is hidden the same way, so both hubs behave identically and neither can
+# ever leak a phantom vertex into the hop.
+#
+# COLOUR: a vivid LIME (hue ~85 deg) -- the one wide-open arc left in this map's
+# palette, which is bounded by the warm yellows at ~36-48 deg (SEC_LOW #ffb347,
+# ROUTE_GOLD #ffcc44, INTEL_AMBER #ffd166, LABEL_GLOW_YELLOW #ffd84d, infra
+# refinery #e0a94d) and the mint greens at ~148-152 deg (RANGE_GREEN #39ff8c,
+# STAGING_FRIENDLY_FILL #59d98c, LABEL_TINT_RANGE #88dfac). It is >=40 deg from
+# BOTH neighbours -- every other gap in the wheel is ~20-25 deg wide (teal is
+# taken by the infra Ansiblex chip #37d1c0 with SEC_HI #33b5e5 / fleet cyan
+# #00d4ff / FRIENDLY_BLUE / BRIDGE_BLUE crowding one side; rose sits between
+# CHARS_MAGENTA #ff44e1 and the #ff1744/#ff2d55/#cc2233 red family; indigo sits
+# between BRIDGE_BLUE and THREAT_PURPLE, the pair the OWNER ALREADY REPORTED as
+# too similar, so a third hue between them is the one place never to go). It does
+# not read as the map's greens either: WH_LIME is G(244) > R(166) > B(60) -- a
+# YELLOW-green -- whereas every "friendly / in-range" green here is G > B > R
+# (RANGE_GREEN 255 > 140 > 57). Same channel-ordering discriminator map_render
+# uses for SPLIT_THREAT_HUE vs THREAT_PURPLE.
+WH_LIME = "#a6f43c"
+# GLYPH: a hollow HEXAGON with a small filled core. The shape is as unclaimed as
+# the hue -- fleet is a filled circle, staging / route-bridge / kill-ping-linger
+# are diamonds, chars is an axis-aligned square, and the intel / capital-kill /
+# destination markers are rings (the gold destination marker is specifically a
+# hollow DOUBLE ring, which is why this is not one). A system connected to BOTH
+# hubs adds one wider outer ring -- the only visual difference, deliberately
+# subtle, since "which hub" is hover/report information, not map-glance
+# information. Max extent WH_BOTH_R (11.5 px) is far inside the ~37 px item that
+# OVERLAY_CULL_PX's centres-only ink trade is derived against, so no re-derivation
+# is owed (see the OVERLAY_CULL_PX comment).
+WH_MARK_R = 8.0              # hollow outer hexagon radius (px)
+WH_CORE_R = 3.0              # filled core hexagon radius (px)
+WH_BOTH_R = 11.5             # extra outer ring, BOTH hubs only (px)
+WH_MARK_W = 2                # outer hexagon line width
+# HOP: a fine DOTTED lime line, so the three hop kinds never read alike --
+# stargate hops are gold dash=(6, 4) at width 2, Ansiblex hops are lightened
+# bridge-blue dash=(10, 6) at width 5.
+WH_HOP_W = 3
+WH_HOP_DASH = (2, 3)
+# Endpoint-visibility cull for the hop + its gate legs: mirrors the destination
+# route overlay's own _RCULL, so a wormhole route reaches exactly one hop past the
+# screen edge like a gate route does. (Deliberately NOT OVERLAY_CULL_PX: that
+# constant is the marker/pan-budget cull and the two must stay independent.)
+WH_RCULL = 60.0
+_WH_HEX_A0 = -math.pi / 2.0  # pointy-top hexagon (first vertex straight up)
+
 # --- Tk overlay item set (MP1) ------------------------------------------------
-# EVERY tag _redraw_overlays owns. All eleven are WORLD-ANCHORED: each item is
+# EVERY tag _redraw_overlays owns. All twelve are WORLD-ANCHORED: each item is
 # placed from cam.world_to_screen(system.x, system.y) (directly, or at a fixed
 # screen offset from such a point -- the fleet count chip, its plate, and the
 # chars count label), so a pure pan translates the whole set by exactly the drag
@@ -187,7 +241,7 @@ STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 # pan would drag it off its anchor.
 OVERLAY_TAGS = ("ov_fleet", "ov_staging", "ov_illegal", "ov_range_strike",
                 "ov_origin", "ov_own", "ov_route", "ov_capkill", "ov_intel",
-                "ov_killping", "ov_chars")
+                "ov_killping", "ov_chars", "ov_wh")
 # Cull margin (px) around the viewport: _redraw_overlays' `project` draws a system
 # only within [-CULL, vw+CULL] x [-CULL, vh+CULL]. DOUBLES as the pan-translate
 # budget: an item culled at the last rebuild has its CENTER at least this far
@@ -524,6 +578,21 @@ class MapTabState:
         # (id_a, id_b) pairs from map_overlays.resolve_bridges). A BASE-layer
         # element -- drawn into the bitmap, not a Tk overlay item.
         self.bridges: tuple = ()
+        # --- wormhole overlay (EVE-Scout Thera/Turnur, SESSION-scoped) ----------
+        # wh_endpoints: PRE-COMPUTED markers {system_id: {"hubs", "count", "sec",
+        # "min_hours", "max_size", "sigs"}} pushed by the host (this file holds
+        # ZERO wormhole imports -- the set_infrastructure precedent). Empty dict =
+        # no markers; an on-but-empty layer draws the same frame as off.
+        # wh_route: the host's computed hub-hidden route spec (see set_wh_route),
+        # or None. wh_leg_in / wh_leg_out: the two GATE legs (origin..entry and
+        # exit..dest) resolved off-thread by _recompute_wh_legs, or None while
+        # unresolved / unresolvable -- a missing leg is a missing decoration, so
+        # the hop and its markers draw regardless. All FOUR are pure Tk-overlay
+        # state (never part of the render request/sig) and never persisted.
+        self.wh_endpoints: dict[int, dict] = {}
+        self.wh_route: dict | None = None
+        self.wh_leg_in: tuple | None = None
+        self.wh_leg_out: tuple | None = None
         # --- kill-heat layer (Task 30) ---
         # kill_heat: the LIVE zkill decay-heat ring (mutated on the MAIN thread
         # via add_kill, marshaled from fc_gui's zkill worker callback through
@@ -1103,6 +1172,12 @@ class MapTab:
             "threat": tk.BooleanVar(value=bool(_layers.get("threat", False))),
             "bridges": tk.BooleanVar(value=bool(_layers.get("bridges", True))),
             "route": tk.BooleanVar(value=bool(_layers.get("route", True))),
+            # Wormhole layer (EVE-Scout, 2026-08-15): ON by default, following the
+            # route/intel/kill_pings/chars precedent -- a pure Tk overlay whose
+            # data is PUSHED by the host costs nothing while empty, so it stays
+            # out of _LAYERS_OFF_BY_DEFAULT (sov/infra are off there for their own
+            # stated reasons: a lazy ESI fetch and palette noise respectively).
+            "wormholes": tk.BooleanVar(value=bool(_layers.get("wormholes", True))),
             # Kill-heat layer (Task 30): ON by default (owner-approved ESI ambient).
             "heat": tk.BooleanVar(value=bool(_layers.get("heat", True))),
             # Intel pulse layer (Task 31): ON by default -- tracked-channel system
@@ -1163,6 +1238,7 @@ class MapTab:
             "threat": "Purple shade over systems inside hostile jump/bridge range",
             "bridges": "Your Ansiblex gates as blue lines",
             "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
+            "wormholes": "Live Thera/Turnur wormholes (EVE-Scout); routes skip the hub, entry to exit",
             "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
             "kill_pings": "Radar bursts for zkill reports that match your alert settings",
             "sov": "Dim alliance-color wash over sovereign space",
@@ -1171,7 +1247,7 @@ class MapTab:
         }
         for _key, _text in (("fleet", "Fleet"), ("staging", "Staging"),
                             ("threat", "Threat"), ("bridges", "Bridges"),
-                            ("route", "Route"),
+                            ("route", "Route"), ("wormholes", "WH"),
                             ("intel", "Intel"), ("kill_pings", "Pings"),
                             ("sov", "Sov"), ("infra", "Infra"),
                             ("chars", "Chars")):
@@ -1333,6 +1409,12 @@ class MapTab:
         # update() rather than mainloop() (e.g. the headless smoke tests), so
         # the worker never touches Tcl; only the main thread applies frames.
         self._result_q: "queue.Queue[tuple]" = queue.Queue()
+        # Wormhole gate-leg generation token. set_wh_route bumps it; each leg
+        # worker captures the value at spawn and _apply_wh_leg drops any result
+        # whose token is stale. Without it, a leg from a SUPERSEDED route can land
+        # after a newer route's and paint a gate leg that belongs to no live
+        # route -- a wrong answer, not a missing decoration. Main-thread only.
+        self._wh_leg_gen = 0
         self._worker: threading.Thread | None = None
         # Signature of the crisp frame currently APPLIED to the canvas (duplicate-
         # settle suppression, Task 18 Step 1b): the worker skips a request whose
@@ -1723,6 +1805,12 @@ class MapTab:
         # bridge, so re-solve it from the current origin.
         if self.state.route_dest is not None:
             self._recompute_route()
+        # Same staleness for a live WORMHOLE route: its two GATE legs were solved
+        # against the OLD bridge list (the owner's real sequence is route first,
+        # Ansiblex import second), so re-solve them. The generation bump inside
+        # orphans the gateless legs still in flight.
+        if self.state.wh_route is not None:
+            self._recompute_wh_legs()
 
     def set_infrastructure(self, badges: dict[int, dict] | None) -> None:
         """Store PRE-COMPUTED infrastructure badges from the host and re-render.
@@ -1823,6 +1911,133 @@ class MapTab:
         empty path (no gate route found) clears the polyline but KEEPS route_dest
         so the destination ring still marks the target."""
         self.state.route_path = tuple(path) or None
+        self._redraw_overlays()
+
+    # ---- wormhole overlay (EVE-Scout Thera/Turnur, 2026-08-15) -----------------
+    def set_wh_endpoints(self, markers: dict[int, dict] | None) -> None:
+        """Store PRE-COMPUTED wormhole endpoint markers from the host and repaint.
+
+        ``markers`` maps ``system_id -> {"hubs": tuple[str, ...], "count": int,
+        "sec": str, "min_hours": int, "max_size": str, "sigs": tuple[dict, ...]}``
+        -- one entry per K-SPACE system with a live EVE-Scout connection.
+        ``None`` (or an empty dict) means no markers: an on-but-empty layer draws
+        the same frame as off. The host owns the data (it fetches EVE-Scout and
+        computes these), so this file keeps ZERO wormhole imports -- the
+        ``set_infrastructure`` precedent.
+
+        UNLIKE ``set_bridges`` / ``set_infrastructure`` these are a pure Tk-OVERLAY
+        element (canvas items, crisp during gestures), NOT a base-bitmap one, so
+        the repaint is ``_redraw_overlays`` alone -- no ``force_dirty`` /
+        ``_request_crisp``, and nothing joins the render request or its signature.
+        Safe before the first ``on_shown``: ``_redraw_overlays`` no-ops while the
+        renderer / model are unset and the stored markers are painted by the first
+        real repaint. An id absent from the coordinate table is skipped silently at
+        draw time (``project`` returns None), never raised."""
+        self.state.wh_endpoints = dict(markers) if markers else {}
+        self._redraw_overlays()
+
+    def set_wh_route(self, spec: dict | None) -> None:
+        """Set (or replace) the computed wormhole route overlay.
+
+        ``spec`` = ``{"hub": str, "entry_id": int, "exit_id": int,
+        "origin_id": int|None, "dest_id": int|None, "entry_sig": str,
+        "exit_sig": str, "entry_size": str, "exit_size": str,
+        "entry_hours": int, "exit_hours": int, "jumps_saved": int,
+        "total_jumps": int|None}``. ``None`` CLEARS it -- session-scoped state,
+        never persisted, exactly like ``clear_route``.
+
+        THE HUB IS DATA, NOT GEOMETRY: ``hub`` is a NAME carried for reporting.
+        Thera has no map coordinates at all (the coordinate table is K-space only),
+        so the drawn hop links ``entry_id`` DIRECTLY to ``exit_id`` and no hub id
+        is ever looked up. Turnur, though mapped, is hidden identically.
+
+        Replacing a route drops the previously resolved gate legs and bumps the
+        leg generation, so a superseded route's in-flight legs can never land on
+        the new one; the two fresh legs are then resolved off-thread (see
+        ``_recompute_wh_legs``). Safe before the first ``on_shown`` for the same
+        reason ``set_wh_endpoints`` is."""
+        if not isinstance(spec, dict):           # None / garbage -> clear
+            self.state.wh_route = None
+            self.state.wh_leg_in = None
+            self.state.wh_leg_out = None
+            self._wh_leg_gen += 1                # orphan any in-flight legs
+            self._redraw_overlays()
+            return
+        self.state.wh_route = dict(spec)
+        self.state.wh_leg_in = None              # replace: drop any stale legs
+        self.state.wh_leg_out = None
+        self._recompute_wh_legs()                # async gate legs (bumps the gen)
+        self._redraw_overlays()                  # show hop + markers at once
+
+    def _recompute_wh_legs(self) -> None:
+        """Resolve the two STARGATE legs of the wormhole route -- ``origin_id ->
+        entry_id`` and ``exit_id -> dest_id`` -- on a worker thread, feeding each
+        back through the main-thread result queue as a
+        ``("wh_leg", gen, slot, tuple)`` message (drained by ``_drain_results``,
+        applied by ``_apply_wh_leg``). Exactly the off-thread pattern
+        ``_recompute_route`` uses: the same injected ``self._route_fn``, the same
+        ``"id1|id2"`` Ansiblex connection strings built from the bridge pairs the
+        map already holds, one daemon thread, and NO Tcl on the worker.
+
+        Bumps the leg generation FIRST, so a leg still in flight from the previous
+        spec -- or from before an Ansiblex refresh -- is orphaned before this
+        call's own legs are spawned, whichever order they land in.
+
+        A leg is skipped when its endpoints are missing or identical (the origin
+        already IS the entry). A leg that RAISES is swallowed and simply never
+        arrives: unlike a route answer, a gate leg is a DECORATION -- the wormhole
+        hop and its endpoint markers must still render, so abort-instead-of-degrade
+        deliberately does not apply here.
+
+        DELIBERATELY does NOT require the model (unlike ``_recompute_route``):
+        solving is pure ``route_fn`` work, so a route pushed before the first
+        ``on_shown`` has its legs ready by the time there is a canvas to draw them
+        on. Gating on the model would strand them -- nothing re-solves at
+        ``on_shown``."""
+        self._wh_leg_gen += 1
+        spec = self.state.wh_route
+        if not spec:
+            return
+        jobs = []
+        for slot, a_key, b_key in (("in", "origin_id", "entry_id"),
+                                   ("out", "exit_id", "dest_id")):
+            a, b = spec.get(a_key), spec.get(b_key)
+            if a is None or b is None or a == b:
+                continue
+            jobs.append((slot, a, b))
+        if not jobs:
+            return
+        # "id1|id2" strings for get_stargate_route's extra-edge parser (order does
+        # not matter -- _bfs_route adds both directions). Empty -> None (gate-only).
+        conns = [f"{a}|{b}" for (a, b) in self.state.bridges] or None
+        route_fn = self._route_fn
+        gen = self._wh_leg_gen
+
+        def work():
+            for slot, a, b in jobs:
+                try:
+                    path = route_fn(a, b, connections=conns)
+                except Exception as exc:         # never crash the helper thread
+                    print(f"[MAP] wormhole {slot}-leg recompute failed: {exc}")
+                    continue                     # a missing leg is not a wrong answer
+                self._result_q.put(("wh_leg", gen, slot, tuple(path or ())))
+
+        threading.Thread(target=work, daemon=True, name="map-wh-legs").start()
+
+    def _apply_wh_leg(self, gen: int, slot: str, path) -> None:
+        """Apply one worker-resolved wormhole gate leg on the main thread. A leg
+        carrying a stale generation belongs to a route that has since been
+        replaced or cleared, and is dropped. An empty path (no gate route found)
+        leaves the leg unset -- the hop and markers are unaffected."""
+        if gen != self._wh_leg_gen or self.state.wh_route is None:
+            return
+        p = tuple(path) or None
+        if slot == "in":
+            self.state.wh_leg_in = p
+        elif slot == "out":
+            self.state.wh_leg_out = p
+        else:
+            return
         self._redraw_overlays()
 
     # ---- kill-heat layer (Task 30) --------------------------------------------
@@ -3000,13 +3215,42 @@ class MapTab:
         self.canvas.create_polygon(sx, sy - r, sx + r, sy, sx, sy + r, sx - r, sy,
                                    fill=color, outline=outline, width=width, tags=tag)
 
+    def _draw_hexagon(self, sx: float, sy: float, r: float, *, fill: str = "",
+                      outline: str = "", width: float = 1.0,
+                      tag: str = "ov_wh") -> None:
+        """Regular POINTY-TOP hexagon centred on (sx, sy). The wormhole overlay's
+        primitive -- a shape no other overlay draws (fleet circles, staging /
+        kill-ping-linger diamonds, the chars square, the intel / capital-kill /
+        destination rings), so the marker reads apart from every one of them even
+        before its colour does. The six vertices are symmetric about the centre,
+        so the item's coordinate mean IS its anchor point (what the tests assert
+        against, and what makes it a well-behaved _pan_overlays passenger)."""
+        pts = []
+        for k in range(6):
+            a = _WH_HEX_A0 + k * (math.pi / 3.0)
+            pts.append(sx + r * math.cos(a))
+            pts.append(sy + r * math.sin(a))
+        self.canvas.create_polygon(*pts, fill=fill, outline=outline, width=width,
+                                   tags=tag)
+
+    def _draw_wh_marker(self, sx: float, sy: float, both: bool = False) -> None:
+        """The wormhole endpoint glyph: a hollow lime hexagon with a small filled
+        core. ``both`` (the system carries a live connection to BOTH hubs) adds
+        one wider outer ring -- deliberately the only difference, since WHICH hub
+        is hover/report information rather than map-glance information."""
+        if both:
+            self._draw_hexagon(sx, sy, WH_BOTH_R, outline=WH_LIME, width=1)
+        self._draw_hexagon(sx, sy, WH_MARK_R, outline=WH_LIME, width=WH_MARK_W)
+        self._draw_hexagon(sx, sy, WH_CORE_R, fill=WH_LIME)
+
     def _redraw_overlays(self) -> None:
         """Delete + repaint every Tk overlay item, projecting with the LIVE camera
         and WITHOUT adding _img_offset -- the live projection already equals the
         on-canvas position of the translated stale bitmap, so adding the offset
         would double-count the drag during the pre-settle window (Task 9 finding
-        #2). Pure Tk, but NOT cheap: ~11 tag deletes + ~160 item creates, measured
-        6.64 ms / 238 Tcl round-trips on realistic FC state. This is the STRUCTURAL
+        #2). Pure Tk, but NOT cheap: one delete per OVERLAY_TAGS entry (12 since
+        the wormhole layer; the figures here were measured at 11) + ~160 item
+        creates, 6.64 ms / 238 Tcl round-trips on realistic FC state. STRUCTURAL
         path -- applied gesture/crisp frames, zoom, layer toggles and pushes. The
         per-motion-event pan path uses _pan_overlays' translate instead (MP1).
 
@@ -3019,7 +3263,7 @@ class MapTab:
 
         E1: no-ops entirely while the tab is hidden -- a backgrounded zkill/intel
         push (add_kill_heat / add_intel_pulse / ...) still mutates state (the
-        caller-side model writes happen before this is called), but the 11-tag
+        caller-side model writes happen before this is called), but the whole-tag
         canvas delete+recreate is pure waste on a canvas nobody sees. on_shown
         force-dirties and requests a crisp render (which itself reprojects
         overlays via _apply_crisp_frame), so the tab repaints correctly the
@@ -3119,6 +3363,75 @@ class MapTab:
                                    outline=ROUTE_GOLD, width=2, tags="ov_route")
                 canvas.create_oval(sx - 4, sy - 4, sx + 4, sy + 4,
                                    outline=ROUTE_GOLD, width=1, tags="ov_route")
+
+        # -- wormhole overlay (EVE-Scout Thera/Turnur): lime hexagon markers at
+        # every K-space system with a live connection, plus the computed route --
+        # a DOTTED lime hop from entry STRAIGHT TO exit (the hub is never drawn
+        # and never looked up: Thera has no map coordinates at all, and Turnur is
+        # hidden identically) and the two resolved stargate legs either side, drawn
+        # in the ordinary route styles so a wormhole route still reads as a route.
+        # Drawn with the destination route, BEFORE the node markers, so staging /
+        # fleet / own / chars pins stay on top. Endpoint-visibility culling matches
+        # the route overlay's (WH_RCULL, either end near-viewport); the standalone
+        # markers use `project`'s OVERLAY_CULL_PX like every other node marker. An
+        # id absent from the coordinate table simply yields None and is skipped,
+        # never raised -- so even if a coordinate-less id (a hub, a J-space system,
+        # an id newer than the bundled table) ever reached this block it would
+        # vanish rather than crash the repaint.
+        if self._layer_on("wormholes"):
+            def wh_pt(sid):
+                s = systems.get(sid) if sid is not None else None
+                if s is None:
+                    return None
+                px, py = cam.world_to_screen(s.x, s.y, vw, vh)
+                vis = (-WH_RCULL <= px <= vw + WH_RCULL
+                       and -WH_RCULL <= py <= vh + WH_RCULL)
+                return (px, py, vis)
+
+            # marker set: pushed endpoints (both-hub flag from the payload) plus
+            # the live route's own two ends, which are marked even when no
+            # endpoint push has landed yet. setdefault keeps one glyph per system.
+            _marks: dict = {}
+            for _sid, _info in st.wh_endpoints.items():
+                _hubs = _info.get("hubs") if isinstance(_info, dict) else None
+                _marks[_sid] = len(_hubs or ()) > 1
+            _spec = st.wh_route
+            if _spec:
+                _entry, _exit = _spec.get("entry_id"), _spec.get("exit_id")
+                pa, pb = wh_pt(_entry), wh_pt(_exit)
+                if pa is not None and pb is not None and (pa[2] or pb[2]):
+                    canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=WH_LIME,
+                                       width=WH_HOP_W, dash=WH_HOP_DASH,
+                                       tags="ov_wh")
+                for _p, _sid in ((pa, _entry), (pb, _exit)):
+                    if _p is not None:
+                        _marks.setdefault(_sid, False)
+                # gate legs (origin..entry, exit..dest). Each is an ordinary
+                # stargate path, so it is classified and styled EXACTLY like the
+                # destination route -- gold dashed hops, lightened-blue dash-dot
+                # Ansiblex hops -- but tagged ov_wh so it lives and dies with this
+                # layer. A leg that never resolved is simply absent.
+                for leg in (st.wh_leg_in, st.wh_leg_out):
+                    if not leg or len(leg) < 2:
+                        continue
+                    for a_id, b_id, kind in mo.classify_route_segments(leg,
+                                                                      st.bridges):
+                        qa, qb = wh_pt(a_id), wh_pt(b_id)
+                        if qa is None or qb is None or not (qa[2] or qb[2]):
+                            continue
+                        if kind == "bridge":
+                            canvas.create_line(qa[0], qa[1], qb[0], qb[1],
+                                               fill=ROUTE_BRIDGE_HEX, width=5,
+                                               dash=(10, 6), tags="ov_wh")
+                        else:
+                            canvas.create_line(qa[0], qa[1], qb[0], qb[1],
+                                               fill=ROUTE_GOLD, width=2,
+                                               dash=(6, 4), tags="ov_wh")
+            for _sid, _both in _marks.items():
+                p = project(_sid)
+                if p is None:
+                    continue
+                self._draw_wh_marker(p[0], p[1], both=_both)
 
         # -- range: struck rings on illegal-in-sphere systems + origin badge
         ov = st.range_overlay
@@ -3987,7 +4300,7 @@ class MapTab:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
         ms, cam), ('threat', frozenset), ('friendly_threat', frozenset),
-        ('route', tuple), ('ambient', tuple),
+        ('route', tuple), ('wh_leg', gen, slot, tuple), ('ambient', tuple),
         ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
@@ -3995,12 +4308,16 @@ class MapTab:
         is_current check in the apply anyway (a queued crisp thus correctly
         supersedes older gesture frames -- it also carries a newer cache). Threat,
         route, ambient and sov results are kept in SEPARATE slots so none is dropped
-        by frame coalescing (nor a frame misread as one). Dispatch by tag: crisp and
-        gesture take different apply paths (sig vs base-image realignment)."""
+        by frame coalescing (nor a frame misread as one). The wormhole legs get a
+        slot each, keyed by "in"/"out": they are TWO independent results of one
+        recompute, so a shared latest-wins slot would silently drop one of them.
+        Dispatch by tag: crisp and gesture take different apply paths (sig vs
+        base-image realignment)."""
         latest_frame = None
         latest_threat = None
         latest_friendly_threat = None
         latest_route = None
+        latest_wh_legs: dict = {}
         latest_ambient = None
         latest_sov = None
         latest_sov_names = None
@@ -4014,6 +4331,8 @@ class MapTab:
                     latest_friendly_threat = item
                 elif item[0] == "route":
                     latest_route = item
+                elif item[0] == "wh_leg":
+                    latest_wh_legs[item[2]] = item   # per-slot latest-wins
                 elif item[0] == "ambient":
                     latest_ambient = item        # Task 30: hourly ESI ambient heat
                 elif item[0] == "sov":
@@ -4037,6 +4356,8 @@ class MapTab:
             self.set_friendly_threat(latest_friendly_threat[1])
         if latest_route is not None:
             self._apply_route(latest_route[1])
+        for _leg in latest_wh_legs.values():
+            self._apply_wh_leg(_leg[1], _leg[2], _leg[3])
         if latest_ambient is not None:
             self._apply_ambient(latest_ambient[1])
         # sov names BEFORE sov so a same-drain names+map pair leaves the legend
