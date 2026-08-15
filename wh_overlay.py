@@ -96,11 +96,16 @@ def _as_int(value) -> int | None:
         pass
     try:                       # "3.5" -> 3 (EVE Scout has shipped floats here)
         # float() does NOT raise on overflow -- "1e400" and a 5000-digit string
-        # both come back as inf, so the guard, not the except, catches them.
+        # both come back as inf.  On THIS path that's redundant
+        # belt-and-braces, not load-bearing: int(parsed) sits INSIDE this try,
+        # so dropping the isfinite guard still leaves the except
+        # OverflowError to catch it, and dropping OverflowError from the
+        # except still leaves the guard returning None before int(parsed)
+        # ever runs.  isfinite is truly load-bearing only on the native-float
+        # branch above (~line 89), which has no try at all.
         parsed = float(str(value).strip())
         return int(parsed) if math.isfinite(parsed) else None
     except (TypeError, ValueError, OverflowError):
-        log.debug("wh_overlay: unparsable numeric %r", value)
         return None
 
 
