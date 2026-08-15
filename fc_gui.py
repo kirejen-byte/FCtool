@@ -5276,7 +5276,17 @@ class FCToolGUI:
             direct_ansiblex = []
             if result and result.gate_jumps_direct is not None and conns:
                 direct_ansiblex = _find_ansiblex_in_route(origin, dest)
-            # If WH route wins, show WH ansiblex; if direct wins, show direct ansiblex
+            # If WH route wins, show WH ansiblex; if direct wins, show direct
+            # ansiblex. NOTE: this inline check is a THIRD near-twin of
+            # _wh_route_beats_direct, deliberately differing only when direct
+            # is None -- there this line falls to the else (direct_ansiblex),
+            # while the helper would say the hole wins (it is the only path).
+            # That difference is unobservable today ONLY because the result
+            # (ansiblex_in_route) is rendered solely in _show_wh_result's
+            # no-shortcut branch (~5965-5972), which direct is None never
+            # reaches. If ansiblex_in_route is ever rendered in the win
+            # branch too, the direct is None case would silently drop the WH
+            # legs' gates -- switch this to _wh_route_beats_direct then.
             via_wh = result.total_jumps_via_wh if result else None
             direct = result.gate_jumps_direct if result else None
             if via_wh is not None and direct is not None and via_wh < direct:
@@ -6075,9 +6085,22 @@ class FCToolGUI:
             conns = fetch_connections()
             thera = sum(1 for c in conns if c.hub_name == "Thera")
             turnur = sum(1 for c in conns if c.hub_name == "Turnur")
-            self._post_ui(self._wh_status_label.config,
-                            {"text": f"Thera: {thera} | Turnur: {turnur} connections",
-                             "fg": FG_GREEN})
+            if conns:
+                self._post_ui(self._wh_status_label.config,
+                                {"text": f"Thera: {thera} | Turnur: {turnur} connections",
+                                 "fg": FG_GREEN})
+            else:
+                # [] is byte-identical for "no holes" and for every fetch
+                # failure -- non-OK response, timeout, DNS, TLS (see the
+                # _wh_overlay_push_endpoints guard below) -- and Thera/Turnur
+                # are never genuinely empty. A green "0 | 0" here would
+                # contradict the map, which deliberately keeps its last
+                # markers on an empty fetch, so report the likely failure
+                # instead of a false success.
+                self._post_ui(
+                    self._wh_status_label.config,
+                    {"text": "EVE Scout unreachable — map showing last known holes",
+                     "fg": FG_ORANGE})
             # Show in log
             self._post_ui(self._show_connections_summary, conns)
             # Update autocomplete with WH system names (reuse the conns we
@@ -6091,7 +6114,12 @@ class FCToolGUI:
 
     def _show_connections_summary(self, conns):
         self._clear_wh_log()
-        self._append_wh_log(f"Current EVE Scout Connections ({len(conns)} total)\n\n", "header")
+        if conns:
+            self._append_wh_log(f"Current EVE Scout Connections ({len(conns)} total)\n\n", "header")
+        else:
+            self._append_wh_log(
+                "EVE Scout unreachable (0 returned) — map still showing last known holes\n\n",
+                "nosave")
 
         for hub in ["Thera", "Turnur"]:
             hub_conns = [c for c in conns if c.hub_name == hub]
@@ -6947,11 +6975,13 @@ class FCToolGUI:
         happens only when EVE-Scout returned nothing or nothing was routable —
         a LOSING detour still carries both connections.
 
-        The entry-connection check stays ANDed in front, and not just because an
-        entry-less route is undrawable: ``find_wh_route`` returns early with both
-        connections None when ESI is down, and ``search_system`` does not
-        negative-cache, so resolving here would add two 10-second-timeout POSTs
-        to a search that already failed.
+        The entry-connection check stays ANDed in front as defence-in-depth
+        against an undrawable route. Against today's ``find_wh_route`` producer
+        it is redundant: ``entry_connection`` is None on exactly the two
+        early-return paths that also force ``total_jumps_via_wh`` to None, so
+        ``_wh_route_beats_direct`` alone already blocks the draw. The check
+        stays anyway because it is cheap and does not depend on ``wh_route``'s
+        internals staying that way.
 
         Ids resolve HERE because ``search_system`` can hit ESI on a cache miss;
         find_wh_route just resolved the same two names, so these are cache hits.

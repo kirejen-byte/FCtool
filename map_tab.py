@@ -203,20 +203,27 @@ STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 # infra refinery #e0a94d, INTEL_AMBER #ffd166, ROUTE_GOLD #ffcc44,
 # LABEL_GLOW_YELLOW #ffd84d) and the mint greens at 144-145 deg
 # (STAGING_FRIENDLY_FILL #59d98c, LABEL_TINT_RANGE #88dfac, RANGE_GREEN #39ff8c).
-# Measured (HLS hue): 38.5 deg clear of the nearest yellow (LABEL_GLOW_YELLOW at
+# Measured (HLS hue): 38.6 deg clear of the nearest yellow (LABEL_GLOW_YELLOW at
 # 46.9) and 58.5 deg clear of the nearest mint (STAGING_FRIENDLY_FILL at 143.9).
-# Two other arcs are comparably wide but are ruled out on CONTENT, not width:
-# rose -- CHARS_MAGENTA #ff44e1 (309.6) to the #ff1744/#ff2d55/#cc2233 red family
-# (348.4), a 38.8 deg gap -- sits between magenta and red; and indigo --
-# BRIDGE_BLUE #3a86ff (216.9) to THREAT_PURPLE #8e5bd6 (264.9), a 48.0 deg gap --
-# sits between the pair the OWNER ALREADY REPORTED as too similar, so a third hue
-# between them is the one place never to go. The teal arc is the genuinely narrow
-# one: the infra Ansiblex chip #37d1c0 / fleet cyan #00d4ff / SEC_HI #33b5e5 /
-# FRIENDLY_BLUE / BRIDGE_BLUE crowd chop it into <=28 deg slices. Lime does not
-# read as the map's greens either: WH_LIME is G(244) > R(166) > B(60) -- a
-# YELLOW-green -- whereas every "friendly / in-range" green here is G > B > R
-# (RANGE_GREEN 255 > 140 > 57). Same channel-ordering discriminator map_render
-# uses for SPLIT_THREAT_HUE vs THREAT_PURPLE.
+# Four other arcs are comparably wide but are ruled out on CONTENT, not width --
+# walking the wheel from BRIDGE_BLUE round to the yellow cluster, every gap in
+# that stretch borders an existing overlay hue: indigo -- BRIDGE_BLUE #3a86ff
+# (216.9) to THREAT_PURPLE #8e5bd6 (264.9), a 48.0 deg gap -- sits between the
+# pair the OWNER ALREADY REPORTED as too similar, so a third hue between them
+# is the one place never to go; purple-to-rose -- THREAT_PURPLE to
+# CHARS_MAGENTA #ff44e1 (309.6), a 44.7 deg gap -- borders THREAT_PURPLE; rose
+# -- CHARS_MAGENTA (309.6) to the #ff1744/#ff2d55/#cc2233 red family (348.4), a
+# 38.7 deg gap -- sits between magenta and red; and red-to-yellow -- that same
+# red family's CAPKILL_RED #ff3b30 (3.2, past the 360/0 wrap) to SEC_LOW
+# #ffb347 (35.2), a 32.0 deg gap -- sits between the danger reds and the
+# yellow cluster. The teal arc is the genuinely narrow one: the infra
+# Ansiblex chip #37d1c0 / fleet cyan #00d4ff / SEC_HI #33b5e5 / FRIENDLY_BLUE /
+# BRIDGE_BLUE crowd chop it into ~28 deg slices (RANGE_GREEN to the Ansiblex
+# chip is the widest, at 28.2). Lime does not read as the map's greens
+# either: WH_LIME is G(244) > R(166) > B(60) -- a YELLOW-green -- whereas
+# every "friendly / in-range" green here is G > B > R (RANGE_GREEN
+# 255 > 140 > 57). Same channel-ordering discriminator map_render uses for
+# SPLIT_THREAT_HUE vs THREAT_PURPLE.
 WH_LIME = "#a6f43c"
 # GLYPH: a hollow HEXAGON with a small filled core. The shape is as unclaimed as
 # the hue -- fleet is a filled circle, staging / route-bridge / kill-ping-linger
