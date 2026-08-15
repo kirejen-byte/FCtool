@@ -5895,6 +5895,30 @@ class FCToolGUI:
                  font=("Consolas", 8), fg=FG_DIM, bg=BG_DARK
                  ).pack(side=tk.LEFT, padx=5)
 
+    @staticmethod
+    def _wh_route_beats_direct(result) -> bool:
+        """Does this WH search actually produce a shortcut worth showing?
+
+        THE single verdict, asked by BOTH readouts -- the Navigation tab's text
+        panel (_show_wh_result) and the star map's route line
+        (_wh_overlay_push_route). They drifted apart once and the map drew a
+        line beside a panel reading "No wormhole route is shorter than the
+        direct route"; one predicate is the cure, so do not re-inline it.
+
+        "A route came back" is NOT the predicate. ``find_wh_route`` seeds its
+        best-total at ``inf`` and never compares against the direct route, so it
+        returns a fully-populated WHRoute (both connections set) for ANY
+        routable entry/exit pairing -- and ``jumps_saved`` can be NEGATIVE. With
+        100+ live EVE-Scout holes such a pairing almost always exists.
+
+        A TIE does not win (matching the panel's ``>=``): equal jumps through a
+        hole is strictly worse than gates. ``direct is None`` DOES win when a WH
+        total exists -- the hole is then the only path there, which the tab
+        presents as the best route."""
+        via_wh = getattr(result, "total_jumps_via_wh", None)
+        direct = getattr(result, "gate_jumps_direct", None)
+        return via_wh is not None and (direct is None or via_wh < direct)
+
     def _show_wh_result(self, result: WHRoute | None,
                         ansiblex_in_route: list[tuple[str, str]] | None = None,
                         leg_ansiblex: dict[int, list[tuple[str, str]]] | None = None,
@@ -5923,7 +5947,10 @@ class FCToolGUI:
         else:
             self._append_wh_log(f"{route_label}: no route found\n", "warn")
 
-        if via_wh is None or (direct is not None and via_wh >= direct):
+        # Exactly the old ``via_wh is None or (direct is not None and
+        # via_wh >= direct)``, now expressed as the one shared predicate so the
+        # map line cannot answer this question differently (see the helper).
+        if not self._wh_route_beats_direct(result):
             if direct is not None:
                 self._wh_result_label.config(text=f"BEST ROUTE: {direct} jumps (direct)", fg=FG_GREEN)
             else:
@@ -6888,9 +6915,21 @@ class FCToolGUI:
 
         Takes the list rather than fetching, deliberately: both callers
         (_fetch_wh_names, _refresh_wh_connections) already paid for the
-        EVE-Scout GET, so the overlay adds none. An empty list is a legitimate
-        push ({} clears markers whose holes died). Fully swallowed — the WH
-        tab's own output is the feature, the map is decoration."""
+        EVE-Scout GET, so the overlay adds none. Fully swallowed — the WH tab's
+        own output is the feature, the map is decoration."""
+        if not conns:
+            # An empty list is NOT the fact "every hole died", so it must never
+            # clear. fetch_connections returns [] for a non-OK response AND for
+            # every exception — timeout, DNS failure, TLS error — byte-identical
+            # to "no holes", and Thera/Turnur are never genuinely empty, so []
+            # means the fetch failed essentially every time. Nothing repairs it
+            # either: there is no periodic refresh, only this startup snapshot
+            # and the manual "Refresh Connections" button, so one blip at launch
+            # would blank the layer for the whole session. An always-on EMPTY
+            # wormhole layer reads as "no holes near me" — the dangerous
+            # inference. Holes live ~16h, so minutes-old markers are still
+            # broadly true: stale beats phantom emptiness.
+            return
         try:
             self._post_ui(self._push_wh_endpoints_to_map,
                           wh_overlay.endpoint_markers(conns))
@@ -6899,8 +6938,20 @@ class FCToolGUI:
 
     def _wh_overlay_push_route(self, result, origin, dest):
         """WORKER thread: turn a finished WH search into the map's route spec and
-        marshal it. None CLEARS — ``route_spec`` returns None whenever no usable
-        shortcut survived, which is the common answer, not an error.
+        marshal it. None CLEARS — and None is the COMMON answer, not an error.
+
+        The line draws only when ``_wh_route_beats_direct`` says the hole
+        actually wins, which is the same predicate the text panel's verdict is
+        made of. A populated route is not evidence of a shortcut: find_wh_route
+        returns both connections set for ANY routable pairing, and both-None
+        happens only when EVE-Scout returned nothing or nothing was routable —
+        a LOSING detour still carries both connections.
+
+        The entry-connection check stays ANDed in front, and not just because an
+        entry-less route is undrawable: ``find_wh_route`` returns early with both
+        connections None when ESI is down, and ``search_system`` does not
+        negative-cache, so resolving here would add two 10-second-timeout POSTs
+        to a search that already failed.
 
         Ids resolve HERE because ``search_system`` can hit ESI on a cache miss;
         find_wh_route just resolved the same two names, so these are cache hits.
@@ -6908,7 +6959,8 @@ class FCToolGUI:
         still push the None, or the superseded line would stay drawn."""
         spec = None
         try:
-            if getattr(result, "entry_connection", None) is not None:
+            if (getattr(result, "entry_connection", None) is not None
+                    and self._wh_route_beats_direct(result)):
                 spec = wh_overlay.route_spec(result, search_system(origin),
                                              search_system(dest))
         except Exception as exc:
