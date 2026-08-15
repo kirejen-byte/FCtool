@@ -76,6 +76,18 @@ BRIDGE_BLUE_HEX = "#%02x%02x%02x" % mr.BRIDGE_BLUE
 # highlight" over the Ansiblex. Same #3A86FF family, so it still reads as a bridge.
 ROUTE_BRIDGE_HEX = "#%02x%02x%02x" % tuple(
     min(255, round(c + (255 - c) * 0.45)) for c in mr.BRIDGE_BLUE)
+# THE cull margin (px) around the viewport for route-ish SEGMENTS, shared by both
+# route overlays -- the destination route's hops and the wormhole layer's hop and
+# gate legs -- so a route reaches one hop past the screen edge instead of stopping
+# at it. ONE constant on purpose: this value used to be written twice (an inline
+# `_RCULL` in the route block, a `WH_RCULL` beside the wormhole constants) with a
+# comment claiming one "mirrors" the other and nothing keeping them in lockstep.
+# Same distance, two different TESTS of it: a one-jump GATE segment is culled on
+# endpoint proximity (draw when either end is near-viewport), while the wormhole
+# hop -- a single segment that can span the galaxy -- is culled on segment-vs-rect
+# intersection (see _segment_hits_rect). Deliberately NOT OVERLAY_CULL_PX: that
+# constant is the marker/pan-budget cull and the two must stay independent.
+ROUTE_RCULL = 60.0
 
 # Kill-heat layer (Task 30). Capital-kill markers reuse a red hex derived from
 # the base-layer HEAT_COLOR family. The periodic decay refresh re-requests a
@@ -186,18 +198,22 @@ STAGING_R_HOSTILE = 9.6        # ~20% larger than friendly (8 * 1.2)
 # but is hidden the same way, so both hubs behave identically and neither can
 # ever leak a phantom vertex into the hop.
 #
-# COLOUR: a vivid LIME (hue ~85 deg) -- the one wide-open arc left in this map's
-# palette, which is bounded by the warm yellows at ~36-48 deg (SEC_LOW #ffb347,
-# ROUTE_GOLD #ffcc44, INTEL_AMBER #ffd166, LABEL_GLOW_YELLOW #ffd84d, infra
-# refinery #e0a94d) and the mint greens at ~148-152 deg (RANGE_GREEN #39ff8c,
-# STAGING_FRIENDLY_FILL #59d98c, LABEL_TINT_RANGE #88dfac). It is >=40 deg from
-# BOTH neighbours -- every other gap in the wheel is ~20-25 deg wide (teal is
-# taken by the infra Ansiblex chip #37d1c0 with SEC_HI #33b5e5 / fleet cyan
-# #00d4ff / FRIENDLY_BLUE / BRIDGE_BLUE crowding one side; rose sits between
-# CHARS_MAGENTA #ff44e1 and the #ff1744/#ff2d55/#cc2233 red family; indigo sits
-# between BRIDGE_BLUE and THREAT_PURPLE, the pair the OWNER ALREADY REPORTED as
-# too similar, so a third hue between them is the one place never to go). It does
-# not read as the map's greens either: WH_LIME is G(244) > R(166) > B(60) -- a
+# COLOUR: a vivid LIME (hue 85 deg) -- the best open arc left in this map's
+# palette, which is bounded by the warm yellows at 35-47 deg (SEC_LOW #ffb347,
+# infra refinery #e0a94d, INTEL_AMBER #ffd166, ROUTE_GOLD #ffcc44,
+# LABEL_GLOW_YELLOW #ffd84d) and the mint greens at 144-145 deg
+# (STAGING_FRIENDLY_FILL #59d98c, LABEL_TINT_RANGE #88dfac, RANGE_GREEN #39ff8c).
+# Measured (HLS hue): 38.5 deg clear of the nearest yellow (LABEL_GLOW_YELLOW at
+# 46.9) and 58.5 deg clear of the nearest mint (STAGING_FRIENDLY_FILL at 143.9).
+# Two other arcs are comparably wide but are ruled out on CONTENT, not width:
+# rose -- CHARS_MAGENTA #ff44e1 (309.6) to the #ff1744/#ff2d55/#cc2233 red family
+# (348.4), a 38.8 deg gap -- sits between magenta and red; and indigo --
+# BRIDGE_BLUE #3a86ff (216.9) to THREAT_PURPLE #8e5bd6 (264.9), a 48.0 deg gap --
+# sits between the pair the OWNER ALREADY REPORTED as too similar, so a third hue
+# between them is the one place never to go. The teal arc is the genuinely narrow
+# one: the infra Ansiblex chip #37d1c0 / fleet cyan #00d4ff / SEC_HI #33b5e5 /
+# FRIENDLY_BLUE / BRIDGE_BLUE crowd chop it into <=28 deg slices. Lime does not
+# read as the map's greens either: WH_LIME is G(244) > R(166) > B(60) -- a
 # YELLOW-green -- whereas every "friendly / in-range" green here is G > B > R
 # (RANGE_GREEN 255 > 140 > 57). Same channel-ordering discriminator map_render
 # uses for SPLIT_THREAT_HUE vs THREAT_PURPLE.
@@ -221,11 +237,10 @@ WH_MARK_W = 2                # outer hexagon line width
 # bridge-blue dash=(10, 6) at width 5.
 WH_HOP_W = 3
 WH_HOP_DASH = (2, 3)
-# Endpoint-visibility cull for the hop + its gate legs: mirrors the destination
-# route overlay's own _RCULL, so a wormhole route reaches exactly one hop past the
-# screen edge like a gate route does. (Deliberately NOT OVERLAY_CULL_PX: that
-# constant is the marker/pan-budget cull and the two must stay independent.)
-WH_RCULL = 60.0
+# (Cull: the shared ROUTE_RCULL, at the top of this file. The GATE LEGS use it the
+# way the destination route does -- endpoint proximity -- because a leg segment is
+# one jump. The HOP does NOT: it is a single segment that can span the galaxy, so
+# it is culled by segment-vs-viewport intersection instead. See ROUTE_RCULL.)
 _WH_HEX_A0 = -math.pi / 2.0  # pointy-top hexagon (first vertex straight up)
 
 # --- Tk overlay item set (MP1) ------------------------------------------------
@@ -455,6 +470,37 @@ _INFRA_HOVER_DETAIL_MAX = 5
 
 def _now_ms() -> float:
     return time.monotonic() * 1000.0
+
+
+def _outcode(px: float, py: float, x0: float, y0: float,
+             x1: float, y1: float) -> int:
+    """Cohen-Sutherland 4-bit region code of a point against a rect: bit 1 left of
+    x0, bit 2 right of x1, bit 4 above y0, bit 8 below y1 (screen axes, y down).
+    Zero means inside."""
+    code = 0
+    if px < x0:
+        code |= 1
+    elif px > x1:
+        code |= 2
+    if py < y0:
+        code |= 4
+    elif py > y1:
+        code |= 8
+    return code
+
+
+def _segment_hits_rect(ax: float, ay: float, bx: float, by: float,
+                       x0: float, y0: float, x1: float, y1: float) -> bool:
+    """Cohen-Sutherland trivial-REJECT test: False only when both endpoints share
+    an outcode bit, i.e. both lie strictly outside the SAME edge's half-plane and
+    the segment provably cannot touch the rect. Deliberately conservative -- a
+    segment that only crosses a corner region is accepted and drawn; Tk clips the
+    ink, so over-accepting costs one canvas item while under-accepting would erase
+    a real line. Used for the wormhole hop, whose two endpoints can BOTH be far
+    off-screen on opposite sides while the segment crosses the whole viewport
+    (endpoint-proximity culling erases exactly that case)."""
+    return not (_outcode(ax, ay, x0, y0, x1, y1)
+                & _outcode(bx, by, x0, y0, x1, y1))
 
 
 def _default_route_fn(origin_id: int, dest_id: int, connections=None):
@@ -1238,7 +1284,11 @@ class MapTab:
             "threat": "Purple shade over systems inside hostile jump/bridge range",
             "bridges": "Your Ansiblex gates as blue lines",
             "route": "Gold route to a tool-set destination; game-set routes can't be read (no ESI endpoint)",
-            "wormholes": "Live Thera/Turnur wormholes (EVE-Scout); routes skip the hub, entry to exit",
+            # The tail names the gate legs on purpose: they are drawn in the Route
+            # layer's gold, but they belong to THIS layer (see the leg-drawing
+            # block in _redraw_overlays), so turning Route off leaves them up.
+            "wormholes": ("Live Thera/Turnur wormholes (EVE-Scout); hub-skipping"
+                          " route; gold legs ride this layer"),
             "intel": "Amber pulses at systems named in tracked intel channels; click to open the report",
             "kill_pings": "Radar bursts for zkill reports that match your alert settings",
             "sov": "Dim alliance-color wash over sovereign space",
@@ -1920,10 +1970,10 @@ class MapTab:
         ``markers`` maps ``system_id -> {"hubs": tuple[str, ...], "count": int,
         "sec": str, "min_hours": int, "max_size": str, "sigs": tuple[dict, ...]}``
         -- one entry per K-SPACE system with a live EVE-Scout connection.
-        ``None`` (or an empty dict) means no markers: an on-but-empty layer draws
-        the same frame as off. The host owns the data (it fetches EVE-Scout and
-        computes these), so this file keeps ZERO wormhole imports -- the
-        ``set_infrastructure`` precedent.
+        ``None``, an empty dict, or anything that is not a dict at all means no
+        markers: an on-but-empty layer draws the same frame as off. The host owns
+        the data (it fetches EVE-Scout and computes these), so this file keeps
+        ZERO wormhole imports -- the ``set_infrastructure`` precedent.
 
         UNLIKE ``set_bridges`` / ``set_infrastructure`` these are a pure Tk-OVERLAY
         element (canvas items, crisp during gestures), NOT a base-bitmap one, so
@@ -1933,7 +1983,11 @@ class MapTab:
         renderer / model are unset and the stored markers are painted by the first
         real repaint. An id absent from the coordinate table is skipped silently at
         draw time (``project`` returns None), never raised."""
-        self.state.wh_endpoints = dict(markers) if markers else {}
+        # Garbage -> no markers, exactly as set_wh_route degrades to cleared: both
+        # payloads come off the SAME third-party EVE-Scout pipeline, so they owe
+        # the same tolerance (a bare isinstance, so a non-mapping sequence can no
+        # longer reach dict() and raise ValueError mid-push).
+        self.state.wh_endpoints = dict(markers) if isinstance(markers, dict) else {}
         self._redraw_overlays()
 
     def set_wh_route(self, spec: dict | None) -> None:
@@ -3324,14 +3378,13 @@ class MapTab:
         # so the route reaches one hop past the screen edge, like the node cull.
         rp = st.route_path
         if self._layer_on("route") and rp and len(rp) >= 2:
-            _RCULL = 60.0
-
             def route_pt(sid):
                 s = systems.get(sid)
                 if s is None:
                     return None
                 px, py = cam.world_to_screen(s.x, s.y, vw, vh)
-                vis = (-_RCULL <= px <= vw + _RCULL and -_RCULL <= py <= vh + _RCULL)
+                vis = (-ROUTE_RCULL <= px <= vw + ROUTE_RCULL
+                       and -ROUTE_RCULL <= py <= vh + ROUTE_RCULL)
                 return (px, py, vis)
 
             for a_id, b_id, kind in mo.classify_route_segments(rp, st.bridges):
@@ -3371,9 +3424,15 @@ class MapTab:
         # hidden identically) and the two resolved stargate legs either side, drawn
         # in the ordinary route styles so a wormhole route still reads as a route.
         # Drawn with the destination route, BEFORE the node markers, so staging /
-        # fleet / own / chars pins stay on top. Endpoint-visibility culling matches
-        # the route overlay's (WH_RCULL, either end near-viewport); the standalone
-        # markers use `project`'s OVERLAY_CULL_PX like every other node marker. An
+        # fleet / own / chars pins stay on top. CULLING, three different rules on
+        # purpose: the standalone markers use `project`'s OVERLAY_CULL_PX like
+        # every other node marker (a glyph only means something at its own system);
+        # the GATE LEGS use the route overlay's endpoint-proximity rule at
+        # ROUTE_RCULL, because a leg segment is one jump; and the HOP uses
+        # segment-vs-viewport intersection at the same ROUTE_RCULL, because it is
+        # NOT a gate segment -- it is one line that can span the galaxy, so
+        # endpoint proximity erased it the moment the FC zoomed into territory
+        # BETWEEN the two ends, exactly where a shortcut route is being read. An
         # id absent from the coordinate table simply yields None and is skipped,
         # never raised -- so even if a coordinate-less id (a hub, a J-space system,
         # an id newer than the bundled table) ever reached this block it would
@@ -3384,8 +3443,8 @@ class MapTab:
                 if s is None:
                     return None
                 px, py = cam.world_to_screen(s.x, s.y, vw, vh)
-                vis = (-WH_RCULL <= px <= vw + WH_RCULL
-                       and -WH_RCULL <= py <= vh + WH_RCULL)
+                vis = (-ROUTE_RCULL <= px <= vw + ROUTE_RCULL
+                       and -ROUTE_RCULL <= py <= vh + ROUTE_RCULL)
                 return (px, py, vis)
 
             # marker set: pushed endpoints (both-hub flag from the payload) plus
@@ -3399,7 +3458,10 @@ class MapTab:
             if _spec:
                 _entry, _exit = _spec.get("entry_id"), _spec.get("exit_id")
                 pa, pb = wh_pt(_entry), wh_pt(_exit)
-                if pa is not None and pb is not None and (pa[2] or pb[2]):
+                if pa is not None and pb is not None and _segment_hits_rect(
+                        pa[0], pa[1], pb[0], pb[1],
+                        -ROUTE_RCULL, -ROUTE_RCULL,
+                        vw + ROUTE_RCULL, vh + ROUTE_RCULL):
                     canvas.create_line(pa[0], pa[1], pb[0], pb[1], fill=WH_LIME,
                                        width=WH_HOP_W, dash=WH_HOP_DASH,
                                        tags="ov_wh")
@@ -3411,6 +3473,15 @@ class MapTab:
                 # destination route -- gold dashed hops, lightened-blue dash-dot
                 # Ansiblex hops -- but tagged ov_wh so it lives and dies with this
                 # layer. A leg that never resolved is simply absent.
+                # OWNERSHIP, STATED PLAINLY because the styling implies otherwise:
+                # these legs speak the Route layer's visual language but belong to
+                # the WORMHOLE layer and are gated on "wormholes" ALONE. Turning
+                # Route OFF does NOT hide them (a user decluttering the map still
+                # sees gold dashes); turning WH off does. That is deliberate --
+                # the wormhole route is a DIFFERENT route from the destination
+                # route, and a layer must own every part of the thing it draws --
+                # so do not "fix" it by adding a `_layer_on("route")` term here.
+                # The WH toolbar tooltip says the same thing to the user.
                 for leg in (st.wh_leg_in, st.wh_leg_out):
                     if not leg or len(leg) < 2:
                         continue
@@ -4310,7 +4381,9 @@ class MapTab:
         route, ambient and sov results are kept in SEPARATE slots so none is dropped
         by frame coalescing (nor a frame misread as one). The wormhole legs get a
         slot each, keyed by "in"/"out": they are TWO independent results of one
-        recompute, so a shared latest-wins slot would silently drop one of them.
+        recompute, so a shared latest-wins slot would silently drop one of them --
+        and each slot coalesces by GENERATION, since (unlike frames) leg results
+        are NOT produced in generation order.
         Dispatch by tag: crisp and gesture take different apply paths (sig vs
         base-image realignment)."""
         latest_frame = None
@@ -4332,7 +4405,20 @@ class MapTab:
                 elif item[0] == "route":
                     latest_route = item
                 elif item[0] == "wh_leg":
-                    latest_wh_legs[item[2]] = item   # per-slot latest-wins
+                    # Per-slot latest-wins by GENERATION, not by arrival order.
+                    # Two leg threads can genuinely be in flight at once --
+                    # _recompute_wh_legs orphans the previous generation but
+                    # cannot cancel its thread -- so a slow gen-N result can land
+                    # after a fast gen-N+1 one in the SAME drain. Overwriting on
+                    # arrival would evict the fresh answer, and _apply_wh_leg
+                    # would then drop the survivor for being stale: the valid
+                    # answer lost entirely. Keeping the higher generation is what
+                    # makes _recompute_wh_legs' "whichever order they land in"
+                    # promise true. (>= so same-generation results keep ordinary
+                    # latest-wins.)
+                    _held = latest_wh_legs.get(item[2])
+                    if _held is None or item[1] >= _held[1]:
+                        latest_wh_legs[item[2]] = item
                 elif item[0] == "ambient":
                     latest_ambient = item        # Task 30: hourly ESI ambient heat
                 elif item[0] == "sov":
@@ -4829,6 +4915,12 @@ class MapTab:
                              command=lambda: self._on_layer_toggle("bridges"))
         menu.add_checkbutton(label="Route", variable=self._layer_vars["route"],
                              command=lambda: self._on_layer_toggle("route"))
+        # Wormholes (2026-08-15): live EVE-Scout endpoints + the hub-hidden
+        # shortcut route (its gold gate legs included -- they ride THIS layer, not
+        # Route). ON by default. Same "WH" label as the toolbar toggle, and the
+        # same var, so the two halves of every layer control read as one.
+        menu.add_checkbutton(label="WH", variable=self._layer_vars["wormholes"],
+                             command=lambda: self._on_layer_toggle("wormholes"))
         menu.add_checkbutton(label="Intel", variable=self._layer_vars["intel"],
                              command=lambda: self._on_layer_toggle("intel"))
         # Kill pings (Task 36): discrete zkill-alert radar bursts; ON by default.
