@@ -32,16 +32,28 @@ both mean "do not advertise time remaining").
 from __future__ import annotations
 
 import logging
+import math
 
 log = logging.getLogger(__name__)
 
-# Ship-size ranking, smallest to largest.  Duplicated BY VALUE from the
-# ``size_order`` dict in wh_route.find_wh_route rather than imported -- this
-# module never imports a sibling (see the module docstring); keep in lockstep.
-# Anything outside this tuple (EVE Scout's "small" frigate holes, "", None,
-# junk) does NOT rank: it can never win ``max_size`` and, when nothing else
-# ranks, leaves ``max_size`` as "".
-SIZE_ORDER = ("medium", "large", "xlarge", "capital")
+# Ship-size ranking for DISPLAY, smallest to largest.
+#
+# DELIBERATELY NOT a copy of the ``size_order`` dict in wh_route.find_wh_route,
+# which omits "small".  Do NOT "restore lockstep" -- the divergence is the point:
+#
+# * wh_route's dict is a FILTER FLOOR.  ``ship_size != "any"`` keeps only the
+#   connections ranking >= the size the pilot asked for, and nobody filters for
+#   "at least frigate-sized", so omitting "small" there is correct.
+# * this tuple is a DISPLAY RANKING.  Omitting "small" made a frigate-only
+#   system report ``max_size == ""`` -- byte-identical to "size genuinely
+#   unknown" -- and the error pointed the DANGEROUS way: an FC sizing a fleet
+#   reads "" as "unknown, probably fine", not "nothing bigger than a frigate
+#   fits".  EVE Scout's Small is frigates/destroyers only
+#   (docs/eve_reference/mechanics.md), so naming the class is the safe report.
+#
+# Anything outside this tuple ("", None, junk) still does NOT rank: it can never
+# win ``max_size`` and, when nothing else ranks, leaves ``max_size`` as "".
+SIZE_ORDER = ("small", "medium", "large", "xlarge", "capital")
 
 
 def _text(value) -> str:
@@ -56,23 +68,38 @@ def _text(value) -> str:
 def _as_int(value) -> int | None:
     """Best-effort int, or None when the value cannot be one.
 
-    Accepts ints, floats (truncated) and numeric strings; rejects bools (a
-    bool system id / hour count is nonsense, and ``isinstance(True, int)`` would
-    otherwise let it through) and anything unparsable.  Returns None rather than
-    raising so one malformed EVE Scout record cannot take down the overlay."""
+    Accepts ints, finite floats (truncated) and numeric strings; rejects bools
+    (a bool system id / hour count is nonsense, and ``isinstance(True, int)``
+    would otherwise let it through), non-finite values and anything unparsable.
+    Returns None rather than raising so one malformed EVE Scout record cannot
+    take down the overlay.
+
+    TOTALITY IS LOAD-BEARING HERE, not paranoia.  ``fetch_connections`` parses
+    EVE Scout with ``resp.json()``, and ``json.loads`` accepts bare ``NaN``,
+    ``Infinity`` and ``1e400`` BY DEFAULT -- so non-finite floats really do
+    reach this function.  ``int(nan)`` raises ValueError and ``int(inf)``
+    raises OverflowError, and both used to escape every caller: ONE such field
+    took down the entire overlay.  Hence the ``isfinite`` guards; None then
+    flows into the existing ``_int_or_zero``/``_system_id`` degradation."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, int):
         return value
     if isinstance(value, float):
-        return int(value)
+        return int(value) if math.isfinite(value) else None
+    # OverflowError is belt-and-braces: the isfinite guards intercept every
+    # overflow reachable today, but a function whose contract is "never raises"
+    # must not depend on that reasoning surviving a future edit.
     try:
         return int(str(value).strip())
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     try:                       # "3.5" -> 3 (EVE Scout has shipped floats here)
-        return int(float(str(value).strip()))
-    except (TypeError, ValueError):
+        # float() does NOT raise on overflow -- "1e400" and a 5000-digit string
+        # both come back as inf, so the guard, not the except, catches them.
+        parsed = float(str(value).strip())
+        return int(parsed) if math.isfinite(parsed) else None
+    except (TypeError, ValueError, OverflowError):
         log.debug("wh_overlay: unparsable numeric %r", value)
         return None
 
@@ -124,20 +151,31 @@ def endpoint_markers(connections) -> dict[int, dict]:
       ranked.
     * ``"sigs"``   -- tuple of per-connection dicts
       ``{"sig", "hub_sig", "hub", "size", "hours", "wh_type"}`` sorted by
-      signature (ties broken by hub then hub signature) so rendering and hover
-      text are byte-stable regardless of the order EVE Scout returned.  ``size``
-      here is the connection's OWN raw size, not the aggregated ``max_size``.
+      signature, then hub, hub signature, size, hours and type, so rendering and
+      hover text are byte-stable regardless of the order EVE Scout returned.
+      ``size`` here is the connection's OWN raw size, not the aggregated
+      ``max_size``.
 
     Accepts None / any iterable of connections; a None entry inside the list, or
     a connection with no usable ``dest_system_id``, is skipped."""
     grouped: dict[int, list] = {}
+    skipped = 0
     for conn in (connections or ()):
         if conn is None:
+            skipped += 1
             continue
         system_id = _system_id(conn)
         if system_id is None:
+            skipped += 1
             continue
         grouped.setdefault(system_id, []).append(conn)
+    if skipped:
+        # ONE line for the whole batch -- never one per connection, this runs
+        # over the entire EVE Scout list.  Without it a systematic upstream
+        # field rename (every in_system_id suddenly 0) presents as "the overlay
+        # shows nothing" with no diagnostics at all.
+        log.debug("wh_overlay: skipped %d connection(s) with no usable "
+                  "dest_system_id", skipped)
 
     markers: dict[int, dict] = {}
     for system_id, conns in grouped.items():
@@ -156,7 +194,13 @@ def endpoint_markers(connections) -> dict[int, dict]:
         } for c in conns]
         # Sort by KEY, never by the dicts themselves: on a duplicate signature
         # Python would fall through to comparing dicts and raise TypeError.
-        sigs.sort(key=lambda s: (s["sig"], s["hub"], s["hub_sig"]))
+        # The key spans EVERY field (all plain str/int, so no dict comparison
+        # can sneak back in) because byte-stability is promised for ANY input
+        # order: with just (sig, hub, hub_sig), two records tied on those three
+        # but differing further along fell through to EVE Scout's own order and
+        # swapped whenever the feed reordered them.
+        sigs.sort(key=lambda s: (s["sig"], s["hub"], s["hub_sig"],
+                                 s["size"], s["hours"], s["wh_type"]))
         markers[system_id] = {
             "hubs": tuple(sorted(h for h in hubs if h)),
             "count": len(conns),
