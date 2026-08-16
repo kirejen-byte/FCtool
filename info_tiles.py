@@ -323,14 +323,24 @@ INTEL_STATUS_EMPTY = "No intel in range"
 # jump filter cannot mean anything, so the tile says so and shows nothing.
 REFERENCE_UNSET = "No reference system - set staging or override"
 
-# Intel keyword spans that mark a line worth the eye. `clear` is deliberately
-# absent: an all-clear is the opposite signal.
+# Intel keyword spans that mark a line worth the eye even from far away.
+# `clear` is deliberately absent: an all-clear is the opposite signal, and it
+# gets its own flag below.
 PRIORITY_SPAN_KINDS = frozenset({"cyno", "camp", "spike"})
 
-#: Gate-jump radius inside which a FLAGGED line stops being merely "worth the
-#: eye" and becomes "close enough to act on" -- those rows paint RED instead of
-#: yellow (owner request 2026-08-15: "make sure any hostiles flagged within 2
-#: jumps are highlighted in red").
+#: The `intel_stream.annotate` span kind that means "this system is EMPTY" --
+#: emitted from `intel_monitor.CLEAR_PATTERN`, i.e. `clr` / `clear` / `nv` /
+#: `nvi`, the same match that makes `parse_intel_message` classify a line as
+#: report_type "clear". Named here so the tile reads the signal off the
+#: annotation it already has: the render path stays OFFLINE and imports no
+#: monitor (see the AST guard).
+CLEAR_SPAN_KIND = "clear"
+
+#: Gate-jump radius inside which an intel line stops being merely traffic and
+#: becomes "close enough to act on" -- those rows paint RED (owner request
+#: 2026-08-15: "make sure any hostiles flagged within 2 jumps are highlighted in
+#: red", corrected 2026-08-16 to mean ANY report, not only a keyworded one --
+#: see ``intel_row_colour_key``).
 #:
 #: This is the SAME number as the FCPreview intel flash's reach
 #: (`preview.intel_flash_jumps`, default 2) and the two are siblings BY INTENT
@@ -957,11 +967,19 @@ class IntelEntry:
     Built by the controller from ``intel_stream.annotate`` and kept in the
     controller's OWN bounded deque. fc_gui's ``_intel_buffer`` is never read
     and never mutated -- this tile is a second consumer of the fan-out, not a
-    second owner of the stream."""
+    second owner of the stream.
+
+    `priority` and `is_clear` are both read off the SAME annotation, once, at
+    push time -- ``PRIORITY_SPAN_KINDS`` and ``CLEAR_SPAN_KIND`` respectively.
+    They are not opposites: a line can carry neither (the commonest hostile
+    report of all) and the colour rule treats that case on distance alone."""
     ts: str
     text: str
     system_ids: tuple
     priority: bool
+    #: Defaulted so a duck-typed or older-shaped entry stays constructible; the
+    #: safe answer for an unknown line is "nobody said it was clear".
+    is_clear: bool = False
 
 
 @dataclass(frozen=True)
@@ -973,6 +991,10 @@ class IntelRowVM:
     text: str
     jumps: int | None
     priority: bool
+    #: Carried from the entry (see ``IntelEntry``) because the colour rule needs
+    #: it a second later, on the row, inside the 1 Hz repaint. Defaulted for the
+    #: same reason.
+    is_clear: bool = False
 
 
 @dataclass(frozen=True)
@@ -1033,7 +1055,9 @@ def build_intel_model(entries, distance_of, max_jumps: int,
         label = _call(name_of, best_id) or str(best_id)
         rows.append(IntelRowVM(ts=entry.ts, system=str(label), text=entry.text,
                                jumps=best_jumps,
-                               priority=bool(entry.priority)))
+                               priority=bool(entry.priority),
+                               is_clear=bool(getattr(entry, "is_clear",
+                                                     False))))
     cap = _as_int(limit, 0)
     # Slice FIRST (chronological, so the cap keeps the most recent), reverse
     # SECOND (so the tile reads newest-first). Reversing first would keep the
@@ -1152,34 +1176,52 @@ def intel_detail_body(row) -> str:
 def intel_row_colour_key(row) -> str:
     """One intel row's palette KEY -- never a colour. Pure, Tk-free.
 
+    PROXIMITY IS THE RULE AND "CLEAR" IS THE ONLY EXCEPTION -- a DENYLIST, not
+    an allowlist (owner correction 2026-08-16: "are intel reports from less than
+    or equal to 2j away being put in red-text ... this should be the case UNLESS
+    someone puts 'clear' or 'clr' (or other permutations) which would indicate
+    that the system is now empty").
+
+    The shipped rule was the other way round: red required a `cyno`/`camp`/
+    `spike` span, so the commonest hostile report of all -- `20 reds gate
+    EC-P8R`, which annotates to a count and a system and no keyword whatsoever
+    -- rendered in ORDINARY TEXT from the system next door. That is the
+    dangerous direction to be wrong in, so the keyword no longer gates red; it
+    only earns yellow out past the radius, where the distance says nothing.
+
     Three states, in escalating order:
 
-    * ``FG_TEXT``   -- not flagged. Ordinary traffic, including a report from
-      the system next door: proximity alone is not an alarm.
-    * ``FG_YELLOW`` -- flagged (``priority``: a `cyno`/`camp`/`spike` span, and
-      never an all-clear -- see ``PRIORITY_SPAN_KINDS``), but not confirmed
-      inside ``INTEL_DANGER_JUMPS``.
-    * ``FG_RED``    -- flagged AND measured at ``INTEL_DANGER_JUMPS`` gate jumps
-      or fewer. The owner's "hostiles flagged within 2 jumps" case.
+    * ``FG_TEXT``   -- an ALL-CLEAR at any distance (``is_clear``: a `clr` /
+      `clear` / `nv` / `nvi` span, see ``CLEAR_SPAN_KIND``), or ordinary traffic
+      measured beyond the radius. Clear takes precedence over everything below:
+      it is the report that the system is EMPTY, and painting it red at two
+      jumps would invert its meaning exactly where the FC reads fastest.
+    * ``FG_YELLOW`` -- worth the eye but not confirmed close: an UNRESOLVED
+      distance, or a ``priority`` (cyno/camp/spike) line further out.
+    * ``FG_RED``    -- a KNOWN distance of ``INTEL_DANGER_JUMPS`` gate jumps or
+      fewer. Close is close, whatever words the reporter used.
 
     UNRESOLVED DISTANCE STAYS YELLOW, and that is not a fail-open violation --
     it is a different axis. The tile fails open on VISIBILITY: a line whose
-    distance is unknown is still SHOWN, still badged ``?j``, still escalated to
-    yellow (``build_intel_model``). Red carries a second, narrower claim on top
-    of that -- *this one is close enough to act on* -- and spending it on a line
-    nobody has measured would cry wolf until the colour stops meaning anything.
-    Nothing is hidden in either direction; only the loudness differs.
+    distance is unknown is still SHOWN and still badged ``?j``
+    (``build_intel_model``); here it is still escalated, just not to red. Red
+    carries the narrower claim -- *this one is measured close enough to act on*
+    -- and spending it on a line nobody has measured would cry wolf until the
+    colour stops meaning anything. Nothing is hidden in either direction; only
+    the loudness differs.
 
     Defensive like its neighbours (this runs inside the 1 Hz repaint): a
     duck-typed or junk row degrades to a key the palette really carries rather
     than raising, and an unparseable distance is treated as unmeasured.
     """
-    if not getattr(row, "priority", False):
+    if getattr(row, "is_clear", False):
         return "FG_TEXT"
     jumps = _as_int(getattr(row, "jumps", None), default=None)
-    if jumps is None:
+    if jumps is not None and jumps <= INTEL_DANGER_JUMPS:
+        return "FG_RED"
+    if jumps is None or getattr(row, "priority", False):
         return "FG_YELLOW"
-    return "FG_RED" if jumps <= INTEL_DANGER_JUMPS else "FG_YELLOW"
+    return "FG_TEXT"
 
 
 def intel_rows_that_fit(height, row_height, limit: int = INTEL_SHOW) -> int:
@@ -2977,10 +3019,17 @@ class InfoTileController:
             spans = []
         system_ids = []
         priority = False
+        is_clear = False
         for span in spans:
             kind = getattr(span, "kind", "")
             if kind in PRIORITY_SPAN_KINDS:
                 priority = True
+                continue
+            # The all-clear rides the SAME annotation (no second matcher, no
+            # `intel_monitor` import on this path): one `clear` span is the
+            # whole signal, and the colour rule reads it off the row.
+            if kind == CLEAR_SPAN_KIND:
+                is_clear = True
                 continue
             if kind != "system":
                 continue
@@ -2990,7 +3039,8 @@ class InfoTileController:
                 system_ids.append(system_id)
         self.intel_entries.append(IntelEntry(ts=_clock(when), text=text,
                                              system_ids=tuple(system_ids),
-                                             priority=priority))
+                                             priority=priority,
+                                             is_clear=is_clear))
         # Collection continues while the tiles are withdrawn (same reason the
         # per-tile switch does not gate it: the reveal must land on a full
         # history, not an empty box), but the REPAINT does not -- writing into
