@@ -1189,17 +1189,28 @@ def intel_row_colour_key(row) -> str:
     dangerous direction to be wrong in, so the keyword no longer gates red; it
     only earns yellow out past the radius, where the distance says nothing.
 
-    Three states, in escalating order:
+    PRECEDENCE, top to bottom -- the first line that matches answers:
 
-    * ``FG_TEXT``   -- an ALL-CLEAR at any distance (``is_clear``: a `clr` /
-      `clear` / `nv` / `nvi` span, see ``CLEAR_SPAN_KIND``), or ordinary traffic
-      measured beyond the radius. Clear takes precedence over everything below:
-      it is the report that the system is EMPTY, and painting it red at two
-      jumps would invert its meaning exactly where the FC reads fastest.
-    * ``FG_YELLOW`` -- worth the eye but not confirmed close: an UNRESOLVED
-      distance, or a ``priority`` (cyno/camp/spike) line further out.
-    * ``FG_RED``    -- a KNOWN distance of ``INTEL_DANGER_JUMPS`` gate jumps or
-      fewer. Close is close, whatever words the reporter used.
+    1. ``FG_TEXT``   -- an ALL-CLEAR that contradicts NOTHING: ``is_clear``
+       (a `clr` / `clear` / `nv` / `nvi` span, see ``CLEAR_SPAN_KIND``) AND NO
+       ``priority`` span. At any distance. This is the report that the system
+       is EMPTY, and painting it red at two jumps would invert its meaning
+       exactly where the FC reads fastest.
+    2. ``FG_RED``    -- a KNOWN distance of ``INTEL_DANGER_JUMPS`` gate jumps
+       or fewer. Close is close, whatever words the reporter used.
+    3. ``FG_YELLOW`` -- worth the eye but not confirmed close: an UNRESOLVED
+       distance, or a ``priority`` (cyno/camp/spike) line further out.
+    4. ``FG_TEXT``   -- everything else: ordinary traffic measured beyond the
+       radius.
+
+    WHY "AND NOT PRIORITY" (2026-08-16, the same day, before shipping): a clear
+    that outranked EVERYTHING was strictly QUIETER than the allowlist it
+    replaced for one family of lines -- `gate camp EC-P8R clr` at one jump went
+    from RED to plain text. An FC reporting a camp on one gate and a clear on
+    the rest of the field writes exactly that line, and a camp two jumps out
+    dropping to ordinary text is the regression the denylist exists to prevent.
+    A CONTRADICTORY line is precisely when the FC should look, so loud wins the
+    tie: the exception covers the uncontested all-clear only.
 
     UNRESOLVED DISTANCE STAYS YELLOW, and that is not a fail-open violation --
     it is a different axis. The tile fails open on VISIBILITY: a line whose
@@ -1210,16 +1221,44 @@ def intel_row_colour_key(row) -> str:
     colour stops meaning anything. Nothing is hidden in either direction; only
     the loudness differs.
 
+    KNOWN LIMITS OF `is_clear` -- recorded, deliberately unfixed. All three are
+    the price of reading the SAME match that drives ``report_type == "clear"``
+    (`intel_monitor.CLEAR_PATTERN`) instead of a second, tile-only matcher, and
+    all three were EQUALLY silent under the old allowlist, so none is a
+    regression -- but the denylist makes silence the LOUD-path exception, which
+    is why they are written down here rather than left to be rediscovered:
+
+    (a) ``nv`` IS AMBIGUOUS IN REAL INTEL. It means "no visual" -- a NEGATIVE
+        report, often filed alongside a positive one -- as well as "clear". So
+        `20 reds EC-P8R, nv on the gate` carries a clear span and, with no
+        keyword beside it, suppresses.
+    (b) NEGATION IS UNMODELLED. `EC-P8R not clear` and `no longer clear` both
+        match the pattern and both suppress; nothing reads the word before it.
+    (c) ``is_clear`` IS PER-LINE WHILE A ROW IS PER-SYSTEM. `10 reds EC-P8R,
+        X-7OMU clr` paints the EC-P8R row clear, and order-independently so --
+        the flag is one bool for the whole line, not one per system span. The
+        fix shape is known and NOT taken: ``annotate`` returns span OFFSETS, so
+        push time could bind the clear to its NEAREST system span instead of to
+        the line. Left alone pending the owner's ruling, because narrowing it
+        wrongly would re-introduce silence somewhere new.
+
     Defensive like its neighbours (this runs inside the 1 Hz repaint): a
     duck-typed or junk row degrades to a key the palette really carries rather
     than raising, and an unparseable distance is treated as unmeasured.
     """
-    if getattr(row, "is_clear", False):
+    priority = getattr(row, "priority", False)
+    # `is True`, not truthiness -- the strict-bool twin of the ``_as_int``
+    # coercion below, and for the same reason. A duck-typed row carrying
+    # `is_clear="no"` is truthy, and reading it as "clear" would SILENCE a
+    # hostile one jump out; reading junk as "not clear" costs at most one red
+    # row that should have been plain text. Both real writers
+    # (``on_intel_line`` and ``build_intel_model``) hand over an actual bool.
+    if getattr(row, "is_clear", False) is True and not priority:
         return "FG_TEXT"
     jumps = _as_int(getattr(row, "jumps", None), default=None)
     if jumps is not None and jumps <= INTEL_DANGER_JUMPS:
         return "FG_RED"
-    if jumps is None or getattr(row, "priority", False):
+    if jumps is None or priority:
         return "FG_YELLOW"
     return "FG_TEXT"
 
