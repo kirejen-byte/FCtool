@@ -266,6 +266,16 @@ INTEL_SHOW = 12
 #: two budgets are measured in different units -- PIXELS here (against the real
 #: font), characters there.
 INTEL_ELLIPSIS = "…"
+#: Fewest glyphs an ellipsized STATUS notice may keep and still be worth
+#: printing. A row's ellipsis eats only free text -- the stamp, system and jump
+#: badge survive any width -- but a status line is one indivisible sentence, so
+#: a narrow enough tile would cut it to "No…", which identifies nothing. Below
+#: this floor the tile hands over the WHOLE notice and lets the frame's clip
+#: take it: same direction as every other degrade here (clipped beats
+#: truncated into uselessness), and the reader at least sees the opening words.
+#: A floor, not a routine path -- the tile's own MIN_W of 120 px still leaves
+#: 106 px, about 17 glyphs of Consolas 8.
+INTEL_STATUS_MIN_CHARS = 12
 #: Row-pool geometry, MEASURED 2026-08-15 on this box (96 dpi, tk scaling
 #: 1.333). ``_LabelPool`` packs each row with `_POOL_PADX` on both sides, and a
 #: default ``tk.Label`` spends `_POOL_LABEL_CHROME` more per axis on its own
@@ -398,6 +408,47 @@ def _ellipsize(text: str, max_chars: int) -> str:
     if max_chars == 1:
         return INTEL_ELLIPSIS
     return text[:max_chars - 1] + INTEL_ELLIPSIS
+
+
+def _fit_to_width(text: str, max_width, measure, compose=None,
+                  min_chars: int = 0):
+    """The longest ellipsized `text` whose COMPOSED line measures within
+    `max_width` PIXELS -- or ``None`` for "do not truncate at all".
+
+    The one width fit on this tile: rows and the status notice differ only in
+    what they wrap the fitted text in (`compose`) and how little they are
+    willing to keep (`min_chars`). Pure and Tk-free -- `measure(text) -> px` is
+    injected, which is what keeps every caller unit-testable without a display.
+
+    ``None`` -- meaning "return the whole line" -- covers EVERY degrade
+    direction: an unrealised width, no measurer, nothing to eat, a measurer
+    that raises, and a budget too small to leave anything recognisable. An
+    un-truncated line is merely clipped by the frame and still says most of
+    what it says; a line truncated against a width nobody could measure is
+    information destroyed, silently and every second.
+    """
+    shape = compose if callable(compose) else (lambda body: body)
+    width = _as_int(max_width, 0)
+    if width <= 1 or not callable(measure) or not text:
+        return None
+    try:
+        if measure(shape(text)) <= width:
+            return None
+        # Largest character budget whose COMPOSED line still fits. Binary
+        # search because each probe is a Tcl round-trip: ~8 for a 200-char
+        # line instead of 200, and the common (already-fits) case costs one.
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if measure(shape(_ellipsize(text, mid))) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        if lo < min_chars:
+            return None
+        return shape(_ellipsize(text, lo))
+    except Exception:
+        return None
 
 
 def _clamp_opacity(value, default=DEFAULT_OPACITY) -> float:
@@ -991,8 +1042,15 @@ def intel_row_text(row, max_width: int = 0, measure=None) -> str:
     clipped by the frame and still says most of what it says; a row truncated
     against a width nobody could measure is information destroyed, silently and
     every second.
+
+    Defensive on every field, like its list-comprehension partner
+    ``intel_row_colour_key``: both run over the SAME row inside the 1 Hz
+    repaint, so a duck-typed or junk row that one tolerates and the other
+    raises on is a dead tile either way. An unparseable distance reads as
+    UNMEASURED here too -- ``?j`` beside the partner's yellow.
     """
-    badge = "?j" if row.jumps is None else f"{row.jumps}j"
+    jumps = _as_int(getattr(row, "jumps", None), default=None)
+    badge = "?j" if jumps is None else f"{jumps}j"
     stamp = str(getattr(row, "ts", "") or "")
     system = str(getattr(row, "system", "") or "")
     text = str(getattr(row, "text", "") or "")
@@ -1002,26 +1060,30 @@ def intel_row_text(row, max_width: int = 0, measure=None) -> str:
         # whose free text was eaten entirely still reads as a line.
         return "  ".join(p for p in (stamp, system, body, f"({badge})") if p)
 
-    full = compose(text)
-    width = _as_int(max_width, 0)
-    if width <= 1 or not callable(measure) or not text:
-        return full
-    try:
-        if measure(full) <= width:
-            return full
-        # Largest character budget whose COMPOSED line still fits. Binary
-        # search because each probe is a Tcl round-trip: ~8 for a 200-char
-        # line instead of 200, and the common (already-fits) case costs one.
-        lo, hi = 0, len(text)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if measure(compose(_ellipsize(text, mid))) <= width:
-                lo = mid
-            else:
-                hi = mid - 1
-        return compose(_ellipsize(text, lo))
-    except Exception:
-        return full
+    fitted = _fit_to_width(text, max_width, measure, compose)
+    return compose(text) if fitted is None else fitted
+
+
+def intel_status_text(status, max_width: int = 0, measure=None) -> str:
+    """The head/status notice, fitted to the tile the same way a row is.
+
+    Pure and Tk-FREE by default (see ``intel_row_text``). This is the one line
+    the row fit did not reach, and it is the LONGEST string the tile ever
+    writes: ``REFERENCE_UNSET`` measures 270 px, while a preview-sized 160 px
+    tile leaves 146 px -- so the notice explaining why the tile is empty was
+    itself clipped mid-sentence (owner report 2026-08-15, "goes off the tile
+    screen").
+
+    Unlike a row it has no fixed tail to protect and no free text to spend:
+    the whole notice IS the message, so it is ellipsized as a whole -- and only
+    while ``INTEL_STATUS_MIN_CHARS`` glyphs still survive. Under that floor the
+    whole notice is returned and the frame's clip takes it, because "No…"
+    identifies nothing while "No reference system - s…" identifies everything.
+    """
+    text = str(status or "")
+    fitted = _fit_to_width(text, max_width, measure,
+                           min_chars=INTEL_STATUS_MIN_CHARS)
+    return text if fitted is None else fitted
 
 
 def intel_row_colour_key(row) -> str:
@@ -1651,6 +1713,9 @@ class IntelRenderer(_TileRenderer):
     to take: it packs only as many rows as the frame's CURRENT height holds,
     and it ellipsizes each row's free text to the frame's CURRENT width so the
     trailing jump badge survives. Both are measured with the real row font.
+    The head/status notice goes through the same width fit -- it is the longest
+    string the tile ever writes, so "nothing left to take" is not true without
+    it.
 
     Because both depend on the frame's size and a RESIZE does not move the
     model at all, the size rides the diff key -- see ``_key``.
@@ -1726,6 +1791,18 @@ class IntelRenderer(_TileRenderer):
         return (model, self._frame_size())
 
     def _draw(self, model):
+        # Measure ONCE, for both branches: the status notice is packed with the
+        # same padding into the same frame in the same font as a row, so it is
+        # fitted by the same numbers. It is also the LONGEST string this tile
+        # writes, which is why leaving it out of the row fit left the owner's
+        # "goes off the tile screen" alive in exactly one place.
+        width, height = self._frame_size()
+        font = self._font()
+        available = _intel_text_width(width)
+        # No font or no realised width => no measurer, and both fitters return
+        # the whole line. Clipped beats truncated-against-nothing.
+        fitting = font is not None and available > 0
+        measure = font.measure if fitting else None
         if model.status:
             # Status and rows are mutually exclusive (the controller sets a
             # status only when there is nothing to list). Rendering them that
@@ -1733,7 +1810,8 @@ class IntelRenderer(_TileRenderer):
             # row pool can never become visible -- `pack` APPENDS, so a status
             # that first appeared mid-session would otherwise land under the
             # rows it is supposed to explain.
-            self._head.configure(text=model.status)
+            self._head.configure(text=intel_status_text(model.status,
+                                                        available, measure))
             if not self._head_packed:
                 self._head.pack(fill="x", padx=_POOL_PADX)
                 self._head_packed = True
@@ -1746,13 +1824,6 @@ class IntelRenderer(_TileRenderer):
         # model already hands the rows over newest-first, so the tail this
         # drops is the OLDEST intel -- the direction the clip used to take the
         # newest lines in.
-        width, height = self._frame_size()
-        font = self._font()
-        available = _intel_text_width(width)
-        # No font or no realised width => no measurer, and `intel_row_text`
-        # returns the whole line. Clipped beats truncated-against-nothing.
-        fitting = font is not None and available > 0
-        measure = font.measure if fitting else None
         limit = intel_rows_that_fit(height, self._row_height(font))
         self._pool.render([(intel_row_text(row, available, measure),
                             intel_row_colour_key(row))
