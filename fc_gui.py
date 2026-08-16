@@ -246,6 +246,11 @@ CHAT_POLL_THREAD_NAME = "fctool-chat-poll"
 # as above, and the same restart-safety contract — see _ensure_intel_monitor.
 INTEL_POLL_THREAD_NAME = "fctool-intel-poll"
 
+# Name carried by the one-shot channel-activity scan worker
+# (_scan_intel_channel_states). Named for the same reason, and because it is
+# what a test's fake threading layer selects the scan spawn by.
+INTEL_SCAN_THREAD_NAME = "fctool-intel-chanscan"
+
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
 # The full TOC panel yields to content when the tab gets too narrow: it collapses
 # to a slim ribbon and the content reclaims the panel's width, so the SSO
@@ -330,6 +335,17 @@ INTEL_SKEW_WINDOW_S = 5.0
 # legitimate repeat is still measured against its own last sighting, and small
 # enough that the map holds only the recent past. Pruned on the way through.
 INTEL_SKEW_EVICT_S = 60.0
+
+# How many distinct channel names the untracked-but-tailed diagnostic will ever
+# warn about (see _on_intel_message). The ingest gate keys on the header's
+# `Channel Name`, CASE-SENSITIVELY, while chat_monitor's channel_filters match
+# FILENAMES case-INSENSITIVELY — so a channel whose header spelling differs from
+# its filename is tailed and then dropped in silence. One log line per name
+# makes that visible; the cap keeps the remembered-names set bounded on a path
+# that runs at 1 Hz for the life of the process. Reaching it stops the warnings
+# entirely rather than letting a fresh name log once per LINE, which is what a
+# membership test alone degrades into as soon as it stops recording.
+INTEL_UNTRACKED_WARN_CAP = 32
 
 # What one channel checkbox in the Intelligence Fusion strip actually does. It
 # is a VIEW filter on the stream panel, not an intel on/off switch — say so,
@@ -1007,6 +1023,12 @@ class FCToolGUI:
         # the bounded join in _stop_intel_monitor.
         self._intel_skew_seen: dict[tuple, float] = {}
         self._intel_skew_lock = threading.Lock()
+        # Channel names already reported by the untracked-but-tailed diagnostic
+        # (see _on_intel_message and INTEL_UNTRACKED_WARN_CAP). Written only
+        # from the intel poll thread and never read anywhere else, so a plain
+        # set is enough: the worst a concurrent re-point generation can cost is
+        # one duplicate log line.
+        self._intel_untracked_warned: set[str] = set()
         # Short TTL cache for get_fleet_info() shared by _fleet_boss_session and
         # _fleet_boss_info. The Fleet Templates window calls both back-to-back on
         # entering live mode; without this each does its own ESI round-trip.
@@ -4836,6 +4858,12 @@ class FCToolGUI:
         # otherwise leak one resolver worker per call.
         self._intel_resolver_starting = False
         self._intel_channels_enabled: set[str] = set()
+        # True once the user has clicked a channel box themselves. The
+        # activity scan seeds the strip's INITIAL state, and it now lands
+        # asynchronously (deferred to t=5 s, then off-thread), so without this
+        # it would silently revert a tick made in the meantime. Cleared by
+        # _stop_intel_monitor, which wipes the selection itself.
+        self._intel_channels_user_touched = False
         self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
         self._intel_channel_colors: dict[str, str] = {}
         # E2: channel -> stable Text tag name ("chan_0", "chan_1", ...). Each is
@@ -28134,10 +28162,22 @@ $bmp.Dispose()
         dim — both clickable either way.
 
         Split out of :meth:`_ensure_intel_monitor` (2026-08-15) because
-        ``scan_available_channels`` globs the entire Chatlogs directory: 0.59 s
-        measured on the owner's 53,499-file directory, and __init__ paid it
-        synchronously before ``mainloop()``. Being display-only, it now rides
-        the startup stagger while ingest starts inline.
+        ``scan_available_channels`` globs the entire Chatlogs directory, then
+        moved OFF THE TK THREAD entirely (2026-08-16): 0.53-0.80 s across two
+        sittings on the owner's real ~53,550-file directory (547/647/798 and
+        534/545/586 ms min/med/max), the ``glob("*.txt")`` alone ~333 ms. The
+        Tk thread now pays ~1 ms — validation and the spawn — and the
+        marshalled apply below is microseconds. Deferring it into the stagger
+        only moved that freeze onto a window the user is by then using — the app
+        painted ~0.6 s sooner and hitched for ~0.6 s five seconds in. Being
+        display-only is exactly what makes the worker safe, and it cures every
+        caller at once: the inline call from :meth:`_ensure_intel_monitor`
+        (Settings->Save, a channel edit, a tag toggle) paid the same stall.
+
+        This half runs on the Tk thread and does no I/O: it validates the
+        inputs, snapshots them, and spawns the worker. The worker's ONLY output
+        is one ``_post_ui`` of :meth:`_apply_intel_channel_states` — nothing off
+        the Tk thread may touch a widget or a Tk var.
 
         ``tracked_character`` is deliberately NOT passed. Intel must cover every
         account the FC is logged in on — the same reason ``listener_filter`` is
@@ -28154,8 +28194,52 @@ $bmp.Dispose()
         channels = list(self._tracked_intel_channels)
         if not logs_path or not os.path.isdir(logs_path) or not channels:
             return
-        scanned = scan_available_channels(logs_path, None, channels)
-        active_names = {ch["name"] for ch in scanned if ch["active"]}
+        # The log universe this reading will describe. The apply half refuses a
+        # result whose universe has since been retired or re-pointed (see
+        # _ensure_intel_monitor's key) — a late scan must never re-tick boxes on
+        # a generation _stop_intel_monitor has already cleared.
+        key = (logs_path, tuple(channels))
+
+        def _scan_worker():
+            try:
+                scanned = scan_available_channels(logs_path, None, channels)
+                active_names = {ch["name"] for ch in scanned if ch["active"]}
+                self._post_ui(self._apply_intel_channel_states,
+                              active_names, key)
+            except Exception:
+                # A worker's unhandled exception dies in a stderr traceback and
+                # takes the checkbox seeding with it silently; this is
+                # display-only work, so log it and leave the strip as built.
+                log.exception("intel: channel-activity scan failed")
+
+        threading.Thread(target=_scan_worker, name=INTEL_SCAN_THREAD_NAME,
+                         daemon=True).start()
+
+    def _apply_intel_channel_states(self, active_names, key=None):
+        """Tk thread: apply the activity reading to the checkbox strip.
+
+        The marshalled half of :meth:`_scan_intel_channel_states` — every widget
+        and Tk-var write lives here, and nothing here does I/O.
+
+        Two refusals, both of them "this reading is no longer the truth":
+
+        * ``key`` names the log universe the worker scanned. A result that lands
+          after ``_stop_intel_monitor`` (key ``None``) or after a re-point (a
+          different key) is dropped rather than re-ticking boxes the stop
+          deliberately cleared.
+        * A strip the USER has already clicked is left alone. The boxes are live
+          from build time and this scan now lands asynchronously — at t=5 s at
+          startup — so applying unconditionally silently reverted a tick made in
+          between (the boxes stayed DISABLED until the inline scan ran inside
+          ``__init__`` before 2026-08-15, which is why the seam did not exist).
+          Whole-strip rather than per-box: the checkbutton command carries no
+          identity, and the user has taken ownership of a strip they have
+          touched — the scan only ever owed it an INITIAL state.
+        """
+        if key is not None and getattr(self, "_intel_source_key", None) != key:
+            return
+        if getattr(self, "_intel_channels_user_touched", False):
+            return
         self._intel_channels_enabled.clear()
         for name, var in self._intel_channel_vars.items():
             is_active = name in active_names
@@ -28195,7 +28279,9 @@ $bmp.Dispose()
         running immediately and still defers that scan's directory glob into the
         stagger. Nothing about ingest depends on it — the gate is the TRACKED
         set — so the skip costs only the checkbox strip's initial ticks, and
-        those arrive seconds later on a panel that starts hidden.
+        those arrive seconds later on a panel that starts hidden. (The scan is
+        off-thread since 2026-08-16, so the deferral is now about keeping the
+        launch burst's disk work spread out, not about a Tk-thread stall.)
 
         IDEMPOTENT by input signature, so every site whose inputs can change
         calls it unconditionally: an unchanged ``(logs path, tracked channels)``
@@ -28264,8 +28350,9 @@ $bmp.Dispose()
 
         # Seed the checkbox strip from log activity — the stream panel's initial
         # selection, and nothing else. Deferred at startup (see the argument's
-        # note above); inline everywhere else, where it is a user action already
-        # paying for a settings round trip.
+        # note above); called here everywhere else, where the inputs just
+        # changed. Cheap either way since 2026-08-16: the directory work rides a
+        # worker thread and only the var writes come back.
         if scan_channel_states:
             self._scan_intel_channel_states()
 
@@ -28359,6 +28446,11 @@ $bmp.Dispose()
         # bounded _intel_buffer still holds what did arrive.
         for var in self._intel_channel_vars.values():
             var.set(False)
+        # This wipes whatever the user had picked, so their ownership of the
+        # strip dies with the generation: the successor's activity scan must be
+        # free to seed it again (_apply_intel_channel_states defers to a touched
+        # strip, and one early click would otherwise freeze it for the session).
+        self._intel_channels_user_touched = False
         for w in self._intel_channels_frame.winfo_children():
             if isinstance(w, tk.Checkbutton):
                 w.config(state=tk.NORMAL, fg=FG_DIM)
@@ -28404,6 +28496,9 @@ $bmp.Dispose()
         Display only — ingest is untouched (:meth:`_on_intel_message` gates on
         the tracked set), so this repaints from the bounded ``_intel_buffer``
         and a channel switched on mid-session shows its history immediately."""
+        # The user now owns this strip: the activity scan lands asynchronously
+        # and must not overwrite a deliberate choice with its guess.
+        self._intel_channels_user_touched = True
         self._intel_channels_enabled.clear()
         for name, var in self._intel_channel_vars.items():
             if var.get():
@@ -28507,8 +28602,34 @@ $bmp.Dispose()
 
         The gate is still needed, only moved: ``channel_filters`` matches by
         filename PREFIX, so a tracked "Intel" also tails "Intel.WOMP" files.
+
+        That refusal is the one place intel can now go missing without a trace,
+        so it says so once per channel name (2026-08-16). This gate reads the
+        header's ``Channel Name`` and compares it CASE-SENSITIVELY, while
+        ``chat_monitor``'s ``channel_filters`` match FILENAMES
+        case-INSENSITIVELY and ``intel_monitor.discover_channels`` derives the
+        tracked names from FILENAMES too. They agree for every channel today,
+        but a file whose header spelling differs from its name (sanitised
+        characters, hand-typed casing) would be tailed, parsed and binned in
+        silence — the always-on promise intact with zero data. The semantics are
+        deliberately unchanged; only the silence is.
         """
-        if msg.channel not in self._tracked_intel_channels:
+        tracked = self._tracked_intel_channels
+        if msg.channel not in tracked:
+            # ONE-SHOT per name, never per line: this runs at the 1 Hz poll
+            # cadence for the life of the process. The cap bounds the remembered
+            # set AND, by gating the log on it, stops a fresh name logging once
+            # per line once recording stops.
+            warned = self._intel_untracked_warned
+            if (msg.channel not in warned
+                    and len(warned) < INTEL_UNTRACKED_WARN_CAP):
+                warned.add(msg.channel)
+                log.warning(
+                    "intel: tailing channel %r but it is not in the tracked "
+                    "set %s — its lines are dropped. The gate compares the "
+                    "log header's 'Channel Name' exactly (case-sensitive); "
+                    "check that spelling against the tagged channel's.",
+                    msg.channel, sorted(tracked))
             return
         if self._intel_is_skew_duplicate(msg):
             return
