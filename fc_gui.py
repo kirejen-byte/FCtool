@@ -4627,19 +4627,40 @@ class FCToolGUI:
             command=self._on_intel_sound_toggle,
         ).pack(side=tk.LEFT, padx=(10, 0))
 
-        # ...and WHICH clip that ping plays (config["intel_alert_sound"]).
-        # Built exactly like the zKill alert-sound picker in Settings: a
-        # readonly combobox over the SHARED catalogue's labels plus a Preview
+        # ...and WHICH clip that ping plays (config["intel_alert_sound"]) — on
+        # its OWN row, deliberately NOT alongside the channel checkboxes.
+        #
+        # GEOMETRY INVARIANT (do not fold this back onto intel_row): the picker
+        # is FIXED width (~259px with its pads) while the channel checkbox list
+        # that ends intel_row is variable-length, and this tab's scroll body is
+        # pinned to the viewport width (_make_scrollable_tab_body) — no
+        # horizontal scroll, no re-flow. Sharing one packed row, the picker's
+        # constant cost comes straight out of the checkboxes, and a packed row
+        # that outgrows its cavity gives the remaining slaves ZERO width and
+        # never maps them, SILENTLY: no error, winfo_ismapped() == 0
+        # (docs/agents/map/facts.md, measured 2026-08-03). Those checkboxes gate
+        # which channels feed the fusion stream, so a vanished one drops that
+        # channel's intel with nothing on screen to say so — measured when this
+        # shipped on intel_row: 1 clipped + 1 unmapped at 1200x900 with 6
+        # channels, 2 unmapped at minsize with 5. Its own row costs one line of
+        # height and cannot compete with them at any channel count.
+        #
+        # Otherwise built exactly like the zKill alert-sound picker in Settings:
+        # a readonly combobox over the SHARED catalogue's labels plus a Preview
         # button, persisting the instant it is picked (no Save Settings round
         # trip). state="readonly" like every other picker — typing a label that
         # isn't in the catalogue would just fall back to the default — and no
         # wheel binding is added (see the MouseWheel invariant in
         # docs/agents/CODEBASE_MAP.md).
+        intel_snd_row = tk.Frame(intel_frame, bg=BG_PANEL)
+        intel_snd_row.pack(fill=tk.X, padx=10, pady=(0, 5))
+        tk.Label(intel_snd_row, text="Intel sound:", font=("Consolas", 9),
+                 fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT)
         _intel_snd_key = self._intel_alert_sound_key()
         self._intel_alert_sound_var = tk.StringVar(
             value=FCToolGUI._ALERT_SOUNDS[_intel_snd_key][0])
         self._intel_alert_sound_combo = ttk.Combobox(
-            intel_row, textvariable=self._intel_alert_sound_var,
+            intel_snd_row, textvariable=self._intel_alert_sound_var,
             state="readonly",
             values=[lbl for lbl, _fn in FCToolGUI._ALERT_SOUNDS.values()],
             width=17, font=("Consolas", 10))
@@ -4648,7 +4669,7 @@ class FCToolGUI:
             "<<ComboboxSelected>>",
             lambda e: self._on_intel_alert_sound_change())
         _intel_snd_preview_btn = ttk.Button(
-            intel_row, text="▶ Preview", style="Dark.TButton",
+            intel_snd_row, text="▶ Preview", style="Dark.TButton",
             command=self._preview_intel_alert_sound)
         _intel_snd_preview_btn.pack(side=tk.LEFT, padx=5)
         _intel_snd_tip = (
