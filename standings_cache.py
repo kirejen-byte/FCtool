@@ -216,10 +216,17 @@ class StandingsCache:
                   *, fleet_char_ids=frozenset()) -> str:
         """Bucket one entity as "ours" / "allies" / "enemies".
 
-        Precedence is fixed and matches ``loss_reconciler.classify_victim``:
+        Precedence is fixed and matches ``battle_ledger.classify_victim``:
         fleet roster (character ids) -> own corp/alliance -> blues -> everyone
         else. An id the cache has never heard of is "enemies" -- this is a
         three-way partition of everything, not a lookup that can miss.
+
+        The blues tier matches a blue CHARACTER id as well as a blue corp or
+        alliance (2026-08-16). ``loss_reconciler.classify_victim`` still tests
+        corp/alliance only, so the two answer differently for a pilot who is
+        personally blue in a corp the cache does not know -- a KNOWN gap, and
+        the reason the agreement test in tests/test_standings_cache.py carries
+        no blue-character case.
 
         ``hostile_ids`` deliberately plays no part: "enemies" here means "not
         ours and not blue", which is the question the tally asks.
@@ -242,7 +249,16 @@ class StandingsCache:
         # Blue-but-not-own == ally. Testing friendly_ids directly (rather than
         # building ally_ids) is O(1) instead of O(len(friendly_ids)) per call
         # and is equivalent: every own id was already answered above.
-        for entity in (corp_id, alliance_id):
+        #
+        # char_id belongs in this test because a blue list is not only corps
+        # and alliances: PERSONAL contacts are individual pilots. On the
+        # owner's live cache (2026-08-16) roughly 14 of 56 blue ids look like
+        # character ids by id-range inference, so a corp/alliance-only test
+        # files about a quarter of a real blue list under ENEMIES -- and every
+        # one of them silently. is_friendly() above has always tested char_id --
+        # the two disagreed until 2026-08-16 -- and battle_ledger.
+        # classify_victim was brought into step in the same change.
+        for entity in (corp_id, alliance_id, char_id):
             if entity and entity in friendly_ids:
                 return BUCKET_ALLIES
         return BUCKET_ENEMIES

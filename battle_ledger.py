@@ -589,24 +589,60 @@ def classify_victim(facts: KillFacts, *, fleet_char_ids=frozenset(),
     for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id):
         if entity_id and entity_id in own_ids:
             return BUCKET_OURS
-    for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id):
+    # The blue test includes the victim's own CHARACTER id, because a blue list
+    # is not only corps and alliances: personal contacts are individual pilots.
+    # On the owner's live cache (2026-08-16) roughly 14 of 56 ally ids look like
+    # character ids by id-range inference, so a corp/alliance-only test silently
+    # files about a quarter of a real blue list under Enemies. The character id
+    # is tested AFTER the roster and own-id checks above,
+    # so precedence is unchanged; `standings_cache.is_friendly` has always
+    # tested char_id, and `bucket_of` was brought into step in the same change.
+    for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id,
+                      facts.victim_character_id):
         if entity_id and entity_id in ally_ids:
             return BUCKET_ALLIES
     return BUCKET_ENEMIES
 
 
 def participates(facts: KillFacts, *, fleet_char_ids=frozenset(),
-                 own_ids=frozenset()) -> bool:
-    """Condition A — "the user's group is participating" — as the UNION of two
-    tests, per the research:
+                 own_ids=frozenset(), ally_ids=frozenset(),
+                 armed=False) -> bool:
+    """Condition A — "the user's group is participating" — as the UNION of
+    three tests, per the research plus the 2026-08-16 ally fix:
 
       * standings: any victim/attacker corp or alliance id in `own_ids`;
-      * roster:    any victim/attacker character id on the live fleet roster.
+      * roster:    any victim/attacker character id on the live fleet roster;
+      * allies:    the VICTIM is blue (corp, alliance or character), and the
+                   caller passes `armed=True` because our own participation has
+                   already opened a ledger for this fight.
 
-    The union matters in both directions. The roster test catches neutral-corp
-    alts the standings test misses, and it is the STRONGER signal — but it is
-    boss-only (ESI 403s on /fleets/{id}/members/ otherwise). The standings test
-    works when you are not fleet boss.
+    The first two matter in both directions. The roster test catches
+    neutral-corp alts the standings test misses, and it is the STRONGER signal
+    — but it is boss-only (ESI 403s on /fleets/{id}/members/ otherwise). The
+    standings test works when you are not fleet boss.
+
+    THE ALLY TERM, and why it is this narrow (the bug it fixes: without it a
+    blue dying to hostiles matched nothing, so it was discarded HERE and
+    `classify_victim`'s BUCKET_ALLIES branch was reachable only through
+    blue-on-blue friendly fire — the owner's report that the ledger "never
+    seems to pick up allied losses, only friendly"):
+
+      * VICTIM only, never an ally on the guns. Blues shoot things all over
+        K-space; qualifying on an ally ATTACKER would pull in fights we are
+        merely near. The kills we forgo by that choice would have landed in the
+        Enemies row, so the error runs toward "we killed less than we did",
+        which is the un-flattering direction — the one honesty rule 5 exists to
+        keep this module pointed at.
+      * ARMED only. Allies may be counted INTO a fight our own group armed;
+        an all-blue brawl must never ARM a ledger we are not in, or one
+        character parked in a system would open a battle panel for somebody
+        else's fight.
+
+    The same gate drops an ally loss that ARRIVES before the arming killmail
+    (the caller does not buffer it either: the candidate buffer feeds the
+    two-kill arm test, so buffering blue-on-blue mails would let them supply
+    the arm witness through the back door). That under-counts the Allies row at
+    the very start of a fight, which is the conservative direction.
     """
     if own_ids:
         for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id):
@@ -619,6 +655,11 @@ def participates(facts: KillFacts, *, fleet_char_ids=frozenset(),
             return True
         if facts.attacker_character_ids & fleet_char_ids:
             return True
+    if armed and ally_ids:
+        for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id,
+                          facts.victim_character_id):
+            if entity_id and entity_id in ally_ids:
+                return True
     return False
 
 
@@ -1113,8 +1154,17 @@ class BattleLedger:
         if not facts.in_kspace:
             return IngestResult(ACTION_IGNORED, REASON_OUT_OF_KSPACE, facts=facts)
 
+        # `armed_here` is computed BEFORE Condition A because the ally term is
+        # gated on it, and it is the SAME expression the presence gate and the
+        # counting branch below reuse — deliberately evaluated once so the
+        # three cannot drift. It reads only `_system_id`/`_state`, neither of
+        # which anything between here and its old site touches.
+        armed_here = (self._system_id == facts.system_id
+                      and self._state != STATE_IDLE)
+
         if not participates(facts, fleet_char_ids=self._roster,
-                            own_ids=self._own_ids):
+                            own_ids=self._own_ids, ally_ids=self._ally_ids,
+                            armed=armed_here):
             return IngestResult(ACTION_IGNORED, REASON_NOT_PARTICIPATING,
                                 facts=facts)
 
@@ -1133,8 +1183,6 @@ class BattleLedger:
         # the FC most wants to read the final ledger AFTER extracting".
         # PRESENCE_LOST_SETTLE_S still moves the LABEL to SETTLED from tick();
         # this gate is only about whether the DATA is allowed in.
-        armed_here = (self._system_id == facts.system_id
-                      and self._state != STATE_IDLE)
         present = facts.system_id in self._presence_systems()
         if present and armed_here:
             self._last_presence_ok_mono = self._monotonic()
@@ -1163,9 +1211,11 @@ class BattleLedger:
         if armed_here:
             # Already armed for this system. Replayed kills inside the fight
             # window ARE counted — that is what recovers a mid-fight restart.
-            # `armed_here` is the SAME expression the presence gate above tested,
-            # deliberately reused rather than retyped: the two must not drift, or
-            # presence would gate a kill this branch then counts (or vice versa).
+            # `armed_here` is the SAME value Condition A's ally term and the
+            # presence gate above read, deliberately reused rather than
+            # retyped: the three must not drift, or presence would gate a kill
+            # this branch then counts (or an ally would qualify for a fight
+            # this branch does not consider armed).
             if replay and (self._fight_started_at is None
                            or facts.time < self._fight_started_at - self._fold_back):
                 self._buffer(facts, replay)
