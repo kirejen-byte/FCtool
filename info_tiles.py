@@ -300,6 +300,22 @@ REFERENCE_UNSET = "No reference system - set staging or override"
 # absent: an all-clear is the opposite signal.
 PRIORITY_SPAN_KINDS = frozenset({"cyno", "camp", "spike"})
 
+#: Gate-jump radius inside which a FLAGGED line stops being merely "worth the
+#: eye" and becomes "close enough to act on" -- those rows paint RED instead of
+#: yellow (owner request 2026-08-15: "make sure any hostiles flagged within 2
+#: jumps are highlighted in red").
+#:
+#: This is the SAME number as the FCPreview intel flash's reach
+#: (`preview.intel_flash_jumps`, default 2) and the two are siblings BY INTENT
+#: -- but deliberately INDEPENDENT constants, not one dial read twice. They
+#: answer different questions on different surfaces (a list the FC reads versus
+#: a border pulsing on a client window) and can legitimately want different
+#: radii; and pointing this tile at a PREVIEW config key would make the HUD's
+#: colours depend on the preview subsystem's settings, which is the wrong
+#: direction for a dependency. One shared dial is a deliberate follow-up if the
+#: owner ever asks for it, never a refactor to do on the way past.
+INTEL_DANGER_JUMPS = 2
+
 # Bucket / state -> palette KEY (not a colour): the composers stay pure and
 # palette-free, and the renderer resolves the key against its own palette.
 _BUCKET_COLOUR = {
@@ -1008,6 +1024,39 @@ def intel_row_text(row, max_width: int = 0, measure=None) -> str:
         return full
 
 
+def intel_row_colour_key(row) -> str:
+    """One intel row's palette KEY -- never a colour. Pure, Tk-free.
+
+    Three states, in escalating order:
+
+    * ``FG_TEXT``   -- not flagged. Ordinary traffic, including a report from
+      the system next door: proximity alone is not an alarm.
+    * ``FG_YELLOW`` -- flagged (``priority``: a `cyno`/`camp`/`spike` span, and
+      never an all-clear -- see ``PRIORITY_SPAN_KINDS``), but not confirmed
+      inside ``INTEL_DANGER_JUMPS``.
+    * ``FG_RED``    -- flagged AND measured at ``INTEL_DANGER_JUMPS`` gate jumps
+      or fewer. The owner's "hostiles flagged within 2 jumps" case.
+
+    UNRESOLVED DISTANCE STAYS YELLOW, and that is not a fail-open violation --
+    it is a different axis. The tile fails open on VISIBILITY: a line whose
+    distance is unknown is still SHOWN, still badged ``?j``, still escalated to
+    yellow (``build_intel_model``). Red carries a second, narrower claim on top
+    of that -- *this one is close enough to act on* -- and spending it on a line
+    nobody has measured would cry wolf until the colour stops meaning anything.
+    Nothing is hidden in either direction; only the loudness differs.
+
+    Defensive like its neighbours (this runs inside the 1 Hz repaint): a
+    duck-typed or junk row degrades to a key the palette really carries rather
+    than raising, and an unparseable distance is treated as unmeasured.
+    """
+    if not getattr(row, "priority", False):
+        return "FG_TEXT"
+    jumps = _as_int(getattr(row, "jumps", None), default=None)
+    if jumps is None:
+        return "FG_YELLOW"
+    return "FG_RED" if jumps <= INTEL_DANGER_JUMPS else "FG_YELLOW"
+
+
 def intel_rows_that_fit(height, row_height, limit: int = INTEL_SHOW) -> int:
     """How many intel rows a content frame `height` px tall can show.
 
@@ -1706,7 +1755,7 @@ class IntelRenderer(_TileRenderer):
         measure = font.measure if fitting else None
         limit = intel_rows_that_fit(height, self._row_height(font))
         self._pool.render([(intel_row_text(row, available, measure),
-                            "FG_YELLOW" if row.priority else "FG_TEXT")
+                            intel_row_colour_key(row))
                            for row in model.rows[:limit]])
 
 
