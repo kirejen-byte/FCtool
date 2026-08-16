@@ -295,10 +295,12 @@ def classify_victim(km: Killmail, *, fleet_char_ids=frozenset(),
                     own_ids=frozenset(), ally_ids=frozenset()) -> str:
     """Bucket a killmail's victim as "ours" / "allies" / "enemies".
 
-    Precedence is fixed: fleet roster -> own corp/alliance ids -> ally ids ->
-    enemies. `own_ids`/`ally_ids` hold CORPORATION and ALLIANCE ids (a flat set
-    of each, as `standings_cache` v2 will expose them); `fleet_char_ids` holds
-    CHARACTER ids.
+    Precedence is fixed and matches battle_ledger.classify_victim and
+    standings_cache.bucket_of: fleet roster -> own corp/alliance ids -> ally ids
+    -> enemies. `own_ids` holds CORPORATION and ALLIANCE ids only;
+    `fleet_char_ids` holds CHARACTER ids; `ally_ids` (`standings_cache.
+    ally_ids`, i.e. friendly_ids minus the owner's own) holds whatever the blue
+    list holds — corps, alliances AND individual pilots.
 
     With own/ally empty — Goal 3's configuration — this degrades to an honest
     two-way split: on the roster is "ours", everything else is "enemies". Goal 4
@@ -309,7 +311,16 @@ def classify_victim(km: Killmail, *, fleet_char_ids=frozenset(),
     for entity_id in (km.corporation_id, km.alliance_id):
         if entity_id and entity_id in own_ids:
             return BUCKET_OURS
-    for entity_id in (km.corporation_id, km.alliance_id):
+    # The blue test includes the victim's own CHARACTER id, because a blue list
+    # is not only corps and alliances: personal contacts are individual pilots.
+    # On the owner's live cache (2026-08-16) roughly 14 of 56 ally ids look like
+    # character ids by id-range inference, so a corp/alliance-only test silently
+    # files about a quarter of a real blue list under Enemies. The character id
+    # is tested AFTER the roster and own-id checks above, so precedence is
+    # unchanged; `standings_cache.is_friendly` has always tested char_id, and
+    # `bucket_of`/`battle_ledger.classify_victim` were brought into step first
+    # (this module was the last of the three to follow).
+    for entity_id in (km.corporation_id, km.alliance_id, km.character_id):
         if entity_id and entity_id in ally_ids:
             return BUCKET_ALLIES
     return BUCKET_ENEMIES
