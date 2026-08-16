@@ -4,6 +4,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 """
 
 import collections
+import hashlib
 import inspect
 import json
 import os
@@ -311,6 +312,35 @@ INTEL_RESOLVE_TAIL_LINES = 200
 # single-callback hitch — if the hitch is ever felt, the follow-up is a
 # per-sweep reclaim budget (N dead tags per pass), never a larger cadence.
 INTEL_SWEEP_EVERY_LINES = 100
+
+# ── Intel second-stage dedupe: the same line, re-stamped by another client ──
+# ChatMonitor de-duplicates (channel, TIMESTAMP, sender, sha1(body)) before its
+# callback, which is right for fleet chat — there the stamp is part of a line's
+# identity. For intel it is not: two EVE clients tailing the same channel write
+# the same message with stamps a second apart often enough to matter. Measured
+# on the owner's real Intel.WOMP logs: 8 surplus deliveries / 216 events (3.7%)
+# on 2026-08-15 and 5 / 40 (12.5%) on 2026-08-13 — each surplus a duplicate HUD
+# row, a duplicate preview flash, a duplicate map pulse and a DOUBLED intel
+# ping. This stage keys on (channel, sender, sha1(body)) — the same line
+# REGARDLESS of stamp — inside a +/- window measured on the LOG stamps, because
+# the skew lives in the stamp and not in arrival time. It stays here rather than
+# in chat_monitor deliberately: that monitor is shared with fleet chat.
+INTEL_SKEW_WINDOW_S = 5.0
+# How long an entry survives in log time. Comfortably above the window, so a
+# legitimate repeat is still measured against its own last sighting, and small
+# enough that the map holds only the recent past. Pruned on the way through.
+INTEL_SKEW_EVICT_S = 60.0
+
+# What one channel checkbox in the Intelligence Fusion strip actually does. It
+# is a VIEW filter on the stream panel, not an intel on/off switch — say so,
+# because it read as the latter for as long as it gated ingest.
+_INTEL_CHANNEL_BOX_TIP = (
+    "Show {channel} in the Intelligence Fusion stream below.\n\n"
+    "Display only. Every channel you tag Intel is read and parsed whether or "
+    "not its box is ticked, so the FC HUD intel tile, the preview intel flash, "
+    "the star-map pulse and the intel ping all see this channel either way.\n\n"
+    "Ticked on start for channels whose log was written today."
+)
 
 
 # ── Intel-filter pure helpers (Tk-free; unit-testable) ──────────────────────
@@ -969,6 +999,14 @@ class FCToolGUI:
         # by Var write-traces wired when the widgets are created in _build_ui.
         self._intel_fusion_enabled = threading.Event()
         self._intel_min_reported = 0
+        # Second-stage intel dedupe state (see INTEL_SKEW_WINDOW_S and
+        # _intel_is_skew_duplicate): dedupe key -> the log stamp, as a float, of
+        # the sighting that was DELIVERED. Written only from the intel poll
+        # thread, but locked because a re-point can leave the outgoing
+        # generation's thread alive alongside the incoming one for the length of
+        # the bounded join in _stop_intel_monitor.
+        self._intel_skew_seen: dict[tuple, float] = {}
+        self._intel_skew_lock = threading.Lock()
         # Short TTL cache for get_fleet_info() shared by _fleet_boss_session and
         # _fleet_boss_info. The Fleet Templates window calls both back-to-back on
         # entering live mode; without this each does its own ESI round-trip.
@@ -1354,7 +1392,15 @@ class FCToolGUI:
         # tile, the FCPreview intel flash and the star-map pulse all hang off it
         # (owner-reported 2026-08-15). Silent no-op without a readable logs path
         # or an Intel-tagged channel.
-        self._ensure_intel_monitor()
+        #
+        # The display-only channel-activity scan is deferred (armed below with
+        # the rest of the startup stagger): it globs the whole Chatlogs
+        # directory — 0.59 s measured on the owner's 53,499-file dir — and every
+        # millisecond here is paid before mainloop() paints anything. Ingest
+        # does not wait for it: the ingest gate is the TRACKED channel set, so
+        # the monitor and its poller are up now and a line arriving before the
+        # scan lands is ingested normally.
+        self._ensure_intel_monitor(scan_channel_states=False)
 
         # Auto-refresh character data in the background shortly after startup
         if self.esi_accounts and hasattr(self, '_char_tab_content'):
@@ -1381,6 +1427,12 @@ class FCToolGUI:
         # Silent no-op unless a market is configured, enabled in Settings,
         # and not already fresh — see _auto_market_rescan_if_needed's gates.
         self.root.after(4500, self._auto_market_rescan_if_needed)
+        # The intel checkbox strip's initial ticks, last of the Chatlogs-reading
+        # tasks (after _motd_scan_channels at 2500 and
+        # _auto_scan_intel_channels_if_needed at 4000) so the three directory
+        # walks never land on the same tick. Ingest has been running since
+        # _ensure_intel_monitor above; only this display state waits.
+        self.root.after(5000, self._scan_intel_channel_states)
         # Infra region auto-scan, later still (15 s) so it never piles onto the
         # startup burst and gives ESI login a beat to settle. Silent no-op unless
         # opted in (config["infra"]["auto_scan_on_start"]), authenticated, and
@@ -4593,12 +4645,15 @@ class FCToolGUI:
         )
         self._intel_fusion_btn.pack(side=tk.LEFT)
         _fusion_tip = (
-            "Tails your tracked in-game intel channels (from EVE's chat logs) "
-            "and parses each report — system, pilot count, d-scan link, "
-            "cyno/camp flags — surfacing it in the live feed below, "
-            "cross-referenced with zKillboard activity. "
-            "Pick which channels to watch in Settings → Channels "
-            "(tag them Intel)."
+            "Show the merged intel stream below.\n\n"
+            "DISPLAY ONLY. FCTool tails your Intel-tagged channels (from EVE's "
+            "chat logs) and parses every report — system, pilot count, d-scan "
+            "link, cyno/camp flags — whether or not this box is ticked, so the "
+            "FC HUD intel tile, the preview intel flash and the star-map pulse "
+            "keep working with the stream closed.\n\n"
+            "Tag channels Intel in Settings → Channels. The boxes to the right "
+            "pick which of those appear in this stream; they do not turn intel "
+            "on or off."
         )
         self._intel_fusion_btn.bind(
             "<Enter>", lambda e, t=_fusion_tip: self._show_tooltip(e, t))
@@ -4643,12 +4698,13 @@ class FCToolGUI:
         # constant cost comes straight out of the checkboxes, and a packed row
         # that outgrows its cavity gives the remaining slaves ZERO width and
         # never maps them, SILENTLY: no error, winfo_ismapped() == 0
-        # (docs/agents/map/facts.md, measured 2026-08-03). Those checkboxes gate
-        # which channels feed the fusion stream, so a vanished one drops that
-        # channel's intel with nothing on screen to say so — measured when this
-        # shipped on intel_row: 1 clipped + 1 unmapped at 1200x900 with 6
-        # channels, 2 unmapped at minsize with 5. Its own row costs one line of
-        # height and cannot compete with them at any channel count.
+        # (docs/agents/map/facts.md, measured 2026-08-03). Those checkboxes pick
+        # which channels the fusion stream SHOWS, so a vanished one silently
+        # takes that channel out of the stream with no way to put it back
+        # (ingest is unaffected — that is gated on the tracked set) — measured
+        # when this shipped on intel_row: 1 clipped + 1 unmapped at 1200x900
+        # with 6 channels, 2 unmapped at minsize with 5. Its own row costs one
+        # line of height and cannot compete with them at any channel count.
         #
         # Otherwise built exactly like the zKill alert-sound picker in Settings:
         # a readonly combobox over the SHARED catalogue's labels plus a Preview
@@ -27924,11 +27980,21 @@ $bmp.Dispose()
                     "[Intel] Not ingesting — set a valid EVE logs path and tag "
                     "at least one channel Intel\n", "dim")
             else:
-                self._log_prepend(
-                    self._intel_log,
-                    f"[Intel] Intelligence Fusion ACTIVE — "
-                    f"{len(self._intel_channels_enabled)} channel(s) streaming\n",
-                    "intel")
+                # Two different numbers, and saying so is the point. This line
+                # read "Intelligence Fusion ACTIVE — 0 channel(s) streaming"
+                # whenever a monitor object existed: the loudest possible lie,
+                # told at the exact moment the user opens the panel to find out
+                # why it is empty. Ingest covers every TRACKED channel; the
+                # checkbox strip picks which of them this stream shows.
+                ingesting = len(self._tracked_intel_channels)
+                showing = len(self._intel_channels_enabled)
+                if showing:
+                    text = (f"[Intel] Ingesting {ingesting} Intel channel(s); "
+                            f"showing {showing} in this stream\n")
+                else:
+                    text = (f"[Intel] Ingesting {ingesting} Intel channel(s) — "
+                            f"none ticked for this stream yet\n")
+                self._log_prepend(self._intel_log, text, "intel")
         else:
             try:
                 self._paned.forget(self._intel_right_frame)
@@ -27940,20 +28006,24 @@ $bmp.Dispose()
 
         Sourced from ``self._tracked_intel_channels``. Safe to call at build
         time and again after a Settings save so the panel reflects the new
-        tracked set without an app restart. Existing per-session enabled state
-        is preserved for channels that still exist; channels removed from the
-        tracked list drop out of both the panel and the enabled set. Checkboxes
-        start DISABLED (greyed) until a fusion session activates them; a channel
-        that is already enabled (running session) is re-shown checked + active.
+        tracked set without an app restart. Existing selection is preserved for
+        channels that still exist; channels removed from the tracked list drop
+        out of both the strip and the selection.
+
+        Each box governs whether that channel appears in the Intelligence Fusion
+        STREAM PANEL — never whether it is ingested (:meth:`_on_intel_message`
+        gates on the tracked set). They are therefore always clickable: they
+        used to start DISABLED until a "fusion session" activated them, which
+        stopped meaning anything once ingest and display split, and left them
+        dead while the deferred activity scan was still pending.
         """
         frame = getattr(self, "_intel_channels_frame", None)
         if frame is None:
             return
 
-        # Preserve which channels are currently enabled so a live fusion session
-        # keeps its toggles across the rebuild.
+        # Preserve which channels the stream is currently showing, so a rebuild
+        # (a Settings save) does not silently change what is on screen.
         previously_enabled = set(getattr(self, "_intel_channels_enabled", set()))
-        running = self._intel_monitor is not None
 
         for child in frame.winfo_children():
             child.destroy()
@@ -27961,7 +28031,7 @@ $bmp.Dispose()
 
         new_enabled: set[str] = set()
         for ch_name in self._tracked_intel_channels:
-            still_on = running and ch_name in previously_enabled
+            still_on = ch_name in previously_enabled
             var = tk.BooleanVar(value=still_on)
             self._intel_channel_vars[ch_name] = var
             if still_on:
@@ -27972,17 +28042,69 @@ $bmp.Dispose()
                 fg=FG_MAGENTA if still_on else FG_DIM, bg=BG_PANEL,
                 selectcolor=BG_ENTRY, activebackground=BG_PANEL,
                 activeforeground=FG_MAGENTA,
-                state=tk.NORMAL if running else tk.DISABLED,
+                state=tk.NORMAL,
                 command=self._on_intel_channel_change,
             )
             cb.pack(side=tk.LEFT, padx=4)
+            attach_tooltip(cb, _INTEL_CHANNEL_BOX_TIP.format(channel=ch_name))
 
         # Drop enabled entries for channels that no longer exist.
         if hasattr(self, "_intel_channels_enabled"):
             self._intel_channels_enabled.clear()
             self._intel_channels_enabled.update(new_enabled)
 
-    def _ensure_intel_monitor(self):
+    def _scan_intel_channel_states(self):
+        """Seed the channel checkboxes' state from log activity. DISPLAY ONLY.
+
+        The checkbox strip picks which tracked channels appear in the
+        Intelligence Fusion stream panel; it does NOT decide what is ingested
+        (see :meth:`_on_intel_message`). So this scan's whole remaining job is
+        the strip's INITIAL state and colouring: a channel whose log was written
+        today starts ticked and magenta, one that was not starts unticked and
+        dim — both clickable either way.
+
+        Split out of :meth:`_ensure_intel_monitor` (2026-08-15) because
+        ``scan_available_channels`` globs the entire Chatlogs directory: 0.59 s
+        measured on the owner's 53,499-file directory, and __init__ paid it
+        synchronously before ``mainloop()``. Being display-only, it now rides
+        the startup stagger while ingest starts inline.
+
+        ``tracked_character`` is deliberately NOT passed. Intel must cover every
+        account the FC is logged in on — the same reason ``listener_filter`` is
+        None — and a tracked-character filter would call a channel inactive
+        whenever the box the FC has open is not the fleet-chat listener. It is
+        also far cheaper: the filtered path opens and decodes the first 2 KB of
+        EVERY matching file.
+
+        Silent no-op without a readable logs path or a tracked channel: it fires
+        off a startup timer and must survive landing on a host with nothing to
+        scan.
+        """
+        logs_path = self.config.get("eve_logs_path", "")
+        channels = list(self._tracked_intel_channels)
+        if not logs_path or not os.path.isdir(logs_path) or not channels:
+            return
+        scanned = scan_available_channels(logs_path, None, channels)
+        active_names = {ch["name"] for ch in scanned if ch["active"]}
+        self._intel_channels_enabled.clear()
+        for name, var in self._intel_channel_vars.items():
+            is_active = name in active_names
+            var.set(is_active)
+            if is_active:
+                self._intel_channels_enabled.add(name)
+            # Every tracked checkbox stays clickable; colour signals activity.
+            for w in self._intel_channels_frame.winfo_children():
+                if isinstance(w, tk.Checkbutton) and w.cget("text") == name:
+                    w.config(state=tk.NORMAL,
+                             fg=FG_MAGENTA if is_active else FG_DIM)
+        # A deferred scan can land after the user already revealed the panel, so
+        # repaint what the new selection admits. Skipped while it is hidden —
+        # _toggle_intel_fusion repaints from _intel_buffer on the way in.
+        if (getattr(self, "_intel_buffer", None) is not None
+                and self._intel_fusion_enabled.is_set()):
+            self._intel_rerender_from_buffer()
+
+    def _ensure_intel_monitor(self, scan_channel_states: bool = True):
         """Start intel INGEST whenever it can run — independent of any display.
 
         Intel feeds four always-on consumers, none of which is the Intelligence
@@ -27991,12 +28113,19 @@ $bmp.Dispose()
         and the intel ping. Until 2026-08-15 the Fusion checkbox owned the whole
         lifecycle, so all four starved while it was unticked — the owner's
         report. The checkbox is now display-only (:meth:`_toggle_intel_fusion`)
-        and this is the single owner of the monitor, the poll thread, the
-        resolver and ``_intel_channels_enabled``.
+        and this is the single owner of the monitor, the poll thread and the
+        resolver.
 
         Preconditions to run at all: a readable ``eve_logs_path`` AND at least
         one Intel-tagged channel. Neither is an error — both are "nothing to
         ingest yet"; each logs once per call and returns.
+
+        ``scan_channel_states=False`` skips the display-only activity scan
+        (:meth:`_scan_intel_channel_states`), which is how startup gets ingest
+        running immediately and still defers that scan's directory glob into the
+        stagger. Nothing about ingest depends on it — the gate is the TRACKED
+        set — so the skip costs only the checkbox strip's initial ticks, and
+        those arrive seconds later on a panel that starts hidden.
 
         IDEMPOTENT by input signature, so every site whose inputs can change
         calls it unconditionally: an unchanged ``(logs path, tracked channels)``
@@ -28063,29 +28192,12 @@ $bmp.Dispose()
                     self._intel_resolver_starting = False
             threading.Thread(target=_load_and_init_resolver, daemon=True).start()
 
-        # Scan the tracked channels for which ones are currently active (have a
-        # log modified today). Active channels are auto-enabled; inactive ones
-        # stay toggleable (clickable but dimmed) so the FC can opt in manually.
-        #
-        # tracked_character is deliberately NOT passed. Intel must cover every
-        # account the FC is logged in on — the same reason listener_filter is
-        # None below — and a tracked-character filter here would call a channel
-        # inactive (so never auto-enable it) whenever the box the FC has open is
-        # not the fleet-chat listener. It is also far cheaper: the filtered path
-        # opens and decodes the first 2 KB of EVERY matching file.
-        scanned = scan_available_channels(logs_path, None, channels)
-        active_names = {ch["name"] for ch in scanned if ch["active"]}
-        self._intel_channels_enabled.clear()
-        for name, var in self._intel_channel_vars.items():
-            is_active = name in active_names
-            var.set(is_active)
-            if is_active:
-                self._intel_channels_enabled.add(name)
-            # Keep every tracked checkbox clickable; colour signals active state.
-            for w in self._intel_channels_frame.winfo_children():
-                if isinstance(w, tk.Checkbutton) and w.cget("text") == name:
-                    w.config(state=tk.NORMAL,
-                             fg=FG_MAGENTA if is_active else FG_DIM)
+        # Seed the checkbox strip from log activity — the stream panel's initial
+        # selection, and nothing else. Deferred at startup (see the argument's
+        # note above); inline everywhere else, where it is a user action already
+        # paying for a settings round trip.
+        if scan_channel_states:
+            self._scan_intel_channel_states()
 
         # listener_filter=None: tail EVERY character's copy of these channels,
         # because "logged in on one of their accounts" is the requirement.
@@ -28172,12 +28284,14 @@ $bmp.Dispose()
         # (correctly) rebuild — but a future short-circuit that trusted the key
         # alone would silently stay stopped.
         self._intel_source_key = None
-        # Disable all checkboxes
+        # Clear the stream's channel selection (nothing new can arrive for it),
+        # but leave the boxes CLICKABLE: they are display controls now, and the
+        # bounded _intel_buffer still holds what did arrive.
         for var in self._intel_channel_vars.values():
             var.set(False)
         for w in self._intel_channels_frame.winfo_children():
             if isinstance(w, tk.Checkbutton):
-                w.config(state=tk.DISABLED, fg=FG_DIM)
+                w.config(state=tk.NORMAL, fg=FG_DIM)
 
     def _intel_poll_loop(self, stop: threading.Event):
         """Background polling loop for intel channels.
@@ -28215,7 +28329,11 @@ $bmp.Dispose()
             stop.wait(self.config.get("poll_interval_seconds", 1.0))
 
     def _on_intel_channel_change(self):
-        """Called when a channel checkbox is toggled."""
+        """A channel checkbox was toggled: re-pick what the STREAM PANEL shows.
+
+        Display only — ingest is untouched (:meth:`_on_intel_message` gates on
+        the tracked set), so this repaints from the bounded ``_intel_buffer``
+        and a channel switched on mid-session shows its history immediately."""
         self._intel_channels_enabled.clear()
         for name, var in self._intel_channel_vars.items():
             if var.get():
@@ -28258,10 +28376,71 @@ $bmp.Dispose()
         except Exception:
             pass
 
+    def _intel_is_skew_duplicate(self, msg) -> bool:
+        """True when this line has already been delivered under another stamp.
+
+        The second dedupe stage described at :data:`INTEL_SKEW_WINDOW_S`. It sits
+        here, above the whole fan-out, rather than inside any one consumer:
+        a surplus delivery costs a duplicate HUD row, a duplicate preview flash,
+        a duplicate map pulse AND a doubled intel ping, so one gate serves them
+        all — and it also saves the annotate/parse work the duplicate would pay.
+
+        A legitimate repeat OUTSIDE the window is two real events and stays two;
+        the anchor then moves to the delivered line, so the repeat's own
+        skew-twin is collapsed in turn. Stamps are compared as floats so a
+        mixed aware/naive pair can never raise mid-poll, and an unparsed stamp
+        suppresses nothing — dropping on the key alone would silence a genuinely
+        repeated report forever.
+
+        Runs on the intel poll thread: Tk-free, lock-protected, and it prunes
+        entries older than :data:`INTEL_SKEW_EVICT_S` in log time on the way
+        through so the map cannot grow.
+        """
+        ts = getattr(msg, "timestamp", None)
+        if not isinstance(ts, datetime):
+            return False
+        try:
+            stamp = ts.timestamp()
+        except (OverflowError, OSError, ValueError):
+            return False
+        body = hashlib.sha1(
+            (msg.message or "").encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        key = (msg.channel, msg.sender, body)
+        with self._intel_skew_lock:
+            seen = self._intel_skew_seen
+            prev = seen.get(key)
+            if prev is not None and abs(stamp - prev) <= INTEL_SKEW_WINDOW_S:
+                return True
+            seen[key] = stamp
+            cutoff = stamp - INTEL_SKEW_EVICT_S
+            for stale in [k for k, t in seen.items() if t < cutoff]:
+                seen.pop(stale, None)
+        return False
+
     def _on_intel_message(self, msg: ChatMessage):
         """Worker-thread callback: annotate verbatim, enrich for priority only,
-        then marshal to the main thread. Nothing is dropped."""
-        if msg.channel not in self._intel_channels_enabled:
+        then marshal to the main thread. Nothing is dropped.
+
+        The gate is the TRACKED set — EVERY Intel-tagged channel is ingested,
+        unconditionally. It was ``_intel_channels_enabled`` (the checkbox strip,
+        seeded from "this channel's log was modified today") until 2026-08-15,
+        and that made the always-on fix dead in the commonest startup order:
+        FCTool opened BEFORE EVE with the last session yesterday scans every
+        channel INACTIVE, the set stays empty for the whole run, and every line
+        is tailed, parsed and then binned — tile, preview and map all read 0
+        until the user manually ticked a box. If the FC tagged a channel Intel
+        they want its intel; a dead channel simply produces no lines, so the
+        activity heuristic bought INGEST nothing and cost everything when it
+        guessed wrong. The checkboxes govern the Fusion stream panel only, in
+        :meth:`_passes_view_filter`.
+
+        The gate is still needed, only moved: ``channel_filters`` matches by
+        filename PREFIX, so a tracked "Intel" also tails "Intel.WOMP" files.
+        """
+        if msg.channel not in self._tracked_intel_channels:
+            return
+        if self._intel_is_skew_duplicate(msg):
             return
         try:
             spans = intel_stream.annotate(msg.message)
