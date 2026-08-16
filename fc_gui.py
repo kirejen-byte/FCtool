@@ -241,9 +241,8 @@ DRAIN_MS = 50
 # anonymous "Thread-N" — see _start_monitoring for the restart-safety contract.
 CHAT_POLL_THREAD_NAME = "fctool-chat-poll"
 
-# Name carried by the Intelligence-Fusion poll thread (_intel_poll_loop). Same
-# reason as above, and the same restart-safety contract — see
-# _start_intel_monitor.
+# Name carried by the intel-ingest poll thread (_intel_poll_loop). Same reason
+# as above, and the same restart-safety contract — see _ensure_intel_monitor.
 INTEL_POLL_THREAD_NAME = "fctool-intel-poll"
 
 # ── Settings-tab floating TOC (right-margin index) responsive-collapse tuning ──
@@ -1350,6 +1349,12 @@ class FCToolGUI:
         self._build_info_tiles()
         self._setup_modules()
         self._start_monitoring()
+        # Intel ingest starts here too, beside the other monitors — NOT behind
+        # the Intelligence Fusion checkbox, which is display-only. The HUD intel
+        # tile, the FCPreview intel flash and the star-map pulse all hang off it
+        # (owner-reported 2026-08-15). Silent no-op without a readable logs path
+        # or an Intel-tagged channel.
+        self._ensure_intel_monitor()
 
         # Auto-refresh character data in the background shortly after startup
         if self.esi_accounts and hasattr(self, '_char_tab_content'):
@@ -4694,8 +4699,16 @@ class FCToolGUI:
         self._intel_monitor: ChatMonitor | None = None
         self._intel_thread: threading.Thread | None = None
         # This generation's stop signal. Assigned as a PAIR with _intel_thread
-        # (see _start_intel_monitor) and never cleared — replaced.
+        # (see _ensure_intel_monitor) and never cleared — replaced.
         self._intel_stop: threading.Event = threading.Event()
+        # (logs_path, tracked intel channels) the live monitor was built for.
+        # _ensure_intel_monitor is idempotent against it: an unchanged pair is a
+        # cheap return, a changed one is a re-point. Cleared by every stop.
+        self._intel_source_key: tuple | None = None
+        # True while the background standings load that builds the resolver is
+        # in flight — _ensure_intel_monitor runs from six call sites and would
+        # otherwise leak one resolver worker per call.
+        self._intel_resolver_starting = False
         self._intel_channels_enabled: set[str] = set()
         self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
         self._intel_channel_colors: dict[str, str] = {}
@@ -23548,6 +23561,11 @@ class FCToolGUI:
                 self._links_backfill_attempts = self._LINKS_BACKFILL_ATTEMPTS
             char_label = f" ({tracked_char})" if tracked_char else ""
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
+        # Intel ingest is deliberately character-AGNOSTIC (it tails every
+        # account's copy of the tracked channels), so this normally short-
+        # circuits — but it is also the moment a first-run user finally has a
+        # usable config, so ask rather than assume.
+        self._ensure_intel_monitor()
 
     def _scan_characters(self):
         """Scan log files to find all character names that have fleet channels.
@@ -23827,8 +23845,10 @@ class FCToolGUI:
         reg.set_tags(chan.name, tags)
         self._save_channels()
         # Intel membership may have just changed — the Intelligence panel's
-        # checkbox strip is derived from the Intel-tagged view.
+        # checkbox strip is derived from the Intel-tagged view, and so is the
+        # ingest monitor's channel_filters (re-points only on a real change).
         self._rebuild_intel_channel_checkboxes()
+        self._ensure_intel_monitor()
         self._set_intel_channels_status(
             f"{chan.name}: {tag} {'on' if want_on else 'off'}",
             FG_GREEN if want_on else FG_DIM)
@@ -23876,6 +23896,7 @@ class FCToolGUI:
         self._save_channels()
         self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
+        self._ensure_intel_monitor()
         self._refresh_intel_channel_suggestions()
         self._set_intel_channels_status(status, FG_GREEN)
 
@@ -23889,6 +23910,7 @@ class FCToolGUI:
         self._save_channels()
         self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
+        self._ensure_intel_monitor()
         self._refresh_intel_channel_suggestions()
         self._set_intel_channels_status(f"Removed {name}", FG_DIM)
 
@@ -24210,6 +24232,10 @@ class FCToolGUI:
         self._rebuild_intel_channel_checkboxes()
         self._setup_modules()
         self._start_monitoring()
+        # Both of intel ingest's inputs live in this dialog (the logs path and,
+        # via the Channels registry, the Intel-tagged set), so re-point it here.
+        # Idempotent: unchanged inputs cost one dict read.
+        self._ensure_intel_monitor()
         self._save_status.config(text="Saved!", fg=FG_GREEN)
 
         # First-run auto-setup on a newly-set/browsed logs path: if the user just
@@ -24470,10 +24496,13 @@ class FCToolGUI:
         if self.zkill_monitor:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
-            # Deliberately NOT _intel_stop: a Settings->Save must not end
-            # Intelligence Fusion (nothing here restarts it — only the user's
-            # toggle does, via _start_intel_monitor). The intel poll thread's
-            # lifecycle belongs to _start/_stop_intel_monitor alone.
+            # Deliberately NOT _intel_stop: this also runs on Settings->Save,
+            # which must not end intel ingest — _save_settings re-points it via
+            # _ensure_intel_monitor a few lines later, and tearing the poller
+            # down here would make every Save pay for a full monitor rebuild.
+            # ChatMonitor.stop() is inert for poll()-driven use. The intel poll
+            # thread's lifecycle belongs to _ensure/_stop_intel_monitor alone;
+            # shutdown calls _stop_intel_monitor explicitly (see _on_close).
             self._intel_monitor.stop()
 
     def _chat_poll_loop(self, stop: threading.Event):
@@ -27862,12 +27891,49 @@ $bmp.Dispose()
             self._intel_min_reported = 0
 
     def _toggle_intel_fusion(self):
-        """Enable or disable intelligence fusion."""
-        enabled = self._intel_fusion_var.get()
-        if enabled:
-            self._start_intel_monitor()
+        """Show or hide the merged Intelligence Fusion stream panel.
+
+        DISPLAY ONLY since 2026-08-15. This checkbox used to own the intel
+        ChatMonitor's entire lifecycle, so with it unticked there was no
+        monitor, no poll thread and an empty ``_intel_channels_enabled`` — and
+        every consumer of the single ``_on_intel_message`` callback starved:
+        the FC HUD intel tile (the owner's report), the FCPreview intel-flash
+        border with its gate-jump radius, and the star-map intel pulse. Ingest
+        is now owned by :meth:`_ensure_intel_monitor` and runs whenever it can;
+        the box only decides whether the merged stream is on screen.
+
+        Nothing here starts or stops ingest — deliberately, so an FC who never
+        wants the raw firehose still gets the tile, the flash and the pulse.
+        """
+        if self._intel_fusion_var.get():
+            try:
+                self._paned.add(self._intel_right_frame, stretch="always")
+            except tk.TclError:
+                pass  # Already added
+            # Ingest never stopped while the panel was hidden, so everything
+            # that arrived is still in the bounded _intel_buffer (maxlen 2000).
+            # Repaint from it rather than revealing an empty widget — the user
+            # loses nothing by leaving the stream closed.
+            self._intel_rerender_from_buffer()
+            if self._intel_monitor is None:
+                # Honest, and the only feedback the refusal path owes the user:
+                # _ensure_intel_monitor logs and returns rather than reaching
+                # back into this checkbox.
+                self._log_prepend(
+                    self._intel_log,
+                    "[Intel] Not ingesting — set a valid EVE logs path and tag "
+                    "at least one channel Intel\n", "dim")
+            else:
+                self._log_prepend(
+                    self._intel_log,
+                    f"[Intel] Intelligence Fusion ACTIVE — "
+                    f"{len(self._intel_channels_enabled)} channel(s) streaming\n",
+                    "intel")
         else:
-            self._stop_intel_monitor()
+            try:
+                self._paned.forget(self._intel_right_frame)
+            except tk.TclError:
+                pass
 
     def _rebuild_intel_channel_checkboxes(self):
         """(Re)build the Intel-panel channel checkboxes from the tracked list.
@@ -27916,39 +27982,99 @@ $bmp.Dispose()
             self._intel_channels_enabled.clear()
             self._intel_channels_enabled.update(new_enabled)
 
-    def _start_intel_monitor(self):
-        """Start the intel channel ChatMonitor."""
-        # Load standings (friendly/hostile) in background, then build and start
-        # the async name->standing resolver for the firehose stream.
-        def _load_and_init_resolver():
-            friendly, hostile = (set(), set())
-            if self.esi_auth and self.esi_auth.is_authenticated:
-                try:
-                    friendly, hostile = load_standings(self.esi_auth)
-                except Exception:
-                    log.exception("intel: load_standings failed")
-            self._intel_resolver = IntelResolver(
-                friendly=friendly, hostile=hostile)
-            self._intel_resolver.start()
-        threading.Thread(target=_load_and_init_resolver, daemon=True).start()
+    def _ensure_intel_monitor(self):
+        """Start intel INGEST whenever it can run — independent of any display.
 
+        Intel feeds four always-on consumers, none of which is the Intelligence
+        Fusion stream panel: the FC HUD intel tile, the FCPreview intel-flash
+        border (with its ``intel_flash_jumps`` radius), the star-map intel pulse
+        and the intel ping. Until 2026-08-15 the Fusion checkbox owned the whole
+        lifecycle, so all four starved while it was unticked — the owner's
+        report. The checkbox is now display-only (:meth:`_toggle_intel_fusion`)
+        and this is the single owner of the monitor, the poll thread, the
+        resolver and ``_intel_channels_enabled``.
+
+        Preconditions to run at all: a readable ``eve_logs_path`` AND at least
+        one Intel-tagged channel. Neither is an error — both are "nothing to
+        ingest yet"; each logs once per call and returns.
+
+        IDEMPOTENT by input signature, so every site whose inputs can change
+        calls it unconditionally: an unchanged ``(logs path, tracked channels)``
+        pair with a live monitor returns before paying for another channel scan,
+        and the generation guard below means even a forced repeat cannot spawn a
+        second poller. A CHANGED signature retires the current generation first,
+        so a re-point replaces the poller rather than stacking one.
+
+        It must NEVER touch ``_intel_fusion_var``: a data-source failure may not
+        flip a display toggle. The old start path did exactly that, which is how
+        "no logs path" presented itself to the user as "Fusion turned itself
+        off".
+        """
         logs_path = self.config.get("eve_logs_path", "")
+        channels = list(self._tracked_intel_channels)
         if not logs_path or not os.path.isdir(logs_path):
-            self._append_zkill_log(
-                "\n[Intel] Cannot start: eve_logs_path not configured\n", "dim"
-            )
-            self._intel_fusion_var.set(False)
+            reason = f"eve_logs_path is not a readable directory ({logs_path!r})"
+        elif not channels:
+            reason = "no Intel-tagged channels configured"
+        else:
+            reason = None
+        if reason is not None:
+            if self._intel_monitor is not None:
+                # The inputs went away UNDER a live generation — the last Intel
+                # tag removed, or the logs path re-pointed at nothing. Nothing
+                # else stops ingest now that the checkbox does not, so leaving
+                # it running would keep tailing a log universe the settings in
+                # force disown (and keep feeding the tile from it).
+                log.info("intel ingest stopping: %s", reason)
+                self._stop_intel_monitor()
+            else:
+                log.info("intel ingest idle: %s", reason)
             return
 
-        tracked_char = self.config.get("tracked_character", "") or None
+        key = (logs_path, tuple(channels))
+        if (getattr(self, "_intel_source_key", None) == key
+                and self._intel_monitor is not None):
+            return          # same log universe, already ingesting
+        if self._intel_monitor is not None:
+            # A re-point (new logs path / new tracked channel set). Retire this
+            # generation BEFORE building the next one so exactly one poller
+            # survives and the outgoing monitor stops tailing the old universe.
+            self._stop_intel_monitor()
+
+        # Load standings (friendly/hostile) in background, then build and start
+        # the async name->standing resolver for the firehose stream. Guarded:
+        # this method now runs from six call sites, and an unguarded rebuild
+        # would leak one resolver worker per call.
+        if self._intel_resolver is None and not self._intel_resolver_starting:
+            self._intel_resolver_starting = True
+
+            def _load_and_init_resolver():
+                try:
+                    friendly, hostile = (set(), set())
+                    if self.esi_auth and self.esi_auth.is_authenticated:
+                        try:
+                            friendly, hostile = load_standings(self.esi_auth)
+                        except Exception:
+                            log.exception("intel: load_standings failed")
+                    resolver = IntelResolver(friendly=friendly, hostile=hostile)
+                    resolver.start()
+                    self._intel_resolver = resolver
+                finally:
+                    self._intel_resolver_starting = False
+            threading.Thread(target=_load_and_init_resolver, daemon=True).start()
 
         # Scan the tracked channels for which ones are currently active (have a
         # log modified today). Active channels are auto-enabled; inactive ones
         # stay toggleable (clickable but dimmed) so the FC can opt in manually.
-        channels = scan_available_channels(
-            logs_path, tracked_char, self._tracked_intel_channels
-        )
-        active_names = {ch["name"] for ch in channels if ch["active"]}
+        #
+        # tracked_character is deliberately NOT passed. Intel must cover every
+        # account the FC is logged in on — the same reason listener_filter is
+        # None below — and a tracked-character filter here would call a channel
+        # inactive (so never auto-enable it) whenever the box the FC has open is
+        # not the fleet-chat listener. It is also far cheaper: the filtered path
+        # opens and decodes the first 2 KB of EVERY matching file.
+        scanned = scan_available_channels(logs_path, None, channels)
+        active_names = {ch["name"] for ch in scanned if ch["active"]}
         self._intel_channels_enabled.clear()
         for name, var in self._intel_channel_vars.items():
             is_active = name in active_names
@@ -27961,19 +28087,26 @@ $bmp.Dispose()
                     w.config(state=tk.NORMAL,
                              fg=FG_MAGENTA if is_active else FG_DIM)
 
+        # listener_filter=None: tail EVERY character's copy of these channels,
+        # because "logged in on one of their accounts" is the requirement.
+        # Affordable because ChatMonitor de-duplicates
+        # (channel, ts, sender, sha1(body)) for 60 s inside _poll_once, BEFORE
+        # the callback — verified against the real monitor in
+        # tests/test_intel_always_on.py — so a line the FC sees on four accounts
+        # still reaches _on_intel_message exactly once.
         self._intel_monitor = ChatMonitor(
             logs_path=logs_path,
             poll_interval=self.config.get("poll_interval_seconds", 1.0),
-            listener_filter=tracked_char,
-            channel_filters=list(self._tracked_intel_channels),
+            listener_filter=None,
+            channel_filters=list(channels),
         )
         self._intel_monitor.on_message(self._on_intel_message)
+        self._intel_source_key = key
         # Restart-safe spawn (the _start_monitoring / _chat_poll_loop shape).
-        # Toggling Intelligence Fusion off then on inside one poll interval used
-        # to leave the outgoing thread parked in a bare time.sleep: it slept
-        # through the stop, woke to a re-populated _intel_monitor and a re-set
-        # fusion Event, and lived FOREVER — one permanent extra poller per
-        # toggle, all of them polling the CURRENT monitor.
+        # Re-pointing intel inside one poll interval used to leave the outgoing
+        # thread parked in a bare time.sleep: it slept through the stop, woke to
+        # a re-populated _intel_monitor and lived FOREVER — one permanent extra
+        # poller per restart, all of them polling the CURRENT monitor.
         prev = self._intel_thread
         if (prev is not None and prev.is_alive()
                 and not self._intel_stop.is_set()):
@@ -27996,30 +28129,25 @@ $bmp.Dispose()
             )
             self._intel_thread.start()
 
-        active = len(self._intel_channels_enabled)
-
-        # Show the right pane
-        try:
-            self._paned.add(self._intel_right_frame, stretch="always")
-        except tk.TclError:
-            pass  # Already added
-
-        self._log_prepend(self._intel_log,
-            f"[Intel] Intelligence Fusion ACTIVE — {active} channel(s) streaming\n",
-            "intel")
-
     def _stop_intel_monitor(self):
-        """Stop the intel channel ChatMonitor."""
+        """Stop intel ingest: the poll thread, the monitor and the resolver.
+
+        Two callers, neither of them the Fusion checkbox (which owns display
+        only): app shutdown, and ``_ensure_intel_monitor``'s re-point path,
+        which retires the current generation before building the next one.
+        Leaves the stream PANEL alone — hiding it is the checkbox's job.
+        """
         # Wake this generation's poll thread out of its interval wait and wait
         # for it to actually exit, so a caller can rely on at most one poller
-        # existing across an off->on toggle. Because the loop waits on the event
+        # existing across a re-point. Because the loop waits on the event
         # rather than sleeping, this join normally returns in microseconds
         # despite the 1 s poll interval; the bound covers a pass wedged mid-poll
-        # (a slow log read). Runs on the Tk thread only on a user toggle, so a
-        # bounded wait is acceptable there.
+        # (a slow log read). Runs on the Tk thread only on rare user actions
+        # (Settings->Save, a channel edit, shutdown), so a bounded wait is
+        # acceptable there.
         #
         # If the bound DOES expire, the stale thread is still guaranteed to
-        # exit: this event stays set forever — _start_intel_monitor hands the
+        # exit: this event stays set forever — _ensure_intel_monitor hands the
         # successor a brand-new Event instead of clearing this one — so the
         # wedged pass ends at its next check.
         intel_stop = getattr(self, "_intel_stop", None)
@@ -28039,17 +28167,17 @@ $bmp.Dispose()
                 pass
             self._intel_resolver = None
         self._intel_channels_enabled.clear()
+        # The source signature must die with the generation, or the next
+        # _ensure_intel_monitor would see a matching key, find no monitor and
+        # (correctly) rebuild — but a future short-circuit that trusted the key
+        # alone would silently stay stopped.
+        self._intel_source_key = None
         # Disable all checkboxes
         for var in self._intel_channel_vars.values():
             var.set(False)
         for w in self._intel_channels_frame.winfo_children():
             if isinstance(w, tk.Checkbutton):
                 w.config(state=tk.DISABLED, fg=FG_DIM)
-        # Hide the right pane
-        try:
-            self._paned.forget(self._intel_right_frame)
-        except tk.TclError:
-            pass
 
     def _intel_poll_loop(self, stop: threading.Event):
         """Background polling loop for intel channels.
@@ -28057,19 +28185,19 @@ $bmp.Dispose()
         ``stop`` is handed in per spawn rather than read off ``self`` on
         purpose: a thread that outlived its join (see _stop_intel_monitor) keeps
         its own, permanently-signalled event and so exits at its next check even
-        after _start_intel_monitor has given a successor a fresh one. Reading a
+        after _ensure_intel_monitor has given a successor a fresh one. Reading a
         shared attribute instead would let the successor's replacement resurrect
-        the stale thread — which is exactly how a fast Fusion off/on toggle used
-        to leak a poller per toggle.
+        the stale thread — which is exactly how a fast re-point used to leak a
+        poller per restart.
 
-        The stop event is a THIRD gate, added to — not in place of — the two the
-        loop already had. Both are kept in the while condition so the exit
-        semantics are unchanged: fusion being disabled still ends the loop
-        within one interval even though nothing signalled stop, and a monitor
-        nulled without a stop still ends it at the next pass.
+        TWO gates, both kept in the while condition: this generation's stop, and
+        a monitor nulled without one (which still ends the loop at the next
+        pass). The Intelligence Fusion Event was a THIRD gate until 2026-08-15
+        and is deliberately gone — ingest must keep running with the stream
+        panel closed, and leaving it in would have made every always-on start
+        exit on its first check.
         """
-        while (not stop.is_set() and self._intel_monitor
-                and self._intel_fusion_enabled.is_set()):
+        while not stop.is_set() and self._intel_monitor:
             try:
                 # Re-read per pass into a local: the attribute is nulled by
                 # _stop_intel_monitor and replaced by a start, so this both
@@ -28081,10 +28209,9 @@ $bmp.Dispose()
             except Exception:
                 log.exception("Intel poll loop iteration failed; continuing to poll")
             # Wait on the stop event, never time.sleep: a stop wakes the thread
-            # immediately instead of up to poll_interval later. Deliberately NOT
-            # the fusion Event — disabling fusion keeps taking effect within one
-            # interval, exactly as before. self.config is re-read here (never
-            # cached) because _save_settings REPLACES the whole dict.
+            # immediately instead of up to poll_interval later. self.config is
+            # re-read here (never cached) because _save_settings REPLACES the
+            # whole dict.
             stop.wait(self.config.get("poll_interval_seconds", 1.0))
 
     def _on_intel_channel_change(self):
@@ -28187,7 +28314,14 @@ $bmp.Dispose()
 
     def _intel_stream_ingest(self, msg, spans, report, priority):
         """Main thread: append to the ring buffer, render if visible, fire the
-        async resolver, and ping on priority lines."""
+        async resolver, and ping on priority lines.
+
+        Everything above the ``panel_visible`` gate is ALWAYS-ON — the buffer,
+        the FC HUD intel tile, the FCPreview intel index, the star-map pulse and
+        (below) the ping. Only the Fusion stream's Text rendering answers to the
+        checkbox, because that is the one surface nobody can be looking at when
+        the panel is hidden.
+        """
         self._intel_buffer.append((msg, spans, report, priority))
         # FC HUD intel tile: a second, read-only consumer of the same line. Same
         # Tk thread (this method is _post_ui-marshaled) and the same
@@ -28221,11 +28355,21 @@ $bmp.Dispose()
                         self._push_intel_to_map(_sid)
         except Exception:
             pass
+        # Render ONLY while the stream panel is on screen. The thread-safe
+        # mirror of the checkbox is read rather than the Tk Var so this gate
+        # reads the same on any thread. Skipping it saves the widget write, the
+        # dynamic-tag churn, the trim and — below — the resolver round trip that
+        # would otherwise repaint a widget nobody can see. Nothing is lost:
+        # _toggle_intel_fusion repaints from _intel_buffer on the way in.
+        panel_visible = self._intel_fusion_enabled.is_set()
         rendered_range = None
-        if self._passes_view_filter(msg):
+        if panel_visible and self._passes_view_filter(msg):
             rendered_range = self._render_line((msg, spans, report, priority))
-        # async name resolution
-        if self._intel_resolver is not None:
+        # async name resolution — display-only work, so it rides the same gate.
+        # (A hidden-panel request would land with rendered_range None, taking
+        # the marshalled TAIL-scan branch below: ~66 ms of Text.search per line
+        # at cap, for colour on a widget that is not mapped.)
+        if panel_visible and self._intel_resolver is not None:
             try:
                 names = intel_stream.candidate_names(msg.message)
                 if names:
@@ -28634,8 +28778,8 @@ $bmp.Dispose()
         first, each parked at that block's END boundary (== the start of the
         next-older block). Tk maintains mark indices across every edit, so the
         ledger cannot drift from the widget the way a per-block LINE count
-        would: a stray non-block append (e.g. _start_intel_monitor's "cannot
-        start" line) shifts line numbers but never a mark.
+        would: a stray non-block append (e.g. a bare _append_zkill_log notice)
+        shifts line numbers but never a mark.
 
         Blocks are only ever inserted at the head ("1.0") and only ever
         trimmed at the tail, so deleting from the cap-th mark to END drops
@@ -30477,6 +30621,14 @@ $bmp.Dispose()
     def _on_close(self):
         self._running = False
         self._stop_monitoring()
+        # Intel ingest runs whether or not the Fusion panel was ever shown, and
+        # the checkbox no longer stops it, so shutdown is the only place that
+        # retires the poll thread + monitor + resolver. Guarded like the other
+        # teardowns below: the intel tab may never have been built.
+        try:
+            self._stop_intel_monitor()
+        except Exception:
+            pass
         # Persist route cache to disk
         try:
             from jump_range import save_route_cache
