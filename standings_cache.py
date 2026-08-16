@@ -222,11 +222,13 @@ class StandingsCache:
         three-way partition of everything, not a lookup that can miss.
 
         The blues tier matches a blue CHARACTER id as well as a blue corp or
-        alliance (2026-08-16). ``loss_reconciler.classify_victim`` still tests
-        corp/alliance only, so the two answer differently for a pilot who is
-        personally blue in a corp the cache does not know -- a KNOWN gap, and
-        the reason the agreement test in tests/test_standings_cache.py carries
-        no blue-character case.
+        alliance (2026-08-16). All THREE implementations do: this one and
+        ``battle_ledger.classify_victim`` first, ``loss_reconciler.
+        classify_victim`` the same day (64e22f1, the last of the three). The
+        pilot who is personally blue in a corp the cache does not know is no
+        longer a known gap between them, and the agreement test in
+        tests/test_standings_cache.py carries blue-character cases -- it is the
+        thing keeping the three in step.
 
         ``hostile_ids`` deliberately plays no part: "enemies" here means "not
         ours and not blue", which is the question the tally asks.

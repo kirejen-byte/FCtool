@@ -163,6 +163,20 @@ CLEAR_AFTER_SETTLED_S = 900
 # (zkill_monitor.py) is exactly the pattern not to repeat.
 REPLAY_BUFFER_MAX = 500
 
+# Bounds on the ally-drop record (honesty rule 5, 2026-08-16). Unlike the
+# candidate buffer above, this one is written BEFORE either qualification test —
+# every blue who dies anywhere in K-space reaches it — so it needs real bounds,
+# not a safety net. Two of them: how many systems are remembered at once
+# (oldest key evicted first) and how many dropped mails are kept per system.
+# Entries also age out on the buffer's own wall-relative horizon (MAX_KILL_AGE)
+# in `_prune_candidates`, which is what drains it in ordinary running; the caps
+# are what hold under a blue massacre with no ticks in between. At the per-system
+# cap the note UNDER-states the blind spot, which is the only place in this
+# feature where under-stating is safe: the row it accompanies is blanked (or is
+# already a floor), so no number moves.
+ALLY_PRE_ARM_SYSTEMS_MAX = 32
+ALLY_PRE_ARM_PER_SYSTEM_MAX = 50
+
 # zKillboard's feed is K-space only (ZKillMonitor.watch_all accepts
 # 30000000-30999999); wormhole systems are 31000000+. A J-space fight produces
 # NO killmails on this path, so the honest answer is a named blind spot, never
@@ -223,6 +237,10 @@ NOTE_NO_ATTRIBUTION = "no_attribution"
 NOTE_LAG = "lag"
 NOTE_PODS = "pods"
 NOTE_STRUCTURES = "structures"
+# Allied losses the participation gate refused before this fight armed. Its
+# text carries a count, so it is built at render time beside the pods and
+# structures notes rather than living in _NOTE_TEXT.
+NOTE_ALLY_PRE_ARM = "ally_pre_arm"
 
 _NOTE_TEXT = {
     NOTE_FEED_DISABLED: "zKill feed is off — no kill data at all, not zero kills.",
@@ -604,6 +622,21 @@ def classify_victim(facts: KillFacts, *, fleet_char_ids=frozenset(),
     return BUCKET_ENEMIES
 
 
+def _victim_is_blue(facts: KillFacts, ally_ids) -> bool:
+    """Is the VICTIM on the blue list — corp, alliance, or the pilot themselves?
+
+    One definition, two callers: `participates`' ally term and the ally-drop
+    record in `BattleLedger._ingest_locked`. They must agree exactly or the
+    engine names a blind spot that is not one (or misses one that is), so the
+    predicate is written once rather than twice.
+    """
+    for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id,
+                      facts.victim_character_id):
+        if entity_id and entity_id in ally_ids:
+            return True
+    return False
+
+
 def participates(facts: KillFacts, *, fleet_char_ids=frozenset(),
                  own_ids=frozenset(), ally_ids=frozenset(),
                  armed=False) -> bool:
@@ -638,11 +671,32 @@ def participates(facts: KillFacts, *, fleet_char_ids=frozenset(),
         character parked in a system would open a battle panel for somebody
         else's fight.
 
-    The same gate drops an ally loss that ARRIVES before the arming killmail
-    (the caller does not buffer it either: the candidate buffer feeds the
-    two-kill arm test, so buffering blue-on-blue mails would let them supply
-    the arm witness through the back door). That under-counts the Allies row at
-    the very start of a fight, which is the conservative direction.
+    WHAT THE ARMED GATE COSTS, AND WHY IT IS NAMED RATHER THAN SILENT
+    (2026-08-16). An ally loss that ARRIVES before the arming killmail is
+    refused here and is then GONE: zKill's stream delivers each killmail once,
+    and a mail refused at this gate enters neither `_counted_ids` nor
+    `_candidate_ids`, so nothing can fold it in later. Our OWN pre-arm losses
+    are recovered — they are buffered and `_fold_candidates` folds them in once
+    a fight arms — so the loss is one-directional and always shrinks a LOSS row.
+
+    This docstring used to call that "the conservative direction". IT IS THE
+    OPPOSITE. Under-counting an allied loss reads as "we did fine", which is the
+    single failure mode this module exists to avoid (compare the presence gate
+    in `_ingest_locked`, which refuses the same trade for our own losses). It
+    still cannot be cured by counting the mail: the candidate buffer feeds the
+    two-kill arm test, so a buffered blue-on-blue mail could supply the arm
+    witness for a fight we are not in. So the blind spot is NAMED instead —
+    `_ingest_locked` records every ally mail it drops, per system; `_arm`
+    captures the count for the same window `_fold_candidates` folds from; and
+    `render_model` emits NOTE_ALLY_PRE_ARM, plus a BLANK (never 0) Allies row
+    when nothing else landed in it.
+
+    "Ally mails are never buffered" would be too strong, and the precision
+    matters to anyone editing `_arms`: ONE path does reach `_buffer` with an
+    ally mail — armed-here + replayed + older than FIGHT_FOLD_BACK_S, which
+    returns buffered/startup_replay. The arm-witness door stays shut there only
+    because `_arms` SKIPS every candidate marked `replay`. Delete that skip and
+    a blue-on-blue mail can arm a ledger again.
     """
     if own_ids:
         for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id):
@@ -655,11 +709,8 @@ def participates(facts: KillFacts, *, fleet_char_ids=frozenset(),
             return True
         if facts.attacker_character_ids & fleet_char_ids:
             return True
-    if armed and ally_ids:
-        for entity_id in (facts.victim_corporation_id, facts.victim_alliance_id,
-                          facts.victim_character_id):
-            if entity_id and entity_id in ally_ids:
-                return True
+    if armed and ally_ids and _victim_is_blue(facts, ally_ids):
+        return True
     return False
 
 
@@ -949,6 +1000,15 @@ class BattleLedger:
         self._counted_ids: set[int] = set()
         self._candidates: list[_Candidate] = []
         self._candidate_ids: set[int] = set()
+        # THE ALLY-DROP RECORD (honesty rule 5) — system id -> the killmail_times
+        # of ally-victim mails `participates` refused because nothing was armed
+        # there yet. Those mails are unrecoverable (see the `participates`
+        # docstring), so what is kept is the FACT that they existed, per system,
+        # bounded by the two ALLY_PRE_ARM_* caps and aged in `_prune_candidates`.
+        # `_ally_missed` is the count `_arm` captured for the fight now open: it
+        # is per-fight state and dies with it in `_clear`.
+        self._ally_pre_arm: dict[int, list[datetime]] = {}
+        self._ally_missed = 0
         self._fast: FastStrip | None = None
         self._revision = 0
 
@@ -1085,6 +1145,12 @@ class BattleLedger:
         self._last_arrival_mono = None
         self._settled_at_mono = None
         self._counted_ids.clear()
+        # The blind spot belonged to the fight that just ended, and so does the
+        # record it was captured from: the next fight names its OWN drops.
+        # (`_arm` reads the record BEFORE it can reach this, so a re-arm in a
+        # different system still gets its count.)
+        self._ally_missed = 0
+        self._ally_pre_arm.clear()
         self._revision += 1
 
     def dismiss(self):
@@ -1165,6 +1231,14 @@ class BattleLedger:
         if not participates(facts, fleet_char_ids=self._roster,
                             own_ids=self._own_ids, ally_ids=self._ally_ids,
                             armed=armed_here):
+            # HONESTY RULE 5, at the one place the fact is still in hand. The
+            # gate's ally term is ARMED-gated, so a blue who died before our own
+            # losses opened the ledger is refused here — and the mail is gone
+            # (delivered once, buffered by nobody). Record that it existed so a
+            # fight arming in this system can NAME the gap instead of publishing
+            # an Allies row that quietly says nothing of theirs died.
+            if self._ally_ids and _victim_is_blue(facts, self._ally_ids):
+                self._record_ally_pre_arm(facts)
             return IngestResult(ACTION_IGNORED, REASON_NOT_PARTICIPATING,
                                 facts=facts)
 
@@ -1267,6 +1341,12 @@ class BattleLedger:
 
     def _arm(self, facts: KillFacts):
         """Open the ledger on `facts`' system."""
+        # Read the ally-drop record FIRST: the `_clear()` below wipes it, and it
+        # is the newly-armed system's count we need. The window is the one
+        # `_fold_candidates` is about to fold this system's buffered kills from,
+        # so the note names exactly the mails that WOULD have been recovered had
+        # the gate let them through.
+        missed = self._ally_pre_arm_count(facts.system_id, facts.time)
         if self._state == STATE_SETTLED:
             # A different system re-arming: clear the old ledger first so the
             # machine never carries one fight's totals into another.
@@ -1277,6 +1357,36 @@ class BattleLedger:
         self._settled_at_mono = None
         self._last_presence_ok_mono = self._monotonic()
         self._transition(STATE_FILLING)
+        self._ally_missed = missed
+        # Consumed: this fight owns those drops now, and nothing else may claim
+        # them a second time.
+        self._ally_pre_arm.pop(facts.system_id, None)
+
+    # ── the ally-drop record (honesty rule 5) ──────────────────────────────
+
+    def _record_ally_pre_arm(self, facts: KillFacts):
+        """Remember one ally-victim mail the participation gate just dropped.
+
+        Bounded twice over — see the ALLY_PRE_ARM_* constants. Newest entries
+        win both caps, because a fight arms on recent mails.
+        """
+        times = self._ally_pre_arm.setdefault(facts.system_id, [])
+        times.append(facts.time)
+        if len(times) > ALLY_PRE_ARM_PER_SYSTEM_MAX:
+            del times[:-ALLY_PRE_ARM_PER_SYSTEM_MAX]
+        # dicts keep insertion order, so the first key is the least recently
+        # ADDED system. A brand-new key is last, so it can never evict itself.
+        while len(self._ally_pre_arm) > ALLY_PRE_ARM_SYSTEMS_MAX:
+            self._ally_pre_arm.pop(next(iter(self._ally_pre_arm)), None)
+
+    def _ally_pre_arm_count(self, system_id: int, fight_started: datetime) -> int:
+        """How many ally mails were dropped for this system inside the window
+        `_fold_candidates` folds from. Deliberately the SAME horizon: a blue who
+        died 25 minutes before this fight started belongs to another one, and
+        claiming them would be its own dishonesty."""
+        horizon = fight_started - self._fold_back
+        return sum(1 for when in self._ally_pre_arm.get(system_id, ())
+                   if when >= horizon)
 
     def _fold_candidates(self, system_id: int):
         """Retroactively count buffered kills for the newly-armed system.
@@ -1406,21 +1516,30 @@ class BattleLedger:
             return self._revision != before
 
     def _prune_candidates(self):
-        """Age the candidate buffer off the DATA clock's NOW.
+        """Age the candidate buffer — and the ally-drop record — off the DATA
+        clock's NOW.
 
         `_buffer` prunes against the arriving kill's own time, which is right on
         the insert path; here the horizon has to be wall-relative or a buffer
         that stops receiving kills never drains (its newest member's timestamp
         would freeze the horizon with it).
         """
-        if not self._candidates:
-            return
         horizon = self._utcnow() - self._max_kill_age
-        kept = [c for c in self._candidates if c.facts.time >= horizon]
-        if len(kept) != len(self._candidates):
-            self._candidates = kept
-            self._candidate_ids = {c.facts.killmail_id for c in kept
-                                   if c.facts.killmail_id is not None}
+        if self._candidates:
+            kept = [c for c in self._candidates if c.facts.time >= horizon]
+            if len(kept) != len(self._candidates):
+                self._candidates = kept
+                self._candidate_ids = {c.facts.killmail_id for c in kept
+                                       if c.facts.killmail_id is not None}
+        # Same horizon, same reason: a system that stops losing blues must drain
+        # rather than hold a note's worth of ancient drops for the next fight.
+        for system_id in list(self._ally_pre_arm):
+            fresh = [when for when in self._ally_pre_arm[system_id]
+                     if when >= horizon]
+            if fresh:
+                self._ally_pre_arm[system_id] = fresh
+            else:
+                del self._ally_pre_arm[system_id]
 
     # ── render model ───────────────────────────────────────────────────────
 
@@ -1494,6 +1613,18 @@ class BattleLedger:
                             suppressed = True
                     else:
                         suppressed = True
+                # Allied losses were refused before this fight armed, and this
+                # row has nothing of its own to show. The distinction is
+                # deliberate and turns on what a number MEANS here: a counted
+                # 1 stays, because a floor of 1 is still true when more were
+                # dropped (counts only ever go up, and blanking it would throw
+                # away a real number). A 0 is not a floor at all — the engine
+                # is holding proof that at least one allied mail was refused —
+                # so it becomes the blank marker (rule 5's prescribed shape),
+                # and the note beside it says why.
+                if (bucket == BUCKET_ALLIES and self._ally_missed
+                        and not totals.ships):
+                    suppressed = True
                 rows.append(LedgerRow(
                     bucket=bucket,
                     label=BUCKET_LABELS[bucket],
@@ -1505,6 +1636,17 @@ class BattleLedger:
                     composition=() if suppressed else self._composition(totals),
                 ))
 
+            # The named blind spot itself (rule 5). Placed with the other
+            # attribution notes, above the pod/structure bookkeeping: an FC
+            # reading a thin Allies row needs to know mails were refused before
+            # they need to know capsules are excluded.
+            missed = self._ally_missed
+            if missed:
+                notes.append(LedgerNote(
+                    NOTE_ALLY_PRE_ARM,
+                    f"{missed} allied loss{'es' if missed != 1 else ''} arrived "
+                    f"before this fight was detected and "
+                    f"{'are' if missed != 1 else 'is'} not in the Allies row."))
             pods = sum(t.pods for t in self._totals.values())
             if pods and not self._count_pod_isk:
                 notes.append(LedgerNote(
