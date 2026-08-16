@@ -62,6 +62,18 @@ LOAD-BEARING RULES (each one is a scar, not a preference):
   naming no system never reaches this tile, and with no reference system the
   tile shows the unset notice and filters nothing rather than becoming a
   firehose.
+- **The intel tile reads NEWEST FIRST and is fitted to its own window.** These
+  are one rule, not two (owner report 2026-08-15: "the intel log also goes off
+  the tile screen and the top should be the newest intel, not the bottom").
+  The body CLIPS -- see the propagation guard below -- so the order decides
+  WHICH rows get thrown away, and newest-last threw away exactly the lines an
+  FC opens the tile for. On top of the ordering, ``IntelRenderer`` packs only
+  the rows the frame's CURRENT height holds and ellipsizes each row's FREE TEXT
+  to its CURRENT width, so the trailing ``(2j)`` badge -- the most
+  decision-relevant token on the row, and the rightmost -- survives a long
+  line. Every fit degrades towards showing MORE: an unmeasured width or
+  height falls back to the old pack-them-all/no-truncation behaviour, whose
+  worst case is the clip, never a blank tile.
 - **The resolver is the only worker and never touches Tk.** Results reach the
   UI exclusively through the injected ``post_ui``.
 - **No per-tick ``place()``.** ``InfoTileWindow.place`` routes through
@@ -118,6 +130,7 @@ import tkinter as tk
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from tkinter import font as tkfont
 from tkinter import ttk
 
 import battle_ledger as bl
@@ -243,8 +256,25 @@ MAX_JUMPS_CEILING = 30
 
 # How many intel lines the controller keeps (its OWN deque -- fc_gui's
 # _intel_buffer is never read and never mutated) and how many a tile shows.
+# INTEL_SHOW is the CEILING, not the count: a tile shorter than twelve rows
+# shows what fits (``intel_rows_that_fit``), because a row packed below the
+# body is a row the propagation guard clips away unseen.
 INTEL_KEEP = 50
 INTEL_SHOW = 12
+#: The glyph an ellipsized intel line ends its free text with. Same character
+#: as the comp cell's ``FLEET_ELLIPSIS``, kept under its own name because the
+#: two budgets are measured in different units -- PIXELS here (against the real
+#: font), characters there.
+INTEL_ELLIPSIS = "…"
+#: Row-pool geometry, MEASURED 2026-08-15 on this box (96 dpi, tk scaling
+#: 1.333). ``_LabelPool`` packs each row with `_POOL_PADX` on both sides, and a
+#: default ``tk.Label`` spends `_POOL_LABEL_CHROME` more per axis on its own
+#: border and padding (bd 2 + pad 1, both sides = 6). Consolas 8 reports a
+#: 13 px linespace, so one packed row is 19 px tall and a 200 px body carries
+#: ten of the twelve -- which is precisely how the owner's newest two lines
+#: went off the bottom of a default-sized tile.
+_POOL_PADX = 4
+_POOL_LABEL_CHROME = 6
 
 FLEET_MAX_ROWS = 6
 OTHER_LABEL = "Other"
@@ -340,6 +370,18 @@ def _as_int(value, default=0):
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _ellipsize(text: str, max_chars: int) -> str:
+    """`text` cut to at most `max_chars` GLYPHS, the ellipsis counted among
+    them. ``0`` yields ``""`` (nothing fits). Pure -- no font, no Tk."""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars == 1:
+        return INTEL_ELLIPSIS
+    return text[:max_chars - 1] + INTEL_ELLIPSIS
 
 
 def _clamp_opacity(value, default=DEFAULT_OPACITY) -> float:
@@ -860,9 +902,20 @@ class IntelTileModel:
 def build_intel_model(entries, distance_of, max_jumps: int,
                       limit: int = INTEL_SHOW,
                       resolve_system_name=None) -> tuple:
-    """Filter/annotate pushed intel entries into rows, newest LAST.
+    """Filter/annotate pushed intel entries into rows, newest FIRST.
 
     `distance_of(system_id) -> int | None` is the resolver's cache read.
+
+    ORDER IS A SAFETY PROPERTY HERE, not a preference (owner report
+    2026-08-15: "the top should be the newest intel, not the bottom"). The tile
+    CLIPS whatever does not fit -- deliberately, because the alternative is a
+    window that resizes itself out from under the owner's placement -- so
+    whichever end of this list is last is the end that gets thrown away. Newest
+    LAST therefore clipped exactly the lines an FC is reading the tile for. The
+    entries are still COLLECTED chronologically, so the `limit` slice below
+    still selects the most RECENT ones; only the finished rows are reversed.
+    ``intel_rows_that_fit`` then trims the tail further to what the tile is
+    actually tall enough to show.
 
     Three rules, in this order:
       * a line naming NO system is not this tile's business (the Intelligence
@@ -898,13 +951,101 @@ def build_intel_model(entries, distance_of, max_jumps: int,
                                jumps=best_jumps,
                                priority=bool(entry.priority)))
     cap = _as_int(limit, 0)
-    return tuple(rows[-cap:]) if cap > 0 else tuple(rows)
+    # Slice FIRST (chronological, so the cap keeps the most recent), reverse
+    # SECOND (so the tile reads newest-first). Reversing first would keep the
+    # OLDEST `cap` entries, which is the bug this ordering exists to fix.
+    kept = rows[-cap:] if cap > 0 else rows
+    return tuple(reversed(kept))
 
 
-def intel_row_text(row) -> str:
-    """``12:04  Jita  10 reds gate  (2j)`` -- ``?j`` while unresolved."""
+def intel_row_text(row, max_width: int = 0, measure=None) -> str:
+    """``12:04  Jita  10 reds gate  (2j)`` -- ``?j`` while unresolved.
+
+    Pure and Tk-FREE by default, which is what keeps the wording unit-testable
+    without a display. Given a positive `max_width` in PIXELS and a
+    ``measure(text) -> px`` callable -- the renderer injects its real font's --
+    the line is fitted to that width by eating the FREE TEXT only. The stamp,
+    the system and the jump badge are never what gets cut: the badge is the
+    most decision-relevant token on the row and it sits at the far RIGHT, so a
+    row left to overrun loses precisely the part worth reading (owner report
+    2026-08-15: "the intel log also goes off the tile screen").
+
+    EVERY degrade direction returns the whole line -- no measurer, an
+    unrealised width, a measurer that raises. An un-truncated row is merely
+    clipped by the frame and still says most of what it says; a row truncated
+    against a width nobody could measure is information destroyed, silently and
+    every second.
+    """
     badge = "?j" if row.jumps is None else f"{row.jumps}j"
-    return f"{row.ts}  {row.system}  {row.text}  ({badge})"
+    stamp = str(getattr(row, "ts", "") or "")
+    system = str(getattr(row, "system", "") or "")
+    text = str(getattr(row, "text", "") or "")
+
+    def compose(body: str) -> str:
+        # Empty parts drop out rather than leaving a four-space hole, so a row
+        # whose free text was eaten entirely still reads as a line.
+        return "  ".join(p for p in (stamp, system, body, f"({badge})") if p)
+
+    full = compose(text)
+    width = _as_int(max_width, 0)
+    if width <= 1 or not callable(measure) or not text:
+        return full
+    try:
+        if measure(full) <= width:
+            return full
+        # Largest character budget whose COMPOSED line still fits. Binary
+        # search because each probe is a Tcl round-trip: ~8 for a 200-char
+        # line instead of 200, and the common (already-fits) case costs one.
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if measure(compose(_ellipsize(text, mid))) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        return compose(_ellipsize(text, lo))
+    except Exception:
+        return full
+
+
+def intel_rows_that_fit(height, row_height, limit: int = INTEL_SHOW) -> int:
+    """How many intel rows a content frame `height` px tall can show.
+
+    Pure/Tk-free -- the renderer measures and passes the numbers in, so the
+    arithmetic is testable without a display.
+
+    Both degrade directions deliberately show MORE rather than fewer:
+
+    * an UNREALISED height (a fresh frame reports 1, and the first draw happens
+      before the tile is mapped) or an unmeasurable row answers `limit` -- the
+      old pack-them-all behaviour, whose worst case is the clip this function
+      exists to aim, never a blank tile;
+    * a frame too short for even one row still answers 1. One clipped row is
+      readable; zero rows look identical to "no intel", and the owner has no
+      way to tell those apart.
+    """
+    cap = max(0, _as_int(limit, 0))
+    px = _as_int(height, 0)
+    pitch = _as_int(row_height, 0)
+    if cap <= 0:
+        return 0
+    if px <= 1 or pitch <= 0:
+        return cap
+    return max(1, min(cap, px // pitch))
+
+
+def _intel_text_width(frame_width) -> int:
+    """Pixels a row's TEXT gets, out of the content frame's current width.
+
+    The pool packs each row with ``_POOL_PADX`` on both sides and the Label
+    spends ``_POOL_LABEL_CHROME`` more on its own border/padding. ``0`` means
+    "not realised / nothing left", which every caller reads as "measure
+    nothing" -- see ``intel_row_text``'s degrade rule.
+    """
+    width = _as_int(frame_width, 0)
+    if width <= 1:
+        return 0
+    return max(0, width - 2 * _POOL_PADX - _POOL_LABEL_CHROME)
 
 
 def intel_title(max_jumps: int, reference_label: str, reference_id) -> str:
@@ -1085,7 +1226,15 @@ class _LabelPool:
             self._packed.append(False)
 
     def render(self, items) -> None:
-        """`items` is a sequence of ``(text, palette_key)``."""
+        """`items` is a sequence of ``(text, palette_key)``.
+
+        The pool always packs a PREFIX of itself, in ascending index order, so
+        ``pack``'s append-only behaviour is harmless here: a row that gets
+        content late is appended BELOW the rows already packed above it, which
+        is exactly its slot. (The intel tile now varies this count with the
+        tile's HEIGHT as well as with the number of rows, so the property does
+        real work -- ``_CompGrid`` documents the same hazard from the other
+        side.)"""
         for index, label in enumerate(self._labels):
             if index < len(items):
                 text, colour_key = items[index]
@@ -1094,7 +1243,7 @@ class _LabelPool:
                     fg=self._palette.get(colour_key,
                                          self._palette.get("FG_TEXT")))
                 if not self._packed[index]:
-                    label.pack(fill="x", padx=4)
+                    label.pack(fill="x", padx=_POOL_PADX)
                     self._packed[index] = True
             elif self._packed[index]:
                 label.pack_forget()
@@ -1444,7 +1593,24 @@ class FleetRenderer(_TileRenderer):
 
 
 class IntelRenderer(_TileRenderer):
-    """Nearby intel, newest last, with a jump badge per row."""
+    """Nearby intel, newest FIRST, with a jump badge per row -- and fitted to
+    the tile it is actually in, both ways.
+
+    The body's propagation guard clips whatever does not fit (it must: the
+    alternative is a Toplevel that resizes itself out from under the owner's
+    placement). This renderer's job is to make sure the clip has nothing left
+    to take: it packs only as many rows as the frame's CURRENT height holds,
+    and it ellipsizes each row's free text to the frame's CURRENT width so the
+    trailing jump badge survives. Both are measured with the real row font.
+
+    Because both depend on the frame's size and a RESIZE does not move the
+    model at all, the size rides the diff key -- see ``_key``.
+
+    Recorded residual: the first draw of a tile happens BEFORE the window maps
+    (render-then-show, on every reveal), so it fits against an unrealised 1x1
+    frame and degrades to the un-fitted layout for one beat. The size in the
+    key is what closes that -- the next 1 Hz tick sees the real geometry and
+    repaints. Same one-beat catch-up after a drag-resize."""
 
     def __init__(self, parent, palette: dict):
         super().__init__(parent, palette)
@@ -1453,6 +1619,62 @@ class IntelRenderer(_TileRenderer):
                               fg=self._palette.get("FG_DIM"), anchor="w")
         self._pool = _LabelPool(self.frame, INTEL_SHOW, self._palette)
         self._head_packed = False
+        self._font_obj = None
+
+    def _frame_size(self) -> tuple:
+        """The content frame's CURRENT laid-out size in px.
+
+        A frame that has never been laid out answers ``1x1`` and a destroyed
+        one answers ``(0, 0)``; both are "unrealised" to every consumer, which
+        then degrades to the pack-them-all/no-truncation behaviour rather than
+        fitting against a number that means nothing."""
+        try:
+            return (int(self.frame.winfo_width()),
+                    int(self.frame.winfo_height()))
+        except tk.TclError:
+            return (0, 0)
+
+    def _font(self):
+        """This renderer's OWN ``tkfont.Font`` for the row font, built lazily.
+
+        PER-INSTANCE, never module-level: a Font belongs to the interpreter
+        that made it, so a shared one would hand a destroyed interpreter's font
+        to the next tile (and, under pytest, to the next root) -- the same rule
+        the module header states for the plain font tuples, and the same one
+        ``preview_tile._label_font`` keeps. A FAILURE is deliberately not
+        cached: the Tk failure class on this box is transient (the AV-filter
+        trap cured in tests/conftest.py), and a cached degraded font would
+        leave the tile un-fitted forever."""
+        if self._font_obj is None:
+            try:
+                self._font_obj = tkfont.Font(root=self.frame, font=_FONT_ROW)
+            except (tk.TclError, RuntimeError):
+                return None
+        return self._font_obj
+
+    def _row_height(self, font) -> int:
+        """One packed row's pitch: the font's own line height plus the Label's
+        chrome (`_POOL_LABEL_CHROME`, measured -- see the constant).
+
+        The chrome is a constant rather than a ``winfo_reqheight()`` read so
+        the count is right on the FIRST draw after a resize, before the pool's
+        labels have been laid out again."""
+        if font is None:
+            return 0
+        try:
+            return int(font.metrics("linespace")) + _POOL_LABEL_CHROME
+        except (tk.TclError, TypeError, ValueError):
+            return 0
+
+    def _key(self, model):
+        # The frame's SIZE rides the key because the draw now depends on it:
+        # the row count and every row's truncation are computed from the
+        # current width/height, and a tile RESIZE moves neither the model nor
+        # anything else the base class diffs. Without this a dragged corner
+        # would leave a stale row count and stale truncation on screen until
+        # the intel itself happened to change -- and the key latches only after
+        # a successful draw, so the base class's TclError contract is intact.
+        return (model, self._frame_size())
 
     def _draw(self, model):
         if model.status:
@@ -1464,16 +1686,28 @@ class IntelRenderer(_TileRenderer):
             # rows it is supposed to explain.
             self._head.configure(text=model.status)
             if not self._head_packed:
-                self._head.pack(fill="x", padx=4)
+                self._head.pack(fill="x", padx=_POOL_PADX)
                 self._head_packed = True
             self._pool.render([])
             return
         if self._head_packed:
             self._head.pack_forget()
             self._head_packed = False
-        self._pool.render([(intel_row_text(row),
+        # Fit to the tile, both ways, with the row font's own metrics. The
+        # model already hands the rows over newest-first, so the tail this
+        # drops is the OLDEST intel -- the direction the clip used to take the
+        # newest lines in.
+        width, height = self._frame_size()
+        font = self._font()
+        available = _intel_text_width(width)
+        # No font or no realised width => no measurer, and `intel_row_text`
+        # returns the whole line. Clipped beats truncated-against-nothing.
+        fitting = font is not None and available > 0
+        measure = font.measure if fitting else None
+        limit = intel_rows_that_fit(height, self._row_height(font))
+        self._pool.render([(intel_row_text(row, available, measure),
                             "FG_YELLOW" if row.priority else "FG_TEXT")
-                           for row in model.rows])
+                           for row in model.rows[:limit]])
 
 
 #: key -> tile spec. Adding a tile type is one entry plus one renderer: the
