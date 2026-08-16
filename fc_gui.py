@@ -4857,12 +4857,25 @@ class FCToolGUI:
         # in flight — _ensure_intel_monitor runs from six call sites and would
         # otherwise leak one resolver worker per call.
         self._intel_resolver_starting = False
+        # Same shape, same reason, for the channel-activity scan worker: rapid
+        # channel edits each call _ensure_intel_monitor, which would otherwise
+        # stack N concurrent ~0.8 s globs of the Chatlogs dir (they were
+        # serialised only by being on the Tk thread until 2026-08-16).
+        # _pending records "the inputs moved while one was in flight", which is
+        # what keeps a skipped spawn from losing a re-point — see
+        # _scan_intel_channel_states.
+        self._intel_scan_inflight = False
+        self._intel_scan_pending = False
         self._intel_channels_enabled: set[str] = set()
         # True once the user has clicked a channel box themselves. The
         # activity scan seeds the strip's INITIAL state, and it now lands
         # asynchronously (deferred to t=5 s, then off-thread), so without this
-        # it would silently revert a tick made in the meantime. Cleared by
-        # _stop_intel_monitor, which wipes the selection itself.
+        # it would silently revert a tick made in the meantime. Cleared ONLY by
+        # _stop_intel_monitor, which wipes the selection in the same breath: the
+        # user's ownership of the strip dies with the generation they expressed
+        # it in. A tick made before ingest ever starts has no such wipe to pair
+        # with and is deliberately honoured until the first stop — see
+        # _apply_intel_channel_states.
         self._intel_channels_user_touched = False
         self._intel_buffer: "collections.deque" = collections.deque(maxlen=2000)
         self._intel_channel_colors: dict[str, str] = {}
@@ -28175,9 +28188,11 @@ $bmp.Dispose()
         (Settings->Save, a channel edit, a tag toggle) paid the same stall.
 
         This half runs on the Tk thread and does no I/O: it validates the
-        inputs, snapshots them, and spawns the worker. The worker's ONLY output
-        is one ``_post_ui`` of :meth:`_apply_intel_channel_states` — nothing off
-        the Tk thread may touch a widget or a Tk var.
+        inputs, snapshots them, spawns the worker if one is not already out, and
+        returns. The worker's ONLY output is one ``_post_ui`` of
+        :meth:`_apply_intel_channel_states` — nothing off the Tk thread may
+        touch a widget or a Tk var — plus, if the inputs moved while it was
+        globbing, one ``_post_ui`` re-arming itself.
 
         ``tracked_character`` is deliberately NOT passed. Intel must cover every
         account the FC is logged in on — the same reason ``listener_filter`` is
@@ -28199,6 +28214,19 @@ $bmp.Dispose()
         # _ensure_intel_monitor's key) — a late scan must never re-tick boxes on
         # a generation _stop_intel_monitor has already cleared.
         key = (logs_path, tuple(channels))
+        # ONE scan at a time (the _intel_resolver_starting shape). Every channel
+        # edit calls _ensure_intel_monitor, so a burst of them would stack that
+        # many concurrent globs of a 53.5k-file directory — nothing serialised
+        # them once the work left the Tk thread. A skipped spawn must not lose a
+        # genuine re-point, though: the in-flight worker is describing the OLD
+        # universe and the apply half refuses its answer against the new key, so
+        # the miss is recorded here and the worker re-arms itself exactly once
+        # when it lands (the next _ensure_intel_monitor cannot be relied on —
+        # an unchanged signature returns before it ever reaches this scan).
+        if getattr(self, "_intel_scan_inflight", False):
+            self._intel_scan_pending = True
+            return
+        self._intel_scan_inflight = True
 
         def _scan_worker():
             try:
@@ -28211,11 +28239,30 @@ $bmp.Dispose()
                 # takes the checkbox seeding with it silently; this is
                 # display-only work, so log it and leave the strip as built.
                 log.exception("intel: channel-activity scan failed")
+            finally:
+                # ALWAYS, and that is the point: a latch released only on the
+                # happy path would wedge the strip's seeding for the rest of the
+                # session on a single raise.
+                self._intel_scan_inflight = False
+                if getattr(self, "_intel_scan_pending", False):
+                    self._intel_scan_pending = False
+                    # Back onto the Tk thread — this entry half re-reads the
+                    # inputs and is Tk-thread code by contract.
+                    self._post_ui(self._scan_intel_channel_states)
 
-        threading.Thread(target=_scan_worker, name=INTEL_SCAN_THREAD_NAME,
-                         daemon=True).start()
+        worker = threading.Thread(target=_scan_worker,
+                                  name=INTEL_SCAN_THREAD_NAME, daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            # A worker that never starts never runs its finally, so the release
+            # belongs here too — the latch must be impossible to strand. Never
+            # re-raised: this is display-only work and _ensure_intel_monitor
+            # calls it INLINE, so a raise here would abort the ingest start.
+            self._intel_scan_inflight = False
+            log.exception("intel: could not start the channel-activity scan")
 
-    def _apply_intel_channel_states(self, active_names, key=None):
+    def _apply_intel_channel_states(self, active_names, key):
         """Tk thread: apply the activity reading to the checkbox strip.
 
         The marshalled half of :meth:`_scan_intel_channel_states` — every widget
@@ -28223,10 +28270,13 @@ $bmp.Dispose()
 
         Two refusals, both of them "this reading is no longer the truth":
 
-        * ``key`` names the log universe the worker scanned. A result that lands
-          after ``_stop_intel_monitor`` (key ``None``) or after a re-point (a
-          different key) is dropped rather than re-ticking boxes the stop
-          deliberately cleared.
+        * ``key`` names the log universe the worker scanned, and it is REQUIRED
+          (2026-08-16). It defaulted to ``None``, which made the UNGUARDED call
+          the easy one: omit the argument and a stale reading re-ticked a strip
+          ``_stop_intel_monitor`` had deliberately cleared. A result is applied
+          only while ``_intel_source_key`` still names that same universe — so a
+          landing after a stop (the key is ``None`` by then) or after a re-point
+          (a different key) is dropped, and no caller can opt out of that.
         * A strip the USER has already clicked is left alone. The boxes are live
           from build time and this scan now lands asynchronously — at t=5 s at
           startup — so applying unconditionally silently reverted a tick made in
@@ -28235,8 +28285,21 @@ $bmp.Dispose()
           Whole-strip rather than per-box: the checkbutton command carries no
           identity, and the user has taken ownership of a strip they have
           touched — the scan only ever owed it an INITIAL state.
+
+          That flag is cleared in exactly ONE place, ``_stop_intel_monitor``,
+          which wipes the selection in the same breath: ownership dies with the
+          generation it was expressed in, so a later generation's scan seeds the
+          strip that stop just blanked. One path has no such wipe, and it is
+          honest about what it does: with no logs path at launch there is no
+          monitor, so configuring one later builds the FIRST generation without
+          going through a stop, and a tick made before ingest ever started is
+          therefore honoured for the rest of the session (until the next
+          re-point or shutdown). That is the wanted answer — the user's explicit
+          pick beats the scan's guess, ingest is unaffected either way (the gate
+          is the TRACKED set), and clearing the flag there would re-open exactly
+          the stomp this guard exists to prevent, only with a longer fuse.
         """
-        if key is not None and getattr(self, "_intel_source_key", None) != key:
+        if getattr(self, "_intel_source_key", None) != key:
             return
         if getattr(self, "_intel_channels_user_touched", False):
             return
@@ -28447,9 +28510,16 @@ $bmp.Dispose()
         for var in self._intel_channel_vars.values():
             var.set(False)
         # This wipes whatever the user had picked, so their ownership of the
-        # strip dies with the generation: the successor's activity scan must be
-        # free to seed it again (_apply_intel_channel_states defers to a touched
-        # strip, and one early click would otherwise freeze it for the session).
+        # strip dies with the generation they expressed it in: the successor's
+        # activity scan must be free to seed the strip this stop just blanked
+        # (_apply_intel_channel_states defers to a touched strip). The PAIRING is
+        # the rule — this is the only place the flag is cleared, and it clears it
+        # only because it also clears the selection. A tick with no wipe behind
+        # it stands: an FCTool launched with no logs path has no generation to
+        # stop, so configuring one later builds the first monitor without coming
+        # through here and that early tick is honoured for the session. Deliberate
+        # (see _apply_intel_channel_states) — clearing it there would let the new
+        # generation's scan revert a live, explicit user choice.
         self._intel_channels_user_touched = False
         for w in self._intel_channels_frame.winfo_children():
             if isinstance(w, tk.Checkbutton):
