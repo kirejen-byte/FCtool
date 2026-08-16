@@ -125,6 +125,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import textwrap
 import threading
 import tkinter as tk
 from collections import Counter, OrderedDict, deque
@@ -276,6 +277,22 @@ INTEL_ELLIPSIS = "…"
 #: A floor, not a routine path -- the tile's own MIN_W of 120 px still leaves
 #: 106 px, about 17 glyphs of Consolas 8.
 INTEL_STATUS_MIN_CHARS = 12
+#: Clicking an intel row raises a transient pop-up carrying the WHOLE report --
+#: the answer to the fit above, which cuts the free text so the jump badge
+#: survives (owner ask 2026-08-15). Two numbers, both deliberate:
+#:
+#: * how long it holds before fading. "Briefly" was the ask, and this is a
+#:   glance at one line the FC just chose to read -- the implant reminder's
+#:   12 s is a dock-time nag with a different urgency;
+#: * how wide the body wraps, in CHARACTERS. The host's window is
+#:   ``client_toast.DEFAULT_W`` (430 px) and its body font is Consolas 9,
+#:   measured at 7 px per glyph on this box, leaving 412 px of text once the
+#:   1 px accent border and the 8 px padding on each side are gone: 58 glyphs
+#:   fit in 406, 60 would overrun. The wrap is CHARACTER-counted rather than
+#:   pixel-measured on purpose -- it keeps this module Tk-free, and Consolas is
+#:   monospaced, so the two agree.
+INTEL_DETAIL_SECONDS = 8.0
+INTEL_DETAIL_WRAP = 58
 #: Row-pool geometry, MEASURED 2026-08-15 on this box (96 dpi, tk scaling
 #: 1.333). ``_LabelPool`` packs each row with `_POOL_PADX` on both sides, and a
 #: default ``tk.Label`` spends `_POOL_LABEL_CHROME` more per axis on its own
@@ -1025,6 +1042,19 @@ def build_intel_model(entries, distance_of, max_jumps: int,
     return tuple(reversed(kept))
 
 
+def _intel_row_parts(row) -> tuple:
+    """``(stamp, system, badge)`` -- a row's FIXED tokens, the ones no fit ever
+    cuts. Single-sourced because two surfaces compose them: the row itself
+    (``intel_row_text``) and the click-through pop-up's title
+    (``intel_detail_title``), and a pop-up that badged a clicked row
+    differently from the row would be worse than no pop-up. Pure, Tk-free, and
+    defensive on every field like its callers."""
+    jumps = _as_int(getattr(row, "jumps", None), default=None)
+    return (str(getattr(row, "ts", "") or ""),
+            str(getattr(row, "system", "") or ""),
+            "?j" if jumps is None else f"{jumps}j")
+
+
 def intel_row_text(row, max_width: int = 0, measure=None) -> str:
     """``12:04  Jita  10 reds gate  (2j)`` -- ``?j`` while unresolved.
 
@@ -1049,10 +1079,7 @@ def intel_row_text(row, max_width: int = 0, measure=None) -> str:
     raises on is a dead tile either way. An unparseable distance reads as
     UNMEASURED here too -- ``?j`` beside the partner's yellow.
     """
-    jumps = _as_int(getattr(row, "jumps", None), default=None)
-    badge = "?j" if jumps is None else f"{jumps}j"
-    stamp = str(getattr(row, "ts", "") or "")
-    system = str(getattr(row, "system", "") or "")
+    stamp, system, badge = _intel_row_parts(row)
     text = str(getattr(row, "text", "") or "")
 
     def compose(body: str) -> str:
@@ -1084,6 +1111,42 @@ def intel_status_text(status, max_width: int = 0, measure=None) -> str:
     fitted = _fit_to_width(text, max_width, measure,
                            min_chars=INTEL_STATUS_MIN_CHARS)
     return text if fitted is None else fitted
+
+
+def intel_detail_title(row) -> str:
+    """The clicked row's pop-up TITLE: ``12:04  EC-P8R  (2j)``. Pure, Tk-free.
+
+    Exactly the tokens the tile never cuts (``_intel_row_parts``), so the
+    pop-up opens by repeating what the FC clicked on -- identification first --
+    and spends its body on the half he could not read. Empty parts drop out
+    rather than leaving a hole, the same rule ``intel_row_text`` follows."""
+    stamp, system, badge = _intel_row_parts(row)
+    return "  ".join(p for p in (stamp, system, f"({badge})") if p)
+
+
+def intel_detail_body(row) -> str:
+    """The clicked row's pop-up BODY: the WHOLE report, wrapped. Pure, Tk-free.
+
+    This is the entire point of the click (owner ask 2026-08-15). The row on
+    the tile is ellipsized to protect the jump badge, so the pop-up must lose
+    NOTHING -- no ellipsis, no truncation, no re-fitting against a width. Only
+    whitespace moves.
+
+    Wrapping happens here rather than in the window because the host's Labels
+    do not wrap on their own and a Toplevel placed by ``SetWindowPos`` cannot
+    grow to fit its text -- one long line would simply be clipped by the
+    window, which is the bug this feature exists to answer. ``INTEL_DETAIL_WRAP``
+    documents how that character count matches the host's pixel width.
+
+    Long unbroken tokens (a pasted URL, a 60-character corp tag) are broken
+    rather than allowed to overrun: an unreadable wrapped token still shows
+    every character, while an overrunning one hides them behind the frame.
+    """
+    text = str(getattr(row, "text", "") or "")
+    if not text:
+        return ""
+    return textwrap.fill(text, width=max(8, _as_int(INTEL_DETAIL_WRAP, 58)),
+                         break_long_words=True, break_on_hyphens=False)
 
 
 def intel_row_colour_key(row) -> str:
@@ -1322,17 +1385,28 @@ class _LabelPool:
     re-attach, and ``attach_tooltip`` binds with ``add="+"`` -- re-attaching
     stacks a fresh handler set every time. So pools build once and re-word
     afterwards. (This one carries no tooltips: the surface that needs them is
-    the fleet comp, and it is gridded -- see ``_CompGrid``.)"""
+    the fleet comp, and it is gridded -- see ``_CompGrid``.)
 
-    def __init__(self, parent, size: int, palette: dict):
+    ``on_click(index) -> str | None`` is bound ONCE per label, at construction,
+    and carries the label's INDEX -- never the item that happened to be in it.
+    The pool is reused and re-worded every second, so a binding that closed
+    over the content would answer with whatever was on screen when it was
+    built; the caller resolves the current item at CLICK time. Same
+    bind-once discipline as ``_CompGrid``'s tooltips, for the same reason
+    (``bind`` with a fresh handler per repaint stacks handlers)."""
+
+    def __init__(self, parent, size: int, palette: dict, on_click=None):
         self._palette = palette
         self._labels = []
         self._packed = []
         bg = palette.get("BG_DARK", ui_theme.BG_DARK)
-        for _ in range(size):
+        for index in range(size):
             label = tk.Label(parent, text="", font=_FONT_ROW, bg=bg,
                              fg=palette.get("FG_TEXT", ui_theme.FG_TEXT),
                              anchor="w", justify="left")
+            if on_click is not None:
+                label.bind("<Button-1>",
+                           lambda _event, i=index: on_click(i))
             self._labels.append(label)
             self._packed.append(False)
 
@@ -1731,9 +1805,50 @@ class IntelRenderer(_TileRenderer):
         self._head = tk.Label(self.frame, text="", font=_FONT_ROW,
                               bg=self._palette.get("BG_DARK"),
                               fg=self._palette.get("FG_DIM"), anchor="w")
-        self._pool = _LabelPool(self.frame, INTEL_SHOW, self._palette)
+        #: What the pool is CURRENTLY showing, in pool order. Written by every
+        #: draw, read by every click -- see ``_row_clicked``.
+        self._rows: tuple = ()
+        #: The controller's row-click seam, filled by ``set_row_click`` right
+        #: after construction (the pool's bindings are already live by then and
+        #: resolve this attribute at click time, so there is no window in which
+        #: a click reaches a half-wired renderer).
+        self._row_click = None
+        self._pool = _LabelPool(self.frame, INTEL_SHOW, self._palette,
+                                on_click=self._row_clicked)
         self._head_packed = False
         self._font_obj = None
+
+    def set_row_click(self, callback) -> None:
+        """Wire (or clear) what a click on a row means. Tk thread."""
+        self._row_click = callback
+
+    def _row_clicked(self, index):
+        """A left click on pooled row `index`: hand the CURRENT row over.
+
+        The row is looked up now, not captured when the label was worded --
+        the pool is a fixed, reused set of labels and the tile re-words itself
+        every second, so a captured row would go stale on the next intel line.
+
+        Always returns ``"break"``, and that is load-bearing rather than tidy:
+        the tile's Toplevel binds ``<Button-1>`` to corner-resize ARMING
+        (``info_tile._on_body_b1_press``), so a row press that fell through
+        would start a resize whenever the pointer sat in a corner zone. The
+        close glyph returns ``"break"`` for exactly this reason. The tile is
+        moved by dragging its title STRIP, not its body, so nothing else on
+        this button competes.
+
+        Guarded end to end: an index with nothing under it (the pool is
+        ``INTEL_SHOW`` wide and only a prefix is ever packed), a callback
+        nobody wired, and a callback that raises all cost the click and
+        nothing else."""
+        rows = self._rows
+        callback = self._row_click
+        if callable(callback) and 0 <= index < len(rows):
+            try:
+                callback(rows[index])
+            except Exception:
+                log.debug("info tiles: intel row click failed", exc_info=True)
+        return "break"
 
     def _frame_size(self) -> tuple:
         """The content frame's CURRENT laid-out size in px.
@@ -1816,6 +1931,11 @@ class IntelRenderer(_TileRenderer):
                 self._head.pack(fill="x", padx=_POOL_PADX)
                 self._head_packed = True
             self._pool.render([])
+            # The labels outlive their content, so the click map has to be
+            # cleared with them -- otherwise a click on an empty tile would
+            # still open the report that was there before the status replaced
+            # it.
+            self._rows = ()
             return
         if self._head_packed:
             self._head.pack_forget()
@@ -1825,9 +1945,13 @@ class IntelRenderer(_TileRenderer):
         # drops is the OLDEST intel -- the direction the clip used to take the
         # newest lines in.
         limit = intel_rows_that_fit(height, self._row_height(font))
+        rows = tuple(model.rows[:limit])
         self._pool.render([(intel_row_text(row, available, measure),
-                            intel_row_colour_key(row))
-                           for row in model.rows[:limit]])
+                            intel_row_colour_key(row)) for row in rows])
+        # The click map is exactly what is PACKED, in pool order, so index N
+        # means the row the owner is looking at in slot N -- including after a
+        # resize changed how many slots there are.
+        self._rows = rows
 
 
 #: key -> tile spec. Adding a tile type is one entry plus one renderer: the
@@ -2199,6 +2323,24 @@ class HudHost:
     #: dead feature, and there is no way to ask for it back from the overlay
     #: itself.
     should_show: object = _always_show
+    #: ``(title, body, tile_rect) -> None`` -- show one clicked intel report in
+    #: a transient pop-up. Called on the TK THREAD, from a user click only,
+    #: never from the beat.
+    #:
+    #: This module composes WHAT is said (``intel_detail_title`` /
+    #: ``intel_detail_body``, both pure) and the host owns the WINDOW it is
+    #: said in -- the same split every other seam keeps. It must not: fc_gui's
+    #: pop-up sits over an EVE client, and this module knows nothing about
+    #: clients and imports no preview module.
+    #:
+    #: ``tile_rect`` is the intel tile's own ``(x, y, w, h)`` -- NOT edges --
+    #: so the host has somewhere to put the window when no client is on
+    #: screen. Unlike the implant reminder, which skips silently in that case,
+    #: this one has to appear: the owner just clicked.
+    #:
+    #: Inert by default like every other seam: a host that never wires it
+    #: makes the click a no-op rather than an error.
+    show_intel_detail: object = _none
     screen_rects: object = _empty        # () -> [(x, y, w, h)]
     route_fn: object = _none             # (origin, dest) -> [ids] | None
     #: The app's own ``TypeCatalog`` (fc_gui's ``self.type_catalog``). Not a
@@ -2595,6 +2737,12 @@ class InfoTileController:
                         exc_info=True)
             _call(tile.destroy)
             return
+        # Row clicks: the RENDERER owns which row was clicked, the CONTROLLER
+        # owns what a click means, and the HOST owns the window it opens.
+        # getattr-guarded because `tile_window_cls`/`render` are injectable and
+        # a renderer without the seam must cost the tile nothing.
+        _call(getattr(renderer, "set_row_click", None),
+              self._on_intel_row_click)
         self._tiles[key] = tile
         self._renderers[key] = renderer
         self._tile_visible[key] = False
@@ -2781,6 +2929,23 @@ class InfoTileController:
         repaints anyway."""
         if self._enabled and self._tile_visible.get("intel", False):
             self._render("intel")
+
+    def _on_intel_row_click(self, row) -> None:
+        """One intel row was clicked: hand the WHOLE report to the host.
+
+        The tile ellipsizes every row's free text so the jump badge survives
+        (``intel_row_text``), which is right for a glance and useless for the
+        one line the FC decides to read -- this is that line's way out (owner
+        ask 2026-08-15). What is SAID is composed here, purely; the window it
+        is said in belongs to the host (``HudHost.show_intel_detail``).
+
+        The tile's own rect travels with it so the host can always place the
+        pop-up: a click that produced nothing visible would read as a dead
+        feature. Tk thread, user click only -- never the beat."""
+        tile = self._tiles.get("intel")
+        rect = _call(getattr(tile, "rect", None)) if tile is not None else None
+        _call(getattr(self._host, "show_intel_detail", None),
+              intel_detail_title(row), intel_detail_body(row), rect)
 
     # -- intel push ----------------------------------------------------------
     def on_intel_line(self, channel: str, text: str, when=None) -> None:

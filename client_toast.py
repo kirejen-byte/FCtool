@@ -55,6 +55,30 @@ FADE_MS = 500
 FADE_STEPS = 10
 #: Resting opacity. Slightly translucent so the client stays readable beneath.
 ALPHA = 0.94
+#: The hint line's shipped wording, and the default every existing caller gets
+#: without asking. The right-click half is a PROMISE about ``on_snooze``: a
+#: caller that wires no snooze (the FC HUD's intel pop-up) must pass its own
+#: hint, or the toast advertises a "not this session" nobody implemented.
+DEFAULT_HINT = "click to dismiss  ·  right-click: not this session"
+#: One BODY line's height in px -- Consolas 9's line space on this box,
+#: measured, not guessed. ``DEFAULT_H`` already carries one such line (plus the
+#: title, the hint and the 1 px accent border), so a multi-line body costs this
+#: much per EXTRA line. See ``height_for``.
+BODY_LINE_PX = 14
+
+
+def height_for(body_lines):
+    """Toast height for a body of `body_lines` lines. Pure.
+
+    ``DEFAULT_H`` is the ONE-line box every shipped caller uses, so that is
+    both the answer for 1 and the floor: a shorter box would only clip the
+    title or the hint. Junk degrades to the same floor rather than raising --
+    this runs on a user click, and a mis-sized toast beats no toast."""
+    try:
+        lines = int(body_lines)
+    except (TypeError, ValueError):
+        lines = 1
+    return DEFAULT_H + max(0, lines - 1) * BODY_LINE_PX
 
 
 def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H):
@@ -96,7 +120,8 @@ class ClientToast:
 
     def __init__(self, root, title, body, *, win32=None, seconds=12.0,
                  width=DEFAULT_W, height=DEFAULT_H,
-                 on_dismiss=None, on_snooze=None, accent=FG_YELLOW):
+                 on_dismiss=None, on_snooze=None, accent=FG_YELLOW,
+                 hint=DEFAULT_HINT):
         if win32 is None:                                  # pragma: no cover
             from preview_tile import _real_tile_win32
             win32 = _real_tile_win32()
@@ -132,8 +157,8 @@ class ClientToast:
         self._body_lbl.pack(fill="x", padx=8)
 
         self._hint_lbl = tk.Label(
-            inner, text="click to dismiss  ·  right-click: not this session",
-            bg=BG_PANEL, fg=FG_DIM, anchor="w", font=("Consolas", 7))
+            inner, text=str(hint), bg=BG_PANEL, fg=FG_DIM, anchor="w",
+            font=("Consolas", 7))
         self._hint_lbl.pack(fill="x", padx=8, pady=(1, 4))
 
         for w in (self.top, inner, self._title_lbl, self._body_lbl,
@@ -185,6 +210,10 @@ class ClientToast:
         self.dismiss()
 
     def _on_right_click(self, _ev=None):
+        """Dismiss, then snooze if the caller wired one. With no ``on_snooze``
+        it is a plain dismiss -- which is exactly why the hint line is a
+        parameter (see ``DEFAULT_HINT``): a toast that cannot snooze must not
+        advertise one."""
         cb = self._on_snooze
         self.dismiss()
         if cb is not None:

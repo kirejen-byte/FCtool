@@ -1150,6 +1150,9 @@ class FCToolGUI:
         # _preview_enable_native, so it stays None for anyone running previews
         # Off -- and the HUD is a feature of its own.
         self._hud_fg_win32 = None
+        # The single live intel-report pop-up (a clicked intel tile row), if
+        # any. Same one-at-a-time rule as _implant_toast / _range_check_toast.
+        self._hud_detail_toast = None
         self._own_location_sid = None        # primary char (_refresh_current_system)
         self._own_location_mono = 0.0
         self._push_standings_to_battle_ledger()   # whatever the cache already holds
@@ -2283,6 +2286,10 @@ class FCToolGUI:
                 # foreground belongs to neither EVE nor us). Tk-thread-only,
                 # and FAIL-VISIBLE by contract.
                 should_show=self._hud_should_show,
+                # Row click -> the whole report in a transient pop-up.
+                # info_tiles composes the strings (pure) and owns nothing about
+                # windows; this side owns the toast and where it sits.
+                show_intel_detail=self._hud_show_intel_detail,
                 screen_rects=self._preview_snap_screens,
                 # Called on the resolver's WORKER thread: a module-level pure
                 # function, never an fc_gui method or a lambda closing over one
@@ -2312,6 +2319,69 @@ class FCToolGUI:
             return None
         return info_tiles.open_hud_settings(self.root, self._info_tiles,
                                             self._hud_host)
+
+    def _hud_intel_client_rect(self):
+        """(left, top, right, bottom) physical-px EDGES of an on-screen EVE
+        client for the intel pop-up to sit over, or None.
+
+        ANY client will do: an intel report belongs to no character, unlike the
+        implant reminder's per-key lookup. `_range_check_clients` is the shipped
+        two-step walk (the preview tracker's free snapshot, falling through to
+        ONE enumeration when it cannot answer) — it is NAMED for its first
+        caller, not owned by it, and a third hand-rolled copy of that walk is
+        exactly how the three would drift apart. Read-only: window_activator
+        remains the only module that changes a real client window's state."""
+        try:
+            for client in self._range_check_clients():
+                if not client.is_iconic:
+                    return tuple(client.rect)
+        except Exception:
+            log.exception("[hud] intel pop-up client lookup failed")
+        return None
+
+    def _hud_show_intel_detail(self, title, body, tile_rect=None):
+        """Tk thread: raise the transient pop-up for ONE clicked intel row.
+
+        The FC HUD's `show_intel_detail` seam. info_tiles composes WHAT it says
+        (`intel_detail_title` / `intel_detail_body`, both pure and already
+        wrapped to this window's width); fc_gui owns only the window and where
+        it sits.
+
+        DELIBERATE DIVERGENCE from `_implant_show_toast`, which skips silently
+        with no client on screen: the owner just CLICKED a row, so something
+        must appear. The intel tile's own rect is the fallback anchor —
+        `place_over` takes EDGES, so the (x, y, w, h) the controller hands over
+        is converted here.
+
+        One pop-up at a time (a newer click replaces the older), the rule both
+        shipped toasts follow. REFERENCE class: it never grabs — a grab in this
+        one-Tk-process app deafens the FCPreview tiles (v4.1.0). The hint line
+        is overridden because no snooze is wired here; the shipped default
+        promises a "not this session" this caller does not implement."""
+        try:
+            prev = self._hud_detail_toast
+            if prev is not None:
+                prev.dismiss()
+                self._hud_detail_toast = None
+            text = str(body or "")
+            width = client_toast.DEFAULT_W
+            height = client_toast.height_for(text.count("\n") + 1)
+            fallback = None
+            try:
+                tx, ty, tw, th = (int(v) for v in tile_rect)
+                fallback = client_toast.place_over(
+                    (tx, ty, tx + tw, ty + th), width, height)
+            except (TypeError, ValueError, OverflowError):
+                fallback = None
+            toast = client_toast.ClientToast(
+                self.root, str(title or ""), text,
+                seconds=info_tiles.INTEL_DETAIL_SECONDS,
+                width=width, height=height, hint="click to dismiss",
+                on_dismiss=lambda: setattr(self, "_hud_detail_toast", None))
+            self._hud_detail_toast = toast
+            toast.show(self._hud_intel_client_rect(), fallback)
+        except Exception:
+            log.exception("[hud] intel detail pop-up failed")
 
     def _hud_should_show(self):
         """Should the FC HUD's tiles be on screen right now?
