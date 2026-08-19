@@ -10,9 +10,21 @@ Design (spec §5):
   body area; it is letterboxed so it never covers the strip.
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
-- Mouse model (EVE-O parity): LEFT click/release = activate (Ctrl = minimize);
-  RIGHT drag = move; RIGHT drag + Ctrl (or + left held) = resize. All callbacks
-  receive the tile's char_key; the controller owns snapping/persistence.
+- Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
+  minimize, Shift = exclude, Ctrl+Shift = switch-external) — matching EVE-O's
+  own ThumbnailView, which fires on MouseDown (2026-08-18 latency fix: waiting
+  for release only cost the user's physical button-hold time, ~60-150ms, for
+  no benefit, since a body drag is right-button and a corner-resize press is
+  intercepted before this path runs). LEFT on the CAPTION STRIP still acts on
+  RELEASE, because a strip press may turn into a drag-to-move and only release
+  can tell. RIGHT drag = move; RIGHT drag + Ctrl (or + left held) = resize.
+  Starting the "+ left held" form left-button-first now fires the LEFT
+  activate ladder at that press — exact EVE-O parity, since its own
+  ThumbnailView fires ThumbnailActivated unconditionally on Left MouseDown and
+  a MouseButtons.Left|Right combination can never match a single-button
+  MouseDown event; use Ctrl+RIGHT-drag instead for an activation-free resize,
+  since that form involves no left press at all. All callbacks receive the
+  tile's char_key; the controller owns snapping/persistence.
 
 All Win32 is behind an injectable backend (default _real_tile_win32); tests inject
 a fake. Tk-thread only touches this object (house rule #1).
@@ -392,6 +404,33 @@ class TileWindow:
         self._strip_press_pos = None   # (x, y) tile position at strip press
         self._strip_moving = False     # True once a strip left-drag passed jitter
 
+        # Body left-click dispatch-on-press state (2026-08-18 latency fix).
+        # self.top's OWN <Button-1>/<ButtonRelease-1> bindings (see _bind_mouse)
+        # are reached via ordinary Tk bindtag propagation for EVERY press/release
+        # anywhere in the tile, not just ones that land on self.top/self._body
+        # directly: a child widget's default bindtags list its toplevel LAST,
+        # and nothing in this class returns "break" to stop it (measured on this
+        # box; mirrors the info_tile toplevel-bindtag fact in facts.md). That
+        # means a genuine body click invokes _on_b1_press TWICE for one physical
+        # press (once via the widget's own binding, once via self.top's), and a
+        # strip click ALSO echoes into _on_b1_press once. _b1_serial dedupes the
+        # former by Tk's per-event `serial` (measured on this box: both
+        # invocations of one physical press carry the IDENTICAL event.serial;
+        # distinct presses carry distinct, monotonically-increasing serials) —
+        # NOT a press/release lifetime flag, because a flag's only clearing path
+        # is a <ButtonRelease-1> reaching the tile, and FCTool can suppress that
+        # release (clicking a tile foregrounds the EVE client while the button
+        # is still down, and with hide_active the next 250ms tick can hide()/
+        # withdraw() the tile mid-press — a hidden window gets no release, so a
+        # flag would strand armed and silently swallow the tile's NEXT click).
+        # A None serial (synthetic/generated events) NEVER dedupes, so the only
+        # failure direction for those is an extra dispatch, never a dead click;
+        # and since nothing here waits for a release to re-arm, a swallowed
+        # release can strand nothing. _strip_press_root (already tracked above)
+        # is reused to detect and ignore the strip echo. See _on_b1_press for
+        # the full mechanism.
+        self._b1_serial = None         # event.serial of the last dispatched press
+
         # corner-hover resize state (this task). `_corner` is the currently-armed
         # corner under the cursor ('nw'/'ne'/'sw'/'se'/None); once a left-press
         # lands on an armed corner, `_corner_resizing` gates the strip-move and
@@ -521,14 +560,20 @@ class TileWindow:
             w.bind("<Button-3>", self._on_b3_press)
             w.bind("<B3-Motion>", self._on_b3_motion)
             w.bind("<ButtonRelease-3>", self._on_b3_release)
-        # LEFT on the BODY (and toplevel) = activate/minimize/etc (click semantics).
+        # LEFT on the BODY (and toplevel) = activate/minimize/etc, dispatched on
+        # PRESS, not release (EVE-O parity + latency fix — see the module
+        # docstring). See _on_b1_press for the toplevel-bindtag echo this bind
+        # list creates (self.top's own binding also fires for every press/
+        # release elsewhere in the tile) and how it's guarded.
         for w in (self.top, self._body):
             w.bind("<Button-1>", self._on_b1_press)
             w.bind("<ButtonRelease-1>", self._on_b1_release)
         # LEFT on the CAPTION STRIP = title-bar drag-to-move; a plain click there
-        # still activates (BUG B). The strip cluster (top strip + bottom strip +
-        # their child labels) gets the strip handlers so a left-drag anywhere on
-        # either caption bar moves the tile (bottom strip = same, no dead zone).
+        # still activates, but only on RELEASE (BUG B) — unlike the body, a strip
+        # press may turn into a drag, so it can't dispatch until release knows
+        # which. The strip cluster (top strip + bottom strip + their child
+        # labels) gets the strip handlers so a left-drag anywhere on either
+        # caption bar moves the tile (bottom strip = same, no dead zone).
         for w in (self._strip, self._name_lbl, self._excl_lbl, self._chip_lbl,
                   self._tag_lbl, self._dot,
                   self._strip_bottom, self._bottom_lbl,
@@ -558,9 +603,60 @@ class TileWindow:
             self._corner_press(event)
             self._b1_press_root = None
             return
-        self._b1_press_root = (event.x_root, event.y_root)
+        # This press may be an ECHO, not a genuine body press: self.top's own
+        # <Button-1> binding (see _bind_mouse) is reached via Tk bindtag
+        # propagation for every press anywhere in the tile, including a strip
+        # press (already fully owned by _on_strip_b1_press, which decides
+        # click-vs-drag only at release) — so if a strip press is currently in
+        # flight, this invocation is just that same click bubbling up and must
+        # NOT pre-empt it by dispatching now.
+        if self._strip_press_root is not None:
+            return
+        # The SAME propagation means a genuine body/toplevel press invokes
+        # THIS handler TWICE for one physical click — once via the widget's
+        # own <Button-1> binding, once via self.top's — both synchronously,
+        # before any release, and BOTH carry the IDENTICAL Tk event.serial
+        # (measured on this box; a distinct physical press always carries a
+        # distinct, monotonically-increasing serial). Dedupe on that serial
+        # instead of a press/release lifetime flag: a flag's only clearing
+        # path is a <ButtonRelease-1> reaching the tile, which FCTool can
+        # suppress (see the _b1_serial comment in __init__), stranding a flag
+        # armed and silently swallowing the tile's next click. A None serial
+        # (synthetic events) never dedupes — the failure direction there is an
+        # extra dispatch, never a dead click — and no release is needed to
+        # re-arm, so a swallowed release strands nothing.
+        serial = getattr(event, "serial", None)
+        if serial is not None and serial == self._b1_serial:
+            return  # bindtag echo of the same physical press (same Tk event serial)
+        self._b1_serial = serial
+        # Body left-click acts on PRESS, not release (EVE-O parity + latency
+        # fix, 2026-08-18): EVE-O's own ThumbnailView fires on MouseDown for
+        # plain Left, Ctrl+Left and Ctrl+Shift+Left alike (its MouseUp only
+        # ends its OWN right-button move mode) — waiting for release here only
+        # cost the user's physical button-hold time (~60-150ms) for no
+        # behavioural benefit, since a body drag is right-button (_on_b3_*)
+        # and a corner-resize press is intercepted above. Modifiers are read
+        # off THIS press event — Tk populates event.state at press time, so
+        # nothing is deferred to release. DELIBERATE behavior change: a body
+        # click no longer supports drag-away-to-cancel (the old release-gated
+        # jitter check) — EVE-O has no such cancel either, and the jitter
+        # check below stays meaningful only for the strip's drag-to-move. It
+        # also means the left-held+right-drag resize chord activates at the
+        # left press when started left-first (see module docstring) — an
+        # activation-free resize is still available via Ctrl+RIGHT-drag.
+        self._dispatch_click(event)
+        self._b1_press_root = None
 
     def _on_b1_release(self, event):
+        # Reached two ways: (1) the bindtag echo of a body/toplevel release —
+        # _on_b1_press already dispatched and cleared _b1_press_root, so this
+        # is a harmless no-op via the anchor-None guard below (a release
+        # clears nothing now — dedupe for the press lives entirely in
+        # _on_b1_press's per-event serial compare, see __init__); (2) the
+        # STRIP's click fall-through (_on_strip_b1_release), which seeds
+        # _b1_press_root fresh right before calling in — a strip left-press
+        # CAN become a drag-to-move, so the strip still needs this
+        # wait-for-release + jitter-check shape.
         press = getattr(self, "_b1_press_root", None)
         self._b1_press_root = None
         if press is None:
@@ -569,10 +665,21 @@ class TileWindow:
         dy = abs(event.y_root - press[1])
         if dx > _MOVE_JITTER or dy > _MOVE_JITTER:
             return  # was a drag, not a click
+        self._dispatch_click(event)
+
+    def _dispatch_click(self, event):
+        """Run the left-click modifier ladder (EVE-O parity + FCTool C4
+        extras): plain Left activates, Ctrl minimizes, Shift toggles
+        cycle-exclusion, Ctrl+Shift switches to the last non-EVE window.
+        Checks the two-modifier combo first so Ctrl+Shift never falls through
+        to a single-modifier branch.
+
+        Called from two different timings depending on the caller: from
+        _on_b1_press (body — reads the PRESS event's modifiers) or from
+        _on_b1_release (strip fall-through — reads the RELEASE event's
+        modifiers). Tk populates `state` on whichever event it is handed."""
         ctrl = bool(event.state & 0x0004)
         shift = bool(event.state & 0x0001)
-        # Modifier ladder (EVE-O parity + FCTool C4 extras). Check the two-modifier
-        # combo first so Ctrl+Shift never falls through to a single-modifier branch.
         if ctrl and shift:                  # Ctrl+Shift+Left → switch to last non-EVE window
             self._on_switch_external()
         elif shift:                         # Shift+Left → toggle cycle-exclusion
@@ -716,9 +823,10 @@ class TileWindow:
             self._on_move_end(self._key, x, y)
             return
         # No drag → a plain caption click: run the same activate/modifier ladder
-        # as a body left-click (reuse the _on_b1_release semantics). Seed the
-        # press anchor from the strip press so the jitter check inside sees a
-        # click, then dispatch the release (which reads modifiers off `event`).
+        # _on_b1_release runs (reuse its guard + jitter-check + dispatch). Seed
+        # the press anchor from the strip press so the jitter check inside sees
+        # a click, then dispatch the release (which reads modifiers off `event`
+        # at RELEASE time — unlike the body, which now reads them at press).
         self._b1_press_root = press
         self._on_b1_release(event)
 
