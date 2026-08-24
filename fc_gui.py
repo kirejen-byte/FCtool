@@ -17720,9 +17720,21 @@ class FCToolGUI:
                     pass
         else:
             cfg.setdefault("sizes", {})[key] = [w, body_h]
+        # The POSITION this write-back preserves (a resize never moves a tile —
+        # a corner grab that shifts the origin commits it through on_move_end
+        # first, so the corrected origin is already visible here).
+        #
+        # Source it from `_preview_tile_rects`, the live registry every
+        # tile-placement path updates, i.e. where the tile ACTUALLY is; fall back
+        # to the saved layout rect, then to the spawn origin. cfg['layouts']
+        # alone is NOT a sufficient source: a tile that has been spawned but
+        # never MOVED has no entry there, so the bare (10, 10) fallback used to
+        # persist a position the tile was never at. The live tile did not jump,
+        # but the next FCTool start respawned it in the top-left corner and the
+        # user's placement was silently gone. The (10, 10) fallback is kept for
+        # the genuinely-unknown case — no registry entry either.
         layouts = cfg.setdefault("layouts", {})
-        prev = layouts.get(key) or [10, 10, w, body_h]
-        layouts[key] = [int(prev[0]), int(prev[1]), w, body_h]
+        hwnd = None
         for c in self._preview_clients.values():
             # Only an hwnd that still HAS a live tile may own a rect entry. The
             # auto-fit pass calls this with `_preview_clients` one tick stale (it
@@ -17735,11 +17747,20 @@ class FCToolGUI:
             # inverse face of the "every tile-placement path must update
             # _preview_tile_rects" invariant — a STALE entry is as bad as a
             # missing one. Keep scanning past a dead hwnd so the live tile for
-            # the same key still gets its rect.
+            # the same key still gets its rect. The same liveness test picks the
+            # hwnd whose registry rect is read below.
             if c.key == key and c.hwnd in self._preview_tiles:
-                self._preview_tile_rects[c.hwnd] = (
-                    int(prev[0]), int(prev[1]), w, body_h)
+                hwnd = c.hwnd
                 break
+        rect = self._preview_tile_rects.get(hwnd) if hwnd is not None else None
+        if rect is not None and len(rect) >= 4:
+            x, y = int(rect[0]), int(rect[1])
+        else:
+            prev = layouts.get(key) or [10, 10, w, body_h]
+            x, y = int(prev[0]), int(prev[1])
+        layouts[key] = [x, y, w, body_h]
+        if hwnd is not None:
+            self._preview_tile_rects[hwnd] = (x, y, w, body_h)
         if save:
             self._save_config()
 
