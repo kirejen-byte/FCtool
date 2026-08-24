@@ -18674,6 +18674,14 @@ class FCToolGUI:
         # Recorded BEFORE the call: _preview_restart_hotkeys reads it to decide
         # whether to register, and a persistently failing service must cost one
         # log line per FLIP rather than one per tick forever.
+        # ASYMMETRY, deliberate — do not "fix" it by moving the latch: a raising
+        # RESUME self-heals (the flag already says un-gated, so the next
+        # focus-loss/return round-trip re-registers, and unticking the checkbox
+        # recovers immediately), while a raising SUSPEND leaves the keys
+        # registered until the next round-trip. Latching after the call instead
+        # would buy a per-tick retry at the price of a per-tick log flood, which
+        # is the worse trade for a fault that has never been seen outside a
+        # broken injected service.
         self._preview_hotkeys_gated = want
         try:
             if want:
@@ -19487,9 +19495,11 @@ class FCToolGUI:
             self._preview_clients = cur
             # "Hotkeys only while EVE is focused": suspend/resume the global
             # registrations on the FOREGROUND edge, reusing the fg_info sampled
-            # above. After the publish, so a resume re-registers against the
-            # just-diffed client set (focus bindings are filtered by live key),
-            # and before the drain, so a resumed key is live this same tick.
+            # above. Sitting here is LOCALITY, not a dependency — it reads no
+            # part of `cur`, and `_preview_hotkey_bindings` deliberately does
+            # NOT filter focus bindings by live key (see its docstring), so a
+            # resume owes nothing to the publish above. The publish-before-drain
+            # order below is the real invariant and is unchanged.
             self._preview_apply_hotkey_gate(cfg, fg_info)
             self._preview_drain_hotkeys()
             self._preview_compose_captions(cur)   # strip + bottom-strip activity label
@@ -21815,6 +21825,9 @@ class FCToolGUI:
         # fires on the OFF->ON edge only, and by then cfg already holds the new
         # value with nothing left to compare it against.
         was_slots = bool(cfg.get("account_slots", False))
+        # Same reason, other direction: unticking "Hotkeys only while EVE is
+        # focused" has to ACT, not just persist (see the ON->OFF block below).
+        was_eve_only = bool(cfg.get("hotkeys_eve_only", False))
 
         def _put(attr, key, value):
             """Write cfg[key] unless `attr`'s control has not moved since the
@@ -21874,6 +21887,25 @@ class FCToolGUI:
         # OFF->ON edge (`was_slots`) -- a re-apply must never re-seed.
         if not was_slots and cfg.get("account_slots", False):
             self._preview_seed_account_slots(cfg)
+        # ── "Hotkeys only while EVE is focused" turned OFF: give the keys back
+        # HERE, not on the next tick. Persisting the flag is NOT enough, and the
+        # gap is not cosmetic:
+        #   _preview_native_tick_body returns at the `preview_running()` refusal
+        #   BEFORE it samples the foreground, so while EVE-O Preview is open the
+        #   gate never runs at all. A session that cold-started gated (or that
+        #   was gated when EVE-O appeared) would then sit with every hotkey
+        #   unregistered and NO WAY OUT — the checkbox that turns the feature off
+        #   would be the one control that could not undo it.
+        # So the OFF edge clears the gate and re-registers through the one choke
+        # point, which resumes a suspended service. This also removes the ≤2 s
+        # untick latency on the ordinary path. The ON edge is deliberately NOT
+        # mirrored: while EVE-O blocks the tick the keys stay RELEASED, the same
+        # fail-safe direction as a blind foreground probe, and this untick is the
+        # escape hatch out of it.
+        if was_eve_only and not cfg.get("hotkeys_eve_only", False):
+            self._preview_hotkeys_gated = False
+            if getattr(self, "_preview_hotkeys", None) is not None:
+                self._preview_restart_hotkeys()
         self._save_config()
 
     def _preview_apply_dmg_mode_visibility(self):
