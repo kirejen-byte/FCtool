@@ -81,6 +81,51 @@ def clamp_size(w, body_h, min_w=MIN_TILE_W, min_body_h=MIN_TILE_BODY_H):
     return _floor_int(w, min_w), _floor_int(body_h, min_body_h)
 
 
+def full_h(body_h, strip_h):
+    """A tile's FULL on-screen height: its body plus its caption strip.
+
+    THE conversion seam, with `body_h_from_full` right below it as the exact
+    inverse. Everything inside FCPreview measures a tile in `body_h` — config,
+    clamp_size, fit_body_h, every place() call — but the number a USER sees is
+    the whole window, so the Settings "Tile size [w] × [h]" box displays this
+    instead and converts at its own edges. Two functions, one file, tested as a
+    pair, because this is the STRIP_H-conversion trap family: three separate
+    bugs have come from a caller re-deriving `body_h + 20` by hand and getting
+    the direction, the constant, or the font-scaled strip height wrong (see
+    preview_tile.strip_h_for — the strip is NOT always STRIP_H). Nobody adds or
+    subtracts a strip height anywhere else.
+
+    `strip_h` is passed IN rather than imported: preview_tile imports this
+    module, so this module can never import preview_tile back, and the caller
+    already knows which strip height applies (STRIP_H for the caption strip, 0
+    for a tile that has none).
+
+    The body is floored at MIN_TILE_BODY_H first, so a hand-edited config can
+    never display — or round-trip back into — a height no tile could be seen at;
+    junk (None, "", NaN, a word) reads as the floor and a junk `strip_h` reads
+    as 0, matching _floor_int's config-load policy. Returns an int."""
+    return _floor_int(body_h, MIN_TILE_BODY_H) + _floor_int(strip_h, 0)
+
+
+def body_h_from_full(full_h, strip_h, min_body_h=MIN_TILE_BODY_H):
+    """The BODY height inside a full on-screen tile height — `full_h`'s inverse.
+
+    Exact round trip for every legal body height:
+    `body_h_from_full(full_h(b, s), s) == b`. The floor is applied to the
+    ANSWER (via `_floor_int` on `min_body_h + strip`), so a full height the user
+    typed below the minimum window — or junk, or a negative — resolves to
+    MIN_TILE_BODY_H rather than to a negative body: the settings Spinbox's
+    `from_` bounds its ARROWS only and typed text reaches the var verbatim, so
+    this is the real floor for anything the user can type.
+
+    Shadows the module-level `full_h` inside this body deliberately — the
+    parameter IS a full height, and nothing here needs the forward conversion.
+
+    Returns an int."""
+    strip = _floor_int(strip_h, 0)
+    return _floor_int(full_h, min_body_h + strip) - strip
+
+
 def aspect_fit(dest_w: int, dest_h: int, src_w: int, src_h: int):
     """Largest (x, y, w, h) inside dest preserving src aspect, centered.
 
