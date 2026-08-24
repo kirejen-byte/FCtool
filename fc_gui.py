@@ -1239,6 +1239,14 @@ class FCToolGUI:
         self._preview_tiles = {}               # hwnd -> TileWindow
         self._preview_video_labels = {}        # hwnd -> composed on-video label text
         self._preview_tile_rects = {}          # hwnd -> (x, y, w, body_h) screen px
+        # hwnd -> account label, SESSION ONLY (never persisted): the window has
+        # shown a character on that account, so it keeps the account's slot
+        # while it sits on the character-select screen -- where the title is
+        # bare "EVE" and every login window shares the key "". Written by
+        # _preview_note_hwnd_account on spawn/rekey, popped on retirement,
+        # emptied in _preview_teardown; hwnds are recycled by Windows, so a
+        # stale entry would hand a brand-new window someone else's position.
+        self._preview_hwnd_account = {}
         self._preview_clients = {}             # hwnd -> ClientWindow
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
         self._preview_hotkey_map = {}          # hk_id -> action tuple
@@ -16964,6 +16972,14 @@ class FCToolGUI:
     # UI just will not grow it further.
     _PREVIEW_ACCOUNT_CAP = 3
 
+    # Namespace for an ACCOUNT's saved geometry inside preview['layouts'] /
+    # preview['sizes'], which are otherwise keyed by character. One owner:
+    # _preview_layout_key writes it and _preview_all_known_chars reads it back
+    # to keep a slot key out of the character lists. A character key is a
+    # lowercased EVE name and can never contain a colon, so the two namespaces
+    # cannot collide.
+    _PREVIEW_ACCOUNT_SLOT_PREFIX = "acct:"
+
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
         "mode": "off",              # "off" | "eveo_labels" | "native"
@@ -17005,6 +17021,14 @@ class FCToolGUI:
         # Characters pane ("Main account", "Alt 1"); blank/absent = ungrouped,
         # and a group exists exactly as long as some character names it.
         "char_accounts": {},
+        # Account slots: keep ONE preview position (and size) per ACCOUNT
+        # instead of one per character, so logging an alt in on a window puts
+        # its tile exactly where its main's was -- and a window sitting on the
+        # character-select screen holds that spot. DEFAULT OFF, deliberately:
+        # the flag changes what an already-saved rect MEANS, so switching it on
+        # by default would re-point every existing user's hand-placed grid on
+        # their behalf. _preview_layout_key is the one place it is read.
+        "account_slots": False,
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
@@ -17494,15 +17518,16 @@ class FCToolGUI:
         case that persists a change here."""
         w, body_h = self._preview_resolve_size(cfg, client.key)
         layouts = cfg.get("layouts", {}) or {}
-        saved = layouts.get(client.key)
+        lkey = self._preview_layout_key(client.key)
+        saved = layouts.get(lkey)
         if saved and len(saved) >= 4:
             # Saved rect carries its own w/body_h; under uniform_size the tick's
             # _preview_apply_tile_size re-places it at the global size next cycle.
             rect = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
             rect, moved = self._preview_clamp_saved_rect(rect)
             if moved:
-                layouts[client.key] = [int(rect[0]), int(rect[1]),
-                                        int(rect[2]), int(rect[3])]
+                layouts[lkey] = [int(rect[0]), int(rect[1]),
+                                 int(rect[2]), int(rect[3])]
                 self._save_config()
             return rect
         if client.is_login:
@@ -17578,6 +17603,10 @@ class FCToolGUI:
             return
         self._preview_tiles[client.hwnd] = tile
         self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
+        # Same evidence as the rekey path, and the one that actually fires for
+        # the usual case: FCTool started while the clients were already logged
+        # in never sees a login->character transition at all.
+        self._preview_note_hwnd_account(client)
         retry = getattr(self, "_preview_spawn_retry", None)
         if retry:
             retry.pop(client.hwnd, None)               # attached → healthy again
@@ -17642,16 +17671,32 @@ class FCToolGUI:
         if tile is None:
             self._preview_spawn_tile(new)
             return
+        # Learn the window's account BEFORE anything can fail below: this is
+        # the login->character moment the whole char-select stickiness is
+        # built on, and it costs nothing when the flag is off.
+        self._preview_note_hwnd_account(new)
         try:
             tile.set_key(new.key)
             cfg = self._preview_cfg()
-            saved = (cfg.get("layouts", {}) or {}).get(new.key)
+            if (not new.key
+                    and cfg.get("account_slots", False)
+                    and (getattr(self, "_preview_hwnd_account", None) or {})
+                    .get(new.hwnd)):
+                # Logged out to character select on a window whose account we
+                # know: the tile HOLDS the account's spot rather than being
+                # treated as a fresh login window. Returning here is the
+                # guarantee -- no layout lookup, no re-place, and no future
+                # login-stack step can reach past it. (_preview_maybe_pin_monitor
+                # below is a no-op for the login key anyway.)
+                return
+            lkey = self._preview_layout_key(new.key)
+            saved = (cfg.get("layouts", {}) or {}).get(lkey)
             if saved and len(saved) >= 4:
                 r = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
                 r, moved = self._preview_clamp_saved_rect(r)
                 if moved:
-                    cfg["layouts"][new.key] = [int(r[0]), int(r[1]),
-                                                int(r[2]), int(r[3])]
+                    cfg["layouts"][lkey] = [int(r[0]), int(r[1]),
+                                            int(r[2]), int(r[3])]
                     self._save_config()
                 tile.place(*r)
                 self._preview_tile_rects[new.hwnd] = r
@@ -17668,6 +17713,12 @@ class FCToolGUI:
     def _preview_retire_tile(self, hwnd):
         """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
         self._preview_tile_rects.pop(hwnd, None)
+        # The account memory is per-WINDOW and Windows recycles hwnds, so it
+        # dies with the window it described -- a stale entry would hand the
+        # next client to get this handle somebody else's slot.
+        seen = getattr(self, "_preview_hwnd_account", None)
+        if seen is not None:
+            seen.pop(hwnd, None)
         # PV7: _preview_video_labels is hwnd-keyed like the two dicts around it
         # and was pruned only at teardown, so a retired client's composed label
         # lingered for the rest of the session (tests read this dict).
@@ -17815,7 +17866,8 @@ class FCToolGUI:
         # fallback above, so flooring keeps the saved rect legal without adding
         # a second write path (this remains the ONE move write-back).
         w, body_h = preview_layout.clamp_size(w, body_h)
-        cfg.setdefault("layouts", {})[key] = [int(x), int(y), int(w), int(body_h)]
+        cfg.setdefault("layouts", {})[self._preview_layout_key(key)] = [
+            int(x), int(y), int(w), int(body_h)]
         if hwnd is not None:
             self._preview_tile_rects[hwnd] = (int(x), int(y), int(w), int(body_h))
         self._save_config()
@@ -17858,7 +17910,8 @@ class FCToolGUI:
         gh = int(cfg.get("tile_body_h", 216))
         if cfg.get("uniform_size", True):
             return preview_layout.clamp_size(gw, gh)
-        override = (cfg.get("sizes", {}) or {}).get(key)
+        override = (cfg.get("sizes", {}) or {}).get(
+            self._preview_layout_key(key))
         if override and len(override) >= 2:
             return preview_layout.clamp_size(override[0], override[1])
         return preview_layout.clamp_size(gw, gh)
@@ -17928,7 +17981,8 @@ class FCToolGUI:
                 except tk.TclError:
                     pass
         else:
-            cfg.setdefault("sizes", {})[key] = [w, body_h]
+            cfg.setdefault("sizes", {})[self._preview_layout_key(key)] = [
+                w, body_h]
         # The POSITION this write-back preserves (a resize never moves a tile —
         # a corner grab that shifts the origin commits it through on_move_end
         # first, so the corrected origin is already visible here).
@@ -17943,6 +17997,7 @@ class FCToolGUI:
         # user's placement was silently gone. The (10, 10) fallback is kept for
         # the genuinely-unknown case — no registry entry either.
         layouts = cfg.setdefault("layouts", {})
+        lkey = self._preview_layout_key(key)
         hwnd = None
         for c in self._preview_clients.values():
             # Only an hwnd that still HAS a live tile may own a rect entry. The
@@ -17965,9 +18020,9 @@ class FCToolGUI:
         if rect is not None and len(rect) >= 4:
             x, y = int(rect[0]), int(rect[1])
         else:
-            prev = layouts.get(key) or [10, 10, w, body_h]
+            prev = layouts.get(lkey) or [10, 10, w, body_h]
             x, y = int(prev[0]), int(prev[1])
-        layouts[key] = [x, y, w, body_h]
+        layouts[lkey] = [x, y, w, body_h]
         if hwnd is not None:
             self._preview_tile_rects[hwnd] = (x, y, w, body_h)
         if save:
@@ -18987,9 +19042,13 @@ class FCToolGUI:
                 if not c.is_login and c.char_name:
                     known.add(c.char_name.strip().lower())
             cfg = self._preview_cfg()
+            slot = FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX
             for key in (cfg.get("layouts", {}) or {}):
                 k = str(key).strip().lower()
-                if k:
+                # An "acct:<label>" entry is an ACCOUNT's shared rect, not a
+                # pilot: offering it here would put a fake character in the
+                # Previews... checklist and in the gamelog tracked-set.
+                if k and not k.startswith(slot):
                     known.add(k)
         except Exception:
             log.exception("[preview] known-char union failed")
@@ -19567,6 +19626,10 @@ class FCToolGUI:
         self._overlay_state_ts = {}
         self._preview_layer_hp = {}
         self._preview_intel_reach = {}        # poller-written balls die with it
+        # Which window belonged to which account is session state by design:
+        # hwnds do not survive a mode bounce, and the next enable re-learns
+        # every one of them from the first tick's spawn.
+        self._preview_hwnd_account = {}
         # The implant verdicts go with them -- AND their fetch stamps, so a
         # re-enable re-asks on first sight instead of sitting icon-less behind
         # a stale 300 s gate. The SDE table survives: it is static bundle data,
@@ -20843,6 +20906,28 @@ class FCToolGUI:
         _tip(cbsnap, "While dragging a preview, edges within ~12 px of another "
                      "preview's edges stick to them — butt together or align flush.")
 
+        # Account slots: one saved position per EVE ACCOUNT instead of one per
+        # character (grouping lives in the Characters pane). Shares this row
+        # rather than the first native row, which is already 903 px of the
+        # app's 1000 px minimum width and cannot carry a ~230 px label.
+        self._preview_account_slots_var = tk.BooleanVar(
+            value=bool(pcfg.get("account_slots", False)))
+        cbacct = tk.Checkbutton(
+            rowSnap, text="Keep preview position per account",
+            variable=self._preview_account_slots_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbacct.grid(row=0, column=1, padx=(0, 8))
+        w.append(cbacct)
+        self._preview_account_slots_check = cbacct
+        _tip(cbacct, "Characters on the same EVE account (set in the Characters "
+                     "tab) share ONE preview position and size, so logging an "
+                     "alt in on a window puts its preview exactly where the "
+                     "last one was — and the window keeps that spot while it "
+                     "sits on the character-select screen. Off: every character "
+                     "remembers its own position.")
+
         # Decloak alert — when one of YOUR chars is decloaked (proximity or a
         # Mobile Observatory), read from your own combat logs, its tile flashes
         # yellow + shows a DECLOAKED banner for 10s. Optional spoken cue (OFF by
@@ -21401,6 +21486,7 @@ class FCToolGUI:
         ("_preview_dmg_ref_var", "damage_flash_reference", str),
         ("_preview_decloak_flash_var", "decloak_flash", bool),
         ("_preview_decloak_audio_var", "decloak_audio", bool),
+        ("_preview_account_slots_var", "account_slots", bool),
     )
 
     def _preview_snapshot_native_vars(self):
@@ -21628,7 +21714,8 @@ class FCToolGUI:
                      origin=(10, 10), gap=8)]
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):
-            layouts[client.key] = [int(x), int(y), tile_w, body_h]
+            layouts[self._preview_layout_key(client.key)] = [
+                int(x), int(y), tile_w, body_h]
             # Iterate hwnd->tile (not just .values()) so the newly-placed rect
             # can be mirrored into _preview_tile_rects. Without this, the next
             # tick's _preview_apply_tile_size (fc_gui.py:13460) reads the STALE
@@ -21853,6 +21940,12 @@ class FCToolGUI:
         layouts = cfg.setdefault("layouts", {})
         added_layouts = 0
         for key, (x, y) in parsed["layouts"].items():
+            # Routed like every other layouts writer. EVE-O has no account
+            # concept, so with slots on the first imported member of an account
+            # fills that account's ONE slot and its siblings are skipped by the
+            # fill-only rule -- and are not counted, because a second position
+            # for the same slot is a layout the user could never see.
+            key = self._preview_layout_key(key)
             if key not in layouts:
                 layouts[key] = [int(x), int(y), tile_w, body_h]
                 added_layouts += 1
@@ -23253,6 +23346,72 @@ class FCToolGUI:
             accounts[key] = want
         self._save_config()
         return True
+
+    def _preview_layout_key(self, char_key):
+        """The key this character's geometry is stored under in
+        preview['layouts'] / preview['sizes'].
+
+        THE indirection behind "Keep preview position per account": with
+        `account_slots` on, every character carrying an account label shares
+        one rect under "acct:<label>", so an alt logging in on a window lands
+        exactly where the main was. With the flag off -- the default -- this
+        returns `char_key` UNCHANGED, which is what makes the feature
+        byte-identical to not existing: same keys read, same keys written.
+
+        EVERY reader and writer of those two blocks asks this first. A site
+        that skips it writes where nothing reads (or reads where nothing
+        writes), and the symptom is a preview that teleports on the next start
+        or refuses to remember a move at all -- the same two-owners-for-one-
+        constraint failure shape as the tile-size floor.
+
+        `_preview_tile_rects` is NOT affected: it is the live hwnd-keyed
+        registry of where tiles actually are, and two same-account windows are
+        two tiles. Monitor pinning, focus hotkeys, captions and per-character
+        overrides all stay per-character too -- a slot shares geometry, nothing
+        else.
+
+        An unusable key is returned verbatim rather than coerced: callers hand
+        the answer straight to layouts.get()/layouts[...], so normalizing here
+        would silently relocate an existing entry.
+
+        The flag is read off the RAW block, NOT through `_preview_cfg()`: that
+        accessor materializes every absent default INTO the block, and this
+        method is asked on the per-tick size path (`_preview_resolve_size`),
+        where the auto-fit pass owes a write-nothing-on-unchanged contract that
+        a defaults fill silently breaks. An absent key reads as absent, which
+        is exactly the default this feature ships with -- off."""
+        block = self.config.get("preview")
+        if not (isinstance(block, dict) and block.get("account_slots", False)):
+            return char_key                 # off: today's behaviour, exactly
+        label = self._preview_account_of(char_key)
+        if not label:
+            return char_key                 # ungrouped stays per-character
+        return FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX + label
+
+    def _preview_note_hwnd_account(self, client):
+        """Remember which account owns this window, for as long as FCPreview
+        runs. Called from both tile paths that learn a character's identity:
+        `_preview_rekey_tile` (the login->character transition, the multibox
+        relog) and `_preview_spawn_tile` (FCTool started with the clients
+        already logged in -- the COMMON case, which never sees a rekey at all).
+
+        Only a REAL, labelled character teaches us anything: a login window's
+        key is "" and an ungrouped character has no slot to hold. Never
+        forgets on its own -- that is _preview_retire_tile's and the
+        teardown's job -- because forgetting is exactly what must NOT happen
+        when the pilot logs out to character select.
+
+        getattr-guarded on the map itself: the bare unit hosts build their own
+        controller state, and a missing dict must not raise into the tick."""
+        seen = getattr(self, "_preview_hwnd_account", None)
+        if seen is None:
+            return
+        key = getattr(client, "key", "")
+        if not key:
+            return
+        label = self._preview_account_of(key)
+        if label:
+            seen[client.hwnd] = label
 
     def _preview_pin_apply_all(self):
         """Apply-now: a fresh sweep moves every live charactered client whose char
