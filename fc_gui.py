@@ -127,7 +127,7 @@ import damage_flash
 import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
-from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
+from preview_tile import TileWindow
 # FC HUD info tiles — the preview tiles' content-carrying cousins (own chrome in
 # info_tile.py, engine + settings popup in info_tiles.py). Both modules are
 # fc_gui-free: everything they need arrives through the HudHost seams built in
@@ -17718,6 +17718,20 @@ class FCToolGUI:
                         shadow["_preview_tilew_var"] = w
                 except tk.TclError:
                     pass
+            # …and the height box beside it. It DISPLAYS full height, so the
+            # widget gets the converted number while the shadow keeps the STORED
+            # body height — the unit _preview_apply_native_state diffs against
+            # (via _preview_tileh_value). Mixing those two up is the whole reason
+            # preview_layout.full_h exists.
+            var_h = getattr(self, "_preview_tileh_var", None)
+            if var_h is not None:
+                try:
+                    var_h.set(preview_layout.full_h(body_h, preview_tile.STRIP_H))
+                    shadow = getattr(self, "_preview_var_shadow", None)
+                    if shadow is not None:
+                        shadow["_preview_tileh_var"] = body_h
+                except tk.TclError:
+                    pass
         else:
             cfg.setdefault("sizes", {})[key] = [w, body_h]
         # The POSITION this write-back preserves (a resize never moves a tile —
@@ -17990,6 +18004,10 @@ class FCToolGUI:
         cfg = self._preview_cfg()
         was = bool(cfg.get("fit_height", False))
         self._preview_apply_native_state()   # writes fit_height + its shadow
+        # Re-gate the Tile "h" Spinbox in BOTH directions: the fit pass owns tile
+        # heights while the flag is on, so the box greys out; unticking hands it
+        # back. One owner for that state (see _preview_sync_native_widgets).
+        self._preview_sync_native_widgets()
         if bool(cfg.get("fit_height", False)) and not was:
             self._preview_fit_tile_heights(cfg, force=True)
 
@@ -20260,25 +20278,61 @@ class FCToolGUI:
         self._preview_native_first_row = rowN
         w = self._preview_native_widgets
 
-        tk.Label(rowN, text="Tile w", font=("Consolas", 10), fg=FG_TEXT,
+        # Tile size: ONE label owning TWO spinboxes, "Tile size [w] × [h]". A
+        # second label+spinbox pair ("Tile w …  Tile h …") does not fit — this row
+        # is the widest in the FCPreview panel and the app's minsize is 1000 px
+        # (guarded by test_the_first_native_row_still_fits_the_app_minimum_window_width),
+        # so replacing the old "Tile w" label is what pays for the extra box.
+        tk.Label(rowN, text="Tile size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
         self._preview_tilew_var = tk.IntVar(value=int(pcfg.get("tile_w", 384)))
-        sw = tk.Spinbox(rowN, from_=160, to=960, increment=16, width=5,
+        sw = tk.Spinbox(rowN, from_=160, to=960, increment=16, width=4,
                         textvariable=self._preview_tilew_var, font=("Consolas", 10),
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                         command=self._preview_apply_native_state)
         sw.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        sw.grid(row=0, column=1, padx=(0, 6))
+        sw.grid(row=0, column=1, padx=(0, 2))
         w.append(sw)
-        _tip(sw, "Width in pixels of each native preview tile. Height comes from "
-                 "dragging a tile corner — or, while 'Fit height' beside this "
-                 "box is ticked, from the EVE client's aspect ratio.")
+        _tip(sw, "Width in pixels of each native preview tile. The box beside it "
+                 "sets the height — greyed out while 'Fit height' is ticked.")
+
+        tk.Label(rowN, text="×", font=("Consolas", 10), fg=FG_DIM,
+                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 2))
+
+        # Tile HEIGHT. The box shows FULL height — body + caption strip, i.e. the
+        # whole window the user sees — while `tile_body_h` stays the config unit;
+        # preview_layout.full_h / body_h_from_full are the ONE conversion seam on
+        # THIS path (the STRIP_H-trap family: three bugs from hand-rolled +20s;
+        # the tile-geometry and FC HUD rect paths own their own). Which is
+        # also why this var canNOT ride _PREVIEW_NATIVE_VARS — that map's cast is
+        # a plain type, with nowhere to put a conversion — so it gets a dedicated
+        # read at the apply seam instead (_preview_tileh_value).
+        self._preview_tileh_var = tk.IntVar(
+            value=preview_layout.full_h(pcfg.get("tile_body_h", 216),
+                                        preview_tile.STRIP_H))
+        sh = tk.Spinbox(rowN,
+                        from_=preview_layout.full_h(preview_layout.MIN_TILE_BODY_H,
+                                                    preview_tile.STRIP_H),
+                        to=1600, increment=8, width=4,
+                        textvariable=self._preview_tileh_var, font=("Consolas", 10),
+                        bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                        command=self._preview_apply_native_state)
+        sh.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
+        sh.grid(row=0, column=3, padx=(0, 10))
+        w.append(sh)
+        self._preview_tileh_spin = sh
+        _tip(sh, "Total height in pixels of each native preview tile, caption "
+                 "strip included. Greyed out while 'Fit height' is ticked: the "
+                 "height is snapped to the EVE client's aspect ratio then, and "
+                 "anything typed here would be overwritten within a couple of "
+                 "seconds.")
 
         # Auto-fit height (fit_height). A CHECKBUTTON, not a button: this flag is
         # sticky, and a control that can only turn it on is a one-way door (see
-        # _preview_toggle_fit_height). Same grid cell the button occupied so the
-        # row does not grow. The var rides _PREVIEW_NATIVE_VARS like every other
-        # native key, so the apply/shadow machinery persists it.
+        # _preview_toggle_fit_height). It sits immediately right of the size pair
+        # it governs (its column moved 2 -> 4 when the h box was inserted). The
+        # var rides _PREVIEW_NATIVE_VARS like every other native key, so the
+        # apply/shadow machinery persists it.
         self._preview_fit_height_var = tk.BooleanVar(
             value=bool(pcfg.get("fit_height", False)))
         fitb = tk.Checkbutton(
@@ -20286,13 +20340,14 @@ class FCToolGUI:
             command=self._preview_toggle_fit_height, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        fitb.grid(row=0, column=2, padx=(0, 16))
+        fitb.grid(row=0, column=4, padx=(0, 12))
         w.append(fitb)
         self._preview_fit_height_check = fitb
         _tip(fitb, "On: each preview's height is snapped to its EVE client's "
                    "aspect ratio, removing the black bands above and below the "
                    "video — now, and for previews that attach later. Off: heights "
-                   "are yours, set by dragging a tile corner.")
+                   "are yours, set by dragging a tile corner or typed into the "
+                   "'Tile size' boxes beside this one.")
 
         # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
         # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
@@ -20304,13 +20359,13 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbu.grid(row=0, column=7, padx=(0, 8))
+        cbu.grid(row=0, column=9, padx=(0, 8))
         w.append(cbu)
         _tip(cbu, "On: resizing one preview resizes them all; Off: each preview "
                   "keeps its own size.")
 
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=3, padx=(0, 4), sticky=tk.W)
+                 bg=BG_DARK).grid(row=0, column=5, padx=(0, 4), sticky=tk.W)
         self._preview_opacity_var = tk.DoubleVar(
             value=float(pcfg.get("opacity_inactive", 0.85)))
         so = tk.Spinbox(rowN, from_=0.2, to=1.0, increment=0.05, width=5,
@@ -20318,7 +20373,7 @@ class FCToolGUI:
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                         command=self._preview_apply_native_state)
         so.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        so.grid(row=0, column=4, padx=(0, 16))
+        so.grid(row=0, column=6, padx=(0, 16))
         w.append(so)
         _tip(so, "Opacity of preview tiles for clients that are NOT the active "
                  "one (1.0 = fully opaque).")
@@ -20329,7 +20384,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbc.grid(row=0, column=5, padx=(0, 8))
+        cbc.grid(row=0, column=7, padx=(0, 8))
         w.append(cbc)
         _tip(cbc, "Show a text caption on each preview tile (character name or its "
                   "label rule).")
@@ -20342,7 +20397,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbd.grid(row=0, column=6, padx=(0, 8))
+        cbd.grid(row=0, column=8, padx=(0, 8))
         w.append(cbd)
         _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
                   "rule or override already labels it.")
@@ -20355,7 +20410,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cblv.grid(row=1, column=0, columnspan=4, padx=(0, 8), pady=(4, 0), sticky=tk.W)
+        cblv.grid(row=1, column=0, columnspan=6, padx=(0, 8), pady=(4, 0), sticky=tk.W)
         w.append(cblv)
         _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') in a small "
                    "strip at the BOTTOM of each preview tile — below the video, "
@@ -20369,7 +20424,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbloc.grid(row=1, column=4, columnspan=2, padx=(0, 8), pady=(4, 0),
+        cbloc.grid(row=1, column=6, columnspan=2, padx=(0, 8), pady=(4, 0),
                    sticky=tk.W)
         w.append(cbloc)
         _tip(cbloc, "Shows each pilot's current system on its own line under the "
@@ -20925,11 +20980,29 @@ class FCToolGUI:
             pass
 
     def _preview_sync_native_widgets(self):
-        """Enable native-only controls iff mode == native (spec §9 row gating)."""
-        state = "normal" if self._preview_cfg().get("mode") == "native" else "disabled"
+        """Enable native-only controls iff mode == native (spec §9 row gating).
+
+        ONE control is gated TWICE: the Tile "h" Spinbox is additionally greyed
+        while `fit_height` is on, because the auto-fit pass owns tile heights then
+        and a number typed here would be silently overwritten within ~2 s. The
+        second gate is applied AFTER the bulk loop on purpose — the loop sets
+        every native widget to "normal" in native mode, so a mode switch would
+        otherwise hand the box back mid-fit. Every path that can move either gate
+        (build, mode switch, the Fit-height tick) comes back through here, which
+        is what keeps the two from disagreeing."""
+        cfg = self._preview_cfg()
+        state = "normal" if cfg.get("mode") == "native" else "disabled"
         for widget in getattr(self, "_preview_native_widgets", []):
             try:
                 widget.configure(state=state)
+            except tk.TclError:
+                pass
+        spin_h = getattr(self, "_preview_tileh_spin", None)
+        if spin_h is not None:
+            try:
+                spin_h.configure(state=("normal" if state == "normal"
+                                        and not cfg.get("fit_height")
+                                        else "disabled"))
             except tk.TclError:
                 pass
 
@@ -21060,6 +21133,13 @@ class FCToolGUI:
         mode = FCToolGUI._preview_dmg_mode_value(self)
         if mode is not None:
             shadow["_preview_dmg_mode_var"] = mode
+        # Same reason for the Tile "h" Spinbox: its IntVar holds FULL height, not
+        # the stored body height, so it cannot ride the map either. Baseline the
+        # RESOLVED (stored) value, exactly as the mode combo does, so the apply's
+        # diff compares like with like.
+        body_h = FCToolGUI._preview_tileh_value(self)
+        if body_h is not None:
+            shadow["_preview_tileh_var"] = body_h
         self._preview_var_shadow = shadow
 
     def _preview_dmg_mode_value(self):
@@ -21074,6 +21154,34 @@ class FCToolGUI:
         except tk.TclError:
             return None
         return getattr(self, "_preview_dmg_mode_from_label", {}).get(label, "any")
+
+    def _preview_tileh_value(self):
+        """The BODY height the Tile "h" Spinbox is currently showing, or None when
+        the control does not exist / cannot be read.
+
+        The widget displays FULL height — body + caption strip, the whole window
+        the user sees — while `tile_body_h` stays the config unit every other
+        FCPreview path speaks. This is the ONE place the widget's number is
+        converted back (its forward twin is the seed in _build_preview_section),
+        and both go through preview_layout.full_h / body_h_from_full so the
+        SETTINGS path's STRIP_H arithmetic exists exactly once. Other paths
+        legitimately do their own (preview_tile's strip/thumb geometry, the FC
+        HUD rect conversion above) — they measure live widgets, not this box.
+
+        Shaped like _preview_dmg_mode_value and for the same reason: a var whose
+        DISPLAYED value is not its STORED value cannot ride the
+        (attr, key, cast) map, so the bulk apply and the shadow snapshot share
+        this reader rather than each rolling their own conversion. Called via the
+        CLASS (FCToolGUI._preview_tileh_value(self)) so the SimpleNamespace test
+        hosts need no new bind-list entry."""
+        var = getattr(self, "_preview_tileh_var", None)
+        if var is None:
+            return None
+        try:
+            raw = var.get()
+        except (tk.TclError, ValueError):
+            return None                     # mid-typing garbage: leave cfg alone
+        return preview_layout.body_h_from_full(raw, preview_tile.STRIP_H)
 
     def _preview_apply_native_state(self):
         """Persist the native-row control values live. No path clears saved data.
@@ -21117,6 +21225,15 @@ class FCToolGUI:
         mode = FCToolGUI._preview_dmg_mode_value(self)
         if mode is not None:
             _put("_preview_dmg_mode_var", "damage_flash_mode", mode)
+        # The Tile "h" Spinbox is off the map for the same class of reason: it
+        # DISPLAYS full height (body + caption strip) and the config unit is body
+        # height, and the map's `cast` is a plain type with nowhere to put a
+        # conversion. Resolve it through the one seam and apply the identical
+        # skip rule — tile_body_h has a second writer too (every corner-resize),
+        # so an untouched box must be incapable of stomping a dragged height.
+        body_h = FCToolGUI._preview_tileh_value(self)
+        if body_h is not None:
+            _put("_preview_tileh_var", "tile_body_h", body_h)
         # The "Tile w" Spinbox's from_=160 constrains its ARROWS only — Tk does
         # not validate typed text — so the user can type 2 (or 0) and every tile
         # is re-placed at that width on the next tick. Floor what actually gets
