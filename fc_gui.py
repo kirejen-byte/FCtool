@@ -19668,10 +19668,12 @@ class FCToolGUI:
         tuple. Single-writer (this method) / single-reader (the tick), the
         _preview_intel_reach discipline; touches no Tk.
 
-        Three gates, in cost order:
+        Four early returns, in the order the code takes them:
 
         * a blank key (a client sitting at character select) has nothing to
           publish under;
+        * a host without the two poller-owned dicts is not a preview host at
+          all (the bare unit hosts) -- nothing to write into;
         * a token without esi-clones.read_implants.v1 is NEVER fetched -- no
           call, no log, no icon. Every pre-2026-07-25 token lacks the scope
           until the owner re-authorises, and a 403 costs 5 of the 100/60s ESI
