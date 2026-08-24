@@ -359,36 +359,87 @@ def _resolve_id(name, resolve):
     return sid if sid > 0 else None
 
 
+#: FCs type jump COUNTS constantly ("2-3 out", "5-10 min") and no real system
+#: name is a bare digit range -- excluded from partial matching outright,
+#: whatever its length (2026-08-24 false-positive fix, F2).
+_NUMBER_RANGE_RE = re.compile(r"^\d+-\d+$")
+#: Below this length a letters-only fragment is ordinary chat, not a typed
+#: system name -- "Gate"/"LOST"/"DEAD"/"FAST" are all 4 letters; real
+#: abbreviations an FC would actually type run 5+ ("Amama" -> Amamake).
+MIN_PARTIAL_LETTERS_LEN = 5
+#: A digit/dash-SHAPED fragment (not a pure number range) needs one fewer --
+#: "3-FK" is real FC shorthand at 4 characters.
+MIN_PARTIAL_SHAPED_LEN = 4
+
+
 def resolve_partial_name(name, catalogue) -> str | None:
     """Resolve a possibly-PARTIAL, case-insensitive ``name`` against a
-    system-name ``catalogue`` (any iterable of name strings; a ``dict`` works
-    too -- only its keys are read), returning the ONE catalogue name it
-    identifies, or ``None``. Pure -- no lookup, no import of ``system_coords``
-    here -- the caller supplies the catalogue, so this stays unit-testable
-    with a literal table (2026-08-24, fleet-chat partial name matching).
+    system-name ``catalogue`` -- a ``{lower_name: original_name}`` dict,
+    lowered ONCE by the caller (``extract_systems`` builds it once per call,
+    never per phrase, so this function never lowers a catalogue entry itself
+    -- only the typed name; ``2026-08-24``, fleet-chat partial name matching,
+    revised the same day after a false-positive/perf review, F1-F3/F5).
+    Returns the ONE catalogue name ``name`` identifies, or ``None``. Any
+    non-dict-like catalogue (``None`` included) degrades to ``None`` rather
+    than raising -- the same "every failure mode is unresolved" contract
+    ``_resolve_id`` keeps.
 
-    Three passes, each returning as soon as it can decide:
-      1. EXACT case-insensitive match always wins, even when that name is
-         ALSO a prefix of others -- typing a system's own full name is never
-         treated as ambiguous.
-      2. Case-insensitive PREFIX match: exactly one candidate resolves it;
-         zero or more than one falls through with no fuzzy tie-break.
-      3. Only when the prefix pass found NOTHING does a case-insensitive
-         SUBSTRING match get tried, under the same one-or-none rule."""
+    An exact hit aside, a partial hit needs real evidence: ordinary chat words
+    and jump-count fragments vastly outnumber abbreviated system names in real
+    fleet chat, and a false hit REPLACES the whole source list.
+
+      1. EXACT case-insensitive match always wins -- O(1) via the dict --
+         whatever the phrase's shape or length; this is the ONLY rule the two
+         eligibility gates below do not apply to.
+      2. A pure jump-count shape (``_NUMBER_RANGE_RE`` -- "2-3", "5-10",
+         "0-2") NEVER partial-matches.
+      3. A LETTERS-ONLY phrase (no digit, no dash) needs length >=
+         ``MIN_PARTIAL_LETTERS_LEN`` and gets PREFIX matching only -- never
+         substring (kills "Gate"/"LOST"/"DEAD"/"FAST" while still catching
+         "Amama" -> "Amamake").
+      4. A SHAPED phrase (digit or dash present, not a pure jump-count) needs
+         length >= ``MIN_PARTIAL_SHAPED_LEN`` and gets PREFIX matching, then
+         -- only if prefix found NOTHING -- SUBSTRING matching. Both stages
+         require a UNIQUE candidate; no fuzzy tie-break.
+
+    Single pass over the catalogue for the prefix/substring stages (no
+    repeated ``.lower()``, no separate substring pass when prefix already
+    decided the answer); bails out as soon as the prefix count is provably
+    ambiguous, since nothing later in the scan can undo that."""
     text = str(name or "").strip()
     if not text:
         return None
-    needle = text.lower()
-    for cand in catalogue:
-        if str(cand).lower() == needle:
-            return cand
-    prefix_hits = [c for c in catalogue if str(c).lower().startswith(needle)]
-    if len(prefix_hits) == 1:
-        return prefix_hits[0]
-    if prefix_hits:
+    try:
+        exact = catalogue.get(text.lower())
+    except AttributeError:
         return None
-    substr_hits = [c for c in catalogue if needle in str(c).lower()]
-    return substr_hits[0] if len(substr_hits) == 1 else None
+    if exact is not None:
+        return exact
+    if _NUMBER_RANGE_RE.match(text):
+        return None
+    shaped = is_system_shaped(text)
+    if len(text) < (MIN_PARTIAL_SHAPED_LEN if shaped
+                    else MIN_PARTIAL_LETTERS_LEN):
+        return None
+    needle = text.lower()
+    prefix_hits = 0
+    prefix_cand = None
+    substr_hits = 0
+    substr_cand = None
+    for lower, original in catalogue.items():
+        if lower.startswith(needle):
+            prefix_hits += 1
+            prefix_cand = original
+            if prefix_hits > 1:
+                break            # already ambiguous; substring is now moot
+        elif shaped and needle in lower:
+            substr_hits += 1
+            substr_cand = original
+    if prefix_hits == 1:
+        return prefix_cand
+    if prefix_hits or not shaped:
+        return None
+    return substr_cand if substr_hits == 1 else None
 
 
 def _as_ref(value, resolve=None) -> SystemRef | None:
@@ -490,7 +541,16 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     Deliberately imperfect: a mid-sentence ``Toon`` still reads as the system.
     Perfect separation would need a dictionary, and the backstop is cheaper and
     more honest — ``provenance_line`` always names the systems the message
-    overrode the sources with, so a surprising report explains itself."""
+    overrode the sources with, so a surprising report explains itself.
+
+    A ``canonical`` LONGER than ``phrase`` (never possible before partial
+    matching) means a letters-only PARTIAL hit is being checked — the exact-
+    equality rule above cannot fire (the two strings differ in length by
+    construction), so it would silently wave a wrongly-cased fragment through.
+    The same discipline applies instead: the typed fragment's casing must
+    match the corresponding lead of the canonical name CHARACTER FOR
+    CHARACTER, so a shouted ``GATEW`` is refused exactly as a shouted exact
+    ``EXIT`` is, while ``Amama`` still reaches ``Amamake`` (2026-08-24, F4)."""
     text = str(phrase or "")
     if len(text) < MIN_PLAIN_NAME_LEN:
         return False
@@ -501,6 +561,8 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     canon = str(canonical or "")
     if canon and canon.lower() == text.lower():
         return text == canon
+    if canon and canon.lower().startswith(text.lower()):
+        return canon.startswith(text)
     return True
 
 
@@ -611,13 +673,20 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     why the disclosure never costs the injected resolver its guarantee.
 
     **A PARTIALLY typed name is a second chance, not a second gate**
-    (2026-08-24): when the exact resolve above misses, ``resolve_partial_name``
-    is tried against the bundled K-space catalogue (prefix, then substring,
-    each requiring a UNIQUE candidate) and a hit is re-resolved through the
-    SAME injected ``resolver`` — so ``"3-FK"`` links "3-FKCZ" when it is the
-    only K-space name starting with it, an ambiguous fragment falls through
-    exactly like an unknown one does today, and a name that resolves EXACTLY
-    is never second-guessed even when it is also a prefix of others."""
+    (2026-08-24, revised same day after a false-positive/perf review — see
+    ``resolve_partial_name``): when the exact resolve above misses, that
+    function is tried against the bundled K-space catalogue — length- and
+    shape-gated, so ordinary chat words and jump-count fragments ("please",
+    "LOST", "2-3") never even reach a catalogue scan — and a hit is
+    re-resolved through the SAME injected ``resolver``, never used directly
+    for the id. A LETTERS-ONLY partial additionally re-runs the plain-phrase
+    casing gate against the ORIGINAL typed text (not the resolved spelling —
+    rewriting first would make the gate trivially pass), so a shouted
+    fragment is refused exactly as a shouted exact name is. ``"3-FK"`` links
+    "3-FKCZ" when it is the only K-space name starting with it; an ambiguous
+    or ineligible fragment falls through exactly like an unknown one does
+    today; a name that resolves EXACTLY is never second-guessed even when it
+    is also a prefix of others."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
 
@@ -656,30 +725,43 @@ def extract_systems(body, resolve=None) -> SystemMentions:
                     miss = _refused_ref(phrase, sentence_initial=initial)
                 continue
             sid = _resolve_id(phrase, resolver)
+            partial_name = None         # set only by a successful partial hit
             if sid is None:
                 # A typed name that does not resolve EXACTLY gets one more
-                # chance: a unique prefix/substring hit against the bundled
-                # catalogue is re-resolved through the SAME injected resolver
-                # (never used directly for the id, matching ``_refused_ref``'s
-                # precedent), so a raising/unaware resolver still yields no
-                # match -- only the CANDIDATE spelling comes from the table.
+                # chance: a length/shape-eligible, unique prefix/substring hit
+                # against the bundled catalogue is re-resolved through the
+                # SAME injected resolver (never used directly for the id,
+                # matching ``_refused_ref``'s precedent), so a raising/unaware
+                # resolver still yields no match -- only the CANDIDATE
+                # spelling comes from the table. Lowered ONCE per call, not
+                # per phrase (see ``resolve_partial_name``, F3).
                 if catalogue is None:
-                    catalogue = system_coords.get_kspace_name_to_id()
+                    catalogue = {nm.lower(): nm for nm in
+                                 system_coords.get_kspace_name_to_id()}
                 partial = resolve_partial_name(phrase, catalogue)
                 if partial is not None and partial.lower() != phrase.lower():
-                    sid = _resolve_id(partial, resolver)
-                    if sid is not None:
-                        phrase = partial
+                    partial_sid = _resolve_id(partial, resolver)
+                    if partial_sid is not None:
+                        sid = partial_sid
+                        partial_name = partial
             if sid is None:
                 continue
             canon = system_coords.get_name(sid)
             # ...and the half that needs the id: the game's own spelling.
+            # Runs against the ORIGINAL typed ``phrase`` even for a partial
+            # hit (``partial_name or canon`` as the canonical) -- rewriting
+            # ``phrase`` to the resolved spelling BEFORE this check would make
+            # it trivially pass (F4: text == canon by construction).
             if plain and not plain_phrase_is_a_reference(
-                    phrase, sentence_initial=initial, canonical=canon):
+                    phrase, sentence_initial=initial,
+                    canonical=partial_name or canon):
                 if miss is None:
                     miss = IgnoredRef(phrase, sid, _retype_hint(
-                        phrase, canon, sentence_initial=initial))
+                        phrase, partial_name or canon,
+                        sentence_initial=initial))
                 continue
+            if partial_name is not None:
+                phrase = partial_name   # safe now -- the gate already ran
             hit = (phrase, sid, size, canon)
             break
         if hit is None:
