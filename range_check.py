@@ -733,8 +733,12 @@ def extract_systems(body, resolve=None) -> SystemMentions:
                 # SAME injected resolver (never used directly for the id,
                 # matching ``_refused_ref``'s precedent), so a raising/unaware
                 # resolver still yields no match -- only the CANDIDATE
-                # spelling comes from the table. Lowered ONCE per call, not
-                # per phrase (see ``resolve_partial_name``, F3).
+                # spelling comes from the table. Lowered ONCE per call,
+                # not per phrase -- and the ENCLOSING ``extract_systems``
+                # call itself happens only once per range-check TRIGGER
+                # (the fc_gui call site gates on keyword + own-char +
+                # cooldown before ever calling it), never per ordinary
+                # chat line (see ``resolve_partial_name``, F3).
                 if catalogue is None:
                     catalogue = {nm.lower(): nm for nm in
                                  system_coords.get_kspace_name_to_id()}
