@@ -19888,7 +19888,8 @@ class FCToolGUI:
           whole pass: without it the refresh spent one /implants/ call per
           scoped character per _PREVIEW_IMPLANT_REFRESH_S with previews switched
           off entirely (the "off feature must never pay" rule the intel-flash
-          ball BFS follows for the same reason);
+          ball BFS follows for the same reason). A host with no _preview_cfg at
+          all has no gate to read and simply falls through to the next return;
         * a blank key (a client sitting at character select) has nothing to
           publish under;
         * a host without the two poller-owned dicts is not a preview host at
@@ -19910,16 +19911,27 @@ class FCToolGUI:
         previous verdict stands, so the icon never flickers off on one bad poll.
         Never raises -- a broken icon must not take the poller down."""
         try:
-            pcfg = self._preview_cfg()
-            # The fallback comes from _PREVIEW_DEFAULTS, not a literal: it is
-            # unreachable (_preview_cfg materialized the key) but two readers
-            # disagreeing about ONE key's default is the failure shape this
-            # subsystem keeps repeating — the compose side reads the same owner.
-            if (pcfg.get("mode") != "native"
-                    or not pcfg.get(
-                        "implant_icon",
-                        FCToolGUI._PREVIEW_DEFAULTS["implant_icon"])):
-                return
+            # getattr-guarded exactly like the two hooks that call this one
+            # (the implant reminder and the intel-flash reach block above): a
+            # bare SimpleNamespace host has no _preview_cfg, and reaching for
+            # it unguarded would raise straight into this method's own outer
+            # except -- one UNTHROTTLED log.exception per character per poll
+            # pass, and the "not a preview host" early return below would never
+            # be reached at all. No accessor => no gate to apply; the dict
+            # check below is then what turns such a host away.
+            cfg_fn = getattr(self, "_preview_cfg", None)
+            if cfg_fn is not None:
+                pcfg = cfg_fn()
+                # The fallback comes from _PREVIEW_DEFAULTS, not a literal: it
+                # is unreachable (_preview_cfg materialized the key) but two
+                # readers disagreeing about ONE key's default is the failure
+                # shape this subsystem keeps repeating -- the compose side
+                # reads the same owner.
+                if (pcfg.get("mode") != "native"
+                        or not pcfg.get(
+                            "implant_icon",
+                            FCToolGUI._PREVIEW_DEFAULTS["implant_icon"])):
+                    return
             key = str(key or "").strip().lower()
             if not key:
                 return
@@ -20764,9 +20776,11 @@ class FCToolGUI:
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
         rowN2.pack(fill=tk.X, pady=2)
-        # rowN is full (903 px of the app's 1000 px minsize), so rowN2 is where
-        # new FCPreview controls land — and it has its own width guard now
-        # (test_the_second_native_row_still_fits_the_app_minimum_window_width).
+        # rowN is full (measured 977 px of the app's 1000 px minsize — 903 until
+        # the Tile "h" Spinbox was inserted), so rowN2 is where new FCPreview
+        # controls land — and it has its own width guard now
+        # (test_the_second_native_row_still_fits_the_app_minimum_window_width),
+        # because at 976 px it is no longer the roomy row it used to be either.
         self._preview_native_second_row = rowN2
         self._preview_highlight_var = tk.BooleanVar(
             value=bool(pcfg.get("highlight_active", True)))

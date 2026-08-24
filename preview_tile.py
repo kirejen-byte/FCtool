@@ -1440,10 +1440,13 @@ class TileWindow:
         the latch, or the unchanged-text skip would swallow the retry (the
         set_alpha bug class).
 
-        A visibility CHANGE also re-renders the caption: the icon eats pixels
-        the name was budgeted, and `_render_caption`'s own guard would otherwise
-        hold the stale (too long) name until something else happened to change
-        it."""
+        A visibility CHANGE also re-renders the caption, because the icon eats
+        pixels the name was budgeted and the truncation may have to move.
+        `_render_caption`'s OWN (name, chip) guard decides whether that costs
+        anything: a budget change that does not actually shorten the name
+        writes nothing. Do NOT clear `_caption_applied` first to "force" it --
+        that only buys three redundant configure() calls on every visibility
+        flip whose name was short enough to fit either way."""
         text = str(tooltip_text or "")
         if text == self._implant_applied:
             return
@@ -1467,7 +1470,6 @@ class TileWindow:
             return                               # never record a failed write
         self._implant_applied = text
         if self._implant_visible != was_visible:
-            self._caption_applied = None         # width budget moved: re-render
             self._render_caption()
 
     def _ellipsize_name(self, name):
@@ -1481,7 +1483,12 @@ class TileWindow:
         # reserve space for the dot (~17px), chip (~len*7px + pad), excl (~14px)
         chip_px = (len(self._chip) + 1) * 8 if self._chip else 0
         # …and the implant icon (its image width + its own 4px pad) while it is
-        # actually packed — a hidden icon costs the name nothing.
+        # actually packed — a hidden icon costs the name nothing. This is a
+        # slight UNDER-estimate, like every other term here: measured, the
+        # packed label really occupies 24 px with the image and 21 with the
+        # glyph fallback (a tk.Label adds its 2px border a side) against the
+        # 20 reserved. The trailing +8 slop below is what absorbs that, exactly
+        # as it already absorbs the dot's and chip's own rounding.
         icon_px = (IMPLANT_ICON_PX + 4) if self._implant_visible else 0
         reserved = 17 + 14 + chip_px + icon_px + 8
         usable = max(0, w - reserved)
