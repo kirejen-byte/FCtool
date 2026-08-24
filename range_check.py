@@ -359,6 +359,38 @@ def _resolve_id(name, resolve):
     return sid if sid > 0 else None
 
 
+def resolve_partial_name(name, catalogue) -> str | None:
+    """Resolve a possibly-PARTIAL, case-insensitive ``name`` against a
+    system-name ``catalogue`` (any iterable of name strings; a ``dict`` works
+    too -- only its keys are read), returning the ONE catalogue name it
+    identifies, or ``None``. Pure -- no lookup, no import of ``system_coords``
+    here -- the caller supplies the catalogue, so this stays unit-testable
+    with a literal table (2026-08-24, fleet-chat partial name matching).
+
+    Three passes, each returning as soon as it can decide:
+      1. EXACT case-insensitive match always wins, even when that name is
+         ALSO a prefix of others -- typing a system's own full name is never
+         treated as ambiguous.
+      2. Case-insensitive PREFIX match: exactly one candidate resolves it;
+         zero or more than one falls through with no fuzzy tie-break.
+      3. Only when the prefix pass found NOTHING does a case-insensitive
+         SUBSTRING match get tried, under the same one-or-none rule."""
+    text = str(name or "").strip()
+    if not text:
+        return None
+    needle = text.lower()
+    for cand in catalogue:
+        if str(cand).lower() == needle:
+            return cand
+    prefix_hits = [c for c in catalogue if str(c).lower().startswith(needle)]
+    if len(prefix_hits) == 1:
+        return prefix_hits[0]
+    if prefix_hits:
+        return None
+    substr_hits = [c for c in catalogue if needle in str(c).lower()]
+    return substr_hits[0] if len(substr_hits) == 1 else None
+
+
 def _as_ref(value, resolve=None) -> SystemRef | None:
     """Accept a ``SystemRef``, a bare system id, a NAME, or a ``(name, id)`` pair.
 
@@ -576,7 +608,16 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     byte-for-byte the shape of "you named nothing", with no tell whatsoever. That
     is the silence this module is not allowed to give, in the one direction it was
     still giving it. ``ignored_line`` renders the mirror; see ``_refused_ref`` for
-    why the disclosure never costs the injected resolver its guarantee."""
+    why the disclosure never costs the injected resolver its guarantee.
+
+    **A PARTIALLY typed name is a second chance, not a second gate**
+    (2026-08-24): when the exact resolve above misses, ``resolve_partial_name``
+    is tried against the bundled K-space catalogue (prefix, then substring,
+    each requiring a UNIQUE candidate) and a hit is re-resolved through the
+    SAME injected ``resolver`` — so ``"3-FK"`` links "3-FKCZ" when it is the
+    only K-space name starting with it, an ambiguous fragment falls through
+    exactly like an unknown one does today, and a name that resolves EXACTLY
+    is never second-guessed even when it is also a prefix of others."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
 
@@ -594,6 +635,7 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     ignored: list[IgnoredRef] = []
     seen: set[int] = set()
     refused: set[int] = set()
+    catalogue = None            # lazy: only built if an exact match ever fails
     i, n = 0, len(words)
     while i < n:
         hit = None
@@ -614,6 +656,20 @@ def extract_systems(body, resolve=None) -> SystemMentions:
                     miss = _refused_ref(phrase, sentence_initial=initial)
                 continue
             sid = _resolve_id(phrase, resolver)
+            if sid is None:
+                # A typed name that does not resolve EXACTLY gets one more
+                # chance: a unique prefix/substring hit against the bundled
+                # catalogue is re-resolved through the SAME injected resolver
+                # (never used directly for the id, matching ``_refused_ref``'s
+                # precedent), so a raising/unaware resolver still yields no
+                # match -- only the CANDIDATE spelling comes from the table.
+                if catalogue is None:
+                    catalogue = system_coords.get_kspace_name_to_id()
+                partial = resolve_partial_name(phrase, catalogue)
+                if partial is not None and partial.lower() != phrase.lower():
+                    sid = _resolve_id(partial, resolver)
+                    if sid is not None:
+                        phrase = partial
             if sid is None:
                 continue
             canon = system_coords.get_name(sid)
