@@ -970,6 +970,18 @@ def _preview_intel_radius(cfg) -> int:
     return max(0, min(_PREVIEW_INTEL_JUMPS_MAX, radius))
 
 
+# FCPreview major-implant icon: how often the ESI location poller re-asks
+# /implants/ for ONE character. A pilot's head changes at a jump clone, not at
+# poll cadence, and the call rides the per-character `char-detail` bucket
+# (600 tokens / 15 min), so this is a hard per-key rate ceiling rather than an
+# optimization -- see _preview_implant_refresh, which stamps the ATTEMPT.
+_PREVIEW_IMPLANT_REFRESH_S = 300.0
+# A broken implants fetch breaks on every refresh for every character; one
+# terse line at most this often while the fault persists (a healthy fetch
+# re-arms the report). Same shape as _PREVIEW_FAST_DRAIN_LOG_EVERY_S.
+_PREVIEW_IMPLANT_LOG_EVERY_S = 300.0
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -1259,6 +1271,17 @@ class FCToolGUI:
         # ball the intel flash fires inside. POLLER-WRITTEN (_overlay_build_state),
         # Tk-read (the tick), same single-writer discipline as _preview_layer_hp.
         self._preview_intel_reach = {}
+        # char key -> tuple[str, ...] of major-implant labels for the tile icon
+        # ("Mid-grade Amulets", "2 hardwirings"). POLLER-WRITTEN
+        # (_preview_implant_refresh), Tk-read (the tick), same single-writer
+        # discipline as _preview_intel_reach above; an empty tuple means "asked,
+        # nothing worth an icon". Its three companions are poller-owned too: the
+        # per-key fetch stamps, the SDE table loaded once worker-side, and the
+        # fetch-fault log throttle.
+        self._preview_implant_labels = {}
+        self._preview_implant_ts = {}
+        self._preview_implant_table = None
+        self._preview_implant_logged_at = None
         self._preview_disabled_session = False
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
         self._preview_tick_fails = 0           # consecutive failed ticks (BUG A guard)
@@ -19372,6 +19395,12 @@ class FCToolGUI:
         self._overlay_state_ts = {}
         self._preview_layer_hp = {}
         self._preview_intel_reach = {}        # poller-written balls die with it
+        # The implant verdicts go with them -- AND their fetch stamps, so a
+        # re-enable re-asks on first sight instead of sitting icon-less behind
+        # a stale 300 s gate. The SDE table survives: it is static bundle data,
+        # not session state.
+        self._preview_implant_labels = {}
+        self._preview_implant_ts = {}
         self._preview_video_labels = {}
         # Clear any native on-video labels off the shared overlay so a mode switch
         # (native → off / eveo_labels) never leaves stale native labels lingering.
@@ -19507,6 +19536,15 @@ class FCToolGUI:
             if _ir is not None:
                 _ir(auth, name, loc)
 
+        # FCPreview major-implant icon: keep this character's verdict fresh on
+        # the SAME pass. Deliberately NOT gated on `loc` -- what is in the
+        # pilot's head does not depend on the location call having answered --
+        # and getattr-guarded for the SimpleNamespace test hosts, exactly like
+        # the reminder hook above. The refresh throttles itself per character.
+        _ii = getattr(self, "_preview_implant_refresh", None)
+        if _ii is not None:
+            _ii(auth, key)
+
         if force_ship or prior is None or sys_id != prior_sys_id:
             try:
                 ship = auth.get_ship_type() or {}
@@ -19629,6 +19667,88 @@ class FCToolGUI:
             rem.observe((name or "").strip().lower(), name, loc, auth)
         except Exception:
             log.exception("[implant] reminder hook failed")
+
+    # ── FCPreview major-implant icon: the verdict the tile tooltip reads ─────
+    # Same poll pass as the reminder above, and for the same reason: the ESI
+    # location poller is already walking every tracked character, so the icon
+    # costs no second poller and no second thread. What it does NOT share is the
+    # reminder's master gate -- the icon is informational and works with "Save
+    # my implants" switched off. It shares only the DESIGNATION (owner decision
+    # 2026-08-24: one knob, not two), by normalizing the same
+    # config['implant_reminder'] block through implant_reminder.normalize_config.
+
+    def _preview_implant_refresh(self, auth, key):
+        """Poller-thread hook: keep ONE character's major-implant verdict fresh.
+
+        Publishes ``_preview_implant_labels[key] = tuple[str, ...]`` -- the
+        summarised verdict ONLY, never the raw type ids: classification runs
+        here, on the poller thread, so the Tk tick does nothing but read a
+        tuple. Single-writer (this method) / single-reader (the tick), the
+        _preview_intel_reach discipline; touches no Tk.
+
+        Four early returns, in the order the code takes them:
+
+        * a blank key (a client sitting at character select) has nothing to
+          publish under;
+        * a host without the two poller-owned dicts is not a preview host at
+          all (the bare unit hosts) -- nothing to write into;
+        * a token without esi-clones.read_implants.v1 is NEVER fetched -- no
+          call, no log, no icon. Every pre-2026-07-25 token lacks the scope
+          until the owner re-authorises, and a 403 costs 5 of the 100/60s ESI
+          error budget, so this is the same inert-on-upgrade behaviour the
+          reminder has;
+        * one fetch per character per _PREVIEW_IMPLANT_REFRESH_S. The stamp is
+          written BEFORE the fetch and is therefore an ATTEMPT stamp, not a
+          success stamp: a persistently failing fetch must re-ask on that
+          cadence and not on every poll pass (/implants/ rides the per-character
+          char-detail bucket, 600 tokens / 15 min). The accepted cost is that a
+          fetch that faults on FIRST sight leaves the character icon-less for
+          one refresh period.
+
+        A fault (raise, or the adapter's None) degrades to "no change": the
+        previous verdict stands, so the icon never flickers off on one bad poll.
+        Never raises -- a broken icon must not take the poller down."""
+        try:
+            key = str(key or "").strip().lower()
+            if not key:
+                return
+            labels = getattr(self, "_preview_implant_labels", None)
+            stamps = getattr(self, "_preview_implant_ts", None)
+            if labels is None or stamps is None:
+                return
+            if not auth.has_scope(_IMPLANTS_SCOPE):
+                return
+            now = time.monotonic()
+            last = stamps.get(key)
+            if last is not None and (now - last) < _PREVIEW_IMPLANT_REFRESH_S:
+                return
+            stamps[key] = now
+            try:
+                ids = auth.get_implants()
+            except Exception:
+                ids = None
+            if ids is None:
+                logged = getattr(self, "_preview_implant_logged_at", None)
+                if (logged is None
+                        or (now - logged) >= _PREVIEW_IMPLANT_LOG_EVERY_S):
+                    self._preview_implant_logged_at = now
+                    log.warning("[preview] implants fetch failed for %s - "
+                                "keeping the last icon verdict", key)
+                return
+            self._preview_implant_logged_at = None
+            table = getattr(self, "_preview_implant_table", None)
+            if table is None:
+                # Parsed at most once per session, off the Tk thread (the
+                # module memoizes too; the instance attribute is what makes
+                # "once" visible at this seam and injectable in tests).
+                table = implant_reminder.load_implant_table()
+                self._preview_implant_table = table
+            cfg = implant_reminder.normalize_config(
+                self.config.get("implant_reminder"))
+            labels[key] = implant_reminder.summary_labels(
+                implant_reminder.classify(ids, table, cfg))
+        except Exception:
+            log.exception("[preview] implant verdict refresh failed")
 
     def _implant_client_rect(self, key):
         """(left, top, right, bottom) physical-px EDGES of the EVE client whose
