@@ -21,6 +21,7 @@ a = Analysis(
         ('assets/bursts/armor_21.png', 'assets/bursts'),
         ('assets/bursts/skirmish_21.png', 'assets/bursts'),
         ('assets/bursts/info_21.png', 'assets/bursts'),
+        ('assets/implant_icon_16.png', 'assets'),
         ('assets/tts/fleet_lost_10.mp3', 'assets/tts'),
         ('assets/tts/fleet_lost_25.mp3', 'assets/tts'),
         ('assets/tts/fleet_lost_50.mp3', 'assets/tts'),

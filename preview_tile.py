@@ -5,9 +5,11 @@ Design (spec §5):
 - Opaque Toplevel, overrideredirect(True); ex-styles WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE
   applied to the GA_ROOT top-level hwnd ONCE, before the first map (no LAYERED,
   no TRANSPARENT, no -transparentcolor — those are overlay-only).
-- A caption strip (tk.Frame height STRIP_H) with name/dot/chip/tag labels, over a
-  black body frame. The DWM thumbnail is composited by the compositor OVER the
-  body area; it is letterboxed so it never covers the strip.
+- A caption strip (tk.Frame height STRIP_H) with name/dot/chip/tag labels and the
+  optional major-implants icon, over a black body frame. The DWM thumbnail is
+  composited by the compositor OVER the body area; it is letterboxed so it never
+  covers the strip — which is why anything readable lives on a strip, never on
+  the body.
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
 - Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
@@ -31,11 +33,14 @@ a fake. Tk-thread only touches this object (house rule #1).
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import tkinter as tk
 
 import preview_layout
+import ui_helpers
+from app_path import bundle_dir
 from dwm_thumbs import Thumbnail, aspect_fit
 
 STRIP_H = 20
@@ -53,6 +58,38 @@ _MIN_BODY_H = preview_layout.MIN_TILE_BODY_H  # min body height; strip is extra
 # Tk diagonal-resize cursor names (Windows): NW/SE share one, NE/SW the other.
 _CORNER_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
                   "ne": "size_ne_sw", "sw": "size_ne_sw"}
+
+# ── major-implants strip icon ────────────────────────────────────────────────
+# The bundled EVE implant-head image, pre-scaled offline (LANCZOS) to the size
+# the owner approved. Tk 8.6 reads PNG natively, so there is no Pillow at
+# runtime. It lives in the CAPTION STRIP and never over the video: the DWM
+# compositor draws each tile's live thumbnail OVER any child widget inside the
+# thumbnail rect (the retired on-video label is the lesson).
+IMPLANT_ICON_FILE = "implant_icon_16.png"
+IMPLANT_ICON_PX = 16
+# Shown instead of the image when the asset cannot be loaded at all — a missing
+# file, a frozen build whose bundle layout moved, or a PNG this Tk cannot
+# decode. An icon path that renders SOMETHING beats one that dies silently.
+IMPLANT_ICON_GLYPH = "◆"
+
+
+def _load_implant_icon(widget):
+    """``tk.PhotoImage`` of the bundled implant icon for ``widget``'s
+    interpreter, or None when it cannot be loaded.
+
+    ALWAYS ``master=widget`` and never memoized at module level: a Tk image
+    belongs to the interpreter that created it, exactly like a ``tkfont.Font``
+    (the per-instance font-cache rule), so a module-level cache would break the
+    second root — and the caller must hold the returned reference for the
+    label's lifetime or Tk garbage-collects the image out from under it (the
+    classic empty-label trap). Never raises: the caller falls back to a glyph."""
+    try:
+        return tk.PhotoImage(
+            master=widget,
+            file=os.path.join(bundle_dir(), "assets", IMPLANT_ICON_FILE))
+    except Exception:
+        return None
+
 
 # ── on-video activity label (caption-onvideo) ────────────────────────────────
 # The activity label ("<label> - <ShipType>") is drawn directly on the tile BODY
@@ -521,6 +558,25 @@ class TileWindow:
                                   font=("Consolas", 8, "bold"))
         self._chip_lbl.pack(side="right", padx=(0, 4))
 
+        # Major-implants icon. Created here but NOT packed: set_implant_icon
+        # packs it (side="right", after the chip in packing order, so it renders
+        # to the LEFT of the chip) the first time a verdict says this pilot's
+        # head is worth the warning, and unpacks it when it stops.
+        self._implant_img = _load_implant_icon(self._strip)
+        self._implant_lbl = tk.Label(self._strip, bg=bg_panel, fg=fg_accent,
+                                     font=("Consolas", 9, "bold"))
+        if self._implant_img is not None:
+            self._implant_lbl.configure(image=self._implant_img)
+        else:
+            self._implant_lbl.configure(text=IMPLANT_ICON_GLYPH)
+        self._implant_visible = False   # True while the icon is packed
+        self._implant_applied = ""      # last tooltip copy applied (zero-write)
+        # ONE attach for the tile's lifetime: attach_tooltip's three binds use
+        # add="+", so re-attaching per push would stack a handler set per tick.
+        # topmost=True because the tile itself is a HWND_TOPMOST window — a tip
+        # without it is created BELOW its owner, i.e. invisible.
+        ui_helpers.attach_tooltip(self._implant_lbl, "", topmost=True)
+
         # ── bottom caption strip (mirror of the top strip) ──────────────────
         # The activity label ('<label> - <ShipType>') lives in a small strip
         # BELOW the video, never over it. The old on-video child-canvas is
@@ -587,7 +643,7 @@ class TileWindow:
     def _bind_mouse(self):
         # RIGHT-drag move/resize + LEFT click-activate are bound on every widget.
         for w in (self.top, self._strip, self._body, self._name_lbl,
-                  self._chip_lbl, self._tag_lbl, self._dot,
+                  self._chip_lbl, self._tag_lbl, self._dot, self._implant_lbl,
                   self._strip_bottom, self._bottom_lbl,
                   self._strip_location, self._location_lbl):
             w.bind("<Button-3>", self._on_b3_press)
@@ -608,7 +664,7 @@ class TileWindow:
         # labels) gets the strip handlers so a left-drag anywhere on either
         # caption bar moves the tile (bottom strip = same, no dead zone).
         for w in (self._strip, self._name_lbl, self._excl_lbl, self._chip_lbl,
-                  self._tag_lbl, self._dot,
+                  self._tag_lbl, self._dot, self._implant_lbl,
                   self._strip_bottom, self._bottom_lbl,
                   self._strip_location, self._location_lbl):
             w.bind("<ButtonPress-1>", self._on_strip_b1_press)
@@ -619,6 +675,7 @@ class TileWindow:
         # diagonal-resize glyph. The armed corner + a left press start a resize.
         for w in (self.top, self._strip, self._body, self._name_lbl,
                   self._excl_lbl, self._chip_lbl, self._tag_lbl, self._dot,
+                  self._implant_lbl,
                   self._strip_bottom, self._bottom_lbl,
                   self._strip_location, self._location_lbl):
             w.bind("<Motion>", self._on_corner_motion, add="+")
@@ -1372,6 +1429,49 @@ class TileWindow:
             return                               # never record a failed write
         self._caption_applied = applied
 
+    def set_implant_icon(self, tooltip_text):
+        """Show (or hide) the major-implants icon on the caption strip, with
+        ``tooltip_text`` as its hover copy. Falsy text hides it.
+
+        A per-tick setter — fc_gui re-pushes the identical verdict for every
+        tile on every ~250 ms tick — so it follows the zero-write contract: the
+        applied copy is latched ONLY after a successful Tk write, and an
+        unchanged push reaches Tk not at all. A ``TclError`` must never poison
+        the latch, or the unchanged-text skip would swallow the retry (the
+        set_alpha bug class).
+
+        A visibility CHANGE also re-renders the caption, because the icon eats
+        pixels the name was budgeted and the truncation may have to move.
+        `_render_caption`'s OWN (name, chip) guard decides whether that costs
+        anything: a budget change that does not actually shorten the name
+        writes nothing. Do NOT clear `_caption_applied` first to "force" it --
+        that only buys three redundant configure() calls on every visibility
+        flip whose name was short enough to fit either way."""
+        text = str(tooltip_text or "")
+        if text == self._implant_applied:
+            return
+        was_visible = self._implant_visible
+        try:
+            if text:
+                if not self._implant_visible:
+                    # `after=self._chip_lbl` pins the packing order across
+                    # hide/show cycles: right-packed AFTER the chip means it
+                    # renders to the chip's LEFT, between it and the name.
+                    self._implant_lbl.pack(side="right", padx=(0, 4),
+                                           after=self._chip_lbl)
+                    self._implant_visible = True
+                ui_helpers.update_tooltip(self._implant_lbl, text)
+            else:
+                if self._implant_visible:
+                    self._implant_lbl.pack_forget()
+                    self._implant_visible = False
+                ui_helpers.update_tooltip(self._implant_lbl, "")
+        except tk.TclError:
+            return                               # never record a failed write
+        self._implant_applied = text
+        if self._implant_visible != was_visible:
+            self._render_caption()
+
     def _ellipsize_name(self, name):
         """Truncate the strip name to fit the fixed-width row. Budget = the tile
         width minus the dot/chip/exclusion glyphs and padding, estimated Tk-free
@@ -1382,7 +1482,15 @@ class TileWindow:
             return name
         # reserve space for the dot (~17px), chip (~len*7px + pad), excl (~14px)
         chip_px = (len(self._chip) + 1) * 8 if self._chip else 0
-        reserved = 17 + 14 + chip_px + 8
+        # …and the implant icon (its image width + its own 4px pad) while it is
+        # actually packed — a hidden icon costs the name nothing. This is a
+        # slight UNDER-estimate, like every other term here: measured, the
+        # packed label really occupies 24 px with the image and 21 with the
+        # glyph fallback (a tk.Label adds its 2px border a side) against the
+        # 20 reserved. The trailing +8 slop below is what absorbs that, exactly
+        # as it already absorbs the dot's and chip's own rounding.
+        icon_px = (IMPLANT_ICON_PX + 4) if self._implant_visible else 0
+        reserved = 17 + 14 + chip_px + icon_px + 8
         usable = max(0, w - reserved)
         per_char = 9 * _CHAR_W_RATIO       # 9pt bold Consolas ≈ this px/glyph
         budget = int(usable // max(1.0, per_char))
