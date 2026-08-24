@@ -16746,6 +16746,12 @@ class FCToolGUI:
     # whole traceback; after that one terse line at most this often while the
     # fault persists. A healthy pass re-arms the full report.
     _PREVIEW_FAST_DRAIN_LOG_EVERY_S = 10.0
+    # Same shape for the auto-fit pass: a permanently-broken tile (dead DWM
+    # handle, destroyed Tk window) throws on EVERY pass, and the pass rides the
+    # tick's %8 cadence — a full traceback every ~2 s, forever. First failure
+    # gets the traceback; after that one terse line at most this often while the
+    # fault persists. A fault-free pass re-arms the full report.
+    _PREVIEW_FIT_LOG_EVERY_S = 30.0
     # How long a hotkey-driven switch stays "pending" (unconfirmed by the
     # foreground probe) and outranks that probe as the cycle anchor. Windows
     # applies SetForegroundWindow asynchronously — and outright denies it under
@@ -16775,6 +16781,18 @@ class FCToolGUI:
         "tile_w": 384, "tile_body_h": 216,
         "uniform_size": True,       # one resize applies to all tiles (EVE-O parity);
                                     # False → per-char cfg['sizes'] overrides apply
+        # Auto-fit each tile's HEIGHT to its client's aspect ratio, so the video
+        # exactly fills the body and the black letterbox bands above and below it
+        # disappear (see preview_layout.fit_body_h).
+        # DEFAULT OFF, deliberately: switching it on by default would silently
+        # re-size every existing user's hand-arranged tile grid the first time
+        # they launched the new build — a layout they butted together tile by
+        # tile, changed underneath them with no action on their part. The
+        # Settings "Fit height" CHECKBUTTON is the explicit opt-in; ticking it
+        # fits everything NOW and sets this flag, after which tiles that attach
+        # later fit themselves within ~2 s. Unticking it stops the auto-fit and
+        # hands corner-dragged heights back (it was a one-way door until then).
+        "fit_height": False,
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
         "login_position": [5, 5],
@@ -17650,7 +17668,7 @@ class FCToolGUI:
             return preview_layout.clamp_size(override[0], override[1])
         return preview_layout.clamp_size(gw, gh)
 
-    def _preview_on_tile_resize_end(self, key, w, body_h):
+    def _preview_on_tile_resize_end(self, key, w, body_h, *, save=True):
         """Persist a finished tile resize (corner-hover OR the legacy Ctrl/L+R
         drag — both land here). Branches on uniform_size:
           - True  (EVE-O parity): update the GLOBAL tile_w/tile_body_h so the next
@@ -17666,7 +17684,14 @@ class FCToolGUI:
         Settings "Tile w" spinbox mirrors the same key — so it pushes the new width
         back into that mirror, which is what makes an on-screen resize show up in
         Settings in real time. Tk-thread only (the resize chain runs entirely on
-        Tk), so no _post_ui marshalling is needed."""
+        Tk), so no _post_ui marshalling is needed.
+
+        `save=False` writes the config dict but skips `_save_config()`, for a
+        CALLER THAT BATCHES. A human corner-drag is one call, so it keeps the
+        default; the auto-fit pass calls this once per tile inside a single Tk
+        tick and under `uniform_size` saves 2..N would re-serialize the whole
+        config to disk to persist byte-identical global keys. It issues one
+        save of its own at the end instead."""
         if not key:
             return
         cfg = self._preview_cfg()
@@ -17699,11 +17724,264 @@ class FCToolGUI:
         prev = layouts.get(key) or [10, 10, w, body_h]
         layouts[key] = [int(prev[0]), int(prev[1]), w, body_h]
         for c in self._preview_clients.values():
-            if c.key == key:
+            # Only an hwnd that still HAS a live tile may own a rect entry. The
+            # auto-fit pass calls this with `_preview_clients` one tick stale (it
+            # is published at the END of the tick), so a client that restarted
+            # this very tick still lists its RETIRED hwnd under the same char
+            # key — and _preview_retire_tile has already popped that hwnd's rect.
+            # Writing it back would re-create a phantom entry nothing ever pops
+            # again: an invisible snap magnet (and FC HUD merge candidate) parked
+            # at a dead tile's position for the rest of the session. This is the
+            # inverse face of the "every tile-placement path must update
+            # _preview_tile_rects" invariant — a STALE entry is as bad as a
+            # missing one. Keep scanning past a dead hwnd so the live tile for
+            # the same key still gets its rect.
+            if c.key == key and c.hwnd in self._preview_tiles:
                 self._preview_tile_rects[c.hwnd] = (
                     int(prev[0]), int(prev[1]), w, body_h)
                 break
-        self._save_config()
+        if save:
+            self._save_config()
+
+    @staticmethod
+    def _preview_expected_bottom_h(cfg, font_size, is_login=False):
+        """The STEADY-STATE total height of a tile's bottom strips, derived from
+        CONFIG — never sampled from a live tile.
+
+        Sampling is the trap. `set_bottom_label("")` / `set_location_label("")`
+        pack_forget their strip, so a tile's real `_bottom_h()` drops by ~20 px
+        the moment a pilot docks (no ship, no system) and jumps back when they
+        undock. A resizer that fitted against the live value would grow and
+        shrink every tile on that churn and tear a butted grid apart. So the
+        auto-fit asks "which strips does config say this pilot's tile SHOWS?"
+        and sizes for that, whether or not they happen to be packed right now.
+
+        `labels_on_video` (the activity strip) and `show_location` (the location
+        line) each contribute one strip. A LOGIN tile shows neither — the
+        caption composer feeds login screens "" on both channels — so it expects
+        0 regardless of the flags. Each strip's height comes from preview_tile's
+        OWN formula (`strip_h_for`), never a re-typed 20, so a user who raised
+        the overlay font size gets the taller strips accounted for.
+
+        ACCEPTED IMPRECISION: preview_tile's `_fit_label_text` may auto-shrink
+        the font on a narrow tile, and the setters additionally cap a strip at
+        ~40% of the body — both make the real strip SMALLER. This estimate is
+        therefore an UPPER bound, and such a tile keeps a few px of residual
+        band. That is the deliberate trade: jitter-free beats pixel-exact."""
+        if is_login:
+            return 0
+        one = preview_tile.strip_h_for(font_size)
+        total = 0
+        # _PREVIEW_DEFAULTS is the SINGLE source of truth for what an absent key
+        # means — read it rather than re-typing a literal. In production neither
+        # fallback fires (_preview_cfg materializes both keys before anyone reads
+        # them), but this subsystem has repeatedly shipped two readers of one key
+        # disagreeing about its default, so the two strip-flag readers
+        # (`_preview_compose_captions` is the other) now name the same source.
+        # Referenced via the CLASS, not `self` — this is a staticmethod and the
+        # unit tests call it unbound.
+        _defaults = FCToolGUI._PREVIEW_DEFAULTS
+        if cfg.get("labels_on_video", _defaults["labels_on_video"]):
+            total += one
+        if cfg.get("show_location", _defaults["show_location"]):
+            total += one
+        return total
+
+    def _preview_fit_tile_heights(self, cfg, *, force=False, clients=None):
+        """Resize live tiles to the height at which each client's video exactly
+        fills the tile body — killing the black letterbox bands above and below
+        it (the "black bars top and bottom" report). Returns True iff anything
+        was actually changed.
+
+        Per tile the target is `tile.fitted_body_h(bottom_h=<config-derived
+        expectation>)`. A tile that answers **None** (no source attached, source
+        size not queried yet, tile not placed yet) is SKIPPED — None means
+        "leave it alone", never "shrink it to the floor".
+
+        Under `uniform_size` every tile must share ONE height, so the targets
+        are polled and the MOST COMMON wins; a tie goes to the LARGER value. A
+        too-small uniform height pillarboxes everybody (black bars on the sides
+        of every wider client); a too-large one costs a single tile one band.
+
+        Persistence routes through `_preview_on_tile_resize_end`, the existing
+        (and only) writer of cfg['sizes'] / co-writer of cfg['tile_w'] —
+        so the global size, the per-char override, cfg['layouts'] and the
+        Settings spinbox mirror all stay consistent with what the tiles show.
+        Width is never touched.
+
+        NO-OP CONTRACT: when every tile already resolves to its target this
+        returns False having written nothing — no Tk call, no config key, no
+        save. The subsystem's per-tick paths are zero-write on unchanged ticks
+        and this one rides the tick, so it owes the same.
+
+        `force` skips the `lock_layout` check: ticking the Settings checkbutton
+        IS the user's explicit intent, while the automatic (per-tick) path must
+        respect a locked layout like every other automatic mover. `clients`
+        defaults to `self._preview_clients`; the tick passes the set it has just
+        diffed, which is not published yet at the call site."""
+        if not force and cfg.get("lock_layout", False):
+            return False
+        tiles = getattr(self, "_preview_tiles", None)
+        if not tiles:
+            return False
+        live = self._preview_clients if clients is None else clients
+        by_hwnd = {c.hwnd: c for c in live.values()}
+        try:
+            font_size = int(self._overlay_cfg().get("font_size", 11))
+        except (TypeError, ValueError, AttributeError):
+            font_size = 11
+        faults = [0]
+
+        def _fault(exc, msg, hwnd):
+            """Throttled per-tile fault report (the fast-drain guard's shape).
+
+            A tile whose DWM handle died throws on every pass, and this pass runs
+            every ~2 s for the rest of the session — unthrottled that is one full
+            traceback per broken tile per 2 s, which buries the log it is trying
+            to inform. First fault carries the traceback, then one terse line per
+            _PREVIEW_FIT_LOG_EVERY_S while it persists."""
+            faults[0] += 1
+            now = time.monotonic()
+            last = getattr(self, "_preview_fit_logged_at", None)
+            every = getattr(self, "_PREVIEW_FIT_LOG_EVERY_S",
+                            FCToolGUI._PREVIEW_FIT_LOG_EVERY_S)
+            if last is None:
+                log.exception(msg, hwnd)
+            elif (now - last) >= every:
+                log.warning(msg + ": %s", hwnd, exc)
+            else:
+                return
+            self._preview_fit_logged_at = now
+
+        def _finish(result):
+            """A pass that faulted nowhere re-arms the full traceback report."""
+            if not faults[0]:
+                self._preview_fit_logged_at = None
+            return result
+
+        # (hwnd, tile, key, w, target_body_h) for every tile that can answer.
+        targets = []
+        for hwnd, tile in list(tiles.items()):
+            client = by_hwnd.get(hwnd)
+            # `client.is_login` is redundant with `not client.key` TODAY (is_login
+            # is char_name == "", key is the stripped-lowercased name, so the two
+            # coincide) — deliberately kept: they are separate concepts that
+            # merely agree, and stating both is the intent. Do not "simplify"
+            # this into a coupling between them.
+            if client is None or client.is_login or not client.key:
+                continue                      # no client / login tile (key "")
+            try:
+                if getattr(tile, "_corner_resizing", False):
+                    continue                  # never fight a live drag
+                ask = getattr(tile, "fitted_body_h", None)
+                if not callable(ask):
+                    continue                  # a fake/legacy tile: nothing to ask
+                target = ask(bottom_h=self._preview_expected_bottom_h(
+                    cfg, font_size, client.is_login))
+                if target is None:
+                    continue                  # undeterminable → leave it alone
+                w, _cur = self._preview_resolve_size(cfg, client.key)
+                targets.append((hwnd, tile, client.key, int(w), int(target)))
+            except Exception as exc:
+                # One bad tile must never abort the pass for the others.
+                _fault(exc, "[preview] fit-height query failed for tile %r", hwnd)
+        if not targets:
+            return _finish(False)
+        uniform = bool(cfg.get("uniform_size", True))
+        if uniform:
+            counts = collections.Counter(t[4] for t in targets)
+            # most common wins; a tie goes to the LARGER height.
+            best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            targets = [(h, ti, k, w, best) for (h, ti, k, w, _t) in targets]
+        pending = [t for t in targets
+                   if self._preview_resolve_size(cfg, t[2])[1] != t[4]]
+        if not pending:
+            return _finish(False)             # already fitted → write nothing
+        # `pending` IS the apply list in both modes. Under uniform_size every
+        # entry in `targets` was just rewritten to the same `best`, and
+        # _preview_resolve_size returns the one global height for every key —
+        # so the filter above is the SAME predicate for every entry and `pending`
+        # is all of `targets` or empty (empty returned on the line above). The
+        # old `targets if uniform else pending` therefore never differed.
+        changed = False
+        for hwnd, tile, key, w, target in pending:
+            # A WITHDRAWN tile must not be resized here: TileWindow.place()
+            # deiconifies (clearing _hidden), so placing a hidden tile pops it
+            # over whatever the user alt-tabbed to until the next tick re-hides
+            # it — and under uniform_size one changed target re-places EVERY
+            # tile, so it flashes all of them at once. The tick's own per-tile
+            # loop already `continue`s for hidden tiles; this pass runs after it
+            # and must honour the same rule. Skipping is safe: the tile keeps its
+            # OLD _preview_tile_rects entry, so the first tick after it is shown
+            # again sees the size mismatch and _preview_apply_tile_size re-places
+            # it at the fitted size.
+            if getattr(tile, "_hidden", False):
+                continue
+            try:
+                # _preview_on_tile_resize_end rebuilds the saved layout rect from
+                # cfg['layouts'][key], falling back to (10, 10) when the char has
+                # none yet — which for a freshly-spawned, never-moved tile would
+                # teleport it to the top-left corner. Seed the entry from where
+                # the tile actually IS first; the resize write-back then only
+                # changes the size, as it does for a corner drag.
+                layouts = cfg.setdefault("layouts", {})
+                rect = self._preview_tile_rects.get(hwnd)
+                if key not in layouts and rect is not None and len(rect) >= 4:
+                    layouts[key] = [int(rect[0]), int(rect[1]),
+                                    int(rect[2]), int(rect[3])]
+                # save=False: this pass calls the writer once per tile inside a
+                # single Tk tick, and under uniform_size saves 2..N would each
+                # re-serialize the WHOLE config (json.dumps + temp file +
+                # os.replace under a lock, on the Tk thread, behind this box's
+                # real-time AV filter) to persist byte-identical global keys —
+                # only layouts[key] differs. ONE save at the end of the pass.
+                self._preview_on_tile_resize_end(key, w, target, save=False)
+                # Re-place NOW so the user sees the fit immediately instead of a
+                # tick later. _preview_apply_tile_size cannot do this job here:
+                # the resize write-back above has ALREADY put the target size in
+                # _preview_tile_rects, so its "already the target size" guard
+                # fires and it returns without placing anything. Hence the
+                # explicit place — which, per the subsystem invariant, updates
+                # _preview_tile_rects itself (EVERY tile-placement path must).
+                rect = self._preview_tile_rects.get(hwnd)
+                if rect is not None and len(rect) >= 4:
+                    x, y = int(rect[0]), int(rect[1])
+                else:
+                    x, y = 10, 10
+                tile.place(x, y, w, target)
+                self._preview_tile_rects[hwnd] = (x, y, w, target)
+                changed = True
+            except Exception as exc:
+                _fault(exc, "[preview] fit-height apply failed for tile %r", hwnd)
+        if changed:
+            # THE one whole-config write of this pass (see the save=False note
+            # above). Gated on `changed`: a pass that placed nothing — every
+            # pending tile hidden, or every apply thrown — wrote no cfg key
+            # either, and the no-op contract owes it no save.
+            self._save_config()
+        return _finish(changed)
+
+    def _preview_toggle_fit_height(self):
+        """Settings "Fit height" CHECKBUTTON command: persist the flag through the
+        standard native-row apply, and on an OFF→ON flip fit every live tile at
+        once so ticking the box does something visible immediately.
+
+        A Checkbutton and not the old one-shot Button because `fit_height` was a
+        ONE-WAY DOOR: the only writer was `cfg["fit_height"] = True` and no UI
+        path ever cleared it, so a user who pressed once could undo it only by
+        hand-editing config.json — and while it was on, dragging a tile corner to
+        change its HEIGHT silently reverted on the next auto-fit pass ~2 s later.
+        Unticking now stops the auto-fit, and hand-dragged heights stick again.
+
+        `force=True` on the ON flip: an explicit tick is the user's intent, so it
+        works through `lock_layout` (which gates only the automatic per-tick
+        path). The fit pass issues its own single save when it changes anything,
+        and _preview_apply_native_state has already saved the flag itself."""
+        cfg = self._preview_cfg()
+        was = bool(cfg.get("fit_height", False))
+        self._preview_apply_native_state()   # writes fit_height + its shadow
+        if bool(cfg.get("fit_height", False)) and not was:
+            self._preview_fit_tile_heights(cfg, force=True)
 
     def _preview_probe_foreground(self):
         """The raw foreground hwnd via the injectable `_preview_foreground_hwnd`
@@ -18156,9 +18434,16 @@ class FCToolGUI:
             (_preview_caption_parts' `tag`) and is joined with the pilot's ship
             TYPE name via preview_tile.format_tile_label."""
         cfg = self._preview_cfg()
-        do_strip = bool(cfg.get("captions", True))
-        do_video = bool(cfg.get("labels_on_video", False))
-        do_location = bool(cfg.get("show_location", True))
+        # Fallbacks come from _PREVIEW_DEFAULTS (the single owner), not literals:
+        # `labels_on_video` used to fall back to False here while
+        # _preview_expected_bottom_h fell back to True for the same key. Neither
+        # is reachable in production (cfg came from _preview_cfg, which
+        # materializes every key), but two readers disagreeing about one key's
+        # default is the failure shape this subsystem keeps repeating.
+        _defaults = FCToolGUI._PREVIEW_DEFAULTS
+        do_strip = bool(cfg.get("captions", _defaults["captions"]))
+        do_video = bool(cfg.get("labels_on_video", _defaults["labels_on_video"]))
+        do_location = bool(cfg.get("show_location", _defaults["show_location"]))
         # E3: the doctrine object, hull->tag index, overlay rules, overlay-config
         # dict and overrides are "rarely-changing inputs" — rebuilding them every
         # ~250 ms tick is waste. Memoise the bundle, keyed on a cheap O(1) signal:
@@ -18772,6 +19057,18 @@ class FCToolGUI:
                                   hwnd)
                     self._preview_retire_tile(hwnd)
                     self._preview_note_stranded(client)
+            # Auto-fit tile heights to each client's aspect ratio (opt-in via
+            # `fit_height`; the Settings checkbutton owns it). Rides the SAME %8
+            # cadence as the refresh_source_size() above, so a tile that just
+            # attached has had its _src_size read this very pass — that is what
+            # makes a new client self-fit within ~2 s. The pass is CROSS-TILE
+            # under uniform_size (one height for everybody), so it runs ONCE per
+            # cadence here, never inside the per-tile loop. The flag is tested
+            # first so an off feature costs one dict lookup per tick and nothing
+            # else, and the pass itself respects lock_layout (only ticking the
+            # Settings checkbutton forces through it).
+            if cfg.get("fit_height", False) and self._preview_tick_count % 8 == 0:
+                self._preview_fit_tile_heights(cfg, clients=cur)
             for hwnd, tile in self._preview_tiles.items():
                 if hwnd in hidden:
                     continue                                        # withdrawn — nothing to retop
@@ -19961,10 +20258,31 @@ class FCToolGUI:
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                         command=self._preview_apply_native_state)
         sw.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        sw.grid(row=0, column=1, padx=(0, 16))
+        sw.grid(row=0, column=1, padx=(0, 6))
         w.append(sw)
-        _tip(sw, "Width in pixels of each native preview tile (height follows the "
-                 "client's aspect ratio).")
+        _tip(sw, "Width in pixels of each native preview tile. Height comes from "
+                 "dragging a tile corner — or, while 'Fit height' beside this "
+                 "box is ticked, from the EVE client's aspect ratio.")
+
+        # Auto-fit height (fit_height). A CHECKBUTTON, not a button: this flag is
+        # sticky, and a control that can only turn it on is a one-way door (see
+        # _preview_toggle_fit_height). Same grid cell the button occupied so the
+        # row does not grow. The var rides _PREVIEW_NATIVE_VARS like every other
+        # native key, so the apply/shadow machinery persists it.
+        self._preview_fit_height_var = tk.BooleanVar(
+            value=bool(pcfg.get("fit_height", False)))
+        fitb = tk.Checkbutton(
+            rowN, text="Fit height", variable=self._preview_fit_height_var,
+            command=self._preview_toggle_fit_height, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        fitb.grid(row=0, column=2, padx=(0, 16))
+        w.append(fitb)
+        self._preview_fit_height_check = fitb
+        _tip(fitb, "On: each preview's height is snapped to its EVE client's "
+                   "aspect ratio, removing the black bands above and below the "
+                   "video — now, and for previews that attach later. Off: heights "
+                   "are yours, set by dragging a tile corner.")
 
         # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
         # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
@@ -19976,13 +20294,13 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbu.grid(row=0, column=6, padx=(0, 8))
+        cbu.grid(row=0, column=7, padx=(0, 8))
         w.append(cbu)
         _tip(cbu, "On: resizing one preview resizes them all; Off: each preview "
                   "keeps its own size.")
 
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
-                 bg=BG_DARK).grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
+                 bg=BG_DARK).grid(row=0, column=3, padx=(0, 4), sticky=tk.W)
         self._preview_opacity_var = tk.DoubleVar(
             value=float(pcfg.get("opacity_inactive", 0.85)))
         so = tk.Spinbox(rowN, from_=0.2, to=1.0, increment=0.05, width=5,
@@ -19990,7 +20308,7 @@ class FCToolGUI:
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
                         command=self._preview_apply_native_state)
         so.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        so.grid(row=0, column=3, padx=(0, 16))
+        so.grid(row=0, column=4, padx=(0, 16))
         w.append(so)
         _tip(so, "Opacity of preview tiles for clients that are NOT the active "
                  "one (1.0 = fully opaque).")
@@ -20001,7 +20319,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbc.grid(row=0, column=4, padx=(0, 8))
+        cbc.grid(row=0, column=5, padx=(0, 8))
         w.append(cbc)
         _tip(cbc, "Show a text caption on each preview tile (character name or its "
                   "label rule).")
@@ -20014,7 +20332,7 @@ class FCToolGUI:
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbd.grid(row=0, column=5, padx=(0, 8))
+        cbd.grid(row=0, column=6, padx=(0, 8))
         w.append(cbd)
         _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
                   "rule or override already labels it.")
@@ -20683,6 +21001,10 @@ class FCToolGUI:
     _PREVIEW_NATIVE_VARS = (
         ("_preview_tilew_var", "tile_w", int),
         ("_preview_uniform_var", "uniform_size", bool),
+        # The "Fit height" Checkbutton's own var: this map is what persists it,
+        # exactly as for every other native checkbutton. _preview_toggle_fit_height
+        # adds only the OFF→ON "fit everything now" hook on top of the apply.
+        ("_preview_fit_height_var", "fit_height", bool),
         ("_preview_opacity_var", "opacity_inactive", float),
         ("_preview_captions_var", "captions", bool),
         ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
@@ -20751,7 +21073,7 @@ class FCToolGUI:
         optimization: these vars are one-way mirrors of config, and a config key can
         have a SECOND writer outside this panel — cfg['tile_w'] is rewritten by
         every tile corner-resize (_preview_on_tile_resize_end). Without the skip,
-        toggling ANY control here bulk-pushes all 23 stale mirrors, shoving the
+        toggling ANY control here bulk-pushes all 24 stale mirrors, shoving the
         app-start width over the hand-dragged one, and the next tick's
         _preview_apply_tile_size physically re-places every tile at it. Diffing
         against the shadow makes a control the user never touched incapable of
