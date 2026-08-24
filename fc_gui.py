@@ -1256,6 +1256,12 @@ class FCToolGUI:
         # built still reaches its status line when that line appears.
         self._preview_hotkey_status = ""
         self._preview_hotkey_status_lbl = None
+        # LAST verdict of the "Hotkeys only while EVE is focused" gate: True =
+        # the bindings are currently held OFF the keyboard. Edge state, not
+        # config — the tick only acts when this flips (see
+        # _preview_apply_hotkey_gate), and _preview_restart_hotkeys reads it so
+        # a re-registration during a gated stretch registers nothing.
+        self._preview_hotkeys_gated = False
         self._preview_after_id = None
         self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
         # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
@@ -17021,6 +17027,12 @@ class FCToolGUI:
                     "groups": [{"name": "All clients", "members": [],
                                 "next": [], "prev": [], "order": []}],
                     "minimize_all": []},
+        # Register the global hotkeys ONLY while an EVE client is the foreground
+        # window (dynamic registration — see _preview_apply_hotkey_gate). OFF by
+        # default and deliberately so: RegisterHotKey works from anywhere, and
+        # some users press a focus key from the desktop precisely to jump INTO
+        # EVE. Turning this on is a trade, not a free win.
+        "hotkeys_eve_only": False,
         "hide_active": False, "hide_login": False,
         "hide_on_lost_focus": False, "hide_delay_ticks": 4,
         "disabled_chars": [],
@@ -18579,19 +18591,38 @@ class FCToolGUI:
         """(Re)register the global hotkeys from current config. Lazily creates
         the HotkeyService (native-only, one worker thread) and rebuilds the
         id->action map in lockstep with the (re)started bindings. Returns the
-        service so the settings modal can read .failures for conflict display."""
+        service so the settings modal can read .failures for conflict display.
+
+        Gate-aware: while `_preview_hotkeys_gated` is set (the "Hotkeys only
+        while EVE is focused" gate is holding), the service is suspended FIRST,
+        so the new set is remembered and nothing reaches the keyboard. That
+        ordering is what stops a re-registration — a settings OK, a preset, a
+        mid-session enable — from quietly handing the user's keys back to
+        RegisterHotKey while they are typing in another application."""
         cfg = self._preview_cfg()
         live_keys = {c.key for c in self._preview_clients.values() if not c.is_login}
         bindings, actions, errors = self._preview_hotkey_bindings(
             cfg.get("hotkeys", {}), live_keys)
         self._preview_hotkey_map = actions
+        gated = bool(getattr(self, "_preview_hotkeys_gated", False))
         svc = self._preview_hotkeys
         if svc is None:
             svc = self._preview_hotkey_factory()
             self._preview_hotkeys = svc
+            # Armed BEFORE the very first start, so a session that BOOTS gated
+            # never puts a single binding on the keyboard.
+            if gated:
+                svc.suspend()
             svc.start(bindings)
         else:
+            if gated:
+                svc.suspend()
             svc.restart(bindings)
+        # Only ever resumes something the gate actually suspended (`suspended`
+        # is False on a service that was never gated), so the ordinary path
+        # registers exactly once, here, as it always did.
+        if not gated and getattr(svc, "suspended", False):
+            svc.resume()
         # Every registration path reports its own failures. This used to happen
         # only in the two settings dialogs' OK handlers, so the plain enable path
         # and the one-click preset threw `.failures` (and these parse errors)
@@ -18599,6 +18630,61 @@ class FCToolGUI:
         # with nothing said in the log or the UI.
         self._preview_surface_hotkey_problems(svc, errors)
         return svc
+
+    def _preview_apply_hotkey_gate(self, cfg, fg_info):
+        """Suspend/resume every FCPreview hotkey per `hotkeys_eve_only`.
+
+        THE PROBLEM: RegisterHotKey swallows a matched keystroke SYSTEM-WIDE.
+        Bind Tab as a cycle key and Tab stops autocompleting in Discord — and
+        declining to ACT on the WM_HOTKEY would not give the keystroke back,
+        because the swallowing happens in the OS, before anything reaches us.
+        The only real fix is dynamic registration: hand the keys back while EVE
+        is not the foreground window, take them again when it is.
+
+        The predicate rides the tick's OWN foreground sample — no second probe.
+        `fg_info.active_hwnd` (see _preview_foreground_info) is set exactly when
+        the foreground hwnd is one of THIS tick's tracked EVE clients, so the
+        gate is one attribute read. Plain hwnd equality, no GA_ROOT walk: the
+        same comparison already drives hide-active and the active-tile
+        highlight, and EVE client hwnds arrive from EnumWindows already
+        top-level (the reasoning is spelled out in _preview_is_client_focused).
+
+        FAIL-SAFE DIRECTION: an unavailable, failed, or zero foreground probe
+        reads as NOT-EVE, so the keys go back to whatever the user is really
+        typing into. Consequence worth knowing: with this flag on and no working
+        probe at all the hotkeys stay suspended — unticking the box is the way
+        back, and that is the safe way round for a feature whose whole point is
+        "stop swallowing my Tab".
+
+        EDGE-TRIGGERED: a tick whose verdict matches the last one does nothing
+        at all — no Tk call, no win32 call, no registration churn (the
+        subsystem's zero-write rule). With the flag off the whole method is one
+        dict lookup and one comparison, and a flag turned off WHILE suspended
+        still resumes, so unticking the box can never strand dead keys.
+
+        The resume goes through `_preview_restart_hotkeys` — the one
+        registration choke point — so a key another application grabbed while we
+        were suspended surfaces through `_preview_surface_hotkey_problems` just
+        like the enable path's collisions. A suspend registers nothing, so it
+        has nothing to surface."""
+        want = (bool(cfg.get("hotkeys_eve_only", False))
+                and getattr(fg_info, "active_hwnd", None) is None)
+        if want == bool(getattr(self, "_preview_hotkeys_gated", False)):
+            return
+        # Recorded BEFORE the call: _preview_restart_hotkeys reads it to decide
+        # whether to register, and a persistently failing service must cost one
+        # log line per FLIP rather than one per tick forever.
+        self._preview_hotkeys_gated = want
+        try:
+            if want:
+                svc = self._preview_hotkeys
+                if svc is not None:
+                    svc.suspend()
+            else:
+                self._preview_restart_hotkeys()
+        except Exception:
+            log.exception("[preview] the EVE-focus hotkey gate could not %s",
+                          "suspend" if want else "resume")
 
     def _preview_describe_hotkey_action(self, action):
         """One short ASCII label for a bound hotkey action.
@@ -19399,6 +19485,12 @@ class FCToolGUI:
             # captions: both resolve char keys against the live set (activation
             # by key needs the just-diffed `cur`, not the previous tick's set).
             self._preview_clients = cur
+            # "Hotkeys only while EVE is focused": suspend/resume the global
+            # registrations on the FOREGROUND edge, reusing the fg_info sampled
+            # above. After the publish, so a resume re-registers against the
+            # just-diffed client set (focus bindings are filtered by live key),
+            # and before the drain, so a resumed key is live this same tick.
+            self._preview_apply_hotkey_gate(cfg, fg_info)
             self._preview_drain_hotkeys()
             self._preview_compose_captions(cur)   # strip + bottom-strip activity label
             # C2: the shown (checked) character set drives damage scanning too, so
@@ -19590,6 +19682,15 @@ class FCToolGUI:
                 self._preview_win32 = eve_client_tracker._real_win32()
             except Exception:
                 self._preview_win32 = None
+        # COLD START under "Hotkeys only while EVE is focused": begin SUSPENDED.
+        # Nothing has sampled the foreground yet, and the fail-safe direction is
+        # "the user's keys belong to whatever they are typing into" — so the
+        # bindings are not registered at all until the first tick sees an EVE
+        # client in the foreground and resumes them (≤250 ms with tiles up, ≤2 s
+        # on the idle probe cadence). With the flag off this is a plain False and
+        # registration is unchanged.
+        self._preview_hotkeys_gated = bool(
+            self._preview_cfg().get("hotkeys_eve_only", False))
         try:
             self._preview_restart_hotkeys()   # lazy service create + register
         except Exception:
@@ -19683,10 +19784,15 @@ class FCToolGUI:
         svc = self._preview_hotkeys
         if svc is not None:
             try:
-                svc.stop()
+                svc.stop()      # a suspended service has no thread → plain no-op
             except Exception:
                 pass
             self._preview_hotkeys = None
+        # The focus gate is edge state on a service that no longer exists. Reset
+        # it so the next enable re-evaluates from scratch (and so a teardown that
+        # happened mid-suspend cannot leave the next session refusing to
+        # register against a service it never gated).
+        self._preview_hotkeys_gated = False
 
     def _preview_tick(self):
         """Reschedule the native controller while native mode is active (mirrors
@@ -21333,6 +21439,35 @@ class FCToolGUI:
              "Warnings about global hotkeys that could not be registered - "
              "usually another application already owns that key combination.")
 
+        # Row 7b (native): the EVE-focus hotkey gate. Its own row on purpose —
+        # rowN4 already measures 729 px of the app's 1000 px minsize and this
+        # checkbox is 259 px wide, which would leave the button row ~12 px of
+        # headroom. It still sits directly under the two hotkey dialogs it
+        # qualifies, which is where a user looking for it will be.
+        rowHK = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowHK.pack(fill=tk.X, pady=2)
+        self._preview_hotkeys_eve_only_var = tk.BooleanVar(
+            value=bool(pcfg.get("hotkeys_eve_only", False)))
+        cbhke = tk.Checkbutton(
+            rowHK, text="Hotkeys only while EVE is focused",
+            variable=self._preview_hotkeys_eve_only_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbhke.grid(row=0, column=0, padx=(0, 16))
+        w.append(cbhke)
+        self._preview_hotkeys_eve_only_check = cbhke
+        # Both halves of the trade, plainly. A hotkey is swallowed system-wide
+        # while it is registered, so this is the only way to get a key like Tab
+        # back in other applications — and the only way to lose the jump-in.
+        _tip(cbhke,
+             "Registers the FCPreview hotkeys only while an EVE client is the "
+             "foreground window. A bound key is swallowed system-wide while it "
+             "is registered, so this is what lets a key like Tab keep working "
+             "in Discord and your browser. The trade: while EVE is not focused "
+             "the keys reach those other apps instead, so you can no longer "
+             "press a focus key from the desktop to jump into EVE.")
+
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
         # Stored so the active mode's panel packs *before* it (see
@@ -21586,6 +21721,7 @@ class FCToolGUI:
         ("_preview_decloak_flash_var", "decloak_flash", bool),
         ("_preview_decloak_audio_var", "decloak_audio", bool),
         ("_preview_account_slots_var", "account_slots", bool),
+        ("_preview_hotkeys_eve_only_var", "hotkeys_eve_only", bool),
     )
 
     def _preview_snapshot_native_vars(self):

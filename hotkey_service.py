@@ -7,6 +7,10 @@ Verified facts this design rests on (do not "simplify" them away):
   Config changes therefore restart the thread (simplest correct lifecycle).
 - Matched keystrokes are swallowed system-wide (EVE never sees them) — that is
   the desired focus-key behavior AND the reason defaults ship EMPTY.
+  It is ALSO why suspend()/resume() exist: a bound Tab is dead in Discord too,
+  and declining to act on the WM_HOTKEY would not give the keystroke back. Only
+  UNREGISTERING releases the key, so an "only while EVE is focused" gate has to
+  be dynamic registration — see suspend() below.
 - ERROR_HOTKEY_ALREADY_REGISTERED == 1409 → surfaced per-binding via .failures.
 """
 from __future__ import annotations
@@ -147,10 +151,31 @@ class HotkeyService:
         self._thread = None
         self._tid = None
         self._ready = threading.Event()
+        # Last set handed to start()/restart(), kept verbatim so suspend() can
+        # give the keys back without the caller re-deriving them, and so a
+        # config change made WHILE suspended is what resume() registers.
+        self._bindings: dict[int, tuple[int, int]] = {}
+        self._suspended = False
+
+    @property
+    def suspended(self) -> bool:
+        """True while the gate holds the bindings off the keyboard. Read-only:
+        suspend()/resume() are the only writers, which is what keeps a redundant
+        call cheap instead of a second registration."""
+        return self._suspended
 
     def start(self, bindings: dict[int, tuple[int, int]]):
+        """(Re)register `bindings` on a fresh worker thread.
+
+        The set is REMEMBERED either way. While suspended nothing is registered
+        — the new set is only recorded, and resume() is what puts it on the
+        keyboard. That is what makes "suspend → user edits a hotkey → resume"
+        land the NEW set rather than the stale one."""
         self.stop()
+        self._bindings = dict(bindings)
         self.failures = {}
+        if self._suspended:
+            return
         self._ready.clear()
         self._thread = threading.Thread(
             target=self._run, args=(dict(bindings),), daemon=True,
@@ -160,6 +185,36 @@ class HotkeyService:
 
     def restart(self, bindings):
         self.start(bindings)
+
+    def suspend(self):
+        """Release every registered key WITHOUT forgetting the bindings.
+
+        Unregistering happens where registering did — on the worker thread, in
+        its own `finally`, reached by the same WM_QUIT `stop()` posts. That is
+        the module's threading model, not a shortcut: RegisterHotKey is
+        thread-affine, so there is no way to unregister from the Tk thread.
+
+        Idempotent by design: the caller flips only on a real state CHANGE, but
+        a redundant suspend must still cost nothing and must never lose the
+        bindings. `stop()` is deliberately left alone — it is the shutdown path
+        and does not touch this flag, so a teardown of a suspended service is a
+        plain no-op with no registrations and no bindings left behind."""
+        if self._suspended:
+            return
+        self._suspended = True
+        self.stop()
+
+    def resume(self):
+        """Put the remembered bindings back on the keyboard.
+
+        Idempotent: a service that is not suspended returns immediately, so a
+        redundant resume can never double-register. Registration failures land
+        in `.failures` exactly as they do for the first registration — same
+        code path, so callers surface them the same way."""
+        if not self._suspended:
+            return
+        self._suspended = False
+        self.start(self._bindings)
 
     def stop(self):
         if self._thread and self._thread.is_alive() and self._tid is not None:
