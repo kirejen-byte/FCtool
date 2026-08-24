@@ -20908,8 +20908,9 @@ class FCToolGUI:
 
         # Account slots: one saved position per EVE ACCOUNT instead of one per
         # character (grouping lives in the Characters pane). Shares this row
-        # rather than the first native row, which is already 903 px of the
-        # app's 1000 px minimum width and cannot carry a ~230 px label.
+        # rather than the first native row, which measures 977 px of the app's
+        # 1000 px minimum width and cannot carry this 259 px control. Measured
+        # 2026-08-24, after the Tile-size w x h pair landed in that row.
         self._preview_account_slots_var = tk.BooleanVar(
             value=bool(pcfg.get("account_slots", False)))
         cbacct = tk.Checkbutton(
@@ -21576,6 +21577,10 @@ class FCToolGUI:
         mutating its config key — for every key in the map, present and future."""
         cfg = self._preview_cfg()
         shadow = getattr(self, "_preview_var_shadow", None)
+        # Sampled BEFORE the var loop writes it: the account-slot seeding below
+        # fires on the OFF->ON edge only, and by then cfg already holds the new
+        # value with nothing left to compare it against.
+        was_slots = bool(cfg.get("account_slots", False))
 
         def _put(attr, key, value):
             """Write cfg[key] unless `attr`'s control has not moved since the
@@ -21627,6 +21632,14 @@ class FCToolGUI:
         _radius = _preview_intel_radius(cfg)
         if "intel_flash_jumps" in cfg and cfg["intel_flash_jumps"] != _radius:
             cfg["intel_flash_jumps"] = _radius
+        # Ticking "Keep preview position per account" starts every account slot
+        # EMPTY, which would silently orphan the grid the user hand-placed: at
+        # the next restart each labelled window finds no rect under its slot key
+        # and falls to the (10, 10) spawn cascade. Adopt the existing
+        # per-character geometry into the new slots instead. Only on the actual
+        # OFF->ON edge (`was_slots`) -- a re-apply must never re-seed.
+        if not was_slots and cfg.get("account_slots", False):
+            self._preview_seed_account_slots(cfg)
         self._save_config()
 
     def _preview_apply_dmg_mode_visibility(self):
@@ -23374,12 +23387,19 @@ class FCToolGUI:
         the answer straight to layouts.get()/layouts[...], so normalizing here
         would silently relocate an existing entry.
 
-        The flag is read off the RAW block, NOT through `_preview_cfg()`: that
-        accessor materializes every absent default INTO the block, and this
-        method is asked on the per-tick size path (`_preview_resolve_size`),
-        where the auto-fit pass owes a write-nothing-on-unchanged contract that
-        a defaults fill silently breaks. An absent key reads as absent, which
-        is exactly the default this feature ships with -- off."""
+        The FLAG read -- and only the flag read -- goes to the RAW block rather
+        than through `_preview_cfg()`: that accessor materializes every absent
+        default INTO the block, and this method is asked on the per-tick size
+        path (`_preview_resolve_size`), where the auto-fit pass owes a
+        write-nothing-on-unchanged contract a defaults fill silently breaks. An
+        absent key reads as absent, which is exactly this feature's default --
+        off -- so the OFF answer costs no write. The LABEL lookup below is NOT
+        raw: `_preview_account_of` reaches `_preview_cfg()` and will fill the
+        block. That is deliberate and harmless -- reaching it means the flag is
+        already ON, which only happens once the panel has written the key, and
+        every caller on the per-tick path is holding a `_preview_cfg()` dict of
+        its own by then -- but do not read the paragraph above as covering
+        it."""
         block = self.config.get("preview")
         if not (isinstance(block, dict) and block.get("account_slots", False)):
             return char_key                 # off: today's behaviour, exactly
@@ -23387,6 +23407,55 @@ class FCToolGUI:
         if not label:
             return char_key                 # ungrouped stays per-character
         return FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX + label
+
+    def _preview_seed_account_slots(self, cfg):
+        """Adopt the existing per-character geometry into the account slots, on
+        the OFF->ON flip of `account_slots` and nowhere else.
+
+        Without this the feature LOSES the user's layout the moment they opt in:
+        the slot keys do not exist yet, so every labelled window resolves to no
+        saved rect and the next FCTool start cascades them all to (10, 10). A
+        multiboxer's hand-butted grid, gone for ticking a checkbox. Seeding
+        makes the flip a re-interpretation of what is already there rather than
+        a reset.
+
+        Per account label, independently for `layouts` and for `sizes`: if the
+        slot key is ABSENT, take the entry of the first member (by sorted
+        char_key -- `_preview_account_members` is sorted, so two identical
+        configs seed identically) that HAS one. Independently, because a
+        character can own a saved rect without owning a size override and the
+        two blocks must each pick the first member that can actually answer.
+
+        - An EXISTING slot is never overwritten: the user has already placed
+          that account's tile and this is not the moment to move it.
+        - The per-character entries are never deleted (house rule: never delete
+          saved data) -- they are what the user gets back if they untick, and
+          leaving them is why unticking is lossless.
+        - `sizes` is only seeded while `uniform_size` is OFF, the sole mode in
+          which per-key overrides are read at all. Under uniform_size a seeded
+          override would be invisible now and would surprise the user later.
+
+        Copies the stored list rather than aliasing it: a shared list would make
+        a later per-character edit silently move the whole account's tile.
+        Malformed entries are skipped, not repaired (same rule as
+        preview_layout.heal_preview_sizes) -- and skipped means the next member
+        gets its turn."""
+        prefix = FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX
+        blocks = [("layouts", 4)]
+        if not cfg.get("uniform_size", True):
+            blocks.append(("sizes", 2))
+        for label in self._preview_account_labels():
+            slot = prefix + label
+            members = self._preview_account_members(label)
+            for name, width in blocks:
+                block = cfg.get(name)
+                if not isinstance(block, dict) or slot in block:
+                    continue                # absent block, or already placed
+                for member in members:
+                    entry = block.get(member)
+                    if isinstance(entry, (list, tuple)) and len(entry) >= width:
+                        block[slot] = list(entry)
+                        break               # first answerable member wins
 
     def _preview_note_hwnd_account(self, client):
         """Remember which account owns this window, for as long as FCPreview
