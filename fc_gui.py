@@ -8740,20 +8740,24 @@ class FCToolGUI:
         )
         name_label.pack(side=tk.LEFT)
 
-        # Account column: which EVE account this character shares with its
-        # siblings. Packed BEFORE loc_label so that in narrow 2-column mode the
-        # location text — which already truncates gracefully — gives up the
-        # space, not the control. A window with no character name has no
-        # char_key to store anything under, so it gets no control at all.
-        panel._char_key = (acct.character_name or "").strip().lower()
-        if panel._char_key:
-            self._build_account_picker(panel, header)
-
         loc_label = tk.Label(
             header, text="  --  loading...",
             font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
         )
         loc_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Account row: which EVE account this character shares with its
+        # siblings. Its OWN full-width row above the capabilities — NOT on the
+        # header line. Measured at the app's minimum window width (canvas 950,
+        # halved by the 2-column uniform grid this pane uses from two
+        # characters on): an account control on the header leaves loc_label
+        # 55 px of the 237 px it asks for, and loc_label has no anchor, so it
+        # clips at BOTH ends — the exact bug _update_panel_display's docstring
+        # records as already fixed once. A window with no character name has no
+        # char_key to store anything under, so it gets no control at all.
+        panel._char_key = (acct.character_name or "").strip().lower()
+        if panel._char_key:
+            self._build_account_picker(panel)
 
         cap_frame = tk.Frame(panel, bg=BG_PANEL)
         cap_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
@@ -8798,22 +8802,36 @@ class FCToolGUI:
     # _preview_*_account* accessors (beside the other preview config owners);
     # everything here is the widget half.
 
-    def _build_account_picker(self, panel, header):
+    def _build_account_picker(self, panel):
         """The card's "Account" control — one combobox carrying all three
         operations: type a name you have not used yet (ADD), pick another
         (EDIT), blank it (REMOVE). Hence free text, not a readonly list; the
         dropdown still offers every label in use, plus a blank entry so the
-        dropdown alone can un-group a character too."""
+        dropdown alone can un-group a character too.
+
+        Its own row, and the refusal note gets its own LINE within that row:
+        the note is the widest thing here (279 px for a 12-char account name)
+        and a card is only ~421 px wide at the app's minimum window size, so
+        sharing a line with the label and the box would clip away the very
+        account name the note exists to report. The line costs nothing when
+        there is nothing to say — it is packed only while it has text."""
         key = panel._char_key
-        note = tk.Label(header, text="", font=("Consolas", 9),
-                        fg=FG_ORANGE, bg=BG_PANEL)
+        row = tk.Frame(panel, bg=BG_PANEL)
+        row.pack(fill=tk.X, padx=20, pady=(0, 3))
+        line = tk.Frame(row, bg=BG_PANEL)
+        line.pack(fill=tk.X)
+        tk.Label(line, text="Account:", font=("Consolas", 9, "bold"),
+                 fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
+                 ).pack(side=tk.LEFT, padx=(0, 6))
         var = tk.StringVar(value=self._preview_account_of(key))
-        combo = ttk.Combobox(header, textvariable=var, width=14,
+        combo = ttk.Combobox(line, textvariable=var, width=16,
                              values=[""] + self._preview_account_labels())
-        combo.pack(side=tk.RIGHT, padx=(0, 10))
-        tk.Label(header, text="Account:", font=("Consolas", 9, "bold"),
-                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.RIGHT, padx=(10, 4))
-        note.pack(side=tk.RIGHT)
+        combo.pack(side=tk.LEFT)
+        # anchor W so that a longer-than-fits account name truncates at the
+        # TAIL — the quoted name is the part the user needs to read.
+        note = tk.Label(row, text="", font=("Consolas", 9), fg=FG_ORANGE,
+                        bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT)
+        panel._account_row = row
         panel._account_var = var
         panel._account_combo = combo
         panel._account_note = note
@@ -8822,9 +8840,7 @@ class FCToolGUI:
         # user could actually see in the box.
         panel._account_last = var.get()
         # Typed text commits on Enter and on leaving the box; a dropdown pick
-        # commits immediately. The card's header collapse binding is
-        # deliberately NOT extended to these widgets — a click meant for the
-        # combobox must not fold the card underneath it.
+        # commits immediately.
         for seq in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
             combo.bind(seq, lambda _e, p=panel: self._on_account_changed(p))
         attach_tooltip(
@@ -8833,6 +8849,23 @@ class FCToolGUI:
             "already named or type a new one; leave it blank to ungroup the "
             f"character. Up to {FCToolGUI._PREVIEW_ACCOUNT_CAP} characters per "
             "account — the number an EVE account holds.")
+
+    @staticmethod
+    def _set_account_note(panel, text):
+        """Show (or hide) one card's account note. An empty note is UNPACKED,
+        not merely blanked, so a card that has nothing to report costs no
+        vertical space."""
+        note = getattr(panel, "_account_note", None)
+        if note is None:
+            return
+        try:
+            note.config(text=text)
+            if text:
+                note.pack(fill=tk.X, anchor=tk.W)
+            else:
+                note.pack_forget()
+        except tk.TclError:
+            pass
 
     def _on_account_changed(self, panel):
         """Commit one card's Account box. A refusal reverts the widget AND says
@@ -8848,17 +8881,28 @@ class FCToolGUI:
         except tk.TclError:
             return
         want = FCToolGUI._preview_normalize_account_label(typed)
+        previous = getattr(panel, "_account_last", "")
         if not self._preview_set_char_account(key, want):
-            var.set(getattr(panel, "_account_last", ""))
-            panel._account_note.config(
-                text=self._preview_account_full_note(want))
+            var.set(previous)
+            # Name the account by ITS OWN spelling, not by what was typed:
+            # "'main' already has 3 characters" points at an account the user
+            # cannot find in the dropdown.
+            full = next((lbl for lbl in self._preview_account_labels()
+                         if lbl.casefold() == want.casefold()), want)
+            FCToolGUI._set_account_note(
+                panel, self._preview_account_full_note(full))
             return
         # Show what was actually stored — the label is trimmed, and a case
         # variant adopts the spelling of the account it joined.
         settled = self._preview_account_of(key)
         var.set(settled)
         panel._account_last = settled
-        panel._account_note.config(text="")
+        # Clear the note only on an ACCEPTED CHANGE. Committing the reverted
+        # value is a no-op success, and the <FocusOut> that follows a refusal
+        # does exactly that — clearing there would erase the explanation as
+        # the user tabbed away from the box that just refused them.
+        if settled != previous:
+            FCToolGUI._set_account_note(panel, "")
         self._refresh_account_combo_values()
 
     def _refresh_account_combo_values(self):
@@ -22912,7 +22956,12 @@ class FCToolGUI:
         the caller reverts its widget and surfaces _preview_account_full_note.
         Re-assigning a character that is ALREADY on the label is never a new
         member, so a full (or hand-edited oversized) account can still be
-        re-picked; only growing it is refused."""
+        re-picked; only growing it is refused.
+
+        False ALSO means an unusable char_key (blank, or not a string): there
+        is nothing to store it under. A caller that turns False into "that
+        account is full" must rule this out first — the pane does, by building
+        no control at all for a card with no character name."""
         key = str(char_key).strip().lower() if isinstance(char_key, str) else ""
         if not key:
             return False
