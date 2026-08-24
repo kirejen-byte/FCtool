@@ -8809,12 +8809,14 @@ class FCToolGUI:
         dropdown still offers every label in use, plus a blank entry so the
         dropdown alone can un-group a character too.
 
-        Its own row, and the refusal note gets its own LINE within that row:
-        the note is the widest thing here (279 px for a 12-char account name)
-        and a card is only ~421 px wide at the app's minimum window size, so
-        sharing a line with the label and the box would clip away the very
-        account name the note exists to report. The line costs nothing when
-        there is nothing to say — it is packed only while it has text."""
+        Its own row, and the refusal note gets its own LINE within that row.
+        Measured at the app's minimum window width: a card's account row is
+        423 px, of which the label and the box take 187, leaving the note 236
+        against the 279 it asks for — a 43 px shortfall, so on a shared line
+        the sentence would lose its tail. (anchor W keeps the leading account
+        name readable, which is what makes the truncation survivable — not
+        what would make it acceptable.) The line costs nothing when there is
+        nothing to say — it is packed only while it has text."""
         key = panel._char_key
         row = tk.Frame(panel, bg=BG_PANEL)
         row.pack(fill=tk.X, padx=20, pady=(0, 3))
@@ -8851,10 +8853,15 @@ class FCToolGUI:
             "account — the number an EVE account holds.")
 
     @staticmethod
-    def _set_account_note(panel, text):
+    def _set_account_note(panel, text, label=""):
         """Show (or hide) one card's account note. An empty note is UNPACKED,
         not merely blanked, so a card that has nothing to report costs no
-        vertical space."""
+        vertical space.
+
+        ``label`` is the account the note is ABOUT, remembered on the panel so
+        _refresh_account_controls can retire the note once that account stops
+        being full. Kept as data rather than parsed back out of the sentence:
+        account labels are free text and can contain quotes themselves."""
         note = getattr(panel, "_account_note", None)
         if note is None:
             return
@@ -8865,7 +8872,8 @@ class FCToolGUI:
             else:
                 note.pack_forget()
         except tk.TclError:
-            pass
+            return
+        panel._note_label = label if text else ""
 
     def _on_account_changed(self, panel):
         """Commit one card's Account box. A refusal reverts the widget AND says
@@ -8890,7 +8898,7 @@ class FCToolGUI:
             full = next((lbl for lbl in self._preview_account_labels()
                          if lbl.casefold() == want.casefold()), want)
             FCToolGUI._set_account_note(
-                panel, self._preview_account_full_note(full))
+                panel, self._preview_account_full_note(full), label=full)
             return
         # Show what was actually stored — the label is trimmed, and a case
         # variant adopts the spelling of the account it joined.
@@ -8903,17 +8911,30 @@ class FCToolGUI:
         # the user tabbed away from the box that just refused them.
         if settled != previous:
             FCToolGUI._set_account_note(panel, "")
-        self._refresh_account_combo_values()
+        self._refresh_account_controls()
 
-    def _refresh_account_combo_values(self):
-        """Re-offer every account label on every card. Without this, grouping
-        the second character means re-typing the label exactly right — and a
-        typo silently opens a second account instead of joining the first."""
+    def _refresh_account_controls(self):
+        """Re-offer every account label on every card, and retire any refusal
+        note whose account has stopped being full.
+
+        The offers: without them, grouping the second character means
+        re-typing the label exactly right — and a typo silently opens a second
+        account instead of joining the first.
+
+        The notes: a refusal is only true until somebody leaves that account.
+        Card D is refused on a full "Main account", then card A blanks itself
+        — D's note would go on claiming the account is full while the very
+        next attempt would succeed. This runs after every accepted change,
+        which is the only thing that can change an account's membership."""
         values = [""] + self._preview_account_labels()
+        cap = FCToolGUI._PREVIEW_ACCOUNT_CAP
         for panel in list(getattr(self, "_char_panels", []) or []):
             combo = getattr(panel, "_account_combo", None)
             if combo is None:
                 continue
+            stale = getattr(panel, "_note_label", "")
+            if stale and len(self._preview_account_members(stale)) < cap:
+                FCToolGUI._set_account_note(panel, "")
             try:
                 combo.config(values=values)
             except tk.TclError:
