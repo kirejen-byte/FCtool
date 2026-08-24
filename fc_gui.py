@@ -8740,6 +8740,15 @@ class FCToolGUI:
         )
         name_label.pack(side=tk.LEFT)
 
+        # Account column: which EVE account this character shares with its
+        # siblings. Packed BEFORE loc_label so that in narrow 2-column mode the
+        # location text — which already truncates gracefully — gives up the
+        # space, not the control. A window with no character name has no
+        # char_key to store anything under, so it gets no control at all.
+        panel._char_key = (acct.character_name or "").strip().lower()
+        if panel._char_key:
+            self._build_account_picker(panel, header)
+
         loc_label = tk.Label(
             header, text="  --  loading...",
             font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL,
@@ -8783,6 +8792,88 @@ class FCToolGUI:
         panel._loc_label = loc_label
         panel._cap_frame = cap_frame
         self._char_panels.append(panel)
+
+    # ── Account column (character grouping) ─────────────────────────────────
+    # Storage, normalization and the 3-per-account cap belong to the
+    # _preview_*_account* accessors (beside the other preview config owners);
+    # everything here is the widget half.
+
+    def _build_account_picker(self, panel, header):
+        """The card's "Account" control — one combobox carrying all three
+        operations: type a name you have not used yet (ADD), pick another
+        (EDIT), blank it (REMOVE). Hence free text, not a readonly list; the
+        dropdown still offers every label in use, plus a blank entry so the
+        dropdown alone can un-group a character too."""
+        key = panel._char_key
+        note = tk.Label(header, text="", font=("Consolas", 9),
+                        fg=FG_ORANGE, bg=BG_PANEL)
+        var = tk.StringVar(value=self._preview_account_of(key))
+        combo = ttk.Combobox(header, textvariable=var, width=14,
+                             values=[""] + self._preview_account_labels())
+        combo.pack(side=tk.RIGHT, padx=(0, 10))
+        tk.Label(header, text="Account:", font=("Consolas", 9, "bold"),
+                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.RIGHT, padx=(10, 4))
+        note.pack(side=tk.RIGHT)
+        panel._account_var = var
+        panel._account_combo = combo
+        panel._account_note = note
+        # What to fall back to when an assignment is refused. Kept beside the
+        # var rather than re-read from config, so the revert restores what the
+        # user could actually see in the box.
+        panel._account_last = var.get()
+        # Typed text commits on Enter and on leaving the box; a dropdown pick
+        # commits immediately. The card's header collapse binding is
+        # deliberately NOT extended to these widgets — a click meant for the
+        # combobox must not fold the card underneath it.
+        for seq in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            combo.bind(seq, lambda _e, p=panel: self._on_account_changed(p))
+        attach_tooltip(
+            combo,
+            "The EVE account this character is on. Pick an account you have "
+            "already named or type a new one; leave it blank to ungroup the "
+            f"character. Up to {FCToolGUI._PREVIEW_ACCOUNT_CAP} characters per "
+            "account — the number an EVE account holds.")
+
+    def _on_account_changed(self, panel):
+        """Commit one card's Account box. A refusal reverts the widget AND says
+        which account is full: a silent revert reads as a broken combobox."""
+        if not self._panel_alive(panel):
+            return
+        key = getattr(panel, "_char_key", "")
+        var = getattr(panel, "_account_var", None)
+        if not key or var is None:
+            return
+        try:
+            typed = var.get()
+        except tk.TclError:
+            return
+        want = FCToolGUI._preview_normalize_account_label(typed)
+        if not self._preview_set_char_account(key, want):
+            var.set(getattr(panel, "_account_last", ""))
+            panel._account_note.config(
+                text=self._preview_account_full_note(want))
+            return
+        # Show what was actually stored — the label is trimmed, and a case
+        # variant adopts the spelling of the account it joined.
+        settled = self._preview_account_of(key)
+        var.set(settled)
+        panel._account_last = settled
+        panel._account_note.config(text="")
+        self._refresh_account_combo_values()
+
+    def _refresh_account_combo_values(self):
+        """Re-offer every account label on every card. Without this, grouping
+        the second character means re-typing the label exactly right — and a
+        typo silently opens a second account instead of joining the first."""
+        values = [""] + self._preview_account_labels()
+        for panel in list(getattr(self, "_char_panels", []) or []):
+            combo = getattr(panel, "_account_combo", None)
+            if combo is None:
+                continue
+            try:
+                combo.config(values=values)
+            except tk.TclError:
+                continue
 
     def _refresh_single_character(self, acct: ESIAuth):
         """Refresh only a single character's panel (background thread)."""
@@ -16775,6 +16866,16 @@ class FCToolGUI:
     _PREVIEW_SPAWN_RETRY_EVERY = 4      # ticks between attempts (~1 s at 250 ms)
     _PREVIEW_SPAWN_RETRY_MAX = 3        # attempts before we give up on that hwnd
 
+    # ── Character grouping (preview.char_accounts) ─────────────────────────
+    # How many characters one account label may hold. Not a preference: an EVE
+    # account holds exactly three characters, so a fourth member is a
+    # mis-grouping — and the Characters pane refuses it rather than storing a
+    # group that cannot exist in game. A hand-edited config with more is left
+    # alone at load (house rule: never delete saved data; harmless anyway,
+    # since only one character per account can be logged in at a time) — the
+    # UI just will not grow it further.
+    _PREVIEW_ACCOUNT_CAP = 3
+
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
         "mode": "off",              # "off" | "eveo_labels" | "native"
@@ -16810,6 +16911,12 @@ class FCToolGUI:
         # Monitor pinning (monitor_pin.py): per-char {char_key: device|"none"} and
         # a global default device ("" = off). Empty → the feature is fully inert.
         "monitor_assignments": {}, "monitor_pin_default": "",
+        # Character grouping: which EVE ACCOUNT each character belongs to, as
+        # ONE flat {char_key: label} dict (char_key = the preview's normalized
+        # lowercase name key). Labels are free text the user types in the
+        # Characters pane ("Main account", "Alt 1"); blank/absent = ungrouped,
+        # and a group exists exactly as long as some character names it.
+        "char_accounts": {},
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
@@ -22735,6 +22842,110 @@ class FCToolGUI:
             assigns.pop(key, None)
         self._save_config()
         self._preview_pin_move_key(key)
+
+    # ── Character grouping: preview.char_accounts ({char_key: label}) ───────
+    # The Characters pane's Account column is the only writer; the readers are
+    # the pane itself and (later) the per-account preview slot. Every one of
+    # them goes through these accessors so "what account is this character on"
+    # has ONE answer — config.json is hand-editable, so the normalization and
+    # the cap cannot live in the widget.
+
+    @staticmethod
+    def _preview_normalize_account_label(value) -> str:
+        """Canonical form of an account label: trimmed, inner whitespace runs
+        collapsed. Anything that is not a real string is not a label ("")."""
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())
+
+    def _preview_char_accounts(self) -> dict:
+        """Normalized {char_key: label} view of preview.char_accounts.
+
+        A read-through copy, never the stored dict: entries whose key or label
+        normalizes away are dropped so every reader sees the same shape. The
+        stored block itself is left exactly as written — including a
+        hand-edited group with more than _PREVIEW_ACCOUNT_CAP members."""
+        raw = self._preview_cfg().get("char_accounts")
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for key, label in raw.items():
+            key = str(key).strip().lower() if isinstance(key, str) else ""
+            label = FCToolGUI._preview_normalize_account_label(label)
+            if key and label:
+                out[key] = label
+        return out
+
+    def _preview_account_of(self, char_key) -> str:
+        """The account label this character belongs to, or "" if ungrouped."""
+        key = str(char_key).strip().lower() if isinstance(char_key, str) else ""
+        if not key:
+            return ""
+        return self._preview_char_accounts().get(key, "")
+
+    def _preview_account_labels(self) -> list:
+        """Every account label in use, sorted, one entry per account (a
+        case-variant spelling is the same account — see _preview_set_char_account)."""
+        seen: dict = {}
+        for label in self._preview_char_accounts().values():
+            seen.setdefault(label.casefold(), label)
+        return sorted(seen.values(), key=str.casefold)
+
+    def _preview_account_members(self, label) -> list:
+        """The char keys on one account label, sorted. Case-insensitive."""
+        want = FCToolGUI._preview_normalize_account_label(label).casefold()
+        if not want:
+            return []
+        return sorted(k for k, v in self._preview_char_accounts().items()
+                      if v.casefold() == want)
+
+    def _preview_account_full_note(self, label) -> str:
+        """The pane's refusal wording — single source, so the cap and the
+        sentence explaining it can never drift."""
+        return (f"'{label}' already has {FCToolGUI._PREVIEW_ACCOUNT_CAP} "
+                f"characters")
+
+    def _preview_set_char_account(self, char_key, label) -> bool:
+        """Persist one character's account label. "" (or blank) removes it.
+
+        Returns False and writes NOTHING when the cap refuses the assignment —
+        the caller reverts its widget and surfaces _preview_account_full_note.
+        Re-assigning a character that is ALREADY on the label is never a new
+        member, so a full (or hand-edited oversized) account can still be
+        re-picked; only growing it is refused."""
+        key = str(char_key).strip().lower() if isinstance(char_key, str) else ""
+        if not key:
+            return False
+        want = FCToolGUI._preview_normalize_account_label(label)
+        current = self._preview_char_accounts()
+        if want:
+            # A case variant of an existing label joins THAT account rather
+            # than forking a lookalike one: a fork would dodge the cap and
+            # (with account slots on) claim a layout rect of its own.
+            for existing in current.values():
+                if existing.casefold() == want.casefold():
+                    want = existing
+                    break
+        if current.get(key, "") == want:
+            return True                     # no-op: never a pointless save
+        if want and len(self._preview_account_members(want)) >= \
+                FCToolGUI._PREVIEW_ACCOUNT_CAP:
+            return False
+        cfg = self._preview_cfg()
+        accounts = cfg.get("char_accounts")
+        if not isinstance(accounts, dict):
+            accounts = {}
+            cfg["char_accounts"] = accounts
+        # Drop every spelling of the key first — a hand-edited config may hold
+        # " Kirejen " where the normalized view reads "kirejen", and writing
+        # the normalized key beside it would give one character two accounts.
+        for stored in [k for k in accounts
+                       if isinstance(k, str) and k.strip().lower() == key]:
+            accounts.pop(stored, None)
+        if want:
+            accounts[key] = want
+        self._save_config()
+        return True
 
     def _preview_pin_apply_all(self):
         """Apply-now: a fresh sweep moves every live charactered client whose char
