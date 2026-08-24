@@ -127,7 +127,7 @@ import damage_flash
 import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
-from preview_tile import TileWindow, STRIP_H as _TILE_STRIP_H
+from preview_tile import TileWindow
 # FC HUD info tiles — the preview tiles' content-carrying cousins (own chrome in
 # info_tile.py, engine + settings popup in info_tiles.py). Both modules are
 # fc_gui-free: everything they need arrives through the HudHost seams built in
@@ -20301,8 +20301,9 @@ class FCToolGUI:
 
         # Tile HEIGHT. The box shows FULL height — body + caption strip, i.e. the
         # whole window the user sees — while `tile_body_h` stays the config unit;
-        # preview_layout.full_h / body_h_from_full are the ONE conversion seam
-        # (the STRIP_H-trap family: three bugs from hand-rolled +20s). Which is
+        # preview_layout.full_h / body_h_from_full are the ONE conversion seam on
+        # THIS path (the STRIP_H-trap family: three bugs from hand-rolled +20s;
+        # the tile-geometry and FC HUD rect paths own their own). Which is
         # also why this var canNOT ride _PREVIEW_NATIVE_VARS — that map's cast is
         # a plain type, with nowhere to put a conversion — so it gets a dedicated
         # read at the apply seam instead (_preview_tileh_value).
@@ -20345,7 +20346,8 @@ class FCToolGUI:
         _tip(fitb, "On: each preview's height is snapped to its EVE client's "
                    "aspect ratio, removing the black bands above and below the "
                    "video — now, and for previews that attach later. Off: heights "
-                   "are yours, set by dragging a tile corner.")
+                   "are yours, set by dragging a tile corner or typed into the "
+                   "'Tile size' boxes beside this one.")
 
         # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
         # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
@@ -21162,7 +21164,9 @@ class FCToolGUI:
         FCPreview path speaks. This is the ONE place the widget's number is
         converted back (its forward twin is the seed in _build_preview_section),
         and both go through preview_layout.full_h / body_h_from_full so the
-        STRIP_H arithmetic exists exactly once.
+        SETTINGS path's STRIP_H arithmetic exists exactly once. Other paths
+        legitimately do their own (preview_tile's strip/thumb geometry, the FC
+        HUD rect conversion above) — they measure live widgets, not this box.
 
         Shaped like _preview_dmg_mode_value and for the same reason: a var whose
         DISPLAYED value is not its STORED value cannot ride the
