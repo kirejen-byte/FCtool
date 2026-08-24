@@ -8791,7 +8791,19 @@ class FCToolGUI:
                 p._arrow.config(text="\u25B6")
                 p._expanded.set(False)
             else:
-                p._cap_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
+                # Re-pack BEFORE the re-auth banner (when this card has one) so
+                # expand restores the original top-to-bottom order instead of
+                # appending cap_frame after a row that was already packed \u2014
+                # same Tk ordering fix as preview_tile._pack_location_lowest.
+                before = getattr(p, "_reauth_row", None)
+                try:
+                    if before is not None:
+                        p._cap_frame.pack(fill=tk.X, padx=20, pady=(0, 5),
+                                           before=before)
+                    else:
+                        p._cap_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
+                except tk.TclError:
+                    p._cap_frame.pack(fill=tk.X, padx=20, pady=(0, 5))
                 p._arrow.config(text="\u25BC")
                 p._expanded.set(True)
 
@@ -8814,6 +8826,7 @@ class FCToolGUI:
                 reauth_row, text="Re-authorize", style="Dark.TButton",
                 command=self._esi_login,
             ).pack(side=tk.LEFT)
+            panel._reauth_row = reauth_row
 
         panel._acct = acct
         panel._loc_label = loc_label
