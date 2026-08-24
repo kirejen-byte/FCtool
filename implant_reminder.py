@@ -840,6 +840,62 @@ def _bucket_label(key: tuple, count: int) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
+def _bucket_census(names) -> tuple:
+    """``(listed, counts, first_seen)`` for a head of implant NAMES. Pure.
+
+    The ONE census both summaries are built from — ``toast_body``'s dominant
+    bucket and ``summary_labels``' ordered list. Extracted rather than copied:
+    two classifiers of the same taxonomy is the drift this module already paid
+    for once (see ``_bucket_of``'s ordering comment). Blank / non-string
+    entries are dropped, so a garbage-only head censuses as empty."""
+    listed = [str(n).strip() for n in (names or ()) if str(n or "").strip()]
+    counts: dict = {}
+    first_seen: dict = {}
+    for index, name in enumerate(listed):
+        key = _bucket_of(name)
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, index)
+    return listed, counts, first_seen
+
+
+#: Order the non-set buckets appear in ``summary_labels``: the things a pilot
+#: would name first. Sets come before all of them (grade-ranked), because a set
+#: is the reason this feature exists.
+_SUMMARY_BUCKET_ORDER = ("mindlink", "attribute", "hardwiring", "other")
+
+
+def summary_labels(names) -> tuple:
+    """The same head as ``toast_body``, as an ORDERED list of short labels.
+
+    The FCPreview tile icon's tooltip source ("Major implants: Mid-grade
+    Amulets · 2 hardwirings"): unlike the toast — which has one line over the
+    game client and so names only the dominant bucket — the tooltip has room
+    for every bucket, but still never lists individual components.
+
+    Built from ``_bucket_census`` / ``_bucket_label``, so a name is bucketed
+    and worded EXACTLY as the toast words it. Order is deterministic:
+
+    * the High-/Mid-/Low-grade SETS first, ranked by grade (High > Mid > Low),
+      then by how many members are plugged in, then by the pilot's own
+      implant-slot order — the same tie-break ``toast_body`` uses, so the copy
+      is stable for a given clone rather than dictionary-order roulette;
+    * then Mindlinks, attribute implants, hardwirings, and anything else
+      (the named/faction rares), counted rather than listed.
+
+    Empty / garbage input answers ``()`` — the caller reads that as "no icon".
+    Returns a TUPLE: the poller publishes it into a dict the Tk tick reads
+    without a lock, and an immutable value is what makes that safe. Pure."""
+    _listed, counts, first_seen = _bucket_census(names)
+    if not counts:
+        return ()
+    sets = sorted((k for k in counts if k[0] == "set"),
+                  key=lambda k: (-_GRADE_RANK.get(k[1].casefold(), 0),
+                                 -counts[k], first_seen[k]))
+    rest = [k for kind in _SUMMARY_BUCKET_ORDER
+            for k in counts if k[0] == kind]
+    return tuple(_bucket_label(k, counts[k]) for k in sets + rest)
+
+
 def toast_body(char_name: str, names) -> str:
     """One-line body for the toast: who, and the SET most of it belongs to.
 
@@ -868,19 +924,12 @@ def toast_body(char_name: str, names) -> str:
     that appears first in ``names`` (i.e. the pilot's own implant-slot order).
 
     Pure."""
-    listed = [str(n).strip() for n in (names or ()) if str(n or "").strip()]
+    listed, counts, first_seen = _bucket_census(names)
     who = str(char_name or "").strip() or "This character"
     if not listed:
         return f"{who} — remember to unplug before the next fleet."
     if len(listed) == 1:
         return f"{who} — {listed[0]}"
-
-    counts: dict = {}
-    first_seen: dict = {}
-    for index, name in enumerate(listed):
-        key = _bucket_of(name)
-        counts[key] = counts.get(key, 0) + 1
-        first_seen.setdefault(key, index)
 
     sets = [k for k in counts if k[0] == "set"]
     pool = sets or list(counts)
