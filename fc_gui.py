@@ -17005,6 +17005,14 @@ class FCToolGUI:
         # Characters pane ("Main account", "Alt 1"); blank/absent = ungrouped,
         # and a group exists exactly as long as some character names it.
         "char_accounts": {},
+        # Major-implants icon on each tile's caption strip (tooltip: which sets
+        # / mindlinks / hardwirings that pilot is flying with). Default ON: it
+        # is informational, costs one gated ESI call per character per 300 s,
+        # and is INERT for any character whose token predates the implants
+        # scope — nothing appears until the owner re-authorises. Shares the
+        # "Save my implants" DESIGNATION (config['implant_reminder']), not its
+        # enabled flag: the icon works with the reminder switched off.
+        "implant_icon": True,
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
@@ -18711,6 +18719,13 @@ class FCToolGUI:
         # _preview_on_decloak) is live, its label strip shows the DECLOAKED banner
         # INSTEAD of the normal '<label> - <ShipType>' text. Gated by decloak_flash.
         decloak_on = bool(cfg.get("decloak_flash", True))
+        # Major-implants strip icon: the poller publishes the SUMMARISED verdict
+        # per char key (_preview_implant_refresh); this pass only turns it into
+        # tooltip copy. getattr-guarded for the bare SimpleNamespace hosts, and
+        # a flag-off tick still pushes "" so a tile that already shows the icon
+        # loses it the moment the user unticks the box.
+        icon_on = bool(cfg.get("implant_icon", _defaults["implant_icon"]))
+        implant_labels = getattr(self, "_preview_implant_labels", None) or {}
         now_mono = time.monotonic()
         for hwnd, client in cur.items():
             tile = self._preview_tiles.get(hwnd)
@@ -18760,6 +18775,13 @@ class FCToolGUI:
                     tile.set_location_label(system, bottom_color, bottom_size)
                 else:
                     tile.set_location_label("")
+                # Major-implants icon. A login screen has no character, so it
+                # never carries one — and never reads a verdict published under
+                # the shared login key "".
+                labels = (() if (client.is_login or not icon_on)
+                          else tuple(implant_labels.get(client.key) or ()))
+                tile.set_implant_icon(
+                    ("Major implants: " + " · ".join(labels)) if labels else "")
             except tk.TclError:
                 pass
 
@@ -19858,8 +19880,15 @@ class FCToolGUI:
         tuple. Single-writer (this method) / single-reader (the tick), the
         _preview_intel_reach discipline; touches no Tk.
 
-        Four early returns, in the order the code takes them:
+        Five early returns, in the order the code takes them:
 
+        * the FEATURE GATE: no native FCPreview tiles to draw an icon on, or the
+          "Implant icon" box unticked, and this costs nothing at all. It is the
+          first thing checked because it is the only one that can spare the
+          whole pass: without it the refresh spent one /implants/ call per
+          scoped character per _PREVIEW_IMPLANT_REFRESH_S with previews switched
+          off entirely (the "off feature must never pay" rule the intel-flash
+          ball BFS follows for the same reason);
         * a blank key (a client sitting at character select) has nothing to
           publish under;
         * a host without the two poller-owned dicts is not a preview host at
@@ -19881,6 +19910,16 @@ class FCToolGUI:
         previous verdict stands, so the icon never flickers off on one bad poll.
         Never raises -- a broken icon must not take the poller down."""
         try:
+            pcfg = self._preview_cfg()
+            # The fallback comes from _PREVIEW_DEFAULTS, not a literal: it is
+            # unreachable (_preview_cfg materialized the key) but two readers
+            # disagreeing about ONE key's default is the failure shape this
+            # subsystem keeps repeating — the compose side reads the same owner.
+            if (pcfg.get("mode") != "native"
+                    or not pcfg.get(
+                        "implant_icon",
+                        FCToolGUI._PREVIEW_DEFAULTS["implant_icon"])):
+                return
             key = str(key or "").strip().lower()
             if not key:
                 return
@@ -20725,6 +20764,10 @@ class FCToolGUI:
         # Row 5 (native): highlight active / lock layout / arrange buttons.
         rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
         rowN2.pack(fill=tk.X, pady=2)
+        # rowN is full (903 px of the app's 1000 px minsize), so rowN2 is where
+        # new FCPreview controls land — and it has its own width guard now
+        # (test_the_second_native_row_still_fits_the_app_minimum_window_width).
+        self._preview_native_second_row = rowN2
         self._preview_highlight_var = tk.BooleanVar(
             value=bool(pcfg.get("highlight_active", True)))
         cbh = tk.Checkbutton(
@@ -20824,6 +20867,29 @@ class FCToolGUI:
         w.append(bnm)
         _tip(bnm, "Pick characters that should stay open and never be minimized "
                   "by 'Minimize inactive'.")
+
+        # Major-implants icon on the caption strip (default ON). Ordinary
+        # native-checkbutton wiring: the var rides _PREVIEW_NATIVE_VARS, so
+        # _preview_apply_native_state persists it like every other flag here.
+        self._preview_implant_icon_var = tk.BooleanVar(
+            value=bool(pcfg.get("implant_icon", True)))
+        cbii = tk.Checkbutton(
+            rowN2, text="Implant icon", variable=self._preview_implant_icon_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        # No TRAILING pad: this is the last control on rowN2 and the row is the
+        # width-budget one now (864 px before this box, 976 px with it, against
+        # the app's 1000 px minsize). Nothing follows it, so the 8 px every
+        # other control here spends on separation would buy nothing but risk.
+        cbii.grid(row=0, column=8, padx=(0, 0))
+        w.append(cbii)
+        self._preview_implant_icon_check = cbii
+        _tip(cbii, "Mark previews whose pilot is flying with implants worth "
+                   "losing — hover the icon to see which sets, mindlinks and "
+                   "hardwirings. Uses the same designation as 'Save my "
+                   "implants', and needs that character re-authorised for the "
+                   "implants scope.")
 
         # Snap previews to each other: while dragging a preview, its edges stick
         # to nearby previews' edges (butt together or align flush). Placement
@@ -21380,6 +21446,11 @@ class FCToolGUI:
         # exactly as for every other native checkbutton. _preview_toggle_fit_height
         # adds only the OFF→ON "fit everything now" hook on top of the apply.
         ("_preview_fit_height_var", "fit_height", bool),
+        # "Implant icon" (rowN2). Anchored here, immediately after fit_height,
+        # deliberately: a concurrent branch adding its own native var appends at
+        # the end of this table, so a fixed neighbour is what keeps the two
+        # merges apart.
+        ("_preview_implant_icon_var", "implant_icon", bool),
         ("_preview_opacity_var", "opacity_inactive", float),
         ("_preview_captions_var", "captions", bool),
         ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
