@@ -17939,17 +17939,6 @@ class FCToolGUI:
             if getattr(tile, "_hidden", False):
                 continue
             try:
-                # _preview_on_tile_resize_end rebuilds the saved layout rect from
-                # cfg['layouts'][key], falling back to (10, 10) when the char has
-                # none yet — which for a freshly-spawned, never-moved tile would
-                # teleport it to the top-left corner. Seed the entry from where
-                # the tile actually IS first; the resize write-back then only
-                # changes the size, as it does for a corner drag.
-                layouts = cfg.setdefault("layouts", {})
-                rect = self._preview_tile_rects.get(hwnd)
-                if key not in layouts and rect is not None and len(rect) >= 4:
-                    layouts[key] = [int(rect[0]), int(rect[1]),
-                                    int(rect[2]), int(rect[3])]
                 # save=False: this pass calls the writer once per tile inside a
                 # single Tk tick, and under uniform_size saves 2..N would each
                 # re-serialize the WHOLE config (json.dumps + temp file +
