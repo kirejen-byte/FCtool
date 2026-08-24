@@ -171,6 +171,39 @@ def _ellipsize(text: str, max_chars: int) -> str:
     return text[:max_chars - 1] + "…"
 
 
+def strip_h_for(font_size):
+    """The height a BOTTOM strip needs to render a label drawn at `font_size`:
+    the strip tracks the font so a larger label stays legible, but never drops
+    below the caption strip's own STRIP_H.
+
+    THE single owner of that formula. set_bottom_label, set_bottom_alert and
+    set_location_label all call it — and so does the fc_gui auto-fit resizer,
+    which has to PREDICT the strip height from config without sampling a live
+    tile. It cannot sample: the strips pack and unpack as activity/location
+    labels arrive and clear, so a resizer reading the live height would chase
+    that churn and grow/shrink every tile ~20 px whenever a pilot docked.
+    Three copies of `max(STRIP_H, size + 8)` plus a fourth in the predictor is
+    exactly the two-modules-disagree shape that already cost this subsystem the
+    tile-size floor bug; keep it at one.
+
+    `font_size` is clamped to [_LABEL_MIN_SIZE, _LABEL_MAX_SIZE]; junk (None,
+    "", a word, NaN, inf) falls back to 9 — the SAME fallback the three setters
+    use when their caller passes no size, so predictor and setter agree on the
+    garbage case too.
+
+    The ~40%-of-body cap the setters apply ON TOP of this deliberately stays
+    with them: it needs the live body height, which the predictor does not have
+    and must not guess. So the predicted height is an UPPER bound.
+
+    Pure — no Tk, no instance state, argument never mutated."""
+    try:
+        size = int(font_size)
+    except (TypeError, ValueError, OverflowError):
+        size = 9
+    size = max(_LABEL_MIN_SIZE, min(size, _LABEL_MAX_SIZE))
+    return max(STRIP_H, size + 8)
+
+
 def clamp_label(text, font_size, tile_w, tile_body_h):
     """Bound an on-video label so it can never overflow or fill the tile.
 
@@ -1100,6 +1133,35 @@ class TileWindow:
         fx, fy, fw, fh = aspect_fit(self._w, avail_h, *self._src_size)
         self._thumb.show((fx, STRIP_H + fy, fx + fw, STRIP_H + fy + fh))
 
+    def fitted_body_h(self, bottom_h=None):
+        """QUERY: the body height at which THIS tile's video would exactly fill
+        the space between the caption strip and the bottom strips — i.e. the
+        height with no black letterbox band above or below it. None when it
+        cannot be determined: no source attached yet, a degenerate/unqueried
+        `_src_size`, or an unplaced tile (`_w` still 0). None means "leave the
+        tile alone", never "shrink it to the floor" — see preview_layout's
+        fit_body_h, which owns the math AND that return convention.
+
+        `bottom_h=None` asks about this tile's LIVE strip state (`_bottom_h()`).
+        A caller may pass its own value instead: the bottom strips pack and
+        unpack as activity/location labels arrive and clear, so a resizer that
+        sampled the live height would chase that churn and jitter the tile. It
+        passes a steady-state expectation derived from config, and this method
+        answers for that hypothetical instead of for right now.
+
+        Read-only by contract — no resize, no _push_thumb_rect, no Win32, no
+        state mutation of any kind. Ask as often as you like."""
+        if not self._thumb:
+            return None
+        try:
+            src_w, src_h = self._src_size
+        except (TypeError, ValueError):
+            return None                       # malformed source size — no answer
+        if bottom_h is None:
+            bottom_h = self._bottom_h()
+        return preview_layout.fit_body_h(self._w, src_w, src_h, bottom_h,
+                                         min_body_h=_MIN_BODY_H)
+
     def refresh_source_size(self):
         """Called by the tick every ~8th cycle: re-letterbox if the client resized."""
         if self._thumb:
@@ -1444,8 +1506,10 @@ class TileWindow:
         shown, drawn_size = self._fit_label_text(text, fsize)
         # Strip height tracks the DRAWN (possibly downscaled) font so a bigger font
         # stays legible, but is CLAMPED to ~40% of the body so it can't swallow the
-        # video.
-        strip_h = max(STRIP_H, drawn_size + 8)
+        # video. The font->height half is strip_h_for's (the fc_gui auto-fit
+        # resizer predicts strip heights with the very same function); the
+        # body-fraction cap stays here, where the live body height is known.
+        strip_h = strip_h_for(drawn_size)
         if self._body_h and self._body_h > 0:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)
@@ -1491,7 +1555,7 @@ class TileWindow:
         # Same auto-fit as the normal label so the banner shrinks/ellipsizes to
         # fit rather than overflowing.
         shown, drawn_size = self._fit_label_text(text, fsize)
-        strip_h = max(STRIP_H, drawn_size + 8)
+        strip_h = strip_h_for(drawn_size)          # shared font->height formula
         if self._body_h and self._body_h > 0:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)
@@ -1652,7 +1716,7 @@ class TileWindow:
         # Auto-fit: keep the chosen size when the location fits, shrink to fit
         # otherwise (measured), ellipsize only at the floor.
         shown, drawn_size = self._fit_label_text(text, fsize)
-        strip_h = max(STRIP_H, drawn_size + 8)
+        strip_h = strip_h_for(drawn_size)          # shared font->height formula
         if self._body_h and self._body_h > 0:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)

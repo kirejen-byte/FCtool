@@ -14,6 +14,16 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
+# aspect_fit MOVED to preview_layout (2026-08-22) and is re-exported here so
+# every existing `from dwm_thumbs import aspect_fit` (preview_tile, tests) keeps
+# working unchanged. Why it moved: it is pure geometry — no ctypes, nothing
+# Windows about it — and preview_layout.fit_body_h answers the INVERSE question
+# ("which body height leaves no letterbox?"), so the two must agree exactly.
+# They did not: fit_body_h rounded a height aspect_fit truncates, and 47% of its
+# answers came back one px taller than the video. Two modules owning halves of
+# one calculation is the same failure shape that produced the clamp_size bug.
+from preview_layout import aspect_fit  # noqa: F401  (re-export, single owner)
+
 DWM_TNP_RECTDESTINATION = 0x00000001
 DWM_TNP_RECTSOURCE = 0x00000002
 DWM_TNP_OPACITY = 0x00000004
@@ -33,16 +43,6 @@ class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
 
 
 assert ctypes.sizeof(DWM_THUMBNAIL_PROPERTIES) == 48
-
-
-def aspect_fit(dest_w: int, dest_h: int, src_w: int, src_h: int):
-    """Largest (x, y, w, h) inside dest preserving src aspect, centered."""
-    if src_w <= 0 or src_h <= 0 or dest_w <= 0 or dest_h <= 0:
-        return (0, 0, max(dest_w, 0), max(dest_h, 0))
-    scale = min(dest_w / src_w, dest_h / src_h)
-    w = max(1, int(src_w * scale))
-    h = max(1, int(src_h * scale))
-    return ((dest_w - w) // 2, (dest_h - h) // 2, w, h)
 
 
 class _RealDwm:  # pragma: no cover — exercised by spike S1 + live use
