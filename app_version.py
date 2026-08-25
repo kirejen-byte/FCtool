@@ -10,8 +10,8 @@ no imports beyond the stdlib, nothing computed.
 (our own constant and whatever tag GitHub hands back). It is deliberately
 STRICT and deliberately TOTAL:
 
-* strict — a pre-release or build-metadata suffix (``v5.1.0-rc1``,
-  ``5.1.0+build7``) is NOT a version here, it is ``None``. GitHub's
+* strict — a pre-release or build-metadata suffix (``v1.2.3-rc1``,
+  ``1.2.3+build7``) is NOT a version here, it is ``None``. GitHub's
   ``/releases/latest`` already excludes drafts and pre-releases, so a suffixed
   tag reaching us means something unexpected happened; the fail-silent
   direction for an update *advertisement* is to say nothing at all rather than
@@ -25,7 +25,7 @@ from __future__ import annotations
 
 # The currently RELEASED version. Bumped by the release cycle (and gated by the
 # packaging battery), never by a feature commit.
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 
 
 def parse_version(tag) -> tuple | None:
@@ -34,14 +34,14 @@ def parse_version(tag) -> tuple | None:
     Accepts an optional leading ``v``/``V`` and surrounding whitespace, then
     one or more dot-separated runs of digits::
 
-        parse_version("v5.1.0")   -> (5, 1, 0)
-        parse_version("5.1")      -> (5, 1)
-        parse_version("v5.1.0rc") -> None
+        parse_version("v1.2.3")   -> (1, 2, 3)
+        parse_version("1.2")      -> (1, 2)
+        parse_version("v1.2.3rc") -> None
         parse_version(None)       -> None
 
     Never raises. Note the tuple length follows the tag, so callers comparing
-    two of these must zero-pad to a common length first (``"5.1"`` and
-    ``"5.1.0"`` are the same version) — ``update_check.check`` does.
+    two of these must zero-pad to a common length first (``"1.2"`` and
+    ``"1.2.0"`` are the same version) — ``update_check.check`` does.
     """
     try:
         if not isinstance(tag, str):
