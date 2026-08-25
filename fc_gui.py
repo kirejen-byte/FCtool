@@ -9292,10 +9292,22 @@ class FCToolGUI:
         # TAIL — the quoted name is the part the user needs to read.
         note = tk.Label(row, text="", font=("Consolas", 9), fg=FG_ORANGE,
                         bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT)
+        # A read-only companion to the (manual) box: it surfaces the account the
+        # ground-truth map OBSERVES for this character — an "auto:" hint when the
+        # card is unlabelled, or a warning when a manual label disagrees with
+        # observation. Its own line, packed only while it has something to say
+        # (like the note). It is NEVER wired to a write path: that is what makes
+        # "manual wins" structural (spec §9.3). Only _account_var (bound to the
+        # MANUAL value) ever reaches _preview_set_char_account, so an observed
+        # account can be SHOWN here but can never be auto-committed into
+        # preview.char_accounts.
+        hint = tk.Label(row, text="", font=("Consolas", 9), fg=FG_DIM,
+                        bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT)
         panel._account_row = row
         panel._account_var = var
         panel._account_combo = combo
         panel._account_note = note
+        panel._account_hint = hint
         # What to fall back to when an assignment is refused. Kept beside the
         # var rather than re-read from config, so the revert restores what the
         # user could actually see in the box.
@@ -9310,6 +9322,10 @@ class FCToolGUI:
             "already named or type a new one; leave it blank to ungroup the "
             f"character. Up to {FCToolGUI._PREVIEW_ACCOUNT_CAP} characters per "
             "account — the number an EVE account holds.")
+        # Fill the observed/effective hint now; _refresh_account_controls keeps
+        # it current after account edits, and it costs nothing (stays unpacked)
+        # whenever the map cannot resolve this character.
+        self._preview_refresh_account_hint(panel)
 
     @staticmethod
     def _set_account_note(panel, text, label=""):
@@ -9394,10 +9410,63 @@ class FCToolGUI:
             stale = getattr(panel, "_note_label", "")
             if stale and len(self._preview_account_members(stale)) < cap:
                 FCToolGUI._set_account_note(panel, "")
+            # The observed/effective hint can change without a manual edit (the
+            # map resolves a character on a later tick), so refresh it on every
+            # sweep too — cheap, and unpacked whenever there is nothing to show.
+            self._preview_refresh_account_hint(panel)
             try:
                 combo.config(values=values)
             except tk.TclError:
                 continue
+
+    def _preview_refresh_account_hint(self, panel):
+        """Update one card's read-only observed/effective account hint.
+
+        This is the DISPLAY half of the read-time grouping overlay (spec §9.3),
+        deliberately kept OFF the editable combobox so no observed value can be
+        auto-committed (approach i — the no-auto-write invariant wins over
+        literally showing the effective value in the box):
+
+          * a MISMATCH — this character shares a manual account label with
+            another character the map observed on a DIFFERENT account — shows a
+            warning naming the observed account;
+          * else an UNLABELLED character with a resolvable observed account
+            shows a dim "auto:" hint naming the account it would group under;
+          * else nothing: the line is unpacked and costs no space. Every host
+            without an `_account_map` (the Characters-pane unit tests, or a
+            failed AccountMap construction) lands here, so the pane looks
+            exactly as it did before this feature.
+
+        Widget-guarded like `_set_account_note`: a card with no hint label (a
+        nameless login window never builds a picker) or a dead widget is a
+        no-op, never a raise into the caller."""
+        hint = getattr(panel, "_account_hint", None)
+        if hint is None:
+            return
+        key = getattr(panel, "_char_key", "")
+        text, colour = "", FG_DIM
+        amap = getattr(self, "_account_map", None)
+        if key and amap is not None:
+            mism = self._preview_account_mismatches()
+            if key in mism:
+                try:
+                    observed = amap.label_for_account(mism[key])
+                except Exception:
+                    observed = ""
+                if observed:
+                    text, colour = f"⚠ observed: {observed}", FG_ORANGE
+            elif not self._preview_account_of(key):
+                observed = self._preview_effective_account_of(key)
+                if observed:
+                    text = f"auto: {observed}"
+        try:
+            hint.config(text=text, fg=colour)
+            if text:
+                hint.pack(fill=tk.X, anchor=tk.W)
+            else:
+                hint.pack_forget()
+        except tk.TclError:
+            return
 
     def _refresh_single_character(self, acct: ESIAuth):
         """Refresh only a single character's panel (background thread)."""
@@ -24180,6 +24249,56 @@ class FCToolGUI:
             return ""
         return self._preview_char_accounts().get(key, "")
 
+    def _preview_effective_account_of(self, char_key) -> str:
+        """The account this character is EFFECTIVELY on: the manual
+        char_accounts label if the user set one, else the observed account's
+        label from the ground-truth map, else "".
+
+        The read-time overlay behind auto-grouping (spec §9.3). "Manual wins" is
+        STRUCTURAL, not a merge: this NEVER writes an observed account back into
+        preview.char_accounts. A character seen only through observation (never
+        hand-labelled) reaches the display and the slot seeder through THIS
+        accessor and is still absent from `_preview_char_accounts()` — the
+        stored block stays 100 % user-authored.
+
+        Guarded on the map itself: with `_account_map` None (construction
+        failed, the kill switch, or a bare unit host) this degrades to
+        manual-only — exactly today's behaviour. `account_for_char` /
+        `label_for_account` are pure reads; a fault in either degrades to "".
+        `_preview_account_of` is the single owner of the manual answer, so the
+        two can never disagree about what "manual" means."""
+        manual = self._preview_account_of(char_key)
+        if manual:
+            return manual
+        amap = getattr(self, "_account_map", None)
+        if amap is None:
+            return ""
+        try:
+            acct = amap.account_for_char(char_key)
+            if acct is None:
+                return ""
+            return amap.label_for_account(acct)
+        except Exception:
+            return ""
+
+    def _preview_account_mismatches(self) -> dict:
+        """{char_key: observed_account_id} for characters whose MANUAL grouping
+        disagrees with observation — exactly `AccountMap.mismatches` over the
+        stored (manual) grouping, which is why the manual view is passed
+        explicitly (a no-arg `mismatches()` is inert and returns {}).
+
+        A character is flagged when it shares a manual account label with
+        another character the map observed on a DIFFERENT account. Consumed by
+        the Characters-pane mismatch marker. A no-map host (or any fault)
+        yields {} — no marks, today's behaviour."""
+        amap = getattr(self, "_account_map", None)
+        if amap is None:
+            return {}
+        try:
+            return amap.mismatches(self._preview_char_accounts())
+        except Exception:
+            return {}
+
     def _preview_account_labels(self) -> list:
         """Every account label in use, sorted, one entry per account (a
         case-variant spelling is the same account — see _preview_set_char_account)."""
@@ -24315,6 +24434,12 @@ class FCToolGUI:
         character can own a saved rect without owning a size override and the
         two blocks must each pick the first member that can actually answer.
 
+        The manual grouping is seeded first; a SECOND pass then seeds accounts
+        known only by observation (the read-time overlay, spec §9.3) so an
+        auto-detected alt keeps its hand-placed position on opt-in. That pass
+        reads the ground-truth map only and never writes preview.char_accounts
+        (manual wins, structurally); it is inert when no map is present.
+
         - An EXISTING slot is never overwritten: the user has already placed
           that account's tile and this is not the moment to move it.
         - The per-character entries are never deleted (house rule: never delete
@@ -24333,9 +24458,49 @@ class FCToolGUI:
         blocks = [("layouts", 4)]
         if not cfg.get("uniform_size", True):
             blocks.append(("sizes", 2))
-        for label in self._preview_account_labels():
-            slot = prefix + label
-            members = self._preview_account_members(label)
+        # (slot key, sorted members) to seed. The MANUAL grouping first — its
+        # slots seed from their own hand-labelled members, byte-identical to the
+        # pre-overlay behaviour.
+        groups = [(prefix + label, self._preview_account_members(label))
+                  for label in self._preview_account_labels()]
+        # Then accounts known ONLY by observation (spec §9.3 read-time overlay):
+        # a character with saved geometry, no manual label, but a ground-truth
+        # account the map resolves seeds THAT account's slot, so an auto-detected
+        # alt keeps its hand-placed position when the user opts in. Reads the
+        # account map directly and NEVER writes preview.char_accounts — "manual
+        # wins" stays structural (manually-labelled keys are skipped, and an
+        # already-seeded slot is never overwritten by the unified loop below).
+        # Inert without a map, which is why the manual behaviour above is
+        # unchanged for every no-map host. Same manual→observed precedence as
+        # `_preview_effective_account_of`, resolved here in bulk.
+        amap = getattr(self, "_account_map", None)
+        if amap is not None:
+            manual_keys = set(self._preview_char_accounts())
+            candidates = set()
+            for name, _width in blocks:
+                block = cfg.get(name)
+                if not isinstance(block, dict):
+                    continue
+                for k in block:
+                    if not isinstance(k, str) or k.startswith(prefix):
+                        continue
+                    nk = k.strip().lower()
+                    if nk and nk not in manual_keys:
+                        candidates.add(nk)  # manual wins; never observed-seeded
+            observed: dict = {}
+            for nk in candidates:
+                try:
+                    acct = amap.account_for_char(nk)
+                    if acct is None:
+                        continue
+                    label = amap.label_for_account(acct)
+                except Exception:
+                    continue
+                if label:
+                    observed.setdefault(label, []).append(nk)
+            for label, members in observed.items():
+                groups.append((prefix + label, sorted(members)))
+        for slot, members in groups:
             for name, width in blocks:
                 block = cfg.get(name)
                 if not isinstance(block, dict) or slot in block:
