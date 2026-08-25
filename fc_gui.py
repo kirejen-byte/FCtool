@@ -18025,8 +18025,14 @@ class FCToolGUI:
             self.root, char_key, self._preview_palette(),
             on_activate=lambda k, h=src_hwnd: self._preview_on_tile_activate(k, h),
             on_minimize=lambda k, h=src_hwnd: self._preview_on_tile_minimize(k, h),
-            on_move_end=self._preview_on_tile_move_end,
-            on_resize_end=self._preview_on_tile_resize_end,
+            # Move/resize write-backs: pass the hwnd like activate/minimize/exclude
+            # do (the by-hwnd invariant). Login windows all share char key "" so a
+            # login tile's drag/resize is only addressable by hwnd; the handlers
+            # resolve it to the client's IDENTITY (login:<id>) and persist its rect
+            # under that per-account namespace. A logged-in char resolves to its
+            # own key, so a real pilot's move/resize stays byte-identical.
+            on_move_end=lambda k, x, y, h=src_hwnd: self._preview_on_tile_move_end(k, x, y, h),
+            on_resize_end=lambda k, w, bh, h=src_hwnd: self._preview_on_tile_resize_end(k, w, bh, hwnd=h),
             # C4: Shift+Left. Pass the hwnd like activate/minimize do — login
             # windows all share char key "" so a login tile is only addressable
             # by hwnd (the by-hwnd invariant); _preview_on_tile_exclude resolves
@@ -18483,19 +18489,35 @@ class FCToolGUI:
         if hwnd:
             window_activator.activate(hwnd)
 
-    def _preview_on_tile_move_end(self, key, x, y):
-        if not key:
-            return
+    def _preview_on_tile_move_end(self, key, x, y, hwnd=None):
+        # Resolve the tile's IDENTITY — the handle its geometry is stored under
+        # (design §9.1) — hwnd-first. Login windows all share char key "" (the
+        # by-hwnd invariant, the same collision activate/exclude handle), so the
+        # tile's client hwnd → its live ClientWindow → identity is the only way
+        # to tell one login from another: login:<id> for an accounted login, the
+        # char key for a logged-in pilot, "" for an unknown-account login. Without
+        # a hwnd (direct-wired unit hosts) fall back to the key scan, which
+        # reproduces the pre-identity behaviour exactly — a char key is unique and
+        # an empty key early-returns just below.
+        client = self._preview_clients.get(hwnd) if hwnd is not None else None
+        if client is not None:
+            ident = client.identity
+        else:
+            ident = key
+            for c in self._preview_clients.values():
+                if c.key == key:
+                    client = c
+                    break
+        if not ident:
+            return          # unknown login ("") / empty char key: nothing per-account to persist
         cfg = self._preview_cfg()
         w = cfg.get("tile_w", 384)
         body_h = cfg.get("tile_body_h", 216)
-        hwnd = None
-        tile = None
-        for c in self._preview_clients.values():
-            if c.key == key:
-                hwnd = c.hwnd
-                tile = self._preview_tiles.get(c.hwnd)
-                break
+        # The live tile (for its true size) and the rect-registry entry both key
+        # off the CLIENT hwnd — _preview_tile_rects / _preview_tiles are hwnd-keyed,
+        # never identity-keyed (two same-account windows are two distinct tiles).
+        rect_hwnd = client.hwnd if client is not None else None
+        tile = self._preview_tiles.get(rect_hwnd) if rect_hwnd is not None else None
         if tile is not None:
             w = getattr(tile, "_w", w) or w
             body_h = getattr(tile, "_body_h", body_h) or body_h
@@ -18504,10 +18526,10 @@ class FCToolGUI:
         # fallback above, so flooring keeps the saved rect legal without adding
         # a second write path (this remains the ONE move write-back).
         w, body_h = preview_layout.clamp_size(w, body_h)
-        cfg.setdefault("layouts", {})[self._preview_layout_key(key)] = [
+        cfg.setdefault("layouts", {})[self._preview_layout_key(ident)] = [
             int(x), int(y), int(w), int(body_h)]
-        if hwnd is not None:
-            self._preview_tile_rects[hwnd] = (int(x), int(y), int(w), int(body_h))
+        if rect_hwnd is not None:
+            self._preview_tile_rects[rect_hwnd] = (int(x), int(y), int(w), int(body_h))
         self._save_config()
 
     def _preview_apply_tile_size(self, hwnd, tile, key, cfg):
@@ -18554,7 +18576,7 @@ class FCToolGUI:
             return preview_layout.clamp_size(override[0], override[1])
         return preview_layout.clamp_size(gw, gh)
 
-    def _preview_on_tile_resize_end(self, key, w, body_h, *, save=True):
+    def _preview_on_tile_resize_end(self, key, w, body_h, hwnd=None, *, save=True):
         """Persist a finished tile resize (corner-hover OR the legacy Ctrl/L+R
         drag — both land here). Branches on uniform_size:
           - True  (EVE-O parity): update the GLOBAL tile_w/tile_body_h so the next
@@ -18577,9 +18599,20 @@ class FCToolGUI:
         default; the auto-fit pass calls this once per tile inside a single Tk
         tick and under `uniform_size` saves 2..N would re-serialize the whole
         config to disk to persist byte-identical global keys. It issues one
-        save of its own at the end instead."""
-        if not key:
-            return
+        save of its own at the end instead.
+
+        `hwnd` is the tile's client hwnd, threaded from the on_resize_end closure
+        (the by-hwnd invariant). It resolves the tile's IDENTITY — the key the
+        layout/size is stored under — hwnd-first: login windows all share char
+        key "" so a login tile's resize is only addressable by hwnd, and its rect
+        persists under login:<id>. A logged-in char resolves to its own key
+        (byte-identical). hwnd=None (the auto-fit pass, direct-wired hosts) falls
+        back to the char key, which already IS the identity for a real pilot; an
+        unknown-account login (identity "") early-returns, persisting nothing."""
+        client = self._preview_clients.get(hwnd) if hwnd is not None else None
+        ident = client.identity if client is not None else key
+        if not ident:
+            return          # unknown login ("") / empty char key: nothing per-account to persist
         cfg = self._preview_cfg()
         # Floor at the persistence boundary too. preview_tile's drag paths
         # already clamp through the same preview_layout.clamp_size, so this is
@@ -18619,7 +18652,7 @@ class FCToolGUI:
                 except tk.TclError:
                     pass
         else:
-            cfg.setdefault("sizes", {})[self._preview_layout_key(key)] = [
+            cfg.setdefault("sizes", {})[self._preview_layout_key(ident)] = [
                 w, body_h]
         # The POSITION this write-back preserves (a resize never moves a tile —
         # a corner grab that shifts the origin commits it through on_move_end
@@ -18635,34 +18668,39 @@ class FCToolGUI:
         # user's placement was silently gone. The (10, 10) fallback is kept for
         # the genuinely-unknown case — no registry entry either.
         layouts = cfg.setdefault("layouts", {})
-        lkey = self._preview_layout_key(key)
-        hwnd = None
-        for c in self._preview_clients.values():
-            # Only an hwnd that still HAS a live tile may own a rect entry. The
-            # auto-fit pass calls this with `_preview_clients` one tick stale (it
+        lkey = self._preview_layout_key(ident)
+        # The live-tile hwnd whose on-screen rect this resize preserves. Only an
+        # hwnd that still HAS a live tile may own a rect entry — a STALE entry is
+        # an invisible snap magnet (and FC HUD merge candidate) parked at a dead
+        # tile's position, the inverse face of the "every tile-placement path
+        # updates _preview_tile_rects" invariant.
+        if hwnd is not None:
+            # Closure-supplied client hwnd (the by-hwnd path — a login's "" key
+            # cannot disambiguate one login from another, so the key scan below
+            # would pick the WRONG login). Honour it only while it still has a tile.
+            rect_hwnd = hwnd if hwnd in self._preview_tiles else None
+        else:
+            # Legacy hwnd-None callers (the auto-fit pass, direct-wired hosts).
+            # The fit pass calls this with `_preview_clients` one tick stale (it
             # is published at the END of the tick), so a client that restarted
-            # this very tick still lists its RETIRED hwnd under the same char
-            # key — and _preview_retire_tile has already popped that hwnd's rect.
-            # Writing it back would re-create a phantom entry nothing ever pops
-            # again: an invisible snap magnet (and FC HUD merge candidate) parked
-            # at a dead tile's position for the rest of the session. This is the
-            # inverse face of the "every tile-placement path must update
-            # _preview_tile_rects" invariant — a STALE entry is as bad as a
-            # missing one. Keep scanning past a dead hwnd so the live tile for
-            # the same key still gets its rect. The same liveness test picks the
-            # hwnd whose registry rect is read below.
-            if c.key == key and c.hwnd in self._preview_tiles:
-                hwnd = c.hwnd
-                break
-        rect = self._preview_tile_rects.get(hwnd) if hwnd is not None else None
+            # this very tick still lists its RETIRED hwnd under the same char key
+            # — and _preview_retire_tile has already popped that hwnd's rect.
+            # Keep scanning past a dead hwnd so the live tile for the same key
+            # still gets its rect (char keys are unique, so this stays correct).
+            rect_hwnd = None
+            for c in self._preview_clients.values():
+                if c.key == key and c.hwnd in self._preview_tiles:
+                    rect_hwnd = c.hwnd
+                    break
+        rect = self._preview_tile_rects.get(rect_hwnd) if rect_hwnd is not None else None
         if rect is not None and len(rect) >= 4:
             x, y = int(rect[0]), int(rect[1])
         else:
             prev = layouts.get(lkey) or [10, 10, w, body_h]
             x, y = int(prev[0]), int(prev[1])
         layouts[lkey] = [x, y, w, body_h]
-        if hwnd is not None:
-            self._preview_tile_rects[hwnd] = (x, y, w, body_h)
+        if rect_hwnd is not None:
+            self._preview_tile_rects[rect_hwnd] = (x, y, w, body_h)
         if save:
             self._save_config()
 
