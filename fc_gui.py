@@ -17585,6 +17585,14 @@ class FCToolGUI:
         # by default would re-point every existing user's hand-placed grid on
         # their behalf. _preview_layout_key is the one place it is read.
         "account_slots": False,
+        # With account_slots on, ALSO route a character FCTool has only OBSERVED
+        # onto an account (detected from the EVE client, never hand-labelled in
+        # the Characters tab) into that account's slot -- through the read-time
+        # effective view (_preview_effective_account_of) instead of the
+        # manual-only map. DEFAULT OFF: an observed grouping is a best guess, so
+        # opting a live tile's POSITION onto it is the user's call. Inert unless
+        # account_slots is on -- _preview_layout_key reads it only past that gate.
+        "account_slots_auto": False,
         # ── Account identity (design §10) ───────────────────────────────────
         # Master switch for the ground-truth account<->character map
         # (eve_account.AccountMap): read each EVE client's OWN command line for
@@ -18890,6 +18898,22 @@ class FCToolGUI:
         self._preview_sync_native_widgets()
         if bool(cfg.get("fit_height", False)) and not was:
             self._preview_fit_tile_heights(cfg, force=True)
+
+    def _preview_toggle_account_slots(self):
+        """Settings "Keep preview position per account" command: persist through
+        the standard native apply (which ALSO seeds the slots on the OFF->ON
+        edge), then re-gate the dependent "Auto-slot detected accounts" checkbox.
+
+        Auto-slot does nothing while the master is off (`_preview_layout_key`
+        returns before it reads the auto flag), so it greys out with the master
+        and un-greys when the master comes back -- the same dependent-control
+        shape as the Tile "h" Spinbox under "Fit height". One owner for that
+        state lives in `_preview_sync_native_widgets`; this command is the hook
+        that re-runs it live on the master's toggle (a plain
+        `_preview_apply_native_state` command would persist the flag but leave
+        the auto box stale until the next mode switch or rebuild)."""
+        self._preview_apply_native_state()
+        self._preview_sync_native_widgets()
 
     def _preview_probe_foreground(self):
         """The raw foreground hwnd via the injectable `_preview_foreground_hwnd`
@@ -21782,7 +21806,7 @@ class FCToolGUI:
         cbacct = tk.Checkbutton(
             rowSnap, text="Keep preview position per account",
             variable=self._preview_account_slots_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
+            command=self._preview_toggle_account_slots, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
         cbacct.grid(row=0, column=1, padx=(0, 8))
@@ -21794,6 +21818,30 @@ class FCToolGUI:
                      "last one was — and the window keeps that spot while it "
                      "sits on the character-select screen. Off: every character "
                      "remembers its own position.")
+
+        # Auto-slot detected accounts: with the box above on, ALSO position a
+        # character FCTool has only OBSERVED on an account (never hand-labelled in
+        # the Characters tab) at that account's shared slot, the same as a
+        # labelled one. Depends on the master above -- greyed while it is off (see
+        # _preview_sync_native_widgets), which is why the master's command re-gates
+        # through _preview_toggle_account_slots. Persists via the native var map.
+        self._preview_account_slots_auto_var = tk.BooleanVar(
+            value=bool(pcfg.get("account_slots_auto", False)))
+        cbacctauto = tk.Checkbutton(
+            rowSnap, text="Auto-slot detected accounts",
+            variable=self._preview_account_slots_auto_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbacctauto.grid(row=0, column=2, padx=(0, 8))
+        w.append(cbacctauto)
+        self._preview_account_slots_auto_check = cbacctauto
+        _tip(cbacctauto, "Position previews for characters FCTool detected on an "
+                         "account — but you never labelled — at that account's "
+                         "shared slot, just like labelled ones. Needs 'Keep "
+                         "preview position per account' on. A detected grouping "
+                         "is a best guess from the EVE client, so this is off by "
+                         "default. Takes effect as each preview next appears.")
 
         # Decloak alert — when one of YOUR chars is decloaked (proximity or a
         # Mobile Observatory), read from your own combat logs, its tile flashes
@@ -22278,6 +22326,19 @@ class FCToolGUI:
                                         else "disabled"))
             except tk.TclError:
                 pass
+        # Second dependent gate, same shape as spin_h: "Auto-slot detected
+        # accounts" only has an effect while "Keep preview position per account"
+        # is on (_preview_layout_key returns before it reads the auto flag), so
+        # grey it out with the master. Applied after the bulk loop, which sets
+        # every native widget to "normal" in native mode.
+        acct_auto = getattr(self, "_preview_account_slots_auto_check", None)
+        if acct_auto is not None:
+            try:
+                acct_auto.configure(state=("normal" if state == "normal"
+                                           and cfg.get("account_slots")
+                                           else "disabled"))
+            except tk.TclError:
+                pass
 
     def _preview_sync_anchor_enabled(self):
         """Grey out the shared Position (anchor) control in native mode.
@@ -22388,6 +22449,7 @@ class FCToolGUI:
         ("_preview_decloak_flash_var", "decloak_flash", bool),
         ("_preview_decloak_audio_var", "decloak_audio", bool),
         ("_preview_account_slots_var", "account_slots", bool),
+        ("_preview_account_slots_auto_var", "account_slots_auto", bool),
         ("_preview_hotkeys_eve_only_var", "hotkeys_eve_only", bool),
     )
 
@@ -24435,6 +24497,16 @@ class FCToolGUI:
         returns `char_key` UNCHANGED, which is what makes the feature
         byte-identical to not existing: same keys read, same keys written.
 
+        With `account_slots_auto` ALSO on, the label comes from the EFFECTIVE
+        (manual-else-observed) account, so a character FCTool has only observed
+        on an account -- never hand-labelled -- shares that account's slot too.
+        The effective view is manual-first, so a hand-labelled character is
+        byte-identical either way -- manual always wins. Auto off (the default)
+        keeps the manual-only answer, byte-identical to before this option
+        existed. A tile re-routes to its slot on its next spawn/rekey/resize, so
+        turning this on mid-session moves an already-drawn observed-only tile
+        only when it is next touched -- accepted, not chased.
+
         EVERY reader and writer of those two blocks asks this first. A site
         that skips it writes where nothing reads (or reads where nothing
         writes), and the symptom is a preview that teleports on the next start
@@ -24451,23 +24523,34 @@ class FCToolGUI:
         the answer straight to layouts.get()/layouts[...], so normalizing here
         would silently relocate an existing entry.
 
-        The FLAG read -- and only the flag read -- goes to the RAW block rather
-        than through `_preview_cfg()`: that accessor materializes every absent
-        default INTO the block, and this method is asked on the per-tick size
-        path (`_preview_resolve_size`), where the auto-fit pass owes a
+        Both FLAG reads -- `account_slots` and `account_slots_auto`, and only
+        the flag reads -- go to the RAW block rather than through
+        `_preview_cfg()`: that accessor materializes every absent default INTO
+        the block, and this method is asked on the per-tick size path
+        (`_preview_resolve_size`), where the auto-fit pass owes a
         write-nothing-on-unchanged contract a defaults fill silently breaks. An
         absent key reads as absent, which is exactly this feature's default --
-        off -- so the OFF answer costs no write. The LABEL lookup below is NOT
-        raw: `_preview_account_of` reaches `_preview_cfg()` and will fill the
-        block. That is deliberate and harmless -- reaching it means the flag is
-        already ON, which only happens once the panel has written the key, and
-        every caller on the per-tick path is holding a `_preview_cfg()` dict of
-        its own by then -- but do not read the paragraph above as covering
-        it."""
+        off -- so the OFF answer costs no write. `account_slots_auto` is read
+        only PAST the `account_slots` gate, so an auto=on config can never drag
+        the write-nothing OFF path into a fill. The LABEL lookup below is NOT
+        raw: `_preview_account_of` (or, on the auto path,
+        `_preview_effective_account_of`) reaches `_preview_cfg()` and will fill
+        the block. That is deliberate and harmless -- reaching it means
+        `account_slots` is already ON, which only happens once the panel has
+        written the key, and every caller on the per-tick path is holding a
+        `_preview_cfg()` dict of its own by then -- but do not read the
+        paragraph above as covering it."""
         block = self.config.get("preview")
         if not (isinstance(block, dict) and block.get("account_slots", False)):
             return char_key                 # off: today's behaviour, exactly
-        label = self._preview_account_of(char_key)
+        if block.get("account_slots_auto", False):
+            # Auto-slot on: an observed-only character (detected on an account
+            # but never hand-labelled) routes to that account's slot too. The
+            # effective view is manual-first, so a hand-labelled character is
+            # byte-identical to the manual branch below -- manual still wins.
+            label = self._preview_effective_account_of(char_key)
+        else:
+            label = self._preview_account_of(char_key)
         if not label:
             return char_key                 # ungrouped stays per-character
         return FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX + label
