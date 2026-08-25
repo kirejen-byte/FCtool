@@ -4,6 +4,14 @@ from __future__ import annotations
 
 EDGE_SNAP_MIN = 20          # EVE-O parity: max(20, w // 10)
 LOGIN_STACK_STEP = 24
+# A cycle-group member naming a whole ACCOUNT by its numeric id (design §9.4),
+# e.g. "acct:2499436". EVE character names cannot contain ":", so this token can
+# never collide with a char key. THE single owner of the cycle-member account
+# token format — fc_gui builds/parses it through resolve_cycle_members and this
+# constant, never a bare literal. (Distinct in ROLE from fc_gui's account-SLOT
+# layout prefix, which happens to share the "acct:" text but keys layouts by
+# account LABEL, not id, in a different store.)
+ACCT_MEMBER_PREFIX = "acct:"
 CLAMP_MIN_VISIBLE_PX = 40   # clamp_visible: min on-desktop overlap (both axes) to leave a rect alone
 SNAP_THRESHOLD_PX = 12      # snap_rect: max px gap at which an edge sticks to a neighbour's edge
 # clamp_size: the tile-size floor. THE single definition for the whole FCPreview
@@ -556,3 +564,52 @@ def cycle_next(order, current, live, direction, strict=False):
         return ring[0]
     i = ring.index(current)
     return ring[(i + direction) % len(ring)]
+
+
+def resolve_cycle_members(members, live_identities, char_for_account):
+    """Resolve cycle-group member tokens to live-client identities (design §9.4).
+
+    `members` are already-normalized tokens (``str(m).strip().lower()``), each
+    either a character key or an ``acct:<id>`` account token. `live_identities`
+    is the set of identities currently on screen — a logged-in char's identity
+    IS its key, an accounted login screen is ``login:<id>``, an unknown-account
+    login is excluded (identity ``""``). `char_for_account` is a callable
+    ``(account_id:int) -> char_key | None``: inject ``AccountMap.char_for_account``
+    in production, or ``lambda _id: None`` when account identity is off / the map
+    is absent (char-only resolution runs the SAME code path). Pure — this module
+    imports neither the account service nor Tk.
+
+    Per member, in order (order preserved, duplicates left untouched):
+      * a character-key member -> itself iff it is a live identity, else dropped;
+      * an ``acct:<id>`` member -> that account's live character key when
+        ``char_for_account(<id>)`` names one that is live; else the account's
+        ``login:<id>`` tile when THAT is live; else dropped. **The character WINS
+        over the login** when both resolve for one account.
+      * an ``acct:`` token whose id is missing or non-integer -> dropped.
+
+    Returns the resolved identity list. ``cycle_next(strict=True)`` re-filters it
+    against the live set, so a non-live char dropped here versus dropped by the
+    ring are equivalent; dropping here keeps the intent explicit AND makes the
+    login fallback correct — only a LIVE login survives, and only when no live
+    char on the account outranks it.
+    """
+    resolved = []
+    for m in members:
+        if m.startswith(ACCT_MEMBER_PREFIX):
+            try:
+                account_id = int(m[len(ACCT_MEMBER_PREFIX):])
+            except (TypeError, ValueError):
+                continue                                  # acct:<not-an-int> -> drop
+            char = char_for_account(account_id)
+            if isinstance(char, str):
+                char = char.strip().lower()
+            if char and char in live_identities:
+                resolved.append(char)                     # char WINS over login
+                continue
+            login = "login:%d" % account_id
+            if login in live_identities:
+                resolved.append(login)
+            # neither the account's char nor its login is live -> drop it
+        elif m in live_identities:
+            resolved.append(m)
+    return resolved

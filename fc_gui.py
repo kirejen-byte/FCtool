@@ -17909,7 +17909,11 @@ class FCToolGUI:
             on_minimize=lambda k, h=src_hwnd: self._preview_on_tile_minimize(k, h),
             on_move_end=self._preview_on_tile_move_end,
             on_resize_end=self._preview_on_tile_resize_end,
-            on_exclude=self._preview_on_tile_exclude,             # C4: Shift+Left
+            # C4: Shift+Left. Pass the hwnd like activate/minimize do — login
+            # windows all share char key "" so a login tile is only addressable
+            # by hwnd (the by-hwnd invariant); _preview_on_tile_exclude resolves
+            # it to the client's IDENTITY (login:<id>) so logins become excludable.
+            on_exclude=lambda k, h=src_hwnd: self._preview_on_tile_exclude(k, h),
             on_switch_external=self._preview_on_tile_switch_external,  # C4: Ctrl+Shift+Left
             # Snap-to-neighbours provider (see _snap_others above):
             # _preview_tile_rects stores (x, y, w, body_h); the tile converts to
@@ -18036,9 +18040,16 @@ class FCToolGUI:
         idx = len(self._preview_tiles)
         return (10 + idx * 24, 10 + idx * 24, w, body_h)
 
-    def _preview_style_tile(self, tile, key, cfg):
+    def _preview_style_tile(self, tile, ident, cfg):
         """Apply opacity + hover-zoom config and the active flag to one tile
-        (Task C1). Guarded so recording fakes without these hooks stay no-ops."""
+        (Task C1). Guarded so recording fakes without these hooks stay no-ops.
+
+        `ident` is the tile's IDENTITY (design §9.4), not its char key: for a
+        logged-in char the two are equal so the active-flag / exclusion-badge
+        comparisons below are byte-identical, while an accounted login tile
+        (identity login:<id>) now reflects its own cycle exclusion. A login
+        identity never equals _preview_last_key (only ever a char key or ""), so
+        set_active stays False for logins exactly as before."""
         conf_hover = getattr(tile, "configure_hover", None)
         if conf_hover is not None:
             conf_hover(inactive=float(cfg.get("opacity_inactive", 0.85)),
@@ -18050,7 +18061,7 @@ class FCToolGUI:
                       anchor=str(cfg.get("zoom_anchor", "nw")))
         set_active = getattr(tile, "set_active", None)
         if set_active is not None:
-            set_active(bool(key) and key == self._preview_last_key)
+            set_active(bool(ident) and ident == self._preview_last_key)
         # caption-onvideo: push the on-video label style from config['overlay']
         # (color/font_size/anchor) so a freshly-spawned tile already matches the
         # saved settings; live edits go through _overlay_apply_style → all tiles.
@@ -18073,7 +18084,7 @@ class FCToolGUI:
         # C4: keep the cycle-exclusion badge in sync (survives retire/respawn).
         set_excluded = getattr(tile, "set_excluded", None)
         if set_excluded is not None:
-            set_excluded(bool(key) and key in self._preview_excluded)
+            set_excluded(bool(ident) and ident in self._preview_excluded)
 
     def _preview_spawn_tile(self, client):
         cfg = self._preview_cfg()
@@ -18101,7 +18112,7 @@ class FCToolGUI:
         retry = getattr(self, "_preview_spawn_retry", None)
         if retry:
             retry.pop(client.hwnd, None)               # attached → healthy again
-        self._preview_style_tile(tile, client.key, cfg)
+        self._preview_style_tile(tile, client.identity, cfg)
 
     def _preview_note_stranded(self, client):
         """Book a client whose tile could not be created for a later attempt.
@@ -18315,24 +18326,35 @@ class FCToolGUI:
                 window_activator.minimize(c.hwnd)
                 return
 
-    def _preview_on_tile_exclude(self, key):
-        """Shift+Left on a tile: toggle that character's session-only exclusion
-        from hotkey cycling (C4). Excluded keys are skipped by cycle_next (the
-        drain passes live_keys - excluded). Purely in-memory: nothing is written
-        to config, so it resets each session. Pushes the strip badge to the tile."""
-        if not key:
+    def _preview_on_tile_exclude(self, key, hwnd=None):
+        """Shift+Left on a tile: toggle that client's session-only exclusion from
+        hotkey cycling (C4). Excluded IDENTITIES are skipped by the cycle drain
+        (it passes live - excluded). Purely in-memory: nothing is written to
+        config, so it resets each session. Pushes the strip badge to the tile.
+
+        Keyed by IDENTITY (design §9.4), resolved hwnd-first: login windows all
+        share char key "" (the same collision activate/minimize handle by hwnd),
+        so a login tile is excludable only via its hwnd -> identity login:<id>.
+        A logged-in char's identity IS its key, so an existing char exclusion is
+        byte-identical and the legacy key-only call (hwnd=None) still works."""
+        client = self._preview_clients.get(hwnd) if hwnd is not None else None
+        ident = client.identity if client is not None else key
+        if not ident:
             return
-        if key in self._preview_excluded:
-            self._preview_excluded.discard(key)
+        if ident in self._preview_excluded:
+            self._preview_excluded.discard(ident)
         else:
-            self._preview_excluded.add(key)
-        excluded = key in self._preview_excluded
-        for c in self._preview_clients.values():
-            if c.key == key:
-                tile = self._preview_tiles.get(c.hwnd)
-                if tile is not None and hasattr(tile, "set_excluded"):
-                    tile.set_excluded(excluded)
-                break
+            self._preview_excluded.add(ident)
+        excluded = ident in self._preview_excluded
+        # Badge push, hwnd-first (a login "" would never match by identity==key).
+        tile = self._preview_tiles.get(hwnd) if hwnd is not None else None
+        if tile is None:
+            for c in self._preview_clients.values():
+                if c.identity == ident:
+                    tile = self._preview_tiles.get(c.hwnd)
+                    break
+        if tile is not None and hasattr(tile, "set_excluded"):
+            tile.set_excluded(excluded)
 
     def _preview_on_tile_switch_external(self):
         """Ctrl+Shift+Left on a tile: focus the last non-EVE, non-ours window the
@@ -18902,25 +18924,48 @@ class FCToolGUI:
                 if not (0 <= group < len(groups)):
                     continue                            # stale / out-of-range group → ignore
                 g = groups[group]
-                # C4: skip session-excluded characters (Shift+Left toggles them).
-                live_keys = set(by_key) - self._preview_excluded
-                # Anchor on the REAL foreground client (manual alt-tabs move focus
-                # out from under _preview_last_key); fall back to the last switch.
-                # Debounced against a still-in-flight hotkey switch of our own —
-                # see _preview_anchor_key.
-                anchor = self._preview_anchor_key(by_key)
                 members = [str(m).strip().lower()
                            for m in g.get("members", []) if str(m).strip()]
                 if members:
-                    # STRICT: members-only ring, member order = cycle order, no extras.
+                    # STRICT members-present path (design §9.4): resolve every
+                    # member — a char key OR an acct:<id> token — against the LIVE
+                    # IDENTITY map, so an accounted login screen (identity
+                    # login:<id>) can be a member and a focused login anchors.
+                    # acct:<id> -> the account's live char, else its login tile
+                    # (char WINS); the resolver is pure and the engine unchanged.
+                    # _account_map absent (synthetic tick-test host) or None
+                    # (construction failed) -> char-only resolution, same path.
+                    # C4 exclusion keys by IDENTITY here (char identity == key, so
+                    # char exclusions are unaffected; this only ADDS login:<id>).
+                    by_identity = {c.identity: c for c in live if c.identity}
+                    live_ids = set(by_identity) - self._preview_excluded
+                    amap = getattr(self, "_account_map", None)
+                    char_for_account = (amap.char_for_account if amap is not None
+                                        else (lambda _id: None))
+                    resolved = preview_layout.resolve_cycle_members(
+                        members, live_ids, char_for_account)
+                    # Anchor as an IDENTITY: _preview_anchor_key is agnostic to
+                    # what its map is keyed by (it matches the foreground hwnd and
+                    # falls back to the char-key pending-switch record /
+                    # _preview_last_key, both valid identities since a char's
+                    # identity IS its key), so feeding it by_identity yields the
+                    # foreground identity with the SAME debounce and NO second
+                    # copy of that logic. The cycle-all branch below is untouched.
+                    anchor = self._preview_anchor_key(by_identity)
                     nxt = preview_layout.cycle_next(
-                        members, anchor, live_keys, direction, strict=True)
+                        resolved, anchor, live_ids, direction, strict=True)
+                    c = by_identity.get(nxt)
                 else:
-                    # Empty members → legacy cycle-all (Proopai empty-order convention).
+                    # Empty members → legacy cycle-all — UNCHANGED, byte-identical:
+                    # char-only by_key, the same order/live_keys/key-anchor and
+                    # by_key.get. Login screens never auto-join cycle-all; only an
+                    # explicit acct:<id> member (above) brings one into a ring.
+                    live_keys = set(by_key) - self._preview_excluded
+                    anchor = self._preview_anchor_key(by_key)
                     order = g.get("order", [])
                     nxt = preview_layout.cycle_next(
                         order, anchor, live_keys, direction)
-                c = by_key.get(nxt)
+                    c = by_key.get(nxt)
                 if c is not None:
                     self._preview_hotkey_switch_to(c)   # C3: minimize-inactive aware
             elif kind == "minall":
@@ -19850,7 +19895,9 @@ class FCToolGUI:
                                    else ("login screen" if client.is_login else None))
                     # C1: keep opacity/zoom config + active flag current. The
                     # active tile (last-activated client) rests at hover opacity.
-                    self._preview_style_tile(tile, client.key, cfg)
+                    # Identity (not key) so a login tile reflects its own C4
+                    # exclusion; identical for chars (identity == key).
+                    self._preview_style_tile(tile, client.identity, cfg)
                     # Uniform/individual sizing: re-place the tile if its resolved
                     # target size drifted from what it currently shows (e.g. a
                     # uniform_size resize on another tile bumped the global size, or
@@ -23124,6 +23171,30 @@ class FCToolGUI:
                      if not c.is_login and c.key}
         sel = [0 if working else None]        # selected group index (or None)
 
+        # Account roster (design §9.5): a member may be an acct:<id> token, and
+        # the dialog also edits per-account aliases. Guarded — absent/None map
+        # (headless test host or a failed construction) hides both features.
+        amap = getattr(self, "_account_map", None)
+        acct_prefix = preview_layout.ACCT_MEMBER_PREFIX
+
+        def _acct_label(account_id):
+            try:
+                return (amap.label_for_account(account_id) if amap is not None
+                        else f"Account {account_id}")
+            except Exception:
+                return f"Account {account_id}"
+
+        def _member_display(token):
+            # Render a stored member token: an acct:<id> shows its label, a char
+            # key shows verbatim (its running-state suffix is added by the caller).
+            if token.startswith(acct_prefix):
+                try:
+                    aid = int(token[len(acct_prefix):])
+                except (TypeError, ValueError):
+                    return token
+                return f"{_acct_label(aid)}  [account]"
+            return token
+
         win = tk.Toplevel(self.root)
         win.title("Cycle groups")
         make_modal(win, self.root, base_bg=BG_DARK)
@@ -23249,6 +23320,39 @@ class FCToolGUI:
         tk.Label(right, text="(no members = cycles ALL clients)", bg=BG_PANEL,
                  fg=FG_DIM, font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
 
+        # ── Account aliases (design §9.5) ────────────────────────────────────
+        # Per known account: a friendly name written to preview.account_aliases
+        # on OK (empty deletes → auto label). Flushed in _ok alongside groups.
+        win._account_alias_vars = {}
+        if amap is not None:
+            try:
+                alias_accounts = amap.known_accounts()
+            except Exception:
+                alias_accounts = []
+            if alias_accounts:
+                cur_aliases = dict(cfg.get("account_aliases") or {})
+                af = tk.LabelFrame(win, text="Account names", bg=BG_PANEL,
+                                   fg=FG_TEXT, font=("Consolas", 9))
+                af.pack(fill=tk.X, padx=10, pady=(6, 0))
+                tk.Label(af, text="Blank = auto (last-active pilot, else "
+                         "\"Account <id>\").", bg=BG_PANEL, fg=FG_DIM,
+                         font=("Consolas", 8), justify=tk.LEFT).grid(
+                             row=0, column=0, columnspan=3, sticky="w",
+                             padx=4, pady=(2, 4))
+                for r, aid in enumerate(alias_accounts, start=1):
+                    tk.Label(af, text=str(aid), bg=BG_PANEL, fg=FG_DIM,
+                             font=("Consolas", 9), width=12, anchor="w").grid(
+                                 row=r, column=0, sticky="w", padx=4, pady=1)
+                    avar = tk.StringVar(value=str(cur_aliases.get(str(aid), "")))
+                    tk.Entry(af, textvariable=avar, font=("Consolas", 9),
+                             bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
+                             width=22).grid(row=r, column=1, sticky="w",
+                                            padx=2, pady=1)
+                    tk.Label(af, text=f"→ {_acct_label(aid)}", bg=BG_PANEL,
+                             fg=FG_DIM, font=("Consolas", 8), anchor="w").grid(
+                                 row=r, column=2, sticky="w", padx=4)
+                    win._account_alias_vars[aid] = avar
+
         win._error_lbl = tk.Label(win, text="", bg=BG_PANEL, fg=FG_ORANGE,
                                   font=("Consolas", 9), justify=tk.LEFT,
                                   wraplength=520)
@@ -23282,8 +23386,12 @@ class FCToolGUI:
             if i is None or not (0 <= i < len(working)):
                 return
             for key in working[i].get("members", []):
-                suffix = "" if key in live_keys else "   (not running)"
-                win._member_listbox.insert(tk.END, f"{key}{suffix}")
+                if key.startswith(acct_prefix):
+                    # An account member has no single running state; label it.
+                    win._member_listbox.insert(tk.END, _member_display(key))
+                else:
+                    suffix = "" if key in live_keys else "   (not running)"
+                    win._member_listbox.insert(tk.END, f"{key}{suffix}")
 
         def _refresh_combo():
             i = sel[0]
@@ -23293,7 +23401,22 @@ class FCToolGUI:
                 known = self._preview_all_known_chars()
             except Exception:
                 known = set()
-            win._member_combo["values"] = sorted(known - current)
+            # display text -> stored token. Char entries: display == token ==
+            # char key. Account entries (design §9.5): "<label>  [account]" ->
+            # acct:<id>, so the picker offers whole accounts by their label.
+            disp_to_token = {k: k for k in (known - current)}
+            if amap is not None:
+                try:
+                    accounts = amap.known_accounts()
+                except Exception:
+                    accounts = []
+                for aid in accounts:
+                    token = f"{acct_prefix}{aid}"
+                    if token in current:
+                        continue
+                    disp_to_token[f"{_acct_label(aid)}  [account]"] = token
+            win._member_value_by_display = disp_to_token
+            win._member_combo["values"] = sorted(disp_to_token)
 
         def _set_right_enabled(on):
             for wdg in (win._name_entry, win._next_entry, win._prev_entry,
@@ -23371,9 +23494,13 @@ class FCToolGUI:
             i = sel[0]
             if i is None or not (0 <= i < len(working)):
                 return
-            raw = win._member_combo.get().strip().lower()
-            if not raw:
+            disp = win._member_combo.get().strip()
+            if not disp:
                 return
+            # Map the picked display back to its token (an account label ->
+            # acct:<id>); a typed value not in the map is taken as a char key.
+            mapping = getattr(win, "_member_value_by_display", {})
+            raw = mapping.get(disp) or disp.lower()
             members = working[i].setdefault("members", [])
             if raw not in members:            # duplicate-in-group → silent no-op
                 members.append(raw)
@@ -23503,6 +23630,17 @@ class FCToolGUI:
                 win._error_lbl.config(text="  •  ".join(msgs), fg=FG_ORANGE)
                 return
             hk["groups"] = working
+            # Account aliases (design §9.5): write user names, empty deletes so
+            # the account falls back to its auto label. Normalized like labels.
+            avars = getattr(win, "_account_alias_vars", {})
+            if avars:
+                aliases = cfg.setdefault("account_aliases", {})
+                for aid, avar in avars.items():
+                    norm = " ".join(str(avar.get()).split())
+                    if norm:
+                        aliases[str(aid)] = norm
+                    else:
+                        aliases.pop(str(aid), None)
             self._save_config()
             # Re-register + surface conflicts (only if a service already exists;
             # the enable path registers otherwise). Dialog stays open on failures.
