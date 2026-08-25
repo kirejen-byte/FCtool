@@ -18003,7 +18003,13 @@ class FCToolGUI:
         case that persists a change here."""
         w, body_h = self._preview_resolve_size(cfg, client.key)
         layouts = cfg.get("layouts", {}) or {}
-        lkey = self._preview_layout_key(client.key)
+        # Position keys off IDENTITY, not key (design §9.1). A logged-in char
+        # has identity == key, so this is byte-identical for real pilots; an
+        # accounted login gets its own `login:<id>` saved-rect namespace, while
+        # an unknown-account login has identity "" — the SAME argument the old
+        # `client.key` ("" for every login) produced, so its saved-rect lookup
+        # and the login-stack fallback below are unchanged bit-for-bit.
+        lkey = self._preview_layout_key(client.identity)
         saved = layouts.get(lkey)
         if saved and len(saved) >= 4:
             # Saved rect carries its own w/body_h; under uniform_size the tick's
@@ -18174,7 +18180,14 @@ class FCToolGUI:
                 # login-stack step can reach past it. (_preview_maybe_pin_monitor
                 # below is a no-op for the login key anyway.)
                 return
-            lkey = self._preview_layout_key(new.key)
+            # Adopt the NEW identity's saved layout (design §9.1): login→char
+            # keys off the char (identity == key, unchanged), while a
+            # char→login logout the account-slots guard above did NOT hold now
+            # keys off `login:<id>` for an accounted window, or "" for an
+            # unknown one (identical to the old `new.key` for every login). The
+            # login label itself is recomputed by the per-tick caption pass
+            # (_preview_compose_captions), so no re-probe or re-caption here.
+            lkey = self._preview_layout_key(new.identity)
             saved = (cfg.get("layouts", {}) or {}).get(lkey)
             if saved and len(saved) >= 4:
                 r = (int(saved[0]), int(saved[1]), int(saved[2]), int(saved[3]))
@@ -19239,6 +19252,17 @@ class FCToolGUI:
         rebuilt exactly when the raw overrides can have changed).
         """
         if client.is_login:
+            # Login tiles caption with the account LABEL when the client's
+            # ground-truth account is known (design §9.1); otherwise the
+            # anonymous "login screen", exactly as before. `account_id` rides
+            # on the enriched client (Task 2, one tick seam); `_account_map`
+            # may be absent on a synthetic tick-test host or None when its
+            # construction failed — either degrades to "login screen"
+            # (failure ladder §11). Tuple shape is unchanged.
+            account_id = getattr(client, "account_id", None)
+            amap = getattr(self, "_account_map", None)
+            if account_id is not None and amap is not None:
+                return (amap.label_for_account(account_id), None, "", "")
             return ("login screen", None, "", "")
         name = client.char_name
         if state is None or state.online is None:
