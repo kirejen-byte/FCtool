@@ -119,6 +119,46 @@ _FIT_MEMO_MAX = 64
 # clamp/ellipsis helpers stay pure (no font metrics / no Tk).
 _CHAR_W_RATIO = 0.62
 
+# ── caption-strip width budget ───────────────────────────────────────────────
+# The top strip is a FIXED-WIDTH row (pack_propagate(False)) whose slaves are
+# all fixed-width furniture EXCEPT the pilot name — the name is the only one
+# that can shrink gracefully, because it ellipsizes. So _ellipsize_name has to
+# answer "how many glyphs fit" from `tile width - furniture` BEFORE Tk lays the
+# row out, and every term below is the slave's MEASURED reqwidth + its pack
+# padding on this box (Tk 8.6), not a guess:
+#
+#   dot 10 + padx (4,3)          = 17     excl  '●' 7 + chrome 6 + padx 2 = 15
+#   tag '' 6 + padx (0,4)        = 10     chip  'FC' 12 + chrome 6 + padx 4 = 22
+#   icon image 16 + chrome 4 + padx 4 = 24  (the ◆ glyph fallback is 21)
+#
+# WHY this matters (the 2026-08-24 bug): the old budget under-reserved on BOTH
+# sides — it estimated the name at _CHAR_W_RATIO (5.58 px/glyph at 9 pt) when
+# the real Consolas advance is 7 px, a 25% shortfall that costs ~1.4 px per
+# character, and it never reserved the always-packed empty tag label at all.
+# At the owner's 160 px tiles a 13-character name asked for 97 px against a
+# 77 px budget, the strip overran by 25 px, and the last-packed slave — the
+# implant icon — was starved of its parcel and never mapped.
+_STRIP_NAME_PT = 9            # caption name font point size (bold Consolas)
+_STRIP_CHIP_PT = 8            # role-chip font point size (bold Consolas)
+_STRIP_LABEL_CHROME = 6       # a tk.Label's own border + internal pad, both sides
+_STRIP_SIDE_PAD = 4           # the (0, 4) pack pad the strip's right group uses
+_STRIP_DOT_PX = 17            # 10 px status canvas + its (4, 3) padx
+_STRIP_EXCL_PAD = 2           # the exclusion marker's (2, 0) padx
+# Width of the ◆ icon fallback in monospace advances (measured 1.6 at 9 pt) —
+# rounded UP, because over-reserving costs the name a character and
+# under-reserving costs the icon its pixels.
+_STRIP_GLYPH_ADVANCES = 2
+# Tk-free fallback for the caption font's advance, used ONLY when the live font
+# cannot be measured (headless / TclError). The REAL measured ratio is 7/9 =
+# 0.778 — deliberately NOT folded into _CHAR_W_RATIO, whose 0.62 is the
+# on-video / bottom-strip estimate with its own callers and tests.
+_STRIP_CHAR_W_RATIO = 0.78
+# Bounded descent for the real-metric verify in _ellipsize_name. The monospace
+# guess is exact for ASCII, but the docked-pilot anchor '⚓' is 2.4 advances
+# wide, so a name carrying one can still overrun. Each round drops the
+# overflow's worth of glyphs, so it converges in one or two passes.
+_NAME_FIT_STEPS = 3
+
 
 # ── damage-flash soft pulse ──────────────────────────────────────────────────
 # The damage flash PULSES: the border eases between a soft red and the peak
@@ -442,6 +482,14 @@ class TileWindow:
         # that made it) and both are bounded — see _label_font / _fit_memo_put.
         self._label_fonts = {}        # (family, size, weight) -> tkfont.Font
         self._fit_memo = {}           # (text, base, avail_w) -> (shown, size)
+        # Caption-strip width budget (see _ellipsize_name). `_strip_char_px`
+        # caches the REAL measured advance per point size — one Tcl round-trip
+        # per size for the tile's whole life — and `_name_fit` is a single-slot
+        # ((name, usable) -> shown) memo, which is all the caption needs: the
+        # compose pass re-pushes the SAME name for every tile on every ~250 ms
+        # tick, so one slot turns the steady state into a tuple compare.
+        self._strip_char_cache = {}   # point size -> measured px per glyph
+        self._name_fit = None         # ((name, usable_px), shown) or None
         self._pos = (0, 0)            # last-placed top-left (physical px)
         self._badge = None
         self._hidden = False          # withdrawn by a C2 hide rule (layout kept)
@@ -540,16 +588,19 @@ class TileWindow:
         self._dot_item = self._dot.create_oval(1, 1, 9, 9, fill=bg_panel,
                                                outline="")
 
-        self._name_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_text,
-                                   font=("Consolas", 9, "bold"))
-        self._name_lbl.pack(side="left")
-
-        # cycle-exclusion marker (C4): shown only while the tile is excluded from
-        # hotkey cycling (Shift+Left toggles it). A dim dot glyph beside the name.
-        self._excl_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_dim,
-                                  font=("Consolas", 9, "bold"))
-        self._excl_lbl.pack(side="left", padx=(2, 0))
-
+        # PACKING ORDER IS ALLOCATION PRIORITY. Tk's packer hands each slave its
+        # parcel in packing order and the last ones get whatever cavity is left —
+        # so on a narrow strip the LAST-packed slave is the one that starves.
+        # Every slave here is fixed-width furniture except the name, which is the
+        # only element that can shrink gracefully (it ellipsizes), so the name is
+        # packed AFTER the whole right-hand group: the role chip, the implant
+        # icon that inserts itself after the chip, and the tag. Before this order
+        # the name came second and the icon last, and at the owner's 160 px tile
+        # width the icon was never mapped at all.
+        #
+        # Order is priority, NOT side placement: `side` and `padx` are unchanged,
+        # so the rendered row is pixel-identical at normal widths (guarded by a
+        # widget-for-widget A/B geometry test at 384 px).
         self._tag_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_dim,
                                  font=("Consolas", 8))
         self._tag_lbl.pack(side="right", padx=(0, 4))
@@ -558,10 +609,28 @@ class TileWindow:
                                   font=("Consolas", 8, "bold"))
         self._chip_lbl.pack(side="right", padx=(0, 4))
 
+        self._name_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_text,
+                                   font=("Consolas", 9, "bold"))
+        self._name_lbl.pack(side="left")
+
+        # cycle-exclusion marker (C4): shown only while the tile is excluded from
+        # hotkey cycling (Shift+Left toggles it). A dim dot glyph beside the name.
+        # It is packed AFTER the name because it must RENDER to the name's right
+        # — the one place where "priority" and "position" pull against each
+        # other. That costs nothing: _ellipsize_name reserves the marker's full
+        # width unconditionally (see _strip_reserve_px), so the name never grows
+        # into the marker's pixels in the first place.
+        self._excl_lbl = tk.Label(self._strip, text="", bg=bg_panel, fg=fg_dim,
+                                  font=("Consolas", 9, "bold"))
+        self._excl_lbl.pack(side="left", padx=(2, 0))
+
         # Major-implants icon. Created here but NOT packed: set_implant_icon
         # packs it (side="right", after the chip in packing order, so it renders
         # to the LEFT of the chip) the first time a verdict says this pilot's
-        # head is worth the warning, and unpacks it when it stops.
+        # head is worth the warning, and unpacks it when it stops. Inserting
+        # after the chip ALSO puts it ahead of the name in the packing order —
+        # i.e. ahead of it for allocation — which is what keeps it on the row at
+        # the 120 px tile floor.
         self._implant_img = _load_implant_icon(self._strip)
         self._implant_lbl = tk.Label(self._strip, bg=bg_panel, fg=fg_accent,
                                      font=("Consolas", 9, "bold"))
@@ -1120,6 +1189,14 @@ class TileWindow:
         self.top.deiconify()
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
+        # The caption name's budget is a function of the tile WIDTH, so a place
+        # that narrows the tile (Arrange, Reset, a saved layout on spawn) has to
+        # re-ellipsize now rather than wait for the next ~250 ms compose tick —
+        # otherwise the row spends that tick over-full and the packer squeezes
+        # the exclusion marker off the end. _render_caption's own (name, chip)
+        # guard means an unchanged budget costs nothing, so this is free on the
+        # arrange paths that re-place a tile at the size it already had.
+        self._render_caption()
 
     def body_screen_rect(self):
         """(left, top, right, bottom) of the BODY region (below the caption strip)
@@ -1472,29 +1549,120 @@ class TileWindow:
         if self._implant_visible != was_visible:
             self._render_caption()
 
+    def _strip_char_px(self, size):
+        """REAL rendered advance, in px, of one caption glyph at `size` pt.
+
+        Consolas is monospace, so one measured advance answers for every glyph
+        it has. Cached per instance and per size — a `font.measure` is a Tcl
+        round-trip and _ellipsize_name runs for every tile on every ~250 ms
+        tick, while family/weight/size here are module constants that never
+        move, so one measure serves the tile's whole life.
+
+        Falls back to the Tk-free _STRIP_CHAR_W_RATIO estimate — and does NOT
+        cache it — when the font cannot be measured (headless, TclError, a
+        destroyed interpreter): the fallback stays pure, and a transient
+        failure retries on the next call instead of poisoning the budget for
+        good (the set_alpha latch lesson)."""
+        px = self._strip_char_cache.get(size)
+        if px is not None:
+            return px
+        try:
+            px = int(self._label_font(size).measure("M"))
+        except (tk.TclError, ValueError, TypeError):
+            px = 0
+        if px <= 0:
+            return max(1.0, size * _STRIP_CHAR_W_RATIO)
+        self._strip_char_cache[size] = px
+        return px
+
+    def _strip_text_px(self, text):
+        """Measured width of `text` in the caption NAME font, or None when Tk
+        cannot measure it. None means "no verify" — the caller keeps its Tk-free
+        char-count answer rather than guessing with a second estimate."""
+        try:
+            return int(self._label_font(_STRIP_NAME_PT).measure(text or ""))
+        except (tk.TclError, ValueError, TypeError):
+            return None
+
+    def _strip_reserve_px(self):
+        """Pixels of the caption row the pilot name may NOT have: every other
+        slave's real width plus its pack padding, plus the name label's own
+        chrome. See the `_STRIP_*` constants for the measured breakdown.
+
+        The exclusion marker is reserved at its FULL '●' width whether or not
+        the tile is currently excluded. That is deliberate: `set_excluded` is a
+        per-tick setter that does not re-render the caption, so a budget that
+        moved with the flag would leave a stale name behind on every toggle.
+        Costing the name one character buys a marker that can never be squeezed
+        — and the marker is the one slave packed after the name, so it is the
+        only one the packer could squeeze."""
+        char_name = self._strip_char_px(_STRIP_NAME_PT)
+        # The chip label is NEVER unpacked (set_implant_icon anchors on it) —
+        # so an EMPTY chip still costs its own chrome and pad, exactly like the
+        # always-empty tag. Reserving 0 for a blank chip is what let the
+        # exclusion marker get clipped at the 120 px floor.
+        chip_px = (len(self._chip) * self._strip_char_px(_STRIP_CHIP_PT)
+                   + _STRIP_LABEL_CHROME + _STRIP_SIDE_PAD)
+        if not self._implant_visible:
+            icon_px = 0
+        elif self._implant_img is not None:
+            icon_px = IMPLANT_ICON_PX + _STRIP_LABEL_CHROME + _STRIP_SIDE_PAD
+        else:
+            icon_px = (_STRIP_GLYPH_ADVANCES * char_name
+                       + _STRIP_LABEL_CHROME + _STRIP_SIDE_PAD)
+        excl_px = char_name + _STRIP_LABEL_CHROME + _STRIP_EXCL_PAD
+        tag_px = _STRIP_LABEL_CHROME + _STRIP_SIDE_PAD   # the tag is always ''
+        return (_STRIP_DOT_PX + excl_px + tag_px + chip_px + icon_px
+                + _STRIP_LABEL_CHROME)                   # the name's own chrome
+
     def _ellipsize_name(self, name):
-        """Truncate the strip name to fit the fixed-width row. Budget = the tile
-        width minus the dot/chip/exclusion glyphs and padding, estimated Tk-free
-        via the strip's 9pt name font. Never returns more chars than fit."""
+        """Truncate the strip name to fit the fixed-width caption row.
+
+        Budget = the tile width minus `_strip_reserve_px()`, divided by the
+        REAL measured advance of the 9 pt bold Consolas name font — not the
+        Tk-free _CHAR_W_RATIO guess, which is 25% low and is what let a 160 px
+        tile's name overrun the row and starve the implant icon.
+
+        The char-count answer is then VERIFIED against real metrics and shrunk
+        if it still overruns: monospace arithmetic is exact for ASCII, but the
+        docked-pilot anchor '⚓' renders 2.4 advances wide, so a name carrying
+        one can overshoot. Bounded to _NAME_FIT_STEPS rounds — each drops the
+        overflow's worth of glyphs, so it converges in one or two, and the
+        packing order (see the ctor) means the worst case of giving up is a
+        name Tk clips, never furniture Tk drops.
+
+        Never returns more characters than fit. The result is memoised in the
+        single-slot `_name_fit` cache, so the steady-state per-tick call costs
+        one tuple compare and no Tcl at all."""
         name = name or ""
         w = self._w if self._w > 0 else 0
         if w <= 0:
             return name
-        # reserve space for the dot (~17px), chip (~len*7px + pad), excl (~14px)
-        chip_px = (len(self._chip) + 1) * 8 if self._chip else 0
-        # …and the implant icon (its image width + its own 4px pad) while it is
-        # actually packed — a hidden icon costs the name nothing. This is a
-        # slight UNDER-estimate, like every other term here: measured, the
-        # packed label really occupies 24 px with the image and 21 with the
-        # glyph fallback (a tk.Label adds its 2px border a side) against the
-        # 20 reserved. The trailing +8 slop below is what absorbs that, exactly
-        # as it already absorbs the dot's and chip's own rounding.
-        icon_px = (IMPLANT_ICON_PX + 4) if self._implant_visible else 0
-        reserved = 17 + 14 + chip_px + icon_px + 8
-        usable = max(0, w - reserved)
-        per_char = 9 * _CHAR_W_RATIO       # 9pt bold Consolas ≈ this px/glyph
+        usable = max(0, w - self._strip_reserve_px())
+        key = (name, usable)
+        if self._name_fit is not None and self._name_fit[0] == key:
+            return self._name_fit[1]
+        per_char = self._strip_char_px(_STRIP_NAME_PT)
         budget = int(usable // max(1.0, per_char))
-        return _ellipsize(name, budget)
+        shown = _ellipsize(name, budget)
+        for _ in range(_NAME_FIT_STEPS):
+            measured = self._strip_text_px(shown)
+            if measured is None or measured <= usable:
+                break                          # fits, or Tk cannot say — accept
+            # Shrink PROPORTIONALLY to the overrun, and always by at least one
+            # glyph. Both halves are load-bearing: dividing the overflow by the
+            # monospace advance under-drops badly when the overrun comes from
+            # wide glyphs, and a budget that already exceeds the string's length
+            # would never move at all (a name of nothing but anchors sat at its
+            # full width for every round of an earlier draft).
+            budget = min(budget, len(shown),
+                         int(len(shown) * usable / measured)) - 1
+            if budget <= 0:
+                shown = ""
+                break
+            shown = _ellipsize(name, budget)
+        self._name_fit = (key, shown)
+        return shown
 
     def set_badge(self, text):
         """Overlay a status word in place of the name (MINIMIZED / login screen /
