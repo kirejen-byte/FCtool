@@ -199,9 +199,24 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False):
                 # requested height is the real content height and is map-independent
                 # once update_idletasks() has realised the geometry request.
                 tip.update_idletasks()
-                tip.wm_geometry(
-                    f"+{widget.winfo_rootx() + 12}"
-                    f"+{widget.winfo_rooty() - tip.winfo_reqheight() - 4}")
+                x = widget.winfo_rootx() + 12
+                above_y = widget.winfo_rooty() - tip.winfo_reqheight() - 4
+                if above_y >= 0:
+                    y = above_y
+                else:
+                    # No room above -- the tile is anchored near the screen TOP
+                    # (FCPreview login tiles default to login_position [5,5]).
+                    # A negative above_y would render as the malformed "+x+-N"
+                    # geometry (the "+-" sequence), which Tk misparses and dumps
+                    # the tip in the screen corner (owner report: "tooltip goes up
+                    # in the left corner of my screen"). Fall back to BELOW THE
+                    # WHOLE TILE: the DWM video body sits ABOVE the tile's bottom
+                    # edge, so a below-the-tile tip still clears it, and a
+                    # top-anchored tile's bottom edge is comfortably on-screen.
+                    # This can never be negative.
+                    top = widget.winfo_toplevel()
+                    y = top.winfo_rooty() + top.winfo_height() + 4
+                tip.wm_geometry(f"+{x}+{y}")
             else:
                 tip.wm_geometry(
                     f"+{widget.winfo_rootx() + 12}"
