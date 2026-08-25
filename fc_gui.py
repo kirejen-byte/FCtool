@@ -119,6 +119,7 @@ from eveo_overlay import OverlayWindow
 import overlay_rules
 import fleet_composer
 import eve_client_tracker
+import eve_account
 import window_activator
 import preview_layout
 import monitor_pin
@@ -1315,6 +1316,29 @@ class FCToolGUI:
         self._preview_caption_memo = None
         self._config_rev = 0                    # bumped in _save_config; memo key
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
+        # The one ground-truth account<->character map for this GUI (design §4),
+        # fed by per-PID command-line probing and read by the preview tick via
+        # eve_client_tracker.enrich_clients. Real collaborators; the sidecar
+        # lives beside config.json (local-only, never shipped). Held on self so
+        # the probe cache + live map persist across ticks. Task 6 adds the
+        # kill-switch gate, sidecar load()/save(), and the _PREVIEW_DEFAULTS
+        # entries; until then observe runs unconditionally and the sidecar is
+        # not persisted (the intended incremental state). Any construction
+        # failure (e.g. a ctypes hiccup) leaves the feature inert, not fatal.
+        self._account_hint_cache = None
+        try:
+            self._account_map = eve_account.AccountMap(
+                win32=eve_account.real_win32(),
+                log_reader=eve_account.read_launcher_log_records,
+                store=eve_account.FileStore(
+                    os.path.join(app_dir(), "account_char_map.json")),
+                clock=time.time,
+                aliases=lambda: self._preview_cfg().get("account_aliases", {}),
+                hint=self._account_char_hint,
+            )
+        except Exception:
+            log.exception("[account] AccountMap init failed; identity inert")
+            self._account_map = None
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
@@ -17504,6 +17528,28 @@ class FCToolGUI:
         "gamelogs_path": "",
     }
 
+    def _account_char_hint(self, account_id):
+        """`account_id -> last-active character NAME` for AccountMap labels
+        (design §2/§9.5), wrapping overview_dat.account_char_hint — the local
+        settings co-flush heuristic joined with the ESI token name map (reads
+        only character_id/character_name, never token secrets, never a roster).
+        The whole map is computed once and cached on self (cheap mtime stats,
+        but the AccountMap may call this per account per tick, so not per call);
+        any failure degrades to None for every account. Mirrors the overview
+        panel's account_hint cache (fc_gui ~16671)."""
+        cache = getattr(self, "_account_hint_cache", None)
+        if cache is None:
+            try:
+                cache = overview_dat.account_char_hint()
+            except Exception:
+                log.exception("[account] account_char_hint failed")
+                cache = {}
+            self._account_hint_cache = cache
+        try:
+            return cache.get(int(account_id))
+        except (TypeError, ValueError):
+            return None
+
     def _preview_cfg(self):
         # Config is not deep-merged (house rule) — fill defaults per key.
         # NOTE: reference the defaults via the CLASS, not self — the unit tests bind
@@ -19717,8 +19763,17 @@ class FCToolGUI:
             return "○ EVE-O Preview detected — close it to enable native previews"
         try:
             disabled = set(cfg.get("disabled_chars", []))
-            cur = {c.hwnd: c for c in self._preview_find_clients()
-                   if c.key not in disabled}
+            clients = list(self._preview_find_clients())
+            # Ground-truth account identity (design §5): observe() probes new
+            # PIDs and caches, then each client is re-stamped with its account
+            # id. ONE seam, so account_id / identity reach every downstream
+            # reader of `cur` -> `_preview_clients`. getattr keeps the synthetic
+            # tick-test host (which never runs __init__) on the legacy path, and
+            # a None map (construction failed) degrades to pre-feature behavior.
+            account_map = getattr(self, "_account_map", None)
+            if account_map is not None:
+                clients = eve_client_tracker.enrich_clients(clients, account_map)
+            cur = {c.hwnd: c for c in clients if c.key not in disabled}
             added, retitled, removed = eve_client_tracker.diff_clients(
                 self._preview_clients, cur)
             for old in removed:

@@ -5,7 +5,7 @@ em-dash (U+2014) normalized to "-" (EVE-O precedent, localized clients)."""
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 EVE_EXE = "exefile.exe"
 LOGIN_TITLE = "EVE"
@@ -20,6 +20,11 @@ class ClientWindow:
     rect: tuple
     is_iconic: bool
     pid: int
+    # Ground-truth account id (design §5), None until the preview tick enriches
+    # the snapshot via `enrich_clients`. LAST field with a default so every
+    # existing `ClientWindow(...)` call and test stays valid; `find_clients`
+    # never sets it.
+    account_id: int | None = None
 
     @property
     def is_login(self) -> bool:
@@ -30,6 +35,19 @@ class ClientWindow:
         """Layout/ESI join key: stripped + lowercased char name (exact match
         with the ESI poller's `.strip().lower()` state keys)."""
         return self.char_name.strip().lower()
+
+    @property
+    def identity(self) -> str:
+        """Handle for tile POSITIONING and CYCLING (design §5); `.key` stays the
+        ESI/state join and is untouched. Logged-in char -> `.key` (unchanged);
+        accounted login screen -> `login:<account_id>`; unknown-account login ->
+        `""` (today's anonymous path). EVE character names cannot contain `:`, so
+        a `login:`/`acct:` token can never collide with a char key."""
+        if not self.is_login:
+            return self.key
+        if self.account_id is not None:
+            return f"login:{self.account_id}"
+        return ""
 
 
 def _normalize(title: str) -> str:
@@ -74,6 +92,24 @@ def find_clients(win32=None) -> list[ClientWindow]:
         except Exception:
             continue  # window died mid-enumeration — skip
     return out
+
+
+def enrich_clients(clients: list["ClientWindow"], account_map) -> list["ClientWindow"]:
+    """Stamp each client with its ground-truth account id (design §5).
+
+    Order matters: call ``account_map.observe(clients)`` FIRST (it probes new
+    PIDs and refreshes its live/cache state from the raw snapshot), THEN return
+    each client re-stamped via ``dataclasses.replace(c, account_id=...)`` from
+    ``account_map.account_for_pid(c.pid)``. The single enrichment point in the
+    preview tick, so ``account_id``/``identity`` reach every downstream reader.
+
+    ``account_map`` is duck-typed (``observe`` + ``account_for_pid``); this
+    module imports nothing from ``eve_account``. ``ClientWindow`` is frozen, so
+    the originals are never mutated — a fresh list of replacements is returned.
+    """
+    account_map.observe(clients)
+    return [replace(c, account_id=account_map.account_for_pid(c.pid))
+            for c in clients]
 
 
 def diff_clients(prev: dict, cur: dict):
