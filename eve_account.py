@@ -376,6 +376,29 @@ class AccountMap:
         clients only — a login screen has no character)."""
         return self._live_acct_to_char.get(account_id)
 
+    def any_char_for_account(self, account_id: int) -> str | None:
+        """A REPRESENTATIVE character key for *account_id*, or ``None`` if none
+        is known — the bridge that lets a login tile (which has no character of
+        its own) inherit its account's per-character / account slot.
+
+        Prefers the LIVE logged-in character on the account
+        (``char_for_account``); with none live, falls back to any character
+        PERSISTED for the account in the sidecar, chosen deterministically
+        (sorted keys, first) so two identical maps answer identically. The
+        sidecar fallback is what makes this work at a LOGIN SCREEN, where the
+        account has no live character but ``account_char_map.json`` remembers
+        the account↔character mapping across sessions (this is exactly the
+        stranded-login case the preview positioner needs).
+
+        Pure and total: reads only in-memory caches, never raises."""
+        live = self._live_acct_to_char.get(account_id)
+        if live:
+            return live
+        members = sorted(
+            key for key, entry in self._sidecar.items()
+            if isinstance(entry, dict) and entry.get("account") == account_id)
+        return members[0] if members else None
+
     def known_accounts(self) -> list[int]:
         """All account ids in play: union of live (login + logged-in), sidecar,
         and alias keys. Sorted; non-integer alias keys are ignored."""

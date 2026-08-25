@@ -1257,6 +1257,15 @@ class FCToolGUI:
         # emptied in _preview_teardown; hwnds are recycled by Windows, so a
         # stale entry would hand a brand-new window someone else's position.
         self._preview_hwnd_account = {}
+        # hwnd -> last-seen account id for a LOGIN window, SESSION ONLY. The
+        # account probe can be AV-blocked for a client's first ~minute, so a
+        # login launched while FCTool runs often SPAWNS with account_id None and
+        # only resolves a tick or so later. `diff_clients` never re-keys it (a
+        # login's `.key` stays "" through the None->id change), so this tracker
+        # is what lets the tick notice the transition and re-place the tile onto
+        # its freshly-resolved slot. Seeded on spawn, popped on retirement,
+        # emptied in _preview_teardown (hwnds are recycled by Windows).
+        self._preview_login_acct = {}
         self._preview_clients = {}             # hwnd -> ClientWindow
         self._preview_hotkeys = None           # HotkeyService (lazy, native only)
         self._preview_hotkey_map = {}          # hk_id -> action tuple
@@ -18233,6 +18242,14 @@ class FCToolGUI:
         # the usual case: FCTool started while the clients were already logged
         # in never sees a login->character transition at all.
         self._preview_note_hwnd_account(client)
+        # Seed the per-hwnd login-account tracker so the tick re-places this
+        # login ONLY when its account later CHANGES (the AV-delayed resolve).
+        # Seeding at spawn -- where the tile was just placed at this same
+        # account's resolved rect -- keeps steady-state ticks zero-work.
+        if getattr(client, "is_login", False):
+            track = getattr(self, "_preview_login_acct", None)
+            if track is not None:
+                track[client.hwnd] = getattr(client, "account_id", None)
         retry = getattr(self, "_preview_spawn_retry", None)
         if retry:
             retry.pop(client.hwnd, None)               # attached → healthy again
@@ -18352,6 +18369,11 @@ class FCToolGUI:
         seen = getattr(self, "_preview_hwnd_account", None)
         if seen is not None:
             seen.pop(hwnd, None)
+        # The login-account tracker is per-WINDOW too (same hwnd-recycle hazard):
+        # forget it here so the next window to get this handle re-learns its own.
+        la = getattr(self, "_preview_login_acct", None)
+        if la is not None:
+            la.pop(hwnd, None)
         # PV7: _preview_video_labels is hwnd-keyed like the two dicts around it
         # and was pruned only at teardown, so a retired client's composed label
         # lingered for the rest of the session (tests read this dict).
@@ -18552,6 +18574,51 @@ class FCToolGUI:
         except Exception:
             return
         self._preview_tile_rects[hwnd] = (x, y, w, body_h)
+
+    def _preview_reposition_resolved_login(self, hwnd, client, cfg):
+        """Re-place a LOGIN tile whose ground-truth account resolved AFTER the
+        tile was already spawned — the AV-delayed-probe heal (design §6).
+
+        A client launched while FCTool is already running can miss its whole
+        probe burst (this box's AV can block the cross-process command-line read
+        for a client's first ~minute), so it SPAWNS with account_id None ->
+        identity "" -> the corner login-stack. When the probe later succeeds,
+        `diff_clients` never re-keys the window (a login's `.key` stays ""
+        through the None->id change, so there is no retitle event and nothing
+        else moves the tile) and it is stranded in the corner. This notices the
+        per-hwnd account_id transition and re-places the tile at
+        `_preview_tile_rect`, which now resolves the login's real layout key:
+        `login:<id>` (its own drag namespace) or, with account_slots on, the
+        account's `acct:<label>` slot via the login bridge in
+        `_preview_layout_key`.
+
+        Change-gated: no work on the ticks where the account is unchanged
+        (seeded at spawn, so steady state is a single dict compare). Login-only
+        (the caller invokes it just for login tiles). The tile is fetched fresh
+        and the WITHDRAWN-tile guard is honoured -- never `place()` a hidden
+        tile (`place()` deiconifies, popping a withdrawn tile over the game;
+        the transition is re-checked and healed once the tile is shown again).
+        Mirrors spawn/rekey placement, which are both lock_layout-agnostic:
+        healing an automatic mis-placement is not the user's drag, so
+        `lock_layout` does not gate it. Every placement path updates
+        `_preview_tile_rects` (invariant); the latch is written only after a
+        successful place, so a placement fault re-tries next tick."""
+        track = getattr(self, "_preview_login_acct", None)
+        if track is None:
+            return
+        acct = getattr(client, "account_id", None)
+        if track.get(hwnd) == acct:
+            return                              # account unchanged: nothing to do
+        tile = self._preview_tiles.get(hwnd)
+        if tile is None:
+            track.pop(hwnd, None)               # tile gone; forget the stale window
+            return
+        if getattr(tile, "_hidden", False):
+            return                              # withdrawn -> never place() (retry when shown)
+        rect = self._preview_tile_rect(client, cfg)
+        tile.place(*rect)
+        self._preview_tile_rects[hwnd] = rect
+        track[hwnd] = acct                      # latch only after a successful place
 
     def _preview_resolve_size(self, cfg, key):
         """Resolve (w, body_h) for a char's tile. When uniform_size is True (EVE-O
@@ -20085,6 +20152,15 @@ class FCToolGUI:
                     # Identity (not key) so a login tile reflects its own C4
                     # exclusion; identical for chars (identity == key).
                     self._preview_style_tile(tile, client.identity, cfg)
+                    # Heal a login tile whose ground-truth account resolved only
+                    # AFTER it spawned (the AV-delayed probe): the diff never
+                    # re-keys a login (its `.key` stays "" through the account
+                    # None->id change), so nothing else moves it off the corner
+                    # login-stack onto its freshly-resolved slot. Login-only +
+                    # change-gated; the tile is SHOWN here (past the hidden guard
+                    # above), so the placement inside honours the withdrawn guard.
+                    if client.is_login:
+                        self._preview_reposition_resolved_login(hwnd, client, cfg)
                     # Uniform/individual sizing: re-place the tile if its resolved
                     # target size drifted from what it currently shows (e.g. a
                     # uniform_size resize on another tile bumped the global size, or
@@ -20495,6 +20571,9 @@ class FCToolGUI:
         # hwnds do not survive a mode bounce, and the next enable re-learns
         # every one of them from the first tick's spawn.
         self._preview_hwnd_account = {}
+        # The login-account tracker rides the same session-only lifecycle: a
+        # re-enable re-seeds every login on its first spawn.
+        self._preview_login_acct = {}
         # The implant verdicts go with them -- AND their fetch stamps, so a
         # re-enable re-asks on first sight instead of sitting icon-less behind
         # a stale 300 s gate. The SDE table survives: it is static bundle data,
@@ -24545,6 +24624,14 @@ class FCToolGUI:
         turning this on mid-session moves an already-drawn observed-only tile
         only when it is next touched -- accepted, not chased.
 
+        Accounted LOGIN screens (identity `login:<id>`, no character of their
+        own) bridge to a representative character of the same account before the
+        label lookup, so a login shares its account's `acct:<label>` slot -- both
+        for READS (spawn/rekey position) and drag WRITES. Off (or with no
+        representative character known yet, e.g. before the AV-delayed probe
+        resolves) the login keeps its `login:<id>` drag namespace, byte-identical
+        to login-drag persistence without this bridge.
+
         EVERY reader and writer of those two blocks asks this first. A site
         that skips it writes where nothing reads (or reads where nothing
         writes), and the symptom is a preview that teleports on the next start
@@ -24581,6 +24668,36 @@ class FCToolGUI:
         block = self.config.get("preview")
         if not (isinstance(block, dict) and block.get("account_slots", False)):
             return char_key                 # off: today's behaviour, exactly
+        # Login bridge (design §9.1): an accounted login carries identity
+        # `login:<id>` and has no character of its own, so on its own it lands in
+        # its `login:<id>` drag namespace and never shares the account's slot.
+        # With account_slots on, route it to a REPRESENTATIVE character of the
+        # same account (the live logged-in char, else a sidecar member) and reuse
+        # THAT character's slot -- so a login lands exactly where its account's
+        # main sits, and a login-drag persists to the shared account slot too.
+        # `rep` is always a char key (never a `login:`/`acct:` token), so the
+        # single re-entry below resolves to `acct:<label>` (or the char's own key
+        # if ungrouped) and cannot recurse into this branch again. Guarded on the
+        # map (None under the kill switch / a bare unit host) and on a non-int id
+        # -> fall through to `login:<id>`, keeping login-drag persistence and the
+        # account_slots-off path byte-identical. The map read is the same
+        # documented-harmless kind as the label lookup below -- the FLAG gate
+        # above stayed RAW, so the per-tick no-write contract is intact.
+        if isinstance(char_key, str) and char_key.startswith("login:"):
+            amap = getattr(self, "_account_map", None)
+            if amap is not None:
+                try:
+                    acct_id = int(char_key[len("login:"):])
+                except (ValueError, TypeError):
+                    acct_id = None
+                if acct_id is not None:
+                    try:
+                        rep = amap.any_char_for_account(acct_id)
+                    except Exception:
+                        rep = None
+                    if rep:
+                        return self._preview_layout_key(rep)
+            return char_key                 # no representative yet -> login:<id>
         if block.get("account_slots_auto", False):
             # Auto-slot on: an observed-only character (detected on an account
             # but never hand-labelled) routes to that account's slot too. The
