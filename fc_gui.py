@@ -1339,6 +1339,29 @@ class FCToolGUI:
         except Exception:
             log.exception("[account] AccountMap init failed; identity inert")
             self._account_map = None
+        # Load the persisted sidecar (design §7): best-effort and gated by the
+        # kill switch, so an OFF feature never even reads the file. A corrupt or
+        # unknown-version sidecar is preserved as account_char_map.json.corrupt
+        # (config.json precedent) and the map continues EMPTY — load() cleared
+        # memory before raising, so it stays usable and rebuilds from live
+        # observation. Any other fault degrades to inert (failure ladder §11).
+        if self._account_map is not None and \
+                self._preview_cfg().get("account_identity", True):
+            try:
+                self._account_map.load()
+            except eve_account.CorruptSidecar as _cs:
+                try:
+                    if _cs.raw is not None:
+                        with open(os.path.join(app_dir(),
+                                               "account_char_map.json.corrupt"),
+                                  "w", encoding="utf-8", newline="") as _cf:
+                            _cf.write(_cs.raw)
+                    log.warning("[account] sidecar corrupt; preserved as "
+                                "account_char_map.json.corrupt, starting empty")
+                except Exception:
+                    log.exception("[account] could not preserve corrupt sidecar")
+            except Exception:
+                log.exception("[account] sidecar load failed; starting empty")
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
@@ -17561,6 +17584,23 @@ class FCToolGUI:
         # by default would re-point every existing user's hand-placed grid on
         # their behalf. _preview_layout_key is the one place it is read.
         "account_slots": False,
+        # ── Account identity (design §10) ───────────────────────────────────
+        # Master switch for the ground-truth account<->character map
+        # (eve_account.AccountMap): read each EVE client's OWN command line for
+        # its account id, then label/position/cycle login tiles by account and
+        # auto-fill the character grouping. DEFAULT ON (silent-on precedent:
+        # intel radius, v4.7.0) — a fresh user just sees richer login captions.
+        # It is ALSO the kill switch: OFF => no probing, no launcher-log reads,
+        # every login identity stays "" (today's anonymous path) and the sidecar
+        # is never touched — insurance against AV friction with the cross-process
+        # command-line read (this box has AV history). This dict is the SINGLE
+        # source of truth for the fallback; do not scatter the default elsewhere.
+        "account_identity": True,
+        # User-chosen display names per account, {"<account_id>": "<label>"}.
+        # Values normalize like account labels (trim + collapse whitespace); an
+        # account with no alias falls back to its last-active-char hint, then
+        # "Account <id>". Empty by default.
+        "account_aliases": {},
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
@@ -19909,8 +19949,23 @@ class FCToolGUI:
             # tick-test host (which never runs __init__) on the legacy path, and
             # a None map (construction failed) degrades to pre-feature behavior.
             account_map = getattr(self, "_account_map", None)
-            if account_map is not None:
+            # Kill switch (design §10): account_identity OFF => skip enrichment
+            # ENTIRELY, so observe() never probes a command line or reads a
+            # launcher log and every login identity stays "" (today's anonymous
+            # behaviour; the feature is fully inert = current release). ON is the
+            # default; `cfg` is this tick's preview config (fetched above).
+            if account_map is not None and cfg.get("account_identity", True):
                 clients = eve_client_tracker.enrich_clients(clients, account_map)
+                # Opportunistic persistence (design §7/§14): save() is dirty-
+                # gated, so it writes only on the tick a NEW mapping was observed
+                # and is a cheap in-memory check otherwise. Self-guarded so a
+                # write hiccup (e.g. an OneDrive lock) never counts as a tick
+                # failure — that belongs to _on_close's shutdown save too.
+                try:
+                    account_map.save()
+                except Exception:
+                    log.debug("[account] opportunistic sidecar save skipped",
+                              exc_info=True)
             cur = {c.hwnd: c for c in clients if c.key not in disabled}
             added, retitled, removed = eve_client_tracker.diff_clients(
                 self._preview_clients, cur)
@@ -33228,6 +33283,16 @@ $bmp.Dispose()
                 preview_teardown()
         except Exception:
             pass
+        # Persist the account<->character sidecar (design §7). save() is dirty-
+        # gated, so it no-ops when the feature never observed anything (kill
+        # switch off => never dirtied) and otherwise writes atomically. Guarded
+        # like the teardowns above: a save fault must never block shutdown.
+        try:
+            amap = getattr(self, "_account_map", None)
+            if amap is not None:
+                amap.save()
+        except Exception:
+            log.exception("[account] sidecar save at shutdown failed")
         # Tear down the FC HUD too (stop the distance worker, destroy the
         # tiles). Guarded like the overlay/preview teardowns above: the
         # controller may never have been built.
