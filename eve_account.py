@@ -82,10 +82,11 @@ def parse_launcher_data(cmdline: str) -> int | None:
     if len(parts) < 4:
         return None
     field = parts[3]
-    # ``isdigit`` rejects "", "-5", "notanumber"; int() of an all-ASCII-digit
-    # string cannot raise. (A pathological unicode-digit field never occurs in
-    # launcher data.)
-    return int(field) if field.isdigit() else None
+    # ``isdigit()`` alone rejects "", "-5", "notanumber" but is also True for
+    # non-ASCII digits: superscripts like "²" make int() raise, and
+    # Arabic-Indic digits silently parse. Require ASCII too so this is an
+    # all-ASCII-decimal string and int() cannot raise.
+    return int(field) if field.isascii() and field.isdigit() else None
 
 
 def account_id_for_pid(pid: int, win32) -> int | None:
@@ -119,10 +120,12 @@ def account_id_from_log(proc_start_utc: float, log_reader, window_s: float = 5.0
     for rec in records:
         try:
             ts, uid = rec
+            ts = float(ts)
+            uid = int(uid)
         except (TypeError, ValueError):
-            continue
-        if abs(float(ts) - proc_start_utc) <= window_s:
-            ids.add(int(uid))
+            continue  # malformed record (unpack or numeric conversion) -> skip
+        if abs(ts - proc_start_utc) <= window_s:
+            ids.add(uid)
     if len(ids) == 1:
         return next(iter(ids))
     return None
