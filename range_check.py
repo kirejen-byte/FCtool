@@ -367,9 +367,19 @@ _NUMBER_RANGE_RE = re.compile(r"^\d+-\d+$")
 #: system name -- "Gate"/"LOST"/"DEAD"/"FAST" are all 4 letters; real
 #: abbreviations an FC would actually type run 5+ ("Amama" -> Amamake).
 MIN_PARTIAL_LETTERS_LEN = 5
-#: A digit/dash-SHAPED fragment (not a pure number range) needs one fewer --
-#: "3-FK" is real FC shorthand at 4 characters.
-MIN_PARTIAL_SHAPED_LEN = 4
+#: A digit/dash-SHAPED fragment (not a pure number range) is eligible for
+#: PREFIX matching at 3 characters -- "1dh" -> 1DH-SX, "3-F" -> 3-FKCZ are
+#: real, unambiguous FC shorthand for null/lowsec abbreviations, and a prefix
+#: match anchors on the START of a name, so a short shaped fragment collides
+#: with nothing real when it is prefix-unique (2026-08-25 split floor).
+MIN_PARTIAL_SHAPED_PREFIX_LEN = 3
+#: SUBSTRING matching for a shaped fragment still needs 4+ characters. A
+#: 3-char fragment that only ever matches MID-name is exactly how "8th" ->
+#: 09-8TH, "b52" -> 85-B52, "c-2"/"2-a" become false positives, and a false
+#: hit REPLACES the whole source list (deleting hostile rows). Prefix-unique
+#: short abbreviations are safe; substring-only short fragments are not, so
+#: the two stages carry different floors (2026-08-25 split floor).
+MIN_PARTIAL_SHAPED_SUBSTR_LEN = 4
 
 
 def resolve_partial_name(name, catalogue) -> str | None:
@@ -397,10 +407,13 @@ def resolve_partial_name(name, catalogue) -> str | None:
          ``MIN_PARTIAL_LETTERS_LEN`` and gets PREFIX matching only -- never
          substring (kills "Gate"/"LOST"/"DEAD"/"FAST" while still catching
          "Amama" -> "Amamake").
-      4. A SHAPED phrase (digit or dash present, not a pure jump-count) needs
-         length >= ``MIN_PARTIAL_SHAPED_LEN`` and gets PREFIX matching, then
-         -- only if prefix found NOTHING -- SUBSTRING matching. Both stages
-         require a UNIQUE candidate; no fuzzy tie-break.
+      4. A SHAPED phrase (digit or dash present, not a pure jump-count) gets
+         PREFIX matching at length >= ``MIN_PARTIAL_SHAPED_PREFIX_LEN`` (3, so
+         "1dh" -> 1DH-SX resolves), then -- only if prefix found NOTHING --
+         SUBSTRING matching, which needs the stricter length >=
+         ``MIN_PARTIAL_SHAPED_SUBSTR_LEN`` (4, so a 3-char fragment matched
+         mid-name -- "8th"/"b52"/"c-2" -- can never fire). Both stages require
+         a UNIQUE candidate; no fuzzy tie-break.
 
     Single pass over the catalogue for the prefix/substring stages (no
     repeated ``.lower()``, no separate substring pass when prefix already
@@ -418,10 +431,15 @@ def resolve_partial_name(name, catalogue) -> str | None:
     if _NUMBER_RANGE_RE.match(text):
         return None
     shaped = is_system_shaped(text)
-    if len(text) < (MIN_PARTIAL_SHAPED_LEN if shaped
+    # The early gate uses the PREFIX floor -- a 3-char shaped phrase is still
+    # eligible to enter the scan (for prefix matching only, per substr_ok).
+    if len(text) < (MIN_PARTIAL_SHAPED_PREFIX_LEN if shaped
                     else MIN_PARTIAL_LETTERS_LEN):
         return None
     needle = text.lower()
+    # Substring matching carries the STRICTER shaped floor, so a 3-char shaped
+    # phrase does prefix-matching only and never substring-matches mid-name.
+    substr_ok = shaped and len(text) >= MIN_PARTIAL_SHAPED_SUBSTR_LEN
     prefix_hits = 0
     prefix_cand = None
     substr_hits = 0
@@ -432,7 +450,7 @@ def resolve_partial_name(name, catalogue) -> str | None:
             prefix_cand = original
             if prefix_hits > 1:
                 break            # already ambiguous; substring is now moot
-        elif shaped and needle in lower:
+        elif substr_ok and needle in lower:
             substr_hits += 1
             substr_cand = original
     if prefix_hits == 1:
