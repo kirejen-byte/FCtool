@@ -791,7 +791,10 @@ _ATTRIBUTE_FAMILIES = ("ocular filter", "memory augmentation", "neural boost",
 _QUOTED_INFIX = re.compile(r"'[^']*'")
 
 #: Plural pairs for the non-set buckets. Sets pluralise structurally instead
-#: ("Mid-grade Amulet" -> "Mid-grade Amulets").
+#: ("Mid-grade Amulet" -> "Mid-grade Amulets"), and so does a mindlink that
+#: carries a discipline ("Skirmish Mindlink" -> "Skirmish Mindlinks", handled in
+#: ``_bucket_label``); the "mindlink" pair below is only the generic fallback
+#: for a name with no discipline word.
 _BUCKET_NOUNS = {
     "mindlink": ("Mindlink", "Mindlinks"),
     "attribute": ("attribute implant", "attribute implants"),
@@ -814,18 +817,73 @@ def _is_attribute_implant(name) -> bool:
     return any(fam in plain for fam in _ATTRIBUTE_FAMILIES)
 
 
+#: The command-burst DISCIPLINE a "* Mindlink" name can carry, mapped to the
+#: short word shown in the tooltip/toast. Read off the bundled SDE's category-20
+#: "* Mindlink" types (``tools/gen_fit_types.py`` output, 15 in the 2026-06 SDE),
+#: not assumed: the boost mindlinks are ``<Discipline> Command Mindlink``
+#: (Skirmish / Armored / Information / Shield), ``Mining Foreman Mindlink``, and
+#: faction/ORE/Sisters variants that put the discipline word later ("ORE Mining
+#: Director Mindlink", "Sisters Expedition Command Mindlink"). ``siege`` is the
+#: pre-2016 name for the Shield line and ``warfare`` the pre-2016 connector
+#: ("Siege Warfare Mindlink" / "Skirmish Warfare Mindlink"), both still
+#: recognised so old data and muscle-memory names resolve. ``expedition`` is the
+#: mining-fleet family. The keys are matched whole-word and case-insensitively,
+#: so word order and any faction prefix are irrelevant.
+#:
+#: Deliberately NOT here: a faction->discipline table for the faction-navy
+#: mindlinks (Caldari Navy, Federation Navy, Imperial Navy, Republic Fleet) and
+#: the named ones (Guri Malakim, Pashan's turret set). Their names carry no
+#: discipline word, so ``_mindlink_discipline`` returns "" and they fall back to
+#: the generic "Mindlink" rather than lean on a hand-written faction list that
+#: goes stale when CCP adds one (the same reason ``_SET_NAME`` derives set names
+#: from the type name instead of a fixed list).
+_MINDLINK_DISCIPLINES = {
+    "skirmish": "Skirmish",
+    "armored": "Armored",
+    "armor": "Armored",
+    "information": "Information",
+    "shield": "Shield",
+    "siege": "Siege",
+    "mining": "Mining",
+    "expedition": "Expedition",
+}
+
+
+def _mindlink_discipline(name) -> str:
+    """The command-burst discipline a "* Mindlink" name carries, e.g. "Skirmish"
+    for "Skirmish Command Mindlink" / "Skirmish Warfare Mindlink" and "Mining"
+    for "Mining Foreman Mindlink" / "ORE Mining Director Mindlink".
+
+    Returns "" when the name carries no recognised discipline word — the
+    faction-navy variants (Caldari Navy / Federation Navy / Imperial Navy /
+    Republic Fleet) and the named ones (Guri Malakim, Pashan's turret set) — so
+    the caller words them as the generic "Mindlink" rather than guess. Pure;
+    never raises."""
+    for word in str(name or "").casefold().split():
+        disc = _MINDLINK_DISCIPLINES.get(word)
+        if disc:
+            return disc
+    return ""
+
+
 def _bucket_of(name) -> tuple:
     """Which kind of thing this implant is, as a hashable bucket key. Pure.
 
     Order matters: a set member is a set even though it has no code, and an
     attribute implant must be claimed before the code-less fall-through so it
-    is not reported as a generic "implant"."""
+    is not reported as a generic "implant".
+
+    A mindlink carries a SECOND element — its command-burst discipline, e.g.
+    ``("mindlink", "Skirmish")`` — or ``("mindlink", "")`` when the name has no
+    discipline word (the faction-navy / named variants). Each discipline is its
+    own bucket, so ``summary_labels`` lists them separately, exactly as it lists
+    each set separately (see ``_mindlink_discipline``)."""
     grade_family = _set_of(name)
     if grade_family:
         return ("set",) + grade_family
     text = str(name or "").strip()
     if text.casefold().endswith("mindlink"):
-        return ("mindlink",)
+        return ("mindlink", _mindlink_discipline(text))
     if _is_attribute_implant(text):
         return ("attribute",)
     if grade_of(text) is not None:
@@ -836,6 +894,14 @@ def _bucket_of(name) -> tuple:
 def _bucket_label(key: tuple, count: int) -> str:
     if key[0] == "set":
         return f"{key[1]}-grade {key[2]}" + ("s" if count > 1 else "")
+    if key[0] == "mindlink" and len(key) > 1 and key[1]:
+        # A discipline-bearing mindlink names its discipline and pluralises
+        # STRUCTURALLY like a set ("Skirmish Mindlink" / "Skirmish Mindlinks"),
+        # not by count. One command mindlink fills the slot, so count > 1 is
+        # only reachable across an odd clone, but the label stays sane if it is.
+        # A disciplineless mindlink ((..., "")) falls through to the generic
+        # "1 Mindlink" / "N Mindlinks" noun pair below, unchanged.
+        return f"{key[1]} Mindlink" + ("s" if count > 1 else "")
     one, many = _BUCKET_NOUNS[key[0]]
     return f"{count} {one if count == 1 else many}"
 
@@ -879,8 +945,10 @@ def summary_labels(names) -> tuple:
       then by how many members are plugged in, then by the pilot's own
       implant-slot order — the same tie-break ``toast_body`` uses, so the copy
       is stable for a given clone rather than dictionary-order roulette;
-    * then Mindlinks, attribute implants, hardwirings, and anything else
-      (the named/faction rares), counted rather than listed.
+    * then Mindlinks — each named by its command-burst discipline ("Skirmish
+      Mindlink"), or a generic "Mindlink" when the name carries none — then
+      attribute implants, hardwirings, and anything else (the named/faction
+      rares), counted rather than listed.
 
     Empty / garbage input answers ``()`` — the caller reads that as "no icon".
     Returns a TUPLE: the poller publishes it into a dict the Tk tick reads
@@ -913,8 +981,9 @@ def toast_body(char_name: str, names) -> str:
       toast, even when hardwirings outnumber it. A set is why this feature
       exists; the count should not let five cheap hardwirings outvote a
       Talisman set;
-    * otherwise -> the largest remaining bucket, counted rather than listed
-      ("4 hardwirings", "2 Mindlinks", "3 attribute implants", "6 implants").
+    * otherwise -> the largest remaining bucket: named when it has a proper
+      name ("Skirmish Mindlink"), else counted ("4 hardwirings", "3 attribute
+      implants", "6 implants").
 
     Anything outside the named bucket is summarised as "+N more", so the copy
     stays honest about how full the head is without listing it.
