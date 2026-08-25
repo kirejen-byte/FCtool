@@ -2739,62 +2739,13 @@ class FCToolGUI:
         self.root.option_add("*TCombobox*Listbox.font", "Consolas 9")
 
         # ── Title Bar ─────────────────────────────────────────────────────────
-        title_frame = tk.Frame(self.root, bg=BG_DARK, pady=8)
-        title_frame.pack(fill=tk.X)
-        tk.Label(title_frame, text="FCTool", font=("Consolas", 18, "bold"),
-                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT, padx=15)
-        tk.Label(title_frame, text="Fleet Commander Assistant",
-                 font=("Consolas", 11), fg=FG_DIM, bg=BG_DARK
-                 ).pack(side=tk.LEFT, padx=5)
-
-        # Staging system indicator (always visible)
-        staging_name = self.config.get("zkillboard", {}).get("staging_system", "")
-        self._staging_display = tk.Label(
-            title_frame, text=f"Staging: {staging_name}" if staging_name else "Staging: --",
-            font=("Consolas", 10, "bold"), fg=FG_YELLOW, bg=BG_DARK,
-        )
-        self._staging_display.pack(side=tk.LEFT, padx=20)
-
-        # Current system indicator (pulled from ESI location)
-        self._current_system_display = tk.Label(
-            title_frame, text="System: --",
-            font=("Consolas", 10, "bold"), fg=FG_GREEN, bg=BG_DARK,
-        )
-        self._current_system_display.pack(side=tk.LEFT, padx=(0, 20))
-        self._current_system_name = ""
-        self._current_system_region = ""
-
-        # EVE Time (UTC) — always-visible clock (EVE servers run on UTC).
-        self._eve_clock = tk.Label(
-            title_frame, text="EVE --:--:--",
-            font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK)
-        self._eve_clock.pack(side=tk.RIGHT, padx=15)
+        # The row itself is built by _build_title_bar so its PACK ORDER -- which
+        # is also its priority order -- can be measured on its own in tests
+        # instead of through a hand-copied mirror. The 1 Hz clock loop is kicked
+        # off HERE, before any tab exists, because everything that rides that
+        # beat tolerates a not-yet-built panel.
+        self._build_title_bar(self.root)
         self._update_eve_clock()
-
-        # Status indicators on right
-        self._status_frame = tk.Frame(title_frame, bg=BG_DARK)
-        self._status_frame.pack(side=tk.RIGHT, padx=15)
-        self._chat_status = tk.Label(self._status_frame, text="CHAT: --",
-                                      font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
-        self._chat_status.pack(side=tk.LEFT, padx=8)
-        self._zkill_status = tk.Label(self._status_frame, text="ZKILL: --",
-                                       font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
-        self._zkill_status.pack(side=tk.LEFT, padx=8)
-
-        # Update-available link. Built here but NOT packed: it stays invisible
-        # until _apply_update_info has a newer GitHub release to advertise (see
-        # the update-awareness block under _update_eve_clock). It is the LAST
-        # side=RIGHT slave of the title bar, so it sits left of the status strip
-        # and the EVE clock and can never shift them -- and because Tk starves
-        # the last-packed slave first, a narrow window squeezes this label
-        # rather than the clock.
-        self._update_link = tk.Label(
-            title_frame, text="", font=("Consolas", 10, "bold"),
-            fg=FG_ACCENT, bg=BG_DARK, cursor="hand2")
-        self._update_link_url = ""      # release page the label currently opens
-        self._update_link_text = ""     # copy currently painted (zero-write latch)
-        self._update_link.bind("<Button-1>", self._on_update_link_click)
-        attach_tooltip(self._update_link, "")
 
         # ── Notebook (Tabs) ──────────────────────────────────────────────────
         self.notebook = ttk.Notebook(self.root, style="Dark.TNotebook")
@@ -2817,6 +2768,94 @@ class FCToolGUI:
         # Track zkill alert notifications
         self._zkill_has_unread = False
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+
+    def _build_title_bar(self, parent):
+        """Build the always-visible title row in ``parent`` and return its frame.
+
+        Extracted from _build_ui so the row's PACK ORDER can be exercised
+        directly by tests -- that order is also its PRIORITY order, and priority
+        is what decides who loses width when the window runs out. Tk places
+        side=RIGHT slaves right-to-left in pack order and starves the LAST one
+        first, so:
+
+          clock (first)  -> rightmost, never moves, never starves
+          status strip   -> next, keeps its slot while there is room
+          update notice  -> last, takes only leftover cavity
+
+        That default costs the existing row exactly nothing. When the cavity is
+        too small for the notice, _fit_update_link escalates: the static
+        subtitle yields first (it is decoration), and only if the row is STILL
+        short is the notice promoted ahead of the status strip.
+        """
+        title_frame = tk.Frame(parent, bg=BG_DARK, pady=8)
+        title_frame.pack(fill=tk.X)
+        self._title_frame = title_frame
+        tk.Label(title_frame, text="FCTool", font=("Consolas", 18, "bold"),
+                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT, padx=15)
+        # The one piece of pure DECORATION in the row, and therefore the first
+        # element to yield when the update notice needs width. Held as an
+        # attribute for exactly that reason -- see _set_update_link_yield.
+        self._title_subtitle = tk.Label(
+            title_frame, text="Fleet Commander Assistant",
+            font=("Consolas", 11), fg=FG_DIM, bg=BG_DARK)
+        self._title_subtitle.pack(side=tk.LEFT, padx=5)
+
+        # Staging system indicator (always visible)
+        staging_name = self.config.get("zkillboard", {}).get("staging_system", "")
+        self._staging_display = tk.Label(
+            title_frame, text=f"Staging: {staging_name}" if staging_name else "Staging: --",
+            font=("Consolas", 10, "bold"), fg=FG_YELLOW, bg=BG_DARK,
+        )
+        self._staging_display.pack(side=tk.LEFT, padx=20)
+
+        # Current system indicator (pulled from ESI location)
+        self._current_system_display = tk.Label(
+            title_frame, text="System: --",
+            font=("Consolas", 10, "bold"), fg=FG_GREEN, bg=BG_DARK,
+        )
+        self._current_system_display.pack(side=tk.LEFT, padx=(0, 20))
+        self._current_system_name = ""
+        self._current_system_region = ""
+
+        # EVE Time (UTC) — always-visible clock (EVE servers run on UTC).
+        # FIRST side=RIGHT slave: rightmost, and the one thing in this row that
+        # never yields.
+        self._eve_clock = tk.Label(
+            title_frame, text="EVE --:--:--",
+            font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_DARK)
+        self._eve_clock.pack(side=tk.RIGHT, padx=15)
+
+        # Status indicators on right
+        self._status_frame = tk.Frame(title_frame, bg=BG_DARK)
+        self._status_frame.pack(side=tk.RIGHT, padx=15)
+        self._chat_status = tk.Label(self._status_frame, text="CHAT: --",
+                                      font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
+        self._chat_status.pack(side=tk.LEFT, padx=8)
+        self._zkill_status = tk.Label(self._status_frame, text="ZKILL: --",
+                                       font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
+        self._zkill_status.pack(side=tk.LEFT, padx=8)
+
+        # Update-available link. Built here but NOT packed: it stays invisible
+        # until _apply_update_info has a newer GitHub release to advertise, and
+        # _set_update_link_yield owns every pack of it thereafter.
+        self._update_link = tk.Label(
+            title_frame, text="", font=("Consolas", 10, "bold"),
+            fg=FG_ACCENT, bg=BG_DARK, cursor="hand2")
+        self._update_link_url = ""      # release page the label currently opens
+        self._update_link_text = ""     # copy currently painted (zero-write latch)
+        self._update_link_yield = self.UPDATE_LINK_YIELD_NONE
+        self._update_link_fitting = False    # re-entrancy guard for the refit
+        self._update_link_fit_after = None   # pending coalesced refit, or None
+        self._update_link.bind("<Button-1>", self._on_update_link_click)
+        attach_tooltip(self._update_link, "")
+
+        # A resize changes the cavity, so a notice already on screen has to be
+        # re-fitted. The handler is a single attribute test while nothing is
+        # showing, which is the overwhelmingly common case.
+        title_frame.bind("<Configure>", self._on_title_bar_configure, add="+")
+        return title_frame
 
     def _update_eve_clock(self):
         """Refresh the always-visible EVE-time (UTC) clock once per second."""
@@ -2857,6 +2896,13 @@ class FCToolGUI:
                                                      # unauthenticated GitHub
                                                      # limit is 60/hour/IP
 
+    # What the title row gives up, in order, so a SHOWING notice always gets its
+    # full requested width. Position in a pack row IS priority, so these are the
+    # only two knobs that can feed the notice without moving the clock.
+    UPDATE_LINK_YIELD_NONE = 0      # nothing yields (the row has room)
+    UPDATE_LINK_YIELD_SUBTITLE = 1  # the static subtitle unmaps -- decoration
+    UPDATE_LINK_YIELD_STATUS = 2    # ...and the notice outranks the status strip
+
     def _update_check_enabled(self) -> bool:
         """True unless the user turned the GitHub update check off in Settings."""
         return bool(self.config.get("update_check_enabled", True))
@@ -2894,6 +2940,104 @@ class FCToolGUI:
             return
         self._post_ui(self._apply_update_info, info)
 
+    def _set_update_link_yield(self, stage):
+        """Apply one yield ``stage`` to the title row. Idempotent; guarded.
+
+        Returns True when the row was reconfigured, False when Tk refused (the
+        widgets are going away) -- the caller must not latch on a False.
+
+        The notice is only (re)packed while it is actually SHOWING: restoring
+        the row on hide must not resurrect it.
+        """
+        try:
+            if stage >= self.UPDATE_LINK_YIELD_SUBTITLE:
+                self._title_subtitle.pack_forget()
+            else:
+                # ``before=`` restores the ORDER, not just the visibility -- a
+                # bare re-pack would append the subtitle to the end of the row.
+                self._title_subtitle.pack(side=tk.LEFT, padx=5,
+                                          before=self._staging_display)
+            if self._update_link_text:
+                if stage >= self.UPDATE_LINK_YIELD_STATUS:
+                    self._update_link.pack(side=tk.RIGHT, padx=15,
+                                           before=self._status_frame)
+                else:
+                    self._update_link.pack(side=tk.RIGHT, padx=15,
+                                           after=self._status_frame)
+        except tk.TclError:
+            return False
+        self._update_link_yield = stage
+        return True
+
+    def _fit_update_link(self):
+        """Give a showing notice its FULL requested width, escalating who yields.
+
+        Each stage is MEASURED, not assumed: the loop stops at the first one
+        that gives the label its reqwidth, so stage 0 -- which costs the
+        existing row nothing -- is kept whenever the cavity is big enough, and
+        the subtitle only disappears once the row has actually run out.
+
+        The fit test is ``ismapped AND width >= reqwidth``, and BOTH halves are
+        load-bearing. When the packer drops a slave entirely it stops updating
+        its width, so an unmapped label keeps reporting the width it had while
+        it still fitted -- on a shrink from 1600 to 1000 that stale figure reads
+        as "it fits" and the row never yields (measured; the width-only version
+        of this loop shipped that bug for one smoke run).
+        """
+        link = getattr(self, "_update_link", None)
+        if link is None or not self._update_link_text:
+            return
+        row = getattr(self, "_title_frame", None)
+        try:
+            if row is not None and not row.winfo_ismapped():
+                # Withdrawn or minimised: every child reports unmapped, so a
+                # measured fit would escalate on false evidence and strip the
+                # subtitle off a window that has plenty of room. Place the
+                # notice and let the <Configure> that arrives on restore fit it.
+                self._set_update_link_yield(self.UPDATE_LINK_YIELD_NONE)
+                return
+        except tk.TclError:
+            return
+        self._update_link_fitting = True
+        try:
+            for stage in (self.UPDATE_LINK_YIELD_NONE,
+                          self.UPDATE_LINK_YIELD_SUBTITLE,
+                          self.UPDATE_LINK_YIELD_STATUS):
+                if not self._set_update_link_yield(stage):
+                    return
+                try:
+                    self.root.update_idletasks()
+                    if (link.winfo_ismapped()
+                            and link.winfo_width() >= link.winfo_reqwidth()):
+                        return
+                except tk.TclError:
+                    return
+        finally:
+            self._update_link_fitting = False
+
+    def _on_title_bar_configure(self, event=None):
+        """Re-fit the notice after the title row's width changes.
+
+        Deferred and coalesced: a window drag raises <Configure> on every pixel
+        and a fit costs a layout pass. Re-entrant by construction otherwise --
+        the fit's own update_idletasks can raise <Configure> again -- hence the
+        _update_link_fitting guard.
+        """
+        if not getattr(self, "_update_link_text", ""):
+            return          # nothing showing: one attribute test and out
+        if self._update_link_fitting or self._update_link_fit_after is not None:
+            return
+        try:
+            self._update_link_fit_after = self.root.after(
+                150, self._refit_update_link)
+        except (tk.TclError, RuntimeError):
+            self._update_link_fit_after = None
+
+    def _refit_update_link(self):
+        """Coalesced <Configure> tail: clear the pending id, then re-fit."""
+        self._update_link_fit_after = None
+        self._fit_update_link()
+
     def _apply_update_info(self, info):
         """Tk thread: show, update or hide the title-bar update link.
 
@@ -2915,6 +3059,9 @@ class FCToolGUI:
             except tk.TclError:
                 return
             self._update_link_text = ""
+            # Give the subtitle its slot back. Ordered AFTER the latch clear so
+            # the restore cannot re-pack the notice we just hid.
+            self._set_update_link_yield(self.UPDATE_LINK_YIELD_NONE)
             return
         self._update_link_url = info.url
         text = f"↑ {info.tag} available"
@@ -2926,13 +3073,12 @@ class FCToolGUI:
                 link,
                 f"FCTool {info.tag} is available (you are running "
                 f"{APP_VERSION}) -- click to open the release page.")
-            # Packed LAST among the title bar's side=RIGHT slaves (see the
-            # build site): left of the status strip and the clock, and the
-            # first to be squeezed on a narrow window.
-            link.pack(side=tk.RIGHT, padx=15)
         except tk.TclError:
             return
         self._update_link_text = text
+        # _fit_update_link owns the pack: it places the notice at the cheapest
+        # yield stage that still gives it its full width.
+        self._fit_update_link()
 
     def _on_update_link_click(self, event=None):
         """Open the advertised release page in the default browser."""
