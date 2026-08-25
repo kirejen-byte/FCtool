@@ -2848,6 +2848,7 @@ class FCToolGUI:
         self._update_link_yield = self.UPDATE_LINK_YIELD_NONE
         self._update_link_fitting = False    # re-entrancy guard for the refit
         self._update_link_fit_after = None   # pending coalesced refit, or None
+        self._update_link_fit_state = None   # last (key, slack) the rider read
         self._update_link.bind("<Button-1>", self._on_update_link_click)
         attach_tooltip(self._update_link, "")
 
@@ -2874,6 +2875,17 @@ class FCToolGUI:
         # (attribute still None) and the tiles' widgets die before the root does.
         try:
             self._info_tiles.tick()
+        except (AttributeError, tk.TclError):
+            pass
+        # The update notice rides it too, for a reason <Configure> cannot cover:
+        # the notice's SIBLINGS grow and shrink on their own -- the system
+        # indicator is rewritten on every ESI location poll, i.e. every gate jump
+        # for an FC mid-roam -- and a sibling's text change raises no <Configure>
+        # on the row. Reads only unless something actually moved; see
+        # _ride_update_link_fit. Guarded like the ledger and the tiles: a fault
+        # here must never stop the clock rescheduling itself.
+        try:
+            self._ride_update_link_fit()
         except (AttributeError, tk.TclError):
             pass
         try:
@@ -2922,10 +2934,19 @@ class FCToolGUI:
             self.root.after(self.UPDATE_CHECK_INTERVAL_MS,
                             self._start_update_check)
         except (tk.TclError, RuntimeError):
-            pass                # root gone (app closing) -- nothing to re-arm
+            return              # root gone (app closing): no beat, and no
+                                # worker either -- its verdict would marshal
+                                # into a dispatcher that will never drain
         if not self._update_check_enabled():
             return
-        threading.Thread(target=self._update_check_worker, daemon=True).start()
+        try:
+            threading.Thread(target=self._update_check_worker,
+                             daemon=True).start()
+        except Exception:
+            pass                # out of threads: skip this round silently. A
+                                # courtesy version check must not surface as a
+                                # traceback through report_callback_exception;
+                                # the beat above already stands re-armed.
 
     def _update_check_worker(self):
         """Worker thread: ask GitHub, marshal the verdict back via the queue.
@@ -2969,8 +2990,15 @@ class FCToolGUI:
         self._update_link_yield = stage
         return True
 
-    def _fit_update_link(self):
+    def _fit_update_link(self, from_stage=None):
         """Give a showing notice its FULL requested width, escalating who yields.
+
+        ``from_stage`` is where the escalation STARTS. None means stage 0, which
+        also probes DE-escalation (give the subtitle its slot back if the row can
+        afford it) and is what a first paint or a cavity GROWTH wants. Passing
+        the current stage is what a SHRINK wants: re-probing stage 0 there maps
+        the subtitle and unmaps it again inside the same fit, which during a
+        drag-resize is one visible strobe per fit.
 
         Each stage is MEASURED, not assumed: the loop stops at the first one
         that gives the label its reqwidth, so stage 0 -- which costs the
@@ -3000,9 +3028,12 @@ class FCToolGUI:
             return
         self._update_link_fitting = True
         try:
-            for stage in (self.UPDATE_LINK_YIELD_NONE,
-                          self.UPDATE_LINK_YIELD_SUBTITLE,
-                          self.UPDATE_LINK_YIELD_STATUS):
+            stages = (self.UPDATE_LINK_YIELD_NONE,
+                      self.UPDATE_LINK_YIELD_SUBTITLE,
+                      self.UPDATE_LINK_YIELD_STATUS)
+            if from_stage:
+                stages = stages[from_stage:]
+            for stage in stages:
                 if not self._set_update_link_yield(stage):
                     return
                 try:
@@ -3033,10 +3064,79 @@ class FCToolGUI:
         except (tk.TclError, RuntimeError):
             self._update_link_fit_after = None
 
+    def _update_link_fit_snapshot(self):
+        """READ-ONLY snapshot of everything that can change the notice's fit.
+
+        Returns ``(key, slack)``. The key is the change detector: the row's
+        allocated width plus the REQUESTED width of every sibling. Requested,
+        never allocated -- the fit itself perturbs allocated widths, so reading
+        those would make this loop feed on its own output (which is also why the
+        link's own <Configure> must never be bound; the clock rider exists to
+        READ instead of listen).
+
+        ``slack`` is a monotone proxy for the cavity: the row's width less what
+        its top-level slaves ask for. It carries a constant offset (the "FCTool"
+        brand label and every padx are omitted, all fixed) because only its
+        DELTA between two ticks is ever used -- the SIGN says whether the row
+        just got tighter or roomier. The status strip's own children are in the
+        key but not the sum, which would double-count them.
+        """
+        row = self._title_frame
+        slaves = (self._title_subtitle, self._staging_display,
+                  self._current_system_display, self._eve_clock,
+                  self._status_frame, self._update_link)
+        reqs = tuple(w.winfo_reqwidth() for w in slaves)
+        inner = (self._chat_status.winfo_reqwidth(),
+                 self._zkill_status.winfo_reqwidth())
+        width = row.winfo_width()
+        return (width,) + reqs + inner, width - sum(reqs)
+
+    def _ride_update_link_fit(self):
+        """1 Hz rider on the clock beat: re-fit when the ROW's contents moved.
+
+        <Configure> only fires when the WINDOW resizes, but this row rearranges
+        itself without one: ``_current_system_display`` is rewritten on every
+        ESI location poll (for an FC mid-roam, every gate jump), and staging /
+        CHAT / ZKILL are rewritten on their own schedules. Measured: a notice
+        sitting at 132/132 in Ahbazon was clipped to 103px by a jump to "J-GAMP
+        (Vale of the Silent)" with ZERO <Configure> events on the frame and
+        nothing pending -- and the 12-hourly beat cannot cure it, because an
+        unchanged verdict early-returns on the zero-write latch. The asymmetry
+        ran the other way too: once escalated, the subtitle stayed hidden for
+        the rest of the session even after the cavity re-opened.
+
+        Change detection FIRST, writes only on a change: an unchanged row costs
+        this tick a handful of winfo reads and not one Tk write, which is the
+        zero-write rule this subsystem is held to.
+        """
+        if not self._update_link_text:
+            self._update_link_fit_state = None
+            return              # nothing showing: nothing to keep fitted
+        key, slack = self._update_link_fit_snapshot()
+        previous = self._update_link_fit_state
+        self._update_link_fit_state = (key, slack)
+        if previous is None or key == previous[0]:
+            # First tick after a paint (which already fitted), or a row that did
+            # not move. Either way there is nothing to do.
+            return
+        if slack > previous[1]:
+            self._fit_update_link()                 # roomier: probe stage 0 too
+        else:
+            self._fit_update_link(self._update_link_yield)   # tighter: no strobe
+
     def _refit_update_link(self):
-        """Coalesced <Configure> tail: clear the pending id, then re-fit."""
+        """Coalesced <Configure> tail: clear the pending id, then re-fit.
+
+        Routed through the rider so a window drag gets the same direction rule
+        as a text change -- a shrink escalates from the CURRENT stage instead of
+        re-probing stage 0, which is what stops the subtitle strobing once per
+        fit across the drag.
+        """
         self._update_link_fit_after = None
-        self._fit_update_link()
+        try:
+            self._ride_update_link_fit()
+        except (AttributeError, tk.TclError):
+            pass
 
     def _apply_update_info(self, info):
         """Tk thread: show, update or hide the title-bar update link.
@@ -3079,6 +3179,15 @@ class FCToolGUI:
         # _fit_update_link owns the pack: it places the notice at the cheapest
         # yield stage that still gives it its full width.
         self._fit_update_link()
+        # Seed the rider's baseline from the paint, not from the first tick.
+        # Without this the very FIRST <Configure> after a notice appears is
+        # swallowed by the rider's "nothing to compare against yet" branch --
+        # measured on a live resize: shown at 1600, dragged to 1000, and the
+        # notice sat unmapped until a clock tick happened to run.
+        try:
+            self._update_link_fit_state = self._update_link_fit_snapshot()
+        except (tk.TclError, AttributeError):
+            self._update_link_fit_state = None
 
     def _on_update_link_click(self, event=None):
         """Open the advertised release page in the default browser."""
