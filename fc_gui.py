@@ -228,7 +228,15 @@ from ui_theme import (
 # wires guarded transient/grab + Escape→cancel + base bg once (D2), attach_tooltip
 # is the single hover-tooltip impl (D9). Adopted here only in the preview-cluster
 # dialogs; fc_gui's other tooltip sites keep their existing helper (scope).
-from ui_helpers import make_modal, attach_tooltip
+from ui_helpers import make_modal, attach_tooltip, update_tooltip
+
+# Update awareness. app_version owns the released version string (and the one
+# tag parser); update_check owns the single GitHub /releases/latest call and the
+# newer-than comparison. Both are pure, Tk-free, network-injectable leaves --
+# fc_gui holds only the wiring: the config gate, the 12-hourly beat, the worker
+# and the title-bar link.
+import update_check
+from app_version import APP_VERSION
 
 # ── Main-thread UI dispatcher ──────────────────────────────────────────────────
 # How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
@@ -1495,6 +1503,11 @@ class FCToolGUI:
         # walks never land on the same tick. Ingest has been running since
         # _ensure_intel_monitor above; only this display state waits.
         self.root.after(5000, self._scan_intel_channel_states)
+        # Update awareness, later still: one unauthenticated GitHub call, and
+        # nothing about it is urgent enough to compete with boot. Silent no-op
+        # when config["update_check_enabled"] is off; the 12-hourly beat re-arms
+        # from here. See _start_update_check.
+        self.root.after(10000, self._start_update_check)
         # Infra region auto-scan, later still (15 s) so it never piles onto the
         # startup burst and gives ESI login a beat to settle. Silent no-op unless
         # opted in (config["infra"]["auto_scan_on_start"]), authenticated, and
@@ -2768,6 +2781,21 @@ class FCToolGUI:
                                        font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
         self._zkill_status.pack(side=tk.LEFT, padx=8)
 
+        # Update-available link. Built here but NOT packed: it stays invisible
+        # until _apply_update_info has a newer GitHub release to advertise (see
+        # the update-awareness block under _update_eve_clock). It is the LAST
+        # side=RIGHT slave of the title bar, so it sits left of the status strip
+        # and the EVE clock and can never shift them -- and because Tk starves
+        # the last-packed slave first, a narrow window squeezes this label
+        # rather than the clock.
+        self._update_link = tk.Label(
+            title_frame, text="", font=("Consolas", 10, "bold"),
+            fg=FG_ACCENT, bg=BG_DARK, cursor="hand2")
+        self._update_link_url = ""      # release page the label currently opens
+        self._update_link_text = ""     # copy currently painted (zero-write latch)
+        self._update_link.bind("<Button-1>", self._on_update_link_click)
+        attach_tooltip(self._update_link, "")
+
         # ── Notebook (Tabs) ──────────────────────────────────────────────────
         self.notebook = ttk.Notebook(self.root, style="Dark.TNotebook")
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -2812,6 +2840,108 @@ class FCToolGUI:
         try:
             self.root.after(1000, self._update_eve_clock)
         except (tk.TclError, RuntimeError):
+            pass
+
+    # ── Update awareness (GitHub /releases/latest) ────────────────────────────
+    # The feature lives in update_check.py / app_version.py (pure, Tk-free,
+    # fail-silent by contract). Everything here is wiring: the config gate, the
+    # beat, the worker, and the title-bar link the verdict paints.
+    #
+    # config["update_check_enabled"] is a TOP-LEVEL flag defaulting to True and
+    # deliberately ABSENT from DEFAULT_CONFIG (the config["intel_alert_sound"]
+    # precedent): the release packaging gates assert the shipped config's exact
+    # top-level key set, so this key self-populates on a Save rather than
+    # shipping and breaking the byte-identical config lineage.
+
+    UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000   # ~2 calls/day; the
+                                                     # unauthenticated GitHub
+                                                     # limit is 60/hour/IP
+
+    def _update_check_enabled(self) -> bool:
+        """True unless the user turned the GitHub update check off in Settings."""
+        return bool(self.config.get("update_check_enabled", True))
+
+    def _start_update_check(self):
+        """Tk thread: re-arm the 12-hourly beat, then spawn one check worker.
+
+        Deliberately NOT in tests/test_no_worker_after.py's WORKER_METHODS: like
+        _ensure_intel_monitor, this is Tk-thread code that SPAWNS a worker, and
+        the ``after`` below is a legitimate main-thread reschedule. The worker
+        half (_update_check_worker) is the listed one.
+
+        The re-arm happens even while the flag is off, so ticking the checkbox
+        back on never needs a restart: the flag gates the FETCH, not the beat.
+        """
+        try:
+            self.root.after(self.UPDATE_CHECK_INTERVAL_MS,
+                            self._start_update_check)
+        except (tk.TclError, RuntimeError):
+            pass                # root gone (app closing) -- nothing to re-arm
+        if not self._update_check_enabled():
+            return
+        threading.Thread(target=self._update_check_worker, daemon=True).start()
+
+    def _update_check_worker(self):
+        """Worker thread: ask GitHub, marshal the verdict back via the queue.
+
+        update_check.check is fail-silent by contract; the guard is belt and
+        braces, because an exception escaping a daemon thread would be a stderr
+        spew earned by nothing more than a courtesy version check.
+        """
+        try:
+            info = update_check.check(APP_VERSION)
+        except Exception:
+            return
+        self._post_ui(self._apply_update_info, info)
+
+    def _apply_update_info(self, info):
+        """Tk thread: show, update or hide the title-bar update link.
+
+        Guarded zero-write: the copy currently painted is latched in
+        ``_update_link_text``, and the latch is set only AFTER the Tk write
+        lands -- so an unchanged verdict costs nothing on the 12-hourly beat,
+        and a TclError never leaves the latch claiming a paint that never
+        happened.
+        """
+        link = getattr(self, "_update_link", None)
+        if link is None:
+            return              # title bar not built yet, or already torn down
+        if info is None:
+            self._update_link_url = ""
+            if not self._update_link_text:
+                return          # already hidden -- nothing to unpaint
+            try:
+                link.pack_forget()
+            except tk.TclError:
+                return
+            self._update_link_text = ""
+            return
+        self._update_link_url = info.url
+        text = f"↑ {info.tag} available"
+        if text == self._update_link_text:
+            return
+        try:
+            link.config(text=text)
+            update_tooltip(
+                link,
+                f"FCTool {info.tag} is available (you are running "
+                f"{APP_VERSION}) -- click to open the release page.")
+            # Packed LAST among the title bar's side=RIGHT slaves (see the
+            # build site): left of the status strip and the clock, and the
+            # first to be squeezed on a narrow window.
+            link.pack(side=tk.RIGHT, padx=15)
+        except tk.TclError:
+            return
+        self._update_link_text = text
+
+    def _on_update_link_click(self, event=None):
+        """Open the advertised release page in the default browser."""
+        url = getattr(self, "_update_link_url", "")
+        if not url:
+            return
+        try:
+            self._open_url(url)
+        except Exception:
             pass
 
     # ── X-Up Tab ──────────────────────────────────────────────────────────────
@@ -16481,6 +16611,27 @@ class FCToolGUI:
                        activeforeground=FG_TEXT,
                        command=self._on_sound_toggle).pack(anchor=tk.W)
 
+        # ── Update check ─────────────────────────────────────────────────
+        # Top-level flag, default ON, deliberately absent from DEFAULT_CONFIG
+        # (see the update-awareness block under _update_eve_clock). No
+        # ``command=``: the flag is read live by _update_check_enabled and
+        # persisted by _save_settings, so there is nothing to react to.
+        self._update_check_var = tk.BooleanVar(
+            value=self.config.get("update_check_enabled", True))
+        update_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        update_frame.pack(fill=tk.X, padx=20, pady=2)
+        update_cb = tk.Checkbutton(update_frame, text="Check GitHub for updates",
+                                   variable=self._update_check_var,
+                                   font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+                                   selectcolor=BG_ENTRY, activebackground=BG_DARK,
+                                   activeforeground=FG_TEXT)
+        update_cb.pack(anchor=tk.W)
+        attach_tooltip(update_cb,
+                       "Twice a day, ask GitHub whether a newer FCTool release "
+                       "exists. When one does, a link appears beside the EVE "
+                       "clock in the title bar. Nothing is downloaded or "
+                       "installed, and no login or token is used.")
+
         # ── Ansiblex Jump Gates ──────────────────────────────────────────
         self._add_section(scroll_frame, "Ansiblex Jump Gates",
                           toc_title="Ansiblex")
@@ -25669,6 +25820,10 @@ class FCToolGUI:
         # Sound setting
         self.config["sound_on_ready"] = self._sound_var.get()
         self._sound_enabled = self._sound_var.get()
+
+        # GitHub update check. Self-populating top-level key -- it lands in
+        # config.json on the first Save and is never shipped in DEFAULT_CONFIG.
+        self.config["update_check_enabled"] = self._update_check_var.get()
 
         # Ansiblex connections
         ansiblex_lines = self._ansiblex_text.get("1.0", tk.END).strip().split("\n")
