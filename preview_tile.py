@@ -644,7 +644,13 @@ class TileWindow:
         # add="+", so re-attaching per push would stack a handler set per tick.
         # topmost=True because the tile itself is a HWND_TOPMOST window — a tip
         # without it is created BELOW its owner, i.e. invisible.
-        ui_helpers.attach_tooltip(self._implant_lbl, "", topmost=True)
+        # place_above=True because this icon is in the TOP strip, directly above
+        # the DWM-composited video body: the default below-the-widget tip lands
+        # over that body and the compositor draws the thumbnail OVER it (occluded
+        # even while -topmost). Hanging it above the top-strip icon clears the
+        # body entirely (map/preview.md).
+        ui_helpers.attach_tooltip(self._implant_lbl, "", topmost=True,
+                                  place_above=True)
 
         # ── bottom caption strip (mirror of the top strip) ──────────────────
         # The activity label ('<label> - <ShipType>') lives in a small strip

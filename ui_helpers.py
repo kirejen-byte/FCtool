@@ -123,7 +123,7 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
     return win
 
 
-def attach_tooltip(widget, text, *, topmost=False):
+def attach_tooltip(widget, text, *, topmost=False, place_above=False):
     """Attach a simple hover tooltip to ``widget`` (D9 shared helper) and return
     ``widget``.
 
@@ -146,6 +146,17 @@ def attach_tooltip(widget, text, *, topmost=False):
     attached inside a ``HWND_TOPMOST`` window (e.g. the FC HUD tiles) — a tip
     with no topmost handling of its own is stacked BELOW its topmost owner at
     the pointer position: created, but invisible.
+
+    ``place_above`` (keyword-only, default False): when True, the tip is hung
+    ABOVE the widget (its bottom edge just above the widget's top) instead of
+    the default just-below-the-widget position. Pass this when the space
+    directly below the widget is covered by something that would occlude the
+    tip — specifically the FCPreview implant icon, which sits in a tile's TOP
+    caption strip directly above the DWM-composited live-video body: a
+    below-the-widget tip lands over that body and the compositor draws the
+    live thumbnail OVER it, so it is never seen even while ``-topmost``
+    (``map/preview.md``). Default False keeps every other caller's tip below
+    the widget, unchanged.
     """
     widget._tooltip_text = text
     state = {"tip": None}
@@ -174,9 +185,27 @@ def attach_tooltip(widget, text, *, topmost=False):
                      fg=ui_theme.FG_TEXT, bg=ui_theme.BG_PANEL,
                      borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
                      wraplength=340, padx=5, pady=3).pack()
-            tip.wm_geometry(
-                f"+{widget.winfo_rootx() + 12}"
-                f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+            if place_above:
+                # Hang the tip ABOVE the widget instead of below it. Used for the
+                # FCPreview implant icon: it lives in the tile's TOP caption strip,
+                # directly above the DWM-composited live-video body, and the default
+                # below-the-widget tip lands over that body where the compositor
+                # draws the live thumbnail OVER it — occluded even while -topmost
+                # (map/preview.md). Above the top-strip icon clears the body.
+                #
+                # winfo_REQheight, not winfo_height: the tip is not yet mapped when
+                # we place it, so on an overrideredirect Toplevel winfo_height()
+                # reads 1 and the tip would drop right back over the body. The
+                # requested height is the real content height and is map-independent
+                # once update_idletasks() has realised the geometry request.
+                tip.update_idletasks()
+                tip.wm_geometry(
+                    f"+{widget.winfo_rootx() + 12}"
+                    f"+{widget.winfo_rooty() - tip.winfo_reqheight() - 4}")
+            else:
+                tip.wm_geometry(
+                    f"+{widget.winfo_rootx() + 12}"
+                    f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
             if topmost:
                 try:
                     tip.wm_attributes("-topmost", True)
