@@ -980,11 +980,12 @@ def _preview_intel_radius(cfg) -> int:
 
 
 # FCPreview major-implant icon: how often the ESI location poller re-asks
-# /implants/ for ONE character. A pilot's head changes at a jump clone, not at
-# poll cadence, and the call rides the per-character `char-detail` bucket
-# (600 tokens / 15 min), so this is a hard per-key rate ceiling rather than an
-# optimization -- see _preview_implant_refresh, which stamps the ATTEMPT.
-_PREVIEW_IMPLANT_REFRESH_S = 300.0
+# /implants/ for ONE character. A pilot's head changes at a jump clone, not
+# at poll cadence. 150s halves the old 300s latency to reflect a clone swap,
+# sits just above ESI's ~2min server-side cache (so no wasted calls), and
+# stays far under the per-character `char-detail` bucket (600 tokens / 15
+# min) -- see _preview_implant_refresh, which stamps the ATTEMPT.
+_PREVIEW_IMPLANT_REFRESH_S = 150.0
 # A broken implants fetch breaks on every refresh for every character; one
 # terse line at most this often while the fault persists (a healthy fetch
 # re-arms the report). Same shape as _PREVIEW_FAST_DRAIN_LOG_EVERY_S.
