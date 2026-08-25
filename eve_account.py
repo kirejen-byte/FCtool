@@ -47,9 +47,25 @@ log = logging.getLogger(__name__)
 
 # --- tuning ------------------------------------------------------------------
 _NEG_RETRY_INTERVAL_S = 10.0   # a per-PID miss re-probes no sooner than this
-_MAX_NEG_RETRIES = 3           # ...and at most this many times (design §6:
-                               # "retries at most 3 times"): 1 initial probe +
-                               # 3 retries = 4 total, then rest until the PID dies.
+_MAX_NEG_RETRIES = 3           # size of the FAST initial burst (design §6): 1
+                               # initial probe + 3 retries = 4 probes ~10s apart.
+                               # NOT a give-up threshold — after the burst the
+                               # probe keeps retrying on the slow cadence below.
+_NEG_RETRY_INTERVAL_LONG_S = 60.0  # post-burst slow-retry cadence; a stranded PID
+                               # is re-probed at this interval forever, never given
+                               # up on. AV on this box can block the cross-process
+                               # command-line read for a client's first ~minute
+                               # (fc_gui.py:17604), so a client launched WHILE FCTool
+                               # is running can miss its whole burst. The old permanent
+                               # exhaustion then stranded that account at None for the
+                               # life of a long-lived process (a login screen never
+                               # dies) — blanking its labels, breaking acct: cycling and
+                               # login-drag persistence. The slow backoff re-probes Tier 0
+                               # ONLY (the cheap cmdline ctypes read) and self-heals the
+                               # instant AV releases the process; Tier 1's ~512KB log-tail
+                               # read is deterministic per process, so the fast burst
+                               # already gave it its shot. A truly-unresolvable PID (e.g.
+                               # GeForce Now, no local cmdline) costs one sub-ms probe/60s.
 _LOG_TAIL_BYTES = 512 * 1024   # launcher-log tail read (design §6)
 _LOG_MAX_AGE_S = 48 * 3600     # ignore launcher logs older than 48 h
 
@@ -237,8 +253,9 @@ class AccountMap:
 
         Reads each client's ``.pid``, ``.is_login``, ``.key`` (the
         ``ClientWindow`` surface; tests pass a stub exposing them). Resolution
-        per PID is per-PID cache -> Tier 0 -> Tier 1, cached with a bounded
-        negative retry. The live map is rebuilt from scratch each call so a
+        per PID is per-PID cache -> Tier 0 -> Tier 1, cached with a fast
+        negative-retry burst then an indefinite slow backoff (a transient miss
+        self-heals). The live map is rebuilt from scratch each call so a
         departed client stops resolving via ``char_for_account``. A per-client
         probe fault is contained — that client is left unknown, the next is
         unaffected (design §11). The caller gates this behind the
@@ -271,21 +288,37 @@ class AccountMap:
                 continue
 
     def _resolve_pid(self, pid: int) -> int | None:
-        """Per-PID cache -> Tier 0 -> Tier 1, with a bounded negative retry."""
+        """Per-PID cache -> Tier 0 -> Tier 1. A miss is retried in a fast initial
+        burst (Tier 0 + Tier 1), then INDEFINITELY on a slow backoff that runs
+        Tier 0 alone — a transient failure (AV blocking the command-line read on
+        a client's first ~minute) must self-heal, so a live PID is never
+        permanently given up on. Tier 1 is burst-only (see the Tier 1 gate)."""
         cached = self._pid_cache.get(pid, _UNSET)
         if cached is not _UNSET and cached is not None:
             return cached  # positive result — probe exactly once per process
         now = self._clock()
         neg = self._pid_neg.get(pid)
+        attempts = neg[0] if neg is not None else 0   # prior misses (0 = first probe)
         if neg is not None:
-            attempts, last_ts = neg
-            if attempts > _MAX_NEG_RETRIES:
-                return None  # exhausted — rest until the PID dies
-            if now - last_ts < _NEG_RETRY_INTERVAL_S:
-                return None  # too soon to retry
+            last_ts = neg[1]
+            # Fast burst first (attempts <= _MAX_NEG_RETRIES) for quick
+            # resolution, then an indefinite slow backoff instead of giving up:
+            # keep re-probing every _NEG_RETRY_INTERVAL_LONG_S so an AV-blocked
+            # startup resolves the moment the command-line read succeeds.
+            interval = (_NEG_RETRY_INTERVAL_S if attempts <= _MAX_NEG_RETRIES
+                        else _NEG_RETRY_INTERVAL_LONG_S)
+            if now - last_ts < interval:
+                return None  # too soon to retry on the current cadence
 
         account = account_id_for_pid(pid, self._win32)          # Tier 0
-        if account is None:                                     # Tier 1
+        # Tier 1 (launcher-log correlation) runs only during the fast burst. Its
+        # result is deterministic for a fixed process-create-time, so a 60s
+        # backoff re-run cannot change the answer — it would only repeat a
+        # ~512KB log-tail read on the Tk/render thread. The burst already gave
+        # Tier 1 its shot (covering a slightly-late log line); the indefinite
+        # backoff needs only the cheap Tier 0 cmdline read, which is the probe
+        # that actually self-heals once AV releases the process.
+        if account is None and attempts <= _MAX_NEG_RETRIES:    # Tier 1
             try:
                 start = self._win32.process_create_time(pid)
                 account = account_id_from_log(start, self._log_reader)
