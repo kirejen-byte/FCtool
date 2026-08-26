@@ -165,7 +165,10 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
     requested-geometry read is realised); if it returns a truthy value it owns
     the tip's geometry and the default winfo-based placement (``place_above``
     or the below-the-widget default) is skipped entirely, otherwise the
-    default placement runs as if ``place_fn`` were never passed. Used by the
+    default placement runs as if ``place_fn`` were never passed. While the
+    callback runs, the tip is still WITHDRAWN (not yet mapped): the preceding
+    ``update_idletasks()`` realises ``winfo_reqheight()`` correctly, but
+    ``winfo_ismapped()`` reads False inside the callback. Used by the
     FCPreview implant icon: its tile is positioned by external Win32
     ``SetWindowPos`` (physical px) outside Tk's geometry manager, so the
     tile's own ``self._pos`` -- the same authoritative physical position that
