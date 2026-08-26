@@ -1372,6 +1372,12 @@ class FCToolGUI:
                     log.exception("[account] could not preserve corrupt sidecar")
             except Exception:
                 log.exception("[account] sidecar load failed; starting empty")
+        # One-time migration to the new account_slots / account_slots_auto ON
+        # defaults: flip existing OFF configs on while adopting their current
+        # per-character geometry into the account slots (see
+        # _preview_migrate_default_slots). Placed AFTER the account-map load so
+        # the observed-account seed pass has self._account_map + sidecar ready.
+        self._preview_migrate_default_slots()
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
@@ -17589,19 +17595,27 @@ class FCToolGUI:
         # Account slots: keep ONE preview position (and size) per ACCOUNT
         # instead of one per character, so logging an alt in on a window puts
         # its tile exactly where its main's was -- and a window sitting on the
-        # character-select screen holds that spot. DEFAULT OFF, deliberately:
-        # the flag changes what an already-saved rect MEANS, so switching it on
-        # by default would re-point every existing user's hand-placed grid on
-        # their behalf. _preview_layout_key is the one place it is read.
-        "account_slots": False,
+        # character-select screen holds that spot. DEFAULT ON: a fresh user just
+        # gets per-account positioning from the start. The flag changes what an
+        # already-saved rect MEANS, so an existing config is NOT flipped
+        # underneath the user -- a one-time startup migration
+        # (_preview_migrate_default_slots) turns it on while ADOPTING the
+        # current hand-placed grid into the account slots (via
+        # _preview_seed_account_slots), so the grid never moves; the only
+        # visible change is that login / character-select tiles now land on
+        # their account's slot. _preview_layout_key is the one place it is read.
+        "account_slots": True,
         # With account_slots on, ALSO route a character FCTool has only OBSERVED
         # onto an account (detected from the EVE client, never hand-labelled in
         # the Characters tab) into that account's slot -- through the read-time
         # effective view (_preview_effective_account_of) instead of the
-        # manual-only map. DEFAULT OFF: an observed grouping is a best guess, so
-        # opting a live tile's POSITION onto it is the user's call. Inert unless
-        # account_slots is on -- _preview_layout_key reads it only past that gate.
-        "account_slots_auto": False,
+        # manual-only map. DEFAULT ON: with the ground-truth account map an
+        # observed grouping is reliable, so a detected alt shares its account's
+        # slot without needing a hand label. The same one-time migration
+        # (_preview_migrate_default_slots) flips this on for existing configs.
+        # Inert unless account_slots is on -- _preview_layout_key reads it only
+        # past that gate.
+        "account_slots_auto": True,
         # ── Account identity (design §10) ───────────────────────────────────
         # Master switch for the ground-truth account<->character map
         # (eve_account.AccountMap): read each EVE client's OWN command line for
@@ -24804,6 +24818,37 @@ class FCToolGUI:
                     if isinstance(entry, (list, tuple)) and len(entry) >= width:
                         block[slot] = list(entry)
                         break               # first answerable member wins
+
+    def _preview_migrate_default_slots(self):
+        """One-time migration flipping `account_slots` / `account_slots_auto`
+        from their old OFF default to the new ON default (owner request
+        2026-08-25) WITHOUT moving a hand-placed grid.
+
+        A config that predated the ON default has `False` stored for both keys
+        (the per-tick layout-key read falls back to a hardcoded False, so a
+        stored False is what an upgrading user actually has). This switches them
+        on with the CURRENT layout preserved -- the existing per-character
+        geometry is adopted into the account slots by `_preview_seed_account_slots`
+        -- so the only visible change is that character-select / login tiles now
+        land on their account's slot; the grid itself does not shift.
+
+        Gated on the `account_slots_migrated` marker so it runs EXACTLY ONCE:
+        after it, a later deliberate untick is never re-flipped (the marker is a
+        migration artifact, deliberately NOT in `_PREVIEW_DEFAULTS` -- it is set
+        only here and preserved as an unknown-but-kept key). Seeding is called
+        unconditionally because `_preview_seed_account_slots` only fills ABSENT
+        slot keys: a fresh config has no members to seed and an already-on
+        config's slots are all present, so both are no-ops; only an existing OFF
+        config with saved geometry actually adopts anything. Mirrors
+        `_migrate_fittings_config`: idempotent, and saves once."""
+        cfg = self._preview_cfg()
+        if cfg.get("account_slots_migrated"):
+            return
+        cfg["account_slots"] = True
+        cfg["account_slots_auto"] = True
+        cfg["account_slots_migrated"] = True
+        self._preview_seed_account_slots(cfg)
+        self._save_config()
 
     def _preview_note_hwnd_account(self, client):
         """Remember which account owns this window, for as long as FCPreview
