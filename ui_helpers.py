@@ -123,7 +123,8 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
     return win
 
 
-def attach_tooltip(widget, text, *, topmost=False, place_above=False):
+def attach_tooltip(widget, text, *, topmost=False, place_above=False,
+                    place_fn=None):
     """Attach a simple hover tooltip to ``widget`` (D9 shared helper) and return
     ``widget``.
 
@@ -157,6 +158,18 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False):
     live thumbnail OVER it, so it is never seen even while ``-topmost``
     (``map/preview.md``). Default False keeps every other caller's tip below
     the widget, unchanged.
+
+    ``place_fn`` (keyword-only, default None): an optional callback
+    ``place_fn(tip) -> bool`` that positions the already-built tip Toplevel
+    itself. It is called with the tip after ``tip.update_idletasks()`` (so a
+    requested-geometry read is realised); if it returns a truthy value it owns
+    the tip's geometry and the default winfo-based placement (``place_above``
+    or the below-the-widget default) is skipped entirely, otherwise the
+    default placement runs as if ``place_fn`` were never passed. Used by the
+    FCPreview implant icon: its tile is positioned by external Win32
+    ``SetWindowPos`` (physical px) outside Tk's geometry manager, so Tk's
+    ``winfo_rootx``/``winfo_rooty`` are stale for it and the default
+    winfo-based placement landed the tip in the screen corner.
     """
     widget._tooltip_text = text
     state = {"tip": None}
@@ -185,42 +198,57 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False):
                      fg=ui_theme.FG_TEXT, bg=ui_theme.BG_PANEL,
                      borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
                      wraplength=340, padx=5, pady=3).pack()
-            if place_above:
-                # Hang the tip ABOVE the widget instead of below it. Used for the
-                # FCPreview implant icon: it lives in the tile's TOP caption strip,
-                # directly above the DWM-composited live-video body, and the default
-                # below-the-widget tip lands over that body where the compositor
-                # draws the live thumbnail OVER it — occluded even while -topmost
-                # (map/preview.md). Above the top-strip icon clears the body.
-                #
-                # winfo_REQheight, not winfo_height: the tip is not yet mapped when
-                # we place it, so on an overrideredirect Toplevel winfo_height()
-                # reads 1 and the tip would drop right back over the body. The
-                # requested height is the real content height and is map-independent
-                # once update_idletasks() has realised the geometry request.
-                tip.update_idletasks()
-                x = widget.winfo_rootx() + 12
-                above_y = widget.winfo_rooty() - tip.winfo_reqheight() - 4
-                if above_y >= 0:
-                    y = above_y
+            # place_fn (e.g. the FCPreview implant icon) gets first refusal: it
+            # positions the tip from a source OTHER than Tk winfo_root*, which is
+            # stale for a widget whose top-level is moved by external
+            # SetWindowPos outside Tk's geometry manager (see its own docstring
+            # paragraph above). Only fall through to the winfo-based placement
+            # below when there is no callback, or it declines (returns falsy) or
+            # raises.
+            placed = False
+            if place_fn is not None:
+                try:
+                    tip.update_idletasks()
+                    placed = bool(place_fn(tip))
+                except Exception:
+                    placed = False
+            if not placed:
+                if place_above:
+                    # Hang the tip ABOVE the widget instead of below it. Used for the
+                    # FCPreview implant icon: it lives in the tile's TOP caption strip,
+                    # directly above the DWM-composited live-video body, and the default
+                    # below-the-widget tip lands over that body where the compositor
+                    # draws the live thumbnail OVER it — occluded even while -topmost
+                    # (map/preview.md). Above the top-strip icon clears the body.
+                    #
+                    # winfo_REQheight, not winfo_height: the tip is not yet mapped when
+                    # we place it, so on an overrideredirect Toplevel winfo_height()
+                    # reads 1 and the tip would drop right back over the body. The
+                    # requested height is the real content height and is map-independent
+                    # once update_idletasks() has realised the geometry request.
+                    tip.update_idletasks()
+                    x = widget.winfo_rootx() + 12
+                    above_y = widget.winfo_rooty() - tip.winfo_reqheight() - 4
+                    if above_y >= 0:
+                        y = above_y
+                    else:
+                        # No room above -- the tile is anchored near the screen TOP
+                        # (FCPreview login tiles default to login_position [5,5]).
+                        # A negative above_y would render as the malformed "+x+-N"
+                        # geometry (the "+-" sequence), which Tk misparses and dumps
+                        # the tip in the screen corner (owner report: "tooltip goes up
+                        # in the left corner of my screen"). Fall back to BELOW THE
+                        # WHOLE TILE: the DWM video body sits ABOVE the tile's bottom
+                        # edge, so a below-the-tile tip still clears it, and a
+                        # top-anchored tile's bottom edge is comfortably on-screen.
+                        # This can never be negative.
+                        top = widget.winfo_toplevel()
+                        y = top.winfo_rooty() + top.winfo_height() + 4
+                    tip.wm_geometry(f"+{x}+{y}")
                 else:
-                    # No room above -- the tile is anchored near the screen TOP
-                    # (FCPreview login tiles default to login_position [5,5]).
-                    # A negative above_y would render as the malformed "+x+-N"
-                    # geometry (the "+-" sequence), which Tk misparses and dumps
-                    # the tip in the screen corner (owner report: "tooltip goes up
-                    # in the left corner of my screen"). Fall back to BELOW THE
-                    # WHOLE TILE: the DWM video body sits ABOVE the tile's bottom
-                    # edge, so a below-the-tile tip still clears it, and a
-                    # top-anchored tile's bottom edge is comfortably on-screen.
-                    # This can never be negative.
-                    top = widget.winfo_toplevel()
-                    y = top.winfo_rooty() + top.winfo_height() + 4
-                tip.wm_geometry(f"+{x}+{y}")
-            else:
-                tip.wm_geometry(
-                    f"+{widget.winfo_rootx() + 12}"
-                    f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+                    tip.wm_geometry(
+                        f"+{widget.winfo_rootx() + 12}"
+                        f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
             if topmost:
                 try:
                     tip.wm_attributes("-topmost", True)

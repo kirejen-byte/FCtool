@@ -649,8 +649,15 @@ class TileWindow:
         # over that body and the compositor draws the thumbnail OVER it (occluded
         # even while -topmost). Hanging it above the top-strip icon clears the
         # body entirely (map/preview.md).
+        # place_fn=self._place_implant_tip positions the tip from self._pos (the
+        # tile's authoritative PHYSICAL top-left) instead of Tk winfo_root* —
+        # this tile is moved by external SetWindowPos outside Tk's geometry
+        # manager, so winfo_root* is stale and the winfo-based place_above
+        # fallback above dumped the tip in the screen corner (owner report).
+        # place_above=True stays as the harmless fallback if the callback ever
+        # returns False.
         ui_helpers.attach_tooltip(self._implant_lbl, "", topmost=True,
-                                  place_above=True)
+                                  place_above=True, place_fn=self._place_implant_tip)
 
         # ── bottom caption strip (mirror of the top strip) ──────────────────
         # The activity label ('<label> - <ShipType>') lives in a small strip
@@ -1214,6 +1221,34 @@ class TileWindow:
             return None
         x, y = self._pos
         return (x, y + STRIP_H, x + self._w, y + STRIP_H + self._body_h)
+
+    def _place_implant_tip(self, tip):
+        """Position the implant-icon tooltip from the tile's AUTHORITATIVE
+        physical top-left (self._pos) + STRIP_H + self._body_h, NOT Tk
+        winfo_root* -- which is stale for a window moved by external
+        SetWindowPos (same reason body_screen_rect and the strip-drag anchor
+        use self._pos). winfo_root* returned ~0 here and dumped the tip in the
+        screen corner (owner report). Hang it ABOVE the tile when that fits
+        on-screen, else BELOW the whole tile; both clear the DWM-composited
+        video body. Monitors are ~1:1 (physical==logical) so the tip's logical
+        reqheight is used directly (matches the app-wide PMv2 1:1 assumption
+        documented in `_detect_corner`'s docstring). Returns True when it
+        placed the tip."""
+        try:
+            if getattr(self, "_hidden", False) or self._w <= 0 or self._body_h <= 0:
+                return False
+            th = tip.winfo_reqheight()
+            px, py = self._pos
+            x = px + 12
+            above_y = py - th - 4
+            if above_y >= 0:
+                y = above_y
+            else:
+                y = py + STRIP_H + self._body_h + 4
+            tip.wm_geometry(f"+{x}+{y}")
+            return True
+        except tk.TclError:
+            return False
 
     def hide(self):
         """Withdraw the tile without destroying it (Task C2 hide rules). The DWM
