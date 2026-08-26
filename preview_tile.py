@@ -652,8 +652,11 @@ class TileWindow:
         # place_fn=self._place_implant_tip positions the tip from self._pos (the
         # tile's authoritative PHYSICAL top-left) instead of Tk winfo_root* —
         # this tile is moved by external SetWindowPos outside Tk's geometry
-        # manager, so winfo_root* is stale and the winfo-based place_above
-        # fallback above dumped the tip in the screen corner (owner report).
+        # manager, so self._pos is the robust source that doesn't depend on Tk
+        # having pumped the external move's messages yet (winfo_root* in fact
+        # measured correct live here too — the screen-corner bug reported by
+        # the owner was a -topmost/pending-wm_geometry clobber in
+        # ui_helpers.attach_tooltip's _show, not a stale-position read).
         # place_above=True stays as the harmless fallback if the callback ever
         # returns False.
         ui_helpers.attach_tooltip(self._implant_lbl, "", topmost=True,
@@ -1224,16 +1227,20 @@ class TileWindow:
 
     def _place_implant_tip(self, tip):
         """Position the implant-icon tooltip from the tile's AUTHORITATIVE
-        physical top-left (self._pos) + STRIP_H + self._body_h, NOT Tk
-        winfo_root* -- which is stale for a window moved by external
-        SetWindowPos (same reason body_screen_rect and the strip-drag anchor
-        use self._pos). winfo_root* returned ~0 here and dumped the tip in the
-        screen corner (owner report). Hang it ABOVE the tile when that fits
-        on-screen, else BELOW the whole tile; both clear the DWM-composited
-        video body. Monitors are ~1:1 (physical==logical) so the tip's logical
-        reqheight is used directly (matches the app-wide PMv2 1:1 assumption
-        documented in `_detect_corner`'s docstring). Returns True when it
-        placed the tip."""
+        physical top-left (self._pos) + STRIP_H + self._body_h -- the same
+        source body_screen_rect and the strip-drag anchor use, and the robust
+        choice because it does not depend on Tk having pumped the external
+        SetWindowPos move's messages yet (measured 2026-08-25: Tk's own
+        winfo_root* in fact matched the physical position live here -- an
+        earlier "stale winfo" theory was WRONG). The real screen-corner bug
+        was wm_attributes(-topmost) clobbering a still-pending wm_geometry
+        move on a freshly-mapped tip, fixed in ui_helpers.attach_tooltip's
+        _show -- not a stale-position read. Hang it ABOVE the tile when that
+        fits on-screen, else BELOW the whole tile; both clear the
+        DWM-composited video body. Monitors are ~1:1 (physical==logical) so
+        the tip's logical reqheight is used directly (matches the app-wide
+        PMv2 1:1 assumption documented in `_detect_corner`'s docstring).
+        Returns True when it placed the tip."""
         try:
             if getattr(self, "_hidden", False) or self._w <= 0 or self._body_h <= 0:
                 return False

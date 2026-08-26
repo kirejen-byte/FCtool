@@ -167,9 +167,16 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
     or the below-the-widget default) is skipped entirely, otherwise the
     default placement runs as if ``place_fn`` were never passed. Used by the
     FCPreview implant icon: its tile is positioned by external Win32
-    ``SetWindowPos`` (physical px) outside Tk's geometry manager, so Tk's
-    ``winfo_rootx``/``winfo_rooty`` are stale for it and the default
-    winfo-based placement landed the tip in the screen corner.
+    ``SetWindowPos`` (physical px) outside Tk's geometry manager, so the
+    tile's own ``self._pos`` -- the same authoritative physical position that
+    ``body_screen_rect`` and the drag anchors use -- is the robust source: it
+    does not depend on Tk having pumped the external move's messages yet
+    (measured 2026-08-25: Tk's own ``winfo_rootx``/``winfo_rooty`` in fact
+    matched the physical position live here -- an earlier "stale winfo" theory
+    was WRONG). The screen-corner bug this callback was added to work around
+    was actually ``wm_attributes(-topmost)`` clobbering a still-pending
+    ``wm_geometry`` move on a freshly-mapped tip (see ``_show`` below), not a
+    stale-position read.
     """
     widget._tooltip_text = text
     state = {"tip": None}
@@ -193,18 +200,33 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
             return
         try:
             tip = tk.Toplevel(widget)
+            # Withdrawn until fully positioned: update_idletasks on a
+            # NON-withdrawn fresh Toplevel MAPS it at (0,0); a wm_geometry call
+            # on the now-mapped tip only files a PENDING move (it reads back
+            # correctly, but the move hasn't landed); and wm_attributes(
+            # -topmost) then fires a SetWindowPos whose WM_WINDOWPOSCHANGED
+            # reports the CURRENT (0,0) -- which Tk adopts as authoritative,
+            # DISCARDING the pending move (measured 2026-08-25: the geometry
+            # request itself read back "+0+0" after the -topmost call). THAT
+            # was the tooltip-in-the-screen-corner bug -- the math in every
+            # prior placement fix was correct, this clobber wasn't. Deiconifying
+            # ONCE at the end (after -topmost is applied) maps the tip directly
+            # at its final position, which also removes the old one-frame (0,0)
+            # flash.
+            tip.wm_withdraw()
             tip.wm_overrideredirect(True)
             tk.Label(tip, text=copy, font=_TOOLTIP_FONT,
                      fg=ui_theme.FG_TEXT, bg=ui_theme.BG_PANEL,
                      borderwidth=1, relief=tk.SOLID, justify=tk.LEFT,
                      wraplength=340, padx=5, pady=3).pack()
             # place_fn (e.g. the FCPreview implant icon) gets first refusal: it
-            # positions the tip from a source OTHER than Tk winfo_root*, which is
-            # stale for a widget whose top-level is moved by external
-            # SetWindowPos outside Tk's geometry manager (see its own docstring
-            # paragraph above). Only fall through to the winfo-based placement
-            # below when there is no callback, or it declines (returns falsy) or
-            # raises.
+            # positions the tip from a source OTHER than Tk winfo_root* -- the
+            # robust choice for a widget whose top-level is moved by external
+            # SetWindowPos outside Tk's geometry manager, since it doesn't
+            # depend on Tk having pumped that move's messages yet (see its own
+            # docstring paragraph above). Only fall through to the winfo-based
+            # placement below when there is no callback, or it declines
+            # (returns falsy) or raises.
             placed = False
             if place_fn is not None:
                 try:
@@ -234,14 +256,17 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
                     else:
                         # No room above -- the tile is anchored near the screen TOP
                         # (FCPreview login tiles default to login_position [5,5]).
-                        # A negative above_y would render as the malformed "+x+-N"
-                        # geometry (the "+-" sequence), which Tk misparses and dumps
-                        # the tip in the screen corner (owner report: "tooltip goes up
-                        # in the left corner of my screen"). Fall back to BELOW THE
-                        # WHOLE TILE: the DWM video body sits ABOVE the tile's bottom
-                        # edge, so a below-the-tile tip still clears it, and a
+                        # A negative above_y would place the tip partly OFF-SCREEN
+                        # above the display (Tk parses "+x+-N" geometry fine -- a
+                        # prior theory that this was a geometry-PARSING bug was
+                        # WRONG, measured 2026-08-25). Fall back to BELOW THE WHOLE
+                        # TILE instead: the DWM video body sits ABOVE the tile's
+                        # bottom edge, so a below-the-tile tip still clears it, and a
                         # top-anchored tile's bottom edge is comfortably on-screen.
-                        # This can never be negative.
+                        # This can never be negative. (The actual reported
+                        # screen-corner bug was the -topmost pending-move clobber
+                        # documented where the tip is created above, not this
+                        # placement math.)
                         top = widget.winfo_toplevel()
                         y = top.winfo_rooty() + top.winfo_height() + 4
                     tip.wm_geometry(f"+{x}+{y}")
@@ -254,6 +279,8 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
                     tip.wm_attributes("-topmost", True)
                 except tk.TclError:
                     pass
+            tip.wm_deiconify()
+            if topmost:
                 try:
                     tip.lift()
                 except tk.TclError:
