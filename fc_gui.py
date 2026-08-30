@@ -122,6 +122,10 @@ import eve_client_tracker
 import eve_account
 import window_activator
 import preview_layout
+# Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
+# cycle-groups dialog's RoleCriteriaPanel editor (pure core + Tk shell in one
+# module, the range_check/market_gap_dialog house shape). Imports no fc_gui.
+import cycle_roles
 import monitor_pin
 import hotkey_service
 import damage_flash
@@ -19531,6 +19535,50 @@ class FCToolGUI:
                 return st
         return None
 
+    def _preview_role_members(self):
+        """`(member dicts, unclassified_count)` — the live snapshot a roles-mode
+        cycle group is resolved against (design §B3).
+
+        One member dict per live, keyed, CLASSIFIED client, shaped exactly as
+        `cycle_roles.role_ring` (and `fleet_composer.pilot_matches` beneath it)
+        expects. "Classified" = a fresh `CharState` with a truthy
+        `ship_type_id`; anything else is counted in the second return value and
+        dropped, because a pilot whose hull we cannot name has no role and must
+        never be focused by "cycle Subcaps" (§10 row 7). Login screens are in
+        NEITHER number — they were never candidates, so counting them as
+        "without ship data" would be a false alarm in the dialog's match line.
+
+        getattr-guarded end to end: the bare SimpleNamespace hosts the preview
+        suites use may carry neither `_preview_clients` nor `_preview_state_for`,
+        and both this and the cycle-groups dialog must still answer."""
+        clients = getattr(self, "_preview_clients", None) or {}
+        state_for = getattr(self, "_preview_state_for", None)
+        if state_for is None:
+            return [], 0
+        members = []
+        skipped = 0
+        for client in list(clients.values()):
+            if getattr(client, "is_login", False):
+                continue
+            key = getattr(client, "key", "") or ""
+            if not key:
+                continue
+            try:
+                state = state_for(key)
+            except Exception:
+                state = None
+            if state is None or not getattr(state, "ship_type_id", 0):
+                skipped += 1
+                continue
+            members.append({
+                "name": key,
+                "ship_type_name": getattr(state, "ship_type_name", "") or "",
+                "ship_class": getattr(state, "ship_group", "") or "",
+                "ship_type_id": getattr(state, "ship_type_id", 0) or 0,
+                "is_capital": getattr(state, "is_capital", None),
+            })
+        return members, skipped
+
     def _preview_caption_parts(self, client, state, rules, overrides_norm,
                                role_chip, tag_index, doctrine_tag_captions):
         """Compose (name, dot_color, chip, tag_text) for one tile's caption.
@@ -23634,6 +23682,12 @@ class FCToolGUI:
             g.setdefault("next", [])
             g.setdefault("prev", [])
             g.setdefault("order", [])
+            # Roles mode (design §B2): absent == "chars" == today's behaviour,
+            # so there is no migration — a legacy group just picks these up the
+            # first time it is edited. members and criteria BOTH persist across
+            # a mode flip; only `mode` decides which one cycle time reads.
+            g.setdefault("mode", "chars")
+            g.setdefault("criteria", [])
         # Which member keys are actually running right now → dim "(not running)"
         # suffix. Computed once at open (spec §4).
         live_keys = {c.key for c in self._preview_clients.values()
@@ -23752,16 +23806,48 @@ class FCToolGUI:
         win._btn_capture_prev.grid(row=2, column=2, padx=(2, 0))
         _tip(win._btn_capture_prev, "Click, then press a key combo to capture it.")
 
-        tk.Label(right, text="Members (cycle order, top → bottom):", bg=BG_PANEL,
-                 fg=FG_TEXT, font=("Consolas", 9)).pack(anchor="w", pady=(6, 0))
-        win._member_listbox = tk.Listbox(right, width=34, height=6,
+        # ── Cycle by: [Characters][Roles] (design §B5) ───────────────────────
+        # A two-button segmented toggle in the app's button idiom (the owner's
+        # "slider"; §10 row 6). Active = sunken + accent — the SAME style as the
+        # settings category buttons and deliberately NOT the mode buttons' green
+        # ✓, which everywhere else in this app means "this feature is ON".
+        mode_row = tk.Frame(right, bg=BG_PANEL)
+        mode_row.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(mode_row, text="Cycle by:", bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).pack(side=tk.LEFT, padx=(0, 6))
+        win._btn_mode_chars = tk.Button(
+            mode_row, text="Characters", font=("Consolas", 9), relief=tk.RIDGE,
+            bd=1, padx=8, pady=1, cursor="hand2", bg=BG_ENTRY, fg=FG_TEXT,
+            command=lambda: _set_mode("chars"))
+        win._btn_mode_chars.pack(side=tk.LEFT, padx=(0, 4))
+        win._btn_mode_roles = tk.Button(
+            mode_row, text="Roles", font=("Consolas", 9), relief=tk.RIDGE,
+            bd=1, padx=8, pady=1, cursor="hand2", bg=BG_ENTRY, fg=FG_TEXT,
+            command=lambda: _set_mode("roles"))
+        win._btn_mode_roles.pack(side=tk.LEFT)
+        _tip(win._btn_mode_chars,
+             "Cycle this group's hand-picked members, in your order. "
+             "No members = cycles ALL clients.")
+        _tip(win._btn_mode_roles,
+             "Cycle whoever is FLYING the right ship right now, matched by the "
+             "filters below. Pilots without ship data are never included.")
+
+        # The whole members UI lives in one frame so the toggle swaps exactly
+        # ONE widget with the roles panel. Every win._member_* attribute below
+        # keeps its name and behaviour — Characters mode is byte-identical.
+        win._members_frame = tk.Frame(right, bg=BG_PANEL)
+        members_ui = win._members_frame
+        tk.Label(members_ui, text="Members (cycle order, top → bottom):",
+                 bg=BG_PANEL, fg=FG_TEXT,
+                 font=("Consolas", 9)).pack(anchor="w", pady=(6, 0))
+        win._member_listbox = tk.Listbox(members_ui, width=34, height=6,
                                          exportselection=0, bg=BG_ENTRY,
                                          fg=FG_TEXT, font=("Consolas", 9),
                                          selectbackground=FG_ACCENT,
                                          selectforeground=BG_DARK,
                                          activestyle="none")
         win._member_listbox.pack(fill=tk.X)
-        mbtns = tk.Frame(right, bg=BG_PANEL)
+        mbtns = tk.Frame(members_ui, bg=BG_PANEL)
         mbtns.pack(fill=tk.X, pady=(2, 0))
         win._btn_member_up = ttk.Button(mbtns, text="↑ Up", style="Dark.TButton",
                                         command=lambda: _member_move(-1))
@@ -23775,7 +23861,7 @@ class FCToolGUI:
                                             command=lambda: _member_remove())
         win._btn_member_remove.pack(side=tk.LEFT)
 
-        addrow = tk.Frame(right, bg=BG_PANEL)
+        addrow = tk.Frame(members_ui, bg=BG_PANEL)
         addrow.pack(fill=tk.X, pady=(4, 0))
         tk.Label(addrow, text="Add member:", bg=BG_PANEL, fg=FG_TEXT,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
@@ -23786,8 +23872,86 @@ class FCToolGUI:
                                          command=lambda: _member_add())
         win._btn_member_add.pack(side=tk.LEFT)
 
-        tk.Label(right, text="(no members = cycles ALL clients)", bg=BG_PANEL,
-                 fg=FG_DIM, font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
+        tk.Label(members_ui, text="(no members = cycles ALL clients)",
+                 bg=BG_PANEL, fg=FG_DIM,
+                 font=("Consolas", 8)).pack(anchor="w", pady=(2, 0))
+
+        # ── Roles panel (cycle_roles.RoleCriteriaPanel) ──────────────────────
+        # Its seams are closures over `working`/`sel`, so the panel edits the
+        # SAME deep copy the members UI does — one working set, no second copy
+        # to reconcile on OK. Every host read is getattr-guarded: this dialog is
+        # also opened on the bare SimpleNamespace hosts the preview suites use,
+        # which carry no type_catalog, no fittings and no doctrine.
+        def _sel_group():
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return None
+            return working[i]
+
+        def _roles_get_criteria():
+            g = _sel_group()
+            return [] if g is None else (g.get("criteria") or [])
+
+        def _roles_set_criteria(criteria):
+            g = _sel_group()
+            if g is not None:
+                g["criteria"] = list(criteria)
+
+        def _catalog_names(method):
+            catalog = getattr(self, "type_catalog", None)
+            fn = getattr(catalog, method, None)
+            if fn is None:
+                return []
+            try:
+                return list(fn() or [])
+            except Exception:
+                return []
+
+        def _roles_tag_names():
+            # The live fit-tag vocabulary: the default set plus every tag any
+            # stored doctrine actually uses, so a Tag filter offers exactly what
+            # the captions can show.
+            tags = set(fit_models.DEFAULT_TAGS)
+            store = getattr(self, "fittings", None)
+            if store is not None:
+                try:
+                    for doc in store.list_doctrines():
+                        for member in getattr(doc, "members", []) or []:
+                            tags.update(str(t) for t in
+                                        (getattr(member, "tags", None) or []) if t)
+                except Exception:
+                    log.exception("[preview] roles tag vocabulary failed")
+            return sorted(tags)
+
+        def _roles_tag_index():
+            # SAME source as the tile captions' doctrine tags, so a Tag filter
+            # and a Tag caption can never disagree about what a hull is.
+            doctrine_fn = getattr(self, "_active_doctrine_obj", None)
+            try:
+                doctrine = doctrine_fn() if doctrine_fn is not None else None
+                return fleet_composer.build_tag_index(
+                    doctrine, getattr(self, "fittings", None))
+            except Exception:
+                return {}
+
+        def _roles_live_members():
+            fn = getattr(self, "_preview_role_members", None)
+            if fn is None:
+                return [], 0
+            try:
+                return fn()
+            except Exception:
+                log.exception("[preview] roles live-member snapshot failed")
+                return [], 0
+
+        win._roles_panel = cycle_roles.RoleCriteriaPanel(
+            right,
+            get_criteria=_roles_get_criteria, set_criteria=_roles_set_criteria,
+            ship_type_names=lambda: _catalog_names("ship_type_names"),
+            ship_group_names=lambda: _catalog_names("ship_group_names"),
+            tag_names=_roles_tag_names, live_members=_roles_live_members,
+            tag_index=_roles_tag_index,
+            on_change=lambda: _render_left(keep_sel=True))
 
         # ── Account aliases (design §9.5) ────────────────────────────────────
         # Per known account: a friendly name written to preview.account_aliases
@@ -23832,11 +23996,20 @@ class FCToolGUI:
             return [p.strip() for p in str(text).replace("\n", ",").split(",")
                     if p.strip()]
 
+        def _group_mode(g):
+            """A group's cycle mode, absent/garbage → "chars" (design §B2)."""
+            mode = str(g.get("mode") or "chars")
+            return "roles" if mode == "roles" else "chars"
+
         def _fmt_group_row(g):
             name = (g.get("name") or "").strip() or "(unnamed)"
+            nxt = g.get("next") or []
+            if _group_mode(g) == "roles":
+                # A roles ring is computed at press time, so a member COUNT
+                # would be a lie here — say what it cycles by instead.
+                return f"{name}   role · {nxt[0] if nxt else '—'}"
             members = g.get("members") or []
             if members:
-                nxt = g.get("next") or []
                 return f"{name}   {len(members)} · {nxt[0] if nxt else '—'}"
             return f"{name}   (all clients)"
 
@@ -23892,11 +24065,52 @@ class FCToolGUI:
                         win._btn_capture_next, win._btn_capture_prev,
                         win._btn_member_up, win._btn_member_down,
                         win._btn_member_remove, win._btn_member_add,
-                        win._member_combo, win._member_listbox):
+                        win._member_combo, win._member_listbox,
+                        win._btn_mode_chars, win._btn_mode_roles):
                 try:
                     wdg.configure(state=("normal" if on else "disabled"))
                 except tk.TclError:
                     pass
+            win._roles_panel.set_enabled(on)
+
+        def _paint_mode_buttons(mode):
+            # Active = sunken + accent (the settings category-button style);
+            # inactive = the house dark entry colour.
+            for btn, value in ((win._btn_mode_chars, "chars"),
+                               (win._btn_mode_roles, "roles")):
+                try:
+                    if value == mode:
+                        btn.configure(relief=tk.SUNKEN, bg=FG_ACCENT,
+                                      fg=BG_DARK, activebackground=FG_ACCENT,
+                                      activeforeground=BG_DARK)
+                    else:
+                        btn.configure(relief=tk.RIDGE, bg=BG_ENTRY, fg=FG_TEXT,
+                                      activebackground=BG_ENTRY,
+                                      activeforeground=FG_TEXT)
+                except tk.TclError:
+                    pass
+
+        def _show_mode_panel(mode):
+            # ONE of the two panels occupies the slot at the bottom of `right`.
+            for panel in (win._members_frame, win._roles_panel):
+                try:
+                    panel.pack_forget()
+                except tk.TclError:
+                    pass
+            if mode == "roles":
+                win._roles_panel.pack(fill=tk.BOTH, expand=True)
+            else:
+                win._members_frame.pack(fill=tk.X)
+
+        def _set_mode(mode):
+            i = sel[0]
+            if i is None or not (0 <= i < len(working)):
+                return
+            mode = "roles" if mode == "roles" else "chars"
+            working[i]["mode"] = mode
+            _paint_mode_buttons(mode)
+            _show_mode_panel(mode)
+            _render_left(keep_sel=True)   # the row form follows the mode
 
         def _load_right():
             i = sel[0]
@@ -23905,6 +24119,12 @@ class FCToolGUI:
                 name_var.set(""); next_var.set(""); prev_var.set("")
                 win._member_listbox.delete(0, tk.END)
                 win._member_combo["values"] = []
+                # Nothing selected → show the (disabled) Characters pane, the
+                # pre-roles look: a right pane with NEITHER panel in it would
+                # be a new, emptier dialog for the zero-groups case.
+                _paint_mode_buttons("chars")
+                _show_mode_panel("chars")
+                win._roles_panel.reload()      # drop the last group's filters
                 return
             _set_right_enabled(True)
             g = working[i]
@@ -23913,6 +24133,10 @@ class FCToolGUI:
             prev_var.set(", ".join(g.get("prev") or []))
             _render_members()
             _refresh_combo()
+            mode = _group_mode(g)
+            _paint_mode_buttons(mode)
+            _show_mode_panel(mode)
+            win._roles_panel.reload()
 
         def _flush_right():
             i = sel[0]
@@ -23932,6 +24156,21 @@ class FCToolGUI:
 
         groups_listbox.bind("<<ListboxSelect>>", _on_select)
 
+        def _select_group(index):
+            """Select group `index` (None = none) exactly as a click does.
+
+            Test seam, in the spirit of `win._describe_action` below: a dialog
+            transient to a withdrawn root is never mapped, and `event_generate`
+            delivers nothing to an unmapped window's widgets (map/facts.md), so
+            a headless suite cannot reach `<<ListboxSelect>>` any other way."""
+            groups_listbox.selection_clear(0, tk.END)
+            if index is not None and 0 <= index < len(working):
+                groups_listbox.selection_set(index)
+                groups_listbox.activate(index)
+            _on_select()
+
+        win._select_group = _select_group
+
         def _on_name_key(_evt=None):
             i = sel[0]
             if i is None or not (0 <= i < len(working)):
@@ -23944,7 +24183,8 @@ class FCToolGUI:
         def _new_group():
             _flush_right()
             working.append({"name": f"Group {len(working) + 1}", "members": [],
-                            "next": [], "prev": [], "order": []})
+                            "next": [], "prev": [], "order": [],
+                            "mode": "chars", "criteria": []})
             sel[0] = len(working) - 1
             _render_left(keep_sel=True)
             _load_right()
@@ -24056,10 +24296,13 @@ class FCToolGUI:
             self._preview_hotkey_preset()     # persists cfg groups[0] = F14/F13
             if not working:
                 working.append({"name": "All clients", "members": [],
-                                "next": [], "prev": [], "order": []})
+                                "next": [], "prev": [], "order": [],
+                                "mode": "chars", "criteria": []})
                 sel[0] = 0
             working[0].setdefault("name", "All clients")
             working[0].setdefault("members", [])
+            working[0].setdefault("mode", "chars")
+            working[0].setdefault("criteria", [])
             working[0]["next"] = ["F14"]      # mirror into the working copy so OK
             working[0]["prev"] = ["F13"]      # never reverts the preset
             _render_left(keep_sel=True)
@@ -24095,6 +24338,18 @@ class FCToolGUI:
                         hotkey_service.parse_hotkey(key)
                     except ValueError as exc:
                         msgs.append(f"{nm}: {exc}")
+                # Roles mode only (design §B5): a ship-type/class/tag filter
+                # with no value would match nothing, so the group would cycle
+                # nobody — block instead of shipping a silently dead hotkey.
+                # The CORE deliberately never strips, so the strip is here.
+                if _group_mode(g) == "roles":
+                    for crit in cycle_roles.normalize_criteria(g.get("criteria")):
+                        kind = crit["kind"]
+                        if (kind in cycle_roles.VALUE_KINDS
+                                and not crit["value"].strip()):
+                            label = cycle_roles.KIND_LABELS[kind]
+                            msgs.append(
+                                f"{nm}: a {label} filter needs a value")
             if msgs:
                 win._error_lbl.config(text="  •  ".join(msgs), fg=FG_ORANGE)
                 return
