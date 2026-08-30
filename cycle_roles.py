@@ -243,6 +243,11 @@ class RoleCriteriaPanel(tk.Frame):
         self._match_lbl.pack(anchor="w", pady=(4, 0))
 
         self.reload()
+        # A dialog close destroys this widget directly -- nothing walks _rows
+        # and calls _delete_row/_render first. Without this, whatever rows
+        # were last rendered keep their traces registered forever (see
+        # _on_destroy).
+        self.bind("<Destroy>", self._on_destroy)
 
     # ── public API ───────────────────────────────────────────────────────────
     def reload(self):
@@ -338,6 +343,29 @@ class RoleCriteriaPanel(tk.Frame):
                     row._del_btn):
             try:
                 wdg.destroy()
+            except tk.TclError:
+                pass
+
+    def _on_destroy(self, event):
+        """Last-chance row teardown when the DIALOG closes the panel directly.
+
+        ``<Destroy>`` bubbles from every descendant (each row's own widgets
+        fire it first, bottom-up), not just this panel, so bail unless this
+        event is for the panel itself. Without this, whatever rows were still
+        rendered at close time never go through ``_destroy_row`` -- their
+        traces (3 Tcl vars + 3 Tcl commands per row) are never removed, and
+        the Tcl command table roots them (command -> lambda -> row ->
+        Variable) for the rest of the process, same as the leak
+        ``_destroy_row`` already prevents on every reload/delete. Teardown
+        order during a window close is not guaranteed, so this (like
+        ``_destroy_row``) tolerates widgets or a variable's trace that are
+        already gone."""
+        if event.widget is not self:
+            return
+        rows, self._rows = self._rows, []
+        for row in rows:
+            try:
+                self._destroy_row(row)
             except tk.TclError:
                 pass
 

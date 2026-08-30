@@ -22558,8 +22558,12 @@ class FCToolGUI:
         category hidden — a settings panel with nothing in it is the one outcome
         this must never produce. The chosen frame is always packed BEFORE the
         hotkey-status row, which is deliberately outside the categories and
-        always visible (an empty-when-healthy warning line must not be buried)."""
-        valid = {k for k, _lbl in self._PREVIEW_SETTINGS_CATEGORIES}
+        always visible (an empty-when-healthy warning line must not be buried).
+
+        Reads the categories table CLASS-QUALIFIED (FCToolGUI.…, the
+        _preview_tileh_value pattern) so SimpleNamespace tick-test hosts that
+        bind this method without also binding the constant do not raise."""
+        valid = {k for k, _lbl in FCToolGUI._PREVIEW_SETTINGS_CATEGORIES}
         if value not in valid:
             value = "display"
         self._preview_settings_category = value
@@ -22578,7 +22582,13 @@ class FCToolGUI:
                 else:
                     frame.pack(fill=tk.X)
             except tk.TclError:
-                pass
+                # A raising `before` anchor must degrade to wrong-order (the
+                # frame still gets packed, just not ahead of the status row),
+                # never to an empty panel -- retry without the anchor.
+                try:
+                    frame.pack(fill=tk.X)
+                except tk.TclError:
+                    pass
         self._preview_refresh_category_buttons()
 
     def _preview_refresh_category_buttons(self):
@@ -22587,12 +22597,16 @@ class FCToolGUI:
 
         Deliberately NOT the mode buttons' green ✓: green-with-a-checkmark means
         "this mode is ON" everywhere else in this section, and a view tab must
-        never read as an on/off state."""
+        never read as an on/off state.
+
+        Reads the categories table CLASS-QUALIFIED for the same reason as
+        _preview_set_settings_category above (SimpleNamespace tick-test hosts
+        bind the method without the constant)."""
         btns = getattr(self, "_preview_cat_buttons", None)
         if not btns:
             return
         active = getattr(self, "_preview_settings_category", "display")
-        for value, _label in self._PREVIEW_SETTINGS_CATEGORIES:
+        for value, _label in FCToolGUI._PREVIEW_SETTINGS_CATEGORIES:
             btn = btns.get(value)
             if btn is None:
                 continue
