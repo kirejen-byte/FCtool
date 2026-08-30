@@ -19183,7 +19183,43 @@ class FCToolGUI:
                 g = groups[group]
                 members = [str(m).strip().lower()
                            for m in g.get("members", []) if str(m).strip()]
-                if members:
+                # Absent `mode` -> "chars": every group written before roles
+                # existed keeps its exact shipped behaviour, zero migration.
+                mode = str(g.get("mode") or "chars")
+                if mode == "roles":
+                    # ROLES ring (design §B3/§B6): computed AT PRESS TIME from
+                    # the live clients' CURRENT hulls instead of read from a
+                    # stored member list. Still the ONE resolution site — only
+                    # the ring differs; the strict machinery below is shared
+                    # verbatim, so exclusion/anchor/debounce behave identically.
+                    #
+                    # Cost is paid per press (N clients x criteria, N <~ 30) and
+                    # never per tick.
+                    members_snap, _unclassified = self._preview_role_members()
+                    # tag_index comes from the CAPTION bundle (its memo, its
+                    # invalidation key) so a Tag criterion and a doctrine-tag
+                    # caption can never disagree about what a hull is. Guarded:
+                    # a bundle fault costs the tags (Tag criteria then match
+                    # nothing, the documented no-doctrine behaviour), never the
+                    # press.
+                    try:
+                        tag_index = self._preview_caption_bundle()[1]
+                    except Exception:
+                        tag_index = {}
+                    ring = cycle_roles.role_ring(
+                        g.get("criteria"), members_snap, tag_index)
+                    # A roles ring holds char keys only (a role needs a ship,
+                    # and a login screen has none), but it resolves through the
+                    # same identity map as the strict members path above — a
+                    # char's identity IS its key, so this is that path with a
+                    # computed order, and C4 exclusion still keys by identity.
+                    by_identity = {c.identity: c for c in live if c.identity}
+                    live_ids = set(by_identity) - self._preview_excluded
+                    anchor = self._preview_anchor_key(by_identity)
+                    nxt = preview_layout.cycle_next(
+                        ring, anchor, live_ids, direction, strict=True)
+                    c = by_identity.get(nxt)
+                elif members:
                     # STRICT members-present path (design §9.4): resolve every
                     # member — a char key OR an acct:<id> token — against the LIVE
                     # IDENTITY map, so an accounted login screen (identity
@@ -19636,6 +19672,55 @@ class FCToolGUI:
             tag = ""
         return (name, dot, role_chip or "", tag)
 
+    def _preview_caption_bundle(self):
+        """`(doctrine, tag_index, rules, ocfg, overrides_norm)` — the caption
+        pass's rarely-changing inputs, memoised on `_preview_caption_memo`.
+
+        E3: the doctrine object, hull->tag index, overlay rules, overlay-config
+        dict and overrides are "rarely-changing inputs" — rebuilding them every
+        ~250 ms tick is waste. Memoise the bundle, keyed on a cheap O(1) signal:
+          * the active-doctrine config value  -> catches doctrine switches;
+          * self.fittings.revision()          -> catches ANY fit/doctrine edit
+            (every mutator persists via FittingsStore.save(), which bumps it);
+          * self._config_rev                  -> catches overlay rule/override
+            edits (they persist via _save_config) and any other config change.
+        Recompute only when that key changes, not per tick. A memo HIT returns
+        the stored tuple itself, so a caller may compare identity.
+
+        PV3: the bundle carries the overrides ALREADY NORMALIZED (keys stripped
+        + lowercased) instead of raw. _preview_caption_parts used to rebuild
+        that dict per tile per tick; it derives purely from the raw overrides,
+        so it belongs to exactly this memo and inherits its (unchanged)
+        invalidation key — no second memo, no new staleness class.
+
+        SECOND CONSUMER (2026-08-29, design §B3): a roles-mode cycle group takes
+        its `tag_index` from here, so a Tag criterion and a doctrine-tag caption
+        can never disagree about what a hull is. That is the whole reason this
+        block is a method — the memo attribute name, key and rebuild semantics
+        are unchanged. Every edge is getattr-guarded (the `fittings` idiom this
+        block already used) so a bare SimpleNamespace host answers with an empty
+        bundle instead of raising."""
+        store = getattr(self, "fittings", None)
+        frev = store.revision() if store is not None else 0
+        cfg_all = getattr(self, "config", None) or {}
+        bundle_key = (cfg_all.get("fleet", {}).get("active_doctrine", ""),
+                      frev, getattr(self, "_config_rev", 0))
+        memo = getattr(self, "_preview_caption_memo", None)
+        if memo is not None and memo[0] == bundle_key:
+            return memo[1]
+        doctrine_fn = getattr(self, "_active_doctrine_obj", None)
+        doctrine = doctrine_fn() if callable(doctrine_fn) else None
+        tag_index = fleet_composer.build_tag_index(doctrine, store)
+        rules_fn = getattr(self, "_overlay_rules", None)
+        rules = rules_fn() if callable(rules_fn) else []
+        ocfg_fn = getattr(self, "_overlay_cfg", None)
+        ocfg = ocfg_fn() if callable(ocfg_fn) else {}
+        overrides_norm = {str(k).strip().lower(): v for k, v
+                          in (ocfg.get("overrides", {}) or {}).items()}
+        bundle = (doctrine, tag_index, rules, ocfg, overrides_norm)
+        self._preview_caption_memo = (bundle_key, bundle)
+        return bundle
+
     def _preview_compose_captions(self, cur):
         """Set each live tile's caption from its staleness-checked ESI state +
         rules/overrides + (optionally) the active doctrine's tag for its hull.
@@ -19659,36 +19744,13 @@ class FCToolGUI:
         do_strip = bool(cfg.get("captions", _defaults["captions"]))
         do_video = bool(cfg.get("labels_on_video", _defaults["labels_on_video"]))
         do_location = bool(cfg.get("show_location", _defaults["show_location"]))
-        # E3: the doctrine object, hull->tag index, overlay rules, overlay-config
-        # dict and overrides are "rarely-changing inputs" — rebuilding them every
-        # ~250 ms tick is waste. Memoise the bundle, keyed on a cheap O(1) signal:
-        #   * the active-doctrine config value  -> catches doctrine switches;
-        #   * self.fittings.revision()          -> catches ANY fit/doctrine edit
-        #     (every mutator persists via FittingsStore.save(), which bumps it);
-        #   * self._config_rev                  -> catches overlay rule/override
-        #     edits (they persist via _save_config) and any other config change.
-        # Recompute only when that key changes, not per tick.
-        # PV3: the bundle now carries the overrides ALREADY NORMALIZED (keys
-        # stripped + lowercased) instead of raw. _preview_caption_parts used to
-        # rebuild that dict per tile per tick; it derives purely from the raw
-        # overrides, so it belongs to exactly this memo and inherits its
-        # (unchanged) invalidation key — no second memo, no new staleness class.
-        store = getattr(self, "fittings", None)
-        frev = store.revision() if store is not None else 0
-        bundle_key = (self.config.get("fleet", {}).get("active_doctrine", ""),
-                      frev, getattr(self, "_config_rev", 0))
-        memo = getattr(self, "_preview_caption_memo", None)
-        if memo is not None and memo[0] == bundle_key:
-            doctrine, tag_index, rules, ocfg, overrides_norm = memo[1]
-        else:
-            doctrine = self._active_doctrine_obj()
-            tag_index = fleet_composer.build_tag_index(doctrine, store)
-            rules = self._overlay_rules()
-            ocfg = self._overlay_cfg()
-            overrides_norm = {str(k).strip().lower(): v for k, v
-                              in (ocfg.get("overrides", {}) or {}).items()}
-            self._preview_caption_memo = (
-                bundle_key, (doctrine, tag_index, rules, ocfg, overrides_norm))
+        # E3/PV3: the doctrine object, hull->tag index, overlay rules,
+        # overlay-config dict and the NORMALIZED overrides are "rarely-changing
+        # inputs" memoised on `_preview_caption_memo` — see
+        # `_preview_caption_bundle` for the key and why the block is a method
+        # (the roles-cycle ring shares its tag_index).
+        (_doctrine, tag_index, rules, ocfg,
+         overrides_norm) = self._preview_caption_bundle()
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
         show_chip = bool(cfg.get("show_role_chip", True))
         # Bottom-strip label style (shared with the eveo overlay): config['overlay']
