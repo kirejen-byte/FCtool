@@ -85,6 +85,12 @@ def _pilot_matches(condition, member, tag_index) -> bool:
     return False
 
 
+# Public alias — THE single owner of rule-condition matching. Consumed by
+# `cycle_roles` (cycle-group role rings) so a cycle filter and a fleet-template
+# rule can never disagree about what a hull is.
+pilot_matches = _pilot_matches
+
+
 def _current_placement(member, id_to_names):
     """(wing_name, squad_name, role) for a member's current ESI position, or
     (None, None, role) if its wing/squad id isn't in the known structure."""
