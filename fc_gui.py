@@ -21615,20 +21615,72 @@ class FCToolGUI:
             "<Enter>", lambda e, t=_labels_tip: self._show_tooltip(e, t))
         labels_btn.bind("<Leave>", lambda e: self._hide_tooltip())
 
-        # Row 4 (native): tile size / inactive opacity / captions / doctrine tag /
-        # highlight / lock layout, all live-applied. Comfort & parity (zoom,
-        # hide-*, minimize-inactive) and damage-flash (Task B6) extend this row.
-        rowN = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        # ── FCPreview settings categories ────────────────────────────────────
+        # ~30 controls in one always-visible wall is what this section grew
+        # into. The cure is the reveal pattern the mode buttons above already
+        # use: a row of category buttons, with exactly ONE category frame packed
+        # beneath it at a time. Which category is showing is SESSION-only (no
+        # config key): it is a view, not a setting. Nothing about any option
+        # changes here — same vars, same commands, same config keys, same
+        # tooltips; only which row each control sits on.
+        self._preview_settings_category = "display"
+        self._preview_cat_buttons = {}
+        self._preview_cat_frames = {}
+        cat_row = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        cat_row.pack(fill=tk.X, pady=(0, 4))
+        self._preview_cat_row = cat_row
+        for value, text in self._PREVIEW_SETTINGS_CATEGORIES:
+            cat_btn = tk.Button(
+                cat_row, text=text, font=("Consolas", 10),
+                relief=tk.RIDGE, bd=1, padx=8, pady=1, cursor="hand2",
+                bg=BG_ENTRY, fg=FG_TEXT,
+                command=lambda v=value: self._preview_set_settings_category(v))
+            cat_btn.pack(side=tk.LEFT, padx=(0, 6))
+            self._preview_cat_buttons[value] = cat_btn
+            # Created UNPACKED: _preview_set_settings_category packs exactly one
+            # of them, always before the always-visible hotkey-status row below.
+            self._preview_cat_frames[value] = tk.Frame(
+                self._preview_panel_native, bg=BG_DARK)
+        # The category buttons stay OUT of _preview_native_widgets on purpose:
+        # that list exists to grey the native controls in the other two modes,
+        # and the whole native panel is unpacked then, so they are unreachable
+        # anyway — registering them would buy nothing but churn.
+        _tip(self._preview_cat_buttons["display"],
+             "Display settings: tile size, opacity, the on-video label controls, "
+             "captions, and the markers drawn on each tile.")
+        _tip(self._preview_cat_buttons["alerts"],
+             "Alert settings: intel flash, damage flash, decloak alert, and the "
+             "Gamelogs source they read.")
+        _tip(self._preview_cat_buttons["visibility"],
+             "Visibility settings: which characters get a preview, and when "
+             "previews hide themselves or minimize the client you just left.")
+        _tip(self._preview_cat_buttons["layout"],
+             "Layout settings: snapping, per-account positions, locking, the "
+             "arrange buttons, EVE-O layout import, and the reset.")
+        _tip(self._preview_cat_buttons["hotkeys"],
+             "Hotkey settings: the focus/cycle hotkey editors and the "
+             "only-while-EVE-is-focused gate.")
+        cat_display = self._preview_cat_frames["display"]
+        cat_alerts = self._preview_cat_frames["alerts"]
+        cat_visibility = self._preview_cat_frames["visibility"]
+        cat_layout = self._preview_cat_frames["layout"]
+        cat_hotkeys = self._preview_cat_frames["hotkeys"]
+
+        # ── Display ▸ row 1 (native): tile geometry + inactive opacity ───────
+        rowN = tk.Frame(cat_display, bg=BG_DARK)
         rowN.pack(fill=tk.X, pady=2)
-        # First native row — the shared overlay-label row is packed *before* it so
-        # the label controls sit at the top of the FCPreview panel.
+        # First Display row — the shared overlay-label row is packed *before* it
+        # so the label controls sit at the top of the Display category.
+        # `_preview_native_first_row` is the historical name for the same frame.
+        self._preview_display_first_row = rowN
         self._preview_native_first_row = rowN
         w = self._preview_native_widgets
 
         # Tile size: ONE label owning TWO spinboxes, "Tile size [w] × [h]". A
-        # second label+spinbox pair ("Tile w …  Tile h …") does not fit — this row
-        # is the widest in the FCPreview panel and the app's minsize is 1000 px
-        # (guarded by test_the_first_native_row_still_fits_the_app_minimum_window_width),
+        # second label+spinbox pair ("Tile w …  Tile h …") does not fit — this
+        # was the widest row in the FCPreview panel before the categories split
+        # it up, and the app's minsize is 1000 px (every category row is guarded
+        # by test_every_preview_category_row_fits_the_app_minimum_window_width),
         # so replacing the old "Tile w" label is what pays for the extra box.
         tk.Label(rowN, text="Tile size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
@@ -21696,21 +21748,6 @@ class FCToolGUI:
                    "are yours, set by dragging a tile corner or typed into the "
                    "'Tile size' boxes beside this one.")
 
-        # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
-        # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
-        # a per-character override. Lives beside the tile-size spin.
-        self._preview_uniform_var = tk.BooleanVar(
-            value=bool(pcfg.get("uniform_size", True)))
-        cbu = tk.Checkbutton(
-            rowN, text="Uniform tile size", variable=self._preview_uniform_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbu.grid(row=0, column=9, padx=(0, 8))
-        w.append(cbu)
-        _tip(cbu, "On: resizing one preview resizes them all; Off: each preview "
-                  "keeps its own size.")
-
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=5, padx=(0, 4), sticky=tk.W)
         self._preview_opacity_var = tk.DoubleVar(
@@ -21725,13 +21762,35 @@ class FCToolGUI:
         _tip(so, "Opacity of preview tiles for clients that are NOT the active "
                  "one (1.0 = fully opaque).")
 
-        self._preview_captions_var = tk.BooleanVar(value=bool(pcfg.get("captions", True)))
-        cbc = tk.Checkbutton(
-            rowN, text="Captions", variable=self._preview_captions_var,
+        # Uniform-vs-individual tile sizing (EVE-O parity default ON): one resize
+        # updates the global tile_w/tile_body_h and re-sizes every tile; OFF stores
+        # a per-character override. Lives beside the tile-size spin.
+        self._preview_uniform_var = tk.BooleanVar(
+            value=bool(pcfg.get("uniform_size", True)))
+        cbu = tk.Checkbutton(
+            rowN, text="Uniform tile size", variable=self._preview_uniform_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbc.grid(row=0, column=7, padx=(0, 8))
+        cbu.grid(row=0, column=7, padx=(0, 8))
+        w.append(cbu)
+        _tip(cbu, "On: resizing one preview resizes them all; Off: each preview "
+                  "keeps its own size.")
+
+        # ── Display ▸ row 2 (native): what the caption/label text says ───────
+        rowNCap = tk.Frame(cat_display, bg=BG_DARK)
+        rowNCap.pack(fill=tk.X, pady=2)
+        # Historical name for the second Display row (was the catch-all row for
+        # new FCPreview controls before the categories existed).
+        self._preview_native_second_row = rowNCap
+
+        self._preview_captions_var = tk.BooleanVar(value=bool(pcfg.get("captions", True)))
+        cbc = tk.Checkbutton(
+            rowNCap, text="Captions", variable=self._preview_captions_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbc.grid(row=0, column=0, padx=(0, 8))
         w.append(cbc)
         _tip(cbc, "Show a text caption on each preview tile (character name or its "
                   "label rule).")
@@ -21739,12 +21798,12 @@ class FCToolGUI:
         self._preview_doctrine_tag_var = tk.BooleanVar(
             value=bool(pcfg.get("doctrine_tag_captions", True)))
         cbd = tk.Checkbutton(
-            rowN, text="Default caption = doctrine tag",
+            rowNCap, text="Default caption = doctrine tag",
             variable=self._preview_doctrine_tag_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbd.grid(row=0, column=8, padx=(0, 8))
+        cbd.grid(row=0, column=1, padx=(0, 16))
         w.append(cbd)
         _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
                   "rule or override already labels it.")
@@ -21752,12 +21811,12 @@ class FCToolGUI:
         self._preview_labels_on_video_var = tk.BooleanVar(
             value=bool(pcfg.get("labels_on_video", True)))
         cblv = tk.Checkbutton(
-            rowN, text="Label bar (bottom)",
+            rowNCap, text="Label bar (bottom)",
             variable=self._preview_labels_on_video_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cblv.grid(row=1, column=0, columnspan=6, padx=(0, 8), pady=(4, 0), sticky=tk.W)
+        cblv.grid(row=0, column=2, padx=(0, 8))
         w.append(cblv)
         _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') in a small "
                    "strip at the BOTTOM of each preview tile — below the video, "
@@ -21766,59 +21825,66 @@ class FCToolGUI:
         self._preview_show_location_var = tk.BooleanVar(
             value=bool(pcfg.get("show_location", True)))
         cbloc = tk.Checkbutton(
-            rowN, text="Show location",
+            rowNCap, text="Show location",
             variable=self._preview_show_location_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbloc.grid(row=1, column=6, columnspan=2, padx=(0, 8), pady=(4, 0),
-                   sticky=tk.W)
+        cbloc.grid(row=0, column=3, padx=(0, 8))
         w.append(cbloc)
         _tip(cbloc, "Shows each pilot's current system on its own line under the "
                     "ship label.")
 
-        # Row 5 (native): highlight active / lock layout / arrange buttons.
-        rowN2 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
-        rowN2.pack(fill=tk.X, pady=2)
-        # rowN is full (measured 977 px of the app's 1000 px minsize — 903 until
-        # the Tile "h" Spinbox was inserted), so rowN2 is where new FCPreview
-        # controls land — and it has its own width guard now
-        # (test_the_second_native_row_still_fits_the_app_minimum_window_width),
-        # because at 976 px it is no longer the roomy row it used to be either.
-        self._preview_native_second_row = rowN2
+        # ── Display ▸ row 3 (native): markers drawn on the tile itself ───────
+        rowNMark = tk.Frame(cat_display, bg=BG_DARK)
+        rowNMark.pack(fill=tk.X, pady=2)
         self._preview_highlight_var = tk.BooleanVar(
             value=bool(pcfg.get("highlight_active", True)))
         cbh = tk.Checkbutton(
-            rowN2, text="Highlight active", variable=self._preview_highlight_var,
+            rowNMark, text="Highlight active", variable=self._preview_highlight_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbh.grid(row=0, column=0, padx=(0, 8))
+        cbh.grid(row=0, column=0, padx=(0, 16))
         w.append(cbh)
         _tip(cbh, "Draw a highlight border around the preview of the currently "
                   "active EVE client.")
 
-        self._preview_lock_var = tk.BooleanVar(value=bool(pcfg.get("lock_layout", False)))
-        cbl = tk.Checkbutton(
-            rowN2, text="Lock layout", variable=self._preview_lock_var,
+        # Major-implants icon on the caption strip (default ON). Ordinary
+        # native-checkbutton wiring: the var rides _PREVIEW_NATIVE_VARS, so
+        # _preview_apply_native_state persists it like every other flag here.
+        self._preview_implant_icon_var = tk.BooleanVar(
+            value=bool(pcfg.get("implant_icon", True)))
+        cbii = tk.Checkbutton(
+            rowNMark, text="Implant icon", variable=self._preview_implant_icon_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbl.grid(row=0, column=1, padx=(0, 16))
-        w.append(cbl)
-        _tip(cbl, "Lock preview positions and sizes so they can't be dragged or "
-                  "resized by accident.")
+        # No TRAILING pad: nothing follows it on this row, so the 8 px every
+        # other control here spends on separation would buy nothing.
+        cbii.grid(row=0, column=1, padx=(0, 0))
+        w.append(cbii)
+        self._preview_implant_icon_check = cbii
+        _tip(cbii, "Mark previews whose pilot is flying with implants worth "
+                   "losing — hover the icon to see which sets, mindlinks and "
+                   "hardwirings. Uses the same designation as 'Save my "
+                   "implants', and needs that character re-authorised for the "
+                   "implants scope.")
+
+        # ── Alerts ▸ row 1 (native): the three border-flash alerts ───────────
+        rowAlert = tk.Frame(cat_alerts, bg=BG_DARK)
+        rowAlert.pack(fill=tk.X, pady=2)
 
         # B3: intel flash — tile border flashes red while the pilot's system has
         # a fresh hostile intel note from your own chat logs. Default OFF.
         self._preview_intel_flash_var = tk.BooleanVar(
             value=bool(pcfg.get("intel_flash", False)))
         cbi = tk.Checkbutton(
-            rowN2, text="Intel flash", variable=self._preview_intel_flash_var,
+            rowAlert, text="Intel flash", variable=self._preview_intel_flash_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbi.grid(row=0, column=2, padx=(0, 4))
+        cbi.grid(row=0, column=0, padx=(0, 4))
         w.append(cbi)
         _intel_tip = (
             "Flash a preview's border red when fresh hostile intel is reported "
@@ -21832,19 +21898,19 @@ class FCToolGUI:
         # where it is read — a Spinbox's from_/to bounds its ARROWS only.
         self._preview_intel_jumps_var = tk.IntVar(
             value=_preview_intel_radius(pcfg))
-        sij = tk.Spinbox(rowN2, from_=0, to=_PREVIEW_INTEL_JUMPS_MAX, width=3,
+        sij = tk.Spinbox(rowAlert, from_=0, to=_PREVIEW_INTEL_JUMPS_MAX, width=3,
                          textvariable=self._preview_intel_jumps_var,
                          font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
                          insertbackground=FG_WHITE,
                          command=self._preview_apply_native_state)
         sij.bind("<KeyRelease>", lambda e: self._preview_apply_native_state())
-        sij.grid(row=0, column=3, padx=(0, 2))
+        sij.grid(row=0, column=1, padx=(0, 2))
         self._preview_intel_jumps_spin = sij
         w.append(sij)
         _tip(sij, _intel_tip)
-        _lbl_ij = tk.Label(rowN2, text="jumps", font=("Consolas", 10),
+        _lbl_ij = tk.Label(rowAlert, text="jumps", font=("Consolas", 10),
                            fg=FG_TEXT, bg=BG_DARK)
-        _lbl_ij.grid(row=0, column=4, padx=(0, 16), sticky=tk.W)
+        _lbl_ij.grid(row=0, column=2, padx=(0, 16), sticky=tk.W)
         w.append(_lbl_ij)
         _tip(_lbl_ij, _intel_tip)
 
@@ -21854,141 +21920,29 @@ class FCToolGUI:
         self._preview_damage_flash_var = tk.BooleanVar(
             value=bool(pcfg.get("damage_flash", True)))
         cbdf = tk.Checkbutton(
-            rowN2, text="Damage flash", variable=self._preview_damage_flash_var,
+            rowAlert, text="Damage flash", variable=self._preview_damage_flash_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbdf.grid(row=0, column=5, padx=(0, 16))
+        cbdf.grid(row=0, column=3, padx=(0, 16))
         w.append(cbdf)
         _tip(cbdf, "Pulse a preview's border red when that character takes "
                    "incoming damage in your own combat logs (tune it in the row "
                    "below).")
 
-        # C3: minimize-inactive — on a switch, the previously-active client is
-        # minimized (unless it's in the never-minimize list). EVE-O parity.
-        self._preview_minimize_inactive_var = tk.BooleanVar(
-            value=bool(pcfg.get("minimize_inactive", False)))
-        cbmi = tk.Checkbutton(
-            rowN2, text="Minimize inactive",
-            variable=self._preview_minimize_inactive_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbmi.grid(row=0, column=6, padx=(0, 8))
-        w.append(cbmi)
-        _tip(cbmi, "When you switch clients, minimize the one you just left "
-                   "(except characters on the never-minimize list).")
-
-        bnm = ttk.Button(rowN2, text="Never minimize…", style="Dark.TButton",
-                         command=self._open_preview_never_minimize_dialog)
-        bnm.grid(row=0, column=7, padx=(0, 6))
-        w.append(bnm)
-        _tip(bnm, "Pick characters that should stay open and never be minimized "
-                  "by 'Minimize inactive'.")
-
-        # Major-implants icon on the caption strip (default ON). Ordinary
-        # native-checkbutton wiring: the var rides _PREVIEW_NATIVE_VARS, so
-        # _preview_apply_native_state persists it like every other flag here.
-        self._preview_implant_icon_var = tk.BooleanVar(
-            value=bool(pcfg.get("implant_icon", True)))
-        cbii = tk.Checkbutton(
-            rowN2, text="Implant icon", variable=self._preview_implant_icon_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        # No TRAILING pad: this is the last control on rowN2 and the row is the
-        # width-budget one now (864 px before this box, 976 px with it, against
-        # the app's 1000 px minsize). Nothing follows it, so the 8 px every
-        # other control here spends on separation would buy nothing but risk.
-        cbii.grid(row=0, column=8, padx=(0, 0))
-        w.append(cbii)
-        self._preview_implant_icon_check = cbii
-        _tip(cbii, "Mark previews whose pilot is flying with implants worth "
-                   "losing — hover the icon to see which sets, mindlinks and "
-                   "hardwirings. Uses the same designation as 'Save my "
-                   "implants', and needs that character re-authorised for the "
-                   "implants scope.")
-
-        # Snap previews to each other: while dragging a preview, its edges stick
-        # to nearby previews' edges (butt together or align flush). Placement
-        # comfort only — never touches saved data. Default OFF. Native-mode only.
-        rowSnap = tk.Frame(self._preview_panel_native, bg=BG_DARK)
-        rowSnap.pack(fill=tk.X, pady=2)
-        self._preview_snap_var = tk.BooleanVar(
-            value=bool(pcfg.get("snap_enabled", False)))
-        cbsnap = tk.Checkbutton(
-            rowSnap, text="Snap previews to each other",
-            variable=self._preview_snap_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbsnap.grid(row=0, column=0, padx=(0, 16))
-        w.append(cbsnap)
-        _tip(cbsnap, "While dragging a preview, edges within ~12 px of another "
-                     "preview's edges stick to them — butt together or align flush.")
-
-        # Account slots: one saved position per EVE ACCOUNT instead of one per
-        # character (grouping lives in the Characters pane). Shares this row
-        # rather than the first native row, which measures 977 px of the app's
-        # 1000 px minimum width and cannot carry this 259 px control. Measured
-        # 2026-08-24, after the Tile-size w x h pair landed in that row.
-        self._preview_account_slots_var = tk.BooleanVar(
-            value=bool(pcfg.get("account_slots", False)))
-        cbacct = tk.Checkbutton(
-            rowSnap, text="Keep preview position per account",
-            variable=self._preview_account_slots_var,
-            command=self._preview_toggle_account_slots, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbacct.grid(row=0, column=1, padx=(0, 8))
-        w.append(cbacct)
-        self._preview_account_slots_check = cbacct
-        _tip(cbacct, "Characters on the same EVE account (set in the Characters "
-                     "tab) share ONE preview position and size, so logging an "
-                     "alt in on a window puts its preview exactly where the "
-                     "last one was — and the window keeps that spot while it "
-                     "sits on the character-select screen. Off: every character "
-                     "remembers its own position.")
-
-        # Auto-slot detected accounts: with the box above on, ALSO position a
-        # character FCTool has only OBSERVED on an account (never hand-labelled in
-        # the Characters tab) at that account's shared slot, the same as a
-        # labelled one. Depends on the master above -- greyed while it is off (see
-        # _preview_sync_native_widgets), which is why the master's command re-gates
-        # through _preview_toggle_account_slots. Persists via the native var map.
-        self._preview_account_slots_auto_var = tk.BooleanVar(
-            value=bool(pcfg.get("account_slots_auto", False)))
-        cbacctauto = tk.Checkbutton(
-            rowSnap, text="Auto-slot detected accounts",
-            variable=self._preview_account_slots_auto_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbacctauto.grid(row=0, column=2, padx=(0, 8))
-        w.append(cbacctauto)
-        self._preview_account_slots_auto_check = cbacctauto
-        _tip(cbacctauto, "Position previews for characters FCTool detected on an "
-                         "account — but you never labelled — at that account's "
-                         "shared slot, just like labelled ones. Needs 'Keep "
-                         "preview position per account' on. A detected grouping "
-                         "is a best guess from the EVE client, so this is off by "
-                         "default. Takes effect as each preview next appears.")
-
         # Decloak alert — when one of YOUR chars is decloaked (proximity or a
         # Mobile Observatory), read from your own combat logs, its tile flashes
         # yellow + shows a DECLOAKED banner for 10s. Optional spoken cue (OFF by
         # default). Native-mode only. Mirrors the label-bar / show-location vars.
-        rowDecloak = tk.Frame(self._preview_panel_native, bg=BG_DARK)
-        rowDecloak.pack(fill=tk.X, pady=2)
         self._preview_decloak_flash_var = tk.BooleanVar(
             value=bool(pcfg.get("decloak_flash", True)))
         cbdk = tk.Checkbutton(
-            rowDecloak, text="Decloak alert",
+            rowAlert, text="Decloak alert",
             variable=self._preview_decloak_flash_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbdk.grid(row=0, column=0, padx=(0, 16))
+        cbdk.grid(row=0, column=4, padx=(0, 16))
         w.append(cbdk)
         _tip(cbdk, "Flashes the tile yellow and shows a DECLOAKED banner for 10s "
                    "when that character is decloaked (proximity or Mobile "
@@ -21998,73 +21952,22 @@ class FCToolGUI:
         self._preview_decloak_audio_var = tk.BooleanVar(
             value=bool(pcfg.get("decloak_audio", False)))
         cbdka = tk.Checkbutton(
-            rowDecloak, text="Decloak audio cue",
+            rowAlert, text="Decloak audio cue",
             variable=self._preview_decloak_audio_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbdka.grid(row=0, column=1, padx=(0, 8))
+        cbdka.grid(row=0, column=5, padx=(0, 8))
         w.append(cbdka)
         _tip(cbdka, "Plays a spoken \"Decloaked\" alert when it happens. "
                     "Off by default.")
 
-        # Row 5b (native, Task C2): hide rules + the per-character "which previews
-        # to show" entry point. Hiding a rule/character never wipes saved data.
-        rowHide = tk.Frame(self._preview_panel_native, bg=BG_DARK)
-        rowHide.pack(fill=tk.X, pady=2)
-        self._preview_hide_active_var = tk.BooleanVar(
-            value=bool(pcfg.get("hide_active", False)))
-        cbha = tk.Checkbutton(
-            rowHide, text="Hide active", variable=self._preview_hide_active_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbha.grid(row=0, column=0, padx=(0, 8))
-        w.append(cbha)
-        _tip(cbha, "Hide the preview of whichever client is currently active "
-                   "(you're already looking at that window).")
-
-        self._preview_hide_login_var = tk.BooleanVar(
-            value=bool(pcfg.get("hide_login", False)))
-        cbhl = tk.Checkbutton(
-            rowHide, text="Hide login", variable=self._preview_hide_login_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbhl.grid(row=0, column=1, padx=(0, 8))
-        w.append(cbhl)
-        _tip(cbhl, "Hide previews of clients still sitting on the character-select "
-                   "/ login screen.")
-
-        self._preview_hide_lost_focus_var = tk.BooleanVar(
-            value=bool(pcfg.get("hide_on_lost_focus", False)))
-        cbhf = tk.Checkbutton(
-            rowHide, text="Hide all on lost focus",
-            variable=self._preview_hide_lost_focus_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbhf.grid(row=0, column=2, padx=(0, 16))
-        w.append(cbhf)
-        _tip(cbhf, "Hide every preview whenever no EVE client has focus (e.g. "
-                   "you've alt-tabbed away from the game).")
-
-        bpv = ttk.Button(rowHide, text="Previews…", style="Dark.TButton",
-                         command=self._open_preview_previews_dialog)
-        bpv.grid(row=0, column=3, padx=(0, 6))
-        w.append(bpv)
-        _tip(bpv, "Choose which characters get a preview window.")
-        self._preview_shown_summary_lbl = tk.Label(
-            rowHide, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
-        self._preview_shown_summary_lbl.grid(row=0, column=4, padx=(4, 0),
-                                             sticky=tk.W)
-        self._preview_update_shown_summary()
-
-        # Row 6 (native): damage-flash tuning. Mode picks 'Any damage' (log-only
-        # default; no HP/ESI gate) or 'Threshold' (pct-of-reference). The pct +
-        # reference controls are shown ONLY in threshold mode; window/cooldown
-        # apply to both (window is also the pulse hold). All live-applied.
-        rowN3 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        # ── Alerts ▸ row 2 (native): damage-flash tuning ─────────────────────
+        # Mode picks 'Any damage' (log-only default; no HP/ESI gate) or
+        # 'Threshold' (pct-of-reference). The pct + reference controls are shown
+        # ONLY in threshold mode; window/cooldown apply to both (window is also
+        # the pulse hold). All live-applied.
+        rowN3 = tk.Frame(cat_alerts, bg=BG_DARK)
         rowN3.pack(fill=tk.X, pady=2)
 
         tk.Label(rowN3, text="Flash on", font=("Consolas", 10), fg=FG_TEXT,
@@ -22157,11 +22060,15 @@ class FCToolGUI:
         # Apply initial threshold-only visibility from the loaded mode.
         self._preview_apply_dmg_mode_visibility()
 
-        # Row 6b (native): Gamelogs source. Damage flash AND decloak both read
-        # EVE's combat Gamelogs, so a missing/empty/mis-detected folder kills BOTH
-        # silently (the friend-box bug). Show the EFFECTIVE folder (an override,
-        # else auto-detected beside Chatlogs) with a Browse override + Auto reset
-        # and a live diagnostic line so the source is never a silent dead end.
+        # ── Alerts ▸ row 3 (native): Gamelogs source ─────────────────────────
+        # Damage flash AND decloak both read EVE's combat Gamelogs, so a
+        # missing/empty/mis-detected folder kills BOTH silently (the friend-box
+        # bug). Show the EFFECTIVE folder (an override, else auto-detected beside
+        # Chatlogs) with a Browse override + Auto reset and a live diagnostic line
+        # so the source is never a silent dead end. The status line stays HERE
+        # rather than joining the always-visible hotkey line at the bottom: it
+        # always has text, so hoisting it would re-add the noise the categories
+        # just removed, and it only matters to the two alerts above it.
         _gl_tip = (
             "Damage flash and the decloak alert both read EVE's combat Gamelogs. "
             "FCTool auto-detects that folder beside your Chatlogs; if a friend "
@@ -22169,7 +22076,7 @@ class FCToolGUI:
             "OneDrive-redirected, or empty. Requires EVE ▸ Settings ▸ 'Log game "
             "events to file' ON and the English client. Browse sets an override; "
             "Auto clears it back to auto-detect. Changes apply immediately.")
-        rowGamelog = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowGamelog = tk.Frame(cat_alerts, bg=BG_DARK)
         rowGamelog.pack(fill=tk.X, pady=2)
         tk.Label(rowGamelog, text="Gamelogs folder", font=("Consolas", 10),
                  fg=FG_TEXT, bg=BG_DARK).grid(row=0, column=0, padx=(0, 4),
@@ -22207,8 +22114,164 @@ class FCToolGUI:
                                               pady=(2, 0), sticky=tk.W)
         _tip(self._preview_gamelog_status_lbl, _gl_tip)
 
-        # Row 7 (native): arrange / hotkey buttons.
-        rowN4 = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        # ── Visibility ▸ row 1 (native): hide rules + minimize-inactive ──────
+        # Hiding a rule/character never wipes saved data.
+        rowHide = tk.Frame(cat_visibility, bg=BG_DARK)
+        rowHide.pack(fill=tk.X, pady=2)
+        self._preview_hide_active_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_active", False)))
+        cbha = tk.Checkbutton(
+            rowHide, text="Hide active", variable=self._preview_hide_active_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbha.grid(row=0, column=0, padx=(0, 8))
+        w.append(cbha)
+        _tip(cbha, "Hide the preview of whichever client is currently active "
+                   "(you're already looking at that window).")
+
+        self._preview_hide_login_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_login", False)))
+        cbhl = tk.Checkbutton(
+            rowHide, text="Hide login", variable=self._preview_hide_login_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbhl.grid(row=0, column=1, padx=(0, 8))
+        w.append(cbhl)
+        _tip(cbhl, "Hide previews of clients still sitting on the character-select "
+                   "/ login screen.")
+
+        self._preview_hide_lost_focus_var = tk.BooleanVar(
+            value=bool(pcfg.get("hide_on_lost_focus", False)))
+        cbhf = tk.Checkbutton(
+            rowHide, text="Hide all on lost focus",
+            variable=self._preview_hide_lost_focus_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbhf.grid(row=0, column=2, padx=(0, 16))
+        w.append(cbhf)
+        _tip(cbhf, "Hide every preview whenever no EVE client has focus (e.g. "
+                   "you've alt-tabbed away from the game).")
+
+        # C3: minimize-inactive — on a switch, the previously-active client is
+        # minimized (unless it's in the never-minimize list). EVE-O parity.
+        self._preview_minimize_inactive_var = tk.BooleanVar(
+            value=bool(pcfg.get("minimize_inactive", False)))
+        cbmi = tk.Checkbutton(
+            rowHide, text="Minimize inactive",
+            variable=self._preview_minimize_inactive_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbmi.grid(row=0, column=3, padx=(0, 8))
+        w.append(cbmi)
+        _tip(cbmi, "When you switch clients, minimize the one you just left "
+                   "(except characters on the never-minimize list).")
+
+        bnm = ttk.Button(rowHide, text="Never minimize…", style="Dark.TButton",
+                         command=self._open_preview_never_minimize_dialog)
+        bnm.grid(row=0, column=4, padx=(0, 6))
+        w.append(bnm)
+        _tip(bnm, "Pick characters that should stay open and never be minimized "
+                  "by 'Minimize inactive'.")
+
+        # ── Visibility ▸ row 2 (native): which characters get a preview ──────
+        rowShown = tk.Frame(cat_visibility, bg=BG_DARK)
+        rowShown.pack(fill=tk.X, pady=2)
+        bpv = ttk.Button(rowShown, text="Previews…", style="Dark.TButton",
+                         command=self._open_preview_previews_dialog)
+        bpv.grid(row=0, column=0, padx=(0, 6))
+        w.append(bpv)
+        _tip(bpv, "Choose which characters get a preview window.")
+        self._preview_shown_summary_lbl = tk.Label(
+            rowShown, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
+        self._preview_shown_summary_lbl.grid(row=0, column=1, padx=(4, 0),
+                                             sticky=tk.W)
+        self._preview_update_shown_summary()
+
+        # ── Layout ▸ row 1 (native): placement comfort ───────────────────────
+        # Snap previews to each other: while dragging a preview, its edges stick
+        # to nearby previews' edges (butt together or align flush). Placement
+        # comfort only — never touches saved data. Default OFF. Native-mode only.
+        rowLayout = tk.Frame(cat_layout, bg=BG_DARK)
+        rowLayout.pack(fill=tk.X, pady=2)
+        self._preview_snap_var = tk.BooleanVar(
+            value=bool(pcfg.get("snap_enabled", False)))
+        cbsnap = tk.Checkbutton(
+            rowLayout, text="Snap previews to each other",
+            variable=self._preview_snap_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbsnap.grid(row=0, column=0, padx=(0, 16))
+        w.append(cbsnap)
+        _tip(cbsnap, "While dragging a preview, edges within ~12 px of another "
+                     "preview's edges stick to them — butt together or align flush.")
+
+        self._preview_lock_var = tk.BooleanVar(value=bool(pcfg.get("lock_layout", False)))
+        cbl = tk.Checkbutton(
+            rowLayout, text="Lock layout", variable=self._preview_lock_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbl.grid(row=0, column=1, padx=(0, 16))
+        w.append(cbl)
+        _tip(cbl, "Lock preview positions and sizes so they can't be dragged or "
+                  "resized by accident.")
+
+        # ── Layout ▸ row 2 (native): per-account slots ───────────────────────
+        # Account slots: one saved position per EVE ACCOUNT instead of one per
+        # character (grouping lives in the Characters pane). Its own row: this
+        # label alone is ~259 px, and the dependent auto-slot box beside it is
+        # ~230 px more, so the pair owns a row of its own.
+        rowSnap = tk.Frame(cat_layout, bg=BG_DARK)
+        rowSnap.pack(fill=tk.X, pady=2)
+        self._preview_account_slots_var = tk.BooleanVar(
+            value=bool(pcfg.get("account_slots", False)))
+        cbacct = tk.Checkbutton(
+            rowSnap, text="Keep preview position per account",
+            variable=self._preview_account_slots_var,
+            command=self._preview_toggle_account_slots, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbacct.grid(row=0, column=0, padx=(0, 8))
+        w.append(cbacct)
+        self._preview_account_slots_check = cbacct
+        _tip(cbacct, "Characters on the same EVE account (set in the Characters "
+                     "tab) share ONE preview position and size, so logging an "
+                     "alt in on a window puts its preview exactly where the "
+                     "last one was — and the window keeps that spot while it "
+                     "sits on the character-select screen. Off: every character "
+                     "remembers its own position.")
+
+        # Auto-slot detected accounts: with the box above on, ALSO position a
+        # character FCTool has only OBSERVED on an account (never hand-labelled in
+        # the Characters tab) at that account's shared slot, the same as a
+        # labelled one. Depends on the master above -- greyed while it is off (see
+        # _preview_sync_native_widgets), which is why the master's command re-gates
+        # through _preview_toggle_account_slots. Persists via the native var map.
+        self._preview_account_slots_auto_var = tk.BooleanVar(
+            value=bool(pcfg.get("account_slots_auto", False)))
+        cbacctauto = tk.Checkbutton(
+            rowSnap, text="Auto-slot detected accounts",
+            variable=self._preview_account_slots_auto_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbacctauto.grid(row=0, column=1, padx=(0, 8))
+        w.append(cbacctauto)
+        self._preview_account_slots_auto_check = cbacctauto
+        _tip(cbacctauto, "Position previews for characters FCTool detected on an "
+                         "account — but you never labelled — at that account's "
+                         "shared slot, just like labelled ones. Needs 'Keep "
+                         "preview position per account' on. A detected grouping "
+                         "is a best guess from the EVE client, so this is off by "
+                         "default. Takes effect as each preview next appears.")
+
+        # ── Layout ▸ row 3 (native): arrange / import / reset ────────────────
+        rowN4 = tk.Frame(cat_layout, bg=BG_DARK)
         rowN4.pack(fill=tk.X, pady=2)
         bg = ttk.Button(rowN4, text="Arrange in grid", style="Dark.TButton",
                         command=self._preview_arrange_grid)
@@ -22223,30 +22286,16 @@ class FCToolGUI:
         _tip(bgf, "Arrange the preview tiles grouped by their fleet wing/squad "
                   "order.")
 
-        bhk = ttk.Button(rowN4, text="Hotkeys…", style="Dark.TButton",
-                         command=self._open_preview_hotkeys_dialog)
-        bhk.grid(row=0, column=2, padx=(0, 6))
-        w.append(bhk)
-        _tip(bhk, "Set global hotkeys to switch/cycle EVE clients (focus only — no "
-                  "input is ever sent to the game).")
-
-        bcg = ttk.Button(rowN4, text="Cycle groups…", style="Dark.TButton",
-                         command=self._open_preview_cycle_groups_dialog)
-        bcg.grid(row=0, column=3, padx=(0, 6))
-        w.append(bcg)
-        _tip(bcg, "Define groups of clients and cycle each with its own hotkey. "
-                  "Cycle keys are swallowed system-wide while FCPreview runs.")
-
         bmp = ttk.Button(rowN4, text="Monitor pinning…", style="Dark.TButton",
                          command=self._open_preview_monitor_pin_dialog)
-        bmp.grid(row=0, column=4, padx=(0, 6))
+        bmp.grid(row=0, column=2, padx=(0, 6))
         w.append(bmp)
         _tip(bmp, "Assign each character's EVE client to a monitor — it moves there "
                   "on login (needs FCPreview mode). Apply moves them anytime.")
 
         bimp = ttk.Button(rowN4, text="Import EVE-O layout…", style="Dark.TButton",
                           command=self._preview_import_eveo)
-        bimp.grid(row=0, column=5, padx=(0, 6))
+        bimp.grid(row=0, column=3, padx=(0, 6))
         w.append(bimp)
         _tip(bimp, "Import tile positions/sizes from your existing Eve-O Preview "
                    "configuration.")
@@ -22261,7 +22310,7 @@ class FCToolGUI:
                           activebackground="#cc3333", activeforeground=FG_WHITE,
                           borderwidth=1, relief=tk.RIDGE, cursor="hand2",
                           command=self._preview_reset_layout)
-        brst.grid(row=0, column=6, padx=(0, 6))
+        brst.grid(row=0, column=4, padx=(0, 6))
         w.append(brst)
         self._preview_reset_btn = brst
         _tip(brst, "Bring all preview windows back on-screen and clear saved "
@@ -22269,28 +22318,28 @@ class FCToolGUI:
                    "previews were dragged off-screen or a monitor was "
                    "disconnected.")
 
-        # Hotkey diagnostics line (same idiom as the Gamelogs source line): a key
-        # RegisterHotKey refused used to be reported only inside the two hotkey
-        # dialogs, so a collision hit on the enable path left a dead key with
-        # nothing said anywhere. Seeded from whatever the last registration found
-        # — that may well have happened before this section existed.
-        _hk_status = getattr(self, "_preview_hotkey_status", "") or ""
-        self._preview_hotkey_status_lbl = tk.Label(
-            rowN4, text=_hk_status, font=("Consolas", 9),
-            fg=FG_ORANGE if _hk_status else FG_DIM, bg=BG_DARK,
-            anchor=tk.W, justify=tk.LEFT, wraplength=760)
-        self._preview_hotkey_status_lbl.grid(row=1, column=0, columnspan=7,
-                                             pady=(2, 0), sticky=tk.W)
-        _tip(self._preview_hotkey_status_lbl,
-             "Warnings about global hotkeys that could not be registered - "
-             "usually another application already owns that key combination.")
+        # ── Hotkeys ▸ row 1 (native): the two hotkey editors ─────────────────
+        rowHKBtns = tk.Frame(cat_hotkeys, bg=BG_DARK)
+        rowHKBtns.pack(fill=tk.X, pady=2)
+        bhk = ttk.Button(rowHKBtns, text="Hotkeys…", style="Dark.TButton",
+                         command=self._open_preview_hotkeys_dialog)
+        bhk.grid(row=0, column=0, padx=(0, 6))
+        w.append(bhk)
+        _tip(bhk, "Set global hotkeys to switch/cycle EVE clients (focus only — no "
+                  "input is ever sent to the game).")
 
-        # Row 7b (native): the EVE-focus hotkey gate. Its own row on purpose —
-        # rowN4 already measures 729 px of the app's 1000 px minsize and this
-        # checkbox is 259 px wide, which would leave the button row ~12 px of
-        # headroom. It still sits directly under the two hotkey dialogs it
-        # qualifies, which is where a user looking for it will be.
-        rowHK = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        bcg = ttk.Button(rowHKBtns, text="Cycle groups…", style="Dark.TButton",
+                         command=self._open_preview_cycle_groups_dialog)
+        bcg.grid(row=0, column=1, padx=(0, 6))
+        w.append(bcg)
+        _tip(bcg, "Define groups of clients and cycle each with its own hotkey. "
+                  "Cycle keys are swallowed system-wide while FCPreview runs.")
+
+        # ── Hotkeys ▸ row 2 (native): the EVE-focus hotkey gate ──────────────
+        # Its own row on purpose — this checkbox is 259 px wide and sits directly
+        # under the two hotkey dialogs it qualifies, which is where a user
+        # looking for it will be.
+        rowHK = tk.Frame(cat_hotkeys, bg=BG_DARK)
         rowHK.pack(fill=tk.X, pady=2)
         self._preview_hotkeys_eve_only_var = tk.BooleanVar(
             value=bool(pcfg.get("hotkeys_eve_only", False)))
@@ -22313,6 +22362,32 @@ class FCToolGUI:
              "in Discord and your browser. The trade: while EVE is not focused "
              "the keys reach those other apps instead, so you can no longer "
              "press a focus key from the desktop to jump into EVE.")
+
+        # Hotkey diagnostics line (same idiom as the Gamelogs source line): a key
+        # RegisterHotKey refused used to be reported only inside the two hotkey
+        # dialogs, so a collision hit on the enable path left a dead key with
+        # nothing said anywhere. Seeded from whatever the last registration found
+        # — that may well have happened before this section existed.
+        # DELIBERATELY OUTSIDE the category frames and always packed: it is empty
+        # while everything is healthy (so it costs nothing), and burying a
+        # dead-key warning behind a category button would recreate exactly the
+        # silent-failure class it was built to kill.
+        rowHKStatus = tk.Frame(self._preview_panel_native, bg=BG_DARK)
+        rowHKStatus.pack(fill=tk.X, pady=2)
+        self._preview_hotkey_status_row = rowHKStatus
+        _hk_status = getattr(self, "_preview_hotkey_status", "") or ""
+        self._preview_hotkey_status_lbl = tk.Label(
+            rowHKStatus, text=_hk_status, font=("Consolas", 9),
+            fg=FG_ORANGE if _hk_status else FG_DIM, bg=BG_DARK,
+            anchor=tk.W, justify=tk.LEFT, wraplength=760)
+        self._preview_hotkey_status_lbl.grid(row=0, column=0, sticky=tk.W)
+        _tip(self._preview_hotkey_status_lbl,
+             "Warnings about global hotkeys that could not be registered - "
+             "usually another application already owns that key combination.")
+
+        # Reveal the starting category (and paint the buttons) now that every
+        # frame exists and the always-visible status row is the pack anchor.
+        self._preview_set_settings_category(self._preview_settings_category)
 
         # Fine print (updated disclaimer — spec §9). Damage-flash fine print
         # (Task B6): base-hull-HP approximation + English-client + own-logs-only.
@@ -22353,6 +22428,75 @@ class FCToolGUI:
         ("eveo_labels", "Eve-O Preview Enhancement"),
         ("native", "FCPreview"),
     )
+
+    # FCPreview settings categories: (internal key, button label). One category
+    # frame is revealed at a time inside the native panel. Unlike the mode keys
+    # above these are NOT persisted — the selection is session-only view state,
+    # so there is no config key and no default_config mirror.
+    _PREVIEW_SETTINGS_CATEGORIES = (
+        ("display", "Display"),
+        ("alerts", "Alerts"),
+        ("visibility", "Visibility"),
+        ("layout", "Layout"),
+        ("hotkeys", "Hotkeys"),
+    )
+
+    def _preview_set_settings_category(self, value):
+        """Reveal exactly ONE FCPreview settings category (session-only view).
+
+        An unrecognised key falls back to "display" rather than leaving every
+        category hidden — a settings panel with nothing in it is the one outcome
+        this must never produce. The chosen frame is always packed BEFORE the
+        hotkey-status row, which is deliberately outside the categories and
+        always visible (an empty-when-healthy warning line must not be buried)."""
+        valid = {k for k, _lbl in self._PREVIEW_SETTINGS_CATEGORIES}
+        if value not in valid:
+            value = "display"
+        self._preview_settings_category = value
+        frames = getattr(self, "_preview_cat_frames", None) or {}
+        for frame in frames.values():
+            try:
+                frame.pack_forget()
+            except tk.TclError:
+                pass
+        frame = frames.get(value)
+        if frame is not None:
+            before = getattr(self, "_preview_hotkey_status_row", None)
+            try:
+                if before is not None:
+                    frame.pack(fill=tk.X, before=before)
+                else:
+                    frame.pack(fill=tk.X)
+            except tk.TclError:
+                pass
+        self._preview_refresh_category_buttons()
+
+    def _preview_refresh_category_buttons(self):
+        """Paint the five category buttons: the revealed one is SUNKEN + accent,
+        the rest keep the house dark style.
+
+        Deliberately NOT the mode buttons' green ✓: green-with-a-checkmark means
+        "this mode is ON" everywhere else in this section, and a view tab must
+        never read as an on/off state."""
+        btns = getattr(self, "_preview_cat_buttons", None)
+        if not btns:
+            return
+        active = getattr(self, "_preview_settings_category", "display")
+        for value, _label in self._PREVIEW_SETTINGS_CATEGORIES:
+            btn = btns.get(value)
+            if btn is None:
+                continue
+            try:
+                if value == active:
+                    btn.configure(relief=tk.SUNKEN, bg=FG_ACCENT, fg=BG_DARK,
+                                  activebackground=FG_ACCENT,
+                                  activeforeground=BG_DARK)
+                else:
+                    btn.configure(relief=tk.RIDGE, bg=BG_ENTRY, fg=FG_TEXT,
+                                  activebackground=BG_ENTRY,
+                                  activeforeground=FG_TEXT)
+            except tk.TclError:
+                pass
 
     def _preview_refresh_mode_buttons(self):
         """Paint the three mode buttons: the active mode gets a leading checkmark
@@ -22411,14 +22555,21 @@ class FCToolGUI:
         if panel is None:
             return
         # The labels + native panels both host the shared overlay-label row at
-        # their top; re-parent it into the active panel before packing. In the
-        # native panel the row-order already exists, so pack before the first
-        # native row to keep the label controls on top.
+        # their top; re-home it into the active panel before packing. In NATIVE
+        # mode its home is the Display CATEGORY frame (the label controls belong
+        # to Display, and hiding with it is the point of the reveal), packed
+        # before that category's first row so they stay on top. Everywhere else
+        # it goes straight into the panel.
         if shared is not None and active in ("eveo_labels", "native"):
-            first = getattr(self, "_preview_native_first_row", None)
+            cats = getattr(self, "_preview_cat_frames", None) or {}
+            home = cats.get("display") if active == "native" else None
+            first = (getattr(self, "_preview_display_first_row", None)
+                     if home is not None else None)
             try:
-                if active == "native" and first is not None:
-                    shared.pack(in_=panel, fill=tk.X, pady=(0, 2), before=first)
+                if home is not None and first is not None:
+                    shared.pack(in_=home, fill=tk.X, pady=(0, 2), before=first)
+                elif home is not None:
+                    shared.pack(in_=home, fill=tk.X, pady=(0, 2))
                 else:
                     shared.pack(in_=panel, fill=tk.X, pady=(0, 2))
             except tk.TclError:
