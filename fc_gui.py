@@ -17748,7 +17748,14 @@ class FCToolGUI:
         known hulls; its permanent in-memory + disk cache backs the rare ESI
         fallback), so a sweep issues at most the two location/ship calls per
         character. A snapshot of ``esi_accounts`` is taken first so a concurrent
-        connect/disconnect/re-auth on the UI thread can't mutate the list mid-sweep."""
+        connect/disconnect/re-auth on the UI thread can't mutate the list mid-sweep.
+
+        Docked convention: ``ESIAuth.get_location`` carries ``station_id`` when
+        docked at an NPC station and ``structure_id`` when docked in a citadel/
+        structure; neither key is present when the pilot is in space. When
+        either is truthy the pair's ship name is the EMPTY STRING "" -- the
+        hover overlay (``map_tab._chars_hover_lines``) reads that convention to
+        show just the pilot's name while docked, "Name (Ship)" when undocked."""
         out: dict[int, list] = {}
         live_tid: dict[str, int] = {}
         accounts = list(getattr(self, "esi_accounts", None) or ())
@@ -17766,12 +17773,13 @@ class FCToolGUI:
                 sid = loc.get("solar_system_id")
                 if not sid:
                     continue
-                ship_name = "Unknown ship"
+                docked = bool(loc.get("station_id") or loc.get("structure_id"))
+                ship_name = "" if docked else "Unknown ship"
                 ship_tid = None
                 ship = acct.get_ship_type()        # None when docked-privacy/no scope
                 if ship:
                     ship_tid = ship.get("ship_type_id")
-                    if ship_tid and catalog is not None:
+                    if ship_tid and catalog is not None and not docked:
                         resolved = catalog.resolve_name(ship_tid)
                         if resolved:
                             ship_name = resolved

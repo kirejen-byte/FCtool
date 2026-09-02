@@ -2406,11 +2406,16 @@ class MapTab:
             self._sync_chars_banner()
 
     def _chars_hover_lines(self, sid) -> list[str] | None:
-        """Characters hover-tooltip provider: one ``"CharName — ShipType"`` line
-        per character currently in the hovered system, sorted by name (the stored
-        snapshot is already name-sorted by _canonical_chars). None when no tracked
-        character is there. Honours the active session filter (a filtered-out
-        system contributes no section). Gated on _layer_on("chars") by the engine."""
+        """Characters hover-tooltip provider: one line per character currently
+        in the hovered system, sorted by name (the stored snapshot is already
+        name-sorted by _canonical_chars). A pilot in space shows
+        ``"CharName (ShipType)"``; a pilot docked at an NPC station or inside a
+        citadel/structure shows just ``"CharName"`` -- ``characters_fetch``
+        (``fc_gui._map_characters_fetch``) publishes the EMPTY STRING "" as the
+        ship for a docked pilot, and that convention is read here. None when no
+        tracked character is there. Honours the active session filter (a
+        filtered-out system contributes no section). Gated on
+        _layer_on("chars") by the engine."""
         chars = self.state.chars
         if not chars:
             return None
@@ -2420,7 +2425,7 @@ class MapTab:
         here = self._chars_visible_occupants(here)      # session filter
         if not here:
             return None
-        return [f"{name} — {ship}" for name, ship in here]
+        return [f"{name} ({ship})" if ship else name for name, ship in here]
 
     # ---- Chars session filter (owner ask) -------------------------------------
     def _chars_visible_occupants(self, occ):
