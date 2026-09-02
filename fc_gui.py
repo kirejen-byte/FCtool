@@ -8810,10 +8810,6 @@ class FCToolGUI:
     # to the combobox, never exported as a role. Lower-cased these become the
     # ``cap_key`` _char_matches_filter switches on ("hic/dictor" -> the dictor flag).
     _CHAR_FILTER_ROLES = ["FAX", "Dreads", "Blops", "Titans", "Cyno", "HIC/Dictor"]
-    # Hull-class filter keys (mirror _char_names_for_role's hull_sets keys): ONLY
-    # these recompute LIVE from each map sweep; cyno / HIC-Dictor stay frozen at
-    # apply time (their fit data isn't in the live location/ship sweep).
-    _LIVE_HULL_FILTER_KEYS = frozenset({"fax", "dreads", "blops", "titans"})
 
     def _build_character_tab(self):
         tab = tk.Frame(self.notebook, bg=BG_DARK)
@@ -10276,7 +10272,7 @@ class FCToolGUI:
         "no filter" entry. Plain data so map_tab stays fc_gui-free."""
         return list(self._CHAR_FILTER_ROLES)
 
-    def _char_names_for_role(self, role_label: str) -> frozenset:
+    def _char_names_for_role(self, role_label: str) -> frozenset | None:
         """Character NAMES matching ``role_label`` — the map Chars filter's
         match-set, keyed by the same names _map_characters_fetch stamps on the
         overlay payload so the frozenset filters the map by simple membership.
@@ -10286,10 +10282,18 @@ class FCToolGUI:
         into ``self._map_live_ship_tid`` — so the filter shows ONLY pilots
         ACTIVELY in that ship class and stays as fresh as the overlay squares
         (owning a capital in a hangar is NOT flying one). CYNO / HIC-Dictor need
-        fit data the live sweep lacks, so they stay on the cached panel-info
+        fit data the live sweep lacks, so they use the cached panel-info
         predicate (``_char_matches_filter``, no region constraint — region is a
-        Characters-tab-only refinement). Empty when nothing matches (an honest
-        empty overlay); a pure snapshot, no ESI."""
+        Characters-tab-only refinement) instead.
+
+        Returns ``None`` for "UNKNOWN YET" — the role's data source has never
+        been populated (no map sweep has bound ``_map_live_ship_tid``; no
+        Characters panel carries ``_info``). That is NOT the same as an empty
+        answer: a sweep that found no accounts binds ``{}``, a populated result
+        that honestly matches nobody. The map turns None into a PENDING filter
+        (every marker still drawn) and ``frozenset()`` into an honest zero-marker
+        one — conflating them hid the whole overlay behind a "(0 pilots)" banner.
+        A pure snapshot, no ESI."""
         cap_key = (role_label or "").lower()
         # Hull-class roles: classify the pilot's LIVE hull, not hangar ownership.
         hull_sets = {
@@ -10300,20 +10304,26 @@ class FCToolGUI:
         }
         hull_set = hull_sets.get(cap_key)
         if hull_set is not None:
-            live = getattr(self, "_map_live_ship_tid", None) or {}
+            live = getattr(self, "_map_live_ship_tid", None)
+            if live is None:
+                return None                   # no sweep has landed: unknown, not empty
             return frozenset(name for name, tid in live.items()
                              if tid in hull_set)
         # CYNO / HIC-Dictor (fit-flag roles): cached panel-info predicate.
         names: set[str] = set()
+        seen_info = False
         for panel in getattr(self, "_char_panels", []) or []:
             info = getattr(panel, "_info", None)
             if not info:
                 continue
+            seen_info = True
             if self._char_matches_filter(info, cap_key, ""):
                 acct = getattr(panel, "_acct", None)
                 name = getattr(acct, "character_name", None) if acct else None
                 if name:
                     names.add(name)
+        if not seen_info:
+            return None                # panel cache never filled: unknown, not empty
         return frozenset(names)
 
     def _apply_char_map_filter(self, role_label, switch_to_map: bool = False):
@@ -10322,8 +10332,11 @@ class FCToolGUI:
         map via set_chars_filter. When ``switch_to_map`` is true (the Characters-tab
         "View on Map" entry) also raise the Map tab. Injected into the map as the
         ``apply_char_filter`` callback, where it is called with a single role label
-        (no tab switch — the user is already on the map). No-op if the map tab is
-        not built."""
+        (no tab switch — the user is already on the map). A ``None`` name-set is
+        forwarded as-is: it means the role's data has not loaded yet, and the map
+        holds the filter PENDING (every marker still drawn) until a sweep resolves
+        it, instead of hiding the whole overlay behind a "(0 pilots)" banner.
+        No-op if the map tab is not built."""
         mt = getattr(self, "map_tab", None)
         if mt is None:
             return
@@ -10333,15 +10346,17 @@ class FCToolGUI:
             self._select_map_tab()
 
     def _recompute_char_map_filter(self, role_label):
-        """Fresh CURRENT-hull member name-set for ``role_label`` so the map can
-        keep a LIVE hull-class filter that tracks each pilot's current hull on
-        every poll — or ``None`` for cyno / HIC-Dictor (fit-flag roles the live
-        location/ship sweep can't refresh, so they stay on their apply-time set).
-        Injected as the map's ``recompute_char_filter`` callback and called on the
-        UI thread after each map-chars sweep has updated ``_map_live_ship_tid``.
-        A pure snapshot (no ESI); reuses the approved ``_char_names_for_role``."""
-        if (role_label or "").lower() not in self._LIVE_HULL_FILTER_KEYS:
-            return None                       # cyno / HIC-Dictor: leave frozen
+        """Fresh member name-set for ``role_label`` so the map's Chars filter
+        tracks its data on EVERY sweep — hull-class roles track each pilot's
+        current hull, and cyno / HIC-Dictor re-read the Characters-tab panel
+        cache (they used to be frozen at apply time, so a filter applied before
+        that cache filled stayed permanently empty and a pilot who lit a cyno
+        later never appeared). Both reads are cheap dict/list walks on the UI
+        thread. ``None`` means UNKNOWN YET (the source has never been populated —
+        see ``_char_names_for_role``), and the map then keeps whatever set it
+        has rather than wiping it. Injected as the map's ``recompute_char_filter``
+        callback, called on the UI thread after each map-chars sweep has updated
+        ``_map_live_ship_tid``. A pure snapshot; no ESI."""
         return self._char_names_for_role(role_label)
 
     def _view_char_filter_on_map(self):

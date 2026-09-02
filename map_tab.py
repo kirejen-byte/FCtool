@@ -1425,8 +1425,10 @@ class MapTab:
         # --- Chars filter banner + session state (owner ask) ------------------
         # A SESSION-scoped filter that narrows the magenta Chars overlay to a set
         # of character NAMES the host computes from its role data (cyno, dread, …).
-        # _chars_filter_names is None => no filter (byte-identical to before); a
-        # frozenset (even empty) => an ACTIVE filter matched by simple membership.
+        # _chars_filter_label is None => no filter (byte-identical to before). With
+        # a label, _chars_filter_names None => PENDING (the host has no data yet;
+        # every marker still draws) and a frozenset (even empty) => an ACTIVE
+        # filter matched by simple membership. See set_chars_filter.
         # The slim themed banner below the toolbar announces the active filter and
         # carries an "✕" to clear it. Created UNPACKED so an inactive filter has
         # ZERO layout footprint; _sync_chars_banner packs it BEFORE the canvas so
@@ -2444,15 +2446,17 @@ class MapTab:
             self._redraw_overlays()
 
     def _refresh_live_char_filter(self) -> None:
-        """After a fresh sweep, recompute the members of an active LIVE (hull-
-        class) char-filter so membership tracks pilots' CURRENT hulls: one who
-        swapped INTO a matching hull appears, one who swapped OUT drops, on this
-        poll. The host's ``recompute_char_filter`` callback returns the fresh
-        name-set for hull-class roles, or ``None`` to leave the filter frozen
-        (cyno / HIC-Dictor keep their apply-time set — their fit data isn't in the
-        sweep). Refreshes the banner count; the caller repaints once (no redraw
-        here). No filter active or no callback wired -> a no-op (byte-identical to
-        the pre-refresh overlay path)."""
+        """After a fresh sweep, recompute the members of the active char-filter so
+        membership tracks its data: a pilot who swapped INTO a matching hull
+        appears, one who swapped OUT drops, and a cyno/dictor pilot whose fit data
+        only just loaded joins — all on this poll. The host's
+        ``recompute_char_filter`` callback is asked for EVERY role (nothing is
+        frozen at apply time any more) and returns the fresh name-set, or ``None``
+        for "unknown yet", which leaves the current state alone — a PENDING filter
+        stays pending and a populated one is never wiped by a missing answer.
+        Refreshes the banner; the caller repaints once (no redraw here). No filter
+        active or no callback wired -> a no-op (byte-identical to the pre-refresh
+        overlay path)."""
         label = self._chars_filter_label
         if label is None:
             return
@@ -2489,8 +2493,9 @@ class MapTab:
     # ---- Chars session filter (owner ask) -------------------------------------
     def _chars_visible_occupants(self, occ):
         """Restrict a system's ``[(name, ship), …]`` occupant list to the active
-        session filter. No filter (names is None) -> the list UNCHANGED (byte-
-        identical to the pre-filter overlay). An active filter -> only the pilots
+        session filter. No filter OR a PENDING one (names is None either way) ->
+        the list UNCHANGED (byte-identical to the pre-filter overlay; a filter
+        whose data has not loaded must not hide the map). An active filter -> only the pilots
         whose name is in the set (possibly the empty list -> the system draws no
         marker, an honest empty match). Pure; cheap membership test."""
         names = self._chars_filter_names
@@ -2505,15 +2510,36 @@ class MapTab:
         pilots (markers + hover), matched by simple membership on the poll payload
         so the filter survives poll refreshes for free (names are stable keys).
         ``set_chars_filter(None)`` clears it. Toggles the slim banner and repaints
-        the Tk overlay at once (no crisp re-render — a pure overlay change). An
-        empty ``names`` set with a non-None label is a VALID active filter that
-        honestly shows zero markers."""
+        the Tk overlay at once (no crisp re-render — a pure overlay change).
+
+        Three states, and the difference is load-bearing:
+          * label None                  -> NO filter (byte-identical to before).
+          * label + ``names is None``   -> PENDING: the host cannot answer yet
+            (no sweep has landed / the panel cache is empty). Every marker keeps
+            drawing (``_chars_visible_occupants`` passes through on None) and the
+            banner says it is waiting; the next recompute that returns a set
+            resolves it. Before this, a not-yet-loaded role became an ACTIVE
+            zero-member filter that hid the entire overlay behind "(0 pilots)"
+            and never healed.
+          * label + a set (EMPTY INCLUDED) -> an active filter that honestly
+            shows exactly its members.
+
+        Applying a filter also turns the Chars LAYER on when it is off (a filter
+        over a dark layer is a banner with no map and no poll loop) — the same
+        path the toolbar checkbutton takes, so cfg and the poll follow. Clearing
+        never touches the layer."""
         if label is None:
             self._chars_filter_label = None
             self._chars_filter_names = None
         else:
             self._chars_filter_label = str(label)
-            self._chars_filter_names = frozenset(names or ())
+            self._chars_filter_names = (None if names is None
+                                        else frozenset(names))
+            if not self._layer_on("chars"):
+                var = self._layer_vars.get("chars")   # standalone builds may lack it
+                if var is not None:
+                    var.set(True)
+                    self._on_layer_toggle("chars")    # persists cfg, starts the poll
         self._sync_chars_banner()
         self._redraw_overlays()
 
@@ -2521,16 +2547,24 @@ class MapTab:
         """Show / update / hide the "Custom filter active" banner to match the
         current filter. Packed (BEFORE the canvas, so it reads as a strip under the
         toolbar) only while a filter is active; pack_forgotten otherwise so an
-        inactive filter leaves ZERO layout footprint. Pluralises the pilot count."""
+        inactive filter leaves ZERO layout footprint. Pluralises the pilot count —
+        or says the filter is still WAITING when the host has not been able to
+        answer yet (``_chars_filter_names is None``), so an unfiltered-looking map
+        under an active banner reads as pending rather than as zero matches."""
         label = self._chars_filter_label
         if label is None:
             if self._chars_banner.winfo_manager():
                 self._chars_banner.pack_forget()
             return
-        n = len(self._chars_filter_names or ())
-        self._chars_banner_label.config(
-            text=f"Custom filter active: {label}  "
-                 f"({n} {'pilot' if n == 1 else 'pilots'})")
+        names = self._chars_filter_names
+        if names is None:
+            self._chars_banner_label.config(
+                text=f"Custom filter active: {label}  (waiting for pilot data)")
+        else:
+            n = len(names)
+            self._chars_banner_label.config(
+                text=f"Custom filter active: {label}  "
+                     f"({n} {'pilot' if n == 1 else 'pilots'})")
         if not self._chars_banner.winfo_manager():
             self._chars_banner.pack(side="top", fill="x", before=self.canvas)
 
