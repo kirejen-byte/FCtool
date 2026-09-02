@@ -148,8 +148,12 @@ KILLPING_STRUCT_MS = 1000.0 # cull + reproject + stage-flip cadence (structure o
 # default -- the palette-noise call is the owner's, so ZERO network until enabled.
 # While the layer is on the data is refreshed at most once per SOV_REFRESH_S via a
 # ONE-SHOT daemon thread (not a persistent loop): it fetches, posts to the result
-# queue, and dies -- nothing to join on hide.
+# queue, and dies -- nothing to join on hide. A FAILED fetch does not wait out the
+# full hourly gate: _apply_sov rewinds the freshness stamp on a None payload so
+# the gate re-opens after the shorter SOV_RETRY_S instead (still throttled -- no
+# immediate re-spawn -- just not stuck for an hour on a transient failure).
 SOV_REFRESH_S = 3600.0
+SOV_RETRY_S = 60.0
 
 # Characters overlay (owner ask: "see where all your characters are"). A 60 s
 # poll enumerates the tool's AUTHED characters (fc_gui injects the fetch -- the
@@ -1578,8 +1582,12 @@ class MapTab:
         # A dedicated daemon loop thread (started on show, stopped on hide) fetches
         # hourly ESI ambient kills and posts them onto the result queue; the stop
         # Event lets on_hidden join it PROMPTLY (Event.wait returns the instant the
-        # event is set, so no thread leaks -- the Task-22 lesson). _last_heat_refresh_ms
-        # gates the periodic decay re-render (see _heat_refresh_due).
+        # event is set, so no thread leaks -- the Task-22 lesson). Each spawn gets
+        # its OWN private Event (mirrors _chars_loop, e623802) -- self._ambient_stop
+        # only ever names the CURRENT loop's event, so a timed-out shutdown join
+        # can never leave an orphan that a later _start_ambient_loop un-stops.
+        # _last_heat_refresh_ms gates the periodic decay re-render (see
+        # _heat_refresh_due).
         self._ambient_thread: threading.Thread | None = None
         self._ambient_stop = threading.Event()
         self._last_heat_refresh_ms = 0.0
@@ -1654,7 +1662,7 @@ class MapTab:
         # them into the pushed badges' "type_counts"). Registered here because the
         # infra badge state (state.infra) lives on this tab.
         self.register_hover_provider("infra", self._infra_hover_lines)
-        # Characters overlay hover (owner ask): "CharName — ShipType" per character
+        # Characters overlay hover (owner ask): "CharName (ShipType)" per character
         # in the hovered system, gated on _layer_on("chars") by the engine and
         # composed alongside the infra section.
         self.register_hover_provider("chars", self._chars_hover_lines)
@@ -2258,25 +2266,37 @@ class MapTab:
         when disabled in cfg (cfg["kill_heat_esi"], default True) or when a loop
         is already running. Owner-approved (2026-07-12: "Ok to make 2 calls per
         hour") -> ON by default; we actually issue ONE call/hour (see
-        _fetch_ambient_heat's jumps decision)."""
+        _fetch_ambient_heat's jumps decision).
+
+        Each spawn gets its OWN stop Event, handed to the thread as an argument;
+        ``self._ambient_stop`` only ever names the CURRENT loop's event. That is
+        load-bearing: shutdown_ambient_loop joins for just 2 s, so a slow fetch
+        can outlive the join and leave an orphan running. With one shared Event
+        this method's old ``.clear()`` un-stopped that orphan -> two ambient
+        loops (mirrors the chars-loop conversion, e623802)."""
         if not self.cfg.get("kill_heat_esi", True):
             return
         if self._ambient_thread is not None and self._ambient_thread.is_alive():
             return
-        self._ambient_stop.clear()
+        stop = threading.Event()
+        self._ambient_stop = stop
         self._ambient_thread = threading.Thread(
-            target=self._ambient_loop, daemon=True, name="map-ambient-heat")
+            target=self._ambient_loop, args=(stop,), daemon=True,
+            name="map-ambient-heat")
         self._ambient_thread.start()
 
-    def _ambient_loop(self) -> None:
+    def _ambient_loop(self, stop=None) -> None:
         """Daemon body: after a short first-fetch delay, fetch ambient kills and
-        post them onto the result queue, then repeat every ~hour. The stop Event
-        is WAITED on (not sleep) for both the initial delay and the interval, so
-        on_hidden's shutdown_ambient_loop wakes it the instant the event is set --
-        it never sleeps out a full hour past a hide (the no-leak guarantee).
-        Failures silent-degrade: _ambient_fetch returns None and the loop simply
-        retries next cycle (zkill-only heat meanwhile)."""
-        stop = self._ambient_stop
+        post them onto the result queue, then repeat every ~hour. ``stop`` is
+        THIS loop's private Event (see _start_ambient_loop); it is WAITED on (not
+        slept) for both the initial delay and the interval so shutdown_ambient_loop
+        wakes it the instant it is set -- it never sleeps out a full hour past a
+        hide (the no-leak guarantee), and an orphan whose own event is set can
+        neither post nor loop again. Failures silent-degrade: _ambient_fetch
+        returns None and the loop simply retries next cycle (zkill-only heat
+        meanwhile)."""
+        if stop is None:                         # defensive: direct/legacy call
+            stop = self._ambient_stop
         if stop.wait(AMBIENT_START_DELAY_S):
             return                               # stopped during the initial delay
         while not stop.is_set():
@@ -2298,7 +2318,10 @@ class MapTab:
         fetch daemon (Task 22 lesson). Idempotent: safe when no loop is running.
         Setting the Event wakes a loop blocked in stop.wait() immediately; the
         join only has to outlast an in-flight request (~10 s worst case, but the
-        loop re-checks is_set right after), so the thread exits promptly."""
+        loop re-checks is_set right after), then the handle is dropped so a later
+        _start_ambient_loop spawns a fresh thread. When a fetch OUTLASTS the 2 s
+        join, the orphan keeps this (now-set) private Event and so exits without
+        posting -- the fresh loop gets an Event of its own."""
         self._ambient_stop.set()
         t = self._ambient_thread
         if t is not None:
@@ -2932,13 +2955,15 @@ class MapTab:
 
     def _maybe_start_sov_fetch(self, now_ms: float | None = None) -> None:
         """Spawn the ONE-SHOT sov fetch thread iff the layer is on, no fetch is in
-        flight, and the data is stale (older than SOV_REFRESH_S). OFF by default ->
-        never spawns until the owner enables the layer (zero network). Idempotent:
-        the in-flight flag blocks a double-spawn (a hide/show while a fetch runs, or
-        the per-tick gate racing a toggle), and the freshness gate blocks an
-        immediate re-fetch on a toggle within the hour. The thread dies after one
-        fetch -- no loop, nothing to join on hide. Cheap-gate-first so the per-tick
-        call costs a dict-get + bool when the layer is off."""
+        flight, and the data is stale (older than SOV_REFRESH_S -- or, after a
+        failed fetch, SOV_RETRY_S; see _apply_sov). OFF by default -> never spawns
+        until the owner enables the layer (zero network). Idempotent: the in-flight
+        flag blocks a double-spawn (a hide/show while a fetch runs, or the per-tick
+        gate racing a toggle), and the freshness gate blocks an immediate re-fetch
+        on a toggle within the hour (or within SOV_RETRY_S of a failure). The
+        thread dies after one fetch -- no loop, nothing to join on hide.
+        Cheap-gate-first so the per-tick call costs a dict-get + bool when the
+        layer is off."""
         if not self._layer_on("sov"):
             return
         if self._sov_inflight:
@@ -2963,8 +2988,9 @@ class MapTab:
         distinct alliance names, posting each result onto the MAIN-thread result
         queue. Touches NO Tk. ALWAYS posts a ('sov', payload|None) message so the
         main thread clears the in-flight flag on every outcome (a None payload =
-        failed/empty fetch -> flag cleared, sov_map + freshness stamp left untouched
-        so the next enable retries). A successful map ALSO triggers a best-effort
+        failed/empty fetch -> flag cleared, sov_map left untouched, freshness stamp
+        REWOUND so the next attempt is throttled to SOV_RETRY_S instead of the full
+        SOV_REFRESH_S -- see _apply_sov). A successful map ALSO triggers a best-effort
         name resolve posted as ('sov_names', ...); a name failure still leaves the
         tint applied with raw-id legend entries (silent degrade). Exits after one
         pass -- there is no loop to leak."""
@@ -2991,9 +3017,12 @@ class MapTab:
         queue). ALWAYS clears the in-flight flag so a later refresh can spawn again.
         A None payload is a failed/empty fetch: clear the flag and leave sov_map
         untouched (map stays untinted); the SPAWN-time freshness stamp
-        (_maybe_start_sov_fetch) throttles the next attempt to the hourly gate --
-        silent degrade, no retry storm (and the canonical memo is left alone, which
-        is correct: sov_map did not change). A real payload replaces sov_map,
+        (_maybe_start_sov_fetch stamped it at spawn as a storm guard) is REWOUND
+        here so the gate re-opens SOV_RETRY_S after this failure instead of
+        SOV_REFRESH_S after the original spawn -- a failed fetch retries in a
+        minute, not an hour, while still never allowing an immediate re-spawn
+        (silent degrade, no retry storm; the canonical memo is left alone, which is
+        correct: sov_map did not change). A real payload replaces sov_map,
         re-stamps the fetch time (refreshing the hourly gate) and -- when the layer
         is on -- force-dirties + re-requests a crisp so the tint appears, plus a
         redraw so the right-click info row reflects it. That sov_map assignment
@@ -3001,6 +3030,22 @@ class MapTab:
         canonical tuple (MP8) -- this is the hourly invalidation point."""
         self._sov_inflight = False
         if pairs is None:
+            # Rewind the freshness stamp: _maybe_start_sov_fetch rejects a re-arm
+            # while (now - _sov_fetched_ms) < SOV_REFRESH_S * 1000. Setting the
+            # stamp to (now - (SOV_REFRESH_S - SOV_RETRY_S) * 1000) makes that gate
+            # open exactly SOV_RETRY_S from now, instead of SOV_REFRESH_S from the
+            # original spawn stamp -- derived from the gate's own arithmetic, not a
+            # second independent clock. Floored at a hair above 0.0: _now_ms() is
+            # process-uptime-based (time.monotonic), so a failure in roughly the
+            # first SOV_REFRESH_S - SOV_RETRY_S of uptime could otherwise compute a
+            # non-positive stamp -- and _maybe_start_sov_fetch treats <= 0.0 as the
+            # "never fetched" sentinel, which would BYPASS the gate entirely (an
+            # immediate re-spawn, the exact storm the guard exists to prevent). The
+            # floor keeps the gate closed in that rare low-uptime case (degrading to
+            # at most SOV_REFRESH_S instead of the intended SOV_RETRY_S) rather than
+            # ever risk reopening it early.
+            self._sov_fetched_ms = max(
+                1.0, _now_ms() - (SOV_REFRESH_S - SOV_RETRY_S) * 1000.0)
             return
         self.state.sov_map = {int(sid): int(aid) for sid, aid in pairs}
         self._sov_fetched_ms = _now_ms()
