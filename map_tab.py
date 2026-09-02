@@ -586,11 +586,29 @@ def _chars_fetch_parts(result):
       * ``None``                         -> ``(None, ())``, the legacy
         total-failure sentinel the loop already refused to post.
     A ``None`` payload and an empty payload with a non-empty ``failed`` are both
-    total failures; see ``_chars_loop`` for what each shape costs."""
-    if isinstance(result, tuple) and len(result) == 2:
-        payload, failed = result
-        return payload, tuple(failed or ())
-    return result, ()
+    total failures; see ``_chars_loop`` for what each shape costs.
+
+    Total and honest: NEVER raises, and any shape outside the three above --
+    a list (only a ``tuple`` is accepted), a tuple whose length isn't 2, a
+    payload that is neither ``None`` nor a dict, or a ``failed`` that can't
+    be coerced into a tuple -- is treated as a TOTAL FAILURE, ``(None, ())``,
+    same as the legacy sentinel. That is deliberate: a malformed result must
+    never be posted as an empty snapshot (which would erase the on-screen
+    markers) and must never propagate an exception that kills the poll
+    thread (see ``_chars_loop``)."""
+    try:
+        if result is None:
+            return None, ()
+        if isinstance(result, dict):
+            return result, ()
+        if isinstance(result, tuple) and len(result) == 2:
+            payload, failed = result
+            if payload is not None and not isinstance(payload, dict):
+                return None, ()
+            return payload, tuple(failed or ())
+        return None, ()
+    except Exception:
+        return None, ()
 
 
 def _canonical_chars(payload) -> tuple:
@@ -2421,10 +2439,10 @@ class MapTab:
         while not stop.is_set():
             try:
                 result = self._characters_fetch()
+                payload, failed = _chars_fetch_parts(result)
             except Exception as exc:             # never let the loop die on a fetch
                 print(f"[MAP] characters loop error: {exc}")
-                result = None
-            payload, failed = _chars_fetch_parts(result)
+                payload, failed = None, ()
             complete = payload is not None and not failed
             post = payload is not None and (not failed or bool(payload))
             if post and not stop.is_set():
