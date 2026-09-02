@@ -167,6 +167,15 @@ SOV_REFRESH_S = 3600.0
 CHARS_MAGENTA = "#ff44e1"
 CHARS_POLL_S = 60.0
 CHARS_START_DELAY_S = 2.0
+# The first sweep lands inside the app's startup ESI burst, so it is the one most
+# likely to come back incomplete (owner bug: "if Characters is ticked it doesn't
+# always load in the characters unless I tick and untick it" -- the tick/untick
+# just restarted the loop, re-arming the 2 s first fetch). An INCOMPLETE sweep --
+# the fetch names the characters it could not read -- retries on this short
+# cadence instead of costing a whole poll interval; the budget is spent once per
+# failing streak, so a permanently scope-less character is never a retry storm.
+CHARS_RETRY_S = 10.0
+CHARS_RETRY_MAX = 3
 
 # Staging-diamond contrast fix (owner report: hostile red diamonds blend into the
 # red nullsec node glow -- both sit in the same #cc2233/#ff5a76 red family, so a
@@ -561,6 +570,23 @@ def _request_sig(req: dict) -> tuple:
     return (c["cx"], c["cy"], c["scale"], req["vw"], req["vh"],
             bool(req["bloom"]), req["mode"], req.get("tint"), req.get("bridges"),
             req.get("heat"), req.get("sov"), req.get("infra"))
+
+
+def _chars_fetch_parts(result):
+    """Normalise a ``characters_fetch`` return into ``(payload, failed)``.
+
+    Three accepted shapes, so every caller (fc_gui's real sweep, standalone
+    embedders, and every existing test fixture) stays valid:
+      * a ``(payload, failed)`` 2-tuple  -> as-is, ``failed`` coerced to a tuple;
+      * a plain dict                     -> ``(dict, ())`` i.e. a COMPLETE sweep;
+      * ``None``                         -> ``(None, ())``, the legacy
+        total-failure sentinel the loop already refused to post.
+    A ``None`` payload and an empty payload with a non-empty ``failed`` are both
+    total failures; see ``_chars_loop`` for what each shape costs."""
+    if isinstance(result, tuple) and len(result) == 2:
+        payload, failed = result
+        return payload, tuple(failed or ())
+    return result, ()
 
 
 def _canonical_chars(payload) -> tuple:
@@ -2323,41 +2349,72 @@ class MapTab:
     def _start_chars_loop(self) -> None:
         """Start the map-chars poll thread. Idempotent: a no-op when the layer is
         off or a loop is already running. Mirrors _start_ambient_loop; the caller
-        (on_shown / the toolbar toggle) has already confirmed the tab is shown."""
+        (on_shown / the toolbar toggle) has already confirmed the tab is shown.
+
+        Each spawn gets its OWN stop Event, handed to the thread as an argument;
+        ``self._chars_stop`` only ever names the CURRENT loop's event. That is
+        load-bearing: shutdown_chars_loop joins for just 2 s, so a slow sweep can
+        outlive the join and leave an orphan running. With one shared Event this
+        method's old ``.clear()`` un-stopped that orphan -> two poll loops."""
         if not self._layer_on("chars"):
             return
         if self._chars_thread is not None and self._chars_thread.is_alive():
             return
-        self._chars_stop.clear()
+        stop = threading.Event()
+        self._chars_stop = stop
         self._chars_thread = threading.Thread(
-            target=self._chars_loop, daemon=True, name="map-chars")
+            target=self._chars_loop, args=(stop,), daemon=True, name="map-chars")
         self._chars_thread.start()
 
-    def _chars_loop(self) -> None:
+    def _chars_loop(self, stop=None) -> None:
         """Daemon body: after a short first-fetch delay, fetch the authed
         characters' locations+ships and post a canonical snapshot onto the result
-        queue, then repeat every CHARS_POLL_S. The stop Event is WAITED on (not
-        slept) for both the initial delay and the interval so shutdown_chars_loop
-        wakes it the instant the event is set -- no leak past a hide/toggle-off.
-        The fetch silent-degrades (per-character inside fc_gui; a total failure
-        returns None here) -> a None result is simply not posted, leaving the last
-        snapshot on screen; an empty dict IS posted so markers clear when every
-        character has logged off. Runs on this thread only -> the injected fetch
-        must be Tk-free."""
-        stop = self._chars_stop
+        queue, then repeat. ``stop`` is THIS loop's private Event (see
+        _start_chars_loop); it is WAITED on (not slept) for both the initial delay
+        and the interval so shutdown_chars_loop wakes it the instant it is set --
+        no leak past a hide/toggle-off, and an orphan whose own event is set can
+        neither post nor loop again.
+
+        The fetch reports its own completeness -- see ``_chars_fetch_parts`` for
+        the accepted shapes -- and each outcome costs a different cadence:
+          * COMPLETE (no failed names): posted, INCLUDING an empty dict (markers
+            must clear when every character has logged off), and the retry budget
+            resets -> next sweep in CHARS_POLL_S.
+          * PARTIAL (some names failed, some pilots landed): posted, because the
+            pilots that did land are real -> next sweep in CHARS_RETRY_S.
+          * TOTAL failure (None, or an empty payload with failed names): NOT
+            posted, so the previous snapshot stays on screen instead of being
+            erased by a sweep that only failed -> next sweep in CHARS_RETRY_S.
+        The fast cadence is capped at CHARS_RETRY_MAX consecutive incomplete
+        sweeps, after which it falls back to CHARS_POLL_S until one completes.
+        Runs on this thread only -> the injected fetch must be Tk-free."""
+        if stop is None:                         # defensive: direct/legacy call
+            stop = self._chars_stop
         if stop.wait(CHARS_START_DELAY_S):
             return                               # stopped during the initial delay
+        retries = 0
         while not stop.is_set():
             try:
-                payload = self._characters_fetch()
+                result = self._characters_fetch()
             except Exception as exc:             # never let the loop die on a fetch
                 print(f"[MAP] characters loop error: {exc}")
-                payload = None
-            if payload is not None and not stop.is_set():
+                result = None
+            payload, failed = _chars_fetch_parts(result)
+            complete = payload is not None and not failed
+            post = payload is not None and (not failed or bool(payload))
+            if post and not stop.is_set():
                 # A stale put after a hide is harmless -- the queue just holds it
                 # until the next show drains it (and on_hidden left state.chars as-is).
                 self._result_q.put(("chars", _canonical_chars(payload)))
-            if stop.wait(CHARS_POLL_S):
+            if complete:
+                retries = 0
+                wait_s = CHARS_POLL_S
+            elif retries < CHARS_RETRY_MAX:
+                retries += 1
+                wait_s = CHARS_RETRY_S
+            else:
+                wait_s = CHARS_POLL_S            # budget spent -> normal cadence
+            if stop.wait(wait_s):
                 return                           # stopped during the interval wait
 
     def shutdown_chars_loop(self) -> None:
@@ -2365,7 +2422,9 @@ class MapTab:
         leaks no daemon (Task 22 lesson). Idempotent: safe when no loop is running.
         Setting the Event wakes a loop blocked in stop.wait() immediately; the join
         only has to outlast an in-flight sweep, then the handle is dropped so a
-        later _start_chars_loop spawns a fresh thread."""
+        later _start_chars_loop spawns a fresh thread. When a sweep OUTLASTS the
+        2 s join, the orphan keeps this (now-set) private Event and so exits
+        without posting -- the fresh loop gets an Event of its own."""
         self._chars_stop.set()
         t = self._chars_thread
         if t is not None:

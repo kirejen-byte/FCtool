@@ -6906,7 +6906,10 @@ class FCToolGUI:
                 else:
                     self.map_tab.on_hidden()
             except Exception:
-                pass
+                # Still swallowed (a tab switch must never raise into Tcl), but no
+                # longer SILENT: a failing on_shown here is exactly the class that
+                # would leave the map's overlays/polls unstarted with no trace.
+                log.exception("[MAP] tab-change show/hide failed")
 
     def _notify_zkill_tab(self):
         """Flash the zKill tab to indicate a new alert if not currently viewing it."""
@@ -17730,9 +17733,20 @@ class FCToolGUI:
             cfg.setdefault(key, val if not isinstance(val, dict) else dict(val))
         return cfg
 
-    def _map_characters_fetch(self) -> dict:
+    def _map_characters_fetch(self) -> tuple:
         """Enumerate the tool's AUTHED characters for the map's Characters overlay:
-        return ``{solar_system_id: [(character_name, ship_type_name), ...]}``.
+        return ``(payload, failed)`` where ``payload`` is
+        ``{solar_system_id: [(character_name, ship_type_name), ...]}`` and
+        ``failed`` is the sorted tuple of character names that were ATTEMPTED but
+        could not be read this sweep (location None / no solar_system_id / any
+        exception). An unauthenticated account is a legitimate skip, NOT a failure.
+
+        The failure list is what makes an incomplete sweep DISTINGUISHABLE from a
+        genuinely empty one (owner bug: the first sweep fires 2 s after the Map
+        tab opens, inside the startup ESI burst -- a silently-empty result used to
+        erase the overlay for a whole 60 s poll interval, which is why toggling
+        the layer off/on "fixed" it). ``map_tab._chars_loop`` refuses to post a
+        total failure and retries it on the short CHARS_RETRY_S cadence.
 
         Injected into MapTab as ``characters_fetch`` and called on the map's
         ``map-chars`` poll thread (NOT the UI thread) -> touches NO Tk. The
@@ -17758,20 +17772,31 @@ class FCToolGUI:
         show just the pilot's name while docked, "Name (Ship)" when undocked."""
         out: dict[int, list] = {}
         live_tid: dict[str, int] = {}
+        failed: list[str] = []
+        attempted = 0
         accounts = list(getattr(self, "esi_accounts", None) or ())
         if not accounts:
             self._map_live_ship_tid = live_tid
-            return out
+            self._map_chars_last_failed = frozenset()
+            return out, ()
         catalog = getattr(self, "type_catalog", None)
+        prev_tid = dict(getattr(self, "_map_live_ship_tid", None) or {})
         for acct in accounts:
+            name = "Unknown"
+            counted = False
             try:
+                name = getattr(acct, "character_name", None) or "Unknown"
                 if not getattr(acct, "is_authenticated", False):
                     continue                       # not signed in -> nothing to show
+                attempted += 1
+                counted = True
                 loc = acct.get_location()
                 if not loc:
-                    continue                       # no scope / HTTP error -> skip char
+                    failed.append(name)            # no scope / HTTP error -> skip char
+                    continue
                 sid = loc.get("solar_system_id")
                 if not sid:
+                    failed.append(name)
                     continue
                 docked = bool(loc.get("station_id") or loc.get("structure_id"))
                 ship_name = "" if docked else "Unknown ship"
@@ -17783,7 +17808,6 @@ class FCToolGUI:
                         resolved = catalog.resolve_name(ship_tid)
                         if resolved:
                             ship_name = resolved
-                name = getattr(acct, "character_name", None) or "Unknown"
                 # Capture the live hull for the map's hull-class filter, keyed by
                 # the SAME name the overlay square uses, so the class filter is as
                 # fresh as the squares (current-ship, not hangar-ownership). A
@@ -17792,14 +17816,42 @@ class FCToolGUI:
                     live_tid[name] = int(ship_tid)
                 out.setdefault(int(sid), []).append((name, ship_name))
             except Exception as exc:
-                # One character's failure must never abort the whole sweep.
-                print(f"[MAP] characters fetch: skipping an account: {exc}")
+                # One character's failure must never abort the whole sweep — but
+                # it IS reported, so the loop can retry instead of showing a hole.
+                log.debug("[MAP] characters fetch: skipping %s: %s", name, exc)
+                if not counted:
+                    attempted += 1
+                failed.append(name)
                 continue
+        failed_t = tuple(sorted(failed))
+        total_failure = attempted > 0 and len(failed) >= attempted
         # Atomic publish: rebind the whole map so the UI-thread reader
         # (_char_names_for_role) always sees a consistent snapshot, never a
         # half-built dict — the worker builds it locally, then swaps it in.
-        self._map_live_ship_tid = live_tid
-        return out
+        # A TOTAL failure publishes nothing: the previous snapshot survives, so a
+        # blipped sweep can never silently empty an active hull-class filter. A
+        # PARTIAL failure publishes, carrying each failed pilot's PREVIOUS hull
+        # forward so one dropped call doesn't reclassify them.
+        if not total_failure:
+            for nm in failed_t:
+                tid = prev_tid.get(nm)
+                if tid and nm not in live_tid:
+                    live_tid[nm] = tid
+            self._map_live_ship_tid = live_tid
+        # ONE summary line per incomplete sweep, at WARNING only when the failing
+        # set CHANGES — a permanently scope-less character must not turn
+        # fctool.log into a diary.
+        if failed_t:
+            now_failed = frozenset(failed_t)
+            args = (len(failed_t), attempted, ", ".join(failed_t))
+            if now_failed != getattr(self, "_map_chars_last_failed", frozenset()):
+                log.warning("[MAP] characters sweep incomplete: %d of %d failed: %s", *args)
+            else:
+                log.debug("[MAP] characters sweep incomplete: %d of %d failed: %s", *args)
+            self._map_chars_last_failed = now_failed
+        else:
+            self._map_chars_last_failed = frozenset()
+        return out, failed_t
 
     @staticmethod
     def _overlay_poll_plan(names, last, now, online_ok):
