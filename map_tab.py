@@ -1626,8 +1626,11 @@ class MapTab:
         # posts the results onto the result queue, and DIES (not a persistent loop
         # -> nothing to join on hide). _sov_inflight guards against a double-spawn
         # (set on the main thread before the spawn, cleared on the main thread when
-        # the result drains); _sov_fetched_ms is the last successful-fetch stamp
-        # for the hourly freshness gate. _sov_legend holds the open legend popup.
+        # the result drains); _sov_fetched_ms is the last-ATTEMPT stamp (taken at
+        # spawn as a storm guard, not a successful-fetch stamp) -- after a failed
+        # fetch, _apply_sov REWINDS it so the freshness gate re-opens SOV_RETRY_S
+        # after the failure instead of the full SOV_REFRESH_S. _sov_legend holds
+        # the open legend popup.
         self._sov_inflight = False
         self._sov_fetched_ms = 0.0
         self._sov_legend = None
@@ -3053,15 +3056,17 @@ class MapTab:
             # stamp to (now - (SOV_REFRESH_S - SOV_RETRY_S) * 1000) makes that gate
             # open exactly SOV_RETRY_S from now, instead of SOV_REFRESH_S from the
             # original spawn stamp -- derived from the gate's own arithmetic, not a
-            # second independent clock. Floored at a hair above 0.0: _now_ms() is
-            # process-uptime-based (time.monotonic), so a failure in roughly the
-            # first SOV_REFRESH_S - SOV_RETRY_S of uptime could otherwise compute a
-            # non-positive stamp -- and _maybe_start_sov_fetch treats <= 0.0 as the
-            # "never fetched" sentinel, which would BYPASS the gate entirely (an
-            # immediate re-spawn, the exact storm the guard exists to prevent). The
-            # floor keeps the gate closed in that rare low-uptime case (degrading to
-            # at most SOV_REFRESH_S instead of the intended SOV_RETRY_S) rather than
-            # ever risk reopening it early.
+            # second independent clock. Floored at a hair above 0.0: _now_ms() uses
+            # time.monotonic(), whose epoch is UNSPECIFIED -- on Windows and Linux
+            # it is effectively time since system BOOT, not process start -- so a
+            # failure within roughly the first SOV_REFRESH_S - SOV_RETRY_S after a
+            # reboot could otherwise compute a non-positive stamp -- and
+            # _maybe_start_sov_fetch treats <= 0.0 as the "never fetched" sentinel,
+            # which would BYPASS the gate entirely (an immediate re-spawn, the
+            # exact storm the guard exists to prevent). The floor keeps the gate
+            # closed in that rare near-boot case (degrading to at most
+            # SOV_REFRESH_S instead of the intended SOV_RETRY_S) rather than ever
+            # risk reopening it early.
             self._sov_fetched_ms = max(
                 1.0, _now_ms() - (SOV_REFRESH_S - SOV_RETRY_S) * 1000.0)
             return
