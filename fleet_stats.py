@@ -708,3 +708,199 @@ def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
     except Exception:
         log.debug("[hud] fleet stats aggregate failed", exc_info=True)
         return None
+
+
+# ── the Fleet-tab headline ─────────────────────────────────────────────────
+#
+# The composition page's own one-line readout of the same VM, sitting under
+# "Fleet Size" (owner request 2026-09-08). It is a PERMANENT consumer -- unlike
+# the FC HUD's optional tile row -- which is why the aggregate is no longer
+# computed only while ``info_tiles.fleet_stats`` is on.
+#
+# ``compact_number`` and :func:`fleet_headline_tip` are DUPLICATES of
+# ``info_tiles.compact_number`` / ``info_tiles.fleet_stats_tip``, character for
+# character, and ``tests/test_fleet_stats.py`` pins the two pairs to identical
+# output over a table so they cannot drift. Duplication rather than an import
+# in EITHER direction, for the reason ``info_tiles.FLEET_STATS_FILTER_DPS_TAG``
+# is a re-typed literal there: ``info_tiles`` reads this feature's data and
+# never imports its stack (an import of this module would drag
+# ``fit_sim_links`` -> ``fit_sim`` -> ``dogma_data`` into the HUD's import
+# graph), and this module may not import upward past its own layer at all.
+
+#: Prefix on the numbers when any modeled fit carried something the simulator
+#: could not model. The HUD row's mark (``info_tiles.FLEET_STATS_PARTIAL_MARK``)
+#: -- one character, one meaning, in both places.
+PARTIAL_MARK = "~"
+
+#: How many hull names a tooltip list names before it summarises the rest.
+#: ``info_tiles.FLEET_TIP_HULLS``.
+TIP_HULLS = 6
+
+#: The headline's fixed left-hand side. The owner asked for it by name, and it
+#: is a constant so the label can be built (and tested) before any aggregate
+#: exists.
+HEADLINE_LABEL = "Fleet DPS/Volley"
+
+#: What stands where the numbers go when there is NO aggregate at all -- no
+#: fleet, no fit library, or the first one has not landed yet. Two hyphens,
+#: matching the "Fleet Size: --" line directly above it on the same page.
+HEADLINE_EMPTY = "--"
+
+#: What stands there when a doctrine IS active, the fleet is real, and nothing
+#: it tags ``DPS`` is undocked. An em dash, exactly as ``fleet_stats_text``
+#: does it: the state is "I have no number", not "the number is zero", and the
+#: ``(0/N)`` tail beside it is what says so out loud. Rendering ``--`` here
+#: instead would make the FC's most informative state look like the boring one.
+HEADLINE_NO_DPS = "—"
+
+
+def compact_number(value) -> str:
+    """``41200 -> "41.2k"``, ``138000 -> "138k"``, ``1_240_000 -> "1.24M"``.
+
+    Three significant figures at most, because the row has ~25 characters for
+    two numbers and a count, and the third digit of a fleet DPS figure is
+    noise next to the assumption the whole number rests on. Junk answers
+    ``"0"`` rather than raising -- this runs inside the 1 Hz repaint."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return "0"
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+    for divisor, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if amount >= divisor:
+            scaled = amount / divisor
+            if scaled < 10:
+                return f"{sign}{scaled:.2f}{suffix}"
+            if scaled < 100:
+                return f"{sign}{scaled:.1f}{suffix}"
+            return f"{sign}{scaled:.0f}{suffix}"
+    return f"{sign}{amount:.0f}"
+
+
+def _capped_hulls(names) -> str:
+    """``"Loki ×3, Sabre ×1, +2 more"`` -- one hull list, capped.
+
+    Shared by the tooltip's two hull lists (the off-doctrine one and the "no
+    fit" one) so they cap at the same place and say the same thing about the
+    tail. ``""`` for an empty list, which the caller reads as "omit the
+    line"."""
+    hulls = [str(name) for name in (names or ())]
+    if not hulls:
+        return ""
+    rest = len(hulls) - TIP_HULLS
+    return ", ".join(hulls[:TIP_HULLS]) + (f", +{rest} more"
+                                           if rest > 0 else "")
+
+
+def fleet_headline_text(vm) -> str:
+    """``Fleet DPS/Volley - 41.2k/138k`` -- the Fleet tab's bold one-liner.
+
+    Unlike the HUD row (``info_tiles.fleet_stats_text``) this NEVER answers
+    ``""``: it labels a permanent widget on a page the FC is already looking
+    at, and a label that empties itself reads as a broken panel rather than as
+    an absent number. So the three no-number states are spelled out instead:
+
+    * ``vm is None`` -- no aggregate at all (no fleet, no fit library, or the
+      first worker has not landed) -> ``Fleet DPS/Volley - --``, the same two
+      hyphens the ``Fleet Size: --`` line above it starts life with.
+    * nothing modeled with NO doctrine active -> the same ``--``. The library
+      simply has no fit for what is undocked; the tooltip's "No fit:" list is
+      where that is stated, and a ``0/0`` here would read as a fleet doing no
+      damage.
+    * nothing modeled WITH a doctrine active and a real fleet -> ``Fleet
+      DPS/Volley - — (0/35)``. That is not a gap in the data, it is the answer:
+      none of the doctrine's DPS-tagged hulls is in fleet. The coverage tail
+      rides along so the em dash cannot be read as "zero damage".
+
+    The coverage tail appears ONLY in that last state. In the normal case the
+    two numbers stand alone -- the pilot counts are one line up (``Fleet
+    Size``) and spelled out in the tooltip, and the owner asked for a headline,
+    not a report.
+
+    ``partial`` prefixes the NUMBERS (``- ~41.2k/138k``) rather than the whole
+    string: the tilde qualifies the figures, and hanging it off the front of a
+    fixed heading (``~Fleet DPS/Volley``) reads as a doubtful label instead of
+    a doubtful number.
+    """
+    if vm is None:
+        return f"{HEADLINE_LABEL} - {HEADLINE_EMPTY}"
+    modeled = _as_int(getattr(vm, "modeled", 0), 0)
+    if modeled <= 0:
+        total = _as_int(getattr(vm, "total", 0), 0)
+        dps_filter = str(getattr(vm, "dps_filter", "") or "")
+        if dps_filter == DPS_FILTER_TAG and total > 0:
+            return (f"{HEADLINE_LABEL} - {HEADLINE_NO_DPS} "
+                    f"({modeled}/{total})")
+        return f"{HEADLINE_LABEL} - {HEADLINE_EMPTY}"
+    mark = PARTIAL_MARK if getattr(vm, "partial", False) else ""
+    return (f"{HEADLINE_LABEL} - {mark}"
+            f"{compact_number(getattr(vm, 'dps', 0.0))}/"
+            f"{compact_number(getattr(vm, 'volley', 0.0))}")
+
+
+def fleet_headline_tip(vm) -> str:
+    """Hover copy for the headline: the assumption, then the gaps.
+
+    Byte-identical to ``info_tiles.fleet_stats_tip`` for every input, ``None``
+    (``""`` -- no aggregate, no tip box) included; see this section's header
+    for why the wording is duplicated rather than imported, and
+    ``tests/test_fleet_stats.py`` for the parity table that keeps the two
+    honest.
+
+    Line 1 is the honesty line and is normally never omitted -- the number is
+    computed from DOCTRINE fits at All-V skills with a chosen link tier, not
+    from what the fleet is actually flying, and an FC reading a DPS figure off
+    a panel is entitled to know that before he plans around it. The one
+    exception is the state the headline prints as ``— (0/N)``: a doctrine
+    active, a non-empty fleet, and NOTHING of its DPS hulls modeled. There the
+    assumption line would describe an assumption that produced no number at
+    all, so line 1 instead states the actual problem, and every line after it
+    prints exactly as it would otherwise.
+
+    The DPS-filter line is never omitted either: with a doctrine active the
+    figure covers only its ``DPS``-tagged hulls (owner rule), while with none
+    it covers every hull that resolved a fit -- two genuinely different claims
+    that print as the same ``41.2k``. The OFF-DOCTRINE line appears only when
+    there are such pilots and names the hulls with their counts; the ``no fit``
+    list names the hulls the number does NOT include; the partial line explains
+    the ``~``.
+    """
+    if vm is None:
+        return ""
+    modeled = _as_int(getattr(vm, "modeled", 0), 0)
+    total = _as_int(getattr(vm, "total", 0), 0)
+    dps_filter = str(getattr(vm, "dps_filter", "") or "")
+    tier = str(getattr(vm, "tier", "") or "none")
+    applied = [str(name) for name
+               in (getattr(vm, "disciplines_applied", ()) or ())]
+    disciplines = "+".join(applied) if applied \
+        else str(getattr(vm, "disciplines", "") or "")
+    links = f"{tier}/{disciplines}" if disciplines and tier != "none" else tier
+    if modeled <= 0 and dps_filter == DPS_FILTER_TAG and total > 0:
+        head = "No DPS-tagged hull in the active doctrine is in fleet"
+    else:
+        head = f"Assumes doctrine fits, all-V skills; links: {links}"
+    lines = [head,
+             f"Avg EHP {compact_number(getattr(vm, 'ehp_avg', 0.0))} "
+             f"({modeled} of {total} pilots modelled)"]
+    if dps_filter == DPS_FILTER_TAG:
+        non_dps = _as_int(getattr(vm, "non_dps", 0), 0)
+        lines.append(
+            "DPS-tagged hulls only"
+            + (f" ({non_dps} non-DPS pilots excluded)" if non_dps > 0 else ""))
+    else:
+        lines.append("No active doctrine: all hulls counted")
+    off_pilots = _as_int(getattr(vm, "off_doctrine", 0), 0)
+    off_hulls = _capped_hulls(getattr(vm, "off_doctrine_hulls", ()))
+    if off_pilots > 0 or off_hulls:
+        lines.append(f"Off-doctrine (not simulated): {off_hulls}")
+    if getattr(vm, "partial", False):
+        lines.append(f"{PARTIAL_MARK} some fits carry modules the "
+                     f"simulator does not model")
+    hulls = _capped_hulls(getattr(vm, "unmodeled_hulls", ()))
+    if hulls:
+        lines.append(f"No fit: {hulls}")
+    return "\n".join(lines)

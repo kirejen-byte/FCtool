@@ -3549,10 +3549,38 @@ class FCToolGUI:
         tk.Label(comp_left, text="Fleet Composition", font=("Consolas", 10, "bold"),
                  fg=FG_ACCENT, bg=BG_PANEL).pack(anchor=tk.W, padx=8, pady=(4, 2))
 
-        self._fleet_size_label = tk.Label(comp_left, text="Fleet Size: --",
+        # Fleet Size and the fleet's modeled DPS/volley share ONE row (owner
+        # request 2026-09-08: a bold, visible headline near Fleet Size).
+        # Side by side rather than stacked because comp_left's cavity is the
+        # scarce resource here (map/shell-fleet.md): at the app's MINIMUM
+        # window size the ship list is left ~45px, and this label on its own
+        # line was measured to take the scroll frame's allocation to 1px and
+        # the visible ship rows from 2 to 1. On this row it costs nothing in
+        # either axis — the row requests ~270px, still under the Doctrine
+        # combobox row's 336px, which is what drives the panel's width.
+        size_row = tk.Frame(comp_left, bg=BG_PANEL)
+        size_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 4))
+        self._fleet_size_label = tk.Label(size_row, text="Fleet Size: --",
                                            font=("Consolas", 10, "bold"),
                                            fg=FG_YELLOW, bg=BG_PANEL)
-        self._fleet_size_label.pack(anchor=tk.W, padx=8, pady=(0, 4))
+        self._fleet_size_label.pack(side=tk.LEFT)
+
+        # It reads "--" until the first aggregate lands and never empties
+        # itself afterwards — fleet_stats owns every string it can show,
+        # including the hover copy, so this page and the FC HUD row can never
+        # word the same aggregate two ways. Unlike that row this label is
+        # permanent, which is why _run_fleet_stats_refresh no longer gates the
+        # aggregate on the HUD's own setting. Accent rather than the size
+        # line's yellow: two bold yellow readings abutting on one row read as
+        # one run-on figure.
+        self._fleet_dps_label = tk.Label(
+            size_row, text=fleet_stats.fleet_headline_text(None),
+            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL)
+        self._fleet_dps_label.pack(side=tk.LEFT, padx=(12, 0))
+        # Attached ONCE with the (empty) idle copy; every later repaint goes
+        # through update_tooltip — re-attaching stacks add="+" handlers.
+        attach_tooltip(self._fleet_dps_label,
+                       fleet_stats.fleet_headline_tip(None))
 
         # Doctrine selector + clickable link → Fittings ▸ Doctrines (Phase C).
         doc_row = tk.Frame(comp_left, bg=BG_PANEL)
@@ -6442,6 +6470,10 @@ class FCToolGUI:
             except Exception:
                 pass
             self._fleet_stats_after = None
+        # The Fleet page's headline is pushed, not pulled: dropping the VM
+        # above leaves the label printing a dead fleet's DPS until something
+        # else repaints it, so it is reset back to "--" here with the rest.
+        self._refresh_fleet_dps_label(None)
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
@@ -28094,24 +28126,19 @@ class FCToolGUI:
         from, so the HUD row and the Fleet tab can never describe two different
         doctrines. Every store/var read here is guarded: this runs inside a
         fleet poll, and a raise would cost the poll, not just the row.
+
+        The aggregate is computed UNCONDITIONALLY (2026-09-08): the fleet
+        page always shows the headline (``self._fleet_dps_label``, built in
+        ``_build_xup_tab``), so it is a permanent consumer of this VM and
+        cannot be gated on an FC HUD setting the FC may never have opened.
+        ``info_tiles.fleet_stats`` now gates only the HUD TILE ROW, where it
+        always belonged — ``InfoTileController._stats_model`` reads it per beat
+        and answers None while it is off, and its ``fleet_stats_request`` seam
+        (which kicks this method when the row is on and empty) is unchanged and
+        still useful: it is what makes toggling the row on mid-fleet show a
+        number without waiting for the fleet to move.
         """
         self._fleet_stats_after = None
-        # The row is OFF by default: computing the aggregate on every fleet
-        # poll (a dogma-table decode + one simulation per hull) for users who
-        # never enabled it costs real time for nothing, and the 60 s retry on
-        # a failing bundle would re-pay that forever. Read through the SAME
-        # source the HUD checks (info_tiles._fleet_stats_enabled), never a
-        # literal default, so the two can never disagree.
-        info_tiles_block = self.config.get("info_tiles")
-        fleet_stats_enabled = bool(
-            (info_tiles_block if isinstance(info_tiles_block, dict) else {})
-            .get("fleet_stats", info_tiles.default_info_tiles_config()[
-                "fleet_stats"]))
-        if not fleet_stats_enabled:
-            self._fleet_stats_vm = None
-            self._fleet_stats_key = None
-            self._fleet_stats_failed_at = None
-            return
         ship_counts = fleet_stats.ship_counts_from_snapshot(
             getattr(self, "_last_specialized_args", None))
         if not ship_counts:
@@ -28234,6 +28261,32 @@ class FCToolGUI:
         self._fleet_stats_vm = vm
         self._fleet_stats_failed_at = None if vm is not None \
             else time.monotonic()
+        # The HUD PULLS its copy once a beat; the Fleet page's label is PUSHED,
+        # so it is repainted here, after the VM is stored (a reader reached
+        # from the repaint must never see the previous aggregate).
+        self._refresh_fleet_dps_label(vm)
+
+    def _refresh_fleet_dps_label(self, vm):
+        """Repaint the composition page's DPS/volley headline. Tk thread only.
+
+        Both the text and the hover copy come from ``fleet_stats`` -- one
+        wording owner for this aggregate, shared with the HUD row.
+
+        Every touch is guarded like the other label updates on this page: the
+        widget does not exist before ``_build_xup_tab`` runs (and never, in the
+        unbound-method test hosts), and it is gone during shutdown, while this
+        is reached from a fleet poll where a raise would cost the poll.
+        """
+        label = getattr(self, "_fleet_dps_label", None)
+        if label is None:
+            return
+        try:
+            if not label.winfo_exists():
+                return
+            label.config(text=fleet_stats.fleet_headline_text(vm))
+            update_tooltip(label, fleet_stats.fleet_headline_tip(vm))
+        except Exception:
+            pass
 
     def _group_of_safe(self, type_id):
         """group_id resolver that never raises (network failure -> None)."""
