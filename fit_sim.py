@@ -48,9 +48,10 @@ Bounded module state
 ~~~~~~~~~~~~~~~~~~~~
 
 The engine owns exactly ONE module-level cache, the All-V skill prototype set
-(``_SKILL_PROTOTYPES`` and the four values built with it -- ``_SKILL_LEVELS``,
-``_SKILL_GAPS``, ``_SKILL_NOTES``, plus the ``_SKILL_PROTOTYPES_BUILD`` /
-``_SKILL_PROTOTYPES_TABLE`` identity it was built for).  It is BOUNDED: one
+(``_SKILL_PROTOTYPES`` and the values built with it -- ``_SKILL_LEVELS``,
+``_SKILL_GAPS``, ``_SKILL_NOTES``, ``_SKILL_GATE``, plus the
+``_SKILL_PROTOTYPES_BUILD`` / ``_SKILL_PROTOTYPES_TABLE`` identity it was built
+for).  It is BOUNDED: one
 immutable tuple of at most one Item per skill the table keeps (588 today), never
 appended to, rebuilt wholesale when a different table is installed and dropped
 by :func:`_reset_prototypes_for_tests`.  Rebuilding those ~580 items per fit was
@@ -79,11 +80,44 @@ they touch a specific fit:
   "module or drone source", which is what the plan specifies;
 * mutaplasmid rolls never reach here (the parser strips them).
 
-Skill-sourced modelling gaps are NOT user-facing.  ~340 of the table's skills
-carry an effect with no modifierInfo (learning effects, skill markers), which
-would drown a fit's own handful of real gaps.  They land in
+Skills that can influence nothing are skipped
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A modifier's value is always its OWN source's reading (rule 5), so a skill's
+attributes are read by nobody but the skill itself.  A skill whose every
+OUTWARD modifier -- everything except the ``itemID`` self step -- resolves to
+zero targets on this fit therefore cannot move a single ship / module / charge /
+drone / character attribute, and evaluating it is pure cost.
+:func:`_build_gate_index` classifies each prototype's modifiers once per table
+into "always reaches something" (a ``shipID`` or ``charID`` modifier that is not
+skill-filtered), "gated on skill X" (a ``shipID``
+``LocationRequiredSkillModifier`` or an ``OwnerRequiredSkillModifier``, which
+reach only ship-located / character-owned items REQUIRING X) and "self or
+nothing"; :func:`build_fit` then keeps a gated prototype only when this fit's
+items actually require its skill.  Measured on the reference Drake (7x HML II
+with Scourge Heavy Missiles, real table, median of 20): 582 prototypes -> 238,
+``evaluate`` 10.2 ms -> 6.2 ms and ``build_fit`` 0.48 -> 0.41 ms, with every
+attribute byte-identical -- ``tests/test_fit_sim_engine.py``'s differential
+golden test proves that over twelve real fits, bare and under a full ``max``
+broadcast, with :data:`_SKILL_GATE_ENABLED` as the only difference.
+
+The gate needs no character-side skill index: the two gated modifier kinds reach
+only ``ship_location`` (ship + modules + charges + drones) and the
+character-OWNED items (drones + charges, a subset of the same list), and neither
+set changes when a skill is dropped.  Skills and implants -- the character
+LOCATION -- are reachable only by modifier kinds the gate always keeps.
+
+Skill-sourced modelling gaps are NOT user-facing.  Two paths feed them, and the
+measured shipped table (588 kept skills, SDE build 3494416) says the second is
+the flood: exactly ONE skill effect carries no ``modifierInfo`` at all, while
+~334 skill effects per fit REACH NOTHING on that particular fit (a hull bonus on
+the wrong hull, a turret skill on a missile boat) and are recorded by
+:func:`_record_effect_gap`.  Either way they would drown a fit's own handful of
+real gaps (7 on the reference Drake), so both land in
 ``FitState.unmodeled_skill_effects`` as ``(skill_type_id, effect_id)`` pairs;
-``FitState.unmodeled`` keeps fit-item gaps only.
+``FitState.unmodeled`` keeps fit-item gaps only.  A skipped skill's would-be
+gaps are recorded en bloc from the gate index, so the set is identical either
+way.
 """
 
 from __future__ import annotations
@@ -293,9 +327,11 @@ class FitState:
     #: numbers are then the best 4 passes could do, not a fixed point).
     converged: bool = False
     unmodeled_keys: set = field(default_factory=set)
-    #: ``(skill_type_id, effect_id)`` for every skill effect the table cannot
-    #: model. Deliberately NOT in ``unmodeled``: ~340 of them exist on every
-    #: fit, they say nothing about the fit, and they would bury its own gaps.
+    #: ``(skill_type_id, effect_id)`` for every skill effect that modelled
+    #: nothing -- one no-``modifierInfo`` effect on the shipped table, plus the
+    #: ~334 per fit that simply reached nothing (measured, reference Drake).
+    #: Deliberately NOT in ``unmodeled``: they say nothing about the fit, and
+    #: they would bury its own gaps (7 on that same Drake).
     unmodeled_skill_effects: set = field(default_factory=set)
 
     @property
@@ -428,9 +464,16 @@ _SKILL_LEVELS = None
 _SKILL_GAPS = frozenset()
 #: ``unmodeled`` lines for skill types the table itself is broken about --
 #: unknown or corrupt rows, which ARE worth showing (they are table defects,
-#: not the ~340 routine effect gaps).
+#: not the routine reached-nothing gaps).
 _SKILL_NOTES = ()
+#: The :class:`_GateIndex` for the same prototypes (see the module docstring).
+_SKILL_GATE = None
 _PROTO_LOCK = threading.Lock()
+
+#: TEST SEAM. The gate is semantics-preserving, so nothing in the app ever turns
+#: it off; the differential test flips it to prove the two agree attribute for
+#: attribute on real fits. Never rebound by this module.
+_SKILL_GATE_ENABLED = True
 
 
 def _clone_skill_item(prototype: Item) -> Item:
@@ -497,18 +540,166 @@ def _build_skill_prototypes():
     return tuple(prototypes), levels, frozenset(gaps), tuple(notes)
 
 
+# ---------------------------------------------------------------------------
+# the gate: which skills can influence this fit at all
+# ---------------------------------------------------------------------------
+#: How far one of a skill's modifiers can reach (see the module docstring).
+_REACH_NOTHING = 0        # an unmodelled domain, or a filter its carrier fails
+_REACH_SELF = 1           # the carrying skill itself, and nothing else
+_REACH_GATED = 2          # only ship-located / owned items REQUIRING a skill
+_REACH_OUTWARD = 3        # the ship, the character, or a whole location
+
+
+class _GateIndex(NamedTuple):
+    """Which skill prototypes a fit has to evaluate, resolved once per table.
+
+    Indexes, not items: they address :data:`_SKILL_PROTOTYPES` positionally, so
+    a kept subset is still in prototype order (evaluation order is part of the
+    result -- float folds are not associative).
+
+    * ``always`` -- prototypes with an outward modifier; never skipped.
+    * ``by_skill`` -- ``gate skill type id -> (prototype index, ...)``: keep
+      these when this fit has an item requiring that skill.
+    * ``skipped_gaps`` -- per index, the ``(skill, effect)`` pairs
+      :func:`_record_effect_gap` WOULD have recorded had the skill been
+      evaluated (its effects that reach nothing even on themselves), so a
+      skipped skill's bookkeeping is identical to an evaluated one's.
+    """
+    always: frozenset
+    by_skill: dict
+    skipped_gaps: tuple
+
+
+def _modifier_reach(modifier, prototype: Item):
+    """``(reach, gate skill)`` for one modifier carried by a SKILL prototype.
+
+    Mirrors :func:`_targets` exactly, for the one source kind a skill can be:
+    an item with no charge and no parent that lives in the character location.
+
+    * ``OwnerRequiredSkillModifier`` ignores its domain and filters the
+      character-OWNED items by skill -- gated.
+    * ``itemID`` is its own location, so EVERY func reaches at most the carrier
+      -- self, or nothing when the carrier fails the group / skill filter.
+    * ``shipID`` + ``LocationRequiredSkillModifier`` filters ship-located items
+      by skill -- gated.  Any other ``shipID`` or ``charID`` modifier can reach
+      the ship, the character, an implant or a whole location: outward.
+    * ``otherID`` resolves through :func:`_other_item`, and a skill item never
+      has a charge or a parent; ``targetID`` / ``structureID`` are not
+      modelled.  All three reach nothing, on every fit.
+    """
+    func = modifier.func
+    if func == FUNC_OWNER_SKILL:
+        if modifier.domain in (DOMAIN_TARGET, DOMAIN_STRUCTURE):
+            return _REACH_NOTHING, None
+        return _REACH_GATED, _required_skill(modifier, prototype)
+    domain = modifier.domain
+    if domain == DOMAIN_ITEM:
+        if func == FUNC_LOCATION_GROUP:
+            return ((_REACH_SELF, None)
+                    if prototype.group_id == modifier.group_id
+                    else (_REACH_NOTHING, None))
+        if func == FUNC_LOCATION_SKILL:
+            skill_id = _required_skill(modifier, prototype)
+            return ((_REACH_SELF, None)
+                    if skill_id in prototype.skill_requirements()
+                    else (_REACH_NOTHING, None))
+        if func in (FUNC_ITEM, FUNC_LOCATION):
+            return _REACH_SELF, None
+        return _REACH_NOTHING, None          # an unknown func reaches nothing
+    if domain == DOMAIN_SHIP:
+        if func == FUNC_LOCATION_SKILL:
+            return _REACH_GATED, _required_skill(modifier, prototype)
+        return _REACH_OUTWARD, None
+    if domain == DOMAIN_CHAR:
+        return _REACH_OUTWARD, None
+    return _REACH_NOTHING, None
+
+
+def _gate_prototype(prototype: Item):
+    """``(always, gate skills, would-be gaps)`` for one skill prototype."""
+    always = False
+    gates: set = set()
+    gaps: list = []
+    for definition, modifiers in (prototype.resolved or ()):
+        if not modifiers:
+            # _plan reports a gap only for an effect that HAD applicable rows.
+            continue
+        reaches_self = False
+        for modifier in modifiers:
+            reach, gate_skill = _modifier_reach(modifier, prototype)
+            if reach == _REACH_OUTWARD:
+                always = True
+            elif reach == _REACH_GATED:
+                gates.add(gate_skill)
+            elif reach == _REACH_SELF:
+                reaches_self = True
+        if not reaches_self:
+            # Nothing but the gated rows can make this effect apply, so if the
+            # skill is skipped its gates missed and the effect reached nothing.
+            gaps.append((prototype.type_id, definition.effect_id))
+    return always, gates, tuple(gaps)
+
+
+def _build_gate_index(prototypes) -> _GateIndex:
+    """Classify every prototype once, for the installed table."""
+    always: set = set()
+    by_skill: dict = {}
+    skipped_gaps: list = []
+    for index, prototype in enumerate(prototypes):
+        is_always, gates, gaps = _gate_prototype(prototype)
+        skipped_gaps.append(gaps)
+        if is_always:
+            always.add(index)
+            continue
+        for gate_skill in gates:
+            by_skill.setdefault(gate_skill, []).append(index)
+    return _GateIndex(frozenset(always),
+                      {skill: tuple(indexes)
+                       for skill, indexes in by_skill.items()},
+                      tuple(skipped_gaps))
+
+
+def _gated_prototypes(prototypes, gate: _GateIndex, ship_items, skill_gaps):
+    """The prototypes this fit must evaluate, in prototype order.
+
+    ``ship_items`` is the ship location (ship + modules + charges + drones);
+    the character-owned items are a subset of it, so ONE required-skill index
+    answers both gate kinds.  A skipped skill's would-be gaps are folded into
+    ``skill_gaps`` so the caller's bookkeeping does not depend on the gate.
+    """
+    keep = set(gate.always)
+    for skill_id in _required_skill_index(ship_items):
+        keep.update(gate.by_skill.get(skill_id, ()))
+    if len(keep) >= len(prototypes):
+        return prototypes
+    kept = []
+    for index, prototype in enumerate(prototypes):
+        if index in keep:
+            kept.append(prototype)
+        else:
+            skill_gaps.update(gate.skipped_gaps[index])
+    return kept
+
+
 def _skill_prototypes():
-    """The cached ``(prototypes, levels, gaps, notes)`` for the installed table.
+    """The cached ``(prototypes, levels, gaps, notes, gate)`` for the installed
+    table.
 
     Rebuilt whenever the SDE build differs or a different table object has been
     installed (a re-seed in tests); the lock makes concurrent worker threads
     build it at most once.
+
+    The identity the decision reads -- the build number and the table object --
+    is sampled INSIDE the lock.  Reading it outside was a TOCTOU: a re-seed
+    landing between the sample and the lock would have had the cache stamped
+    with the OLD identity while it was built from the NEW table, and every later
+    caller would then have been handed prototypes it believed were current.
     """
     global _SKILL_PROTOTYPES, _SKILL_PROTOTYPES_BUILD, _SKILL_PROTOTYPES_TABLE
-    global _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES
-    build = dogma_data.sde_build()
-    table = getattr(dogma_data, "_table", None)
+    global _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES, _SKILL_GATE
     with _PROTO_LOCK:
+        build = dogma_data.sde_build()
+        table = getattr(dogma_data, "_table", None)
         if (_SKILL_PROTOTYPES is None or _SKILL_PROTOTYPES_BUILD != build
                 or _SKILL_PROTOTYPES_TABLE is not table):
             prototypes, levels, gaps, notes = _build_skill_prototypes()
@@ -516,9 +707,11 @@ def _skill_prototypes():
             _SKILL_LEVELS = levels
             _SKILL_GAPS = gaps
             _SKILL_NOTES = notes
+            _SKILL_GATE = _build_gate_index(prototypes)
             _SKILL_PROTOTYPES_BUILD = build
             _SKILL_PROTOTYPES_TABLE = table
-        return _SKILL_PROTOTYPES, _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES
+        return (_SKILL_PROTOTYPES, _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES,
+                _SKILL_GATE)
 
 
 def _reset_prototypes_for_tests() -> None:
@@ -528,7 +721,7 @@ def _reset_prototypes_for_tests() -> None:
     already covered by the identity check; this exists so a test can also prove
     the REBUILD path, and so no fixture table outlives its test."""
     global _SKILL_PROTOTYPES, _SKILL_PROTOTYPES_BUILD, _SKILL_PROTOTYPES_TABLE
-    global _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES
+    global _SKILL_LEVELS, _SKILL_GAPS, _SKILL_NOTES, _SKILL_GATE
     with _PROTO_LOCK:
         _SKILL_PROTOTYPES = None
         _SKILL_PROTOTYPES_BUILD = None
@@ -536,6 +729,7 @@ def _reset_prototypes_for_tests() -> None:
         _SKILL_LEVELS = None
         _SKILL_GAPS = frozenset()
         _SKILL_NOTES = ()
+        _SKILL_GATE = None
 
 
 def build_fit(parsed: ParsedFit, *, implants: Sequence[int] = ()) -> FitState:
@@ -545,6 +739,11 @@ def build_fit(parsed: ParsedFit, *, implants: Sequence[int] = ()) -> FitState:
     (``module.charge`` / ``charge.parent``) so ``otherID`` can resolve either
     direction, and inheriting the module's state so an offline launcher's
     ammunition is silent too.
+
+    Only the skills that can influence THIS fit become items (see the module
+    docstring's gate section); ``FitState.skills`` still carries every kept
+    skill's level, and a skipped skill's modelling gaps are recorded exactly as
+    an evaluated one's would have been.
 
     ``implants`` are type ids the pilot is wearing; they become active,
     character-LOCATED items (rule 4), so a Mindlink's ``shipID`` modifiers reach
@@ -600,8 +799,20 @@ def build_fit(parsed: ParsedFit, *, implants: Sequence[int] = ()) -> FitState:
         _record(unmodeled, seen, ("subsystem", subsystem_id),
                 f"unmodeled subsystem {subsystem_id}")
 
-    prototypes, levels, gaps, notes = _skill_prototypes()
+    prototypes, levels, gaps, notes, gate = _skill_prototypes()
     unmodeled.extend(notes)
+    skill_gaps = set(gaps)
+    if _SKILL_GATE_ENABLED:
+        # The gate needs the ship LOCATION, which is exactly what has been
+        # built so far: the ship, its modules, their charges and the drones.
+        ship_items = [ship]
+        for module_item in modules:
+            ship_items.append(module_item)
+            if module_item.charge is not None:
+                ship_items.append(module_item.charge)
+        ship_items.extend(drones)
+        prototypes = _gated_prototypes(prototypes, gate, ship_items,
+                                       skill_gaps)
     skill_items = [_clone_skill_item(p) for p in prototypes]
 
     character = Item(0, 0, CATEGORY_CHARACTER, {}, ())
@@ -609,7 +820,7 @@ def build_fit(parsed: ParsedFit, *, implants: Sequence[int] = ()) -> FitState:
                     skills=dict(levels), unmodeled=unmodeled,
                     character=character, skill_items=skill_items,
                     implants=implant_items, unmodeled_keys=seen,
-                    unmodeled_skill_effects=set(gaps))
+                    unmodeled_skill_effects=skill_gaps)
 
 
 # ===========================================================================
@@ -847,8 +1058,9 @@ class _Entry:
     ``(source, modifying_attr)`` is itself a group.  A static entry is read once
     for the whole evaluation, and a group built only from static entries folds
     to the same number every pass, so it is folded once too.  On a real fit that
-    is most of the work: ~910 of 1,460 groups are a skill scaling its own
-    per-level bonus attribute by its (fixed) level.
+    is a large slice of the work: of the reference Drake's 1,458 groups, 910
+    write a SKILL item's own attribute and 582 (40 %) are static -- almost all
+    of them a skill scaling its per-level bonus attribute by its (fixed) level.
     """
 
     __slots__ = ("source", "modifying_attr", "default", "value", "dynamic")

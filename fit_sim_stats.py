@@ -364,7 +364,8 @@ class FitStats:
     #: for several fitted items.
     unmodeled_items: tuple[tuple[int, str], ...] = ()
     #: Diagnostics that are NOT gaps: a hull bonus whose modifiers simply found
-    #: no matching module (a Raven's launcher bonus on a fit with no launcher).
+    #: no matching module (a Raven's launcher bonus on a fit with no launcher),
+    #: or an evaluation that hit the pass cap without settling.
     #: Never shown as a gap, never sets ``partial``.
     notes: tuple[str, ...] = ()
     sde_build: int = 0
@@ -834,6 +835,13 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     dps_drone, drone_volley, drone_rows = _drone_stats(fit, name)
 
     lines, items, notes, partial = _unmodeled_entries(fit, name)
+    if not fit.converged:
+        # Rule 8 cut the fixed-point loop short, so every number below is the
+        # best MAX_PASSES could do rather than a settled value. That is a
+        # WARNING, not a gap: nothing is missing from the model, the arithmetic
+        # simply has not stopped moving, so it never sets ``partial``.
+        notes.append(f"evaluation hit the pass cap ({fit_sim.MAX_PASSES}) "
+                     "— numbers may be off")
     if links_unavailable:
         # The links the caller asked for and did not get -- an honest "this
         # number is missing a boost" rather than a silently unboosted fit.
