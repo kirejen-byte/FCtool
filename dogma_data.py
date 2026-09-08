@@ -348,8 +348,17 @@ def _build_group_index() -> None:
         buckets: dict[int, list[int]] = {}
         for key, row in _require()["types"].items():
             buckets.setdefault(int(row["g"]), []).append(int(key))
-        _group_index.update((gid, tuple(sorted(ids)))
-                            for gid, ids in buckets.items())
+        # Build the complete mapping in a plain LOCAL dict first, then publish
+        # it in one `dict.update(dict)` call. That overload runs as a single
+        # C-level merge (no per-item bytecode, so no mid-merge yield point) --
+        # unlike `_group_index.update(<generator>)`, which drives the update
+        # from Python bytecode one bucket at a time and can hand control back
+        # to a lock-free reader (see `types_in_group`) between buckets, so
+        # that reader could observe a `_group_index` that is non-empty (fails
+        # the `if not _group_index` gate) yet still missing a populated
+        # group's entry.
+        built = {gid: tuple(sorted(ids)) for gid, ids in buckets.items()}
+        _group_index.update(built)
 
 
 def effect(effect_id: int) -> EffectDef | None:
