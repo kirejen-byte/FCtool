@@ -17,13 +17,14 @@ docstring of the code that implements it, so a reviewer can walk them:
 2. **Charges** -- :func:`build_fit`, :func:`_other_item`.
 3. **Domains** -- :func:`_domain`.
 4. **Funcs** -- :func:`_targets`.
-5. **Skill levels** -- :func:`_modifier_value`.
+5. **Skill levels** -- :func:`build_fit`, :func:`_modifier_value`.
 6. **Operation order** -- :func:`_reduce`.
 7. **Stacking penalty** -- :func:`stacking_multiplier`, :func:`_penalised`,
    :func:`_combined_multiplier`.
 8. **Dependency passes** -- :func:`evaluate`.
 9. **Fleet buffs** -- :func:`_buff_contributions`.
-10. **Never raise for data problems** -- :func:`_make_item`, :func:`_record`.
+10. **Never raise for data problems** -- :func:`_make_item`, :func:`_record`,
+    :func:`_skippable_modifier`.
 
 **Never loads anything.**  ``dogma_data.load()`` is the caller's business, on a
 worker thread; every entry point here raises
@@ -39,6 +40,10 @@ they touch a specific fit:
   :class:`Item` by hand, and the state machine honours it);
 * overload (effect category 5) is never applied;
 * ``targetID`` / ``structureID`` modifiers are skipped (no target is modelled);
+* ``EffectStopper`` rows, and rows whose ``operation`` is not one of the nine
+  dogma op codes, are skipped SILENTLY -- they are a row shape the engine has
+  no arithmetic for, not a gap in what the fit models, so they are never
+  reported (see :func:`_skippable_modifier`);
 * T3 subsystems and cargo (which is where the parser puts implants) are not
   evaluated -- subsystems are recorded as unmodeled, cargo is ignored;
 * mutaplasmid rolls never reach here (the parser strips them).
@@ -68,6 +73,10 @@ OP_POST_ASSIGN = 7
 OP_ORDER = (OP_PRE_ASSIGN, OP_PRE_MUL, OP_PRE_DIV, OP_MOD_ADD, OP_MOD_SUB,
             OP_POST_MUL, OP_POST_DIV, OP_POST_PERCENT, OP_POST_ASSIGN)
 _ASSIGN_OPS = frozenset({OP_PRE_ASSIGN, OP_POST_ASSIGN})
+#: Rule 10: every operation code the engine has arithmetic for. The SDE carries
+#: exactly one row outside it (``operation`` 9, on ``skillEffect``) plus the ten
+#: ``EffectStopper`` rows whose ``operation`` is absent altogether.
+VALID_OPERATIONS = frozenset(OP_ORDER)
 #: The ops a stacking penalty can apply to (rule 7).
 MULTIPLICATIVE_OPS = frozenset({OP_PRE_MUL, OP_PRE_DIV, OP_POST_MUL,
                                 OP_POST_DIV, OP_POST_PERCENT})
@@ -118,6 +127,9 @@ PENALISED_SOURCE_CATEGORIES = frozenset({CATEGORY_MODULE, CATEGORY_DRONE})
 # ── modifier domains (rule 3) ────────────────────────────────────────────────
 DOMAIN_SHIP = "shipID"
 DOMAIN_CHAR = "charID"
+#: "the item that carries the effect" -- self. 221 SDE modifiers use it, and it
+#: is the first half of the two-step skill-bonus pattern (rule 5).
+DOMAIN_ITEM = "itemID"
 DOMAIN_OTHER = "otherID"
 DOMAIN_TARGET = "targetID"
 DOMAIN_STRUCTURE = "structureID"
@@ -128,6 +140,9 @@ FUNC_LOCATION = "LocationModifier"
 FUNC_LOCATION_GROUP = "LocationGroupModifier"
 FUNC_LOCATION_SKILL = "LocationRequiredSkillModifier"
 FUNC_OWNER_SKILL = "OwnerRequiredSkillModifier"
+#: Rule 10: not a modifier at all -- it names an effect to suppress, and its
+#: rows carry no modified/modifying attribute or operation.
+FUNC_EFFECT_STOPPER = "EffectStopper"
 
 # ── dbuff modifier kinds (rule 9) ────────────────────────────────────────────
 BUFF_ITEM = "item"
@@ -141,6 +156,10 @@ MAX_PASSES = 4
 
 #: Every skill is trained to V (the pyfa default and the FC convention).
 ALL_V = 5
+
+#: Cache miss marker -- ``None`` is a legitimate cached value (an effect the
+#: table does not carry), so it cannot double as "not looked up yet".
+_UNCACHED = object()
 
 
 class Buff(NamedTuple):
@@ -355,6 +374,14 @@ def build_fit(parsed: ParsedFit) -> FitState:
     skills = {int(sid): ALL_V for sid in dogma_data.skill_type_ids()}
     skill_items: list[Item] = []
     for skill_id in skills:
+        # Rule 5 + bounded work: a skill with NO effects is inert. It can never
+        # be a modifier SOURCE (a source has to carry the effect), and nothing
+        # reads an inert item's values, so building an Item for it would only
+        # churn dogma_data's 256-entry per-type LRU -- ~590 skills per fit, of
+        # which a handful matter. Its LEVEL is still recorded in `skills`.
+        if dogma_data.has_type(skill_id) and \
+                not dogma_data.type_effects(skill_id):
+            continue
         item = _make_item(skill_id, state=STATE_ACTIVE, quantity=1,
                           unmodeled=unmodeled, seen=seen,
                           category=CATEGORY_SKILL)
@@ -385,24 +412,51 @@ def attr(item: Item, attr_id: int) -> float:
     return value
 
 
-def _domain(modifier, source: Item, fit: FitState):
+def _skippable_modifier(modifier) -> bool:
+    """Rule 10: whether this row is one the engine has no arithmetic for and
+    must pass over WITHOUT reporting a modelling gap.
+
+    Two shapes, both straight out of the SDE census (spec A.3): the ten
+    ``EffectStopper`` rows, which carry no modified/modifying attribute and no
+    ``operation`` at all, and the single ``operation`` 9 row on ``skillEffect``.
+    The generator drops both, but the engine does not depend on that -- a table
+    built by an older generator, or by hand, must degrade the same way.
+
+    ``operation`` is compared by MEMBERSHIP so a ``None`` is skipped rather than
+    raising.
+    """
+    return (modifier.func == FUNC_EFFECT_STOPPER
+            or modifier.operation not in VALID_OPERATIONS)
+
+
+def _domain(modifier, source: Item, fit: FitState,
+            ship_location, char_location):
     """Rule 3: resolve a modifier's domain to ``(domain_item, located_items)``,
     or ``None`` when the domain is not modelled in v1.
 
-    ``targetID`` (no target exists) and ``structureID`` (no structure exists)
-    are skipped.  ``otherID`` resolves to the source's counterpart -- a module's
-    charge or a charge's launcher -- which is its own one-item location.
+    ``itemID`` is the effect-carrying item itself, and it is its OWN location:
+    a ``LocationModifier`` on ``itemID`` reaches the carrier alone, never the
+    hull's contents, even when the carrier happens to be the hull.
+    ``otherID`` resolves to the source's counterpart -- a module's charge or a
+    charge's launcher -- likewise its own one-item location.  ``targetID`` (no
+    target exists) and ``structureID`` (no structure exists) are skipped.
+
+    The ship and character locations are passed in already built: they are the
+    same lists for every modifier of a pass, and rebuilding them per modifier
+    was measurable on a full skill table.
     """
     domain = modifier.domain
     if domain == DOMAIN_SHIP:
-        return fit.ship, fit.ship_location()
+        return fit.ship, ship_location
     if domain == DOMAIN_CHAR:
-        return fit.character, fit.char_location()
+        return fit.character, char_location
+    if domain == DOMAIN_ITEM:
+        return source, (source,)
     if domain == DOMAIN_OTHER:
         other = _other_item(source)
         if other is None:
             return None
-        return other, [other]
+        return other, (other,)
     return None
 
 
@@ -420,7 +474,7 @@ def _targets(modifier, source: Item, fit: FitState,
     * ``ItemModifier`` -- the domain item itself.
     * ``LocationModifier`` -- everything in the domain's location (ship
       location = ship + modules + charges + drones; character location =
-      skills).
+      skills; ``itemID`` / ``otherID`` locations are the one resolved item).
     * ``LocationGroupModifier`` -- located items of the named group.
     * ``LocationRequiredSkillModifier`` -- located items requiring the skill.
     * ``OwnerRequiredSkillModifier`` -- character-OWNED items requiring the
@@ -434,14 +488,10 @@ def _targets(modifier, source: Item, fit: FitState,
         return [i for i in owned
                 if modifier.skill_type_id in i.skill_requirements()]
 
-    resolved = _domain(modifier, source, fit)
+    resolved = _domain(modifier, source, fit, ship_location, char_location)
     if resolved is None:
         return []
     domain_item, located = resolved
-    if domain_item is fit.ship:
-        located = ship_location
-    elif domain_item is fit.character:
-        located = char_location
 
     func = modifier.func
     if func == FUNC_ITEM:
@@ -459,25 +509,29 @@ def _targets(modifier, source: Item, fit: FitState,
 def _modifier_value(modifier, source: Item, source_values: dict) -> float:
     """Rule 5: the magnitude a modifier carries this pass.
 
-    The raw value is the SOURCE's current reading of ``modifying_attr`` (from
+    ALWAYS, and only, the SOURCE's current reading of ``modifying_attr`` (from
     the previous pass's snapshot, so a chain converges instead of depending on
-    iteration order).
+    iteration order).  There is no hidden multiplication anywhere -- in
+    particular the engine does NOT scale a skill-sourced value by the skill's
+    level.
 
-    Skill-sourced modifiers scale with the skill's level: a skill whose bonus
-    attribute reads 5 ("+5 %/level") contributes 25 at All V.  The one exception
-    is a modifier whose modifying attribute IS ``ATTR_SKILL_LEVEL`` -- that
-    value already is the level and must not be squared.
+    Skill levels reach the numbers through data, in the SDE's own two steps
+    (spec A.7, "skill levels are not read directly by bonus modifiers"):
+
+    1. a ``preMul`` whose ``modifying_attr`` IS ``ATTR_SKILL_LEVEL`` multiplies
+       the per-level bonus attribute by the level -- on the skill itself via
+       ``domain: itemID`` (Medium Hybrid Turret's effect 152), or on the hull
+       via ``domain: shipID`` (the Caldari Battlecruiser skill's effect 5286);
+    2. a ``Location*Modifier`` ``postPercent`` then applies the now-scaled
+       bonus attribute to the targets (effect 160 / the hull's own effect).
+
+    552 SDE modifiers do step 1.  An engine that ALSO folded the level into
+    every skill-sourced value would double-scale every one of them.
     """
     values = source_values.get(id(source)) or source.attrs
     raw = values.get(modifier.modifying_attr)
     if raw is None:
         raw = dogma_data.attr_info(modifier.modifying_attr).default
-    if source.category_id == CATEGORY_SKILL and \
-            modifier.modifying_attr != ATTR_SKILL_LEVEL:
-        level = values.get(ATTR_SKILL_LEVEL)
-        if level is None:
-            level = ALL_V
-        raw *= level
     return raw
 
 
@@ -497,14 +551,18 @@ def _penalised(modifier, source: Item) -> bool:
 def _effect_defs(source: Item, cache: dict):
     """Rule 1: the effects this source contributes right now, filtered by its
     state.  ``dogma_data.effect`` rebuilds NamedTuples on every call, so one
-    cache per evaluation keeps the passes cheap."""
+    cache per evaluation keeps the passes cheap.
+
+    The cache remembers MISSES too (via ``_UNCACHED``): an effect the table does
+    not carry is otherwise re-probed on every item on every pass, which is the
+    common case for a fit full of slot-marker effects."""
     allowed = _ALLOWED_CATEGORIES.get(source.state, frozenset())
     if not allowed:
         return ()
     out = []
     for effect_id in source.effects:
-        definition = cache.get(effect_id)
-        if definition is None:
+        definition = cache.get(effect_id, _UNCACHED)
+        if definition is _UNCACHED:
             definition = dogma_data.effect(effect_id)
             cache[effect_id] = definition
         if definition is None or not definition.modifiers:
@@ -523,6 +581,10 @@ def _collect(fit: FitState, source_values: dict, effect_cache: dict,
     resolve to nothing (a pure ``targetID`` effect, say) is recorded once per
     type; an effect with at least one applicable modifier is not recorded at
     all, because it did something.
+
+    Rule 10's partial rows are invisible to that bookkeeping: a row the engine
+    skips as unparseable is not a target it FAILED to reach, so an effect whose
+    every row is skippable is neither applied nor reported.
     """
     contributions: dict = {}
     ship_location = fit.ship_location()
@@ -532,7 +594,11 @@ def _collect(fit: FitState, source_values: dict, effect_cache: dict,
     for source in fit.all_items():
         for definition in _effect_defs(source, effect_cache):
             applied = False
+            modelled = False
             for modifier in definition.modifiers:
+                if _skippable_modifier(modifier):
+                    continue
+                modelled = True
                 targets = _targets(modifier, source, fit, ship_location,
                                    char_location, owned)
                 if not targets:
@@ -545,7 +611,7 @@ def _collect(fit: FitState, source_values: dict, effect_cache: dict,
                     per_op = contributions.setdefault(key, {})
                     per_op.setdefault(modifier.operation, []).append(
                         (value, penalised))
-            if not applied and record_unmodeled:
+            if modelled and not applied and record_unmodeled:
                 _record(fit.unmodeled, fit.unmodeled_keys,
                         ("effect", source.type_id, definition.effect_id),
                         f"effect {definition.effect_id} on type "
