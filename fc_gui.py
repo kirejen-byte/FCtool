@@ -106,6 +106,12 @@ import fit_models
 import fleet_guidance
 import fit_parser
 import fit_dna
+# Fit simulator (pure, stdlib-only). Importing these costs nothing at startup:
+# the bundled dogma table is decoded lazily by dogma_data.load(), which is
+# called ONLY from worker threads (spec 5.4, "no load at startup").
+import dogma_data
+import fit_sim_stats
+import fleet_stats
 import pyfa_import
 import motd_builder
 import motd_markup
@@ -1132,6 +1138,17 @@ class FCToolGUI:
         # FC HUD's fleet tile renders the same coverage report — see the
         # links_snapshot seam in _build_info_tiles.
         self._booster_coverage: dict = {}         # discipline -> charge_tracker.CoverageStatus
+        # FC HUD fleet DPS/volley aggregate (fleet_stats.FleetStatsVM). Tk-thread
+        # -only state: the aggregate is COMPUTED on a worker and lands here via
+        # _post_ui, the HUD's 1 Hz beat only reads it (spec 5.4, "no per-tick
+        # compute"). _fleet_stats_key is the (counts, doctrine, revision, tier,
+        # disciplines) identity the stored VM was computed for AND the in-flight
+        # spawn guard — set when the worker is launched, so a second poll with
+        # an unchanged fleet spawns nothing. _fleet_stats_after is the 250 ms
+        # coalescer's pending after id.
+        self._fleet_stats_vm = None
+        self._fleet_stats_key = None
+        self._fleet_stats_after = None
         # Per-section ship-type expand state, keyed by id(content_frame) -> set of
         # open type_ids. Lets _populate_role_section preserve user expansions
         # across its frequent destroy/recreate rebuilds (every fleet poll and
@@ -2437,8 +2454,12 @@ class FCToolGUI:
                 # The app's catalog, so the fleet tile's hull names cost no
                 # second parse of the bundled table.
                 type_catalog=self.type_catalog)
-            self._info_tiles = info_tiles.InfoTileController(self.root,
-                                                             self._hud_host)
+            self._info_tiles = info_tiles.InfoTileController(
+                self.root, self._hud_host,
+                # A PULL, not a push: the beat reads whatever the aggregator
+                # last stored, so the 1 Hz tick never triggers a simulation.
+                # Tk-thread-only state, written by _apply_fleet_stats.
+                fleet_stats_snapshot=lambda: self._fleet_stats_vm)
             block = self.config.get("info_tiles")
             # Single source of truth for the master-enabled fallback: fc_gui
             # must not re-type info_tiles's own shipped-dark default.
@@ -6184,6 +6205,10 @@ class FCToolGUI:
                     roster[name.lower()] = tid
         self._booster_roster = roster
         self._schedule_booster_refresh()
+        # The FC HUD's fleet DPS/volley aggregate rides the same Tk-side applier
+        # every fleet poll already reaches, and coalesces the same way: the
+        # snapshot it needs (_last_specialized_args) was written above.
+        self._schedule_fleet_stats_refresh()
 
         # Check >50% command ship rule
         command_count = sum(ship_counts.get(tid, 0) for tid in ALL_LINKS_COMMAND)
@@ -6378,6 +6403,21 @@ class FCToolGUI:
         self._last_specialized_args = None
         self._last_polled_fleet_id = None
         self._last_polled_fleet_is_boss = False
+        # The HUD's fleet DPS/volley aggregate, all three fields together: the
+        # stored VM (else the tile keeps printing a dead fleet's DPS), the key
+        # (else the next real fleet with the same shape would be suppressed as
+        # "unchanged"), and the coalescer's pending after -- which the
+        # _update_specialized_roles([], {}, 0) call above has just re-armed, so
+        # cancelling it here is what makes this clear stick.
+        self._fleet_stats_vm = None
+        self._fleet_stats_key = None
+        after_id = getattr(self, "_fleet_stats_after", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+            self._fleet_stats_after = None
 
     # Panel role-section key -> doctrine rollup tag (Phase C guidance).
     _ROLE_KEY_TO_TAG = {"dps": "DPS", "links": "Links", "logi": "Logi",
@@ -27893,6 +27933,143 @@ class FCToolGUI:
                 lambda: self._apply_booster_compute(rows_by_name, coverage, ship_names))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ── FC HUD fleet DPS/volley aggregate (fit-sim) ──────────────────────────
+    # The shape mirrors the booster trio above: coalesce on the Tk loop, do the
+    # work off-thread, marshal the result back through the dispatcher. What is
+    # DIFFERENT is the key: a fleet poll fires every ~30 s whether or not the
+    # fleet moved, and one aggregate costs a dogma simulation per hull type, so
+    # an unchanged (counts, doctrine, fittings revision, tier, disciplines)
+    # spawns nothing at all (spec 5.4).
+
+    def _schedule_fleet_stats_refresh(self):
+        """Coalesce fleet-stats requests onto the Tk loop (Tk thread only).
+
+        Every caller is Tk-side (``_update_specialized_roles``), so this uses
+        ``root.after`` directly rather than ``_post_ui_after`` -- it needs the
+        after id back, because ``_clear_fleet_snapshot`` has to cancel a pending
+        recompute for a fleet that no longer exists."""
+        if getattr(self, "_fleet_stats_after", None) is not None:
+            return
+        try:
+            self._fleet_stats_after = self.root.after(
+                250, self._run_fleet_stats_refresh)
+        except Exception:
+            self._fleet_stats_after = None
+
+    def _run_fleet_stats_refresh(self):
+        """Build the recompute key and, if it moved, spawn the worker. Tk thread.
+
+        Everything the worker needs is SNAPSHOTTED here into plain dicts: the
+        worker must never reach back into ``self.fittings`` (an internally
+        locked store the Tk thread also writes) nor into ``self.config`` (which
+        ``_save_settings`` REPLACES wholesale — a held reference goes stale and
+        its reads land in an orphan). Config values are read fresh on every call
+        and passed by value, per the same rule.
+        """
+        self._fleet_stats_after = None
+        cached = getattr(self, "_last_specialized_args", None)
+        ship_counts = {}
+        if cached:
+            try:
+                _members, ship_counts, _total = cached
+            except (TypeError, ValueError):
+                ship_counts = {}
+        if not isinstance(ship_counts, dict) or not ship_counts:
+            # No fleet is an ANSWER, not a gap: drop the stored aggregate so the
+            # tile stops printing the last one, and clear the key so the next
+            # real fleet is never mistaken for "unchanged".
+            self._fleet_stats_vm = None
+            self._fleet_stats_key = None
+            return
+
+        fittings_cfg = self.config.get("fittings")
+        if not isinstance(fittings_cfg, dict):
+            fittings_cfg = {}
+        tier = str(fittings_cfg.get("sim_links_tier", "none") or "none")
+        disciplines = str(fittings_cfg.get("sim_links_disciplines", "auto")
+                          or "auto")
+        doctrine = self._active_doctrine_obj()
+        doctrine_id = getattr(doctrine, "id", None)
+        try:
+            revision = self.fittings.revision()
+        except Exception:
+            revision = 0
+
+        key = fleet_stats.fleet_key(ship_counts, doctrine_id, revision, tier,
+                                    disciplines)
+        if key == getattr(self, "_fleet_stats_key", None):
+            return
+
+        # hull -> [Fit] and the doctrine's fit ids per hull, both resolved HERE
+        # (Tk thread) out of live store state and handed to the worker as plain
+        # containers it owns outright. Both builders are pure — fleet_stats.
+        try:
+            fits_by_hull = fleet_stats.index_fits(self.fittings.list_fits())
+        except Exception:
+            fits_by_hull = {}
+        doctrine_ids = fleet_stats.doctrine_fit_ids(doctrine, fits_by_hull)
+
+        # Marked in flight BEFORE the spawn: the next poll's identical key then
+        # finds nothing to do instead of racing a second worker onto the same
+        # answer. _apply_fleet_stats drops any result whose key is no longer
+        # this one.
+        self._fleet_stats_key = key
+        threading.Thread(
+            target=self._fleet_stats_worker,
+            args=(key, dict(ship_counts), fits_by_hull, doctrine_ids,
+                  tier, disciplines),
+            daemon=True).start()
+
+    def _fleet_stats_worker(self, key, ship_counts, fits_by_hull,
+                            doctrine_ids, tier, disciplines):
+        """Simulate one fit per hull and sum the fleet. WORKER THREAD.
+
+        ``dogma_data.load()`` lives HERE and nowhere else on this path: the
+        bundled table is never decoded at startup and never on the Tk thread
+        (spec 5.4). ``type_catalog.resolve_name`` is also worker-only by
+        contract -- on a cache miss it makes a synchronous ESI call, which is
+        precisely why it must not run inside the 1 Hz render path.
+
+        Everything is inside one try/except: a failure costs the row (the
+        aggregate stays None and the tile simply omits it), never the poll.
+        """
+        vm = None
+        try:
+            if not dogma_data.load():
+                # No table (missing or corrupt bundle) is an ANSWER: bail once
+                # instead of letting simulate raise DogmaUnavailable per hull.
+                self._post_ui(self._apply_fleet_stats, key, None)
+                return
+            vm = fleet_stats.aggregate(
+                ship_counts,
+                # The doctrine OBJECT is deliberately not handed over: its
+                # member list is live store state the Tk thread may rewrite, so
+                # the ordering was resolved into doctrine_ids up there and that
+                # plain map is authoritative here.
+                lambda hull: fleet_stats.fit_for_hull(
+                    hull, None, fits_by_hull, doctrine_ids),
+                lambda parsed: fit_sim_stats.simulate(
+                    parsed, links=tier, disciplines=disciplines,
+                    name_of=self.type_catalog.resolve_name),
+                self.type_catalog.resolve_name,
+                tier=tier, disciplines=disciplines)
+        except Exception:
+            log.debug("[hud] fleet stats aggregate failed", exc_info=True)
+            vm = None
+        self._post_ui(self._apply_fleet_stats, key, vm)
+
+    def _apply_fleet_stats(self, key, vm):
+        """Store one aggregate for the HUD to read. Tk thread only.
+
+        A result whose key is no longer the current one is DROPPED: the fleet
+        (or the doctrine, or the fit library) moved while the worker ran, and a
+        newer spawn owns the answer. Dropping is safe precisely because the key
+        is set at spawn time -- there is always a live computation for the
+        current key, or a fresh one on the next poll."""
+        if key != getattr(self, "_fleet_stats_key", None):
+            return
+        self._fleet_stats_vm = vm
 
     def _group_of_safe(self, type_id):
         """group_id resolver that never raises (network failure -> None)."""

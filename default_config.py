@@ -286,6 +286,9 @@ DEFAULT_CONFIG = {
         "lock_layout": False,
         "snap_enabled": True,
         "opacity": 0.92,
+        # The Fleet tile's estimated DPS/volley row (doctrine fits, all-V
+        # skills). Opt-in like every tile: it costs a fit simulation per hull.
+        "fleet_stats": False,
         "tiles": {
             "battle": {"enabled": False},
             "fleet": {"enabled": False},

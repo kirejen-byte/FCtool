@@ -201,6 +201,21 @@ _FONT_ROW = ("Consolas", 8)
 #   The standard 6-bucket board (no overflow) is 3 grid rows: 79 -> 37 px of
 #   slack.
 #
+# THE DPS/VOLLEY ROW (2026-09-07, default OFF) costs 13 linespace + 1 pady = 14.
+#   Owner's 160x136 tile (116 px body): worst case 93 + 14 = 107, still fits.
+#   The SHIPPED default 180x120 (100 px body) carries the worst case with 7 px
+#   of slack, so worst case + the row = 107 OVERFLOWS it by 7 px and the
+#   propagation guard clips the links strip. Recorded, not cured: the size pin
+#   stays (180, 120) by owner decision, the row is opt-in, and only a fleet
+#   with seven distinct bucket classes reaches it -- the standard 3-grid-row
+#   board plus the row is 93 against 100 and fits.
+# WIDTH of the row, MEASURED at Consolas 8:
+#   "DPS 41.2k · Vly 138k (31/35)" = 168 px / 28 chars
+#   "DPS 41.2k (31/35)"            = 102 px / 17 chars (the volley-less form)
+#   The whole line fits the 180 px default (178 px available) but NOT the
+#   owner's 160 px tile (158) -- which is why ``fleet_stats_text`` drops the
+#   volley WHOLE rather than truncating a number. See its fit ladder.
+#
 # WIDTH, against the 160 px body:
 #   comp cell   80 px column (two uniform halves) - 2 padx = 78 available;
 #               FLEET_ROW_CHARS=12 x 6 px         = 72     ->  6 px of slack
@@ -385,6 +400,11 @@ def default_info_tiles_config() -> dict:
         "lock_layout": False,
         "snap_enabled": True,
         "opacity": DEFAULT_OPACITY,
+        # The fleet tile's DPS/volley row. Feature-scoped rather than nested
+        # under tiles.fleet: it is one extra LINE on a tile the owner already
+        # chose, and it costs a fit simulation per hull, so it gets its own
+        # opt-in and follows the tile-by-tile enable policy (default OFF).
+        "fleet_stats": False,
         "tiles": {
             "battle": {"enabled": False},
             "fleet": {"enabled": False},
@@ -637,11 +657,19 @@ class FleetCompModel:
     there is nothing tracked -- a separate, nested-frozen component so the
     renderer's ``==`` diff still covers it, and so a fleet snapshot the ESI
     gate rejects can still carry one: charge tracking is CHAT-sourced and owes
-    ESI nothing (see ``build_links_model``)."""
+    ESI nothing (see ``build_links_model``).
+
+    `stats` is the fleet DPS/volley rollup (``fleet_stats.FleetStatsVM``) or
+    None -- None whenever the setting is off, no aggregate has been computed
+    yet, or the last one failed. Deliberately DUCK-TYPED: this module imports
+    nothing from the fit-sim stack (the layering rule), it only reads the VM's
+    fields. Like `links` it must stay FROZEN and hashable, because the whole
+    model IS the renderer's dirty key."""
     status: str
     total: int
     rows: tuple
     links: "LinksVM | None" = None
+    stats: object = None
 
 
 _SHARED_CATALOG = None
@@ -821,6 +849,160 @@ def fleet_row_text(row) -> str:
     if len(label) > room:
         label = label[:room - len(FLEET_ELLIPSIS)] + FLEET_ELLIPSIS
     return prefix + label
+
+
+# ── fleet DPS / volley: one row, off an injected aggregate ──────────────────
+# The VM (``fleet_stats.FleetStatsVM``) is DUCK-TYPED here on purpose -- this
+# module imports nothing from the fit-sim stack, exactly as it imports no
+# preview module and no charge tracker. It reads fields; it does not construct.
+#
+# The row is a DOCTRINE-ASSUMPTION number, never a live measurement, and the
+# battle tile's honesty rule applies: the text never claims otherwise, the
+# ``(modeled/total)`` suffix says how much of the fleet it covers, and the
+# tooltip states the assumption in words.
+
+#: How many unmodeled hull names the tooltip lists before it summarises the
+#: rest. Six lines of "no fit" is already more than a glance can use, and the
+#: tooltip is a hover over a 180 px tile.
+FLEET_TIP_HULLS = 6
+FLEET_STATS_PARTIAL_MARK = "~"
+
+
+def compact_number(value) -> str:
+    """``41200 -> "41.2k"``, ``138000 -> "138k"``, ``1_240_000 -> "1.24M"``.
+
+    Three significant figures at most, because the row has ~25 characters for
+    two numbers and a count, and the third digit of a fleet DPS figure is
+    noise next to the assumption the whole number rests on. Junk answers
+    ``"0"`` rather than raising -- this runs inside the 1 Hz repaint."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return "0"
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+    for divisor, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if amount >= divisor:
+            scaled = amount / divisor
+            if scaled < 10:
+                return f"{sign}{scaled:.2f}{suffix}"
+            if scaled < 100:
+                return f"{sign}{scaled:.1f}{suffix}"
+            return f"{sign}{scaled:.0f}{suffix}"
+    return f"{sign}{amount:.0f}"
+
+
+def _fleet_stats_parts(vm) -> tuple:
+    """``(head, body, tail)`` of the stats row -- see ``fleet_stats_text``."""
+    mark = FLEET_STATS_PARTIAL_MARK if getattr(vm, "partial", False) else ""
+    head = f"{mark}DPS {compact_number(getattr(vm, 'dps', 0.0))}"
+    body = f"Vly {compact_number(getattr(vm, 'volley', 0.0))}"
+    tail = (f"({_as_int(getattr(vm, 'modeled', 0), 0)}/"
+            f"{_as_int(getattr(vm, 'total', 0), 0)})")
+    return head, body, tail
+
+
+def _fleet_stats_compose(head: str, body: str, tail: str) -> str:
+    """``DPS 41.2k · Vly 138k (31/35)``, with empty parts dropping out rather
+    than leaving a dangling separator."""
+    left = " · ".join(part for part in (head, body) if part)
+    return " ".join(part for part in (left, tail) if part)
+
+
+def fleet_stats_text(vm, max_width=None, measure=None) -> str:
+    """``DPS 41.2k · Vly 138k (31/35)`` -- or ``""`` when there is nothing.
+
+    ``""`` for a missing VM AND for a VM with nothing modeled: a row reading
+    ``DPS 0 · Vly 0 (0/35)`` says only that the fit library has not caught up
+    with the fleet, and it costs the tile a line it does not have. The
+    tooltip's "no fit" list is where that gap is stated.
+
+    THE FIT LADDER, in order, because the row does not fit the shipped tile at
+    full length (measured: the whole line wants ~28 chars, and a 180 px tile
+    leaves ~29 while the owner's 160 px one leaves ~26 at Consolas 8's 6 px):
+
+    1. the whole line, when it measures within `max_width`;
+    2. the line WITHOUT the volley -- ``DPS 41.2k (31/35)``, 17 chars, which
+       fits even a floor-width 120 px tile. A number is dropped WHOLE or not
+       at all: ``Vly 13…`` reads as a volley of thirteen thousand, which is a
+       wrong number rather than a missing one, and this row is read at a
+       glance during a fight;
+    3. only then ``_fit_to_width`` on the DPS half, keeping the ``(31/35)``
+       tail -- the coverage suffix is the decision-critical token, because a
+       DPS figure whose coverage you cannot see is worse than a short one.
+
+    Every degrade direction (no measurer, unrealised width, a measurer that
+    raises) returns the whole line and lets the frame clip it -- ``_fit_to_
+    width``'s contract, kept here by hand because this fit is a ladder rather
+    than a single truncation. The leading ``~`` marks an aggregate containing
+    partly-unmodeled fits and is never cut.
+    """
+    if vm is None:
+        return ""
+    if _as_int(getattr(vm, "modeled", 0), 0) <= 0:
+        return ""
+    head, body, tail = _fleet_stats_parts(vm)
+    full = _fleet_stats_compose(head, body, tail)
+    width = _as_int(max_width, 0)
+    if width <= 1 or not callable(measure):
+        return full
+    try:
+        if measure(full) <= width:
+            return full
+        short = _fleet_stats_compose(head, "", tail)
+        if measure(short) <= width:
+            return short
+    except Exception:
+        return full
+    fitted = _fit_to_width(head, width, measure,
+                           lambda text: _fleet_stats_compose(text, "", tail))
+    return short if fitted is None else fitted
+
+
+def fleet_stats_tip(vm) -> str:
+    """Hover copy for the stats row: the assumption, then the gaps.
+
+    Line 1 is the honesty line and is never omitted -- the number is computed
+    from DOCTRINE fits at All-V skills with a chosen link tier, not from what
+    the fleet is actually flying, and an FC reading a DPS figure off a HUD is
+    entitled to know that before he plans around it. The ``no fit`` list names
+    the hulls the number does NOT include (capped, with a count for the rest);
+    the partial line explains the ``~``.
+    """
+    if vm is None:
+        return ""
+    tier = str(getattr(vm, "tier", "") or "none")
+    disciplines = str(getattr(vm, "disciplines", "") or "")
+    links = f"{tier}/{disciplines}" if disciplines and tier != "none" else tier
+    lines = [f"Assumes doctrine fits, all-V skills; links: {links}",
+             f"Avg EHP {compact_number(getattr(vm, 'ehp_avg', 0.0))} "
+             f"({_as_int(getattr(vm, 'modeled', 0), 0)} of "
+             f"{_as_int(getattr(vm, 'total', 0), 0)} pilots modelled)"]
+    if getattr(vm, "partial", False):
+        lines.append(f"{FLEET_STATS_PARTIAL_MARK} some fits carry modules the "
+                     f"simulator does not model")
+    hulls = [str(name) for name in (getattr(vm, "unmodeled_hulls", ()) or ())]
+    if hulls:
+        shown = ", ".join(hulls[:FLEET_TIP_HULLS])
+        rest = len(hulls) - FLEET_TIP_HULLS
+        lines.append(f"No fit: {shown}" + (f" (+{rest} more)"
+                                           if rest > 0 else ""))
+    return "\n".join(lines)
+
+
+def fleet_stats_width(frame_width) -> int:
+    """Pixels the stats row's TEXT gets out of the content frame's width.
+
+    The label is ``_FLEET_TIGHT`` (no border, no internal padding) gridded with
+    ``_FLEET_CELL_PADX``, so only that padding comes off the top. ``0`` means
+    "not realised", which every caller reads as "measure nothing" -- the same
+    degrade contract ``_intel_text_width`` keeps."""
+    width = _as_int(frame_width, 0)
+    if width <= 1:
+        return 0
+    return max(0, width - sum(_FLEET_CELL_PADX))
 
 
 # ── links: the command-burst COVERAGE line ──────────────────────────────────
@@ -1748,9 +1930,15 @@ class _TileRenderer:
     from a torn-down widget can never convince the renderer that a failed
     write landed (the guarded-setter invariant the tile chrome also keeps)."""
 
+    #: The font ``_font()`` builds for this renderer's text measurements.
+    #: Per-CLASS because two renderers measure now (intel rows, the fleet
+    #: stats row) and they answer to different constants.
+    ROW_FONT = _FONT_ROW
+
     def __init__(self, parent, palette: dict):
         self._palette = dict(palette or PALETTE)
         self._last = None
+        self._font_obj = None
         self.frame = tk.Frame(parent, width=1, height=1,
                               bg=self._palette.get("BG_DARK",
                                                    ui_theme.BG_DARK))
@@ -1783,6 +1971,40 @@ class _TileRenderer:
     def _draw(self, model):
         raise NotImplementedError
 
+    # -- measurement (shared by every renderer that FITS its text) ----------
+
+    def _frame_size(self) -> tuple:
+        """The content frame's CURRENT laid-out size in px.
+
+        A frame that has never been laid out answers ``1x1`` and a destroyed
+        one answers ``(0, 0)``; both are "unrealised" to every consumer, which
+        then degrades to the pack-them-all/no-truncation behaviour rather than
+        fitting against a number that means nothing."""
+        try:
+            return (int(self.frame.winfo_width()),
+                    int(self.frame.winfo_height()))
+        except tk.TclError:
+            return (0, 0)
+
+    def _font(self):
+        """This renderer's OWN ``tkfont.Font`` for ``ROW_FONT``, built lazily.
+
+        PER-INSTANCE, never module-level: a Font belongs to the interpreter
+        that made it, so a shared one would hand a destroyed interpreter's font
+        to the next tile (and, under pytest, to the next root) -- the same rule
+        the module header states for the plain font tuples, and the same one
+        ``preview_tile._label_font`` keeps. A FAILURE is deliberately not
+        cached: the Tk failure class on this box is transient (the AV-filter
+        trap cured in tests/conftest.py), and a cached degraded font would
+        leave the tile un-fitted forever."""
+        if self._font_obj is None:
+            try:
+                self._font_obj = tkfont.Font(root=self.frame,
+                                             font=self.ROW_FONT)
+            except (tk.TclError, RuntimeError):
+                return None
+        return self._font_obj
+
 
 class BattleRenderer(_TileRenderer):
     """Killed-vs-lost, straight off the shared ``BattleLedgerView``."""
@@ -1814,8 +2036,11 @@ class BattleRenderer(_TileRenderer):
 
 class FleetRenderer(_TileRenderer):
     """Fleet size + abbreviated inv-group buckets in TWO columns, each cell
-    hovering its hull breakdown, with the command-burst coverage line
-    underneath."""
+    hovering its hull breakdown, an optional fleet DPS/volley line, and the
+    command-burst coverage line underneath."""
+
+    #: The comp/stats font, not the pooled-row one (see ``_TileRenderer``).
+    ROW_FONT = _FLEET_FONT_ROW
 
     def __init__(self, parent, palette: dict):
         super().__init__(parent, palette)
@@ -1839,7 +2064,71 @@ class FleetRenderer(_TileRenderer):
                                FLEET_MAX_ROWS + 1)
         self._grid.frame.grid(row=1, column=0, columnspan=COMP_COLUMNS,
                               sticky="ew")
+        # The DPS/volley line joins the ROWS container, never ``tile.body`` or
+        # ``self.frame``: ``pack`` appends, so anything loose in the body would
+        # land UNDER the links coverage strip (the container rule this
+        # renderer's two siblings exist for). It is gridded after the comp
+        # grid, inside the same two-column span the head uses.
+        self._stats = tk.Label(self._rows_holder, text="",
+                               font=_FLEET_FONT_ROW, bg=bg,
+                               fg=self._palette.get("FG_DIM"), anchor="w",
+                               **_FLEET_TIGHT)
+        #: Whether ``_stats`` is currently gridded. The row is absent -- not
+        #: blank -- when there is nothing to say, because a blank 14 px row
+        #: costs the comp grid a bucket on a 120 px-tall tile.
+        self._stats_shown = False
+        # Attached ONCE, with empty copy (an empty tip draws no box), and
+        # re-worded with ``update_tooltip`` afterwards -- ``attach_tooltip``
+        # binds with ``add="+"``, so re-attaching per repaint would stack a
+        # handler set every second (``_CompGrid``'s rule, same reason).
+        # topmost=True or the tip stacks BELOW the HWND_TOPMOST tile and is
+        # invisible -- the round-3 owner report.
+        attach_tooltip(self._stats, "", topmost=True)
         self._links = _LinksPanel(self.frame, self._palette)
+
+    def _key(self, model):
+        # The frame's WIDTH rides the key for the same reason the intel tile's
+        # size does: the stats row is fitted to the current width and a RESIZE
+        # moves nothing the base class diffs, so without this a dragged corner
+        # would leave stale truncation on screen until the fleet changed. The
+        # key still latches only after a successful draw.
+        return (model, self._frame_size())
+
+    def _stats_row(self, model):
+        """``(text, tooltip)`` for the DPS/volley line, fitted to the tile.
+
+        Both empty whenever there is nothing to show -- no aggregate, or one
+        that modelled nothing. No font or no realised width means no measurer,
+        and ``fleet_stats_text`` then returns the whole line: clipped beats
+        truncated against a width nobody could measure (``_fit_to_width``'s
+        contract)."""
+        vm = getattr(model, "stats", None)
+        if vm is None:
+            return "", ""
+        width, _height = self._frame_size()
+        font = self._font()
+        available = fleet_stats_width(width)
+        measure = font.measure if (font is not None and available > 0) else None
+        return fleet_stats_text(vm, available, measure), fleet_stats_tip(vm)
+
+    def _render_stats(self, model):
+        text, tip = self._stats_row(model)
+        if not text:
+            if self._stats_shown:
+                self._stats.grid_forget()
+                self._stats_shown = False
+            update_tooltip(self._stats, "")
+            return
+        self._stats.configure(text=text)
+        update_tooltip(self._stats, tip)
+        if not self._stats_shown:
+            # FULL option set on every grid(): Tk RETAINS unspecified options
+            # across a re-grid, and grid_forget() discards them -- the
+            # stale-columnspan class of bug.
+            self._stats.grid(row=2, column=0, columnspan=COMP_COLUMNS,
+                             sticky="w", padx=_FLEET_CELL_PADX,
+                             pady=_FLEET_CELL_PADY)
+            self._stats_shown = True
 
     def _draw(self, model):
         if model.status:
@@ -1853,6 +2142,10 @@ class FleetRenderer(_TileRenderer):
                 (fleet_row_text(row),
                  "FG_DIM" if row[0] == OTHER_LABEL else "FG_TEXT",
                  fleet_group_tip(row)) for row in model.rows])
+        # Also outside the status branch below, and for its own reason: a
+        # gated comp rollup (not boss / no snapshot) carries no `stats`
+        # either, so the row simply has nothing to draw and removes itself.
+        self._render_stats(model)
         # Deliberately OUTSIDE the status branch: the coverage report is
         # chat-sourced, so a tile gated to "not fleet boss" still carries one.
         self._links.render(getattr(model, "links", None))
@@ -1897,7 +2190,6 @@ class IntelRenderer(_TileRenderer):
         self._pool = _LabelPool(self.frame, INTEL_SHOW, self._palette,
                                 on_click=self._row_clicked)
         self._head_packed = False
-        self._font_obj = None
 
     def set_row_click(self, callback) -> None:
         """Wire (or clear) what a click on a row means. Tk thread."""
@@ -1930,37 +2222,6 @@ class IntelRenderer(_TileRenderer):
             except Exception:
                 log.debug("info tiles: intel row click failed", exc_info=True)
         return "break"
-
-    def _frame_size(self) -> tuple:
-        """The content frame's CURRENT laid-out size in px.
-
-        A frame that has never been laid out answers ``1x1`` and a destroyed
-        one answers ``(0, 0)``; both are "unrealised" to every consumer, which
-        then degrades to the pack-them-all/no-truncation behaviour rather than
-        fitting against a number that means nothing."""
-        try:
-            return (int(self.frame.winfo_width()),
-                    int(self.frame.winfo_height()))
-        except tk.TclError:
-            return (0, 0)
-
-    def _font(self):
-        """This renderer's OWN ``tkfont.Font`` for the row font, built lazily.
-
-        PER-INSTANCE, never module-level: a Font belongs to the interpreter
-        that made it, so a shared one would hand a destroyed interpreter's font
-        to the next tile (and, under pytest, to the next root) -- the same rule
-        the module header states for the plain font tuples, and the same one
-        ``preview_tile._label_font`` keeps. A FAILURE is deliberately not
-        cached: the Tk failure class on this box is transient (the AV-filter
-        trap cured in tests/conftest.py), and a cached degraded font would
-        leave the tile un-fitted forever."""
-        if self._font_obj is None:
-            try:
-                self._font_obj = tkfont.Font(root=self.frame, font=_FONT_ROW)
-            except (tk.TclError, RuntimeError):
-                return None
-        return self._font_obj
 
     def _row_height(self, font) -> int:
         """One packed row's pitch: the font's own line height plus the Label's
@@ -2438,10 +2699,19 @@ class InfoTileController:
     Tk thread only (the distance worker is the single exception and never
     reaches back except through ``post_ui``)."""
 
-    def __init__(self, root, host: HudHost, tile_window_cls=InfoTileWindow):
+    def __init__(self, root, host: HudHost, tile_window_cls=InfoTileWindow,
+                 fleet_stats_snapshot=None):
         self._root = root
         self._host = host
         self._tile_cls = tile_window_cls
+        #: ``() -> FleetStatsVM | None`` -- the fleet DPS/volley aggregate the
+        #: host recomputes off-thread. A PULL, deliberately: the beat reads one
+        #: already-computed frozen VM, so the 1 Hz tick never triggers a
+        #: simulation (spec section 5.4, "no per-tick compute"). Absent,
+        #: non-callable or raising all read as "no aggregate" -- the row then
+        #: simply does not appear, which is the honest inert state for a number
+        #: nobody could compute.
+        self._fleet_stats_snapshot = fleet_stats_snapshot
         self._tiles: dict = {}
         self._renderers: dict = {}
         self._enabled = False
@@ -2947,7 +3217,24 @@ class InfoTileController:
             members, ship_counts, total, authenticated, fleet_id, is_boss,
             resolve_type_name=lambda tid: offline_type_name(tid, catalog),
             resolve_group_name=lambda tid: offline_group_name(tid, catalog))
-        return replace(model, links=self._links_model())
+        return replace(model, links=self._links_model(),
+                       stats=self._stats_model())
+
+    def _stats_model(self):
+        """The fleet DPS/volley aggregate, or None when the row is off.
+
+        The SETTING is checked here rather than in the renderer so a disabled
+        row costs one dict read per beat and never reaches the fitter -- and
+        so the model itself (the renderer's dirty key) changes the instant the
+        checkbox moves, which is what makes the popup's live-apply visible on
+        the next tick."""
+        if not self._fleet_stats_enabled():
+            return None
+        return _call(self._fleet_stats_snapshot, default=None)
+
+    def _fleet_stats_enabled(self) -> bool:
+        return bool(self._block().get(
+            "fleet_stats", default_info_tiles_config()["fleet_stats"]))
 
     def _links_model(self):
         """The command-burst coverage line, or None when nothing is tracked.
@@ -3238,6 +3525,9 @@ _TIP_REFERENCE = ("Measure jumps from this system. Blank = automatic: your "
 _TIP_OPACITY = "Tile opacity, applied to every tile."
 _TIP_SNAP = "Tiles stick to each other, to preview tiles and to screen edges."
 _TIP_LOCK = "Freeze tile positions. The close glyph still works."
+_TIP_FLEET_STATS = ("Add estimated fleet DPS and volley to the Fleet tile. "
+                    "Computed from your doctrine fits at all-V skills -- not "
+                    "from what the fleet is actually flying.")
 _TIP_ARRANGE = "Re-place the visible tiles on the default grid."
 _TIP_RESET = "Forget saved positions and re-place the tiles."
 _TIP_MATCH_PREVIEW = ("Resize every tile to the FCPreview tiles' current "
@@ -3374,6 +3664,9 @@ def open_hud_settings(root, controller, host):
             "max_jumps", DEFAULT_MAX_JUMPS))),
         "reference_system": tk.StringVar(win, str(intel_block().get(
             "reference_system", "") or "")),
+        "fleet_stats": tk.BooleanVar(win, bool(current.get(
+            "fleet_stats",
+            default_info_tiles_config()["fleet_stats"]))),
     }
     for key in TILE_SPECS:
         tiles = current.get("tiles") if isinstance(current.get("tiles"),
@@ -3403,6 +3696,15 @@ def open_hud_settings(root, controller, host):
         # Clamped at the STORE, never trusted from the widget: a Spinbox's
         # from_/to bounds its arrows only, and typed text arrives verbatim.
         current_block["opacity"] = _clamp_opacity(variables["opacity"].get())
+        _call(host.save_config)
+        controller.tick()
+
+    def apply_fleet_stats(*_a):
+        """The Fleet tile's DPS/volley row. Live-apply like every other box:
+        the flag is read by ``_fleet_model`` on the very next beat, and
+        ``tick()`` makes that beat immediate."""
+        current_block = block()
+        current_block["fleet_stats"] = bool(variables["fleet_stats"].get())
         _call(host.save_config)
         controller.tick()
 
@@ -3438,6 +3740,12 @@ def open_hud_settings(root, controller, host):
         _check(body, variables[f"tile_{key}"],
                f"  {TILE_SPECS[key]['title']} tile",
                _TIP_TILE).pack(anchor="w")
+        if key == "fleet":
+            # Indented one level under its own tile: it is a row ON the fleet
+            # tile, not a tile of its own, and it costs a fit simulation per
+            # hull -- so it gets its own opt-in beside the tile that carries it.
+            _check(body, variables["fleet_stats"], "    DPS / volley row",
+                   _TIP_FLEET_STATS).pack(anchor="w")
 
     grid = tk.Frame(body, bg=ui_theme.BG_DARK)
     grid.pack(fill="x", pady=(8, 4))
@@ -3503,7 +3811,10 @@ def open_hud_settings(root, controller, host):
                  ("max_jumps", str(intel.get("max_jumps",
                                              DEFAULT_MAX_JUMPS))),
                  ("reference_system", str(intel.get("reference_system", "")
-                                          or ""))]
+                                          or "")),
+                 ("fleet_stats", bool(found.get(
+                     "fleet_stats",
+                     default_info_tiles_config()["fleet_stats"])))]
         for key_name in TILE_SPECS:
             entry = (tiles.get(key_name)
                      if isinstance(tiles.get(key_name), dict) else {})
@@ -3528,6 +3839,7 @@ def open_hud_settings(root, controller, host):
                           ("opacity", apply_chrome),
                           ("snap_enabled", apply_chrome),
                           ("lock_layout", apply_chrome),
+                          ("fleet_stats", apply_fleet_stats),
                           ("max_jumps", apply_intel)):
         variables[name].trace_add("write", handler)
     for key in TILE_SPECS:
