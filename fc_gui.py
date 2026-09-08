@@ -1153,14 +1153,19 @@ class FCToolGUI:
         self._fleet_stats_key = None
         self._fleet_stats_after = None
         self._fleet_stats_failed_at = None
-        # Fit-detail stats readout (fit_sim_panel). The two StringVars are made
-        # ONCE and reused for every fit, so the tier/discipline pick survives
-        # re-selecting a fitting; the generation counter drops results whose
-        # request has been superseded. Seeded from config at first paint.
+        # Fit-detail stats readout (fit_sim_panel). The three StringVars are
+        # made ONCE and reused for every fit, so the tier/discipline/ammo pick
+        # survives re-selecting a fitting; the generation counter drops results
+        # whose request has been superseded. Seeded from config at first paint.
+        # The ammo var holds the combobox LABEL, never the stored mode —
+        # fit_sim_panel.ammo_label/ammo_mode own that translation.
         self._fit_sim_panel = None
         self._fit_sim_gen = 0
         self._fit_sim_tier_var = tk.StringVar(value="none")
         self._fit_sim_disc_var = tk.StringVar(value="auto")
+        self._fit_sim_ammo_var = tk.StringVar(
+            value=fit_sim_panel.ammo_label(
+                fit_sim_panel.DEFAULTS["sim_ammo"]))
         # Per-section ship-type expand state, keyed by id(content_frame) -> set of
         # open type_ids. Lets _populate_role_section preserve user expansions
         # across its frequent destroy/recreate rebuilds (every fleet poll and
@@ -15533,15 +15538,17 @@ class FCToolGUI:
         # Seeding the vars BEFORE constructing the panel is what makes the
         # comboboxes show the persisted pick without firing on_change — the
         # panel fires only on <<ComboboxSelected>>, never on a programmatic set.
-        enabled, tier, disciplines = fit_sim_panel.settings(self.config)
+        enabled, tier, disciplines, ammo = fit_sim_panel.settings(self.config)
         self._fit_sim_panel = None
         if enabled:
             self._fit_sim_tier_var.set(tier)
             self._fit_sim_disc_var.set(disciplines)
+            self._fit_sim_ammo_var.set(fit_sim_panel.ammo_label(ammo))
             self._fit_sim_panel = fit_sim_panel.FitStatsPanel(
                 parent, tier_var=self._fit_sim_tier_var,
                 disciplines_var=self._fit_sim_disc_var,
-                on_change=lambda: self._on_fit_sim_links_change(fit))
+                ammo_var=self._fit_sim_ammo_var,
+                on_change=lambda: self._on_fit_sim_option_change(fit))
             self._fit_sim_panel.frame.pack(anchor=tk.W, fill=tk.X, padx=10,
                                            pady=(0, 6))
             self._fit_sim_request(fit)
@@ -15636,14 +15643,14 @@ class FCToolGUI:
         if panel is None or fit is None:
             return
         self._fit_sim_gen += 1
-        _enabled, tier, disciplines = fit_sim_panel.settings(self.config)
+        _enabled, tier, disciplines, ammo = fit_sim_panel.settings(self.config)
         panel.set_pending()
         threading.Thread(
             target=self._fit_sim_worker,
-            args=(self._fit_sim_gen, fit.parsed, tier, disciplines),
+            args=(self._fit_sim_gen, fit.parsed, tier, disciplines, ammo),
             daemon=True).start()
 
-    def _fit_sim_worker(self, gen, parsed, tier, disciplines):
+    def _fit_sim_worker(self, gen, parsed, tier, disciplines, ammo):
         """Simulate ONE fit. WORKER THREAD.
 
         ``dogma_data.load()`` lives here and nowhere else on this path (the
@@ -15657,7 +15664,7 @@ class FCToolGUI:
             if dogma_data.load():
                 stats = fit_sim_stats.simulate(
                     parsed, name_of=self.type_catalog.resolve_name,
-                    links=tier, disciplines=disciplines)
+                    links=tier, disciplines=disciplines, ammo=ammo)
             else:
                 reason = "dogma table missing"
         except Exception:
@@ -15684,11 +15691,17 @@ class FCToolGUI:
         else:
             panel.set_result(stats)
 
-    def _on_fit_sim_links_change(self, fit):
-        """Persist the tier/discipline pick, then recompute. Tk thread only."""
+    def _on_fit_sim_option_change(self, fit):
+        """Persist the tier/discipline/ammo pick, then recompute. Tk thread.
+
+        The ammo combobox shows a LABEL and the config stores a MODE, so the
+        var goes back through ``fit_sim_panel.ammo_mode`` — writing the label
+        would hand ``fit_sim_stats.simulate`` a value it raises on."""
         fit_cfg = self.config.setdefault("fittings", {})
         fit_cfg["sim_links_tier"] = self._fit_sim_tier_var.get()
         fit_cfg["sim_links_disciplines"] = self._fit_sim_disc_var.get()
+        fit_cfg["sim_ammo"] = fit_sim_panel.ammo_mode(
+            self._fit_sim_ammo_var.get())
         try:
             self._save_config()
         except Exception:
@@ -28112,6 +28125,10 @@ class FCToolGUI:
 
         tier, disciplines = fleet_stats.sim_options(
             self.config.get("fittings"))
+        # The ammo policy lives in the SAME "fittings" block, and the readout
+        # owns its vocabulary — one validator, so the pane and the HUD row can
+        # never assume different ammunition for the same fit.
+        ammo = fit_sim_panel.settings(self.config)[3]
         try:
             doctrine = self._active_fleet_doctrine()
         except Exception:
@@ -28121,8 +28138,14 @@ class FCToolGUI:
         except Exception:
             revision = 0
 
+        # The ammo mode moves every DPS number, so it has to invalidate the
+        # aggregate the way the tier does. It rides as an extra element rather
+        # than a fleet_key field because it is not a FLEET fact: fleet_key
+        # owns the fleet/doctrine/library identity, and this is the readout's
+        # own setting travelling with it. Equality is all the key is ever used
+        # for (_apply_fleet_stats), so the shape is free.
         key = fleet_stats.fleet_key(ship_counts, getattr(doctrine, "id", None),
-                                    revision, tier, disciplines)
+                                    revision, tier, disciplines) + (ammo,)
         # An unchanged fleet spawns nothing — unless the last attempt FAILED
         # and its retry is due, which is the only way a transient no-table
         # answer heals (the key is latched at spawn: it suppresses forever).
@@ -28164,10 +28187,12 @@ class FCToolGUI:
             target=self._fleet_stats_worker,
             args=(key, ship_counts, fits_by_hull, doctrine_ids, dps_fit_ids,
                   tier, disciplines),
+            kwargs={"ammo": ammo},
             daemon=True).start()
 
     def _fleet_stats_worker(self, key, ship_counts, fits_by_hull,
-                            doctrine_ids, dps_fit_ids, tier, disciplines):
+                            doctrine_ids, dps_fit_ids, tier, disciplines,
+                            ammo=fit_sim_stats.AMMO_BEST_CLOSE):
         """Simulate one fit per hull and sum the fleet. WORKER THREAD.
 
         The body is ``fleet_stats.compute`` (pure, injected edges); this method
@@ -28177,12 +28202,17 @@ class FCToolGUI:
         ``type_catalog.resolve_name``, which is worker-only by contract because
         a cache miss makes a synchronous ESI call. ``compute`` never raises: a
         failure costs the row, never the poll.
+
+        ``ammo`` is BOUND into the injected ``simulate`` rather than threaded
+        through ``compute``: the aggregate has no opinion about ammunition, it
+        only sums what the simulator returns. It arrives as a KEYWORD with the
+        policy default, so the positional args stay the aggregate's own inputs.
         """
         self._post_ui(self._apply_fleet_stats, key, fleet_stats.compute(
             ship_counts, fits_by_hull, doctrine_ids, dps_fit_ids=dps_fit_ids,
             tier=tier, disciplines=disciplines, load=dogma_data.load,
             simulate=lambda parsed: fit_sim_stats.simulate(
-                parsed, links=tier, disciplines=disciplines,
+                parsed, links=tier, disciplines=disciplines, ammo=ammo,
                 name_of=self.type_catalog.resolve_name),
             hull_name=self.type_catalog.resolve_name))
 

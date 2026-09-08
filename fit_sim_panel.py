@@ -30,10 +30,17 @@ Load-bearing decisions, each a place this readout could be quietly wrong:
 * **A chargeless weapon still prints its range**, tagged ``(no charge)``: the
   gun is fitted and its reach is real, it just contributes no DPS. Dropping
   the row would make an empty-racked fit look unarmed rather than unloaded.
-* **The panel never computes on the Tk thread.** It has no simulate call and
-  no ``dogma_data`` import: the caller's worker does that and hands the result
-  to :meth:`FitStatsPanel.set_result`. ``set_pending`` / ``set_unavailable``
-  are the other two states, so the block is never blank and never stale.
+* **The panel never computes on the Tk thread.** It imports
+  ``fit_sim_stats`` for its VOCABULARY only — the ammo-mode names and nothing
+  else — and calls neither ``simulate`` nor ``dogma_data.load``: the caller's
+  worker does that and hands the result to :meth:`FitStatsPanel.set_result`.
+  ``set_pending`` / ``set_unavailable`` are the other two states, so the block
+  is never blank and never stale.
+* **The ammo mode is a LABEL on screen and a MODE in the config.**
+  ``best_close`` is honest wire vocabulary and unreadable in a combobox, so
+  :data:`AMMO_LABELS` translates in both directions and the two ends never
+  meet: nothing outside this module writes a raw mode into the widget, and
+  nothing writes a label into ``config["fittings"]["sim_ammo"]``.
 * **No ``grab_set``** — anywhere in this module. A grab in this one-Tk-process
   app deafens the FCPreview tiles (map/preview.md), and this is a passive
   readout inside an existing pane, not a dialog.
@@ -41,6 +48,7 @@ Load-bearing decisions, each a place this readout could be quietly wrong:
 from __future__ import annotations
 
 import fit_sim_links
+import fit_sim_stats
 
 # ===========================================================================
 # pure core
@@ -74,6 +82,34 @@ LINKS_TIP = ("The command-link tier this readout assumes, and the discipline "
 #: One-letter layer tags, in :data:`fit_sim_stats.LAYER_SPECS` order.
 LAYER_TAGS = {"shield": "S", "armor": "A", "hull": "H"}
 
+#: What each :data:`fit_sim_stats.AMMO_MODES` value reads as in the combobox.
+#: Keyed by mode so a mode the table does not name is a KeyError here rather
+#: than a silently unlabelled entry in the widget.
+AMMO_LABELS = {
+    fit_sim_stats.AMMO_BEST_CLOSE: "best close-range",
+    fit_sim_stats.AMMO_AS_FITTED: "as fitted",
+}
+
+#: The combobox's ``values``, in :data:`fit_sim_stats.AMMO_MODES` order.
+AMMO_VALUES = tuple(AMMO_LABELS[mode] for mode in fit_sim_stats.AMMO_MODES)
+
+#: What ``as_fitted`` puts on the Ammo row: there is nothing to name, and an
+#: absent row would read as "no ammo" rather than "the pilot's own".
+AMMO_AS_FITTED_TEXT = "as fitted"
+
+#: Marks a charge the ammo POLICY chose rather than one the pilot loaded.
+AMMO_ASSUMED_MARK = "(assumed)"
+
+#: Hover copy for the DPS row's raw total, completed with the number.
+DPS_RAW_TIP_PREFIX = "Raw total incl. drones: "
+
+#: How the DPS breakdown annotates the drone rule (spec §4.1.3): drones count
+#: toward the headline only on a primarily-drone ship, and a readout that
+#: showed a D number without saying which side of that line it fell on would
+#: be arithmetic that does not add up.
+DRONES_EXCLUDED_MARK = " excluded"
+DRONES_COUNTED_MARK = " counted: drone ship"
+
 
 #: Where the ``k`` band ends. Not 1e6: ``999,999`` would otherwise print as
 #: ``"1000.0k"``, which is a wrong-looking number rather than a rounded one.
@@ -82,7 +118,7 @@ _K_CEILING = 999_950
 
 
 #: The ``config["fittings"]`` keys this readout owns, and their defaults —
-#: the same three values ``default_config.DEFAULT_CONFIG`` seeds. Kept HERE as
+#: the same four values ``default_config.DEFAULT_CONFIG`` seeds. Kept HERE as
 #: well because ``_load_config`` does not deep-merge: an existing config.json
 #: that already carries a "fittings" block never gains the new keys, so every
 #: read has to carry the default with it.
@@ -90,21 +126,46 @@ DEFAULTS = {
     "sim_enabled": True,
     "sim_links_tier": fit_sim_links.TIER_NONE,
     "sim_links_disciplines": fit_sim_links.MODE_AUTO,
+    "sim_ammo": fit_sim_stats.AMMO_BEST_CLOSE,
 }
 
 
+def ammo_label(mode) -> str:
+    """A stored mode -> the combobox's reading of it.
+
+    An unknown mode answers with the DEFAULT's label rather than the raw
+    string: a readonly Combobox handed a value outside its ``values`` list
+    shows a blank box, which reads as a broken widget rather than a
+    hand-edited config.
+    """
+    return AMMO_LABELS.get(str(mode), AMMO_LABELS[DEFAULTS["sim_ammo"]])
+
+
+def ammo_mode(label) -> str:
+    """A combobox reading -> the mode to store. The inverse of
+    :func:`ammo_label`, and equally unwilling to pass junk through: anything
+    unrecognised falls back to the default rather than being written into the
+    config, where ``fit_sim_stats.simulate`` would later raise on it."""
+    for mode, text in AMMO_LABELS.items():
+        if text == label:
+            return mode
+    return DEFAULTS["sim_ammo"]
+
+
 def settings(config) -> tuple:
-    """``(enabled, tier, disciplines)`` out of one app-config dict.
+    """``(enabled, tier, disciplines, ammo)`` out of one app-config dict.
 
     Takes the config BY VALUE on every call and keeps nothing: the app replaces
     its config dict wholesale when settings are saved, so anything that held a
     reference would read from an orphan (CODEBASE_MAP, ``_save_settings``).
 
     Garbage — a missing block, a non-dict, a null, an empty string, or a value
-    outside the tier/discipline vocabulary — falls back to :data:`DEFAULTS`
-    rather than raising: a hand-edited config must not be able to stop the
-    fittings pane from rendering, nor hand the Tk shell a Combobox value its
-    ``values`` list doesn't contain.
+    outside the tier/discipline/ammo vocabulary — falls back to
+    :data:`DEFAULTS` rather than raising: a hand-edited config must not be able
+    to stop the fittings pane from rendering, nor hand the Tk shell a Combobox
+    value its ``values`` list doesn't contain, nor reach
+    ``fit_sim_stats.simulate``, which raises ``ValueError`` on an unknown ammo
+    mode.
     """
     block = config.get("fittings") if isinstance(config, dict) else None
     if not isinstance(block, dict):
@@ -116,8 +177,11 @@ def settings(config) -> tuple:
                        or DEFAULTS["sim_links_disciplines"])
     if disciplines not in fit_sim_links.DISCIPLINE_MODES:
         disciplines = DEFAULTS["sim_links_disciplines"]
+    ammo = str(block.get("sim_ammo") or DEFAULTS["sim_ammo"])
+    if ammo not in fit_sim_stats.AMMO_MODES:
+        ammo = DEFAULTS["sim_ammo"]
     return (bool(block.get("sim_enabled", DEFAULTS["sim_enabled"])),
-            tier, disciplines)
+            tier, disciplines, ammo)
 
 
 def format_number(value) -> str:
@@ -196,6 +260,81 @@ def format_weapon_range(row) -> str:
     return line
 
 
+def format_dps_breakdown(stats) -> str:
+    """``"(T 507 · M 0 · D 99 excluded)"`` — the split, and the drone verdict.
+
+    The headline DPS is ``dps_total``, which under the owner's rule (spec
+    §4.1.3) EXCLUDES drones unless the ship is primarily a drone ship. The
+    three components are always shown, so without a word beside the D number
+    the row would be visibly bad arithmetic — 507 + 0 + 99 next to a headline
+    of 606 or of 507, with nothing saying which. The annotation is that word:
+
+    * drones present but not counted -> ``D 99 excluded``;
+    * drones counted ALONGSIDE weapons -> ``D 300 counted: drone ship``, the
+      surprising case (the headline is bigger than the guns);
+    * drones counted on a fit with no weapon DPS, or no drones at all -> no
+      annotation, because nothing about the sum needs explaining.
+    """
+    drone = float(getattr(stats, "dps_drone", 0.0) or 0.0)
+    weapons = (float(getattr(stats, "dps_turret", 0.0) or 0.0)
+               + float(getattr(stats, "dps_missile", 0.0) or 0.0))
+    mark = ""
+    if drone > 0:
+        if not getattr(stats, "drones_counted", False):
+            mark = DRONES_EXCLUDED_MARK
+        elif weapons > 0:
+            mark = DRONES_COUNTED_MARK
+    return (f"(T {format_number(stats.dps_turret)}"
+            f" · M {format_number(stats.dps_missile)}"
+            f" · D {format_number(stats.dps_drone)}{mark})")
+
+
+def weapon_group_label(stats, weapon_type_id) -> str:
+    """``"7× 800mm Repeating Cannon II"`` for one weapon type id.
+
+    The count comes from the ``ranges`` rows, which are the only place the fit
+    is counted — :attr:`fit_sim_stats.FitStats.ammo_assumed` carries type ids
+    and a charge name, deliberately, so nothing is recomputed here. A weapon
+    with no range row (it cannot normally happen: the policy only chooses for
+    weapons the simulation also ranged) degrades to its id rather than
+    dropping the line, because the ASSUMPTION is the thing worth showing.
+    """
+    for row in (getattr(stats, "ranges", None) or ()):
+        if int(getattr(row, "type_id", -1)) == int(weapon_type_id):
+            return f"{int(row.count)}× {row.name}"
+    return f"type {int(weapon_type_id)}"
+
+
+def format_ammo_lines(stats) -> list:
+    """The Ammo row's lines — one per assumed weapon group, or the mode.
+
+    ``as_fitted`` states itself in one line: the numbers came from the pilot's
+    own charges, and an ABSENT row would read as "no ammo" rather than "not
+    assumed". ``best_close`` names every assumption instead, and contributes
+    nothing when it assumed nothing (a weaponless fit) — the weapons it could
+    find no charge for are already an ``Unmodeled`` line, so listing them here
+    too would double-report one gap.
+    """
+    if str(getattr(stats, "ammo", "")) != fit_sim_stats.AMMO_BEST_CLOSE:
+        return [AMMO_AS_FITTED_TEXT]
+    return [f"{weapon_group_label(stats, weapon_id)}: {charge_name} "
+            f"{AMMO_ASSUMED_MARK}"
+            for weapon_id, _charge_id, charge_name
+            in (getattr(stats, "ammo_assumed", None) or ())]
+
+
+def dps_tip(stats) -> str:
+    """Hover copy for the DPS row: the total with EVERYTHING in it.
+
+    ``dps_raw_total`` is the number the drone rule may have taken drones out
+    of, so it is the one figure the row cannot show and the reader may still
+    want — an FC comparing a drone boat against a gunboat is comparing raw
+    output. It is a hover rather than a row because the headline is the policy
+    answer, and two totals side by side would make the pane ambiguous.
+    """
+    return f"{DPS_RAW_TIP_PREFIX}{format_number(stats.dps_raw_total)}"
+
+
 def format_links(stats) -> str:
     """``"max · shield"`` — the tier, then what ``auto`` actually resolved to.
 
@@ -220,17 +359,22 @@ def format_stats(stats) -> list:
     A fit with no weapons contributes no Range rows at all (rather than a
     "none" placeholder) — the module list above it already says the racks are
     empty. ``Unmodeled`` appears only when there is something to name.
+
+    DPS and Volley are the POLICY numbers (``dps_total`` / ``volley``, drones
+    in or out per the owner's rule), never the raw ones: one headline per
+    stat, and the raw total is a hover on the DPS row (:func:`dps_tip`). The
+    Ammo rows sit under Range because they qualify exactly those weapons.
     """
     mark = PARTIAL_MARK if stats.partial else ""
     rows = [
         ("DPS", f"{mark}{format_number(stats.dps_total)}  "
-                f"(T {format_number(stats.dps_turret)}"
-                f" · M {format_number(stats.dps_missile)}"
-                f" · D {format_number(stats.dps_drone)})"),
+                f"{format_dps_breakdown(stats)}"),
         ("Volley", f"{mark}{format_number(stats.volley)}"),
     ]
     for index, row in enumerate(stats.ranges or ()):
         rows.append(("Range" if index == 0 else "", format_weapon_range(row)))
+    for index, line in enumerate(format_ammo_lines(stats)):
+        rows.append(("Ammo" if index == 0 else "", line))
     rows.append(
         ("EHP", f"{format_number(stats.ehp_total)}  "
                 f"(S {format_number(stats.ehp_shield)}"
@@ -291,13 +435,16 @@ class FitStatsPanel:
 
     Ctor seams:
 
-    ``tier_var`` / ``disciplines_var``  the caller's ``tk.StringVar``s, created
+    ``tier_var`` / ``disciplines_var`` / ``ammo_var``
+                                        the caller's ``tk.StringVar``s, created
                                         ONCE and reused across fits so the
                                         pick survives re-selecting a fitting.
                                         The panel reads and displays them; it
                                         never persists anything itself.
-    ``on_change()``                     fired after a user pick in either
-                                        combobox — the caller persists the
+                                        ``ammo_var`` holds the LABEL, not the
+                                        mode (see :func:`ammo_label`).
+    ``on_change()``                     fired after a user pick in any of the
+                                        comboboxes — the caller persists the
                                         value and re-requests the simulation.
 
     Three states, and it is always in exactly one: ``set_pending`` (the worker
@@ -305,7 +452,8 @@ class FitStatsPanel:
     the simulation raised). The block is never left blank.
     """
 
-    def __init__(self, parent, *, tier_var, disciplines_var, on_change):
+    def __init__(self, parent, *, tier_var, disciplines_var, ammo_var,
+                 on_change):
         self._on_change = on_change
         #: The last rows :meth:`set_result` painted (``[]`` in the other two
         #: states) — the assertable twin of the widgets.
@@ -330,7 +478,14 @@ class FitStatsPanel:
             values=list(fit_sim_links.DISCIPLINE_MODES),
             state="readonly", width=7, font=_VALUE_FONT)
         self.disciplines_combo.pack(side=tk.LEFT, padx=(3, 0))
-        for combo in (self.tier_combo, self.disciplines_combo):
+        tk.Label(header, text="ammo", font=_VALUE_FONT, fg=FG_DIM,
+                 bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 3))
+        self.ammo_combo = ttk.Combobox(
+            header, textvariable=ammo_var, values=list(AMMO_VALUES),
+            state="readonly", width=15, font=_VALUE_FONT)
+        self.ammo_combo.pack(side=tk.LEFT)
+        for combo in (self.tier_combo, self.disciplines_combo,
+                      self.ammo_combo):
             combo.bind("<<ComboboxSelected>>", self._fire_change, add="+")
 
         self._grid = tk.Frame(self.frame, bg=BG_PANEL)
@@ -379,6 +534,8 @@ class FitStatsPanel:
                 attach_tooltip(name, RESIST_ORDER_TIP)
             elif group == "Links":
                 attach_tooltip(cell, links_tip(stats))
+            elif group == "DPS":
+                attach_tooltip(cell, dps_tip(stats))
 
     # ── internals ────────────────────────────────────────────────────────
     def _fire_change(self, _event=None):

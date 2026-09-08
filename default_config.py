@@ -335,6 +335,14 @@ DEFAULT_CONFIG = {
         # "shield" | "armor" | "both" | "none"). "auto" reads the fit's own
         # shield-vs-armor HP and boosts the tank the pilot actually built.
         "sim_links_disciplines": "auto",
+        # Which ammunition the numbers assume — one of
+        # fit_sim_stats.AMMO_MODES ("best_close" | "as_fitted").
+        # "best_close" is the owner's default (spec §4.1.1): most saved fits
+        # carry no inline charge at all, so "as_fitted" would report 0 DPS for
+        # a perfectly good fit. It picks the highest-DPS close-range non-T2
+        # charge FROM DATA, per weapon group, and the readout names what it
+        # chose. "as_fitted" keeps whatever the fit text loaded.
+        "sim_ammo": "best_close",
     },
     # NOTE: the REST of the "fittings" block is not seeded here — those keys are
     # created lazily (setdefault) by the Fittings/MOTD subsystem the first time
