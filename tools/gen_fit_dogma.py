@@ -25,7 +25,10 @@ FILTER (spec Appendix A.4 -- the recipe that measured 199.5 KiB):
 
 A type's ``a`` list carries only kept attributes whose value DIFFERS from the
 attribute default, so the table stores the type's own values and the reader
-fills defaults from ``attrs``.
+fills defaults from ``attrs``.  A type's ``mg`` key (``metaGroupID``: 1 Tech I,
+2 Tech II, 4 faction, ...) is likewise OPTIONAL -- the SDE publishes one for
+only a minority of types, and a type without one is simply left without the key
+(``dogma_data.type_meta`` reads that as 0).
 
 Modifier-row policy (Appendix A.8 items 4/5): a row whose ``func`` is
 ``EffectStopper`` (it carries no ``modifiedAttributeID``/``operation`` at all) or
@@ -160,6 +163,13 @@ ATTR_WHITELIST_NAMES = (
     "maxRange", "falloff", "barrageFalloff", "trackingSpeed",
     "maxVelocity", "explosionDelay", "aoeVelocity", "aoeCloudSize",
     "optimalSigRadius",
+    # charge selection: which ammo groups a weapon accepts, at which size, and
+    # the per-charge range multiplier the stats layer needs to rank them.  The
+    # five chargeGroup ids are NOT contiguous in this build (604/605/606/609/610
+    # -- 607/608 are something else entirely), which is exactly why the
+    # whitelist is by NAME.
+    "chargeGroup1", "chargeGroup2", "chargeGroup3", "chargeGroup4", "chargeGroup5",
+    "weaponRangeMultiplier",
     # drones / capacity
     "droneBandwidth", "droneBandwidthUsed", "maxActiveDrones", "droneCapacity",
     "capacity", "chargeSize", "chargeRate", "volume",
@@ -186,6 +196,7 @@ class TypeIndex(NamedTuple):
     """What one streaming pass over ``types.jsonl`` yields."""
     group: dict          # type_id -> group_id
     category: dict       # type_id -> category_id
+    meta: dict           # type_id -> metaGroupID, for the types that HAVE one
     skills: set          # category-16 type ids
     burst_modules: set   # group 1770
     burst_charges: set   # groups 1769/1772/1773/1774
@@ -227,12 +238,16 @@ def load_group_categories(lines: Iterable) -> dict:
 
 
 def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
-    """Stream ``types.jsonl`` into the per-type group/category maps plus the four
-    membership sets the filter needs.
+    """Stream ``types.jsonl`` into the per-type group/category/meta maps plus the
+    four membership sets the filter needs.
 
     Names are inspected (Mindlinks are identified by name) but never retained --
-    the table carries no names, and holding 53k of them would be pure waste."""
-    group, category = {}, {}
+    the table carries no names, and holding 53k of them would be pure waste.
+
+    ``metaGroupID`` is recorded ONLY where the SDE publishes one (most types --
+    39,176 of 53,000 in build 3494416 -- have none), so the assembly step can
+    omit the key rather than encode a made-up 0 for every type."""
+    group, category, meta = {}, {}, {}
     skills, burst_modules, burst_charges, mindlinks = set(), set(), set(), set()
     for rec in iter_jsonl(lines):
         tid = rec.get("_key")
@@ -242,6 +257,9 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
         cid = group_categories.get(gid, 0)
         group[tid] = gid
         category[tid] = cid
+        mgid = rec.get("metaGroupID")
+        if isinstance(mgid, int) and not isinstance(mgid, bool) and mgid:
+            meta[tid] = mgid
         if cid == SKILL_CATEGORY_ID:
             skills.add(tid)
         if gid == BURST_MODULE_GROUP_ID:
@@ -250,7 +268,8 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
             burst_charges.add(tid)
         if cid == IMPLANT_CATEGORY_ID and MINDLINK_NAME_NEEDLE in _en(rec.get("name")).lower():
             mindlinks.add(tid)
-    return TypeIndex(group, category, skills, burst_modules, burst_charges, mindlinks)
+    return TypeIndex(group, category, meta, skills, burst_modules, burst_charges,
+                     mindlinks)
 
 
 def select_types(index: TypeIndex, fit_type_ids: Iterable[int]) -> frozenset:
@@ -609,6 +628,9 @@ def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
             flat.append(aid)
             flat.append(value)
         rec = {"g": index.group[tid], "c": index.category[tid]}
+        meta_group = index.meta.get(tid)
+        if meta_group:                     # absent for most types: omit the key
+            rec["mg"] = meta_group
         if flat:
             rec["a"] = flat
         kept_ids = [e for e in effect_ids if str(e) in effects]

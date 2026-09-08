@@ -29,7 +29,7 @@ arrive as strings)::
     {"v": <sde build>,
      "attrs":   {"<id>": [default, stackable01, highIsGood01]},
      "types":   {"<id>": {"a": [attr_id, value, ...], "e": [effect_id, ...],
-                          "g": group_id, "c": category_id}},
+                          "g": group_id, "c": category_id, "mg": meta_group_id}},
      "effects": {"<id>": {"cat": n,
                           "m": [[domain, func, modifiedAttr, modifyingAttr,
                                  op, skillTypeID|null, groupID|null], ...]}},
@@ -41,9 +41,15 @@ A type's ``a`` list is a FLAT id/value sequence and carries only the attributes
 whose value differs from the attribute default, so :func:`type_attrs` returns
 the type's OWN values only -- defaults are supplied on read via
 ``attr_info(attr_id).default`` (the engine's ``attr(item, id)`` does the fill).
+``"mg"`` (metaGroupID: 1 Tech I, 2 Tech II, 4 faction, ...) is OPTIONAL -- the
+SDE publishes one for only a minority of types, so a type without one carries no
+key at all and :func:`type_meta` answers 0.
 
-Module-level state is exactly ``_table``, ``_loaded``, ``_lock`` and the one
-bounded LRU (``_type_cache``, 256 entries).  No append-only containers.
+Module-level state is exactly ``_table``, ``_loaded``, ``_lock``, the one
+bounded LRU (``_type_cache``, 256 entries) and the lazy group index
+(``_group_index``, at most one entry per group the table's types occupy).  Both
+caches are derived from the loaded table and are emptied whenever one is
+installed or dropped.  No append-only containers.
 """
 
 import functools
@@ -116,6 +122,14 @@ _table: dict | None = None
 _loaded = False
 _lock = threading.Lock()
 
+#: Lazy ``group_id -> (type_id, ...)`` index over the loaded table's ``g``
+#: fields, built once by :func:`types_in_group` and MUTATED IN PLACE (never
+#: rebound), so it is bounded by the table: at most one entry per group the
+#: table's types occupy, and the values partition the type set exactly once.
+#: Emptied by :func:`_install` and :func:`_reset_for_tests`, which is what keeps
+#: it from outliving the table it describes.
+_group_index: dict[int, tuple[int, ...]] = {}
+
 
 # --------------------------------------------------------------------------
 # loading
@@ -168,6 +182,7 @@ def _install(table: dict) -> None:
     _table = table
     _loaded = True
     _type_cache.cache_clear()
+    _group_index.clear()
 
 
 def load() -> bool:
@@ -294,6 +309,49 @@ def type_category(type_id: int) -> int:
     return int(_type_row(type_id)["c"])
 
 
+def type_meta(type_id: int) -> int:
+    """metaGroupID -- 1 Tech I, 2 Tech II, 3 storyline, 4 faction, 5 officer,
+    6 deadspace, 14 Tech III, 15 abyssal, 17/19 structure tech/faction,
+    52/53/54 SKINs.
+
+    ``0`` when the SDE publishes none for the type (the common case: most types
+    have no meta group at all), so a caller ranking "non-Tech-II" ammo can
+    compare against 2 without a presence check.  ``KeyError`` for an unknown
+    type, like the other ``type_*`` accessors."""
+    value = _type_row(type_id).get("mg")
+    return 0 if value is None else int(value)
+
+
+def types_in_group(group_id: int) -> tuple[int, ...]:
+    """Every type id the table carries in ``group_id``, sorted ascending; an
+    empty tuple when the table has none (an unknown group is not an error --
+    the table is a FILTERED slice of the SDE, so "no rows" is a normal answer).
+
+    Backed by :data:`_group_index`, built once per loaded table by one pass over
+    the ``types`` section.  An empty index means "not built yet"; the only table
+    that yields an empty one carries no types at all, so the re-pass it triggers
+    walks zero rows."""
+    if not _group_index:
+        _build_group_index()
+    return _group_index.get(int(group_id), ())
+
+
+def _build_group_index() -> None:
+    """Populate :data:`_group_index` from the loaded table.
+
+    Runs under ``_lock`` -- the same lock :func:`_install` is called beneath --
+    so a table swapped in mid-build can never leave entries describing the OLD
+    table behind, and concurrent first callers build exactly once."""
+    with _lock:
+        if _group_index:
+            return
+        buckets: dict[int, list[int]] = {}
+        for key, row in _require()["types"].items():
+            buckets.setdefault(int(row["g"]), []).append(int(key))
+        _group_index.update((gid, tuple(sorted(ids)))
+                            for gid, ids in buckets.items())
+
+
 def effect(effect_id: int) -> EffectDef | None:
     """The effect, or None when the table does not carry it."""
     row = _row("effects", effect_id)
@@ -384,3 +442,4 @@ def _reset_for_tests() -> None:
         _table = None
         _loaded = False
         _type_cache.cache_clear()
+        _group_index.clear()
