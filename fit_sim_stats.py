@@ -117,6 +117,16 @@ ATTR = {
     "falloff": 158,
     "maxVelocity": 37,                      # missile flight speed (m/s)
     "explosionDelay": 281,                  # missile flight time, in MS
+    # Ballistic Control Systems (and any other missile damage rig/implant) do
+    # NOT land on the launcher or the charge -- effect 763 (``missileDMGBonus``)
+    # is a ``charID``/``ItemModifier`` that multiplies attribute 212 on the
+    # CHARACTER item itself (verified against dogmaEffects.jsonl; default 1.0,
+    # non-stackable, so 3x BCS II stacking-penalises).  Turret and drone damage
+    # bonuses never take this shape -- every character-domain modifier that
+    # touches their own ``damageMultiplier`` (64) does so via
+    # ``OwnerRequiredSkillModifier`` reaching the DRONE items themselves (an
+    # already-implemented domain), so this attribute is missile-only.
+    "missileDamageMultiplier": 212,
     # ammo selection (spec 4.1.1) -- read off the WEAPON to find its charges,
     # and off a CHARGE to tell close range from long.  ``chargeSize`` is absent
     # on every launcher (missiles are sized by their own group), which is why
@@ -606,15 +616,34 @@ def _cycle_seconds(item) -> float:
     return fit_sim.attr(item, ATTR["speed"]) / 1000.0
 
 
-def _module_volley(module, kind: str) -> float:
+def _missile_damage_multiplier(character) -> float:
+    """The character's BCS-and-friends bonus to missile damage.
+
+    Effect 763 (``missileDMGBonus``, the SDE effect every Ballistic Control
+    System carries) is a ``charID``/``ItemModifier`` that multiplies attribute
+    212 on the CHARACTER item itself -- not the launcher, not the charge --
+    which is why :func:`_module_volley` cannot read it off either weapon item.
+    ``character`` is ``None`` only for a hand-built :class:`fit_sim.FitState`
+    that skipped :func:`fit_sim.build_fit` (production always populates it);
+    the dogma default for attribute 212 is 1.0, so that is the honest answer
+    for "no character item" too.
+    """
+    if character is None:
+        return 1.0
+    return fit_sim.attr(character, ATTR["missileDamageMultiplier"])
+
+
+def _module_volley(module, kind: str, character=None) -> float:
     """One LOADED weapon's volley.
 
     Turret volley = the charge's damage times the GUN's multiplier; the engine
     has already folded skills, ship bonuses and the charge's own ``otherID``
-    modifiers into both numbers.  Missile damage lives ENTIRELY on the charge
-    (the engine applied the missile skills to it through
+    modifiers into both numbers.  Missile damage lives almost entirely on the
+    charge (the engine applied the missile skills to it through
     ``OwnerRequiredSkillModifier``), so multiplying by the launcher would
-    double-count.
+    double-count -- but Ballistic Control Systems land on the CHARACTER
+    (:func:`_missile_damage_multiplier`), which nothing else folds in, so it
+    is applied here explicitly.
 
     The single owner of that formula: the readout and the ammo policy's
     candidate scoring both go through here, so a candidate is ranked by exactly
@@ -623,16 +652,16 @@ def _module_volley(module, kind: str) -> float:
     if kind == KIND_TURRET:
         return _damage_sum(module.charge) * fit_sim.attr(
             module, ATTR["damageMultiplier"])
-    return _damage_sum(module.charge)
+    return _damage_sum(module.charge) * _missile_damage_multiplier(character)
 
 
-def _module_dps(module, kind: str) -> float:
+def _module_dps(module, kind: str, character=None) -> float:
     """One loaded weapon's DPS -- volley over its cycle, 0.0 for a cycle-less
     (and so unfireable) module rather than a division by zero."""
     cycle = _cycle_seconds(module)
     if cycle <= 0:
         return 0.0
-    return _module_volley(module, kind) / cycle
+    return _module_volley(module, kind, character) / cycle
 
 
 def _weapon_stats(fit, name):
@@ -671,7 +700,7 @@ def _weapon_stats(fit, name):
                          _falloff_m(module), 1, False))
             continue
 
-        volley = _module_volley(module, kind)
+        volley = _module_volley(module, kind, fit.character)
         if kind == KIND_TURRET:
             optimal = fit_sim.attr(module, ATTR["maxRange"])
             falloff = _falloff_m(module)
@@ -680,7 +709,7 @@ def _weapon_stats(fit, name):
                        * fit_sim.attr(charge, ATTR["explosionDelay"]) / 1000.0)
             falloff = 0.0
 
-        dps = _module_dps(module, kind)
+        dps = _module_dps(module, kind, fit.character)
         if kind == KIND_TURRET:
             dps_turret += dps
         else:
@@ -950,7 +979,7 @@ def _group_dps(fit, weapon_type_id: int) -> float:
         kind = _weapon_kind(module)
         if kind is None:
             continue
-        total += _module_dps(module, kind)
+        total += _module_dps(module, kind, fit.character)
     return total
 
 
