@@ -1143,7 +1143,7 @@ class FCToolGUI:
         # -only state: the aggregate is COMPUTED on a worker and lands here via
         # _post_ui, the HUD's 1 Hz beat only reads it (spec 5.4, "no per-tick
         # compute"). _fleet_stats_key is the (counts, doctrine, revision, tier,
-        # disciplines) identity the stored VM was computed for AND the in-flight
+        # disciplines, ammo) identity the stored VM was computed for AND the in-flight
         # spawn guard — set when the worker is launched, so a second poll with
         # an unchanged fleet spawns nothing. _fleet_stats_after is the 250 ms
         # coalescer's pending after id. _fleet_stats_failed_at stamps a FAILED

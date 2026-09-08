@@ -471,18 +471,24 @@ class FitStatsPanel:
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 3))
         self.tier_combo = ttk.Combobox(
             header, textvariable=tier_var, values=list(fit_sim_links.TIERS),
-            state="readonly", width=8, font=_VALUE_FONT)
+            state="readonly",
+            width=max(len(v) for v in fit_sim_links.TIERS) + 1,
+            font=_VALUE_FONT)
         self.tier_combo.pack(side=tk.LEFT)
         self.disciplines_combo = ttk.Combobox(
             header, textvariable=disciplines_var,
             values=list(fit_sim_links.DISCIPLINE_MODES),
-            state="readonly", width=7, font=_VALUE_FONT)
+            state="readonly",
+            width=max(len(v) for v in fit_sim_links.DISCIPLINE_MODES) + 1,
+            font=_VALUE_FONT)
         self.disciplines_combo.pack(side=tk.LEFT, padx=(3, 0))
         tk.Label(header, text="ammo", font=_VALUE_FONT, fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 3))
         self.ammo_combo = ttk.Combobox(
             header, textvariable=ammo_var, values=list(AMMO_VALUES),
-            state="readonly", width=15, font=_VALUE_FONT)
+            state="readonly",
+            width=max(len(v) for v in AMMO_VALUES) + 1,
+            font=_VALUE_FONT)
         self.ammo_combo.pack(side=tk.LEFT)
         for combo in (self.tier_combo, self.disciplines_combo,
                       self.ammo_combo):
