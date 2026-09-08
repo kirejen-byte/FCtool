@@ -142,6 +142,7 @@ import preview_layout
 import system_coords
 import ui_theme
 from app_path import bundle_dir
+from info_tile import STRIP_H as TILE_STRIP_H
 from info_tile import InfoTileWindow
 from ui_helpers import attach_tooltip, update_tooltip
 
@@ -1232,6 +1233,126 @@ def build_links_model(coverage) -> "LinksVM | None":
     return LinksVM(coverage=rows)
 
 
+# ── the fleet tile's HEIGHT budget ──────────────────────────────────────────
+# The width budget lives with the text (`fleet_stats_width`, `FLEET_ROW_CHARS`);
+# this is the other axis, and it exists because the DPS/volley row made the
+# fleet tile the first one whose sections can compete for VERTICAL space.
+#
+# MEASURED, not derived from theory (this box, 96 dpi, tk scaling 1.333, the
+# numbers behind `TILE_SPECS["fleet"]`'s 152x93 worst case):
+#
+#   head                 13 px line + 1 px grid pady  = 14
+#   comp grid, 4 rows    4 x 14                       = 56
+#   coverage strip       21 px icon + 2 px top inset  = 23
+#                                                   ----
+#   worst case content                                 93   <- the pin
+#   + the DPS/volley row 14                            107
+#
+# against the shipped 180x120 tile's 100 px body (120 - info_tile's 20 px
+# strip). The row therefore does NOT fit the default tile in the worst case,
+# which is the whole reason `fleet_stats_fits` exists: the row is HIDDEN there
+# (its numbers move to the head's tooltip) rather than drawn 7 px short and cut
+# through the middle of its glyphs. The owner's own 160x136 tile -- 116 px of
+# body -- fits it with 9 px to spare.
+#
+# `line_px` is passed IN by every caller rather than assumed: the renderer
+# measures the real font (`_line_px`), and the controller, which has no font,
+# uses `FLEET_LINE_PX` below. A caller that cannot measure passes 0 and every
+# consumer degrades to "it fits" -- the same fail-visible direction the width
+# fit takes.
+
+#: Consolas 8's linespace, MEASURED. The fallback for a caller with no font.
+FLEET_LINE_PX = 13
+#: One gridded/packed fleet row's pitch: the line plus the cell's own pady
+#: (`_FLEET_TIGHT` leaves the label no border of its own to add).
+FLEET_ROW_PX = FLEET_LINE_PX + sum(_FLEET_CELL_PADY)
+#: The coverage strip's height when it draws: the burst icon (the tallest
+#: thing in a cell -- the ✓/✗ mark is only a text line) plus its top inset.
+FLEET_LINKS_PX = BURST_ICON_PX + sum(_LINKS_ROW_PADY)
+#: What ``InfoTileController.grow_for_fleet_stats`` adds to a fleet tile's
+#: persisted height, once: exactly the one row the DPS/volley line costs.
+FLEET_STATS_ROW_PX = FLEET_ROW_PX
+#: Comp-grid rows in the WORST case: the six-bucket cap plus Other, row-major
+#: in `COMP_COLUMNS` columns.
+FLEET_MAX_COMP_ROWS = -(-(FLEET_MAX_ROWS + 1) // COMP_COLUMNS)
+#: The FULL window height the worst case needs to carry the row as well:
+#: content plus info_tile's OWN caption strip. (`TILE_STRIP_H` is info_tile's
+#: 20 px, NEVER preview_tile's -- the two families carry independent 20s on
+#: purpose and this module imports no preview chrome.) 127 px, against the
+#: 120 px default tile: the 7 px `grow_for_fleet_stats` exists to find.
+FLEET_STATS_MIN_TILE_H = (FLEET_ROW_PX * (FLEET_MAX_COMP_ROWS + 2)
+                          + FLEET_LINKS_PX + TILE_STRIP_H)
+#: One-time layout migration marker, written into the ``info_tiles`` block --
+#: NOT into ``default_info_tiles_config()``, so the defaults mirror is
+#: untouched and an absent key honestly means "never grown".
+FLEET_STATS_GROWN_KEY = "fleet_stats_grown"
+
+
+def comp_grid_rows(cells, columns: int = COMP_COLUMNS) -> int:
+    """Grid rows `_CompGrid` lays out for `cells` cells, filled row-major."""
+    cells = max(0, _as_int(cells, 0))
+    columns = max(1, _as_int(columns, COMP_COLUMNS))
+    return -(-cells // columns)
+
+
+def links_cell_count(model) -> int:
+    """How many discipline cells `_LinksPanel` will lay out for `model`.
+
+    The panel skips a row whose discipline it has no cell for, so counting the
+    VM's rows blind would over-state the strip on a junk model."""
+    rows = (tuple(getattr(model, "coverage", ()) or ())
+            if model is not None else ())
+    return sum(1 for row in rows
+               if getattr(row, "discipline", None) in cb.DISCIPLINES)
+
+
+def links_strip_px(model, line_px, icon_px: int = BURST_ICON_PX) -> int:
+    """The coverage strip's height in px -- ``0`` when it lays nothing out.
+
+    `icon_px` is 0 for a panel whose icons failed to load: the cells then draw
+    the two-letter text fallback, which is only a text line tall, and pretending
+    otherwise would hide the stats row on a tile that had room for it."""
+    if links_cell_count(model) <= 0:
+        return 0
+    tallest = max(max(0, _as_int(icon_px, 0)), max(0, _as_int(line_px, 0)))
+    return tallest + sum(_LINKS_ROW_PADY)
+
+
+def fleet_content_px(line_px, comp_rows, links_px, stats_rows: int = 0) -> int:
+    """Height the fleet tile's content asks for: head + comp rows + strip
+    (+ the DPS/volley row when `stats_rows` is 1). Pure arithmetic."""
+    row = max(0, _as_int(line_px, 0)) + sum(_FLEET_CELL_PADY)
+    rows = 1 + max(0, _as_int(comp_rows, 0)) + max(0, _as_int(stats_rows, 0))
+    return row * rows + max(0, _as_int(links_px, 0))
+
+
+def fleet_stats_fits(frame_height, line_px, comp_rows, links_px) -> bool:
+    """Is there room for the DPS/volley row UNDER everything else?
+
+    Two degrades, both to True, both deliberate: an UNREALISED frame (the
+    first draw precedes mapping -- ``_frame_size``'s 1x1) and a missing font
+    metric. Assuming it fits is the fail-VISIBLE direction: the worst case is
+    one clipped row for a beat, where assuming it does not would silently
+    withhold the numbers from a tile that had room all along."""
+    height = _as_int(frame_height, 0)
+    if height <= 1 or _as_int(line_px, 0) <= 0:
+        return True
+    return fleet_content_px(line_px, comp_rows, links_px, 1) <= height
+
+
+def fleet_stats_hidden_tip(vm) -> str:
+    """The stats row's own copy, for the HEAD label, when the row is hidden.
+
+    The numbers lead: the row's whole text (unfitted -- a tooltip has no width
+    budget), then the assumption tooltip that would have hung off the row
+    itself. An FC whose tile is too short still gets the figures on a hover
+    instead of losing them silently, which is the trade the hide is only
+    acceptable under."""
+    text = fleet_stats_text(vm)
+    tip = fleet_stats_tip(vm)
+    return "\n".join(part for part in (text, tip) if part)
+
+
 # ── intel ───────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -2128,8 +2249,16 @@ class BattleRenderer(_TileRenderer):
 
 class FleetRenderer(_TileRenderer):
     """Fleet size + abbreviated inv-group buckets in TWO columns, each cell
-    hovering its hull breakdown, an optional fleet DPS/volley line, and the
-    command-burst coverage line underneath."""
+    hovering its hull breakdown, the command-burst coverage line underneath,
+    and -- last, and only when it fits -- an optional fleet DPS/volley line.
+
+    THE ORDER IS THE FIT POLICY (2026-09-08, owner ask: the row "must not
+    cause the rest of the tile to break"). Everything here is packed top-down
+    into a frame that clips, so the last section packed is the first one to
+    lose pixels when the tile is too short. Buckets and links go first because
+    they are what the tile is FOR; the DPS row goes last, and if the arithmetic
+    says even 1 px is missing it is not drawn at all -- see ``_render_stats``.
+    """
 
     #: The comp/stats font, not the pooled-row one (see ``_TileRenderer``).
     ROW_FONT = _FLEET_FONT_ROW
@@ -2140,7 +2269,9 @@ class FleetRenderer(_TileRenderer):
         # Two containers, both packed HERE and in this order, because content
         # inside either can appear late and ``pack`` appends -- see
         # ``_LinksPanel``. The head joins the TOP container rather than sitting
-        # loose in the body, for exactly that reason.
+        # loose in the body, for exactly that reason. (The stats row at the
+        # bottom of this method is the one deliberate exception; its own
+        # comment says why.)
         self._rows_holder = tk.Frame(self.frame, bg=bg)
         self._rows_holder.pack(fill="x")
         self._rows_holder.columnconfigure(0, weight=1)
@@ -2156,35 +2287,79 @@ class FleetRenderer(_TileRenderer):
                                FLEET_MAX_ROWS + 1)
         self._grid.frame.grid(row=1, column=0, columnspan=COMP_COLUMNS,
                               sticky="ew")
-        # The DPS/volley line joins the ROWS container, never ``tile.body`` or
-        # ``self.frame``: ``pack`` appends, so anything loose in the body would
-        # land UNDER the links coverage strip (the container rule this
-        # renderer's two siblings exist for). It is gridded after the comp
-        # grid, inside the same two-column span the head uses.
-        self._stats = tk.Label(self._rows_holder, text="",
-                               font=_FLEET_FONT_ROW, bg=bg,
-                               fg=self._palette.get("FG_DIM"), anchor="w",
-                               **_FLEET_TIGHT)
-        #: Whether ``_stats`` is currently gridded. The row is absent -- not
+        # The head's OWN tooltip: normally empty (an empty tip draws no box),
+        # and carrying the DPS/volley numbers whenever the row below could not
+        # be fitted -- see ``_render_stats``. Attached ONCE for the same reason
+        # every other tip here is (``attach_tooltip`` binds with ``add="+"``),
+        # topmost for the same reason too (the round-3 owner report: a plain
+        # tip stacks BELOW the HWND_TOPMOST tile and is never seen).
+        attach_tooltip(self._head, "", topmost=True)
+        self._links = _LinksPanel(self.frame, self._palette)
+        # THE ONE DELIBERATE EXCEPTION to this renderer's container rule, and
+        # the reason it is one: PACK ORDER IS FIT PRIORITY. A packed row that
+        # outgrows its cavity starves the LAST slaves (`map/facts.md`), so
+        # whichever section is packed last is the one that loses pixels when
+        # the tile is too short. The comp rollup and the coverage strip are the
+        # tile's primary content -- an FC glances at "what is my fleet flying"
+        # and "are my links up" -- while DPS/volley is an estimate he can also
+        # get on a hover. So the row is packed into ``self.frame`` AFTER
+        # ``_links.frame``: pack's append-only behaviour, which every other
+        # piece of content here has to be protected FROM, is exactly what puts
+        # this one in its place, and nothing is ever added to this frame after
+        # construction. (Before 2026-09-08 the row lived in ``_rows_holder``
+        # and the 7 px worst-case overflow fell on the links strip instead,
+        # cropping the bottom of all four 21 px burst icons.)
+        self._stats = tk.Label(self.frame, text="", font=_FLEET_FONT_ROW,
+                               bg=bg, fg=self._palette.get("FG_DIM"),
+                               anchor="w", **_FLEET_TIGHT)
+        #: Whether ``_stats`` is currently packed. The row is absent -- not
         #: blank -- when there is nothing to say, because a blank 14 px row
         #: costs the comp grid a bucket on a 120 px-tall tile.
         self._stats_shown = False
-        # Attached ONCE, with empty copy (an empty tip draws no box), and
-        # re-worded with ``update_tooltip`` afterwards -- ``attach_tooltip``
-        # binds with ``add="+"``, so re-attaching per repaint would stack a
-        # handler set every second (``_CompGrid``'s rule, same reason).
-        # topmost=True or the tip stacks BELOW the HWND_TOPMOST tile and is
-        # invisible -- the round-3 owner report.
         attach_tooltip(self._stats, "", topmost=True)
-        self._links = _LinksPanel(self.frame, self._palette)
 
     def _key(self, model):
-        # The frame's WIDTH rides the key for the same reason the intel tile's
-        # size does: the stats row is fitted to the current width and a RESIZE
-        # moves nothing the base class diffs, so without this a dragged corner
-        # would leave stale truncation on screen until the fleet changed. The
-        # key still latches only after a successful draw.
-        return (model, self._frame_size())
+        # The frame's SIZE rides the key for the same reason the intel tile's
+        # does: the stats row is fitted to the current width AND gated on the
+        # current height, and a RESIZE moves nothing the base class diffs, so
+        # without this a dragged corner would leave stale truncation -- or a
+        # row that should now be showing -- on screen until the fleet changed.
+        # The fit DECISION rides it explicitly rather than being left implicit
+        # in (model, size): it is what the draw branches on, so it is what the
+        # diff has to be able to see change. The key still latches only after a
+        # successful draw.
+        return (model, self._frame_size(), self._stats_fits(model))
+
+    def _line_px(self) -> int:
+        """This renderer's font linespace in px, or ``0`` when unmeasurable.
+
+        ``0`` is the "no metric" answer every height consumer degrades on --
+        never a cached failure, for the reason ``_font`` states."""
+        font = self._font()
+        if font is None:
+            return 0
+        try:
+            return max(0, int(font.metrics("linespace")))
+        except (tk.TclError, RuntimeError, TypeError, ValueError):
+            return 0
+
+    def _stats_fits(self, model) -> bool:
+        """Room for the DPS/volley row under the head, the buckets and the
+        strip? Pure function of the MODEL and the frame's realised height, so
+        ``_key`` and ``_draw`` can both ask and always agree.
+
+        The comp-grid row count comes off the model (a status replaces the
+        buckets, so it grids nothing) and the strip's height off the links VM
+        the panel is about to be handed -- never off ``winfo_reqheight``, which
+        the packer settles over SEVERAL idle cycles and would read stale inside
+        a repaint (`map/facts.md`)."""
+        _width, height = self._frame_size()
+        line = self._line_px()
+        cells = (0 if getattr(model, "status", "")
+                 else len(getattr(model, "rows", ()) or ()))
+        links = links_strip_px(getattr(model, "links", None), line,
+                               BURST_ICON_PX if self._links.icons else 0)
+        return fleet_stats_fits(height, line, comp_grid_rows(cells), links)
 
     def _stats_row(self, model):
         """``(text, tooltip)`` for the DPS/volley line, fitted to the tile.
@@ -2203,22 +2378,39 @@ class FleetRenderer(_TileRenderer):
         measure = font.measure if (font is not None and available > 0) else None
         return fleet_stats_text(vm, available, measure), fleet_stats_tip(vm)
 
+    def _hide_stats(self, head_tip: str = "") -> None:
+        """Take the row off the tile and hand `head_tip` to the head label."""
+        if self._stats_shown:
+            self._stats.pack_forget()
+            self._stats_shown = False
+        update_tooltip(self._stats, "")
+        update_tooltip(self._head, head_tip)
+
     def _render_stats(self, model):
+        """Draw the DPS/volley row -- or HIDE it, numbers and all, on a tile
+        too short to carry it whole.
+
+        Hidden, never cropped: pack would hand a 14 px row whatever pixels are
+        left, and 7 of 14 px of Consolas 8 is a line of half-glyphs that still
+        reads like a number. A row that cannot be drawn honestly is not drawn,
+        and its text moves to the TOP of the head's tooltip so the figures are
+        still one hover away (``fleet_stats_hidden_tip``)."""
         text, tip = self._stats_row(model)
         if not text:
-            if self._stats_shown:
-                self._stats.grid_forget()
-                self._stats_shown = False
-            update_tooltip(self._stats, "")
+            self._hide_stats()
             return
+        if not self._stats_fits(model):
+            self._hide_stats(fleet_stats_hidden_tip(getattr(model, "stats",
+                                                            None)))
+            return
+        update_tooltip(self._head, "")
         self._stats.configure(text=text)
         update_tooltip(self._stats, tip)
         if not self._stats_shown:
-            # FULL option set on every grid(): Tk RETAINS unspecified options
-            # across a re-grid, and grid_forget() discards them -- the
-            # stale-columnspan class of bug.
-            self._stats.grid(row=2, column=0, columnspan=COMP_COLUMNS,
-                             sticky="w", padx=_FLEET_CELL_PADX,
+            # FULL option set on every pack(): the packer, like grid, RETAINS
+            # options it is not given, and pack_forget() discards them. Packed
+            # into ``self.frame`` -- see the ctor: last in, first starved.
+            self._stats.pack(fill="x", padx=_FLEET_CELL_PADX,
                              pady=_FLEET_CELL_PADY)
             self._stats_shown = True
 
@@ -2234,13 +2426,15 @@ class FleetRenderer(_TileRenderer):
                 (fleet_row_text(row),
                  "FG_DIM" if row[0] == OTHER_LABEL else "FG_TEXT",
                  fleet_group_tip(row)) for row in model.rows])
-        # Also outside the status branch below, and for its own reason: a
-        # gated comp rollup (not boss / no snapshot) carries no `stats`
-        # either, so the row simply has nothing to draw and removes itself.
-        self._render_stats(model)
         # Deliberately OUTSIDE the status branch: the coverage report is
         # chat-sourced, so a tile gated to "not fleet boss" still carries one.
         self._links.render(getattr(model, "links", None))
+        # LAST, in both senses. Outside the status branch for its own reason (a
+        # gated comp rollup carries no `stats` either, so the row simply has
+        # nothing to draw and removes itself) -- and after the links render
+        # because the row is the section that YIELDS: it is packed under the
+        # strip and it is the one that goes away when the tile is too short.
+        self._render_stats(model)
 
 
 class IntelRenderer(_TileRenderer):
@@ -3609,6 +3803,77 @@ class InfoTileController:
             self._save()
         return changed
 
+    def _screen_at(self, x, y):
+        """The screen rect containing `(x, y)`, else the primary. Used only to
+        decide which bottom edge a growing tile must stay above -- a tile on a
+        second monitor must not be measured against the first one's height."""
+        for screen in self._screens():
+            sx, sy, sw, sh = screen
+            if sx <= x < sx + sw and sy <= y < sy + sh:
+                return screen
+        return self._bounds()
+
+    def grow_for_fleet_stats(self) -> bool:
+        """ONE-TIME: make room on the fleet tile for the DPS/volley row.
+
+        Called from the settings popup's live-apply when ``fleet_stats`` goes
+        ON, never from the beat -- so its ``place()`` is one of the sanctioned
+        user-click retops (``arrange`` / ``match_preview_size``'s class), not a
+        per-tick SetWindowPos.
+
+        The row costs one line, and the shipped 180x120 tile's worst case is
+        7 px short of ``FLEET_STATS_MIN_TILE_H`` -- short by less than the row
+        it needs (see the height budget above) -- so a user who turns the row
+        on and leaves his tile alone would get the honest-but-unhelpful
+        hidden-row state forever. This adds that one row's height, once:
+
+        * MARKER-GATED (``FLEET_STATS_GROWN_KEY`` in the ``info_tiles`` block).
+          Toggling the box off and on again must not ratchet the tile taller
+          every time, and a tile the owner has since resized himself is his.
+        * NO-OP when the tile already has room -- ``FLEET_STATS_MIN_TILE_H``
+          against the persisted FULL height. The marker is still set: the
+          question "does this HUD need the one-time bump" has been answered.
+        * NO-OP, and NO marker, when there is no fleet tile and no stored rect
+          for one: there is no height to grow and no position to grow it at,
+          and the first spawn will use the default size anyway. Enabling again
+          once a tile exists then still works.
+        * TURNING THE SETTING OFF NEVER SHRINKS (the caller simply does not
+          call this) -- a size the owner has got used to is not ours to undo.
+        * CLAMPED: a tile already against the bottom of its screen moves UP by
+          the overflow rather than growing off the edge, and the result goes
+          through the same ``_rescue`` every restored rect does.
+
+        Returns True iff the tile actually grew."""
+        block = self._block(create=True)
+        if block.get(FLEET_STATS_GROWN_KEY):
+            return False
+        tile = self._tiles.get("fleet")
+        rect = _call(tile.rect) if tile is not None else None
+        if rect is None:
+            stored = block.get("layouts")
+            rect = stored.get("fleet") if isinstance(stored, dict) else None
+        try:
+            x, y = int(rect[0]), int(rect[1])
+            w, h = int(rect[2]), int(rect[3])
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+            # Same malformed net as `_spawn_rect` / `heal_info_tile_layouts`,
+            # OverflowError included for JSON's non-standard ``Infinity``.
+            return False
+        block[FLEET_STATS_GROWN_KEY] = True
+        if h >= FLEET_STATS_MIN_TILE_H:
+            self._save()          # the marker is a decision worth persisting
+            return False
+        height = h + FLEET_STATS_ROW_PX
+        _sx, sy, _sw, sh = self._screen_at(x, y)
+        if y + height > sy + sh:
+            y = max(sy, sy + sh - height)
+        x, y = self._rescue(x, y, w, height)
+        if tile is not None:
+            _call(tile.place, x, y, w, height)
+        self._persist_rect("fleet", x, y, w, height)
+        self._save()
+        return True
+
     def shutdown(self) -> None:
         self.resolver.stop()
         for key in list(self._tiles):
@@ -3810,10 +4075,21 @@ def open_hud_settings(root, controller, host):
     def apply_fleet_stats(*_a):
         """The Fleet tile's DPS/volley row. Live-apply like every other box:
         the flag is read by ``_fleet_model`` on the very next beat, and
-        ``tick()`` makes that beat immediate."""
+        ``tick()`` makes that beat immediate.
+
+        Turning it ON also asks the controller for its one-time height bump --
+        the shipped tile's worst case is one row short of carrying the line, so
+        without this the box would look broken on a default HUD (the row would
+        correctly hide itself and the owner would never see why). OFF does not
+        call it: the setting is reversible, a tile size the owner has got used
+        to is not. Guarded so an injected controller without the seam costs the
+        checkbox nothing."""
         current_block = block()
-        current_block["fleet_stats"] = bool(variables["fleet_stats"].get())
+        turned_on = bool(variables["fleet_stats"].get())
+        current_block["fleet_stats"] = turned_on
         _call(host.save_config)
+        if turned_on:
+            _call(getattr(controller, "grow_for_fleet_stats", None))
         controller.tick()
 
     def apply_intel(*_a):
