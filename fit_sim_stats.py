@@ -118,12 +118,13 @@ ATTR = {
     "maxVelocity": 37,                      # missile flight speed (m/s)
     "explosionDelay": 281,                  # missile flight time, in MS
     # Ballistic Control Systems (and any other missile damage rig/implant) do
-    # NOT land on the launcher or the charge -- effect 763 (``missileDMGBonus``)
-    # is a ``charID``/``ItemModifier`` that multiplies attribute 212 on the
-    # CHARACTER item itself (verified against dogmaEffects.jsonl; default 1.0,
-    # non-stackable, so 3x BCS II stacking-penalises).  Turret and drone damage
-    # bonuses never take this shape -- every character-domain modifier that
-    # touches their own ``damageMultiplier`` (64) does so via
+    # NOT land on the launcher or the charge -- effect 763 (``missileDMGBonus``,
+    # BCS modules) and effect 2851 (Warhead Calefaction Catalyst rigs/boosters)
+    # are both ``charID``/``ItemModifier`` rows that multiply attribute 212 on
+    # the CHARACTER item itself (verified against dogmaEffects.jsonl; default
+    # 1.0, non-stackable, so 3x BCS II stacking-penalises).  Turret and drone
+    # damage bonuses never take this shape -- every character-domain modifier
+    # that touches their own ``damageMultiplier`` (64) does so via
     # ``OwnerRequiredSkillModifier`` reaching the DRONE items themselves (an
     # already-implemented domain), so this attribute is missile-only.
     "missileDamageMultiplier": 212,
@@ -633,7 +634,7 @@ def _missile_damage_multiplier(character) -> float:
     return fit_sim.attr(character, ATTR["missileDamageMultiplier"])
 
 
-def _module_volley(module, kind: str, character=None) -> float:
+def _module_volley(module, kind: str, character) -> float:
     """One LOADED weapon's volley.
 
     Turret volley = the charge's damage times the GUN's multiplier; the engine
@@ -655,7 +656,7 @@ def _module_volley(module, kind: str, character=None) -> float:
     return _damage_sum(module.charge) * _missile_damage_multiplier(character)
 
 
-def _module_dps(module, kind: str, character=None) -> float:
+def _module_dps(module, kind: str, character) -> float:
     """One loaded weapon's DPS -- volley over its cycle, 0.0 for a cycle-less
     (and so unfireable) module rather than a division by zero."""
     cycle = _cycle_seconds(module)
