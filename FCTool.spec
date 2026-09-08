@@ -11,6 +11,7 @@ a = Analysis(
         ('system_coords.json', '.'),
         ('map_layout.json', '.'),
         ('fit_types.json', '.'),
+        ('fit_dogma.json.gz', '.'),
         ('inv_groups.json', '.'),
         ('inv_categories.json', '.'),
         ('assets/bursts/shield.png', 'assets/bursts'),
