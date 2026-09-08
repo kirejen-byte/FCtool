@@ -357,7 +357,11 @@ class FitStats:
     #: can re-resolve a name without re-running the simulation.  Reason codes:
     #: ``unknown_type``, ``corrupt_row``, ``subsystem``, ``no_charge``,
     #: ``special_effect:<id>``, ``effect:<id>``, ``unknown_buff:<id>`` (type id
-    #: 0 -- a buff id is not a type id), ``unknown_key:<kind>``.
+    #: 0 -- a buff id is not a type id), ``links_unavailable`` (also type id 0
+    #: -- a link tier whose preset this SDE no longer carries),
+    #: ``unknown_key:<kind>``.  Identical reports are FOLDED (five empty guns
+    #: of one type are one line, prefixed ``5x``), so one entry here can stand
+    #: for several fitted items.
     unmodeled_items: tuple[tuple[int, str], ...] = ()
     #: Diagnostics that are NOT gaps: a hull bonus whose modifiers simply found
     #: no matching module (a Raven's launcher bonus on a fit with no launcher).
@@ -671,6 +675,47 @@ def _effect_has_modifiers(effect_id) -> bool:
     return definition is not None and bool(definition.modifiers)
 
 
+def _fold_repeats(lines, items):
+    """Fold repeated reports into one counted line, first-seen order kept.
+
+    The identity of a report is its ``(type id, reason code)`` pair plus the
+    rendered line, so the fold is generic over every reason code rather than
+    special-cased on the one that repeats today.  Five empty guns of one type
+    are ONE hole in the numbers, and printing it five times pushes the rest of
+    the report off a small readout.
+
+    The line is part of the key because a reason code is not always unique on
+    its own: ``links_unavailable`` carries type id 0 and names its discipline
+    only in the text, so keying on the pair alone would fold a missing SHIELD
+    link and a missing ARMOR link into one line that named a single discipline.
+    A repeat is therefore a genuinely IDENTICAL report, never merely a
+    similar one.
+
+    ``lines`` and ``items`` come in index-parallel and go out index-parallel:
+    each folded line keeps exactly one structured entry, so a formatter can
+    still re-resolve the name behind a counted line.
+
+    The count prefix is ``N`` U+00D7 (the multiplication sign) plus a space --
+    "5x" would read as part of a module name.
+    """
+    folded_lines: list = []
+    folded_items: list = []
+    counts: list = []
+    seen: dict = {}
+    for line, item in zip(lines, items):
+        key = (item, line)
+        at = seen.get(key)
+        if at is None:
+            seen[key] = len(folded_items)
+            folded_lines.append(line)
+            folded_items.append(item)
+            counts.append(1)
+        else:
+            counts[at] += 1
+    return ([line if count == 1 else f"{count}× {line}"
+             for line, count in zip(folded_lines, counts)], folded_items)
+
+
 def _unmodeled_entries(fit, name):
     """``(lines, items, notes, partial)`` for everything the engine could not
     model.
@@ -762,6 +807,7 @@ def _unmodeled_entries(fit, name):
 
 def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
            disciplines: Sequence[str] = (),
+           links_unavailable: Sequence[str] = (),
            name_of: Callable[[int], str] | None = None) -> FitStats:
     """Read DPS / volley / range / EHP off an ALREADY EVALUATED fit.
 
@@ -772,6 +818,13 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     keeps a default, because nothing here is cached: a ``derive`` result is
     never shared with a caller that wanted different names.
 
+    ``disciplines`` is what was ACTUALLY applied; ``links_unavailable`` names
+    the disciplines that were asked for and could not be modelled (the tier's
+    preset no longer resolves in this SDE).  Each of those is reported and
+    makes the result ``partial``: a link tier that silently applied nothing
+    would read as "your fit gains nothing from links", which is a different --
+    and wrong -- statement.
+
     Never raises for fit data: an empty, weaponless or entirely unknown fit
     yields zeros plus an ``unmodeled`` list.
     """
@@ -781,11 +834,20 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     dps_drone, drone_volley, drone_rows = _drone_stats(fit, name)
 
     lines, items, notes, partial = _unmodeled_entries(fit, name)
+    if links_unavailable:
+        # The links the caller asked for and did not get -- an honest "this
+        # number is missing a boost" rather than a silently unboosted fit.
+        lines = [f"command links ({links}/{discipline}): preset unavailable "
+                 "in this SDE" for discipline in links_unavailable] + lines
+        items = [(0, "links_unavailable")
+                 for _discipline in links_unavailable] + items
+        partial = True
     if missing:
         # A weapon with no ammo is the loudest hole there is: first in the list.
         lines = [f"{n}: no charge loaded" for _tid, n in missing] + lines
         items = [(tid, "no_charge") for tid, _n in missing] + items
         partial = True
+    lines, items = _fold_repeats(lines, items)
 
     layers = _layer_stats(fit.ship, profile)
     resists = tuple((layer, layers[layer][2]) for layer, _hp, _res
@@ -863,7 +925,8 @@ def clear_cache() -> None:
 
 
 def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
-             links: str = TIER_NONE, disciplines: str = "auto",
+             links: str = TIER_NONE,
+             disciplines: str = fit_sim_links.MODE_AUTO,
              profile: DamageProfile = OMNI) -> FitStats:
     """Simulate one parsed fit at All-V skills.  The single public entry point.
 
@@ -926,6 +989,7 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
             return hit
 
     fit = fit_sim.build_fit(parsed)
+    unavailable: tuple = ()
     if links == TIER_NONE:
         # No booster, no discipline: the mode is validated but never resolved,
         # so the no-links tier costs exactly one evaluation.
@@ -934,11 +998,27 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
     else:
         if disciplines == fit_sim_links.MODE_AUTO:
             fit_sim.evaluate(fit)               # the receiver at rest
-        applied = fit_sim_links.choose_disciplines(fit, disciplines)
-        buffs = fit_sim_links.buffs_for(links, applied)
+        requested = fit_sim_links.choose_disciplines(fit, disciplines)
+        # Per discipline rather than through ``buffs_for``, because a booster
+        # that broadcasts NOTHING has to be told apart from one that was never
+        # asked for: a preset id this SDE no longer carries yields no buffs,
+        # and applying nothing while still claiming the tier would be a lie
+        # the readout has no way to see.
+        applied_list, unavailable_list, collected = [], [], []
+        for discipline in requested:
+            broadcast = fit_sim_links.booster_buffs(links, discipline)
+            if broadcast:
+                applied_list.append(discipline)
+                collected.extend(broadcast)
+            else:
+                unavailable_list.append(discipline)
+        applied = tuple(applied_list)
+        unavailable = tuple(unavailable_list)
+        buffs = tuple(collected)
 
     stats = derive(fit_sim.evaluate(fit, buffs), profile,
-                   links=links, disciplines=applied, name_of=name_of)
+                   links=links, disciplines=applied,
+                   links_unavailable=unavailable, name_of=name_of)
 
     with _cache_lock:
         # A ``clear_cache`` that landed WHILE this was computing means the

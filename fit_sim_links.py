@@ -20,8 +20,9 @@ How a burst's strength is assembled (read off the shipped table, SDE build
                domain otherID -- which ALSO postAssigns the charge's
                warfareBuff{N}ID onto the module; that id names the dbuff the
                receiver applies
-      postPercent by Shield/Armored Warfare Specialist (skill 3351 / 11569,
-               attribute 2572 = 10 per level -> +50 % at V)
+      postPercent by the SPECIALIST skill of the discipline -- Shield Command
+               Specialist (3351) or Armored Command Specialist (11569), the
+               SDE's own names; attribute 2572 = 10 per level -> +50 % at V
       postPercent by the hull's eliteBonusCommandShips3 (attribute 1924 = 3.0,
                preMul'd by Command Ships level -> +15 % at V) -- Command Ships
                only, which is exactly what separates ``bonused`` from ``basic``
@@ -53,6 +54,7 @@ from __future__ import annotations
 
 import functools
 import threading
+from types import MappingProxyType
 from typing import NamedTuple, Sequence
 
 import dogma_data
@@ -138,42 +140,51 @@ class BoosterPreset(NamedTuple):
     (Vulture for shield, Damnation for armor), so the plan's sketch of a single
     ``hull_type_id`` would have given the armor tiers a hull that bonuses
     nothing -- a silent 15 % under-count, not an error.
+
+    Every field is a ``MappingProxyType``: a preset is shared -- one charge
+    map serves all three tiers, and every caller reads the SAME
+    :data:`TIER_PRESETS` entry -- so an in-place edit anywhere would silently
+    re-point every other reader's booster.  Read-only by construction beats
+    read-only by convention.
     """
 
-    hull_type_id: dict                        # discipline -> hull type id
-    burst_type_id: dict                       # discipline -> burst module id
-    charge_type_ids: dict                     # discipline -> 3 charge ids
-    mindlink_type_id: dict                    # discipline -> implant id or None
+    hull_type_id: MappingProxyType            # discipline -> hull type id
+    burst_type_id: MappingProxyType           # discipline -> burst module id
+    charge_type_ids: MappingProxyType         # discipline -> 3 charge ids
+    mindlink_type_id: MappingProxyType        # discipline -> implant id or None
 
 
 #: Shared by every tier: the charge set is a property of the discipline, not of
-#: how bonused the booster is.  Read-only by contract (nothing here mutates a
-#: preset), so one object serves all three tiers.
-_CHARGES = {"shield": SHIELD_CHARGES, "armor": ARMOR_CHARGES}
-_NO_MINDLINK = {"shield": None, "armor": None}
+#: how bonused the booster is.  Immutable, so one object safely serves all
+#: three tiers.
+_CHARGES = MappingProxyType({"shield": SHIELD_CHARGES, "armor": ARMOR_CHARGES})
+_NO_MINDLINK = MappingProxyType({"shield": None, "armor": None})
 
 #: ``tier -> BoosterPreset``.  ``none`` is deliberately ABSENT: it has no
 #: booster, and :func:`booster_buffs` answers it without ever reading a table.
 TIER_PRESETS = {
     "basic": BoosterPreset(
-        hull_type_id={"shield": DRAKE, "armor": DRAKE},
-        burst_type_id={"shield": SHIELD_COMMAND_BURST_I,
-                       "armor": ARMOR_COMMAND_BURST_I},
+        hull_type_id=MappingProxyType({"shield": DRAKE, "armor": DRAKE}),
+        burst_type_id=MappingProxyType({"shield": SHIELD_COMMAND_BURST_I,
+                                        "armor": ARMOR_COMMAND_BURST_I}),
         charge_type_ids=_CHARGES,
         mindlink_type_id=_NO_MINDLINK),
     "bonused": BoosterPreset(
-        hull_type_id={"shield": VULTURE, "armor": DAMNATION},
-        burst_type_id={"shield": SHIELD_COMMAND_BURST_II,
-                       "armor": ARMOR_COMMAND_BURST_II},
+        hull_type_id=MappingProxyType({"shield": VULTURE,
+                                       "armor": DAMNATION}),
+        burst_type_id=MappingProxyType({"shield": SHIELD_COMMAND_BURST_II,
+                                        "armor": ARMOR_COMMAND_BURST_II}),
         charge_type_ids=_CHARGES,
         mindlink_type_id=_NO_MINDLINK),
     "max": BoosterPreset(
-        hull_type_id={"shield": VULTURE, "armor": DAMNATION},
-        burst_type_id={"shield": SHIELD_COMMAND_BURST_II,
-                       "armor": ARMOR_COMMAND_BURST_II},
+        hull_type_id=MappingProxyType({"shield": VULTURE,
+                                       "armor": DAMNATION}),
+        burst_type_id=MappingProxyType({"shield": SHIELD_COMMAND_BURST_II,
+                                        "armor": ARMOR_COMMAND_BURST_II}),
         charge_type_ids=_CHARGES,
-        mindlink_type_id={"shield": SHIELD_COMMAND_MINDLINK,
-                          "armor": ARMORED_COMMAND_MINDLINK}),
+        mindlink_type_id=MappingProxyType(
+            {"shield": SHIELD_COMMAND_MINDLINK,
+             "armor": ARMORED_COMMAND_MINDLINK})),
 }
 
 # ===========================================================================
@@ -315,6 +326,21 @@ def _derive_buffs(tier: str, discipline: str) -> tuple:
     return tuple(sorted(buffs))
 
 
+def _check_arguments(tier: str, discipline: str) -> None:
+    """Reject a caller's typo before it becomes a silently empty booster.
+
+    A bad tier or discipline is caller misuse, not fit data, so it raises --
+    the engine's never-raise rule covers DATA.  Shared by every public
+    ``(tier, discipline)`` entry point so they cannot drift apart.
+    """
+    if tier not in TIERS:
+        raise ValueError(f"unknown link tier {tier!r}; expected one of "
+                         f"{list(TIERS)}")
+    if discipline not in DISCIPLINES:
+        raise ValueError(f"unknown discipline {discipline!r}; expected one of "
+                         f"{list(DISCIPLINES)}")
+
+
 def booster_buffs(tier: str, discipline: str) -> tuple:
     """The :class:`fit_sim.Buff` tuple one tier broadcasts in one discipline.
 
@@ -323,17 +349,57 @@ def booster_buffs(tier: str, discipline: str) -> tuple:
     This never calls ``dogma_data.load()`` -- that multi-megabyte decode belongs
     to the caller's worker thread.  Memoised: a booster is the same for every
     receiving fit.
+
+    An EMPTY tuple from a real tier is meaningful, not an error: it means the
+    canonical booster found nothing to broadcast -- a preset type this SDE no
+    longer carries (see :func:`preset_available`), or a hull that no longer
+    bonuses the burst.  Callers must report that rather than quietly applying
+    nothing; ``fit_sim_stats.simulate`` does.
     """
-    if tier not in TIERS:
-        raise ValueError(f"unknown link tier {tier!r}; expected one of "
-                         f"{list(TIERS)}")
-    if discipline not in DISCIPLINES:
-        raise ValueError(f"unknown discipline {discipline!r}; expected one of "
-                         f"{list(DISCIPLINES)}")
+    _check_arguments(tier, discipline)
     if tier == TIER_NONE:
         return ()
     _sync_cache_to_table()
     return _derive_buffs(tier, discipline)
+
+
+def preset_type_ids(tier: str, discipline: str) -> tuple:
+    """Every type id one ``(tier, discipline)`` booster is made of.
+
+    ``none`` has no booster, so it answers ``()``.  Order is hull, burst, the
+    three charges, then the Mindlink when the tier wears one.
+    """
+    _check_arguments(tier, discipline)
+    if tier == TIER_NONE:
+        return ()
+    preset = TIER_PRESETS[tier]
+    ids = [preset.hull_type_id[discipline], preset.burst_type_id[discipline]]
+    ids.extend(preset.charge_type_ids[discipline])
+    mindlink = preset.mindlink_type_id[discipline]
+    if mindlink is not None:
+        ids.append(mindlink)
+    return tuple(ids)
+
+
+def preset_available(tier: str, discipline: str) -> bool:
+    """Whether the LOADED table still carries every type this preset names.
+
+    A curated id is the one thing in this feature that data cannot check for
+    itself: CCP can rename, re-id or remove a hull, a burst or a charge, and a
+    preset that no longer resolves would otherwise model a booster with nothing
+    in it and hand back a silent zero.  Consumers use this to say so out loud
+    (``fit_sim_stats.simulate`` reports it as ``links_unavailable``) or to grey
+    a tier out before offering it.
+
+    ``none`` is always available -- it needs no preset and reads no table.
+    Every other tier reads the table, so this raises
+    :class:`dogma_data.DogmaUnavailable` when none is loaded, exactly like
+    :func:`booster_buffs`.
+    """
+    ids = preset_type_ids(tier, discipline)
+    if not ids:
+        return True
+    return all(dogma_data.has_type(type_id) for type_id in ids)
 
 
 def buffs_for(tier: str, disciplines: Sequence[str]) -> tuple:

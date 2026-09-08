@@ -47,8 +47,9 @@ Per-skill divergence
 effect means the same thing on every skill that carries it).  When a future
 effect's semantics DIFFER per carrying skill, the value may instead be a dict
 ``{skill_type_id: rows, "*": default_rows}``; the generator then emits, per
-(effect, skill) pair, a SYNTHETIC effect id ``OVERRIDE_EFFECT_BASE +
-skill_type_id`` attached only to that one skill.  **No effect in the current SDE
+(effect, skill) pair, a SYNTHETIC effect id (see
+:func:`synthetic_effect_id` -- keyed on the PAIR, and asserted unique at
+generation time) attached only to that one skill.  **No effect in the current SDE
 needs this** -- 1730's nine drone skills differ only in the VALUE of their
 ``damageMultiplierBonus`` attribute (5 % vs 2 % per level), which is data the
 uniform row already reads off each skill.  The mechanism exists so the next
@@ -64,11 +65,20 @@ from __future__ import annotations
 #: The engine resolves it per source item; the SDE never emits -1 itself.
 SELF_SKILL = -1
 
-#: Synthetic per-skill effect ids are ``OVERRIDE_EFFECT_BASE + skill_type_id``.
-#: Far above every real SDE effect id (the current build's largest is ~13k) and
-#: above every type id (~90k), so a synthetic id can never collide with a real
-#: effect, and the id itself names the skill it was minted for.
+#: Synthetic per-skill effect ids are
+#: ``OVERRIDE_EFFECT_BASE + effect_id * SYNTHETIC_SKILL_SPAN + skill_type_id``.
+#: Keyed on the PAIR: keying on the skill alone would mint ONE id for two
+#: different overridden effects carried by the same skill, and the second would
+#: silently overwrite the first's rows.  The base sits far above every real SDE
+#: effect id (measured, build 3494416: the largest is **12,975**), and the span
+#: is wider than every real type id (measured: the largest is **371,027**), so
+#: the mapping is injective and no synthetic id can ever shadow a real effect.
 OVERRIDE_EFFECT_BASE = 9_000_000
+
+#: The digit span reserved for the carrying skill's type id -- see above.  A
+#: skill id outside ``0 <= id < SYNTHETIC_SKILL_SPAN`` would break injectivity,
+#: so :func:`synthetic_effect_id` refuses it rather than minting a collision.
+SYNTHETIC_SKILL_SPAN = 1_000_000
 
 # --------------------------------------------------------------------------
 # attribute ids used below (names are the SDE's own)
@@ -184,9 +194,24 @@ SKILL_EFFECTS_IGNORED: dict = {
 # accessors
 # --------------------------------------------------------------------------
 
-def synthetic_effect_id(skill_type_id: int) -> int:
-    """The reserved effect id a per-skill override is emitted under."""
-    return OVERRIDE_EFFECT_BASE + int(skill_type_id)
+def synthetic_effect_id(effect_id: int, skill_type_id: int) -> int:
+    """The reserved effect id a per-skill override is emitted under.
+
+    Injective in ``(effect_id, skill_type_id)``, and both halves are readable
+    back out of the number, so a table dump names the pair it was minted for.
+    Raises :class:`ValueError` for ids the scheme cannot separate -- a silent
+    collision would overwrite one override's rows with another's."""
+    effect_id = int(effect_id)
+    skill_type_id = int(skill_type_id)
+    if effect_id < 0:
+        raise ValueError(f"effect id {effect_id} must not be negative")
+    if not 0 <= skill_type_id < SYNTHETIC_SKILL_SPAN:
+        raise ValueError(
+            f"skill type id {skill_type_id} is outside the synthetic id span "
+            f"[0, {SYNTHETIC_SKILL_SPAN}) -- widen SYNTHETIC_SKILL_SPAN "
+            "(and re-check OVERRIDE_EFFECT_BASE) before minting it")
+    return (OVERRIDE_EFFECT_BASE + effect_id * SYNTHETIC_SKILL_SPAN
+            + skill_type_id)
 
 
 def is_per_skill(effect_id: int) -> bool:

@@ -37,10 +37,13 @@ SKILL-EFFECT OVERRIDES: a handful of skill effects have no ``modifierInfo`` in
 the SDE at all (CCP never published one -- pyfa hand-writes them), so a pure
 ``modifierInfo`` engine applies nothing and the numbers those skills feed come
 out low.  ``tools/dogma_overrides.py`` carries curated rows for them, spliced in
-here after filtering.  The gate is total: a modifier-less effect on a
-category-16 type that is in NEITHER ``SKILL_EFFECT_OVERRIDES`` nor
-``SKILL_EFFECTS_IGNORED`` aborts the build with exit 2, so a gap a future SDE
-introduces gets triaged rather than shipped.
+here after filtering.  The gate is total in BOTH directions, each an exit 2:
+a modifier-less effect on a category-16 type that is in NEITHER
+``SKILL_EFFECT_OVERRIDES`` nor ``SKILL_EFFECTS_IGNORED`` aborts the build (a gap
+a future SDE introduces gets triaged rather than shipped), and so does an
+overridden effect the SDE has since given its OWN ``modifierInfo`` (that
+override is stale and must be retired -- splicing over CCP's rows would replace
+the game's semantics with a hand-authored guess).
 
 Output encoding is the contract in ``dogma_data.py`` -- that module is the only
 reader, and its docstring is authoritative.  Compact separators, gzip level 9,
@@ -51,8 +54,9 @@ Usage:
   py -3.12 tools/gen_fit_dogma.py --download
 
 Exit codes: 0 ok, 2 a size budget was exceeded (the file is still written so the
-breach can be inspected) or an untriaged modifier-less skill effect was found,
-1 anything fatal.
+breach can be inspected) or an override gate tripped -- an untriaged
+modifier-less skill effect, an override the SDE now publishes its own rows for,
+or a synthetic effect id that is not unique -- 1 anything fatal.
 """
 from __future__ import annotations
 
@@ -459,15 +463,34 @@ def apply_overrides(effects: dict, types: dict) -> dict:
     stale entry cannot fabricate an effect out of nothing.
 
     Per-skill overrides (a dict value) are emitted as one synthetic effect per
-    carrying skill under ``dogma_overrides.synthetic_effect_id`` and swapped
-    into that skill's ``e`` list; the original effect id is then dropped if no
-    kept type still names it.  The current SDE needs none of this -- see the
-    module docstring of ``dogma_overrides``."""
+    (effect, carrying skill) pair under ``dogma_overrides.synthetic_effect_id``
+    and swapped into that skill's ``e`` list; the original effect id is then
+    dropped if no kept type still names it.  Every minted id is asserted UNIQUE
+    (and free of any real effect id) -- a collision would silently overwrite one
+    override's rows with another's.  The current SDE needs none of this -- see
+    the module docstring of ``dogma_overrides``.
+
+    Exits 2 when an override is STALE in the loud way: the SDE now publishes its
+    own ``modifierInfo`` for an overridden effect.  Splicing over that would
+    replace CCP's semantics with a hand-authored guess, so the override must be
+    retired instead."""
     applied = synthetic = 0
+    minted: dict = {}
     for effect_id in sorted(dogma_overrides.SKILL_EFFECT_OVERRIDES):
         key = str(effect_id)
         if key not in effects:
             continue
+        native = effects[key]["m"]
+        if native:
+            print(f"OVERRIDDEN EFFECT {effect_id} NOW HAS ITS OWN modifierInfo: "
+                  f"this SDE publishes {len(native)} modifier row(s) for it, and "
+                  "an override would REPLACE the game's own semantics with a "
+                  "hand-authored guess.", file=sys.stderr)
+            print(f"  RETIRE THE OVERRIDE: delete "
+                  f"dogma_overrides.SKILL_EFFECT_OVERRIDES[{effect_id}] and "
+                  "regenerate; the native rows are what the engine should read.",
+                  file=sys.stderr)
+            raise SystemExit(2)
         category = effects[key]["cat"]
         if not dogma_overrides.is_per_skill(effect_id):
             effects[key]["m"] = [list(row)
@@ -478,7 +501,19 @@ def apply_overrides(effects: dict, types: dict) -> dict:
             rows = dogma_overrides.rows_for(effect_id, int(tid))
             if rows is None:
                 continue
-            new_id = dogma_overrides.synthetic_effect_id(int(tid))
+            new_id = dogma_overrides.synthetic_effect_id(effect_id, int(tid))
+            clash = minted.get(new_id)
+            if clash is not None or str(new_id) in effects:
+                print(f"SYNTHETIC EFFECT ID {new_id} IS NOT UNIQUE: minted for "
+                      f"effect {effect_id} / skill {tid}, but it already names "
+                      + (f"effect {clash[0]} / skill {clash[1]}" if clash
+                         else "a real effect in this table")
+                      + " -- the second would silently overwrite the first.",
+                      file=sys.stderr)
+                print("  Fix dogma_overrides.synthetic_effect_id's scheme "
+                      "before regenerating.", file=sys.stderr)
+                raise SystemExit(2)
+            minted[new_id] = (effect_id, int(tid))
             effects[str(new_id)] = {"cat": category, "m": [list(row) for row in rows]}
             types[tid]["e"] = [new_id if e == effect_id else e for e in types[tid]["e"]]
             applied += 1

@@ -127,6 +127,25 @@ class Doctrine:
 
 
 # ── Content hashing (order-independent, for de-dupe) ──────────────────────────
+def _orderable(value):
+    """Ordering stand-in for a column that may be ``None``.
+
+    ``charge_type_id`` is None for an empty gun and an int for a loaded one, so
+    a fit carrying both of the SAME module type -- one loaded launcher and one
+    empty, an entirely ordinary EFT -- made the raw tuple sort raise
+    ``TypeError`` comparing None with an int. (``quantity`` is the same hazard
+    one column over: a stored ``"quantity": null`` loads as None, because
+    ``dict.get`` returns the stored None rather than the default.)
+
+    ``-1`` is the stand-in: every real type id and quantity is >= 0, so an
+    absent value sorts below all of them, and the relative order of values that
+    never mixed None with an int is EXACTLY what it was. This is used as a sort
+    KEY only -- the hashed tuples are the originals, so every fit that hashed
+    before this fix keeps the hash it had.
+    """
+    return -1 if value is None else value
+
+
 def fit_content_hash(parsed: ParsedFit) -> str:
     """Return a stable, order-independent hash of a fit's contents.
 
@@ -134,13 +153,20 @@ def fit_content_hash(parsed: ParsedFit) -> str:
     two fits with identical contents in a different order hash the same. Slot
     and loaded-charge identity are part of a module's identity; instance order
     and display names are not.
+
+    The sorts are keyed through :func:`_orderable` so a None charge or quantity
+    orders instead of raising; see that function for why the digests are
+    unchanged.
     """
     modules = sorted(
-        (m.type_id, m.slot, m.charge_type_id, bool(m.offline))
-        for m in parsed.modules
+        ((m.type_id, m.slot, m.charge_type_id, bool(m.offline))
+         for m in parsed.modules),
+        key=lambda row: (row[0], row[1], _orderable(row[2]), row[3]),
     )
-    drones = sorted((d.type_id, d.quantity) for d in parsed.drones)
-    cargo = sorted((c.type_id, c.quantity) for c in parsed.cargo)
+    drones = sorted(((d.type_id, d.quantity) for d in parsed.drones),
+                    key=lambda row: (row[0], _orderable(row[1])))
+    cargo = sorted(((c.type_id, c.quantity) for c in parsed.cargo),
+                   key=lambda row: (row[0], _orderable(row[1])))
     subsystems = sorted(parsed.subsystems)
     canonical = (parsed.ship_type_id, modules, drones, cargo, subsystems)
     return hashlib.sha1(repr(canonical).encode("utf-8")).hexdigest()
