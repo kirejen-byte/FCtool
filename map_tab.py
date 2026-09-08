@@ -1522,6 +1522,14 @@ class MapTab:
         # after a newer route's and paint a gate leg that belongs to no live
         # route -- a wrong answer, not a missing decoration. Main-thread only.
         self._wh_leg_gen = 0
+        # Destination-route generation token, the same shape as _wh_leg_gen
+        # (Task 35 fix round): set_route_destination and clear_route bump it;
+        # _recompute_route captures the value at spawn and _apply_route drops
+        # any result whose token is stale OR whose route_dest has since gone
+        # None. Without it, a BFS answer already in flight when the user hits
+        # 'Clear route' could land AFTER the clear and repaint the polyline the
+        # clear was supposed to remove. Main-thread only.
+        self._route_gen = 0
         self._worker: threading.Thread | None = None
         # Signature of the crisp frame currently APPLIED to the canvas (duplicate-
         # settle suppression, Task 18 Step 1b): the worker skips a request whose
@@ -1978,15 +1986,47 @@ class MapTab:
             return
         self.state.route_dest = system_id
         self.state.route_path = None             # replace: drop any stale path
+        self._route_gen += 1                      # orphan any in-flight BFS answer
         self._recompute_route()                  # async BFS (handles own == dest)
         self._redraw_overlays()                  # show the destination ring at once
 
     def clear_route(self) -> None:
-        """Drop the destination-route overlay (arrival, replacement, or the user's
-        'Clear route' menu action). Session state only -- nothing persisted."""
+        """Drop BOTH route overlays -- the destination route AND the wormhole
+        navigation route -- and repaint once. Triggered by arrival, a
+        replacement destination, or the user's 'Clear route' menu action
+        (offered whenever either route has something to clear -- see
+        ``_has_clearable_route``). Session state only -- nothing persisted.
+
+        Folds in the wormhole-route reset (owner bug report: clearing the
+        route left the lime hop + gold/blue gate legs from the Navigation
+        tab's WH search still drawn -- the only production caller of
+        ``set_wh_route(None)`` was the START of the NEXT search, never a
+        clear). Reuses ``_reset_wh_route_state`` -- the same field reset
+        ``set_wh_route(None)`` performs -- rather than calling
+        ``set_wh_route(None)`` itself, so this method still repaints exactly
+        ONCE. Also bumps ``_route_gen`` so a BFS answer already in flight for
+        the destination route (spawned by ``_recompute_route``) is dropped by
+        ``_apply_route`` if it lands after this clear.
+
+        DELIBERATELY does not notify the host / fc_gui: the Navigation
+        panel's own WH-search verdict text is a separate, independently-
+        driven display and keeps showing its last result after this call --
+        only the MAP line is what the owner asked to clear."""
         self.state.route_dest = None
         self.state.route_path = None
+        self._route_gen += 1                      # orphan any in-flight BFS answer
+        self._reset_wh_route_state()
         self._redraw_overlays()
+
+    def _has_clearable_route(self) -> bool:
+        """True when either route overlay -- the destination route or the
+        wormhole navigation route -- has something for 'Clear route' to
+        clear. Single predicate shared by both context-menu builders
+        (``_build_system_menu`` / ``_build_empty_menu``) so a WH-only route
+        (no destination set) still offers the clear affordance -- the gap
+        that let a cleared destination route leave a WH route's markers
+        behind with no menu entry to remove them."""
+        return self.state.route_dest is not None or self.state.wh_route is not None
 
     def _recompute_route(self) -> None:
         """Re-solve the travel route from own location to route_dest on a worker
@@ -2009,6 +2049,7 @@ class MapTab:
         # not matter -- _bfs_route adds both directions). Empty -> None (gate-only).
         conns = [f"{a}|{b}" for (a, b) in self.state.bridges] or None
         route_fn = self._route_fn
+        gen = self._route_gen                     # captured at spawn (fix round)
 
         def work():
             try:
@@ -2016,14 +2057,22 @@ class MapTab:
             except Exception as exc:             # never crash the helper thread
                 print(f"[MAP] route recompute failed: {exc}")
                 return
-            self._result_q.put(("route", tuple(path or ())))
+            self._result_q.put(("route", gen, tuple(path or ())))
 
         threading.Thread(target=work, daemon=True, name="map-route").start()
 
-    def _apply_route(self, path) -> None:
+    def _apply_route(self, gen: int, path) -> None:
         """Apply a worker-resolved route path on the main thread (Task 35). An
         empty path (no gate route found) clears the polyline but KEEPS route_dest
-        so the destination ring still marks the target."""
+        so the destination ring still marks the target.
+
+        A result carrying a stale generation -- or arriving after
+        ``route_dest`` has since gone ``None`` (a clear issued between the
+        BFS spawn and it landing) -- is dropped, mirroring ``_apply_wh_leg``'s
+        guard (fix round: a clear used to be repainted-over by a route answer
+        that was already in flight)."""
+        if gen != self._route_gen or self.state.route_dest is None:
+            return
         self.state.route_path = tuple(path) or None
         self._redraw_overlays()
 
@@ -2075,10 +2124,7 @@ class MapTab:
         ``_recompute_wh_legs``). Safe before the first ``on_shown`` for the same
         reason ``set_wh_endpoints`` is."""
         if not isinstance(spec, dict):           # None / garbage -> clear
-            self.state.wh_route = None
-            self.state.wh_leg_in = None
-            self.state.wh_leg_out = None
-            self._wh_leg_gen += 1                # orphan any in-flight legs
+            self._reset_wh_route_state()
             self._redraw_overlays()
             return
         self.state.wh_route = dict(spec)
@@ -2086,6 +2132,17 @@ class MapTab:
         self.state.wh_leg_out = None
         self._recompute_wh_legs()                # async gate legs (bumps the gen)
         self._redraw_overlays()                  # show hop + markers at once
+
+    def _reset_wh_route_state(self) -> None:
+        """Reset the wormhole-route fields (route spec + both resolved gate
+        legs) WITHOUT repainting -- the caller owns its own single redraw.
+        Shared by ``set_wh_route(None)`` and ``clear_route`` (fix round: the
+        latter used to leave WH-route state untouched entirely) so the two
+        never drift apart."""
+        self.state.wh_route = None
+        self.state.wh_leg_in = None
+        self.state.wh_leg_out = None
+        self._wh_leg_gen += 1                    # orphan any in-flight legs
 
     def _recompute_wh_legs(self) -> None:
         """Resolve the two STARGATE legs of the wormhole route -- ``origin_id ->
@@ -4544,7 +4601,7 @@ class MapTab:
         """Coalesce worker output on the main thread. Every result is a tuple led
         by a string tag: ('crisp', gen, ppm, ms, sig), ('gesture', gen, ppm|None,
         ms, cam), ('threat', frozenset), ('friendly_threat', frozenset),
-        ('route', tuple), ('wh_leg', gen, slot, tuple), ('ambient', tuple),
+        ('route', gen, tuple), ('wh_leg', gen, slot, tuple), ('ambient', tuple),
         ('sov', tuple|None) and ('sov_names', tuple). Frames (crisp OR
         gesture) share one latest-wins slot -- the worker produces them in strictly
         increasing generation order, so the last one drained has the highest
@@ -4614,7 +4671,7 @@ class MapTab:
         if latest_friendly_threat is not None:
             self.set_friendly_threat(latest_friendly_threat[1])
         if latest_route is not None:
-            self._apply_route(latest_route[1])
+            self._apply_route(latest_route[1], latest_route[2])
         for _leg in latest_wh_legs.values():
             self._apply_wh_leg(_leg[1], _leg[2], _leg[3])
         if latest_ambient is not None:
@@ -4982,7 +5039,7 @@ class MapTab:
         if self.state.range_overlay is not None:
             menu.add_command(label="Clear range overlay",
                              command=self.clear_range_overlay)
-        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+        if self._has_clearable_route():            # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         menu.add_separator()
         self._menu_add(menu, "Set destination", "set_destination", name)
@@ -5108,7 +5165,7 @@ class MapTab:
         # Characters overlay (owner ask): ON by default; magenta markers + hover.
         menu.add_checkbutton(label="Chars", variable=self._layer_vars["chars"],
                              command=lambda: self._on_layer_toggle("chars"))
-        if self.state.route_dest is not None:      # Task 35: drop the route overlay
+        if self._has_clearable_route():            # Task 35: drop the route overlay
             menu.add_command(label="Clear route", command=self.clear_route)
         # Manage infrastructure… (Task 5): open the manager for the whole DB.
         cb_infra = self.callbacks.get("open_infra_manager")
