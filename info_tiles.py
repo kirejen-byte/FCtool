@@ -922,10 +922,17 @@ def _fleet_stats_compose(head: str, body: str, tail: str) -> str:
 def fleet_stats_text(vm, max_width=None, measure=None) -> str:
     """``DPS 41.2k · Vly 138k (31/35)`` -- or ``""`` when there is nothing.
 
-    ``""`` for a missing VM AND for a VM with nothing modeled: a row reading
-    ``DPS 0 · Vly 0 (0/35)`` says only that the fit library has not caught up
-    with the fleet, and it costs the tile a line it does not have. The
-    tooltip's "no fit" list is where that gap is stated.
+    ``""`` for a missing VM. Nothing modeled is not always silent, though: with
+    NO doctrine active a row reading ``DPS 0 · Vly 0 (0/35)`` says only that
+    the fit library has not caught up with the fleet, and it costs the tile a
+    line it does not have -- so that case stays ``""`` and the tooltip's "no
+    fit" list is where the gap is stated. But with a doctrine ACTIVE
+    (``dps_filter`` is the DPS-tag filter) and a non-empty fleet, nothing
+    modeled means the doctrine's DPS hulls are not what is undocked, which is
+    exactly the state the FC most needs the HUD to say something about -- so
+    the row instead reads ``DPS — (0/35)`` (an em dash standing in for the
+    missing number, no volley to drop) rather than vanishing and reading as
+    "the tile is broken".
 
     THE FIT LADDER, in order, because the row does not fit the shipped tile at
     full length (measured: the whole line wants ~28 chars, and a 180 px tile
@@ -956,7 +963,12 @@ def fleet_stats_text(vm, max_width=None, measure=None) -> str:
     """
     if vm is None:
         return ""
-    if _as_int(getattr(vm, "modeled", 0), 0) <= 0:
+    modeled = _as_int(getattr(vm, "modeled", 0), 0)
+    if modeled <= 0:
+        total = _as_int(getattr(vm, "total", 0), 0)
+        dps_filter = str(getattr(vm, "dps_filter", "") or "")
+        if dps_filter == FLEET_STATS_FILTER_DPS_TAG and total > 0:
+            return f"DPS — ({modeled}/{total})"
         return ""
     head, body, tail = _fleet_stats_parts(vm)
     full = _fleet_stats_compose(head, body, tail)
@@ -972,43 +984,61 @@ def fleet_stats_text(vm, max_width=None, measure=None) -> str:
 
 
 def _capped_hulls(names) -> str:
-    """``"Loki ×3, Sabre ×1 (+2 more)"`` -- one hull list, capped.
+    """``"Loki ×3, Sabre ×1, +2 more"`` -- one hull list, capped.
 
     Shared by the tooltip's two hull lists (the off-doctrine one and the "no
     fit" one) so they cap at the same place and say the same thing about the
     tail. ``""`` for an empty list, which the caller reads as "omit the
-    line"."""
+    line". The ``+N more`` tail is comma-joined rather than its own
+    parenthetical: the off-doctrine line already wraps ``(not simulated)``
+    around this list's caller, and a ``(+2 more)`` nested inside that reads as
+    two mismatched parenthetical levels at a glance."""
     hulls = [str(name) for name in (names or ())]
     if not hulls:
         return ""
     rest = len(hulls) - FLEET_TIP_HULLS
-    return ", ".join(hulls[:FLEET_TIP_HULLS]) + (f" (+{rest} more)"
+    return ", ".join(hulls[:FLEET_TIP_HULLS]) + (f", +{rest} more"
                                                  if rest > 0 else "")
 
 
 def fleet_stats_tip(vm) -> str:
     """Hover copy for the stats row: the assumption, then the gaps.
 
-    Line 1 is the honesty line and is never omitted -- the number is computed
-    from DOCTRINE fits at All-V skills with a chosen link tier, not from what
-    the fleet is actually flying, and an FC reading a DPS figure off a HUD is
-    entitled to know that before he plans around it. The ``no fit`` list names
-    the hulls the number does NOT include (capped, with a count for the rest);
-    the partial line explains the ``~``.
+    Line 1 is the honesty line and is normally never omitted -- the number is
+    computed from DOCTRINE fits at All-V skills with a chosen link tier, not
+    from what the fleet is actually flying, and an FC reading a DPS figure off
+    a HUD is entitled to know that before he plans around it. The one
+    exception is the silent-vanish state ``fleet_stats_text`` also special-
+    cases: a doctrine active, a non-empty fleet, and NOTHING of its DPS hulls
+    modeled. There the assumption line would describe an assumption that
+    produced no number at all, so line 1 instead states the actual problem --
+    ``"No DPS-tagged hull in the active doctrine is in fleet"`` -- and every
+    line after it (Avg EHP, the filter line, off-doctrine, "no fit") still
+    prints exactly as it would otherwise, because those explain the gap the
+    same way regardless of which line 1 is showing.
+
+    The ``no fit`` list names the hulls the number does NOT include (capped,
+    with a count for the rest); the partial line explains the ``~``.
 
     The DPS-filter line is never omitted either, and for the same reason: with
     a doctrine active the figure covers only its ``DPS``-tagged hulls (owner
     rule), while with none it covers every hull that resolved a fit -- two
     genuinely different claims that print as the same ``DPS 41.2k``. Naming
     the excluded pilot count is what lets an FC tell "my logi wing is not in
-    this" from "half my fleet fell out of the number".
+    this" from "half my fleet fell out of the number" -- except at zero
+    excluded, where naming "0 non-DPS pilots excluded" is a fact about a wing
+    that does not exist and just adds noise; the line then reads the bare
+    ``"DPS-tagged hulls only"``.
 
     The OFF-DOCTRINE line appears only when there are such pilots, and names
     the hulls with their counts (``Loki ×3``): a hull the active doctrine does
     not contain is neither a gap the FC can close by writing a fit ("No fit:"
     would send him looking for one) nor a doctrine row that failed to say
     "DPS" -- it is a ship nobody planned for, and the count is the number that
-    tells him whether it is one straggler or a third of the fleet.
+    tells him whether it is one straggler or a third of the fleet. The
+    "not simulated" qualifier sits in its own leading parenthetical rather
+    than wrapping the hull list, so the list's own ``", +N more"`` tail
+    (``_capped_hulls``) never ends up nested inside a second pair of parens.
 
     The links half names what was APPLIED (``max/shield``) whenever every
     modeled hull resolved the same disciplines, and falls back to the MODE
@@ -1018,29 +1048,33 @@ def fleet_stats_tip(vm) -> str:
     """
     if vm is None:
         return ""
+    modeled = _as_int(getattr(vm, "modeled", 0), 0)
+    total = _as_int(getattr(vm, "total", 0), 0)
+    dps_filter = str(getattr(vm, "dps_filter", "") or "")
     tier = str(getattr(vm, "tier", "") or "none")
     applied = [str(name) for name
                in (getattr(vm, "disciplines_applied", ()) or ())]
     disciplines = "+".join(applied) if applied \
         else str(getattr(vm, "disciplines", "") or "")
     links = f"{tier}/{disciplines}" if disciplines and tier != "none" else tier
-    lines = [f"Assumes doctrine fits, all-V skills; links: {links}",
+    if modeled <= 0 and dps_filter == FLEET_STATS_FILTER_DPS_TAG and total > 0:
+        head = "No DPS-tagged hull in the active doctrine is in fleet"
+    else:
+        head = f"Assumes doctrine fits, all-V skills; links: {links}"
+    lines = [head,
              f"Avg EHP {compact_number(getattr(vm, 'ehp_avg', 0.0))} "
-             f"({_as_int(getattr(vm, 'modeled', 0), 0)} of "
-             f"{_as_int(getattr(vm, 'total', 0), 0)} pilots modelled)"]
-    if str(getattr(vm, "dps_filter", "") or "") == FLEET_STATS_FILTER_DPS_TAG:
+             f"({modeled} of {total} pilots modelled)"]
+    if dps_filter == FLEET_STATS_FILTER_DPS_TAG:
+        non_dps = _as_int(getattr(vm, "non_dps", 0), 0)
         lines.append(
-            "DPS-tagged hulls only "
-            f"({_as_int(getattr(vm, 'non_dps', 0), 0)} non-DPS pilots "
-            "excluded)")
+            "DPS-tagged hulls only"
+            + (f" ({non_dps} non-DPS pilots excluded)" if non_dps > 0 else ""))
     else:
         lines.append("No active doctrine: all hulls counted")
     off_pilots = _as_int(getattr(vm, "off_doctrine", 0), 0)
     off_hulls = _capped_hulls(getattr(vm, "off_doctrine_hulls", ()))
     if off_pilots > 0 or off_hulls:
-        detail = f" ({off_hulls})" if off_hulls else ""
-        lines.append(f"Off-doctrine: {off_pilots} pilots{detail} "
-                     "— not simulated")
+        lines.append(f"Off-doctrine (not simulated): {off_hulls}")
     if getattr(vm, "partial", False):
         lines.append(f"{FLEET_STATS_PARTIAL_MARK} some fits carry modules the "
                      f"simulator does not model")

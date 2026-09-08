@@ -24,12 +24,19 @@ Four rules shape the module, and each is load-bearing rather than tidy:
    for that hull" send the FC to three different places:
 
    * **OFF-DOCTRINE** -- a doctrine is active and names no fit for the hull.
-     ``off_doctrine`` (pilots) + ``off_doctrine_hulls`` (``"Loki ×3"``).
+     ``off_doctrine`` (pilots) + ``off_doctrine_hulls`` (``"Loki ×3"``). This is
+     also where a doctrine member's fit id lands once that fit is deleted from
+     the library: :func:`doctrine_fit_ids` builds its map FROM the library, so
+     a dangling id never enters the map and the hull it named simply has no
+     entry -- indistinguishable, on the real path, from a hull the doctrine
+     never mentioned. Safe by construction: the hull is never simulated and
+     never guessed from the library, and ``FittingsStore.delete_fit`` cascades
+     the member out of the doctrine anyway, so the dangling-id shape is rare
+     even off the worker path.
    * **NON-DPS** -- a doctrine fit resolved, but the doctrine does not tag it
      ``DPS``. ``non_dps``.
-   * **UNMODELED** -- no fit at all (no doctrine and 0 or >1 library fits, or
-     a doctrine fit id that no longer resolves), or a simulate that failed.
-     ``unmodeled_hulls``.
+   * **UNMODELED** -- no fit at all (no doctrine and 0 or >1 library fits), or
+     a simulate that failed. ``unmodeled_hulls``.
 
    None of the three is simulated. The off-doctrine class is the reason the
    library rung below is DOCTRINE-GATED: with a doctrine active, an
@@ -271,7 +278,13 @@ def resolve_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids, *,
 
     1. A DOCTRINE fit for the hull -- if several, the member with the lowest
        ``DoctrineMember.order``. The doctrine is the FC's own statement of what
-       the fleet is flying, so it outranks the library every time.
+       the fleet is flying, so it outranks the library every time. When the
+       hull is named by TWO DIFFERENT fits (a shield and an armor Loki as
+       separate doctrine rows), only the lowest-order one is ever resolved --
+       the DPS tag test downstream (:attr:`FleetStatsVM.dps_filter`) reads
+       THAT fit's tags alone, never the union across the hull's rows. An
+       under-claim by design: a hull with one DPS row and one non-DPS row at
+       higher order counts as DPS, matching what actually gets simulated.
     2. Otherwise, and **only when no doctrine is active**, the library's fit
        for the hull, and only when there is exactly ONE. Two library fits for
        the same hull is a genuine ambiguity (a shield and an armor Loki are
@@ -291,18 +304,34 @@ def resolve_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids, *,
 
     The two miss reasons:
 
-    * ``REASON_OFF_DOCTRINE`` -- a doctrine is active and names NO fit id for
-      this hull.
+    * ``REASON_OFF_DOCTRINE`` -- a doctrine is active and the ``doctrine_fit_ids``
+      map has no entry for this hull. On the real (worker) path this is ALSO
+      where a doctrine member's DELETED fit id lands: :func:`doctrine_fit_ids`
+      builds its map FROM the library, so an id that no longer resolves never
+      enters the map, and the hull it named is then indistinguishable from a
+      hull the doctrine never mentioned at all. Safe by construction -- never
+      simulated, never guessed from the library -- and ``FittingsStore.
+      delete_fit`` cascades the member out of the doctrine on delete anyway,
+      so a stale id reaching here at all is the rare/defensive case.
     * ``REASON_NO_FIT`` -- everything else: no doctrine and nothing (or too
-      much) in the library, or a doctrine that names ids for this hull of
-      which none still resolves (the deleted-fit case: the FC's doctrine DOES
-      cover the hull, so it is a gap in the number, not an exclusion).
+      much) in the library; or, reachable only when a caller hands this
+      function a ``doctrine_fit_ids`` mapping whose ids are stale relative to
+      ``fits_by_hull`` (never true of the precomputed map :func:`doctrine_fit_ids`
+      itself returns, which is filtered against that same library), a hull
+      entry naming ids none of which resolve.
 
-    One asymmetry is deliberate and only reachable off the worker path: with
-    ``doctrine_fit_ids=None`` (walk the doctrine OBJECT), a member whose fit
-    is gone leaves no trace to distinguish from a member for another hull, so
-    that hull reads off-doctrine. The precomputed map -- the only shape the
-    aggregator uses -- keeps the distinction.
+    One distinction exists only for a HAND-BUILT ``doctrine_fit_ids`` map, never
+    for the real ``doctrine_fit_ids()`` output the aggregator actually uses:
+    the dict branch of :func:`_ordered_doctrine_ids` trusts the map verbatim,
+    with no re-check against ``by_id``, so a map naming a stale id reaches
+    ``REASON_NO_FIT`` here. ``doctrine_fit_ids=None`` (walk the doctrine
+    OBJECT) instead filters dangling ids out before they ever reach
+    ``ordered``, landing on ``REASON_OFF_DOCTRINE``. This split is a test seam
+    for exercising ``resolve_hull`` in isolation -- see the ``stale`` case in
+    ``test_fit_for_hull_library_rung_is_doctrine_gated`` -- and not a real code
+    path: the actual :func:`doctrine_fit_ids` builder filters stale ids out of
+    the map at build time, so on the worker path both branches already agree
+    on ``REASON_OFF_DOCTRINE`` before this function ever sees the hull.
     """
     candidates = list((fits_by_hull or {}).get(hull_type_id) or ())
     by_id = {}
