@@ -33,6 +33,15 @@ whose ``operation`` is outside the eight real dogma op codes is DROPPED -- it
 carries no attribute semantics.  The EFFECT itself is always kept, possibly with
 an empty ``m``, so the engine can still see that the effect exists and report it.
 
+SKILL-EFFECT OVERRIDES: a handful of skill effects have no ``modifierInfo`` in
+the SDE at all (CCP never published one -- pyfa hand-writes them), so a pure
+``modifierInfo`` engine applies nothing and the numbers those skills feed come
+out low.  ``tools/dogma_overrides.py`` carries curated rows for them, spliced in
+here after filtering.  The gate is total: a modifier-less effect on a
+category-16 type that is in NEITHER ``SKILL_EFFECT_OVERRIDES`` nor
+``SKILL_EFFECTS_IGNORED`` aborts the build with exit 2, so a gap a future SDE
+introduces gets triaged rather than shipped.
+
 Output encoding is the contract in ``dogma_data.py`` -- that module is the only
 reader, and its docstring is authoritative.  Compact separators, gzip level 9,
 atomic temp+replace write.
@@ -42,7 +51,8 @@ Usage:
   py -3.12 tools/gen_fit_dogma.py --download
 
 Exit codes: 0 ok, 2 a size budget was exceeded (the file is still written so the
-breach can be inspected), 1 anything fatal.
+breach can be inspected) or an untriaged modifier-less skill effect was found,
+1 anything fatal.
 """
 from __future__ import annotations
 
@@ -55,6 +65,9 @@ import tracemalloc
 import zipfile
 from pathlib import Path
 from typing import Iterable, NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import dogma_overrides  # noqa: E402  (sibling module; the insert above is what finds it)
 
 SDE_ZIP_URL = "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip"
 SDE_BUILD_URL = "https://developers.eveonline.com/static-data/tranquility/latest.jsonl"
@@ -421,6 +434,95 @@ def referenced_attributes(effects: dict, dbuffs: dict) -> set:
     return out
 
 
+# --------------------------------------------------------------------------
+# stage 3b: skill-effect overrides (tools/dogma_overrides.py)
+# --------------------------------------------------------------------------
+
+def skill_carriers(types: dict, effect_id: int) -> list:
+    """The category-16 type ids (as the table's string keys, sorted by id) that
+    list ``effect_id``."""
+    return [tid for tid in sorted(types, key=int)
+            if types[tid].get("c") == SKILL_CATEGORY_ID
+            and effect_id in (types[tid].get("e") or ())]
+
+
+def apply_overrides(effects: dict, types: dict) -> dict:
+    """Splice ``dogma_overrides.SKILL_EFFECT_OVERRIDES`` into a built table.
+
+    Mutates ``effects`` and ``types`` in place and returns
+    ``{"applied": n, "synthetic": m}`` -- ``applied`` counts effect RECORDS that
+    now carry override rows, of which ``synthetic`` are the per-skill ones.
+
+    An overridden effect keeps its real ``cat`` (the engine's state gating reads
+    it, and an override changes what the effect DOES, never when it applies).
+    An override for an effect this SDE build does not carry is a no-op, so a
+    stale entry cannot fabricate an effect out of nothing.
+
+    Per-skill overrides (a dict value) are emitted as one synthetic effect per
+    carrying skill under ``dogma_overrides.synthetic_effect_id`` and swapped
+    into that skill's ``e`` list; the original effect id is then dropped if no
+    kept type still names it.  The current SDE needs none of this -- see the
+    module docstring of ``dogma_overrides``."""
+    applied = synthetic = 0
+    for effect_id in sorted(dogma_overrides.SKILL_EFFECT_OVERRIDES):
+        key = str(effect_id)
+        if key not in effects:
+            continue
+        category = effects[key]["cat"]
+        if not dogma_overrides.is_per_skill(effect_id):
+            effects[key]["m"] = [list(row)
+                                 for row in dogma_overrides.rows_for(effect_id, 0)]
+            applied += 1
+            continue
+        for tid in skill_carriers(types, effect_id):
+            rows = dogma_overrides.rows_for(effect_id, int(tid))
+            if rows is None:
+                continue
+            new_id = dogma_overrides.synthetic_effect_id(int(tid))
+            effects[str(new_id)] = {"cat": category, "m": [list(row) for row in rows]}
+            types[tid]["e"] = [new_id if e == effect_id else e for e in types[tid]["e"]]
+            applied += 1
+            synthetic += 1
+        if not any(effect_id in (rec.get("e") or ()) for rec in types.values()):
+            del effects[key]
+    return {"applied": applied, "synthetic": synthetic}
+
+
+def untriaged_skill_effects(effects: dict, types: dict) -> dict:
+    """``{effect_id: [carrying skill type id, ...]}`` for every effect on a
+    category-16 type that STILL has no modifier rows and is not listed in
+    ``dogma_overrides.SKILL_EFFECTS_IGNORED``.
+
+    Call after :func:`apply_overrides`; a non-empty result is a hard build
+    failure, because such an effect is a bonus the engine silently drops."""
+    out = {}
+    for tid, rec in types.items():
+        if rec.get("c") != SKILL_CATEGORY_ID:
+            continue
+        for effect_id in rec.get("e") or ():
+            row = effects.get(str(effect_id))
+            if row is None or row["m"]:
+                continue
+            if effect_id in dogma_overrides.SKILL_EFFECTS_IGNORED:
+                continue
+            out.setdefault(effect_id, []).append(int(tid))
+    return {eid: sorted(skills) for eid, skills in sorted(out.items())}
+
+
+def ignored_skill_effect_count(effects: dict, types: dict) -> int:
+    """How many distinct modifier-less skill effects the shipped table carries
+    under ``SKILL_EFFECTS_IGNORED`` (the summary's ``K``)."""
+    seen = set()
+    for rec in types.values():
+        if rec.get("c") != SKILL_CATEGORY_ID:
+            continue
+        for effect_id in rec.get("e") or ():
+            row = effects.get(str(effect_id))
+            if row is not None and not row["m"]:
+                seen.add(effect_id)
+    return len(seen)
+
+
 def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
                 attributes_lines, dbuff_lines, fit_type_ids, build: int,
                 stats: dict | None = None) -> dict:
@@ -449,7 +551,9 @@ def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
     attributes = load_attributes(attributes_lines)
     dbuffs = normalise_dbuffs(dbuff_lines)
 
-    kept_attrs = referenced_attributes(effects, dbuffs) | resolve_whitelist(attributes)
+    kept_attrs = (referenced_attributes(effects, dbuffs)
+                  | resolve_whitelist(attributes)
+                  | dogma_overrides.referenced_attribute_ids())
     kept_attrs &= set(attributes)          # an id no SDE record defines cannot be encoded
 
     out_attrs = {}
@@ -476,6 +580,25 @@ def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
         if kept_ids:
             rec["e"] = kept_ids
         out_types[str(tid)] = rec
+
+    override_stats = apply_overrides(effects, out_types)
+    untriaged = untriaged_skill_effects(effects, out_types)
+    if untriaged:
+        # Exit 2 (not a bare FATAL/1) so a CI caller can tell "this SDE grew a
+        # new modifier-less skill effect" apart from a broken invocation.
+        print("UNTRIAGED SKILL EFFECT(S): in NEITHER "
+              "dogma_overrides.SKILL_EFFECT_OVERRIDES nor SKILL_EFFECTS_IGNORED --",
+              file=sys.stderr)
+        for eid, skills in untriaged.items():
+            print(f"  effect {eid} on skill(s) "
+                  f"{', '.join(str(s) for s in skills)}", file=sys.stderr)
+        print("Triage each one (write an override row, or list it as ignored with a "
+              "reason) before regenerating; shipping it would silently drop the bonus.",
+              file=sys.stderr)
+        raise SystemExit(2)
+    if stats is not None:
+        stats["overrides"] = override_stats
+        stats["ignored_skill_effects"] = ignored_skill_effect_count(effects, out_types)
 
     return {
         "v": int(build),
@@ -627,6 +750,8 @@ def emit(table: dict, out_path: Path, *, stats: dict | None = None) -> int:
     pairs = sum(len(rec.get("a", ())) // 2 for rec in table["types"].values())
     mods = sum(len(rec["m"]) for rec in table["effects"].values())
     unknown = tuple((stats or {}).get("unknown_fit_type_ids") or ())
+    overrides = (stats or {}).get("overrides") or {"applied": 0, "synthetic": 0}
+    ignored = (stats or {}).get("ignored_skill_effects", 0)
     print(f"wrote {out_path}")
     print(f"  SDE build      {table['v']}")
     print(f"  types          {len(table['types']):,} ({pairs:,} attribute pairs, "
@@ -634,6 +759,10 @@ def emit(table: dict, out_path: Path, *, stats: dict | None = None) -> int:
     print(f"  effects        {len(table['effects']):,} ({mods:,} modifier rows)")
     print(f"  attributes     {len(table['attrs']):,}")
     print(f"  dbuffs         {len(table['dbuffs']):,}")
+    print(f"  skill-effect overrides applied: {overrides['applied']} "
+          f"({overrides['synthetic']} synthetic per-skill effects)")
+    print(f"  skill effects still without modifiers: {ignored} "
+          "(all listed in SKILL_EFFECTS_IGNORED)")
     print(f"  fit_types ids unknown to SDE: {len(unknown)}")
     if unknown:
         shown = ", ".join(str(t) for t in unknown[:10])
