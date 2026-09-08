@@ -403,9 +403,13 @@ def default_info_tiles_config() -> dict:
         "opacity": DEFAULT_OPACITY,
         # The fleet tile's DPS/volley row. Feature-scoped rather than nested
         # under tiles.fleet: it is one extra LINE on a tile the owner already
-        # chose, and it costs a fit simulation per hull, so it gets its own
-        # opt-in and follows the tile-by-tile enable policy (default OFF).
-        "fleet_stats": False,
+        # chose. DEFAULT ON (owner ask, 2026-09-08) -- unlike the tile-by-tile
+        # enable policy above (the MASTER switch and every per-tile "enabled"
+        # stay False; the owner still enables tiles one by one), this
+        # sub-setting of an already-off-by-default tile pre-arms the row so
+        # whichever install turns the fleet tile on sees it immediately,
+        # rather than discovering a second checkbox it has to also find.
+        "fleet_stats": True,
         "tiles": {
             "battle": {"enabled": False},
             "fleet": {"enabled": False},
@@ -1351,6 +1355,39 @@ def fleet_stats_hidden_tip(vm) -> str:
     text = fleet_stats_text(vm)
     tip = fleet_stats_tip(vm)
     return "\n".join(part for part in (text, tip) if part)
+
+
+def grown_fleet_rect(rect, screen_rect):
+    """Pure: the ONE-TIME fleet-tile height bump, or ``None`` when it is a
+    no-op.
+
+    ``rect`` is ``(x, y, w, h)``; ``screen_rect`` is the ``(sx, sy, sw, sh)``
+    of the screen judged to contain it (``InfoTileController._screen_at``'s
+    job, not this function's -- a growing tile must not be measured against
+    the WRONG monitor's bottom edge).
+
+    Shared by the two places a fleet tile can grow, so their math cannot
+    drift apart: ``InfoTileController.grow_for_fleet_stats`` (the settings
+    popup's live-apply click, for a tile that already exists when the owner
+    turns the row on) and the fleet tile's SPAWN path (``fleet_stats``
+    defaults ON since 2026-09-08, so an existing install's persisted tile, or
+    a brand-new install's default-sized one, needs the same bump with no
+    click to trigger it).
+
+    Returns the grown ``(x, y, w, h)`` -- moved UP rather than off the bottom
+    edge when it would overflow the screen -- or ``None`` when the tile
+    already has room (``h >= FLEET_STATS_MIN_TILE_H``). Callers still run a
+    non-``None`` result through ``InfoTileController._rescue`` for the full
+    clamp-across-every-screen treatment; this function only answers "should
+    this grow, and by how much."""
+    x, y, w, h = rect
+    if h >= FLEET_STATS_MIN_TILE_H:
+        return None
+    height = h + FLEET_STATS_ROW_PX
+    _sx, sy, _sw, sh = screen_rect
+    if y + height > sy + sh:
+        y = max(sy, sy + sh - height)
+    return (x, y, w, height)
 
 
 # ── intel ───────────────────────────────────────────────────────────────────
@@ -2600,6 +2637,13 @@ TILE_SPECS = {
     # and still lands well above the floors (MIN_W 120 / MIN_H 90), so the
     # default did not need to move. Stored layouts win over this at spawn, so
     # an existing 280x170 tile keeps its size.
+    # THE PIN STAYS 180x120: ``fleet_stats`` defaulting ON (2026-09-08) does
+    # NOT move this tuple. `_fleet_spawn_grow` applies its one-time bump to
+    # WHATEVER rect spawn resolves to -- including this very default -- so a
+    # brand-new install's effective first-run fleet tile is actually 180x134;
+    # the extra 14 px is the DPS/volley row's own budget
+    # (`FLEET_STATS_ROW_PX`), added once, after this default is read, never
+    # baked into the pin itself.
     "fleet": {"title": "Fleet", "default_size": (180, 120),
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
@@ -3393,6 +3437,10 @@ class InfoTileController:
         self._renderers[key] = renderer
         self._tile_visible[key] = False
         x, y, w, h = self._spawn_rect(key)
+        if key == "fleet":
+            # The one-time fleet_stats height bump, applied BEFORE the single
+            # spawn place() below (no extra retop) -- see the docstring.
+            x, y, w, h = self._fleet_spawn_grow(x, y, w, h)
         _call(tile.place, x, y, w, h)
         _call(tile.set_lock_layout, self._lock_layout())
         _call(tile.configure_snap, self._snap_enabled(), None,
@@ -3819,13 +3867,16 @@ class InfoTileController:
         Called from the settings popup's live-apply when ``fleet_stats`` goes
         ON, never from the beat -- so its ``place()`` is one of the sanctioned
         user-click retops (``arrange`` / ``match_preview_size``'s class), not a
-        per-tick SetWindowPos.
+        per-tick SetWindowPos. (``_fleet_spawn_grow`` below is this method's
+        twin for the case there is no click to catch -- see its docstring.)
 
         The row costs one line, and the shipped 180x120 tile's worst case is
         7 px short of ``FLEET_STATS_MIN_TILE_H`` -- short by less than the row
         it needs (see the height budget above) -- so a user who turns the row
         on and leaves his tile alone would get the honest-but-unhelpful
-        hidden-row state forever. This adds that one row's height, once:
+        hidden-row state forever. This adds that one row's height, once, via
+        the pure ``grown_fleet_rect`` (shared with ``_fleet_spawn_grow`` so
+        the two cannot drift):
 
         * MARKER-GATED (``FLEET_STATS_GROWN_KEY`` in the ``info_tiles`` block).
           Toggling the box off and on again must not ratchet the tile taller
@@ -3860,19 +3911,55 @@ class InfoTileController:
             # OverflowError included for JSON's non-standard ``Infinity``.
             return False
         block[FLEET_STATS_GROWN_KEY] = True
-        if h >= FLEET_STATS_MIN_TILE_H:
+        grown = grown_fleet_rect((x, y, w, h), self._screen_at(x, y))
+        if grown is None:
             self._save()          # the marker is a decision worth persisting
             return False
-        height = h + FLEET_STATS_ROW_PX
-        _sx, sy, _sw, sh = self._screen_at(x, y)
-        if y + height > sy + sh:
-            y = max(sy, sy + sh - height)
-        x, y = self._rescue(x, y, w, height)
+        gx, gy, gw, gh = grown
+        gx, gy = self._rescue(gx, gy, gw, gh)
         if tile is not None:
-            _call(tile.place, x, y, w, height)
-        self._persist_rect("fleet", x, y, w, height)
+            _call(tile.place, gx, gy, gw, gh)
+        self._persist_rect("fleet", gx, gy, gw, gh)
         self._save()
         return True
+
+    def _fleet_spawn_grow(self, x, y, w, h):
+        """The fleet tile's SPAWN-time twin of ``grow_for_fleet_stats``.
+
+        ``fleet_stats`` defaults ON since 2026-09-08 (owner ask), which means
+        there is no enable click for it to ride: an EXISTING install's
+        persisted 120 px tile, or a BRAND-NEW install's default-sized one,
+        would otherwise spawn with the row already on and already hidden --
+        the box would look broken with nothing to explain it, since a
+        genuinely-too-short tile still hides the row correctly and silently.
+        Called from ``_spawn`` for the fleet tile only, BEFORE its single
+        spawn ``place()`` -- this never places anything itself, so the spawn
+        stays one retop, not two.
+
+        Shares ``grown_fleet_rect`` with the click path so the two cannot
+        disagree about how much a tile needs to grow. Differs from the click
+        path only in gating: NO-OP whenever ``fleet_stats`` is OFF (a later
+        manual enable still grows through the popup's click, exactly as
+        before this feature existed) and NO-OP, with no marker touched,
+        when it is already set (a tile grown once -- by either path -- is
+        never grown again).
+
+        Returns the rect the caller's ``place()`` should use."""
+        if not self._block().get("fleet_stats", False):
+            return x, y, w, h
+        block = self._block(create=True)
+        if block.get(FLEET_STATS_GROWN_KEY):
+            return x, y, w, h
+        block[FLEET_STATS_GROWN_KEY] = True
+        grown = grown_fleet_rect((x, y, w, h), self._screen_at(x, y))
+        if grown is None:
+            self._save()
+            return x, y, w, h
+        gx, gy, gw, gh = grown
+        gx, gy = self._rescue(gx, gy, gw, gh)
+        self._persist_rect("fleet", gx, gy, gw, gh)
+        self._save()
+        return gx, gy, gw, gh
 
     def shutdown(self) -> None:
         self.resolver.stop()
