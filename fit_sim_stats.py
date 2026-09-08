@@ -26,7 +26,9 @@ caller's worker thread owns the decision to pay for it.
 v1 simplifications, each of them honest -- every one shows up in
 ``FitStats.unmodeled`` and (where it moves a number) sets ``FitStats.partial``:
 
-* links are not wired yet: ``links`` must be ``"none"`` (task 4 lifts that);
+* only the four dbuffs that move a v1 stat are visible in the numbers -- a
+  Skirmish or Information link changes nothing the readout shows, so those
+  disciplines have no preset at all (:mod:`fit_sim_links`);
 * the Reactive Armor Hardener's resist shift is not simulated;
 * smartbomb damage is excluded from DPS;
 * missile application (explosion radius / velocity vs a target), capacitor,
@@ -42,6 +44,7 @@ from typing import Callable, NamedTuple, Sequence
 
 import dogma_data
 import fit_sim
+import fit_sim_links
 from fit_models import ParsedFit, fit_content_hash
 
 # ===========================================================================
@@ -222,8 +225,9 @@ REPORTABLE_CATEGORIES = frozenset({
 #: Cache bound for :func:`simulate` (spec 5.4).
 CACHE_SIZE = 512
 
-#: The tier :func:`simulate` accepts until task 4 lands the others.
-TIER_NONE = "none"
+#: The no-links tier, re-exported so a consumer needs one import.  Single
+#: source: :mod:`fit_sim_links` owns the tier vocabulary.
+TIER_NONE = fit_sim_links.TIER_NONE
 
 
 # ===========================================================================
@@ -650,20 +654,35 @@ def simulate(parsed: ParsedFit, *, links: str = TIER_NONE,
     HIT.  ``name_of`` is deliberately NOT part of the key -- it only decides
     cosmetic strings, and every consumer in the app shares one catalog.
 
-    ``disciplines`` is the MODE string ("auto" / "shield" / "armor" / "both").
-    Task 3 accepts only ``links="none"``, where no discipline can apply, so
-    ``FitStats.disciplines_applied`` is always empty; task 4 resolves the mode
-    into the applied tuple.  The raw mode still enters the key, so results
-    computed today cannot leak into a later tier's answer.
+    ``disciplines`` is the MODE string, one of
+    :data:`fit_sim_links.DISCIPLINE_MODES` -- the MODE, not the resolved
+    disciplines, is what enters the cache key.  That is sound because the mode
+    resolves DETERMINISTICALLY for a given fit: ``auto`` reads the fit's own
+    shield-vs-armor HP, and the fit is already pinned by its content hash.
+    :attr:`FitStats.disciplines_applied` reports what the mode resolved to.
 
-    Raises :class:`ValueError` for an unsupported tier and
+    **Cost.** One ``build_fit`` always, and ONE ``evaluate`` -- except for
+    ``links != "none"`` with ``disciplines="auto"``, which needs TWO: the first
+    settles the receiver's own fitted HP so ``auto`` can read the tank the
+    pilot actually built, the second re-folds it with the buffs applied.
+    ``evaluate`` rebuilds every value from ``base``, so the second pass is a
+    clean re-evaluation, not an accumulation on top of the first.
+
+    Raises :class:`ValueError` for an unknown tier or discipline mode, and
     :class:`dogma_data.DogmaUnavailable` when no table is loaded -- this never
     calls ``dogma_data.load()`` itself: that decode belongs to the caller's
     worker thread.
     """
-    if links != TIER_NONE:
+    if links not in fit_sim_links.TIERS:
+        raise ValueError(f"unknown link tier {links!r}; expected one of "
+                         f"{list(fit_sim_links.TIERS)}")
+    # Validated even for the no-links tier, which never resolves it: a typo in
+    # the mode is a caller bug either way, and it must not lie dormant until
+    # someone switches the tier on.
+    if disciplines not in fit_sim_links.DISCIPLINE_MODES:
         raise ValueError(
-            f"link tier {links!r} is not wired yet (task 4); pass 'none'")
+            f"unknown discipline mode {disciplines!r}; expected one of "
+            f"{list(fit_sim_links.DISCIPLINE_MODES)}")
     if not dogma_data.is_loaded():
         raise dogma_data.DogmaUnavailable(
             "no dogma table loaded -- call dogma_data.load() from a worker "
@@ -676,8 +695,20 @@ def simulate(parsed: ParsedFit, *, links: str = TIER_NONE,
             _cache.move_to_end(key)
             return hit
 
-    stats = derive(fit_sim.evaluate(fit_sim.build_fit(parsed)), profile,
-                   links=links, disciplines=(), name_of=name_of)
+    fit = fit_sim.build_fit(parsed)
+    if links == TIER_NONE:
+        # No booster, no discipline: the mode is validated but never resolved,
+        # so the no-links tier costs exactly one evaluation.
+        applied: tuple = ()
+        buffs: tuple = ()
+    else:
+        if disciplines == fit_sim_links.MODE_AUTO:
+            fit_sim.evaluate(fit)               # the receiver at rest
+        applied = fit_sim_links.choose_disciplines(fit, disciplines)
+        buffs = fit_sim_links.buffs_for(links, applied)
+
+    stats = derive(fit_sim.evaluate(fit, buffs), profile,
+                   links=links, disciplines=applied, name_of=name_of)
 
     with _cache_lock:
         _cache[key] = stats
