@@ -1961,14 +1961,14 @@ class MapTab:
         # from the new origin.
         if changed and self.state.route_dest is not None:
             if system_id is not None and system_id == self.state.route_dest:
-                self.clear_route()
+                self._clear_dest_route()      # automatic: keep a live WH route
                 return
             self._recompute_route()
         # E5: the 15 s poll re-pushes the SAME id most ticks -- when nothing
         # changed (and so no route recompute could have run above either), the
         # own-location marker's screen position is identical to what's already
         # painted, so skip the repaint. A real move (or the branches above)
-        # still repaints -- via clear_route() above or the fall-through here.
+        # still repaints -- via _clear_dest_route() above or the fall-through here.
         if not changed:
             return
         self._redraw_overlays()
@@ -1990,31 +1990,54 @@ class MapTab:
         self._recompute_route()                  # async BFS (handles own == dest)
         self._redraw_overlays()                  # show the destination ring at once
 
+    def _clear_dest_route_state(self) -> None:
+        """Reset the destination-route fields (dest + path) WITHOUT
+        repainting -- the caller owns its own single redraw. Bumps
+        ``_route_gen`` so a BFS answer already in flight for the destination
+        route (spawned by ``_recompute_route``) is dropped by ``_apply_route``
+        if it lands after this reset. Shared by ``_clear_dest_route`` (the two
+        AUTOMATIC clear sites -- arrival in ``set_own_location``, destination
+        == current system in ``_recompute_route``) and ``clear_route`` (the
+        user's EXPLICIT clear) so the two never drift apart."""
+        self.state.route_dest = None
+        self.state.route_path = None
+        self._route_gen += 1                      # orphan any in-flight BFS answer
+
+    def _clear_dest_route(self) -> None:
+        """Drop ONLY the destination route overlay and repaint once. This is
+        the AUTOMATIC clear -- arrival at the destination (``set_own_location``)
+        or the destination already matching the current system at the moment
+        it is set (``_recompute_route``) -- which must leave a live wormhole
+        route drawn: the pilot may still want the hop out. Contrast
+        ``clear_route``, the user's EXPLICIT 'Clear route' action, which drops
+        both overlays."""
+        self._clear_dest_route_state()
+        self._redraw_overlays()
+
     def clear_route(self) -> None:
         """Drop BOTH route overlays -- the destination route AND the wormhole
-        navigation route -- and repaint once. Triggered by arrival, a
-        replacement destination, or the user's 'Clear route' menu action
-        (offered whenever either route has something to clear -- see
-        ``_has_clearable_route``). Session state only -- nothing persisted.
+        navigation route -- and repaint once. Triggered ONLY by the user's
+        EXPLICIT 'Clear route' menu action (offered whenever either route has
+        something to clear -- see ``_has_clearable_route``) or a replacement
+        destination (``set_route_destination(None)``). The two AUTOMATIC
+        clears -- arrival and destination == current system -- go through
+        ``_clear_dest_route`` instead and leave the wormhole route alone.
+        Session state only -- nothing persisted.
 
         Folds in the wormhole-route reset (owner bug report: clearing the
         route left the lime hop + gold/blue gate legs from the Navigation
         tab's WH search still drawn -- the only production caller of
         ``set_wh_route(None)`` was the START of the NEXT search, never a
-        clear). Reuses ``_reset_wh_route_state`` -- the same field reset
-        ``set_wh_route(None)`` performs -- rather than calling
-        ``set_wh_route(None)`` itself, so this method still repaints exactly
-        ONCE. Also bumps ``_route_gen`` so a BFS answer already in flight for
-        the destination route (spawned by ``_recompute_route``) is dropped by
-        ``_apply_route`` if it lands after this clear.
+        clear). Reuses ``_clear_dest_route_state`` and ``_reset_wh_route_state``
+        -- the same field resets ``set_route_destination``/``set_wh_route(None)``
+        perform -- rather than calling either setter itself, so this method
+        still repaints exactly ONCE.
 
         DELIBERATELY does not notify the host / fc_gui: the Navigation
         panel's own WH-search verdict text is a separate, independently-
         driven display and keeps showing its last result after this call --
         only the MAP line is what the owner asked to clear."""
-        self.state.route_dest = None
-        self.state.route_path = None
-        self._route_gen += 1                      # orphan any in-flight BFS answer
+        self._clear_dest_route_state()
         self._reset_wh_route_state()
         self._redraw_overlays()
 
@@ -2031,19 +2054,20 @@ class MapTab:
     def _recompute_route(self) -> None:
         """Re-solve the travel route from own location to route_dest on a worker
         thread (Ansiblex-aware BFS), feeding the result back through the main-
-        thread result queue as a ``("route", tuple)`` message (drained by
+        thread result queue as a ``("route", gen, tuple)`` message (drained by
         _drain_results, applied by _apply_route -- the same off-thread pattern as
         _recompute_threat). No-ops while origin / dest / model are missing (the
-        destination ring still draws); arrival (own == dest) clears. Ansiblex
-        connection strings are built from the resolved bridge pairs the map
-        already holds -- the SAME resolution the jump-range BFS consumes -- so no
-        fc_gui import is needed."""
+        destination ring still draws); dest == current system is an AUTOMATIC
+        clear (``_clear_dest_route`` -- the wormhole route, if any, is left
+        drawn). Ansiblex connection strings are built from the resolved bridge
+        pairs the map already holds -- the SAME resolution the jump-range BFS
+        consumes -- so no fc_gui import is needed."""
         dest = self.state.route_dest
         origin = self.state.own_system_id
         if dest is None or origin is None or self.state.model is None:
             return
-        if origin == dest:                       # already there -> arrival clear
-            self.clear_route()
+        if origin == dest:                       # already there -> automatic clear
+            self._clear_dest_route()
             return
         # "id1|id2" strings for get_stargate_route's extra-edge parser (order does
         # not matter -- _bfs_route adds both directions). Empty -> None (gate-only).
