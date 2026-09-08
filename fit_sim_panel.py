@@ -100,17 +100,24 @@ def settings(config) -> tuple:
     its config dict wholesale when settings are saved, so anything that held a
     reference would read from an orphan (CODEBASE_MAP, ``_save_settings``).
 
-    Garbage — a missing block, a non-dict, a null, an empty string — falls back
-    to :data:`DEFAULTS` rather than raising: a hand-edited config must not be
-    able to stop the fittings pane from rendering.
+    Garbage — a missing block, a non-dict, a null, an empty string, or a value
+    outside the tier/discipline vocabulary — falls back to :data:`DEFAULTS`
+    rather than raising: a hand-edited config must not be able to stop the
+    fittings pane from rendering, nor hand the Tk shell a Combobox value its
+    ``values`` list doesn't contain.
     """
     block = config.get("fittings") if isinstance(config, dict) else None
     if not isinstance(block, dict):
         block = {}
+    tier = str(block.get("sim_links_tier") or DEFAULTS["sim_links_tier"])
+    if tier not in fit_sim_links.TIERS:
+        tier = DEFAULTS["sim_links_tier"]
+    disciplines = str(block.get("sim_links_disciplines")
+                       or DEFAULTS["sim_links_disciplines"])
+    if disciplines not in fit_sim_links.DISCIPLINE_MODES:
+        disciplines = DEFAULTS["sim_links_disciplines"]
     return (bool(block.get("sim_enabled", DEFAULTS["sim_enabled"])),
-            str(block.get("sim_links_tier") or DEFAULTS["sim_links_tier"]),
-            str(block.get("sim_links_disciplines")
-                or DEFAULTS["sim_links_disciplines"]))
+            tier, disciplines)
 
 
 def format_number(value) -> str:
@@ -165,7 +172,11 @@ def format_range(metres) -> str:
     if amount < METRE_FLOOR:
         return f"{sign}{amount:,.0f} m"
     km = amount / 1000.0
-    return f"{sign}{km:.0f} km" if km >= 100 else f"{sign}{km:.1f} km"
+    # Test the ROUNDED value, not the raw one: 99,950 m is 99.95 km, which
+    # the one-decimal branch would print as "100.0 km" — a number that looks
+    # rounded rather than one that is. round() puts it in the right branch.
+    return (f"{sign}{km:.0f} km" if round(km, 1) >= 100
+            else f"{sign}{km:.1f} km")
 
 
 def format_weapon_range(row) -> str:
@@ -350,7 +361,13 @@ class FitStatsPanel:
         self.state = "result"
         self.rows = format_stats(stats)
         self._clear()
+        # A continuation row (the 2nd/3rd Resists line) carries an empty
+        # label — format_stats' own convention (module docstring) — so the
+        # group a row belongs to has to be tracked forward, the same way
+        # tests/test_fit_sim_panel.py's `_rows` helper reads the table back.
+        group = ""
         for index, (label, value) in enumerate(self.rows):
+            group = label or group
             name = tk.Label(self._grid, text=label, font=_LABEL_FONT,
                             fg=FG_DIM, bg=BG_PANEL, anchor=tk.NW)
             name.grid(row=index, column=0, sticky="nw", padx=(0, 6))
@@ -358,9 +375,9 @@ class FitStatsPanel:
                             fg=FG_TEXT, bg=BG_PANEL, anchor=tk.W,
                             justify=tk.LEFT, wraplength=_VALUE_WRAP)
             cell.grid(row=index, column=1, sticky="w")
-            if label == "Resists":
+            if group == "Resists":
                 attach_tooltip(name, RESIST_ORDER_TIP)
-            elif label == "Links":
+            elif group == "Links":
                 attach_tooltip(cell, links_tip(stats))
 
     # ── internals ────────────────────────────────────────────────────────
