@@ -105,7 +105,16 @@ The gate needs no character-side skill index: the two gated modifier kinds reach
 only ``ship_location`` (ship + modules + charges + drones) and the
 character-OWNED items (drones + charges, a subset of the same list), and neither
 set changes when a skill is dropped.  Skills and implants -- the character
-LOCATION -- are reachable only by modifier kinds the gate always keeps.
+LOCATION -- are reachable only by modifier kinds the gate always keeps.  What
+that preserves is REACHABILITY of a fit's numbers, not the char-location
+MEMBERSHIP list itself: dropping a skill removes its Item from
+``char_location()``, so a NON-skill ``charID`` + ``LocationRequiredSkillModifier``
+source (only implants carry those; 186 in the shipped table, all gating on
+skill 3411, which no kept skill requires) could in principle miss a target that
+a skipped skill would otherwise have supplied.  On the real table this changes
+gap BOOKKEEPING only, never a number -- the gate skill is unreached either way
+-- and ``tests/test_fit_sim_engine.py`` carries a data guard that fires if a
+future SDE regen ever lets a kept skill require that gate skill.
 
 Skill-sourced modelling gaps are NOT user-facing.  Two paths feed them, and the
 measured shipped table (588 kept skills, SDE build 3494416) says the second is

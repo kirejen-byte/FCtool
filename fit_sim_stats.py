@@ -845,8 +845,8 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     if links_unavailable:
         # The links the caller asked for and did not get -- an honest "this
         # number is missing a boost" rather than a silently unboosted fit.
-        lines = [f"command links ({links}/{discipline}): preset unavailable "
-                 "in this SDE" for discipline in links_unavailable] + lines
+        lines = [f"command links ({links}/{discipline}): no buffs from this "
+                 "preset" for discipline in links_unavailable] + lines
         items = [(0, "links_unavailable")
                  for _discipline in links_unavailable] + items
         partial = True
