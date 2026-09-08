@@ -971,6 +971,21 @@ def fleet_stats_text(vm, max_width=None, measure=None) -> str:
     return _fleet_stats_compose(head, "", tail)
 
 
+def _capped_hulls(names) -> str:
+    """``"Loki ×3, Sabre ×1 (+2 more)"`` -- one hull list, capped.
+
+    Shared by the tooltip's two hull lists (the off-doctrine one and the "no
+    fit" one) so they cap at the same place and say the same thing about the
+    tail. ``""`` for an empty list, which the caller reads as "omit the
+    line"."""
+    hulls = [str(name) for name in (names or ())]
+    if not hulls:
+        return ""
+    rest = len(hulls) - FLEET_TIP_HULLS
+    return ", ".join(hulls[:FLEET_TIP_HULLS]) + (f" (+{rest} more)"
+                                                 if rest > 0 else "")
+
+
 def fleet_stats_tip(vm) -> str:
     """Hover copy for the stats row: the assumption, then the gaps.
 
@@ -987,6 +1002,13 @@ def fleet_stats_tip(vm) -> str:
     genuinely different claims that print as the same ``DPS 41.2k``. Naming
     the excluded pilot count is what lets an FC tell "my logi wing is not in
     this" from "half my fleet fell out of the number".
+
+    The OFF-DOCTRINE line appears only when there are such pilots, and names
+    the hulls with their counts (``Loki ×3``): a hull the active doctrine does
+    not contain is neither a gap the FC can close by writing a fit ("No fit:"
+    would send him looking for one) nor a doctrine row that failed to say
+    "DPS" -- it is a ship nobody planned for, and the count is the number that
+    tells him whether it is one straggler or a third of the fleet.
 
     The links half names what was APPLIED (``max/shield``) whenever every
     modeled hull resolved the same disciplines, and falls back to the MODE
@@ -1013,15 +1035,18 @@ def fleet_stats_tip(vm) -> str:
             "excluded)")
     else:
         lines.append("No active doctrine: all hulls counted")
+    off_pilots = _as_int(getattr(vm, "off_doctrine", 0), 0)
+    off_hulls = _capped_hulls(getattr(vm, "off_doctrine_hulls", ()))
+    if off_pilots > 0 or off_hulls:
+        detail = f" ({off_hulls})" if off_hulls else ""
+        lines.append(f"Off-doctrine: {off_pilots} pilots{detail} "
+                     "— not simulated")
     if getattr(vm, "partial", False):
         lines.append(f"{FLEET_STATS_PARTIAL_MARK} some fits carry modules the "
                      f"simulator does not model")
-    hulls = [str(name) for name in (getattr(vm, "unmodeled_hulls", ()) or ())]
+    hulls = _capped_hulls(getattr(vm, "unmodeled_hulls", ()))
     if hulls:
-        shown = ", ".join(hulls[:FLEET_TIP_HULLS])
-        rest = len(hulls) - FLEET_TIP_HULLS
-        lines.append(f"No fit: {shown}" + (f" (+{rest} more)"
-                                           if rest > 0 else ""))
+        lines.append(f"No fit: {hulls}")
     return "\n".join(lines)
 
 

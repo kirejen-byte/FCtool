@@ -17,6 +17,26 @@ Four rules shape the module, and each is load-bearing rather than tidy:
    can print ``(31/35)`` and the FC can see how much of his fleet the number
    actually covers. A number that quietly describes 60 % of the fleet while
    looking like all of it is worse than no number.
+
+   There are THREE distinct ways a pilot can fall out of the number, they are
+   counted separately, and the tooltip names each -- because "your logi wing
+   is excluded", "that Loki is not in your doctrine at all" and "I have no fit
+   for that hull" send the FC to three different places:
+
+   * **OFF-DOCTRINE** -- a doctrine is active and names no fit for the hull.
+     ``off_doctrine`` (pilots) + ``off_doctrine_hulls`` (``"Loki ×3"``).
+   * **NON-DPS** -- a doctrine fit resolved, but the doctrine does not tag it
+     ``DPS``. ``non_dps``.
+   * **UNMODELED** -- no fit at all (no doctrine and 0 or >1 library fits, or
+     a doctrine fit id that no longer resolves), or a simulate that failed.
+     ``unmodeled_hulls``.
+
+   None of the three is simulated. The off-doctrine class is the reason the
+   library rung below is DOCTRINE-GATED: with a doctrine active, an
+   off-doctrine hull's single library fit is a guess about a ship the FC never
+   asked for, and a guessed hull silently folded into ``non_dps`` was the bug
+   this table replaced (it read as "your doctrine says that is not a damage
+   dealer", which the doctrine never said).
 3. **Never raise.** A resolver that throws, a fit whose ``parsed`` is missing,
    a simulate that hits an unmodellable hull -- each costs that hull's
    contribution and nothing else. This runs on a worker feeding a 1 Hz HUD
@@ -79,6 +99,30 @@ DPS_TAG = "dps"
 DPS_FILTER_ALL = "all"
 DPS_FILTER_TAG = "dps-tag"
 
+#: :attr:`Resolution.reason` -- WHY a hull resolved no fit, which is the whole
+#: difference between the OFF-DOCTRINE and UNMODELED classes above. ``""`` (a
+#: fit resolved) is the third value and needs no name.
+REASON_OFF_DOCTRINE = "off-doctrine"
+REASON_NO_FIT = "no-fit"
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """One hull's fit lookup: the fit, or the REASON there is none.
+
+    ``fit_for_hull`` answers ``Fit | None`` and always will -- that is the
+    question most callers have. This is the same walk with its reasoning
+    preserved, because the aggregate cannot classify a miss without it: a hull
+    the doctrine never mentions and a hull whose doctrine fit was deleted both
+    resolve nothing, and telling the FC "no fit" about the first would send him
+    hunting a fit he deliberately never wrote.
+    """
+
+    fit: object = None
+    #: ``""`` when :attr:`fit` is set; else ``REASON_OFF_DOCTRINE`` /
+    #: ``REASON_NO_FIT``.
+    reason: str = ""
+
 
 @dataclass(frozen=True)
 class FleetStatsVM:
@@ -126,6 +170,17 @@ class FleetStatsVM:
     #: The tooltip states it because the row's wording cannot -- ``DPS 41.2k``
     #: is the same eight characters either way.
     dps_filter: str = DPS_FILTER_ALL
+    #: Pilots flying a hull the ACTIVE doctrine does not name at all. Never
+    #: simulated (there is no fit to simulate that the FC ever chose), never
+    #: folded into ``non_dps`` -- "your doctrine does not tag that DPS" is a
+    #: claim about a doctrine row that does not exist. Always 0 with no
+    #: doctrine: with nothing to be off, nothing is off-doctrine.
+    off_doctrine: int = 0
+    #: Those hulls as ``"Loki ×3"`` labels, count-descending. The count rides
+    #: IN the label (unlike ``unmodeled_hulls``, whose wording is pinned by the
+    #: shipped tooltip) because this list answers "how much of my fleet is off
+    #: doctrine, and which part" -- a bare name answers only half of it.
+    off_doctrine_hulls: tuple = ()
 
 
 # ── small guards (nothing in this module may raise on junk) ─────────────────
@@ -158,6 +213,19 @@ def _call(fn, *args, default=None):
         return fn(*args)
     except Exception:
         return default
+
+
+def _resolved(value) -> tuple:
+    """``(fit, reason)`` out of whatever a ``resolve`` seam answered.
+
+    A :class:`Resolution` is read as itself; anything else is the historical
+    ``Fit | None`` shape, whose only possible miss is ``REASON_NO_FIT`` -- a
+    plain resolver cannot report an off-doctrine hull because it does not know
+    the doctrine is on. Keeping BOTH shapes legal is what lets the arithmetic
+    stay testable with a one-line ``fits.get`` fake."""
+    if isinstance(value, Resolution):
+        return value.fit, (value.reason if value.fit is None else "")
+    return (value, "") if value is not None else (None, REASON_NO_FIT)
 
 
 def _hull_label(hull_type_id, hull_name) -> str:
@@ -195,20 +263,46 @@ def _ordered_doctrine_ids(hull_type_id, doctrine, by_id,
     return [fit_id for _order, _index, fit_id in rows]
 
 
-def fit_for_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids):
-    """The fit this fleet's <hull> is assumed to be flying, or None.
+def resolve_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids, *,
+                 doctrine_active: bool = False) -> Resolution:
+    """The fit this fleet's <hull> is assumed to be flying, WITH its reasoning.
 
     The ladder, in order (spec section 5.6):
 
     1. A DOCTRINE fit for the hull -- if several, the member with the lowest
        ``DoctrineMember.order``. The doctrine is the FC's own statement of what
        the fleet is flying, so it outranks the library every time.
-    2. Otherwise the library's fit for the hull, and only when there is exactly
-       ONE. Two library fits for the same hull is a genuine ambiguity (a shield
-       and an armor Loki are different ships for every number here), and
-       guessing would put a confident wrong figure on the HUD.
-    3. Otherwise None -- the hull is counted as unmodeled and named in the
-       tooltip.
+    2. Otherwise, and **only when no doctrine is active**, the library's fit
+       for the hull, and only when there is exactly ONE. Two library fits for
+       the same hull is a genuine ambiguity (a shield and an armor Loki are
+       different ships for every number here), and guessing would put a
+       confident wrong figure on the HUD.
+    3. Otherwise nothing, with the reason recorded.
+
+    ``doctrine_active`` is what gates rung 2, and it is a SEPARATE argument
+    rather than ``doctrine is not None`` because the worker never sees the
+    doctrine object -- it is handed the precomputed ``doctrine_fit_ids`` map,
+    whose ``{}`` means "an active doctrine that names nothing here" exactly as
+    often as it means "no doctrine". With a doctrine active the library rung is
+    OFF: a doctrine that does not mention the hull has said what it is flying,
+    and the library's lone Loki fit is then a guess about a ship the FC did not
+    put in his doctrine -- so the hull is reported off-doctrine instead of
+    quietly modeled (or, worse, quietly counted as "not a damage dealer").
+
+    The two miss reasons:
+
+    * ``REASON_OFF_DOCTRINE`` -- a doctrine is active and names NO fit id for
+      this hull.
+    * ``REASON_NO_FIT`` -- everything else: no doctrine and nothing (or too
+      much) in the library, or a doctrine that names ids for this hull of
+      which none still resolves (the deleted-fit case: the FC's doctrine DOES
+      cover the hull, so it is a gap in the number, not an exclusion).
+
+    One asymmetry is deliberate and only reachable off the worker path: with
+    ``doctrine_fit_ids=None`` (walk the doctrine OBJECT), a member whose fit
+    is gone leaves no trace to distinguish from a member for another hull, so
+    that hull reads off-doctrine. The precomputed map -- the only shape the
+    aggregator uses -- keeps the distinction.
     """
     candidates = list((fits_by_hull or {}).get(hull_type_id) or ())
     by_id = {}
@@ -216,14 +310,30 @@ def fit_for_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids):
         fit_id = str(getattr(fit, "id", "") or "")
         if fit_id and fit_id not in by_id:
             by_id[fit_id] = fit
-    for fit_id in _ordered_doctrine_ids(hull_type_id, doctrine, by_id,
-                                        doctrine_fit_ids):
+    ordered = _ordered_doctrine_ids(hull_type_id, doctrine, by_id,
+                                    doctrine_fit_ids)
+    for fit_id in ordered:
         fit = by_id.get(fit_id)
         if fit is not None:
-            return fit
+            return Resolution(fit)
+    if doctrine_active:
+        return Resolution(None,
+                          REASON_NO_FIT if ordered else REASON_OFF_DOCTRINE)
     if len(candidates) == 1:
-        return candidates[0]
-    return None
+        return Resolution(candidates[0])
+    return Resolution(None, REASON_NO_FIT)
+
+
+def fit_for_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids, *,
+                 doctrine_active: bool = False):
+    """The fit this fleet's <hull> is assumed to be flying, or None.
+
+    :func:`resolve_hull`'s ladder with the reasoning dropped -- the answer most
+    callers want. The aggregate uses ``resolve_hull`` instead, because "no fit"
+    and "not in the doctrine" are different lines in the tooltip.
+    """
+    return resolve_hull(hull_type_id, doctrine, fits_by_hull, doctrine_fit_ids,
+                        doctrine_active=doctrine_active).fit
 
 
 def index_fits(fits) -> dict:
@@ -430,6 +540,12 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
     hulls are visited count-descending so the call order is deterministic and
     the heaviest part of the fleet is modeled first.
 
+    ``resolve`` may answer a :class:`Resolution` instead of a bare fit, and
+    that is how the three exclusion classes stay apart: a bare ``None`` can
+    only mean "no fit", while a ``Resolution`` carries WHY. Both shapes are
+    accepted forever -- every caller that only wants arithmetic keeps handing
+    a plain ``hull -> Fit | None`` callable.
+
     ``dps_fit_ids`` is rule 4's switch (build it with
     :func:`doctrine_dps_fit_ids`). ``None`` = no doctrine, so no filter: every
     resolved hull counts. A SET = a doctrine is active, and a hull counts only
@@ -437,12 +553,14 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
     all -- it costs nothing, and its pilots land in ``non_dps`` rather than in
     ``modeled`` or in ``unmodeled_hulls``: it is an EXCLUSION, not a gap, and
     listing the logi wing under "no fit" would send the FC hunting a fit that
-    is right there.
+    is right there. An OFF-DOCTRINE hull is a third answer again, and reaching
+    it needs a ``Resolution``-shaped resolver.
     """
     dps = volley = ehp_sum = 0.0
-    modeled = total = non_dps = 0
+    modeled = total = non_dps = off_doctrine = 0
     partial = False
     unresolved = []
+    off_hulls = []
     applied = set()
     filtering = dps_fit_ids is not None
     wanted = frozenset(str(fit_id) for fit_id in (dps_fit_ids or ()))
@@ -454,7 +572,14 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
         if count <= 0:
             continue
         total += count
-        fit = _call(resolve, hull, default=None)
+        fit, reason = _resolved(_call(resolve, hull, default=None))
+        if fit is None and reason == REASON_OFF_DOCTRINE:
+            # A hull the active doctrine never names. Not a gap the FC can
+            # close by writing a fit, and not something to simulate from a
+            # library guess -- so it is counted, named, and left alone.
+            off_doctrine += count
+            off_hulls.append((count, _hull_label(hull, hull_name)))
+            continue
         if filtering and fit is not None and \
                 str(getattr(fit, "id", "") or "") not in wanted:
             # Resolved, and deliberately not counted. Note the ORDER: an
@@ -496,13 +621,18 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
         disciplines_applied=(next(iter(applied)) if len(applied) == 1
                              else ()),
         non_dps=non_dps,
-        dps_filter=DPS_FILTER_TAG if filtering else DPS_FILTER_ALL)
+        dps_filter=DPS_FILTER_TAG if filtering else DPS_FILTER_ALL,
+        off_doctrine=off_doctrine,
+        off_doctrine_hulls=tuple(
+            f"{name} ×{count}" for count, name
+            in sorted(off_hulls, key=lambda row: (-row[0], row[1]))))
 
 
 # ── the worker's whole body ────────────────────────────────────────────────
 
 def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
-            disciplines: str, load, simulate, hull_name, dps_fit_ids=None):
+            disciplines: str, load, simulate, hull_name, dps_fit_ids=None,
+            doctrine_active=None):
     """One aggregate, or ``None`` when there is no answer. WORKER SIDE.
 
     This is the fc_gui worker's entire body, kept here so the wiring stays
@@ -521,8 +651,16 @@ def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
 
     ``dps_fit_ids`` is rule 4's filter, resolved on the Tk thread by
     :func:`doctrine_dps_fit_ids` for the same reason ``doctrine_ids`` is: the
-    doctrine object never crosses to a worker.
+    doctrine object never crosses to a worker. It also ANSWERS "is a doctrine
+    active?" -- :func:`doctrine_dps_fit_ids` returns ``None`` for exactly that
+    case and a (possibly empty) set otherwise -- so ``doctrine_active``
+    defaults to reading it rather than making every caller repeat itself.
+    ``doctrine_ids`` cannot answer it: ``{}`` is both "no doctrine" and "a
+    doctrine that names no fit any of these hulls can use". Pass
+    ``doctrine_active`` explicitly to state it anyway.
     """
+    active = (dps_fit_ids is not None) if doctrine_active is None \
+        else bool(doctrine_active)
     try:
         if not _call(load, default=False):
             log.debug("[hud] fleet stats: no dogma table, no aggregate")
@@ -532,8 +670,10 @@ def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
             # The doctrine OBJECT is deliberately never handed to a worker: its
             # member list is live store state the Tk thread may rewrite, so the
             # ordering was resolved into `doctrine_ids` up there and that plain
-            # map is authoritative here.
-            lambda hull: fit_for_hull(hull, None, fits_by_hull, doctrine_ids),
+            # map is authoritative here. `resolve_hull` (not `fit_for_hull`)
+            # because the aggregate needs the REASON a hull resolved nothing.
+            lambda hull: resolve_hull(hull, None, fits_by_hull, doctrine_ids,
+                                      doctrine_active=active),
             simulate, hull_name, tier=tier, disciplines=disciplines,
             dps_fit_ids=dps_fit_ids)
     except Exception:
