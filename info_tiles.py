@@ -929,9 +929,16 @@ def fleet_stats_text(vm, max_width=None, measure=None) -> str:
        at all: ``Vly 13…`` reads as a volley of thirteen thousand, which is a
        wrong number rather than a missing one, and this row is read at a
        glance during a fight;
-    3. only then ``_fit_to_width`` on the DPS half, keeping the ``(31/35)``
-       tail -- the coverage suffix is the decision-critical token, because a
-       DPS figure whose coverage you cannot see is worse than a short one.
+    3. and that is the LAST rung -- the volley-less line is returned even when
+       it overflows, and the frame clips it.
+
+    There is deliberately NO truncating rung under (2). Everything left in the
+    short line is a number or the coverage tail: at a 118 px budget the ladder
+    used to hand back ``~DPS 1.2… (180/256)`` for a 1.24M-DPS fleet, an
+    ellipsis that turns 1.24 MILLION into "1.2-something" while still looking
+    like a reading. Clipping loses the RIGHT-hand end visibly; ellipsizing
+    invents a plausible wrong number in the middle of the row, and the same
+    rule already governs the intel tile's ``(2j)`` badge.
 
     Every degrade direction (no measurer, unrealised width, a measurer that
     raises) returns the whole line and lets the frame clip it -- ``_fit_to_
@@ -951,14 +958,9 @@ def fleet_stats_text(vm, max_width=None, measure=None) -> str:
     try:
         if measure(full) <= width:
             return full
-        short = _fleet_stats_compose(head, "", tail)
-        if measure(short) <= width:
-            return short
     except Exception:
         return full
-    fitted = _fit_to_width(head, width, measure,
-                           lambda text: _fleet_stats_compose(text, "", tail))
-    return short if fitted is None else fitted
+    return _fleet_stats_compose(head, "", tail)
 
 
 def fleet_stats_tip(vm) -> str:
@@ -970,11 +972,20 @@ def fleet_stats_tip(vm) -> str:
     entitled to know that before he plans around it. The ``no fit`` list names
     the hulls the number does NOT include (capped, with a count for the rest);
     the partial line explains the ``~``.
+
+    The links half names what was APPLIED (``max/shield``) whenever every
+    modeled hull resolved the same disciplines, and falls back to the MODE
+    (``max/auto``) when they did not: ``auto`` is a rule, not an answer, and a
+    single resolved name would be a fleet-wide claim that is true of only part
+    of the fleet. ``none`` never grows a suffix -- there is nothing to name.
     """
     if vm is None:
         return ""
     tier = str(getattr(vm, "tier", "") or "none")
-    disciplines = str(getattr(vm, "disciplines", "") or "")
+    applied = [str(name) for name
+               in (getattr(vm, "disciplines_applied", ()) or ())]
+    disciplines = "+".join(applied) if applied \
+        else str(getattr(vm, "disciplines", "") or "")
     links = f"{tier}/{disciplines}" if disciplines and tier != "none" else tier
     lines = [f"Assumes doctrine fits, all-V skills; links: {links}",
              f"Avg EHP {compact_number(getattr(vm, 'ehp_avg', 0.0))} "

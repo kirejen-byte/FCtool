@@ -1146,10 +1146,13 @@ class FCToolGUI:
         # disciplines) identity the stored VM was computed for AND the in-flight
         # spawn guard — set when the worker is launched, so a second poll with
         # an unchanged fleet spawns nothing. _fleet_stats_after is the 250 ms
-        # coalescer's pending after id.
+        # coalescer's pending after id. _fleet_stats_failed_at stamps a FAILED
+        # attempt (monotonic) so the latched key is re-opened for one retry a
+        # minute later — None means "succeeded, or in flight".
         self._fleet_stats_vm = None
         self._fleet_stats_key = None
         self._fleet_stats_after = None
+        self._fleet_stats_failed_at = None
         # Fit-detail stats readout (fit_sim_panel). The two StringVars are made
         # ONCE and reused for every fit, so the tier/discipline pick survives
         # re-selecting a fitting; the generation counter drops results whose
@@ -6412,14 +6415,16 @@ class FCToolGUI:
         self._last_specialized_args = None
         self._last_polled_fleet_id = None
         self._last_polled_fleet_is_boss = False
-        # The HUD's fleet DPS/volley aggregate, all three fields together: the
+        # The HUD's fleet DPS/volley aggregate, all four fields together: the
         # stored VM (else the tile keeps printing a dead fleet's DPS), the key
         # (else the next real fleet with the same shape would be suppressed as
         # "unchanged"), and the coalescer's pending after -- which the
         # _update_specialized_roles([], {}, 0) call above has just re-armed, so
-        # cancelling it here is what makes this clear stick.
+        # cancelling it here is what makes this clear stick. The retry stamp
+        # goes with them: it only ever qualifies the key it was recorded for.
         self._fleet_stats_vm = None
         self._fleet_stats_key = None
+        self._fleet_stats_failed_at = None
         after_id = getattr(self, "_fleet_stats_after", None)
         if after_id is not None:
             try:
@@ -28037,7 +28042,9 @@ class FCToolGUI:
     # DIFFERENT is the key: a fleet poll fires every ~30 s whether or not the
     # fleet moved, and one aggregate costs a dogma simulation per hull type, so
     # an unchanged (counts, doctrine, fittings revision, tier, disciplines)
-    # spawns nothing at all (spec 5.4).
+    # spawns nothing at all (spec 5.4) -- unless the last attempt FAILED, which
+    # `fleet_stats.retry_due` re-opens on a clock (the sov layer's pattern).
+    # Every decision here is a pure fleet_stats call; this is wiring only.
 
     def _schedule_fleet_stats_refresh(self):
         """Coalesce fleet-stats requests onto the Tk loop (Tk thread only).
@@ -28063,39 +28070,45 @@ class FCToolGUI:
         ``_save_settings`` REPLACES wholesale — a held reference goes stale and
         its reads land in an orphan). Config values are read fresh on every call
         and passed by value, per the same rule.
+
+        The doctrine comes from ``_active_fleet_doctrine`` — the SAME source
+        the kick site (``_update_specialized_roles``) computes its guidance
+        from, so the HUD row and the Fleet tab can never describe two different
+        doctrines. Every store/var read here is guarded: this runs inside a
+        fleet poll, and a raise would cost the poll, not just the row.
         """
         self._fleet_stats_after = None
-        cached = getattr(self, "_last_specialized_args", None)
-        ship_counts = {}
-        if cached:
-            try:
-                _members, ship_counts, _total = cached
-            except (TypeError, ValueError):
-                ship_counts = {}
-        if not isinstance(ship_counts, dict) or not ship_counts:
+        ship_counts = fleet_stats.ship_counts_from_snapshot(
+            getattr(self, "_last_specialized_args", None))
+        if not ship_counts:
             # No fleet is an ANSWER, not a gap: drop the stored aggregate so the
             # tile stops printing the last one, and clear the key so the next
             # real fleet is never mistaken for "unchanged".
             self._fleet_stats_vm = None
             self._fleet_stats_key = None
+            self._fleet_stats_failed_at = None
             return
 
-        fittings_cfg = self.config.get("fittings")
-        if not isinstance(fittings_cfg, dict):
-            fittings_cfg = {}
-        tier = str(fittings_cfg.get("sim_links_tier", "none") or "none")
-        disciplines = str(fittings_cfg.get("sim_links_disciplines", "auto")
-                          or "auto")
-        doctrine = self._active_doctrine_obj()
-        doctrine_id = getattr(doctrine, "id", None)
+        tier, disciplines = fleet_stats.sim_options(
+            self.config.get("fittings"))
+        try:
+            doctrine = self._active_fleet_doctrine()
+        except Exception:
+            doctrine = None
         try:
             revision = self.fittings.revision()
         except Exception:
             revision = 0
 
-        key = fleet_stats.fleet_key(ship_counts, doctrine_id, revision, tier,
-                                    disciplines)
-        if key == getattr(self, "_fleet_stats_key", None):
+        key = fleet_stats.fleet_key(ship_counts, getattr(doctrine, "id", None),
+                                    revision, tier, disciplines)
+        # An unchanged fleet spawns nothing — unless the last attempt FAILED
+        # and its retry is due, which is the only way a transient no-table
+        # answer heals (the key is latched at spawn: it suppresses forever).
+        if key == getattr(self, "_fleet_stats_key", None) and not \
+                fleet_stats.retry_due(
+                    getattr(self, "_fleet_stats_failed_at", None),
+                    time.monotonic()):
             return
 
         # hull -> [Fit] and the doctrine's fit ids per hull, both resolved HERE
@@ -28105,16 +28118,21 @@ class FCToolGUI:
             fits_by_hull = fleet_stats.index_fits(self.fittings.list_fits())
         except Exception:
             fits_by_hull = {}
-        doctrine_ids = fleet_stats.doctrine_fit_ids(doctrine, fits_by_hull)
+        try:
+            doctrine_ids = fleet_stats.doctrine_fit_ids(doctrine, fits_by_hull)
+        except Exception:
+            doctrine_ids = {}
 
         # Marked in flight BEFORE the spawn: the next poll's identical key then
         # finds nothing to do instead of racing a second worker onto the same
-        # answer. _apply_fleet_stats drops any result whose key is no longer
-        # this one.
+        # answer (clearing the failure stamp is what makes "in flight" mean
+        # "not owed a retry"). _apply_fleet_stats drops any result whose key is
+        # no longer this one, and re-arms the stamp when the answer is None.
         self._fleet_stats_key = key
+        self._fleet_stats_failed_at = None
         threading.Thread(
             target=self._fleet_stats_worker,
-            args=(key, dict(ship_counts), fits_by_hull, doctrine_ids,
+            args=(key, ship_counts, fits_by_hull, doctrine_ids,
                   tier, disciplines),
             daemon=True).start()
 
@@ -28122,39 +28140,21 @@ class FCToolGUI:
                             doctrine_ids, tier, disciplines):
         """Simulate one fit per hull and sum the fleet. WORKER THREAD.
 
-        ``dogma_data.load()`` lives HERE and nowhere else on this path: the
-        bundled table is never decoded at startup and never on the Tk thread
-        (spec 5.4). ``type_catalog.resolve_name`` is also worker-only by
-        contract -- on a cache miss it makes a synchronous ESI call, which is
-        precisely why it must not run inside the 1 Hz render path.
-
-        Everything is inside one try/except: a failure costs the row (the
-        aggregate stays None and the tile simply omits it), never the poll.
+        The body is ``fleet_stats.compute`` (pure, injected edges); this method
+        is the thread's two bindings to the app: ``dogma_data.load`` and
+        ``fit_sim_stats.simulate`` — the bundled table is never decoded at
+        startup and never on the Tk thread (spec 5.4) — plus
+        ``type_catalog.resolve_name``, which is worker-only by contract because
+        a cache miss makes a synchronous ESI call. ``compute`` never raises: a
+        failure costs the row, never the poll.
         """
-        vm = None
-        try:
-            if not dogma_data.load():
-                # No table (missing or corrupt bundle) is an ANSWER: bail once
-                # instead of letting simulate raise DogmaUnavailable per hull.
-                self._post_ui(self._apply_fleet_stats, key, None)
-                return
-            vm = fleet_stats.aggregate(
-                ship_counts,
-                # The doctrine OBJECT is deliberately not handed over: its
-                # member list is live store state the Tk thread may rewrite, so
-                # the ordering was resolved into doctrine_ids up there and that
-                # plain map is authoritative here.
-                lambda hull: fleet_stats.fit_for_hull(
-                    hull, None, fits_by_hull, doctrine_ids),
-                lambda parsed: fit_sim_stats.simulate(
-                    parsed, links=tier, disciplines=disciplines,
-                    name_of=self.type_catalog.resolve_name),
-                self.type_catalog.resolve_name,
-                tier=tier, disciplines=disciplines)
-        except Exception:
-            log.debug("[hud] fleet stats aggregate failed", exc_info=True)
-            vm = None
-        self._post_ui(self._apply_fleet_stats, key, vm)
+        self._post_ui(self._apply_fleet_stats, key, fleet_stats.compute(
+            ship_counts, fits_by_hull, doctrine_ids,
+            tier=tier, disciplines=disciplines, load=dogma_data.load,
+            simulate=lambda parsed: fit_sim_stats.simulate(
+                parsed, links=tier, disciplines=disciplines,
+                name_of=self.type_catalog.resolve_name),
+            hull_name=self.type_catalog.resolve_name))
 
     def _apply_fleet_stats(self, key, vm):
         """Store one aggregate for the HUD to read. Tk thread only.
@@ -28163,10 +28163,17 @@ class FCToolGUI:
         (or the doctrine, or the fit library) moved while the worker ran, and a
         newer spawn owns the answer. Dropping is safe precisely because the key
         is set at spawn time -- there is always a live computation for the
-        current key, or a fresh one on the next poll."""
+        current key, or a fresh one on the next poll.
+
+        ``vm is None`` is a FAILED attempt (no table, or a rollup that threw),
+        not an empty fleet, and it stamps the retry clock: without that stamp
+        the latched key would suppress every later poll, and one transient
+        file-open failure would be permanent."""
         if key != getattr(self, "_fleet_stats_key", None):
             return
         self._fleet_stats_vm = vm
+        self._fleet_stats_failed_at = None if vm is not None \
+            else time.monotonic()
 
     def _group_of_safe(self, type_id):
         """group_id resolver that never raises (network failure -> None)."""

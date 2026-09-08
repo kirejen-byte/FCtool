@@ -26,10 +26,29 @@ Three rules shape the module, and each is load-bearing rather than tidy:
 rides inside ``info_tiles.FleetCompModel``, whose renderer early-returns on an
 unchanged dirty key -- a mutable member there would silently repaint, or worse,
 silently NOT repaint.
+
+``fit_sim_links`` is the ONE sibling import: :func:`sim_options` validates the
+two config strings against that module's own vocabularies, so a hand-edited
+``config.json`` cannot push an unknown tier down into the simulator. It is a
+vocabulary read, not an engine one -- nothing here loads the dogma table
+(``load`` is injected too, for exactly that reason).
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+import fit_sim_links
+
+log = logging.getLogger(__name__)
+
+#: Seconds before a FAILED aggregate is attempted again for an UNCHANGED fleet.
+#: Without it a single transient failure -- ``dogma_data.load()`` answering
+#: False because an AV filter briefly refused the bundle open, the documented
+#: file-open class -- would be permanent: the key is latched at spawn, so every
+#: later poll would find it unchanged and spawn nothing, forever. The map's sov
+#: layer carries the same clock for the same reason.
+FLEET_STATS_RETRY_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +78,15 @@ class FleetStatsVM:
     tier: str
     disciplines: str
     partial: bool
+    #: The disciplines the simulator actually APPLIED, sorted -- but only when
+    #: every modeled hull resolved the same set; ``()`` when the hulls disagree
+    #: (a shield fleet with an armor logi wing under ``auto``) or when nothing
+    #: resolved. The tooltip prints these instead of the mode, because
+    #: ``links: max/shield`` states what the number was computed under while
+    #: ``max/auto`` states only that something chose. A union across DIFFERING
+    #: hulls would read as one fleet-wide claim that is true of no hull, so the
+    #: mixed case deliberately falls back to naming the mode.
+    disciplines_applied: tuple = ()
 
 
 # ── small guards (nothing in this module may raise on junk) ─────────────────
@@ -204,6 +232,71 @@ def doctrine_fit_ids(doctrine, fits_by_hull) -> dict:
     return ordered
 
 
+# ── the Tk thread's inputs, made pure ──────────────────────────────────────
+
+def ship_counts_from_snapshot(cached) -> dict:
+    """``{hull_type_id: pilots}`` out of ``_last_specialized_args``.
+
+    The snapshot is ``(members, ship_counts, total)`` when a fleet poll has run
+    and ``None`` before the first one -- but it is ALSO briefly ``([], {}, 0)``
+    (the honest empty fleet the teardown republishes), and anything at all if a
+    future caller re-shapes it. Every one of those answers ``{}``: an empty map
+    is what the caller reads as "no fleet", and it is returned as a fresh dict
+    the worker owns outright, never the live one the Tk thread rewrites.
+    """
+    if not isinstance(cached, (tuple, list)) or len(cached) != 3:
+        return {}
+    counts = cached[1]
+    if not isinstance(counts, dict):
+        return {}
+    return {_as_int(hull, 0): _as_int(count, 0)
+            for hull, count in counts.items()}
+
+
+def sim_options(fittings_cfg) -> tuple:
+    """``(tier, disciplines)`` from the ``fittings`` config block, VALIDATED.
+
+    ``config.json`` is a hand-editable file and these two strings are handed
+    straight to the simulator, so an unknown value is corrected here rather
+    than carried: an unknown tier becomes ``none`` (compute nothing extra --
+    the safe direction is fewer claims) and an unknown mode becomes ``auto``.
+    Both are recorded in ``FleetStatsVM.tier``/``disciplines`` and printed in
+    the tooltip, so the correction is visible rather than silent, and one DEBUG
+    line per recompute says which value was rejected.
+    """
+    block = fittings_cfg if isinstance(fittings_cfg, dict) else {}
+    tier = str(block.get("sim_links_tier", fit_sim_links.TIER_NONE)
+               or fit_sim_links.TIER_NONE)
+    if tier not in fit_sim_links.TIERS:
+        log.debug("[hud] unknown sim_links_tier %r -> %s", tier,
+                  fit_sim_links.TIER_NONE)
+        tier = fit_sim_links.TIER_NONE
+    mode = str(block.get("sim_links_disciplines", fit_sim_links.MODE_AUTO)
+               or fit_sim_links.MODE_AUTO)
+    if mode not in fit_sim_links.DISCIPLINE_MODES:
+        log.debug("[hud] unknown sim_links_disciplines %r -> %s", mode,
+                  fit_sim_links.MODE_AUTO)
+        mode = fit_sim_links.MODE_AUTO
+    return tier, mode
+
+
+def retry_due(failed_at, now, retry_s: float = FLEET_STATS_RETRY_S) -> bool:
+    """Is an UNCHANGED fleet's failed aggregate owed another attempt?
+
+    ``failed_at`` is ``None`` whenever the last attempt succeeded or one is in
+    flight, and a ``time.monotonic()`` stamp when it failed -- so ``False``
+    (the common case) costs one identity test. A stamp from the FUTURE, or one
+    that is not a number at all, reads as due: the clock only exists to stop a
+    retry storm, and refusing to retry forever is the worse failure.
+    """
+    if failed_at is None:
+        return False
+    try:
+        return (float(now) - float(failed_at)) >= float(retry_s)
+    except (TypeError, ValueError):
+        return True
+
+
 # ── recompute key ──────────────────────────────────────────────────────────
 
 def fleet_key(ship_counts, doctrine_id, revision, tier, disciplines) -> tuple:
@@ -243,6 +336,7 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
     modeled = total = 0
     partial = False
     unresolved = []
+    applied = set()
 
     for hull, raw_count in sorted(
             ((ship_counts or {}).items()),
@@ -263,6 +357,9 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
         volley += _as_float(getattr(stats, "volley", 0.0)) * count
         ehp_sum += _as_float(getattr(stats, "ehp_total", 0.0)) * count
         partial = partial or bool(getattr(stats, "partial", False))
+        applied.add(tuple(sorted(
+            str(name) for name
+            in (getattr(stats, "disciplines_applied", ()) or ()))))
 
     return FleetStatsVM(
         dps=dps, volley=volley,
@@ -275,4 +372,45 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
             name for _count, name
             in sorted(unresolved, key=lambda row: (-row[0], row[1]))),
         tier=str(tier or ""), disciplines=str(disciplines or ""),
-        partial=partial)
+        partial=partial,
+        # ONE set across every modeled hull, or nothing: see the field's own
+        # note. `applied` holds one sorted tuple per hull, so "they all agree"
+        # is exactly "the set has one member".
+        disciplines_applied=(next(iter(applied)) if len(applied) == 1
+                             else ()))
+
+
+# ── the worker's whole body ────────────────────────────────────────────────
+
+def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
+            disciplines: str, load, simulate, hull_name):
+    """One aggregate, or ``None`` when there is no answer. WORKER SIDE.
+
+    This is the fc_gui worker's entire body, kept here so the wiring stays
+    wiring: ``load`` (``dogma_data.load``), ``simulate`` and ``hull_name`` are
+    injected exactly as everywhere else in this module, which is what keeps the
+    engine's ~45 ms decode -- and its import -- out of this file.
+
+    ``None`` means "no row this time", and there are two ways to reach it: a
+    table that will not load (missing or corrupt bundle) is bailed on ONCE
+    rather than letting every hull raise ``DogmaUnavailable``, and anything
+    that escapes the rollup costs the row and nothing else. It is distinct from
+    a VM with ``modeled == 0``, which is the honest "the fleet flies nothing I
+    have a fit for" -- the caller re-tries a ``None`` on a clock and leaves a
+    zero-coverage VM alone.
+    """
+    try:
+        if not _call(load, default=False):
+            log.debug("[hud] fleet stats: no dogma table, no aggregate")
+            return None
+        return aggregate(
+            ship_counts,
+            # The doctrine OBJECT is deliberately never handed to a worker: its
+            # member list is live store state the Tk thread may rewrite, so the
+            # ordering was resolved into `doctrine_ids` up there and that plain
+            # map is authoritative here.
+            lambda hull: fit_for_hull(hull, None, fits_by_hull, doctrine_ids),
+            simulate, hull_name, tier=tier, disciplines=disciplines)
+    except Exception:
+        log.debug("[hud] fleet stats aggregate failed", exc_info=True)
+        return None
