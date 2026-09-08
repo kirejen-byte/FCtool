@@ -311,10 +311,35 @@ DEFAULT_CONFIG = {
         "dat_sync_enabled": False,
         "dat_sync_acceptance_passed": False,
     },
-    # NOTE: the "fittings" block is NOT seeded here — its keys are created lazily
-    # (setdefault) by the Fittings/MOTD subsystem the first time they are needed,
-    # so the shape of this defaults dict is unchanged. For reference, the MOTD
-    # composer manages these "fittings" sub-keys:
+    "fittings": {
+        # ── fit-stats simulator (fit_sim_panel / fleet_stats) ──────────────
+        # The ONLY seeded "fittings" keys; everything else in this block is
+        # created lazily by the MOTD composer (see the NOTE below). Seeded
+        # because they are FEATURE dials rather than remembered state: a fresh
+        # install must ship with the readout on, no links assumed, and the
+        # discipline chosen from the fit — and every reader still goes through
+        # `.get(key, <this default>)`, because an existing config.json that
+        # already carries a "fittings" block never gains new keys (_load_config
+        # does not deep-merge).
+        #
+        # Show the Stats block in the fittings detail pane. Passive and
+        # off-thread (the dogma table is decoded on a worker, never at
+        # startup), so it is ON by default.
+        "sim_enabled": True,
+        # Command-link tier the readout and the FC HUD aggregate assume — one
+        # of fit_sim_links.TIERS ("none" | "basic" | "bonused" | "max").
+        # "none" by default: an unasked-for boost would silently inflate every
+        # number in the pane.
+        "sim_links_tier": "none",
+        # Discipline MODE — one of fit_sim_links.DISCIPLINE_MODES ("auto" |
+        # "shield" | "armor" | "both" | "none"). "auto" reads the fit's own
+        # shield-vs-armor HP and boosts the tank the pilot actually built.
+        "sim_links_disciplines": "auto",
+    },
+    # NOTE: the REST of the "fittings" block is not seeded here — those keys are
+    # created lazily (setdefault) by the Fittings/MOTD subsystem the first time
+    # they are needed. For reference, the MOTD composer manages these "fittings"
+    # sub-keys:
     #   * "saved_motds"        — list of named per-doctrine MOTD templates. v2
     #     entries are {name, doctrine, fc, doc: [runs…], version: 2} (a pill-canvas
     #     document; a v1 entry that pre-dates the composer redesign auto-migrates

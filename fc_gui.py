@@ -111,6 +111,7 @@ import fit_dna
 # called ONLY from worker threads (spec 5.4, "no load at startup").
 import dogma_data
 import fit_sim_stats
+import fit_sim_panel
 import fleet_stats
 import pyfa_import
 import motd_builder
@@ -1149,6 +1150,14 @@ class FCToolGUI:
         self._fleet_stats_vm = None
         self._fleet_stats_key = None
         self._fleet_stats_after = None
+        # Fit-detail stats readout (fit_sim_panel). The two StringVars are made
+        # ONCE and reused for every fit, so the tier/discipline pick survives
+        # re-selecting a fitting; the generation counter drops results whose
+        # request has been superseded. Seeded from config at first paint.
+        self._fit_sim_panel = None
+        self._fit_sim_gen = 0
+        self._fit_sim_tier_var = tk.StringVar(value="none")
+        self._fit_sim_disc_var = tk.StringVar(value="auto")
         # Per-section ship-type expand state, keyed by id(content_frame) -> set of
         # open type_ids. Lets _populate_role_section preserve user expansions
         # across its frequent destroy/recreate rebuilds (every fleet poll and
@@ -15510,6 +15519,23 @@ class FCToolGUI:
                  font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
                      side=tk.LEFT)
 
+        # Stats block (fit_sim_panel owns every widget in it; this is wiring).
+        # Seeding the vars BEFORE constructing the panel is what makes the
+        # comboboxes show the persisted pick without firing on_change — the
+        # panel fires only on <<ComboboxSelected>>, never on a programmatic set.
+        enabled, tier, disciplines = fit_sim_panel.settings(self.config)
+        self._fit_sim_panel = None
+        if enabled:
+            self._fit_sim_tier_var.set(tier)
+            self._fit_sim_disc_var.set(disciplines)
+            self._fit_sim_panel = fit_sim_panel.FitStatsPanel(
+                parent, tier_var=self._fit_sim_tier_var,
+                disciplines_var=self._fit_sim_disc_var,
+                on_change=lambda: self._on_fit_sim_links_change(fit))
+            self._fit_sim_panel.frame.pack(anchor=tk.W, fill=tk.X, padx=10,
+                                           pady=(0, 6))
+            self._fit_sim_request(fit)
+
         # Slot-grouped module list.
         parsed = fit.parsed
         by_slot: dict[str, list] = {}
@@ -15587,6 +15613,77 @@ class FCToolGUI:
             tk.Label(parent, text="  (not in any doctrine)",
                      font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL).pack(
                          anchor=tk.W, padx=14)
+
+    # ── Fit stats simulator wiring (engine: fit_sim_stats, UI: fit_sim_panel) ─
+
+    def _fit_sim_request(self, fit):
+        """Kick one fit simulation and show "computing…". Tk thread only.
+
+        The generation counter is bumped HERE, so a result that arrives after
+        the user selected another fit (or flipped the tier) is dropped by
+        ``_fit_sim_apply`` rather than painted over the newer request."""
+        panel = getattr(self, "_fit_sim_panel", None)
+        if panel is None or fit is None:
+            return
+        self._fit_sim_gen += 1
+        _enabled, tier, disciplines = fit_sim_panel.settings(self.config)
+        panel.set_pending()
+        threading.Thread(
+            target=self._fit_sim_worker,
+            args=(self._fit_sim_gen, fit.parsed, tier, disciplines),
+            daemon=True).start()
+
+    def _fit_sim_worker(self, gen, parsed, tier, disciplines):
+        """Simulate ONE fit. WORKER THREAD.
+
+        ``dogma_data.load()`` lives here and nowhere else on this path (the
+        table is never decoded at startup nor on the Tk thread, spec 5.4), as
+        does ``resolve_name`` — worker-only by contract, since a cache miss
+        makes a synchronous ESI call. Every outcome, failure included, reaches
+        the panel through ``_post_ui``: a bad fit costs the block, not the pane.
+        """
+        stats, reason = None, ""
+        try:
+            if dogma_data.load():
+                stats = fit_sim_stats.simulate(
+                    parsed, name_of=self.type_catalog.resolve_name,
+                    links=tier, disciplines=disciplines)
+            else:
+                reason = "dogma table missing"
+        except Exception:
+            log.debug("[fit-sim] simulate failed", exc_info=True)
+            stats, reason = None, "simulation failed"
+        self._post_ui(self._fit_sim_apply, gen, stats, reason)
+
+    def _fit_sim_apply(self, gen, stats, reason):
+        """Paint one simulation result. Tk thread only.
+
+        Guards BOTH ways a result can be stale: a superseded generation, and a
+        panel whose widgets ``_clear_fit_detail`` already destroyed (the fit
+        selection changed, or the pane was emptied, while the worker ran)."""
+        if gen != getattr(self, "_fit_sim_gen", 0):
+            return
+        panel = getattr(self, "_fit_sim_panel", None)
+        try:
+            if panel is None or not panel.frame.winfo_exists():
+                return
+        except Exception:
+            return
+        if stats is None:
+            panel.set_unavailable(reason)
+        else:
+            panel.set_result(stats)
+
+    def _on_fit_sim_links_change(self, fit):
+        """Persist the tier/discipline pick, then recompute. Tk thread only."""
+        fit_cfg = self.config.setdefault("fittings", {})
+        fit_cfg["sim_links_tier"] = self._fit_sim_tier_var.get()
+        fit_cfg["sim_links_disciplines"] = self._fit_sim_disc_var.get()
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        self._fit_sim_request(fit)
 
     def _rename_fit(self, fit_id):
         fit = self.fittings.get_fit(fit_id)
