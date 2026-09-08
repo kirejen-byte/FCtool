@@ -3551,13 +3551,14 @@ class FCToolGUI:
 
         # Fleet Size and the fleet's modeled DPS/volley share ONE row (owner
         # request 2026-09-08: a bold, visible headline near Fleet Size).
-        # Side by side rather than stacked because comp_left's cavity is the
-        # scarce resource here (map/shell-fleet.md): at the app's MINIMUM
-        # window size the ship list is left ~45px, and this label on its own
-        # line was measured to take the scroll frame's allocation to 1px and
-        # the visible ship rows from 2 to 1. On this row it costs nothing in
-        # either axis — the row requests ~270px, still under the Doctrine
-        # combobox row's 336px, which is what drives the panel's width.
+        # Measured: alone on its own line the label took comp_scroll_outer
+        # from 225->200px at 1200x900 and 25->1px at the 1000x700 minsize
+        # (visible ship rows 2->1); sharing this row costs zero vertically at
+        # both sizes. Horizontally it requests 269px idle (the 316px Doctrine
+        # row still drives comp_left, reqwidth 336) and 325-339px with real
+        # numbers (~1.24M/3.90M worst case), where it becomes the driver --
+        # comp_left 336->345->359, costing Specialized Roles 4-11px, 0px
+        # vertically. Accepted; re-measure if anything else joins the row.
         size_row = tk.Frame(comp_left, bg=BG_PANEL)
         size_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 4))
         self._fleet_size_label = tk.Label(size_row, text="Fleet Size: --",
