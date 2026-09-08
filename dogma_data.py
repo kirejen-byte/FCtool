@@ -103,7 +103,8 @@ class BuffModifier(NamedTuple):
 class DbuffDef(NamedTuple):
     buff_id: int
     aggregate: str               # "Maximum" | "Minimum"
-    operation: int               # op the buff applies with (postPercent for every current buff)
+    operation: int               # the op code the buff applies with; NOT always postPercent --
+                                  # consumers must honour it
     modifiers: tuple[BuffModifier, ...]
 
 
@@ -252,9 +253,16 @@ def has_type(type_id: int) -> bool:
 
 @functools.lru_cache(maxsize=_TYPE_CACHE_SIZE)
 def _type_attrs_pairs(type_id: int) -> tuple[tuple[int, float], ...]:
-    """The type's own (attr_id, value) pairs, immutable and cached."""
+    """The type's own (attr_id, value) pairs, immutable and cached.
+
+    ``a`` is a flat id/value sequence and so must have an even length; the
+    generator can never emit an odd one, so an odd length here is a
+    corruption signal, not a degrade path -- raise rather than silently drop
+    the dangling id or misread it as the next pair's id."""
     flat = _type_row(type_id).get("a") or ()
-    return tuple((int(flat[i]), float(flat[i + 1])) for i in range(0, len(flat) - 1, 2))
+    if len(flat) % 2:
+        raise ValueError(f"type {type_id}: odd attribute list")
+    return tuple((int(flat[i]), float(flat[i + 1])) for i in range(0, len(flat), 2))
 
 
 #: The one bounded cache this module owns. Cleared on every (re)install.

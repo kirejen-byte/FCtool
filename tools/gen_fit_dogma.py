@@ -240,10 +240,20 @@ def select_types(index: TypeIndex, fit_type_ids: Iterable[int]) -> frozenset:
     """The kept-type id set (Appendix A.4).
 
     Ids the SDE does not know are dropped -- the table could not carry their
-    group/category, and ``dogma_data``'s type accessors require both."""
+    group/category, and ``dogma_data``'s type accessors require both. See
+    :func:`unknown_fit_type_ids` for surfacing which ids that was."""
     wanted = set(int(t) for t in fit_type_ids)
     wanted |= index.skills | index.burst_modules | index.burst_charges | index.mindlinks
     return frozenset(t for t in wanted if t in index.group)
+
+
+def unknown_fit_type_ids(index: TypeIndex, fit_type_ids: Iterable[int]) -> tuple:
+    """``--fit-types`` ids that ``types.jsonl`` does not define at all.
+
+    ``select_types`` drops these silently (it has to -- the table cannot carry
+    a group/category for an id the SDE never defines); this is what lets the
+    caller report them instead of losing the count."""
+    return tuple(sorted(t for t in (int(t) for t in fit_type_ids) if t not in index.group))
 
 
 # --------------------------------------------------------------------------
@@ -412,13 +422,22 @@ def referenced_attributes(effects: dict, dbuffs: dict) -> set:
 
 
 def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
-                attributes_lines, dbuff_lines, fit_type_ids, build: int) -> dict:
+                attributes_lines, dbuff_lines, fit_type_ids, build: int,
+                stats: dict | None = None) -> dict:
     """Assemble the whole table from six JSONL line iterables.
 
     Each iterable is consumed exactly once, in this order, so the caller can hand
-    over streaming zip members (production) or plain lists (tests)."""
+    over streaming zip members (production) or plain lists (tests).
+
+    ``stats``, when given, is populated with generation-run metrics that do NOT
+    belong in the wire table itself -- currently just ``unknown_fit_type_ids``
+    (see :func:`unknown_fit_type_ids`), which :func:`emit` reports in its
+    summary. ``fit_type_ids`` must therefore be re-iterable (a list, not a
+    one-shot generator); every caller already passes one."""
     group_categories = load_group_categories(groups_lines)
     index = index_types(types_lines, group_categories)
+    if stats is not None:
+        stats["unknown_fit_type_ids"] = unknown_fit_type_ids(index, fit_type_ids)
     kept_types = select_types(index, fit_type_ids)
     type_dogma = load_type_dogma(type_dogma_lines, kept_types)
 
@@ -569,7 +588,11 @@ def main(argv: list | None = None) -> int:
 
     fit_type_ids = [int(t) for t in json.loads(args.fit_types.read_text(encoding="utf-8"))]
 
-    with zipfile.ZipFile(zpath) as zf:
+    try:
+        zf = zipfile.ZipFile(zpath)
+    except zipfile.BadZipFile as exc:
+        raise SystemExit(f"FATAL: {zpath} is not a valid zip file: {exc}")
+    with zf:
         missing = [m for m in (MEMBER_GROUPS, MEMBER_TYPES, MEMBER_TYPE_DOGMA,
                                MEMBER_EFFECTS, MEMBER_ATTRIBUTES, MEMBER_DBUFFS)
                    if m not in zf.namelist()]
@@ -580,6 +603,7 @@ def main(argv: list | None = None) -> int:
             raise SystemExit(
                 f"FATAL: no SDE build number ({MEMBER_BUILD} absent from {zpath} and no "
                 "--build given) -- the table stamps it and dogma_data requires an int")
+        stats = {}
         # Streamed one member at a time: types.jsonl alone is 152 MB uncompressed.
         with zf.open(MEMBER_GROUPS) as groups, zf.open(MEMBER_TYPES) as types, \
                 zf.open(MEMBER_TYPE_DOGMA) as tdog, zf.open(MEMBER_EFFECTS) as effects, \
@@ -587,12 +611,12 @@ def main(argv: list | None = None) -> int:
             table = build_table(groups_lines=groups, types_lines=types,
                                 type_dogma_lines=tdog, effects_lines=effects,
                                 attributes_lines=attrs, dbuff_lines=dbuffs,
-                                fit_type_ids=fit_type_ids, build=build)
+                                fit_type_ids=fit_type_ids, build=build, stats=stats)
 
-    return emit(table, args.out)
+    return emit(table, args.out, stats=stats)
 
 
-def emit(table: dict, out_path: Path) -> int:
+def emit(table: dict, out_path: Path, *, stats: dict | None = None) -> int:
     """Encode, write and report one table; ``SystemExit(2)`` on a budget breach.
 
     The file is written BEFORE the gate so an over-budget table can be inspected
@@ -602,6 +626,7 @@ def emit(table: dict, out_path: Path) -> int:
 
     pairs = sum(len(rec.get("a", ())) // 2 for rec in table["types"].values())
     mods = sum(len(rec["m"]) for rec in table["effects"].values())
+    unknown = tuple((stats or {}).get("unknown_fit_type_ids") or ())
     print(f"wrote {out_path}")
     print(f"  SDE build      {table['v']}")
     print(f"  types          {len(table['types']):,} ({pairs:,} attribute pairs, "
@@ -609,6 +634,11 @@ def emit(table: dict, out_path: Path) -> int:
     print(f"  effects        {len(table['effects']):,} ({mods:,} modifier rows)")
     print(f"  attributes     {len(table['attrs']):,}")
     print(f"  dbuffs         {len(table['dbuffs']):,}")
+    print(f"  fit_types ids unknown to SDE: {len(unknown)}")
+    if unknown:
+        shown = ", ".join(str(t) for t in unknown[:10])
+        more = f" ... (+{len(unknown) - 10} more)" if len(unknown) > 10 else ""
+        print(f"    {shown}{more}")
     print(f"  gzip on disk   {len(blob):,} B (budget {GZIP_BUDGET_BYTES:,})")
     print(f"  decoded text   {len(text):,} B (budget {TEXT_BUDGET_BYTES:,})")
     print(f"  resident peak  {_resident_mb(text):.2f} MB (reported, not budgeted)")
