@@ -37,6 +37,20 @@ report as ``(type_id, reason code)`` pairs, index-parallel to ``unmodeled``.
 ``dogma_data.load()`` itself, because that is a multi-megabyte decode and the
 caller's worker thread owns the decision to pay for it.
 
+Two OWNER RULES shape the headline numbers (spec 4.1, recorded verbatim there):
+
+* **Ammo.**  ``simulate(..., ammo="best_close")`` -- the DEFAULT -- ignores what
+  the EFT loaded and assumes the highest-DPS CLOSE-RANGE non-Tech-II charge for
+  every weapon group, chosen from data and confirmed by SIMULATION (a
+  kinetic-bonused hull picks its kinetic ammo by itself).  ``"as_fitted"`` keeps
+  the pilot's own charges.  :attr:`FitStats.ammo_assumed` names what was chosen.
+* **Drones.**  Drone damage joins the headline ``dps_total`` / ``volley`` ONLY
+  when it is more than half the fit's raw total -- a primarily-drone ship.  The
+  breakdown (:attr:`FitStats.dps_drone`) always reports it, and
+  :attr:`FitStats.dps_raw_total` / :attr:`FitStats.volley_raw` carry the
+  everything-counted numbers, so the readout can say "(drones excluded)" rather
+  than quietly showing a smaller number.
+
 v1 simplifications, each of them honest -- every one shows up in
 ``FitStats.unmodeled`` and (where it moves a number) sets ``FitStats.partial``:
 
@@ -59,7 +73,7 @@ from typing import Callable, NamedTuple, Sequence
 import dogma_data
 import fit_sim
 import fit_sim_links
-from fit_models import ParsedFit, fit_content_hash
+from fit_models import ParsedFit, ParsedModule, fit_content_hash
 
 # ===========================================================================
 # attribute ids
@@ -103,6 +117,15 @@ ATTR = {
     "falloff": 158,
     "maxVelocity": 37,                      # missile flight speed (m/s)
     "explosionDelay": 281,                  # missile flight time, in MS
+    # ammo selection (spec 4.1.1) -- read off the WEAPON to find its charges,
+    # and off a CHARGE to tell close range from long.  ``chargeSize`` is absent
+    # on every launcher (missiles are sized by their own group), which is why
+    # the size filter is conditional; ``weaponRangeMultiplier``'s dogma default
+    # is 1.0, and close-range ammo publishes a value BELOW it (0.5 for Fusion /
+    # EMP / Antimatter / Multifrequency), which is what makes "closer range" a
+    # data question rather than a name one.
+    "chargeSize": 128,
+    "weaponRangeMultiplier": 120,
     # drones
     "droneBandwidth": 1271,                 # on the ship
     "droneBandwidthUsed": 1272,             # on the drone
@@ -277,6 +300,58 @@ REPORTABLE_CATEGORIES = frozenset({
 #: Cache bound for :func:`simulate` (spec 5.4).
 CACHE_SIZE = 512
 
+# ===========================================================================
+# the ammo policy (spec 4.1.1 -- the owner's first assumption)
+# ===========================================================================
+# "Default DPS numbers are with the highest DPS close range non-T2 ammunition
+# (Republic Fleet EMP, Antimatter, Multifrequency, Navy missiles)."  Everything
+# below is that sentence turned into data questions: which charges FIT this gun
+# (its chargeGroups and chargeSize), which of them are non-T2 (meta group), and
+# which one actually produces the most DPS ON THIS HULL (simulated, so a
+# damage-type bonus decides for itself instead of being hard-coded).
+
+#: Assume the best close-range non-T2 charge for every weapon group.
+AMMO_BEST_CLOSE = "best_close"
+#: Keep whatever the EFT loaded -- what every caller got before the policy.
+AMMO_AS_FITTED = "as_fitted"
+AMMO_MODES = (AMMO_BEST_CLOSE, AMMO_AS_FITTED)
+
+#: ``chargeGroup1..5``.  NON-contiguous by CCP's own numbering (604, 605, 606,
+#: then 609, 610) -- a ``range(604, 609)`` would silently drop two of them, and
+#: a hybrid turret keeps its Charges in the ones a naive range misses.
+CHARGE_GROUP_ATTRS = (604, 605, 606, 609, 610)
+
+#: The meta groups a default charge may come from: 1 Tech I and 4 faction.
+#: NEVER 2 (Tech II ammo carries a real drawback -- less range, worse tracking
+#: -- and the owner's rule says non-T2), never 0 (no meta group published: the
+#: type is not an ammo tier at all), and never 3/5/6/14/15 (storyline, officer,
+#: deadspace, Tech III, abyssal), which no fleet ever undocks with.
+AMMO_META_GROUPS = frozenset({1, 4})
+
+#: How many of the highest-raw-damage candidates are actually SIMULATED.  Four
+#: is the number that makes the hull decide: a faction ammo line has three or
+#: four damage-type variants tied on raw total (EMP / Fusion / Phased Plasma;
+#: Scourge / Inferno / Mjolnir / Nova), so the top four are exactly "one line's
+#: worth of choices" and the fit's own bonuses break the tie.  Each candidate
+#: costs one ``build_fit`` + ``evaluate``, so this is also the cost knob:
+#: MEASURED cold on the owner's Machariel (7 guns, one group), 16 ms
+#: ``as_fitted`` -> 77 ms ``best_close``, median of 5.  It is paid once per
+#: fit on a worker thread and then held by the results LRU.
+AMMO_CANDIDATES = 4
+
+#: Two simulated DPS numbers this close are the same number (float noise from a
+#: chain of multipliers), so the tie-breaks below decide instead.
+AMMO_DPS_EPSILON = 1e-9
+
+#: The LAST tie-break before the type id: the owner's own vocabulary, in his
+#: order.  Only ever consulted when the simulated DPS and the range multiplier
+#: are both tied -- i.e. between the damage-type variants of ONE ammo line on a
+#: hull with no damage-type bonus, where every choice is equally right and only
+#: the printed name differs.  It reads the RESOLVED name, so a caller that
+#: passed ``name_of=None`` simply falls through to the type id.
+CLOSE_RANGE_NAME_PREFERENCE = ("EMP", "Antimatter", "Multifrequency",
+                               "Scourge", "Inferno", "Mjolnir", "Nova")
+
 #: The no-links tier, re-exported so a consumer needs one import.  Single
 #: source: :mod:`fit_sim_links` owns the tier vocabulary.
 TIER_NONE = fit_sim_links.TIER_NONE
@@ -356,6 +431,7 @@ class FitStats:
     #: order -- the machine-readable twin of the human strings, so a formatter
     #: can re-resolve a name without re-running the simulation.  Reason codes:
     #: ``unknown_type``, ``corrupt_row``, ``subsystem``, ``no_charge``,
+    #: ``no_ammo_candidate`` (a weapon the ammo policy found nothing for),
     #: ``special_effect:<id>``, ``effect:<id>``, ``unknown_buff:<id>`` (type id
     #: 0 -- a buff id is not a type id), ``links_unavailable`` (also type id 0
     #: -- a link tier whose preset this SDE no longer carries),
@@ -373,6 +449,26 @@ class FitStats:
     #: number: a weapon, charge, drone or tank module, an unfitted charge, a
     #: vanished fitted type, or one of SPECIAL_STAT_EFFECTS.
     partial: bool = False
+    #: DPS and volley with EVERYTHING counted, drones included, whatever the
+    #: drone rule decided.  ``dps_total`` is these minus the drones when
+    #: :attr:`drones_counted` is False, so a readout can show both without
+    #: re-deriving anything.
+    dps_raw_total: float = 0.0
+    volley_raw: float = 0.0
+    #: Whether drone damage is IN ``dps_total`` / ``volley``: the owner's rule
+    #: is "only when the ship is primarily a drone ship", i.e. drone DPS is
+    #: strictly more than half the raw total.  A fit with no DPS at all is
+    #: False -- there is nothing to be more than half of.
+    drones_counted: bool = False
+    #: The ammo mode these numbers were computed under, one of
+    #: :data:`AMMO_MODES`.
+    ammo: str = AMMO_AS_FITTED
+    #: ``((weapon type id, charge type id, charge name), ...)`` -- what
+    #: ``best_close`` ASSUMED, one entry per weapon group in fit order.  Empty
+    #: under ``as_fitted`` (nothing was assumed), and a weapon group the policy
+    #: could not resolve is absent rather than listed with the pilot's charge:
+    #: it kept what the EFT loaded, and says so through an ``unmodeled`` line.
+    ammo_assumed: tuple[tuple[int, int, str], ...] = ()
 
     def resists_map(self) -> dict:
         """``{layer: (em, th, kin, exp)}`` -- the dict view of
@@ -410,16 +506,19 @@ def _namer(name_of: Callable[[int], str] | None) -> Callable[[int], str]:
 # weapons
 # ===========================================================================
 
-def _weapon_kind(item) -> str | None:
-    """"turret" / "missile" / None for one fitted module.
+def _weapon_kind_from_effects(effects) -> str | None:
+    """"turret" / "missile" / None for a bare effect-id sequence.
 
     The hardpoint markers win: ``turretFitted`` / ``launcherFitted`` are the
     game's own bookkeeping.  Only then do the classifier effects speak, so a
     launcher that also carries ``barrage``-flavoured ammo cannot be misread.
     An explicit ``None`` in :data:`WEAPON_EFFECTS` (a defender missile, a probe
     launcher) is not a weapon this layer counts.
+
+    Split out from :func:`_weapon_kind` so the ammo policy -- which classifies
+    from the TABLE, before any item exists -- shares this one rule rather than
+    growing a second copy that could drift from it.
     """
-    effects = item.effects
     if TURRET_FITTED in effects:
         return KIND_TURRET
     if LAUNCHER_FITTED in effects:
@@ -429,6 +528,17 @@ def _weapon_kind(item) -> str | None:
         if kind:
             return kind
     return None
+
+
+def _weapon_kind(item) -> str | None:
+    """"turret" / "missile" / None for one fitted module.
+
+    Reads ``Item.effects`` -- every effect the type has -- and NEVER
+    ``Item.unmodeled_effects``: a classifier that does carry modifierInfo never
+    lands in the unmodelled list, so reading that list would stop recognising
+    the gun.
+    """
+    return _weapon_kind_from_effects(item.effects)
 
 
 def _damage_sum(item) -> float:
@@ -476,6 +586,35 @@ def _cycle_seconds(item) -> float:
     return fit_sim.attr(item, ATTR["speed"]) / 1000.0
 
 
+def _module_volley(module, kind: str) -> float:
+    """One LOADED weapon's volley.
+
+    Turret volley = the charge's damage times the GUN's multiplier; the engine
+    has already folded skills, ship bonuses and the charge's own ``otherID``
+    modifiers into both numbers.  Missile damage lives ENTIRELY on the charge
+    (the engine applied the missile skills to it through
+    ``OwnerRequiredSkillModifier``), so multiplying by the launcher would
+    double-count.
+
+    The single owner of that formula: the readout and the ammo policy's
+    candidate scoring both go through here, so a candidate is ranked by exactly
+    the number the readout will print.
+    """
+    if kind == KIND_TURRET:
+        return _damage_sum(module.charge) * fit_sim.attr(
+            module, ATTR["damageMultiplier"])
+    return _damage_sum(module.charge)
+
+
+def _module_dps(module, kind: str) -> float:
+    """One loaded weapon's DPS -- volley over its cycle, 0.0 for a cycle-less
+    (and so unfireable) module rather than a division by zero."""
+    cycle = _cycle_seconds(module)
+    if cycle <= 0:
+        return 0.0
+    return _module_volley(module, kind) / cycle
+
+
 def _weapon_stats(fit, name):
     """Per-weapon DPS / volley / ranges for the fitted modules.
 
@@ -512,25 +651,16 @@ def _weapon_stats(fit, name):
                          _falloff_m(module), 1, False))
             continue
 
+        volley = _module_volley(module, kind)
         if kind == KIND_TURRET:
-            # Turret volley = the charge's damage times the GUN's multiplier;
-            # the engine has already folded skills, ship bonuses and the
-            # charge's own otherID modifiers into both numbers.
-            volley = _damage_sum(charge) * fit_sim.attr(
-                module, ATTR["damageMultiplier"])
             optimal = fit_sim.attr(module, ATTR["maxRange"])
             falloff = _falloff_m(module)
         else:
-            # Missile damage lives entirely on the charge: the engine applied
-            # the missile skills to it through OwnerRequiredSkillModifier, so
-            # multiplying by the launcher would double-count.
-            volley = _damage_sum(charge)
             optimal = (fit_sim.attr(charge, ATTR["maxVelocity"])
                        * fit_sim.attr(charge, ATTR["explosionDelay"]) / 1000.0)
             falloff = 0.0
 
-        cycle = _cycle_seconds(module)
-        dps = volley / cycle if cycle > 0 else 0.0
+        dps = _module_dps(module, kind)
         if kind == KIND_TURRET:
             dps_turret += dps
         else:
@@ -613,6 +743,273 @@ def _weapon_ranges(rows) -> tuple[WeaponRange, ...]:
                              kind=key[2], optimal_m=key[3], falloff_m=key[4],
                              loaded=key[5])
                  for key, count in grouped.items())
+
+
+# ===========================================================================
+# ammo: choosing the best close-range non-T2 charge (spec 4.1.1)
+# ===========================================================================
+
+def _type_attr(attrs: dict, attr_id: int) -> float:
+    """One attribute off a RAW type-attribute mapping, dogma default filled.
+
+    The table stores only values that DIFFER from the attribute default, so
+    ``attrs.get(id, 0.0)`` is wrong by construction here exactly as it is on an
+    :class:`fit_sim.Item` -- ``weaponRangeMultiplier``'s default is 1.0, and
+    reading an absent one as 0.0 would make every long-range charge look like
+    the closest-range one there is.
+    """
+    value = attrs.get(attr_id)
+    if value is None:
+        return dogma_data.attr_info(attr_id).default
+    return float(value)
+
+
+def _type_attrs_or_empty(type_id: int) -> dict:
+    """A type's own attributes, or ``{}`` for an unknown or corrupt row.
+
+    The ammo policy walks whole GROUPS of the table, so it meets rows the fit
+    itself never named: an unreadable one is a candidate that does not exist,
+    never an exception out of ``simulate``."""
+    try:
+        return dogma_data.type_attrs(type_id)
+    except (KeyError, ValueError):
+        return {}
+
+
+def _raw_damage_sum(attrs: dict) -> float:
+    """The four damage types of a charge, added, straight off its type row.
+
+    "Raw" is the point: this ranks candidates BEFORE any hull bonus or skill
+    exists, purely to pick which handful are worth simulating."""
+    return sum(_type_attr(attrs, attr_id) for attr_id in DAMAGE_ATTRS)
+
+
+def _declared_charge_groups(weapon_type_id: int) -> tuple[int, ...]:
+    """The group ids this weapon accepts, first-declared order, deduped.
+
+    An EMPTY result means the table publishes no ``chargeGroup`` at all for the
+    type -- there is no question to ask, so the policy leaves that weapon's own
+    charge alone and says nothing (every real gun and launcher declares at
+    least ``chargeGroup1``; a weapon-shaped module that does not is one whose
+    ammunition the table cannot describe)."""
+    attrs = _type_attrs_or_empty(weapon_type_id)
+    groups: list[int] = []
+    for attr_id in CHARGE_GROUP_ATTRS:
+        group_id = int(attrs.get(attr_id) or 0)
+        if group_id and group_id not in groups:
+            groups.append(group_id)
+    return tuple(groups)
+
+
+def _charge_candidates(weapon_type_id: int) -> tuple[int, ...]:
+    """The ``AMMO_CANDIDATES`` best close-range non-T2 charges for one weapon.
+
+    Four filters, each of them a data question:
+
+    * the charge is in one of the weapon's own ``chargeGroup`` groups AND is
+      category 8 (a group can hold non-charges);
+    * its meta group is 1 or 4 -- Tech I or faction, never Tech II
+      (:data:`AMMO_META_GROUPS`);
+    * its ``chargeSize`` matches the weapon's, WHEN the weapon publishes one --
+      launchers do not (a missile's size is its group), so for them the filter
+      is skipped rather than made to reject everything;
+    * it does damage at all, which is what drops scripts, probes and every
+      other utility "charge" that shares a group with real ammunition.
+
+    Ranked by raw damage descending (type id as the stable secondary key) and
+    CAPPED: the simulation that follows is the expensive half, and everything
+    below the cap is a strictly worse starting point than the four above it.
+    """
+    groups = _declared_charge_groups(weapon_type_id)
+    if not groups:
+        return ()
+    weapon_size = _type_attrs_or_empty(weapon_type_id).get(ATTR["chargeSize"])
+    ranked: list[tuple[float, int]] = []
+    seen: set = set()
+    for group_id in groups:
+        for type_id in dogma_data.types_in_group(group_id):
+            if type_id in seen:
+                continue
+            seen.add(type_id)
+            try:
+                if dogma_data.type_category(type_id) != fit_sim.CATEGORY_CHARGE:
+                    continue
+                if dogma_data.type_meta(type_id) not in AMMO_META_GROUPS:
+                    continue
+            except (KeyError, ValueError):                # pragma: no cover
+                continue
+            attrs = _type_attrs_or_empty(type_id)
+            if weapon_size and attrs.get(ATTR["chargeSize"]) != weapon_size:
+                continue
+            damage = _raw_damage_sum(attrs)
+            if damage <= 0:
+                continue
+            ranked.append((damage, type_id))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    return tuple(type_id for _damage, type_id in ranked[:AMMO_CANDIDATES])
+
+
+def _weapon_type_ids(parsed: ParsedFit) -> tuple[int, ...]:
+    """The fit's weapon GROUPS -- one entry per weapon type, in fit order.
+
+    Classified from the table, not from a built fit: the policy has to choose
+    the ammo BEFORE the fit exists.  Offline weapons are skipped for the same
+    reason the readout skips them -- an offline gun fires nothing, so assuming
+    ammunition for it would buy a simulation pass and change no number.
+    """
+    weapons: list[int] = []
+    seen: set = set()
+    for parsed_module in parsed.modules:
+        type_id = int(parsed_module.type_id)
+        if parsed_module.offline or type_id in seen:
+            continue
+        try:
+            effects = dogma_data.type_effects(type_id)
+        except (KeyError, ValueError):
+            continue
+        if _weapon_kind_from_effects(effects) is None:
+            continue
+        seen.add(type_id)
+        weapons.append(type_id)
+    return tuple(weapons)
+
+
+def _reloaded(parsed: ParsedFit, charges: dict) -> ParsedFit:
+    """``parsed`` with every weapon group's charge replaced by ``charges``.
+
+    A NEW :class:`fit_models.ParsedFit` -- the caller's fit is the library's
+    own object and is never mutated (it is also what the results cache is keyed
+    on, so writing through it would poison the key).  Offline modules keep what
+    the pilot loaded: they are not in ``charges`` and fire nothing anyway.
+    """
+    if not charges:
+        return parsed
+    modules = []
+    changed = False
+    for parsed_module in parsed.modules:
+        charge_id = (None if parsed_module.offline
+                     else charges.get(int(parsed_module.type_id)))
+        if charge_id is None or charge_id == parsed_module.charge_type_id:
+            modules.append(parsed_module)
+            continue
+        changed = True
+        modules.append(ParsedModule(
+            type_id=parsed_module.type_id, name=parsed_module.name,
+            slot=parsed_module.slot, charge_type_id=int(charge_id),
+            charge_name=None, offline=parsed_module.offline))
+    if not changed:
+        return parsed
+    return ParsedFit(ship_type_id=parsed.ship_type_id,
+                     ship_name=parsed.ship_name, modules=modules,
+                     drones=parsed.drones, cargo=parsed.cargo,
+                     subsystems=parsed.subsystems,
+                     name_hint=parsed.name_hint)
+
+
+def _group_dps(fit, weapon_type_id: int) -> float:
+    """The DPS ONE weapon group contributes to an evaluated fit.
+
+    Scoring the group rather than the whole fit is what keeps a multi-group fit
+    honest: the other groups are loaded too (so hull bonuses and stacking are
+    real), but only this group's number decides this group's ammo.
+    """
+    total = 0.0
+    for module in fit.modules:
+        if module.type_id != weapon_type_id:
+            continue
+        if module.state == fit_sim.STATE_OFFLINE or module.charge is None:
+            continue
+        kind = _weapon_kind(module)
+        if kind is None:
+            continue
+        total += _module_dps(module, kind)
+    return total
+
+
+def _best_candidate(scored, name) -> int:
+    """The winning charge from ``[(dps, type id), ...]``.
+
+    Highest simulated DPS, then -- for the variants that tie, which on a hull
+    with no damage-type bonus is all of them -- the CLOSER-range one
+    (``weaponRangeMultiplier`` ascending), then the owner's own name order, then
+    the lowest type id.  Every step is total, so the choice is deterministic:
+    a readout whose assumed ammo changed between two identical runs would be
+    unreportable.
+    """
+    best = max(dps for dps, _type_id in scored)
+    tied = [type_id for dps, type_id in scored
+            if abs(dps - best) <= AMMO_DPS_EPSILON]
+    if len(tied) == 1:
+        return tied[0]
+    return min(tied, key=lambda type_id: (
+        _type_attr(_type_attrs_or_empty(type_id),
+                   ATTR["weaponRangeMultiplier"]),
+        _name_preference(name(type_id)),
+        type_id))
+
+
+def _name_preference(charge_name: str) -> int:
+    """Where a charge's resolved name sits in
+    :data:`CLOSE_RANGE_NAME_PREFERENCE`; past the end when it names none of
+    them (which is what an unresolved ``type <id>`` does)."""
+    for index, token in enumerate(CLOSE_RANGE_NAME_PREFERENCE):
+        if token in charge_name:
+            return index
+    return len(CLOSE_RANGE_NAME_PREFERENCE)
+
+
+def _choose_ammo(parsed: ParsedFit, name):
+    """``(charges, unavailable, assumed)`` for the ``best_close`` policy.
+
+    ``charges`` maps weapon type id -> chosen charge type id; ``unavailable``
+    names the weapon groups nothing could be found for; ``assumed`` is the
+    report :attr:`FitStats.ammo_assumed` carries.
+
+    Groups are resolved ONE AT A TIME in fit order, each candidate simulated
+    with the already-decided groups carrying their choice and the undecided
+    ones carrying their top-raw candidate.  That ordering matters on a mixed
+    fit: a stacking-penalised damage modifier makes a group's DPS depend on
+    what the rest of the fit is shooting, and evaluating each group in a void
+    would score it against a fit that does not exist.
+
+    **Links-independent by construction.**  The choice is made on the BARE fit,
+    before any warfare buff is applied, because no v1 dbuff touches a weapon
+    attribute (they move shield/armor HP and resonances).  So the ``auto``
+    discipline pre-pass never re-runs this search, and a linked and an unlinked
+    simulation of one fit assume the same ammunition -- asserted by a test.
+    """
+    weapons = _weapon_type_ids(parsed)
+    if not weapons:
+        return {}, (), ()
+
+    candidates = {type_id: _charge_candidates(type_id) for type_id in weapons}
+    # A weapon that declares charge groups and still has no candidate is a real
+    # hole (nothing T1/faction of the right group and size exists in this
+    # table); one that declares NO groups is not a question the table can
+    # answer, so it passes in silence with the pilot's own charge.
+    unavailable = tuple(type_id for type_id in weapons
+                        if not candidates[type_id]
+                        and _declared_charge_groups(type_id))
+    chosen = {type_id: found[0]
+              for type_id, found in candidates.items() if found}
+
+    for weapon_id in weapons:
+        found = candidates[weapon_id]
+        if len(found) < 2:
+            # Nothing to compare: the single candidate (or none at all) is
+            # already in ``chosen``, and an evaluate would only cost time.
+            continue
+        scored = []
+        for candidate in found:
+            chosen[weapon_id] = candidate
+            evaluated = fit_sim.evaluate(
+                fit_sim.build_fit(_reloaded(parsed, chosen)))
+            scored.append((_group_dps(evaluated, weapon_id), candidate))
+        chosen[weapon_id] = _best_candidate(scored, name)
+
+    assumed = tuple((type_id, chosen[type_id], name(chosen[type_id]))
+                    for type_id in weapons if type_id in chosen)
+    return chosen, unavailable, assumed
 
 
 # ===========================================================================
@@ -809,7 +1206,10 @@ def _unmodeled_entries(fit, name):
 def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
            disciplines: Sequence[str] = (),
            links_unavailable: Sequence[str] = (),
-           name_of: Callable[[int], str] | None = None) -> FitStats:
+           name_of: Callable[[int], str] | None = None,
+           ammo: str = AMMO_AS_FITTED,
+           ammo_assumed: Sequence[tuple] = (),
+           ammo_unavailable: Sequence[int] = ()) -> FitStats:
     """Read DPS / volley / range / EHP off an ALREADY EVALUATED fit.
 
     ``fit`` must have been through :func:`fit_sim.evaluate` -- this function
@@ -818,6 +1218,11 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     without one every name reads ``type <id>``.  Unlike :func:`simulate` it
     keeps a default, because nothing here is cached: a ``derive`` result is
     never shared with a caller that wanted different names.
+
+    ``ammo`` / ``ammo_assumed`` / ``ammo_unavailable`` are the ammo policy's
+    REPORT, not an instruction: by the time a fit reaches here its charges are
+    already whatever they are going to be.  The default says ``as_fitted``,
+    which is the truth for every caller that evaluated a fit itself.
 
     ``disciplines`` is what was ACTUALLY applied; ``links_unavailable`` names
     the disciplines that were asked for and could not be modelled (the tier's
@@ -850,6 +1255,16 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         items = [(0, "links_unavailable")
                  for _discipline in links_unavailable] + items
         partial = True
+    if ammo_unavailable:
+        # The ammo policy was asked for a charge and found none of the right
+        # group and size.  NOT partial on its own: the weapon kept whatever the
+        # pilot loaded, so the number is as right as ``as_fitted`` would be --
+        # and if it loaded NOTHING, the "no charge loaded" line below is the
+        # one that says the DPS is missing.
+        lines = [f"{name(type_id)}: no close-range ammo found"
+                 for type_id in ammo_unavailable] + lines
+        items = [(int(type_id), "no_ammo_candidate")
+                 for type_id in ammo_unavailable] + items
     if missing:
         # A weapon with no ammo is the loudest hole there is: first in the list.
         lines = [f"{n}: no charge loaded" for _tid, n in missing] + lines
@@ -865,12 +1280,22 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     except dogma_data.DogmaUnavailable:                   # pragma: no cover
         build = 0
 
+    # The owner's drone rule: drones count toward the HEADLINE only on a ship
+    # that is primarily a drone ship.  Strictly more than half, so a fit whose
+    # drones are exactly half of it (a Gila-shaped 50/50) reports the gun
+    # number and says drones are excluded -- and a fit with no damage at all is
+    # never "primarily" anything.  The breakdown reports drones either way.
+    dps_weapons = dps_turret + dps_missile
+    dps_raw_total = dps_weapons + dps_drone
+    volley_raw = weapon_volley + drone_volley
+    drones_counted = dps_drone > 0.5 * dps_raw_total
+
     return FitStats(
-        dps_total=dps_turret + dps_missile + dps_drone,
+        dps_total=dps_raw_total if drones_counted else dps_weapons,
         dps_turret=dps_turret,
         dps_missile=dps_missile,
         dps_drone=dps_drone,
-        volley=weapon_volley + drone_volley,
+        volley=volley_raw if drones_counted else weapon_volley,
         ranges=_weapon_ranges(weapon_rows + drone_rows),
         hp_shield=layers["shield"][0],
         hp_armor=layers["armor"][0],
@@ -888,6 +1313,13 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         notes=tuple(notes),
         sde_build=build,
         partial=partial,
+        dps_raw_total=dps_raw_total,
+        volley_raw=volley_raw,
+        drones_counted=drones_counted,
+        ammo=ammo,
+        ammo_assumed=tuple((int(weapon_id), int(charge_id), str(charge_name))
+                           for weapon_id, charge_id, charge_name
+                           in ammo_assumed),
     )
 
 
@@ -895,7 +1327,8 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
 # the facade + its bounded LRU
 # ===========================================================================
 
-#: ``(content hash, links, disciplines, profile) -> FitStats``, oldest first.
+#: ``(content hash, links, disciplines, profile, ammo) -> FitStats``, oldest
+#: first.
 #: Bounded at :data:`CACHE_SIZE`; ``_cache_lock`` guards it because several
 #: worker threads (the fit readout and the fleet aggregator) share it.
 _cache: OrderedDict = OrderedDict()
@@ -935,12 +1368,21 @@ def clear_cache() -> None:
 def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
              links: str = TIER_NONE,
              disciplines: str = fit_sim_links.MODE_AUTO,
-             profile: DamageProfile = OMNI) -> FitStats:
+             profile: DamageProfile = OMNI,
+             ammo: str = AMMO_BEST_CLOSE) -> FitStats:
     """Simulate one parsed fit at All-V skills.  The single public entry point.
 
-    Cached on ``(fit_content_hash(parsed), links, disciplines, profile)``: the
-    content hash is order-independent, so re-sorting a fit's modules is a cache
-    HIT.
+    Cached on ``(fit_content_hash(parsed), links, disciplines, profile,
+    ammo)``: the content hash is order-independent, so re-sorting a fit's
+    modules is a cache HIT.
+
+    ``ammo`` is one of :data:`AMMO_MODES`.  The default ``"best_close"`` is the
+    owner's rule -- every weapon group is loaded with the highest-DPS
+    close-range non-Tech-II charge the table offers it, chosen by SIMULATING
+    the top :data:`AMMO_CANDIDATES` and keeping the winner, so a hull's own
+    damage-type bonus picks its ammunition.  ``"as_fitted"`` keeps whatever the
+    EFT loaded.  Either way :attr:`FitStats.ammo` records which, and
+    ``best_close`` names every assumption in :attr:`FitStats.ammo_assumed`.
 
     ``name_of`` is REQUIRED and deliberately NOT part of the key.  The strings
     it renders are cached with the numbers, so whichever caller misses first
@@ -966,9 +1408,15 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
     settles the receiver's own fitted HP so ``auto`` can read the tank the
     pilot actually built, the second re-folds it with the buffs applied.
     ``evaluate`` rebuilds every value from ``base``, so the second pass is a
-    clean re-evaluation, not an accumulation on top of the first.
+    clean re-evaluation, not an accumulation on top of the first.  ``ammo=
+    "best_close"`` adds at most :data:`AMMO_CANDIDATES` evaluates per weapon
+    GROUP (not per gun) -- and none at all for a fit with no weapons, or one
+    whose weapon has a single candidate.  The ammo search runs ONCE, on the
+    bare fit, before any link buff: no v1 dbuff touches a weapon attribute, so
+    the choice cannot depend on the tier.
 
-    Raises :class:`ValueError` for an unknown tier or discipline mode, and
+    Raises :class:`ValueError` for an unknown tier, discipline mode or ammo
+    mode, and
     :class:`dogma_data.DogmaUnavailable` when no table is loaded -- this never
     calls ``dogma_data.load()`` itself: that decode belongs to the caller's
     worker thread.
@@ -983,12 +1431,15 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
         raise ValueError(
             f"unknown discipline mode {disciplines!r}; expected one of "
             f"{list(fit_sim_links.DISCIPLINE_MODES)}")
+    if ammo not in AMMO_MODES:
+        raise ValueError(f"unknown ammo mode {ammo!r}; expected one of "
+                         f"{list(AMMO_MODES)}")
     if not dogma_data.is_loaded():
         raise dogma_data.DogmaUnavailable(
             "no dogma table loaded -- call dogma_data.load() from a worker "
             "thread and honour a False result")
 
-    key = (fit_content_hash(parsed), links, disciplines, profile)
+    key = (fit_content_hash(parsed), links, disciplines, profile, ammo)
     with _cache_lock:
         generation = _cache_state.generation
         hit = _cache.get(key)
@@ -996,7 +1447,15 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
             _cache.move_to_end(key)
             return hit
 
-    fit = fit_sim.build_fit(parsed)
+    if ammo == AMMO_BEST_CLOSE:
+        charges, ammo_unavailable, ammo_assumed = _choose_ammo(
+            parsed, _namer(name_of))
+        effective = _reloaded(parsed, charges)
+    else:
+        ammo_unavailable, ammo_assumed = (), ()
+        effective = parsed
+
+    fit = fit_sim.build_fit(effective)
     unavailable: tuple = ()
     if links == TIER_NONE:
         # No booster, no discipline: the mode is validated but never resolved,
@@ -1026,7 +1485,9 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
 
     stats = derive(fit_sim.evaluate(fit, buffs), profile,
                    links=links, disciplines=applied,
-                   links_unavailable=unavailable, name_of=name_of)
+                   links_unavailable=unavailable, name_of=name_of,
+                   ammo=ammo, ammo_assumed=ammo_assumed,
+                   ammo_unavailable=ammo_unavailable)
 
     with _cache_lock:
         # A ``clear_cache`` that landed WHILE this was computing means the
