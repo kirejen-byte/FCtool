@@ -29,7 +29,8 @@ arrive as strings)::
     {"v": <sde build>,
      "attrs":   {"<id>": [default, stackable01, highIsGood01]},
      "types":   {"<id>": {"a": [attr_id, value, ...], "e": [effect_id, ...],
-                          "g": group_id, "c": category_id, "mg": meta_group_id}},
+                          "g": group_id, "c": category_id, "mg": meta_group_id,
+                          "f": faction_id}},
      "effects": {"<id>": {"cat": n,
                           "m": [[domain, func, modifiedAttr, modifyingAttr,
                                  op, skillTypeID|null, groupID|null], ...]}},
@@ -43,7 +44,10 @@ the type's OWN values only -- defaults are supplied on read via
 ``attr_info(attr_id).default`` (the engine's ``attr(item, id)`` does the fill).
 ``"mg"`` (metaGroupID: 1 Tech I, 2 Tech II, 4 faction, ...) is OPTIONAL -- the
 SDE publishes one for only a minority of types, so a type without one carries no
-key at all and :func:`type_meta` answers 0.
+key at all and :func:`type_meta` answers 0.  ``"f"`` (the owning faction's id --
+500001 Caldari State, 500002 Minmatar Republic, 500003 Amarr Empire, 500004
+Gallente Federation, 5000xx for the pirate factions) is optional in exactly the
+same way and reads through :func:`type_faction`.
 
 Module-level state is exactly ``_table``, ``_loaded``, ``_lock``, the one
 bounded LRU (``_type_cache``, 256 entries) and the lazy group index
@@ -319,6 +323,26 @@ def type_meta(type_id: int) -> int:
     compare against 2 without a presence check.  ``KeyError`` for an unknown
     type, like the other ``type_*`` accessors."""
     value = _type_row(type_id).get("mg")
+    return 0 if value is None else int(value)
+
+
+def type_faction(type_id: int) -> int:
+    """The id of the faction that owns the type -- 500001 Caldari State, 500002
+    Minmatar Republic, 500003 Amarr Empire, 500004 Gallente Federation, and the
+    5000xx pirate factions (500010 Guristas, 500011 Angel Cartel, 500012 Blood
+    Raider Covenant, 500019 Sansha's Nation, 500020 Serpentis, ...).
+
+    ``0`` when the type owns no faction, which is the common case AND the
+    reading for a faction item the generator could not classify -- so a caller
+    selecting empire-navy gear must test MEMBERSHIP of its own id set and never
+    "not a pirate".  ``KeyError`` for an unknown type, like the other ``type_*``
+    accessors.
+
+    For every category but charges this is the SDE's own ``factionID``.  The SDE
+    publishes that field for no charge at all (navy and pirate ammo differ only
+    in name and damage), so charge factions are derived by the generator from
+    the name; see ``tools/gen_fit_dogma.CHARGE_FACTION_NAME_PREFIXES``."""
+    value = _type_row(type_id).get("f")
     return 0 if value is None else int(value)
 
 

@@ -321,12 +321,32 @@ AMMO_MODES = (AMMO_BEST_CLOSE, AMMO_AS_FITTED)
 #: a hybrid turret keeps its Charges in the ones a naive range misses.
 CHARGE_GROUP_ATTRS = (604, 605, 606, 609, 610)
 
-#: The meta groups a default charge may come from: 1 Tech I and 4 faction.
-#: NEVER 2 (Tech II ammo carries a real drawback -- less range, worse tracking
-#: -- and the owner's rule says non-T2), never 0 (no meta group published: the
-#: type is not an ammo tier at all), and never 3/5/6/14/15 (storyline, officer,
-#: deadspace, Tech III, abyssal), which no fleet ever undocks with.
-AMMO_META_GROUPS = frozenset({1, 4})
+#: The meta groups a default charge may come from: 0 (none published), 1 Tech I
+#: and 4 faction.  NEVER 2 -- Tech II ammo carries a real drawback (less range,
+#: worse tracking) and the owner's rule says non-T2 -- and never 3/5/6/14/15
+#: (storyline, officer, deadspace, Tech III, abyssal), which no fleet undocks
+#: with.  0 IS ALLOWED and that is load-bearing: 85 category-8 charges publish
+#: no meta group at all and 11 of them deal damage, including the entire T1
+#: exotic-plasma line (Baryon S/M/L) and EVERY XL exotic plasma.  Excluding 0
+#: left the Zirnitra's Ultratidal Entropic Disintegrator with zero candidates.
+#: Zero-damage members of that band (bombs' payloads aside, probes, scripts)
+#: drop on the damage filter instead, where they belong.
+AMMO_META_GROUPS = frozenset({0, 1, 4})
+
+#: The only factions a meta-4 (faction) charge may come from: the four empire
+#: navies.  The SDE gives navy AND pirate ammunition the SAME meta group 4 and
+#: publishes no ``factionID`` on charges at all, so without this set the policy
+#: picks Domination EMP L over Republic Fleet EMP L and Dread Guristas Scourge
+#: over Caldari Navy Scourge -- ~4 % more damage, a tier the owner did not name
+#: and a fleet does not actually fly.  Charge factions are name-derived by
+#: ``tools/gen_fit_dogma.CHARGE_FACTION_NAME_PREFIXES``; an unclassified faction
+#: charge reads 0 and so fails this whitelist, which is the safe direction.
+#: Meta 0 and meta 1 charges need no faction -- T1 ammo owns none.
+AMMO_NAVY_FACTIONS = frozenset({500001, 500002, 500003, 500004})
+
+#: The meta group :data:`AMMO_NAVY_FACTIONS` gates -- "Faction" in the SDE's own
+#: ``metaGroups`` table.  Named so the gate below reads as the rule it is.
+AMMO_FACTION_META_GROUP = 4
 
 #: How many of the highest-raw-damage candidates are actually SIMULATED.  Four
 #: is the number that makes the hull decide: a faction ammo line has three or
@@ -804,12 +824,15 @@ def _declared_charge_groups(weapon_type_id: int) -> tuple[int, ...]:
 def _charge_candidates(weapon_type_id: int) -> tuple[int, ...]:
     """The ``AMMO_CANDIDATES`` best close-range non-T2 charges for one weapon.
 
-    Four filters, each of them a data question:
+    Five filters, each of them a data question:
 
     * the charge is in one of the weapon's own ``chargeGroup`` groups AND is
       category 8 (a group can hold non-charges);
-    * its meta group is 1 or 4 -- Tech I or faction, never Tech II
-      (:data:`AMMO_META_GROUPS`);
+    * its meta group is 0, 1 or 4 -- unclassified, Tech I or faction, never
+      Tech II (:data:`AMMO_META_GROUPS`);
+    * if it IS faction (meta 4), its faction is one of the four empire navies
+      (:data:`AMMO_NAVY_FACTIONS`) -- the SDE files pirate ammo under the same
+      meta group, and the owner's tier is the navy one;
     * its ``chargeSize`` matches the weapon's, WHEN the weapon publishes one --
       launchers do not (a missile's size is its group), so for them the filter
       is skipped rather than made to reject everything;
@@ -834,7 +857,12 @@ def _charge_candidates(weapon_type_id: int) -> tuple[int, ...]:
             try:
                 if dogma_data.type_category(type_id) != fit_sim.CATEGORY_CHARGE:
                     continue
-                if dogma_data.type_meta(type_id) not in AMMO_META_GROUPS:
+                meta_group = dogma_data.type_meta(type_id)
+                if meta_group not in AMMO_META_GROUPS:
+                    continue
+                if (meta_group == AMMO_FACTION_META_GROUP
+                        and dogma_data.type_faction(type_id)
+                        not in AMMO_NAVY_FACTIONS):
                     continue
             except (KeyError, ValueError):                # pragma: no cover
                 continue

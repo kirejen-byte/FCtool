@@ -28,7 +28,10 @@ attribute default, so the table stores the type's own values and the reader
 fills defaults from ``attrs``.  A type's ``mg`` key (``metaGroupID``: 1 Tech I,
 2 Tech II, 4 faction, ...) is likewise OPTIONAL -- the SDE publishes one for
 only a minority of types, and a type without one is simply left without the key
-(``dogma_data.type_meta`` reads that as 0).
+(``dogma_data.type_meta`` reads that as 0).  A type's ``f`` key (the owning
+faction's id, ``dogma_data.type_faction``) is optional in the same way; see
+:data:`CHARGE_FACTION_NAME_PREFIXES` for why charges need a NAME rule where
+every other category can just read the SDE's own ``factionID``.
 
 Modifier-row policy (Appendix A.8 items 4/5): a row whose ``func`` is
 ``EffectStopper`` (it carries no ``modifiedAttributeID``/``operation`` at all) or
@@ -104,7 +107,48 @@ SKILL_CATEGORY_ID = 16
 IMPLANT_CATEGORY_ID = 20
 BURST_MODULE_GROUP_ID = 1770
 BURST_CHARGE_GROUP_IDS = frozenset({1769, 1772, 1773, 1774})
+CHARGE_CATEGORY_ID = 8
 MINDLINK_NAME_NEEDLE = "mindlink"
+
+#: Charge name prefix -> owning faction id (``factions.jsonl`` ``_key``).
+#:
+#: MEASURED on SDE build 3494416: ``types.jsonl`` publishes ``factionID`` for
+#: 1,376 types and NOT ONE of them is a charge (the field lands on categories
+#: 2/3/6/9/11/17/20/91 only).  Republic Fleet EMP L (21894) and Domination EMP L
+#: (20799) are byte-for-byte indistinguishable in the SDE outside their names:
+#: same group 83, same ``metaGroupID`` 4 "Faction", same market group 987, same
+#: ``variationParentTypeID`` 201, same icon, same base price.  ``typeLists``,
+#: ``typeElements`` and ``typeBonus`` mention neither.  So the empire-navy tier
+#: the owner actually names -- Republic Fleet EMP, Federation Navy Antimatter,
+#: Imperial Navy Multifrequency, Caldari Navy Scourge -- is separable from the
+#: ~4 %-stronger pirate tier by NAME and by nothing else, and this table is that
+#: rule written down once.  Applied to category-8 charges ONLY: every other
+#: category takes the SDE's own ``factionID``, which also keeps the Amarr
+#: logistics cruiser "Guardian" clear of the Serpentis "Guardian <x> Charge"
+#: line.  Longest prefix wins; an unmatched charge simply carries no ``f`` key,
+#: which is the SAFE direction -- the consumer's navy set is a whitelist, so
+#: "unknown" reads as "not empire navy" and is excluded, never promoted.
+CHARGE_FACTION_NAME_PREFIXES = (
+    # the four empire navies (128 charges on build 3494416)
+    ("Caldari Navy ", 500001),
+    ("Republic Fleet ", 500002),
+    ("Imperial Navy ", 500003),
+    ("Federation Navy ", 500004),
+    # pirate factions -- carried so the accessor answers honestly (and so the
+    # tests can PIN the exclusion), never so the ammo policy can select them
+    ("Dread Guristas ", 500010),
+    ("Guristas ", 500010),
+    ("Arch Angel ", 500011),
+    ("Domination ", 500011),
+    ("Dark Blood ", 500012),
+    ("Blood ", 500012),
+    ("Sisters ", 500016),
+    ("Legion ", 500018),
+    ("True Sanshas ", 500019),
+    ("Sanshas ", 500019),
+    ("Shadow ", 500020),
+    ("Guardian ", 500020),
+)
 
 #: The eight real dogma operation codes: -1 preAssign, 0 preMul, 2 modAdd,
 #: 3 modSub, 4 postMul, 5 postDiv, 6 postPercent, 7 postAssign.  (1 preDiv is
@@ -197,6 +241,7 @@ class TypeIndex(NamedTuple):
     group: dict          # type_id -> group_id
     category: dict       # type_id -> category_id
     meta: dict           # type_id -> metaGroupID, for the types that HAVE one
+    faction: dict        # type_id -> faction id, for the types that HAVE one
     skills: set          # category-16 type ids
     burst_modules: set   # group 1770
     burst_charges: set   # groups 1769/1772/1773/1774
@@ -214,6 +259,20 @@ def iter_jsonl(lines: Iterable) -> Iterable[dict]:
         line = line.strip()
         if line:
             yield json.loads(line)
+
+
+def charge_faction_from_name(name: str) -> int:
+    """The faction id a CHARGE's name announces, or 0 when it announces none.
+
+    Longest matching prefix wins, so "Dread Guristas Scourge ..." resolves as
+    Guristas rather than stopping at the shorter "Guristas " row.  Exact,
+    case-sensitive, and space-terminated on purpose: "Navy Cap Booster 800" is
+    not an empire-navy charge and must NOT match "Caldari Navy " and friends."""
+    best_prefix, best_faction = "", 0
+    for prefix, faction_id in CHARGE_FACTION_NAME_PREFIXES:
+        if len(prefix) > len(best_prefix) and name.startswith(prefix):
+            best_prefix, best_faction = prefix, faction_id
+    return best_faction
 
 
 def _en(value) -> str:
@@ -241,13 +300,19 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
     """Stream ``types.jsonl`` into the per-type group/category/meta maps plus the
     four membership sets the filter needs.
 
-    Names are inspected (Mindlinks are identified by name) but never retained --
-    the table carries no names, and holding 53k of them would be pure waste.
+    Names are inspected (Mindlinks are identified by name, and so is a charge's
+    faction -- see :data:`CHARGE_FACTION_NAME_PREFIXES`) but never retained: the
+    table carries no names, and holding 53k of them would be pure waste.
 
     ``metaGroupID`` is recorded ONLY where the SDE publishes one (most types --
     39,176 of 53,000 in build 3494416 -- have none), so the assembly step can
-    omit the key rather than encode a made-up 0 for every type."""
-    group, category, meta = {}, {}, {}
+    omit the key rather than encode a made-up 0 for every type.
+
+    ``factionID`` is recorded the same way, from the SDE's own field, with ONE
+    fallback: the SDE publishes that field for not a single category-8 charge
+    (measured, build 3494416), so a charge that has none is classified from its
+    name (:func:`charge_faction_from_name`) instead of being lost."""
+    group, category, meta, faction = {}, {}, {}, {}
     skills, burst_modules, burst_charges, mindlinks = set(), set(), set(), set()
     for rec in iter_jsonl(lines):
         tid = rec.get("_key")
@@ -260,6 +325,16 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
         mgid = rec.get("metaGroupID")
         if isinstance(mgid, int) and not isinstance(mgid, bool) and mgid:
             meta[tid] = mgid
+        fid = rec.get("factionID")
+        if not isinstance(fid, int) or isinstance(fid, bool):
+            fid = 0
+        if not fid and cid == CHARGE_CATEGORY_ID:
+            # The SDE's own field first, ALWAYS -- the name rule is the fallback
+            # for the one category on which CCP publishes nothing, so the day
+            # they start publishing it the data wins without a code change.
+            fid = charge_faction_from_name(_en(rec.get("name")))
+        if fid:
+            faction[tid] = fid
         if cid == SKILL_CATEGORY_ID:
             skills.add(tid)
         if gid == BURST_MODULE_GROUP_ID:
@@ -268,8 +343,8 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
             burst_charges.add(tid)
         if cid == IMPLANT_CATEGORY_ID and MINDLINK_NAME_NEEDLE in _en(rec.get("name")).lower():
             mindlinks.add(tid)
-    return TypeIndex(group, category, meta, skills, burst_modules, burst_charges,
-                     mindlinks)
+    return TypeIndex(group, category, meta, faction, skills, burst_modules,
+                     burst_charges, mindlinks)
 
 
 def select_types(index: TypeIndex, fit_type_ids: Iterable[int]) -> frozenset:
@@ -631,6 +706,9 @@ def build_table(*, groups_lines, types_lines, type_dogma_lines, effects_lines,
         meta_group = index.meta.get(tid)
         if meta_group:                     # absent for most types: omit the key
             rec["mg"] = meta_group
+        faction_id = index.faction.get(tid)
+        if faction_id:                     # ditto -- most types own no faction
+            rec["f"] = faction_id
         if flat:
             rec["a"] = flat
         kept_ids = [e for e in effect_ids if str(e) in effects]
