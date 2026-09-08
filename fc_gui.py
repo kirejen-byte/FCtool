@@ -28132,9 +28132,10 @@ class FCToolGUI:
                     time.monotonic()):
             return
 
-        # hull -> [Fit] and the doctrine's fit ids per hull, both resolved HERE
-        # (Tk thread) out of live store state and handed to the worker as plain
-        # containers it owns outright. Both builders are pure — fleet_stats.
+        # hull -> [Fit], the doctrine's fit ids per hull, and its DPS-tagged
+        # fit ids: all resolved HERE (Tk thread) out of live store state and
+        # handed to the worker as plain containers it owns outright. Every
+        # builder is pure — fleet_stats.
         try:
             fits_by_hull = fleet_stats.index_fits(self.fittings.list_fits())
         except Exception:
@@ -28143,6 +28144,14 @@ class FCToolGUI:
             doctrine_ids = fleet_stats.doctrine_fit_ids(doctrine, fits_by_hull)
         except Exception:
             doctrine_ids = {}
+        # None (no doctrine) and an empty set (a doctrine that tags nothing
+        # DPS) are DIFFERENT answers downstream — see doctrine_dps_fit_ids —
+        # so the guard degrades to None, the "count everything" reading, which
+        # is the pre-filter behaviour rather than a silently empty fleet.
+        try:
+            dps_fit_ids = fleet_stats.doctrine_dps_fit_ids(doctrine)
+        except Exception:
+            dps_fit_ids = None
 
         # Marked in flight BEFORE the spawn: the next poll's identical key then
         # finds nothing to do instead of racing a second worker onto the same
@@ -28153,12 +28162,12 @@ class FCToolGUI:
         self._fleet_stats_failed_at = None
         threading.Thread(
             target=self._fleet_stats_worker,
-            args=(key, ship_counts, fits_by_hull, doctrine_ids,
+            args=(key, ship_counts, fits_by_hull, doctrine_ids, dps_fit_ids,
                   tier, disciplines),
             daemon=True).start()
 
     def _fleet_stats_worker(self, key, ship_counts, fits_by_hull,
-                            doctrine_ids, tier, disciplines):
+                            doctrine_ids, dps_fit_ids, tier, disciplines):
         """Simulate one fit per hull and sum the fleet. WORKER THREAD.
 
         The body is ``fleet_stats.compute`` (pure, injected edges); this method
@@ -28170,7 +28179,7 @@ class FCToolGUI:
         failure costs the row, never the poll.
         """
         self._post_ui(self._apply_fleet_stats, key, fleet_stats.compute(
-            ship_counts, fits_by_hull, doctrine_ids,
+            ship_counts, fits_by_hull, doctrine_ids, dps_fit_ids=dps_fit_ids,
             tier=tier, disciplines=disciplines, load=dogma_data.load,
             simulate=lambda parsed: fit_sim_stats.simulate(
                 parsed, links=tier, disciplines=disciplines,

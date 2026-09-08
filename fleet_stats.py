@@ -7,7 +7,7 @@ and ``hull_name`` (hull id -> display name) -- which is what lets the whole
 rollup be tested with fakes, and what keeps the dogma table's ~45 ms decode out
 of every consumer that only wants the arithmetic.
 
-Three rules shape the module, and each is load-bearing rather than tidy:
+Four rules shape the module, and each is load-bearing rather than tidy:
 
 1. **Per HULL, never per member.** A 200-pilot fleet flying 8 hulls costs 8
    simulations, not 200 -- and ``fit_sim_stats.simulate``'s own LRU makes the
@@ -21,6 +21,19 @@ Three rules shape the module, and each is load-bearing rather than tidy:
    a simulate that hits an unmodellable hull -- each costs that hull's
    contribution and nothing else. This runs on a worker feeding a 1 Hz HUD
    tile; a raise there is a dead tile, not an error message.
+4. **Only DPS-tagged ships count -- when a doctrine says which those are.**
+   (Owner rule, 2026-09-07.) A fleet's damage is what its damage dealers put
+   out; folding the logi wing's zero and the tackle's forty into the same
+   figure -- and then averaging the fleet's EHP over a pilot count that
+   includes them -- describes a fleet nobody is flying. So with a doctrine
+   ACTIVE the rollup keeps only hulls whose resolved fit carries the ``DPS``
+   tag, and the rest are counted in ``non_dps`` and never simulated at all
+   (the cheap direction as well as the honest one). With NO doctrine there is
+   no tag to read, so every resolved hull counts, exactly as before.
+   ``dps_filter`` records which of the two happened and the tooltip prints it:
+   the same ``DPS 41.2k`` means two different things under the two rules, and
+   a number that changes meaning with the doctrine dropdown while looking
+   identical is the worst of the three options.
 
 ``FleetStatsVM`` is frozen and hashable (tuples only, no dicts) because it
 rides inside ``info_tiles.FleetCompModel``, whose renderer early-returns on an
@@ -50,6 +63,21 @@ log = logging.getLogger(__name__)
 #: later poll would find it unchanged and spawn nothing, forever. The map's sov
 #: layer carries the same clock for the same reason.
 FLEET_STATS_RETRY_S = 60.0
+
+#: The doctrine tag that marks a member as a damage dealer, LOWER-CASED.
+#: Doctrine tags are free text: ``fit_models.DEFAULT_TAGS`` merely seeds the
+#: vocabulary and the user extends (and re-cases) it at will, so the match is
+#: done on the lower-cased tag rather than on the shipped literal. Deliberately
+#: a local constant and not an import of ``fit_models``: the coupling is to the
+#: STRING an FC types on a doctrine row, not to a list he is free to edit.
+DPS_TAG = "dps"
+
+#: ``FleetStatsVM.dps_filter`` -- which of rule 4's two worlds produced the
+#: numbers. ``ALL`` = no doctrine, every resolved hull counted (the pre-2026-09
+#: behaviour); ``TAG`` = a doctrine was active and only its ``DPS``-tagged fits
+#: were summed. The tooltip prints one line per value; nothing else branches.
+DPS_FILTER_ALL = "all"
+DPS_FILTER_TAG = "dps-tag"
 
 
 @dataclass(frozen=True)
@@ -88,6 +116,16 @@ class FleetStatsVM:
     #: hulls would read as one fleet-wide claim that is true of no hull, so the
     #: mixed case deliberately falls back to naming the mode.
     disciplines_applied: tuple = ()
+    #: Pilots EXCLUDED by rule 4's DPS-tag filter: hulls that resolved to a fit
+    #: the active doctrine does not tag ``DPS``. Disjoint from ``modeled`` and
+    #: from ``unmodeled_hulls`` (those never resolved at all), so
+    #: ``modeled + non_dps <= total`` always holds. Always 0 under
+    #: ``DPS_FILTER_ALL`` -- with no doctrine nothing is filtered.
+    non_dps: int = 0
+    #: ``DPS_FILTER_TAG`` or ``DPS_FILTER_ALL``: which rule produced ``dps``.
+    #: The tooltip states it because the row's wording cannot -- ``DPS 41.2k``
+    #: is the same eight characters either way.
+    dps_filter: str = DPS_FILTER_ALL
 
 
 # ── small guards (nothing in this module may raise on junk) ─────────────────
@@ -233,6 +271,56 @@ def doctrine_fit_ids(doctrine, fits_by_hull) -> dict:
     return ordered
 
 
+def doctrine_fit_tags(doctrine) -> dict:
+    """``{fit_id: frozenset(lower-cased tags)}`` for one doctrine.
+
+    Tags live on the doctrine LINK (``DoctrineMember.tags``), not on the fit --
+    the same Ishtar is DPS in one doctrine and a ratting hull in another -- so
+    this reads members, not the library. Everything is lower-cased on the way
+    in: the vocabulary is user-extensible free text, and an FC who typed
+    ``Dps`` on one row and ``DPS`` on the next meant the same thing both times.
+
+    A fit named by SEVERAL members of one doctrine (legal: two entries, two
+    orders) gets the UNION of their tags -- if any row calls it DPS, it is a
+    DPS fit. A member with no ``fit_id`` is dropped; it can match no fit.
+    """
+    tags: dict = {}
+    for member in (getattr(doctrine, "members", None) or ()):
+        fit_id = str(getattr(member, "fit_id", "") or "")
+        if not fit_id:
+            continue
+        raw = getattr(member, "tags", None) or ()
+        # A bare string is one tag, not a tag per character -- the ONE junk
+        # shape a hand-edited library file plausibly produces.
+        if isinstance(raw, str):
+            raw = (raw,)
+        names = frozenset(
+            text for text in (str(tag).strip().lower() for tag in raw) if text)
+        tags[fit_id] = tags.get(fit_id, frozenset()) | names
+    return tags
+
+
+def doctrine_dps_fit_ids(doctrine, tag: str = DPS_TAG):
+    """The doctrine's ``DPS``-tagged fit ids, or ``None`` when none is active.
+
+    ``None`` and ``frozenset()`` are DIFFERENT answers and the aggregate reads
+    them differently: ``None`` means "there is no doctrine, so there is no tag
+    to filter on" (count every resolved hull -- rule 4's second half), while an
+    empty set means "a doctrine is active and tags nothing DPS" (count
+    nothing, and say so). Collapsing the two would make an untagged doctrine
+    silently report the whole fleet's damage as if it were the damage dealers'.
+
+    Resolved on the Tk thread and handed to the worker as a plain frozenset,
+    for the same reason ``doctrine_fit_ids`` is: the doctrine object's member
+    list is live store state the Tk thread may rewrite underneath a worker.
+    """
+    if doctrine is None:
+        return None
+    wanted = str(tag or "").strip().lower()
+    return frozenset(fit_id for fit_id, tags in doctrine_fit_tags(
+        doctrine).items() if wanted in tags)
+
+
 # ── the Tk thread's inputs, made pure ──────────────────────────────────────
 
 def ship_counts_from_snapshot(cached) -> dict:
@@ -331,7 +419,8 @@ def fleet_key(ship_counts, doctrine_id, revision, tier, disciplines) -> tuple:
 # ── the rollup ─────────────────────────────────────────────────────────────
 
 def aggregate(ship_counts, resolve, simulate, hull_name, *,
-              tier: str, disciplines: str) -> FleetStatsVM:
+              tier: str, disciplines: str,
+              dps_fit_ids=None) -> FleetStatsVM:
     """Roll `ship_counts` (hull type id -> pilot count) up into one VM.
 
     ``resolve(hull_type_id) -> Fit | None``,
@@ -340,12 +429,23 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
     called at most ONCE per hull type (see the module docstring's rule 1);
     hulls are visited count-descending so the call order is deterministic and
     the heaviest part of the fleet is modeled first.
+
+    ``dps_fit_ids`` is rule 4's switch (build it with
+    :func:`doctrine_dps_fit_ids`). ``None`` = no doctrine, so no filter: every
+    resolved hull counts. A SET = a doctrine is active, and a hull counts only
+    when its resolved fit id is in it. A filtered-out hull is not simulated at
+    all -- it costs nothing, and its pilots land in ``non_dps`` rather than in
+    ``modeled`` or in ``unmodeled_hulls``: it is an EXCLUSION, not a gap, and
+    listing the logi wing under "no fit" would send the FC hunting a fit that
+    is right there.
     """
     dps = volley = ehp_sum = 0.0
-    modeled = total = 0
+    modeled = total = non_dps = 0
     partial = False
     unresolved = []
     applied = set()
+    filtering = dps_fit_ids is not None
+    wanted = frozenset(str(fit_id) for fit_id in (dps_fit_ids or ()))
 
     for hull, raw_count in sorted(
             ((ship_counts or {}).items()),
@@ -355,6 +455,14 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
             continue
         total += count
         fit = _call(resolve, hull, default=None)
+        if filtering and fit is not None and \
+                str(getattr(fit, "id", "") or "") not in wanted:
+            # Resolved, and deliberately not counted. Note the ORDER: an
+            # unresolvable hull (fit is None) still falls through to the
+            # unmodeled branch below under either rule, because "I have no fit
+            # for that hull" is a gap in the number no filter can excuse.
+            non_dps += count
+            continue
         parsed = getattr(fit, "parsed", None) if fit is not None else None
         stats = _call(simulate, parsed, default=None) if parsed is not None \
             else None
@@ -386,13 +494,15 @@ def aggregate(ship_counts, resolve, simulate, hull_name, *,
         # note. `applied` holds one sorted tuple per hull, so "they all agree"
         # is exactly "the set has one member".
         disciplines_applied=(next(iter(applied)) if len(applied) == 1
-                             else ()))
+                             else ()),
+        non_dps=non_dps,
+        dps_filter=DPS_FILTER_TAG if filtering else DPS_FILTER_ALL)
 
 
 # ── the worker's whole body ────────────────────────────────────────────────
 
 def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
-            disciplines: str, load, simulate, hull_name):
+            disciplines: str, load, simulate, hull_name, dps_fit_ids=None):
     """One aggregate, or ``None`` when there is no answer. WORKER SIDE.
 
     This is the fc_gui worker's entire body, kept here so the wiring stays
@@ -406,7 +516,12 @@ def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
     that escapes the rollup costs the row and nothing else. It is distinct from
     a VM with ``modeled == 0``, which is the honest "the fleet flies nothing I
     have a fit for" -- the caller re-tries a ``None`` on a clock and leaves a
-    zero-coverage VM alone.
+    zero-coverage VM alone. A fleet of pure logi under an active doctrine is
+    the same kind of answer: ``modeled 0``, ``non_dps`` = everyone.
+
+    ``dps_fit_ids`` is rule 4's filter, resolved on the Tk thread by
+    :func:`doctrine_dps_fit_ids` for the same reason ``doctrine_ids`` is: the
+    doctrine object never crosses to a worker.
     """
     try:
         if not _call(load, default=False):
@@ -419,7 +534,8 @@ def compute(ship_counts, fits_by_hull, doctrine_ids, *, tier: str,
             # ordering was resolved into `doctrine_ids` up there and that plain
             # map is authoritative here.
             lambda hull: fit_for_hull(hull, None, fits_by_hull, doctrine_ids),
-            simulate, hull_name, tier=tier, disciplines=disciplines)
+            simulate, hull_name, tier=tier, disciplines=disciplines,
+            dps_fit_ids=dps_fit_ids)
     except Exception:
         log.debug("[hud] fleet stats aggregate failed", exc_info=True)
         return None

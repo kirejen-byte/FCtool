@@ -867,6 +867,14 @@ def fleet_row_text(row) -> str:
 FLEET_TIP_HULLS = 6
 FLEET_STATS_PARTIAL_MARK = "~"
 
+#: ``FleetStatsVM.dps_filter``'s "a doctrine was active, so only its
+#: ``DPS``-tagged hulls were summed" value. Written out rather than imported
+#: from ``fleet_stats.DPS_FILTER_TAG`` for the same reason the VM itself is
+#: duck-typed above: this module reads the fit-sim stack's data, it does not
+#: import it. The pairing is pinned by tests/test_fleet_stats.py, which reads
+#: both names.
+FLEET_STATS_FILTER_DPS_TAG = "dps-tag"
+
 
 def compact_number(value) -> str:
     """``41200 -> "41.2k"``, ``138000 -> "138k"``, ``1_240_000 -> "1.24M"``.
@@ -973,6 +981,13 @@ def fleet_stats_tip(vm) -> str:
     the hulls the number does NOT include (capped, with a count for the rest);
     the partial line explains the ``~``.
 
+    The DPS-filter line is never omitted either, and for the same reason: with
+    a doctrine active the figure covers only its ``DPS``-tagged hulls (owner
+    rule), while with none it covers every hull that resolved a fit -- two
+    genuinely different claims that print as the same ``DPS 41.2k``. Naming
+    the excluded pilot count is what lets an FC tell "my logi wing is not in
+    this" from "half my fleet fell out of the number".
+
     The links half names what was APPLIED (``max/shield``) whenever every
     modeled hull resolved the same disciplines, and falls back to the MODE
     (``max/auto``) when they did not: ``auto`` is a rule, not an answer, and a
@@ -991,6 +1006,13 @@ def fleet_stats_tip(vm) -> str:
              f"Avg EHP {compact_number(getattr(vm, 'ehp_avg', 0.0))} "
              f"({_as_int(getattr(vm, 'modeled', 0), 0)} of "
              f"{_as_int(getattr(vm, 'total', 0), 0)} pilots modelled)"]
+    if str(getattr(vm, "dps_filter", "") or "") == FLEET_STATS_FILTER_DPS_TAG:
+        lines.append(
+            "DPS-tagged hulls only "
+            f"({_as_int(getattr(vm, 'non_dps', 0), 0)} non-DPS pilots "
+            "excluded)")
+    else:
+        lines.append("No active doctrine: all hulls counted")
     if getattr(vm, "partial", False):
         lines.append(f"{FLEET_STATS_PARTIAL_MARK} some fits carry modules the "
                      f"simulator does not model")
