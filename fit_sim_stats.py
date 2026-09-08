@@ -18,6 +18,20 @@ Public surface:
   through a bounded LRU.  The single entry point every consumer uses.
 * :func:`clear_cache`.
 
+:class:`FitStats` is FROZEN and HASHABLE -- every field is a tuple or a scalar,
+including ``resists`` (see :meth:`FitStats.resists_map` for the dict view).  A
+cached result is therefore safe to hand to two consumers at once: neither can
+mutate what the other reads.
+
+``simulate``'s ``name_of`` is a REQUIRED keyword.  The cache is shared and the
+rendered strings are NOT part of its key, so whichever caller misses first
+decides the names every later caller sees.  Passing it explicitly makes that a
+deliberate choice rather than a race -- every app consumer passes the single
+``TypeCatalog.resolve_name``, so the cached strings are consistent.  A caller
+that genuinely wants raw ids passes ``name_of=None``.  For anything that must
+re-resolve a name itself, :attr:`FitStats.unmodeled_items` carries the same
+report as ``(type_id, reason code)`` pairs, index-parallel to ``unmodeled``.
+
 **Nothing loads at startup.**  :func:`simulate` raises
 :class:`dogma_data.DogmaUnavailable` when no table is installed; it never calls
 ``dogma_data.load()`` itself, because that is a multi-megabyte decode and the
@@ -93,6 +107,25 @@ ATTR = {
     "droneBandwidth": 1271,                 # on the ship
     "droneBandwidthUsed": 1272,             # on the drone
     "maxActiveDrones": 352,                 # on the ship
+    # TANK MARKERS -- what a module DECLARES when it is tank gear.  Read off
+    # real SDE rows, not guessed (1600mm Steel Plates II 20353 -> 1159; Large
+    # Shield Extender II 3841 -> 72, which the SDE calls capacityBonus, NOT
+    # shieldCapacityBonus; Multispectrum Energized Membrane II 11269 -> 984-7;
+    # Damage Control II 2048 and the Reactive Armor Hardener 4403 -> the
+    # resonances themselves).  ``hp`` / ``shieldCapacity`` / ``armorHP`` are
+    # deliberately NOT tank markers: every module in the game carries ``hp``.
+    "capacityBonus": 72,                    # shield extenders (SDE's own name)
+    "shieldCapacityMultiplier": 146,
+    "armorHPMultiplier": 148,
+    "structureHPMultiplier": 150,
+    "hullHpBonus": 327,
+    "armorHpBonus": 335,
+    "shieldCapacityBonus": 337,
+    "emDamageResistanceBonus": 984,
+    "explosiveDamageResistanceBonus": 985,
+    "kineticDamageResistanceBonus": 986,
+    "thermalDamageResistanceBonus": 987,
+    "armorHPBonusAdd": 1159,
 }
 
 #: Damage attribute ids in :class:`DamageProfile` field order (em, th, kin, exp).
@@ -117,6 +150,25 @@ LAYER_SPECS = (
       ATTR["hullKineticDamageResonance"],
       ATTR["hullExplosiveDamageResonance"])),
 )
+
+#: Every resonance attribute, as a flat set -- a hardener/membrane/damage
+#: control declares them as its OWN attributes, which is what finds them.
+RESONANCE_ATTRS = frozenset(
+    attr_id for _layer, _hp, resonances in LAYER_SPECS
+    for attr_id in resonances)
+
+#: A module carrying ANY of these is tank gear, so an effect the engine could
+#: not model on it means the EHP number is wrong (spec: ``partial``). Membership
+#: is tested against the module's BASE attributes -- what its type declares --
+#: never against a modified value, which every hull would incidentally have.
+TANK_ATTRS = frozenset(RESONANCE_ATTRS | {
+    ATTR["capacityBonus"], ATTR["shieldCapacityBonus"],
+    ATTR["shieldCapacityMultiplier"], ATTR["armorHpBonus"],
+    ATTR["armorHPBonusAdd"], ATTR["armorHPMultiplier"],
+    ATTR["hullHpBonus"], ATTR["structureHPMultiplier"],
+    ATTR["emDamageResistanceBonus"], ATTR["explosiveDamageResistanceBonus"],
+    ATTR["kineticDamageResistanceBonus"], ATTR["thermalDamageResistanceBonus"],
+})
 
 # ===========================================================================
 # the effect-handler registry (spec A.5 / A.8)
@@ -248,18 +300,36 @@ OMNI = DamageProfile(0.25, 0.25, 0.25, 0.25)
 
 
 class WeaponRange(NamedTuple):
-    """One weapon group's reach.  Missiles and drones with no falloff report
-    ``falloff_m = 0.0``; a missile's ``optimal_m`` is its maximum flight range."""
+    """One weapon group's reach.
+
+    ``falloff_m`` is ``0.0`` whenever the item does not DECLARE a falloff:
+    attribute 158's dogma default is 1.0 (verified against
+    ``dogmaAttributes.jsonl``), so a launcher read through :func:`fit_sim.attr`
+    would otherwise report a one-metre falloff.  A missile's ``optimal_m`` is
+    its maximum flight range.
+
+    ``loaded`` is False for a turret or launcher with no charge: the row is
+    still reported (the pilot fitted the gun, and its RANGE is real) but it
+    contributes no DPS, and the fit is ``partial``.
+    """
     name: str
+    type_id: int
     count: int
     kind: str                       # "turret" | "missile" | "drone"
     optimal_m: float
     falloff_m: float
+    loaded: bool = True
 
 
 @dataclass(frozen=True)
 class FitStats:
-    """Everything the readout shows for one fit, at All-V skills."""
+    """Everything the readout shows for one fit, at All-V skills.
+
+    Frozen AND hashable: every field is a scalar or a tuple, so a cached
+    instance handed to two consumers cannot be mutated by either.  That is why
+    ``resists`` is a tuple of pairs rather than the dict the spec sketched --
+    :meth:`resists_map` gives the dict view for readability at the call site.
+    """
 
     dps_total: float
     dps_turret: float
@@ -274,16 +344,35 @@ class FitStats:
     ehp_armor: float
     ehp_hull: float
     ehp_total: float
-    #: layer -> (em, th, kin, exp) as RESIST fractions, i.e. ``1 - resonance``.
-    resists: dict
+    #: ``((layer, (em, th, kin, exp)), ...)`` in LAYER_SPECS order (shield,
+    #: armor, hull); the four numbers are RESIST fractions, i.e.
+    #: ``1 - resonance``.
+    resists: tuple
     links: str
     disciplines_applied: tuple[str, ...]
     skills: str = "all_v"
     unmodeled: tuple[str, ...] = ()
+    #: ``(type_id, reason code)`` for every ``unmodeled`` line, in the SAME
+    #: order -- the machine-readable twin of the human strings, so a formatter
+    #: can re-resolve a name without re-running the simulation.  Reason codes:
+    #: ``unknown_type``, ``corrupt_row``, ``subsystem``, ``no_charge``,
+    #: ``special_effect:<id>``, ``effect:<id>``, ``unknown_buff:<id>`` (type id
+    #: 0 -- a buff id is not a type id), ``unknown_key:<kind>``.
+    unmodeled_items: tuple[tuple[int, str], ...] = ()
+    #: Diagnostics that are NOT gaps: a hull bonus whose modifiers simply found
+    #: no matching module (a Raven's launcher bonus on a fit with no launcher).
+    #: Never shown as a gap, never sets ``partial``.
+    notes: tuple[str, ...] = ()
     sde_build: int = 0
     #: True when something the engine could not model would have moved a
-    #: number: a weapon, charge or drone, or one of SPECIAL_STAT_EFFECTS.
+    #: number: a weapon, charge, drone or tank module, an unfitted charge, a
+    #: vanished fitted type, or one of SPECIAL_STAT_EFFECTS.
     partial: bool = False
+
+    def resists_map(self) -> dict:
+        """``{layer: (em, th, kin, exp)}`` -- the dict view of
+        :attr:`resists`, built fresh so mutating it cannot poison the cache."""
+        return dict(self.resists)
 
 
 # ===========================================================================
@@ -346,6 +435,36 @@ def _damage_sum(item) -> float:
     return sum(fit_sim.attr(item, attr_id) for attr_id in DAMAGE_ATTRS)
 
 
+def _falloff_m(item) -> float:
+    """Falloff in metres, or 0.0 when the item does not declare one.
+
+    Attribute 158's dogma DEFAULT is 1.0 (verified against the SDE's
+    ``dogmaAttributes.jsonl``), not 0.0 -- so :func:`fit_sim.attr` answers "1"
+    for every launcher, missile and drone that has no falloff at all.  Absence
+    is read off the stores (``base`` = what the type declares, ``attrs`` = what
+    a modifier wrote), never off the VALUE: a real 1 m falloff and a missing
+    one are the same number.
+    """
+    attr_id = ATTR["falloff"]
+    if attr_id not in item.base and attr_id not in item.attrs:
+        return 0.0
+    return fit_sim.attr(item, attr_id)
+
+
+def _is_tank_module(item) -> bool:
+    """Whether this item's own attributes make it tank gear, so an effect the
+    engine could not model on it means the EHP number is wrong.
+
+    MODULES only: the hull declares HP and every resonance by definition, and a
+    rig/module declares one of :data:`TANK_ATTRS` only when it is there to
+    change the tank.  Read off ``base`` -- ``attrs`` carries whatever a
+    modifier wrote, which would make half the fit look like a plate.
+    """
+    if item is None or item.category_id != fit_sim.CATEGORY_MODULE:
+        return False
+    return not TANK_ATTRS.isdisjoint(item.base)
+
+
 def _cycle_seconds(item) -> float:
     """Rate of fire in seconds.  Attribute 51 ``speed`` is milliseconds for
     turrets, launchers AND drones (spec A.7: there is no ``rateOfFire``)."""
@@ -355,11 +474,14 @@ def _cycle_seconds(item) -> float:
 def _weapon_stats(fit, name):
     """Per-weapon DPS / volley / ranges for the fitted modules.
 
-    Returns ``(dps_turret, dps_missile, volley, range_rows, missing_charge)``.
+    Returns ``(dps_turret, dps_missile, volley, range_rows, missing_charge)``,
+    where ``missing_charge`` is a list of ``(type_id, name)``.
     An offline module contributes nothing (the engine already gives it no
     effects; DPS follows the same rule).  A turret or launcher with NO charge
-    contributes zero and is reported -- that is a real hole in the number, so
-    it also sets ``partial``.
+    contributes zero DPS and is reported -- that is a real hole in the number,
+    so it also sets ``partial`` -- but it STILL yields a range row (marked
+    ``loaded=False``): the pilot fitted the gun, and the gun's own optimal and
+    falloff are real numbers the readout should show.
     """
     dps_turret = 0.0
     dps_missile = 0.0
@@ -376,7 +498,13 @@ def _weapon_stats(fit, name):
         module_name = name(module.type_id)
         charge = module.charge
         if charge is None:
-            missing_charge.append(f"{module_name}: no charge loaded")
+            missing_charge.append((module.type_id, module_name))
+            # The module's OWN reach -- a launcher declares no maxRange, which
+            # reads as the attribute's 0.0 default, and that is the honest
+            # answer for a launcher with nothing in it.
+            rows.append((module.type_id, module_name, kind,
+                         fit_sim.attr(module, ATTR["maxRange"]),
+                         _falloff_m(module), 1, False))
             continue
 
         if kind == KIND_TURRET:
@@ -386,7 +514,7 @@ def _weapon_stats(fit, name):
             volley = _damage_sum(charge) * fit_sim.attr(
                 module, ATTR["damageMultiplier"])
             optimal = fit_sim.attr(module, ATTR["maxRange"])
-            falloff = fit_sim.attr(module, ATTR["falloff"])
+            falloff = _falloff_m(module)
         else:
             # Missile damage lives entirely on the charge: the engine applied
             # the missile skills to it through OwnerRequiredSkillModifier, so
@@ -403,7 +531,8 @@ def _weapon_stats(fit, name):
         else:
             dps_missile += dps
         volley_total += volley
-        rows.append((module_name, kind, optimal, falloff, 1))
+        rows.append((module.type_id, module_name, kind, optimal, falloff, 1,
+                     True))
 
     return dps_turret, dps_missile, volley_total, rows, missing_charge
 
@@ -456,21 +585,28 @@ def _drone_stats(fit, name):
         cycle = _cycle_seconds(drone)
         dps_total += (volley / cycle * active) if cycle > 0 else 0.0
         volley_total += volley * active
-        rows.append((name(drone.type_id), KIND_DRONE,
+        rows.append((drone.type_id, name(drone.type_id), KIND_DRONE,
                      fit_sim.attr(drone, ATTR["maxRange"]),
-                     fit_sim.attr(drone, ATTR["falloff"]), active))
+                     _falloff_m(drone), active, True))
 
     return dps_total, volley_total, rows
 
 
 def _weapon_ranges(rows) -> tuple[WeaponRange, ...]:
-    """Fold identical weapon rows into counted groups, first-seen order."""
+    """Fold identical weapon rows into counted groups, first-seen order.
+
+    The type id is part of the key, so two DIFFERENT guns that happen to share
+    a resolved name and a reach stay two rows; ``loaded`` is too, so a loaded
+    and an empty gun of the same type never merge into one misleading count.
+    """
     grouped: OrderedDict = OrderedDict()
-    for name, kind, optimal, falloff, count in rows:
-        key = (name, kind, round(optimal, 3), round(falloff, 3))
+    for type_id, name, kind, optimal, falloff, count, loaded in rows:
+        key = (type_id, name, kind, round(optimal, 3), round(falloff, 3),
+               loaded)
         grouped[key] = grouped.get(key, 0) + count
-    return tuple(WeaponRange(name=key[0], count=count, kind=key[1],
-                             optimal_m=key[2], falloff_m=key[3])
+    return tuple(WeaponRange(name=key[1], type_id=key[0], count=count,
+                             kind=key[2], optimal_m=key[3], falloff_m=key[4],
+                             loaded=key[5])
                  for key, count in grouped.items())
 
 
@@ -520,31 +656,72 @@ def _is_weapon_like(item) -> bool:
     return _weapon_kind(item) is not None
 
 
+def _effect_has_modifiers(effect_id) -> bool:
+    """Whether the table declares modifiers for this effect.
+
+    This is the ONE thing that tells the engine's two gap classes apart, since
+    both land on the same ``("effect", type, effect)`` key:
+    ``fit_sim._make_item`` records an effect with NO ``modifierInfo`` at all,
+    while
+    ``fit_sim._record_effect_gap`` records one whose modifiers resolved to no
+    target.  Only the second can be a "reached nothing" note (see
+    :func:`_unmodeled_entries`).
+    """
+    definition = dogma_data.effect(effect_id)
+    return definition is not None and bool(definition.modifiers)
+
+
 def _unmodeled_entries(fit, name):
-    """``(lines, partial)`` for everything the engine could not model.
+    """``(lines, items, notes, partial)`` for everything the engine could not
+    model.
 
     ``FitState.unmodeled_keys`` is the STRUCTURED record (the ``unmodeled``
     list is the same information already rendered for a human), so this filter
     reads tuples rather than re-parsing English.  Keys are sorted so the
     readout is stable across runs -- a set has no order to inherit.
+    ``lines`` and ``items`` are built in lockstep and stay index-parallel.
 
     The registry decides who is heard: ids in :data:`NO_OP_EFFECTS`,
     :data:`WEAPON_EFFECTS` and :data:`GANG_BUFF_EFFECTS` are silent by design,
     :data:`SPECIAL_STAT_EFFECTS` speak with their own wording, and anything
     else is reported by name and id so an SDE change surfaces instead of
     quietly zeroing a stat.
+
+    A HULL bonus whose modifiers found no target is not a gap at all -- a
+    Raven's launcher bonus on a fit with no launcher is the engine working
+    correctly, and the user can do nothing about it.  Those go to ``notes``
+    and never set ``partial``.  A hull effect with no modifierInfo IS a gap
+    (the table cannot express the bonus) and stays in ``lines``.
     """
     lines = []
+    items = []
+    notes = []
     partial = False
     by_type = _items_by_type(fit)
+
+    def report(text, type_id, reason):
+        lines.append(text)
+        items.append((int(type_id), reason))
+
     for key in sorted(fit.unmodeled_keys, key=lambda k: tuple(map(str, k))):
         kind = key[0]
         if kind == "type":
-            lines.append(f"{name(key[1])}: unknown type")
+            # A type the table does not know is a type that VANISHED from the
+            # fit: whatever it was -- gun, plate, rig -- its contribution is
+            # missing from every number below.
+            report(f"{name(key[1])}: unknown type", key[1], "unknown_type")
+            partial = True
+        elif kind == "corrupt":
+            # Same hole, different cause: the row exists but cannot be read.
+            report(f"{name(key[1])}: corrupt table row", key[1], "corrupt_row")
+            partial = True
         elif kind == "subsystem":
-            lines.append(f"{name(key[1])}: subsystem not simulated")
+            report(f"{name(key[1])}: subsystem not simulated", key[1],
+                   "subsystem")
         elif kind == "buff":
-            lines.append(f"unknown warfare buff {key[1]}")
+            # A buff id is not a type id, so there is nothing to re-resolve.
+            report(f"unknown warfare buff {key[1]}", 0,
+                   f"unknown_buff:{key[1]}")
             partial = True
         elif kind == "effect":
             type_id, effect_id = key[1], key[2]
@@ -557,15 +734,26 @@ def _unmodeled_entries(fit, name):
                 continue
             label = SPECIAL_STAT_EFFECTS.get(effect_id)
             if label is not None:
-                lines.append(f"{name(type_id)}: {label}")
+                report(f"{name(type_id)}: {label}", type_id,
+                       f"special_effect:{effect_id}")
                 partial = True
                 continue
-            lines.append(f"{name(type_id)}: effect {effect_id}")
-            if _is_weapon_like(item):
+            if item is not None and item.category_id == fit_sim.CATEGORY_SHIP \
+                    and _effect_has_modifiers(effect_id):
+                notes.append(f"{name(type_id)}: effect {effect_id} "
+                             f"matched nothing on this fit")
+                continue
+            report(f"{name(type_id)}: effect {effect_id}", type_id,
+                   f"effect:{effect_id}")
+            if _is_weapon_like(item) or _is_tank_module(item):
                 partial = True
-        else:                                            # pragma: no cover
-            lines.append(str(key))
-    return lines, partial
+        else:
+            # An unrecognised key KIND -- a future engine records something
+            # this layer has never heard of.  Rendered field by field so the
+            # readout says what it knows instead of printing a raw tuple.
+            rest = ", ".join(str(part) for part in key[1:])
+            report(f"{kind}: {rest}", 0, f"unknown_key:{kind}")
+    return lines, items, notes, partial
 
 
 # ===========================================================================
@@ -580,7 +768,9 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     ``fit`` must have been through :func:`fit_sim.evaluate` -- this function
     only reads attributes, it never applies a modifier.  ``name_of`` resolves
     type ids for the readout (consumers pass ``type_catalog.resolve_name``);
-    without one every name reads ``type <id>``.
+    without one every name reads ``type <id>``.  Unlike :func:`simulate` it
+    keeps a default, because nothing here is cached: a ``derive`` result is
+    never shared with a caller that wanted different names.
 
     Never raises for fit data: an empty, weaponless or entirely unknown fit
     yields zeros plus an ``unmodeled`` list.
@@ -590,14 +780,16 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         _weapon_stats(fit, name)
     dps_drone, drone_volley, drone_rows = _drone_stats(fit, name)
 
-    lines, partial = _unmodeled_entries(fit, name)
+    lines, items, notes, partial = _unmodeled_entries(fit, name)
     if missing:
         # A weapon with no ammo is the loudest hole there is: first in the list.
-        lines = list(missing) + lines
+        lines = [f"{n}: no charge loaded" for _tid, n in missing] + lines
+        items = [(tid, "no_charge") for tid, _n in missing] + items
         partial = True
 
     layers = _layer_stats(fit.ship, profile)
-    resists = {layer: values[2] for layer, values in layers.items()}
+    resists = tuple((layer, layers[layer][2]) for layer, _hp, _res
+                    in LAYER_SPECS)
     try:
         build = dogma_data.sde_build()
     except dogma_data.DogmaUnavailable:                   # pragma: no cover
@@ -622,6 +814,8 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         links=links,
         disciplines_applied=tuple(disciplines),
         unmodeled=tuple(lines),
+        unmodeled_items=tuple(items),
+        notes=tuple(notes),
         sde_build=build,
         partial=partial,
     )
@@ -637,22 +831,57 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
 _cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
 
+class _CacheState:
+    """The cache's generation number, and nothing else.
+
+    A slotted holder rather than a module-level ``int`` that ``clear_cache``
+    rebinds with ``global``: the purity guard
+    (``tests/test_fit_sim_purity.py``) refuses undeclared global rebinds in
+    these modules, and rightly -- the failure it hunts is a pure module that
+    quietly starts remembering things.  One int behind ``__slots__`` is
+    bounded by construction and cannot grow into that.
+    """
+
+    __slots__ = ("generation",)
+
+    def __init__(self) -> None:
+        self.generation = 0
+
+
+#: Bumped by :func:`clear_cache`.  A ``simulate`` call that started before the
+#: table was swapped must not file its stale result afterwards -- it snapshots
+#: this before computing and drops the INSERT (never the answer it already
+#: gave the caller) when the number moved underneath it.
+_cache_state = _CacheState()
+
 
 def clear_cache() -> None:
     """Drop every memoised result.  Call after a table reload."""
     with _cache_lock:
         _cache.clear()
+        _cache_state.generation += 1
 
 
-def simulate(parsed: ParsedFit, *, links: str = TIER_NONE,
-             disciplines: str = "auto", profile: DamageProfile = OMNI,
-             name_of: Callable[[int], str] | None = None) -> FitStats:
+def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
+             links: str = TIER_NONE, disciplines: str = "auto",
+             profile: DamageProfile = OMNI) -> FitStats:
     """Simulate one parsed fit at All-V skills.  The single public entry point.
 
     Cached on ``(fit_content_hash(parsed), links, disciplines, profile)``: the
     content hash is order-independent, so re-sorting a fit's modules is a cache
-    HIT.  ``name_of`` is deliberately NOT part of the key -- it only decides
-    cosmetic strings, and every consumer in the app shares one catalog.
+    HIT.
+
+    ``name_of`` is REQUIRED and deliberately NOT part of the key.  The strings
+    it renders are cached with the numbers, so whichever caller misses first
+    decides the names every later caller sees; making it required is what stops
+    that being an accident.  **Every app consumer passes the one
+    ``TypeCatalog.resolve_name``**, which makes the shared strings correct by
+    construction.  ``name_of=None`` is a legitimate explicit choice (names read
+    ``type <id>``) -- but a caller that mixes it with a real resolver on the
+    same fit gets whichever came first, so tests that care must
+    :func:`clear_cache` between them.  For a consumer that has to re-resolve a
+    name itself, :attr:`FitStats.unmodeled_items` carries the type ids and
+    :attr:`WeaponRange.type_id` the weapons'.
 
     ``disciplines`` is the MODE string, one of
     :data:`fit_sim_links.DISCIPLINE_MODES` -- the MODE, not the resolved
@@ -690,6 +919,7 @@ def simulate(parsed: ParsedFit, *, links: str = TIER_NONE,
 
     key = (fit_content_hash(parsed), links, disciplines, profile)
     with _cache_lock:
+        generation = _cache_state.generation
         hit = _cache.get(key)
         if hit is not None:
             _cache.move_to_end(key)
@@ -711,8 +941,12 @@ def simulate(parsed: ParsedFit, *, links: str = TIER_NONE,
                    links=links, disciplines=applied, name_of=name_of)
 
     with _cache_lock:
-        _cache[key] = stats
-        _cache.move_to_end(key)
-        while len(_cache) > CACHE_SIZE:
-            _cache.popitem(last=False)
+        # A ``clear_cache`` that landed WHILE this was computing means the
+        # table (or the names) changed underneath it: the caller still gets the
+        # answer it asked for, but nobody else inherits it.
+        if _cache_state.generation == generation:
+            _cache[key] = stats
+            _cache.move_to_end(key)
+            while len(_cache) > CACHE_SIZE:
+                _cache.popitem(last=False)
     return stats
