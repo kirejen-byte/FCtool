@@ -2471,7 +2471,12 @@ class FCToolGUI:
                 # A PULL, not a push: the beat reads whatever the aggregator
                 # last stored, so the 1 Hz tick never triggers a simulation.
                 # Tk-thread-only state, written by _apply_fleet_stats.
-                fleet_stats_snapshot=lambda: self._fleet_stats_vm)
+                fleet_stats_snapshot=lambda: self._fleet_stats_vm,
+                # Lets the controller kick the SAME coalesced aggregator the
+                # fleet poll uses when the setting is turned on live and no
+                # aggregate exists yet, so the row appears without waiting
+                # for the next fleet change.
+                fleet_stats_request=lambda: self._schedule_fleet_stats_refresh())
             block = self.config.get("info_tiles")
             # Single source of truth for the master-enabled fallback: fc_gui
             # must not re-type info_tiles's own shipped-dark default.
@@ -28078,6 +28083,22 @@ class FCToolGUI:
         fleet poll, and a raise would cost the poll, not just the row.
         """
         self._fleet_stats_after = None
+        # The row is OFF by default: computing the aggregate on every fleet
+        # poll (a dogma-table decode + one simulation per hull) for users who
+        # never enabled it costs real time for nothing, and the 60 s retry on
+        # a failing bundle would re-pay that forever. Read through the SAME
+        # source the HUD checks (info_tiles._fleet_stats_enabled), never a
+        # literal default, so the two can never disagree.
+        info_tiles_block = self.config.get("info_tiles")
+        fleet_stats_enabled = bool(
+            (info_tiles_block if isinstance(info_tiles_block, dict) else {})
+            .get("fleet_stats", info_tiles.default_info_tiles_config()[
+                "fleet_stats"]))
+        if not fleet_stats_enabled:
+            self._fleet_stats_vm = None
+            self._fleet_stats_key = None
+            self._fleet_stats_failed_at = None
+            return
         ship_counts = fleet_stats.ship_counts_from_snapshot(
             getattr(self, "_last_specialized_args", None))
         if not ship_counts:

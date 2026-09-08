@@ -2711,7 +2711,7 @@ class InfoTileController:
     reaches back except through ``post_ui``)."""
 
     def __init__(self, root, host: HudHost, tile_window_cls=InfoTileWindow,
-                 fleet_stats_snapshot=None):
+                 fleet_stats_snapshot=None, fleet_stats_request=None):
         self._root = root
         self._host = host
         self._tile_cls = tile_window_cls
@@ -2723,6 +2723,15 @@ class InfoTileController:
         #: simply does not appear, which is the honest inert state for a number
         #: nobody could compute.
         self._fleet_stats_snapshot = fleet_stats_snapshot
+        #: ``() -> None`` -- kicks the host's OWN coalesced aggregator
+        #: (``_schedule_fleet_stats_refresh``) so turning the setting ON in the
+        #: popup shows the row without waiting for the next fleet-poll change.
+        #: Called from ``_stats_model`` only when the setting is on and the
+        #: snapshot is still empty, so the worst case is one call per 1 Hz beat
+        #: -- and the aggregator itself is 250 ms coalesced, key-guarded and
+        #: 60 s failure-backed-off, so that rate is bounded and cheap. Absent or
+        #: raising costs nothing: the row just waits for the next real poll.
+        self._fleet_stats_request = fleet_stats_request
         self._tiles: dict = {}
         self._renderers: dict = {}
         self._enabled = False
@@ -3241,7 +3250,14 @@ class InfoTileController:
         the next tick."""
         if not self._fleet_stats_enabled():
             return None
-        return _call(self._fleet_stats_snapshot, default=None)
+        vm = _call(self._fleet_stats_snapshot, default=None)
+        if vm is None:
+            # Setting just turned ON (or the very first beat after boot with
+            # it already on) and no aggregate exists yet -- kick the
+            # aggregator rather than wait for the next fleet-poll change so
+            # the row appears promptly. See the ctor doc for the rate bound.
+            _call(getattr(self, "_fleet_stats_request", None), default=None)
+        return vm
 
     def _fleet_stats_enabled(self) -> bool:
         return bool(self._block().get(

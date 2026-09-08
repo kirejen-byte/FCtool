@@ -36,6 +36,7 @@ vocabulary read, not an engine one -- nothing here loads the dogma table
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 import fit_sim_links
@@ -292,9 +293,17 @@ def retry_due(failed_at, now, retry_s: float = FLEET_STATS_RETRY_S) -> bool:
     if failed_at is None:
         return False
     try:
-        return (float(now) - float(failed_at)) >= float(retry_s)
+        failed_at = float(failed_at)
+        now = float(now)
     except (TypeError, ValueError):
         return True
+    # A NaN stamp (or a NaN "now") is not a usable clock reading, and a
+    # comparison against it is False either way -- read the same as an
+    # unusable stamp (retry) rather than as "never due" (permanent
+    # suppression).
+    if math.isnan(failed_at) or math.isnan(now):
+        return True
+    return (now - failed_at) >= float(retry_s)
 
 
 # ── recompute key ──────────────────────────────────────────────────────────
