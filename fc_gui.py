@@ -1161,7 +1161,8 @@ class FCToolGUI:
         # fit_sim_panel.ammo_label/ammo_mode own that translation.
         self._fit_sim_panel = None
         self._fit_sim_gen = 0
-        self._fit_sim_tier_var = tk.StringVar(value="none")
+        self._fit_sim_tier_var = tk.StringVar(
+            value=fit_sim_panel.DEFAULTS["sim_links_tier"])
         self._fit_sim_disc_var = tk.StringVar(value="auto")
         self._fit_sim_ammo_var = tk.StringVar(
             value=fit_sim_panel.ammo_label(
