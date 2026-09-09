@@ -71,6 +71,16 @@ TIER_NONE = "none"
 #: Link tiers, weakest first.
 TIERS = (TIER_NONE, "basic", "bonused", "max")
 
+#: Owner rule (2026-09-08, verbatim): "Create an EHP assumption by default of
+#: Level V skills for a mindlinked command ship (claymore/damnation/eos/vulture
+#: tier) with a mindlink. EHP is omni resists." Skills-V and the omni profile
+#: are already the only behaviour this module has -- the one free variable is
+#: the link TIER, so the owner rule pins it to the strongest preset. Only the
+#: shield (Vulture) and armor (Damnation) disciplines move a v1 stat -- the
+#: Claymore (skirmish) and Eos (info) tiers the owner also named are untouched
+#: by this feature's stat set and are not modeled here.
+TIER_DEFAULT = "max"
+
 #: The disciplines with a preset.  v1 has exactly the two whose dbuffs move a
 #: number the readout shows (see the module docstring).
 DISCIPLINES = ("shield", "armor")

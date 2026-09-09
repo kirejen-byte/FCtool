@@ -124,7 +124,7 @@ _K_CEILING = 999_950
 #: read has to carry the default with it.
 DEFAULTS = {
     "sim_enabled": True,
-    "sim_links_tier": fit_sim_links.TIER_NONE,
+    "sim_links_tier": fit_sim_links.TIER_DEFAULT,
     "sim_links_disciplines": fit_sim_links.MODE_AUTO,
     "sim_ammo": fit_sim_stats.AMMO_BEST_CLOSE,
 }

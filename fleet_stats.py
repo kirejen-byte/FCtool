@@ -486,19 +486,20 @@ def sim_options(fittings_cfg) -> tuple:
 
     ``config.json`` is a hand-editable file and these two strings are handed
     straight to the simulator, so an unknown value is corrected here rather
-    than carried: an unknown tier becomes ``none`` (compute nothing extra --
-    the safe direction is fewer claims) and an unknown mode becomes ``auto``.
-    Both are recorded in ``FleetStatsVM.tier``/``disciplines`` and printed in
-    the tooltip, so the correction is visible rather than silent, and one DEBUG
-    line per recompute says which value was rejected.
+    than carried: a missing/unknown tier falls back to
+    :data:`fit_sim_links.TIER_DEFAULT` (the owner's default assumption -- a
+    mindlinked max-tier command ship, all-V) and an unknown mode becomes
+    ``auto``. Both are recorded in ``FleetStatsVM.tier``/``disciplines`` and
+    printed in the tooltip, so the correction is visible rather than silent,
+    and one DEBUG line per recompute says which value was rejected.
     """
     block = fittings_cfg if isinstance(fittings_cfg, dict) else {}
-    tier = str(block.get("sim_links_tier", fit_sim_links.TIER_NONE)
-               or fit_sim_links.TIER_NONE)
+    tier = str(block.get("sim_links_tier", fit_sim_links.TIER_DEFAULT)
+               or fit_sim_links.TIER_DEFAULT)
     if tier not in fit_sim_links.TIERS:
         log.debug("[hud] unknown sim_links_tier %r -> %s", tier,
-                  fit_sim_links.TIER_NONE)
-        tier = fit_sim_links.TIER_NONE
+                  fit_sim_links.TIER_DEFAULT)
+        tier = fit_sim_links.TIER_DEFAULT
     mode = str(block.get("sim_links_disciplines", fit_sim_links.MODE_AUTO)
                or fit_sim_links.MODE_AUTO)
     if mode not in fit_sim_links.DISCIPLINE_MODES:

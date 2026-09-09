@@ -331,9 +331,11 @@ DEFAULT_CONFIG = {
         "sim_enabled": True,
         # Command-link tier the readout and the FC HUD aggregate assume — one
         # of fit_sim_links.TIERS ("none" | "basic" | "bonused" | "max").
-        # "none" by default: an unasked-for boost would silently inflate every
-        # number in the pane.
-        "sim_links_tier": "none",
+        # "max" by default (owner rule 2026-09-08, verbatim: "Create an EHP
+        # assumption by default of Level V skills for a mindlinked command
+        # ship ... with a mindlink"): must equal fit_sim_links.TIER_DEFAULT
+        # (mirror test).
+        "sim_links_tier": "max",
         # Discipline MODE — one of fit_sim_links.DISCIPLINE_MODES ("auto" |
         # "shield" | "armor" | "both" | "none"). "auto" reads the fit's own
         # shield-vs-armor HP and boosts the tank the pilot actually built.
