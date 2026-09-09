@@ -232,6 +232,11 @@ _FONT_ROW = ("Consolas", 8)
 #   this font at 7 through round 4.
 _FLEET_FONT_ROW = ("Consolas", 8)
 _FLEET_FONT_HEAD = ("Consolas", 8, "bold")
+#: The DPS/volley row's own font (2026-09-08, owner: make the numbers
+#: high-contrast). MEASURED bold-vs-regular identical advance width at
+#: Consolas 8 on this box (168 px either way for the worst-case row text --
+#: see the WIDTH comment above), so bold does not cost the 178 px budget.
+_FLEET_FONT_ROW_BOLD = ("Consolas", 8, "bold")
 #: Zero-padding label options. Spacing is the geometry manager's job here, so
 #: the arithmetic above stays readable -- a Label's own default border (2 px)
 #: and padx/pady (1 px) would add 6 px to EVERY row and 4 px to every icon.
@@ -2346,8 +2351,15 @@ class FleetRenderer(_TileRenderer):
         # construction. (Before 2026-09-08 the row lived in ``_rows_holder``
         # and the 7 px worst-case overflow fell on the links strip instead,
         # cropping the bottom of all four 21 px burst icons.)
-        self._stats = tk.Label(self.frame, text="", font=_FLEET_FONT_ROW,
-                               bg=bg, fg=self._palette.get("FG_DIM"),
+        # High-contrast green + bold (owner ask, 2026-09-08): the row IS the
+        # numbers, so the whole line takes the colour -- red already means
+        # "danger" elsewhere in this HUD (intel tile), so it is not a
+        # candidate here. Applies uniformly whether the line is a full
+        # DPS+volley read, the volley-dropped/ellipsized fit-ladder forms, or
+        # the "~"-partial-aggregate marker baked into ``fleet_stats_text`` --
+        # there is no separate colour for those, on purpose.
+        self._stats = tk.Label(self.frame, text="", font=_FLEET_FONT_ROW_BOLD,
+                               bg=bg, fg=self._palette.get("FG_GREEN"),
                                anchor="w", **_FLEET_TIGHT)
         #: Whether ``_stats`` is currently packed. The row is absent -- not
         #: blank -- when there is nothing to say, because a blank 14 px row
