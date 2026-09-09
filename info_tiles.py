@@ -3778,15 +3778,22 @@ class InfoTileController:
         owner is in when a saved rect is what he wants gone) ``arrange`` has
         nothing to place and returns before saving, so the clear would live
         only in memory and die with the process. Whenever the block actually
-        moved, this writes."""
+        moved, this writes.
+
+        Also drops ``FLEET_STATS_GROWN_KEY``: the re-arrange lands every tile
+        back at its 180x120 DEFAULT, and if the one-time-grow marker survived
+        that, neither growth path (spawn or a later click) could ever fire
+        again -- the fleet DPS/volley row would stay hidden until a hand
+        resize. Persisted in the same save as the layouts clear."""
         block = self._block(create=True)
         cleared = bool(block.get("layouts"))
         block["layouts"] = {}
+        grown = block.pop(FLEET_STATS_GROWN_KEY, None) is not None
         # `arrange` re-places + re-persists + saves, but only when there is
         # something live to place; its gate is exactly `self._tiles`.
         placing = bool(self._tiles)
         self.arrange()
-        if cleared and not placing:
+        if (cleared or grown) and not placing:
             self._save()
 
     def match_preview_size(self) -> bool:
@@ -3945,7 +3952,7 @@ class InfoTileController:
         never grown again).
 
         Returns the rect the caller's ``place()`` should use."""
-        if not self._block().get("fleet_stats", False):
+        if not self._fleet_stats_enabled():
             return x, y, w, h
         block = self._block(create=True)
         if block.get(FLEET_STATS_GROWN_KEY):
