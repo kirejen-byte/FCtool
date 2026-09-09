@@ -1498,6 +1498,7 @@ class TileWindow:
         self._win32.set_window_pos(self._hwnd, zx, zy, zw, zbody + STRIP_H)
         self._push_thumb_rect()
         self._win32.retop(self._hwnd)
+        self._relift_tooltips()
 
     def _restore_zoom(self):
         if not self._zoomed or self._prezoom_rect is None:
@@ -1509,6 +1510,23 @@ class TileWindow:
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
         self._win32.retop(self._hwnd)
+        self._relift_tooltips()
+
+    @staticmethod
+    def _relift_tooltips():
+        """Put any live topmost tooltip back on top after a zoom retop.
+
+        `top.bind("<Enter>", self._on_enter)` sits on this tile's Toplevel and
+        the strip Labels carry that toplevel in their bindtags, so entering the
+        implant icon fires the tooltip's own `_show` AND this tile's zoom in
+        the same event dispatch — and the retop above (HWND_TOPMOST without
+        SWP_NOZORDER) would otherwise bury the tip the hover just produced.
+        Same contract as the FCPreview tick's batch: nothing may escape.
+        """
+        try:
+            ui_helpers.relift_topmost_tooltips()
+        except Exception:
+            pass
 
     def detach(self):
         if self._thumb:

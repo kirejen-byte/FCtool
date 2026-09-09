@@ -240,7 +240,8 @@ from ui_theme import (
 # wires guarded transient/grab + Escape→cancel + base bg once (D2), attach_tooltip
 # is the single hover-tooltip impl (D9). Adopted here only in the preview-cluster
 # dialogs; fc_gui's other tooltip sites keep their existing helper (scope).
-from ui_helpers import make_modal, attach_tooltip, update_tooltip
+from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
+                        relift_topmost_tooltips)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -18778,6 +18779,12 @@ class FCToolGUI:
                 overlay.retop()
             except Exception:
                 pass
+        # A live topmost tooltip was just re-topped over by that batch — put it
+        # back on top (see ui_helpers.relift_topmost_tooltips).
+        try:
+            relift_topmost_tooltips()
+        except Exception:
+            pass
 
     def _preview_on_tile_activate(self, key, hwnd=None):
         # hwnd-first: login screens (title exactly "EVE") all share key ""
@@ -20720,6 +20727,13 @@ class FCToolGUI:
                 if hwnd in hidden:
                     continue                                        # withdrawn — nothing to retop
                 tile.retop()
+            # ...and put any live topmost tooltip back on top of the batch we
+            # just re-topped over it (retop is HWND_TOPMOST without
+            # SWP_NOZORDER — see ui_helpers.relift_topmost_tooltips).
+            try:
+                relift_topmost_tooltips()
+            except Exception:
+                pass
             # NOTE: native mode NEVER re-tops the OverlayWindow. The activity label
             # now lives in each tile's bottom strip (set_bottom_label); driving a
             # topmost overlay per tick was the in-game lag source and is retired.

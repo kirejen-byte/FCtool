@@ -46,7 +46,13 @@ Two helpers:
     False: the vast majority of callers attach to widgets inside ordinary
     windows, where an always-topmost tip would float over OTHER applications
     too (the same band hazard documented on ``autocomplete.py`` in
-    ``map/facts.md``).
+    ``map/facts.md``). A tip shown this way is also REGISTERED for
+    ``relift_topmost_tooltips`` (below), because being on top once is not the
+    same as staying there.
+
+``relift_topmost_tooltips()``
+    Re-lift every live ``topmost=True`` tip. Called by whoever re-asserts
+    HWND_TOPMOST on OTHER windows in the same band — see its docstring.
 
 ``update_tooltip(widget, text)``
     Change the copy of an ALREADY-attached tooltip. It exists because
@@ -66,6 +72,53 @@ import ui_theme
 
 # Tooltip type is deliberately small/monospace to match the app's Consolas UI.
 _TOOLTIP_FONT = ("Consolas", 8)
+
+# Live tips shown with topmost=True — the ONLY tips that have a z-order
+# relationship worth re-asserting. Populated by attach_tooltip's ``_show``,
+# discarded by its ``_hide`` (which both <Leave> and the widget's <Destroy>
+# call) and pruned by relift_topmost_tooltips(). At most one entry per hovered
+# widget in practice, and empty whenever nothing is hovered.
+_TOPMOST_TIPS = set()
+
+
+def relift_topmost_tooltips():
+    """Re-lift every live ``topmost=True`` tooltip. Never raises.
+
+    **Why this exists.** ``-topmost`` puts a window in the always-on-top BAND;
+    it does not pin a position INSIDE that band. ``attach_tooltip``'s ``_show``
+    lifts the tip once, which is correct at that instant — but the FCPreview
+    tick re-asserts every tile's topmost state ~4x/second with
+    ``SetWindowPos(hwnd, HWND_TOPMOST, ...)`` and **no SWP_NOZORDER**, so each
+    tile is moved to the TOP of the band. One tick after the implant tooltip
+    appears, every overlapping tile is above it and the tip is gone from view
+    (owner-reported: "the tooltip shows for a moment, then hides behind the
+    other previews"). The same reorder happens in ``_preview_switch_to``'s
+    immediate post-activation re-assert and in ``preview_tile``'s hover
+    zoom/restore.
+
+    The cure is ordering, not a new mechanism: whoever re-tops a batch of
+    windows calls this afterwards, so the tip ends the batch on top again.
+    ``lift()`` is HWND_TOP, which for a window already in the topmost band
+    means the top of THAT band — exactly the call ``_show`` already relies on,
+    just repeated.
+
+    Cheap by contract: it runs on a ~250 ms tick, so the no-tooltip case (the
+    overwhelming majority) is one empty-set test and no Tk call at all. A tip
+    torn down out of band (destroyed parent, dead interpreter) is pruned here
+    rather than raising into the tick.
+    """
+    if not _TOPMOST_TIPS:
+        return
+    for tip in tuple(_TOPMOST_TIPS):
+        try:
+            if not tip.winfo_exists():
+                _TOPMOST_TIPS.discard(tip)
+                continue
+            tip.lift()
+        except Exception:
+            # A dead tip (TclError) or anything else out of a Tk call: drop it.
+            # Nothing here may escape into a caller's tick loop.
+            _TOPMOST_TIPS.discard(tip)
 
 
 def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
@@ -187,6 +240,9 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
     def _hide(_e=None):
         tip = state.get("tip")
         if tip is not None:
+            # Deregister BEFORE destroying: a tip that never reaches
+            # relift_topmost_tooltips() alive must not be left for it to prune.
+            _TOPMOST_TIPS.discard(tip)
             try:
                 tip.destroy()
             except tk.TclError:
@@ -289,6 +345,11 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
                 except tk.TclError:
                     pass
             state["tip"] = tip
+            if topmost:
+                # Register for relift_topmost_tooltips(): the lift above is
+                # correct only until the next batch of HWND_TOPMOST re-asserts
+                # on the tiles around it moves them back over the tip.
+                _TOPMOST_TIPS.add(tip)
         except tk.TclError:
             state["tip"] = None
 
