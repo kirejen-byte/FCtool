@@ -3560,6 +3560,31 @@ class FCToolGUI:
         # numbers (~1.24M/3.90M worst case), where it becomes the driver --
         # comp_left 336->345->359, costing Specialized Roles 4-11px, 0px
         # vertically. Accepted; re-measure if anything else joins the row.
+        #
+        # 2026-09-08 follow-up (owner: "bigger and more prominent"): the
+        # headline renders as an accent-bordered badge (highlightthickness
+        # ring, the same colored-border technique comp_left's own frame uses
+        # -- never bd/relief, which draws a border sized from the *background*
+        # shade, not a chosen color). Measured every font from 11-14pt bold,
+        # with and without the badge ring, at both 1200x900 and the 1000x700
+        # minsize, worst-case text "Fleet DPS/Volley - ~1.24M/3.90M":
+        #   11pt + ring : row height 21px (Δ0, IDENTICAL to the 10pt baseline
+        #     at both sizes) -> comp_scroll_outer / visible-row count
+        #     UNCHANGED at both sizes; Specialized Roles 593->575 / 493->475
+        #     (-18px, under the ~20px budget).
+        #   12pt + ring : row height still 21px (Δ0, safe on (a)) but
+        #     Specialized Roles -34px -- over budget, rejected on (b).
+        #   13pt + ring : row height 22px (Δ1) -> comp_scroll_outer shrinks by
+        #     1px at both sizes (225->224, 25->24) -- rejected on (a); also
+        #     -34px on (b).
+        #   14pt + ring : row height 24px (Δ3) -> comp_scroll_outer 225->222 /
+        #     25->22, visible rows unchanged only by luck of rounding at
+        #     these two sizes -- rejected on (a); -49px on (b).
+        # 11pt bold is therefore the largest font that clears both guards;
+        # the ring itself is free at 11pt (a plain 11pt label without it also
+        # measures Δ0 row height), so it stays for the "more prominent" ask.
+        # Badge panel color is BG_ENTRY (measured lighter than this frame's
+        # BG_PANEL) so the ring reads as a raised chip, not just a text tint.
         size_row = tk.Frame(comp_left, bg=BG_PANEL)
         size_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 4))
         self._fleet_size_label = tk.Label(size_row, text="Fleet Size: --",
@@ -3577,7 +3602,9 @@ class FCToolGUI:
         # one run-on figure.
         self._fleet_dps_label = tk.Label(
             size_row, text=fleet_stats.fleet_headline_text(None),
-            font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL)
+            font=("Consolas", 11, "bold"), fg=FG_ACCENT, bg=BG_ENTRY,
+            highlightbackground=FG_ACCENT, highlightcolor=FG_ACCENT,
+            highlightthickness=1, bd=0, relief=tk.FLAT, padx=5, pady=0)
         self._fleet_dps_label.pack(side=tk.LEFT, padx=(12, 0))
         # Attached ONCE with the (empty) idle copy; every later repaint goes
         # through update_tooltip — re-attaching stacks add="+" handlers.
