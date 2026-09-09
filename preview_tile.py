@@ -965,6 +965,7 @@ class TileWindow:
             if abs(dx) <= _MOVE_JITTER and abs(dy) <= _MOVE_JITTER:
                 return  # still within jitter → treat as a click, not a drag yet
             self._strip_moving = True
+            self._hide_implant_tip()   # only now is it a drag, not a click
         x = self._strip_press_pos[0] + dx
         y = self._strip_press_pos[1] + dy
         x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
@@ -1083,6 +1084,7 @@ class TileWindow:
             return
         dx = event.x_root - self._corner_press_root[0]
         dy = event.y_root - self._corner_press_root[1]
+        self._hide_implant_tip()   # first corner motion = a real resize
         w0, body0 = self._corner_press_size
         # Grabbed edge moves with the pointer; the OTHER edge is the fixed anchor.
         # West/North corners invert the delta (drag right/down shrinks them).
@@ -1158,6 +1160,7 @@ class TileWindow:
         dx = event.x_root - self._press_root[0]
         dy = event.y_root - self._press_root[1]
         if self._mode == "resize":
+            self._hide_implant_tip()   # a right-drag resize is under way
             w, body_h = preview_layout.clamp_size(self._press_size[0] + dx,
                                                   self._press_size[1] + dy)
             self._w, self._body_h = w, body_h
@@ -1167,6 +1170,7 @@ class TileWindow:
         else:  # move
             if self._lock_layout:
                 return  # locked layout → right-drag move is a no-op (BUG B)
+            self._hide_implant_tip()   # the tile is about to move
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
             x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
@@ -1525,6 +1529,25 @@ class TileWindow:
         """
         try:
             ui_helpers.relift_topmost_tooltips()
+        except Exception:
+            pass
+
+    def _hide_implant_tip(self):
+        """Drop the implant icon's tooltip once a gesture really moves the tile.
+
+        `<ButtonPress-1>`/`<Button-3>`/the corner binds all sit ON the implant
+        Label, so a drag can START on the tooltipped icon — and a drag holds the
+        implicit pointer grab, so `<Leave>` never fires and the tip would stay
+        up for the whole gesture. It would also be WRONG for that whole gesture:
+        the tip is placed from `self._pos` at show time and does not follow the
+        moving tile, while every motion handler's `set_window_pos` re-asserts
+        HWND_TOPMOST (no SWP_NOZORDER) over it and the tick relift pulls it back
+        ~4x/second — a strobe over stale copy. Hiding beats re-lifting here.
+        Called only once a gesture is a REAL drag/resize: a plain click on the
+        icon must leave the tip the user is reading alone.
+        """
+        try:
+            ui_helpers.hide_tooltip(self._implant_lbl)
         except Exception:
             pass
 

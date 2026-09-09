@@ -54,6 +54,10 @@ Two helpers:
     Re-lift every live ``topmost=True`` tip. Called by whoever re-asserts
     HWND_TOPMOST on OTHER windows in the same band — see its docstring.
 
+``hide_tooltip(widget)``
+    Tear down ``widget``'s currently-shown tip explicitly, for the gestures
+    where ``<Leave>`` cannot fire — see its docstring.
+
 ``update_tooltip(widget, text)``
     Change the copy of an ALREADY-attached tooltip. It exists because
     ``attach_tooltip``'s binds use ``add="+"``: calling it again on the same
@@ -249,6 +253,9 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
                 pass
             state["tip"] = None
 
+    # The teardown, reachable by anyone holding the widget — see hide_tooltip.
+    widget._tooltip_hide = _hide
+
     def _show(_e=None):
         _hide()
         # Read the copy LIVE, not from the closure: update_tooltip re-stashes
@@ -372,4 +379,32 @@ def update_tooltip(widget, text):
     string, which no handler will read) — so a caller need not branch.
     """
     widget._tooltip_text = text
+    return widget
+
+
+def hide_tooltip(widget):
+    """Hide ``widget``'s tip now, if one is up. Never raises; returns ``widget``.
+
+    **Why an explicit teardown exists.** ``attach_tooltip`` hides on ``<Leave>``,
+    which covers every ordinary hover — but a press that becomes a DRAG takes
+    the implicit pointer grab, and a grabbed pointer generates no ``<Leave>``
+    for the widget it started on. So a drag begun on a tooltipped widget leaves
+    the tip up for the whole gesture. In FCPreview that widget is the implant
+    icon, whose Label carries the tile's move/resize bindings: the tip would sit
+    at the tile's PRESS-time position (stale the moment the tile moves) while
+    every motion event re-asserts HWND_TOPMOST on the tile over it and the
+    ~4 Hz tick relift pulls it back — a strobe. The gesture owner calls this
+    once the drag is real instead.
+
+    Idempotent and unconditional by design: callers fire it from a motion
+    handler, so a second call, a widget whose tip was never shown, and a widget
+    that never had a tooltip attached at all are all silent no-ops. Nothing
+    (a dead Tk interpreter included) escapes into the drag in progress.
+    """
+    hide = getattr(widget, "_tooltip_hide", None)
+    if hide is not None:
+        try:
+            hide()
+        except Exception:
+            pass
     return widget
