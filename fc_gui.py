@@ -3568,23 +3568,44 @@ class FCToolGUI:
         # shade, not a chosen color). Measured every font from 11-14pt bold,
         # with and without the badge ring, at both 1200x900 and the 1000x700
         # minsize, worst-case text "Fleet DPS/Volley - ~1.24M/3.90M":
-        #   11pt + ring : row height 21px (Δ0, IDENTICAL to the 10pt baseline
-        #     at both sizes) -> comp_scroll_outer / visible-row count
-        #     UNCHANGED at both sizes; Specialized Roles 593->575 / 493->475
-        #     (-18px, under the ~20px budget).
-        #   12pt + ring : row height still 21px (Δ0, safe on (a)) but
-        #     Specialized Roles -34px -- over budget, rejected on (b).
-        #   13pt + ring : row height 22px (Δ1) -> comp_scroll_outer shrinks by
-        #     1px at both sizes (225->224, 25->24) -- rejected on (a); also
-        #     -34px on (b).
-        #   14pt + ring : row height 24px (Δ3) -> comp_scroll_outer 225->222 /
-        #     25->22, visible rows unchanged only by luck of rounding at
-        #     these two sizes -- rejected on (a); -49px on (b).
-        # 11pt bold is therefore the largest font that clears both guards;
-        # the ring itself is free at 11pt (a plain 11pt label without it also
-        # measures Δ0 row height), so it stays for the "more prominent" ask.
+        #   11pt + ring=1 : row height 21px (Δ0, IDENTICAL to the 10pt
+        #     pre-badge baseline at both sizes) -> comp_scroll_outer /
+        #     visible-row count UNCHANGED at both sizes; Specialized Roles
+        #     comfortably clears its own request.
+        #   12pt + ring=1 : row height still 21px (Δ0, safe) -- see the
+        #     second follow-up below, this is what shipped.
+        #   13pt + ring=1 : row height 22px (Δ1) -> comp_scroll_outer shrinks
+        #     by 1px at both sizes (225->224, 25->24) -- fails the >=224/>=24
+        #     floor.
+        #   14pt + ring=1 : row height 24px (Δ3) -> comp_scroll_outer 225->222
+        #     / 25->22, visible rows unchanged only by luck of rounding at
+        #     these two sizes -- fails the floor harder.
         # Badge panel color is BG_ENTRY (measured lighter than this frame's
         # BG_PANEL) so the ring reads as a raised chip, not just a text tint.
+        #
+        # 2026-09-08 second follow-up (owner: "even bigger, more prominent
+        # ring"): re-measured 12pt bold + a 2px ring (highlightthickness=2)
+        # against 12pt + a 1px ring, on the real tree, worst-case text:
+        #   12pt + ring=2 : row height 23px (Δ2 vs the 21px baseline) ->
+        #     comp_scroll_outer 225->223 / 25->23 -- BOTH land 1px under the
+        #     >=224/>=24 floor (visible ship rows stayed 10/2 only by the
+        #     same rounding luck the 14pt case above hit). Rejected.
+        #   12pt + ring=1 : row height 21px (Δ0, byte-identical to the 10pt
+        #     pre-badge baseline) -> comp_scroll_outer UNCHANGED at 225px /
+        #     25px, visible ship rows unchanged at 10/2. Specialized Roles
+        #     drops 608->559px (1200x900) / 508->463px (1000x700) against
+        #     the plain pre-badge label measured on the SAME tree, but its
+        #     own request is only 404px either way (155px / 59px of
+        #     headroom) -- nothing clips. SHIPPED.
+        # The Δ0 row height at 11-12pt is NOT the font being "free" -- it is
+        # the padx=5/pady=0/bd=0 below offsetting the larger linespace:
+        # measured on the same tree, a 12pt label left at Tk's own pady=1/
+        # bd=2 label defaults costs row height 25px, +4px over the 21px
+        # baseline; overriding pady/bd to 0 brings it back to 21px exactly.
+        # So the badge's visual weight is carried almost entirely by the
+        # ring, not the chip fill: BG_ENTRY vs this frame's own BG_PANEL is
+        # only a 1.27:1 WCAG contrast ratio (measured) -- too close to read
+        # as a distinct chip on its own.
         size_row = tk.Frame(comp_left, bg=BG_PANEL)
         size_row.pack(anchor=tk.W, fill=tk.X, padx=8, pady=(0, 4))
         self._fleet_size_label = tk.Label(size_row, text="Fleet Size: --",
@@ -3602,7 +3623,7 @@ class FCToolGUI:
         # one run-on figure.
         self._fleet_dps_label = tk.Label(
             size_row, text=fleet_stats.fleet_headline_text(None),
-            font=("Consolas", 11, "bold"), fg=FG_ACCENT, bg=BG_ENTRY,
+            font=("Consolas", 12, "bold"), fg=FG_ACCENT, bg=BG_ENTRY,
             highlightbackground=FG_ACCENT, highlightcolor=FG_ACCENT,
             highlightthickness=1, bd=0, relief=tk.FLAT, padx=5, pady=0)
         self._fleet_dps_label.pack(side=tk.LEFT, padx=(12, 0))
