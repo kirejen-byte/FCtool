@@ -3784,7 +3784,16 @@ class InfoTileController:
         back at its 180x120 DEFAULT, and if the one-time-grow marker survived
         that, neither growth path (spawn or a later click) could ever fire
         again -- the fleet DPS/volley row would stay hidden until a hand
-        resize. Persisted in the same save as the layouts clear."""
+        resize. Persisted in the same save as the layouts clear.
+
+        If the fleet stats row is ON and a fleet tile is live, this then
+        re-applies the one-time grow immediately (via ``grow_for_fleet_stats``)
+        rather than leaving the row dark until the tile's next spawn -- the
+        marker was just dropped above, so the call proceeds exactly as it
+        would from the popup's click. That call persists its own rect and
+        marker (and its own save); this adds no save on top of it, so a reset
+        with a live, stats-enabled fleet tile costs the usual `arrange` save
+        plus grow's one -- never a third."""
         block = self._block(create=True)
         cleared = bool(block.get("layouts"))
         block["layouts"] = {}
@@ -3795,6 +3804,8 @@ class InfoTileController:
         self.arrange()
         if (cleared or grown) and not placing:
             self._save()
+        if self._fleet_stats_enabled() and "fleet" in self._tiles:
+            self.grow_for_fleet_stats()
 
     def match_preview_size(self) -> bool:
         """One-shot: resize every HUD tile -- live or merely saved -- to the
@@ -3872,10 +3883,12 @@ class InfoTileController:
         """ONE-TIME: make room on the fleet tile for the DPS/volley row.
 
         Called from the settings popup's live-apply when ``fleet_stats`` goes
-        ON, never from the beat -- so its ``place()`` is one of the sanctioned
-        user-click retops (``arrange`` / ``match_preview_size``'s class), not a
-        per-tick SetWindowPos. (``_fleet_spawn_grow`` below is this method's
-        twin for the case there is no click to catch -- see its docstring.)
+        ON, and from ``reset_layouts`` (to re-arm the bump immediately after a
+        reset lands the tile back at the default height) -- never from the
+        beat, so its ``place()`` is one of the sanctioned user-click retops
+        (``arrange`` / ``match_preview_size``'s class), not a per-tick
+        SetWindowPos. (``_fleet_spawn_grow`` below is this method's twin for
+        the case there is no click to catch -- see its docstring.)
 
         The row costs one line, and the shipped 180x120 tile's worst case is
         7 px short of ``FLEET_STATS_MIN_TILE_H`` -- short by less than the row
