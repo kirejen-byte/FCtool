@@ -2987,6 +2987,7 @@ class FCToolGUI:
         self._update_housekeeping_busy = False   # boot sweep owns staging
         self._relaunch_after_close = False   # main() reads this after mainloop
         self._last_update_info = None        # verdict the link is advertising
+        self._update_installed_info = None   # release actually swapped in
         self._update_link.bind("<Button-1>", self._on_update_link_click)
         attach_tooltip(self._update_link, "")
 
@@ -3292,6 +3293,19 @@ class FCToolGUI:
         except (AttributeError, tk.TclError):
             pass
 
+    def _advertised_update_info(self, info):
+        """The release the UI must advertise, given a fresh verdict ``info``.
+
+        Once one is installed, THAT one -- whatever a later check says. The
+        check is fail-silent, so any failure (offline, 403, 5xx) returns None,
+        and None here would unpaint the "installed — restart" affordance while
+        the new exe sits staged; a release published after the swap would be
+        worse still, relabelling the link with a tag the restart will not run.
+        """
+        if getattr(self, "_update_install_state", "idle") != "ready":
+            return info
+        return getattr(self, "_update_installed_info", None) or info
+
     def _apply_update_info(self, info):
         """Tk thread: show, update or hide the title-bar update link.
 
@@ -3299,8 +3313,10 @@ class FCToolGUI:
         ``_update_link_text``, and the latch is set only AFTER the Tk write
         lands -- so an unchanged verdict costs nothing on the 12-hourly beat,
         and a TclError never leaves the latch claiming a paint that never
-        happened.
+        happened. In "ready" the advertised verdict is the INSTALLED one, so
+        neither a failed check nor a newer tag can touch the link.
         """
+        info = self._advertised_update_info(info)
         link = getattr(self, "_update_link", None)
         # Latched whatever happens to the widget: the click handler and the
         # post-install repaint both need the verdict, not the label.
@@ -3360,9 +3376,11 @@ class FCToolGUI:
         The browser is no longer the destination: the dialog carries the notes,
         the install button and a release-page button of its own. A boot NOTICE
         painted into the same slot has no UpdateInfo behind it, so it keeps the
-        old behaviour and opens the release page.
+        old behaviour and opens the release page. In "ready" the INSTALLED
+        release is the destination, never a later check's verdict.
         """
-        info = getattr(self, "_last_update_info", None)
+        info = self._advertised_update_info(
+            getattr(self, "_last_update_info", None))
         try:
             if info is not None:
                 self._open_update_dialog(info)
@@ -3443,6 +3461,7 @@ class FCToolGUI:
             pass                # window died without telling us; build a new one
         self._update_dialog = None
         idle = getattr(self, "_update_install_state", "idle") == "idle"
+        info = self._advertised_update_info(info)   # in "ready": the latch
         try:
             self._update_dialog = UpdateDialog(
                 self, info,
@@ -3473,7 +3492,7 @@ class FCToolGUI:
         self._update_cancel = threading.Event()
         try:
             threading.Thread(target=self._update_install_worker, daemon=True,
-                             args=(plan, progress_cb, done_cb)).start()
+                             args=(plan, progress_cb, done_cb, info)).start()
         except Exception:
             self._update_install_state, self._update_cancel = "idle", None
             self._update_install_reason = ("FCTool could not start the "
@@ -3481,8 +3500,12 @@ class FCToolGUI:
             return False
         return True
 
-    def _update_install_worker(self, plan, progress_cb, done_cb):
+    def _update_install_worker(self, plan, progress_cb, done_cb, info=None):
         """Worker: run the whole install, marshal progress and the result.
+
+        ``info`` rides along untouched so the finish can latch the release
+        that was ACTUALLY installed -- a 12-hourly check landing mid-download
+        would otherwise be the only record of it, and it can move.
 
         Progress goes straight onto the queue: self_update.download already
         throttles to ~10 Hz and never drops the final frame, so a second
@@ -3503,19 +3526,25 @@ class FCToolGUI:
             result = self_update.InstallResult(
                 False, "error",
                 "The update stopped unexpectedly. Nothing was changed.")
-        self._post_ui(self._finish_update_install, result, done_cb)
+        self._post_ui(self._finish_update_install, result, done_cb, info)
 
-    def _finish_update_install(self, result, done_cb):
-        """Tk thread: land one install result -- state, link, then the dialog."""
+    def _finish_update_install(self, result, done_cb, info=None):
+        """Tk thread: land one install -- state, latch, link, then the dialog.
+
+        The latch is the point: from here the UI advertises the release that
+        was swapped in, not whatever the next check happens to return.
+        """
         ok = bool(getattr(result, "ok", False))
         self._update_install_state = "ready" if ok else "idle"
         self._update_cancel = None
-        info = getattr(self, "_last_update_info", None)
-        if ok and info is not None:
-            try:
-                self._apply_update_info(info)   # repaints "installed — restart"
-            except Exception:
-                pass
+        if ok:
+            self._update_installed_info = info or getattr(
+                self, "_last_update_info", None)
+            if self._update_installed_info is not None:
+                try:
+                    self._apply_update_info(self._update_installed_info)
+                except Exception:
+                    pass        # repaints "installed — restart"
         try:
             if callable(done_cb):
                 done_cb(result)
@@ -3559,14 +3588,19 @@ class FCToolGUI:
         """Tk thread: the status line after a USER-initiated check.
 
         The check is fail-silent by contract, so "up to date" and "GitHub
-        unreachable" are indistinguishable here -- the line says both.
+        unreachable" are indistinguishable here -- the line says both. The
+        "ready" branch is tested FIRST and reads the LATCHED release: a check
+        that fails after an install must not claim FCTool is up to date while
+        the new exe sits staged.
         """
-        if info is None:
+        if getattr(self, "_update_install_state", "idle") == "ready":
+            installed = self._advertised_update_info(info)
+            self._set_update_status(
+                f"{getattr(installed, 'tag', '')} installed — restart FCTool "
+                f"to finish.")
+        elif info is None:
             self._set_update_status(
                 f"Up to date ({APP_VERSION}), or GitHub unreachable.")
-        elif getattr(self, "_update_install_state", "idle") == "ready":
-            self._set_update_status(
-                f"{getattr(info, 'tag', '')} installed — restart FCTool.")
         else:
             self._set_update_status(
                 f"{getattr(info, 'tag', '')} available — click the link in "
