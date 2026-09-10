@@ -347,10 +347,11 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
     cancel check and the stall clock — which live BETWEEN chunks — are
     unreachable while a peer dribbles bytes slowly enough to keep the read
     timeout from firing but too slowly to fill a chunk. That is why a guard
-    thread (:func:`_start_download_guard`) watches from outside and closes the
-    response on cancel or on the deadline: closing the socket is the only
-    thing that can unblock a read the loop is stuck in. The read then raises,
-    and the guard's verdict — not the generic exception — names the outcome.
+    thread (:func:`_start_download_guard`) watches from outside and releases
+    the response on cancel or on the deadline — shutting the socket down and
+    then closing it, the only thing that can unblock a read the loop is stuck
+    in. The read then ends (raising, or simply returning on a closed fp), and
+    the guard's verdict — not whatever the loop made of it — names the outcome.
 
     The deadline is :func:`download_budget_s` of the published size, i.e. the
     time an implausibly slow but non-malicious link would need. It is a
@@ -446,9 +447,14 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
         reason = "Download failed — try again."
         ok = False
     finally:
-        # Stop the guard and let it finish BEFORE its verdict is read: it is
-        # the only writer of ``guard_verdict``, and a close it is halfway
-        # through is exactly the close that explains the error above.
+        # Stop the guard and give it a moment to finish BEFORE its verdict is
+        # read: it is the only writer of ``guard_verdict``, and a release it
+        # is halfway through is exactly the one that explains the error above.
+        # The join is BOUNDED (``_join_quiet``, 1 s) — a guard still stuck at
+        # the end of that window costs only this sentence, not correctness:
+        # the outcome is already decided, the partial file is deleted either
+        # way, and the user gets the generic "Download failed" instead of the
+        # specific "cancelled"/"too slow".
         guard_stop.set()
         _join_quiet(guard)
         try:
@@ -610,9 +616,10 @@ def swap_in(plan, *, replace=os.replace, remove=os.remove, retries=5,
     * the first rename fails — nothing has moved;
     * the second fails — the first is undone and the old build is back;
     * even the undo fails (a same-volume rename into a name we just vacated:
-      never seen) — the message names both files so the user can rename by
-      hand, and the running process is unaffected either way, because its
-      image is mapped from the ``.old`` file it already holds open.
+      never seen) — the message names BOTH rescues, the ``.new`` build and the
+      ``.old`` one, so the user can rename either into place by hand, and the
+      running process is unaffected either way, because its image is mapped
+      from the ``.old`` file it already holds open.
 
     ``replace``/``remove``/``sleep`` are seams: the whole table above is
     testable without a locked file or a real antivirus.
@@ -644,8 +651,9 @@ def swap_in(plan, *, replace=os.replace, remove=os.remove, retries=5,
                 replace(old, exe)
             except Exception as undo:
                 _quiet_log(f"swap restore {type(undo).__name__}: {undo}")
-                return (f'The update could not be completed. Rename "{old}" '
-                        f'back to "{exe}" to restore the previous version.')
+                return (f'The update could not be completed. Rename "{new}" '
+                        f'to "{exe}" to finish it, or "{old}" to "{exe}" to '
+                        f'go back to the previous version.')
             return ("Could not put the new version in place — "
                     "the previous version was restored.")
         return None
@@ -949,8 +957,8 @@ def run_install(plan, progress_cb, cancel_event, *,
             _remove_quiet(plan.zip_path)
             # ``.new`` is debris only while there is still an FCTool.exe to
             # run. In swap_in's restore-failed branch there is not, and this
-            # file is one of the two the message tells the user to rename —
-            # deleting it would take away the simpler of the two rescues.
+            # file is the FIRST of the two rescues that message names —
+            # deleting it would take away the simpler of the two.
             if os.path.isfile(plan.exe_path):
                 _remove_quiet(plan.new_path)
             return InstallResult(False, "swap", reason)
@@ -1104,7 +1112,17 @@ def _start_download_guard(thread_factory, resp, cancel_event, deadline, stop,
     and ``iter_content`` may sit inside one read for as long as the peer keeps
     dribbling. This thread has no such problem: it wakes every ``tick``, and
     when the user cancels or the deadline passes it records WHY and then
-    closes the response, which is what unblocks the read.
+    releases the response, which is what unblocks the read.
+
+    Releasing is two steps, not one. ``close()`` hands the connection back to
+    the pool; it does not necessarily touch the socket a FOREIGN thread is
+    parked in. urllib3's ``HTTPResponse.shutdown()`` does exactly that —
+    ``socket.shutdown(SHUT_RD)`` — and is the contractual way to end another
+    thread's blocked ``recv``, so it is tried first and ``close()`` still
+    follows. It raises (``ValueError``/``RuntimeError``) when the connection
+    has already been released, and a transport that is not urllib3 has no
+    ``raw`` at all, so its failure is swallowed on its own: the close that
+    always worked is never skipped because the shutdown did not apply.
 
     The verdict is written before the close, so by the time the loop's
     exception reaches ``download`` the reason for it is already there. Failing
@@ -1121,6 +1139,11 @@ def _start_download_guard(thread_factory, resp, cancel_event, deadline, stop,
                     verdict["reason"] = "deadline"
                 else:
                     continue
+                raw = getattr(resp, "raw", None)
+                try:
+                    raw.shutdown()
+                except Exception:
+                    pass
                 try:
                     resp.close()
                 except Exception:
