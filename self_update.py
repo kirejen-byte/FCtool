@@ -1211,8 +1211,20 @@ def inherited_stale_meipass(*, meipass=None, ppid=None) -> bool:
         return False
 
 
+# How long the inherited-mode stub stands in for the app while the clean copy
+# it spawned boots. Twice the watcher window it is standing in front of
+# (:data:`RELAUNCH_WATCH_S`, 45 s), because the copy pays a full cold onefile
+# extraction of a brand-new binary — the same 24.6 s measured boot, plus this
+# hop. Waiting too long only delays an exit nobody is watching; exiting too
+# early costs the user the update (see :func:`reexec_if_inherited`).
+REEXEC_BOOT_WAIT_S = 90.0
+
+
 def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
-                        exe=None, exit=os._exit) -> bool:
+                        exe=None, exit=os._exit, staging_dir=None,
+                        read_marker=read_marker, now=time.monotonic,
+                        sleep=time.sleep, wait_s=REEXEC_BOOT_WAIT_S,
+                        poll_s=0.5) -> bool:
     """Restart ourselves properly if we were launched in inherited child mode.
 
     ``True`` when a replacement was started and ``exit`` was called (so in the
@@ -1231,6 +1243,30 @@ def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
     ``sys._MEIPASS`` and before any window exists. The child gets a cleaned
     environment plus ``FCTOOL_REEXEC=1``, which is what stops a mis-detection
     from turning into an unbounded chain of processes.
+
+    WHY THIS DOES NOT EXIT THE MOMENT THE CHILD IS SPAWNED. The process that
+    launched us is the v5.7.0 watcher — :func:`relaunch_and_watch` as that
+    build shipped it, which is in the field and can never be changed. It polls
+    twice a second and checks, IN THIS ORDER, the marker for ``booted`` and
+    then whether the process it started has exited. So ANY exit before the
+    marker says ``booted`` reads to it as "the update crashed on startup", and
+    it rolls back: ``FCTool.exe`` is renamed to ``FCTool.exe.failed`` and
+    ``FCTool.exe.old`` is put back. A stub that exits the instant it has
+    spawned the clean copy hands it exactly that within a second. Today that
+    rollback usually fails with a sharing violation only because the clean
+    copy's bootloader still holds the exe open while it extracts — luck, not
+    design. So we stay alive, holding the watcher's "child is still running"
+    signal, until the clean copy has written ``booted`` (or the marker is
+    gone, or ``wait_s`` has passed), and only then exit.
+
+    We wait only when there is something to wait for: no marker at
+    ``staging_dir`` (default ``<exe folder>/updates``), or one already
+    ``booted``/``rolled_back``, means this is not an update boot and the stub
+    leaves at once. The wait is read-only — it never writes the marker, never
+    touches ``.old``/``.new`` and never calls :func:`mark_booted`. Announcing
+    the boot belongs to the clean copy, which does it a few seconds into its
+    own startup once it is really up; doing it from here would tell the
+    watcher "booted" about a process that had not yet drawn a window.
     """
     try:
         source = environ if environ is not None else os.environ
@@ -1247,11 +1283,16 @@ def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
         rest = [str(item) for item in (argv if argv is not None else sys.argv[1:])]
         child_env = clean_child_env(source)
         child_env[REEXEC_ENV] = "1"
+        stage = (staging_dir if isinstance(staging_dir, str) and staging_dir.strip()
+                 else os.path.join(os.path.dirname(target), "updates"))
         popen([target, *rest], cwd=os.path.dirname(target) or None,
               close_fds=True, creationflags=CREATION_FLAGS, env=child_env)
     except Exception as exc:
         _quiet_log(f"reexec {type(exc).__name__}: {exc}")
         return False
+    # Past this point the clean copy is running, so we exit no matter what the
+    # wait does — never back to the caller, which would leave two of us.
+    _await_clean_boot(stage, read_marker, now, sleep, wait_s, poll_s)
     try:
         exit(0)
     except Exception as exc:                   # os._exit does not return
@@ -1724,3 +1765,44 @@ def _positive(value, default: float) -> float:
         return number if number > 0 else default
     except Exception:
         return default
+
+
+def _await_clean_boot(staging_dir, read_marker, now, sleep, wait_s, poll_s) -> str:
+    """Stand in for the app until the copy :func:`reexec_if_inherited` spawned
+    is up. Never raises; the caller exits whatever this returns.
+
+    ``"not_pending"`` when nothing is in flight (no marker, or one that has
+    already finished as ``booted``/``rolled_back``), ``"booted"`` when the
+    clean copy reported for duty, ``"gone"`` when the marker vanished under us
+    — housekeeping got there first, which is the same "nothing left to wait
+    for" answer — and ``"timeout"`` when ``wait_s`` passed with the marker
+    still unresolved. The string is for diagnosis only.
+
+    READ-ONLY BY CONSTRUCTION. The marker belongs to the clean copy from the
+    moment it starts; a write from here would be a second writer racing it,
+    and a ``booted`` written from here would be a lie about a process that has
+    not finished starting. All this does is read, sleep and give up on time.
+    """
+    try:
+        path = marker_path(staging_dir)
+        marker = read_marker(path)
+        if marker is None or marker.state in ("booted", "rolled_back"):
+            return "not_pending"
+        watch = _positive(wait_s, REEXEC_BOOT_WAIT_S)
+        step = _positive(poll_s, 0.5)
+        start = now()
+        # Bounded by poll count as well as by the clock, so a monotonic seam
+        # that never advances cannot hang this exit.
+        for _ in range(int(watch / step) + 2):
+            _call_quiet(sleep, step)
+            marker = read_marker(path)
+            if marker is None:
+                return "gone"
+            if marker.state == "booted":
+                return "booted"
+            if now() - start >= watch:
+                break
+        return "timeout"
+    except Exception as exc:
+        _quiet_log(f"await_clean_boot {type(exc).__name__}: {exc}")
+        return "timeout"
