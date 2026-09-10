@@ -1202,7 +1202,7 @@ class FCToolGUI:
         # own permanently-set event and cannot be resurrected — see
         # _start_monitoring / _stop_monitoring / _chat_poll_loop.
         self._chat_stop: threading.Event = threading.Event()
-        self._sound_enabled = self.config.get("sound_on_ready", False)
+        self._sound_enabled = self.config.get("sound_on_ready", True)
         # Fleet loss tracker
         self._loss_tracker = FleetLossTracker()
         # zKillboard reconciliation (config loss_tracking.source: esi/zkill/
@@ -5631,13 +5631,15 @@ class FCToolGUI:
                  font=("Consolas", 10, "bold"),
                  fg=FG_GREEN, bg=BG_DARK).pack(side=tk.LEFT, padx=10)
 
-        # Mute all alert sounds on this tab
-        self._intel_mute_var = tk.BooleanVar(value=False)
+        # Mute all alert sounds on this tab (persists across restarts)
+        self._intel_mute_var = tk.BooleanVar(
+            value=bool(self.config.get("intel_alerts_muted", False)))
         tk.Checkbutton(header, text="\U0001F50A Mute Alerts",
                        variable=self._intel_mute_var,
                        font=("Consolas", 11, "bold"), fg=FG_YELLOW, bg=BG_DARK,
                        selectcolor=BG_ENTRY, activebackground=BG_DARK,
                        activeforeground=FG_RED,
+                       command=self._on_intel_mute_toggle,
                        ).pack(side=tk.LEFT, padx=15)
 
         # ── Config-driven intel filter panel ───────────────────────────────
@@ -17635,7 +17637,7 @@ class FCToolGUI:
                        activeforeground=FG_TEXT).pack(anchor=tk.W)
 
         # ── Sound ────────────────────────────────────────────────────────
-        self._sound_var = tk.BooleanVar(value=self.config.get("sound_on_ready", False))
+        self._sound_var = tk.BooleanVar(value=self.config.get("sound_on_ready", True))
         sound_frame = tk.Frame(scroll_frame, bg=BG_DARK)
         sound_frame.pack(fill=tk.X, padx=20, pady=2)
         tk.Checkbutton(sound_frame, text="Play sound when X-up threshold reached",
@@ -32488,6 +32490,13 @@ $bmp.Dispose()
 
     def _on_intel_sound_toggle(self):
         self.config["intel_sound_enabled"] = bool(self._intel_sound_var.get())
+        try:
+            self._save_config()
+        except Exception:
+            pass
+
+    def _on_intel_mute_toggle(self):
+        self.config["intel_alerts_muted"] = bool(self._intel_mute_var.get())
         try:
             self._save_config()
         except Exception:
