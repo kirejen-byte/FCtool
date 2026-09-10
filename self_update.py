@@ -100,15 +100,23 @@ _FALLBACK_ZIP = "FCTool_update.zip"
 ProgressCb = Callable[[int, int], None]
 
 
+#: Every value :func:`run_install` can put in :attr:`InstallResult.stage`.
+#: The first five name the step that FAILED; ``installed`` is the only one
+#: that ever comes back with ``ok=True``; ``error`` is the catch-all for a
+#: crash no branch anticipated. Deliberately not "install" — one character
+#: from the success value is a trap for anything that matches on a prefix.
+INSTALL_STAGES = ("preflight", "download", "verify", "extract", "swap",
+                  "installed", "error")
+
+
 @dataclass(frozen=True)
 class InstallResult:
     """The outcome of one install attempt, as the dialog wants to show it.
 
-    ``stage`` is the step that ended it (``"preflight"``, ``"download"``,
-    ``"verify"``, ``"extract"``, ``"swap"``, ``"done"``) and ``message`` is
-    the human sentence to print. Defined here rather than beside the
-    orchestration that returns it because both the swap layer and the dialog
-    depend on the shape.
+    ``stage`` is one of :data:`INSTALL_STAGES` — the step that ended the
+    install — and ``message`` is the human sentence to print. Defined here
+    rather than beside the orchestration that returns it because both the
+    swap layer and the dialog depend on the shape.
     """
 
     ok: bool
@@ -651,11 +659,16 @@ def write_marker(path, marker) -> bool:
 def read_marker(path) -> Marker | None:
     """The marker at ``path``, or ``None`` for anything unusable.
 
-    Absent, unreadable, not JSON, not an object, missing a field, or holding a
-    field of the wrong type all collapse to the same answer on purpose: the
+    Absent, unreadable, not JSON, not an object, missing a field, holding a
+    field of the wrong type, or naming a ``state`` outside
+    :data:`MARKER_STATES` all collapse to the same answer on purpose: the
     marker is a hint about what to clean up, and a hint we cannot trust is one
     we ignore. :func:`startup_housekeeping` then sweeps staging and says
-    nothing — which is exactly what an interrupted install deserves.
+    nothing — which is exactly what an interrupted install deserves. The state
+    check mirrors :func:`write_marker`'s refusal to write one, so the only
+    ways to get an unknown state past a reader are a hand-edited file and a
+    downgrade to a build that predates the state — and both should be read as
+    "no marker", not acted on blindly.
     """
     try:
         if not isinstance(path, str) or not path.strip():
@@ -669,7 +682,7 @@ def read_marker(path) -> Marker | None:
         state = raw.get("state")
         if not isinstance(tag, str) or not isinstance(previous, str):
             return None
-        if not isinstance(state, str) or not state:
+        if not isinstance(state, str) or state not in MARKER_STATES:
             return None
         ts = raw.get("ts")
         pid = raw.get("old_pid")
@@ -783,8 +796,15 @@ def run_install(plan, progress_cb, cancel_event, *,
     A failure at any stage removes what that stage produced (and everything
     earlier that is now pointless — a verified-but-unswappable zip is 53 MB of
     nothing), so a second attempt always starts clean and no half-finished
-    artefact can be mistaken for a finished one. ``FCTool.exe`` is untouched
-    until :func:`swap_in`, and that function is itself reversible.
+    artefact can be mistaken for a finished one. The single exception is the
+    unpacked build after a swap that could not be undone: with no
+    ``FCTool.exe`` on disk it stops being debris and becomes a rescue.
+    ``FCTool.exe`` is untouched until :func:`swap_in`, and that function is
+    itself reversible.
+
+    The cancel flag is re-read once more between the extract and the swap: up
+    to there, stopping costs a deleted file; past it, the user's program has
+    already been renamed.
 
     The marker is written BEFORE the swap so that a crash between the two
     still leaves the next boot able to explain itself. Its failure is not
@@ -835,6 +855,15 @@ def run_install(plan, progress_cb, cancel_event, *,
             _remove_quiet(plan.zip_path)
             return InstallResult(False, "extract", reason)
 
+        # The last moment at which stopping is free. Everything above this
+        # line is a file in the staging dir; everything below renames the
+        # program the user is running. A dialog closed during the download
+        # must not be answered with a swapped exe half a minute later.
+        if _cancelled(cancel_event):
+            _remove_quiet(plan.new_path)
+            _remove_quiet(plan.zip_path)
+            return InstallResult(False, "swap", "Update cancelled before install.")
+
         path = marker_path(plan.staging_dir)
         write_marker(path, Marker(plan.tag, str(previous_version), "installed",
                                   time.time(), os.getpid()))
@@ -842,8 +871,13 @@ def run_install(plan, progress_cb, cancel_event, *,
         reason = swap_in(plan)
         if reason:
             clear_marker(path)
-            _remove_quiet(plan.new_path)
             _remove_quiet(plan.zip_path)
+            # ``.new`` is debris only while there is still an FCTool.exe to
+            # run. In swap_in's restore-failed branch there is not, and this
+            # file is one of the two the message tells the user to rename —
+            # deleting it would take away the simpler of the two rescues.
+            if os.path.isfile(plan.exe_path):
+                _remove_quiet(plan.new_path)
             return InstallResult(False, "swap", reason)
 
         _remove_quiet(plan.zip_path)
@@ -852,7 +886,7 @@ def run_install(plan, progress_cb, cancel_event, *,
                              f"run it.")
     except Exception as exc:
         _quiet_log(f"run_install {type(exc).__name__}: {exc}")
-        return InstallResult(False, "install", "The update could not be installed.")
+        return InstallResult(False, "error", "The update could not be installed.")
 
 
 # ── the relaunch watchdog (runs after the mainloop, writes only the marker) ──
@@ -884,6 +918,14 @@ def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
     The watch is deliberately short and deliberately one-sided: it can only
     make things better. Every second of it is a second the user is staring at
     a window that has already closed.
+
+    LOG-FREE BY CONSTRUCTION, and it must stay that way. This runs after
+    ``logging.shutdown()``, while the NEW process already has ``fctool.log``
+    open: a handler re-opened from this dying process would be a second writer
+    on the same file. Nothing here logs above DEBUG, and ``app_log`` pins the
+    root at INFO, so every ``_quiet_log`` on this path is dropped before a
+    handler is asked for. Anyone raising this module's log level, or adding a
+    louder call below, has to keep that true.
     """
     try:
         if not isinstance(exe_path, str) or not exe_path.strip():
