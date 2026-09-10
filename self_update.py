@@ -128,10 +128,24 @@ SWAP_BACKOFF_S = 0.08
 # three seconds of patience on a worker thread, and only after a real kill.
 OLD_DELETE_TRIES = 6
 OLD_DELETE_BACKOFF_S = 0.5
-# How far up our own parent chain we look before killing a pid. Our bootloader
-# is one hop, the process that spawned us two, its bootloader three — six is
-# generous slack over that and still bounded.
-ANCESTOR_DEPTH = 6
+# How far up our own parent chain we look before killing a pid: ONE hop — our
+# own PyInstaller bootloader. That is the ONLY ancestor whose death would hurt
+# us: it owns the ``_MEIxxxxx`` extraction we are running out of and deletes it
+# on the way out. Anything above it can die without touching us, because the
+# kill names a single pid and never ``/T`` (see :func:`_kill_pid`).
+#
+# Going deeper is not "extra safety", it is the bug: in the steady-state update
+# chain the predecessor we exist to kill IS our grandparent — old build ->
+# our bootloader -> us, and ``DETACHED_PROCESS`` does not sever that — so any
+# depth above 1 puts ``marker.old_pid`` in the refuse-set and permanently
+# disarms the zombie cure for every future update.
+ANCESTOR_DEPTH = 1
+# How old a marker may be before its ``old_pid`` stops being evidence about
+# anything. Windows recycles pids, and ``tasklist`` only proves that SOME
+# FCTool.exe holds that number now — an hour later that can be a copy the user
+# started by hand. The real predecessor is killed at boot+20 s of the very
+# boot that follows the swap, so a legitimate kill is always minutes old.
+STALE_MARKER_S = 3600.0
 
 _DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$", re.IGNORECASE)
 # A plain file name: no separators, no drive, no dots-dots, no absurd length.
@@ -829,7 +843,7 @@ def mark_booted(staging_dir, current_version) -> bool:
 
 def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
                                 is_fctool=None, kill=None,
-                                ancestors=None) -> bool:
+                                ancestors=None, now=None) -> bool:
     """End the process this build replaced, if it is somehow still running.
 
     ``True`` when a kill was issued. Never raises.
@@ -849,24 +863,41 @@ def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
     wants; it is a window-less process holding a file hostage.
 
     Every refusal below exists because a pid is a weak identifier. We will not
-    touch a pid that is missing, zero, negative, our own, our parent's, one of
-    our ANCESTORS, or one that ``tasklist`` does not confirm is an
-    ``FCTool.exe`` — pids are recycled, and killing a stranger would be far
-    worse than leaving a stale file on disk. The ``is_fctool``/``kill``/
-    ``ancestors`` seams exist for the tests; the defaults shell out to
-    ``tasklist``/``taskkill`` and walk the process table.
+    touch a pid that is missing, zero, negative, our own, our parent's, our
+    bootloader's, one that ``tasklist`` does not confirm is an ``FCTool.exe``,
+    or one named by a marker older than :data:`STALE_MARKER_S` — pids are
+    recycled, and killing a stranger would be far worse than leaving a stale
+    file on disk. The ``is_fctool``/``kill``/``ancestors``/``now`` seams exist
+    for the tests; the defaults shell out to ``tasklist``/``taskkill``, walk
+    the process table and read the wall clock.
 
-    The ancestor rule is belt-and-braces on top of the single most important
-    property of the kill itself: it names ONE pid and never ``/T``. We are a
-    descendant of the process in the marker — it spawned our bootloader, which
-    spawned us, and ``DETACHED_PROCESS`` does not sever that parentage — so a
-    tree kill by ParentProcessId would take the running new build down with
-    its target. See :func:`_kill_pid`.
+    THE AGE GUARD IS THE ONE THAT DOES THE WORK. ``tasklist`` proves only that
+    SOME live process holds that number and is called ``FCTool.exe`` — an hour
+    on, that can just as well be a copy the user started by hand. A genuine
+    predecessor is killed at boot+20 s of the boot that follows the swap, so
+    the marker it is named in is always minutes old.
+
+    THE ANCESTOR RULE IS EXACTLY ONE HOP, AND THAT IS DELIBERATE. The pid in
+    the marker is normally our GRANDPARENT — the old build spawned our
+    bootloader, which spawned us, and ``DETACHED_PROCESS`` does not sever that
+    parentage — so a deeper walk would refuse the only kill this function was
+    ever written to make. What we must never kill is our own bootloader parent
+    (depth 1): it owns the ``_MEI`` dir we are running out of. Everything above
+    it can go, because the kill names ONE pid and never ``/T`` — a tree kill by
+    ParentProcessId would take the running new build down with its target. See
+    :data:`ANCESTOR_DEPTH` and :func:`_kill_pid`.
     """
     try:
         if not isinstance(marker, Marker):
             return False
         if marker.state not in ("installed", "launched", "booted"):
+            return False
+        clock = now if callable(now) else time.time
+        try:
+            age = float(clock()) - float(marker.ts)
+        except Exception:
+            return False                        # an unreadable stamp is stale
+        if age > STALE_MARKER_S:
             return False
         pid = marker.old_pid
         if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
@@ -1299,6 +1330,17 @@ def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
     the boot belongs to the clean copy, which does it a few seconds into its
     own startup once it is really up; doing it from here would tell the
     watcher "booted" about a process that had not yet drawn a window.
+
+    ...AND WHY IT NEVER OUTLIVES THE COPY IT SPAWNED. Holding the "child is
+    alive" signal is only ever right while the clean copy is in fact alive. If
+    it dies during boot and we sat here to ``wait_s`` (90 s), the v5.7.0
+    watcher would time out at 45 s, roll back nothing, and leave the user with
+    an exe that does not start. So the ``Popen`` is kept and watched: the
+    moment it has exited, this exits too, which is precisely the "the update
+    crashed on startup" signal the watcher needs to put ``.old`` back. That
+    handle is the clean copy's BOOTLOADER, which lives as long as the Python
+    process it extracted for — so it can only report a real boot failure, and
+    a user closing the window cannot beat ``booted`` at +3 s.
     """
     try:
         source = environ if environ is not None else os.environ
@@ -1317,14 +1359,15 @@ def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
         child_env[REEXEC_ENV] = "1"
         stage = (staging_dir if isinstance(staging_dir, str) and staging_dir.strip()
                  else os.path.join(os.path.dirname(target), "updates"))
-        popen([target, *rest], cwd=os.path.dirname(target) or None,
-              close_fds=True, creationflags=CREATION_FLAGS, env=child_env)
+        proc = popen([target, *rest], cwd=os.path.dirname(target) or None,
+                     close_fds=True, creationflags=CREATION_FLAGS,
+                     env=child_env)
     except Exception as exc:
         _quiet_log(f"reexec {type(exc).__name__}: {exc}")
         return False
     # Past this point the clean copy is running, so we exit no matter what the
     # wait does — never back to the caller, which would leave two of us.
-    _await_clean_boot(stage, read_marker, now, sleep, wait_s, poll_s)
+    _await_clean_boot(stage, read_marker, now, sleep, wait_s, poll_s, proc=proc)
     try:
         exit(0)
     except Exception as exc:                   # os._exit does not return
@@ -1917,7 +1960,8 @@ def _positive(value, default: float) -> float:
         return default
 
 
-def _await_clean_boot(staging_dir, read_marker, now, sleep, wait_s, poll_s) -> str:
+def _await_clean_boot(staging_dir, read_marker, now, sleep, wait_s, poll_s,
+                      proc=None) -> str:
     """Stand in for the app until the copy :func:`reexec_if_inherited` spawned
     is up. Never raises; the caller exits whatever this returns.
 
@@ -1925,8 +1969,15 @@ def _await_clean_boot(staging_dir, read_marker, now, sleep, wait_s, poll_s) -> s
     already finished as ``booted``/``rolled_back``), ``"booted"`` when the
     clean copy reported for duty, ``"gone"`` when the marker vanished under us
     — housekeeping got there first, which is the same "nothing left to wait
-    for" answer — and ``"timeout"`` when ``wait_s`` passed with the marker
-    still unresolved. The string is for diagnosis only.
+    for" answer — ``"child_died"`` when the copy exited before it announced
+    anything, and ``"timeout"`` when ``wait_s`` passed with the marker still
+    unresolved. The string is for diagnosis only.
+
+    ``child_died`` is the one that has to be fast. Standing in front of a
+    process that is already dead only burns the watcher's 45 s window; leaving
+    at once IS the crash signal that gets ``.old`` put back. It is checked
+    after the marker (a copy that wrote ``booted`` and then exited succeeded)
+    and before the clock, so a dead child never waits out the window.
 
     READ-ONLY BY CONSTRUCTION. The marker belongs to the clean copy from the
     moment it starts; a write from here would be a second writer racing it,
@@ -1950,6 +2001,8 @@ def _await_clean_boot(staging_dir, read_marker, now, sleep, wait_s, poll_s) -> s
                 return "gone"
             if marker.state == "booted":
                 return "booted"
+            if proc is not None and _poll(proc) is not None:
+                return "child_died"
             if now() - start >= watch:
                 break
         return "timeout"
