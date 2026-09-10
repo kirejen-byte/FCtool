@@ -16,10 +16,12 @@ Design rules, all load-bearing
   caller runs on a worker thread and paints the result into a dialog; a
   traceback there would be a frozen dialog and a log line nobody reads.
 * **Nothing is installed unless every check passed.** The order is
-  deliberately paranoid — size, then GitHub's SHA-256, then the zip's own
-  integrity, then its member set, then the PE header of what came out — and
-  every failure deletes the partial file it produced. At no point is there
-  anything half-written where a later step would find it.
+  deliberately paranoid — size, then GitHub's SHA-256, then the member set and
+  the declared sizes read out of the central directory, then the zip's own
+  CRC pass, then the PE header of what came out — and every failure deletes
+  the partial file it produced. At no point is there anything half-written
+  where a later step would find it, and nothing is ever inflated before the
+  cheap checks have agreed that inflating it is safe.
 * **Only our own files.** The updater reads and writes exactly
   ``<exe_dir>/FCTool.exe``, its ``.old``/``.failed`` siblings and
   ``<exe_dir>/updates/*``. It never touches config, tokens, caches or any
@@ -66,8 +68,18 @@ CHUNK = 256 * 1024
 STALL_S = 30
 # (connect, read) — the app-wide convention for every outbound call.
 TIMEOUT = (10, 30)
-# Exactly one member, at the zip root, spelled exactly this.
+# The one member we install: at the zip root, spelled exactly this, and the
+# only member in the archive that may be a program at all.
 EXE_MEMBER = "FCTool.exe"
+# The published zip is FCTool.exe beside a clean config.json and a SETUP.txt.
+# The cap leaves room for a couple more small siblings and is nowhere near an
+# archive whose member LIST is itself the attack.
+MAX_ZIP_MEMBERS = 16
+# What the siblings may add on top of one build before the archive is refused.
+# Today they are ~2 KB together, so this is pure slack — but it means no
+# sibling can declare a gigabyte and get inflated on the strength of a
+# well-behaved FCTool.exe.
+SIBLING_SLACK_BYTES = 16 * 2**20
 # Between the tries at removing a stale .old: a OneDrive/antivirus lock on a
 # file nobody has mapped clears in milliseconds (the app_io replace pattern).
 SWAP_BACKOFF_S = 0.08
@@ -75,6 +87,13 @@ SWAP_BACKOFF_S = 0.08
 _DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$", re.IGNORECASE)
 # A plain file name: no separators, no drive, no dots-dots, no absurd length.
 _SAFE_ZIP_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}\.zip$", re.IGNORECASE)
+# ...and Windows device names, which pass that pattern but are not files at
+# all: opening "NUL.zip" writes to the null device, "COM1.zip" to a serial
+# port. The extension is irrelevant to the rule — the STEM is the device.
+_RESERVED_STEMS = frozenset(
+    ("con", "prn", "aux", "nul")
+    + tuple(f"com{d}" for d in "123456789")
+    + tuple(f"lpt{d}" for d in "123456789"))
 _FALLBACK_ZIP = "FCTool_update.zip"
 
 #: ``progress_cb(done_bytes, total_bytes)`` — called on the worker thread.
@@ -116,12 +135,17 @@ class InstallPlan:
 
         GitHub's asset name is used when it is a plain ``*.zip`` file name and
         replaced by a fixed one otherwise — a name is remote data and must
-        never be able to point a write anywhere but at the staging dir.
+        never be able to point a write anywhere but at the staging dir, nor at
+        a Windows device (``NUL.zip``, ``COM1.zip``) that is not a file.
         """
         try:
             raw = getattr(self.asset, "name", "") or ""
             name = os.path.basename(str(raw).strip())
-            return name if _SAFE_ZIP_RE.match(name) else _FALLBACK_ZIP
+            if not _SAFE_ZIP_RE.match(name):
+                return _FALLBACK_ZIP
+            if name.split(".", 1)[0].strip().lower() in _RESERVED_STEMS:
+                return _FALLBACK_ZIP
+            return name
         except Exception:
             return _FALLBACK_ZIP
 
@@ -245,7 +269,10 @@ def preflight(plan, *, frozen=None, platform=None, disk_usage=shutil.disk_usage)
         try:
             exe_size = os.path.getsize(plan.exe_path)
         except Exception:
-            exe_size = 0
+            # An unreadable exe is not a reason to UNDER-estimate: the build we
+            # are about to install is the best stand-in for the one on disk, so
+            # the space demand stays honest instead of collapsing to the zip.
+            exe_size = zip_size
         need = zip_size + 2 * exe_size + FREE_MARGIN_BYTES
         free = None
         try:
@@ -323,10 +350,16 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
                 if _cancelled(cancel_event):
                     return "Download cancelled."
                 stamp = now()
-                if stamp - last_byte_ts > STALL_S:
-                    return "The download stalled — try again."
                 if not chunk:
-                    continue          # keep-alive: no bytes, clock keeps running
+                    # A keep-alive carried no bytes. This is the ONLY thing
+                    # that may expire the stall clock: iter_content BLOCKS
+                    # until a whole 256 KiB chunk has arrived, so a chunk that
+                    # DID carry bytes proves the link is alive no matter how
+                    # long it took to fill — timing it would make every link
+                    # slower than ~8.7 KB/s permanently "stalled".
+                    if stamp - last_byte_ts > STALL_S:
+                        return "The download stalled — try again."
+                    continue
                 last_byte_ts = stamp
                 done += len(chunk)
                 if done > expected_size:
@@ -357,13 +390,14 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
 def verify_zip(zip_path, expected_size, digest) -> str | None:
     """Judge the downloaded archive. Reason string, or ``None`` when it is ours.
 
-    Five checks, cheapest first: the byte count GitHub published, GitHub's
-    SHA-256 streamed over the file, ``zipfile``'s own CRC pass, exactly ONE
-    member named exactly ``FCTool.exe`` at the root, and that member's
-    declared size inside the same 20-500 MB band. Case matters
-    (``fctool.EXE`` is refused) and so does the path (``sub/FCTool.exe`` is
-    refused): a release that does not have the documented shape is not one we
-    can install unattended.
+    Five checks, in the one order that never inflates a byte on the strength
+    of an unchecked number: the size GitHub published must itself be a
+    plausible build (a 4 GB "asset" is refused before we stream a hash over
+    it), the file must be exactly that many bytes, its SHA-256 must be
+    GitHub's, its member set must be the release shape read straight out of
+    the central directory (:func:`_single_member` — this is where a declared
+    size gets vetoed), and only THEN does ``zipfile``'s CRC pass actually
+    decompress anything.
 
     This is integrity, not authenticity — GitHub's digest proves the bytes we
     got are the bytes that were uploaded, and the app's trust model is already
@@ -375,11 +409,14 @@ def verify_zip(zip_path, expected_size, digest) -> str | None:
         want = parse_digest(digest)
         if want is None:
             return "GitHub did not publish a checksum for this release."
-        if not os.path.isfile(zip_path):
-            return "The downloaded file is missing."
         if (not isinstance(expected_size, int) or isinstance(expected_size, bool)
                 or expected_size <= 0):
             return "GitHub did not publish a usable size for this release."
+        if not MIN_ASSET_BYTES <= expected_size <= MAX_ASSET_BYTES:
+            return (f"The release zip is an unexpected size "
+                    f"({_mb(expected_size)} MB) — it was not installed.")
+        if not os.path.isfile(zip_path):
+            return "The downloaded file is missing."
 
         actual = os.path.getsize(zip_path)
         if actual != expected_size:
@@ -390,16 +427,12 @@ def verify_zip(zip_path, expected_size, digest) -> str | None:
             return "The download did not match GitHub's checksum — it was not installed."
 
         with zipfile.ZipFile(zip_path) as archive:
+            reason, _info = _single_member(archive)
+            if reason:
+                return reason
             broken = archive.testzip()
             if broken:
                 return f"The downloaded zip is damaged ({broken})."
-            reason, info = _single_member(archive)
-            if reason:
-                return reason
-            declared = _sane_size(getattr(info, "file_size", None))
-            if not MIN_ASSET_BYTES <= declared <= MAX_ASSET_BYTES:
-                return (f"{EXE_MEMBER} inside the zip is an unexpected size "
-                        f"({_mb(declared)} MB).")
         return None
     except zipfile.BadZipFile:
         return "The downloaded file is not a valid zip."
@@ -439,9 +472,6 @@ def extract_exe(zip_path, new_path) -> str | None:
             if reason:
                 return reason
             declared = _sane_size(getattr(info, "file_size", None))
-            if not MIN_ASSET_BYTES <= declared <= MAX_ASSET_BYTES:
-                return (f"{EXE_MEMBER} inside the zip is an unexpected size "
-                        f"({_mb(declared)} MB).")
 
             written = 0
             with archive.open(info) as src, open(new_path, "wb") as dst:
@@ -958,15 +988,63 @@ def _sha256_file(path) -> str:
 
 
 def _single_member(archive):
-    """``(None, info)`` when the archive holds exactly one root ``FCTool.exe``,
-    else ``(reason, None)``. One owner for the rule both readers apply."""
+    """``(None, info)`` for the archive's ``FCTool.exe``, else ``(reason, None)``.
+
+    The published release zip is NOT a one-file archive — it is ``FCTool.exe``
+    beside a clean ``config.json`` and a ``SETUP.txt`` — so the rule is a
+    member-SET rule, not a member count:
+
+    * exactly one entry named exactly ``FCTool.exe`` (``fctool.EXE`` is not it);
+    * no other entry whose name ends in ``.exe`` — a second program in the
+      archive is the whole game, since the one we install runs unattended;
+    * no entry carrying a path of any kind (a separator either way, ``..``, a
+      drive colon, or the trailing slash that marks a directory);
+    * at most :data:`MAX_ZIP_MEMBERS` entries;
+    * ``FCTool.exe``'s declared size inside the asset band;
+    * every declared size TOGETHER no more than one build plus
+      :data:`SIBLING_SLACK_BYTES`, so a well-behaved exe cannot escort a
+      sibling that inflates to a gigabyte.
+
+    All of it reads the central directory only — no decompression — which is
+    what lets :func:`verify_zip` run it before ``testzip()``. One owner for
+    the rule both readers apply.
+    """
     try:
         infos = list(archive.infolist())
     except Exception:
         return "The downloaded zip could not be read.", None
-    if len(infos) != 1 or getattr(infos[0], "filename", None) != EXE_MEMBER:
+
+    if len(infos) > MAX_ZIP_MEMBERS:
+        return (f"The zip holds more than {MAX_ZIP_MEMBERS} files — that is "
+                f"not an FCTool release."), None
+
+    found = []
+    total = 0
+    for info in infos:
+        name = str(getattr(info, "filename", "") or "")
+        # zipfile spells a directory entry with a trailing slash, so the
+        # separator test covers those too.
+        if (not name or "/" in name or "\\" in name
+                or ".." in name or ":" in name):
+            return ("The zip contains a file path where a plain file name "
+                    "should be."), None
+        if name == EXE_MEMBER:
+            found.append(info)
+        elif name.lower().endswith(".exe"):
+            return f"The zip contains another program beside {EXE_MEMBER}.", None
+        total += _sane_size(getattr(info, "file_size", None))
+
+    if len(found) != 1:
         return (f"The zip does not contain exactly one {EXE_MEMBER} at its root."), None
-    return None, infos[0]
+
+    declared = _sane_size(getattr(found[0], "file_size", None))
+    if not MIN_ASSET_BYTES <= declared <= MAX_ASSET_BYTES:
+        return (f"{EXE_MEMBER} inside the zip is an unexpected size "
+                f"({_mb(declared)} MB)."), None
+    if total > MAX_ASSET_BYTES + SIBLING_SLACK_BYTES:
+        return (f"The files inside the zip add up to {_mb(total)} MB — far "
+                f"more than an FCTool release."), None
+    return None, found[0]
 
 
 def _check_pe(path) -> str | None:
