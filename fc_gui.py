@@ -35060,28 +35060,52 @@ def main():
                 return              # reexec already called exit for us
         except Exception:
             pass
-    app = FCToolGUI()
-    app.run()
-    # The mainloop has returned, so _on_close has already saved and torn down
-    # everything; all that is left is to let go of the log file and — for the
-    # restart hand-off — give the new exe the floor (self_update rolls the swap
-    # back if it will not boot). No argv parsing on purpose: an older exe
-    # launched with a newer build's flags must still start.
+    # The process ALWAYS ends via _hard_exit below, even when FCToolGUI() or
+    # app.run() blows up mid-boot: without the finally, the exception would
+    # propagate past main(), CPython would fall through to
+    # threading._shutdown (the no-timeout join _hard_exit exists to skip),
+    # and a failed boot would resurrect exactly the never-exits hang this
+    # module works around. No argv parsing on purpose: an older exe launched
+    # with a newer build's flags must still start.
+    app = None
+    code = 0
     try:
-        import logging
-        logging.shutdown()          # the new process appends to the same log
+        app = FCToolGUI()
+        app.run()
     except Exception:
-        pass
-    if (getattr(app, "_relaunch_after_close", False)
-            and getattr(sys, "frozen", False)):
+        code = 1
         try:
-            # _update_staging_dir is the ONE owner of "<exe dir>/updates" and
-            # touches no Tk, so it is safe to ask a torn-down app for it.
-            self_update.relaunch_and_watch(sys.executable,
-                                           app._update_staging_dir())
+            import traceback
+            traceback.print_exc()
         except Exception:
-            pass                    # we are on the way out either way
-    _hard_exit(0)
+            pass
+    finally:
+        # The mainloop has returned (or the boot blew up), so _on_close has
+        # already saved and torn down everything it could reach; all that is
+        # left is to let go of the log file and — for the restart hand-off —
+        # give the new exe the floor (self_update rolls the swap back if it
+        # will not boot).
+        try:
+            import logging
+            logging.shutdown()      # the new process appends to the same log
+        except Exception:
+            pass
+        if (app is not None and getattr(app, "_relaunch_after_close", False)
+                and getattr(sys, "frozen", False)):
+            try:
+                # _update_staging_dir is the ONE owner of "<exe dir>/updates"
+                # and touches no Tk, so it is safe to ask a torn-down app
+                # for it.
+                self_update.relaunch_and_watch(sys.executable,
+                                               app._update_staging_dir())
+            except Exception:
+                pass                # we are on the way out either way
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        _hard_exit(code)
 
 
 if __name__ == "__main__":
