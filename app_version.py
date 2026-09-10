@@ -25,7 +25,7 @@ from __future__ import annotations
 
 # The currently RELEASED version. Bumped by the release cycle (and gated by the
 # packaging battery), never by a feature commit.
-APP_VERSION = "5.6.1"
+APP_VERSION = "5.7.0"
 
 
 def parse_version(tag) -> tuple | None:
