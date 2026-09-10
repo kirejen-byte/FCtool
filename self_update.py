@@ -39,6 +39,18 @@ Design rules, all load-bearing
   ``<exe_dir>/updates/*``. It never touches config, tokens, caches or any
   other user data — and staging deliberately lives on the exe's OWN volume so
   the two renames of the swap are atomic renames, not copy-and-delete.
+* **The new build is spawned with a CLEAN PyInstaller environment.** A frozen
+  onefile process advertises its own extraction to every child it starts,
+  through the ``_PYI_*`` env vars (``_MEIPASS2`` on bootloaders before 6.10).
+  Spawn the same exe path with those still set and the "new" process starts
+  in INHERITED CHILD MODE: a single process, NO fresh extraction, and a
+  ``sys._MEIPASS`` pointing at the OLD build's ``_MEIxxxxx`` temp dir — new
+  Python code out of the new PYZ, running against the old build's DLLs and
+  bundled data — which the old process's bootloader then DELETES out from
+  under it as it exits. :func:`clean_child_env` strips them and sets
+  ``PYINSTALLER_RESET_ENVIRONMENT``, and every spawn on this path uses it.
+  :func:`reexec_if_inherited` is the other half of the defence, for the build
+  that was launched by an OLDER exe which never knew to clean.
 * **The remote name is data, not a path.** ``asset.name`` comes from GitHub;
   :attr:`InstallPlan.zip_name` refuses anything that is not a plain ``*.zip``
   file name and falls back to a fixed local one, so no archive name can steer
@@ -804,6 +816,56 @@ def mark_booted(staging_dir, current_version) -> bool:
         return False
 
 
+def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
+                                is_fctool=None, kill=None) -> bool:
+    """End the process this build replaced, if it is somehow still running.
+
+    ``True`` when a kill was issued. Never raises.
+
+    Why this is needed: FCTool up to and including v5.7.0 does not exit when
+    its window closes (a non-daemon executor is joined and never finishes), so
+    the process that installed the update lingers as a zombie — and while it
+    lives it holds ``FCTool.exe.old`` mapped, which is exactly the file
+    :func:`startup_housekeeping` is trying to delete. Every later boot then
+    finds the same locked file and the ``.old`` never goes away.
+
+    Why killing it is safe: this runs at boot+20 s in the NEW build, on a
+    marker whose ``expected_tag`` is the version now running. The predecessor
+    therefore finished ``_on_close`` — every save, every settings write —
+    BEFORE it spawned us, and the watchdog it ran afterwards returns within a
+    few seconds of the boot marker. There is nothing left in it that anyone
+    wants; it is a window-less process holding a file hostage.
+
+    Every refusal below exists because a pid is a weak identifier. We will not
+    touch a pid that is missing, zero, negative, our own, our parent's, or one
+    that ``tasklist`` does not confirm is an ``FCTool.exe`` — pids are
+    recycled, and killing a stranger would be far worse than leaving a stale
+    file on disk. The ``is_fctool``/``kill`` seams exist for the tests; the
+    defaults shell out to ``tasklist``/``taskkill``.
+    """
+    try:
+        if not isinstance(marker, Marker):
+            return False
+        if marker.state not in ("installed", "launched", "booted"):
+            return False
+        pid = marker.old_pid
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+        mine = my_pid if my_pid is not None else os.getpid()
+        parent = parent_pid if parent_pid is not None else os.getppid()
+        if pid == mine or pid == parent:
+            return False
+        identify = is_fctool if callable(is_fctool) else _is_fctool_pid
+        if not identify(pid):
+            return False
+        killer = kill if callable(kill) else _kill_pid_tree
+        killer(pid)
+        return True
+    except Exception as exc:
+        _quiet_log(f"terminate predecessor {type(exc).__name__}: {exc}")
+        return False
+
+
 def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | None:
     """Clean up after the previous update and say what happened, if anything.
 
@@ -820,8 +882,11 @@ def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | Non
       not match. Clean up and tell the user their update did not start.
     * **the marker names the version now running** — the update worked. That
       holds whether the state is ``booted``, ``installed`` or ``launched``:
-      being here, as this version, IS the success. Delete ``.old`` (one
-      successful boot is all we keep it for), ``.failed``, and the archive.
+      being here, as this version, IS the success. End the predecessor if it
+      is still around (see :func:`terminate_stale_predecessor` — it holds
+      ``.old`` mapped and every build up to v5.7.0 fails to exit), then delete
+      ``.old`` (one successful boot is all we keep it for), ``.failed``, and
+      the archive.
     * **anything else** (``installed``/``launched`` naming a version that is
       not us) — the user launched the old copy while an install waits for its
       restart. Touch NOTHING: that ``.old`` may be the mapped image of the
@@ -853,6 +918,9 @@ def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | Non
                           f"download.")
 
         if _same_version(marker.expected_tag, current_version):
+            # Before taking the file, take the process holding it: a hung
+            # predecessor is the one reason .old survives boot after boot.
+            terminate_stale_predecessor(marker)
             _remove_quiet(_sibling(exe_path, ".old"))
             _remove_quiet(_sibling(exe_path, ".failed"))
             _sweep_staging(staging_dir)
@@ -980,6 +1048,22 @@ def run_install(plan, progress_cb, cancel_event, *,
 CREATION_FLAGS = (getattr(subprocess, "DETACHED_PROCESS", 0)
                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
+#: Keep the ``tasklist``/``taskkill`` helpers from flashing a console window
+#: out of a windowed build. Windows-only, read the same defensive way.
+NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+#: The onefile state a frozen bootloader publishes to its children. Anything
+#: with this prefix (plus the pre-6.10 ``_MEIPASS2``) must be gone from the
+#: environment of a process we start from our own exe path — see
+#: :func:`clean_child_env`.
+PYI_ENV_PREFIX = "_PYI_"
+PYI_ENV_LEGACY = "_MEIPASS2"
+#: Understood by PyInstaller 6.10+ bootloaders, ignored by older ones (for
+#: which stripping the variables above is already enough).
+PYI_RESET_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
+#: Set on the process we re-exec so it can never re-exec again.
+REEXEC_ENV = "FCTOOL_REEXEC"
+
 # How long the watchdog waits for the new build's "booted" marker before
 # giving up and returning "timeout". Measured on a real built v5.7.0 exe: a
 # freshly written onefile took 24.6 s from spawn to writing the marker (cold
@@ -999,6 +1083,15 @@ def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
     shut down, so this process holds no app-data file open — and it writes
     nothing but the marker from here on, which is what makes it safe for the
     new process to be opening the same config and log at the same time.
+
+    The child is started with :func:`clean_child_env`, and that is not a
+    detail: we are frozen, and a frozen onefile process passes its extraction
+    to children through ``_PYI_*``/``_MEIPASS2``. Spawning our own exe path
+    without clearing them starts the new build in PyInstaller's inherited
+    child mode — no fresh extraction, ``sys._MEIPASS`` aimed at THIS process's
+    ``_MEIxxxxx`` dir (so the new code runs against the old build's DLLs and
+    data), and that directory deleted by our own bootloader seconds later as
+    we exit. It looks exactly like "the update crashed on startup".
 
     Returns one of ``"booted"`` (the new build reported for duty),
     ``"timeout"`` (alive but silent — assume it is fine and get out of its
@@ -1051,6 +1144,119 @@ def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
     except Exception as exc:
         _quiet_log(f"relaunch {type(exc).__name__}: {exc}")
         return "timeout"
+
+
+# ── PyInstaller onefile hygiene ──────────────────────────────────────────────
+
+def clean_child_env(environ=None) -> dict:
+    """A copy of the environment safe to start our own exe path with.
+
+    Every ``_PYI_*`` variable and the legacy ``_MEIPASS2`` are removed, and
+    ``PYINSTALLER_RESET_ENVIRONMENT=1`` is added (honoured by bootloaders from
+    6.10, ignored by older ones — for which the stripping alone is enough).
+    Everything else is passed through untouched: the child still needs PATH,
+    APPDATA, TEMP and the user's own variables.
+
+    Without this the child does not extract its own archive at all; it runs as
+    an inherited child of the process that spawned it, out of that process's
+    ``_MEIxxxxx`` directory, which disappears when that process exits.
+
+    Total: junk in gets the real environment, cleaned, rather than an
+    exception — a spawn with a half-built environment is still a spawn.
+    """
+    cleaned = {PYI_RESET_ENV: "1"}
+    try:
+        source = environ if hasattr(environ, "items") else os.environ
+        for key, value in source.items():
+            name = str(key)
+            upper = name.upper()
+            if upper.startswith(PYI_ENV_PREFIX) or upper == PYI_ENV_LEGACY:
+                continue
+            cleaned[name] = str(value)
+        cleaned[PYI_RESET_ENV] = "1"
+        return cleaned
+    except Exception as exc:
+        _quiet_log(f"clean_child_env {type(exc).__name__}: {exc}")
+        return cleaned
+
+
+def inherited_stale_meipass(*, meipass=None, ppid=None) -> bool:
+    """Are we running out of somebody ELSE's onefile extraction?
+
+    A onefile bootloader names its temp directory ``_MEI`` + its own pid + a
+    few random digits, and it is the direct parent of the Python process it
+    starts. So a healthy frozen main process always sees a ``sys._MEIPASS``
+    whose basename begins ``_MEI<our ppid>``; a process launched in inherited
+    child mode sees the dir of a bootloader that is not its parent — the tell
+    that our data files, DLLs and splash belong to another build and are about
+    to be deleted under us.
+
+    ``False`` for everything that is not that: not frozen, a onedir build,
+    an unreadable pid, garbage. ``_PYI_PARENT_PROCESS_LEVEL`` deliberately
+    plays no part — it reads ``"1"`` in both the healthy and the broken case.
+    """
+    try:
+        path = meipass if meipass is not None else getattr(sys, "_MEIPASS", None)
+        if not isinstance(path, str) or not path.strip():
+            return False
+        name = os.path.basename(os.path.normpath(path.strip()))
+        if not name.startswith("_MEI"):
+            return False                       # onedir, or not frozen at all
+        parent = ppid if ppid is not None else os.getppid()
+        if isinstance(parent, bool) or not isinstance(parent, int) or parent <= 0:
+            return False
+        return not name.startswith("_MEI%d" % parent)
+    except Exception as exc:
+        _quiet_log(f"inherited_stale_meipass {type(exc).__name__}: {exc}")
+        return False
+
+
+def reexec_if_inherited(*, popen=subprocess.Popen, environ=None, argv=None,
+                        exe=None, exit=os._exit) -> bool:
+    """Restart ourselves properly if we were launched in inherited child mode.
+
+    ``True`` when a replacement was started and ``exit`` was called (so in the
+    real app nothing after this line runs); ``False`` when there was nothing
+    to do — or when the respawn failed, in which case we deliberately keep
+    going: an app running against a doomed ``_MEI`` dir is worse than a clean
+    one, but far better than no app at all.
+
+    This is the compatibility half of the fix. :func:`clean_child_env` stops
+    THIS build from creating the problem, but the exe that installs an update
+    is the PREVIOUS build — every published version up to v5.7.0 spawns its
+    successor with the onefile variables still set. That successor is us, and
+    this is the only place that can notice.
+
+    Call it FIRST in ``main()`` when frozen, before anything is read out of
+    ``sys._MEIPASS`` and before any window exists. The child gets a cleaned
+    environment plus ``FCTOOL_REEXEC=1``, which is what stops a mis-detection
+    from turning into an unbounded chain of processes.
+    """
+    try:
+        source = environ if environ is not None else os.environ
+        try:
+            if source.get(REEXEC_ENV) == "1":
+                return False                   # this hop already happened
+        except Exception:
+            return False
+        if not inherited_stale_meipass():
+            return False
+        target = exe if isinstance(exe, str) and exe.strip() else sys.executable
+        if not isinstance(target, str) or not target.strip():
+            return False
+        rest = [str(item) for item in (argv if argv is not None else sys.argv[1:])]
+        child_env = clean_child_env(source)
+        child_env[REEXEC_ENV] = "1"
+        popen([target, *rest], cwd=os.path.dirname(target) or None,
+              close_fds=True, creationflags=CREATION_FLAGS, env=child_env)
+    except Exception as exc:
+        _quiet_log(f"reexec {type(exc).__name__}: {exc}")
+        return False
+    try:
+        exit(0)
+    except Exception as exc:                   # os._exit does not return
+        _quiet_log(f"reexec exit {type(exc).__name__}: {exc}")
+    return True
 
 
 # ── internals ────────────────────────────────────────────────────────────────
@@ -1399,13 +1605,61 @@ def _spawn(popen, exe_path):
 
     ``cwd`` is the exe's own folder so the new process resolves its data files
     the way a double-click would, whatever directory this one was started in.
+
+    ``env`` is :func:`clean_child_env` and must stay that way: with our own
+    ``_PYI_*`` variables inherited, the child would not extract its archive at
+    all — it would run out of OUR ``_MEIxxxxx`` dir and lose it when we exit.
     """
     try:
         return popen([exe_path], cwd=os.path.dirname(exe_path) or None,
-                     close_fds=True, creationflags=CREATION_FLAGS)
+                     close_fds=True, creationflags=CREATION_FLAGS,
+                     env=clean_child_env())
     except Exception as exc:
         _quiet_log(f"spawn {type(exc).__name__}: {exc}")
         return None
+
+
+def _is_fctool_pid(pid) -> bool:
+    """Is ``pid`` a live ``FCTool.exe``? The default identity check behind
+    :func:`terminate_stale_predecessor`.
+
+    ``tasklist /FI "PID eq <pid>" /FO CSV /NH`` prints one quoted CSV row per
+    match and an unquoted ``INFO:`` line when there is none, so "starts with a
+    quote" separates a real answer from every other output. Anything that goes
+    wrong — no such tool, a timeout, a non-Windows box — is ``False``: this
+    gates a kill, so silence must mean "do not".
+    """
+    try:
+        number = int(pid)
+        if number <= 0:
+            return False
+        done = subprocess.run(
+            ["tasklist", "/FI", "PID eq %d" % number, "/FO", "CSV", "/NH"],
+            capture_output=True, timeout=10, creationflags=NO_WINDOW_FLAGS)
+        text = (done.stdout or b"").decode("utf-8", "replace")
+        for line in text.splitlines():
+            row = line.strip()
+            if not row.startswith('"'):
+                continue
+            image = row.split('","')[0].strip('"')
+            if image.lower() == EXE_MEMBER.lower():
+                return True
+        return False
+    except Exception as exc:
+        _quiet_log(f"tasklist {type(exc).__name__}: {exc}")
+        return False
+
+
+def _kill_pid_tree(pid) -> None:
+    """End ``pid`` and anything it started. Raises for the caller to swallow.
+
+    ``/T`` because the predecessor may have spawned helpers, ``/F`` because it
+    is hung by definition — it is being killed precisely because it did not
+    end when it was asked to.
+    """
+    subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+                   capture_output=True, timeout=10,
+                   creationflags=NO_WINDOW_FLAGS)
 
 
 def _poll(proc):
