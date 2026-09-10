@@ -367,9 +367,12 @@ class UpdateDialog(tk.Toplevel):
             done_f = total_f = 0.0
         try:
             self.progress.configure(value=pct)
+            # Displayed "done" is clamped to "total" too: a server that sends
+            # more than it promised must not read as "57.2 MB of 53.0 MB".
+            done_disp = _clamp(done_f, 0.0, total_f) if total_f > 0 else done_f
             self.progress_text.configure(
                 text=("%.1f MB of %.1f MB (%d%%)"
-                      % (done_f / 1048576.0, total_f / 1048576.0, pct))
+                      % (done_disp / 1048576.0, total_f / 1048576.0, pct))
                 if total_f > 0 else "")
         except (tk.TclError, AttributeError):
             pass                                   # the window is already gone
