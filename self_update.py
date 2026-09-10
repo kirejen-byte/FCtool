@@ -33,10 +33,12 @@ Design rules, all load-bearing
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import time
 import zipfile
@@ -45,7 +47,9 @@ from typing import Callable
 
 import requests
 
+from app_io import atomic_write_json
 from app_path import _is_dir_writable
+from app_version import APP_VERSION, parse_version
 from update_check import HEADERS, AssetInfo, _quiet_log
 
 # The asset must be a plausible FCTool build: today's zip is ~53 MB, and both
@@ -64,6 +68,9 @@ STALL_S = 30
 TIMEOUT = (10, 30)
 # Exactly one member, at the zip root, spelled exactly this.
 EXE_MEMBER = "FCTool.exe"
+# Between the tries at removing a stale .old: a OneDrive/antivirus lock on a
+# file nobody has mapped clears in milliseconds (the app_io replace pattern).
+SWAP_BACKOFF_S = 0.08
 
 _DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$", re.IGNORECASE)
 # A plain file name: no separators, no drive, no dots-dots, no absurd length.
@@ -465,6 +472,420 @@ def extract_exe(zip_path, new_path) -> str | None:
             _remove_quiet(new_path)
 
 
+# ── the swap: two renames, and a way back from each of them ─────────────────
+
+def swap_in(plan, *, replace=os.replace, remove=os.remove, retries=5,
+            sleep=time.sleep) -> str | None:
+    """Make the extracted build the one that runs. Reason, or ``None``.
+
+    Windows refuses to delete or overwrite the image of a running process, but
+    it happily RENAMES it — that is the whole trick, and the reason this needs
+    no helper script, no second copy of the exe and no elevation::
+
+        FCTool.exe      -> FCTool.exe.old     (we keep running from it)
+        updates/...new  -> FCTool.exe
+
+    Both are same-volume renames (staging is deliberately a subfolder of the
+    exe's own directory), so each is atomic: there is no instant at which
+    ``FCTool.exe`` is a half-written file. The ordering is chosen so that
+    every failure leaves something runnable at ``FCTool.exe``:
+
+    * the new file vanished (an antivirus quarantine between extract and swap)
+      — nothing is renamed at all;
+    * a stale ``.old`` will not go — an update is installed but not restarted
+      and its file is a live process's image; nothing is renamed;
+    * the first rename fails — nothing has moved;
+    * the second fails — the first is undone and the old build is back;
+    * even the undo fails (a same-volume rename into a name we just vacated:
+      never seen) — the message names both files so the user can rename by
+      hand, and the running process is unaffected either way, because its
+      image is mapped from the ``.old`` file it already holds open.
+
+    ``replace``/``remove``/``sleep`` are seams: the whole table above is
+    testable without a locked file or a real antivirus.
+    """
+    try:
+        if not isinstance(plan, InstallPlan):
+            return "There is nothing staged to install."
+
+        exe, old, new = plan.exe_path, plan.old_path, plan.new_path
+
+        if not os.path.isfile(new):
+            return "The new file vanished before install (antivirus?)."
+
+        reason = _clear_stale_old(old, remove=remove, retries=retries, sleep=sleep)
+        if reason:
+            return reason
+
+        try:
+            replace(exe, old)
+        except Exception as exc:
+            _quiet_log(f"swap stage {type(exc).__name__}: {exc}")
+            return "Could not stage the current FCTool.exe — nothing was changed."
+
+        try:
+            replace(new, exe)
+        except Exception as exc:
+            _quiet_log(f"swap install {type(exc).__name__}: {exc}")
+            try:
+                replace(old, exe)
+            except Exception as undo:
+                _quiet_log(f"swap restore {type(undo).__name__}: {undo}")
+                return (f'The update could not be completed. Rename "{old}" '
+                        f'back to "{exe}" to restore the previous version.')
+            return ("Could not put the new version in place — "
+                    "the previous version was restored.")
+        return None
+    except Exception as exc:
+        _quiet_log(f"swap_in {type(exc).__name__}: {exc}")
+        return "The update could not be installed."
+
+
+# ── the marker: the only channel between the old process and the new one ────
+
+#: Lives in the staging dir, beside the archive it came from.
+MARKER_NAME = "pending_update.json"
+#: ``installed`` -> ``launched`` -> ``booted`` | ``rolled_back``.
+MARKER_STATES = ("installed", "launched", "booted", "rolled_back")
+
+
+@dataclass
+class Marker:
+    """What the swap knows and the next boot needs to know.
+
+    Mutable on purpose: exactly one field changes at each hand-off, and the
+    file is rewritten atomically every time (:func:`app_io.atomic_write_json`),
+    so a reader never sees a half-written marker — only the previous state or
+    the next one.
+
+    ``old_pid`` is recorded for diagnosis only; nothing waits on it. The old
+    process has already finished every save before it spawns the new one, so
+    making the new build wait for a pid would add seconds to every restart and
+    buy nothing.
+    """
+
+    expected_tag: str
+    previous_version: str
+    state: str
+    ts: float
+    old_pid: int
+
+
+@dataclass(frozen=True)
+class Notice:
+    """A one-line thing to tell the user at boot. ``kind`` is ``"updated"`` or
+    ``"rolled_back"``; the caller picks the colour, not the words."""
+
+    kind: str
+    text: str
+
+
+def marker_path(staging_dir) -> str:
+    """The marker's full path, or ``""`` when ``staging_dir`` is unusable
+    (every reader treats ``""`` as "no marker")."""
+    try:
+        if not isinstance(staging_dir, str) or not staging_dir.strip():
+            return ""
+        return os.path.join(staging_dir, MARKER_NAME)
+    except Exception:
+        return ""
+
+
+def write_marker(path, marker) -> bool:
+    """Write ``marker`` atomically. ``True`` when it landed.
+
+    Refuses anything it could not read back — a wrong type, an unknown state —
+    rather than writing a file the next boot would have to treat as corrupt.
+    """
+    try:
+        if not isinstance(path, str) or not path.strip():
+            return False
+        if not isinstance(marker, Marker) or marker.state not in MARKER_STATES:
+            return False
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        atomic_write_json(path, {
+            "expected_tag": str(marker.expected_tag),
+            "previous_version": str(marker.previous_version),
+            "state": str(marker.state),
+            "ts": float(marker.ts),
+            "old_pid": int(marker.old_pid),
+        })
+        return True
+    except Exception as exc:
+        _quiet_log(f"write_marker {type(exc).__name__}: {exc}")
+        return False
+
+
+def read_marker(path) -> Marker | None:
+    """The marker at ``path``, or ``None`` for anything unusable.
+
+    Absent, unreadable, not JSON, not an object, missing a field, or holding a
+    field of the wrong type all collapse to the same answer on purpose: the
+    marker is a hint about what to clean up, and a hint we cannot trust is one
+    we ignore. :func:`startup_housekeeping` then sweeps staging and says
+    nothing — which is exactly what an interrupted install deserves.
+    """
+    try:
+        if not isinstance(path, str) or not path.strip():
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        if not isinstance(raw, dict):
+            return None
+        tag = raw.get("expected_tag")
+        previous = raw.get("previous_version")
+        state = raw.get("state")
+        if not isinstance(tag, str) or not isinstance(previous, str):
+            return None
+        if not isinstance(state, str) or not state:
+            return None
+        ts = raw.get("ts")
+        pid = raw.get("old_pid")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            return None
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return None
+        return Marker(tag, previous, state, float(ts), pid)
+    except Exception:
+        return None
+
+
+def clear_marker(path) -> None:
+    """Delete the marker. A missing (or locked) one is not an error."""
+    _remove_quiet(path)
+
+
+def mark_booted(staging_dir, current_version) -> bool:
+    """Record "the new build is up" — the signal the watchdog waits for.
+
+    Called by the NEW process a few seconds into its own boot. It writes only
+    when a marker exists AND names the version now running, so a marker left
+    by some other update (or an old copy the user started by hand) can never
+    be mistaken for a successful boot of THIS one. Versions are compared the
+    way :func:`update_check.check` compares them — zero-padded, ``v`` optional
+    — so ``v5.7.0`` and ``5.7.0`` are one version.
+    """
+    try:
+        path = marker_path(staging_dir)
+        marker = read_marker(path)
+        if marker is None or not _same_version(marker.expected_tag, current_version):
+            return False
+        return _advance_marker(path, "booted")
+    except Exception as exc:
+        _quiet_log(f"mark_booted {type(exc).__name__}: {exc}")
+        return False
+
+
+def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | None:
+    """Clean up after the previous update and say what happened, if anything.
+
+    Runs on a worker a few seconds into every boot. Four cases, and the marker
+    (plus the version actually running) decides which:
+
+    * **no marker** — nothing is pending, so anything left in staging is
+      debris from an interrupted attempt, and a ``.old``/``.failed`` beside
+      the exe is the residue of an update that already finished. Sweep both
+      and say nothing. This is also where a ``.old`` that was locked on the
+      previous boot (the old process was still alive) finally goes.
+    * **rolled_back** — checked BEFORE the version test on purpose: after a
+      rollback the running version is the OLD one, so the tags deliberately do
+      not match. Clean up and tell the user their update did not start.
+    * **the marker names the version now running** — the update worked. That
+      holds whether the state is ``booted``, ``installed`` or ``launched``:
+      being here, as this version, IS the success. Delete ``.old`` (one
+      successful boot is all we keep it for), ``.failed``, and the archive.
+    * **anything else** (``installed``/``launched`` naming a version that is
+      not us) — the user launched the old copy while an install waits for its
+      restart. Touch NOTHING: that ``.old`` may be the mapped image of the
+      process asking this question.
+
+    Every delete is best-effort — a locked file is skipped, the notice is
+    still returned, and the next boot's first case picks it up. Nothing here
+    raises: it runs on a worker at startup and its worst possible outcome is
+    a file left on disk.
+    """
+    try:
+        path = marker_path(staging_dir)
+        marker = read_marker(path)
+
+        if marker is None:
+            _remove_quiet(path)                 # a corrupt marker IS no marker
+            _sweep_staging(staging_dir)
+            _remove_quiet(_sibling(exe_path, ".old"))
+            _remove_quiet(_sibling(exe_path, ".failed"))
+            return None
+
+        if marker.state == "rolled_back":
+            _remove_quiet(_sibling(exe_path, ".failed"))
+            _sweep_staging(staging_dir)
+            clear_marker(path)
+            return Notice("rolled_back",
+                          f"Update to {_vtag(marker.expected_tag)} failed to start "
+                          f"and was rolled back — the release page has the manual "
+                          f"download.")
+
+        if _same_version(marker.expected_tag, current_version):
+            _remove_quiet(_sibling(exe_path, ".old"))
+            _remove_quiet(_sibling(exe_path, ".failed"))
+            _sweep_staging(staging_dir)
+            clear_marker(path)
+            return Notice("updated", f"Updated to {_vtag(marker.expected_tag)}.")
+
+        return None
+    except Exception as exc:
+        _quiet_log(f"housekeeping {type(exc).__name__}: {exc}")
+        return None
+
+
+# ── the whole install, in order ──────────────────────────────────────────────
+
+def run_install(plan, progress_cb, cancel_event, *,
+                previous_version=APP_VERSION) -> InstallResult:
+    """Run every step, in the one order that is safe. Never raises.
+
+    ``preflight -> download -> verify -> extract -> marker -> swap``: nothing
+    is written where the next boot would look for it until the bytes have been
+    matched against GitHub's checksum and the file that came out of the zip
+    has been proven to be a Windows program.
+
+    A failure at any stage removes what that stage produced (and everything
+    earlier that is now pointless — a verified-but-unswappable zip is 53 MB of
+    nothing), so a second attempt always starts clean and no half-finished
+    artefact can be mistaken for a finished one. ``FCTool.exe`` is untouched
+    until :func:`swap_in`, and that function is itself reversible.
+
+    The marker is written BEFORE the swap so that a crash between the two
+    still leaves the next boot able to explain itself. Its failure is not
+    fatal: a marker that will not write costs the "Updated to X" notice and
+    the automatic rollback watch, which is not worth refusing the update the
+    user asked for.
+    """
+    try:
+        if not isinstance(plan, InstallPlan):
+            return InstallResult(False, "preflight",
+                                 "This release has nothing that can be "
+                                 "installed automatically.")
+
+        reason = preflight(plan)
+        if reason:
+            return InstallResult(False, "preflight", reason)
+
+        try:
+            os.makedirs(plan.staging_dir, exist_ok=True)
+        except Exception as exc:
+            _quiet_log(f"staging {type(exc).__name__}: {exc}")
+            return InstallResult(False, "preflight",
+                                 "FCTool could not create its updates folder.")
+
+        size = getattr(plan.asset, "size", None)
+        reason = download(getattr(plan.asset, "url", None), plan.part_path, size,
+                          progress_cb, cancel_event)
+        if reason:
+            _remove_quiet(plan.part_path)
+            return InstallResult(False, "download", reason)
+
+        try:
+            os.replace(plan.part_path, plan.zip_path)
+        except Exception as exc:
+            _quiet_log(f"download rename {type(exc).__name__}: {exc}")
+            _remove_quiet(plan.part_path)
+            return InstallResult(False, "download",
+                                 "The download could not be finished.")
+
+        reason = verify_zip(plan.zip_path, size, getattr(plan.asset, "digest", ""))
+        if reason:
+            _remove_quiet(plan.zip_path)
+            return InstallResult(False, "verify", reason)
+
+        reason = extract_exe(plan.zip_path, plan.new_path)
+        if reason:
+            _remove_quiet(plan.new_path)
+            _remove_quiet(plan.zip_path)
+            return InstallResult(False, "extract", reason)
+
+        path = marker_path(plan.staging_dir)
+        write_marker(path, Marker(plan.tag, str(previous_version), "installed",
+                                  time.time(), os.getpid()))
+
+        reason = swap_in(plan)
+        if reason:
+            clear_marker(path)
+            _remove_quiet(plan.new_path)
+            _remove_quiet(plan.zip_path)
+            return InstallResult(False, "swap", reason)
+
+        _remove_quiet(plan.zip_path)
+        return InstallResult(True, "installed",
+                             f"Installed {_vtag(plan.tag)} — restart FCTool to "
+                             f"run it.")
+    except Exception as exc:
+        _quiet_log(f"run_install {type(exc).__name__}: {exc}")
+        return InstallResult(False, "install", "The update could not be installed.")
+
+
+# ── the relaunch watchdog (runs after the mainloop, writes only the marker) ──
+
+#: Detach the child so it outlives us and owns its own console signals. Read
+#: through ``getattr`` because these names exist only on Windows and this
+#: module must stay importable (and testable) everywhere.
+CREATION_FLAGS = (getattr(subprocess, "DETACHED_PROCESS", 0)
+                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
+def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
+                       watch_s=20.0, poll_s=0.5, sleep=time.sleep,
+                       now=time.monotonic) -> str:
+    """Start the new build and stay alive long enough to undo it if it dies.
+
+    Called from ``main()`` AFTER the mainloop has ended and logging has been
+    shut down, so this process holds no app-data file open — and it writes
+    nothing but the marker from here on, which is what makes it safe for the
+    new process to be opening the same config and log at the same time.
+
+    Returns one of ``"booted"`` (the new build reported for duty),
+    ``"timeout"`` (alive but silent — assume it is fine and get out of its
+    way), ``"rolled_back"`` (it died young; the previous build is back and
+    running), ``"spawn_failed"`` (nothing started; the update stays on disk
+    for the user's next manual launch) or ``"rollback_failed"`` (it died and
+    could not be undone; the new build is still there and runnable).
+
+    The watch is deliberately short and deliberately one-sided: it can only
+    make things better. Every second of it is a second the user is staring at
+    a window that has already closed.
+    """
+    try:
+        if not isinstance(exe_path, str) or not exe_path.strip():
+            return "spawn_failed"
+        path = marker_path(staging_dir)
+        _advance_marker(path, "launched", old_pid=os.getpid())
+
+        proc = _spawn(popen, exe_path)
+        if proc is None:
+            _advance_marker(path, "installed")
+            return "spawn_failed"
+
+        watch = _positive(watch_s, 20.0)
+        step = _positive(poll_s, 0.5)
+        start = now()
+        # A belt for a seam that never advances: the loop is bounded by polls
+        # as well as by the clock, so a stubbed monotonic cannot hang an exit.
+        for _ in range(int(watch / step) + 2):
+            _call_quiet(sleep, step)
+            marker = read_marker(path)
+            if marker is not None and marker.state == "booted":
+                return "booted"
+            if _poll(proc) is not None:
+                return _rollback(exe_path, path, popen)
+            if now() - start >= watch:
+                break
+        return "timeout"
+    except Exception as exc:
+        _quiet_log(f"relaunch {type(exc).__name__}: {exc}")
+        return "timeout"
+
+
 # ── internals ────────────────────────────────────────────────────────────────
 
 def _mb(count) -> str:
@@ -572,3 +993,180 @@ def _check_pe(path) -> str | None:
     except Exception as exc:
         _quiet_log(f"pe check {type(exc).__name__}: {exc}")
         return "The unpacked file could not be checked."
+
+
+def _clear_stale_old(old, *, remove, retries, sleep) -> str | None:
+    """Get rid of a leftover ``FCTool.exe.old``, or say why we must not swap.
+
+    Two very different files wear this name: garbage from an update that
+    already restarted (delete it) and the mapped image of a process that is
+    running RIGHT NOW (never deletable, and the reason a second update must
+    wait for a restart). The only way to tell them apart is to try — with a
+    short backoff, because the third possibility is a transient OneDrive or
+    antivirus lock that clears in milliseconds.
+    """
+    try:
+        if not isinstance(old, str) or not old or not os.path.exists(old):
+            return None
+        attempts = retries if isinstance(retries, int) and retries > 0 else 1
+        for attempt in range(attempts):
+            try:
+                remove(old)
+                return None
+            except Exception as exc:
+                _quiet_log(f"stale .old {type(exc).__name__}: {exc}")
+                if attempt < attempts - 1:
+                    _call_quiet(sleep, SWAP_BACKOFF_S * (attempt + 1))
+        return "Restart FCTool to finish the previous update first."
+    except Exception as exc:
+        _quiet_log(f"stale .old {type(exc).__name__}: {exc}")
+        return "Restart FCTool to finish the previous update first."
+
+
+def _advance_marker(path, state, *, old_pid=None) -> bool:
+    """Move an EXISTING marker to ``state``. False when there is none.
+
+    Never creates one: a marker is written exactly once, by the install that
+    earned it. Without it there is nothing to advance and nothing to clean up
+    — the callers all degrade to "watch the process and hope", which is what
+    they would do anyway.
+    """
+    marker = read_marker(path)
+    if marker is None:
+        return False
+    marker.state = state
+    marker.ts = time.time()
+    if old_pid is not None:
+        marker.old_pid = old_pid
+    return write_marker(path, marker)
+
+
+def _same_version(left, right) -> bool:
+    """Are these two tags the same version? ``v5.7`` == ``5.7.0``.
+
+    Zero-padded like :func:`update_check.check`, because the tag on GitHub
+    carries a ``v`` and ``APP_VERSION`` does not, and a tag with a different
+    number of components is still the same release.
+    """
+    first = parse_version(left)
+    second = parse_version(right)
+    if first is None or second is None:
+        return False
+    width = max(len(first), len(second))
+    return (first + (0,) * (width - len(first))
+            == second + (0,) * (width - len(second)))
+
+
+def _vtag(tag) -> str:
+    """A tag as the user should read it: ``v5.7.0``, whichever form we hold."""
+    try:
+        text = str(tag).strip()
+        if not text:
+            return "the new version"
+        return text if text[:1] in ("v", "V") else "v" + text
+    except Exception:
+        return "the new version"
+
+
+def _sibling(exe_path, suffix) -> str:
+    """``FCTool.exe`` + ``suffix``, or ``""`` when there is no exe path."""
+    try:
+        if not isinstance(exe_path, str) or not exe_path.strip():
+            return ""
+        return exe_path + suffix
+    except Exception:
+        return ""
+
+
+def _sweep_staging(staging_dir) -> None:
+    """Delete leftover archives and unpacked builds from the staging dir.
+
+    Exactly three suffixes, and nothing else in there is touched: the marker
+    (``.json``) is state, not debris, and the caller decides when it goes.
+    """
+    try:
+        if not isinstance(staging_dir, str) or not os.path.isdir(staging_dir):
+            return
+        for name in os.listdir(staging_dir):
+            if name.lower().endswith((".part", ".zip", ".new")):
+                _remove_quiet(os.path.join(staging_dir, name))
+    except Exception as exc:
+        _quiet_log(f"sweep {type(exc).__name__}: {exc}")
+
+
+def _spawn(popen, exe_path):
+    """Start ``exe_path`` detached, or ``None`` if it would not start.
+
+    ``cwd`` is the exe's own folder so the new process resolves its data files
+    the way a double-click would, whatever directory this one was started in.
+    """
+    try:
+        return popen([exe_path], cwd=os.path.dirname(exe_path) or None,
+                     close_fds=True, creationflags=CREATION_FLAGS)
+    except Exception as exc:
+        _quiet_log(f"spawn {type(exc).__name__}: {exc}")
+        return None
+
+
+def _poll(proc):
+    """The child's exit code, or ``None`` while it is alive.
+
+    A ``poll`` that raises counts as alive: an unreadable handle is not
+    evidence that the new build failed, and rolling back on a guess would undo
+    a perfectly good update.
+    """
+    try:
+        return proc.poll()
+    except Exception:
+        return None
+
+
+def _rollback(exe_path, path, popen) -> str:
+    """Undo the swap after the new build died, and start the old one again.
+
+    Order matters and is the reverse of :func:`swap_in`: park the failed build
+    under ``.failed`` (kept, not deleted — it is the only evidence of what
+    went wrong), then give its name back to ``.old``. If the FIRST rename
+    fails, stop: the new build is still in place and still runnable, which is
+    strictly better than a half-finished rollback. If the second fails we are
+    momentarily without an ``FCTool.exe``, so the failed build is put back
+    rather than leaving the user with no program at all.
+    """
+    failed = _sibling(exe_path, ".failed")
+    old = _sibling(exe_path, ".old")
+    try:
+        os.replace(exe_path, failed)
+    except Exception as exc:
+        _quiet_log(f"rollback park {type(exc).__name__}: {exc}")
+        return "rollback_failed"
+    try:
+        os.replace(old, exe_path)
+    except Exception as exc:
+        _quiet_log(f"rollback restore {type(exc).__name__}: {exc}")
+        try:
+            os.replace(failed, exe_path)
+        except Exception:
+            pass
+        return "rollback_failed"
+    _advance_marker(path, "rolled_back")
+    _spawn(popen, exe_path)
+    return "rolled_back"
+
+
+def _call_quiet(fn, value) -> None:
+    """Call an injected one-argument seam (``sleep``) and swallow anything."""
+    try:
+        if callable(fn):
+            fn(value)
+    except Exception:
+        pass
+
+
+def _positive(value, default: float) -> float:
+    """``value`` as a positive float, or ``default`` — a zero or negative
+    interval from a caller must not turn the watch into a spin."""
+    try:
+        number = float(value)
+        return number if number > 0 else default
+    except Exception:
+        return default
