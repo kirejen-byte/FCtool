@@ -980,9 +980,18 @@ def run_install(plan, progress_cb, cancel_event, *,
 CREATION_FLAGS = (getattr(subprocess, "DETACHED_PROCESS", 0)
                   | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
+# How long the watchdog waits for the new build's "booted" marker before
+# giving up and returning "timeout". Measured on a real built v5.7.0 exe: a
+# freshly written onefile took 24.6 s from spawn to writing the marker (cold
+# onefile extraction of a 53 MB exe + first-run work + antivirus scanning a
+# new binary). The watcher returns the instant "booted" lands, so a longer
+# window costs nothing on the happy path and only extends how long a crash
+# is still caught — 20 s left too little margin over that 24.6 s measurement.
+RELAUNCH_WATCH_S = 45.0
+
 
 def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
-                       watch_s=20.0, poll_s=0.5, sleep=time.sleep,
+                       watch_s=RELAUNCH_WATCH_S, poll_s=0.5, sleep=time.sleep,
                        now=time.monotonic) -> str:
     """Start the new build and stay alive long enough to undo it if it dies.
 
@@ -1000,7 +1009,10 @@ def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
 
     The watch is deliberately short and deliberately one-sided: it can only
     make things better. Every second of it is a second the user is staring at
-    a window that has already closed.
+    a window that has already closed. The default is 45 s — a real built
+    v5.7.0 exe measured a 24.6 s cold first boot (onefile extraction +
+    antivirus scan of a fresh binary), so 45 s leaves real margin over that
+    while staying short.
 
     LOG-FREE BY CONSTRUCTION, and it must stay that way. This runs after
     ``logging.shutdown()``, while the NEW process already has ``fctool.log``
@@ -1021,7 +1033,7 @@ def relaunch_and_watch(exe_path, staging_dir, *, popen=subprocess.Popen,
             _advance_marker(path, "installed")
             return "spawn_failed"
 
-        watch = _positive(watch_s, 20.0)
+        watch = _positive(watch_s, RELAUNCH_WATCH_S)
         step = _positive(poll_s, 0.5)
         start = now()
         # A belt for a seam that never advances: the loop is bounded by polls
