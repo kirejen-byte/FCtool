@@ -15,6 +15,18 @@ Design rules, all load-bearing
   string, or ``None`` meaning "clear") for ANY input, and never raises. The
   caller runs on a worker thread and paints the result into a dialog; a
   traceback there would be a frozen dialog and a log line nobody reads.
+* **A download that stops must end, and Cancel must work while it is
+  stopped.** Three mechanisms, in the order they bite. (1) The read timeout
+  ``TIMEOUT[1]`` ends a socket that goes silent — that is the common case and
+  it needs no help from us. (2) A guard thread watches the transfer from
+  OUTSIDE the read and closes the response when the user cancels or the
+  deadline passes; without it a peer dripping a few bytes every 25 s never
+  trips the read timeout, ``iter_content`` never returns, and Cancel — which
+  is only read BETWEEN chunks — is inert for as long as the drip lasts.
+  (3) The empty-chunk stall clock. Honest statement of its worth: with
+  ``requests`` on urllib3 it is dead code, because ``iter_content`` yields
+  only non-empty data. It is kept as a fallback for a transport that does
+  hand back empty reads, and nothing depends on it firing.
 * **Nothing is installed unless every check passed.** The order is
   deliberately paranoid — size, then GitHub's SHA-256, then the member set and
   the declared sizes read out of the central directory, then the zip's own
@@ -42,6 +54,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -63,9 +76,22 @@ MAX_ASSET_BYTES = 500 * 2**20
 # slack that we never leave the user's volume completely full.
 FREE_MARGIN_BYTES = 64 * 2**20
 CHUNK = 256 * 1024
-# No bytes at all for this long means the socket is dead in a way that read
-# timeouts do not always catch (a trickle of keep-alives, a stuck CDN edge).
+# An EMPTY read for this long would mean the socket is dead in a way the read
+# timeout did not catch. Fallback only: ``requests`` on urllib3 never yields
+# an empty chunk, so on the real transport this clock never expires — the
+# guard thread below is what actually ends a transfer that will not finish.
 STALL_S = 30
+# The floor under the whole transfer, and the rate the deadline is derived
+# from. 20 KB/s is well below any link that could realistically finish a
+# 53 MB build, so a healthy-but-slow download is never cut off; a peer
+# dripping bytes to keep the socket alive is. +60 s absorbs a slow start and
+# TLS setup, and the floor keeps a tiny asset from getting a silly budget.
+# 53 MB works out to ~45 minutes: generous, and finite.
+DOWNLOAD_MIN_RATE_BPS = 20_000
+DOWNLOAD_DEADLINE_FLOOR_S = 120.0
+# How often the guard thread looks at cancel and the clock. Fast enough that
+# Cancel feels immediate, slow enough to cost nothing over 45 minutes.
+_GUARD_TICK_S = 0.5
 # (connect, read) — the app-wide convention for every outbound call.
 TIMEOUT = (10, 30)
 # The one member we install: at the zip root, spelled exactly this, and the
@@ -305,15 +331,30 @@ def preflight(plan, *, frozen=None, platform=None, disk_usage=shutil.disk_usage)
 
 
 def download(url, part_path, expected_size, progress_cb, cancel_event, *,
-             get=requests.get, now=time.monotonic) -> str | None:
+             get=requests.get, now=time.monotonic,
+             thread_factory=threading.Thread) -> str | None:
     """Stream ``url`` into ``part_path``. Reason string, or ``None`` on success.
 
     Success means the file is complete and exactly ``expected_size`` bytes;
     the caller renames it to ``.zip`` itself. ANY other outcome — a wrong
-    ``Content-Length``, a short or oversized body, a stalled socket, a
-    cancelled dialog, a dead connection — deletes the partial file, so a retry
-    always starts from a clean slate and no half-download can ever be mistaken
-    for an archive.
+    ``Content-Length``, a short or oversized body, a transfer that will not
+    finish, a cancelled dialog, a dead connection — deletes the partial file,
+    so a retry always starts from a clean slate and no half-download can ever
+    be mistaken for an archive.
+
+    **The loop alone cannot end a bad transfer.** ``iter_content`` blocks
+    inside a buffered read until a whole ``CHUNK`` has arrived, so both the
+    cancel check and the stall clock — which live BETWEEN chunks — are
+    unreachable while a peer dribbles bytes slowly enough to keep the read
+    timeout from firing but too slowly to fill a chunk. That is why a guard
+    thread (:func:`_start_download_guard`) watches from outside and closes the
+    response on cancel or on the deadline: closing the socket is the only
+    thing that can unblock a read the loop is stuck in. The read then raises,
+    and the guard's verdict — not the generic exception — names the outcome.
+
+    The deadline is :func:`download_budget_s` of the published size, i.e. the
+    time an implausibly slow but non-malicious link would need. It is a
+    backstop, not a rate limit: a genuinely slow download finishes.
 
     ``progress_cb(done, total)`` is throttled to ~10 Hz (a 53 MB download is
     ~200 chunks; a repaint per chunk would be pointless) and is always called
@@ -332,8 +373,12 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
         return "The release zip is an unexpected size — download it from the release page."
 
     resp = None
+    guard = None
+    guard_stop = threading.Event()
+    guard_verdict = {}
     ok = False
     done = 0
+    reason = "Download failed — try again."
     try:
         parent = os.path.dirname(part)
         if parent:
@@ -342,57 +387,87 @@ def download(url, part_path, expected_size, progress_cb, cancel_event, *,
 
         resp = get(url, headers=dict(HEADERS), timeout=TIMEOUT, stream=True)
         status = getattr(resp, "status_code", None)
+        declared = _content_length(resp) if status == 200 else None
         if status != 200:
-            return f"Download failed (HTTP {status})."
+            reason = f"Download failed (HTTP {status})."
+        elif declared is not None and declared != expected_size:
+            reason = "The download did not match the size GitHub published."
+        else:
+            # ONE clock read for both the stall clock and the deadline: the
+            # injected ``now`` seam is scripted per read in the tests, and an
+            # extra read here would silently shift every script.
+            last_byte_ts = now()
+            last_cb_ts = last_byte_ts
+            guard = _start_download_guard(
+                thread_factory, resp, cancel_event,
+                last_byte_ts + download_budget_s(expected_size),
+                guard_stop, guard_verdict, now)
+            _report(progress_cb, 0, expected_size)
+            reason = None
 
-        declared = _content_length(resp)
-        if declared is not None and declared != expected_size:
-            return "The download did not match the size GitHub published."
+            with open(part, "wb") as fh:
+                for chunk in resp.iter_content(chunk_size=CHUNK):
+                    # Fast path only. The guard is what makes Cancel work
+                    # while this loop is parked inside a read.
+                    if _cancelled(cancel_event):
+                        reason = "Download cancelled."
+                        break
+                    stamp = now()
+                    if not chunk:
+                        # Defence in depth for a transport that hands back
+                        # empty reads. ``requests`` is not one: urllib3's
+                        # ``stream()`` yields only non-empty data, so on the
+                        # real download this branch never runs. A chunk that
+                        # DID carry bytes is never timed here — that would
+                        # call every link slower than ~8.7 KB/s "stalled";
+                        # the deadline is what bounds a slow one.
+                        if stamp - last_byte_ts > STALL_S:
+                            reason = "The download stalled — try again."
+                            break
+                        continue
+                    last_byte_ts = stamp
+                    done += len(chunk)
+                    if done > expected_size:
+                        reason = "The download was larger than GitHub published."
+                        break
+                    fh.write(chunk)
+                    if stamp - last_cb_ts >= 0.1:
+                        last_cb_ts = stamp
+                        _report(progress_cb, done, expected_size)
 
-        last_byte_ts = now()
-        last_cb_ts = last_byte_ts
-        _report(progress_cb, 0, expected_size)
-
-        with open(part, "wb") as fh:
-            for chunk in resp.iter_content(chunk_size=CHUNK):
-                if _cancelled(cancel_event):
-                    return "Download cancelled."
-                stamp = now()
-                if not chunk:
-                    # A keep-alive carried no bytes. This is the ONLY thing
-                    # that may expire the stall clock: iter_content BLOCKS
-                    # until a whole 256 KiB chunk has arrived, so a chunk that
-                    # DID carry bytes proves the link is alive no matter how
-                    # long it took to fill — timing it would make every link
-                    # slower than ~8.7 KB/s permanently "stalled".
-                    if stamp - last_byte_ts > STALL_S:
-                        return "The download stalled — try again."
-                    continue
-                last_byte_ts = stamp
-                done += len(chunk)
-                if done > expected_size:
-                    return "The download was larger than GitHub published."
-                fh.write(chunk)
-                if stamp - last_cb_ts >= 0.1:
-                    last_cb_ts = stamp
+            if reason is None:
+                if done != expected_size:
+                    reason = "The download ended early — try again."
+                else:
                     _report(progress_cb, done, expected_size)
-
-        if done != expected_size:
-            return "The download ended early — try again."
-        _report(progress_cb, done, expected_size)
-        ok = True
-        return None
+                    ok = True
     except Exception as exc:
         _quiet_log(f"download {type(exc).__name__}: {exc}")
-        return "Download failed — try again."
+        reason = "Download failed — try again."
+        ok = False
     finally:
+        # Stop the guard and let it finish BEFORE its verdict is read: it is
+        # the only writer of ``guard_verdict``, and a close it is halfway
+        # through is exactly the close that explains the error above.
+        guard_stop.set()
+        _join_quiet(guard)
         try:
             if resp is not None and hasattr(resp, "close"):
                 resp.close()
         except Exception:
             pass
-        if not ok:
-            _remove_quiet(part)
+
+    verdict = guard_verdict.get("reason")
+    if verdict == "cancel":
+        ok = False
+        reason = "Download cancelled."
+    elif verdict == "deadline" and not ok:
+        reason = "The download is too slow — try again on a better connection."
+    if not ok:
+        _remove_quiet(part)
+        if not isinstance(reason, str) or not reason:
+            reason = "Download failed — try again."
+    return None if ok else reason
 
 
 def verify_zip(zip_path, expected_size, digest) -> str | None:
@@ -1002,6 +1077,76 @@ def _cancelled(cancel_event) -> bool:
         return bool(cancel_event.is_set())
     except Exception:
         return False
+
+
+def download_budget_s(expected_size) -> float:
+    """Seconds one download may take before it is called hopeless.
+
+    ``max(floor, size / minimum rate + 60)`` — deliberately far more time than
+    any usable connection needs (53 MB gets ~45 minutes), because the point is
+    to be FINITE, not to be tight. An unusable ``expected_size`` gets the
+    floor: a bad size must not turn the deadline into zero (an instant abort)
+    or infinity (the hang this exists to end).
+    """
+    try:
+        size = _sane_size(expected_size)
+        return max(DOWNLOAD_DEADLINE_FLOOR_S,
+                   size / float(DOWNLOAD_MIN_RATE_BPS) + 60.0)
+    except Exception:
+        return DOWNLOAD_DEADLINE_FLOOR_S
+
+
+def _start_download_guard(thread_factory, resp, cancel_event, deadline, stop,
+                          verdict, now, tick=_GUARD_TICK_S):
+    """Watch a streaming response from outside the read; return the thread.
+
+    ``download``'s loop can only look at cancel and the clock between chunks,
+    and ``iter_content`` may sit inside one read for as long as the peer keeps
+    dribbling. This thread has no such problem: it wakes every ``tick``, and
+    when the user cancels or the deadline passes it records WHY and then
+    closes the response, which is what unblocks the read.
+
+    The verdict is written before the close, so by the time the loop's
+    exception reaches ``download`` the reason for it is already there. Failing
+    to start is not an error — the download simply falls back to what the read
+    timeout can catch on its own — so this returns ``None`` rather than
+    raising into a function that promises never to.
+    """
+    def _watch():
+        try:
+            while not stop.wait(tick):
+                if _cancelled(cancel_event):
+                    verdict["reason"] = "cancel"
+                elif now() >= deadline:
+                    verdict["reason"] = "deadline"
+                else:
+                    continue
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+    try:
+        thread = thread_factory(target=_watch, name="fctool-download-guard",
+                                daemon=True)
+        thread.start()
+        return thread
+    except Exception as exc:
+        _quiet_log(f"download guard {type(exc).__name__}: {exc}")
+        return None
+
+
+def _join_quiet(thread, timeout: float = 1.0) -> None:
+    """Wait briefly for the guard. It is a daemon: a join that will not
+    complete must not be allowed to hold the download's worker thread."""
+    try:
+        if thread is not None and hasattr(thread, "join"):
+            thread.join(timeout)
+    except Exception:
+        pass
 
 
 def _content_length(resp):
