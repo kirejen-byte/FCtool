@@ -2984,6 +2984,7 @@ class FCToolGUI:
         self._update_install_reason = ""     # why the last start was refused
         self._update_cancel = None           # threading.Event while installing
         self._update_dialog = None           # the one open UpdateDialog, if any
+        self._update_housekeeping_busy = False   # boot sweep owns staging
         self._relaunch_after_close = False   # main() reads this after mainloop
         self._last_update_info = None        # verdict the link is advertising
         self._update_link.bind("<Button-1>", self._on_update_link_click)
@@ -3051,11 +3052,6 @@ class FCToolGUI:
     UPDATE_LINK_YIELD_NONE = 0      # nothing yields (the row has room)
     UPDATE_LINK_YIELD_SUBTITLE = 1  # the static subtitle unmaps -- decoration
     UPDATE_LINK_YIELD_STATUS = 2    # ...and the notice outranks the status strip
-
-    # Floor between two progress posts from the download worker. It reports
-    # every 256 KiB chunk -- ~200 posts for a 53 MB zip on a slow line, but a
-    # burst on a fast one -- and the bar cannot show more than the eye can see.
-    UPDATE_PROGRESS_MIN_S = 0.1
 
     def _update_check_enabled(self) -> bool:
         """True unless the user turned the GitHub update check off in Settings."""
@@ -3406,7 +3402,9 @@ class FCToolGUI:
     def _update_install_plan(self, info):
         """``(plan, reason)`` for ``info``: exactly one of the two is set.
 
-        The single owner of every "no". Tk-thread safe -- preflight only stats.
+        The single owner of every "no". Tk-thread safe in the sense that
+        matters -- preflight is stats plus ONE small probe write (and, at most,
+        removing a stale ``.old``), which is fast on a local disk.
         """
         if not getattr(sys, "frozen", False):
             return None, "Running from source — pull the repo instead."
@@ -3426,7 +3424,15 @@ class FCToolGUI:
         return self._update_install_plan(info)[1]
 
     def _open_update_dialog(self, info):
-        """Tk thread: show the update dialog for ``info``. One at a time."""
+        """Tk thread: show the update dialog for ``info``. One at a time.
+
+        The block reason is a PREFLIGHT verdict, so it is asked for only while
+        an install could still start. Once one is installed the running exe's
+        own ``FCTool.exe.old`` makes preflight refuse ("restart to finish the
+        previous update"), which would re-open the dialog BLOCKED with no
+        Restart button -- the reopen after "Later" is the headline flow. An
+        empty reason hands the dialog over to the host-state mapping instead.
+        """
         dialog = getattr(self, "_update_dialog", None)
         try:
             if dialog is not None and dialog.winfo_exists():
@@ -3436,17 +3442,18 @@ class FCToolGUI:
         except Exception:
             pass                # window died without telling us; build a new one
         self._update_dialog = None
+        idle = getattr(self, "_update_install_state", "idle") == "idle"
         try:
             self._update_dialog = UpdateDialog(
-                self, info, block_reason=self._update_block_reason(info))
+                self, info,
+                block_reason=self._update_block_reason(info) if idle else "")
         except Exception:
             self._update_dialog = None
 
     def _start_update_install(self, info, progress_cb, done_cb) -> bool:
         """Tk thread: begin one install. True when a worker was spawned.
 
-        Every refusal is a sentence in ``_update_install_reason`` (the dialog
-        reads it), never an exception: this runs inside a button callback.
+        Every refusal is a sentence in ``_update_install_reason``, not a raise.
         """
         state = getattr(self, "_update_install_state", "idle")
         self._update_install_reason = ""
@@ -3455,55 +3462,43 @@ class FCToolGUI:
                 "An update is already in progress." if state == "installing"
                 else "An update is installed — restart FCTool to run it.")
             return False
+        if getattr(self, "_update_housekeeping_busy", False):
+            self._update_install_reason = ("Startup housekeeping is still "
+                                           "running — try again in a moment.")
+            return False
         plan, self._update_install_reason = self._update_install_plan(info)
         if plan is None:
             return False
         self._update_install_state = "installing"
         self._update_cancel = threading.Event()
         try:
-            threading.Thread(target=self._update_install_worker,
-                             args=(plan, progress_cb, done_cb),
-                             daemon=True).start()
+            threading.Thread(target=self._update_install_worker, daemon=True,
+                             args=(plan, progress_cb, done_cb)).start()
         except Exception:
-            self._update_install_state = "idle"
-            self._update_cancel = None
+            self._update_install_state, self._update_cancel = "idle", None
             self._update_install_reason = ("FCTool could not start the "
                                            "download — try again in a moment.")
             return False
         return True
 
-    def _update_progress_relay(self, progress_cb, *, now=time.monotonic):
-        """Build the throttled worker->Tk progress relay for one install.
-
-        The download reports every 256 KiB chunk, which on a fast line is a
-        burst the drain would carry a frame at a time. ~10 posts/s, with the
-        FINAL post (``done == total``) never dropped. Worker-side by design:
-        the throttle must happen BEFORE the queue, not after it.
-        """
-        state = {"last": float("-inf")}
-
-        def relay(done, total):
-            try:
-                stamp = now()
-                if (done < total
-                        and stamp - state["last"] < self.UPDATE_PROGRESS_MIN_S):
-                    return
-                state["last"] = stamp
-                self._post_ui(progress_cb, done, total)
-            except Exception:
-                pass            # a dropped progress frame is not worth a spew
-        return relay
-
     def _update_install_worker(self, plan, progress_cb, done_cb):
         """Worker: run the whole install, marshal progress and the result.
 
-        run_install is total by contract; the guard is belt and braces -- an
-        escaping exception would strand the state at "installing" forever.
+        Progress goes straight onto the queue: self_update.download already
+        throttles to ~10 Hz and never drops the final frame, so a second
+        throttle here would only alias the first. run_install is total by
+        contract; the guard is belt and braces -- an escaping exception would
+        strand the state at "installing" forever.
         """
+        def relay(done, total):
+            try:
+                self._post_ui(progress_cb, done, total)
+            except Exception:
+                pass        # a dropped progress frame is not worth a spew
+
         try:
             result = self_update.run_install(
-                plan, self._update_progress_relay(progress_cb),
-                getattr(self, "_update_cancel", None))
+                plan, relay, getattr(self, "_update_cancel", None))
         except Exception:
             result = self_update.InstallResult(
                 False, "error",
@@ -3596,39 +3591,49 @@ class FCToolGUI:
         """Tk thread: spawn the one boot-time cleanup pass.
 
         Never while an install is in flight -- housekeeping sweeps the staging
-        dir the installer is writing into. OFF WORKER_METHODS by design: a
-        Tk-thread spawner (the _start_update_check category).
+        dir the installer is writing into. The REVERSE race is closed by
+        _update_housekeeping_busy, which _start_update_install refuses on until
+        the sweep's result lands. OFF WORKER_METHODS by design: a Tk-thread
+        spawner (the _start_update_check category).
         """
         if getattr(self, "_update_install_state", "idle") != "idle":
             return
         staging = self._update_staging_dir()
         if not staging:
             return
+        self._update_housekeeping_busy = True
         try:
             threading.Thread(target=self._update_housekeeping_worker,
                              args=(staging,), daemon=True).start()
         except Exception:
-            pass                # nothing here is urgent: the next boot retries
+            self._update_housekeeping_busy = False   # the next boot retries
 
     def _update_housekeeping_worker(self, staging_dir):
-        """Worker: clean up after the previous update, marshal any notice."""
+        """Worker: clean up after the previous update, marshal what happened.
+
+        Always ONE post, even for a quiet pass: the Tk thread has a latch to
+        drop whether or not the sweep found anything to say.
+        """
+        notice = None
         try:
             notice = self_update.startup_housekeeping(
                 sys.executable, staging_dir, APP_VERSION)
         except Exception:
-            return
-        if notice is None:
-            return              # nothing happened, and silence is the report
-        self._post_ui(self._apply_update_notice, notice)
+            pass                # a failed sweep is still a finished sweep
+        self._post_ui(self._finish_update_housekeeping, notice)
+
+    def _finish_update_housekeeping(self, notice):
+        """Tk thread: drop the sweep's latch, then say what it found (if any)."""
+        self._update_housekeeping_busy = False
+        if notice is not None:
+            self._apply_update_notice(notice)
 
     def _apply_update_notice(self, notice):
         """Tk thread: say what the last update did, once, at boot.
 
-        Two existing surfaces: the Settings status line (full wording), and --
-        only while no release is being advertised -- the title-bar notice slot,
-        the one a user who never opens Settings sees. That slot's measured-yield
-        fit is reused untouched; a long sentence is ellipsised into it and kept
-        whole in the tooltip.
+        Two surfaces: the Settings status line, and -- only while no release is
+        being advertised -- the title-bar slot, whose measured-yield fit is
+        reused untouched (long text is ellipsised, kept whole in the tooltip).
         """
         text = getattr(notice, "text", "")
         if not isinstance(text, str) or not text.strip():
@@ -3647,6 +3652,12 @@ class FCToolGUI:
         self._update_link_url = update_check.RELEASES_PAGE
         self._update_link_text = short
         self._fit_update_link()
+        # The same baseline seed _apply_update_info does: without it a BOOT
+        # notice can sit unmapped until some later tick sees a change.
+        try:
+            self._update_link_fit_state = self._update_link_fit_snapshot()
+        except (tk.TclError, AttributeError):
+            self._update_link_fit_state = None
 
     # ── X-Up Tab ──────────────────────────────────────────────────────────────
 
@@ -34989,9 +35000,10 @@ def main():
     except Exception:
         pass
     try:
-        self_update.relaunch_and_watch(
-            sys.executable,
-            os.path.join(os.path.dirname(sys.executable), "updates"))
+        # _update_staging_dir is the ONE owner of "<exe dir>/updates" and
+        # touches no Tk, so it is safe to ask a torn-down app for it.
+        self_update.relaunch_and_watch(sys.executable,
+                                       app._update_staging_dir())
     except Exception:
         pass                        # we are on the way out either way
 
