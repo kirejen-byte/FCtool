@@ -121,6 +121,17 @@ SIBLING_SLACK_BYTES = 16 * 2**20
 # Between the tries at removing a stale .old: a OneDrive/antivirus lock on a
 # file nobody has mapped clears in milliseconds (the app_io replace pattern).
 SWAP_BACKOFF_S = 0.08
+# After the predecessor is killed, its PyInstaller bootloader parent still has
+# to notice, unmap the image and exit before ``.old`` can be deleted. That is
+# a fraction of a second, but it is not instant — so the delete gets a small
+# budget instead of the single try that used to lose the race. 6 x 0.5 s is
+# three seconds of patience on a worker thread, and only after a real kill.
+OLD_DELETE_TRIES = 6
+OLD_DELETE_BACKOFF_S = 0.5
+# How far up our own parent chain we look before killing a pid. Our bootloader
+# is one hop, the process that spawned us two, its bootloader three — six is
+# generous slack over that and still bounded.
+ANCESTOR_DEPTH = 6
 
 _DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$", re.IGNORECASE)
 # A plain file name: no separators, no drive, no dots-dots, no absurd length.
@@ -817,7 +828,8 @@ def mark_booted(staging_dir, current_version) -> bool:
 
 
 def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
-                                is_fctool=None, kill=None) -> bool:
+                                is_fctool=None, kill=None,
+                                ancestors=None) -> bool:
     """End the process this build replaced, if it is somehow still running.
 
     ``True`` when a kill was issued. Never raises.
@@ -837,11 +849,19 @@ def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
     wants; it is a window-less process holding a file hostage.
 
     Every refusal below exists because a pid is a weak identifier. We will not
-    touch a pid that is missing, zero, negative, our own, our parent's, or one
-    that ``tasklist`` does not confirm is an ``FCTool.exe`` — pids are
-    recycled, and killing a stranger would be far worse than leaving a stale
-    file on disk. The ``is_fctool``/``kill`` seams exist for the tests; the
-    defaults shell out to ``tasklist``/``taskkill``.
+    touch a pid that is missing, zero, negative, our own, our parent's, one of
+    our ANCESTORS, or one that ``tasklist`` does not confirm is an
+    ``FCTool.exe`` — pids are recycled, and killing a stranger would be far
+    worse than leaving a stale file on disk. The ``is_fctool``/``kill``/
+    ``ancestors`` seams exist for the tests; the defaults shell out to
+    ``tasklist``/``taskkill`` and walk the process table.
+
+    The ancestor rule is belt-and-braces on top of the single most important
+    property of the kill itself: it names ONE pid and never ``/T``. We are a
+    descendant of the process in the marker — it spawned our bootloader, which
+    spawned us, and ``DETACHED_PROCESS`` does not sever that parentage — so a
+    tree kill by ParentProcessId would take the running new build down with
+    its target. See :func:`_kill_pid`.
     """
     try:
         if not isinstance(marker, Marker):
@@ -855,10 +875,12 @@ def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
         parent = parent_pid if parent_pid is not None else os.getppid()
         if pid == mine or pid == parent:
             return False
+        if pid in _ancestor_set(ancestors, mine):
+            return False
         identify = is_fctool if callable(is_fctool) else _is_fctool_pid
         if not identify(pid):
             return False
-        killer = kill if callable(kill) else _kill_pid_tree
+        killer = kill if callable(kill) else _kill_pid
         killer(pid)
         return True
     except Exception as exc:
@@ -866,7 +888,8 @@ def terminate_stale_predecessor(marker, *, my_pid=None, parent_pid=None,
         return False
 
 
-def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | None:
+def startup_housekeeping(exe_path, staging_dir, current_version, *,
+                         sleep=None, remove=None) -> Notice | None:
     """Clean up after the previous update and say what happened, if anything.
 
     Runs on a worker a few seconds into every boot. Four cases, and the marker
@@ -896,20 +919,29 @@ def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | Non
     still returned, and the next boot's first case picks it up. Nothing here
     raises: it runs on a worker at startup and its worst possible outcome is
     a file left on disk.
+
+    The one place that waits is the delete AFTER a kill: the predecessor's
+    bootloader parent needs a moment to reap it and unmap the image, so the
+    siblings get :data:`OLD_DELETE_TRIES` tries with
+    :data:`OLD_DELETE_BACKOFF_S` between them, and stop the instant they are
+    gone. With no kill issued there is nothing to wait for, so that path keeps
+    its single attempt. ``sleep``/``remove`` are seams for the tests.
     """
     try:
+        remover = remove if callable(remove) else _remove_quiet
+        napper = sleep if callable(sleep) else time.sleep
         path = marker_path(staging_dir)
         marker = read_marker(path)
+        siblings = (_sibling(exe_path, ".old"), _sibling(exe_path, ".failed"))
 
         if marker is None:
             _remove_quiet(path)                 # a corrupt marker IS no marker
             _sweep_staging(staging_dir)
-            _remove_quiet(_sibling(exe_path, ".old"))
-            _remove_quiet(_sibling(exe_path, ".failed"))
+            _remove_stubborn(siblings, remover, napper, 1)
             return None
 
         if marker.state == "rolled_back":
-            _remove_quiet(_sibling(exe_path, ".failed"))
+            remover(_sibling(exe_path, ".failed"))
             _sweep_staging(staging_dir)
             clear_marker(path)
             return Notice("rolled_back",
@@ -920,9 +952,9 @@ def startup_housekeeping(exe_path, staging_dir, current_version) -> Notice | Non
         if _same_version(marker.expected_tag, current_version):
             # Before taking the file, take the process holding it: a hung
             # predecessor is the one reason .old survives boot after boot.
-            terminate_stale_predecessor(marker)
-            _remove_quiet(_sibling(exe_path, ".old"))
-            _remove_quiet(_sibling(exe_path, ".failed"))
+            killed = terminate_stale_predecessor(marker)
+            _remove_stubborn(siblings, remover, napper,
+                             OLD_DELETE_TRIES if killed else 1)
             _sweep_staging(staging_dir)
             clear_marker(path)
             return Notice("updated", f"Updated to {_vtag(marker.expected_tag)}.")
@@ -1329,6 +1361,38 @@ def _remove_quiet(path) -> None:
         pass
 
 
+def _exists_quiet(path) -> bool:
+    """Is ``path`` still on disk? Anything unanswerable counts as gone — this
+    only decides whether to spend another retry."""
+    try:
+        return bool(isinstance(path, str) and path and os.path.exists(path))
+    except Exception:
+        return False
+
+
+def _remove_stubborn(paths, remove, sleep, tries) -> None:
+    """Delete ``paths``, retrying the ones that are still there.
+
+    ``tries`` of 1 is the old single-shot behaviour and never sleeps, which is
+    what a boot with no kill wants. Above that, each round drops the files
+    that went and sleeps only when something is left AND another round is
+    coming — so the common case (the image is released at once) costs nothing
+    and the hopeless case costs a bounded ``tries - 1`` naps.
+    """
+    try:
+        rounds = tries if isinstance(tries, int) and tries > 1 else 1
+        left = [p for p in paths if isinstance(p, str) and p]
+        for attempt in range(rounds):
+            for path in left:
+                remove(path)
+            left = [p for p in left if _exists_quiet(p)]
+            if not left or attempt >= rounds - 1:
+                return
+            _call_quiet(sleep, OLD_DELETE_BACKOFF_S)
+    except Exception as exc:
+        _quiet_log(f"remove stubborn {type(exc).__name__}: {exc}")
+
+
 def _report(progress_cb, done: int, total: int) -> None:
     """Hand progress to the caller. A callback that raises is its own problem."""
     try:
@@ -1691,16 +1755,102 @@ def _is_fctool_pid(pid) -> bool:
         return False
 
 
-def _kill_pid_tree(pid) -> None:
-    """End ``pid`` and anything it started. Raises for the caller to swallow.
+def _kill_pid(pid) -> None:
+    """End ``pid`` — that pid ALONE. Raises for the caller to swallow.
 
-    ``/T`` because the predecessor may have spawned helpers, ``/F`` because it
-    is hung by definition — it is being killed precisely because it did not
-    end when it was asked to.
+    ``/F`` because the target is hung by definition: it is being killed
+    precisely because it did not end when it was asked to.
+
+    There is deliberately no ``/T``. ``taskkill /T`` walks ParentProcessId,
+    and WE ARE UNDER THE TARGET: the old build spawned our PyInstaller
+    bootloader, which spawned us, and ``DETACHED_PROCESS`` does not sever that
+    parentage on Windows (measured on this box — the new build is a
+    grandchild of ``marker.old_pid``). A tree kill here would kill the very
+    process doing the killing, mid-boot, and leave the user staring at a
+    program that vanished after an update. One pid, no tree.
+
+    Killing only the target is also sufficient: the predecessor's own
+    bootloader parent exits as soon as its child does, taking its ``_MEI``
+    temp dir with it, and the mapped ``.old`` goes with the image.
     """
-    subprocess.run(["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+    subprocess.run(["taskkill", "/PID", str(int(pid)), "/F"],
                    capture_output=True, timeout=10,
                    creationflags=NO_WINDOW_FLAGS)
+
+
+def _ancestor_set(ancestors, my_pid) -> frozenset:
+    """The pids we must never kill, from the seam or from the process table.
+
+    A failed walk is an EMPTY set, not a refusal: the ancestor rule is a
+    second line of defence and the first one — :func:`_kill_pid` naming a
+    single pid — already makes the kill safe on its own.
+    """
+    try:
+        if ancestors is not None:
+            return frozenset(int(p) for p in ancestors
+                             if not isinstance(p, bool) and isinstance(p, int))
+        return _process_ancestors(my_pid)
+    except Exception as exc:
+        _quiet_log(f"ancestors {type(exc).__name__}: {exc}")
+        return frozenset()
+
+
+def _process_ancestors(pid, depth=ANCESTOR_DEPTH) -> frozenset:
+    """Our parent chain, up to ``depth`` hops. Empty on anything unexpected.
+
+    One ``CreateToolhelp32Snapshot`` pass builds the whole pid -> ppid map, so
+    this costs a single syscall rather than ``depth`` subprocesses — it runs
+    inside a boot-time worker and must not be a visible pause. The loop is
+    bounded twice over: by ``depth``, and by a seen-set, because a recycled
+    ppid can point back into the chain and would otherwise spin forever.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD),
+                        ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                        ("th32ModuleID", wintypes.DWORD),
+                        ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * 260)]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot in (None, 0, -1, 2**32 - 1, 2**64 - 1):
+            return frozenset()
+        parents = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = kernel32.Process32FirstW(ctypes.c_void_p(snapshot),
+                                            ctypes.byref(entry))
+            while more:
+                parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                more = kernel32.Process32NextW(ctypes.c_void_p(snapshot),
+                                               ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(snapshot))
+
+        chain, seen = set(), set()
+        cursor = int(pid) if isinstance(pid, int) and not isinstance(pid, bool) \
+            else os.getpid()
+        for _ in range(max(0, int(depth))):
+            seen.add(cursor)
+            nxt = parents.get(cursor)
+            if not nxt or nxt in seen:
+                break
+            chain.add(nxt)
+            cursor = nxt
+        return frozenset(chain)
+    except Exception as exc:
+        _quiet_log(f"process ancestors {type(exc).__name__}: {exc}")
+        return frozenset()
 
 
 def _poll(proc):
