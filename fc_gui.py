@@ -34952,6 +34952,18 @@ $bmp.Dispose()
     def _on_close(self):
         self._running = False
         self._stop_monitoring()
+        # Stop the region-map prewarm's ESI fan-out. Unlike every thread we
+        # start ourselves, ThreadPoolExecutor workers are NON-daemon, and
+        # CPython joins them at interpreter shutdown with no timeout after
+        # draining the whole queue — on a fresh install (no regions_cache.json)
+        # that is ~1100 rate-limited fetches, i.e. an invisible frozen exe that
+        # outlives its window by minutes. request_shutdown() is idempotent and
+        # a no-op when nothing is running.
+        try:
+            import system_cache
+            system_cache.request_shutdown()
+        except Exception:
+            pass
         # Intel ingest runs whether or not the Fusion panel was ever shown, and
         # the checkbox no longer stops it, so shutdown is the only place that
         # retires the poll thread + monitor + resolver. Guarded like the other
@@ -35026,29 +35038,50 @@ $bmp.Dispose()
         self.root.mainloop()
 
 
+# The process ends EXPLICITLY at the end of main(). os._exit skips
+# threading._shutdown — which joins every non-daemon thread with no timeout,
+# e.g. a ThreadPoolExecutor worker still draining ESI fetches — and skips
+# atexit. Both are safe to skip here: FCTool registers no atexit hooks, every
+# save is explicit and has already run in _on_close, the logging handlers flush
+# per record (and logging.shutdown() runs just above), and skipping pygame/SDL's
+# own exit hook is a benefit rather than a loss. Module-level so tests can
+# record the call instead of killing the pytest process.
+_hard_exit = os._exit
+
+
 def main():
+    # Boot-time clean re-exec: a build started by the outgoing exe inherits its
+    # handles/environment, so self_update spawns a clean copy of us and exits.
+    # It returns True only once that copy is on its way — nothing left to do.
+    if getattr(sys, "frozen", False):
+        try:
+            _reexec = getattr(self_update, "reexec_if_inherited", None)
+            if _reexec is not None and _reexec():
+                return              # reexec already called exit for us
+        except Exception:
+            pass
     app = FCToolGUI()
     app.run()
-    # The restart hand-off. The mainloop has returned, so _on_close has already
-    # saved and torn down everything; all that is left is to let go of the log
-    # file and give the new exe the floor (self_update rolls the swap back if it
-    # will not boot). No argv parsing on purpose: an older exe launched with a
-    # newer build's flags must still start.
-    if not (getattr(app, "_relaunch_after_close", False)
-            and getattr(sys, "frozen", False)):
-        return
+    # The mainloop has returned, so _on_close has already saved and torn down
+    # everything; all that is left is to let go of the log file and — for the
+    # restart hand-off — give the new exe the floor (self_update rolls the swap
+    # back if it will not boot). No argv parsing on purpose: an older exe
+    # launched with a newer build's flags must still start.
     try:
         import logging
         logging.shutdown()          # the new process appends to the same log
     except Exception:
         pass
-    try:
-        # _update_staging_dir is the ONE owner of "<exe dir>/updates" and
-        # touches no Tk, so it is safe to ask a torn-down app for it.
-        self_update.relaunch_and_watch(sys.executable,
-                                       app._update_staging_dir())
-    except Exception:
-        pass                        # we are on the way out either way
+    if (getattr(app, "_relaunch_after_close", False)
+            and getattr(sys, "frozen", False)):
+        try:
+            # _update_staging_dir is the ONE owner of "<exe dir>/updates" and
+            # touches no Tk, so it is safe to ask a torn-down app for it.
+            self_update.relaunch_and_watch(sys.executable,
+                                           app._update_staging_dir())
+        except Exception:
+            pass                    # we are on the way out either way
+    _hard_exit(0)
 
 
 if __name__ == "__main__":

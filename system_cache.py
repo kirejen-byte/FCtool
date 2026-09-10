@@ -10,7 +10,7 @@ import os
 import time
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from rate_limiter import rate_limit
 from app_path import app_dir
 from app_io import atomic_write_json
@@ -25,6 +25,101 @@ CACHE_MAX_AGE = 7 * 24 * 3600  # Refresh weekly (system list rarely changes)
 
 _refresh_lock = threading.Lock()
 _refreshing = False
+
+# ── Shutdown latch ─────────────────────────────────────────────────────────
+# The region-map build fans ~67 region + ~1100 constellation ESI calls out over
+# a ThreadPoolExecutor, and it runs on EVERY boot while regions_cache.json is
+# absent (i.e. every fresh install). Executor workers are NON-daemon, and
+# CPython's threading._shutdown joins them with NO timeout after the last
+# non-daemon thread returns — draining every queued task first. With the whole
+# work list submitted up front that kept the (console-less) frozen FCTool.exe
+# alive, invisibly, for minutes after its window closed.
+#
+# So: the fan-out is bounded (at most _REGION_FETCH_WORKERS in flight, the rest
+# submitted only as slots free up) and cancellable. fc_gui._on_close calls
+# request_shutdown(); the submit loop then stops feeding, cancels what is
+# pending and releases the pool without waiting, and the individual fetches
+# short-circuit to a None sentinel instead of opening another socket.
+_REGION_FETCH_WORKERS = 10
+_shutdown = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Ask any in-progress ESI fan-out to stop as soon as it can.
+
+    Idempotent and safe from any thread (including the Tk thread at close).
+    An aborted run returns empty maps, so nothing is written to the cache."""
+    _shutdown.set()
+
+
+def _reset_for_tests() -> None:
+    """Clear the shutdown latch. Tests only — never called by the app."""
+    _shutdown.clear()
+
+
+def _bounded_gather(fn, items, workers: int = _REGION_FETCH_WORKERS):
+    """Apply `fn` to every item with at most `workers` calls in flight.
+
+    Returns ``(results, aborted)``. ``results`` holds every non-None return
+    value **in input order** (so callers see exactly what ``executor.map``
+    used to hand them); ``aborted`` is True when request_shutdown() fired
+    mid-run, in which case the remaining items were never submitted, the
+    pending futures were cancelled and the pool was released without waiting.
+
+    Exceptions raised by `fn` propagate, as they did through executor.map —
+    the pool is still released on the way out, and pending work is cancelled
+    so that release cannot block."""
+    items = list(items)
+    if not items:
+        return [], False
+    if _shutdown.is_set():
+        return [], True
+
+    width = min(workers, len(items))
+    ex = ThreadPoolExecutor(max_workers=width)
+    pending = iter(enumerate(items))
+    inflight: set = set()
+    collected: list[tuple[int, object]] = []
+    aborted = False
+
+    def _submit_next() -> bool:
+        if _shutdown.is_set():
+            return False
+        nxt = next(pending, None)
+        if nxt is None:
+            return False
+        idx, item = nxt
+        fut = ex.submit(fn, item)
+        fut._sc_idx = idx           # completion order != input order
+        inflight.add(fut)
+        return True
+
+    try:
+        for _ in range(width):
+            if not _submit_next():
+                break
+        while inflight:
+            done = wait(inflight, return_when=FIRST_COMPLETED).done
+            for fut in done:
+                inflight.discard(fut)
+                res = fut.result()
+                if res is not None:
+                    collected.append((fut._sc_idx, res))
+            if _shutdown.is_set():
+                aborted = True
+                for fut in inflight:
+                    fut.cancel()
+                break
+            for _ in range(len(done)):
+                if not _submit_next():
+                    break
+    finally:
+        # Clean/exception exits wait (nothing is left queued, so it returns at
+        # once); an aborted exit must NOT — that wait is the whole bug.
+        ex.shutdown(wait=not aborted, cancel_futures=True)
+
+    collected.sort(key=lambda pair: pair[0])
+    return [value for _, value in collected], aborted
 
 # In-memory memo of parsed on-disk cache JSON, keyed by absolute file path, so
 # repeated calls to get_system_names()/get_region_map()/get_region_name_to_id()
@@ -224,9 +319,15 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
       - system_to_region: {str(system_id): region_name}
       - region_name_to_id: {region_name: region_id}
 
-    ~67 region calls + ~1100 constellation calls, run concurrently.
+    ~67 region calls + ~1100 constellation calls, run concurrently through a
+    BOUNDED, cancellable window (see _bounded_gather / request_shutdown).
     On total failure (can't fetch region IDs) returns ({}, {}).
+    A run aborted by request_shutdown() also returns ({}, {}), so the caller
+    writes nothing to the cache and a later boot rebuilds from scratch.
     """
+    if _shutdown.is_set():
+        return {}, {}
+
     print("[RegionCache] Building region map from ESI...")
 
     # Step 1: Get all region IDs
@@ -242,7 +343,14 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
     constellation_to_region: dict[int, int] = {}
 
     def fetch_region(rid):
+        # None = "we are shutting down, this slot did nothing" (the sentinel
+        # _bounded_gather drops). Checked again after rate_limit, which can
+        # park this worker for a while before it would open a socket.
+        if _shutdown.is_set():
+            return None
         rate_limit("esi")
+        if _shutdown.is_set():
+            return None
         r = requests.get(f"{ESI_BASE}/universe/regions/{rid}/", headers=HEADERS, timeout=10)
         if r.ok:
             data = r.json()
@@ -250,13 +358,14 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
         return rid, "", []
 
     print(f"[RegionCache] Fetching {len(region_ids)} regions...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        for result in executor.map(fetch_region, region_ids):
-            rid, name, consts = result
-            if name:
-                region_names[rid] = name
-                for cid in consts:
-                    constellation_to_region[cid] = rid
+    region_results, aborted = _bounded_gather(fetch_region, region_ids)
+    if aborted or _shutdown.is_set():
+        return {}, {}
+    for rid, name, consts in region_results:
+        if name:
+            region_names[rid] = name
+            for cid in consts:
+                constellation_to_region[cid] = rid
 
     # Build region NAME -> ID map (instant/local region resolution later).
     region_name_to_id: dict[str, int] = {
@@ -268,21 +377,26 @@ def _download_region_data() -> tuple[dict[str, str], dict[str, int]]:
     constellation_ids = list(constellation_to_region.keys())
 
     def fetch_constellation(cid):
+        if _shutdown.is_set():
+            return None
         rate_limit("esi")
+        if _shutdown.is_set():
+            return None
         r = requests.get(f"{ESI_BASE}/universe/constellations/{cid}/", headers=HEADERS, timeout=10)
         if r.ok:
             return cid, r.json().get("systems", [])
         return cid, []
 
     print(f"[RegionCache] Fetching {len(constellation_ids)} constellations...")
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        for result in executor.map(fetch_constellation, constellation_ids):
-            cid, system_ids = result
-            rid = constellation_to_region.get(cid)
-            if rid and rid in region_names:
-                rname = region_names[rid]
-                for sid in system_ids:
-                    system_to_region[str(sid)] = rname
+    const_results, aborted = _bounded_gather(fetch_constellation, constellation_ids)
+    if aborted or _shutdown.is_set():
+        return {}, {}
+    for cid, system_ids in const_results:
+        rid = constellation_to_region.get(cid)
+        if rid and rid in region_names:
+            rname = region_names[rid]
+            for sid in system_ids:
+                system_to_region[str(sid)] = rname
 
     print(
         f"[RegionCache] Done. {len(system_to_region)} systems mapped to "
