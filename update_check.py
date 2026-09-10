@@ -215,6 +215,11 @@ def fetch_latest(timeout_s: float = 6) -> dict | None:
     A release whose payload carries no usable ``html_url`` still returns a
     result, pointed at :data:`RELEASES_PAGE` — the canonical page resolves to
     that same release, so a missing link is no reason to withhold the notice.
+
+    The result also carries ``"body"`` (the release notes) and ``"assets"``
+    (a ``list[AssetInfo]``) — but ONLY when the release actually supplies
+    them; a bare release omits both keys rather than including them empty.
+    Callers must read them with ``.get()``.
     """
     try:
         resp = requests.get(RELEASES_API, headers=dict(HEADERS), timeout=timeout_s)
