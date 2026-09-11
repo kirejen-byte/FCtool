@@ -11818,9 +11818,15 @@ class FCToolGUI:
         doctrine = self.fittings.get_doctrine(doctrine_id)
         if doctrine is None:
             return
+        # Pre-fill with the name that will actually be used: several fc_gui
+        # sites resolve doctrines BY NAME (_active_fleet_doctrine, the MOTD
+        # and Fleet doctrine combos, name-linked saved MOTD templates), so a
+        # same-named twin would silently point guidance at the wrong copy.
+        existing = {d.name for d in self.fittings.list_doctrines()}
+        default_name = self.fittings._unique_name(
+            f"{doctrine.name} (copy)", existing)
         name = self._prompt_text_line(
-            "Duplicate Doctrine", "Name for the copy:",
-            f"{doctrine.name} (copy)")
+            "Duplicate Doctrine", "Name for the copy:", default_name)
         if name is None:
             return
         name = name.strip()

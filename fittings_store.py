@@ -437,10 +437,13 @@ class FittingsStore:
         shared BY ID — that is the point: the library fit objects are not
         copied. Gets a fresh uuid and fresh created/modified stamps.
 
-        ``name`` (stripped, non-empty) is used verbatim when given; otherwise
-        the new doctrine is named "<source> (copy)", de-duplicated against
-        every existing doctrine name via ``_unique_name`` (so a second
-        duplicate becomes "<source> (copy) (2)").
+        ``name`` (stripped, non-empty) is used as the base when given,
+        otherwise the base is "<source> (copy)". Either way the base is
+        ALWAYS run through ``_unique_name`` against every existing doctrine
+        name, so a caller-supplied name that collides gets the " (2)" suffix
+        rather than creating a same-named twin (several fc_gui sites resolve
+        doctrines BY NAME — `_active_fleet_doctrine`, doctrine combos, etc. —
+        so a duplicate name would silently point guidance at the wrong copy).
 
         Returns None (and writes nothing) for an unknown ``doctrine_id``.
         Does NOT save — callers save, same as ``add_doctrine`` callers do.
@@ -449,10 +452,9 @@ class FittingsStore:
             src = self._doctrines.get(doctrine_id)
             if src is None:
                 return None
-            new_name = (name or "").strip()
-            if not new_name:
-                existing_names = {d.name for d in self._doctrines.values()}
-                new_name = self._unique_name(f"{src.name} (copy)", existing_names)
+            existing_names = {d.name for d in self._doctrines.values()}
+            base = (name or "").strip() or f"{src.name} (copy)"
+            new_name = self._unique_name(base, existing_names)
             did = uuid4().hex
             stamp = _now()
             self._doctrines[did] = Doctrine(
