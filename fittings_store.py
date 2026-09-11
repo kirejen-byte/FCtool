@@ -27,6 +27,7 @@ Pure logic: no Tkinter, no network.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -423,6 +424,48 @@ class FittingsStore:
                 members=[],
                 created=stamp,
                 modified=stamp,
+            )
+            return did
+
+    def duplicate_doctrine(self, doctrine_id: str, name: str | None = None) -> str | None:
+        """Copy an existing doctrine into a new one and return the new id.
+
+        Deep-copies ``members`` (every `DoctrineMember`, incl. tags/order/
+        ideal_*/seed_target), ``description``, ``exemptions`` (a deep-copied
+        list, or None) and ``seed_target`` so editing the copy (e.g. swapping
+        one or two members) can never mutate the source. Fits themselves are
+        shared BY ID — that is the point: the library fit objects are not
+        copied. Gets a fresh uuid and fresh created/modified stamps.
+
+        ``name`` (stripped, non-empty) is used as the base when given,
+        otherwise the base is "<source> (copy)". Either way the base is
+        ALWAYS run through ``_unique_name`` against every existing doctrine
+        name, so a caller-supplied name that collides gets the " (2)" suffix
+        rather than creating a same-named twin (several fc_gui sites resolve
+        doctrines BY NAME — `_active_fleet_doctrine`, doctrine combos, etc. —
+        so a duplicate name would silently point guidance at the wrong copy).
+
+        Returns None (and writes nothing) for an unknown ``doctrine_id``.
+        Does NOT save — callers save, same as ``add_doctrine`` callers do.
+        """
+        with self._lock:
+            src = self._doctrines.get(doctrine_id)
+            if src is None:
+                return None
+            existing_names = {d.name for d in self._doctrines.values()}
+            base = (name or "").strip() or f"{src.name} (copy)"
+            new_name = self._unique_name(base, existing_names)
+            did = uuid4().hex
+            stamp = _now()
+            self._doctrines[did] = Doctrine(
+                id=did,
+                name=new_name,
+                description=src.description,
+                members=copy.deepcopy(src.members),
+                created=stamp,
+                modified=stamp,
+                exemptions=copy.deepcopy(src.exemptions),
+                seed_target=src.seed_target,
             )
             return did
 
