@@ -12905,6 +12905,10 @@ class FCToolGUI:
         self._motd_template_dirty = False
         self._motd_loaded_template_snapshot = self._motd_snapshot_state()
         self._motd_update_dirty_indicator()
+        # If the current doctrine has a saved template, it replaces the blank
+        # default (never open the tab on a blank template when one exists);
+        # _apply_motd_fields already re-snapshots and clears dirty on success.
+        self._motd_apply_top_template()
         self._motd_palette.refresh_tray()
         self._rebuild_motd_preview()
         self._motd_link_tick()
@@ -13229,6 +13233,10 @@ class FCToolGUI:
         self._motd_doctrine_prev = name
         self._motd_on_doctrine_change()
         self._motd_mark_dirty()
+        # Auto-load the new doctrine's top template (if any) so the switch never
+        # lands on a blank default; a successful load leaves the composer clean
+        # against the loaded template, a doctrine with no templates is unaffected.
+        self._motd_apply_top_template()
 
     # ── recents ───────────────────────────────────────────────────────────────
 
@@ -13903,6 +13911,10 @@ class FCToolGUI:
         self._motd_doctrine_prev = new
         self._motd_on_doctrine_change()
         self._motd_mark_dirty()
+        # Auto-load the new doctrine's top template (if any) so the switch never
+        # lands on a blank default; a successful load leaves the composer clean
+        # against the loaded template, a doctrine with no templates is unaffected.
+        self._motd_apply_top_template()
 
     def _motd_on_doctrine_change(self, event=None):
         """Doctrine changed: refresh the linked-MOTD dropdown + Quick-Add tray for
@@ -14059,6 +14071,44 @@ class FCToolGUI:
         # Keep the switch-guard baseline in step with any programmatic reset so a
         # later user pick of the same name is not mistaken for a no-op.
         self._motd_saved_prev = self._motd_saved_var.get()
+
+    def _motd_apply_top_template(self) -> bool:
+        """Auto-select and silently load the first named (non-blank) template in
+        the TEMPLATE combo for the current doctrine, so the composer never opens
+        on a blank default when a template exists. The blank ``—`` entry stays
+        in the dropdown and remains pickable (picking it is the existing no-op);
+        this only changes what is selected/loaded BY DEFAULT.
+
+        A template with no FC of its own (every v1 template, or any template
+        explicitly saved with "(leave blank)") inherits the CURRENT FC default
+        on this auto-apply rather than blanking the combo — this is an
+        auto-apply-only courtesy; a user-initiated template pick still loads the
+        template's fc verbatim (including blank), unchanged from today.
+
+        Returns True when a template was applied, False as a no-op (no combo yet,
+        or no named template for the current doctrine) — callers must leave the
+        composer untouched on False."""
+        combo = getattr(self, "_motd_saved_combo", None)
+        if combo is None:
+            return False
+        values = combo["values"] or ()
+        top = next((v for v in values if v != self._MOTD_SAVED_BLANK), None)
+        if not top:
+            return False
+        doctrine = self._motd_doctrine_var.get()
+        for m in self._saved_motds():
+            if (m.get("doctrine") or "") == doctrine and m.get("name") == top:
+                self._motd_saved_var.set(top)
+                self._motd_saved_prev = top
+                prev_fc = self._motd_fc_var.get()
+                self._apply_motd_fields(m)
+                if not (m.get("fc") or ""):
+                    self._motd_fc_var.set(prev_fc)
+                    self._motd_loaded_template_snapshot = self._motd_snapshot_state()
+                    self._motd_template_dirty = False
+                    self._motd_update_dirty_indicator()
+                return True
+        return False
 
     def _on_saved_motd_change(self, event=None):
         """A template was picked by the USER: dirty-gate (prompt to discard; revert
