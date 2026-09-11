@@ -27,6 +27,7 @@ Pure logic: no Tkinter, no network.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -423,6 +424,46 @@ class FittingsStore:
                 members=[],
                 created=stamp,
                 modified=stamp,
+            )
+            return did
+
+    def duplicate_doctrine(self, doctrine_id: str, name: str | None = None) -> str | None:
+        """Copy an existing doctrine into a new one and return the new id.
+
+        Deep-copies ``members`` (every `DoctrineMember`, incl. tags/order/
+        ideal_*/seed_target), ``description``, ``exemptions`` (a deep-copied
+        list, or None) and ``seed_target`` so editing the copy (e.g. swapping
+        one or two members) can never mutate the source. Fits themselves are
+        shared BY ID — that is the point: the library fit objects are not
+        copied. Gets a fresh uuid and fresh created/modified stamps.
+
+        ``name`` (stripped, non-empty) is used verbatim when given; otherwise
+        the new doctrine is named "<source> (copy)", de-duplicated against
+        every existing doctrine name via ``_unique_name`` (so a second
+        duplicate becomes "<source> (copy) (2)").
+
+        Returns None (and writes nothing) for an unknown ``doctrine_id``.
+        Does NOT save — callers save, same as ``add_doctrine`` callers do.
+        """
+        with self._lock:
+            src = self._doctrines.get(doctrine_id)
+            if src is None:
+                return None
+            new_name = (name or "").strip()
+            if not new_name:
+                existing_names = {d.name for d in self._doctrines.values()}
+                new_name = self._unique_name(f"{src.name} (copy)", existing_names)
+            did = uuid4().hex
+            stamp = _now()
+            self._doctrines[did] = Doctrine(
+                id=did,
+                name=new_name,
+                description=src.description,
+                members=copy.deepcopy(src.members),
+                created=stamp,
+                modified=stamp,
+                exemptions=copy.deepcopy(src.exemptions),
+                seed_target=src.seed_target,
             )
             return did
 

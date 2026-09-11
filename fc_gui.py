@@ -11396,6 +11396,9 @@ class FCToolGUI:
         ttk.Button(head_btns, text="Edit description", style="Dark.TButton",
                    command=lambda: self._edit_doctrine_desc(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
+        ttk.Button(head_btns, text="Duplicate", style="Dark.TButton",
+                   command=lambda: self._duplicate_doctrine(doctrine.id)).pack(
+                       side=tk.LEFT, padx=2)
         ttk.Button(head_btns, text="Delete", style="Red.TButton",
                    command=lambda: self._delete_doctrine(doctrine.id)).pack(
                        side=tk.LEFT, padx=2)
@@ -11807,6 +11810,31 @@ class FCToolGUI:
         self.fittings.save()
         self._refresh_doctrine_list()
         self._show_doctrine_detail(doctrine_id)
+
+    def _duplicate_doctrine(self, doctrine_id):
+        """Copy the doctrine (members/tags/ideals/exemptions) under a new
+        name, then select and open the copy for editing — the point is to
+        make it easy to tweak just 1-2 ships rather than the whole thing."""
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        name = self._prompt_text_line(
+            "Duplicate Doctrine", "Name for the copy:",
+            f"{doctrine.name} (copy)")
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            return
+        new_id = self.fittings.duplicate_doctrine(doctrine_id, name)
+        if new_id is None:
+            return
+        self.fittings.save()
+        self._doctrine_selected_id = new_id
+        self._refresh_doctrine_list()
+        self._motd_refresh_doctrines()
+        self._refresh_fit_list(self._fit_search_var.get())
+        self._show_doctrine_detail(new_id)
 
     def _edit_doctrine_desc(self, doctrine_id):
         doctrine = self.fittings.get_doctrine(doctrine_id)
