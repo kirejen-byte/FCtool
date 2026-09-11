@@ -26,7 +26,10 @@ DESIGN NOTES that are load-bearing (docs/agents/map/preview.md):
   a size floor with two owners is exactly how a preview tile once got driven to
   0 px wide by a path that did not know the constant existed. ``MIN_H`` is this
   module's own: preview's ``MIN_TILE_BODY_H`` is a DWM *body* height (its strip
-  is extra) and does not describe a full info-tile window.
+  is extra) and does not describe a full info-tile window. Both are the SHARED
+  default; the keyword-only ``min_size=`` lets the registry give ONE tile a
+  smaller floor (the x-up tile, 2026-09-11) without moving either constant --
+  the override is per INSTANCE and every clamp in this module reads it.
 - This module's rects are (x, y, w, h) with h the FULL window height, strip
   INCLUDED. preview_tile's are (x, y, w, body_h) and it converts to full height
   before snapping. A caller merging preview rects into ``neighbor_provider``
@@ -208,7 +211,7 @@ class InfoTileWindow:
 
     def __init__(self, root, tile_key: str, title: str, palette: dict,
                  win32=None, on_move_end=None, on_resize_end=None,
-                 on_close=None):
+                 on_close=None, *, min_size=None):
         self._win32 = win32 or _real_info_win32()
         self._key = tile_key
         self._palette = palette or {}
@@ -218,12 +221,31 @@ class InfoTileWindow:
         self._on_resize_end = on_resize_end or (lambda k, x, y, w, h: None)
         self._on_close = on_close or (lambda k: None)
 
+        # THIS tile's size floors. The class constants are the SHARED default
+        # and stay exactly where they are (MIN_W is preview_layout's alias --
+        # one owner, source-text guarded); a registry entry may hand one tile
+        # a smaller one (info_tiles.tile_min_size), and then every clamp in
+        # this chrome -- the seed just below, place(), and the corner resize --
+        # has to read the instance value. Missing one of the three is invisible
+        # until the owner drags a small tile and it springs back.
+        # Garbage degrades to the shared default: the same "never repair, never
+        # raise" net every other geometry reader in this family keeps.
+        self._min_w, self._min_h = self.MIN_W, self.MIN_H
+        if min_size is not None:
+            try:
+                floor_w, floor_h = int(min_size[0]), int(min_size[1])
+            except (TypeError, ValueError, IndexError, KeyError,
+                    OverflowError):
+                pass
+            else:
+                self._min_w, self._min_h = floor_w, floor_h
+
         # geometry (physical px, virtual-screen space). Seeded at the floors so
         # a show() before the first place() still yields a visible, grabbable
         # window and corner detection has real dimensions to work with.
         self._pos = (0, 0)
-        self._w = self.MIN_W
-        self._h = self.MIN_H
+        self._w = self._min_w
+        self._h = self._min_h
         self._visible = False          # mirrors mapped/withdrawn state
         self._lock_layout = False
 
@@ -332,8 +354,9 @@ class InfoTileWindow:
         preview_layout.clamp_size. Records the rect but does NOT map: show()
         owns mapping (and therefore owns the single retop)."""
         # clamp_size's params are (w, body_h) for preview; here the second is a
-        # FULL height and the floors are passed explicitly.
-        w, h = preview_layout.clamp_size(w, h, self.MIN_W, self.MIN_H)
+        # FULL height and the floors are passed explicitly -- THIS tile's, not
+        # the class's (see the ctor).
+        w, h = preview_layout.clamp_size(w, h, self._min_w, self._min_h)
         x, y = _as_int(x), _as_int(y)
         self._pos = (x, y)
         self._w, self._h = w, h
@@ -668,7 +691,7 @@ class InfoTileWindow:
         # west/north grabs invert the delta (drag right/down shrinks them).
         w = w0 - dx if self._corner in ("nw", "sw") else w0 + dx
         h = h0 - dy if self._corner in ("nw", "ne") else h0 + dy
-        w, h = preview_layout.clamp_size(w, h, self.MIN_W, self.MIN_H)
+        w, h = preview_layout.clamp_size(w, h, self._min_w, self._min_h)
         ax, ay = self._corner_anchor
         x = ax if self._corner in ("ne", "se") else ax - w
         y = ay if self._corner in ("sw", "se") else ay - h

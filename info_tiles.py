@@ -420,6 +420,7 @@ def default_info_tiles_config() -> dict:
             "fleet": {"enabled": False},
             "intel": {"enabled": False, "max_jumps": DEFAULT_MAX_JUMPS,
                       "reference_system": ""},
+            "xup": {"enabled": False},
         },
         "layouts": {},
     }
@@ -1894,6 +1895,114 @@ def battle_is_live(view) -> bool:
     return bool(getattr(view, "visible", False))
 
 
+# ── x-up tile ───────────────────────────────────────────────────────────────
+# Owner ask 2026-09-11: "a tile for X-up (by default much smaller than the
+# others but still with snap-to) which shows the x-up amount/total and nothing
+# else". One centred line, sized to whatever the tile has been dragged to.
+
+#: What the tile shows when there is no counter to read. NOT "0/0": that is
+#: indistinguishable from a real, freshly-reset counter, so an absent seam
+#: would read as "nobody has x-ed up" -- the one lie this tile must not tell.
+XUP_EMPTY_TEXT = "—"          # em dash
+
+#: Em size in PIXELS for an UNREALISED frame. Every tile's first draw precedes
+#: its mapping (render-then-show), so the first fit always runs against 1x1;
+#: this is the size that frame is readable at, and the frame size in the
+#: renderer's dirty key is what re-fits it on the next beat.
+#:
+#: PIXELS, NOT POINTS, and that is load-bearing (2026-09-11). The tile's body
+#: is measured in PHYSICAL px -- SetWindowPos places it and this app is
+#: per-monitor DPI aware -- while Tk scales a POSITIVE font size by the
+#: interpreter's points-per-pixel. On the owner's 100% monitor the two agree
+#: closely enough to hide the bug; at 150% a 20 pt line is 47 px of linespace
+#: inside a 40 px body and "999/999" measures 154 px inside 120 px -- clipped
+#: on BOTH axes, on the one tile whose entire content is a single line. A
+#: NEGATIVE Tk size is in pixels and is therefore DPI-invariant, which is what
+#: the renderer passes.
+XUP_DEFAULT_PX = 26
+XUP_MIN_PX = 12
+XUP_MAX_PX = 64
+
+#: The x-up line's family. Consolas like every other tile -- digits are
+#: monospaced, so the count does not shuffle sideways as it climbs.
+XUP_FONT_FAMILY = "Consolas"
+
+
+@dataclass(frozen=True)
+class XUpTileModel:
+    """What the x-up tile draws: a count, its threshold, and readiness.
+
+    ``count``/``threshold`` are None TOGETHER and only when the host could not
+    answer at all. Frozen and hashable so it can ride the renderer's dirty key
+    like every other tile model."""
+    count: int | None = None
+    threshold: int | None = None
+    ready: bool = False
+
+
+def build_xup_model(snapshot) -> XUpTileModel:
+    """``(count, threshold, ready)`` -> the model. Total; never raises.
+
+    Anything that is not a readable 3-tuple of numbers -- None, a short or
+    long tuple, a string, a non-numeric member, JSON's ``Infinity`` surviving
+    into an ``int()`` -- degrades to the EMPTY model, which the tile renders
+    as ``XUP_EMPTY_TEXT``. Deliberately NOT to ``(0, 0)``: see the constant.
+
+    The SEQUENCE gate is not belt-and-braces: any 3-character string unpacks
+    into three members, so a host answering ``"125"`` would otherwise render a
+    confident ``1/2`` -- garbage that looks exactly like data, which is the
+    one failure this builder exists to prevent."""
+    if not isinstance(snapshot, (tuple, list)):
+        return XUpTileModel()
+    try:
+        count, threshold, ready = snapshot
+    except (TypeError, ValueError):
+        return XUpTileModel()
+    try:
+        count, threshold = int(count), int(threshold)
+    except (TypeError, ValueError, OverflowError):
+        return XUpTileModel()
+    return XUpTileModel(count, threshold, bool(ready))
+
+
+def xup_text(model) -> str:
+    """The tile's ONE line: ``count/threshold``, else the empty dash."""
+    count = getattr(model, "count", None)
+    threshold = getattr(model, "threshold", None)
+    if count is None or threshold is None:
+        return XUP_EMPTY_TEXT
+    return f"{count}/{threshold}"
+
+
+def xup_font_px(body_w, body_h, n_chars) -> int:
+    """Em size in PIXELS for `n_chars` of Consolas in a `body_w` x `body_h` body.
+
+    The answer is handed to Tk NEGATED (``font=(family, -px, "bold")``), which
+    is Tk's own "this number is pixels" convention and the only DPI-invariant
+    way to size text against a body whose dimensions came from SetWindowPos --
+    see ``XUP_DEFAULT_PX`` for the measured failure a point size produced at
+    150%.
+
+    Pure, and approximate on purpose: Consolas runs about 1.17 em of linespace
+    and 0.55 em of advance, so ``height / 1.25`` and ``width / (0.6 * chars)``
+    are the two budgets -- each carrying a little slack over the real ratio --
+    and the tighter one wins. The clamp keeps it honest at the extremes: a
+    4000 px-wide tile does not get a 500 px digit, and a tile dragged down to
+    its floor still shows something readable rather than a 2 px smudge.
+
+    An UNREALISED frame (either dimension at or below 1 px -- the un-laid-out
+    1x1 and the destroyed 0x0 alike) or a nonsense length answers
+    ``XUP_DEFAULT_PX``. Total: garbage in any argument reads as unrealised."""
+    try:
+        width, height, chars = int(body_w), int(body_h), int(n_chars)
+    except (TypeError, ValueError, OverflowError):
+        return XUP_DEFAULT_PX
+    if width <= 1 or height <= 1 or chars <= 0:
+        return XUP_DEFAULT_PX
+    budget = min(height / 1.25, width / (0.6 * chars))
+    return int(max(XUP_MIN_PX, min(XUP_MAX_PX, budget)))
+
+
 # ── renderers ───────────────────────────────────────────────────────────────
 
 class _LabelPool:
@@ -2631,8 +2740,68 @@ class IntelRenderer(_TileRenderer):
         self._rows = rows
 
 
+class XUpRenderer(_TileRenderer):
+    """The fleet x-up counter as ONE centred ``count/threshold`` line.
+
+    "and nothing else" is the whole spec (owner, 2026-09-11): no bar, no
+    status line, no last-x-upper. The tile is small by default and the FC
+    reads it at a glance from across a second monitor, so the only thing the
+    renderer does beyond writing the text is SIZE it -- the em size comes from
+    the body's current dimensions through the pure ``xup_font_px``, and is
+    handed to Tk NEGATED because the body is measured in physical pixels and
+    this app is per-monitor DPI aware (a positive Tk size is points, and
+    scales; see ``XUP_DEFAULT_PX``).
+
+    Which means a RESIZE changes the draw without changing the model, so the
+    frame size rides the dirty key exactly as it does on the intel tile --
+    without it, a dragged corner would leave the old point size on screen
+    until the count happened to move. The first draw still precedes mapping
+    (render-then-show) and so fits against an unrealised 1x1; the size in the
+    key is what re-fits it one beat later."""
+
+    def __init__(self, parent, palette: dict):
+        super().__init__(parent, palette)
+        bg = self._palette.get("BG_DARK", ui_theme.BG_DARK)
+        self._label = tk.Label(self.frame, text="", anchor="center", bg=bg,
+                               fg=self._idle_colour(),
+                               font=(XUP_FONT_FAMILY, -XUP_DEFAULT_PX,
+                                     "bold"))
+        # The frame's propagation guard clips; this just centres inside it.
+        self._label.pack(fill="both", expand=True)
+
+    def _idle_colour(self):
+        """Not-ready: the palette's accent, the same colour the Fleet tab's
+        own counter wears. FG_TEXT is the fallback for a caller-supplied
+        palette that carries no accent."""
+        return (self._palette.get("FG_ACCENT")
+                or self._palette.get("FG_TEXT", ui_theme.FG_TEXT))
+
+    def _key(self, model):
+        return (model, self._frame_size())
+
+    def _draw(self, model):
+        text = xup_text(model)
+        width, height = self._frame_size()
+        colour = (self._palette.get("FG_GREEN", ui_theme.FG_GREEN)
+                  if getattr(model, "ready", False) else self._idle_colour())
+        # NEGATED: Tk reads a negative size as PIXELS, which is what the body
+        # dimensions above are. A positive (point) size would be re-scaled by
+        # the interpreter's dpi and overflow the tile on a scaled monitor.
+        self._label.configure(
+            text=text, fg=colour,
+            font=(XUP_FONT_FAMILY, -xup_font_px(width, height, len(text)),
+                  "bold"))
+
+
 #: key -> tile spec. Adding a tile type is one entry plus one renderer: the
 #: chrome, layout persistence, snapping and settings all read this registry.
+#:
+#: Optional per-key keys:
+#:   ``min_size``      -- this tile's OWN size floor, replacing the shared
+#:                        ``(InfoTileWindow.MIN_W, MIN_H)`` everywhere a rect
+#:                        is clamped (read through ``tile_min_size``).
+#:   ``match_preview`` -- False opts the tile out of the settings popup's
+#:                        "Match preview size" button. Defaults to True.
 TILE_SPECS = {
     "battle": {"title": "Battle", "default_size": (260, 150),
                "render": BattleRenderer},
@@ -2660,7 +2829,39 @@ TILE_SPECS = {
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
               "render": IntelRenderer},
+    # "much smaller than the others but still with snap-to" (owner ask,
+    # 2026-09-11). It carries ONE short line, so the shared 90 px height floor
+    # -- sized for tiles with rows to stack -- is the only thing standing
+    # between the owner and the tile he asked for: hence the per-tile
+    # ``min_size``, 50 px of which the 20 px caption strip takes, leaving a
+    # 30 px body that ``xup_font_px`` still fills with a readable 24 px line.
+    # OUT of "Match preview size": that button lines the tiles up with the
+    # FCPreview family (160x136 on this install) and would undo the whole
+    # point of a small tile the moment it is pressed.
+    "xup": {"title": "X-up", "default_size": (120, 60),
+            "min_size": (120, 50), "match_preview": False,
+            "render": XUpRenderer},
 }
+
+
+def tile_min_size(key) -> tuple:
+    """The size floor for `key`: its own ``min_size``, else the shared one.
+
+    The SHARED floor is ``InfoTileWindow``'s pair of class constants, and they
+    stay the shared floor -- ``MIN_W`` in particular is preview_layout's alias
+    and has exactly one owner. A per-tile override is a registry fact, read
+    here by every clamp (``heal_info_tile_layouts``, ``_spawn_rect``, and the
+    ``min_size=`` the chrome is constructed with) so the three cannot drift.
+
+    An unregistered key, or a malformed ``min_size``, answers the shared
+    floor: this is consulted while healing whatever a hand-edited config
+    happens to hold, so it has to be total."""
+    spec = TILE_SPECS.get(key) or {}
+    try:
+        floor_w, floor_h = spec.get("min_size")
+        return (int(floor_w), int(floor_h))
+    except (TypeError, ValueError, IndexError, KeyError, OverflowError):
+        return (InfoTileWindow.MIN_W, InfoTileWindow.MIN_H)
 
 
 # ── distance resolver (the ONLY worker) ─────────────────────────────────────
@@ -2897,8 +3098,12 @@ def heal_info_tile_layouts(cfg) -> bool:
             w, h = int(value[2]), int(value[3])
         except (TypeError, ValueError, IndexError, KeyError, OverflowError):
             continue
-        healed = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
-                                           InfoTileWindow.MIN_H)
+        # PER KEY (2026-09-11): the x-up tile's floor is lower than the shared
+        # one, and healing it against the shared pair would re-inflate a
+        # legitimately-small stored rect at every single boot -- which reads
+        # as "the tile forgets its size", never as a heal bug. An unregistered
+        # key still floors at the shared pair (``tile_min_size`` is total).
+        healed = preview_layout.clamp_size(w, h, *tile_min_size(key))
         if healed != (w, h):
             layouts[key] = [x, y, healed[0], healed[1]]
             changed = True
@@ -2954,6 +3159,18 @@ class HudHost:
     #: This feed is CHAT-sourced, so it is deliberately NOT gated by
     #: ``fleet_state`` -- see ``build_links_model``.
     links_snapshot: object = _none
+    #: () -> (count, threshold, ready) | None -- the fleet x-up counter, read
+    #: on the 1 Hz beat like the fleet and battle seams (no push path: chat
+    #: polling is slower than the beat, so an event feed would buy nothing).
+    #:
+    #: The THRESHOLD comes from the counter, never from config -- the Fleet
+    #: tab's spinner writes the live value onto the counter object, so a
+    #: config read would show the tile a stale target.
+    #:
+    #: None is the honest "there is no counter" and is what the tile renders
+    #: as ``XUP_EMPTY_TEXT``; a host must NOT invent ``(0, 0, False)``, which
+    #: is indistinguishable from a real, freshly-reset counter.
+    xup_snapshot: object = _none
     own_system_id: object = _none        # () -> int | None
     staging_name: object = _none         # () -> str
     #: () -> [(x, y, w, h)] -- the FCPreview tiles' rects, and a CONTRACT the
@@ -3387,8 +3604,10 @@ class InfoTileController:
             # survives ``json.load`` and only dies at ``int()`` -- here that
             # would take the whole `set_enabled(True)` down with it.
             return self._grid_rects(list(TILE_SPECS))[key]
-        w, h = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
-                                         InfoTileWindow.MIN_H)
+        # This tile's OWN floor -- the other half of the per-key heal: a
+        # shared floor here would re-inflate a small stored rect at spawn even
+        # after the heal left it alone.
+        w, h = preview_layout.clamp_size(w, h, *tile_min_size(key))
         x, y = self._rescue(x, y, w, h)
         return (x, y, w, h)
 
@@ -3427,7 +3646,8 @@ class InfoTileController:
             tile = self._tile_cls(self._root, key, spec["title"], PALETTE,
                                   on_move_end=self._on_move_end,
                                   on_resize_end=self._on_resize_end,
-                                  on_close=self._on_close)
+                                  on_close=self._on_close,
+                                  min_size=tile_min_size(key))
         except Exception:
             log.warning("info tiles: could not create the %s tile", key,
                         exc_info=True)
@@ -3545,6 +3765,11 @@ class InfoTileController:
                 title = TILE_SPECS[key]["title"]
             elif key == "fleet":
                 model = self._fleet_model()
+                title = TILE_SPECS[key]["title"]
+            elif key == "xup":
+                model = build_xup_model(
+                    _call(getattr(self._host, "xup_snapshot", None),
+                          default=None))
                 title = TILE_SPECS[key]["title"]
             else:
                 model, title = self._intel_model()
@@ -3833,8 +4058,12 @@ class InfoTileController:
         never wired it, one that raises, or one that answers anything other
         than a plain (w, h) pair all make this a safe no-op. A numeric
         answer under the floor is clamped exactly like any other stored
-        size, through ``InfoTileWindow``'s OWN (taller) floor -- these are
-        info tiles, not FCPreview tiles. A malformed stored layout (not a
+        size, through the INFO-tile floors -- these are info tiles, not
+        FCPreview tiles -- and PER KEY (``tile_min_size``), for the same
+        reason ``_spawn_rect`` and the heal do it that way: the clamp is a
+        per-tile fact, and a shared one here would re-inflate any future tile
+        that declares a smaller ``min_size`` and still opts IN to this
+        button. A malformed stored layout (not a
         proper [x, y, w, h] list -- a hand-edited config, say) is SKIPPED
         exactly like ``heal_info_tile_layouts``'s own malformed net: not
         repaired, not zeroed to (0, 0).
@@ -3848,16 +4077,24 @@ class InfoTileController:
         """
         raw = _call(self._host.preview_tile_size)
         try:
-            w, h = raw
-            w, h = int(w), int(h)
+            target_w, target_h = raw
+            target_w, target_h = int(target_w), int(target_h)
         except (TypeError, ValueError, OverflowError):
             return False
-        w, h = preview_layout.clamp_size(w, h, InfoTileWindow.MIN_W,
-                                         InfoTileWindow.MIN_H)
         stored = self._block().get("layouts")
         stored = stored if isinstance(stored, dict) else {}
         changed = False
         for key in TILE_SPECS:
+            # PER KEY, inside the loop: the floor is a per-tile fact (see the
+            # docstring), so the target size is clamped against THIS tile's.
+            w, h = preview_layout.clamp_size(target_w, target_h,
+                                             *tile_min_size(key))
+            if not TILE_SPECS[key].get("match_preview", True):
+                # An OPT-OUT tile (the x-up counter) is skipped whole: it is
+                # small BY DESIGN and the preview size would undo that. Not
+                # live-placed, not persisted -- one press must not cost the
+                # owner a size he then has to drag back.
+                continue
             tile = self._tiles.get(key)
             if tile is not None:
                 rect = _call(tile.rect)

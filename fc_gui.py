@@ -2454,6 +2454,12 @@ class FCToolGUI:
                     getattr(self, "_booster_coverage", {}),
                     getattr(self, "_booster_ship_names", {}),
                     bool(getattr(self, "_booster_is_boss", False))),
+                # The fleet x-up counter as one count/threshold line. A METHOD,
+                # not a lambda: the shapes it reads (a @property count, a
+                # threshold that lives on the counter and not on the state)
+                # are exactly the kind that a lambda gets subtly wrong and
+                # info_tiles' _call then swallows — see _hud_xup_snapshot.
+                xup_snapshot=self._hud_xup_snapshot,
                 # READ-ONLY: the stale-attribution guard that clears this pair on
                 # an ESI rebind stays with its owner (_range_check_own_location).
                 own_system_id=lambda: getattr(self, "_own_location_sid", None),
@@ -2582,6 +2588,51 @@ class FCToolGUI:
             toast.show(self._hud_intel_client_rect(), fallback)
         except Exception:
             log.exception("[hud] intel detail pop-up failed")
+
+    def _hud_xup_snapshot(self):
+        """The fleet x-up counter as `(count, threshold, ready)`, or None.
+
+        The FC HUD's `xup_snapshot` seam, read once per 1 Hz beat. THIS METHOD
+        runs only on the Tk thread (the HUD beat is its sole caller), which is
+        why it is NOT a WORKER_METHODS entry — but the counter it reads is
+        MUTATED OFF-THREAD: `_on_chat_message` is a worker method and calls
+        `xup_counter.process_message` on the chat-poll thread.
+
+        The read is safe anyway because of what it takes: `state.count` is
+        `len()` of a dict and `is_ready`/`threshold` are a bool and an int —
+        each a single GIL-atomic load, with no iteration over a dict a worker
+        may be inserting into (a `for` over `state.xups` here WOULD be a
+        RuntimeError waiting to happen). The three are read INDEPENDENTLY, so
+        a beat can catch a torn pair — 49/50 already painted green for one
+        second, say, when the 50th x-up lands between the two loads. That is
+        the accepted cost: it is a one-beat cosmetic skew on a glanceable
+        counter and the next beat corrects it; nothing downstream acts on it.
+
+        THE THRESHOLD COMES FROM THE COUNTER, never from
+        `self.config["xup"]["threshold"]`: the Fleet tab's spinner writes the
+        live value straight onto the counter (`_on_threshold_change`), so a
+        config read would leave the tile showing the target the app booted
+        with. `state.count` is a @property over the x-up dict, not a stored
+        int — the reason this is a real method with a real-shaped stub test
+        rather than an inline lambda (the `fleet_state` property-called-as-a-
+        method bug, 2026-08-02).
+
+        None means "there is no counter", which the tile renders as its empty
+        dash. It must NEVER be answered as `(0, 0, False)`: that is
+        indistinguishable from a real, freshly-reset counter and would tell an
+        FC nobody had x-ed up. Any unreadable shape — no counter, a half-built
+        one, a state without a count — takes that same honest None.
+        """
+        counter = getattr(self, "xup_counter", None)
+        if counter is None:
+            return None
+        try:
+            state = counter.state
+            return (int(state.count), int(counter.threshold),
+                    bool(state.is_ready))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            log.debug("[hud] x-up counter is not readable", exc_info=True)
+            return None
 
     def _hud_should_show(self):
         """Should the FC HUD's tiles be on screen right now?

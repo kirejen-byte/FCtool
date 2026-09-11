@@ -299,6 +299,9 @@ DEFAULT_CONFIG = {
             # the zkillboard staging system); a name here overrides it.
             "intel": {"enabled": False, "max_jumps": 5,
                       "reference_system": ""},
+            # The fleet x-up counter as one line (count/threshold) — small by
+            # default and, like every tile above, off until it is chosen.
+            "xup": {"enabled": False},
         },
         # tile_key -> [x, y, w, h], written on every move/resize end. Absent
         # entries are placed on the default grid; garbage is floored at boot by
