@@ -251,8 +251,12 @@ class UpdateDialog(tk.Toplevel):
             self.title("FCTool update")
         except tk.TclError:
             pass
+        # NEVER a grab — see module doc. center=False because this window owns
+        # its OWN placement (_place_near_parent, an offset so it does not open
+        # UNDER the main window); make_modal's centring would fight it and the
+        # deferred half would win, moving the dialog after it opened.
         make_modal(self, getattr(host, "root", None), on_cancel=self.close,
-                   grab=False)                     # NEVER a grab — see module doc
+                   grab=False, center=False)
         self._build()
         try:
             self.protocol("WM_DELETE_WINDOW", self.close)
