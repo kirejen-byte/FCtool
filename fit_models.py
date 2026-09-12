@@ -12,7 +12,7 @@ keep persistence concerns out of the storage layer's hot path.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ── Fitting slots ────────────────────────────────────────────────────────────
 SLOT_HIGH = "high"
@@ -103,6 +103,23 @@ class DoctrineMember:
     # 50 stabbers / 20 scythes / 10 bifrosts rather than a flat N of every hull.
     # Resolved via fc_gui._market_seed_target(doctrine, member).
     seed_target: int | None = None
+    # Alternate fits this slot can fly ("refits"), ordered; `[0]` is the DEFAULT
+    # (what "Reset refits" returns to) and `fit_id` is the ACTIVE one. An EMPTY
+    # list means a plain member — exactly today's shape, serialized to a
+    # byte-identical dict (the zero-migration guarantee).
+    #
+    # Invariants on a store-managed member: `refits == []` OR `fit_id in refits`,
+    # and every refit shares the active fit's `hull_type_id` (a refit is the same
+    # ship, differently fitted — a different hull is a different slot). Both are
+    # enforced by `fittings_store.add_refit`, NOT by this loader: a hand-edited
+    # library that breaks either is tolerated on load (consumers read `fit_id`
+    # and see one fit per slot regardless) and normalised by the store's first
+    # mutation of that slot. Never mutate on load.
+    #
+    # Design rule (see fittings_store's module docstring): `fit_id` is what every
+    # "which fit is this ship" consumer reads; only the MOTD palette, the market
+    # enumerators and the library membership views may enumerate `refits`.
+    refits: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -286,6 +303,13 @@ def doctrine_member_to_dict(member: DoctrineMember) -> dict:
     # back as None, unaffected). Mirrors the doctrine-level seed_target/exemptions.
     if member.seed_target is not None:
         d["seed_target"] = member.seed_target
+    # Serialize refits ONLY when the slot HAS them (same omit-when-default
+    # discipline as seed_target). A plain member therefore produces a dict
+    # byte-identical to the one it produced before refits existed — that is the
+    # zero-migration guarantee, and an older build reading a newer library just
+    # ignores the extra key on the slots that do carry it.
+    if member.refits:
+        d["refits"] = list(member.refits)
     return d
 
 
@@ -298,6 +322,10 @@ def doctrine_member_from_dict(d: dict) -> DoctrineMember:
         ideal_min=d.get("ideal_min"),
         ideal_max=d.get("ideal_max"),
         seed_target=d.get("seed_target"),
+        # Absent key (every library written before refits existed) => []. A
+        # stored null degrades to [] too rather than raising. Loaded verbatim:
+        # normalisation is the store's job, on mutation, never here.
+        refits=list(d.get("refits", []) or []),
     )
 
 
