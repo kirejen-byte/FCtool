@@ -50,7 +50,7 @@ verified against the bundled table::
     (21096 Cyno I,   11963 Rapier, V) -> 50     500 x 0.5 x 0.2
     (21096 Cyno I,   12013 Broadsword, V) -> 250   (no hull bonus)
     (28646 Covert,   11963 Rapier, V) -> 5      50 x 0.5 x 0.2
-    (28646 Covert,   22436 Sin,    V) -> 25     (Black Ops: NO bonus)
+    (28646 Covert, 22436 Widow,   V) -> 25     (Black Ops: NO bonus)
     (52694 Indy,     32880 Venture, V) -> 200   800 x 0.5 x 0.5
     (21096 Cyno I,   11963 Rapier, 0) -> 100    500 x 1.0 x 0.2
 
@@ -62,6 +62,7 @@ for it either, so the id is hardcoded here and the display string is ours.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -192,7 +193,20 @@ CYNO_SKILL_ID = 21603
 
 ATTR_CONSUMPTION = 714            # consumptionQuantity (ozone units per light)
 ATTR_CONSUMPTION_BONUS = 1296     # the PERCENTAGE reduction, per level for a skill
+ATTR_DURATION = 73                # the generator's cycle time, in MILLISECONDS
 EFFECT_CYNO_CONSUMPTION = 3526    # LocationRequiredSkillModifier(714 <- 1296, skill 21603)
+
+# NOTE on reading these three through ``type_attrs``: the bundled table OMITS
+# every attribute whose value equals the attribute default, and all three of
+# these default to 0.0 (measured: ``attr_info(73/714/1296).default == 0.0``).
+# So "absent" and "zero" are the same reading here, and an absent 714 is
+# correctly treated as "no cost known" rather than "costs nothing" — which is
+# why ``effective_ozone_cost`` answers None on a missing 714 instead of
+# defaulting it in the way ``fit_sim.attr()`` would.
+
+#: A generator's cycle time when the table cannot answer (the 10-minute one the
+#: two full-size generators carry). Used by the cyno-lit dedupe window.
+DEFAULT_CYCLE_S = 600.0
 
 #: Used only when the table cannot answer for type 21603 (a missing or corrupt
 #: ``fit_dogma.json.gz``). The SDE value, stated so a degraded table produces
@@ -216,48 +230,68 @@ GENERATOR_SHORT_DEFAULT = "Cyno"
 
 # ── cyno-capable hulls ───────────────────────────────────────────────────────
 # The gate that decides whether an undock/login edge is worth an assets read.
-# It is a deliberate SUPERSET of ``ship_classes.CYNO_LOSS_GROUPS`` (which covers
-# only the combat-cyno victim hulls CynoCheck cares about): a false positive
-# costs one cached assets read, a false negative is a silently missed warning —
-# the whole failure mode this feature exists to close.
 #
-# Group ids and names are ``type_catalog.SHIP_GROUP_NAMES``; the two Venture
-# entries were MEASURED off the bundled table (see the note below).
+# This is NOT a hand-picked "probably cyno-ish" list: it is the SDE's own
+# fitting restriction, read off the three generators' ``canFitShipGroupNN`` and
+# ``canFitShipTypeNN`` attributes (those attributes are FILTERED OUT of the
+# bundled ``fit_dogma.json.gz``, so they were read from ``tools/_cache/sde.zip``
+# at review time). Every hull below can actually mount a cynosural field
+# generator, and every hull NOT below cannot — so a group that merely sounds
+# cyno-capable (Combat Recon, Mining Barge, Exhumer, Capital Industrial,
+# Industrial Command, the T1 Frigate group at large) is deliberately absent:
+# 66 hulls that cannot fit any of the three modules.
+#
+# Two shapes are needed because the SDE restricts by group AND by individual
+# type — the industrial generator names five specific hulls that live in groups
+# whose other members cannot fit it (an Etana is a Logistics cruiser, a Venture
+# a plain Frigate).
+#
+# ``ship_classes.CYNO_LOSS_GROUPS`` stays a strict SUBSET (test-pinned): this
+# gate still covers every hull CynoCheck treats as a lightswitch.
 CYNO_HULL_GROUP_NAMES = {
-    # -- combat / covert cyno hulls (superset of CYNO_LOSS_GROUPS) --
+    28: "Hauler",                       # industrial cyno
+    380: "Deep Space Transport",        # industrial cyno
     830: "Covert Ops",                  # covert cyno
     833: "Force Recon Ship",            # normal OR covert cyno; carries the -80 bonus
     834: "Stealth Bomber",              # covert cyno
     894: "Heavy Interdiction Cruiser",  # normal cyno
     898: "Black Ops",                   # covert cyno; NO SDE bonus (see the docstring)
-    906: "Combat Recon Ship",           # sibling of Force Recon; not in CYNO_LOSS_GROUPS
     963: "Strategic Cruiser",           # covert cyno via the covert subsystem
-    # -- industrial cyno hulls --
-    # 25 "Frigate" is where the SDE puts the VENTURE (32880) and its Vespera
-    # variant (89648) — measured off fit_dogma.json.gz, not assumed. There is
-    # no narrower group containing them, so the whole T1 frigate group is in.
-    # The cost is bounded: the wiring reads assets only on an edge and caches
-    # per ship_item_id for asset_ttl_s.
-    25: "Frigate (Venture)",
-    28: "Hauler",
-    380: "Deep Space Transport",
-    463: "Mining Barge",
-    543: "Exhumer",
-    883: "Capital Industrial Ship",
-    941: "Industrial Command Ship",
-    1202: "Blockade Runner",
-    1283: "Expedition Frigate",         # Prospect / Endurance
+    1202: "Blockade Runner",            # industrial cyno
 }
 
-#: The gate itself. Frozen so no consumer can widen it in place.
+#: Hulls the SDE names INDIVIDUALLY on a generator's ``canFitShipTypeNN``,
+#: because their group is not cyno-capable as a whole. Measured, like the
+#: groups, off the SDE's own fitting restrictions.
+CYNO_HULL_TYPE_NAMES = {
+    32790: "Etana",                     # group 832 Logistics
+    42245: "Rabisu",                    # group 832 Logistics
+    33697: "Prospect",                  # group 1283 Expedition Frigate
+    32880: "Venture",                   # group 25 Frigate
+    89648: "Venture Consortium Issue",  # group 25 Frigate
+}
+
+#: The gate itself. Frozen so no consumer can widen either half in place.
 CYNO_HULL_GROUPS = frozenset(CYNO_HULL_GROUP_NAMES)
+CYNO_HULL_TYPE_IDS = frozenset(CYNO_HULL_TYPE_NAMES)
 
 
-def is_cyno_hull_group(group_id) -> bool:
-    """Whether a hull group is worth an assets read. Total: a non-int answers
-    False rather than raising."""
+def is_cyno_hull(group_id, type_id=None) -> bool:
+    """Can this hull mount a cynosural field generator?
+
+    True when the hull's GROUP is cyno-capable or the hull is one of the five
+    types the SDE names individually. ``type_id`` is optional so a caller that
+    only has a group can still ask — but a caller that has both should pass
+    both, or it will miss a Venture (group 25 is not cyno-capable at large).
+
+    Total: non-integers on either side answer False rather than raising."""
     try:
-        return int(group_id) in CYNO_HULL_GROUPS
+        if int(group_id) in CYNO_HULL_GROUPS:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(type_id) in CYNO_HULL_TYPE_IDS
     except (TypeError, ValueError):
         return False
 
@@ -452,10 +486,12 @@ def _view(dogma):
 
 # ── cost ─────────────────────────────────────────────────────────────────────
 
-#: Float slack absorbed before the ceil. ``500 x 0.5 x (1 + -80/100)`` lands on
-#: 49.999999999999993 in binary floating point and ``800 x ...`` can land a
-#: hair ABOVE its integer; without the epsilon one of those two directions
-#: turns a clean 50 into a 51.
+#: Float slack absorbed before the ceil. ``1 + -80/100`` is 0.19999999999999996
+#: in binary floating point, so the Rapier row lands on 49.99999999999999 —
+#: BELOW its integer, which ``ceil`` happens to round correctly. The epsilon
+#: guards the opposite direction: a factor product that lands a hair ABOVE an
+#: exact integer would ceil to N+1 and quietly overstate every cost. (The
+#: Venture row, 800 x 0.5 x 0.5, is exact in binary and needs no help.)
 _CEIL_EPSILON = 1e-9
 
 
@@ -549,6 +585,47 @@ def is_generator(type_id, dogma=None) -> bool:
     return tid in KNOWN_GENERATOR_IDS
 
 
+#: What every generator's name contains, lower-cased. The gamelog parser is
+#: deliberately module-agnostic (``is already active`` is emitted for any module
+#: re-click), so this is how its output is filtered down to cyno lines.
+GENERATOR_NAME_TOKEN = "cynosural field generator"
+
+
+def is_generator_name(name) -> bool:
+    """Does this module name denote a cynosural field generator?
+
+    Case-insensitive substring match on "cynosural field generator", which
+    covers all three ("Cynosural Field Generator I", "Covert Cynosural Field
+    Generator I", "Industrial Cynosural Field Generator I") and any future
+    variant CCP names the same way. The complement of a name check is what the
+    O2 gamelog hook needs, because the log line names the module but never its
+    type id. Never raises."""
+    try:
+        return GENERATOR_NAME_TOKEN in str(name or "").lower()
+    except Exception:                                       # pragma: no cover
+        return False
+
+
+def generator_cycle_s(gen_type_id, dogma=None) -> float:
+    """One activation's cycle time, in SECONDS.
+
+    Attribute 73 is the duration in MILLISECONDS: 600 000 for the standard and
+    industrial generators (10 min), 60 000 for the covert one (1 min) —
+    measured off the shipped table. An unknown generator, a missing attribute
+    or no table at all answer :data:`DEFAULT_CYCLE_S` (600.0) rather than 0,
+    because this value is a DEDUPE WINDOW: a zero would collapse the window and
+    let a burst of re-click hints each burn an activation, which is the exact
+    defect it exists to prevent. Never raises."""
+    try:
+        ms = _view(dogma).attrs(gen_type_id).get(ATTR_DURATION)
+        if ms is None:
+            return DEFAULT_CYCLE_S
+        seconds = float(ms) / 1000.0
+        return seconds if seconds > 0 else DEFAULT_CYCLE_S
+    except Exception:                                       # pragma: no cover
+        return DEFAULT_CYCLE_S
+
+
 def generator_short(type_id) -> str:
     """Short display label for a generator id. Unknown ids read "Cyno" rather
     than exposing a raw type id in a toast."""
@@ -597,7 +674,19 @@ def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
     ``ship_item_id`` of ``None``/0 (the character is in a capsule, or the ship
     read failed) answers ``EMPTY_CARGO`` without walking the payload at all.
     Garbage rows — non-dicts, missing keys, unparseable numbers — are skipped
-    individually, so one bad row cannot cost the good ones. Never raises."""
+    individually, so one bad row cannot cost the good ones. Never raises.
+
+    **``assets`` MUST be the FULLY paginated asset list.** This function cannot
+    tell a short list from an empty hold, so a partial or failed pull reads as
+    "generator fitted, 0 ozone" and would fire a confident, wrong toast. A pull
+    that did not complete is NO SAMPLE: the caller must skip the observation
+    entirely rather than hand over what it managed to fetch (the O2 contract).
+
+    One honest under-count remains: ozone inside a container in the cargo hold
+    is a child of the CONTAINER's item_id, not the ship's, so it is invisible
+    here. That under-counts and so can only produce a spurious warning, never a
+    missed one — the safe direction, and rare enough not to be worth a second
+    pass over the payload."""
     ship = _int_or_none(ship_item_id)
     if not ship:
         return EMPTY_CARGO
@@ -712,10 +801,15 @@ SUPPRESSED = "SUPPRESSED"  # per-character opt-out
 
 class LastSeen(NamedTuple):
     """The most recent sample for a character — what ``observe_cyno_lit``
-    decrements. ``cargo``/``cost`` may be ``None`` when nothing is known."""
+    decrements. ``cargo``/``cost`` may be ``None`` when nothing is known.
+
+    ``lit_at`` is the ``now`` of the last ACCEPTED cyno-lit event, which is how
+    the per-cycle dedupe window is enforced; it is cleared whenever the ship
+    changes, because the window is per ``(character, ship_item_id)``."""
     ship_item_id: int | None = None
     cargo: ShipCargo | None = None
     cost: int | None = None
+    lit_at: float | None = None
 
 
 @dataclass
@@ -735,12 +829,24 @@ def _key(char_key) -> str:
 class WatchState:
     """Latch bookkeeping for every watched character. Pure + Tk-free.
 
-    ``observe_edge`` is called on an UNDOCK or LOGIN edge (not every poll) and
-    returns ``FIRE`` only when the sample is new evidence of a low hold. The
-    latch is keyed on ``(ship_item_id, ozone)``, which is what makes the
+    **Thread safety.** This object is written from TWO threads: the ESI poller
+    (undock/login edges, via ``observe_edge``) and whichever thread the gamelog
+    tailer's callback runs on (``observe_cyno_lit``). Every public method —
+    readers included — therefore takes ``_lock``, a re-entrant lock (
+    ``observe_cyno_lit`` calls ``observe_edge`` beneath it). ``threading`` is
+    standard library, so the module stays pure. Nothing outside this class may
+    reach into ``_chars``.
+
+    ``observe_edge`` is called on an UNDOCK or LOGIN edge, not on every poll,
+    and returns ``FIRE`` only when the sample is new evidence of a low hold.
+    The latch is keyed on ``(ship_item_id, ozone)``, which is what makes the
     re-arming honest:
 
-    * the same ship with the same ozone is the same warning — ``HOLD``;
+    * the same ship with the same ozone is the same warning — ``HOLD``. That is
+      not a theoretical case: an undock and a login edge routinely arrive as a
+      burst for the same character (logging in undocked fires both), and the
+      wiring may re-observe an edge it is unsure about. ``HOLD`` is what
+      collapses that burst into one toast.
     * a different ship, or the same ship after the number moved (a restock, or
       our own cyno-lit decrement), is a new fact — ``FIRE``;
     * a generator that is gone, or enough lights, releases the latch outright —
@@ -753,7 +859,18 @@ class WatchState:
     a window nobody watched. After a gap that long the latch is dropped and the
     next low sample warns. At worst that is ONE extra toast after a minute of
     blindness, against a silently eaten warning — the error direction the owner
-    asked for."""
+    asked for.
+
+    **The cyno-lit decrement is deduped per generator CYCLE.** Neither gamelog
+    line this feature reads is an activation: both are REJECTED-action lines (a
+    re-click hint, and a dock refusal while the field burns) and a pilot can
+    produce a dozen of either during one 10-minute cycle — and the tailer
+    replays a whole file on rotation. Counting each one would walk a Rapier's
+    500 ozone down to a fabricated "3 lights" in seconds. So an accepted event
+    stamps ``LastSeen.lit_at`` and every further event inside
+    ``generator_cycle_s`` of it answers ``HOLD`` without touching the figure.
+    The one deliberate exception: once the hold reads ZERO, an accepted event
+    re-``FIRE``s rather than holding — "you are dry" is worth repeating."""
 
     #: Warn below this many lights. Comes from ``normalize_config``.
     min_activations: int = 4
@@ -762,16 +879,22 @@ class WatchState:
     blind_gap_s: float = 60.0
 
     _chars: dict = field(default_factory=dict)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     # -- bookkeeping --------------------------------------------------------
     def forget(self, char_key) -> None:
         """Drop all state for a character (client closed / logged out)."""
-        self._chars.pop(_key(char_key), None)
+        with self._lock:
+            self._chars.pop(_key(char_key), None)
 
     def last(self, char_key):
-        """The most recent sample for a character, or ``None`` if unknown."""
-        st = self._chars.get(_key(char_key))
-        return None if st is None else st.last
+        """The most recent sample for a character, or ``None`` if unknown.
+
+        ``LastSeen`` is an immutable tuple, so the value handed back cannot be
+        used to mutate this object's state from another thread."""
+        with self._lock:
+            st = self._chars.get(_key(char_key))
+            return None if st is None else st.last
 
     def remember(self, char_key, ship_item_id, cargo, cost) -> None:
         """Record a sample WITHOUT evaluating it — the seam the wiring uses to
@@ -781,8 +904,9 @@ class WatchState:
         k = _key(char_key)
         if not k:
             return
-        st = self._chars.setdefault(k, _CharWatch())
-        st.last = self._sample(ship_item_id, cargo, cost)
+        with self._lock:
+            st = self._chars.setdefault(k, _CharWatch())
+            st.last = self._sample(st.last, ship_item_id, cargo, cost)
 
     # -- the machine --------------------------------------------------------
     def observe_edge(self, char_key, ship_item_id, cargo, cost, now, *,
@@ -801,51 +925,94 @@ class WatchState:
         except (TypeError, ValueError):
             ts = 0.0
 
-        st = self._chars.setdefault(k, _CharWatch())
-        previous = st.seen
-        st.seen = ts
-        st.last = self._sample(ship_item_id, cargo, cost)
-        ident = (st.last.ship_item_id, st.last.cargo.ozone
-                 if st.last.cargo is not None else None)
+        with self._lock:
+            st = self._chars.setdefault(k, _CharWatch())
+            previous = st.seen
+            st.seen = ts
+            st.last = self._sample(st.last, ship_item_id, cargo, cost)
+            ident = (st.last.ship_item_id,
+                     st.last.cargo.ozone if st.last.cargo is not None else None)
 
-        if disabled:
+            if disabled:
+                st.latch = ident
+                return SUPPRESSED
+
+            if not verdict(st.last.cargo, cost, self.min_activations).fire:
+                st.latch = None
+                return CLEAR
+
+            blind = previous is None or (ts - previous) > self._blind_gap()
+            if st.latch is not None and st.latch == ident and not blind:
+                return HOLD
             st.latch = ident
-            return SUPPRESSED
+            return FIRE
 
-        if not verdict(st.last.cargo, cost, self.min_activations).fire:
-            st.latch = None
-            return CLEAR
-
-        blind = previous is None or (ts - previous) > float(self.blind_gap_s)
-        if st.latch is not None and st.latch == ident and not blind:
-            return HOLD
-        st.latch = ident
-        return FIRE
-
-    def observe_cyno_lit(self, char_key, now, *, disabled: bool = False) -> str:
-        """A cyno-active gamelog line: burn one activation locally and
+    def observe_cyno_lit(self, char_key, now, *, disabled: bool = False,
+                         dogma=None) -> str:
+        """A cyno-is-burning gamelog line: burn ONE activation locally and
         re-evaluate.
 
         ESI will not show the burn for up to an hour (the assets endpoint is
         cached), so the last known figure is decremented by one ``cost``. With
         no figure known — an unwatched character, no generator, an unknown cost
-        — the answer is ``CLEAR`` and nothing is invented. Never raises."""
-        st = self._chars.get(_key(char_key))
-        if st is None:
-            return CLEAR
-        cargo, cost = st.last.cargo, st.last.cost
-        if not isinstance(cargo, ShipCargo) or cargo.generator_type_id is None:
-            return CLEAR
-        per = _int_or_none(cost)
-        if per is None or per <= 0:
-            return CLEAR
-        burnt = ShipCargo(cargo.generator_type_id, max(0, cargo.ozone - per))
-        return self.observe_edge(char_key, st.last.ship_item_id, burnt, per,
-                                 now, disabled=disabled)
+        — the answer is ``CLEAR`` and nothing is invented.
+
+        At most one decrement per generator cycle per ``(character, ship)``:
+        the lines that feed this are repeatable rejections, not activations, so
+        an event inside ``generator_cycle_s`` of the last accepted one answers
+        ``HOLD`` and changes nothing. An accepted event on an already-EMPTY
+        hold releases the latch so it re-``FIRE``s. ``dogma`` injects the table
+        the cycle time is read from. Never raises."""
+        with self._lock:
+            st = self._chars.get(_key(char_key))
+            if st is None:
+                return CLEAR
+            cargo, cost = st.last.cargo, st.last.cost
+            if not isinstance(cargo, ShipCargo) or cargo.generator_type_id is None:
+                return CLEAR
+            per = _int_or_none(cost)
+            if per is None or per <= 0:
+                return CLEAR
+
+            try:
+                ts = float(now)
+            except (TypeError, ValueError):
+                ts = 0.0
+            window = generator_cycle_s(cargo.generator_type_id, dogma)
+            if st.last.lit_at is not None and (ts - st.last.lit_at) < window:
+                return HOLD
+
+            burnt = ShipCargo(cargo.generator_type_id, max(0, cargo.ozone - per))
+            if burnt.ozone <= 0:
+                # Dry. Release the latch so the re-evaluation below FIREs even
+                # though the figure did not move — being out of ozone with a
+                # cyno fitted is worth saying again, once per cycle.
+                st.latch = None
+            verb = self.observe_edge(char_key, st.last.ship_item_id, burnt, per,
+                                     ts, disabled=disabled)
+            # Stamped AFTER observe_edge, which rebuilds ``last``.
+            st.last = st.last._replace(lit_at=ts)
+            return verb
 
     # -- helpers ------------------------------------------------------------
+    def _blind_gap(self) -> float:
+        """The blind-gap window as a float. A None or hostile value on the
+        dataclass field falls back to the documented 60 s rather than raising
+        inside the state machine."""
+        try:
+            gap = float(self.blind_gap_s)
+        except (TypeError, ValueError):
+            return 60.0
+        return gap if gap > 0 else 60.0
+
     @staticmethod
-    def _sample(ship_item_id, cargo, cost) -> LastSeen:
+    def _sample(previous, ship_item_id, cargo, cost) -> LastSeen:
+        """Build the new ``LastSeen``, carrying ``lit_at`` forward only while
+        the SHIP is unchanged — the dedupe window is per (character, ship), so
+        stepping into a different hull starts a fresh one."""
         if not isinstance(cargo, ShipCargo):
             cargo = None
-        return LastSeen(_int_or_none(ship_item_id), cargo, _int_or_none(cost))
+        ship = _int_or_none(ship_item_id)
+        lit_at = previous.lit_at if (previous is not None
+                                     and previous.ship_item_id == ship) else None
+        return LastSeen(ship, cargo, _int_or_none(cost), lit_at)

@@ -119,8 +119,21 @@ DECLOAK_RE = re.compile(
 # else ("… is already active" is emitted for any module re-click, so the gate
 # substring alone is NOT sufficient — the captured name is what identifies it,
 # and the ozone watch only acts on a name it recognises as a generator).
+# Both gate substrings are matched CASE-INSENSITIVELY, to agree with the
+# IGNORECASE regexes behind them: a gate stricter than its regex is a silent
+# filter, and the client has changed the capitalisation of notify text before.
+# One `.lower()` per candidate line is paid only after the raw-substring fast
+# path misses, so the ordinary line still costs two `in` tests and nothing else.
 _CYNO_ALREADY_ACTIVE_GATE = "is already active"
 _CYNO_DOCKING_GATE = "is active your docking systems"
+
+
+def _cyno_gate(line: str) -> bool:
+    """Cheap "could this be a cyno-active line?" test, case-insensitive."""
+    if _CYNO_ALREADY_ACTIVE_GATE in line or _CYNO_DOCKING_GATE in line:
+        return True
+    low = line.lower()
+    return _CYNO_ALREADY_ACTIVE_GATE in low or _CYNO_DOCKING_GATE in low
 
 # The client wraps the module name in markup (`<b>`, `<color=…>`, `<font …>`)
 # and BREAKS IT UP: `<color=..><b>Cynosural Field Generator I</b> is already
@@ -157,7 +170,13 @@ class DecloakEvent:
 
 @dataclass(frozen=True)
 class CynoActiveEvent:
-    """A line proving a cynosural field is burning right now."""
+    """A line proving a cynosural field is burning right now.
+
+    Same three-field shape as its two siblings above, for the same reason: the
+    consumer needs to know WHO, and the timestamp is what lets a replayed file
+    (the tailer re-reads from the top on rotation) be told from a live line."""
+    timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
+    character_name: str     # from the file's "Listener:" header
     generator_name: str     # e.g. "Covert Cynosural Field Generator I", verbatim
 
 
@@ -200,22 +219,28 @@ def parse_decloak_line(line: str):
     return None
 
 
-def parse_cyno_active_line(line: str):
+def parse_cyno_active_line(line: str, character_name: str = ""):
     """Return a :class:`CynoActiveEvent` for a cyno-is-burning line, else None.
 
     Matches BOTH conditional templates (the ``(hint) … is already active``
     re-click and the ``unable to dock because while … is active your docking
     systems are unusable`` notify) and captures the module name each names
-    verbatim, stripped of the client's markup tags.
+    verbatim, stripped of the client's markup tags. The timestamp is read off
+    the line; ``character_name`` is supplied by the tailer from the file's
+    ``Listener:`` header, exactly as for the damage and decloak events.
+
+    **Neither line is an ACTIVATION** — both are rejected-action lines and a
+    pilot can emit a dozen of either during one cycle, so a consumer must
+    de-duplicate (``ozone_watch.WatchState.observe_cyno_lit`` does, per
+    generator cycle). Treating each line as one burn walks a full hold down to
+    a fabricated number in seconds.
 
     Short-circuits on the two cheap gate substrings so the tailer runs no regex
     on an ordinary line. The gate is deliberately NOT specific to cyno
     generators — ``is already active`` is emitted for any module re-click — so
-    the name is the identification and the caller decides whether it is a
-    generator it cares about. Never raises."""
-    if not line:
-        return None
-    if _CYNO_ALREADY_ACTIVE_GATE not in line and _CYNO_DOCKING_GATE not in line:
+    the name is the identification and the caller filters it
+    (``ozone_watch.is_generator_name``). Never raises."""
+    if not line or not _cyno_gate(line):
         return None
     plain = _TAG_RE.sub(" ", line)
     for pattern in (_CYNO_DOCKING_RE, _CYNO_ALREADY_ACTIVE_RE):
@@ -223,7 +248,9 @@ def parse_cyno_active_line(line: str):
         if m:
             name = (m.group("gen") or "").strip()
             if name:
-                return CynoActiveEvent(generator_name=name)
+                return CynoActiveEvent(timestamp=_ts_of(line),
+                                       character_name=str(character_name or ""),
+                                       generator_name=name)
     return None
 
 
