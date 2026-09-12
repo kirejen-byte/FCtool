@@ -224,6 +224,35 @@ DEFAULT_CONFIG = {
         # preview.disabled_chars): a brand-new character defaults to reminded.
         "disabled_chars": [],
     },
+    # "Watch my ozone" (ozone_watch.py) — the implant reminder's sibling on the
+    # Characters tab. Warns when a character undocks, logs in, or lights a cyno
+    # in a hull with a cynosural field generator fitted and fewer than
+    # `min_activations` lights of Liquid Ozone aboard. The cost is computed from
+    # the fitted GENERATOR and the hull's own bonus (a covert cyno on a Force
+    # Recon is 5 units, not 50), never guessed from the hull alone.
+    #
+    # DEFAULT ON, unlike the range check: it never reacts to anything a third
+    # party can say, it costs no ESI at all while nothing undocks, and the
+    # assets scope it needs is already granted on every existing token — so it
+    # is live on upgrade rather than waiting on a re-auth.
+    #
+    # This block is a key-for-key mirror of ozone_watch.DEFAULTS (guarded by
+    # tests/test_default_config.py); fc_gui never names a default value itself,
+    # and an existing config.json (never deep-merged) simply has no block, which
+    # ozone_watch.is_enabled reads as the default — ON.
+    "ozone_watch": {
+        "enabled": True,            # MASTER GATE
+        "min_activations": 4,       # warn below this many lights (owner's ask)
+        "toast_seconds": 12.0,      # hold before the fade (clamped 3..60)
+        "asset_ttl_s": 600,         # per-ship assets cache (clamped 60..3600)
+        # ESI skills are NOT authorised (the skills scope is unregistered on the
+        # dev app), so Cynosural Field Theory is assumed at V. Disclosed in the
+        # tick's ⓘ tooltip rather than hidden.
+        "assumed_skill_level": 5,
+        # Show-oriented UX, disabled-oriented storage (mirrors the implant
+        # reminder's): a brand-new character defaults to watched.
+        "disabled_chars": [],
+    },
     # Fleet-chat "range check" (range_check.py). Typing the keyword in Fleet
     # chat pops a short-lived window over the EVE client that posted it,
     # summarising who can reach that character's system (Titan / Capital /
