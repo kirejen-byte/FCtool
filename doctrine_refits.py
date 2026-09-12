@@ -308,6 +308,11 @@ class RefitStrip(tk.Frame):
       that the strip must be GIVEN a width — hence the ``pack``/``grid``
       overrides below, which add ``fill=x`` / ``sticky=ew`` to whatever the
       host asked for — and must ask for its own HEIGHT, which the reflow sets.
+      ``fill`` alone only spends space the master already gave the strip, so
+      pack it ``side=TOP`` (the member row's stacked sub-lines, where a
+      ``fill=x`` slave gets the master's full width), or pass ``expand=True``
+      when packing it ``side=LEFT``/``RIGHT`` — otherwise it is handed its
+      1 px request and clips every chip.
     * a ``<Configure>`` reflow that re-``pack``s the SAME chip Labels into
       per-line sub-frames. The chips stay children of the strip (Tk lets a
       slave be packed ``in_`` any descendant of its parent), so
@@ -475,7 +480,16 @@ class RefitStrip(tk.Frame):
     def reflow(self, width) -> None:
         """Re-wrap to ``width`` px. Public so a host (and the tests) can drive
         the layout without a display pass — a withdrawn root never delivers a
-        real ``<Configure>``."""
+        real ``<Configure>``.
+
+        Safe on a DESTROYED strip: the Doctrines pane re-renders wholesale, so
+        a queued reflow can land after the row it belonged to is gone, and
+        every Tk call below would raise ``TclError`` on a dead widget."""
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         try:
             width = int(width or 0)
         except (TypeError, ValueError):
@@ -492,29 +506,43 @@ class RefitStrip(tk.Frame):
 
     def _apply_layout(self, lines) -> None:
         """Pack every item into its line's sub-frame and ask for the height the
-        result needs (propagation is off, so nothing else will)."""
+        result needs (propagation is off, so nothing else will).
+
+        Individually tolerant of a destroyed child: a teardown that runs while
+        a reflow is in flight must not leave the rest of the strip unlaid-out
+        (and must not raise out of a ``<Configure>`` handler)."""
         lines = tuple(lines)
         self._line_of = lines
         count = (max(lines) + 1) if lines else 0
-        while len(self._lines) < count:
-            self._lines.append(tk.Frame(self, bg=self._palette_colours["bg"]))
-        for index, frame in enumerate(self._lines):
-            if index < count:
-                frame.pack(side=tk.TOP, anchor=tk.W, fill=tk.X,
-                           pady=(_LINE_GAP if index else 0, 0))
-            else:
-                frame.pack_forget()
+        try:
+            while len(self._lines) < count:
+                self._lines.append(
+                    tk.Frame(self, bg=self._palette_colours["bg"]))
+            for index, frame in enumerate(self._lines):
+                if index < count:
+                    frame.pack(side=tk.TOP, anchor=tk.W, fill=tk.X,
+                               pady=(_LINE_GAP if index else 0, 0))
+                else:
+                    frame.pack_forget()
+        except tk.TclError:
+            return
         heights = [0] * count
         for (widget, gap), index in zip(self._items, lines):
-            frame = self._lines[index]
-            widget.pack(in_=frame, side=tk.LEFT, padx=gap)
-            # A slave packed into a master that is not its parent must sit
-            # ABOVE that master in the stacking order, or the master's own
-            # window covers it (Tk's documented ``pack -in`` caveat).
-            widget.lift(frame)
-            heights[index] = max(heights[index], widget.winfo_reqheight())
+            try:
+                frame = self._lines[index]
+                widget.pack(in_=frame, side=tk.LEFT, padx=gap)
+                # A slave packed into a master that is not its parent must sit
+                # ABOVE that master in the stacking order, or the master's own
+                # window covers it (Tk's documented ``pack -in`` caveat).
+                widget.lift(frame)
+                heights[index] = max(heights[index], widget.winfo_reqheight())
+            except tk.TclError:
+                continue
         total = sum(heights) + _LINE_GAP * max(0, count - 1)
-        self.configure(height=max(1, total))
+        try:
+            self.configure(height=max(1, total))
+        except tk.TclError:
+            pass
 
 
 def _make_menu(parent) -> tk.Menu:
