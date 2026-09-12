@@ -747,7 +747,6 @@ def _choose_generator(type_ids, dogma):
     raises, and never returns ``None`` for a non-empty ``type_ids``."""
     view = _view(dogma)
     best = type_ids[0]
-    best_base = 0.0
     try:
         best_base = float(view.attrs(best).get(ATTR_CONSUMPTION) or 0.0)
     except Exception:                                       # pragma: no cover
@@ -1027,7 +1026,8 @@ class WatchState:
             if st.last.lit_at is not None and (ts - st.last.lit_at) < window:
                 return HOLD
 
-            burnt = ShipCargo(cargo.generator_type_id, max(0, cargo.ozone - per))
+            burnt = ShipCargo(cargo.generator_type_id, max(0, cargo.ozone - per),
+                             cargo.generator_type_ids)
             if burnt.ozone <= 0:
                 # Dry. Release the latch so the re-evaluation below FIREs even
                 # though the figure did not move — being out of ozone with a
