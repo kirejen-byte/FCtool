@@ -23575,7 +23575,10 @@ class FCToolGUI:
 
         Four outcomes, in order:
 
-        * ``doctrine_id`` names a doctrine the COMPOSER is not showing -- the
+        * ``doctrine_id`` names a doctrine the COMPOSER is not showing (or the
+          composer is showing none at all -- a separate line, because "another
+          doctrine" would send the FC hunting a selection that is not there)
+          -- the
           markup this method would serialise belongs to a different doctrine
           than the one that was just swapped, so pushing it would PUT an
           unrelated draft over the live fleet MOTD. Checked FIRST, before the
@@ -23605,6 +23608,11 @@ class FCToolGUI:
                 shown = self._motd_selected_doctrine()
             except Exception:
                 shown = None
+            if shown is None:
+                # Told apart from the mismatch below on purpose: "another
+                # doctrine" would send the FC hunting the composer's combo for
+                # a selection that is not there.
+                return "(MOTD not pushed — no doctrine in the MOTD composer)"
             if getattr(shown, "id", None) != doctrine_id:
                 return "(MOTD not pushed — composer shows another doctrine)"
         if getattr(self, "_motd_link_enabled", False):
