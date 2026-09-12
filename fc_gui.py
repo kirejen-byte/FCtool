@@ -4,6 +4,7 @@ Tkinter-based GUI that wraps all FCTool modules.
 """
 
 import collections
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -160,6 +161,13 @@ import client_toast
 # over-client toast. Everything above RangeToast is Tk-free and it imports no
 # fc_gui; wiring is the chat-tail hook + _range_check_show_toast below.
 import range_check
+# Fleet-chat "refit" command (default ON): refit_command is the pure parse/
+# resolve engine (no Tk, no store — doctrines and fits arrive duck-typed),
+# refit_toast its own over-client window with clickable option rows. Wiring is
+# the chat-tail hook _refit_observe + _refit_apply_resolution below; both
+# modules import no fc_gui.
+import refit_command
+import refit_toast
 # The module, alongside the `from jump_range import ...` names above: the range
 # check injects jump_range.calculate_ly_distance as its distance function.
 import jump_range
@@ -315,6 +323,15 @@ FITTINGS_TAB_INDEX = 6
 #   0 Fittings (library), 1 Doctrines, 2 MOTD.
 FITTINGS_SUBTAB_INDEX = 0
 DOCTRINES_SUBTAB_INDEX = 1
+
+# Pack options for each ``Refits ▾`` microbutton, by host attribute name.
+# The button is hidden with ``pack_forget()``, which DISCARDS every option, so
+# its geometry has to be restatable — this is where it is stated, once, for
+# both hosts (_refits_update_buttons).
+REFITS_BUTTON_PACK = {
+    "_fleet_refits_btn": {"side": tk.LEFT, "padx": (0, 4)},
+    "_motd_refits_btn": {"side": tk.LEFT, "padx": (4, 0)},
+}
 
 # ESI fittings scopes (added after some characters were already authed; SSO
 # grants scopes only at login, so older tokens lack these and need re-auth).
@@ -4097,7 +4114,13 @@ class FCToolGUI:
         self._fleet_doctrine_link.pack(side=tk.LEFT, padx=6)
         self._fleet_doctrine_link.bind(
             "<Button-1>", lambda e: self._open_active_doctrine())
+        # Mid-fleet refit swap (spec §7.3). Built here but NOT packed: the
+        # visibility rule lives in _refits_update_buttons, so a user who never
+        # made a refit never sees the button on any refresh path.
+        self._fleet_refits_btn = doctrine_refits.make_refits_button(
+            doc_row, self._post_fleet_refits_menu)
         self._refresh_fleet_doctrine_combo()
+        self._refits_update_buttons()
 
         comp_header = tk.Frame(comp_left, bg=BG_PANEL)
         comp_header.pack(fill=tk.X, padx=8)
@@ -12060,6 +12083,88 @@ class FCToolGUI:
             if getattr(self, "_motd_link_enabled", False):
                 self._motd_maybe_autopush()
 
+        # (f) Both ``Refits ▾`` buttons: a mutation can have added the
+        # doctrine's FIRST refit (show them) or removed its LAST (hide them),
+        # and neither host is otherwise told. Guarded + last, so a failure here
+        # cannot swallow the refreshes above.
+        self._refits_update_buttons()
+
+    # ── The ``Refits ▾`` hosts (Fleet tab + MOTD sub-tab, spec §7.3) ────────
+    # Two buttons, ONE factory, ONE swap handler. fc_gui owns no menu code and
+    # no chip code: doctrine_refits builds the button, the spec and the menu,
+    # and owns the posted menu's lifetime.
+
+    def _refits_update_buttons(self):
+        """Show each ``Refits ▾`` button only while its host's doctrine has at
+        least one slot WITH refits (spec §7.3).
+
+        THE single visibility owner — the Fleet combo refresh, the two doctrine
+        pickers and the post-mutation chain all call this rather than each
+        deciding for itself, so the two hosts can never disagree about whether
+        the doctrine they are pointing at is refittable.
+
+        Every step is guarded: either tab may never have been built (tests, and
+        the MOTD sub-tab before its first open), the doctrine resolvers read Tk
+        vars that may not exist yet, and this runs at the TAIL of a chain whose
+        earlier steps already committed a store mutation."""
+        for attr, resolve in (("_fleet_refits_btn", self._active_fleet_doctrine),
+                              ("_motd_refits_btn", self._motd_selected_doctrine)):
+            button = getattr(self, attr, None)
+            if button is None:
+                continue
+            try:
+                doctrine = resolve()
+            except Exception:
+                doctrine = None
+            try:
+                if doctrine_refits.has_refits(doctrine):
+                    # Re-packing an already-packed slave would be harmless but
+                    # pointless; the check also keeps the row's widget order
+                    # obviously stable.
+                    if not button.winfo_manager():
+                        button.pack(**REFITS_BUTTON_PACK[attr])
+                else:
+                    button.pack_forget()
+            except tk.TclError:
+                pass
+
+    def _build_refits_menu(self, doctrine):
+        """Mint the ``Refits ▾`` menu for ``doctrine`` — the ONE factory both
+        hosts use, so the Fleet tab and the MOTD tab can never offer different
+        menus for the same doctrine.
+
+        The doctrine id is bound HERE rather than left to ``_refits_swap``'s
+        "the doctrine the fleet is flying" default: the MOTD host can legally
+        point at a different doctrine than the Fleet tab, and a menu posted
+        from it must act on the doctrine it was built from."""
+        return doctrine_refits.build_refit_menu(
+            self.root,
+            doctrine_refits.menu_spec(doctrine, self.fittings.get_fit),
+            on_pick=lambda fit_id: self._refits_swap(fit_id, doctrine.id),
+            on_reset=lambda: self._refits_reset(doctrine.id))
+
+    def _post_refits_menu(self, doctrine, button):
+        """Build a FRESH menu and post it under ``button``.
+
+        Minted per post (the active-refit glyphs and the reset entry's enabled
+        state are read at post time) and destroyed by ``post_menu_under``,
+        which owns the ``<Unmap>`` teardown — the intel-menu leak pattern."""
+        if doctrine is None or button is None:
+            return
+        doctrine_refits.post_menu_under(self._build_refits_menu(doctrine),
+                                        button)
+
+    def _post_fleet_refits_menu(self):
+        """Fleet tab: resolve the doctrine AT POST TIME (the combo may have
+        moved since the button appeared)."""
+        self._post_refits_menu(self._active_fleet_doctrine(),
+                               getattr(self, "_fleet_refits_btn", None))
+
+    def _post_motd_refits_menu(self):
+        """MOTD sub-tab: the COMPOSER's doctrine, not the fleet's."""
+        self._post_refits_menu(self._motd_selected_doctrine(),
+                               getattr(self, "_motd_refits_btn", None))
+
     def _build_member_seed_target_row(self, parent, doctrine, mem):
         """Compact per-fit seed-target editor for one doctrine member row.
 
@@ -13298,13 +13403,22 @@ class FCToolGUI:
         cstrip.pack(fill=tk.X, padx=8, pady=(8, 2))
 
         _lbl(cstrip, "DOCTRINE").pack(anchor=tk.W)
+        # Sub-frame so the Refits ▾ microbutton can sit at the combo's right —
+        # the TEMPLATE row's ``trow`` below is the exact precedent (the combo
+        # keeps the whole width when the button is hidden, which is the normal
+        # case: it only appears for a doctrine that HAS refits).
+        drow = tk.Frame(cstrip, bg=BG_PANEL)
+        drow.pack(fill=tk.X)
         self._motd_doctrine_var = tk.StringVar()
         self._motd_doctrine_combo = ttk.Combobox(
-            cstrip, textvariable=self._motd_doctrine_var, state="readonly",
+            drow, textvariable=self._motd_doctrine_var, state="readonly",
             font=("Consolas", 10))
-        self._motd_doctrine_combo.pack(fill=tk.X)
+        self._motd_doctrine_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._motd_doctrine_combo.bind(
             "<<ComboboxSelected>>", self._motd_on_doctrine_selected)
+        # Built unpacked; _refits_update_buttons owns whether it shows.
+        self._motd_refits_btn = doctrine_refits.make_refits_button(
+            drow, self._post_motd_refits_menu)
 
         _lbl(cstrip, "FC / ANCHOR").pack(anchor=tk.W, pady=(8, 0))
         self._motd_fc_var = tk.StringVar()
@@ -14231,6 +14345,11 @@ class FCToolGUI:
         cur = self._motd_doctrine_var.get()
         if cur not in names:
             self._motd_doctrine_var.set(names[0] if names else "")
+        # The PROGRAMMATIC settle point for this combo (tab build, and every
+        # library edit that re-fills it) — _motd_on_doctrine_change covers only
+        # the user's own switches, so without this the MOTD Refits ▾ button
+        # would not appear until the FC changed doctrine by hand.
+        self._refits_update_buttons()
 
     def _motd_refresh_fc_choices(self):
         """Fill the FC/Anchor dropdown with authed characters + '(leave blank)'.
@@ -14326,6 +14445,9 @@ class FCToolGUI:
             combo["values"] = [""] + names
         except Exception:
             pass
+        # The selection can have been dropped or re-pointed by a library edit,
+        # so the Refits ▾ visibility is re-derived alongside the values.
+        self._refits_update_buttons()
 
     def _on_fleet_doctrine_change(self):
         """Persist the Fleet-tab doctrine pick and re-render the role sections."""
@@ -14335,6 +14457,7 @@ class FCToolGUI:
         self.config.setdefault("fleet", {})["active_doctrine"] = var.get()
         self._save_config()
         self._refresh_specialized_roles_from_cache()
+        self._refits_update_buttons()
 
     def _auto_select_fleet_doctrine(self, doctrine_name):
         """After a successful MOTD push, point the Fleet-Management tab's doctrine
@@ -14569,6 +14692,10 @@ class FCToolGUI:
             pal.refresh_tray()
         self._motd_refresh_canvas_pills()
         self._schedule_motd_preview()
+        # THE settle point for the composer's doctrine selection (every user
+        # pick and every programmatic switch routes through here), so it is
+        # where the MOTD Refits ▾ button's visibility is re-derived.
+        self._refits_update_buttons()
 
     def _on_motd_fc_change(self):
         """FC changed: re-resolve fleet/boss status (changes which fleet the Set
@@ -18526,6 +18653,31 @@ class FCToolGUI:
                 "\"range check on me\" fires too.\n\n"
                 "Leave it BLANK to switch the feature off — a blank keyword "
                 "matches nothing rather than every line.")
+
+        # ── Fleet-chat refit command (refit_command.py; default ON) ──────────
+        # ONE control: the master gate, read through the module's own predicate
+        # for the same reason the tick above is. No keyword entry — the config
+        # key exists for power users, but a second free-text field here would
+        # be a second thing to get wrong for a feature nobody renames.
+        self._refit_command_enabled_var = tk.BooleanVar(
+            value=refit_command.is_enabled(self.config.get("refit_command")))
+        rf_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        rf_frame.pack(fill=tk.X, padx=20, pady=2)
+        rf_check = tk.Checkbutton(
+            rf_frame, text="Refit commands on fleet chat",
+            variable=self._refit_command_enabled_var,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT,
+            command=self._on_refit_command_toggle)
+        rf_check.pack(side=tk.LEFT)
+        attach_tooltip(
+            rf_check,
+            "In fleet chat, from one of your own characters:\n"
+            "refit <ship or role> <number|name>   e.g. refit dps 2 / "
+            "refit muninn ac\n"
+            "refit <name>   when only one ship has refits\n"
+            "refit reset   back to defaults")
 
         # ── zKillboard Settings ──────────────────────────────────────────────
         self._add_section(scroll_frame, "zKillboard", toc_title="zKillboard")
@@ -22960,6 +23112,285 @@ class FCToolGUI:
         restoring the default here would re-arm a feature the owner disarmed."""
         if self._collect_range_check_settings():
             self._save_config()
+
+    # ── Fleet-chat refit command (default ON) ───────────────────────────────
+    # The engine is refit_command.py (pure: parse, resolve, cooldown) and the
+    # window is refit_toast.RefitToast. fc_gui owns the same three seams the
+    # range check above owns and no policy: the chat-tail hook (chat poll
+    # thread), the Tk-thread outcome, and the silent MOTD push that follows a
+    # successful swap. Every default value comes from the module.
+
+    def _refit_observe(self, msg):
+        """Chat-tail hook: consider ONE fleet message as a refit command.
+
+        Runs on the chat poll thread (see _chat_poll_loop) beside
+        _range_check_observe and touches no Tk: only the finished Resolution,
+        the client rect and the doctrine id cross to the main thread via the
+        dispatcher queue. The resolution itself is pure — refit_command reads
+        the doctrine and the fits through a getter and mutates nothing — so the
+        store is never written from here.
+
+        Gate order, cheapest first, each a place this must NOT fire:
+
+        1. refit_command.is_enabled — THE master gate, the same call the
+           Settings tick reads, so a ticked box can never sit over a feature
+           that cannot fire (the implant reminder's shipped defect).
+        2. The parse. The keyword must START the body, unlike the range
+           check's substring rule: a command carries arguments, so "we should
+           refit 2 of those" is not a command. A non-command costs one
+           startswith and returns here, before the client read below — which on
+           a previews-off box is a full window enumeration.
+        3. The sender must own one of the owner's live client windows. That
+           list is BOTH the own-character gate and the source of the toast's
+           rect, so the two can never disagree about who counts. Unlike the
+           range check there is no is_iconic branch: a minimized client means
+           no rect, which the toast's own placement already refuses, and the
+           swap itself is worth doing either way — but see the toast call.
+        4. The per-sender cooldown, consulted LAST so a line dropped by an
+           earlier gate never burns it. It exists only so a double-send cannot
+           double-swap; ChatMonitor already drops duplicate deliveries.
+
+        Never raises into the poll loop."""
+        try:
+            block = self.config.get("refit_command") or {}
+            if not refit_command.is_enabled(block):
+                return
+            body = getattr(msg, "message", "") or ""
+            sender = getattr(msg, "sender", "") or ""
+            keyword = refit_command.normalize_config(block)["keyword"]
+            command = refit_command.parse(body, keyword)
+            if command is None:
+                return
+            # Same own-character gate as the range check, through the same
+            # lookup — a character the two disagreed about would be able to
+            # trigger one feature and not the other.
+            key = range_check.own_key(sender)
+            clients = {c.key: c for c in self._range_check_clients(key) if c.key}
+            client = clients.get(key)
+            if client is None:
+                # Someone else in fleet typed the keyword. A no-op by design;
+                # logged once per name so a fleet full of people saying "refit"
+                # cannot spam the log. ASCII only -- this box's console is
+                # cp1252.
+                seen = getattr(self, "_refit_foreign_senders", None)
+                if seen is None:
+                    seen = self._refit_foreign_senders = set()
+                if key and key not in seen:
+                    seen.add(key)
+                    log.debug("[refit] %s is not one of the owner's live "
+                              "characters - command ignored", key)
+                return
+            cooldown = getattr(self, "_refit_cooldown", None)
+            if cooldown is None:
+                cooldown = self._refit_cooldown = refit_command.Cooldown()
+            if not cooldown.consider(key):
+                return
+            doctrine = self._active_fleet_doctrine()
+            resolution = refit_command.resolve(
+                doctrine, self.fittings.get_fit, command)
+            self._post_ui(self._refit_apply_resolution, resolution,
+                          tuple(client.rect), getattr(doctrine, "id", None))
+        except Exception:
+            log.exception("[refit] chat hook failed")
+
+    def _refit_apply_resolution(self, res, client_rect, doctrine_id):
+        """Tk thread: carry out ONE Resolution and report it over the client.
+
+        The Resolution is the entire instruction (refit_command's invariant:
+        only ``swap`` carries a fit id), so this method decides nothing about
+        the grammar -- it only routes. ``ambiguous`` in particular must never
+        become a swap here: the FC typed something the doctrine answers more
+        than one way, and the answer is a click, not a guess.
+
+        Re-entered by the ambiguity chooser with a swap Resolution built from
+        the clicked option, which is why the toast is raised through one
+        helper."""
+        try:
+            kind = getattr(res, "kind", "")
+            message = getattr(res, "message", "") or ""
+            if kind == "swap":
+                lines = [message]
+                if self._refits_swap(getattr(res, "fit_id", None), doctrine_id):
+                    lines.append(self._motd_push_after_refit())
+                self._refit_show_toast(lines, (), client_rect)
+                return
+            if kind == "reset":
+                changed = self._refits_reset(doctrine_id)
+                lines = [f"Refits reset to defaults ({changed})"]
+                if changed:
+                    lines.append(self._motd_push_after_refit())
+                self._refit_show_toast(lines, (), client_rect)
+                return
+            if kind == "ambiguous":
+                options = tuple(getattr(res, "options", ()) or ())
+                self._refit_show_toast(
+                    [message or "Which refit?"], options, client_rect,
+                    on_pick=lambda fit_id: self._refit_pick_option(
+                        res, fit_id, client_rect, doctrine_id))
+                return
+            # noop / error / anything unknown: say so, change nothing.
+            self._refit_show_toast([message], (), client_rect)
+        except Exception:
+            log.exception("[refit] applying a %r resolution failed",
+                          getattr(res, "kind", ""))
+
+    def _refit_pick_option(self, res, fit_id, client_rect, doctrine_id):
+        """An ambiguity row was clicked: re-enter the swap path for that fit.
+
+        Built with ``dataclasses.replace`` rather than a hand-rolled
+        Resolution so every field the engine set (slot label, fit label)
+        survives the promotion and this stays one kind of object. The clicked
+        row's own label becomes the message, so the confirmation toast names
+        exactly what the FC picked."""
+        label = ""
+        for option_id, option_label in (getattr(res, "options", ()) or ()):
+            if option_id == fit_id:
+                label = option_label
+                break
+        chosen = dataclasses.replace(
+            res, kind="swap", fit_id=fit_id, options=(),
+            message=f"Refit: {label}" if label else "Refit applied")
+        self._refit_apply_resolution(chosen, client_rect, doctrine_id)
+
+    def _refit_show_toast(self, lines, options, client_rect, on_pick=None):
+        """Raise the refit outcome over the posting client's window.
+
+        ONE live refit toast at a time -- a newer outcome replaces the older
+        one rather than stacking, the rule _range_check_show_toast and
+        _implant_show_toast both follow. That also covers the chooser: picking
+        a row runs the swap, whose toast dismisses the chooser on its way in.
+
+        Blank lines are dropped rather than rendered as empty rows -- the
+        second line is absent whenever there was no MOTD push to report."""
+        try:
+            previous = getattr(self, "_refit_toast", None)
+            if previous is not None:
+                previous.dismiss()
+                self._refit_toast = None
+            toast = refit_toast.RefitToast(
+                self.root, "Refit", [ln for ln in lines if ln], tuple(options),
+                on_pick=on_pick if on_pick is not None else (lambda _fid: None),
+                on_dismiss=lambda: setattr(self, "_refit_toast", None))
+            self._refit_toast = toast
+            toast.show(client_rect)
+        except Exception:
+            log.exception("[refit] toast failed")
+
+    def _motd_push_after_refit(self) -> str:
+        """Push the recomposed MOTD to the fleet after a chat-command refit.
+
+        Returns the toast's SECOND LINE -- the FC has to be able to read, from
+        the same window that confirmed the swap, whether the fleet was told.
+
+        Three outcomes, in order:
+
+        * the auto-update link is ARMED -- _after_refit_change already ran
+          _motd_maybe_autopush inside the same-doctrine gate, so pushing again
+          here would be a second ESI write of identical markup;
+        * the FC is not the fleet boss (or there is no fleet, or no
+          authenticated FC), or the markup is over budget -- nothing is pushed
+          and the line says which;
+        * otherwise ONE silent push on a worker. Deliberately not
+          _set_fleet_motd: that one asks for confirmation over budget and
+          raises a messagebox on failure, both of which are modal dialogs on
+          top of a live fight. The failure surface here is the status label and
+          the toast line. No _auto_select_fleet_doctrine either -- this push
+          did not come from the FC deciding to broadcast a doctrine.
+
+        Tk thread only (it reads the composer's widgets); the PUT is the
+        worker's."""
+        if getattr(self, "_motd_link_enabled", False):
+            return "MOTD auto-update will push"
+        if not getattr(self, "_motd_is_boss", False) or \
+                not getattr(self, "_motd_fleet_id", None):
+            return "(MOTD not pushed — not fleet boss)"
+        auth = self._motd_selected_fc_auth() or self.esi_auth
+        if auth is None or not auth.is_authenticated:
+            return "(MOTD not pushed — not fleet boss)"
+        try:
+            markup, _compacted = self._motd_output_markup()
+        except Exception:
+            log.exception("[refit] composing the MOTD failed")
+            return "(MOTD not pushed — compose failed)"
+        # The same ceiling _set_fleet_motd confirms over; here it simply
+        # refuses, because there is nobody to answer a confirm dialog.
+        if motd_builder.estimate_length(markup) >= self._motd_budget():
+            return "(MOTD over budget — not pushed)"
+
+        fleet_id = self._motd_fleet_id
+        self._motd_set_fleet_status("Setting MOTD...", FG_ACCENT)
+
+        def worker():
+            ok = False
+            try:
+                ok = auth.set_fleet_motd(fleet_id, markup)
+            except Exception as e:
+                log.debug("[refit] MOTD push failed: %s", e)
+            self._post_ui(_done, ok)
+
+        def _done(ok):
+            if ok:
+                # Keeps the auto-update link's baseline honest: if the FC arms
+                # it later, an unchanged markup must read as already-synced.
+                self._motd_last_pushed_markup = markup
+                self._motd_set_fleet_status("MOTD set successfully (204).",
+                                            FG_GREEN)
+            else:
+                self._motd_set_fleet_status("Failed to set MOTD.", FG_RED)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return "MOTD push requested"
+
+    def _motd_set_fleet_status(self, text, colour):
+        """Write the MOTD tab's fleet-status label, if that tab exists.
+
+        Guarded because the refit command can push a MOTD on a host whose MOTD
+        sub-tab was never opened -- the push is real, the label is not there to
+        carry the news."""
+        label = getattr(self, "_motd_fleet_status", None)
+        if label is None:
+            return
+        try:
+            label.config(text=text, fg=colour)
+        except tk.TclError:
+            pass
+
+    def _refit_command_config(self) -> dict:
+        """The live ``config['refit_command']`` block, created lazily.
+
+        Seeded from ``refit_command.DEFAULTS`` via ``normalize_config`` so
+        fc_gui names no default of its own; isinstance-guarded because
+        config.json is never deep-merged and a hand-edited one can be ``null``.
+        Mirrors _range_check_config."""
+        block = self.config.setdefault(
+            "refit_command", refit_command.normalize_config(None))
+        if not isinstance(block, dict):
+            block = refit_command.normalize_config(None)
+            self.config["refit_command"] = block
+        return block
+
+    def _on_refit_command_toggle(self):
+        """Persist the master gate immediately -- no Save-Settings round trip
+        (mirrors _on_range_check_toggle). Only ``enabled`` is written; the
+        keyword is left exactly as the owner left it."""
+        self._refit_command_config()["enabled"] = bool(
+            self._refit_command_enabled_var.get())
+        self._save_config()
+
+    def _collect_refit_command_settings(self) -> bool:
+        """Fold the tick into config WITHOUT saving, so Save Settings persists
+        it in its own single write.
+
+        The checkbox autosaves on click, but Save Settings REPLACES self.config
+        from disk afterwards; without this the tick would survive only because
+        the autosave beat the reload. Returns whether there was anything to
+        fold -- the Settings tab may never have been built, and a config write
+        with no control behind it must not create a block."""
+        var = getattr(self, "_refit_command_enabled_var", None)
+        if var is None:
+            return False
+        self._refit_command_config()["enabled"] = bool(var.get())
+        return True
 
     def _overlay_start_poller(self):
         """Start the daemon poller if not already running."""
@@ -28780,6 +29211,10 @@ class FCToolGUI:
         # without leaving the field would otherwise be dropped by the config
         # reload below. Guarded — the section may never have been built.
         self._collect_range_check_settings()
+        # Same reason for the refit command's tick: it autosaves on click, but
+        # the config reload below would drop a click the autosave has not yet
+        # landed. Guarded — the section may never have been built.
+        self._collect_refit_command_settings()
 
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
@@ -29142,6 +29577,11 @@ class FCToolGUI:
         # (a window read, then LY distances), and nothing above it may wait on
         # that. Inert in one predicate call while the feature is switched off.
         self._range_check_observe(msg)
+        # Fleet-chat refit command, on the same tail and with the same
+        # own-character gate. After the range check because it is the more
+        # expensive of the two on a matching line (it resolves a doctrine),
+        # and because a line can only ever be one of the two.
+        self._refit_observe(msg)
 
     def _on_xup_update(self, state: XUpState):
         self._post_ui(self._update_xup_display, state)

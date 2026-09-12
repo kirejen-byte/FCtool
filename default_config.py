@@ -245,6 +245,25 @@ DEFAULT_CONFIG = {
         "enabled": False,           # MASTER GATE (opt-in)
         "keyword": "range check",   # case-insensitive substring; BLANK = off
     },
+    # Fleet-chat "refit" command (refit_command.py). Typing `refit <ship/role>
+    # <number|name>` in Fleet chat swaps that doctrine slot's ACTIVE refit and
+    # re-pushes the MOTD, so a mid-fight refit call reaches the fleet in-game
+    # without the FC leaving the client.
+    #
+    # DEFAULT ON, unlike the range check above, and the difference is
+    # deliberate: this one fires only for the owner's OWN logged-in characters
+    # AND only for a line that STARTS with the keyword (a command carries
+    # arguments, so substring matching would be wrong), which makes the blast
+    # radius of leaving it armed a toast. Nothing a fleet member types can
+    # reach it.
+    #
+    # A BLANK keyword disables it, exactly as it does for the range check.
+    # Key-for-key mirror of refit_command.DEFAULTS (guarded by
+    # tests/test_default_config.py) — fc_gui never names a default itself.
+    "refit_command": {
+        "enabled": True,            # MASTER GATE (opt-out)
+        "keyword": "refit",         # must START the body; BLANK = off
+    },
     # Fleet loss tracking source (spike 2026-07-25-zkill-loss-source). The
     # capsule-transition detector in loss_tracker.py is FAST (~20-35s) but blind
     # to podded pilots (measured 26-43% of PvP ship losses) and does not run at
