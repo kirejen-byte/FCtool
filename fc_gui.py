@@ -23308,11 +23308,17 @@ class FCToolGUI:
         """Chat-tail hook: consider ONE fleet message as a refit command.
 
         Runs on the chat poll thread (see _chat_poll_loop) beside
-        _range_check_observe and touches no Tk: only the finished Resolution,
-        the client rect and the doctrine id cross to the main thread via the
-        dispatcher queue. The resolution itself is pure — refit_command reads
-        the doctrine and the fits through a getter and mutates nothing — so the
-        store is never written from here.
+        _range_check_observe and touches NO Tk whatsoever: it reads config, the
+        parser, the live client list and its own cooldown, then marshals the
+        parsed Command and the client rect to the Tk thread via the dispatcher
+        queue. RESOLUTION DELIBERATELY DOES NOT HAPPEN HERE — resolving needs
+        the active doctrine, and _active_fleet_doctrine reads two Tk StringVars
+        (_fleet_doctrine_var, _motd_doctrine_var). A ``.get()`` on those is a
+        Tcl call, which off the main thread is exactly the class of bug the
+        v3.3.0 dispatcher exists to prevent, so the whole
+        doctrine-read-and-resolve step lives in _refit_resolve_and_apply on the
+        other side of the queue. ``resolve`` is pure and walks one small
+        doctrine, so the Tk thread pays nothing perceptible for it.
 
         Gate order, cheapest first, each a place this must NOT fire:
 
@@ -23369,16 +23375,43 @@ class FCToolGUI:
                 cooldown = self._refit_cooldown = refit_command.Cooldown()
             if not cooldown.consider(key):
                 return
-            doctrine = self._active_fleet_doctrine()
-            resolution = refit_command.resolve(
-                doctrine, self.fittings.get_fit, command)
-            self._post_ui(self._refit_apply_resolution, resolution,
-                          tuple(client.rect), getattr(doctrine, "id", None))
+            self._post_ui(self._refit_resolve_and_apply, command,
+                          tuple(client.rect))
         except Exception:
             log.exception("[refit] chat hook failed")
 
+    def _refit_resolve_and_apply(self, cmd, client_rect):
+        """Tk thread: resolve a parsed Command against the ACTIVE doctrine.
+
+        The main thread's half of the chat hook, and the only reason the split
+        exists: _active_fleet_doctrine reads Tk StringVars, which may only ever
+        happen here. ``refit_command.resolve`` is pure — it walks the
+        doctrine's members and reads fits through the store's getter, mutates
+        nothing, and a doctrine is a handful of slots — so doing it on this
+        side costs no perceptible frame time.
+
+        Reached ONLY through _post_ui. Split out rather than folded into
+        _refit_apply_resolution so that method keeps taking a finished
+        Resolution: the ambiguity chooser re-enters it with a promoted swap and
+        must not re-resolve anything."""
+        try:
+            doctrine = self._active_fleet_doctrine()
+            resolution = refit_command.resolve(
+                doctrine, self.fittings.get_fit, cmd)
+        except Exception:
+            log.exception("[refit] resolving a chat command failed")
+            return
+        self._refit_apply_resolution(resolution, client_rect,
+                                     getattr(doctrine, "id", None))
+
     def _refit_apply_resolution(self, res, client_rect, doctrine_id):
         """Tk thread: carry out ONE Resolution and report it over the client.
+
+        Tk-thread ONLY — it writes the store, re-renders panes through
+        _after_refit_change and builds a Toplevel. Its two callers are
+        _refit_resolve_and_apply (itself reached only through _post_ui) and the
+        ambiguity chooser's row click, which is a Tk event. Nothing may call it
+        from a worker.
 
         The Resolution is the entire instruction (refit_command's invariant:
         only ``swap`` carries a fit id), so this method decides nothing about
