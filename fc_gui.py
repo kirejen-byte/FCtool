@@ -329,7 +329,8 @@ DOCTRINES_SUBTAB_INDEX = 1
 # its geometry has to be restatable — this is where it is stated, once, for
 # both hosts (_refits_update_buttons).
 REFITS_BUTTON_PACK = {
-    "_fleet_refits_btn": {"side": tk.LEFT, "padx": (0, 4)},
+    # The Fleet row's left pad clears the "↗ open" link it follows.
+    "_fleet_refits_btn": {"side": tk.LEFT, "padx": (6, 4)},
     "_motd_refits_btn": {"side": tk.LEFT, "padx": (4, 0)},
 }
 
@@ -12005,10 +12006,14 @@ class FCToolGUI:
         doctrine the fleet is flying" (``_active_fleet_doctrine``) — the
         mid-fleet callers never carry an id.
 
-        Returns the store's bool. Saves ONLY on a real change: the store returns
-        True for a re-pick of the fit that is already active without stamping
-        ``modified``, and a save there would dirty the library and invalidate
-        every ``revision()``-keyed memo for a no-op.
+        Returns True ONLY when the active refit actually MOVED. The store
+        answers True for a re-pick of the fit that is already active (it found
+        the slot; it just had nothing to stamp), but every caller uses this
+        return to decide whether something happened — the chat command hangs
+        its MOTD push on it, and pushing for a no-op would mean an ESI write
+        and a toast line for a library that did not change. Saving is gated the
+        same way: a save there would dirty the library and invalidate every
+        ``revision()``-keyed memo for nothing.
         """
         if doctrine_id is None:
             doctrine = self._active_fleet_doctrine()
@@ -12018,10 +12023,11 @@ class FCToolGUI:
         mem = self.fittings.find_member(doctrine_id, fit_id)
         already = mem is not None and getattr(mem, "fit_id", None) == fit_id
         ok = self.fittings.set_active_refit(doctrine_id, fit_id)
-        if ok and not already:
+        changed = bool(ok and not already)
+        if changed:
             self.fittings.save()
             self._after_refit_change(doctrine_id)
-        return ok
+        return changed
 
     def _refits_reset(self, doctrine_id=None):
         """Return every slot of the doctrine to its DEFAULT refit (the form-up
@@ -14976,6 +14982,10 @@ class FCToolGUI:
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         self._schedule_motd_preview()
+        # A template can carry its own doctrine, and this loader sets the combo
+        # directly without going through _motd_on_doctrine_change — so the
+        # Refits ▾ visibility has to be re-derived here too.
+        self._refits_update_buttons()
 
     def _motd_refresh_saved_dropdown(self):
         """Populate the MOTD TEMPLATE combo with a leading blank plus the names of
@@ -16416,6 +16426,10 @@ class FCToolGUI:
         self._motd_template_dirty = False
         self._motd_update_dirty_indicator()
         self._rebuild_motd_preview()
+        # Clear blanks the doctrine combo, so the Refits ▾ button must go with
+        # it — a button offering swaps in a doctrine nothing is showing is the
+        # same class of lie as the push guard above.
+        self._refits_update_buttons()
 
     def _clear_motd(self):
         """'Clear MOTD' button: wipe the local builder, then — if the active FC
@@ -23332,13 +23346,19 @@ class FCToolGUI:
            a previews-off box is a full window enumeration.
         3. The sender must own one of the owner's live client windows. That
            list is BOTH the own-character gate and the source of the toast's
-           rect, so the two can never disagree about who counts. Unlike the
-           range check there is no is_iconic branch: a minimized client means
-           no rect, which the toast's own placement already refuses, and the
-           swap itself is worth doing either way — but see the toast call.
-        4. The per-sender cooldown, consulted LAST so a line dropped by an
-           earlier gate never burns it. It exists only so a double-send cannot
-           double-swap; ChatMonitor already drops duplicate deliveries.
+           rect, so the two can never disagree about who counts.
+        4. That window must not be minimized — the range check's gate, for a
+           sharper reason here. A minimized client's rect is off-screen but
+           NOT degenerate, so `client_toast.place_over` happily places the
+           toast there: the FC would get no feedback at all, and an ambiguity
+           chooser would be an invisible, unclickable window holding a swap
+           that never happens. Refusing the whole command is the honest
+           outcome, and it is logged once per character.
+        5. The per-sender cooldown, consulted LAST so a line dropped by an
+           earlier gate never burns it — a command skipped for a minimized
+           client must work the moment the FC restores the window and retypes.
+           It exists only so a double-send cannot double-swap; ChatMonitor
+           already drops duplicate deliveries.
 
         Never raises into the poll loop."""
         try:
@@ -23370,6 +23390,19 @@ class FCToolGUI:
                     log.debug("[refit] %s is not one of the owner's live "
                               "characters - command ignored", key)
                 return
+            if client.is_iconic:
+                # Ours, but minimized: the toast would land off-screen and an
+                # ambiguity chooser would be unclickable. Once per character,
+                # so a repeat cannot spam the log. ASCII only -- this box's
+                # console is cp1252.
+                no_client = getattr(self, "_refit_no_client", None)
+                if no_client is None:
+                    no_client = self._refit_no_client = set()
+                if key not in no_client:
+                    no_client.add(key)
+                    log.warning("[refit] no on-screen EVE client for %s - "
+                                "refit command skipped", key)
+                return
             cooldown = getattr(self, "_refit_cooldown", None)
             if cooldown is None:
                 cooldown = self._refit_cooldown = refit_command.Cooldown()
@@ -23380,11 +23413,38 @@ class FCToolGUI:
         except Exception:
             log.exception("[refit] chat hook failed")
 
+    def _refit_command_doctrine(self):
+        """THE doctrine a fleet-chat refit command acts on.
+
+        **The composer's doctrine when it has one, else the Fleet tab's.**
+        Deliberately NOT `_active_fleet_doctrine` (which prefers the Fleet
+        combo): the command's whole point is that the fleet is told in-game, so
+        it has to swap inside the doctrine the MOTD push will serialise. Those
+        two selectors diverge by default on a fresh start — the Fleet combo is
+        restored from `fleet.active_doctrine`, the composer's opens on the
+        alphabetically first doctrine — and the divergence was silently
+        dangerous: the swap landed in doctrine A, `_after_refit_change`'s
+        same-doctrine gate then skipped the composer, and the push PUT
+        doctrine B's unrelated draft over the live fleet MOTD while the toast
+        said it had pushed (caught in review, 2026-09-12).
+
+        Falls back to the Fleet tab when the composer has no doctrine at all
+        (an empty library, or the MOTD sub-tab never built) — and then
+        `_motd_push_after_refit`'s id guard is what keeps the report honest.
+        Guarded: `_motd_selected_doctrine` reads a Tk var that may not exist."""
+        try:
+            doctrine = self._motd_selected_doctrine()
+        except Exception:
+            doctrine = None
+        if doctrine is not None:
+            return doctrine
+        return self._active_fleet_doctrine()
+
     def _refit_resolve_and_apply(self, cmd, client_rect):
-        """Tk thread: resolve a parsed Command against the ACTIVE doctrine.
+        """Tk thread: resolve a parsed Command against the target doctrine.
 
         The main thread's half of the chat hook, and the only reason the split
-        exists: _active_fleet_doctrine reads Tk StringVars, which may only ever
+        exists: the doctrine selectors read Tk StringVars, which may only ever
         happen here. ``refit_command.resolve`` is pure — it walks the
         doctrine's members and reads fits through the store's getter, mutates
         nothing, and a doctrine is a handful of slots — so doing it on this
@@ -23395,16 +23455,18 @@ class FCToolGUI:
         Resolution: the ambiguity chooser re-enters it with a promoted swap and
         must not re-resolve anything."""
         try:
-            doctrine = self._active_fleet_doctrine()
+            doctrine = self._refit_command_doctrine()
             resolution = refit_command.resolve(
                 doctrine, self.fittings.get_fit, cmd)
         except Exception:
             log.exception("[refit] resolving a chat command failed")
             return
-        self._refit_apply_resolution(resolution, client_rect,
-                                     getattr(doctrine, "id", None))
+        self._refit_apply_resolution(
+            resolution, client_rect, getattr(doctrine, "id", None),
+            str(getattr(doctrine, "name", "") or ""))
 
-    def _refit_apply_resolution(self, res, client_rect, doctrine_id):
+    def _refit_apply_resolution(self, res, client_rect, doctrine_id,
+                                doctrine_name=""):
         """Tk thread: carry out ONE Resolution and report it over the client.
 
         Tk-thread ONLY — it writes the store, re-renders panes through
@@ -23421,37 +23483,47 @@ class FCToolGUI:
 
         Re-entered by the ambiguity chooser with a swap Resolution built from
         the clicked option, which is why the toast is raised through one
-        helper."""
+        helper.
+
+        ``doctrine_name`` names the doctrine in the toast's TITLE, for every
+        outcome. The FC can be looking at three doctrines at once (the Fleet
+        combo, the composer, whatever the Doctrines pane shows), so a bare
+        "Refit: Muninn → Muninn AC" does not say WHICH library row moved —
+        and after the selector divergence found in review, saying so is the
+        point."""
+        title = f"Refit ({doctrine_name})" if doctrine_name else "Refit"
         try:
             kind = getattr(res, "kind", "")
             message = getattr(res, "message", "") or ""
             if kind == "swap":
                 lines = [message]
                 if self._refits_swap(getattr(res, "fit_id", None), doctrine_id):
-                    lines.append(self._motd_push_after_refit())
-                self._refit_show_toast(lines, (), client_rect)
+                    lines.append(self._motd_push_after_refit(doctrine_id))
+                self._refit_show_toast(lines, (), client_rect, title=title)
                 return
             if kind == "reset":
                 changed = self._refits_reset(doctrine_id)
                 lines = [f"Refits reset to defaults ({changed})"]
                 if changed:
-                    lines.append(self._motd_push_after_refit())
-                self._refit_show_toast(lines, (), client_rect)
+                    lines.append(self._motd_push_after_refit(doctrine_id))
+                self._refit_show_toast(lines, (), client_rect, title=title)
                 return
             if kind == "ambiguous":
                 options = tuple(getattr(res, "options", ()) or ())
                 self._refit_show_toast(
                     [message or "Which refit?"], options, client_rect,
                     on_pick=lambda fit_id: self._refit_pick_option(
-                        res, fit_id, client_rect, doctrine_id))
+                        res, fit_id, client_rect, doctrine_id, doctrine_name),
+                    title=title)
                 return
             # noop / error / anything unknown: say so, change nothing.
-            self._refit_show_toast([message], (), client_rect)
+            self._refit_show_toast([message], (), client_rect, title=title)
         except Exception:
             log.exception("[refit] applying a %r resolution failed",
                           getattr(res, "kind", ""))
 
-    def _refit_pick_option(self, res, fit_id, client_rect, doctrine_id):
+    def _refit_pick_option(self, res, fit_id, client_rect, doctrine_id,
+                           doctrine_name=""):
         """An ambiguity row was clicked: re-enter the swap path for that fit.
 
         Built with ``dataclasses.replace`` rather than a hand-rolled
@@ -23467,9 +23539,11 @@ class FCToolGUI:
         chosen = dataclasses.replace(
             res, kind="swap", fit_id=fit_id, options=(),
             message=f"Refit: {label}" if label else "Refit applied")
-        self._refit_apply_resolution(chosen, client_rect, doctrine_id)
+        self._refit_apply_resolution(chosen, client_rect, doctrine_id,
+                                     doctrine_name)
 
-    def _refit_show_toast(self, lines, options, client_rect, on_pick=None):
+    def _refit_show_toast(self, lines, options, client_rect, on_pick=None,
+                          title="Refit"):
         """Raise the refit outcome over the posting client's window.
 
         ONE live refit toast at a time -- a newer outcome replaces the older
@@ -23485,7 +23559,7 @@ class FCToolGUI:
                 previous.dismiss()
                 self._refit_toast = None
             toast = refit_toast.RefitToast(
-                self.root, "Refit", [ln for ln in lines if ln], tuple(options),
+                self.root, title, [ln for ln in lines if ln], tuple(options),
                 on_pick=on_pick if on_pick is not None else (lambda _fid: None),
                 on_dismiss=lambda: setattr(self, "_refit_toast", None))
             self._refit_toast = toast
@@ -23493,14 +23567,24 @@ class FCToolGUI:
         except Exception:
             log.exception("[refit] toast failed")
 
-    def _motd_push_after_refit(self) -> str:
+    def _motd_push_after_refit(self, doctrine_id=None) -> str:
         """Push the recomposed MOTD to the fleet after a chat-command refit.
 
         Returns the toast's SECOND LINE -- the FC has to be able to read, from
         the same window that confirmed the swap, whether the fleet was told.
 
-        Three outcomes, in order:
+        Four outcomes, in order:
 
+        * ``doctrine_id`` names a doctrine the COMPOSER is not showing -- the
+          markup this method would serialise belongs to a different doctrine
+          than the one that was just swapped, so pushing it would PUT an
+          unrelated draft over the live fleet MOTD. Checked FIRST, before the
+          armed-link branch, so that branch can never claim an auto-update
+          will carry a change it will not: `_after_refit_change`'s autopush
+          sits inside the same same-doctrine gate and would also have skipped.
+          (Belt-and-braces: `_refit_command_doctrine` already prefers the
+          composer, so this only fires on the empty-composer fallback -- but
+          the hazard it guards was a real, silent, live-MOTD-clobbering bug.)
         * the auto-update link is ARMED -- _after_refit_change already ran
           _motd_maybe_autopush inside the same-doctrine gate, so pushing again
           here would be a second ESI write of identical markup;
@@ -23516,6 +23600,13 @@ class FCToolGUI:
 
         Tk thread only (it reads the composer's widgets); the PUT is the
         worker's."""
+        if doctrine_id is not None:
+            try:
+                shown = self._motd_selected_doctrine()
+            except Exception:
+                shown = None
+            if getattr(shown, "id", None) != doctrine_id:
+                return "(MOTD not pushed — composer shows another doctrine)"
         if getattr(self, "_motd_link_enabled", False):
             return "MOTD auto-update will push"
         if not getattr(self, "_motd_is_boss", False) or \
