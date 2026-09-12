@@ -9874,7 +9874,31 @@ class FCToolGUI:
         if not isinstance(block, dict):
             block = ozone_watch.normalize_config(None)
             self.config["ozone_watch"] = block
-        block["enabled"] = bool(self._ozone_enabled_var.get())
+        enabled = bool(self._ozone_enabled_var.get())
+        block["enabled"] = enabled
+        if enabled:
+            # Switching ON forgets every prior sample.
+            #
+            # While the feature is off _ozone_observe returns at the master
+            # gate, BEFORE it refreshes _ozone_prev -- but _ozone_prune runs
+            # from the poll loop regardless and keeps the key alive. So without
+            # this the first pass after re-enabling would compare a fresh
+            # sample against an arbitrarily old (docked, online) and read a
+            # phantom undock: a toast for a hull the pilot left an hour ago.
+            #
+            # _ozone_started_at is cleared with it, and that is the load-bearing
+            # half: an empty _ozone_prev makes the next sighting a FIRST
+            # sighting, which past the grace window counts as a login (see
+            # _ozone_observe). Re-enabling is exactly the startup case -- the
+            # whole roster is already there and none of it just logged in -- so
+            # the grace window has to restart too, or the phantom undock is
+            # simply traded for a phantom login.
+            #
+            # Both writes are single, atomic rebinds on a plain dict/attribute;
+            # a poller pass racing this can only lose the sample it was about
+            # to take, which is the outcome we are asking for anyway.
+            self._ozone_prev.clear()
+            self._ozone_started_at = None
         self._save_config()
         self._refresh_ozone_tooltip()
 
