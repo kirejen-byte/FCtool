@@ -315,7 +315,13 @@ def _begin_hidden(win):
     BEFORE touching alpha — free of the usual flash cost, because the window is
     still invisible while it moves.
 
-    The caller's own alpha is saved and put back, never a hard-coded 1.0.
+    The caller's own alpha is saved and put back, never a hard-coded 1.0 — and
+    a window that is ALREADY at alpha 0 is left alone entirely (None, no
+    restore). That is the nested-hide case: ``make_modal`` hides a dialog for
+    the build and the builder's own closing ``center_over`` re-enters here.
+    Without the guard the inner call reads 0.0 as the caller's own value and
+    its restore writes 0.0 back — a permanently blank dialog, saved today only
+    by the outer restore happening to run last. The outer hide owns the reveal.
 
     ``wm_withdraw`` survives only as the fallback for a platform/toolkit that
     refuses ``-alpha``, and it is a LOSSY one. The focus record is captured
@@ -336,23 +342,42 @@ def _begin_hidden(win):
     except Exception:
         return None
 
+    unsupported = object()
     try:
         prev_alpha = win.wm_attributes("-alpha")
-        win.wm_attributes("-alpha", 0.0)
     except Exception:
-        pass
-    else:
-        def _restore_alpha():
-            try:
-                win.update_idletasks()       # apply the move BEFORE the alpha
-            except Exception:                # SetWindowPos can discard it
-                pass
-            try:
-                win.wm_attributes(
-                    "-alpha", 1.0 if prev_alpha is None else prev_alpha)
-            except Exception:
-                pass
-        return _restore_alpha
+        prev_alpha = unsupported
+    if prev_alpha is not unsupported:
+        try:
+            already_hidden = prev_alpha is not None and float(prev_alpha) <= 0.0
+        except (TypeError, ValueError):
+            already_hidden = False
+        if already_hidden:
+            # A NESTED hide: the window is invisible already, so there is
+            # nothing to hide and — critically — nothing to restore. Hiding
+            # again would read that 0.0 as "the caller's own alpha" and the
+            # restore would write 0.0 straight back, leaving the dialog
+            # permanently blank. Live shape: make_modal hides a dialog for the
+            # build, and the builder's own closing center_over re-enters here
+            # (market_gap_dialog does exactly that). The OUTER hide owns the
+            # reveal; this one declines.
+            return None
+        try:
+            win.wm_attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        else:
+            def _restore_alpha():
+                try:
+                    win.update_idletasks()   # apply the move BEFORE the alpha
+                except Exception:            # SetWindowPos can discard it
+                    pass
+                try:
+                    win.wm_attributes(
+                        "-alpha", 1.0 if prev_alpha is None else prev_alpha)
+                except Exception:
+                    pass
+            return _restore_alpha
 
     # Fallback only. Capture the focus record first -- wm_withdraw destroys it.
     try:
