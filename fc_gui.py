@@ -1090,6 +1090,17 @@ _IMPLANT_TOOLTIP_BASE = (
 # uncommitted local line and is not this task's file to touch.
 _ASSETS_SCOPE = "esi-assets.read_assets.v1"
 
+# "Watch my ozone": how long after the first observation a character's FIRST
+# sighting still reads as "FCTool just started" rather than "this pilot just
+# logged in". The poller's roster holds only CONNECTED characters, so a client
+# at the login screen is never polled and an offline->online transition is
+# nearly unreachable -- a pilot logging in mid-session simply APPEARS in the
+# roster. Treating a first sighting as a login is therefore what makes the
+# owner's "logs in" trigger work at all; this window is what stops it firing
+# for the whole roster during startup. Two minutes comfortably covers the
+# staggered first pass over every character.
+_OZONE_LOGIN_GRACE_S = 120.0
+
 
 def _ozone_fill_cyno(info, generator_type_id, ozone, cfg):
     """Fill ``info``'s four cyno keys from ONE (generator, ozone) pair.
@@ -1563,6 +1574,10 @@ class FCToolGUI:
         # _ozone_watch_state) -- nothing else in it comes from config, so
         # _save_settings' config replacement needs no re-point here.
         self._ozone_state = None               # ozone_watch.WatchState (lazy)
+        self._ozone_state_lock = threading.Lock()   # guards that lazy BUILD only
+        # Monotonic stamp of the first observation, so "first sighting" can be
+        # told from "FCTool just started" -- see _ozone_observe's login edge.
+        self._ozone_started_at = None
         self._ozone_toast = None               # the single live ClientToast, if any
         self._ozone_prev = {}                  # char key -> (docked, online) last sample
         self._ozone_ship = {}                  # char key -> (ship_type_id, ship_item_id)
@@ -9861,6 +9876,19 @@ class FCToolGUI:
             self.config["ozone_watch"] = block
         block["enabled"] = bool(self._ozone_enabled_var.get())
         self._save_config()
+        self._refresh_ozone_tooltip()
+
+    def _refresh_ozone_tooltip(self):
+        """Re-stash the ⓘ hover from live config.
+
+        The hover names the threshold and the assumed skill level, both of
+        which a hand-edited config can change, so it cannot be a build-time
+        constant. Through ``update_tooltip``, never ``attach_tooltip`` -- the
+        latter's binds use ``add="+"`` and re-attaching leaks one handler set
+        per call (the implant sibling's rule). Safe before the tab exists."""
+        icon = getattr(self, "_ozone_help_icon", None)
+        if icon is not None:
+            update_tooltip(icon, self._ozone_tooltip_text())
 
     def _ozone_tooltip_text(self) -> str:
         """The ⓘ hover for the tick. Names the live threshold, and DISCLOSES the
@@ -9885,7 +9913,8 @@ class FCToolGUI:
                 f"with fewer than {need} lights of Liquid Ozone aboard. Cost "
                 f"uses the fitted generator and hull bonuses; skills are "
                 f"assumed at Cynosural Field Theory {rank} (ESI skills are "
-                f"not authorised).")
+                f"not authorised). Requires native previews (the location "
+                f"poller and game-log watcher run with them).")
 
     def _populate_character_panels(self):
         """Build the character panels from scratch (static layout, no ESI calls)."""
@@ -9975,7 +10004,10 @@ class FCToolGUI:
         # "Save my implants" staging line must never survive a Settings >
         # Staging System edit stale, and this is the one seam both the tab-show
         # (_on_tab_changed) and the Refresh All button already run through.
+        # Its sibling hover follows the same rule, for the same reason: the
+        # ozone threshold it names is config and can change under it.
         self._refresh_implant_staging_label()
+        self._refresh_ozone_tooltip()
         if not self.esi_accounts:
             self._populate_character_panels()
             return
@@ -10584,10 +10616,17 @@ class FCToolGUI:
                     elif ship_check.get("has_cyno"):
                         info["cyno"] = True
                         info["cyno_ozone"] = int(ship_check.get("ozone", 0) or 0)
-                        info["cyno_lights"] = int(ship_check.get("lights", 0) or 0)
+                        # An entry with no "lights" either is pre-upgrade: the
+                        # generator is unknown, so the cost is unknown and the
+                        # lights count is UNKNOWABLE. Claim nothing -- reading
+                        # a missing count as 0 painted [LOW OZONE] in red over
+                        # a full hold, which is worse than saying less.
+                        known = "lights" in ship_check
+                        info["cyno_lights"] = int(ship_check.get("lights") or 0)
                         info["cyno_text"] = f"{info['cyno_ozone']} ozone"
-                        info["cyno_low"] = (info["cyno_lights"]
-                                            < ozone_cfg["min_activations"])
+                        info["cyno_low"] = bool(
+                            known and info["cyno_lights"]
+                            < ozone_cfg["min_activations"])
             # Fold in the currently-piloted capital (from the fresh get_ship_type
             # signal, NOT the 10-min asset cache) so a titan/dread/blops/FAX flown
             # right now — including in space — is a filter/card member.
@@ -23237,14 +23276,56 @@ class FCToolGUI:
         ``_save_settings`` replacing ``self.config`` cannot leave it stale --
         every caller re-reads the block and this re-derives the threshold. A
         rebuild drops the latches, which is correct: a changed threshold is a
-        changed question and every character deserves a fresh answer."""
+        changed question and every character deserves a fresh answer.
+
+        LOCKED, because this is reached from TWO threads -- the ESI poller and
+        the Tk thread (the gamelog hook). Unlocked, a poll pass and a cyno-lit
+        line arriving together could each build their own WatchState, and the
+        loser's latch and last-known figure would vanish into an orphan the
+        moment the winner's reference won the attribute. The object itself is
+        internally locked; this guards only the BUILD."""
         want = int(cfg.get("min_activations",
                            ozone_watch.DEFAULTS["min_activations"]))
-        state = self._ozone_state
-        if state is None or state.min_activations != want:
-            state = self._ozone_state = ozone_watch.WatchState(
-                min_activations=want)
-        return state
+        with self._ozone_state_lock:
+            state = self._ozone_state
+            if state is None or state.min_activations != want:
+                state = self._ozone_state = ozone_watch.WatchState(
+                    min_activations=want)
+            return state
+
+    def _ozone_prune(self, keys):
+        """Drop every watched character not in ``keys`` (the poller's CURRENT
+        roster). Called once per poller pass, on the poller thread.
+
+        Four dicts and a set hang off a character key, plus the engine's own
+        latch. Without this they accumulate for every character ever previewed
+        in a session and, worse, go STALE: a client closed and reopened an hour
+        later would come back with its old ``(docked, online)`` sample, its old
+        ship memo and its old latch, so the first poll pass could read a
+        phantom undock edge off a sample from the previous session -- or,
+        having latched then, stay silent on a genuinely low hold now. Dropping
+        a character is the honest answer: the next sighting starts clean, and
+        the login grace window (see _ozone_observe) is what keeps a whole
+        roster re-appearing at startup from firing.
+
+        Tk-free and marshals nothing. Never raises."""
+        try:
+            live = {str(k or "").strip().lower() for k in (keys or ())}
+            gone = [k for k in self._ozone_prev if k not in live]
+            state = self._ozone_state
+            for key in gone:
+                self._ozone_prev.pop(key, None)
+                self._ozone_ship.pop(key, None)
+                self._ozone_scope_logged.discard(key)
+                if state is not None:
+                    state.forget(key)
+            if gone:
+                dead = set(gone)
+                for cache_key in [k for k in self._ozone_asset_cache
+                                  if k[0] in dead]:
+                    self._ozone_asset_cache.pop(cache_key, None)
+        except Exception:
+            log.exception("[ozone] roster prune failed")
 
     def _ozone_observe(self, key, name, loc, online, ship, auth, now):
         """Poller-thread hook: advance ONE character by one poll pass.
@@ -23267,22 +23348,35 @@ class FCToolGUI:
             location call that answered nothing leaves `docked` carried forward,
             so a failed poll can never fabricate an edge;
           * login = the previous sample was explicitly offline and this one is
-            online. Strictly False->True: a character already online at startup
-            is NOT a login, and treating it as one would pull assets for every
-            cyno-capable character every time FCTool starts.
+            online (strictly False->True), OR this character's FIRST sighting
+            once FCTool has been up for _OZONE_LOGIN_GRACE_S. The second half is
+            not belt-and-braces: the poller's roster is built from CONNECTED
+            characters, so a client sitting at the login screen is not polled at
+            all and False->True is nearly unreachable in practice -- a character
+            logging in mid-session simply APPEARS. The grace window is what
+            keeps that from firing for the whole roster at startup, which is the
+            case the strict rule was protecting.
 
         WHAT AN EDGE COSTS. A scope-less token, a non-cyno hull or an unknown
         ship all return before /assets/ is touched. Past those, the per-ship
         cache (``asset_ttl_s``, 600 s) answers a redock/undock inside ten
         minutes for free -- ESI's own cache on that endpoint is longer anyway.
 
-        A FAILED PULL IS NO SAMPLE. get_assets() returns [] for a 403 and for a
-        genuinely empty hangar alike, and it breaks out of its pagination loop
-        on any error -- so an empty list cannot be told from a partial one. It
-        is therefore treated as "we learned nothing": nothing is cached, the
-        latch is untouched, and the next edge asks again. Inventing a
-        zero-ozone reading here would fire a spurious toast, which is the one
-        failure that gets a feature switched off.
+        THE HULL IS RE-READ ON AN EDGE. The poller fetches /ship/ only every
+        Nth pass, so the memo can be up to ~20 s stale -- and the canonical
+        flow is exactly that window: dock in one hull, swap into the cyno ship,
+        undock. A stale memo would scan the PREVIOUS ship's item id and report
+        its hold. Edges are rare and an assets pull follows anyway, so the edge
+        pays for one /ship/ (itself memoised in ESIAuth for _POLL_MEMO_TTL_S).
+        The memo survives only as the fallback for a FAILED re-read.
+
+        A PARTIAL PULL IS NO SAMPLE. ``get_assets(with_status=True)`` reports
+        whether pagination actually ran to completion, because every failure in
+        it -- a 403, a dead token, a non-ok page, a raised request -- returns a
+        SHORT list rather than an error. A truncated list reads as "generator
+        fitted, empty hold" and would fire a confident, wrong toast and then
+        cache it for ten minutes. So an incomplete pull is "we learned
+        nothing": nothing cached, latch untouched, next edge asks again.
 
         Never raises -- a broken watch must not take the poller down."""
         try:
@@ -23292,17 +23386,16 @@ class FCToolGUI:
             key = str(key or "").strip().lower()
             if not key:
                 return
+            if self._ozone_started_at is None:
+                self._ozone_started_at = now
 
+            first_sighting = key not in self._ozone_prev
             prev_docked, prev_online = self._ozone_prev.get(key, (None, None))
 
-            # Remember the freshest ship we have seen. The poller fetches /ship/
-            # only every Nth pass (or on a system change), and an undock inside
-            # one system is exactly a pass where it does not -- so the memo, not
-            # a re-fetch, is what makes ship_item_id available on the edge.
+            # The freshest ship this pass carried, if it carried one.
             if isinstance(ship, dict) and ship.get("ship_type_id"):
                 self._ozone_ship[key] = (ship.get("ship_type_id"),
                                          int(ship.get("ship_item_id") or 0))
-            ship_type_id, ship_item_id = self._ozone_ship.get(key, (None, 0))
 
             docked = prev_docked
             if loc:
@@ -23311,7 +23404,10 @@ class FCToolGUI:
                 docked, prev_online if online is None else bool(online))
 
             undocked = prev_docked is True and docked is False
-            logged_in = prev_online is False and online is True
+            logged_in = (
+                (prev_online is False and online is True)
+                or (first_sighting
+                    and (now - self._ozone_started_at) > _OZONE_LOGIN_GRACE_S))
             if not (undocked or logged_in):
                 return
 
@@ -23321,6 +23417,20 @@ class FCToolGUI:
                     log.warning("[ozone] %s has no %s - ozone watch skipped "
                                 "for this character", key, _ASSETS_SCOPE)
                 return
+
+            # Re-read the hull unless THIS pass already brought one (see the
+            # docstring): a swap inside the poller's ship-fetch interval is the
+            # normal way a pilot gets into a cyno ship.
+            if not (isinstance(ship, dict) and ship.get("ship_type_id")):
+                try:
+                    fresh = auth.get_ship_type() or {}
+                except Exception:
+                    fresh = {}
+                if fresh.get("ship_type_id"):
+                    self._ozone_ship[key] = (fresh.get("ship_type_id"),
+                                             int(fresh.get("ship_item_id") or 0))
+            ship_type_id, ship_item_id = self._ozone_ship.get(key, (None, 0))
+
             if not ship_type_id:
                 return
             catalog = getattr(self, "type_catalog", None)
@@ -23339,10 +23449,10 @@ class FCToolGUI:
                 cargo = entry[1]
             else:
                 try:
-                    assets = auth.get_assets()
+                    assets, complete = auth.get_assets(with_status=True)
                 except Exception:
-                    assets = None
-                if not assets:
+                    assets, complete = None, False
+                if not assets or not complete:
                     return                      # no sample; nothing cached
                 cargo = ozone_watch.scan_ship_assets(assets, ship_item_id)
                 self._ozone_asset_cache[cache_key] = (now, cargo)
@@ -23436,8 +23546,12 @@ class FCToolGUI:
                 self._ozone_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
-                log.warning("[ozone] no on-screen EVE client for %s - "
-                            "toast skipped", key)
+                # The other way this feature can "not fire": the engine did its
+                # job and the toast had nowhere to sit. The BODY goes in the
+                # line too, so a skipped warning is still a warning somewhere
+                # -- a log that only says "skipped" cannot be told from noise.
+                log.warning("[ozone] no on-screen EVE client for %s - toast "
+                            "skipped: %s", char_name or key, body)
                 return
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
             toast = client_toast.ClientToast(
@@ -24247,6 +24361,12 @@ class FCToolGUI:
                 # who is on screen right now? (mode-routed: eveo thumbs vs native
                 # client tiles — either way it feeds the SAME _overlay_states dict)
                 names = self._preview_tracked_names()
+                # "Watch my ozone" keeps per-character state off this roster;
+                # prune it here, where the roster is known. getattr-guarded for
+                # the bare test hosts, the house pattern.
+                _ozp = getattr(self, "_ozone_prune", None)
+                if _ozp is not None:
+                    _ozp(names)
                 if not names:
                     stop.wait(1.0)
                     continue

@@ -1013,13 +1013,31 @@ class ESIAuth:
 
     # ── Assets ───────────────────────────────────────────────────────────────
 
-    def get_assets(self) -> list[dict]:
+    def get_assets(self, *, with_status: bool = False):
         """Get all character assets (auto-paginated).
-        Returns flat list of asset items with type_id, location_id, etc.
-        Returns empty list if the esi-assets scope is not granted."""
+
+        Returns a flat list of asset items with type_id, location_id, etc.
+
+        **Every failure mode here returns a SHORT list, not an exception.** A
+        403, a missing token, a non-ok page and a raised request all leave the
+        loop with whatever pages already landed — so the returned list can be
+        empty, complete, or silently TRUNCATED mid-pagination, and the caller
+        cannot tell those apart. That is fine for a reader asking "does this
+        character own a dreadnought?" (a false negative costs a missing row) and
+        actively dangerous for one asking "how much is in this ship's hold?" —
+        a truncated pull reads as an EMPTY hold, which is a confident wrong
+        answer rather than a missing one.
+
+        ``with_status=True`` is the honest shape for the second kind of caller:
+        it returns ``(assets, complete)`` where ``complete`` is False if ANY
+        page was refused, errored or raised, and True only when pagination ran
+        to ``x-pages``. The default call shape is unchanged, so every existing
+        caller keeps today's behaviour.
+        """
         if not self._character_id:
-            return []
+            return ([], False) if with_status else []
         all_assets = []
+        complete = False
         page = 1
         while True:
             token = self.access_token
@@ -1036,19 +1054,21 @@ class ESIAuth:
                 if resp.status_code == 403:
                     # Scope not granted — silently return empty
                     print(f"[ESI] Assets scope not granted for {self._character_name}")
-                    return []
+                    return ([], False) if with_status else []
                 if not resp.ok:
                     break
                 items = resp.json()
                 all_assets.extend(items)
                 total_pages = int(resp.headers.get("x-pages", 1))
                 if page >= total_pages:
+                    # The ONLY exit that saw every page ESI said there were.
+                    complete = True
                     break
                 page += 1
             except Exception as e:
                 print(f"[ESI] Assets page {page} error: {e}")
                 break
-        return all_assets
+        return (all_assets, complete) if with_status else all_assets
 
     # ── Fleet ────────────────────────────────────────────────────────────────
 
