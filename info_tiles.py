@@ -1837,6 +1837,11 @@ def battle_lines(view) -> tuple:
 # something to say" can never disagree:
 #
 #   fleet   the ESI fleet poll (``fleet_state``) reports a fleet id;
+#   xup     the SAME ``fleet_state`` fleet id as the fleet tile (2026-09-12,
+#           owner: only show the x-up counter while actually in a fleet) --
+#           the count itself keeps accumulating off-seam (``xup_counter`` is
+#           chat-fed, independent of this gate), so re-entering a fleet shows
+#           the live total immediately rather than a reset one;
 #   battle  the battle ledger's OWN view says it is showing (``visible``) --
 #           its ARMED/FILLING/SETTLED lifecycle is the authority, and a
 #           dismissed or reset ledger hides the tile with it;
@@ -3481,9 +3486,13 @@ class InfoTileController:
         is what makes the owner's memory work -- see ``set_tile_enabled``.
 
         Unregistered keys and ``intel`` answer True: an intel tile is a
-        standing watch with no idle state to gate on.
+        standing watch with no idle state to gate on. ``xup`` (2026-09-12) is
+        NOT unregistered any more -- it shares the fleet tile's exact
+        ``fleet_state`` gate rather than answering always, because the x-up
+        counter overlay only makes sense while its primary character is in a
+        fleet to x-up for.
         """
-        if key == "fleet":
+        if key in ("fleet", "xup"):
             state = _call(getattr(self._host, "fleet_state", None),
                           default=_UNKNOWN)
             return state is _UNKNOWN or fleet_is_live(state)
