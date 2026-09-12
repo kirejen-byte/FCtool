@@ -287,6 +287,9 @@ class InfoTileWindow:
         fg_dim = self._palette.get("FG_DIM", ui_theme.FG_DIM)
         self._fg_dim = fg_dim
         self._fg_close_hot = self._palette.get("FG_RED", ui_theme.FG_RED)
+        # Action glyphs hover ACCENT, not the ✕'s red: red is this strip's
+        # "this closes something" colour and an action glyph is not that.
+        self._fg_action_hot = self._palette.get("FG_ACCENT", ui_theme.FG_ACCENT)
 
         self.top = tk.Toplevel(root)
         self.top.overrideredirect(True)
@@ -317,11 +320,24 @@ class InfoTileWindow:
         # exactly ONCE, here, and nothing on the 1 Hz render beat ever touches
         # them again -- chrome costs nothing per tick, which is the rule the
         # whole HUD family lives by.
-        # A malformed entry is dropped rather than raised: the registry that
-        # supplies these is data, and one bad tuple must not cost the tile.
+        # ORDER: with side="right" the FIRST list entry is packed first and so
+        # lands RIGHTMOST -- nearest the ✕ -- and later entries march leftward
+        # toward the title. A caller reading the list left-to-right is reading
+        # it backwards.
+        # Neither the CONTAINER nor an ENTRY is trusted: the registry that
+        # supplies these is data, so a non-iterable degrades to no actions and
+        # one bad tuple costs only its own glyph. Nothing here may take the
+        # tile down -- a tile that failed to construct is swallowed by the
+        # engine into a log line and reads to the owner as a dead feature.
         self._action_lbls = []
         self._action_fns = []
-        for entry in (strip_actions or ()):
+        self._action_pressed = None     # the label whose press is still live
+        try:
+            entries = list(strip_actions or ())
+        except TypeError:
+            log.debug("info tile %s: strip_actions is not iterable", tile_key)
+            entries = []
+        for entry in entries:
             try:
                 glyph, tip, callback = entry
             except (TypeError, ValueError):
@@ -589,11 +605,18 @@ class InfoTileWindow:
         # Action glyphs: same deal. They sit clear of the 12 px 'ne' corner
         # zone (the ✕ and its padding own that), but the toplevel's own
         # <Button-1>/<ButtonRelease-1> still fire for every press anywhere in
-        # its subtree (map/facts.md), so these return "break" too.
+        # its subtree (map/facts.md), so these return "break" too. Each label
+        # carries its OWN identity into every handler by default argument --
+        # a closure over the loop variable would give every glyph the last
+        # one's callback.
         for lbl, fn in zip(self._action_lbls, self._action_fns):
-            lbl.bind("<Button-1>", self._on_action_press)
+            lbl.bind("<Enter>", lambda _e, _l=lbl: self._on_action_enter(_l))
+            lbl.bind("<Leave>", lambda _e, _l=lbl: self._on_action_leave(_l))
+            lbl.bind("<Button-1>",
+                     lambda _e, _l=lbl: self._on_action_press(_l))
             lbl.bind("<ButtonRelease-1>",
-                     lambda _e, _fn=fn: self._on_action_release(_fn))
+                     lambda _e, _l=lbl, _fn=fn: self._on_action_release(_l,
+                                                                        _fn))
 
     # move gestures (shared implementation, one anchor per gesture) ------------
     def _move_press(self, event, slot):
@@ -816,12 +839,42 @@ class InfoTileWindow:
         return "break"
 
     # strip action glyphs ------------------------------------------------------
-    def _on_action_press(self, _event):
+    def _set_action_fg(self, lbl, colour):
+        try:
+            lbl.configure(fg=colour)
+        except tk.TclError:
+            pass
+
+    def _on_action_enter(self, lbl):
+        self._corner = None             # same defence the ✕ keeps
+        self._set_cursor("")
+        self._set_action_fg(lbl, self._fg_action_hot)
+        return "break"
+
+    def _on_action_leave(self, lbl):
+        """Leaving CANCELS a live press, exactly like the ✕'s.
+
+        This is the destructive-action guard: Tk's implicit grab sends the
+        release to the widget that took the press, so without it a user who
+        pressed the reset glyph, thought better of it and dragged off would
+        still have the counter zeroed under his hand. Nothing on this strip
+        may fire on a gesture the user visibly abandoned."""
+        if self._action_pressed is lbl:
+            self._action_pressed = None
+        self._set_action_fg(lbl, self._fg_dim)
+        return "break"
+
+    def _on_action_press(self, lbl):
+        self._action_pressed = lbl
         self._glyph_press()
         return "break"
 
-    def _on_action_release(self, fn):
+    def _on_action_release(self, lbl, fn):
         """Fire one action glyph's callback, absorbing whatever it does.
+
+        Only for a press that is still live ON THIS LABEL -- see
+        ``_on_action_leave``. The latch holds the LABEL rather than a bool so
+        a press on one glyph can never be released by another.
 
         The callback belongs to the HOST (fc_gui), reached through the engine's
         seam table, and it runs on the Tk thread from inside a Tk binding: an
@@ -831,6 +884,9 @@ class InfoTileWindow:
         The message carries the tile KEY and never the glyph: a non-cp1252
         character in a log string raises inside logging on this box
         (map/facts.md)."""
+        if self._action_pressed is not lbl:
+            return "break"
+        self._action_pressed = None
         try:
             if callable(fn):
                 fn()
