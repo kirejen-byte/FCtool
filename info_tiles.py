@@ -2837,7 +2837,13 @@ TILE_SPECS = {
     # the extra 14 px is the DPS/volley row's own budget
     # (`FLEET_STATS_ROW_PX`), added once, after this default is read, never
     # baked into the pin itself.
+    # The ↻ glyph resets LINK tracking (the chat-sourced command-burst
+    # charges), which is what the tile's coverage strip shows: the FC reads
+    # "shield ✗" off the tile, and the moment he wants to re-ask the fleet for
+    # charges is exactly the moment he is looking at it. Same seam-named-here
+    # arrangement as the x-up tile's; see ``strip_actions`` above.
     "fleet": {"title": "Fleet", "default_size": (180, 120),
+              "strip_actions": [("↻", "Reset link tracking", "links_reset")],
               "render": FleetRenderer},
     "intel": {"title": "Intel", "default_size": (380, 220),
               "render": IntelRenderer},
@@ -3175,6 +3181,18 @@ class HudHost:
     #: This feed is CHAT-sourced, so it is deliberately NOT gated by
     #: ``fleet_state`` -- see ``build_links_model``.
     links_snapshot: object = _none
+    #: () -> None -- drop every tracked command-burst charge. Backs the fleet
+    #: tile's ↻ strip glyph (``TILE_SPECS["fleet"]["strip_actions"]`` names
+    #: this attribute), the links twin of ``xup_reset``.
+    #:
+    #: TK THREAD, and from a USER CLICK ONLY -- never the beat. It is the same
+    #: handler the Fleet tab's own ↻ uses, deliberately: one owner, so the
+    #: tile can never empty the tracker without the Specialized Roles area
+    #: being re-rendered from the same cleared state in the same call.
+    #:
+    #: Inert by default like every other seam, and the SPAWN path checks for
+    #: that: a host that never wires it gets NO glyph at all.
+    links_reset: object = _none
     #: () -> (count, threshold, ready) | None -- the fleet x-up counter, read
     #: on the 1 Hz beat like the fleet and battle seams (no push path: chat
     #: polling is slower than the beat, so an event feed would buy nothing).

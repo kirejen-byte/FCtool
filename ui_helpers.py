@@ -79,9 +79,12 @@ The helpers:
 """
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 
 import ui_theme
+
+log = logging.getLogger(__name__)
 
 # Tooltip type is deliberately small/monospace to match the app's Consolas UI.
 _TOOLTIP_FONT = ("Consolas", 8)
@@ -851,3 +854,114 @@ def hide_tooltip(widget):
         except Exception:
             pass
     return widget
+
+
+# ── glyph buttons ───────────────────────────────────────────────────────────
+#: The caption-strip action glyph's press model, lifted out of the FC HUD
+#: chrome so an ordinary tab header can carry the same control (2026-09-12,
+#: the Fleet tab's links reset). ``info_tile`` keeps its OWN copy on purpose:
+#: its glyphs also have to disarm the tile's corner-resize arming and its
+#: strip-drag anchor, neither of which exists outside a HUD tile, and its
+#: handlers return "break" to truncate the toplevel's bindtags. What is
+#: SHARED is the look and the gesture — and those are what this reproduces.
+GLYPH_FONT = ("Consolas", 9, "bold")
+
+
+def make_glyph_button(parent, glyph, tooltip, callback, *, palette=None,
+                      topmost=False):
+    """A flat, one-character text button: a ``tk.Label`` that acts like one.
+
+    Returns the Label, already built but NOT packed — the caller owns layout.
+
+    Why a Label and not a ``ttk.Button``: this is chrome, not a form control.
+    A themed button brings its own border, padding and focus ring, none of
+    which belongs beside a section heading.
+
+    THE GESTURE is the FC HUD's, kept identical so the two surfaces feel the
+    same, and every part of it is load-bearing:
+
+      * hover repaints the glyph ``FG_ACCENT``, so a control with no border
+        still announces that it is one;
+      * a press LATCHES the button and ``<Leave>`` CANCELS the latch. That is
+        the destructive-action guard: Tk's implicit pointer grab delivers the
+        release to the widget that took the press, so without it a user who
+        pressed, thought better of it and dragged off would still have fired
+        the callback. The callbacks this is used for are unconfirmed by
+        design (no "are you sure?" dialog), and dragging off IS the cancel;
+      * the latch is cleared BEFORE the callback runs, so a raising callback
+        cannot leave the button armed;
+      * the callback is swallowed and logged. It runs inside a Tk binding: an
+        exception escaping here reaches ``report_callback_exception`` and
+        costs the user a traceback dialog over his game.
+
+    ``tooltip`` is attached with ``attach_tooltip`` when truthy, and the four
+    binds below ALL pass ``add="+"`` — mandatory, not tidiness: a plain
+    ``bind()`` REPLACES a widget's whole script for that sequence, which
+    silently threw the tip's own ``<Enter>``/``<Leave>`` handlers away the
+    first time this gesture was written (``docs/agents/map/facts.md``).
+
+    ``palette`` (keyword-only): the FC HUD's ``{name: colour}`` dict shape, so
+    a caller inside a tile can hand its own. Anything that is not a dict — and
+    any missing key — falls back to ``ui_theme``, which is what an fc_gui
+    caller wants anyway. ``topmost`` is passed straight through to
+    ``attach_tooltip`` (True only inside an always-on-top window).
+    """
+    pal = palette if isinstance(palette, dict) else {}
+    bg = pal.get("BG_PANEL", ui_theme.BG_PANEL)
+    fg_dim = pal.get("FG_DIM", ui_theme.FG_DIM)
+    fg_hot = pal.get("FG_ACCENT", ui_theme.FG_ACCENT)
+
+    lbl = tk.Label(parent, text=str(glyph), bg=bg, fg=fg_dim,
+                   font=GLYPH_FONT, cursor="hand2")
+    if tooltip:
+        attach_tooltip(lbl, str(tooltip), topmost=topmost)
+
+    # A dict, not a closed-over name: the handlers below are separate
+    # functions and two of them have to WRITE the latch.
+    state = {"pressed": False}
+
+    def _paint(colour):
+        try:
+            lbl.configure(fg=colour)
+        except tk.TclError:
+            pass
+
+    def _enter(_event=None):
+        _paint(fg_hot)
+
+    def _leave(_event=None):
+        state["pressed"] = False
+        _paint(fg_dim)
+
+    def _press(_event=None):
+        state["pressed"] = True
+
+    def _release(_event=None):
+        if not state["pressed"]:
+            return
+        state["pressed"] = False
+        if not callable(callback):
+            return
+        try:
+            callback()
+        except Exception:
+            # ASCII only: a non-cp1252 glyph raises inside logging on this
+            # box, so the message never carries the character itself.
+            log.warning("glyph button action failed", exc_info=True)
+
+    lbl.bind("<Enter>", _enter, add="+")
+    lbl.bind("<Leave>", _leave, add="+")
+    lbl.bind("<Button-1>", _press, add="+")
+    lbl.bind("<ButtonRelease-1>", _release, add="+")
+    # The four handlers, reachable from the widget. This is a TEST SEAM and it
+    # is here because ``event_generate`` reaches nothing on an UNMAPPED widget
+    # (measured, ``docs/agents/map/facts.md``): a headless test can drive the
+    # real gesture through these, and prove the binds themselves with a
+    # bind-script census, without mapping a window. It costs four attributes
+    # and mirrors ``info_tile``'s own glyphs, whose handlers are real methods
+    # for the same reason.
+    lbl._glyph_enter = _enter
+    lbl._glyph_leave = _leave
+    lbl._glyph_press = _press
+    lbl._glyph_release = _release
+    return lbl

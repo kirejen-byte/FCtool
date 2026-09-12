@@ -259,7 +259,8 @@ from ui_theme import (
 # call it themselves, at the END of the builder while the window is still
 # unmapped, so the placement is applied at map time with no visible jump.
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
-                        relift_topmost_tooltips, center_over)
+                        relift_topmost_tooltips, center_over,
+                        make_glyph_button)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -2509,6 +2510,11 @@ class FCToolGUI:
                     getattr(self, "_booster_coverage", {}),
                     getattr(self, "_booster_ship_names", {}),
                     bool(getattr(self, "_booster_is_boss", False))),
+                # The fleet tile's reset glyph. THE Fleet tab's own ↻ handler,
+                # not a charge_tracker.clear() of its own: one owner, so the
+                # tile's press also re-renders the Specialized Roles area from
+                # the same cleared state.
+                links_reset=self._reset_links,
                 # The fleet x-up counter as one count/threshold line. A METHOD,
                 # not a lambda: the shapes it reads (a @property count, a
                 # threshold that lives on the counter and not on the state)
@@ -4273,6 +4279,14 @@ class FCToolGUI:
             "new message REPLACES that pilot's previous set — charges split "
             "across two messages lose the first one. Drag all of a pilot's "
             "charges into a single message. Max 3 per pilot.")
+        # ↻ — drop every tracked link. Same control, same gesture and the same
+        # handler as the FC HUD fleet tile's strip glyph (make_glyph_button
+        # owns the press/leave/release latch, so dragging off cancels); the
+        # Fleet tab's red "Reset" beside the x-up counter is the precedent it
+        # mirrors, one section over.
+        self._links_reset_glyph = make_glyph_button(
+            spec_header_row, "↻", "Reset link tracking", self._reset_links)
+        self._links_reset_glyph.pack(side=tk.LEFT, padx=(5, 0))
         self._spec_roles_blurb = tk.Label(
             comp_right_outer,
             text="Pilots drag burst charges into fleet chat — all in one message.",
@@ -30387,6 +30401,65 @@ class FCToolGUI:
         self.charge_tracker.clear()
         self._booster_roster = {}
         self._schedule_booster_refresh()
+
+    def _reset_links(self):
+        """Drop every tracked command-burst link, NOW. Tk thread, user click only.
+
+        The owner-facing twin of ``_reset_xup``: one handler behind both the
+        Fleet tab's ↻ (beside the Specialized Roles heading) and the FC HUD
+        fleet tile's ↻ strip glyph (``HudHost.links_reset``), so the tile can
+        never empty the tracker without the tab being re-rendered from the same
+        cleared state in the same call. Unconfirmed by design, exactly like the
+        x-up reset — the glyph's drag-off cancel is the only guard.
+
+        WHAT IT CLEARS, and just as importantly what it does NOT:
+
+          * ``ChargeTracker`` — the whole chat-sourced per-pilot charge set.
+            ``clear()`` takes the tracker's own lock, so this is safe against
+            the chat-poll thread's concurrent ``record()``;
+          * the three derived Tk-thread mirrors, through the ONE existing
+            applier ``_apply_booster_compute`` (empty rows, empty hull names,
+            freshly-recomputed all-empty coverage). Going through the applier
+            rather than assigning the attributes here is what makes the reset
+            VISIBLE in the same call: it drives the coverage strip, the boss
+            banner and the Links section. Waiting for
+            ``_schedule_booster_refresh``'s 250 ms debounce plus its worker
+            round-trip would leave the ✓s standing for a beat after the press;
+          * ``_booster_roster`` STAYS. It is fleet-ESI-derived (hull per pilot,
+            rebuilt by ``_update_specialized_roles`` on every fleet poll), not
+            link state — dropping it would flip ``_booster_is_boss`` False and
+            raise the "ship verification unavailable" banner until the next
+            poll, for a button that says "reset link tracking". That is the one
+            line between this and ``_clear_booster_state``, which clears the
+            roster precisely because it runs when the FLEET is gone.
+
+        Also not touched: ``_last_specialized_args``. That is the fleet
+        COMPOSITION snapshot (the HUD fleet tile's comp grid, the MOTD
+        palette's character provider, the MOTD fit deltas) and has nothing to
+        do with links; ``_clear_fleet_snapshot`` owns it.
+
+        Every member is ``getattr``-guarded: tests build partial hosts, and the
+        seam is reachable from a tile press before the Fleet tab is built.
+        """
+        tracker = getattr(self, "charge_tracker", None)
+        coverage = {}
+        if tracker is not None:
+            try:
+                tracker.clear()
+                coverage = tracker.coverage()
+            except Exception as exc:
+                print(f"[Links] reset failed to clear the tracker: {exc}")
+        self._booster_rows_by_name = {}
+        self._booster_ship_names = {}
+        self._booster_coverage = coverage
+        try:
+            self._apply_booster_compute({}, coverage, {})
+        except Exception as exc:
+            # A half-built Fleet tab (or a test host with no widgets) must not
+            # take the press down with it — the tracker is already cleared and
+            # the next refresh repaints from it either way.
+            print(f"[Links] reset could not re-render the panel: {exc}")
+        print("[Links] [Manual Reset] link tracking cleared")
 
     def _open_remove_charge_dialog(self):
         """Modal listing pilots with a tracked command-burst/charge record, each
