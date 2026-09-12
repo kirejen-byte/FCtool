@@ -609,14 +609,27 @@ class InfoTileWindow:
         # carries its OWN identity into every handler by default argument --
         # a closure over the loop variable would give every glyph the last
         # one's callback.
+        # EVERY one of these is add="+", and <Enter>/<Leave> MUST be: this
+        # label already carries attach_tooltip's own <Enter>/<Leave> handlers,
+        # and a plain bind() REPLACES the widget's whole script for that
+        # sequence rather than appending to it -- which silently removed the
+        # tooltip from the glyph (measured; the tip was created and bound, then
+        # thrown away three lines later). add="+" leaves the tip's handler in
+        # front of ours; it returns None, so ours still runs, and our "break"
+        # still truncates the REMAINING BINDTAGS (the toplevel's corner arming)
+        # exactly as before -- "break" stops the bindtag chain, and the tip's
+        # handler has already had its turn.
         for lbl, fn in zip(self._action_lbls, self._action_fns):
-            lbl.bind("<Enter>", lambda _e, _l=lbl: self._on_action_enter(_l))
-            lbl.bind("<Leave>", lambda _e, _l=lbl: self._on_action_leave(_l))
+            lbl.bind("<Enter>", lambda _e, _l=lbl: self._on_action_enter(_l),
+                     add="+")
+            lbl.bind("<Leave>", lambda _e, _l=lbl: self._on_action_leave(_l),
+                     add="+")
             lbl.bind("<Button-1>",
-                     lambda _e, _l=lbl: self._on_action_press(_l))
+                     lambda _e, _l=lbl: self._on_action_press(_l), add="+")
             lbl.bind("<ButtonRelease-1>",
                      lambda _e, _l=lbl, _fn=fn: self._on_action_release(_l,
-                                                                        _fn))
+                                                                        _fn),
+                     add="+")
 
     # move gestures (shared implementation, one anchor per gesture) ------------
     def _move_press(self, event, slot):
