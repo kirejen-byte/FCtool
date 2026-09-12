@@ -2460,6 +2460,10 @@ class FCToolGUI:
                 # are exactly the kind that a lambda gets subtly wrong and
                 # info_tiles' _call then swallows — see _hud_xup_snapshot.
                 xup_snapshot=self._hud_xup_snapshot,
+                # The x-up tile's reset glyph. THE Fleet-tab Reset handler, not
+                # a counter.reset() of its own: one owner, so the tile's press
+                # also refreshes the tab and writes the manual-reset log line.
+                xup_reset=self._reset_xup,
                 # READ-ONLY: the stale-attribution guard that clears this pair on
                 # an ESI rebind stays with its owner (_range_check_own_location).
                 own_system_id=lambda: getattr(self, "_own_location_sid", None),
