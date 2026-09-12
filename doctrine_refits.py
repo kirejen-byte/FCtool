@@ -232,6 +232,7 @@ def menu_spec(doctrine, get_fit) -> MenuSpec:
 # Tk shell — the widgets. Everything above this line is pure (source-guarded).
 # ══════════════════════════════════════════════════════════════════════════════
 import tkinter as tk                                              # noqa: E402
+import tkinter.font as tkfont                                     # noqa: E402
 
 from ui_helpers import attach_tooltip                              # noqa: E402
 from ui_theme import BG_DARK, BG_PANEL, FG_ACCENT, FG_DIM, FG_TEXT  # noqa: E402
@@ -242,6 +243,14 @@ from ui_theme import BG_DARK, BG_PANEL, FG_ACCENT, FG_DIM, FG_TEXT  # noqa: E402
 CHIP_FONT = ("Consolas", 8)
 _CHIP_PADX = 2
 _CHIP_GAP = (0, 3)
+_CAPTION_GAP = (0, 4)
+# Vertical breathing room between two WRAPPED lines of chips (the row's own
+# sub-lines use pady=(1, 0); this matches).
+_LINE_GAP = 1
+# Last-resort per-character width when even the font query fails (Consolas 8
+# measures ~7 px/char on this box) — a wrong-but-sane number beats a 1 px chip
+# that would put every refit back on one line.
+_ESTIMATE_CHAR_PX = 7
 
 # Palette keys a host may override (the strip is also built inside the MOTD/
 # Fleet panes, which are the same BG_PANEL today — the seam exists so a future
@@ -282,24 +291,79 @@ class RefitStrip(tk.Frame):
       ``on_context(fit_id, event)``  right-click on a refit chip.
 
     ``chip_widgets`` (fit id -> Label) is a TEST SEAM and a host seam; renaming
-    it is an API change.
+    it is an API change. So is ``add_widget``, ``line_widgets()`` and
+    ``reflow(width)``.
+
+    **WRAPPING (2026-09-12).** The strip WRAPS to the width it is given and
+    NEVER requests more. Five refits with real fit names measured 1,024 px on
+    one line; the member row's ``info`` column is packed FIRST
+    (``fill=X, expand=True``) and so took the whole row, pack-starving the
+    row's right-hand ``ctrls`` frame — Ideal…/Tags/Remove ended up 1 px wide
+    and unlaid-out — while the chips ran past the detail canvas's clip. Two
+    mechanisms, together:
+
+    * ``pack_propagate(False)`` with ``width=1``: the strip's REQUEST is
+      decoupled from its content, so the row's width is driven by the pane
+      (and by the name label) and never by the number of refits. The cost is
+      that the strip must be GIVEN a width — hence the ``pack``/``grid``
+      overrides below, which add ``fill=x`` / ``sticky=ew`` to whatever the
+      host asked for — and must ask for its own HEIGHT, which the reflow sets.
+      ``fill`` alone only spends space the master already gave the strip, so
+      pack it ``side=TOP`` (the member row's stacked sub-lines, where a
+      ``fill=x`` slave gets the master's full width), or pass ``expand=True``
+      when packing it ``side=LEFT``/``RIGHT`` — otherwise it is handed its
+      1 px request and clips every chip.
+    * a ``<Configure>`` reflow that re-``pack``s the SAME chip Labels into
+      per-line sub-frames. The chips stay children of the strip (Tk lets a
+      slave be packed ``in_`` any descendant of its parent), so
+      ``chip_widgets``, the bindings and the tooltips all survive a reflow —
+      nothing is rebuilt, so nothing can be rebuilt WRONG.
+
+    The reflow is guarded twice — the latched width, then the computed line
+    assignment — because setting the height re-fires ``<Configure>``; without
+    the guards the widget would relayout forever.
     """
 
     def __init__(self, parent, chips, *, on_pick=None, on_add=None,
                  on_context=None, palette=None):
         colours = _palette(palette)
-        super().__init__(parent, bg=colours["bg"])
+        super().__init__(parent, bg=colours["bg"], width=1, height=1)
+        # See the class docstring: the strip must not inflate the row.
+        self.pack_propagate(False)
+        self.grid_propagate(False)
         self._palette_colours = colours
         self._on_pick = on_pick
         self._on_add = on_add
         self._on_context = on_context
         self.chip_widgets: dict[str, tk.Label] = {}
+        # (widget, (padx_left, padx_right)) in draw order — the caption, then a
+        # chip per refit, then the trailing "+".
+        self._items: list[tuple[tk.Widget, tuple[int, int]]] = []
+        self._gaps: dict[tk.Widget, tuple[int, int]] = {}
+        self._lines: list[tk.Frame] = []
+        self._line_of: tuple[int, ...] = ()
+        self._last_width = None
+        self._font = None
 
-        tk.Label(self, text="Refits:", font=CHIP_FONT, fg=colours["dim"],
-                 bg=colours["bg"]).pack(side=tk.LEFT, padx=(0, 4))
+        self._add_item(
+            tk.Label(self, text="Refits:", font=CHIP_FONT, fg=colours["dim"],
+                     bg=colours["bg"]), _CAPTION_GAP)
         for chip in chips or ():
-            self.chip_widgets[chip.fit_id] = self._build_chip(chip)
-        self.add_widget = self._build_add_chip()
+            self.chip_widgets[chip.fit_id] = self._add_item(
+                self._build_chip(chip), _CHIP_GAP)
+        self.add_widget = self._add_item(self._build_add_chip(), _CHIP_GAP)
+
+        # One line until someone tells us how wide we are: an unrealised strip
+        # (no display pass, a 1 px allocation) renders exactly as it did before
+        # wrapping existed.
+        self._apply_layout((0,) * len(self._items))
+        self.bind("<Configure>", self._on_configure, add="+")
+
+    # ── construction ────────────────────────────────────────────────────────
+    def _add_item(self, widget, gap):
+        self._items.append((widget, gap))
+        self._gaps[widget] = gap
+        return widget
 
     def _build_chip(self, chip):
         colours = self._palette_colours
@@ -311,7 +375,6 @@ class RefitStrip(tk.Frame):
             cursor="" if chip.active else "hand2",
             fg=colours["on_accent"] if chip.active else colours["dim"],
             bg=colours["accent"] if chip.active else colours["bg"])
-        label.pack(side=tk.LEFT, padx=_CHIP_GAP)
         if not chip.active:
             label.bind("<Button-1>",
                        lambda ev, f=chip.fit_id: _call(self._on_pick, f))
@@ -326,10 +389,160 @@ class RefitStrip(tk.Frame):
         label = tk.Label(self, text=f" {ADD_GLYPH} ", font=CHIP_FONT,
                          padx=_CHIP_PADX, cursor="hand2",
                          fg=colours["dim"], bg=colours["bg"])
-        label.pack(side=tk.LEFT, padx=_CHIP_GAP)
         label.bind("<Button-1>", lambda ev: _call(self._on_add))
         attach_tooltip(label, "Add a refit to this ship")
         return label
+
+    # ── geometry-manager overrides ──────────────────────────────────────────
+    #
+    # The strip requests 1 px of width ON PURPOSE, so a host that packs it with
+    # no ``fill`` (fc_gui's member row packs ``anchor=W``) would hand it 1 px
+    # and clip every chip. Rather than make every host remember, the strip adds
+    # the fill to its own geometry request; an explicit host value still wins.
+    def pack_configure(self, cnf=None, **kw):
+        opts = dict(cnf or {})
+        opts.update(kw)
+        opts.setdefault("fill", tk.X)
+        super().pack_configure(opts)
+
+    pack = pack_configure
+
+    def grid_configure(self, cnf=None, **kw):
+        opts = dict(cnf or {})
+        opts.update(kw)
+        opts.setdefault("sticky", "ew")
+        super().grid_configure(opts)
+
+    grid = grid_configure
+
+    # ── wrapping ────────────────────────────────────────────────────────────
+    def line_widgets(self) -> list[list[tk.Widget]]:
+        """The current layout: one list of widgets per rendered line, in draw
+        order. A host/test seam — the strip's own state, not a Tk query, so it
+        is honest on an unmapped widget too."""
+        if not self._line_of:
+            return []
+        count = max(self._line_of) + 1
+        lines: list[list[tk.Widget]] = [[] for _ in range(count)]
+        for (widget, _gap), index in zip(self._items, self._line_of):
+            lines[index].append(widget)
+        return lines
+
+    def _measure(self, widget) -> int:
+        """The width one item occupies, gaps included.
+
+        ``winfo_reqwidth`` is real for an unmapped Label (measured), but a
+        widget can answer 1 before Tk has computed its geometry — fall back to
+        measuring the text in the chip font rather than believing a 1 px chip
+        and packing the whole strip onto one line."""
+        gap_l, gap_r = self._gaps.get(widget, (0, 0))
+        width = 0
+        try:
+            width = int(widget.winfo_reqwidth())
+        except Exception:
+            width = 0
+        if width <= 1:
+            width = self._estimate(widget)
+        return width + gap_l + gap_r
+
+    def _estimate(self, widget) -> int:
+        """Chip width from the FONT, for an item Tk has not measured yet."""
+        try:
+            text = str(widget.cget("text"))
+        except Exception:
+            return _ESTIMATE_CHAR_PX
+        try:
+            if self._font is None:
+                # NB do NOT call Font.delete_font on this — it is a bool
+                # ATTRIBUTE on this Tk, not a method (docs/agents/map/facts.md).
+                self._font = tkfont.Font(root=self, font=CHIP_FONT)
+            return self._font.measure(text) + 2 * _CHIP_PADX
+        except Exception:
+            return len(text) * _ESTIMATE_CHAR_PX + 2 * _CHIP_PADX
+
+    def _plan(self, width) -> tuple[int, ...]:
+        """Greedy left-to-right line assignment. An item wider than the whole
+        strip still gets a line of its own — it overflows rather than being
+        cut in half or dropped."""
+        out, line, x = [], 0, 0
+        for widget, _gap in self._items:
+            item_w = self._measure(widget)
+            if x and x + item_w > width:
+                line += 1
+                x = 0
+            out.append(line)
+            x += item_w
+        return tuple(out)
+
+    def _on_configure(self, event):
+        self.reflow(getattr(event, "width", 0))
+
+    def reflow(self, width) -> None:
+        """Re-wrap to ``width`` px. Public so a host (and the tests) can drive
+        the layout without a display pass — a withdrawn root never delivers a
+        real ``<Configure>``.
+
+        Safe on a DESTROYED strip: the Doctrines pane re-renders wholesale, so
+        a queued reflow can land after the row it belonged to is gone, and
+        every Tk call below would raise ``TclError`` on a dead widget."""
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            width = int(width or 0)
+        except (TypeError, ValueError):
+            return
+        if width == self._last_width:
+            return
+        self._last_width = width
+        if width <= 1:
+            return                      # unrealised: keep the single line
+        lines = self._plan(width)
+        if lines == self._line_of:
+            return                      # same layout — do not touch a widget
+        self._apply_layout(lines)
+
+    def _apply_layout(self, lines) -> None:
+        """Pack every item into its line's sub-frame and ask for the height the
+        result needs (propagation is off, so nothing else will).
+
+        Individually tolerant of a destroyed child: a teardown that runs while
+        a reflow is in flight must not leave the rest of the strip unlaid-out
+        (and must not raise out of a ``<Configure>`` handler)."""
+        lines = tuple(lines)
+        self._line_of = lines
+        count = (max(lines) + 1) if lines else 0
+        try:
+            while len(self._lines) < count:
+                self._lines.append(
+                    tk.Frame(self, bg=self._palette_colours["bg"]))
+            for index, frame in enumerate(self._lines):
+                if index < count:
+                    frame.pack(side=tk.TOP, anchor=tk.W, fill=tk.X,
+                               pady=(_LINE_GAP if index else 0, 0))
+                else:
+                    frame.pack_forget()
+        except tk.TclError:
+            return
+        heights = [0] * count
+        for (widget, gap), index in zip(self._items, lines):
+            try:
+                frame = self._lines[index]
+                widget.pack(in_=frame, side=tk.LEFT, padx=gap)
+                # A slave packed into a master that is not its parent must sit
+                # ABOVE that master in the stacking order, or the master's own
+                # window covers it (Tk's documented ``pack -in`` caveat).
+                widget.lift(frame)
+                heights[index] = max(heights[index], widget.winfo_reqheight())
+            except tk.TclError:
+                continue
+        total = sum(heights) + _LINE_GAP * max(0, count - 1)
+        try:
+            self.configure(height=max(1, total))
+        except tk.TclError:
+            pass
 
 
 def _make_menu(parent) -> tk.Menu:
@@ -343,11 +556,15 @@ def build_refit_menu(parent, spec: MenuSpec, *, on_pick=None,
                      on_reset=None) -> tk.Menu:
     """Build (do NOT post) the ``Refits ▾`` menu for ``spec``.
 
-    One cascade per slot, each entry prefixed by the active/inactive glyph; the
-    active entry is DISABLED (picking it would be a no-op that still costs a
-    save). Then the reset row, disabled when nothing is off its default.
-    Returned for the caller to post and for tests to inspect without entering
-    Tk's menu loop.
+    One cascade per slot, each entry prefixed by the active/inactive glyph.
+    The active entry is a NORMAL entry wearing the ACCENT foreground — the same
+    accent the active chip wears. It used to be ``state=disabled``, which
+    Windows draws embossed/greyed: the owner read the active refit as a
+    rendering glitch rather than as the selected one (2026-09-12). Re-picking
+    the active refit is harmless — ``fc_gui._refits_swap`` finds nothing moved,
+    returns False and never saves — so nothing is protected by disabling it.
+    Then the reset row, disabled when nothing is off its default. Returned for
+    the caller to post and for tests to inspect without entering Tk's menu loop.
     """
     menu = _make_menu(parent)
     for slot in getattr(spec, "slots", ()) or ():
@@ -356,7 +573,7 @@ def build_refit_menu(parent, spec: MenuSpec, *, on_pick=None,
             glyph = ACTIVE_GLYPH if active else INACTIVE_GLYPH
             sub.add_command(
                 label=f"{glyph} {label}",
-                state=tk.DISABLED if active else tk.NORMAL,
+                foreground=FG_ACCENT if active else FG_TEXT,
                 command=lambda f=fit_id: _call(on_pick, f))
         menu.add_cascade(label=slot.label, menu=sub)
     if menu.index("end") is not None:
