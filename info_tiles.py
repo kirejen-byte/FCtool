@@ -2802,6 +2802,13 @@ class XUpRenderer(_TileRenderer):
 #:                        is clamped (read through ``tile_min_size``).
 #:   ``match_preview`` -- False opts the tile out of the settings popup's
 #:                        "Match preview size" button. Defaults to True.
+#:   ``strip_actions`` -- [(glyph, tooltip, seam_name)] extra click targets in
+#:                        the caption strip. The third element NAMES a
+#:                        ``HudHost`` attribute rather than holding a callable:
+#:                        this registry is module-level and the host is
+#:                        per-controller, so a real function could not live
+#:                        here. ``InfoTileController._spawn`` resolves the name
+#:                        ONCE, at spawn, and hands the chrome real closures.
 TILE_SPECS = {
     "battle": {"title": "Battle", "default_size": (260, 150),
                "render": BattleRenderer},
@@ -2838,8 +2845,12 @@ TILE_SPECS = {
     # OUT of "Match preview size": that button lines the tiles up with the
     # FCPreview family (160x136 on this install) and would undo the whole
     # point of a small tile the moment it is pressed.
+    # The ↻ glyph resets the counter from the tile itself: the whole point of
+    # this tile is that the FC never has to go back to the Fleet tab to read
+    # the count, and reading it is exactly when he wants to zero it.
     "xup": {"title": "X-up", "default_size": (120, 60),
             "min_size": (120, 50), "match_preview": False,
+            "strip_actions": [("↻", "Reset x-ups to 0", "xup_reset")],
             "render": XUpRenderer},
 }
 
@@ -3171,6 +3182,18 @@ class HudHost:
     #: as ``XUP_EMPTY_TEXT``; a host must NOT invent ``(0, 0, False)``, which
     #: is indistinguishable from a real, freshly-reset counter.
     xup_snapshot: object = _none
+    #: () -> None -- zero the fleet x-up counter. Backs the x-up tile's ↻ strip
+    #: glyph (``TILE_SPECS["xup"]["strip_actions"]`` names this attribute).
+    #:
+    #: TK THREAD, and from a USER CLICK ONLY -- never the beat. It is the same
+    #: handler the Fleet tab's own Reset button uses, deliberately: one owner
+    #: for "reset means reset", so the tile can never zero the counter without
+    #: also refreshing the tab's labels and writing the manual-reset log line.
+    #:
+    #: Inert by default like every other seam, and the SPAWN path checks for
+    #: that: a host that never wires it gets NO glyph at all, because a button
+    #: that visibly does nothing is worse than a button that is not there.
+    xup_reset: object = _none
     own_system_id: object = _none        # () -> int | None
     staging_name: object = _none         # () -> str
     #: () -> [(x, y, w, h)] -- the FCPreview tiles' rects, and a CONTRACT the
@@ -3638,6 +3661,36 @@ class InfoTileController:
         return rects
 
     # -- spawn / teardown ----------------------------------------------------
+    def _strip_actions(self, key, spec):
+        """Resolve `spec`'s ``strip_actions`` seam NAMES into real closures.
+
+        Called ONCE per tile, at spawn -- the chrome builds its glyphs from the
+        result and never consults this again, so nothing here is on the beat.
+
+        An entry is DROPPED when its named seam is absent, is not callable, or
+        is still ``HudHost``'s inert ``_none`` default. That last check is the
+        load-bearing one: every seam has an inert default, so a host that never
+        wired ``xup_reset`` would otherwise get a ↻ glyph that silently does
+        nothing on every press -- strictly worse than no glyph. Fail-quiet and
+        logged at debug: a missing optional seam is a configuration fact, not
+        an error, and this runs while the HUD is coming up."""
+        out = []
+        for entry in (spec.get("strip_actions") or ()):
+            try:
+                glyph, tip, seam = entry
+            except (TypeError, ValueError):
+                log.debug("info tiles: malformed strip action on the %s tile",
+                          key)
+                continue
+            fn = getattr(self._host, seam, None) if isinstance(seam, str) \
+                else seam
+            if fn is _none or not callable(fn):
+                log.debug("info tiles: the %s tile's %r strip action has no "
+                          "host seam -- skipped", key, seam)
+                continue
+            out.append((glyph, tip, fn))
+        return out
+
     def _spawn(self, key):
         if key in self._tiles or key not in TILE_SPECS:
             return
@@ -3647,7 +3700,8 @@ class InfoTileController:
                                   on_move_end=self._on_move_end,
                                   on_resize_end=self._on_resize_end,
                                   on_close=self._on_close,
-                                  min_size=tile_min_size(key))
+                                  min_size=tile_min_size(key),
+                                  strip_actions=self._strip_actions(key, spec))
         except Exception:
             log.warning("info tiles: could not create the %s tile", key,
                         exc_info=True)

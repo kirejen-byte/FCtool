@@ -18,6 +18,11 @@ those are the behaviours the owner asked to reuse:
   drag is a no-op while lock_layout is on. The strip's close glyph reports
   on_close(tile_key) and never destroys anything -- the controller owns tile
   lifecycle.
+- Optional ``strip_actions`` glyphs: a tile type may put its own
+  ``(glyph, tooltip, callback)`` buttons in the strip, between the title and
+  the ✕. Built once at construction and never touched again, so they add
+  nothing to the 1 Hz render beat. This chrome knows only that a callback
+  exists -- WHAT it does belongs to the engine's host seams.
 
 DESIGN NOTES that are load-bearing (docs/agents/map/preview.md):
 
@@ -51,10 +56,14 @@ Tk-thread only touches this object (house rule #1).
 """
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 
 import preview_layout
 import ui_theme
+from ui_helpers import attach_tooltip
+
+log = logging.getLogger(__name__)
 
 STRIP_H = 20              # caption-strip height in px (this module's own)
 _MOVE_JITTER = 4          # a left press/release within this many px is a click
@@ -211,7 +220,7 @@ class InfoTileWindow:
 
     def __init__(self, root, tile_key: str, title: str, palette: dict,
                  win32=None, on_move_end=None, on_resize_end=None,
-                 on_close=None, *, min_size=None):
+                 on_close=None, *, min_size=None, strip_actions=()):
         self._win32 = win32 or _real_info_win32()
         self._key = tile_key
         self._palette = palette or {}
@@ -278,6 +287,9 @@ class InfoTileWindow:
         fg_dim = self._palette.get("FG_DIM", ui_theme.FG_DIM)
         self._fg_dim = fg_dim
         self._fg_close_hot = self._palette.get("FG_RED", ui_theme.FG_RED)
+        # Action glyphs hover ACCENT, not the ✕'s red: red is this strip's
+        # "this closes something" colour and an action glyph is not that.
+        self._fg_action_hot = self._palette.get("FG_ACCENT", ui_theme.FG_ACCENT)
 
         self.top = tk.Toplevel(root)
         self.top.overrideredirect(True)
@@ -300,6 +312,51 @@ class InfoTileWindow:
                                    fg=fg_dim, font=("Consolas", 9, "bold"),
                                    cursor="hand2")
         self._close_lbl.pack(side="right", padx=(2, 5))
+
+        # Optional per-tile action glyphs (2026-09-12). Packed side="right"
+        # AFTER the close glyph, so pack's right-to-left stacking lands them
+        # BETWEEN the title and the ✕; the title is packed last and its
+        # expand=True then takes whatever width is left over. They are built
+        # exactly ONCE, here, and nothing on the 1 Hz render beat ever touches
+        # them again -- chrome costs nothing per tick, which is the rule the
+        # whole HUD family lives by.
+        # ORDER: with side="right" the FIRST list entry is packed first and so
+        # lands RIGHTMOST -- nearest the ✕ -- and later entries march leftward
+        # toward the title. A caller reading the list left-to-right is reading
+        # it backwards.
+        # Neither the CONTAINER nor an ENTRY is trusted: the registry that
+        # supplies these is data, so a non-iterable degrades to no actions and
+        # one bad tuple costs only its own glyph. Nothing here may take the
+        # tile down -- a tile that failed to construct is swallowed by the
+        # engine into a log line and reads to the owner as a dead feature.
+        self._action_lbls = []
+        self._action_fns = []
+        self._action_pressed = None     # the label whose press is still live
+        try:
+            entries = list(strip_actions or ())
+        except TypeError:
+            log.debug("info tile %s: strip_actions is not iterable", tile_key)
+            entries = []
+        for entry in entries:
+            try:
+                glyph, tip, callback = entry
+            except (TypeError, ValueError):
+                log.debug("info tile %s: malformed strip action entry",
+                          tile_key)
+                continue
+            lbl = tk.Label(self._strip, text=str(glyph), bg=bg_panel,
+                           fg=fg_dim, font=("Consolas", 9, "bold"),
+                           cursor="hand2")
+            lbl.pack(side="right", padx=(2, 2))
+            if tip:
+                # topmost: a tip inside a HWND_TOPMOST window is stacked BELOW
+                # its owner otherwise -- created, but invisible (ui_helpers).
+                try:
+                    attach_tooltip(lbl, str(tip), topmost=True)
+                except tk.TclError:
+                    pass
+            self._action_lbls.append(lbl)
+            self._action_fns.append(callback)
 
         title_text = "" if title is None else str(title)
         self._title_lbl = tk.Label(self._strip, text=title_text, bg=bg_panel,
@@ -545,6 +602,35 @@ class InfoTileWindow:
         self._close_lbl.bind("<Button-1>", self._on_close_press)
         self._close_lbl.bind("<ButtonRelease-1>", self._on_close_release)
 
+        # Action glyphs: same deal. They sit clear of the 12 px 'ne' corner
+        # zone (the ✕ and its padding own that), but the toplevel's own
+        # <Button-1>/<ButtonRelease-1> still fire for every press anywhere in
+        # its subtree (map/facts.md), so these return "break" too. Each label
+        # carries its OWN identity into every handler by default argument --
+        # a closure over the loop variable would give every glyph the last
+        # one's callback.
+        # EVERY one of these is add="+", and <Enter>/<Leave> MUST be: this
+        # label already carries attach_tooltip's own <Enter>/<Leave> handlers,
+        # and a plain bind() REPLACES the widget's whole script for that
+        # sequence rather than appending to it -- which silently removed the
+        # tooltip from the glyph (measured; the tip was created and bound, then
+        # thrown away three lines later). add="+" leaves the tip's handler in
+        # front of ours; it returns None, so ours still runs, and our "break"
+        # still truncates the REMAINING BINDTAGS (the toplevel's corner arming)
+        # exactly as before -- "break" stops the bindtag chain, and the tip's
+        # handler has already had its turn.
+        for lbl, fn in zip(self._action_lbls, self._action_fns):
+            lbl.bind("<Enter>", lambda _e, _l=lbl: self._on_action_enter(_l),
+                     add="+")
+            lbl.bind("<Leave>", lambda _e, _l=lbl: self._on_action_leave(_l),
+                     add="+")
+            lbl.bind("<Button-1>",
+                     lambda _e, _l=lbl: self._on_action_press(_l), add="+")
+            lbl.bind("<ButtonRelease-1>",
+                     lambda _e, _l=lbl, _fn=fn: self._on_action_release(_l,
+                                                                        _fn),
+                     add="+")
+
     # move gestures (shared implementation, one anchor per gesture) ------------
     def _move_press(self, event, slot):
         slot.root = (event.x_root, event.y_root)
@@ -741,9 +827,17 @@ class InfoTileWindow:
         self._corner = None
         return "break"
 
+    def _glyph_press(self):
+        """The one thing EVERY strip glyph's press has to do: drop the strip's
+        move anchor, because a glyph press is never the start of a strip drag.
+        Shared by the ✕ and by every `strip_actions` glyph so the two cannot
+        drift apart (the close glyph got this right first; an action glyph
+        that forgot it would move the tile on a click-with-a-twitch)."""
+        self._strip_move.root = None
+
     def _on_close_press(self, _event):
         self._close_pressed = True
-        self._strip_move.root = None    # a glyph press is never a strip drag
+        self._glyph_press()
         return "break"
 
     def _on_close_release(self, _event):
@@ -755,4 +849,61 @@ class InfoTileWindow:
             return "break"
         self._close_pressed = False
         self._on_close(self._key)
+        return "break"
+
+    # strip action glyphs ------------------------------------------------------
+    def _set_action_fg(self, lbl, colour):
+        try:
+            lbl.configure(fg=colour)
+        except tk.TclError:
+            pass
+
+    def _on_action_enter(self, lbl):
+        self._corner = None             # same defence the ✕ keeps
+        self._set_cursor("")
+        self._set_action_fg(lbl, self._fg_action_hot)
+        return "break"
+
+    def _on_action_leave(self, lbl):
+        """Leaving CANCELS a live press, exactly like the ✕'s.
+
+        This is the destructive-action guard: Tk's implicit grab sends the
+        release to the widget that took the press, so without it a user who
+        pressed the reset glyph, thought better of it and dragged off would
+        still have the counter zeroed under his hand. Nothing on this strip
+        may fire on a gesture the user visibly abandoned."""
+        if self._action_pressed is lbl:
+            self._action_pressed = None
+        self._set_action_fg(lbl, self._fg_dim)
+        return "break"
+
+    def _on_action_press(self, lbl):
+        self._action_pressed = lbl
+        self._glyph_press()
+        return "break"
+
+    def _on_action_release(self, lbl, fn):
+        """Fire one action glyph's callback, absorbing whatever it does.
+
+        Only for a press that is still live ON THIS LABEL -- see
+        ``_on_action_leave``. The latch holds the LABEL rather than a bool so
+        a press on one glyph can never be released by another.
+
+        The callback belongs to the HOST (fc_gui), reached through the engine's
+        seam table, and it runs on the Tk thread from inside a Tk binding: an
+        exception escaping here reaches Tkinter's report_callback_exception and
+        costs the user a traceback dialog over his game. Log it and move on --
+        the same "a seam failing costs only itself" net info_tiles._call keeps.
+        The message carries the tile KEY and never the glyph: a non-cp1252
+        character in a log string raises inside logging on this box
+        (map/facts.md)."""
+        if self._action_pressed is not lbl:
+            return "break"
+        self._action_pressed = None
+        try:
+            if callable(fn):
+                fn()
+        except Exception:
+            log.warning("info tile %s: strip action failed", self._key,
+                        exc_info=True)
         return "break"
