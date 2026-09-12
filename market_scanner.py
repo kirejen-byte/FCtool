@@ -66,8 +66,25 @@ from typing import Protocol
 from app_io import atomic_write_json
 from app_log import get_logger
 from app_path import app_dir
+# Doctrine-slot enumeration only (`slot_fit_ids`) — a pure module function. The
+# dependency is one-way: `fittings_store` never imports the scanner.
+import fittings_store
 
 log = get_logger(__name__)
+
+
+def _slot_fit_ids(member) -> list:
+    """Every fit id a doctrine SLOT can fly (active + refits), default first.
+
+    Thin, TOTAL wrapper over ``fittings_store.slot_fit_ids`` (the single source
+    of truth) so a duck-typed member without ``.refits`` — a hand-built stand-in
+    in a caller or a test host — degrades to its single ``fit_id`` instead of
+    raising inside a scan."""
+    try:
+        return fittings_store.slot_fit_ids(member)
+    except AttributeError:
+        fid = getattr(member, "fit_id", None)
+        return [] if fid is None else [fid]
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -847,6 +864,13 @@ class MarketScanner:
         """For every fit in ``doctrine``, compute per-component depth/breadth and
         the binding-constraint ``completable_fits``.
 
+        "Every fit" spans a slot's REFITS as well as its active fit (design
+        2026-09-12 §6), enumerated through ``fittings_store.slot_fit_ids`` — the
+        FC can swap to any of them mid-fleet, so the doctrine pane must be able
+        to say whether the market covers the alternates too. One result row per
+        FIT (a slot with three refits yields three); the sole consumer,
+        ``fc_gui._market_doctrine_avail_map``, keys by ``fit_id``.
+
         ``components`` on each result carries the FULL bill-of-materials (hull +
         modules + subsystems + charges + cargo + drones), each row flagged by
         ``role``, so a later UI can render complete tables. ``completable_fits``
@@ -858,10 +882,11 @@ class MarketScanner:
         """
         results: list[DoctrineAvailability] = []
         for member in getattr(doctrine, "members", []):
-            fit = store.get_fit(member.fit_id) if store is not None else None
-            if fit is None:
-                continue
-            results.append(self._fit_availability(fit, snap, contracts))
+            for fit_id in _slot_fit_ids(member):
+                fit = store.get_fit(fit_id) if store is not None else None
+                if fit is None:
+                    continue
+                results.append(self._fit_availability(fit, snap, contracts))
         return results
 
     def _fit_availability(
@@ -1414,9 +1439,13 @@ class MarketScanner:
         across fits; ``available`` = current market sell qty; ``short`` =
         ``max(0, needed - available)``. Only short items appear.
 
-        **Members are de-duplicated by ``fit_id`` (first occurrence wins)** — a
+        **Every fit a slot can fly is seeded** — its active fit AND its refits
+        (design 2026-09-12 §6), enumerated through ``fittings_store.slot_fit_ids``.
+
+        **Fits are de-duplicated by ``fit_id`` (first occurrence wins)** — a
         doctrine that lists the same fit twice is seeded once, so the list can
-        never ask for more than ``target_desc`` claims.
+        never ask for more than ``target_desc`` claims. Refits carry distinct fit
+        ids, so the de-dupe never collapses them.
 
         **Per-fit seed targets.** ``target_fits`` is the doctrine-wide fallback.
         ``per_fit_targets`` (optional) is a ``fit_id -> target`` mapping consulted
@@ -1449,38 +1478,45 @@ class MarketScanner:
         seen_fit_ids: set = set()
 
         for member in getattr(doctrine, "members", []):
-            # A doctrine can list the SAME fit twice — neither
-            # ``fittings_store.add_fit_to_doctrine`` nor the MOTD→doctrine import
-            # guards against it — and a naive walk then adds that fit's whole BoM
-            # twice while ``target_desc`` still names a single target: the
-            # shopping list asks for double what its own summary claims.
-            # Collapse by fit_id, FIRST occurrence wins — the same rule
-            # ``market_gap_dialog.GapSelection`` applies to the dialog's picks,
-            # so the backend and the picker agree on which row is live. It is the
-            # SAME key the target below resolves on, so one row means one target.
-            fid = getattr(member, "fit_id", None)
-            if fid is not None:
-                if fid in seen_fit_ids:
+            # A slot's REFITS are shopped for alongside its active fit (design
+            # 2026-09-12 §6): the FC can swap to any of them mid-fleet, and an
+            # active-only list hides the gap exactly when the swap happens. Each
+            # refit resolves its own target below — the host builds the override
+            # map so every fit of a slot carries the OWNING SLOT's seed target.
+            for fid in _slot_fit_ids(member):
+                # A doctrine can list the SAME fit twice — neither
+                # ``fittings_store.add_fit_to_doctrine`` nor the MOTD→doctrine
+                # import guards against it — and a naive walk then adds that
+                # fit's whole BoM twice while ``target_desc`` still names a
+                # single target: the shopping list asks for double what its own
+                # summary claims. Collapse by fit_id, FIRST occurrence wins —
+                # the same rule ``market_gap_dialog.GapSelection`` applies to the
+                # dialog's picks, so the backend and the picker agree on which
+                # row is live. It is the SAME key the target below resolves on,
+                # so one row means one target. Refits have DISTINCT fit ids, so
+                # they are never collapsed by it.
+                if fid is not None:
+                    if fid in seen_fit_ids:
+                        continue
+                    seen_fit_ids.add(fid)
+                fit = store.get_fit(fid) if store is not None else None
+                if fit is None:
                     continue
-                seen_fit_ids.add(fid)
-            fit = store.get_fit(member.fit_id) if store is not None else None
-            if fit is None:
-                continue
-            fit_target = overrides.get(fid, target_fits)
-            try:
-                fit_target = int(fit_target)
-            except (TypeError, ValueError):
-                fit_target = target_fits
-            fit_target = max(0, fit_target)
-            applied_targets.add(fit_target)
-            for c in fit_bom(fit.parsed, self._catalog):
-                if not role_filter(c.role):
-                    continue
-                units = c.per_fit_qty * fit_target
-                if units <= 0:
-                    continue
-                entry = needed.setdefault(c.type_id, [c.name, 0])
-                entry[1] += units
+                fit_target = overrides.get(fid, target_fits)
+                try:
+                    fit_target = int(fit_target)
+                except (TypeError, ValueError):
+                    fit_target = target_fits
+                fit_target = max(0, fit_target)
+                applied_targets.add(fit_target)
+                for c in fit_bom(fit.parsed, self._catalog):
+                    if not role_filter(c.role):
+                        continue
+                    units = c.per_fit_qty * fit_target
+                    if units <= 0:
+                        continue
+                    entry = needed.setdefault(c.type_id, [c.name, 0])
+                    entry[1] += units
 
         items: list[GapItem] = []
         for tid, (name, need_units) in needed.items():
