@@ -137,9 +137,11 @@ def relift_topmost_tooltips():
 def _parse_geometry(spec):
     """Parse a Tk ``"WxH+X+Y"`` geometry string into ``(w, h, x, y)``.
 
-    Returns None for anything that is not a complete WxH+X+Y (Tk also emits
-    size-only and position-only forms, and ``+-12`` negative offsets, which are
-    handled). Never raises.
+    ONLY the full ``WxH+X+Y`` form is understood. Tk also emits size-only
+    (``"600x400"``) and position-only (``"+300+250"``) forms; both return None
+    here, deliberately — a caller that got one of those learned nothing about
+    the other half and must not pretend otherwise. Negative offsets in either
+    Tk spelling (``+-12`` and ``-12``) ARE handled. Never raises.
     """
     try:
         text = str(spec)
@@ -285,7 +287,98 @@ def _clamp_into(v, lo, hi):
     return max(lo, min(v, hi))
 
 
-def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None):
+def _begin_hidden(win):
+    """Make ``win`` invisible for the measure-and-place window, WITHOUT costing
+    it the keyboard focus. Returns a ``restore()`` callable, or None when
+    nothing was hidden (and so nothing must be restored). Never raises.
+
+    **Why a dialog has to be hidden at all.** ``update_idletasks()`` on a fresh
+    non-withdrawn Toplevel MAPS it at the window manager's position, so a
+    measure-then-move sequence shows the dialog in the screen corner this whole
+    change exists to stop using, and then jumps it. Hidden, the geometry
+    request lands before anyone sees the window.
+
+    **Why NOT ``wm_withdraw()``.** Measured: withdrawing a never-mapped
+    Toplevel and deiconifying it DISCARDS that toplevel's focus record —
+    ``focus_lastfor()`` comes back as the toplevel itself instead of the widget
+    the builder called ``focus_set()`` on. Five dialogs lost their caret that
+    way, including the paste dialog, where it meant Ctrl+V went nowhere.
+    ``-alpha 0.0`` hides the window just as completely and leaves the record
+    intact (measured: ``focus_lastfor()`` is still the Entry).
+
+    **The flush is load-bearing.** ``wm_attributes("-alpha", ...)`` fires a
+    ``SetWindowPos`` whose ``WM_WINDOWPOSCHANGED`` reports the CURRENT position,
+    which Tk adopts as authoritative — exactly the clobber ``map/facts.md``
+    documents for ``-topmost``. Measured here too: restoring alpha straight
+    after ``wm_geometry("+x+y")`` discarded the move and the dialog stayed at
+    +0+0. So ``restore()`` flushes the pending move with ``update_idletasks()``
+    BEFORE touching alpha — free of the usual flash cost, because the window is
+    still invisible while it moves.
+
+    The caller's own alpha is saved and put back, never a hard-coded 1.0.
+
+    ``wm_withdraw`` survives only as the fallback for a platform/toolkit that
+    refuses ``-alpha``, and it is a LOSSY one. The focus record is captured
+    BEFORE the withdraw (afterwards it already reads as the toplevel) and
+    re-issued after, which measurably repairs a record that had SETTLED. It
+    cannot repair a ``focus_set()`` the caller made moments earlier in the same
+    builder: Tk does not resolve that until the next event pass, so at this
+    instant neither ``focus_lastfor()`` nor ``tk.call("focus")`` can name the
+    widget (both answer the toplevel / the root — measured). That is the whole
+    reason the alpha path is the primary one rather than a nicety: it never
+    disturbs the pending focus in the first place.
+    """
+    try:
+        if win.winfo_ismapped():
+            return None          # already on screen: moving it is the whole job
+        if win.wm_state() != "normal":
+            return None          # deliberately withdrawn/iconified: not ours
+    except Exception:
+        return None
+
+    try:
+        prev_alpha = win.wm_attributes("-alpha")
+        win.wm_attributes("-alpha", 0.0)
+    except Exception:
+        pass
+    else:
+        def _restore_alpha():
+            try:
+                win.update_idletasks()       # apply the move BEFORE the alpha
+            except Exception:                # SetWindowPos can discard it
+                pass
+            try:
+                win.wm_attributes(
+                    "-alpha", 1.0 if prev_alpha is None else prev_alpha)
+            except Exception:
+                pass
+        return _restore_alpha
+
+    # Fallback only. Capture the focus record first -- wm_withdraw destroys it.
+    try:
+        focused = win.focus_lastfor()
+    except Exception:
+        focused = None
+    try:
+        win.wm_withdraw()
+    except Exception:
+        return None
+
+    def _restore_withdrawn():
+        try:
+            win.wm_deiconify()
+        except Exception:
+            pass
+        try:
+            if focused is not None and str(focused) != str(win):
+                focused.focus_set()          # best effort; see the docstring
+        except Exception:
+            pass
+    return _restore_withdrawn
+
+
+def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None,
+                hide=True):
     """Centre ``win`` over ``parent`` and return the applied ``(x, y)``, or None.
 
     **Why this exists.** ``make_modal`` set ``transient()`` and a grab but never
@@ -301,17 +394,22 @@ def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None):
                         for the monitor containing a point, so a caller (or a
                         test) can supply its own enumeration. Default: the
                         ``monitor_pin`` backend, then Tk's virtual desktop.
+    ``hide``            hide the dialog around the measurement (see
+                        ``_begin_hidden``). Pass False when the CALLER already
+                        hid it and owns the restore — ``make_modal`` does,
+                        because it has to hide before the caller builds the
+                        content and can only place after.
 
-    **Placement, and the map-order trap.** When ``win`` has not been mapped yet
-    this WITHDRAWS it around the measurement, because ``update_idletasks()`` on
-    a fresh non-withdrawn Toplevel MAPS it at the window manager's position —
-    the dialog would flash in the wrong place before moving. Withdrawn, the
-    geometry request is applied AT MAP TIME and the dialog appears directly
-    where it belongs (the ``attach_tooltip`` pattern; ``map/facts.md``). An
-    already-mapped window is simply moved, which files a PENDING move — and a
-    following ``wm_attributes("-topmost", ...)`` DISCARDS that pending move
-    (measured 2026-08-25). **A caller that sets ``-topmost`` must do so BEFORE
-    centring**, never after.
+    **Placement, and the map-order trap.** An unmapped dialog is hidden
+    (``-alpha 0.0``, never ``wm_withdraw``, which would cost it the keyboard
+    focus — see ``_begin_hidden``) around the measurement, because
+    ``update_idletasks()`` on a fresh visible Toplevel MAPS it at the window
+    manager's position and the dialog would appear in the wrong place before
+    moving. An already-mapped window is simply moved, which files a PENDING
+    move — and a following ``wm_attributes("-topmost", ...)`` DISCARDS that
+    pending move (measured 2026-08-25; ``-alpha`` does the same, which is why
+    the restore flushes first). **A caller that sets ``-topmost`` must do so
+    BEFORE centring**, never after.
 
     Never raises, by contract: it is called from dialog builders and from a
     deferred ``after`` callback, and a window it cannot measure (a destroyed
@@ -321,15 +419,9 @@ def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None):
     try:
         prect = _parent_rect(parent)
 
-        # Withdraw an unmapped dialog around the measurement (see the docstring)
+        # Hide an unmapped dialog around the measurement (see the docstring)
         # so update_idletasks() cannot map it at the WM's position first.
-        hidden = False
-        try:
-            if win.wm_state() == "normal" and not win.winfo_ismapped():
-                win.wm_withdraw()
-                hidden = True
-        except Exception:
-            hidden = False
+        restore = _begin_hidden(win) if hide else None
         try:
             try:
                 win.update_idletasks()
@@ -381,11 +473,8 @@ def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None):
             win.wm_geometry(f"+{int(x)}+{int(y)}")
             return (int(x), int(y))
         finally:
-            if hidden:
-                try:
-                    win.wm_deiconify()
-                except Exception:
-                    pass
+            if restore is not None:
+                restore()
     except Exception:
         return None
 
@@ -405,43 +494,38 @@ def _center_when_built(win, parent):
 
     **Why it hides first.** By then Tk would already have MAPPED the dialog at
     the window manager's position, so a post-hoc move is a visible jump from
-    exactly the screen corner this whole change exists to stop using.
-    Withdrawing the dialog for the length of the caller's build keeps it off
-    screen until it has a position; the ``after(0)`` pass then centres it and
-    deiconifies ONCE, so it appears directly where it belongs (the
-    ``attach_tooltip`` pattern, ``map/facts.md``). The deiconify lives in a
-    ``finally``: a dialog that could not be measured must still be shown.
+    exactly the screen corner this whole change exists to stop using. Hiding
+    the dialog for the length of the caller's build keeps it out of sight until
+    it has a position; the ``after(0)`` pass then centres it and reveals it
+    ONCE, so it appears directly where it belongs (the ``attach_tooltip``
+    pattern, ``map/facts.md``). The hide is ``-alpha 0.0``, NOT
+    ``wm_withdraw()`` — withdrawing discards the toplevel's focus record and
+    the dialog opens with no caret in its Entry (see ``_begin_hidden``). The
+    reveal lives in a ``finally``: a dialog that could not be measured must
+    still be shown.
 
-    Only a window that is on its way to being mapped (state ``normal``, not yet
-    mapped) is hidden. An already-mapped window — or any stub whose state
-    cannot be read — is simply centred in place, then refined once from the
-    same deferred pass.
+    This function owns the hide, so the deferred pass is told ``hide=False``:
+    letting ``center_over`` hide again would read the ALREADY-ZERO alpha as the
+    caller's own value and restore the dialog to invisible.
+
+    Only a window on its way to being mapped is hidden. An already-mapped
+    window — or any stub whose state cannot be read — is placed once, from the
+    same deferred pass, and never moved twice.
     """
-    hidden = False
-    try:
-        if win.wm_state() == "normal" and not win.winfo_ismapped():
-            win.wm_withdraw()
-            hidden = True
-    except Exception:
-        hidden = False
+    restore = _begin_hidden(win)
 
     def _place_and_show():
         try:
-            center_over(win, parent)
+            center_over(win, parent, hide=restore is None)
         finally:
-            if hidden:
-                try:
-                    win.wm_deiconify()
-                except Exception:
-                    pass
+            if restore is not None:
+                restore()
 
-    if not hidden:
-        center_over(win, parent)
     try:
         win.after(0, _place_and_show)
     except Exception:
         # No scheduler (a headless stub, a dead interpreter): do it now rather
-        # than leave a withdrawn dialog nobody will ever show.
+        # than leave a hidden dialog nobody will ever show.
         _place_and_show()
 
 
