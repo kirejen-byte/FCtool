@@ -23434,6 +23434,7 @@ class FCToolGUI:
                     and (now - self._ozone_started_at) > _OZONE_LOGIN_GRACE_S))
             if not (undocked or logged_in):
                 return
+            edge_kind = "undock" if undocked else "login"
 
             if not auth.has_scope(_ASSETS_SCOPE):
                 if key not in self._ozone_scope_logged:
@@ -23456,14 +23457,22 @@ class FCToolGUI:
             ship_type_id, ship_item_id = self._ozone_ship.get(key, (None, 0))
 
             if not ship_type_id:
+                log.info("[ozone] %s %s edge: no ship known - skipped",
+                         key, edge_kind)
                 return
             catalog = getattr(self, "type_catalog", None)
             group = catalog.group_of(ship_type_id) if catalog is not None else None
             # BOTH ids: a Venture lives in group 25, which is not cyno-capable
             # at large, and is whitelisted by type instead.
             if not ozone_watch.is_cyno_hull(group, ship_type_id):
+                hull = catalog.resolve_name(ship_type_id) if catalog is not None else None
+                log.info("[ozone] %s %s edge: hull %s (type %s, group %s) "
+                         "is not cyno-capable - skipped",
+                         key, edge_kind, hull or "?", ship_type_id, group)
                 return
             if not ship_item_id:
+                log.info("[ozone] %s %s edge: no ship_item_id - skipped",
+                         key, edge_kind)
                 return
 
             cfg = ozone_watch.normalize_config(raw)
@@ -23477,6 +23486,8 @@ class FCToolGUI:
                 except Exception:
                     assets, complete = None, False
                 if not assets or not complete:
+                    log.info("[ozone] %s %s edge: assets pull "
+                             "incomplete/empty - no sample", key, edge_kind)
                     return                      # no sample; nothing cached
                 cargo = ozone_watch.scan_ship_assets(assets, ship_item_id)
                 self._ozone_asset_cache[cache_key] = (now, cargo)
@@ -23487,11 +23498,18 @@ class FCToolGUI:
             verb = self._ozone_watch_state(cfg).observe_edge(
                 key, ship_item_id, cargo, cost, now,
                 disabled=key in cfg["disabled_chars"])
-            if verb != ozone_watch.FIRE:
-                return
             hull = ""
             if catalog is not None:
                 hull = catalog.resolve_name(ship_type_id) or ""
+            gen_desc = (ozone_watch.generator_short(cargo.generator_type_id)
+                        if cargo.generator_type_id is not None
+                        else "no generator fitted")
+            lights = ozone_watch.lights_left(cargo.ozone, cost)
+            cargo_summary = f"{gen_desc}, {cargo.ozone} ozone, {lights} lights"
+            log.info("[ozone] %s %s edge: %s - %s (%s)",
+                     key, edge_kind, hull or "?", cargo_summary, verb)
+            if verb != ozone_watch.FIRE:
+                return
             self._post_ui(
                 self._ozone_show_toast, key, name,
                 ozone_watch.toast_body(hull, cargo, cost,
@@ -23532,6 +23550,7 @@ class FCToolGUI:
             verb = state.observe_cyno_lit(
                 key, time.monotonic(),
                 disabled=key in cfg["disabled_chars"])
+            log.info("[ozone] %s cyno-lit accepted: %s", key, verb)
             if verb != ozone_watch.FIRE:
                 return
             last = state.last(key)
