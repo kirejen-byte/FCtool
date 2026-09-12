@@ -357,9 +357,13 @@ class GamelogMonitor:
     """
 
     def __init__(self, on_event, logs_dir=None, state_path=STATE_FILE_PATH,
-                 poll_interval=1.0, on_decloak=None):
+                 poll_interval=1.0, on_decloak=None, on_cyno_active=None):
         self._on_event = on_event
         self._on_decloak = on_decloak        # optional DecloakEvent sink (parallel of on_event)
+        # optional CynoActiveEvent sink ("Watch my ozone"); same shape again.
+        # An UNSET callback is the cheap gate: no sink, no parse, so a consumer
+        # that does not want these lines pays nothing per line.
+        self._on_cyno_active = on_cyno_active
         self._logs_dir = logs_dir            # resolved lazily (see B6 wiring)
         self._state_path = state_path
         self._poll_interval = poll_interval
@@ -733,7 +737,9 @@ class GamelogMonitor:
         For each COMPLETE line, parse_damage_line(); on a hit, emit a
         DamageEvent(timestamp=_ts_of(line), character_name=listener, ...). The
         SAME line is also run through parse_decloak_line() (short-circuited on a
-        cheap substring); on a hit a DecloakEvent is emitted via on_decloak.
+        cheap substring); on a hit a DecloakEvent is emitted via on_decloak, and
+        again through parse_cyno_active_line() for on_cyno_active. Both extra
+        parses are skipped entirely when their sink is None.
 
         The file's `Listener:` is resolved only once there is actually new text
         to attribute (below), so a pass that finds nothing new never opens the
@@ -806,6 +812,16 @@ class GamelogMonitor:
                     self._on_decloak(DecloakEvent(timestamp=_ts_of(ln),
                                                   character_name=listener,
                                                   cause=cause))
+            # Cyno-is-burning ("Watch my ozone"); same pass, same deal — the
+            # parser short-circuits on two cheap substrings, and no sink means
+            # not even that runs. The event is NOT filtered to cyno generators
+            # here: "is already active" is emitted for any module and the name
+            # is the identification, so the consumer filters
+            # (ozone_watch.is_generator_name).
+            if self._on_cyno_active is not None:
+                ev = parse_cyno_active_line(ln, listener)
+                if ev is not None:
+                    self._on_cyno_active(ev)
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos

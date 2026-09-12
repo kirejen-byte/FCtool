@@ -157,6 +157,13 @@ import info_tiles
 # imports no fc_gui); wiring is the poller hook + _implant_show_toast below.
 import implant_reminder
 import client_toast
+# "Watch my ozone" (default ON): the implant reminder's sibling. ozone_watch is
+# PURE (stdlib + the offline dogma_data loader — no Tk, no network, no fc_gui)
+# and owns the whole decision: the cyno-hull gate, the ozone cost model, the
+# cargo scan and the per-character latch. fc_gui owns four seams and no policy —
+# the poller hook (_ozone_observe), the gamelog hook (_ozone_on_cyno_active),
+# the Tk-thread toast, and the Characters-tab card row that shares the cost.
+import ozone_watch
 # Fleet-chat "range check" (default OFF): pure trigger/report engine plus its own
 # over-client toast. Everything above RangeToast is Tk-free and it imports no
 # fc_gui; wiring is the chat-tail hook + _range_check_show_toast below.
@@ -1067,6 +1074,52 @@ _PREVIEW_IMPLANT_REFRESH_S = 150.0
 # re-arms the report). Same shape as _PREVIEW_FAST_DRAIN_LOG_EVERY_S.
 _PREVIEW_IMPLANT_LOG_EVERY_S = 300.0
 
+# "Save my implants" ⓘ help text, first sentence. ONE owner, because it is
+# written twice: attach_tooltip stashes it at build time and
+# _refresh_implant_staging_label re-stashes it with the live staging DETAIL
+# appended (owner directive 2026-09-12 moved the rung / the Settings pointer off
+# the status line and into this hover, to make room for "Watch my ozone").
+_IMPLANT_TOOLTIP_BASE = (
+    "Pops up a brief message over the EVE client reminding you to "
+    "remove your implants when you dock at your staging system.")
+
+# Scope backing "Watch my ozone". The assets pull is the only ESI call the
+# feature makes; a token without the scope is skipped outright rather than left
+# to 403 (a 403 costs 5 of the 100/60s error budget) -- the implant reminder's
+# rule. Spelled here rather than imported from esi_auth, which carries an
+# uncommitted local line and is not this task's file to touch.
+_ASSETS_SCOPE = "esi-assets.read_assets.v1"
+
+
+def _ozone_fill_cyno(info, generator_type_id, ozone, cfg):
+    """Fill ``info``'s four cyno keys from ONE (generator, ozone) pair.
+
+    The Characters-tab card row and "Watch my ozone" must agree, so they share
+    ozone_watch's cost model through this one function. Before it the card
+    keyed the cost off the HULL (every Force Recon 50, everything else 250),
+    which reported a covert cyno on a Rapier -- 5 units -- as ten times its
+    real cost, and treated an empty hold as "no cyno fitted" at all.
+
+    ``cyno`` is now true whenever a generator is FITTED, zero ozone included:
+    a cyno ship with nothing to burn is the single most important thing this
+    row can say. ``cyno_low`` is the engine's own verdict, so the row and the
+    toast can never disagree about what "low" means."""
+    cargo = ozone_watch.ShipCargo(generator_type_id,
+                                  max(0, int(ozone or 0)))
+    cost = ozone_watch.effective_ozone_cost(
+        generator_type_id, info.get("ship_type_id"),
+        cfg["assumed_skill_level"])
+    verdict = ozone_watch.verdict(cargo, cost, cfg["min_activations"])
+    info["cyno"] = generator_type_id is not None
+    info["cyno_ozone"] = cargo.ozone
+    info["cyno_lights"] = verdict.lights
+    # The rendered phrase comes from the engine too ("12 ozone = 2 lights",
+    # "1 light", "no lights"), so the card and the toast are word-for-word the
+    # same sentence and fc_gui owns no wording of its own.
+    info["cyno_text"] = verdict.text
+    info["cyno_low"] = bool(verdict.fire)
+    return cost
+
 
 class FCToolGUI:
     def __init__(self):
@@ -1503,6 +1556,18 @@ class FCToolGUI:
         # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
         self._implant_toast = None             # the single live ClientToast, if any
+        # ── "Watch my ozone" (default ON; see ozone_watch.py) ────────────────
+        # ONE WatchState for the whole app: the latch has to outlive the edge
+        # that set it, and the gamelog decrement has to land on the SAME sample
+        # the poller took. Rebuilt only when min_activations changes (see
+        # _ozone_watch_state) -- nothing else in it comes from config, so
+        # _save_settings' config replacement needs no re-point here.
+        self._ozone_state = None               # ozone_watch.WatchState (lazy)
+        self._ozone_toast = None               # the single live ClientToast, if any
+        self._ozone_prev = {}                  # char key -> (docked, online) last sample
+        self._ozone_ship = {}                  # char key -> (ship_type_id, ship_item_id)
+        self._ozone_asset_cache = {}           # (key, ship_item_id) -> (monotonic, ShipCargo)
+        self._ozone_scope_logged = set()       # keys already logged as scope-less
         # ── Fleet-chat range check (default OFF; see range_check.py) ─────────
         # ONE trigger for the whole app so its per-sender cooldown outlives the
         # line that created it -- a per-call trigger would forget every stamp
@@ -9522,16 +9587,40 @@ class FCToolGUI:
             implant_frame, text="ⓘ", font=("Consolas", 9, "bold"),
             fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow")
         self._implant_help_icon.pack(side=tk.LEFT, padx=(0, 12), pady=5)
-        attach_tooltip(
-            self._implant_help_icon,
-            "Pops up a brief message over the EVE client reminding you to "
-            "remove your implants when you dock at your staging system.")
+        attach_tooltip(self._implant_help_icon, _IMPLANT_TOOLTIP_BASE)
+        # The tooltip also carries the staging DETAIL the status line used to
+        # spell out (which config key won, or where to set one) -- see
+        # _refresh_implant_staging_label, which keeps both in step.
 
         self._implant_staging_label = tk.Label(
             implant_frame, text="", font=("Consolas", 9), fg=FG_DIM,
             bg=BG_PANEL, anchor=tk.W)
         self._implant_staging_label.pack(side=tk.LEFT, padx=(0, 10), pady=5)
         self._refresh_implant_staging_label()
+
+        # ── "Watch my ozone" — the cyno ozone watch (ozone_watch.py) ─────────
+        # Deliberately the SAME ridge frame, packed after the implant status
+        # line: the owner asked for it "right next to" the implant tick, and the
+        # status line was shortened (see _implant_staging_status) precisely to
+        # leave this room. Same shape as its sibling in every respect — a global
+        # tick, a ⓘ that carries the detail, immediate persistence, no default
+        # value re-typed here.
+        self._ozone_enabled_var = tk.BooleanVar(
+            value=self._ozone_watch_enabled())
+        tk.Checkbutton(
+            implant_frame, text="Watch my ozone",
+            variable=self._ozone_enabled_var,
+            font=("Consolas", 10, "bold"), fg=FG_TEXT, bg=BG_PANEL,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_YELLOW,
+            command=self._on_ozone_watch_toggle,
+        ).pack(side=tk.LEFT, padx=(10, 2), pady=5)
+
+        self._ozone_help_icon = tk.Label(
+            implant_frame, text="ⓘ", font=("Consolas", 9, "bold"),
+            fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow")
+        self._ozone_help_icon.pack(side=tk.LEFT, padx=(0, 12), pady=5)
+        attach_tooltip(self._ozone_help_icon, self._ozone_tooltip_text())
 
         # Filter bar
         filter_frame = tk.Frame(tab, bg=BG_PANEL, bd=1, relief=tk.RIDGE,
@@ -9669,13 +9758,24 @@ class FCToolGUI:
         self._save_config()
 
     def _implant_staging_status(self):
-        """``(text, colour)`` for the staging status line under the tick.
+        """``(text, colour, detail)`` for the staging status line under the tick.
 
         Resolution goes through ``implant_reminder.resolve_staging`` — the single
         source of truth for the override -> Settings > Staging System ladder —
         never re-derived from config here. The name resolver is the OFFLINE
         bundled-SDE lookup (``system_coords.resolve_name``), so this costs no
-        network call on the Tk thread."""
+        network call on the Tk thread.
+
+        Owner directive 2026-09-12: the LINE is now the short answer only --
+        "Fires when you dock in X" / "No staging system set". The rung (which
+        config key won) and the Settings > Staging System pointer moved into the
+        ⓘ tooltip, whose detail is returned as the third element here so both
+        come from one resolution. The line had to shrink to make room for the
+        "Watch my ozone" tick on the same row, and it is the half nobody reads
+        twice -- the rung matters exactly once, when the answer surprises you,
+        which is precisely a hover.
+
+        Returns ``(text, colour, detail)``."""
         try:
             cfg = implant_reminder.normalize_config(
                 self.config.get("implant_reminder"))
@@ -9686,28 +9786,106 @@ class FCToolGUI:
             log.exception("[implant] staging resolution failed")
             target = implant_reminder.StagingTarget()
         if not target.configured:
-            return ("No staging system set — Settings > Staging System",
-                    FG_ORANGE)
+            return ("No staging system set", FG_ORANGE,
+                    "No staging system set — Settings > Staging System.")
         # label is the human system name for both system rungs; a structure
         # override has only an id. rung names the config key that won, so a
         # surprising answer says WHERE it came from.
         where = target.label or f"structure {target.value}"
-        return (f"Fires when you dock in {where} — {target.rung}", FG_DIM)
+        return (f"Fires when you dock in {where}", FG_DIM,
+                f"Staging resolved from {target.rung}.")
 
     def _refresh_implant_staging_label(self):
         """Re-render the staging status line from live config.
 
         Cheap (one config read + an in-memory SDE lookup) and safe to call
         before the tab exists, so it can ride the tab's own refresh path and
-        never go stale after a Settings > Staging System edit."""
+        never go stale after a Settings > Staging System edit.
+
+        Also re-stashes the ⓘ tooltip, which now carries the staging DETAIL the
+        line dropped. Through ``update_tooltip``, never ``attach_tooltip``: the
+        latter's binds use ``add="+"`` and re-attaching would leak one handler
+        set per refresh."""
         label = getattr(self, "_implant_staging_label", None)
         if label is None:
             return
-        text, colour = self._implant_staging_status()
+        text, colour, detail = self._implant_staging_status()
         try:
             label.config(text=text, fg=colour)
         except tk.TclError:
             pass
+        icon = getattr(self, "_implant_help_icon", None)
+        if icon is not None:
+            update_tooltip(icon, f"{_IMPLANT_TOOLTIP_BASE} {detail}")
+
+    # ── "Watch my ozone" box wiring (Characters tab) ────────────────────────
+    # Same three-method shape as the implant box above and for the same reason:
+    # every default, every coercion and the whole cost model belong to
+    # ozone_watch.py, so fc_gui cannot drift from the module that owns them.
+
+    def _ozone_watch_enabled(self) -> bool:
+        """Initial state of the "Watch my ozone" tick.
+
+        ``ozone_watch.is_enabled`` is THE master-gate predicate and is the same
+        call the poller hook and the gamelog hook gate on, so the tick cannot
+        claim the feature is on while the engine treats it as off -- the exact
+        defect the implant reminder shipped (see
+        tests/test_char_implant_box.py's gate-agreement section).
+
+        Tolerant by requirement, not by habit: an existing config.json carries
+        no ``ozone_watch`` block at all (this app never deep-merges
+        default_config), so "absent" is the ordinary case rather than an error,
+        and this runs inside the UNGUARDED Characters tab builder where anything
+        thrown takes the whole tab down."""
+        try:
+            return ozone_watch.is_enabled(self.config.get("ozone_watch"))
+        except Exception:
+            log.exception("[ozone] could not read the watch config")
+            return False
+
+    def _on_ozone_watch_toggle(self):
+        """Persist the tick immediately -- no Save-Settings round trip (mirrors
+        _on_implant_reminder_toggle).
+
+        Creates the config block lazily on first use, seeded from
+        ``ozone_watch.DEFAULTS`` via ``normalize_config`` so every key is present
+        and sane without fc_gui naming a single default value. An EXISTING block
+        is otherwise left alone: only ``enabled`` is written, because
+        re-normalising a block the owner hand-edited would silently rewrite it
+        (a clamped toast_seconds, a raised min_activations) and the module is
+        explicit that its coercions are effective-only."""
+        block = self.config.setdefault(
+            "ozone_watch", ozone_watch.normalize_config(None))
+        if not isinstance(block, dict):
+            block = ozone_watch.normalize_config(None)
+            self.config["ozone_watch"] = block
+        block["enabled"] = bool(self._ozone_enabled_var.get())
+        self._save_config()
+
+    def _ozone_tooltip_text(self) -> str:
+        """The ⓘ hover for the tick. Names the live threshold, and DISCLOSES the
+        skill assumption -- the one place the feature can be quietly wrong.
+
+        ESI skills are not authorised (the scope is unregistered on the dev
+        app), so Cynosural Field Theory is assumed at the configured level, V by
+        default. A pilot below V burns MORE ozone than we say, so the honest
+        move is to state the assumption rather than hide it."""
+        try:
+            cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
+            need, level = cfg["min_activations"], cfg["assumed_skill_level"]
+        except Exception:
+            log.exception("[ozone] could not read the watch config")
+            need, level = (ozone_watch.DEFAULTS["min_activations"],
+                           ozone_watch.DEFAULTS["assumed_skill_level"])
+        # EVE writes skill levels in roman numerals; "Theory 5" would read as a
+        # typo to the only person who will ever hover this.
+        rank = {0: "0", 1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}.get(
+            level, str(level))
+        return (f"Warns when a character undocks, logs in, or lights a cyno "
+                f"with fewer than {need} lights of Liquid Ozone aboard. Cost "
+                f"uses the fitted generator and hull bonuses; skills are "
+                f"assumed at Cynosural Field Theory {rank} (ESI skills are "
+                f"not authorised).")
 
     def _populate_character_panels(self):
         """Build the character panels from scratch (static layout, no ESI calls)."""
@@ -9765,6 +9943,12 @@ class FCToolGUI:
             "titans": cap_data.get("titans", []),
             "cyno": cap_data.get("cyno", False),
             "cyno_ozone": cap_data.get("cyno_ozone", 0),
+            # Both absent in a cap_data written before the shared cost model
+            # (the disk cache survives a restart). The blank text makes the row
+            # fall back to a bare "N ozone" rather than claim "0 lights" it
+            # cannot know -- for the one refresh until the next fetch.
+            "cyno_lights": cap_data.get("cyno_lights", 0),
+            "cyno_text": cap_data.get("cyno_text", ""),
             "cyno_low": cap_data.get("cyno_low", False),
             "dictor": cap_data.get("dictor", False),
         }
@@ -10313,27 +10497,26 @@ class FCToolGUI:
     def _fetch_character_info(self, acct: ESIAuth) -> dict:
         """Fetch location, ship, and capital assets for a character.
         Location/ship are always fresh; assets are cached for 10 minutes."""
-        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS, CYNO_SHIPS, HICS, INTERDICTORS
+        from ship_classes import FAX, DREADNOUGHTS, BLACK_OPS, TITANS, HICS, INTERDICTORS
         from zkill_monitor import resolve_name
         from jump_range import get_system_info
 
-        # Cyno fitting check constants
-        CYNO_MODULE_TYPES = {
-            21096,  # Cynosural Field Generator I
-            28646,  # Covert Cynosural Field Generator I
-        }
-        LIQUID_OZONE_TYPE_ID = 16273
-        # Ozone cost per activation, by ship type_id (defaults to 250 base)
-        # Force Recons get 80% role bonus → 250 * 0.20 = 50
-        OZONE_COST_PER_ACTIVATION = {
-            tid: 50 for tid in CYNO_SHIPS
-        }
-        DEFAULT_OZONE_COST = 250
+        # Every cyno constant and the whole cost model now live in ozone_watch,
+        # shared with "Watch my ozone" -- see _ozone_fill_cyno. The four
+        # hard-coded ones that used to sit here (the two generator ids, the
+        # Liquid Ozone id, and the hull-keyed 50/250 cost table) were all wrong
+        # in some direction and are gone.
+        # getattr-guarded, the house pattern: this fetcher is also driven on
+        # bare/uninitialised hosts by the Tk-free Characters-tab unit tests, and
+        # normalize_config answers the full default shape for a None block.
+        ozone_cfg = ozone_watch.normalize_config(
+            getattr(self, "config", None) and self.config.get("ozone_watch"))
 
         info = {"system": "???", "region": "", "ship": "???", "ship_type_id": 0,
                 "ship_item_id": 0,
                 "fax": [], "dreads": [], "blops": [], "titans": [],
-                "cyno": False, "cyno_ozone": 0, "cyno_low": False,
+                "cyno": False, "cyno_ozone": 0, "cyno_lights": 0,
+                "cyno_text": "", "cyno_low": False,
                 "dictor": False}
 
         if not acct.is_authenticated:
@@ -10351,7 +10534,7 @@ class FCToolGUI:
 
         # Current ship
         ship = acct.get_ship_type()
-        in_force_recon = False
+        cyno_hull = False
         if ship:
             ship_type_id = ship.get("ship_type_id")
             ship_item_id = ship.get("ship_item_id", 0)
@@ -10359,8 +10542,15 @@ class FCToolGUI:
                 info["ship"] = resolve_name(ship_type_id, "type")
                 info["ship_type_id"] = ship_type_id
                 info["ship_item_id"] = ship_item_id
-                if ship_type_id in CYNO_SHIPS:
-                    in_force_recon = True
+                # The SDE's own fitting restriction (ozone_watch.is_cyno_hull),
+                # not the five-hull ship_classes.CYNO_SHIPS this used to test:
+                # bombers, HICs, blops, T3Cs, Ventures and haulers can all mount
+                # a generator and every one of them was silently skipped here.
+                # BOTH ids -- a Venture's group is not cyno-capable at large.
+                _cat = getattr(self, "type_catalog", None)
+                cyno_hull = ozone_watch.is_cyno_hull(
+                    _cat.group_of(ship_type_id) if _cat is not None else None,
+                    ship_type_id)
                 if ship_type_id in HICS or ship_type_id in INTERDICTORS:
                     info["dictor"] = True
 
@@ -10377,18 +10567,27 @@ class FCToolGUI:
             cap_data = cached[2]
             for k in ("fax", "dreads", "blops", "titans"):
                 info[k] = cap_data.get(k, [])
-            # Cyno verification from cached fitting check (per active ship)
-            if in_force_recon:
+            # Cyno verification from cached fitting check (per active ship).
+            # The cached entry carries the GENERATOR id ("gen") since the shared
+            # cost model landed, because the cost depends on which of the three
+            # generators is fitted and a bare has_cyno bool cannot answer that.
+            # An entry written before then has no "gen" and falls back to its
+            # stored "lights"/"has_cyno" -- it is at most 10 minutes old and the
+            # next fetch replaces it.
+            if cyno_hull:
                 cyno_cache = cap_data.get("cyno_check", {})
                 ship_check = cyno_cache.get(str(info["ship_item_id"]))
                 if ship_check:
-                    if ship_check.get("has_cyno") and ship_check.get("ozone", 0) > 0:
+                    if "gen" in ship_check:
+                        _ozone_fill_cyno(info, ship_check.get("gen"),
+                                         ship_check.get("ozone", 0), ozone_cfg)
+                    elif ship_check.get("has_cyno"):
                         info["cyno"] = True
-                        info["cyno_ozone"] = ship_check["ozone"]
-                        cost = OZONE_COST_PER_ACTIVATION.get(
-                            info["ship_type_id"], DEFAULT_OZONE_COST
-                        )
-                        info["cyno_low"] = info["cyno_ozone"] <= cost
+                        info["cyno_ozone"] = int(ship_check.get("ozone", 0) or 0)
+                        info["cyno_lights"] = int(ship_check.get("lights", 0) or 0)
+                        info["cyno_text"] = f"{info['cyno_ozone']} ozone"
+                        info["cyno_low"] = (info["cyno_lights"]
+                                            < ozone_cfg["min_activations"])
             # Fold in the currently-piloted capital (from the fresh get_ship_type
             # signal, NOT the 10-min asset cache) so a titan/dread/blops/FAX flown
             # right now — including in space — is a filter/card member.
@@ -10437,35 +10636,24 @@ class FCToolGUI:
                             info[cat_key].append(entry)
                             break
 
-            # Cyno fitting check: only meaningful if in a Force Recon
-            if in_force_recon and info["ship_item_id"]:
+            # Cyno fitting check: only meaningful in a cyno-capable hull.
+            # The walk itself is ozone_watch.scan_ship_assets -- the SAME reader
+            # "Watch my ozone" uses, so the card and the toast can never
+            # disagree about what is fitted or how much is aboard.
+            if cyno_hull and info["ship_item_id"]:
                 ship_iid = info["ship_item_id"]
-                has_cyno = False
-                ozone_amount = 0
-                for a in assets:
-                    if a.get("location_id") != ship_iid:
-                        continue
-                    flag = a.get("location_flag", "")
-                    tid = a.get("type_id", 0)
-                    # Cyno module fitted in any high slot
-                    if flag.startswith("HiSlot") and tid in CYNO_MODULE_TYPES:
-                        has_cyno = True
-                    # Liquid ozone in cargo
-                    elif flag == "Cargo" and tid == LIQUID_OZONE_TYPE_ID:
-                        ozone_amount += a.get("quantity", 0)
-
+                cargo = ozone_watch.scan_ship_assets(assets, ship_iid)
+                cost = _ozone_fill_cyno(info, cargo.generator_type_id,
+                                        cargo.ozone, ozone_cfg)
                 cyno_check_data[str(ship_iid)] = {
-                    "has_cyno": has_cyno,
-                    "ozone": ozone_amount,
+                    # "gen" is what makes the cached entry re-costable; the
+                    # other three stay for readers of the older shape.
+                    "gen": cargo.generator_type_id,
+                    "has_cyno": cargo.generator_type_id is not None,
+                    "ozone": cargo.ozone,
+                    "cost": cost,
+                    "lights": info["cyno_lights"],
                 }
-
-                if has_cyno and ozone_amount > 0:
-                    info["cyno"] = True
-                    info["cyno_ozone"] = ozone_amount
-                    cost = OZONE_COST_PER_ACTIVATION.get(
-                        info["ship_type_id"], DEFAULT_OZONE_COST
-                    )
-                    info["cyno_low"] = ozone_amount <= cost
         except Exception as e:
             print(f"[Characters] Asset fetch error for {acct.character_name}: {e}")
 
@@ -10505,6 +10693,8 @@ class FCToolGUI:
         cap_data["region"] = info["region"]
         cap_data["cyno"] = info["cyno"]
         cap_data["cyno_ozone"] = info["cyno_ozone"]
+        cap_data["cyno_lights"] = info["cyno_lights"]
+        cap_data["cyno_text"] = info["cyno_text"]
         cap_data["cyno_low"] = info["cyno_low"]
         cap_data["dictor"] = info["dictor"]
         self._asset_cache[char_id] = (time.monotonic(), time.time(), cap_data)
@@ -10847,7 +11037,10 @@ class FCToolGUI:
                      anchor=tk.W, wraplength=wraplen, justify=tk.LEFT,
                      ).pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
 
-        # Cyno capability (current ship is Force Recon with cyno fitted + ozone)
+        # Cyno capability: the current ship is cyno-capable AND has a generator
+        # fitted. Zero ozone still shows the row -- "0 ozone = no lights" is the
+        # single most useful thing this card can say to a cyno pilot, and used
+        # to read as no cyno at all.
         if (info.get("cyno") and (not only_cap or only_cap == "cyno")
                 and (not only_region or info.get("region") == only_region)):
             has_caps = True
@@ -10859,14 +11052,17 @@ class FCToolGUI:
             tk.Label(row, text=f"Active — {info['ship']} in {info['system']}",
                      font=("Consolas", 9), fg=FG_GREEN, bg=BG_PANEL,
                      anchor=tk.W).pack(side=tk.LEFT, padx=(5, 0))
-            ozone = info.get("cyno_ozone", 0)
+            # Lights, not raw units: 600 ozone means nothing until you know the
+            # fitted generator's cost. Wording comes from ozone_watch, the same
+            # phrase the toast uses (singular "1 light", "no lights" at zero).
+            text = (info.get("cyno_text")
+                    or f"{info.get('cyno_ozone', 0)} ozone")
+            tk.Label(row, text=f"  ({text})",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
+                     anchor=tk.W).pack(side=tk.LEFT)
             if info.get("cyno_low"):
-                tk.Label(row, text=f"  [LOW OZONE - {ozone}]",
+                tk.Label(row, text="  [LOW OZONE]",
                          font=("Consolas", 9, "bold"), fg=FG_RED, bg=BG_PANEL,
-                         anchor=tk.W).pack(side=tk.LEFT)
-            else:
-                tk.Label(row, text=f"  ({ozone} ozone)",
-                         font=("Consolas", 9), fg=FG_DIM, bg=BG_PANEL,
                          anchor=tk.W).pack(side=tk.LEFT)
 
         # Dictor/HIC capability (current ship is interdictor or heavy interdictor)
@@ -22303,6 +22499,15 @@ class FCToolGUI:
             mon = self._preview_gamelog_factory(
                 on_event=lambda ev: self._post_ui(self._preview_on_damage, ev),
                 on_decloak=lambda ev: self._post_ui(self._preview_on_decloak, ev),
+                # "Watch my ozone" rides the same tailing pass. The sink is
+                # always attached rather than gated on the config HERE: this
+                # monitor is built once per session and the feature can be
+                # toggled after, so a build-time gate would need a restart to
+                # take effect. The per-line cost of an attached sink is one
+                # short-circuited substring test, and the master gate lives in
+                # _ozone_on_cyno_active where a toggle reaches it immediately.
+                on_cyno_active=lambda ev: self._post_ui(
+                    self._ozone_on_cyno_active, ev),
                 logs_dir=logs_dir)
             mon.start()
             self._preview_gamelog = mon
@@ -22698,10 +22903,17 @@ class FCToolGUI:
         if _ii is not None:
             _ii(auth, key)
 
+        # The RAW /ship/ payload of THIS pass, or None when the fetch was
+        # skipped or failed. "Watch my ozone" needs ship_item_id -- the id the
+        # assets endpoint hangs a fitted module and a cargo row off -- and
+        # CharState deliberately does not carry it, so the payload is handed
+        # straight to the hook below rather than re-fetched there.
+        ship_payload = None
         if force_ship or prior is None or sys_id != prior_sys_id:
             try:
                 ship = auth.get_ship_type() or {}
                 if ship.get("ship_type_id"):
+                    ship_payload = ship
                     ship_type_id = ship.get("ship_type_id")
                     # HULL TYPE (Thrasher, Onyx, …) from the local bundled SDE — NOT
                     # ship.get("ship_name"), which is the pilot's CUSTOM ship name.
@@ -22769,6 +22981,16 @@ class FCToolGUI:
                     online = bool(res["online"])
             except Exception:
                 pass
+
+        # "Watch my ozone": the undock and login EDGES both live in this one
+        # pass, so the hook rides it. Deliberately here at the BOTTOM rather
+        # than beside the implant hook above -- it needs the fresh `online`
+        # (fetched a few lines up) and the fresh /ship/ payload, neither of
+        # which exists yet at the location hook. getattr-guarded for the bare
+        # SimpleNamespace test hosts, the house pattern the two hooks above use.
+        _oz = getattr(self, "_ozone_observe", None)
+        if _oz is not None:
+            _oz(key, name, loc, online, ship_payload, auth, time.monotonic())
 
         return overlay_rules.CharState(
             character_id=getattr(auth, "character_id", 0) or 0, name=name,
@@ -22991,6 +23213,241 @@ class FCToolGUI:
             toast.show(rect)
         except Exception:
             log.exception("[implant] toast failed for %s", key)
+
+    # ── "Watch my ozone" wiring (default ON) ────────────────────────────────
+    # The feature itself lives in ozone_watch.py (pure cost model + cargo scan +
+    # latch, Tk-free), gamelog_monitor.parse_cyno_active_line (the cyno-lit
+    # lines) and client_toast.py. fc_gui owns three seams and no policy:
+    #
+    #   * _ozone_observe -- the ESI poller hook, one call per character per
+    #     poll. It derives the two EDGES the owner asked for (undock, login)
+    #     and is the only thing that ever reads /assets/;
+    #   * _ozone_on_cyno_active -- the gamelog hook, Tk thread, which burns one
+    #     activation off the last known figure (ESI will not show the burn for
+    #     up to an hour);
+    #   * _ozone_show_toast -- the Tk-thread raise, over the character's own
+    #     client, exactly like the implant reminder's.
+
+    def _ozone_watch_state(self, cfg):
+        """The ONE ``WatchState``, built lazily and rebuilt only on a changed
+        ``min_activations``.
+
+        Both hooks come through here, which is what makes the gamelog decrement
+        land on the sample the poller took. It holds no other config value, so
+        ``_save_settings`` replacing ``self.config`` cannot leave it stale --
+        every caller re-reads the block and this re-derives the threshold. A
+        rebuild drops the latches, which is correct: a changed threshold is a
+        changed question and every character deserves a fresh answer."""
+        want = int(cfg.get("min_activations",
+                           ozone_watch.DEFAULTS["min_activations"]))
+        state = self._ozone_state
+        if state is None or state.min_activations != want:
+            state = self._ozone_state = ozone_watch.WatchState(
+                min_activations=want)
+        return state
+
+    def _ozone_observe(self, key, name, loc, online, ship, auth, now):
+        """Poller-thread hook: advance ONE character by one poll pass.
+
+        Runs on the ESI poll thread and touches no Tk (the toast crosses via
+        _post_ui). Fully inert while config['ozone_watch']['enabled'] is False,
+        so an off feature costs one predicate call per character per poll and no
+        ESI call at all -- the implant reminder's rule, and the reason the gate
+        is ozone_watch.is_enabled rather than a raw dict read here (two
+        implementations of one predicate is precisely how that feature once
+        shipped a ticked box over a dead engine).
+
+        THE EDGES. Both come from the PREVIOUS pass, held in ``_ozone_prev`` as
+        ``(docked, online)``. That dict is this method's alone, deliberately:
+        ``_overlay_states`` is written by the CALLER after this builder returns,
+        so reading the prior sample from there would couple the hook to another
+        method's write ordering for no gain.
+
+          * undock = the previous sample was docked and this one is not. A
+            location call that answered nothing leaves `docked` carried forward,
+            so a failed poll can never fabricate an edge;
+          * login = the previous sample was explicitly offline and this one is
+            online. Strictly False->True: a character already online at startup
+            is NOT a login, and treating it as one would pull assets for every
+            cyno-capable character every time FCTool starts.
+
+        WHAT AN EDGE COSTS. A scope-less token, a non-cyno hull or an unknown
+        ship all return before /assets/ is touched. Past those, the per-ship
+        cache (``asset_ttl_s``, 600 s) answers a redock/undock inside ten
+        minutes for free -- ESI's own cache on that endpoint is longer anyway.
+
+        A FAILED PULL IS NO SAMPLE. get_assets() returns [] for a 403 and for a
+        genuinely empty hangar alike, and it breaks out of its pagination loop
+        on any error -- so an empty list cannot be told from a partial one. It
+        is therefore treated as "we learned nothing": nothing is cached, the
+        latch is untouched, and the next edge asks again. Inventing a
+        zero-ozone reading here would fire a spurious toast, which is the one
+        failure that gets a feature switched off.
+
+        Never raises -- a broken watch must not take the poller down."""
+        try:
+            raw = self.config.get("ozone_watch")
+            if not ozone_watch.is_enabled(raw):
+                return
+            key = str(key or "").strip().lower()
+            if not key:
+                return
+
+            prev_docked, prev_online = self._ozone_prev.get(key, (None, None))
+
+            # Remember the freshest ship we have seen. The poller fetches /ship/
+            # only every Nth pass (or on a system change), and an undock inside
+            # one system is exactly a pass where it does not -- so the memo, not
+            # a re-fetch, is what makes ship_item_id available on the edge.
+            if isinstance(ship, dict) and ship.get("ship_type_id"):
+                self._ozone_ship[key] = (ship.get("ship_type_id"),
+                                         int(ship.get("ship_item_id") or 0))
+            ship_type_id, ship_item_id = self._ozone_ship.get(key, (None, 0))
+
+            docked = prev_docked
+            if loc:
+                docked = bool(loc.get("station_id") or loc.get("structure_id"))
+            self._ozone_prev[key] = (
+                docked, prev_online if online is None else bool(online))
+
+            undocked = prev_docked is True and docked is False
+            logged_in = prev_online is False and online is True
+            if not (undocked or logged_in):
+                return
+
+            if not auth.has_scope(_ASSETS_SCOPE):
+                if key not in self._ozone_scope_logged:
+                    self._ozone_scope_logged.add(key)
+                    log.warning("[ozone] %s has no %s - ozone watch skipped "
+                                "for this character", key, _ASSETS_SCOPE)
+                return
+            if not ship_type_id:
+                return
+            catalog = getattr(self, "type_catalog", None)
+            group = catalog.group_of(ship_type_id) if catalog is not None else None
+            # BOTH ids: a Venture lives in group 25, which is not cyno-capable
+            # at large, and is whitelisted by type instead.
+            if not ozone_watch.is_cyno_hull(group, ship_type_id):
+                return
+            if not ship_item_id:
+                return
+
+            cfg = ozone_watch.normalize_config(raw)
+            cache_key = (key, ship_item_id)
+            entry = self._ozone_asset_cache.get(cache_key)
+            if entry is not None and (now - entry[0]) < cfg["asset_ttl_s"]:
+                cargo = entry[1]
+            else:
+                try:
+                    assets = auth.get_assets()
+                except Exception:
+                    assets = None
+                if not assets:
+                    return                      # no sample; nothing cached
+                cargo = ozone_watch.scan_ship_assets(assets, ship_item_id)
+                self._ozone_asset_cache[cache_key] = (now, cargo)
+
+            cost = ozone_watch.effective_ozone_cost(
+                cargo.generator_type_id, ship_type_id,
+                cfg["assumed_skill_level"])
+            verb = self._ozone_watch_state(cfg).observe_edge(
+                key, ship_item_id, cargo, cost, now,
+                disabled=key in cfg["disabled_chars"])
+            if verb != ozone_watch.FIRE:
+                return
+            hull = ""
+            if catalog is not None:
+                hull = catalog.resolve_name(ship_type_id) or ""
+            self._post_ui(
+                self._ozone_show_toast, key, name,
+                ozone_watch.toast_body(hull, cargo, cost,
+                                       cfg["min_activations"]))
+        except Exception:
+            log.exception("[ozone] watch hook failed")
+
+    def _ozone_on_cyno_active(self, ev):
+        """Tk-thread ingest of a GamelogMonitor CynoActiveEvent.
+
+        Mirrors _preview_on_decloak: the monitor marshals here via _post_ui, so
+        everything below runs on the main thread.
+
+        NEITHER gamelog line behind this event is an activation -- both are
+        rejected-action lines (a module re-click hint, and a dock refusal while
+        the field burns) and a pilot can emit a dozen of either per cycle. The
+        de-duplication is the engine's (one decrement per generator cycle per
+        ship); this method's own job is the NAME filter: "is already active" is
+        emitted for any module, so the line only concerns us when the module it
+        names is actually a cynosural field generator.
+
+        The figure decremented is the last one /assets/ gave us. With none --
+        an unwatched character, a hull with no generator -- observe_cyno_lit
+        answers CLEAR and nothing is invented."""
+        try:
+            raw = self.config.get("ozone_watch")
+            if not ozone_watch.is_enabled(raw):
+                return
+            if not ozone_watch.is_generator_name(
+                    getattr(ev, "generator_name", "")):
+                return
+            name = str(getattr(ev, "character_name", "") or "")
+            key = name.strip().lower()
+            if not key:
+                return
+            cfg = ozone_watch.normalize_config(raw)
+            state = self._ozone_watch_state(cfg)
+            verb = state.observe_cyno_lit(
+                key, time.monotonic(),
+                disabled=key in cfg["disabled_chars"])
+            if verb != ozone_watch.FIRE:
+                return
+            last = state.last(key)
+            if last is None or last.cargo is None:
+                return
+            ship_type_id, _item = self._ozone_ship.get(key, (None, 0))
+            catalog = getattr(self, "type_catalog", None)
+            hull = ""
+            if catalog is not None and ship_type_id:
+                hull = catalog.resolve_name(ship_type_id) or ""
+            self._ozone_show_toast(
+                key, name,
+                ozone_watch.toast_body(hull, last.cargo, last.cost,
+                                       cfg["min_activations"]))
+        except Exception:
+            log.exception("[ozone] cyno-lit hook failed")
+
+    def _ozone_show_toast(self, key, char_name, body):
+        """Tk-thread: raise the transient over-client toast for ONE character.
+
+        Same contract as _implant_show_toast, and it shares that method's client
+        lookup (_implant_client_rect is a pure read-only rect lookup keyed on a
+        char key -- nothing about it is implant-specific). No foreground
+        suppression, for the same reason: a pilot staring at the client he is
+        about to undock is exactly who this is for.
+
+        One ozone toast at a time, tracked separately from the implant one so
+        neither feature can dismiss the other's window. With no client rect
+        there is nothing sensible to sit over, so the toast is skipped rather
+        than parked at a guessed screen position -- logged, because a silent
+        skip is indistinguishable from a missed edge."""
+        try:
+            prev = self._ozone_toast
+            if prev is not None:
+                prev.dismiss()
+                self._ozone_toast = None
+            rect = self._implant_client_rect(key)
+            if rect is None:
+                log.warning("[ozone] no on-screen EVE client for %s - "
+                            "toast skipped", key)
+                return
+            cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
+            toast = client_toast.ClientToast(
+                self.root, ozone_watch.TOAST_TITLE, body,
+                seconds=cfg["toast_seconds"],
+                on_dismiss=lambda: setattr(self, "_ozone_toast", None))
+            self._ozone_toast = toast
+            toast.show(rect)
+        except Exception:
+            log.exception("[ozone] toast failed for %s", key)
 
     # ── Fleet-chat range check wiring (default OFF) ─────────────────────────
     # The feature itself lives in range_check.py: a pure Tk-free engine (keyword
