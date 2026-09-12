@@ -322,10 +322,12 @@ def doctrine_member_from_dict(d: dict) -> DoctrineMember:
         ideal_min=d.get("ideal_min"),
         ideal_max=d.get("ideal_max"),
         seed_target=d.get("seed_target"),
-        # Absent key (every library written before refits existed) => []. A
-        # stored null degrades to [] too rather than raising. Loaded verbatim:
-        # normalisation is the store's job, on mutation, never here.
-        refits=list(d.get("refits", []) or []),
+        # Absent key (every library written before refits existed) => []. So does
+        # any non-list value: a stored null, and a hand-edited `"refits": "abc"`
+        # — which `list()` would otherwise turn into the three fit ids
+        # ['a', 'b', 'c'] rather than rejecting. The CONTENTS are loaded
+        # verbatim: normalisation is the store's job, on mutation, never here.
+        refits=list(d["refits"]) if isinstance(d.get("refits"), list) else [],
     )
 
 

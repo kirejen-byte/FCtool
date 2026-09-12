@@ -372,6 +372,12 @@ class FittingsStore:
         member. Deleting a refit therefore never removes a slot while another fit
         remains — the doctrine still wants that ship. The slot goes only when
         nothing is left to fly it (the active fit deleted and no refit survives).
+
+        Normalises the hand-edited `fit_id ∉ refits` shape first, exactly as
+        `remove_refit` does: without it a slot flying `a` with refits `[b, c]`
+        would, on deleting `b`, collapse to one remaining fit and silently lose
+        `c`. With it the slot lands on `[a, c]` — the same answer both mutators
+        give.
         """
         with self._lock:
             self._fits.pop(fit_id, None)
@@ -382,6 +388,7 @@ class FittingsStore:
                         if member.fit_id != fit_id:
                             survivors.append(member)
                         continue
+                    self._normalise_slot(member)
                     remaining = [f for f in member.refits if f != fit_id]
                     if member.fit_id == fit_id:
                         if not remaining:
@@ -623,12 +630,17 @@ class FittingsStore:
 
     def add_fit_to_doctrine(
         self, doctrine_id: str, fit_id: str, tags: list[str]
-    ) -> None:
+    ) -> bool:
         """Add a fit to a doctrine with its own tag list. Tags are copied so
         the same fit can carry different tags in another doctrine.
 
-        Silently no-ops (today's style — the return value is None and callers
-        don't check) when `fit_id` is already a REFIT of some slot in this
+        Returns True when a member was added, False when the doctrine is unknown
+        or the add was refused — so a caller can tell the user why nothing
+        appeared instead of watching the row silently not arrive. (Additive: the
+        method returned None before and every existing caller ignores the
+        result, so nothing breaks.)
+
+        It is refused when `fit_id` is already a REFIT of some slot in this
         doctrine: a fit belongs to at most one slot, and adding it as a second
         member would give the doctrine two rows for one ship whose refit chip
         and member row disagree. Adding a fit that is already another member's
@@ -639,10 +651,10 @@ class FittingsStore:
         with self._lock:
             doctrine = self._doctrines.get(doctrine_id)
             if doctrine is None:
-                return
+                return False
             for member in doctrine.members:
                 if fit_id in member.refits:
-                    return
+                    return False
             tags = list(tags or [])
             if self.catalog is not None and "Defenders" not in tags:
                 fit = self.get_fit(fit_id)
@@ -652,6 +664,7 @@ class FittingsStore:
                 DoctrineMember(fit_id=fit_id, tags=list(tags), order=len(doctrine.members))
             )
             doctrine.modified = _now()
+            return True
 
     def set_member_tags(
         self, doctrine_id: str, fit_id: str, tags: list[str]
@@ -890,6 +903,11 @@ class FittingsStore:
         The default is what `reset_refits` returns the slot to; which refit is
         ACTIVE right now is left exactly as it was. Returns False for an unknown
         doctrine or fit, or for a plain member.
+
+        Returns True without touching `modified` when the fit is ALREADY the
+        default — same rationale as `set_active_refit`: re-picking the current
+        entry from a menu must not dirty the library, and so must not make the
+        caller save, bump `revision()` and miss every memo keyed on it.
         """
         with self._lock:
             doctrine = self._doctrines.get(doctrine_id)
@@ -898,6 +916,8 @@ class FittingsStore:
             member = self._slot_of(doctrine, fit_id)
             if member is None or not member.refits:
                 return False
+            if member.refits[0] == fit_id:
+                return True
             self._normalise_slot(member)
             if fit_id not in member.refits:
                 return False
@@ -1075,7 +1095,18 @@ class FittingsStore:
                 incoming.name = self._unique_name(incoming.name, existing_names)
                 existing_names.add(incoming.name)
                 # Remap member fit ids; drop members whose fit didn't travel.
+                #
+                # This is the ONE place the store could mint a doctrine that
+                # breaks its own uniqueness rule, because the content-hash
+                # de-dupe above is name-blind: two DIFFERENT incoming fits with
+                # identical modules ("AC" and "AC2", or one member's fit and
+                # another's) map onto the SAME local id. Left alone that yields a
+                # refit list carrying an id twice, or two slots flying one fit —
+                # and `find_member`, which matches a single slot, would then edit
+                # whichever row came first. So each remapped id is claimed at
+                # most once per doctrine, first slot wins.
                 remapped: list[DoctrineMember] = []
+                claimed: set[str] = set()
                 for member in incoming.members:
                     local_fit_id = id_map.get(member.fit_id)
                     # Refits are remapped the same way and the ones whose fit did
@@ -1084,9 +1115,15 @@ class FittingsStore:
                     # is still in the doctrine, just on a different variant. Only
                     # when NOTHING survived is the member dropped (today's rule).
                     # A single survivor collapses back to a plain member.
-                    local_refits = [
+                    # `dict.fromkeys` de-dupes while keeping first-seen order.
+                    local_refits = list(dict.fromkeys(
                         id_map[f] for f in member.refits if f in id_map
-                    ]
+                    ))
+                    # Anything an earlier slot of this doctrine already flies is
+                    # not this slot's to carry.
+                    local_refits = [f for f in local_refits if f not in claimed]
+                    if local_fit_id in claimed:
+                        local_fit_id = None
                     if local_fit_id is None:
                         if not local_refits:
                             continue
@@ -1095,6 +1132,8 @@ class FittingsStore:
                         local_refits.insert(0, local_fit_id)   # normalise (§ _normalise_slot)
                     if len(local_refits) <= 1:
                         local_refits = []
+                    claimed.add(local_fit_id)
+                    claimed.update(local_refits)
                     remapped.append(
                         DoctrineMember(
                             fit_id=local_fit_id,
