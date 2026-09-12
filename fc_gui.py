@@ -13068,7 +13068,7 @@ class FCToolGUI:
                     seen.append(t)
         return seen
 
-    def _motd_refit_active(self, dna):
+    def _motd_refit_active(self, dna, doctrine=None):
         """``(dna, name)`` of the ACTIVE refit for a fit pill's ``dna`` — or None.
 
         The ``motd_doc.ResolveContext.refit_active`` seam (design 2026-09-12
@@ -13083,15 +13083,21 @@ class FCToolGUI:
         ``(doctrine.id, fittings.revision())`` because ``resolve`` calls it once
         per fit link: a refit swap bumps the revision, so the very next
         serialisation rebuilds the map even when the per-cycle ``_motd_ctx`` is
-        still holding this bound method.
+        still holding this seam.
+
+        ``doctrine`` is passed by ``_motd_build_resolve_context`` (which already
+        resolved it) so one compose pass does not re-read the combo once per fit
+        link; omitting it falls back to the combo, which keeps the seam usable
+        stand-alone.
 
         Both sides of the comparison are CANONICAL DNA — pills store canonical
         DNA but ``fit.dna`` may not (legacy bare-id T3 subsystems), so a raw
         compare would silently never match."""
-        try:
-            doctrine = self._motd_selected_doctrine()
-        except Exception:
-            doctrine = None
+        if doctrine is None:
+            try:
+                doctrine = self._motd_selected_doctrine()
+            except Exception:
+                doctrine = None
         if doctrine is None:
             return None
         try:
@@ -13100,9 +13106,20 @@ class FCToolGUI:
             rev = None
         key = (getattr(doctrine, "id", None), rev)
         if getattr(self, "_motd_refit_key", None) != key:
+            # Build into a LOCAL first and publish key+map together: assigning
+            # the key up front would, on a raising build, leave a key claiming a
+            # map that was never stored — every later call in that revision then
+            # fails on the missing attribute instead of retrying. A failed build
+            # leaves the PREVIOUS memo (and key) untouched, so the next call
+            # simply tries again.
+            try:
+                table = self._motd_build_refit_map(doctrine)
+            except Exception:
+                log.exception("[motd] refit map build failed")
+                return None
             self._motd_refit_key = key
-            self._motd_refit_map = self._motd_build_refit_map(doctrine)
-        table = self._motd_refit_map
+            self._motd_refit_map = table
+        table = getattr(self, "_motd_refit_map", None)
         if not table:
             return None
         hit = table.get(dna)
@@ -13120,7 +13137,12 @@ class FCToolGUI:
 
         Only slots WITH refits contribute, and the slot's OWN active fit is
         excluded — an already-active pill must resolve to None so
-        :func:`motd_doc._finalize_fit` leaves it exactly as written."""
+        :func:`motd_doc._finalize_fit` leaves it exactly as written.
+
+        Keyed on canonical DNA, not fit id, so two refits in DIFFERENT slots that
+        share a canonical DNA collapse and the LAST slot walked wins. Pathological
+        (the store's per-doctrine fit-id uniqueness rule does not reach identical
+        DNA under two ids) and harmless — both readings name a live active fit."""
         out = {}
         for mem in getattr(doctrine, "members", []) or []:
             fit_ids = _slot_fit_ids(mem)
@@ -13167,6 +13189,20 @@ class FCToolGUI:
         fc_auth = self._motd_selected_fc_auth()
         fc_selected = ((fc_auth.character_id, fc_auth.character_name)
                        if fc_auth else None)
+        # getattr-guarded, not a bare attribute read: the composer wiring is
+        # exercised by SimpleNamespace hosts, and every new ``self.<method>``
+        # this builder reads becomes one more harness bind-list entry to keep in
+        # sync. An unbound seam simply leaves every pill literal — which is
+        # exactly the no-refits behaviour. The doctrine is CLOSED OVER (it was
+        # resolved once above) so one compose pass does not re-read the combo
+        # per fit link.
+        refit_seam = getattr(self, "_motd_refit_active", None)
+        if refit_seam is None:
+            def refit_active(dna):
+                return None
+        else:
+            def refit_active(dna):
+                return refit_seam(dna, doctrine)
         return motd_doc.ResolveContext(
             selected_doctrine=doctrine,
             fits_by_tag=fits_by_tag,
@@ -13177,13 +13213,7 @@ class FCToolGUI:
             resolve_channel_id=self._motd_resolve_channel_id,
             fc_selected=fc_selected,
             legacy_fits=self._motd_loaded_fits,
-            # getattr-guarded, not a bare attribute read: the composer wiring is
-            # exercised by SimpleNamespace hosts, and every new ``self.<method>``
-            # this builder reads becomes one more harness bind-list entry to keep
-            # in sync. An unbound seam simply leaves every pill literal — which
-            # is exactly the no-refits behaviour.
-            refit_active=getattr(self, "_motd_refit_active", None)
-            or (lambda dna: None),
+            refit_active=refit_active,
         )
 
     def _motd_resolve_token_label(self, run):

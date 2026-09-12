@@ -393,7 +393,18 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         parsed = ctx.parse_fit(dna)
         ok = parsed is not None
         delta = ctx.deltas.get(parsed.ship_type_id, 0) if ok else 0
-        tip = f"resolves to fit link: {name}" if ok else f"unparseable DNA — link kept, no delta: {name}"
+        sub = _refit_substitute(dna, name, ctx)
+        if sub != (dna, name):
+            # The pill is LITERAL on disk but its link resolves to the slot's
+            # ACTIVE refit (§13), so the tooltip must not name a fit the MOTD
+            # will not contain. The LABEL stays the saved name (the document did
+            # not change), and the delta is unaffected: refits are same-hull by
+            # rule, so the substitute parses to the same ship_type_id.
+            tip = f"follows the active refit → {sub[1]}"
+        elif ok:
+            tip = f"resolves to fit link: {name}"
+        else:
+            tip = f"unparseable DNA — link kept, no delta: {name}"
         # SOLID even when the DNA won't parse: the link is kept with the raw DNA
         # (§4.2), only the delta drops — a fit chip is never stale on parse failure.
         return TokenLabel(_ellip(name), True, tip, delta)
