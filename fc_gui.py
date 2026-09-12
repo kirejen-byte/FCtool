@@ -106,6 +106,11 @@ import fit_models
 import fleet_guidance
 import fit_parser
 import fit_dna
+# Doctrine refits — the chip/menu MODEL plus the thin Tk widgets that draw it
+# (pure core + Tk shell in one module, the range_check/market_gap_dialog house
+# shape). Imports no fc_gui and no store: members/fits arrive duck-typed and
+# every action is an injected callback, so fc_gui keeps only the wiring.
+import doctrine_refits
 # Fit simulator (pure, stdlib-only). Importing these costs nothing at startup:
 # the bundled dogma table is decoded lazily by dogma_data.load(), which is
 # called ONLY from worker threads (spec 5.4, "no load at startup").
@@ -306,6 +311,9 @@ _SETTINGS_TOC_PADY = 10             # panel/ribbon vertical padding (matches pac
 # FITTINGS_TAB_INDEX stays 6 either way and nothing references the Settings
 # tab by a hardcoded index.
 FITTINGS_TAB_INDEX = 6
+# Sub-tabs of the Fittings notebook, in _build_fitting_tab's add() order:
+#   0 Fittings (library), 1 Doctrines, 2 MOTD.
+FITTINGS_SUBTAB_INDEX = 0
 DOCTRINES_SUBTAB_INDEX = 1
 
 # ESI fittings scopes (added after some characters were already authed; SSO
@@ -11589,7 +11597,18 @@ class FCToolGUI:
         """One member row: fit name + its tag-chip cluster within this doctrine
         + Tags/Remove controls. When ``avail_map`` (fit_id -> DoctrineAvailability)
         carries an entry for this member, a compact market-availability line is
-        appended below the tag chips."""
+        appended below the tag chips.
+
+        The name line shows the slot's ACTIVE fit — for a slot with refits that
+        is the feedback a swap produces. A slot WITH refits also grows one extra
+        sub-line under the tag chips (the ``doctrine_refits.RefitStrip``); a
+        PLAIN member row is built exactly as before, widget for widget, so the
+        pane it renders is pixel-identical to the pre-refits build.
+
+        Right-clicking the row's info column posts the member menu (Add refit… /
+        Tags… / Ideal… / Remove) — the discoverable entry point for a plain
+        member, which has no chips to right-click and no fourth button.
+        """
         fit = self.fittings.get_fit(mem.fit_id)
         name = fit.name if fit is not None else f"(missing fit {mem.fit_id})"
         hull = f"  ·  {fit.hull_name}" if fit is not None and fit.hull_name \
@@ -11600,20 +11619,52 @@ class FCToolGUI:
 
         info = tk.Frame(row, bg=BG_PANEL)
         info.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(info, text=f"{name}{hull}", font=("Consolas", 9),
-                 fg=FG_TEXT if fit is not None else FG_RED, bg=BG_PANEL,
-                 anchor=tk.W, justify=tk.LEFT, wraplength=300).pack(anchor=tk.W)
+        name_lbl = tk.Label(info, text=f"{name}{hull}", font=("Consolas", 9),
+                            fg=FG_TEXT if fit is not None else FG_RED,
+                            bg=BG_PANEL, anchor=tk.W, justify=tk.LEFT,
+                            wraplength=300)
+        name_lbl.pack(anchor=tk.W)
+        # Right-click targets for the member menu. Bindtags run
+        # (widget, class, toplevel, all) — a parent Frame is NOT in a child's
+        # chain — so every surface the user can plausibly hit is bound
+        # explicitly rather than relying on propagation from ``info``.
+        menu_targets = [info, name_lbl]
         # Tag-chip cluster: shows all tags this member carries in this doctrine.
         if mem.tags:
             chips = tk.Frame(info, bg=BG_PANEL)
             chips.pack(anchor=tk.W, pady=(1, 0))
+            menu_targets.append(chips)
             for tag in mem.tags:
-                tk.Label(chips, text=f" {tag} ", font=("Consolas", 8),
-                         fg=BG_DARK, bg=FG_ACCENT, padx=2).pack(
-                             side=tk.LEFT, padx=(0, 3))
+                chip = tk.Label(chips, text=f" {tag} ", font=("Consolas", 8),
+                                fg=BG_DARK, bg=FG_ACCENT, padx=2)
+                chip.pack(side=tk.LEFT, padx=(0, 3))
+                menu_targets.append(chip)
         else:
-            tk.Label(info, text="(no tags)", font=("Consolas", 8),
-                     fg=FG_DIM, bg=BG_PANEL).pack(anchor=tk.W, pady=(1, 0))
+            no_tags = tk.Label(info, text="(no tags)", font=("Consolas", 8),
+                               fg=FG_DIM, bg=BG_PANEL)
+            no_tags.pack(anchor=tk.W, pady=(1, 0))
+            menu_targets.append(no_tags)
+        for target in menu_targets:
+            target.bind(
+                "<Button-3>",
+                lambda ev, d=doctrine.id, m=mem:
+                    self._post_member_row_menu(d, m, ev))
+
+        # Refit strip — ONLY for a slot that carries refits (§7.1). Directly
+        # under the tag chips, same chip visual language. Availability text is
+        # per-refit and comes from the row's own market data; ``None`` when
+        # there is no snapshot (no tooltip market line rather than a blank one).
+        if getattr(mem, "refits", None):
+            strip = doctrine_refits.RefitStrip(
+                info,
+                doctrine_refits.chip_row(
+                    mem, self.fittings.get_fit,
+                    self._refit_availability_texts(doctrine, mem, avail_map)),
+                on_pick=lambda fid, d=doctrine.id: self._refits_swap(fid, d),
+                on_add=lambda d=doctrine.id, m=mem: self._add_refit_dialog(d, m),
+                on_context=lambda fid, ev, d=doctrine.id, m=mem:
+                    self._post_refit_chip_menu(d, m, fid, ev))
+            strip.pack(anchor=tk.W, pady=(1, 0))
 
         # Market availability line (only when a snapshot produced an entry). The
         # colour bar is the PER-FIT resolved seed target (member override wins,
@@ -11669,6 +11720,329 @@ class FCToolGUI:
         ttk.Button(ctrls, text="Remove", style="Red.TButton",
                    command=lambda: self._remove_doctrine_member(
                        doctrine.id, mem.fit_id)).pack(side=tk.LEFT, padx=1)
+
+    # ── Doctrine refits: member-row strip, menus, mutation handlers ──────────
+    #
+    # The widgets live in ``doctrine_refits``; everything below is wiring. The
+    # ONE post-mutation refresh chain is ``_after_refit_change`` (spec §7.4) —
+    # every refit mutator here ends in store-mutate → ``save()`` → that method,
+    # and nothing else re-renders on its own.
+
+    def _refit_availability_texts(self, doctrine, mem, avail_map):
+        """``{fit_id: market line}`` for this slot's refits, or None.
+
+        The chips' tooltips carry the same availability wording the row's own
+        market line uses (``_market_row_text``), computed against the SLOT's
+        resolved seed target — a refit is the same ship in the same role, so it
+        inherits the slot's target rather than owning one.
+
+        Returns None (not ``{}``) when the doctrine has no usable snapshot, so
+        ``chip_row`` leaves the tooltips market-free instead of hinting at data
+        that does not exist. Reads ``avail_map`` with ``.get`` only: whether it
+        carries entries for refit ids at all is the market enumerators' business.
+        """
+        amap = avail_map or {}
+        if not amap:
+            return None
+        target = self._market_seed_target(doctrine, mem)
+        pending = getattr(self, "_market_contracts_pending", False)
+        out = {}
+        for fit_id in (getattr(mem, "refits", None) or []):
+            avail = amap.get(fit_id)
+            if avail is None:
+                continue
+            out[fit_id] = self._market_row_text(
+                avail, target, contracts_pending=pending)[0]
+        return out or None
+
+    def _build_member_row_menu(self, doctrine_id, mem):
+        """The member row's right-click menu (built, NOT posted).
+
+        Every entry routes to the handler its button/dialog already uses, so the
+        menu adds an entry point and no second code path. ``Add refit…`` is the
+        affordance a PLAIN member has no chip for."""
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        fit_id = mem.fit_id
+        menu.add_command(label="Add refit…",
+                         command=lambda: self._add_refit_dialog(doctrine_id, mem))
+        menu.add_command(label="Tags…",
+                         command=lambda: self._edit_member_tags(doctrine_id, fit_id))
+        menu.add_command(label="Ideal…",
+                         command=lambda: self._edit_member_ideal(doctrine_id, fit_id))
+        menu.add_separator()
+        menu.add_command(label="Remove",
+                         command=lambda: self._remove_doctrine_member(
+                             doctrine_id, fit_id))
+        return menu
+
+    def _post_member_row_menu(self, doctrine_id, mem, event):
+        """Post the member-row menu at the pointer; returns it for tests."""
+        menu = self._build_member_row_menu(doctrine_id, mem)
+        self._post_menu(menu, event.x_root, event.y_root)
+        return menu
+
+    def _build_refit_chip_menu(self, doctrine_id, mem, fit_id):
+        """One refit chip's right-click menu (built, NOT posted).
+
+        ``Make active`` is disabled on the chip that is already active and
+        ``Make default`` on the one already at ``refits[0]`` — both store calls
+        are no-ops there, and a live entry that does nothing reads as a bug.
+        ``Remove refit`` on the last remaining refit collapses the slot back to
+        a plain member (the store's rule), which is why it never removes the row.
+        """
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        refits = list(getattr(mem, "refits", None) or [])
+        is_active = getattr(mem, "fit_id", None) == fit_id
+        is_default = bool(refits) and refits[0] == fit_id
+        menu.add_command(label="Make active",
+                         state=tk.DISABLED if is_active else tk.NORMAL,
+                         command=lambda: self._refits_swap(fit_id, doctrine_id))
+        menu.add_command(label="Make default",
+                         state=tk.DISABLED if is_default else tk.NORMAL,
+                         command=lambda: self._refit_make_default(
+                             doctrine_id, fit_id))
+        menu.add_command(label="Open in library",
+                         command=lambda: self._open_fit_in_library(fit_id))
+        menu.add_separator()
+        menu.add_command(label="Remove refit",
+                         command=lambda: self._remove_refit(doctrine_id, fit_id))
+        return menu
+
+    def _post_refit_chip_menu(self, doctrine_id, mem, fit_id, event):
+        """Post a refit chip's menu at the pointer; returns it for tests."""
+        menu = self._build_refit_chip_menu(doctrine_id, mem, fit_id)
+        self._post_menu(menu, event.x_root, event.y_root)
+        return menu
+
+    def _open_fit_in_library(self, fit_id):
+        """Navigate to ``fit_id`` in Fittings ▸ Fittings (best-effort).
+
+        The ``_open_active_doctrine`` navigation pattern: select the top-level
+        tab, then the sub-tab, then the tree row (which fires the tree-select
+        binding and renders the detail). The detail render is repeated
+        unconditionally so a tree miss — a fit filtered out of the list — still
+        opens the fit rather than silently doing nothing."""
+        try:
+            self.notebook.select(FITTINGS_TAB_INDEX)
+            subnb = getattr(self, "_fitting_subnb", None)
+            if subnb is not None:
+                subnb.select(FITTINGS_SUBTAB_INDEX)
+            tree = getattr(self, "_fit_tree", None)
+            if tree is not None and fit_id in tree.get_children(""):
+                tree.selection_set(fit_id)
+                tree.focus(fit_id)
+                tree.see(fit_id)
+            self._fit_selected_id = fit_id
+            self._show_fit_detail(fit_id)
+        except Exception:
+            log.exception("[fittings] open fit in library failed")
+
+    def _add_refit_dialog(self, doctrine_id, member):
+        """Pick library fits to add as refits of ``member``'s slot (§7.2).
+
+        Candidates are the library's fits with the SLOT'S HULL that are not
+        already anywhere in this doctrine (active OR refit — ``slot_fit_ids`` is
+        the enumerator, so a fit already carried as someone's refit is not
+        offered and then silently refused). An empty candidate list shows a
+        message instead of a dead picker.
+
+        The slot is re-resolved through ``find_member`` so a member object
+        captured before an earlier swap still targets the right slot.
+        """
+        import fittings_store as _fittings_store
+
+        doctrine = self.fittings.get_doctrine(doctrine_id)
+        if doctrine is None:
+            return
+        mem = self.fittings.find_member(
+            doctrine_id, getattr(member, "fit_id", "")) or member
+        active = self.fittings.get_fit(mem.fit_id)
+        if active is None:
+            messagebox.showinfo(
+                "Add refit",
+                "This row's fit is missing from the library, so there is no "
+                "hull to match refits against. Remove the row or re-import the "
+                "fit first.")
+            return
+        taken = set()
+        for m in doctrine.members:
+            taken.update(_fittings_store.slot_fit_ids(m))
+            taken.add(m.fit_id)
+        hull = active.hull_name or str(active.hull_type_id)
+        candidates = [f for f in sorted(self.fittings.list_fits(),
+                                        key=lambda f: (f.name or "").lower())
+                      if f.id not in taken
+                      and f.hull_type_id == active.hull_type_id]
+        if not candidates:
+            messagebox.showinfo(
+                "Add refit",
+                f"No other {hull} fits in the library — import or paste one "
+                f"first.")
+            return
+
+        items = [{"id": f.id, "label": f"{hull}  —  {f.name or '?'}",
+                  "row_data": f} for f in candidates]
+
+        def _on_import(chosen, ctl):
+            if not chosen:
+                ctl.close()
+                return
+            added = 0
+            for item in chosen:
+                if self.fittings.add_refit(
+                        doctrine_id, mem.fit_id, item["row_data"].id):
+                    added += 1
+            if added:
+                self.fittings.save()
+                self._after_refit_change(doctrine_id)
+                self._refit_refresh_library_views()
+            if added < len(chosen):
+                messagebox.showinfo(
+                    "Add refit",
+                    f"{len(chosen) - added} of the selected fits could not be "
+                    f"added as refits of this {hull} (different hull, or "
+                    f"already used by another row in this doctrine).")
+            ctl.close()
+
+        self._show_multi_select_picker(
+            items, on_import=_on_import, title=f"Add refit — {hull}")
+
+    def _refit_make_default(self, doctrine_id, fit_id):
+        """Move ``fit_id`` to the head of its slot's refits (what Reset returns
+        to). Saves + refreshes only when it actually moved — the store returns
+        True without stamping ``modified`` for a fit that is already the
+        default, and saving there would bump ``revision()`` and miss every memo
+        keyed on it for nothing."""
+        mem = self.fittings.find_member(doctrine_id, fit_id)
+        already = (mem is not None
+                   and list(getattr(mem, "refits", None) or [])[:1] == [fit_id])
+        ok = self.fittings.set_default_refit(doctrine_id, fit_id)
+        if ok and not already:
+            self.fittings.save()
+            self._after_refit_change(doctrine_id)
+        return ok
+
+    def _remove_refit(self, doctrine_id, fit_id):
+        """Drop ONE refit from its slot, keeping the slot (the store promotes a
+        new active / collapses the slot back to a plain member as needed).
+        Membership changed, so the library's #Doc + Tags columns are re-rendered
+        as well as the refresh chain."""
+        ok = self.fittings.remove_refit(doctrine_id, fit_id)
+        if ok:
+            self.fittings.save()
+            self._after_refit_change(doctrine_id)
+            self._refit_refresh_library_views()
+        return ok
+
+    def _refits_swap(self, fit_id, doctrine_id=None):
+        """Make ``fit_id`` the ACTIVE refit of its slot — the ONE swap handler.
+
+        Shared by the member-row chips, the chip menu and (bite 6) the
+        ``Refits ▾`` menus and the fleet-chat command, so every surface produces
+        the identical store call + refresh. ``doctrine_id=None`` means "the
+        doctrine the fleet is flying" (``_active_fleet_doctrine``) — the
+        mid-fleet callers never carry an id.
+
+        Returns the store's bool. Saves ONLY on a real change: the store returns
+        True for a re-pick of the fit that is already active without stamping
+        ``modified``, and a save there would dirty the library and invalidate
+        every ``revision()``-keyed memo for a no-op.
+        """
+        if doctrine_id is None:
+            doctrine = self._active_fleet_doctrine()
+            if doctrine is None:
+                return False
+            doctrine_id = doctrine.id
+        mem = self.fittings.find_member(doctrine_id, fit_id)
+        already = mem is not None and getattr(mem, "fit_id", None) == fit_id
+        ok = self.fittings.set_active_refit(doctrine_id, fit_id)
+        if ok and not already:
+            self.fittings.save()
+            self._after_refit_change(doctrine_id)
+        return ok
+
+    def _refits_reset(self, doctrine_id=None):
+        """Return every slot of the doctrine to its DEFAULT refit (the form-up
+        reset). Returns the store's changed-slot COUNT; 0 means nothing moved,
+        and then nothing is saved and nothing refreshes."""
+        if doctrine_id is None:
+            doctrine = self._active_fleet_doctrine()
+            if doctrine is None:
+                return 0
+            doctrine_id = doctrine.id
+        changed = self.fittings.reset_refits(doctrine_id)
+        if changed:
+            self.fittings.save()
+            self._after_refit_change(doctrine_id)
+        return changed
+
+    def _refit_refresh_library_views(self):
+        """Re-render the Fittings library list after a refit was ADDED or
+        REMOVED. Membership (not just which variant is active) changed, and the
+        list's #Doc / Tags columns count refits. A pure SWAP does not call this
+        — nothing in the library list depends on which refit is active.
+
+        Guarded: the Fittings sub-tab may never have been built (tests, and any
+        future partial host)."""
+        tree = getattr(self, "_fit_tree", None)
+        var = getattr(self, "_fit_search_var", None)
+        if tree is None or var is None:
+            return
+        self._refresh_fit_list(var.get())
+
+    def _after_refit_change(self, doctrine_id):
+        """THE post-mutation refresh chain for a refit change (spec §7.4).
+
+        Called after every refit mutation + ``save()``, by every surface. The
+        steps, and why the omitted ones are omitted:
+
+        a. the Doctrines detail pane re-renders when it is showing THIS
+           doctrine (the pane already re-renders wholesale on every edit);
+        b. ``_refresh_doctrine_list`` is deliberately NOT called — the list's
+           #Fits column counts SLOTS, and no refit mutation changes that;
+        c. the MOTD composer refreshes its Quick-Add tray + preview/meter when
+           its selected doctrine is this one — the role lines and the tray chips
+           re-resolve against the new active fit. The document is NOT marked
+           dirty: the doc did not change, only its resolution;
+        d. an ARMED auto-update link re-pushes (``_motd_maybe_autopush`` is a
+           quiet no-op when the serialised markup is unchanged);
+        e. fleet stats, preview captions and cycle roles need nothing — their
+           memos are keyed on ``fittings.revision()``, which the save bumped.
+
+        Every step is guarded, so a host where a tab was never built (tests,
+        the Fittings tab before first open) refreshes what exists and skips the
+        rest instead of raising into a store mutation that already committed.
+        """
+        # (a) Doctrines detail pane.
+        if getattr(self, "_doctrine_selected_id", None) == doctrine_id:
+            pane = getattr(self, "_doctrine_detail", None)
+            if pane is not None:
+                try:
+                    alive = bool(pane.winfo_exists())
+                except Exception:
+                    alive = False
+                if alive:
+                    self._show_doctrine_detail(doctrine_id)
+
+        # (c) MOTD composer, only when it is showing this doctrine.
+        selected = None
+        if getattr(self, "_motd_doctrine_var", None) is not None:
+            try:
+                selected = self._motd_selected_doctrine()
+            except Exception:
+                selected = None
+        if selected is not None and getattr(selected, "id", None) == doctrine_id:
+            pal = getattr(self, "_motd_palette", None)
+            if pal is not None:
+                pal.refresh_tray()
+            if getattr(self, "_motd_preview", None) is not None:
+                self._rebuild_motd_preview()
+
+        # (d) Auto-update link armed → push (no-op on unchanged markup).
+        if getattr(self, "_motd_link_enabled", False):
+            self._motd_maybe_autopush()
 
     def _build_member_seed_target_row(self, parent, doctrine, mem):
         """Compact per-fit seed-target editor for one doctrine member row.
@@ -12002,11 +12376,26 @@ class FCToolGUI:
     def _add_fit_to_doctrine(self, doctrine_id):
         """Bulk-add library fits to a doctrine via the shared multi-select
         picker. Candidates are fits not already in the doctrine; the chosen
-        fits all receive the SAME tag set (prompted once) on add."""
+        fits all receive the SAME tag set (prompted once) on add.
+
+        "Already in the doctrine" means anywhere in a slot — active fit OR refit
+        (``slot_fit_ids``). Offering a fit that is already someone's refit would
+        get it silently refused by the store's uniqueness rule.
+
+        When the selection contains fits whose hull a slot already flies (or two
+        chosen fits that share a hull), ONE prompt asks whether they should join
+        the existing rows as REFITS or become separate rows (§7.2) — this is the
+        moment refits are discovered.
+        """
+        import fittings_store as _fittings_store
+
         doctrine = self.fittings.get_doctrine(doctrine_id)
         if doctrine is None:
             return
-        existing = {m.fit_id for m in doctrine.members}
+        existing = set()
+        for m in doctrine.members:
+            existing.update(_fittings_store.slot_fit_ids(m))
+            existing.add(m.fit_id)
         candidates = [f for f in sorted(self.fittings.list_fits(),
                                         key=lambda f: (f.name or "").lower())
                       if f.id not in existing]
@@ -12038,30 +12427,145 @@ class FCToolGUI:
         def _on_import(chosen, ctl):
             if not chosen:
                 return
+            picked = [item["row_data"] for item in chosen]
+            # Same-hull partition FIRST (before the tag prompt): fits whose hull
+            # a slot already flies, or which collide by hull among themselves.
+            rows, colliders = self._partition_doctrine_adds(doctrine, picked)
+            if colliders:
+                mode = self._prompt_refit_collision(colliders)
+                if mode is None:
+                    return                      # Cancel → nothing added at all
+                if mode == "separate":
+                    rows, colliders = picked, []   # today's behaviour exactly
             # Prompt tags ONCE. Any chosen tags apply to every selected fit;
             # leaving them all UNCHECKED adds the fits TAGLESS so you can tag
             # each one individually afterwards (per-fit "Tags" in the doctrine
-            # detail). Cancel aborts the add entirely.
-            tags = self._prompt_tag_multiselect(
-                "Tags for these fits",
-                "Optional: choose tags to apply to ALL selected fits.\n"
-                "Leave everything unchecked to add them WITHOUT tags — you can "
-                "tag each fit individually later.",
-                selected=[])
-            if tags is None:
-                return
-            for item in chosen:
-                self.fittings.add_fit_to_doctrine(
-                    doctrine_id, item["row_data"].id, tags)
+            # detail). Cancel aborts the add entirely. Refits carry no tags of
+            # their own (tags are slot-level), so a selection that became ALL
+            # refits is not asked.
+            tags = []
+            if rows:
+                tags = self._prompt_tag_multiselect(
+                    "Tags for these fits",
+                    "Optional: choose tags to apply to ALL selected fits.\n"
+                    "Leave everything unchecked to add them WITHOUT tags — you "
+                    "can tag each fit individually later.",
+                    selected=[])
+                if tags is None:
+                    return
+            refused = []
+            for fit in rows:
+                if not self.fittings.add_fit_to_doctrine(
+                        doctrine_id, fit.id, tags):
+                    refused.append(fit)
+            # Refits go on after the rows: a self-colliding group's head is one
+            # of those rows and has to exist before its siblings refit onto it.
+            for fit, slot_fit_id in colliders:
+                if not self.fittings.add_refit(
+                        doctrine_id, slot_fit_id, fit.id):
+                    refused.append(fit)
             self.fittings.save()
             self._refresh_doctrine_list()
             self._show_doctrine_detail(doctrine_id)
             self._refresh_fit_list(self._fit_search_var.get())
             self._motd_refresh_doctrines()
+            if refused:
+                names = ", ".join((f.name or f.id) for f in refused[:5])
+                messagebox.showinfo(
+                    "Add fits",
+                    f"{len(refused)} fit(s) were not added — they are already "
+                    f"used by a row in this doctrine, or their hull does not "
+                    f"match the row they would refit:\n\n{names}")
             ctl.close()
 
         self._show_multi_select_picker(
             items, on_import=_on_import, title="Add fits to doctrine")
+
+    def _partition_doctrine_adds(self, doctrine, fits):
+        """Split chosen fits into ``(rows, colliders)`` for the §7.2 prompt.
+
+        ``rows`` are the fits that become member ROWS: one whose hull is new to
+        the doctrine, and — for a group of chosen fits that share a hull the
+        doctrine does not have yet — the FIRST of that group, which is the row
+        its siblings refit onto.
+
+        ``colliders`` is ``[(fit, slot_fit_id)]``: the fits that would join an
+        existing slot, paired with the fit id identifying that slot (an existing
+        slot's ACTIVE fit, or the head fit of a self-colliding group). Order is
+        the selection's, so the pairs can be applied in sequence.
+
+        Hull identity is ``hull_type_id``; a fit whose slot's active fit is
+        missing from the library contributes no hull and so collides with
+        nothing (the store would refuse the add_refit anyway — it cannot check
+        the same-hull rule against a fit that is not there).
+        """
+        slot_by_hull = {}
+        for member in doctrine.members:
+            fit = self.fittings.get_fit(member.fit_id)
+            if fit is not None and fit.hull_type_id not in slot_by_hull:
+                slot_by_hull[fit.hull_type_id] = member.fit_id
+        rows, colliders, heads = [], [], {}
+        for fit in fits:
+            hull = fit.hull_type_id
+            if hull in slot_by_hull:
+                colliders.append((fit, slot_by_hull[hull]))
+            elif hull in heads:
+                colliders.append((fit, heads[hull].id))
+            else:
+                heads[hull] = fit
+                rows.append(fit)
+        return rows, colliders
+
+    def _prompt_refit_collision(self, colliders):
+        """The one same-hull prompt: refits, separate rows, or cancel.
+
+        Returns ``"refits"``, ``"separate"`` or None (cancel / closed). Built
+        with ``grab=False``: ANY Tk grab deafens the FCPreview tiles for as long
+        as the window is open (``ui_helpers.make_modal``), and this dialog can
+        surface mid-form-up. ``wait_window`` still makes the call blocking for
+        the caller, which is what the add flow needs.
+        """
+        counts = {}
+        for fit, _slot in colliders:
+            hull = getattr(fit, "hull_name", "") or str(
+                getattr(fit, "hull_type_id", "?"))
+            counts[hull] = counts.get(hull, 0) + 1
+        listing = ", ".join(h if n == 1 else f"{h} ×{n}"
+                            for h, n in counts.items())
+        n = len(colliders)
+        message = (
+            f"{n} of the selected fits use a hull already in this doctrine "
+            f"({listing}).\n\n"
+            "Add them as refits of the existing rows, or as separate rows?\n\n"
+            "A refit is the same ship flying a different fitting — it shares "
+            "the row's tags, ideal and seed target. Separate rows are for two "
+            "genuinely different jobs on one hull (a shield Loki and an armor "
+            "Loki).")
+
+        result = {"choice": None}
+        win = tk.Toplevel(self.root)
+        win.title("Same hull already in this doctrine")
+        make_modal(win, self.root, on_cancel=win.destroy, grab=False)
+        tk.Label(win, text=message, font=("Consolas", 9), fg=FG_TEXT,
+                 bg=BG_DARK, wraplength=420, justify=tk.LEFT).pack(
+                     anchor=tk.W, padx=14, pady=(14, 4))
+
+        def _choose(value):
+            result["choice"] = value
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=win.destroy).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Separate rows", style="Dark.TButton",
+                   command=lambda: _choose("separate")).pack(
+                       side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Add as refits", style="Green.TButton",
+                   command=lambda: _choose("refits")).pack(
+                       side=tk.RIGHT, padx=4)
+        self.root.wait_window(win)
+        return result["choice"]
 
     def _edit_member_tags(self, doctrine_id, fit_id):
         """Multi-select the tag vocabulary for one (doctrine, fit) membership."""
