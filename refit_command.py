@@ -73,7 +73,7 @@ RESET_WORD = "reset"
 KINDS = ("swap", "reset", "ambiguous", "noop", "error")
 
 #: Rendered between the slot's hull and the fit name in every label/message.
-ARROW = "→"          # →
+ARROW = "→"
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -133,11 +133,13 @@ def parse(body, keyword) -> Command | None:
     """``"refit 2"`` -> ``Command``; anything that is not a command -> ``None``.
 
     The body must START with ``keyword`` (case-insensitive, after ``lstrip``)
-    and the keyword must be followed by end-of-line or whitespace. Substring
-    matching — which is what the range check does — is WRONG here: a refit
-    command carries arguments, so "we should refit 2 of those" would otherwise
-    swap a fit. A bare keyword with no arguments is not a command either
-    (there is nothing to select), and neither is a blank keyword."""
+    and the keyword must be followed by end-of-line, whitespace, or a single
+    ``:`` — "refit: 2" is how half the FCs in the game punctuate a command, and
+    refusing it would look like the feature is broken. Substring matching —
+    which is what the range check does — is WRONG here: a refit command carries
+    arguments, so "we should refit 2 of those" would otherwise swap a fit. A
+    bare keyword with no arguments is not a command either (there is nothing to
+    select), and neither is a blank keyword."""
     needle = str(keyword or "").strip().lower()
     if not needle:
         return None
@@ -145,7 +147,9 @@ def parse(body, keyword) -> Command | None:
     if not text.lower().startswith(needle):
         return None
     rest = text[len(needle):]
-    if rest and not rest[:1].isspace():
+    if rest[:1] == ":":
+        rest = rest[1:]
+    elif rest and not rest[:1].isspace():
         return None                      # "refitting", not "refit"
     tokens = tuple(rest.split())
     if not tokens:
@@ -225,8 +229,35 @@ def _fit_name(fit, fallback="") -> str:
     return str(getattr(fit, "name", "") or "") or fallback
 
 
-def _option_label(hull, fit_name) -> str:
-    return f"{hull} {ARROW} {fit_name}"
+def _option_label(slot_label, fit_name) -> str:
+    return f"{slot_label} {ARROW} {fit_name}"
+
+
+def _slot_label_map(picks, get_fit) -> dict:
+    """``id(member) -> display label`` for the slots in ``picks``.
+
+    Normally the hull. When two DIFFERENT slots in the same list share a hull
+    (the doctrine legitimately carries "shield Loki (Links)" and "armor Loki
+    (DPS)"), both get ``hull · first tag`` — the §7.3 cascade rule, applied to
+    the chat options too so the FC is never offered "Loki → X" twice with no
+    way to tell which row is which. Counted over DISTINCT members: one slot
+    contributing three matching fits is not a hull collision."""
+    distinct = []
+    for member, _fit_id, _fit in picks:
+        if not any(m is member for m in distinct):
+            distinct.append(member)
+    hulls = {id(m): _slot_hull(m, get_fit) for m in distinct}
+    counts: dict = {}
+    for member in distinct:
+        hull = hulls[id(member)]
+        counts[hull] = counts.get(hull, 0) + 1
+    labels = {}
+    for member in distinct:
+        hull = hulls[id(member)]
+        tags = _tags_of(member)
+        labels[id(member)] = (f"{hull} · {tags[0]}"
+                              if counts[hull] > 1 and tags else hull)
+    return labels
 
 
 def _refit_slots(doctrine) -> list:
@@ -281,7 +312,9 @@ def _resolve_number(number, slots, get_fit) -> Resolution:
         refits = slot_refits(member)
         hull = _slot_hull(member, get_fit)
         if not 1 <= number <= len(refits):
-            return _error(f"{hull} has only {len(refits)} refits")
+            count = len(refits)
+            return _error(f"{hull} has only {count} "
+                          f"refit{'' if count == 1 else 's'}")
         fit_id = refits[number - 1]
         fit = _fit_of(get_fit, fit_id)
         if fit is None:
@@ -347,14 +380,26 @@ def _from_picks(picks, get_fit, *, empty_message) -> Resolution:
     several become ``ambiguous`` with one clickable option each; none becomes
     an error. A filter that happens to leave ONE candidate standing resolves it
     rather than posting a single-option "which did you mean?" — the FC named
-    something unique, the fact that other slots were considered is invisible."""
+    something unique, the fact that other slots were considered is invisible.
+
+    Already-ACTIVE fits are dropped from an ambiguity: a clickable row that
+    changes nothing is a trap, and "refit 1" on a doctrine already at its
+    defaults would otherwise offer one such row per slot. If dropping them
+    leaves one real choice it resolves; if it leaves none, nothing to do."""
     if not picks:
         return _error(empty_message)
+    if len(picks) > 1:
+        live = [p for p in picks
+                if str(getattr(p[0], "fit_id", "") or "") != str(p[1])]
+        if not live:
+            return _noop("already at that refit")
+        picks = live
     if len(picks) == 1:
         member, fit_id, fit = picks[0]
         return _swap_or_noop(member, fit_id, fit, get_fit)
+    labels = _slot_label_map(picks, get_fit)
     options = tuple(
-        (fit_id, _option_label(_slot_hull(member, get_fit), _fit_name(fit)))
+        (fit_id, _option_label(labels[id(member)], _fit_name(fit)))
         for member, fit_id, fit in picks)
     return Resolution(kind="ambiguous", options=options,
                       message="Which refit?")
@@ -405,29 +450,58 @@ def resolve(doctrine, get_fit, command) -> Resolution:
     # reporting that failure. Fit names begin with their hull ("Muninn AC"),
     # which means the hull-prefix slot filter eats the first word of the most
     # natural thing an FC types — leaving "ac", which is below the fragment
-    # floor. Only a SUCCESS overrides: a filtered error usually says something
-    # sharper ("Scimitar has only 2 refits") than the whole-line miss would,
-    # and never swapping on a failure is the module's contract.
+    # floor.
+    #
+    # The retry stays INSIDE ``filtered``, never over every slot: the FC named
+    # a slot, and widening the search past it swaps the wrong ship. With
+    # DPS=Muninn and a Logi fit called "Scimitar DPS Support", "refit dps
+    # support" re-matched the whole line across the doctrine and swapped the
+    # LOGI slot (caught in review, 2026-09-12). Only a SUCCESS overrides
+    # anyway: a filtered error usually says something sharper ("Scimitar has
+    # only 2 refits") than the retry's miss would.
     if len(tokens) > 1:
-        alternative = _resolve_selector(tokens, slots, get_fit)
+        alternative = _resolve_selector(tokens, filtered, get_fit)
         if alternative.kind != "error":
             return alternative
-    else:
-        # A bare slot name ("refit muninn"): offer that slot's refits rather
-        # than answering "missing refit number or name" to a line that named
-        # exactly one ship.
-        alternative = _resolve_fragment(tokens[0], filtered, get_fit)
-        if alternative.kind != "error":
-            return alternative
+        return primary
+    # A bare slot name ("refit muninn") named exactly one ship and no fit.
+    # Offering that slot's refits beats "missing refit number or name" — but
+    # ONLY as a CHOICE, or when the word is a fit's exact name. A bare ship
+    # name that happened to prefix-match one refit must not swap silently:
+    # the FC typed a ship, not a fit.
+    alternative = _resolve_fragment(tokens[0], filtered, get_fit)
+    if alternative.kind == "ambiguous":
+        return alternative
+    if (alternative.kind in ("swap", "noop")
+            and _names_a_fit_exactly(tokens[0], filtered, get_fit)):
+        return alternative
     return primary
 
 
+def _names_a_fit_exactly(token, slots, get_fit) -> bool:
+    """Is ``token`` the full name of a fit in one of ``slots``' refit lists?"""
+    needle = str(token or "").strip().lower()
+    if not needle:
+        return False
+    for member in slots:
+        for fit_id in slot_refits(member):
+            fit = _fit_of(get_fit, fit_id)
+            if fit is not None and _fit_name(fit).strip().lower() == needle:
+                return True
+    return False
+
+
 def _resolve_selector(tokens, candidates, get_fit) -> Resolution:
-    """Dispatch a selector — an all-digit pick or a name fragment."""
+    """Dispatch a selector — an all-digit pick or a name fragment.
+
+    ``isascii()`` guards the ``int()``: ``str.isdigit`` is True for '²' and
+    '②', which ``int()`` then refuses with a ValueError. This runs on the chat
+    poll thread against arbitrary player text, so that would be an exception
+    escaping ``resolve`` rather than a resolution saying no."""
     if not tokens:
         return _error("missing refit number or name")
     selector = " ".join(tokens)
-    if selector.isdigit():
+    if selector.isascii() and selector.isdigit():
         return _resolve_number(int(selector), candidates, get_fit)
     return _resolve_fragment(selector, candidates, get_fit)
 
