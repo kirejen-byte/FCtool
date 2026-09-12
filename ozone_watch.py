@@ -643,9 +643,25 @@ CARGO_FLAG = "Cargo"
 
 
 class ShipCargo(NamedTuple):
-    """What the current ship carries that this feature cares about."""
+    """What the current ship carries that this feature cares about.
+
+    ``generator_type_id`` is the CHOSEN generator when more than one is
+    fitted at once (a standard AND a covert cyno on the same Force Recon is a
+    real, reported fit): the one with the largest attr-714 BASE consumption
+    (before the skill/hull multipliers) — the owner's rule, "when in doubt
+    always count the module with the bigger consumption". The hull multiplier
+    in :func:`effective_ozone_cost` is IDENTICAL for every generator fitted to
+    the same hull, so ranking by base 714 alone always agrees with ranking by
+    effective cost; nothing here needs to compute the full cost to choose.
+    Ties (equal or both-unknown base) keep the FIRST fitted one seen in asset
+    order — a generator the table carries no 714 for sorts as base 0 and is
+    still a candidate, so "no generator has a known base" falls out of the
+    same tie-break rather than needing its own branch. ``generator_type_ids``
+    carries every fitted generator, in asset order, so a caller that needs the
+    full fit (not just the one that decides) still has it."""
     generator_type_id: int | None = None
     ozone: int = 0
+    generator_type_ids: tuple[int, ...] = ()
 
 
 #: "Nothing aboard" — the answer for an unknown ship and every degrade path.
@@ -686,11 +702,17 @@ def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
     is a child of the CONTAINER's item_id, not the ship's, so it is invisible
     here. That under-counts and so can only produce a spurious warning, never a
     missed one — the safe direction, and rare enough not to be worth a second
-    pass over the payload."""
+    pass over the payload.
+
+    **When more than one generator is fitted** (a standard AND a covert cyno
+    on the same Force Recon is a real fit, not a hypothetical), the returned
+    ``generator_type_id`` is the one with the largest attr-714 base
+    consumption — see :class:`ShipCargo`. Every fitted generator, in asset
+    order, is still returned via ``generator_type_ids``."""
     ship = _int_or_none(ship_item_id)
     if not ship:
         return EMPTY_CARGO
-    generator = None
+    generator_ids = []
     ozone = 0
     try:
         rows = list(assets or ())
@@ -708,13 +730,36 @@ def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
         if type_id is None:
             continue
         if flag.startswith(HISLOT_PREFIX):
-            if generator is None and is_generator(type_id, dogma):
-                generator = type_id
+            if is_generator(type_id, dogma):
+                generator_ids.append(type_id)
         elif flag == CARGO_FLAG and type_id == LIQUID_OZONE_TYPE_ID:
             qty = _int_or_none(row.get("quantity"))
             if qty and qty > 0:
                 ozone += qty
-    return ShipCargo(generator, ozone)
+    generator = _choose_generator(generator_ids, dogma) if generator_ids else None
+    return ShipCargo(generator, ozone, tuple(generator_ids))
+
+
+def _choose_generator(type_ids, dogma):
+    """Which fitted generator DECIDES, per :class:`ShipCargo`'s rule: the
+    largest attr-714 base consumption, ties keeping the first seen. An id the
+    table carries no 714 for reads as base 0 (still a candidate) — never
+    raises, and never returns ``None`` for a non-empty ``type_ids``."""
+    view = _view(dogma)
+    best = type_ids[0]
+    best_base = 0.0
+    try:
+        best_base = float(view.attrs(best).get(ATTR_CONSUMPTION) or 0.0)
+    except Exception:                                       # pragma: no cover
+        best_base = 0.0
+    for tid in type_ids[1:]:
+        try:
+            base = float(view.attrs(tid).get(ATTR_CONSUMPTION) or 0.0)
+        except Exception:                                   # pragma: no cover
+            base = 0.0
+        if base > best_base:
+            best, best_base = tid, base
+    return best
 
 
 # ── verdict + copy ───────────────────────────────────────────────────────────
