@@ -31,6 +31,15 @@ Load-bearing decisions, each a place this feature could be silently wrong:
   case-insensitive) beats a hull-name prefix, and the hull prefix needs >= 3
   characters — the ``resolve_partial_name`` floor, for the same reason: short
   fragments are ordinary chat words far more often than they are ship names.
+* **A multi-match always ASKS.** Only a line that identified exactly one fit
+  swaps; anything the doctrine answers more than one way becomes an
+  ``ambiguous`` the FC clicks, even when dropping the already-active rows
+  leaves a single option. One click beats a guess made mid-fight.
+* **Ambiguity labels lean on tags for slots that share a hull.** Two UNTAGGED
+  slots on the same hull therefore render the same ``Hull → `` prefix and are
+  told apart only by their fit names — acceptable because the fit name is the
+  thing the FC is choosing, and a doctrine with two untagged same-hull slots
+  has bigger ambiguities than this one.
 * **The name ladder is exact -> prefix -> substring**, mirroring
   ``range_check.resolve_partial_name``, but substring IS allowed here: fit names
   are free text ("Muninn Grappler/AC") and the pool is a handful of fits the
@@ -147,10 +156,11 @@ def parse(body, keyword) -> Command | None:
     if not text.lower().startswith(needle):
         return None
     rest = text[len(needle):]
-    if rest[:1] == ":":
-        rest = rest[1:]
-    elif rest and not rest[:1].isspace():
+    if rest and not rest[:1].isspace() and rest[:1] != ":":
         return None                      # "refitting", not "refit"
+    rest = rest.lstrip()
+    if rest[:1] == ":":                  # "refit: 2" and "refit :2" alike
+        rest = rest[1:]
     tokens = tuple(rest.split())
     if not tokens:
         return None                      # bare keyword selects nothing
@@ -376,27 +386,27 @@ def _resolve_fragment(fragment, slots, get_fit) -> Resolution:
 def _from_picks(picks, get_fit, *, empty_message) -> Resolution:
     """Turn candidate ``(member, fit_id, fit)`` triples into a Resolution.
 
-    Exactly one candidate resolves (swap, or noop when it is already active);
-    several become ``ambiguous`` with one clickable option each; none becomes
-    an error. A filter that happens to leave ONE candidate standing resolves it
-    rather than posting a single-option "which did you mean?" — the FC named
-    something unique, the fact that other slots were considered is invisible.
+    A line that matched exactly ONE fit resolves it (swap, or noop when it is
+    already active). A line that matched SEVERAL always asks — **no unattended
+    swap**: the FC typed something the doctrine answers more than one way, so
+    the decision is theirs, and one click on a one-row chooser is cheaper than
+    discovering mid-fight that the tool guessed.
 
-    Already-ACTIVE fits are dropped from an ambiguity: a clickable row that
-    changes nothing is a trap, and "refit 1" on a doctrine already at its
-    defaults would otherwise offer one such row per slot. If dropping them
-    leaves one real choice it resolves; if it leaves none, nothing to do."""
+    Already-ACTIVE fits are dropped from the DISPLAY of an ambiguity: a
+    clickable row that changes nothing is a trap, and "refit 1" on a doctrine
+    already at its defaults would otherwise offer one such row per slot.
+    Dropping them never promotes the ambiguity to a swap — a single surviving
+    row is still a chooser. Only when EVERY match was already active is there
+    nothing to ask about."""
     if not picks:
         return _error(empty_message)
-    if len(picks) > 1:
-        live = [p for p in picks
-                if str(getattr(p[0], "fit_id", "") or "") != str(p[1])]
-        if not live:
-            return _noop("already at that refit")
-        picks = live
     if len(picks) == 1:
         member, fit_id, fit = picks[0]
         return _swap_or_noop(member, fit_id, fit, get_fit)
+    picks = [p for p in picks
+             if str(getattr(p[0], "fit_id", "") or "") != str(p[1])]
+    if not picks:
+        return _noop("already at that refit")
     labels = _slot_label_map(picks, get_fit)
     options = tuple(
         (fit_id, _option_label(labels[id(member)], _fit_name(fit)))
