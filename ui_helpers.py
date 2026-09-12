@@ -9,7 +9,7 @@ module (fleet templates, infra manager, overview manager/editor, markup editor,
 previously shipped ~11 subtly-different dialog setups and 5 divergent tooltips in
 one app (see OPTIMIZATION_REVIEW.md findings D2, D5, D6, D7, D9).
 
-Two helpers:
+The helpers:
 
 ``make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True)``
     The house modal-dialog contract, wired once so every dialog behaves the same:
@@ -29,6 +29,15 @@ Two helpers:
       * D5 — the window base colour is set once from the shared palette
         (``base_bg`` or the canonical ``ui_theme.BG_DARK``), retiring the
         BG_DARK-vs-BG_PANEL split across dialogs.
+
+``center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None)``
+    Centre a dialog over the window that opened it, clamped inside the monitor
+    the parent lives on. Windows places a fresh ``Toplevel`` wherever it likes
+    (the owner saw every dialog land in the top-right corner of a secondary
+    monitor), so the house contract now says: a dialog belongs over the tool.
+    ``make_modal`` calls it for every caller; hand-built dialogs that do not go
+    through ``make_modal`` call it themselves. Never raises — a window it cannot
+    measure is simply left where Tk put it.
 
 ``attach_tooltip(widget, text, *, topmost=False)``
     The single hover-tooltip implementation (D9). Promoted verbatim-in-spirit
@@ -125,7 +134,319 @@ def relift_topmost_tooltips():
             _TOPMOST_TIPS.discard(tip)
 
 
-def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
+def _parse_geometry(spec):
+    """Parse a Tk ``"WxH+X+Y"`` geometry string into ``(w, h, x, y)``.
+
+    Returns None for anything that is not a complete WxH+X+Y (Tk also emits
+    size-only and position-only forms, and ``+-12`` negative offsets, which are
+    handled). Never raises.
+    """
+    try:
+        text = str(spec)
+        size, sep, pos = text.partition("+")
+        if not sep:
+            return None
+        w_s, _x, h_s = size.partition("x")
+        # pos is "X+Y" or "X+-Y" / "-X+-Y" — split on the separators Tk emits.
+        parts, cur = [], ""
+        for ch in pos:
+            if ch in "+-" and cur not in ("", "-"):
+                parts.append(cur)
+                cur = "" if ch == "+" else "-"
+            elif ch == "-" and cur == "":
+                cur = "-"
+            elif ch != "+":
+                cur += ch
+        if cur not in ("", "-"):
+            parts.append(cur)
+        if len(parts) != 2:
+            return None
+        return (int(w_s), int(h_s), int(parts[0]), int(parts[1]))
+    except Exception:
+        return None
+
+
+def _parent_rect(parent):
+    """``(x, y, w, h)`` on-screen rect of ``parent``, or None.
+
+    ``winfo_geometry()`` FIRST, deliberately. On Windows a Tk geometry string
+    carries the FRAME origin with the CLIENT size (measured: a root at
+    ``600x400+150+120`` reports ``winfo_rootx() == 158``, ``rooty() == 151`` —
+    the 8 px resize border and 31 px title bar), and ``wm_geometry("+x+y")``
+    sets the FRAME origin too. Centring frame-origin against frame-origin makes
+    those two offsets cancel EXACTLY, so the dialog's client area lands dead
+    centre over the parent's; measuring the parent by ``winfo_rootx/rooty``
+    instead leaves the dialog 8 px right and 31 px low. ``winfo_root*`` is the
+    fallback for a parent whose geometry string is not yet realised (an
+    unmapped window reports ``1x1+0+0``), where the small skew beats no
+    placement at all.
+    """
+    try:
+        parsed = _parse_geometry(parent.winfo_geometry())
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        gw, gh, gx, gy = parsed
+        if gw > 1 and gh > 1:
+            return (gx, gy, gw, gh)
+    try:
+        w, h = int(parent.winfo_width()), int(parent.winfo_height())
+        x, y = int(parent.winfo_rootx()), int(parent.winfo_rooty())
+    except Exception:
+        return None
+    if w > 1 and h > 1:
+        return (x, y, w, h)
+    return None
+
+
+def _window_size(win):
+    """``(w, h)`` of the dialog, or None when nothing sane can be measured.
+
+    ``winfo_width``/``winfo_height`` first: after ``update_idletasks()`` they
+    carry an explicit ``geometry("WxH")`` request (measured — a withdrawn but
+    laid-out Toplevel reports the requested 420x460, not 1x1), which the
+    REQUESTED size would miss entirely for a dialog whose content is smaller
+    than the window it asked for. Requested size is the fallback for a dialog
+    that never got an explicit size.
+    """
+    for getters in (("winfo_width", "winfo_height"),
+                    ("winfo_reqwidth", "winfo_reqheight")):
+        try:
+            w = int(getattr(win, getters[0])())
+            h = int(getattr(win, getters[1])())
+        except Exception:
+            return None
+        if w > 1 and h > 1:
+            return (w, h)
+    return None
+
+
+def _monitor_work_rect(x, y):
+    """Work-area EDGES ``(l, t, r, b)`` of the monitor containing ``(x, y)``.
+
+    Delegates to ``monitor_pin`` — the repo's ONE monitor enumerator
+    (EnumDisplayMonitors + GetMonitorInfoW, physical pixels, EDGES rects, and
+    already injectable/testable). Imported LAZILY so this module keeps its
+    stdlib-only import surface and still works when the enumeration is
+    unavailable (non-Windows, or a ctypes failure): the caller then falls back
+    to Tk's own virtual-desktop bounds.
+
+    Falls back to the NEAREST monitor when the point is in a gap between
+    displays (MonitorFromPoint/NEAREST semantics). Returns None if nothing can
+    be enumerated.
+    """
+    try:
+        import monitor_pin
+        monitors = monitor_pin.list_monitors()
+    except Exception:
+        return None
+    if not monitors:
+        return None
+    for mon in monitors:
+        l, t, r, b = mon.rect
+        if l <= x < r and t <= y < b:
+            return tuple(mon.work)
+    # No monitor contains the point (a gap, or an off-screen parent): nearest
+    # by squared distance from the point to each monitor's clamped rect.
+    def _dist(mon):
+        l, t, r, b = mon.rect
+        dx = max(l - x, 0, x - (r - 1))
+        dy = max(t - y, 0, y - (b - 1))
+        return dx * dx + dy * dy
+    try:
+        return tuple(min(monitors, key=_dist).work)
+    except Exception:
+        return None
+
+
+def _virtual_bounds(win):
+    """Tk's own virtual-desktop EDGES ``(l, t, r, b)``, or None.
+
+    ``winfo_vroot*`` spans EVERY monitor; ``winfo_screenwidth/height`` report
+    the PRIMARY monitor only and would yank a dialog back onto screen 1 when
+    the app lives on screen 2 (measured: 3840x1080 @ x=-1920 vs 1920x1080).
+    """
+    try:
+        l = int(win.winfo_vrootx())
+        t = int(win.winfo_vrooty())
+        r = l + int(win.winfo_vrootwidth())
+        b = t + int(win.winfo_vrootheight())
+    except Exception:
+        return None
+    return (l, t, r, b) if r > l and b > t else None
+
+
+def _clamp_into(v, lo, hi):
+    """Clamp ``v`` into ``[lo, hi]``; pin to ``lo`` when the span is inverted
+    (the dialog is bigger than the monitor in that axis — keep its TOP-LEFT
+    visible, which is where the title bar and the close button live)."""
+    if hi < lo:
+        return lo
+    return max(lo, min(v, hi))
+
+
+def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None):
+    """Centre ``win`` over ``parent`` and return the applied ``(x, y)``, or None.
+
+    **Why this exists.** ``make_modal`` set ``transient()`` and a grab but never
+    a position, so Windows placed every dialog by its own cascade rule — which
+    on the owner's multi-monitor layout parked "Add to doctrine", the tag
+    pickers and friends in the TOP-RIGHT corner, nowhere near the main window
+    they came from. A dialog belongs over the tool that opened it.
+
+    ``margin``          keep-out inset from the monitor's work-area edges.
+    ``size``            optional ``(w, h)`` override; by default the dialog
+                        measures itself (see ``_window_size``).
+    ``monitor_rect_fn`` optional ``fn(x, y) -> (l, t, r, b)`` work-area EDGES
+                        for the monitor containing a point, so a caller (or a
+                        test) can supply its own enumeration. Default: the
+                        ``monitor_pin`` backend, then Tk's virtual desktop.
+
+    **Placement, and the map-order trap.** When ``win`` has not been mapped yet
+    this WITHDRAWS it around the measurement, because ``update_idletasks()`` on
+    a fresh non-withdrawn Toplevel MAPS it at the window manager's position —
+    the dialog would flash in the wrong place before moving. Withdrawn, the
+    geometry request is applied AT MAP TIME and the dialog appears directly
+    where it belongs (the ``attach_tooltip`` pattern; ``map/facts.md``). An
+    already-mapped window is simply moved, which files a PENDING move — and a
+    following ``wm_attributes("-topmost", ...)`` DISCARDS that pending move
+    (measured 2026-08-25). **A caller that sets ``-topmost`` must do so BEFORE
+    centring**, never after.
+
+    Never raises, by contract: it is called from dialog builders and from a
+    deferred ``after`` callback, and a window it cannot measure (a destroyed
+    dialog, an exotic parent, a headless stub) must leave the caller's dialog
+    exactly as it found it. Returns None in every such case.
+    """
+    try:
+        prect = _parent_rect(parent)
+
+        # Withdraw an unmapped dialog around the measurement (see the docstring)
+        # so update_idletasks() cannot map it at the WM's position first.
+        hidden = False
+        try:
+            if win.wm_state() == "normal" and not win.winfo_ismapped():
+                win.wm_withdraw()
+                hidden = True
+        except Exception:
+            hidden = False
+        try:
+            try:
+                win.update_idletasks()
+            except Exception:
+                pass
+            dsize = size if size else _window_size(win)
+            if not dsize:
+                return None
+            dw, dh = int(dsize[0]), int(dsize[1])
+            if dw <= 1 or dh <= 1:
+                return None
+
+            if prect is not None:
+                px, py, pw, ph = prect
+                x = px + (pw - dw) // 2
+                y = py + (ph - dh) // 2
+                cx, cy = px + pw // 2, py + ph // 2
+            else:
+                # No usable parent rect (withdrawn/iconified, never laid out):
+                # fall back to the monitor the POINTER is on — the display the
+                # user is actually looking at.
+                try:
+                    cx, cy = int(win.winfo_pointerx()), int(win.winfo_pointery())
+                except Exception:
+                    return None
+                x = y = None
+
+            bounds = None
+            if monitor_rect_fn is not None:
+                try:
+                    bounds = monitor_rect_fn(cx, cy)
+                except Exception:
+                    bounds = None
+            if not bounds:
+                bounds = _monitor_work_rect(cx, cy)
+            if not bounds:
+                bounds = _virtual_bounds(win)
+            if not bounds:
+                return None
+            l, t, r, b = (int(v) for v in bounds)
+
+            if x is None:
+                # Pointer-monitor fallback: centre of that monitor's work area.
+                x = l + ((r - l) - dw) // 2
+                y = t + ((b - t) - dh) // 2
+
+            x = _clamp_into(x, l + margin, r - margin - dw)
+            y = _clamp_into(y, t + margin, b - margin - dh)
+            win.wm_geometry(f"+{int(x)}+{int(y)}")
+            return (int(x), int(y))
+        finally:
+            if hidden:
+                try:
+                    win.wm_deiconify()
+                except Exception:
+                    pass
+    except Exception:
+        return None
+
+
+def _center_when_built(win, parent):
+    """``make_modal``'s deferred centring: hide, let the caller build, place,
+    show. Never raises.
+
+    **Why it has to be deferred.** ``make_modal`` runs BEFORE the caller packs
+    a single widget, so the only size available at that moment is a bare
+    Toplevel's 200x200 default — centring on that would be visibly off. And the
+    size cannot simply be re-measured a moment later either: a Toplevel's
+    REQUESTED size is not recomputed until the packer's idle pass, and inside
+    ``after_idle`` the window is still 1x1 and unmapped even after an explicit
+    ``update_idletasks()`` (both measured). The first honest measurement is a
+    plain ``after(0)`` timer, which runs after the geometry pass.
+
+    **Why it hides first.** By then Tk would already have MAPPED the dialog at
+    the window manager's position, so a post-hoc move is a visible jump from
+    exactly the screen corner this whole change exists to stop using.
+    Withdrawing the dialog for the length of the caller's build keeps it off
+    screen until it has a position; the ``after(0)`` pass then centres it and
+    deiconifies ONCE, so it appears directly where it belongs (the
+    ``attach_tooltip`` pattern, ``map/facts.md``). The deiconify lives in a
+    ``finally``: a dialog that could not be measured must still be shown.
+
+    Only a window that is on its way to being mapped (state ``normal``, not yet
+    mapped) is hidden. An already-mapped window — or any stub whose state
+    cannot be read — is simply centred in place, then refined once from the
+    same deferred pass.
+    """
+    hidden = False
+    try:
+        if win.wm_state() == "normal" and not win.winfo_ismapped():
+            win.wm_withdraw()
+            hidden = True
+    except Exception:
+        hidden = False
+
+    def _place_and_show():
+        try:
+            center_over(win, parent)
+        finally:
+            if hidden:
+                try:
+                    win.wm_deiconify()
+                except Exception:
+                    pass
+
+    if not hidden:
+        center_over(win, parent)
+    try:
+        win.after(0, _place_and_show)
+    except Exception:
+        # No scheduler (a headless stub, a dead interpreter): do it now rather
+        # than leave a withdrawn dialog nobody will ever show.
+        _place_and_show()
+
+
+def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True,
+               center=True):
     """Apply the house modal contract to ``win`` and return it.
 
     ``win``        the dialog Toplevel (already created + titled by the caller).
@@ -142,6 +463,17 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
                    ``grab=False`` skips ONLY ``grab_set()``; transient,
                    ``<Escape>`` → cancel and the themed background all still
                    apply, so the window is otherwise a house dialog.
+    ``center``     centre the dialog over ``parent`` (``center_over``).
+                   **Default True** — the house behaviour: Windows otherwise
+                   places a fresh Toplevel by its own cascade rule, which on a
+                   multi-monitor layout parked every dialog in a screen corner
+                   far from the main window. Pass ``False`` only for a window
+                   that positions itself deliberately.
+                   **Ordering:** a caller that sets ``wm_attributes("-topmost",
+                   True)`` must do so BEFORE ``make_modal`` — on an
+                   already-mapped window ``-topmost`` DISCARDS a pending
+                   geometry move (measured, ``map/facts.md``) — or skip
+                   ``center`` and call ``center_over`` itself afterwards.
 
     **Why the grab opt-out exists (a whole CLASS of window, not one instance).**
     ``grab_set()`` is an application-wide Tk input grab: while it is held, every
@@ -177,6 +509,8 @@ def make_modal(win, parent, *, on_cancel=None, base_bg=None, grab=True):
     win.bind("<Escape>", lambda _e=None: cancel())
 
     win.configure(bg=base_bg or ui_theme.BG_DARK)
+    if center:
+        _center_when_built(win, parent)
     return win
 
 

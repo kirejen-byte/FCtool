@@ -253,8 +253,13 @@ from ui_theme import (
 # wires guarded transient/grab + Escape→cancel + base bg once (D2), attach_tooltip
 # is the single hover-tooltip impl (D9). Adopted here only in the preview-cluster
 # dialogs; fc_gui's other tooltip sites keep their existing helper (scope).
+# center_over puts a dialog over the MAIN WINDOW instead of wherever Windows
+# cascades a fresh Toplevel (owner-reported: every popup opened in the top-right
+# corner). make_modal calls it for its own callers; the hand-built dialogs below
+# call it themselves, at the END of the builder while the window is still
+# unmapped, so the placement is applied at map time with no visible jump.
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
-                        relift_topmost_tooltips)
+                        relift_topmost_tooltips, center_over)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -5349,6 +5354,7 @@ class FCToolGUI:
         # Initial population.
         self._cm_refresh_list()
         self._cm_refresh_members()
+        center_over(win, self.root)
 
     # ---- Coalition manager: list (left) ----
 
@@ -5524,16 +5530,11 @@ class FCToolGUI:
         entry.bind("<Escape>", lambda e: _cancel())
         dlg.protocol("WM_DELETE_WINDOW", _cancel)
 
-        # Center over the manager dialog and make modal.
-        dlg.update_idletasks()
-        parent = self._coalition_mgr or self.root
-        try:
-            px = parent.winfo_rootx() + max(
-                0, (parent.winfo_width() - dlg.winfo_width()) // 2)
-            py = parent.winfo_rooty() + 60
-            dlg.geometry(f"+{px}+{py}")
-        except tk.TclError:
-            pass
+        # Center over the manager dialog and make modal. The house helper
+        # replaces this dialog's bespoke maths: it also CLAMPS into the monitor
+        # the manager is on, and it positions while still unmapped so the
+        # prompt never flashes at the window manager's corner first.
+        center_over(dlg, self._coalition_mgr or self.root)
         entry.focus_set()
         entry.select_range(0, tk.END)
         try:
@@ -11925,7 +11926,7 @@ class FCToolGUI:
                 "Add refit",
                 "This row's fit is missing from the library, so there is no "
                 "hull to match refits against. Remove the row or re-import the "
-                "fit first.")
+                "fit first.", parent=getattr(self, "root", None))
             return
         taken = set()
         for m in doctrine.members:
@@ -11940,7 +11941,7 @@ class FCToolGUI:
             messagebox.showinfo(
                 "Add refit",
                 f"No other {hull} fits in the library — import or paste one "
-                f"first.")
+                f"first.", parent=getattr(self, "root", None))
             return
 
         items = [{"id": f.id, "label": f"{hull}  —  {f.name or '?'}",
@@ -11964,7 +11965,7 @@ class FCToolGUI:
                     "Add refit",
                     f"{len(chosen) - added} of the selected fits could not be "
                     f"added as refits of this {hull} (different hull, or "
-                    f"already used by another row in this doctrine).")
+                    f"already used by another row in this doctrine).", parent=getattr(self, "root", None))
             ctl.close()
 
         self._show_multi_select_picker(
@@ -12360,6 +12361,7 @@ class FCToolGUI:
                    command=_save).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.RIGHT)
+        center_over(win, self.root)
         self.root.wait_window(win)
 
     # ── Doctrine CRUD controllers (Task 6.1) ──────────────────────────────────
@@ -12448,7 +12450,7 @@ class FCToolGUI:
         if not messagebox.askyesno(
                 "Delete Doctrine",
                 f"Delete doctrine '{doctrine.name}'?\n\nThe fits themselves "
-                "stay in the library."):
+                "stay in the library.", parent=getattr(self, "root", None)):
             return
         self.fittings.delete_doctrine(doctrine_id)
         self.fittings.save()
@@ -12468,7 +12470,7 @@ class FCToolGUI:
         if not doctrine_id:
             messagebox.showinfo(
                 "Export doctrine",
-                "Select a doctrine to export first.")
+                "Select a doctrine to export first.", parent=getattr(self, "root", None))
             return
         doctrine = self.fittings.get_doctrine(doctrine_id)
         if doctrine is None:
@@ -12478,7 +12480,7 @@ class FCToolGUI:
             title="Export doctrine",
             defaultextension=".fctdoc",
             initialfile=f"{safe_name}.fctdoc",
-            filetypes=[("FCTool doctrine", "*.fctdoc"), ("All files", "*.*")])
+            filetypes=[("FCTool doctrine", "*.fctdoc"), ("All files", "*.*")], parent=getattr(self, "root", None))
         if not path:
             return
         try:
@@ -12487,18 +12489,18 @@ class FCToolGUI:
                 json.dump(payload, f, indent=2)
         except Exception as e:
             messagebox.showerror("Export failed",
-                                 f"Could not write the doctrine file:\n{e}")
+                                 f"Could not write the doctrine file:\n{e}", parent=getattr(self, "root", None))
             return
         messagebox.showinfo(
             "Export doctrine",
-            f"Exported '{doctrine.name}' to:\n{path}")
+            f"Exported '{doctrine.name}' to:\n{path}", parent=getattr(self, "root", None))
 
     def _import_doctrine(self):
         """Import a .fctdoc share file: read JSON -> import_share -> summary."""
         path = filedialog.askopenfilename(
             title="Import doctrine",
             filetypes=[("FCTool doctrine", "*.fctdoc"),
-                       ("JSON files", "*.json"), ("All files", "*.*")])
+                       ("JSON files", "*.json"), ("All files", "*.*")], parent=getattr(self, "root", None))
         if not path:
             return
         try:
@@ -12506,14 +12508,14 @@ class FCToolGUI:
                 payload = json.load(f)
         except Exception as e:
             messagebox.showerror("Import failed",
-                                 f"Could not read the doctrine file:\n{e}")
+                                 f"Could not read the doctrine file:\n{e}", parent=getattr(self, "root", None))
             return
         try:
             summary = self.fittings.import_share(payload)
             self.fittings.save()
         except Exception as e:
             messagebox.showerror("Import failed",
-                                 f"Could not import the doctrine:\n{e}")
+                                 f"Could not import the doctrine:\n{e}", parent=getattr(self, "root", None))
             return
         # Refresh both the doctrine list and the fittings list (new fits may
         # have been added to the library).
@@ -12525,7 +12527,7 @@ class FCToolGUI:
             "Import doctrine",
             f"Imported {summary.doctrines_added} doctrine(s).\n\n"
             f"Fits added: {summary.fits_added}\n"
-            f"Fits reused (already in library): {summary.fits_reused}")
+            f"Fits reused (already in library): {summary.fits_reused}", parent=getattr(self, "root", None))
 
     # ── Doctrine membership + tags (Task 6.2) ─────────────────────────────────
 
@@ -12559,7 +12561,7 @@ class FCToolGUI:
             messagebox.showinfo(
                 "Add fits",
                 "Every fit in the library is already in this doctrine, or the "
-                "library is empty. Import fits on the Fittings sub-tab first.")
+                "library is empty. Import fits on the Fittings sub-tab first.", parent=getattr(self, "root", None))
             return
 
         # Build picker items ship-first ("ShipClass — FitName"), consistent
@@ -12659,7 +12661,7 @@ class FCToolGUI:
                 "Add fits",
                 f"{len(refused)} fit(s) were not added — they are already "
                 f"used by a row in this doctrine, or their hull does not "
-                f"match the row they would refit:\n\n{names}")
+                f"match the row they would refit:\n\n{names}", parent=getattr(self, "root", None))
         ctl.close()
 
     def _partition_doctrine_adds(self, doctrine, fits):
@@ -12819,7 +12821,7 @@ class FCToolGUI:
                     "Remove ship",
                     f"Remove {label} and its {len(refits)} refits from this "
                     f"doctrine?\n\nEvery fit this row can fly goes with it. "
-                    f"The fits stay in the library."):
+                    f"The fits stay in the library.", parent=getattr(self, "root", None)):
                 return
         self.fittings.remove_fit_from_doctrine(doctrine_id, fit_id)
         self.fittings.save()
@@ -12846,12 +12848,12 @@ class FCToolGUI:
             if self.fittings.list_doctrines():
                 messagebox.showinfo(
                     "Add to doctrine",
-                    f"'{fit.name}' is already in every doctrine.")
+                    f"'{fit.name}' is already in every doctrine.", parent=getattr(self, "root", None))
             else:
                 messagebox.showinfo(
                     "Add to doctrine",
                     "No doctrines yet. Create one on the Doctrines sub-tab "
-                    "first.")
+                    "first.", parent=getattr(self, "root", None))
             return
 
         win = tk.Toplevel(self.root)
@@ -12906,6 +12908,7 @@ class FCToolGUI:
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.RIGHT)
         listbox.bind("<Double-Button-1>", lambda e: _do_pick())
+        center_over(win, self.root)
 
     def _add_custom_tag(self, doctrine_id=None):
         """Append a custom tag to the library's tag vocabulary."""
@@ -12917,13 +12920,13 @@ class FCToolGUI:
         if not name:
             return
         if name in self.fittings.tags:
-            messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+            messagebox.showinfo("Add tag", f"'{name}' is already a tag.", parent=getattr(self, "root", None))
             return
         self.fittings.add_tag(name)
         self.fittings.save()
         messagebox.showinfo(
             "Add tag",
-            f"Added tag '{name}'. It is now available when tagging fits.")
+            f"Added tag '{name}'. It is now available when tagging fits.", parent=getattr(self, "root", None))
 
     def _prompt_tag_multiselect(self, title, label, selected):
         """Modal multi-select of the library tag vocabulary via checkbuttons.
@@ -13019,6 +13022,7 @@ class FCToolGUI:
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
         self.root.wait_window(win)
         return result["value"]
 
@@ -13189,6 +13193,7 @@ class FCToolGUI:
         _rebuild_rows()
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
         if not _test_no_wait:
             self.root.wait_window(win)
         return win
@@ -13268,13 +13273,13 @@ class FCToolGUI:
             new_name = new_name.strip()
             if not new_name:
                 messagebox.showwarning(
-                    "Rename tag", "The new tag name cannot be blank.")
+                    "Rename tag", "The new tag name cannot be blank.", parent=getattr(self, "root", None))
                 return
             if new_name == tag:
                 return
             if new_name in self.fittings.tags:
                 messagebox.showwarning(
-                    "Rename tag", f"'{new_name}' is already a tag.")
+                    "Rename tag", f"'{new_name}' is already a tag.", parent=getattr(self, "root", None))
                 return
             try:
                 # rename_tag persists internally (calls save()); do NOT save
@@ -13284,14 +13289,14 @@ class FCToolGUI:
                 log.exception("Failed to rename tag %r to %r", tag, new_name)
                 messagebox.showwarning(
                     "Rename tag",
-                    f"Could not rename '{tag}'. See the log for details.")
+                    f"Could not rename '{tag}'. See the log for details.", parent=getattr(self, "root", None))
                 return
             if not ok:
                 messagebox.showwarning(
                     "Rename tag",
                     f"Could not rename '{tag}' to '{new_name}'. The original "
                     "tag may no longer exist, or the new name is already in "
-                    "use.")
+                    "use.", parent=getattr(self, "root", None))
                 return
             _refresh_after_tag_change()
 
@@ -13302,7 +13307,7 @@ class FCToolGUI:
                 if not messagebox.askyesno(
                         "Delete tag",
                         f"Delete tag '{tag}'? It is used by {used} fit(s) "
-                        "across your doctrines and will be removed from them."):
+                        "across your doctrines and will be removed from them.", parent=getattr(self, "root", None)):
                     return
             self.fittings.remove_tag(tag)
             self.fittings.save()
@@ -13315,7 +13320,7 @@ class FCToolGUI:
             if not name:
                 return
             if name in self.fittings.tags:
-                messagebox.showinfo("Add tag", f"'{name}' is already a tag.")
+                messagebox.showinfo("Add tag", f"'{name}' is already a tag.", parent=getattr(self, "root", None))
                 return
             self.fittings.add_tag(name)
             self.fittings.save()
@@ -13344,6 +13349,7 @@ class FCToolGUI:
         _rebuild()
         win.bind("<Escape>", lambda e: _close())
         win.protocol("WM_DELETE_WINDOW", _close)
+        center_over(win, self.root)
         self.root.wait_window(win)
 
     # ── MOTD writer sub-tab (Phase 7: Tasks 7.1 / 7.2 / 7.3) ──────────────────
@@ -14017,7 +14023,7 @@ class FCToolGUI:
 
     def _motd_confirm(self, title, message):
         try:
-            return bool(messagebox.askyesno(title, message))
+            return bool(messagebox.askyesno(title, message, parent=getattr(self, "root", None)))
         except Exception:
             return True
 
@@ -15071,13 +15077,13 @@ class FCToolGUI:
         if not name or name == self._MOTD_SAVED_BLANK:
             messagebox.showinfo(
                 "Delete MOTD template",
-                "Select an MOTD template from the dropdown first.")
+                "Select an MOTD template from the dropdown first.", parent=getattr(self, "root", None))
             return
         doctrine = self._motd_doctrine_var.get()
         if not messagebox.askyesno(
                 "Delete MOTD template",
                 f"Delete MOTD template '{name}'"
-                + (f" from doctrine '{doctrine}'?" if doctrine else "?")):
+                + (f" from doctrine '{doctrine}'?" if doctrine else "?"), parent=getattr(self, "root", None)):
             return
         fit_cfg = self.config.setdefault("fittings", {})
         saved = fit_cfg.get("saved_motds")
@@ -15105,7 +15111,7 @@ class FCToolGUI:
         if not name or name == self._MOTD_SAVED_BLANK:
             messagebox.showinfo(
                 "Rename MOTD template",
-                "Select an MOTD template from the dropdown first.")
+                "Select an MOTD template from the dropdown first.", parent=getattr(self, "root", None))
             return
         doctrine = self._motd_doctrine_var.get()
         new_name = simpledialog.askstring(
@@ -15118,7 +15124,7 @@ class FCToolGUI:
         if not new_name:
             messagebox.showwarning(
                 "Rename MOTD template",
-                "The new template name cannot be blank.")
+                "The new template name cannot be blank.", parent=getattr(self, "root", None))
             return
         if new_name == name:
             return
@@ -15130,7 +15136,7 @@ class FCToolGUI:
                 "Rename MOTD template",
                 f"A MOTD template named '{new_name}' already exists under "
                 + (f"doctrine '{doctrine}'." if doctrine
-                   else "this (blank) doctrine."))
+                   else "this (blank) doctrine."), parent=getattr(self, "root", None))
             return
         try:
             fit_cfg = self.config.setdefault("fittings", {})
@@ -15146,7 +15152,7 @@ class FCToolGUI:
                 messagebox.showwarning(
                     "Rename MOTD template",
                     f"Could not find template '{name}' to rename. It may have "
-                    "been removed.")
+                    "been removed.", parent=getattr(self, "root", None))
                 return
             target["name"] = new_name
             self._save_config()
@@ -15156,7 +15162,7 @@ class FCToolGUI:
                 name, new_name, doctrine)
             messagebox.showwarning(
                 "Rename MOTD template",
-                f"Could not rename '{name}'. See the log for details.")
+                f"Could not rename '{name}'. See the log for details.", parent=getattr(self, "root", None))
             return
         self._motd_saved_var.set(new_name)
         self._motd_refresh_saved_dropdown()
@@ -15228,7 +15234,7 @@ class FCToolGUI:
             messagebox.showinfo(
                 "Link to doctrine",
                 "No doctrines exist yet. Create a doctrine first (Doctrines "
-                "tab) or import a MOTD to create one.")
+                "tab) or import a MOTD to create one.", parent=getattr(self, "root", None))
             return
 
         # Small modal: pick a doctrine, then name the linked MOTD.
@@ -15268,6 +15274,7 @@ class FCToolGUI:
             dlg.grab_set()
         except Exception:
             pass
+        center_over(dlg, self.root)
         self.root.wait_window(dlg)
 
         if not result["ok"]:
@@ -15291,7 +15298,7 @@ class FCToolGUI:
         if collides and not messagebox.askyesno(
                 "Overwrite?",
                 f"A MOTD template named '{motd_name}' already exists under "
-                f"doctrine '{doctrine_name}'. Overwrite it?"):
+                f"doctrine '{doctrine_name}'. Overwrite it?", parent=getattr(self, "root", None)):
             return
         self._save_linked_motd(doctrine_name, motd_name)
 
@@ -16030,12 +16037,12 @@ class FCToolGUI:
             messagebox.showwarning(
                 "Cannot set MOTD",
                 "The selected FC character must be the current fleet boss. "
-                "Use 'Refresh fleet' after forming/joining a fleet.")
+                "Use 'Refresh fleet' after forming/joining a fleet.", parent=getattr(self, "root", None))
             return
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             messagebox.showwarning("Cannot set MOTD",
-                                   "No authenticated FC character selected.")
+                                   "No authenticated FC character selected.", parent=getattr(self, "root", None))
             return
 
         markup, _compacted = self._motd_output_markup()
@@ -16045,7 +16052,7 @@ class FCToolGUI:
             if not messagebox.askyesno(
                     "Over budget",
                     f"This MOTD is {length} chars (budget {budget}). The "
-                    f"server may truncate it. Set it anyway?"):
+                    f"server may truncate it. Set it anyway?", parent=getattr(self, "root", None)):
                 return
 
         fleet_id = self._motd_fleet_id
@@ -16080,7 +16087,7 @@ class FCToolGUI:
                 self._motd_fleet_status.config(
                     text="Failed to set MOTD.", fg=FG_RED)
                 messagebox.showerror("Set MOTD failed",
-                                     f"Could not set the fleet MOTD.{detail}")
+                                     f"Could not set the fleet MOTD.{detail}", parent=getattr(self, "root", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -16353,7 +16360,7 @@ class FCToolGUI:
             self._motd_fleet_status.config(
                 text="Markup copied to clipboard.", fg=FG_GREEN)
         except Exception as e:
-            messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}")
+            messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}", parent=getattr(self, "root", None))
 
     # ── MOTD: import current MOTD + template persistence (Task 7.3) ────────────
 
@@ -16367,7 +16374,7 @@ class FCToolGUI:
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             messagebox.showwarning("Import MOTD",
-                                   "No authenticated FC character selected.")
+                                   "No authenticated FC character selected.", parent=getattr(self, "root", None))
             return
         self._motd_fleet_status.config(text="Loading current MOTD...",
                                        fg=FG_ACCENT)
@@ -16450,7 +16457,7 @@ class FCToolGUI:
 
         if not messagebox.askyesno(
                 "Clear MOTD",
-                "Also clear the current in-game fleet MOTD?"):
+                "Also clear the current in-game fleet MOTD?", parent=getattr(self, "root", None)):
             self._motd_fleet_status.config(
                 text="Cleared the local MOTD builder.", fg=FG_GREEN)
             return
@@ -16458,7 +16465,7 @@ class FCToolGUI:
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             messagebox.showwarning("Clear MOTD",
-                                   "No authenticated FC character selected.")
+                                   "No authenticated FC character selected.", parent=getattr(self, "root", None))
             return
 
         fleet_id = self._motd_fleet_id
@@ -16486,7 +16493,7 @@ class FCToolGUI:
                     text="Failed to clear in-game MOTD.", fg=FG_RED)
                 messagebox.showerror(
                     "Clear MOTD failed",
-                    f"Could not clear the fleet MOTD.{detail}")
+                    f"Could not clear the fleet MOTD.{detail}", parent=getattr(self, "root", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -16499,7 +16506,7 @@ class FCToolGUI:
         if err is not None or raw is None:
             self._motd_fleet_status.config(text="Import failed.", fg=FG_RED)
             messagebox.showerror("Import MOTD",
-                                 err or "Could not load the current MOTD.")
+                                 err or "Could not load the current MOTD.", parent=getattr(self, "root", None))
             return
 
         # Confirm before replacing an unsaved composition with the imported MOTD.
@@ -16542,7 +16549,7 @@ class FCToolGUI:
                 "Create doctrine?",
                 "Create a new doctrine from this MOTD and import its linked "
                 "fits? (You can save it as an MOTD template afterwards via "
-                "'Link to doctrine'.)"):
+                "'Link to doctrine'.)", parent=getattr(self, "root", None)):
             result = self._create_doctrine_from_motd(raw, fittings)
             if result is not None:
                 _did, name, added, reused, failed = result
@@ -16551,18 +16558,18 @@ class FCToolGUI:
                     f"Created doctrine '{name}' with "
                     f"{added + reused} fit(s) ({added} new, {reused} reused"
                     + (f", {failed} unparsable" if failed else "")
-                    + ").")
+                    + ").", parent=getattr(self, "root", None))
         # Fallback: still let the user import the embedded fits into the library
         # without creating a doctrine.
         elif fittings and messagebox.askyesno(
                 "Import fits",
                 f"Import {len(fittings)} fit link(s) from this MOTD into the "
-                f"library? Duplicates are skipped automatically."):
+                f"library? Duplicates are skipped automatically.", parent=getattr(self, "root", None)):
             added, reused, failed = self._import_motd_fits(fittings)
             messagebox.showinfo(
                 "Fit import",
                 f"Imported {added} new fit(s); {reused} already in the "
-                f"library; {failed} could not be parsed.")
+                f"library; {failed} could not be parsed.", parent=getattr(self, "root", None))
 
         # Rebuild the preview from the populated fields as the LAST step. The
         # modal dialogs above run nested Tk event loops that can fire a
@@ -17295,7 +17302,7 @@ class FCToolGUI:
                 messagebox.showwarning(
                     "Replaced with warnings",
                     "Fit replaced. Some items were not recognized:\n\n"
-                    + "\n".join(warnings[:12]))
+                    + "\n".join(warnings[:12]), parent=getattr(self, "root", None))
 
         self._open_paste_dialog(
             title="Edit Fitting",
@@ -17368,7 +17375,7 @@ class FCToolGUI:
             return
         if not messagebox.askyesno(
                 "Delete Fitting",
-                f"Delete '{fit.name}'?\n\nThis also removes it from any doctrine."):
+                f"Delete '{fit.name}'?\n\nThis also removes it from any doctrine.", parent=getattr(self, "root", None)):
             return
         self.fittings.delete_fit(fit_id)   # cascades doctrine membership
         self.fittings.save()
@@ -17416,7 +17423,7 @@ class FCToolGUI:
         if not messagebox.askyesno(
                 "Delete Fittings",
                 f"Delete {len(fits)} fittings?\n\n{shown}\n\n"
-                "This also removes them from any doctrine."):
+                "This also removes them from any doctrine.", parent=getattr(self, "root", None)):
             return
         self.fittings.delete_fits([fid for fid, _ in fits])  # N cascades + ONE save
         self._fit_selected_id = None
@@ -17433,7 +17440,7 @@ class FCToolGUI:
             messagebox.showwarning(
                 "No character",
                 "Connect a character (Characters tab) before saving to in-game "
-                "Fittings.")
+                "Fittings.", parent=getattr(self, "root", None))
             return
         if not char.has_scope(SCOPE_FITTINGS_WRITE):
             messagebox.showwarning(
@@ -17442,7 +17449,7 @@ class FCToolGUI:
                 "before in-game fittings support was added, so it cannot save "
                 "fits to its in-game Fittings yet.\n\nOpen the Characters or "
                 "Settings tab and click \"Re-authorize\" for this character, "
-                "then try again.")
+                "then try again.", parent=getattr(self, "root", None))
             return
         self._push_fit_to_eve(fit, char)
 
@@ -17487,6 +17494,7 @@ class FCToolGUI:
         entry.bind("<Return>", lambda e: _ok())
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
         self.root.wait_window(win)
         return result["value"]
 
@@ -17496,7 +17504,7 @@ class FCToolGUI:
         the list is empty. Used by the exemptions editor's group/type add flows."""
         options = list(options or [])
         if not options:
-            messagebox.showinfo(title, "Nothing to choose from.")
+            messagebox.showinfo(title, "Nothing to choose from.", parent=getattr(self, "root", None))
             return None
         win = tk.Toplevel(self.root)
         win.title(title)
@@ -17555,6 +17563,7 @@ class FCToolGUI:
         entry.bind("<Return>", _ok)
         win.bind("<Escape>", _cancel)
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
         self.root.wait_window(win)
         return result["value"]
 
@@ -17597,6 +17606,7 @@ class FCToolGUI:
                    command=_cancel).pack(side=tk.RIGHT)
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
         self.root.wait_window(win)
         return result["value"]
 
@@ -17677,6 +17687,7 @@ class FCToolGUI:
                    command=_cancel).pack(side=tk.RIGHT)
         win.bind("<Escape>", lambda e: _cancel())
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
 
     @staticmethod
     def _looks_like_dna(text: str) -> bool:
@@ -17706,7 +17717,7 @@ class FCToolGUI:
                 messagebox.showwarning(
                     "Imported with warnings",
                     "Fit imported. Some items were not recognized:\n\n"
-                    + "\n".join(warnings[:12]))
+                    + "\n".join(warnings[:12]), parent=getattr(self, "root", None))
 
         self._open_paste_dialog(
             title="Paste EFT / DNA",
@@ -17738,7 +17749,7 @@ class FCToolGUI:
             fid = self.fittings.add_fit(fit)
             self.fittings.save()
         except Exception as e:
-            messagebox.showerror("Import failed", f"Could not add fit:\n{e}")
+            messagebox.showerror("Import failed", f"Could not add fit:\n{e}", parent=getattr(self, "root", None))
             return None
         self._fit_selected_id = fid
         self._refresh_fit_list(self._fit_search_var.get())
@@ -17778,7 +17789,7 @@ class FCToolGUI:
                 if not fits:
                     messagebox.showinfo(
                         "pyfa import",
-                        "The pyfa database has no saved fits.")
+                        "The pyfa database has no saved fits.", parent=getattr(self, "root", None))
                     return
                 self._show_pyfa_picker(db_path, fits)
             else:
@@ -17791,7 +17802,7 @@ class FCToolGUI:
                     "pyfa stores all fits in a single file 'saveddata.db', by "
                     "default in your user folder under .pyfa "
                     "(Windows: %USERPROFILE%\\.pyfa). If you used pyfa's "
-                    "-s/--savepath option it may be elsewhere.")
+                    "-s/--savepath option it may be elsewhere.", parent=getattr(self, "root", None))
                 if locate:
                     self._set_pyfa_folder()
                     return
@@ -17800,7 +17811,7 @@ class FCToolGUI:
                        + (f" ({err})" if err else "")
                        + ".\n\nChoose an EFT-text export file (.txt/.cfg) "
                          "to import instead.")
-                messagebox.showinfo("pyfa import", msg)
+                messagebox.showinfo("pyfa import", msg, parent=getattr(self, "root", None))
                 self._import_eft_text_file()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -17812,7 +17823,7 @@ class FCToolGUI:
             title="Locate your pyfa saveddata.db",
             filetypes=[("pyfa database", "saveddata.db"),
                        ("SQLite db", "*.db"),
-                       ("All files", "*.*")])
+                       ("All files", "*.*")], parent=getattr(self, "root", None))
         if not path:
             return
         cfg = self.config.setdefault("fittings", {})
@@ -17824,7 +17835,7 @@ class FCToolGUI:
         """Fallback path: pick an EFT-text export file and parse it."""
         path = filedialog.askopenfilename(
             title="Select EFT text export",
-            filetypes=[("EFT/text exports", "*.txt *.cfg"), ("All files", "*.*")])
+            filetypes=[("EFT/text exports", "*.txt *.cfg"), ("All files", "*.*")], parent=getattr(self, "root", None))
         if not path:
             return
 
@@ -17841,7 +17852,7 @@ class FCToolGUI:
         def _apply(result, raw_text, err):
             if err is not None or result is None:
                 messagebox.showerror("Import failed",
-                                     f"Could not parse the file:\n{err}")
+                                     f"Could not parse the file:\n{err}", parent=getattr(self, "root", None))
                 return
             parsed = result.fit
             name = parsed.name_hint or (parsed.ship_name or "Imported Fit")
@@ -17851,7 +17862,7 @@ class FCToolGUI:
                 messagebox.showwarning(
                     "Imported with warnings",
                     "Fit imported. Some items were not recognized:\n\n"
-                    + "\n".join(result.warnings[:12]))
+                    + "\n".join(result.warnings[:12]), parent=getattr(self, "root", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -18089,6 +18100,7 @@ class FCToolGUI:
         # fully visible the moment the window opens.
         _apply_filter()
         _update_count()
+        center_over(win, self.root)
 
     def _show_pyfa_picker(self, db_path, fits):
         """Searchable, multi-select picker over pyfa fits with bulk import.
@@ -18186,7 +18198,7 @@ class FCToolGUI:
                     self.fittings.save()
                 except Exception as e:
                     messagebox.showerror("Import failed",
-                                         f"Could not save imported fits:\n{e}")
+                                         f"Could not save imported fits:\n{e}", parent=getattr(self, "root", None))
                 try:
                     self._refresh_fit_list(self._fit_search_var.get())
                 except Exception:
@@ -18195,7 +18207,7 @@ class FCToolGUI:
                 messagebox.showinfo(
                     "pyfa import",
                     f"Imported {imported}, skipped {skipped} duplicate(s), "
-                    f"{failed} failed.")
+                    f"{failed} failed.", parent=getattr(self, "root", None))
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -18221,7 +18233,7 @@ class FCToolGUI:
         if char is None or not char.character_id:
             messagebox.showwarning(
                 "No character",
-                "Connect a character (Characters tab) before importing from EVE.")
+                "Connect a character (Characters tab) before importing from EVE.", parent=getattr(self, "root", None))
             return
         if not char.has_scope(SCOPE_FITTINGS_READ):
             messagebox.showwarning(
@@ -18229,7 +18241,7 @@ class FCToolGUI:
                 f"{char.character_name or 'This character'} was authorized "
                 "before in-game fittings support was added, so it cannot read "
                 "in-game fittings yet.\n\nOpen the Characters or Settings tab "
-                "and click \"Re-authorize\" for this character, then try again.")
+                "and click \"Re-authorize\" for this character, then try again.", parent=getattr(self, "root", None))
             return
         char_id = char.character_id
 
@@ -18302,12 +18314,12 @@ class FCToolGUI:
                         "Import from EVE failed",
                         f"Could not read in-game fittings:\n{err}\n\n"
                         "If this character was authorized before fittings support "
-                        "was added, re-authorize it on the Characters tab.")
+                        "was added, re-authorize it on the Characters tab.", parent=getattr(self, "root", None))
                     return
                 if not entries:
                     messagebox.showinfo(
                         "Import from EVE",
-                        "No in-game fittings found for this character.")
+                        "No in-game fittings found for this character.", parent=getattr(self, "root", None))
                     return
                 self._show_esi_import_picker(entries)
             finally:
@@ -18400,7 +18412,7 @@ class FCToolGUI:
                     self.fittings.save()
                 except Exception as e:
                     messagebox.showerror("Import failed",
-                                         f"Could not save imported fits:\n{e}")
+                                         f"Could not save imported fits:\n{e}", parent=getattr(self, "root", None))
                 try:
                     self._refresh_fit_list(self._fit_search_var.get())
                 except Exception:
@@ -18409,7 +18421,7 @@ class FCToolGUI:
                 messagebox.showinfo(
                     "Import from EVE",
                     f"Imported {imported}, skipped {skipped} duplicate(s), "
-                    f"{failed} failed.")
+                    f"{failed} failed.", parent=getattr(self, "root", None))
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -18437,7 +18449,7 @@ class FCToolGUI:
                 messagebox.showinfo(
                     "Saved to in-game Fittings",
                     f"'{fit.name}' was saved to {char.character_name}'s in-game "
-                    "Fittings.")
+                    "Fittings.", parent=getattr(self, "root", None))
                 self._show_fit_detail(fit.id)
             else:
                 detail = f"\n\n{err}" if err else ""
@@ -18446,7 +18458,7 @@ class FCToolGUI:
                     "Could not save the fit to in-game Fittings. The character "
                     "may need to re-authorize (Characters tab) to grant the "
                     "fittings write scope, or ESI rejected the fit."
-                    + detail)
+                    + detail, parent=getattr(self, "root", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -18494,7 +18506,7 @@ class FCToolGUI:
                     "Overview editor unavailable",
                     "The bundled EVE type tables (inv_groups.json / "
                     "inv_categories.json) could not be loaded, so the pack "
-                    "editor cannot open. Reinstalling FCTool restores them.")
+                    "editor cannot open. Reinstalling FCTool restores them.", parent=getattr(self, "root", None))
                 return
 
             def on_save(pack_id, pack):
@@ -22313,7 +22325,7 @@ class FCToolGUI:
     def _preview_browse_gamelogs(self):
         """Settings 'Browse…' — pick an explicit Gamelogs folder override, persist
         it, re-point a live monitor, and refresh the diagnostic line/entry."""
-        path = filedialog.askdirectory(title="Select EVE Gamelogs Folder")
+        path = filedialog.askdirectory(title="Select EVE Gamelogs Folder", parent=getattr(self, "root", None))
         if not path:
             return
         self._preview_cfg()["gamelogs_path"] = path
@@ -25619,7 +25631,7 @@ class FCToolGUI:
         path = filedialog.askopenfilename(
             title="Import EVE-O Preview layout",
             initialfile="EVE-O-Preview.json",
-            filetypes=[("EVE-O Preview config", "*.json"), ("All files", "*.*")])
+            filetypes=[("EVE-O Preview config", "*.json"), ("All files", "*.*")], parent=getattr(self, "root", None))
         if not path:
             return
         try:
@@ -25627,7 +25639,7 @@ class FCToolGUI:
         except Exception as e:
             log.exception("[preview] EVE-O import read failed")
             messagebox.showerror("Import EVE-O layout",
-                                 f"Could not read the file:\n{e}")
+                                 f"Could not read the file:\n{e}", parent=getattr(self, "root", None))
             return
         parsed = self.parse_eveo_config(text)
         summary = self._preview_merge_eveo(parsed)
@@ -25646,7 +25658,7 @@ class FCToolGUI:
             lines.extend(f"  • {e}" for e in shown)
             if more > 0:
                 lines.append(f"  • …and {more} more")
-        messagebox.showinfo("Import EVE-O layout", "\n".join(lines))
+        messagebox.showinfo("Import EVE-O layout", "\n".join(lines), parent=getattr(self, "root", None))
 
     def _overlay_toggle_changed(self):
         want = self._overlay_enabled_var.get()
@@ -28856,7 +28868,7 @@ class FCToolGUI:
             pass
 
     def _browse_logs(self):
-        path = filedialog.askdirectory(title="Select EVE Chat Logs Folder")
+        path = filedialog.askdirectory(title="Select EVE Chat Logs Folder", parent=getattr(self, "root", None))
         if path:
             self._logs_path_var.set(path)
 
@@ -30454,6 +30466,7 @@ class FCToolGUI:
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         win.bind("<Escape>", lambda e: win.destroy())
         _rebuild()
+        center_over(win, self.root)
 
     def _on_zkill_alert(self, alert: KillAlert):
         # Get route from staging
@@ -30837,6 +30850,7 @@ class FCToolGUI:
         list_wrap.pack(fill=tk.BOTH, expand=True, padx=12)
         win.bind("<Escape>", lambda e: win.destroy())
         _rebuild()
+        center_over(win, self.root)
 
     # ── Role Tracker Methods ──────────────────────────────────────────────────
 
@@ -32090,14 +32104,12 @@ class FCToolGUI:
 
         dlg.protocol("WM_DELETE_WINDOW", lambda: _choose(None))
         dlg.bind("<Escape>", lambda e: _choose(None))
-        dlg.update_idletasks()
-        try:
-            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
-            rw, rh = self.root.winfo_width(), self.root.winfo_height()
-            w, h = dlg.winfo_width(), dlg.winfo_height()
-            dlg.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 3)}")
-        except Exception:
-            pass
+        # House placement (ui_helpers.center_over) instead of this dialog's own
+        # copy of the maths: same "over the main window" intent, plus the
+        # work-area clamp for the monitor the app is actually on, and no
+        # update_idletasks() that MAPS the dialog at the window manager's
+        # position before moving it (the visible-jump class in map/facts.md).
+        center_over(dlg, self.root)
         dlg.grab_set()
         dlg.wait_window()
         return result["value"]

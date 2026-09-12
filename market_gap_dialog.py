@@ -46,7 +46,7 @@ from ui_theme import (
     BORDER_COLOR,
     FG_ACCENT, FG_DIM, FG_GREEN, FG_ORANGE, FG_RED, FG_TEXT, FG_WHITE,
 )
-from ui_helpers import attach_tooltip, make_modal
+from ui_helpers import attach_tooltip, center_over, make_modal
 
 log = logging.getLogger(__name__)
 
@@ -1023,14 +1023,13 @@ def open_gap_dialog(parent, *, doctrine_name, picks, doctrine_target,
 
 
 def _center_over(dlg, parent):
-    """Centre ``dlg`` over ``parent`` (kept from the retired
-    ``FCToolGUI._finalize_modal_dialog``). Fully guarded: a headless/unmapped
-    parent must not stop the dialog opening."""
-    try:
-        dlg.update_idletasks()
-        rx, ry = parent.winfo_rootx(), parent.winfo_rooty()
-        rw, rh = parent.winfo_width(), parent.winfo_height()
-        w, h = dlg.winfo_width(), dlg.winfo_height()
-        dlg.geometry(f"+{rx + max(0, (rw - w) // 2)}+{ry + max(0, (rh - h) // 3)}")
-    except Exception:
-        pass
+    """Centre ``dlg`` over ``parent``.
+
+    Delegates to the house helper. This used to be a local copy of the maths
+    (inherited from the retired ``FCToolGUI._finalize_modal_dialog``); once
+    ``make_modal`` started centring its own callers the copy became a SECOND,
+    slightly different placement racing the first — the dialog would settle,
+    then hop. ``ui_helpers.center_over`` is the one owner, and it also clamps
+    into the monitor the parent is actually on. Still fully guarded: a
+    headless/unmapped parent must not stop the dialog opening."""
+    center_over(dlg, parent)
