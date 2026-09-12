@@ -4284,6 +4284,11 @@ class FCToolGUI:
         # owns the press/leave/release latch, so dragging off cancels); the
         # Fleet tab's red "Reset" beside the x-up counter is the precedent it
         # mirrors, one section over.
+        # HERE and not on spec_top_row beside "Remove link…": spec_top_row
+        # lives INSIDE the Specialized Roles scroll canvas and scrolls out of
+        # reach as the role sections fill up. This header row is fixed chrome,
+        # so the reset is always one click away — which is the whole point of
+        # a control the FC reaches for mid-fight.
         self._links_reset_glyph = make_glyph_button(
             spec_header_row, "↻", "Reset link tracking", self._reset_links)
         self._links_reset_glyph.pack(side=tk.LEFT, padx=(5, 0))
@@ -30425,6 +30430,15 @@ class FCToolGUI:
             banner and the Links section. Waiting for
             ``_schedule_booster_refresh``'s 250 ms debounce plus its worker
             round-trip would leave the ✓s standing for a beat after the press;
+          * ``_links_backfill_attempts`` — an explicit reset retires the
+            session log as truth. While that budget is > 0 (it is recharged
+            whenever the tracked character / channel / logs path changes, and
+            left DECREMENTED after a failed read), the very next in-fleet
+            fleet-poll calls ``_links_backfill_current_session``, re-feeds the
+            whole session chat log into the tracker and the ✓s come back on
+            their own — seconds after the FC pressed the button. Zeroing it is
+            what ``remove_pilot``'s own de-duplication rule already implies:
+            a deliberate removal must survive the backfill;
           * ``_booster_roster`` STAYS. It is fleet-ESI-derived (hull per pilot,
             rebuilt by ``_update_specialized_roles`` on every fleet poll), not
             link state — dropping it would flip ``_booster_is_boss`` False and
@@ -30447,19 +30461,28 @@ class FCToolGUI:
             try:
                 tracker.clear()
                 coverage = tracker.coverage()
-            except Exception as exc:
-                print(f"[Links] reset failed to clear the tracker: {exc}")
+            except Exception:
+                log.exception("Links reset failed to clear the tracker")
         self._booster_rows_by_name = {}
         self._booster_ship_names = {}
         self._booster_coverage = coverage
+        self._links_backfill_attempts = 0
+        log.info("[Links] [Manual Reset] link tracking cleared")
+        if not coverage:
+            # No tracker, or a coverage() that failed: there is nothing HONEST
+            # to render. _render_coverage_strip destroys the strip's children
+            # before it indexes coverage[disc], so handing it {} would leave
+            # the fleet-aggregate strip permanently blank. The mirrors above
+            # are already empty, and the next booster refresh repaints from the
+            # cleared tracker either way.
+            return
         try:
             self._apply_booster_compute({}, coverage, {})
-        except Exception as exc:
+        except Exception:
             # A half-built Fleet tab (or a test host with no widgets) must not
             # take the press down with it — the tracker is already cleared and
             # the next refresh repaints from it either way.
-            print(f"[Links] reset could not re-render the panel: {exc}")
-        print("[Links] [Manual Reset] link tracking cleared")
+            log.exception("Links reset could not re-render the panel")
 
     def _open_remove_charge_dialog(self):
         """Modal listing pilots with a tracked command-burst/charge record, each
