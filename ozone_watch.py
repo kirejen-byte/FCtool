@@ -779,17 +779,11 @@ def lights_left(ozone, cost) -> int:
 class Verdict(NamedTuple):
     fire: bool      # warn now?
     lights: int     # activations the cargo pays for
-    text: str       # "N ozone = M lights" / "N ozone = no lights"
+    text: str       # "N ozone - M activations left" (e.g. "175 ozone - 3 activations left")
 
 
 def _lights_phrase(ozone: int, lights: int) -> str:
-    if lights <= 0:
-        tail = "no lights"
-    elif lights == 1:
-        tail = "1 light"
-    else:
-        tail = f"{lights} lights"
-    return f"{ozone} ozone = {tail}"
+    return f"{ozone} ozone - {lights} activation{'s' if lights != 1 else ''} left"
 
 
 def verdict(cargo, cost, min_activations) -> Verdict:
@@ -799,6 +793,11 @@ def verdict(cargo, cost, min_activations) -> Verdict:
     lights aboard fall short of ``min_activations``. No generator fitted or an
     unknown cost are both "nothing to say" — the text is still built, because
     the Characters-tab card row shows it whether or not it warns.
+
+    ``text`` is ``"{ozone} ozone - {lights} activation(s) left"`` (e.g.
+    "175 ozone - 3 activations left", "50 ozone - 1 activation left",
+    "0 ozone - 0 activations left") — it names neither the hull, the
+    generator, nor ``min_activations``.
 
     ``min_activations`` <= 0 disables the warning (a legitimate reading of the
     config, preserved by ``normalize_config``). Never raises."""
@@ -823,16 +822,19 @@ TOAST_TITLE = "Ozone"
 
 
 def toast_body(hull_name, cargo, cost, min_activations) -> str:
-    """``"{Hull} · {Generator short} · {ozone} ozone = {lights} lights (need N)"``.
+    """``"{ozone} ozone - {lights} activation(s) left"`` — e.g.
+    "175 ozone - 3 activations left", "50 ozone - 1 activation left",
+    "0 ozone - 0 activations left".
 
-    Zero lights read "no lights" (so "0 ozone = no lights" for an empty hold),
-    and one reads "1 light". Never raises."""
-    hull = str(hull_name or "").strip() or "Ship"
+    Mentions neither the hull, the generator, "lights" (the internal count,
+    yes; the word, no), nor "need N" — the toast title and the client it
+    floats over already identify the ship. ``hull_name`` and
+    ``min_activations`` are accepted for API stability but are unused by the
+    body (``min_activations`` still gates ``verdict()``'s ``fire`` decision
+    upstream, just not this string). Never raises."""
     if not isinstance(cargo, ShipCargo):
         cargo = EMPTY_CARGO
-    short = generator_short(cargo.generator_type_id)
-    need = max(0, _int_or_none(min_activations) or 0)
-    return f"{hull} · {short} · {verdict(cargo, cost, need).text} (need {need})"
+    return verdict(cargo, cost, min_activations).text
 
 
 # ── per-character latch ──────────────────────────────────────────────────────

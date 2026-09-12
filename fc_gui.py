@@ -1124,9 +1124,10 @@ def _ozone_fill_cyno(info, generator_type_id, ozone, cfg):
     info["cyno"] = generator_type_id is not None
     info["cyno_ozone"] = cargo.ozone
     info["cyno_lights"] = verdict.lights
-    # The rendered phrase comes from the engine too ("12 ozone = 2 lights",
-    # "1 light", "no lights"), so the card and the toast are word-for-word the
-    # same sentence and fc_gui owns no wording of its own.
+    # The rendered phrase comes from the engine too ("175 ozone - 3
+    # activations left", "1 activation left", "0 ozone - 0 activations
+    # left"), so the card and the toast are word-for-word the same sentence
+    # and fc_gui owns no wording of its own.
     info["cyno_text"] = verdict.text
     info["cyno_low"] = bool(verdict.fire)
     return cost
@@ -11101,9 +11102,9 @@ class FCToolGUI:
                      ).pack(side=tk.LEFT, padx=(5, 0), fill=tk.X, expand=True)
 
         # Cyno capability: the current ship is cyno-capable AND has a generator
-        # fitted. Zero ozone still shows the row -- "0 ozone = no lights" is the
-        # single most useful thing this card can say to a cyno pilot, and used
-        # to read as no cyno at all.
+        # fitted. Zero ozone still shows the row -- "0 ozone - 0 activations
+        # left" is the single most useful thing this card can say to a cyno
+        # pilot, and used to read as no cyno at all.
         if (info.get("cyno") and (not only_cap or only_cap == "cyno")
                 and (not only_region or info.get("region") == only_region)):
             has_caps = True
@@ -11117,7 +11118,8 @@ class FCToolGUI:
                      anchor=tk.W).pack(side=tk.LEFT, padx=(5, 0))
             # Lights, not raw units: 600 ozone means nothing until you know the
             # fitted generator's cost. Wording comes from ozone_watch, the same
-            # phrase the toast uses (singular "1 light", "no lights" at zero).
+            # phrase the toast uses ("175 ozone - 3 activations left",
+            # singular "1 activation left", "0 activations left" at zero).
             text = (info.get("cyno_text")
                     or f"{info.get('cyno_ozone', 0)} ozone")
             tk.Label(row, text=f"  ({text})",
