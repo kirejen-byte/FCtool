@@ -88,6 +88,23 @@ def _as_int(value, default=0):
         return default
 
 
+def _slot_fit_ids(member) -> list:
+    """Every fit id a doctrine SLOT can fly (active + refits), default first.
+
+    A deliberate two-line copy of ``fittings_store.slot_fit_ids``, which is THE
+    source of truth for this rule: this module is fc_gui-free AND
+    market_scanner-free by design (see the module docstring) and imports only
+    stdlib + tkinter + the ``ui_theme``/``ui_helpers`` leaves, so it duck-types
+    the members it is handed rather than taking a store dependency for one
+    expression. Keep the two in step — a plain member yields its single
+    ``fit_id``, a refit slot yields ``refits`` in order (``[0]`` = default)."""
+    refits = getattr(member, "refits", None)
+    if refits:
+        return [str(f) for f in refits]
+    fid = getattr(member, "fit_id", None)
+    return [] if fid is None else [str(fid)]
+
+
 # ── Pure core (§4.1) ─────────────────────────────────────────────────────────
 
 
@@ -205,23 +222,30 @@ class GapSelection:
 
         A member whose saved target is ``0`` ("don't seed this fit") starts
         UNCHECKED — re-checking it defaults its qty to ``doctrine_target``.
+
+        A slot with REFITS (design 2026-09-12 §6) contributes one row PER FIT —
+        the FC can swap to any of them, so each is independently tickable — all
+        pre-filled from the SLOT's saved seed target, which is slot-level and
+        therefore resolved once per member, not per fit.
         """
         target_default = max(0, _as_int(doctrine_target, 20))
         picks = []
         for mem in (members or ()):
-            fid = getattr(mem, "fit_id", None)
-            if fid is None:
+            fit_ids = _slot_fit_ids(mem)
+            if not fit_ids:
                 continue
-            fid = str(fid)
             try:
                 target = _as_int(resolve_target(mem), target_default)
             except Exception:
-                log.exception("[gaps] seed-target resolution failed for %s", fid)
+                log.exception("[gaps] seed-target resolution failed for %s",
+                              fit_ids[0])
                 target = target_default
             target = max(0, target)
-            label, hull = _fit_labels(fit_info, fid)
-            picks.append(ShipPick(fit_id=fid, label=(label or fid), hull=hull,
-                                  include=target > 0, qty=target))
+            for fid in fit_ids:
+                label, hull = _fit_labels(fit_info, fid)
+                picks.append(ShipPick(fit_id=fid, label=(label or fid),
+                                      hull=hull, include=target > 0,
+                                      qty=target))
         return cls(picks, doctrine_name=doctrine_name,
                    default_qty=target_default)
 

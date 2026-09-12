@@ -93,6 +93,13 @@ class ResolveContext:
     resolve_channel_id: Callable[[str], object] = lambda name: None  # str | int | None
     fc_selected: tuple | None = None                             # (character_id, name) or None
     legacy_fits: list | None = None                             # [(dna, name)] template fallback
+    # Doctrine refits (design 2026-09-12 §13): given a fit pill's DNA, return the
+    # ``(dna, name)`` of that slot's ACTIVE refit when the DNA belongs to a slot
+    # WITH refits in the selected doctrine AND the active fit differs; else None.
+    # Every fit link in the document is substituted through it, so a saved
+    # template's hand-placed pill FOLLOWS the FC's refit swap without the stored
+    # document ever being mutated (templates stay literal on disk).
+    refit_active: Callable[[str], "tuple | None"] = lambda dna: None
 
 
 @dataclass
@@ -143,13 +150,40 @@ DEFAULT_TAG_LINES = ("DPS", "Logi", "Links")
 
 # --- fit finalisation (canonical DNA + delta lookup) ----------------------
 
+def _refit_substitute(dna: str, name: str, ctx: ResolveContext):
+    """``(dna, name)`` after the doctrine-refit substitution (design §13).
+
+    THE single substitution point: every fit link in the document is emitted by
+    :func:`_finalize_fit`, so routing it here makes "pills follow the active
+    refit" uniform across the ``fit`` token, ``tag_line``, ``doctrine_block`` and
+    the v1 ``legacy_fits`` fallback.
+
+    Deliberately total: an out-of-contract ``refit_active`` (raising, returning a
+    bare string, a 1-tuple, an empty dna) leaves the pair UNCHANGED rather than
+    corrupting a link — the worst case for a broken provider is today's
+    behaviour. A substitute whose name is blank keeps the original link text.
+    """
+    try:
+        sub = ctx.refit_active(dna)
+    except Exception:
+        return dna, name
+    if not isinstance(sub, (tuple, list)) or len(sub) != 2:
+        return dna, name
+    sub_dna, sub_name = sub
+    if not isinstance(sub_dna, str) or not sub_dna:
+        return dna, name
+    return sub_dna, (sub_name if isinstance(sub_name, str) and sub_name else name)
+
+
 def _finalize_fit(dna: str, name: str, ctx: ResolveContext):
     """Return ``(markup, delta, parsed_ok)`` for one fit, matching ``build_motd``.
 
-    Canonicalises the DNA, looks up the ideal-fleet delta by the parsed ship
-    type, and emits ``fitting_link(canon, name) + delta_markup(delta)``. An
-    unparseable DNA keeps the raw DNA and drops the delta (today's behavior).
+    Applies the refit substitution (:func:`_refit_substitute`), canonicalises the
+    DNA, looks up the ideal-fleet delta by the parsed ship type, and emits
+    ``fitting_link(canon, name) + delta_markup(delta)``. An unparseable DNA keeps
+    the raw DNA and drops the delta (today's behavior).
     """
+    dna, name = _refit_substitute(dna, name, ctx)
     parsed = ctx.parse_fit(dna)
     canon = ctx.canonical_dna(dna, parsed)
     delta = ctx.deltas.get(parsed.ship_type_id, 0) if parsed is not None else 0
@@ -359,7 +393,18 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         parsed = ctx.parse_fit(dna)
         ok = parsed is not None
         delta = ctx.deltas.get(parsed.ship_type_id, 0) if ok else 0
-        tip = f"resolves to fit link: {name}" if ok else f"unparseable DNA — link kept, no delta: {name}"
+        sub = _refit_substitute(dna, name, ctx)
+        if sub != (dna, name):
+            # The pill is LITERAL on disk but its link resolves to the slot's
+            # ACTIVE refit (§13), so the tooltip must not name a fit the MOTD
+            # will not contain. The LABEL stays the saved name (the document did
+            # not change), and the delta is unaffected: refits are same-hull by
+            # rule, so the substitute parses to the same ship_type_id.
+            tip = f"follows the active refit → {sub[1]}"
+        elif ok:
+            tip = f"resolves to fit link: {name}"
+        else:
+            tip = f"unparseable DNA — link kept, no delta: {name}"
         # SOLID even when the DNA won't parse: the link is kept with the raw DNA
         # (§4.2), only the delta drops — a fit chip is never stale on parse failure.
         return TokenLabel(_ellip(name), True, tip, delta)

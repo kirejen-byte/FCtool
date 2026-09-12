@@ -772,6 +772,30 @@ def _filter_cap_entries(entries, only_region: str) -> list:
     ]
 
 
+def _slot_fit_ids(member) -> list:
+    """Every fit id a doctrine SLOT can fly (active + refits), default first.
+
+    The ONE fc_gui-side enumerator for the three consumer families allowed to
+    look past ``member.fit_id`` (design 2026-09-12 §6: the MOTD palette, the
+    market scan/gap enumerators and the library membership views — everything
+    else reads the ACTIVE fit and must stay untouched).
+
+    Delegates to ``fittings_store.slot_fit_ids``, the single source of truth,
+    but tolerates the duck-typed members the market seams are handed (a bare
+    stand-in without ``.refits``, or one whose ``fit_id`` is None) so a hand-
+    built subset or a test host never turns into an AttributeError inside a scan.
+
+    MODULE-LEVEL on purpose, not a method: every ``self.<helper>`` a seam reads
+    becomes one more entry the SimpleNamespace test hosts must bind (the
+    standing harness trap documented on ``_open_market_gaps_dialog``)."""
+    import fittings_store as _fittings_store
+    try:
+        return _fittings_store.slot_fit_ids(member)
+    except AttributeError:
+        fid = getattr(member, "fit_id", None)
+        return [] if fid is None else [fid]
+
+
 def _exemption_entry_key(entry: dict):
     """Canonical de-dupe key for a doctrine ideal-% exemption entry.
 
@@ -12799,14 +12823,18 @@ class FCToolGUI:
 
     def _add_fit_to_doctrine_from_fit(self, fit_id):
         """Cross-link from the Fittings detail pane: pick a doctrine (excluding
-        ones already containing this fit), choose tags, then add the fit."""
+        ones already containing this fit), choose tags, then add the fit.
+
+        "Already containing" spans REFITS (design §6): the store's uniqueness rule
+        refuses a fit that is already anywhere in the doctrine, so offering such a
+        doctrine here would only produce a silent no-op."""
         fit = self.fittings.get_fit(fit_id)
         if fit is None:
             return
         candidates = []
         for doc in sorted(self.fittings.list_doctrines(),
                           key=lambda d: (d.name or "").lower()):
-            if not any(m.fit_id == fit_id for m in doc.members):
+            if not any(fit_id in _slot_fit_ids(m) for m in doc.members):
                 candidates.append(doc)
         if not candidates:
             if self.fittings.list_doctrines():
@@ -13754,6 +13782,104 @@ class FCToolGUI:
                     seen.append(t)
         return seen
 
+    def _motd_refit_active(self, dna, doctrine=None):
+        """``(dna, name)`` of the ACTIVE refit for a fit pill's ``dna`` — or None.
+
+        The ``motd_doc.ResolveContext.refit_active`` seam (design 2026-09-12
+        §13): a hand-placed pill for a fit that is one of a slot's REFITS renders
+        as whatever that slot is currently flying, so "update the MOTD with DPS 1
+        swapped to DPS 2" needs no template edit. Returns None for a plain
+        member's fit, for an already-ACTIVE refit (nothing to substitute) and
+        whenever no doctrine is selected — i.e. today's behaviour everywhere the
+        feature is not in use.
+
+        Tk thread only (it reads the composer's doctrine combo). Memoised on
+        ``(doctrine.id, fittings.revision())`` because ``resolve`` calls it once
+        per fit link: a refit swap bumps the revision, so the very next
+        serialisation rebuilds the map even when the per-cycle ``_motd_ctx`` is
+        still holding this seam.
+
+        ``doctrine`` is passed by ``_motd_build_resolve_context`` (which already
+        resolved it) so one compose pass does not re-read the combo once per fit
+        link; omitting it falls back to the combo, which keeps the seam usable
+        stand-alone.
+
+        Both sides of the comparison are CANONICAL DNA — pills store canonical
+        DNA but ``fit.dna`` may not (legacy bare-id T3 subsystems), so a raw
+        compare would silently never match."""
+        if doctrine is None:
+            try:
+                doctrine = self._motd_selected_doctrine()
+            except Exception:
+                doctrine = None
+        if doctrine is None:
+            return None
+        try:
+            rev = self.fittings.revision()
+        except Exception:
+            rev = None
+        key = (getattr(doctrine, "id", None), rev)
+        if getattr(self, "_motd_refit_key", None) != key:
+            # Build into a LOCAL first and publish key+map together: assigning
+            # the key up front would, on a raising build, leave a key claiming a
+            # map that was never stored — every later call in that revision then
+            # fails on the missing attribute instead of retrying. A failed build
+            # leaves the PREVIOUS memo (and key) untouched, so the next call
+            # simply tries again.
+            try:
+                table = self._motd_build_refit_map(doctrine)
+            except Exception:
+                log.exception("[motd] refit map build failed")
+                return None
+            self._motd_refit_key = key
+            self._motd_refit_map = table
+        table = getattr(self, "_motd_refit_map", None)
+        if not table:
+            return None
+        hit = table.get(dna)
+        if hit is None:
+            # The pill's DNA is normally already canonical (every insert path
+            # runs through _canonical_fit_dna); re-canonicalise only on a miss so
+            # the common case costs one dict lookup, not a re-parse.
+            canon = self._canonical_fit_dna(dna)
+            if canon != dna:
+                hit = table.get(canon)
+        return hit
+
+    def _motd_build_refit_map(self, doctrine):
+        """``{canonical refit dna: (active dna, active name)}`` for one doctrine.
+
+        Only slots WITH refits contribute, and the slot's OWN active fit is
+        excluded — an already-active pill must resolve to None so
+        :func:`motd_doc._finalize_fit` leaves it exactly as written.
+
+        Keyed on canonical DNA, not fit id, so two refits in DIFFERENT slots that
+        share a canonical DNA collapse and the LAST slot walked wins. Pathological
+        (the store's per-doctrine fit-id uniqueness rule does not reach identical
+        DNA under two ids) and harmless — both readings name a live active fit."""
+        out = {}
+        for mem in getattr(doctrine, "members", []) or []:
+            fit_ids = _slot_fit_ids(mem)
+            if len(fit_ids) < 2:          # plain member: nothing to follow
+                continue
+            active = self.fittings.get_fit(getattr(mem, "fit_id", None))
+            if active is None or not active.dna:
+                continue
+            active_dna = self._canonical_fit_dna(active.dna, active.parsed)
+            target = (active_dna,
+                      active.name or self._motd_fit_compact_label(active))
+            for fid in fit_ids:
+                if fid == mem.fit_id:
+                    continue
+                fit = self.fittings.get_fit(fid)
+                if fit is None or not fit.dna:
+                    continue
+                canon = self._canonical_fit_dna(fit.dna, fit.parsed)
+                if canon == active_dna:   # identical DNA: substitution is a no-op
+                    continue
+                out[canon] = target
+        return out
+
     def _motd_build_resolve_context(self):
         """Assemble a fresh :class:`motd_doc.ResolveContext` from the live seams.
 
@@ -13777,6 +13903,20 @@ class FCToolGUI:
         fc_auth = self._motd_selected_fc_auth()
         fc_selected = ((fc_auth.character_id, fc_auth.character_name)
                        if fc_auth else None)
+        # getattr-guarded, not a bare attribute read: the composer wiring is
+        # exercised by SimpleNamespace hosts, and every new ``self.<method>``
+        # this builder reads becomes one more harness bind-list entry to keep in
+        # sync. An unbound seam simply leaves every pill literal — which is
+        # exactly the no-refits behaviour. The doctrine is CLOSED OVER (it was
+        # resolved once above) so one compose pass does not re-read the combo
+        # per fit link.
+        refit_seam = getattr(self, "_motd_refit_active", None)
+        if refit_seam is None:
+            def refit_active(dna):
+                return None
+        else:
+            def refit_active(dna):
+                return refit_seam(dna, doctrine)
         return motd_doc.ResolveContext(
             selected_doctrine=doctrine,
             fits_by_tag=fits_by_tag,
@@ -13787,6 +13927,7 @@ class FCToolGUI:
             resolve_channel_id=self._motd_resolve_channel_id,
             fc_selected=fc_selected,
             legacy_fits=self._motd_loaded_fits,
+            refit_active=refit_active,
         )
 
     def _motd_resolve_token_label(self, run):
@@ -14053,20 +14194,36 @@ class FCToolGUI:
         return f"{cls} — {name}" if name and name != cls else cls
 
     def _motd_palette_doctrine_fits(self):
+        """"Doctrine fits" palette group — one item per fit the doctrine can fly.
+
+        Enumerates REFITS (design §6): a slot with alternates offers all of them,
+        marked ` · active` / ` · refit` after its tags so the FC can tell which
+        one is flying before dropping a pill. A plain member's item is unchanged
+        (tags only), so a library with no refits renders exactly as before.
+        Bounded by doctrine size — no cap, as today."""
         d = self._motd_selected_doctrine()
         if d is None:
             return []
         out = []
         for mem in d.members:
-            fit = self.fittings.get_fit(mem.fit_id)
-            if fit is None or not fit.dna:
-                continue
-            out.append(motd_palette.PaletteItem(
-                kind="fit",
-                params={"dna": self._canonical_fit_dna(fit.dna, fit.parsed),
-                        "name": fit.name or self._motd_fit_compact_label(fit)},
-                label=self._motd_fit_palette_label(fit),
-                meta=", ".join(mem.tags or []), group="Doctrine fits"))
+            fit_ids = _slot_fit_ids(mem)
+            has_refits = len(fit_ids) > 1
+            tag_meta = ", ".join(mem.tags or [])
+            for fid in fit_ids:
+                fit = self.fittings.get_fit(fid)
+                if fit is None or not fit.dna:
+                    continue
+                meta = tag_meta
+                if has_refits:
+                    marker = "active" if fid == mem.fit_id else "refit"
+                    # An untagged slot must not lead with a stray separator.
+                    meta = f"{tag_meta} · {marker}" if tag_meta else marker
+                out.append(motd_palette.PaletteItem(
+                    kind="fit",
+                    params={"dna": self._canonical_fit_dna(fit.dna, fit.parsed),
+                            "name": fit.name or self._motd_fit_compact_label(fit)},
+                    label=self._motd_fit_palette_label(fit),
+                    meta=meta, group="Doctrine fits"))
         return out
 
     def _motd_palette_library_fits(self, query):
@@ -16565,23 +16722,54 @@ class FCToolGUI:
     # ── Fittings library controllers (Task 5.2) ───────────────────────────────
 
     def _doctrine_count_for_fit(self, fit_id: str) -> int:
-        """How many doctrines reference this fit (for the list's #Doc column)."""
+        """How many doctrines reference this fit (for the list's #Doc column).
+
+        Membership counts REFITS too (design §6): a fit carried only as a slot's
+        alternate is still in the doctrine, and a `#Doc` of 0 would invite the
+        owner to delete it."""
         count = 0
         try:
             for doc in self.fittings.list_doctrines():
-                if any(m.fit_id == fit_id for m in doc.members):
+                if any(fit_id in _slot_fit_ids(m) for m in doc.members):
                     count += 1
         except Exception:
             pass
         return count
 
+    def _fit_doctrine_memberships(self, fit_id: str) -> list:
+        """``[(doctrine name, slot tags, suffix)]`` for the fit-detail pane's
+        "Doctrines" section — the pure half, so the rule is testable without Tk.
+
+        Membership includes REFITS (design §6). A slot WITH refits says which
+        side of the swap this fit is on — ``" (active refit)"`` when it is the
+        one flying, ``" (refit)"`` when it is an alternate; a plain member
+        carries NO suffix, so a library with no refits renders byte-identically
+        to today. Doctrine order is the store's; a doctrine is listed once even
+        if a (hand-edited) library repeats the fit across slots."""
+        out = []
+        for doc in self.fittings.list_doctrines():
+            mem = next((m for m in doc.members
+                        if fit_id in _slot_fit_ids(m)), None)
+            if mem is None:
+                continue
+            if getattr(mem, "refits", None):
+                suffix = (" (active refit)" if mem.fit_id == fit_id
+                          else " (refit)")
+            else:
+                suffix = ""
+            out.append((doc.name, mem.tags, suffix))
+        return out
+
     def _fit_member_tags(self, fit_id: str) -> list[str]:
-        """Union of this fit's per-membership tags across all doctrines."""
+        """Union of this fit's per-membership tags across all doctrines.
+
+        Tags are SLOT-level, so a refit inherits its slot's tags (design §4) —
+        the walk matches the active fit or any refit."""
         tags: list[str] = []
         try:
             for doc in self.fittings.list_doctrines():
                 for m in doc.members:
-                    if m.fit_id == fit_id:
+                    if fit_id in _slot_fit_ids(m):
                         for t in m.tags:
                             if t not in tags:
                                 tags.append(t)
@@ -16945,17 +17133,13 @@ class FCToolGUI:
                      wraplength=380).pack(anchor=tk.W, padx=14)
 
         # Doctrine membership.
-        member_docs = []
-        for doc in self.fittings.list_doctrines():
-            mem = next((m for m in doc.members if m.fit_id == fit.id), None)
-            if mem is not None:
-                member_docs.append((doc.name, mem.tags))
+        member_docs = self._fit_doctrine_memberships(fit.id)
         tk.Label(parent, text="Doctrines", font=("Consolas", 9, "bold"),
                  fg=FG_GREEN, bg=BG_PANEL).pack(anchor=tk.W, padx=12, pady=(8, 0))
         if member_docs:
-            for dname, dtags in member_docs:
+            for dname, dtags, suffix in member_docs:
                 tag_txt = f" [{', '.join(dtags)}]" if dtags else ""
-                tk.Label(parent, text=f"  {dname}{tag_txt}",
+                tk.Label(parent, text=f"  {dname}{tag_txt}{suffix}",
                          font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
                          anchor=tk.W, wraplength=380, justify=tk.LEFT).pack(
                              anchor=tk.W, padx=14)
@@ -35277,17 +35461,20 @@ $bmp.Dispose()
         auth = self.esi_auth  # snapshot for the worker (stable across the scan)
         doctrine = self._market_active_doctrine()
         # Collect the active doctrine's fits for the contract scan (region from
-        # config; system filter unless contracts_scope == "region").
+        # config; system filter unless contracts_scope == "region"). REFITS are
+        # included (design §6): the FC can swap to any of them mid-fleet, so a
+        # contract match for an alternate is as useful as one for the active fit.
         fits = []
         if doctrine is not None:
             for mem in getattr(doctrine, "members", []):
-                fit = None
-                try:
-                    fit = self.fittings.get_fit(mem.fit_id)
-                except Exception:
+                for fid in _slot_fit_ids(mem):
                     fit = None
-                if fit is not None:
-                    fits.append(fit)
+                    try:
+                        fit = self.fittings.get_fit(fid)
+                    except Exception:
+                        fit = None
+                    if fit is not None:
+                        fits.append(fit)
 
         # ── Scan scope ────────────────────────────────────────────────────────
         # Targeted (default) unless the caller forced a full scan or there's no
@@ -35573,6 +35760,10 @@ $bmp.Dispose()
         defensive throughout (a missing store/catalog or an unparsable fit yields
         an empty set, so the caller falls back to a full scan / renders nothing).
 
+        Each slot contributes every fit it can fly — active AND refits (design
+        §6) — so a targeted scan covers the hulls the FC can swap to and the
+        coverage gate built on this set stays honest after a swap.
+
         ``members`` optionally narrows the walk to a SUBSET of the doctrine's
         members (the gap dialog's per-ship selection). ``None`` (default) walks
         every member — identical to the original no-argument behaviour. An EMPTY
@@ -35591,20 +35782,19 @@ $bmp.Dispose()
         catalog = getattr(self, "type_catalog", None)
         walk = getattr(doctrine, "members", []) if members is None else members
         for mem in walk:
-            fid = getattr(mem, "fit_id", None)
-            if fid is None:
-                continue
-            try:
-                fit = store.get_fit(fid)
-            except Exception:
-                fit = None
-            if fit is None:
-                continue
-            try:
-                for c in market_scanner.fit_bom(fit.parsed, catalog):
-                    out.add(c.type_id)
-            except Exception:
-                log.exception("[market] fit_bom failed collecting scan type_ids")
+            for fid in _slot_fit_ids(mem):
+                try:
+                    fit = store.get_fit(fid)
+                except Exception:
+                    fit = None
+                if fit is None:
+                    continue
+                try:
+                    for c in market_scanner.fit_bom(fit.parsed, catalog):
+                        out.add(c.type_id)
+                except Exception:
+                    log.exception(
+                        "[market] fit_bom failed collecting scan type_ids")
         return out
 
     def _market_snapshot_covers(self, type_ids):
@@ -35950,24 +36140,35 @@ $bmp.Dispose()
         # asking for only the hulls that WERE scanned is no longer refused.
         scope_members = None
         if per_fit_targets is not None:
-            def _seeded(mem):
-                """Mirror gap_list's OWN per-member target resolution so the
-                gate and the build can never disagree: an absent (or junk) entry
+            def _seeded(fid):
+                """Mirror gap_list's OWN per-FIT target resolution so the gate
+                and the build can never disagree: an absent (or junk) entry
                 falls back to the doctrine target there, so it must stay INSIDE
                 the coverage set — only an explicit 0 narrows the gate.
+
+                Keyed on the FIT id, not the member, because gap_list resolves a
+                target for every fit a slot can fly (design §6) — a slot whose
+                only unticked pick is one refit must still narrow the gate by
+                exactly that refit's bill of materials.
 
                 ``OverflowError`` is caught alongside the two gap_list itself
                 names: ``int(float("inf"))`` raises it, and an escape here would
                 leave the ONE caller-visible contract of this method (always
                 ``(gap, error)``, never a raise) broken for that input."""
-                raw = per_fit_targets.get(getattr(mem, "fit_id", None),
-                                          doctrine_target)
+                raw = per_fit_targets.get(fid, doctrine_target)
                 try:
                     return int(raw) > 0
                 except (TypeError, ValueError, OverflowError):
                     return doctrine_target > 0
-            scope_members = [m for m in getattr(doctrine, "members", [])
-                             if _seeded(m)]
+            # One stand-in member per SEEDED fit: `_market_doctrine_scan_type_ids`
+            # expands whatever it is handed through `_slot_fit_ids`, and a
+            # refit-less stand-in expands to exactly its own fit — so the
+            # coverage set is the BoM of the fits actually being shopped for.
+            scope_members = [
+                fit_models.DoctrineMember(fit_id=fid, tags=[], order=0)
+                for m in getattr(doctrine, "members", [])
+                for fid in _slot_fit_ids(m)
+                if _seeded(fid)]
         bom_ids = self._market_doctrine_scan_type_ids(doctrine, scope_members)
         if bom_ids and not self._market_snapshot_covers(bom_ids):
             return None, self._market_scope_mismatch_message(doctrine)
@@ -35980,13 +36181,17 @@ $bmp.Dispose()
             # doctrine target for every fit (so target_desc stays "Nx
             # <doctrine>" and the call is byte-identical to the pre-per-fit
             # behaviour).
+            # Seed targets are SLOT-level (design §4), so every fit the slot can
+            # fly — active and refits alike — gets the OWNING slot's resolved
+            # target. The map stays sparse: a slot that does not override the
+            # doctrine bar contributes nothing and its fits fall back to
+            # ``target_fits`` inside gap_list, which is the same number.
             per_fit: dict[str, int] = {}
             for m in getattr(doctrine, "members", []):
-                fid = getattr(m, "fit_id", None)
-                if fid is None:
-                    continue
                 resolved = self._market_seed_target(doctrine, m)
-                if resolved != doctrine_target:
+                if resolved == doctrine_target:
+                    continue
+                for fid in _slot_fit_ids(m):
                     per_fit[fid] = resolved
             per_fit_targets = per_fit or None
         try:
