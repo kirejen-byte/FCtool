@@ -28,12 +28,18 @@ Two rules this module exists to keep:
 
 Nothing here mutates anything: ``chip_row``/``menu_spec`` are total functions of
 their inputs, and a missing or unreadable fit degrades to a labelled placeholder
-rather than raising (a refit whose fit was deleted must still be REMOVABLE from
-the row — see the spec's §9 edge-case table).
+rather than raising. That placeholder is DEFENCE IN DEPTH, not an expected
+state: per the spec's §9 edge-case table the store's ``delete_fit`` cascade
+drops a deleted fit from every slot's ``refits``, so a refit chip should never
+read ``(missing fit)`` in practice. If one does, the row still renders and the
+chip is still removable instead of the pane dying — that is the whole point.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 # Glyph vocabulary — shared by the chips and the menu so the two surfaces can
 # never drift. There are no radiobutton menus in this app; the active entry is
@@ -76,18 +82,39 @@ class MenuSpec:
 
 def _refits_of(member) -> list[str]:
     """The slot's ordered refit ids — ``[]`` for a plain member, and for a
-    member object that predates the ``refits`` field entirely."""
-    return [str(f) for f in (getattr(member, "refits", None) or [])]
+    member object that predates the ``refits`` field entirely.
+
+    DE-DUPED, first occurrence wins. The store's uniqueness rule makes a repeat
+    impossible, but a hand-edited library can carry ``["a", "a"]`` and the whole
+    UI downstream is keyed by fit id: two chips for one id would collapse
+    ``chip_widgets`` to one entry while drawing two active-looking chips, and
+    the menu would show the same refit twice. Normalising here fixes every
+    consumer at once (``chip_row``, ``menu_spec``, ``has_refits``)."""
+    return list(dict.fromkeys(
+        str(f) for f in (getattr(member, "refits", None) or [])))
+
+
+_LOOKUP_FAILURE_LOGGED = False
 
 
 def _get(get_fit, fit_id):
     """``get_fit(fit_id)`` with the lookup's own failure folded into "missing"
-    — the model must never be the thing that raises inside a row render."""
+    — the model must never be the thing that raises inside a row render.
+
+    A raising lookup is a bug in the HOST, not an expected state, so the first
+    one in the process is logged at debug with its traceback; the rest stay
+    quiet (this runs once per chip per re-render — a broken lookup would
+    otherwise flood the log)."""
+    global _LOOKUP_FAILURE_LOGGED
     if not callable(get_fit):
         return None
     try:
         return get_fit(fit_id)
     except Exception:
+        if not _LOOKUP_FAILURE_LOGGED:
+            _LOOKUP_FAILURE_LOGGED = True
+            log.debug("doctrine_refits: fit lookup failed for %r "
+                      "(further failures silenced)", fit_id, exc_info=True)
         return None
 
 
@@ -279,7 +306,9 @@ class RefitStrip(tk.Frame):
         glyph = ACTIVE_GLYPH if chip.active else INACTIVE_GLYPH
         label = tk.Label(
             self, text=f" {glyph} {chip.label} ", font=CHIP_FONT,
-            padx=_CHIP_PADX, cursor="hand2",
+            padx=_CHIP_PADX,
+            # The active chip is inert, so it must NOT advertise a click.
+            cursor="" if chip.active else "hand2",
             fg=colours["on_accent"] if chip.active else colours["dim"],
             bg=colours["accent"] if chip.active else colours["bg"])
         label.pack(side=tk.LEFT, padx=_CHIP_GAP)
@@ -352,8 +381,20 @@ def make_refits_button(parent, on_post, *, palette=None) -> tk.Button:
 
 def post_menu_under(menu, button) -> None:
     """Post ``menu`` just under ``button`` — the app's anchoring for a ``▾``
-    microbutton (``map_tab._show_chars_menu``). ``grab_release`` runs in a
-    ``finally``: a menu that fails to post must not leave the pointer grabbed."""
+    microbutton (``map_tab._show_chars_menu``).
+
+    **This function OWNS the menu's lifetime**: menus here are minted per post
+    (``build_refit_menu`` reads a fresh spec every time), so the teardown is
+    armed here rather than left to the caller — otherwise every post leaks a
+    Tk widget for the life of the window. Do NOT pass a long-lived menu.
+
+    Two details are load-bearing, both from fc_gui's cured ``_post_menu``:
+    the destroy hangs off ``<Unmap>`` (which fires when Tk unposts the menu)
+    and is DEFERRED 100 ms — an immediate destroy races Tk's idle-scheduled
+    command invocation and swallows the click; and ``grab_release`` runs in a
+    ``finally``, so a menu that fails to post never leaves the pointer grabbed.
+    """
+    menu.bind("<Unmap>", lambda ev: menu.after(100, menu.destroy))
     try:
         x = button.winfo_rootx()
         y = button.winfo_rooty() + button.winfo_height() + 2
