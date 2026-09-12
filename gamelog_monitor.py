@@ -104,6 +104,42 @@ DECLOAK_RE = re.compile(
 )
 
 
+# ── Cyno-active lines (English client) ───────────────────────────────────────
+# EVE writes NO line when a cynosural field is lit — the only evidence in the
+# Gamelog is one of two CONDITIONAL lines the client emits while a field is
+# already burning, both of which name the generator type verbatim:
+#   … (hint) Cynosural Field Generator I is already active.
+#   … (notify) You are unable to dock because while Cynosural Field Generator I
+#     is active your docking systems are unusable.
+# Either one proves a field is lit right now, which is all the ozone watch needs
+# (it decrements the last known ozone figure by one activation — ESI's assets
+# cache will not show the burn for up to an hour).
+#
+# NEAR-MISS lines that must NOT match: the module-activation hints for anything
+# else ("… is already active" is emitted for any module re-click, so the gate
+# substring alone is NOT sufficient — the captured name is what identifies it,
+# and the ozone watch only acts on a name it recognises as a generator).
+_CYNO_ALREADY_ACTIVE_GATE = "is already active"
+_CYNO_DOCKING_GATE = "is active your docking systems"
+
+# The client wraps the module name in markup (`<b>`, `<color=…>`, `<font …>`)
+# and BREAKS IT UP: `<color=..><b>Cynosural Field Generator I</b> is already
+# active.` A pattern anchored on the name therefore cannot span the closing tag
+# — so the line is stripped of tags FIRST and these patterns read plain text.
+# Both gate substrings survive stripping intact (the phrases are contiguous in
+# the rendered text), which is what lets the cheap gate stay on the raw line.
+_TAG_RE = re.compile(r"<[^>]*>")
+
+_CYNO_ALREADY_ACTIVE_RE = re.compile(
+    r"\(hint\)\s*(?P<gen>.+?)\s+is already active",
+    re.IGNORECASE,
+)
+_CYNO_DOCKING_RE = re.compile(
+    r"\bwhile\s+(?P<gen>.+?)\s+is active your docking systems",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class DamageEvent:
     timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
@@ -117,6 +153,12 @@ class DecloakEvent:
     timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
     character_name: str     # from the file's "Listener:" header
     cause: str              # e.g. "proximity to a nearby Stargate (Caldari System)"
+
+
+@dataclass(frozen=True)
+class CynoActiveEvent:
+    """A line proving a cynosural field is burning right now."""
+    generator_name: str     # e.g. "Covert Cynosural Field Generator I", verbatim
 
 
 def parse_damage_line(line: str):
@@ -155,6 +197,33 @@ def parse_decloak_line(line: str):
     m = DECLOAK_RE.search(line)
     if m:
         return (m.group("cause") or "").strip()
+    return None
+
+
+def parse_cyno_active_line(line: str):
+    """Return a :class:`CynoActiveEvent` for a cyno-is-burning line, else None.
+
+    Matches BOTH conditional templates (the ``(hint) … is already active``
+    re-click and the ``unable to dock because while … is active your docking
+    systems are unusable`` notify) and captures the module name each names
+    verbatim, stripped of the client's markup tags.
+
+    Short-circuits on the two cheap gate substrings so the tailer runs no regex
+    on an ordinary line. The gate is deliberately NOT specific to cyno
+    generators — ``is already active`` is emitted for any module re-click — so
+    the name is the identification and the caller decides whether it is a
+    generator it cares about. Never raises."""
+    if not line:
+        return None
+    if _CYNO_ALREADY_ACTIVE_GATE not in line and _CYNO_DOCKING_GATE not in line:
+        return None
+    plain = _TAG_RE.sub(" ", line)
+    for pattern in (_CYNO_DOCKING_RE, _CYNO_ALREADY_ACTIVE_RE):
+        m = pattern.search(plain)
+        if m:
+            name = (m.group("gen") or "").strip()
+            if name:
+                return CynoActiveEvent(generator_name=name)
     return None
 
 
