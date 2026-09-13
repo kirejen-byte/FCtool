@@ -1,2 +1,8 @@
 *.gz binary
 *.json.gz binary
+# vendor/x11helper.zip is byte-reproducible (tools/build_x11helper_zip.py); any
+# eol/text munging would break that contract.
+*.zip binary
+# Vendored upstream bytes (python-xlib/six) must never be eol-normalised, or the
+# packed zip stops being byte-reproducible across clones/checkouts.
+vendor/x11helper/** -text

@@ -32,6 +32,10 @@ a = Analysis(
         ('assets/alerts/zkill_blip.mp3', 'assets/alerts'),
         ('assets/alerts/zkill_horn.mp3', 'assets/alerts'),
         ('assets/alerts/zkill_comms.mp3', 'assets/alerts'),
+        # Vendored python-xlib + six for the Linux (Proton/Wine) preview helper;
+        # dead weight on Windows, so it ships as ONE zip (built by
+        # tools/build_x11helper_zip.py) to keep the one-file cold boot unchanged.
+        ('vendor/x11helper.zip', 'vendor'),
     ],
     # 'pygame.gfxdraw': belt-and-braces. map_render.py imports it statically,
     # but falls back to importlib.import_module() on a transient ModuleNotFoundError
