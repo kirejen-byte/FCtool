@@ -69,13 +69,25 @@ T_QUIT = "quit"
 T_ACTIVATE = "activate"
 # both directions (app asks with {id}, helper answers/pushes with {id,w,h})
 T_SIZE = "size"
+# app -> helper: "send me the monitor layout now" (no fields).
+T_MONITORS = "monitors"
+# helper -> app: the X server's REAL screen size and per-CRTC layout.  Sent
+# unsolicited right after 'hello' (so FCTool owns it before the first pin) and
+# again on every RandR screen change, plus on request.  It exists because
+# Wine's own monitor enumeration has been seen reporting a DPI-scaled
+# 1280x720 for a 1920x1080 output, and a wrong rect means a wrongly resized
+# client.  Shape: {"screen": [w, h], "outputs": [{name, x, y, w, h, primary,
+# connected}, ...]}; on a server without RandR >= 1.2 (or after any Xlib
+# failure) ``outputs`` is [] and a plain ``note`` string says why -- that is
+# NOT an error code, so ERROR_CODES stays as it is.
+T_MONITORS_REPLY = "monitors_reply"
 # synthesised locally by LineDecoder -- never sent on the wire
 T_MALFORMED = "malformed"
 
 MESSAGE_TYPES = (
     T_HELLO, T_OK, T_ATTACH, T_ATTACHED, T_UPDATE, T_VISIBLE, T_SIZE,
     T_DETACH, T_DETACHED, T_PROBE, T_PROBE_RESULT, T_QUIT, T_ACTIVATE,
-    T_STATS, T_ERROR, T_MALFORMED,
+    T_STATS, T_ERROR, T_MALFORMED, T_MONITORS, T_MONITORS_REPLY,
 )
 
 ERROR_CODES = (
@@ -210,10 +222,16 @@ _REQUIRED = {
               ("coalesced", "int"), ("errors", "int"), ("uptime_s", "num")),
     T_ERROR: (("id", "id_or_null"), ("code", "error_code"), ("msg", "str")),
     T_MALFORMED: (("raw", "str"),),
+    T_MONITORS: (),
+    # Only the envelope is validated here: a per-output dict is checked by the
+    # consumer, because a helper that cannot describe one CRTC must still be
+    # able to report the others.
+    T_MONITORS_REPLY: (("screen", "pair"), ("outputs", "list")),
 }  # type: Dict[str, Tuple[Tuple[str, str], ...]]
 
 _OPTIONAL = {
     T_SIZE: (("w", "int"), ("h", "int")),
+    T_MONITORS_REPLY: (("note", "str"),),
 }  # type: Dict[str, Tuple[Tuple[str, str], ...]]
 
 

@@ -19,9 +19,13 @@
 #
 # Plus one repair path EPM never needed: Wine flushes a window's GDI surface
 # into the X window with an IncludeInferiors GC, which paints straight over our
-# child.  The server announces that as an Expose (or a ConfigureNotify when the
+# child.  Most of that is announced as an Expose (or a ConfigureNotify when the
 # tile is dragged) on the TILE, so we select both on the destination window and
-# recomposite at once -- see HelperCore._repair.
+# recomposite at once -- see HelperCore._repair.  But a plain XPutImage over an
+# already-visible child uncovers nothing, so the server sends NO Expose for it:
+# the TILE therefore carries its own XDamage as well, and the damaged area says
+# whether Wine painted over us or whether it is just our own composite bouncing
+# back through the parent -- see HelperCore._on_tile_damage.
 #
 # And one job that is not compositing at all: 'activate'.  A PE process under
 # Wine cannot make the wineserver hand the foreground to another client, so
@@ -100,9 +104,23 @@ ACTIVE_WINDOW_SOURCE_PAGER = 2
 #: user perceives as slow is still far inside it.
 ACTIVATE_FOCUS_TIMEOUT_S = 2.0
 
+#: How long after a composite a CONTAINED tile-damage rectangle still reads as
+#: our own frame bouncing back off the parent.  Outside this window a damage
+#: that fits inside the child is somebody ELSE's paint (Wine repainting exactly
+#: the body rect, which fit-height makes the common case) and must be repaired.
+#: The repair's own echo returns with elapsed ~0, so the loop stays closed.
+ECHO_WINDOW_MS = 50.0
+
 #: 'stats' cadence, and the longest the select() loop ever sleeps.
 STATS_INTERVAL_S = 5.0
 MAX_SELECT_TIMEOUT_S = 0.25
+
+#: A monitor unplug/replug can fire several RRScreenChangeNotify events in a
+#: single drain (next_events() already folds those into one tuple, but the
+#: caller can still hand HelperCore several such tuples back to back).  The
+#: re-read + re-push is therefore deferred to one deadline instead of running
+#: once per event; tick() pushes exactly once when it elapses.
+MONITORS_COALESCE_S = 0.1
 
 #: Probe mode's helper-owned test window.
 PROBE_W = 320
@@ -288,6 +306,13 @@ class XSession(object):
         self._shape = None
         self._composite = None
         self._xrender = None
+        # RandR (monitor layout).  OPTIONAL: a server without RandR >= 1.2
+        # still does previews, it just cannot answer 'monitors'.  Same clone
+        # trap as DAMAGE, so the screen-change event is matched on its CODE.
+        self._randr = None
+        self._randr_ok = False
+        self._screen_change_code = None
+        self._screen_change_cls_name = "ScreenChangeNotify"
         # Xlib.protocol.event, for the two SYNTHETIC events we send (the
         # _NET_ACTIVE_WINDOW ClientMessage and the pointer nudge).
         self._event = None
@@ -369,8 +394,80 @@ class XSession(object):
             self._net_active_window = None
             _log("cannot intern _NET_ACTIVE_WINDOW: %s" % (exc,))
 
+        # Optional, and deliberately last: a RandR failure must never cost the
+        # previews.  It subscribes to screen changes so monitor_layout() can be
+        # re-pushed when the desktop is reconfigured.
+        self._setup_randr(disp)
+
         disp.set_error_handler(self._on_async_error)
         return self
+
+    def _setup_randr(self, disp):
+        """Arm RandR: version gate, RRScreenChangeNotify selection, event code.
+
+        Everything here is best effort -- ``self._randr_ok`` stays False on any
+        failure and monitor_layout() then answers ``no_randr``.  RandR 1.2 is
+        the floor: CRTCs, outputs and get_output_primary do not exist below it.
+        """
+        try:
+            from Xlib.ext import randr as randr_mod
+        except ImportError as exc:
+            _log("no RandR module: %s" % (exc,))
+            return False
+        try:
+            if not disp.has_extension("RANDR"):
+                _log("the X server has no RANDR extension")
+                return False
+            version = disp.xrandr_query_version()
+            major = int(version.major_version)
+            minor = int(version.minor_version)
+            if (major, minor) < (1, 2):
+                _log("RandR %d.%d is older than 1.2" % (major, minor))
+                return False
+        except Exception as exc:
+            _log("RandR QueryVersion failed: %s" % (exc,))
+            return False
+
+        self._randr = randr_mod
+        self._screen_change_code = self._query_screen_change_code(disp)
+        try:
+            disp.screen().root.xrandr_select_input(
+                randr_mod.RRScreenChangeNotifyMask)
+            disp.flush()
+        except Exception as exc:
+            # Not fatal: layout can still be REQUESTED, only the unsolicited
+            # re-push on a desktop reconfigure is lost.
+            _log("RandR select_input failed: %s" % (exc,))
+        self._randr_ok = True
+        return True
+
+    def _query_screen_change_code(self, disp):
+        """The wire code RRScreenChangeNotify was registered under, or None.
+
+        Exactly the ``_query_damage_code`` story: python-xlib decodes extension
+        events into an anonymous CLONE of the class, so the code is the only
+        stable identity.  The vendored randr module only registers the event on
+        a 1.5+ server, hence the query_extension fallback.
+        """
+        code = None
+        try:
+            code = getattr(disp.extension_event, self._screen_change_cls_name)
+        except Exception:
+            code = None
+        if code is None:
+            try:
+                info = disp.query_extension("RANDR")
+            except Exception:
+                info = None
+            first = getattr(info, "first_event", None)
+            if first is not None:
+                code = first + self._randr.RRScreenChangeNotify
+        if code is None:
+            return None
+        try:
+            return int(code) & 0x7f
+        except (TypeError, ValueError):
+            return None
 
     def _query_damage_code(self, disp):
         """The wire event code the server's DAMAGE extension was given.
@@ -460,6 +557,98 @@ class XSession(object):
         except Exception:
             pass
         return out
+
+    # ---- monitor layout (RandR) -----------------------------------------
+
+    def monitor_layout(self):
+        """The X server's REAL screen size and per-CRTC geometry.
+
+        ``{"screen": [w, h], "outputs": [{"name", "x", "y", "w", "h",
+        "primary", "connected"}, ...]}`` -- one entry per RandR CRTC that has a
+        mode (w/h > 0), named after its first CONNECTED output, primary first
+        and then in (x, y) order.
+
+        TOTAL by contract: this is a cross-check for Wine's own monitor
+        enumeration (which reported a DPI-scaled 1280x720 for a 1920x1080
+        output), so it must always answer something.  No RandR, or any Xlib
+        failure at all, comes back as ``outputs: []`` plus a plain ``note``
+        -- never an exception, never an error code.
+        """
+        try:
+            info = self.screen_info()
+            screen = [int(info.get("w") or 0), int(info.get("h") or 0)]
+        except Exception as exc:
+            return {"screen": [0, 0], "outputs": [], "note": _describe(exc)}
+        if not self._randr_ok:
+            return {"screen": screen, "outputs": [], "note": "no_randr"}
+        try:
+            outputs = self._randr_outputs()
+        except Exception as exc:
+            return {"screen": screen, "outputs": [], "note": _describe(exc)}
+        return {"screen": screen, "outputs": outputs}
+
+    def _randr_outputs(self):
+        """One row per live CRTC, primary first then by (x, y).
+
+        ``get_screen_resources_current`` is the cheap read (it never polls the
+        outputs); the full ``get_screen_resources`` is the fallback for a
+        server that does not implement it.  Every row is resolved against the
+        SAME ``config_timestamp`` the resource list came back with, which is
+        what the CRTC/output requests demand.
+        """
+        root = self.display.screen().root
+        try:
+            res = root.xrandr_get_screen_resources_current()
+        except Exception as exc:
+            _log("RandR GetScreenResourcesCurrent failed: %s" % (exc,))
+            res = root.xrandr_get_screen_resources()
+        config_ts = res.config_timestamp
+        try:
+            primary = int(root.xrandr_get_output_primary().output)
+        except Exception as exc:
+            _log("RandR GetOutputPrimary failed: %s" % (exc,))
+            primary = 0
+
+        rows = []
+        for crtc in list(res.crtcs):
+            crtc_info = self.display.xrandr_get_crtc_info(crtc, config_ts)
+            width = int(crtc_info.width)
+            height = int(crtc_info.height)
+            # A CRTC with no mode is not a monitor: it is a disabled head, and
+            # a 0x0 rect would be a lie the app could pin a client onto.
+            if width <= 0 or height <= 0:
+                continue
+            crtc_outputs = [int(o) for o in list(crtc_info.outputs)]
+            name, connected = self._first_connected_output(crtc_outputs,
+                                                           config_ts)
+            rows.append({"name": name,
+                         "x": int(crtc_info.x), "y": int(crtc_info.y),
+                         "w": width, "h": height,
+                         "primary": bool(primary and primary in crtc_outputs),
+                         "connected": connected})
+        rows.sort(key=lambda row: (0 if row["primary"] else 1,
+                                   row["x"], row["y"]))
+        return rows
+
+    def _first_connected_output(self, output_ids, config_ts):
+        """``(name, connected)`` for the first CONNECTED output of a CRTC.
+
+        A live CRTC whose outputs cannot be read (or that reports none
+        connected) still gets a row -- unnamed, ``connected: False`` -- because
+        its rect is real geometry the app may need to cross-check.
+        """
+        for output_id in output_ids:
+            try:
+                info = self.display.xrandr_get_output_info(output_id,
+                                                           config_ts)
+            except Exception as exc:
+                _log("RandR GetOutputInfo 0x%x failed: %s"
+                     % (int(output_id), exc))
+                continue
+            if int(info.connection) != self._randr.Connected:
+                continue
+            return _ascii(_text_of(info.name)), True
+        return "", False
 
     # ---- windows --------------------------------------------------------
 
@@ -737,10 +926,15 @@ class XSession(object):
     def next_events(self):
         """Drain the queue into normalised tuples.
 
-        ``("damage", xid)`` / ``("configure", xid, w, h)`` /
+        ``("damage", xid, (x, y, w, h))`` / ``("configure", xid, w, h)`` /
         ``("expose", xid)`` / ``("destroy", xid)`` /
         ``("focus_in", xid)`` / ``("error", code, resource)``.  Anything else
         is dropped here so HelperCore never sees an Xlib object.
+
+        Damage carries the damaged AREA (None when the event has none): a
+        source's area is ignored, but on a TILE it is the whole story -- it
+        says whether Wine just flushed over our child or whether the damage is
+        only our own composite bouncing back (see _on_tile_damage).
 
         Expose is deliberately NOT batched on its ``count`` field: one tuple per
         event is cheap, and HelperCore coalesces a burst itself (_repair).
@@ -757,6 +951,10 @@ class XSession(object):
             _log("pending_events failed: %s" % (exc,))
             return out
         X = self._X
+        # A monitor unplug/replug can fire several RRScreenChangeNotify events
+        # in this one drain -- the layout is re-read and re-pushed as a whole,
+        # so only the FIRST one in the burst needs to be surfaced here.
+        screen_changed = False
         for _ in range(pending):
             try:
                 ev = self.display.next_event()
@@ -771,7 +969,15 @@ class XSession(object):
             # dropped every damage event and left the previews repainting on
             # the heartbeat alone.  The class-name check is belt and braces.
             if self._is_damage_event(ev, etype):
-                out.append(("damage", _xid_of(ev.drawable)))
+                out.append(("damage", _xid_of(ev.drawable), _area_of(ev)))
+                continue
+            # The desktop was reconfigured (resolution, rotation, a monitor
+            # plugged or unplugged).  Carries no id: the whole layout is
+            # re-read and re-pushed, so the event's own fields are redundant.
+            if self._is_screen_change_event(ev, etype):
+                if not screen_changed:
+                    out.append(("screen_change",))
+                    screen_changed = True
                 continue
             if etype == X.ConfigureNotify:
                 out.append(("configure", _xid_of(ev.window),
@@ -810,6 +1016,23 @@ class XSession(object):
             except (TypeError, ValueError):
                 pass
         return type(ev).__name__ == self._damage_cls_name
+
+    def _is_screen_change_event(self, ev, etype):
+        """True for a decoded RRScreenChangeNotify, by code then by name.
+
+        Gated on ``_randr_ok``: without RandR armed nothing may be classified
+        as a screen change (the name check alone would otherwise match a test
+        double on a server that never registered the event).
+        """
+        if not self._randr_ok:
+            return False
+        if self._screen_change_code is not None and etype is not None:
+            try:
+                if (int(etype) & 0x7f) == self._screen_change_code:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return type(ev).__name__ == self._screen_change_cls_name
 
     # ---- error plumbing -------------------------------------------------
 
@@ -885,6 +1108,33 @@ def _xid_of(value):
         return 0
 
 
+def _area_of(ev):
+    """A DamageNotify's damaged rectangle as ``(x, y, w, h)``, else None.
+
+    The decoded ``area`` is a Rectangle: a DictWrapper when it came off the
+    wire (attribute access), a plain dict when a test built the event by hand
+    (item access).  Both shapes are read here, and anything else -- including
+    an event with no area at all -- answers None, which every caller must
+    treat as "unknown", never as an empty rectangle.
+    """
+    area = getattr(ev, "area", None)
+    if area is None:
+        return None
+    out = []
+    for name in ("x", "y", "width", "height"):
+        value = getattr(area, name, None)
+        if value is None:
+            try:
+                value = area[name]
+            except (TypeError, KeyError, IndexError):
+                return None
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            return None
+    return (out[0], out[1], out[2], out[3])
+
+
 _RESOURCE_ERRORS = ("BadWindow", "BadDrawable", "BadPixmap")
 
 
@@ -914,6 +1164,13 @@ class Thumb(object):
         self.src_pic = None
         self.dst_pic = None
         self.damage = None
+        #: RawRectangles damage on the TILE window.  Wine paints a window's
+        #: own surface with an IncludeInferiors GC -- an XPutImage straight
+        #: over our child, which is NOT an Expose (the server only exposes
+        #: regions it uncovered), so the Expose repair never fires for it and
+        #: the tile stayed black until the next damage-driven composite.  This
+        #: is the only notification that says Wine just painted over us.
+        self.dst_damage = None
         self.last_composite_ts = 0.0
         self.dirty = False
         #: When a follow-up repair composite is due (0.0 = none scheduled).
@@ -972,6 +1229,10 @@ class HelperCore(object):
         self.running = True
         self.frames = 0
         self.damage_events = 0
+        #: Damage on a TILE, counted apart from the clients' own damage so the
+        #: diagnostic can tell "EVE is painting" from "Wine is flushing over
+        #: our child".
+        self.tile_damage = 0
         self.coalesced = 0
         #: Composites driven by the Wine-flush repair path (immediate ones and
         #: their follow-ups), reported in 'stats'.
@@ -992,6 +1253,9 @@ class HelperCore(object):
         self._probe_counts = None
         #: sources already offered to Composite (asked once, never again).
         self._redirected = set()
+        #: Deadline for the deferred RandR re-push (see _on_screen_change());
+        #: 0.0 means nothing is pending.
+        self._monitors_due = 0.0
 
     # ---- outgoing -------------------------------------------------------
 
@@ -1036,6 +1300,8 @@ class HelperCore(object):
                 self._on_detach(msg)
             elif mtype == proto.T_ACTIVATE:
                 self._on_activate(msg)
+            elif mtype == proto.T_MONITORS:
+                self._on_monitors(msg)
             elif mtype == proto.T_PROBE:
                 self._on_probe(msg)
             elif mtype == proto.T_QUIT:
@@ -1090,6 +1356,9 @@ class HelperCore(object):
             thumb.src_pic = session.create_source_picture(src)
             thumb.dst_pic = session.create_dest_picture(child)
             thumb.damage = session.damage_create(src)
+            # ... and one on the TILE, because Wine's surface flush is an
+            # XPutImage rather than an Expose (see Thumb.dst_damage).
+            thumb.dst_damage = session.damage_create(dst)
         except XCallError:
             thumb.owns_dst = False
             self._release(thumb)
@@ -1162,6 +1431,12 @@ class HelperCore(object):
             except Exception as exc:
                 _log("damage_destroy: %s" % (exc,))
             thumb.damage = None
+        if thumb.dst_damage is not None:
+            try:
+                session.damage_destroy(thumb.dst_damage)
+            except Exception as exc:
+                _log("damage_destroy (tile): %s" % (exc,))
+            thumb.dst_damage = None
         if thumb.child:
             try:
                 session.destroy(thumb.child)
@@ -1304,6 +1579,43 @@ class HelperCore(object):
                         "activate 0x%x failed: %s: %s"
                         % (src, type(exc).__name__, exc))
 
+    # ---- monitor layout -------------------------------------------------
+
+    def push_monitors(self):
+        """Send one 'monitors_reply' with the X server's real layout.
+
+        THREE callers, all of them this one method: the unsolicited push right
+        after 'hello' (so FCTool owns the truth before it can pin anything), a
+        RandR screen change, and an explicit 'monitors' request.
+
+        Never raises for a layout reason: ``monitor_layout`` is total, and a
+        dead display reaches _run_loop the usual way.
+        """
+        payload = self.session.monitor_layout() or {}
+        screen = payload.get("screen") or [0, 0]
+        msg = {"type": proto.T_MONITORS_REPLY,
+               "screen": [int(screen[0]), int(screen[1])],
+               "outputs": list(payload.get("outputs") or [])}
+        note = payload.get("note")
+        if note:
+            msg["note"] = _ascii(note)
+        self.send(msg)
+
+    def _on_monitors(self, msg):
+        self.push_monitors()
+
+    def _on_screen_change(self):
+        """The desktop was reconfigured: re-read and re-push, unprompted.
+
+        Deferred rather than pushed here: a monitor unplug/replug can deliver
+        several of these in quick succession (next_events() already folds a
+        single drain's burst into one event, but that does not stop several
+        drains' worth from arriving back to back), and RandR-querying once per
+        event would be wasted work for one desktop reconfiguration.  tick()
+        does the actual push once the coalescing window elapses.
+        """
+        self._monitors_due = self.clock() + MONITORS_COALESCE_S
+
     # ---- events ---------------------------------------------------------
 
     def handle_event(self, ev):
@@ -1312,7 +1624,8 @@ class HelperCore(object):
         kind = ev[0]
         try:
             if kind == "damage":
-                self._on_damage(int(ev[1]))
+                self._on_damage(int(ev[1]),
+                                ev[2] if len(ev) > 2 else None)
             elif kind == "configure":
                 self._on_configure(int(ev[1]),
                                    int(ev[2]) if len(ev) > 2 else 0,
@@ -1323,6 +1636,8 @@ class HelperCore(object):
                 self._on_destroy(int(ev[1]))
             elif kind == "focus_in":
                 self._on_focus_in(int(ev[1]))
+            elif kind == "screen_change":
+                self._on_screen_change()
             elif kind == "error":
                 self._on_x_error(ev[1], int(ev[2]) if len(ev) > 2 else 0)
         except Exception as exc:
@@ -1333,10 +1648,19 @@ class HelperCore(object):
             self._error(None, "internal", "event %s failed: %s: %s"
                         % (kind, type(exc).__name__, exc))
 
-    def _on_damage(self, xid):
-        self.damage_events += 1
+    def _on_damage(self, xid, area=None):
         now = self.clock()
-        for thumb in self._by_src(xid):
+        # ``damage_events`` is the SOURCE-damage counter the diagnostic reads
+        # as "the clients are painting": a tile's own damage must never inflate
+        # it (that is ``tile_damage``), or a strobing tile would look like a
+        # healthy client.
+        sources = self._by_src(xid)
+        if sources:
+            self.damage_events += 1
+        for thumb in sources:
+            # The SOURCE's damaged area is not used: a client repaint always
+            # costs one whole rescaled frame, so there is nothing to gain from
+            # knowing which corner of EVE moved.
             self._note_probe(thumb.id, "damage_events", 1)
             if not thumb.visible:
                 continue
@@ -1348,6 +1672,76 @@ class HelperCore(object):
                 # tile can usefully show.  Mark and let tick() catch up once.
                 thumb.dirty = True
                 self.coalesced += 1
+        self._on_tile_damage(xid, area, now)
+
+    def _on_tile_damage(self, xid, area, now):
+        """Damage on a TILE window: Wine flushing its surface over our child.
+
+        Wine paints the tile's window surface with an IncludeInferiors GC --
+        an XPutImage, not an Expose (the server exposes only regions it
+        UNCOVERED), so the Expose repair never fires for it and the tile stays
+        black until the next damage-driven composite.  The tile is therefore
+        watched with its own RawRectangles damage, and the damaged AREA is
+        what tells the three cases apart:
+
+        * fully INSIDE the child's current rect -- that is our own composite
+          bouncing back (a child's drawing damages its parent), so repairing
+          it would immediately re-trigger itself.  Ignore.
+        * no intersection with the child at all -- a caption/border strip
+          repaint outside the video.  Nothing of ours was painted over.
+        * overlapping the child WITHOUT being contained in it -- Wine's flush
+          bounding box, which always spans more than the child.  Repair.
+
+        An area we could not read (None) is repaired: a missed repair is a
+        black tile, and the containment rule already stops the self-trigger.
+        The subtract is unconditional: RawRectangles reports regardless of
+        whether it was subtracted, so this does not keep events flowing -- it
+        mirrors composite()'s own subtract and keeps the reported region
+        bounded.
+        """
+        if not xid:
+            return
+        # thumb.dst only, deliberately NOT self._by_dst(xid): that helper also
+        # matches thumb.child, and a damage event ON THE CHILD is the client's
+        # own paint (handled above, by _by_src), not a Wine flush over it.
+        wine_flush = False
+        for thumb in list(self.thumbs.values()):
+            if thumb.dst != xid or thumb.dst_damage is None:
+                continue
+            if self._tile_damage_is_wine_flush(thumb, area, now):
+                wine_flush = True
+                self._repair(thumb, now)
+            self.session.damage_subtract(thumb.dst_damage)
+        if wine_flush:
+            self.tile_damage += 1
+
+    @staticmethod
+    def _tile_damage_is_wine_flush(thumb, area, now):
+        """True when ``area`` overlaps the child rect but is not our own echo.
+
+        Containment alone is not enough to call it an echo: Wine repaints the
+        tile's BODY rect, which under fit-height is exactly the child's rect,
+        and treating that as an echo left the preview black.  So a contained
+        area only reads as our own frame bouncing back while it is still
+        ECHO_WINDOW_MS fresh; later than that it is somebody else's paint and
+        gets repaired.  The repair's own echo comes back with elapsed ~0, so
+        this cannot start a self-trigger loop.
+        """
+        if area is None:
+            return True
+        try:
+            ax, ay, aw, ah = (int(v) for v in area)
+        except (TypeError, ValueError):
+            return True
+        cx, cy, cw, ch = _rect_xywh(thumb.rect)
+        contained = (ax >= cx and ay >= cy
+                     and ax + aw <= cx + cw and ay + ah <= cy + ch)
+        if contained:
+            elapsed_ms = (now - thumb.last_composite_ts) * 1000.0
+            return elapsed_ms >= ECHO_WINDOW_MS
+        intersects = (ax < cx + cw and ax + aw > cx
+                      and ay < cy + ch and ay + ah > cy)
+        return intersects
 
     def _on_configure(self, xid, w=0, h=0):
         for thumb in self._by_src(xid):
@@ -1426,7 +1820,8 @@ class HelperCore(object):
         hit = None
         for thumb in list(self.thumbs.values()):
             if resource and resource in (thumb.src, thumb.child, thumb.dst,
-                                         thumb.damage or 0):
+                                         thumb.damage or 0,
+                                         thumb.dst_damage or 0):
                 hit = thumb
                 break
         if hit is None:
@@ -1541,6 +1936,11 @@ class HelperCore(object):
                 if _is_display_dead(exc):
                     raise
                 self._fail_thumb(thumb, _as_internal(exc, "tick"))
+        if self._monitors_due and now >= self._monitors_due:
+            # The coalescing window from _on_screen_change() elapsed: push the
+            # layout exactly once for the whole burst.
+            self._monitors_due = 0.0
+            self.push_monitors()
         self._expire_pending_activate(now)
         self._maybe_stats(now)
 
@@ -1565,6 +1965,8 @@ class HelperCore(object):
                 continue        # heartbeat disabled: nothing is ever due
             due = thumb.last_composite_ts + window_ms / 1000.0
             timeout = min(timeout, due - now)
+        if self._monitors_due:
+            timeout = min(timeout, self._monitors_due - now)
         timeout = min(timeout, self._next_stats_ts - now)
         if timeout < 0.0:
             return 0.0
@@ -1577,6 +1979,7 @@ class HelperCore(object):
         self.send({"type": proto.T_STATS,
                    "frames": self.frames,
                    "damage_events": self.damage_events,
+                   "tile_damage": self.tile_damage,
                    "coalesced": self.coalesced,
                    # Not in the codec's required set for 'stats'; validate()
                    # checks the required (and the few optional) fields and
@@ -1719,6 +2122,18 @@ class HelperCore(object):
 def _ascii(text):
     """Log/report strings must survive a cp1252 console on the Windows side."""
     return str(text).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _describe(exc):
+    """One exception as the ``note`` field's ``<Type: msg>`` ASCII string."""
+    return _ascii("%s: %s" % (type(exc).__name__, exc))
+
+
+def _text_of(value):
+    """An X String8 field as str -- python-xlib hands back bytes or str."""
+    if isinstance(value, bytes):
+        return value.decode("latin-1", "replace")
+    return str(value)
 
 
 # ==========================================================================
@@ -1892,6 +2307,10 @@ def main(argv=None):
         # Inside the guard: build_hello QUERIES the server, so it can die too,
         # and the finally below is what closes the display and the socket.
         core.send(build_hello(session, opts.token))
+        # Unsolicited, and immediately after hello: FCTool cross-checks Wine's
+        # monitor rects against this before the first pin, so it must not have
+        # to ask and wait for a round trip first.
+        core.push_monitors()
         code = _run_loop(core, session, transport)
     except KeyboardInterrupt:
         pass
