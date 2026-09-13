@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import app_path
+import monitor_pin
 import wine_detect
 import x11_thumbs_proto as proto
 from app_log import get_logger
@@ -97,6 +98,17 @@ MAX_REPORT_PROBE = 16
 
 STATES = ("idle", "starting", "ready", "failed", "stopped")
 
+#: Wire types for the RandR layout exchange.  Read through ``getattr`` so this
+#: module still imports against a codec that predates them (the helper half and
+#: this one land independently).
+T_MONITORS = getattr(proto, "T_MONITORS", "monitors")
+T_MONITORS_REPLY = getattr(proto, "T_MONITORS_REPLY", "monitors_reply")
+
+#: The X screen and Wine's virtual extent are "the same display" when they
+#: differ by no more than this fraction on EITHER axis (rounding, a stray
+#: panel row).  Above it the two disagree and something has to give.
+LAYOUT_TOLERANCE = 0.01
+
 
 def _ascii(value, default="-"):
     """Collapse any value to a one-line ASCII string (cp1252 log trap)."""
@@ -125,7 +137,12 @@ class HelperStatus:
     python: Optional[str] = None          # the Unix interpreter we spawned
     display: Optional[str] = None         # DISPLAY the helper actually opened
     frames: int = 0
-    damage_events: int = 0
+    damage_events: int = 0          # SOURCE-window damage only
+    #: Damage on the TILE windows themselves - i.e. Wine painting over the
+    #: preview child. A non-zero count here with steady frames is the
+    #: "something repaints my tile" signature, which is why it is counted
+    #: apart from the source's damage.
+    tile_damage: int = 0
     coalesced: int = 0
     errors: int = 0
     malformed: int = 0
@@ -153,6 +170,12 @@ class HelperStatus:
     shape: Optional[bool] = None
     composite: Optional[bool] = None
     screen: Optional[Tuple[int, int, int]] = None   # (w, h, depth)
+    #: The helper's last ``monitors_reply``, sanitised by
+    #: :func:`_layout_from_reply` (or None before the first one lands).  The
+    #: X server's REAL geometry, which is the only thing that can catch Wine
+    #: handing a monitor pin a DPI-scaled rect.  Built once and never mutated,
+    #: so sharing the same dict across snapshots is safe.
+    x_layout: Optional[dict] = None
     #: Strings :func:`build_report` must scrub from its free-text fields -
     #: every one-shot auth token this supervisor has issued.  ``repr=False``
     #: keeps them out of any log line that formats the snapshot; nothing
@@ -227,6 +250,42 @@ def python_candidates(facts):
         return list(wine_detect.find_unix_python())
     except Exception:
         return []
+
+
+def _layout_from_reply(msg):
+    """Sanitise one ``monitors_reply`` into the cached layout dict, or None.
+
+    Shape out: ``{"screen": (w, h) or None, "outputs": [{name, x, y, w, h,
+    primary, connected}, ...], "note": str or None}``.  Every field is coerced
+    here and never again: the cached dict is built once, handed to the UI
+    thread inside an immutable snapshot and never mutated, so nothing
+    downstream has to defend against a forged payload.  None means "not a
+    layout at all" - the previous cache then stands, because a garbled frame
+    is not evidence that the desktop changed.
+    """
+    if not isinstance(msg, dict):
+        return None
+    rows = msg.get("outputs")
+    if not isinstance(rows, list):
+        rows = []
+    outputs = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        x = _as_int(row.get("x"))
+        y = _as_int(row.get("y"))
+        w = _as_int(row.get("w"))
+        h = _as_int(row.get("h"))
+        if None in (x, y, w, h):
+            continue
+        outputs.append({"name": _ascii(row.get("name")),
+                        "x": x, "y": y, "w": w, "h": h,
+                        "primary": bool(row.get("primary")),
+                        "connected": bool(row.get("connected"))})
+    note = msg.get("note")
+    return {"screen": _pair(msg.get("screen")),
+            "outputs": outputs,
+            "note": _ascii(note, default=None) if note is not None else None}
 
 
 def _screen(value):
@@ -423,6 +482,7 @@ class HelperSupervisor(object):
         self._display = None
         self._frames = 0
         self._damage_events = 0
+        self._tile_damage = 0
         self._coalesced = 0
         self._errors = 0
         self._malformed = 0
@@ -437,6 +497,7 @@ class HelperSupervisor(object):
         self._spawn_attempts = 0
         self._spawn_errors = []                # one line per FAILED attempt
         self._hello = {}
+        self._x_layout = None                  # last monitors_reply (sanitised)
 
         self._sock = None
         self._listener = None
@@ -463,6 +524,7 @@ class HelperSupervisor(object):
                 display=self._display,
                 frames=self._frames,
                 damage_events=self._damage_events,
+                tile_damage=self._tile_damage,
                 coalesced=self._coalesced,
                 errors=self._errors,
                 malformed=self._malformed,
@@ -482,6 +544,7 @@ class HelperSupervisor(object):
                 shape=self._hello.get("shape"),
                 composite=self._hello.get("composite"),
                 screen=_screen(self._hello.get("screen")),
+                x_layout=self._x_layout,
                 redact=tuple(self._tokens),
             )
 
@@ -498,6 +561,17 @@ class HelperSupervisor(object):
     def note_error(self, message) -> None:
         """Record a caller-side failure in the snapshot (ASCII, last wins)."""
         self._note_error(message)
+
+    def request_layout(self) -> None:
+        """Ask the helper to (re)send the X monitor layout.  Fire and forget.
+
+        The reply lands on the reader thread and refreshes
+        :attr:`HelperStatus.x_layout`, so a caller that asks here reads the
+        answer on its NEXT pass - never inline.  ``send`` is total (a dead
+        channel counts a drop), which is what makes this safe to call from the
+        UI thread on the pin path.
+        """
+        self.send({"type": T_MONITORS})
 
     def on_size(self, callback) -> None:
         """Register the (id, w, h) sink for helper size messages.
@@ -1097,6 +1171,8 @@ class HelperSupervisor(object):
             self._apply_error(msg)
         elif mtype == proto.T_SIZE:
             self._apply_size(msg)
+        elif mtype == T_MONITORS_REPLY:
+            self._apply_monitors(msg)
         self._resolve(msg)
 
     def _apply_stats(self, msg):
@@ -1108,7 +1184,8 @@ class HelperSupervisor(object):
                 value = msg.get(key)
                 if isinstance(value, int) and not isinstance(value, bool):
                     setattr(self, attr, value)
-            for key, attr in (("repairs", "_repairs"),
+            for key, attr in (("tile_damage", "_tile_damage"),
+                              ("repairs", "_repairs"),
                               ("activations", "_activations"),
                               ("activate_focus_seen", "_activate_focus_seen"),
                               ("activate_focus_missed",
@@ -1139,6 +1216,16 @@ class HelperSupervisor(object):
         if fatal:
             self._log.warning("[x11] helper reported a fatal condition: %s",
                               text)
+
+    def _apply_monitors(self, msg):
+        """Cache one ``monitors_reply`` (unsolicited, requested, or a RandR
+        screen change).  A frame that sanitises to None leaves the previous
+        layout standing."""
+        layout = _layout_from_reply(msg)
+        if layout is None:
+            return
+        with self._lock:
+            self._x_layout = layout
 
     def _apply_size(self, msg):
         with self._lock:
@@ -1423,6 +1510,316 @@ class X11ThumbBackend(object):
             pass
 
 
+# ------------------------------------------------- monitor layout cross-check
+#
+# Field report (2026-09-13): under Wine a monitor pin resized a fill client to
+# 1280x720 on a 1920x1080 panel (= 1920 / 1.5, a KDE-at-150% desktop read by a
+# process Wine treats as DPI-unaware).  ``monitor_pin.plan_move``'s FILL branch
+# resizes to the TARGET monitor's rect, so a wrong rect is a wrongly resized
+# client and a corrupted swapchain.  The helper reports what the X server
+# actually has; everything below is the pure comparison of the two.
+
+
+def _rect_of(mon):
+    """One monitor's EDGES rect, whichever shape it arrives in: a
+    ``MonitorInfo`` (the enumerator) or a ``wine_detect.display_facts`` dict
+    (the report).  ONE owner, so the verdict the tester reads is computed by
+    the same code the pin obeyed."""
+    rect = getattr(mon, "rect", None)
+    if rect is None and isinstance(mon, dict):
+        rect = mon.get("rect")
+    try:
+        left, top, right, bottom = (int(v) for v in rect)
+    except Exception:
+        return None
+    return (left, top, right, bottom)
+
+
+def _virtual_extent(monitors):
+    """``(w, h)`` of the union of every monitor rect, or None when there is
+    nothing usable to measure."""
+    rects = [r for r in (_rect_of(m) for m in monitors or ()) if r is not None]
+    if not rects:
+        return None
+    width = max(r[2] for r in rects) - min(r[0] for r in rects)
+    height = max(r[3] for r in rects) - min(r[1] for r in rects)
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
+
+
+def classify_layout(wine_monitors, x_layout):
+    """Compare Wine's monitor list with the X server's own geometry.
+
+    Pure and total.  Returns ``(verdict, factor)``:
+
+      * ``("ok", 1.0)`` - Wine's virtual extent IS the X screen size; Wine's
+        list is the truth and is used unchanged.
+      * ``("scaled", f)`` - the two differ by the SAME factor on both axes
+        (within :data:`LAYOUT_TOLERANCE`), e.g. 1280x720 vs 1920x1080 -> 1.5.
+        Wine's list is right in shape and wrong in scale, so multiplying it
+        through keeps the device names (which the assignments are stored by).
+      * ``("mismatch", None)`` - they disagree non-uniformly; nothing can be
+        salvaged from Wine's list and the X outputs replace it.
+      * ``("not ready", None)`` - no layout yet, no ``screen``, no Wine
+        monitors to check, or a disagreement that could only be resolved by
+        rebuilding from outputs there are none of (a server without RandR
+        answers with an empty list plus a note).  The caller DEFERS: a late
+        pin is cheap, a pin onto a wrong rect resizes the client.
+
+    EXTENT FIRST: the verdict rests on ``screen`` alone, and ``outputs`` is
+    read only on the one path that would REBUILD from them.  A server without
+    RandR still reports its screen size, and that alone catches the field
+    fault (Wine's 1280x720 against a 1920x1080 screen) and corrects it in
+    place; demanding outputs first deferred every such pin forever.
+    """
+    if not isinstance(x_layout, dict):
+        return ("not ready", None)
+    screen = _pair(x_layout.get("screen"))
+    if screen is None or screen[0] <= 0 or screen[1] <= 0:
+        return ("not ready", None)
+    extent = _virtual_extent(wine_monitors)
+    if extent is None:
+        return ("not ready", None)
+    if extent == screen:
+        return ("ok", 1.0)
+    fx = screen[0] / float(extent[0])
+    fy = screen[1] / float(extent[1])
+    if abs(fx - fy) <= LAYOUT_TOLERANCE * max(fx, fy):
+        return ("scaled", (fx + fy) / 2.0)
+    # Only a rebuild can salvage this, and a rebuild needs outputs.
+    outputs = x_layout.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        return ("not ready", None)
+    return ("mismatch", None)
+
+
+def _scale_edges(rect, factor):
+    left, top, right, bottom = rect
+    return (int(round(left * factor)), int(round(top * factor)),
+            int(round(right * factor)), int(round(bottom * factor)))
+
+
+def _scaled_monitors(monitors, factor):
+    """Wine's list with every rect/work edge multiplied through.  Device names
+    survive - per-character assignments are stored BY device."""
+    return [monitor_pin.MonitorInfo(device=m.device,
+                                    rect=_scale_edges(m.rect, factor),
+                                    work=_scale_edges(m.work, factor),
+                                    primary=bool(m.primary))
+            for m in monitors]
+
+
+def _monitors_from_outputs(x_layout):
+    """A monitor list rebuilt from the X outputs: device = the output name
+    (``DP-1``), work = rect (X has no taskbar reservation to read here)."""
+    out = []
+    for row in (x_layout or {}).get("outputs") or ():
+        if not isinstance(row, dict) or not row.get("connected"):
+            continue
+        x, y = _as_int(row.get("x")), _as_int(row.get("y"))
+        w, h = _as_int(row.get("w")), _as_int(row.get("h"))
+        if None in (x, y, w, h) or w <= 0 or h <= 0:
+            continue
+        rect = (x, y, x + w, y + h)
+        out.append(monitor_pin.MonitorInfo(device=_ascii(row.get("name"), ""),
+                                           rect=rect, work=rect,
+                                           primary=bool(row.get("primary"))))
+    return out
+
+
+def _mapped_monitors(wine_monitors, x_layout):
+    """X's rects carrying WINE's device names wherever the two can be paired.
+
+    Returns ``(monitors, names_kept)``.
+
+    Per-character assignments are stored BY DEVICE NAME (``\\\\.\\DISPLAY2``),
+    so a rebuild that adopted X's own names (``DP-1``) silently matches
+    nothing and every stored pin is skipped.  When Wine's list and the
+    CONNECTED X outputs are the same length the pairing is unambiguous in the
+    one order both sides agree on - GEOMETRY ONLY, left-to-right then
+    top-to-bottom by rect origin - so Wine's names ride onto X's geometry
+    (work = rect: X has no taskbar reservation to read here).
+
+    Pairing must NOT key on ``primary``: Wine's primary flag and the X
+    server's are independent facts (a laptop's primary is often not its
+    left-most physical monitor), so a primary-first sort would silently
+    swap devices whenever the two sides disagree about which monitor is
+    "first" - exactly the case :func:`monitor_pin.sort_monitors` (primary
+    first, then left-to-right) is unsafe for here; it is the right order for
+    display LABELS, not for matching one enumerator's devices to another's.
+
+    Different lengths mean Wine genuinely lost or invented a monitor and there
+    is no pairing at all: the X names stand, ``names_kept`` is False, and the
+    caller warns that the stored pins will not match.
+    """
+    rebuilt = _monitors_from_outputs(x_layout)
+    wine = list(wine_monitors or ())
+    if not rebuilt or len(rebuilt) != len(wine):
+        return rebuilt, False
+    try:
+        wine_sorted = _by_geometry(wine)
+        x_sorted = _by_geometry(rebuilt)
+        paired = [monitor_pin.MonitorInfo(device=w.device, rect=x.rect,
+                                          work=x.rect, primary=x.primary)
+                  for w, x in zip(wine_sorted, x_sorted)]
+    except Exception:
+        return rebuilt, False
+    return paired, True
+
+
+def _by_geometry(monitors):
+    """Stable order by rect ORIGIN alone - ``(left, top)`` - never ``primary``.
+    The one thing both an enumerator's Wine side and its X side can agree on
+    independently of either one's notion of "the primary"."""
+    return sorted(monitors, key=lambda m: (m.rect[0], m.rect[1]))
+
+
+class WineMonitorEnumerator(object):
+    """``monitor_pin``'s enumerator seam, cross-checked against the X server.
+
+    Same duck type as ``monitor_pin._RealMonitorWin32``: ``enum_monitors() ->
+    [MonitorInfo]``, which is the whole surface ``monitor_pin.list_monitors``
+    touches.  ``base`` is that real enumerator (Wine's own answer, device
+    names kept); ``backend`` is the :class:`X11ThumbBackend` whose supervisor
+    caches the helper's ``monitors_reply``.  ``mode`` is
+    ``preview.linux_monitor_check`` (see :data:`MODES`).
+
+    Total: any failure degrades to an EMPTY list with :attr:`last_reason` set,
+    which the pin path reads as "defer, do not move".  :attr:`last_verdict`
+    carries the cross-check's own answer; :attr:`last_corrected` is the
+    narrower fact the caller actually needs to decide HOW to move (a
+    rescaled layout is moved without being resized).
+
+    ``mode="off"`` is a hard bypass: it is checked BEFORE any of the base
+    enumeration or cross-check plumbing runs, so an ``off`` call behaves
+    exactly like calling ``base.enum_monitors()`` directly - exceptions
+    included - and never sets :attr:`last_reason`, :attr:`last_verdict` or
+    :attr:`last_corrected`.
+    """
+
+    #: The deferral the caller renders; anything else is a real fault.
+    NOT_READY = "x layout not ready"
+
+    #: Accepted ``preview.linux_monitor_check`` values.  ``auto`` = the
+    #: cross-check below; ``off`` = Wine's raw list, no check at all (the
+    #: owner's escape hatch if the correction itself ever misfires); ``x11`` =
+    #: always rebuild from the X outputs, whatever the verdict.
+    MODES = ("auto", "off", "x11")
+
+    def __init__(self, backend, base, mode="auto"):
+        self._backend = backend
+        self._base = base
+        self._mode = self._clean_mode(mode)
+        #: Why the last :meth:`enum_monitors` returned [] (None = no reason,
+        #: i.e. the enumeration itself succeeded).  Re-set on every call.
+        self.last_reason = None
+        #: The last :func:`classify_layout` verdict - ``ok`` / ``scaled`` /
+        #: ``mismatch`` / ``not ready``, or None when no check ran (before the
+        #: first call, in ``off`` mode, or when Wine's own enumeration blew
+        #: up).
+        self.last_verdict = None
+        #: True only when the returned list was produced by SCALING Wine's
+        #: own rects (the ``scaled`` verdict in ``auto`` mode - see
+        #: :func:`_scaled_monitors`).  This, not ``last_verdict``, is what the
+        #: pin path keys its safety valve on: the correction rests on the
+        #: assumption that Wine scales the monitor QUERY but not
+        #: ``SetWindowPos``, so only a SCALED list downgrades the move to
+        #: position-only.  A forced ``x11`` rebuild returns a ``scaled``
+        #: verdict too but never sets this - it discards Wine's rects
+        #: entirely and uses X's own, which need no such valve.  Reset to
+        #: False on every call, never set in ``off`` mode.
+        self.last_corrected = False
+        self._logged = None            # last warning key (throttle)
+
+    @classmethod
+    def _clean_mode(cls, mode):
+        """``mode`` as one of :data:`MODES`; anything else reads as auto."""
+        try:
+            text = str(mode or "auto").strip().lower()
+        except Exception:
+            return "auto"
+        return text if text in cls.MODES else "auto"
+
+    def enum_monitors(self):
+        self.last_reason = None
+        self.last_verdict = None
+        self.last_corrected = False
+        if self._mode == "off":
+            # The owner's escape hatch, checked BEFORE the base call even
+            # runs through this method's own try/except: no check, no
+            # correction, no verdict, and a failing base enumeration raises
+            # exactly as it would with no wrapper at all - it is not this
+            # class's place to turn a real fault into a silent [] here.
+            self._logged = None
+            return list(self._base.enum_monitors())
+        try:
+            wine = list(self._base.enum_monitors())
+        except Exception as exc:
+            return self._defer("wine enumeration failed: %s" % (_ascii(exc),))
+        layout = self._layout()
+        verdict, factor = classify_layout(wine, layout)
+        self.last_verdict = verdict
+        if verdict == "not ready":
+            note = layout.get("note") if isinstance(layout, dict) else None
+            reason = self.NOT_READY
+            if note:
+                reason = "%s (%s)" % (reason, _ascii(note))
+            return self._defer(reason)
+        forced = self._mode == "x11"
+        try:
+            if verdict == "ok" and not forced:
+                self._logged = None
+                return wine
+            extent = _virtual_extent(wine) or (0, 0)
+            screen = _pair(layout.get("screen")) or (0, 0)
+            if verdict == "scaled" and not forced:
+                self._warn(("scaled", round(factor, 4)),
+                           "[x11] Wine reports a %dx%d desktop, X reports "
+                           "%dx%d - scaling every monitor rect by %.4g before "
+                           "the pin" % (extent[0], extent[1], screen[0],
+                                        screen[1], factor))
+                self.last_corrected = True
+                return _scaled_monitors(wine, factor)
+            rebuilt, names_kept = _mapped_monitors(wine, layout)
+            if not rebuilt:
+                return self._defer("x layout has no usable outputs")
+            if verdict == "mismatch":
+                self._warn(("mismatch", extent, screen, names_kept),
+                           "[x11] Wine reports a %dx%d desktop, X reports "
+                           "%dx%d and the two do not scale - using the X "
+                           "outputs and discarding Wine's monitor list%s"
+                           % (extent[0], extent[1], screen[0], screen[1],
+                              (" (Wine's device names kept)" if names_kept else
+                               "; the monitor COUNT differs too, so the X "
+                               "output names are used and any per-character "
+                               "assignment stored by Wine device name will "
+                               "not match - those pins are skipped")))
+            return rebuilt
+        except Exception as exc:
+            return self._defer("layout cross-check failed: %s" % (_ascii(exc),))
+
+    # --- internals --------------------------------------------------------
+
+    def _layout(self):
+        try:
+            return self._backend.supervisor.status_snapshot().x_layout
+        except Exception:
+            return None
+
+    def _defer(self, reason):
+        self.last_reason = reason
+        return []
+
+    def _warn(self, key, message):
+        """One WARNING per distinct verdict: the pin path runs on every client
+        detection, and an unthrottled warning would be a per-login log flood."""
+        if key == self._logged:
+            return
+        self._logged = key
+        log.warning("%s", message)
+
+
 # ------------------------------------------------------------- factories
 
 
@@ -1555,15 +1952,64 @@ def _csv_ints(values):
     return text or "-"
 
 
-def _report_monitors(display):
-    """Wine's idea of the desktop, next to this process's DPI stance.
+def _verdict_text(verdict, factor):
+    """The ``check=`` value: ``ok``, ``scaled x1.5``, ``mismatch`` or
+    ``not ready``."""
+    if verdict == "scaled" and factor:
+        return "scaled x%.4g" % (factor,)
+    return _ascii(verdict, default="not ready")
+
+
+def _report_x_layout(display, layout):
+    """The X server's own geometry plus the cross-check verdict.
+
+    Wine's numbers alone cannot say whether they are wrong; these lines are
+    what makes the tester's paste decide it.  The verdict comes from
+    :func:`classify_layout` - the SAME function the pin obeys.
+    """
+    rows = display.get("monitors") if isinstance(display, dict) else []
+    rows = rows if isinstance(rows, list) else []
+    lines = []
+    outputs = layout.get("outputs") if isinstance(layout, dict) else None
+    outputs = outputs if isinstance(outputs, list) else []
+    if not isinstance(layout, dict):
+        lines.append("x11 none (no reply)")
+    else:
+        screen = _pair(layout.get("screen"))
+        lines.append("x11 screen=%s"
+                     % ("%dx%d" % screen if screen else "-",))
+        for out in outputs[:MAX_REPORT_CLIENTS]:
+            if not isinstance(out, dict):
+                continue
+            lines.append("%s x=%s y=%s w=%s h=%s primary=%s connected=%s"
+                         % (_ascii(out.get("name"))[:40], _ascii(out.get("x")),
+                            _ascii(out.get("y")), _ascii(out.get("w")),
+                            _ascii(out.get("h")),
+                            "yes" if out.get("primary") else "no",
+                            "yes" if out.get("connected") else "no"))
+        if len(outputs) > MAX_REPORT_CLIENTS:
+            # Same shape as [clients]: a capped list must say it was capped,
+            # or a 20-output wall reads as a 16-output desktop.
+            lines.append("... %d more" % (len(outputs) - MAX_REPORT_CLIENTS,))
+        if not outputs:
+            lines.append("x11 none (%s)"
+                         % (_ascii(layout.get("note"), default="no outputs"),))
+    verdict, factor = classify_layout(rows, layout)
+    lines.append("check=%s" % (_verdict_text(verdict, factor),))
+    return lines
+
+
+def _report_monitors(display, layout=None):
+    """Wine's idea of the desktop, next to this process's DPI stance and the
+    X server's own answer.
 
     A DPI-UNAWARE process under a scaled desktop (KDE at 150%) is handed
     SCALED geometry - a 1920x1080 panel reads as 1280x720 - and every monitor
     pin then lands on the wrong rect, so the raw numbers ship verbatim.
     """
     if not isinstance(display, dict):
-        return ["error=%s" % (_ascii(display, default="unavailable"),)]
+        return ["error=%s" % (_ascii(display, default="unavailable"),)] \
+            + _report_x_layout(display, layout)
     screen = display.get("sm_screen")
     try:
         screen_text = ("%sx%s" % (_ascii(screen[0]), _ascii(screen[1]))
@@ -1590,7 +2036,7 @@ def _report_monitors(display):
     error = display.get("error")
     if error:
         lines.append("error=%s" % (_ascii(error),))
-    return lines
+    return lines + _report_x_layout(display, layout)
 
 
 def _report_helper(snapshot):
@@ -1749,8 +2195,12 @@ def build_report(facts, snapshot, probe_result, clients=None,
 
     ``display`` is the injection seam for the ``[monitors]`` facts: a dict, a
     callable returning one, or None for the live
-    :func:`wine_detect.display_facts`.  A failure there degrades that one
-    section to an ``error=`` line - the report itself never fails.
+    :func:`wine_detect.display_facts`.  A failure there degrades WINE's half
+    of that section to an ``error=`` line - the report itself never fails.
+    The X half of the section (the helper's ``monitors_reply`` and the
+    ``check=`` verdict) comes from ``snapshot.x_layout`` and is rendered
+    either way: a Wine enumeration that failed is exactly when the X numbers
+    matter most.
     """
     payload = probe_result if isinstance(probe_result, dict) else {}
     results = payload.get("results")
@@ -1768,15 +2218,18 @@ def build_report(facts, snapshot, probe_result, clients=None,
     sections = [
         ("[fctool]", _report_fctool()),
         ("[host]", [_ascii(facts)]),
-        ("[monitors]", _report_monitors(display_facts)),
+        ("[monitors]", _report_monitors(display_facts,
+                                        getattr(snapshot, "x_layout", None))),
         ("[helper]", _report_helper(snapshot)),
         ("[clients]", _report_clients(rows)),
         ("[probe]", _report_probe(results)),
-        ("[stats]", ["frames=%s damage=%s coalesced=%s errors=%s "
+        ("[stats]", ["frames=%s damage=%s tile_damage=%s coalesced=%s "
+                     "errors=%s "
                      "malformed=%s dropped=%s repairs=%s activations=%s "
                      "uptime_s=%s"
                      % (_ascii(getattr(snapshot, "frames", 0)),
                         _ascii(getattr(snapshot, "damage_events", 0)),
+                        _ascii(getattr(snapshot, "tile_damage", 0)),
                         _ascii(getattr(snapshot, "coalesced", 0)),
                         _ascii(getattr(snapshot, "errors", 0)),
                         _ascii(getattr(snapshot, "malformed", 0)),

@@ -1071,6 +1071,40 @@ def _preview_intel_radius(cfg) -> int:
     return max(0, min(_PREVIEW_INTEL_JUMPS_MAX, radius))
 
 
+# Shown in the monitor-pinning dialog when the enumeration DEFERRED (Wine: the
+# helper's X layout has not landed). ASCII only — this string reaches a Tk
+# label and the log, and the console is cp1252.
+PIN_LAYOUT_NOT_READY = "(Linux layout not ready - try again in a moment)"
+
+
+def _preview_pin_monitors(win32, backend=None):
+    """Enumerate monitors for ONE monitor-pin application.
+
+    Windows: plain `monitor_pin.list_monitors` — `win32` is None and `backend`
+    is None, so this is the old call with the old result.
+
+    Under Wine `win32` is an `x11_thumbs.WineMonitorEnumerator`, which returns
+    an EMPTY list with `last_reason` set when the X server's layout has not
+    arrived yet (a pin onto a DPI-scaled rect resizes the client and corrupts
+    its swapchain — a late pin is the cheap failure). Empty ⇒ every caller's
+    existing "target monitor not present → no move, log only" invariant
+    already declines to move; this adds the REASON to the log. The layout
+    re-request is fire-and-forget and lands for the NEXT pin."""
+    try:
+        sup = getattr(backend, "supervisor", None)
+        request = getattr(sup, "request_layout", None)
+        if request is not None:
+            request()
+    except Exception:
+        log.debug("[monitor-pin] layout re-request failed", exc_info=True)
+    monitors = monitor_pin.list_monitors(win32)
+    if not monitors:
+        reason = getattr(win32, "last_reason", None)
+        if reason:
+            log.info("[monitor-pin] deferred: %s", reason)
+    return monitors
+
+
 # FCPreview major-implant icon: how often the ESI location poller re-asks
 # /implants/ for ONE character. A pilot's head changes at a jump clone, not
 # at poll cadence. 150s halves the old 300s latency to reflect a clone swap,
@@ -1592,6 +1626,10 @@ class FCToolGUI:
         # Monitor pinning injectable backends (None → lazy real singletons).
         self._preview_monitor_win32 = None     # monitor enumeration (monitor_pin)
         self._preview_move_win32 = None        # window-move backend (window_activator)
+        # Char keys with a pin deferred onto the ONE bounded retry (Linux X
+        # layout not ready yet) — see _preview_pin_retry_later. Session-only,
+        # like _preview_spawn_retry: cleared in _preview_teardown.
+        self._preview_pin_retries = set()
         # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
         self._implant_toast = None             # the single live ClientToast, if any
@@ -19772,6 +19810,13 @@ class FCToolGUI:
         # python3 is reachable, "off" = never start it (stay on DWM and let the
         # tiles strand, which is today's Linux behaviour).
         "linux_backend": "auto",     # "auto" | "off"
+        # Monitor-pin cross-check (Wine's monitor list vs the X server's own
+        # geometry). "auto" = correct a DPI-scaled list and rebuild a
+        # mismatched one; "off" = trust Wine's raw list (the escape hatch if
+        # the correction itself ever misfires); "x11" = always rebuild from
+        # the X outputs. Inert on Windows: the wrapper is only ever built
+        # under Wine.
+        "linux_monitor_check": "auto",   # "auto" | "off" | "x11"
         "linux_fps_cap": 30,         # per-thumbnail composite ceiling (damage-driven)
         "linux_heartbeat_ms": 500,   # unconditional recomposite; repairs Wine's
                                      # IncludeInferiors flushes over the child window
@@ -22995,6 +23040,26 @@ class FCToolGUI:
                         x11_thumbs.wine_activator(self._preview_thumb_backend))
                 except Exception:
                     log.exception("[x11] wine activator injection failed")
+                # Same shape for monitor pinning: Wine's own enumeration has
+                # been caught reporting a DPI-scaled rect (1280x720 for a
+                # 1920x1080 panel), and plan_move's FILL branch would resize
+                # the client to it. The wrapper cross-checks Wine's list
+                # against the helper's X layout and defers the pin until it
+                # can. Cleared in _preview_teardown. A failure here leaves the
+                # plain (Wine) enumerator in place rather than stranding
+                # anything.
+                try:
+                    base = getattr(self, "_preview_monitor_win32", None)
+                    if not isinstance(base, x11_thumbs.WineMonitorEnumerator):
+                        self._preview_monitor_win32 = \
+                            x11_thumbs.WineMonitorEnumerator(
+                                self._preview_thumb_backend,
+                                base if base is not None
+                                else monitor_pin._real_monitor_win32(),
+                                mode=_lin_cfg.get("linux_monitor_check",
+                                                  "auto"))
+                except Exception:
+                    log.exception("[x11] monitor enumerator injection failed")
             if self._preview_thumb_backend is None:
                 # Fail VISIBLE: the always-packed hotkey-status line is the one
                 # place a Linux user sees WHY every tile is about to strand.
@@ -23124,6 +23189,17 @@ class FCToolGUI:
             window_activator.set_wine_activator(None)
         except Exception:
             log.exception("[x11] clearing the Wine activator failed")
+        # Same for the monitor enumerator: the Wine wrapper holds this
+        # backend, so it must not outlive it. None = the lazy real singleton,
+        # which is what Windows always had (nothing is cleared there because
+        # nothing was ever installed).
+        if isinstance(getattr(self, "_preview_monitor_win32", None),
+                      x11_thumbs.WineMonitorEnumerator):
+            self._preview_monitor_win32 = None
+        # ...and its ONE bounded retry set: hwnds/keys are session state, and
+        # a stale pending key surviving a mode bounce would silently block
+        # that key's retry on the next enable (see _preview_pin_retry_later).
+        self._preview_pin_retries = set()
         if be is not None:
             try:
                 be.close()
@@ -28036,13 +28112,17 @@ class FCToolGUI:
     # the first move; a second idempotent move to the same rect wins that race.
     _MONITOR_PIN_REASSERT_MS = 1800
 
-    def _preview_maybe_pin_monitor(self, client):
+    def _preview_maybe_pin_monitor(self, client, allow_retry=True):
         """Resolve `client`'s monitor assignment and move its real window onto the
         target monitor. Fires on the login→character rekey — the exact moment the
         pilot's identity becomes known. No-op for login windows (key ""),
         unassigned chars, or a target monitor that isn't currently present. Runs
         on the UI thread (the native tick); move_window touches no Tk, and the
-        re-assert is scheduled via Tk `after`."""
+        re-assert is scheduled via Tk `after`.
+
+        `allow_retry` is False on the ONE bounded retry a Linux deferral
+        schedules (see `_preview_pin_retry_later`), so a layout that never
+        arrives costs two attempts, not a retry loop."""
         if client.is_login or not client.key:
             return
         cfg = self._preview_cfg()
@@ -28051,9 +28131,19 @@ class FCToolGUI:
             cfg.get("monitor_pin_default", ""))
         if not device:
             return
-        monitors = monitor_pin.list_monitors(
-            getattr(self, "_preview_monitor_win32", None))
-        plan = monitor_pin.plan_move_for_client(tuple(client.rect), monitors, device)
+        win32 = getattr(self, "_preview_monitor_win32", None)
+        monitors = _preview_pin_monitors(
+            win32, getattr(self, "_preview_thumb_backend", None))
+        if not monitors and getattr(win32, "last_reason", None):
+            # Wine only: the helper's X layout has not landed yet, so the pin
+            # was DEFERRED rather than refused. Dropping it here costs the
+            # pilot their placement for the whole session; the layout normally
+            # arrives milliseconds later, so try exactly once more. On Windows
+            # there is no wrapper and no last_reason — this branch is dead.
+            if allow_retry:
+                self._preview_pin_retry_later(client)
+            return
+        plan = self._preview_pin_plan(client, monitors, device)
         if plan is None:
             log.info("[monitor-pin] target monitor %s not present for %s; skip",
                      device, client.key)
@@ -28073,6 +28163,105 @@ class FCToolGUI:
         except Exception:
             pass
 
+    def _preview_pin_plan(self, client, monitors, device):
+        """Plan ONE pin placement, applying the Wine SCALED safety valve.
+
+        Returns an `(x, y, w, h)` placement or None (target device absent).
+
+        The valve: `last_corrected` True means `x11_thumbs` handed us a
+        DPI-shrunk Wine monitor list multiplied back up by a scale factor — a
+        correction that rests on Wine scaling the monitor QUERY but not
+        `SetWindowPos`. If that assumption is wrong the MOVE still lands
+        roughly right, but plan_move's FILL branch would RESIZE the client to
+        a rect that is out by the scale factor and corrupt its swapchain. So
+        when the plan rests on that correction the client keeps its own
+        width/height and only the position is applied — then clamped inside
+        the union of `monitors`' (also corrected) rects, since the scaling
+        that produced them is exactly the thing that might be wrong: keeping
+        the client's own size can otherwise land it partly or wholly off
+        every screen. Windows never wraps the enumerator, and a forced `x11`
+        rebuild never sets `last_corrected` either (it discards Wine's rects
+        for X's own, which need no valve) — the plan is returned untouched in
+        both cases."""
+        plan = monitor_pin.plan_move_for_client(tuple(client.rect), monitors,
+                                                device)
+        if plan is None:
+            return None
+        if not getattr(getattr(self, "_preview_monitor_win32", None),
+                       "last_corrected", False):
+            return plan
+        l, t, r, b = tuple(client.rect)
+        w, h = max(0, r - l), max(0, b - t)
+        if w and h and (w, h) != (plan[2], plan[3]):
+            log.info("[monitor-pin] scaled Wine layout: moving %s to "
+                     "(%d,%d) WITHOUT resizing - keeping %dx%d (planned "
+                     "%dx%d)", client.key, plan[0], plan[1], w, h,
+                     plan[2], plan[3])
+            plan = (plan[0], plan[1], w, h)
+        return self._preview_pin_clamp_to_monitors(plan, monitors)
+
+    def _preview_pin_clamp_to_monitors(self, plan, monitors):
+        """Clamp `plan`'s (x, y) inside the union of `monitors`' rects,
+        keeping w/h untouched. Position-only fallback for the Wine SCALED
+        valve above: the correction that produced `monitors` is itself the
+        thing that might be off, so this is the last line of defense against
+        a client landing off every screen."""
+        if not monitors:
+            return plan
+        x, y, w, h = plan
+        lefts = [m.rect[0] for m in monitors]
+        tops = [m.rect[1] for m in monitors]
+        rights = [m.rect[2] for m in monitors]
+        bottoms = [m.rect[3] for m in monitors]
+        ul, ut, ur, ub = min(lefts), min(tops), max(rights), max(bottoms)
+        nx = monitor_pin._clamp(x, ul, ur - w)
+        ny = monitor_pin._clamp(y, ut, ub - h)
+        return (nx, ny, w, h)
+
+    def _preview_pin_retry_later(self, client):
+        """Schedule the ONE bounded retry of a pin the X layout deferred.
+
+        At most one pending retry per character key (a mass login re-detects
+        the same client on several ticks), and the retry itself never
+        schedules another. A destroyed/absent root simply drops it — the pin
+        is a convenience, never a reason to raise into the Tk after-loop."""
+        key = client.key
+        pending = getattr(self, "_preview_pin_retries", None)
+        if pending is None:
+            pending = self._preview_pin_retries = set()
+        if key in pending:
+            return
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        hwnd = client.hwnd
+        try:
+            root.after(self._MONITOR_PIN_REASSERT_MS,
+                       lambda k=key, h=hwnd: self._preview_pin_retry(k, h))
+        except Exception:
+            return
+        pending.add(key)
+        log.info("[monitor-pin] pin for %s deferred; one retry in %d ms",
+                 key, self._MONITOR_PIN_REASSERT_MS)
+
+    def _preview_pin_retry(self, key, hwnd):
+        """Re-run one deferred pin. Guarded: the client may have closed, been
+        rekeyed or been replaced during the delay, and no exception may escape
+        into the Tk after-loop."""
+        try:
+            pending = getattr(self, "_preview_pin_retries", None)
+            if pending is not None:
+                pending.discard(key)
+        except Exception:
+            pass
+        client = (self._preview_clients or {}).get(hwnd)
+        if client is None or client.is_login or client.key != key:
+            return
+        try:
+            self._preview_maybe_pin_monitor(client, allow_retry=False)
+        except Exception:
+            log.exception("[monitor-pin] deferred retry failed for %s", key)
+
     def _preview_reassert_pin(self, hwnd, plan):
         """Re-apply the planned rect once, guarded: the client/tile may have closed
         during the delay (no exception may escape into the Tk after-loop)."""
@@ -28087,7 +28276,7 @@ class FCToolGUI:
     def _preview_pin_move_client(self, client, monitors, device):
         """Plan + issue one move for a live client onto `device`. Returns True on a
         move, False when the device isn't present or the move errored."""
-        plan = monitor_pin.plan_move_for_client(tuple(client.rect), monitors, device)
+        plan = self._preview_pin_plan(client, monitors, device)
         if plan is None:
             log.info("[monitor-pin] target monitor %s not present for %s; skip",
                      device, client.key)
@@ -28115,8 +28304,9 @@ class FCToolGUI:
         except Exception:
             log.exception("[monitor-pin] client sweep failed")
             return
-        monitors = monitor_pin.list_monitors(
-            getattr(self, "_preview_monitor_win32", None))
+        monitors = _preview_pin_monitors(
+            getattr(self, "_preview_monitor_win32", None),
+            getattr(self, "_preview_thumb_backend", None))
         for c in clients:
             if not c.is_login and c.key == key:
                 self._preview_pin_move_client(c, monitors, device)
@@ -28571,8 +28761,9 @@ class FCToolGUI:
         except Exception:
             log.exception("[monitor-pin] apply sweep failed")
             return 0
-        monitors = monitor_pin.list_monitors(
-            getattr(self, "_preview_monitor_win32", None))
+        win32 = getattr(self, "_preview_monitor_win32", None)
+        monitors = _preview_pin_monitors(
+            win32, getattr(self, "_preview_thumb_backend", None))
         moved = 0
         for c in clients:
             if c.is_login or not c.key:
@@ -28582,6 +28773,13 @@ class FCToolGUI:
                 continue
             if self._preview_pin_move_client(c, monitors, device):
                 moved += 1
+        if not moved and not monitors:
+            # FAIL VISIBLE: "Apply now" moved nobody because the enumeration
+            # DEFERRED, not because nothing was assigned. Windows has no
+            # wrapper and so no reason — this line is Wine-only.
+            reason = getattr(win32, "last_reason", None)
+            if reason:
+                log.info("[monitor-pin] apply moved nothing: %s", reason)
         return moved
 
     def _preview_monitor_pin_chars(self):
@@ -28601,9 +28799,18 @@ class FCToolGUI:
         Apply. The row/combobox assembly lives in
         monitor_pin.build_settings_section (containment); this shell gathers
         state, wires the persist/move callbacks, and owns the Toplevel. Returns
-        the Toplevel (tests pass _test_no_wait=True to skip wait_window)."""
-        monitors = monitor_pin.list_monitors(
-            getattr(self, "_preview_monitor_win32", None))
+        the Toplevel (tests pass _test_no_wait=True to skip wait_window).
+
+        The enumeration goes through `_preview_pin_monitors` — the SAME call
+        the pin obeys — so the dialog can never offer a monitor the pin would
+        refuse to use. Under Wine that can come back empty with a reason, and
+        an empty picker with no explanation reads as "FCTool sees no
+        monitors"; the reason is rendered instead."""
+        win32 = getattr(self, "_preview_monitor_win32", None)
+        monitors = _preview_pin_monitors(
+            win32, getattr(self, "_preview_thumb_backend", None))
+        pin_deferred = bool(not monitors and getattr(win32, "last_reason",
+                                                     None))
         cfg = self._preview_cfg()
         assigns = dict(cfg.get("monitor_assignments", {}) or {})
         default = cfg.get("monitor_pin_default", "")
@@ -28617,6 +28824,15 @@ class FCToolGUI:
             chars=chars, on_default_change=self._preview_pin_set_default,
             on_char_change=self._preview_pin_set_char,
             on_apply=self._preview_pin_apply_all)
+
+        if pin_deferred:
+            # ASCII (cp1252 trap) and one line: the picker is empty because
+            # the Linux layout has not arrived, not because the desktop has no
+            # monitors. Reopening the dialog re-enumerates.
+            self._preview_pin_notice = tk.Label(
+                win, text=PIN_LAYOUT_NOT_READY, bg=BG_PANEL, fg=FG_DIM,
+                font=("Consolas", 9), justify=tk.LEFT, wraplength=460)
+            self._preview_pin_notice.pack(anchor="w", padx=10, pady=(0, 4))
 
         btns = tk.Frame(win, bg=BG_PANEL)
         btns.pack(fill=tk.X, pady=8)
