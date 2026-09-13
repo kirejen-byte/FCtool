@@ -61,6 +61,12 @@ T_VISIBLE = "visible"
 T_DETACH = "detach"
 T_PROBE = "probe"
 T_QUIT = "quit"
+# Focus a client: the helper sends _NET_ACTIVE_WINDOW (source=2, "pager") plus a
+# StackMode Above on its OWN X connection.  Wine's FocusIn handler then sets the
+# foreground internally, which is the only route that survives the wineserver's
+# SetForegroundWindow deny rule for a hotkey-driven swap.  Fire-and-forget: the
+# app never learns whether the WM honoured it (there is no reply type).
+T_ACTIVATE = "activate"
 # both directions (app asks with {id}, helper answers/pushes with {id,w,h})
 T_SIZE = "size"
 # synthesised locally by LineDecoder -- never sent on the wire
@@ -68,8 +74,8 @@ T_MALFORMED = "malformed"
 
 MESSAGE_TYPES = (
     T_HELLO, T_OK, T_ATTACH, T_ATTACHED, T_UPDATE, T_VISIBLE, T_SIZE,
-    T_DETACH, T_DETACHED, T_PROBE, T_PROBE_RESULT, T_QUIT, T_STATS, T_ERROR,
-    T_MALFORMED,
+    T_DETACH, T_DETACHED, T_PROBE, T_PROBE_RESULT, T_QUIT, T_ACTIVATE,
+    T_STATS, T_ERROR, T_MALFORMED,
 )
 
 ERROR_CODES = (
@@ -196,6 +202,10 @@ _REQUIRED = {
     T_PROBE: (("src_list", "int_list"), ("seconds", "int")),
     T_PROBE_RESULT: (("results", "list"),),
     T_QUIT: (),
+    # ``src`` is the EVE client's X window id, NOT a thumbnail handle: focus is
+    # asked for by window, and a client with no attached thumbnail can still be
+    # activated.
+    T_ACTIVATE: (("src", "int"),),
     T_STATS: (("frames", "int"), ("damage_events", "int"),
               ("coalesced", "int"), ("errors", "int"), ("uptime_s", "num")),
     T_ERROR: (("id", "id_or_null"), ("code", "error_code"), ("msg", "str")),

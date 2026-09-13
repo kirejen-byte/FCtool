@@ -130,6 +130,8 @@ class HelperStatus:
     errors: int = 0
     malformed: int = 0
     dropped: int = 0
+    repairs: int = 0
+    activations: int = 0
     uptime_s: float = 0.0
     last_error: Optional[str] = None
     spawn_attempts: int = 0
@@ -419,6 +421,8 @@ class HelperSupervisor(object):
         self._errors = 0
         self._malformed = 0
         self._dropped = 0
+        self._repairs = 0
+        self._activations = 0
         self._uptime_s = 0.0
         self._last_error = None
         self._spawn_attempts = 0
@@ -454,6 +458,8 @@ class HelperSupervisor(object):
                 errors=self._errors,
                 malformed=self._malformed,
                 dropped=self._dropped,
+                repairs=self._repairs,
+                activations=self._activations,
                 uptime_s=self._uptime_s,
                 last_error=self._last_error,
                 spawn_attempts=self._spawn_attempts,
@@ -1090,6 +1096,11 @@ class HelperSupervisor(object):
                 value = msg.get(key)
                 if isinstance(value, int) and not isinstance(value, bool):
                     setattr(self, attr, value)
+            for key, attr in (("repairs", "_repairs"),
+                              ("activations", "_activations")):
+                total = _as_int(msg.get(key))
+                if total is not None:
+                    setattr(self, attr, total)
             uptime = msg.get("uptime_s")
             if isinstance(uptime, (int, float)) and not isinstance(uptime, bool):
                 self._uptime_s = float(uptime)
@@ -1309,6 +1320,29 @@ class X11ThumbBackend(object):
         if known:
             self._send({"type": proto.T_DETACH, "id": handle})
 
+    def activate(self, src_hwnd) -> bool:
+        """Ask the helper to focus one EVE client.  Fire-and-forget, total.
+
+        The X11 route exists because Wine denies a plain SetForegroundWindow
+        from a process whose input ``user_time`` is older than the foreground's
+        - which is every HOTKEY-driven swap, since WM_HOTKEY never bumps that
+        clock.  The helper instead sends ``_NET_ACTIVE_WINDOW`` as a pager on
+        its own X connection and Wine's FocusIn handler does the rest.
+
+        Returns True when the message was HANDED to the supervisor, never that
+        the window is now focused (there is no reply and no confirmation:
+        ``GetForegroundWindow`` under Wine is stale right after a switch).
+        False means nothing was sent: the helper is not ready, or the hwnd has
+        no X window (Wayland / a window that just died).
+        """
+        if not self.ready:
+            return False
+        src_x = _as_int(self.x_id_for(src_hwnd))
+        if not src_x:
+            return False
+        self._send({"type": proto.T_ACTIVATE, "src": src_x})
+        return True
+
     def close(self) -> None:
         """Stop the helper (idempotent)."""
         try:
@@ -1369,6 +1403,28 @@ class X11ThumbBackend(object):
 
 
 # ------------------------------------------------------------- factories
+
+
+def wine_activator(backend):
+    """Return the ``hwnd -> bool`` callable ``window_activator`` expects.
+
+    Injection, not an import: ``window_activator`` must not learn about the
+    X11 helper (it stays the ONE module allowed to touch a client window, and
+    it must keep importing clean on real Windows).  The caller registers the
+    result with ``window_activator.set_wine_activator`` and clears it with
+    ``set_wine_activator(None)`` when the backend goes away.
+
+    Total by contract: a dead/duck-typed backend reads as False (not sent),
+    never as an exception on the UI thread.
+    """
+    def _activate(hwnd):
+        try:
+            return bool(backend.activate(hwnd))
+        except Exception as exc:
+            log.warning("[x11] activate failed: %s", _ascii(exc))
+            return False
+
+    return _activate
 
 
 def make_backend(cfg, log=None):
@@ -1584,13 +1640,16 @@ def build_report(facts, snapshot, probe_result, clients=None) -> str:
         ("[clients]", _report_clients(rows)),
         ("[probe]", _report_probe(results)),
         ("[stats]", ["frames=%s damage=%s coalesced=%s errors=%s "
-                     "malformed=%s dropped=%s uptime_s=%s"
+                     "malformed=%s dropped=%s repairs=%s activations=%s "
+                     "uptime_s=%s"
                      % (_ascii(getattr(snapshot, "frames", 0)),
                         _ascii(getattr(snapshot, "damage_events", 0)),
                         _ascii(getattr(snapshot, "coalesced", 0)),
                         _ascii(getattr(snapshot, "errors", 0)),
                         _ascii(getattr(snapshot, "malformed", 0)),
                         _ascii(getattr(snapshot, "dropped", 0)),
+                        _ascii(getattr(snapshot, "repairs", 0)),
+                        _ascii(getattr(snapshot, "activations", 0)),
                         _ascii(getattr(snapshot, "uptime_s", 0)))]),
         ("[last_error]", [_ascii(getattr(snapshot, "last_error", None))]),
     ]

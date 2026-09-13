@@ -22,6 +22,32 @@ cannot confirm is a fact to LOG; the caller's next press is the retry.
 Compliance envelope (spec §4) is unchanged: focus APIs only, verification is
 strictly read-only (GetForegroundWindow / GetAncestor), and no input is injected
 beyond the pre-existing ALT-nudge into our own queue.
+
+UNDER WINE the ladder is DIFFERENT, because four of its rungs are provably
+useless or harmful there (all source-verified against Wine, 2026-09-13):
+
+  * ``ShowWindow`` on a FOREIGN window is a synchronous cross-process send
+    (win32u/window.c -> WM_WINE_SHOWWINDOW) that blocks this thread for one of
+    the target's frames; ``ShowWindowAsync`` posts instead.
+  * the wineserver DENIES SetForegroundWindow from a process that is not
+    foreground whose input ``user_time`` is older than the foreground's, and
+    ``WM_HOTKEY`` never bumps ``user_time`` -- so after the one-shot per-window
+    freebie EVERY hotkey-driven swap is denied, forever (tile clicks still
+    work, which is exactly the field report).
+  * ``SwitchToThisWindow`` is a stub, and the ALT nudge is delivered to the EVE
+    client (a spurious ALT that perturbs the next keystroke) while ALSO bumping
+    the target's ``user_time``, making the retry LESS likely to pass.
+  * ``GetForegroundWindow`` right after a successful activate still returns the
+    OLD window (the target's thread writes ``active`` later), so the closing
+    probe is always stale and False would be a lie.
+
+So under Wine the real mechanism is an X11 ``_NET_ACTIVE_WINDOW`` (source=2,
+"pager") + StackMode Above sent by the preview helper on its own X connection
+-- Wine's FocusIn handler then sets the foreground internally, bypassing the
+deny rule (this is EVE Preview Manager's mechanism). That callable is INJECTED
+via ``set_wine_activator`` (this module never imports the helper), the three
+dead rungs are skipped, and an unconfirmable switch returns the truthy sentinel
+``ISSUED`` rather than False. Off Wine NOTHING here changes.
 """
 from __future__ import annotations
 
@@ -67,6 +93,11 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
         u.IsIconic.restype = wintypes.BOOL
         u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         u.ShowWindow.restype = wintypes.BOOL
+        # POSTs the show-state change instead of sending it. Used only under
+        # Wine, where ShowWindow on a foreign window blocks this thread for a
+        # frame of the TARGET's message loop.
+        u.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.ShowWindowAsync.restype = wintypes.BOOL
         u.SetForegroundWindow.argtypes = [wintypes.HWND]
         u.SetForegroundWindow.restype = wintypes.BOOL
         u.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
@@ -96,6 +127,9 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
 
     def show_window(self, hwnd, cmd):
         return bool(self._u.ShowWindow(hwnd, cmd))
+
+    def show_window_async(self, hwnd, cmd):
+        return bool(self._u.ShowWindowAsync(hwnd, cmd))
 
     def set_foreground(self, hwnd):
         return bool(self._u.SetForegroundWindow(hwnd))
@@ -153,6 +187,80 @@ def _real_user32():  # pragma: no cover
 # reads "skip", which is itself the diagnostic ("did we even get that far?").
 _RUNGS = ("is_iconic", "restore", "set_foreground", "alt_nudge",
           "set_foreground_retry", "switch_to_window")
+
+# The Wine ladder reports the SAME rungs (so the log shape never moves) plus
+# the X11 one; the three rungs Wine makes useless read "skip(wine)".
+_WINE_RUNG = "x11_activate"
+_WINE_RUNGS = ("is_iconic", "restore", _WINE_RUNG, "set_foreground",
+               "alt_nudge", "set_foreground_retry", "switch_to_window")
+_WINE_SKIPPED = ("alt_nudge", "set_foreground_retry", "switch_to_window")
+_SKIP_WINE = "skip(wine)"
+
+
+class _Issued(int):
+    """``activate``'s "sent, cannot be confirmed" verdict under Wine.
+
+    An int subclass so it is unambiguously TRUTHY (``bool(ISSUED) is True``)
+    for every existing caller that only branches on the return, while still
+    being distinguishable from a confirmed True by identity - Wine's
+    GetForegroundWindow is stale right after a switch, so there is nothing
+    honest to confirm with and False would wrongly read as "did not happen".
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):          # pragma: no cover - cosmetic
+        return "ISSUED"
+
+
+ISSUED = _Issued(1)
+
+# The injected X11 focus callable (``hwnd -> bool``), or None. Registered by
+# the preview layer; this module never imports the helper.
+_wine_activator = None
+
+
+def set_wine_activator(fn) -> None:
+    """Register (``fn``) or clear (``None``) the Wine X11 focus callable.
+
+    Anything not callable clears it: a half-wired backend must degrade to the
+    plain ladder, never raise inside a hotkey.
+    """
+    global _wine_activator
+    _wine_activator = fn if callable(fn) else None
+
+
+def get_wine_activator():
+    """The registered Wine X11 focus callable, or None."""
+    return _wine_activator
+
+
+def _is_wine() -> bool:
+    """True under Wine/Proton. The import is LAZY and the result total.
+
+    ``wine_detect`` touches ctypes, and this module is imported at boot on
+    real Windows, so the probe must not run at import time; ``is_wine()``
+    caches its own answer, so calling this per activate is free.
+    """
+    try:
+        import wine_detect
+        return bool(wine_detect.is_wine())
+    except Exception:
+        return False
+
+
+def _show(u, hwnd, cmd):
+    """Change a window's show-state: POSTed under Wine, SENT on Windows.
+
+    Falls back to ``show_window`` when the backend predates
+    ``show_window_async`` (injected test doubles, older duck types), so the
+    Wine path can never crash on a missing method.
+    """
+    if _is_wine():
+        fn = getattr(u, "show_window_async", None)
+        if fn is not None:
+            return fn(hwnd, cmd)
+    return u.show_window(hwnd, cmd)
 
 # A client that is permanently unfocusable must not flood the log while the user
 # keeps hammering the cycle key: one WARNING per hwnd per interval.
@@ -226,7 +334,42 @@ def _log_failed_activate(hwnd, outcomes, detail):
             _last_fail_log.pop(stale, None)
     _last_fail_log[hwnd] = now
     log.warning("activate could not confirm foreground: %s; rungs: %s", detail,
-                " ".join("%s=%s" % (n, outcomes[n]) for n in _RUNGS))
+                _rung_text(outcomes, _RUNGS))
+
+
+def _rung_text(outcomes, rungs):
+    """The fixed, greppable ``name=outcome`` line for one ladder run."""
+    return " ".join("%s=%s" % (name, outcomes.get(name, "skip"))
+                    for name in rungs)
+
+
+def _activate_wine(hwnd, u):
+    """The Wine ladder: restore (posted) -> X11 activate -> one SetForeground.
+
+    Returns True when the (stale-prone) probe happens to confirm the target
+    anyway, else ``ISSUED``: the request WAS made and Wine simply cannot be
+    asked yet. Never False and never a WARNING - under Wine "unconfirmed" is
+    the normal case, so the old warning would fire on every single switch.
+    """
+    outcomes = {name: "skip" for name in _WINE_RUNGS}
+    for name in _WINE_SKIPPED:
+        outcomes[name] = _SKIP_WINE
+
+    if _run_rung(outcomes, "is_iconic", lambda: u.is_iconic(hwnd)):
+        _run_rung(outcomes, "restore", lambda: _show(u, hwnd, SW_RESTORE))
+    activator = _wine_activator
+    if activator is not None:
+        _run_rung(outcomes, _WINE_RUNG, lambda: activator(hwnd))
+    # Still worth one try: it is free when this process IS foreground (a tile
+    # click), and denied-but-harmless when it is not (a hotkey).
+    _run_rung(outcomes, "set_foreground", lambda: u.set_foreground(hwnd))
+
+    confirmed, detail = _confirm_foreground(u, hwnd)
+    if confirmed:
+        return True
+    log.debug("activate issued (wine, foreground unconfirmable): %s; rungs: %s",
+              detail, _rung_text(outcomes, _WINE_RUNGS))
+    return ISSUED
 
 
 def activate(hwnd: int, win32=None) -> bool:
@@ -249,8 +392,15 @@ def activate(hwnd: int, win32=None) -> bool:
     lock, which is precisely why the confirmation is a single read rather than a
     wait: blocking here would stall the Tk thread in the one regime that already
     feels slow. An unconfirmed switch is retried by the next press, never here.
+
+    UNDER WINE this delegates to ``_activate_wine`` (see the module docstring):
+    a posted restore, the injected X11 activation, ONE SetForegroundWindow, and
+    a truthy ``ISSUED`` instead of an un-confirmable False. Off Wine, every line
+    below runs exactly as it did before that path existed.
     """
     u = win32 or _real_user32()
+    if _is_wine():
+        return _activate_wine(hwnd, u)
     outcomes = {name: "skip" for name in _RUNGS}
 
     if _run_rung(outcomes, "is_iconic", lambda: u.is_iconic(hwnd)):
@@ -269,11 +419,11 @@ def activate(hwnd: int, win32=None) -> bool:
 
 
 def minimize(hwnd: int, win32=None) -> None:
-    (win32 or _real_user32()).show_window(hwnd, SW_MINIMIZE)
+    _show(win32 or _real_user32(), hwnd, SW_MINIMIZE)
 
 
 def restore_no_focus(hwnd: int, win32=None) -> None:
-    (win32 or _real_user32()).show_window(hwnd, SW_SHOWNOACTIVATE)
+    _show(win32 or _real_user32(), hwnd, SW_SHOWNOACTIVATE)
 
 
 def move_window(hwnd: int, x: int, y: int, w: int, h: int, win32=None) -> None:
