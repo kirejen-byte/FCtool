@@ -22,6 +22,10 @@ Facts this module rests on (see the plan's section 0 - do not re-derive):
   the real Unix environment, argv is passed verbatim, and **stdio is closed
   for a GUI parent** - so pipes are unusable and the control channel is TCP on
   127.0.0.1 (shared with the child inside the pressure-vessel netns).
+* That same call returns SUCCESS with a **zeroed** ``PROCESS_INFORMATION``
+  (no pid, NULL handles), which makes ``subprocess.Popen`` raise
+  ``[WinError 6] Invalid handle`` AFTER the child is already exec'd - so the
+  spawner under Wine is :func:`wine_spawn`, not ``Popen``.
 * No environment is passed or altered: the helper needs the Unix ``DISPLAY``
   and ``XAUTHORITY`` it inherits, and anything we injected would be the
   Windows-side (renamed) spelling.
@@ -36,6 +40,7 @@ tiles rather than a traceback.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import secrets
 import select
@@ -128,6 +133,11 @@ class HelperStatus:
     uptime_s: float = 0.0
     last_error: Optional[str] = None
     spawn_attempts: int = 0
+    #: One line per FAILED spawn attempt, ``"<python>: <error>"``, newest
+    #: last, at most the final 3.  ``last_error`` is last-wins by design, so
+    #: without this a three-candidate failure reaches the tester as a single
+    #: line and the earlier interpreters' verdicts are lost.
+    spawn_errors: Tuple[str, ...] = ()
     # hello fields (report section [helper])
     helper_python: Optional[str] = None   # the helper's sys.version
     xrender: Optional[Tuple[int, int]] = None
@@ -222,14 +232,176 @@ def _screen(value):
     return None
 
 
+# ----------------------------------------------------------------- spawner
+
+
+#: Spawn kwargs for the ``Popen`` branch ONLY: Wine closes a GUI parent's
+#: stdio anyway, and an inherited pipe would wedge the child on its first
+#: write.  :func:`wine_spawn` takes argv and nothing else.
+_POPEN_KWARGS = {"stdin": subprocess.DEVNULL,
+                 "stdout": subprocess.DEVNULL,
+                 "stderr": subprocess.DEVNULL,
+                 "close_fds": True}
+
+
+class _STARTUPINFOW(ctypes.Structure):
+    """Win32 ``STARTUPINFOW`` - only ``cb`` is ever set (no std handles)."""
+
+    _fields_ = [("cb", ctypes.c_ulong),
+                ("lpReserved", ctypes.c_wchar_p),
+                ("lpDesktop", ctypes.c_wchar_p),
+                ("lpTitle", ctypes.c_wchar_p),
+                ("dwX", ctypes.c_ulong),
+                ("dwY", ctypes.c_ulong),
+                ("dwXSize", ctypes.c_ulong),
+                ("dwYSize", ctypes.c_ulong),
+                ("dwXCountChars", ctypes.c_ulong),
+                ("dwYCountChars", ctypes.c_ulong),
+                ("dwFillAttribute", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("wShowWindow", ctypes.c_ushort),
+                ("cbReserved2", ctypes.c_ushort),
+                ("lpReserved2", ctypes.c_void_p),
+                ("hStdInput", ctypes.c_void_p),
+                ("hStdOutput", ctypes.c_void_p),
+                ("hStdError", ctypes.c_void_p)]
+
+
+class _PROCESS_INFORMATION(ctypes.Structure):
+    """Win32 ``PROCESS_INFORMATION`` - Wine zeroes ALL of it for a Unix
+    child (no pid, NULL handles)."""
+
+    _fields_ = [("hProcess", ctypes.c_void_p),
+                ("hThread", ctypes.c_void_p),
+                ("dwProcessId", ctypes.c_ulong),
+                ("dwThreadId", ctypes.c_ulong)]
+
+
+class _UnixChild(object):
+    """All Wine gives back for a fork/exec'd Unix child: a pid, at most.
+
+    Deliberately NOT a ``Popen`` look-alike beyond the two calls the
+    supervisor makes: there is no process handle to wait on, so every method
+    answers honestly that it cannot know.  ``poll()`` returning None keeps
+    the supervisor's contract ("assume it runs until the control channel says
+    otherwise") - EOF on that channel is the real death signal, and
+    ``terminate()`` was already best-effort insurance before this existed.
+    """
+
+    __slots__ = ("pid",)
+
+    returncode = None
+
+    def __init__(self, pid=None):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return None
+
+    def terminate(self):
+        return None
+
+    def kill(self):
+        return None
+
+
+def _format_error(code):
+    """The Win32 message for ``code``, ASCII and never raising."""
+    try:
+        return _ascii(ctypes.FormatError(code))
+    except Exception:
+        return "error %s" % (_ascii(code),)
+
+
+def _close_handles(k32, handles):
+    """Close each NON-NULL handle; Wine hands back NULLs for a Unix child.
+
+    Closing a NULL handle is exactly the ``[WinError 6]`` that made ``Popen``
+    unusable here, so a zero is skipped rather than closed-and-forgiven, and
+    every real close is isolated so one failure cannot lose the other.
+    """
+    close = None
+    for handle in handles:
+        if not handle:
+            continue
+        if close is None:
+            close = getattr(k32, "CloseHandle", None)
+            if close is None:
+                return
+            try:
+                close.argtypes = [ctypes.c_void_p]
+                close.restype = ctypes.c_int
+            except Exception:
+                pass
+        try:
+            close(handle)
+        except Exception:
+            pass
+
+
+def wine_spawn(argv, kernel32=None):
+    """Start a native Unix program through Wine's ``CreateProcessW``.
+
+    ``subprocess.Popen`` CANNOT do this.  For a non-PE executable Wine
+    ``fork_and_exec``s the file and returns STATUS_SUCCESS with a ZEROED
+    ``PROCESS_INFORMATION`` - no pid, NULL process and thread handles.
+    CPython's ``Popen._execute_child`` then calls ``CloseHandle`` on that NULL
+    thread handle, gets ``ERROR_INVALID_HANDLE`` and raises ``OSError``
+    **after the child has already been exec'd**: the first Linux tester's
+    three "[WinError 6] Invalid handle" attempts had each actually started a
+    helper, and the supervisor moved on believing none of them had.
+
+    So the call is made raw.  argv is rendered with ``list2cmdline`` because
+    Wine parses the command line with Windows quoting rules before handing
+    the pieces to the Unix child as its argv; no handles are inherited, no
+    creation flags, no environment and no working directory are imposed (the
+    helper needs the Unix env it inherits); and a returned handle is closed
+    only when it is non-NULL.  ``OSError`` is raised only when CreateProcessW
+    itself fails.  ``kernel32`` is injectable for tests and nothing is loaded
+    at import time.
+    """
+    # CreateProcessW may modify lpCommandLine, so it must be a writable buffer.
+    cmdline = ctypes.create_unicode_buffer(
+        subprocess.list2cmdline([str(arg) for arg in argv]))
+    k32 = kernel32
+    if k32 is None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = getattr(k32, "CreateProcessW", None)
+    if create is None:
+        raise OSError("kernel32 exports no CreateProcessW")
+    create.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_void_p,
+                       ctypes.c_void_p, ctypes.c_int, ctypes.c_ulong,
+                       ctypes.c_void_p, ctypes.c_wchar_p,
+                       ctypes.POINTER(_STARTUPINFOW),
+                       ctypes.POINTER(_PROCESS_INFORMATION)]
+    create.restype = ctypes.c_int
+    startup = _STARTUPINFOW()
+    startup.cb = ctypes.sizeof(_STARTUPINFOW)
+    info = _PROCESS_INFORMATION()
+    ctypes.set_last_error(0)
+    created = create(None, cmdline, None, None, False, 0, None, None,
+                     ctypes.byref(startup), ctypes.byref(info))
+    if not created:
+        code = ctypes.get_last_error()
+        raise OSError(code, "CreateProcessW failed: %s"
+                      % (_format_error(code),))
+    _close_handles(k32, (info.hProcess, info.hThread))
+    return _UnixChild(info.dwProcessId or None)
+
+
 # ------------------------------------------------------------- supervisor
 
 
 class HelperSupervisor(object):
     """Owns the helper process, the control socket and the reader thread."""
 
-    def __init__(self, spawn=subprocess.Popen, listen_factory=None, facts=None,
+    def __init__(self, spawn=None, listen_factory=None, facts=None,
                  bundle_dir=None, log=None):
+        #: None means "decide at spawn time" (see :meth:`_default_spawn`):
+        #: the Wine verdict is a DLL probe, which must not run at import.
         self._spawn = spawn
         self._listen_factory = listen_factory or _default_listener
         self._facts = facts
@@ -250,6 +422,7 @@ class HelperSupervisor(object):
         self._uptime_s = 0.0
         self._last_error = None
         self._spawn_attempts = 0
+        self._spawn_errors = []                # one line per FAILED attempt
         self._hello = {}
 
         self._sock = None
@@ -284,6 +457,7 @@ class HelperSupervisor(object):
                 uptime_s=self._uptime_s,
                 last_error=self._last_error,
                 spawn_attempts=self._spawn_attempts,
+                spawn_errors=tuple(self._spawn_errors),
                 helper_python=self._hello.get("python"),
                 xrender=_pair(self._hello.get("xrender")),
                 damage=_pair(self._hello.get("damage")),
@@ -329,6 +503,7 @@ class HelperSupervisor(object):
                 return
             self._state = "starting"
             self._pipelined = []
+            self._spawn_errors = []      # a fresh cycle, not stale attempts
         self._stop.clear()
         self._settled.clear()
         try:
@@ -584,21 +759,24 @@ class HelperSupervisor(object):
                 "--port", str(port),
                 "--token", token,
                 "--vendor", vendor]
+        spawn = self._spawn
+        if spawn is None:
+            spawn = self._default_spawn()
+        # wine_spawn takes argv and nothing else; only Popen gets the
+        # no-env/no-stdio kwargs (Wine closes a GUI parent's handles anyway,
+        # and an inherited pipe would wedge the child on its first write).
+        kwargs = {} if spawn is wine_spawn else dict(_POPEN_KWARGS)
         try:
-            # No env, no stdio: Wine closes a GUI parent's handles anyway, and
-            # an inherited pipe would wedge the child on its first write.
-            proc = self._spawn(argv,
-                               stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL,
-                               close_fds=True)
+            proc = spawn(argv, **kwargs)
         except Exception as exc:
             self._note_error("spawn %s failed: %s"
                              % (_ascii(python), _ascii(exc)))
+            self._note_attempt(python)
             return False
         conn, decoder, hello, backlog = self._await_hello(token)
         if hello is None or self._stop.is_set():
             self._kill(proc, conn)
+            self._note_attempt(python)
             return False
         try:
             # Blocking for the rest of its life: see send().  The reader waits
@@ -608,6 +786,7 @@ class HelperSupervisor(object):
             self._note_error("cannot switch the control socket to blocking: %s"
                              % (_ascii(exc),))
             self._kill(proc, conn)
+            self._note_attempt(python)
             return False
         with self._lock:
             if self._stop.is_set():      # a stop() landed in this instant
@@ -734,6 +913,35 @@ class HelperSupervisor(object):
             proc.terminate()
         except Exception:
             pass
+
+    def _default_spawn(self):
+        """The spawner to use when the caller injected none.
+
+        Resolved HERE, on the starter thread at spawn time, and never at
+        import: the verdict is a DLL probe, and the answer differs per host.
+        Under Wine the child is a native Unix binary, which only
+        :func:`wine_spawn` can start (see its docstring); everywhere else -
+        the Windows test rig included - plain ``Popen`` is correct.
+        """
+        try:
+            wine = bool(wine_detect.is_wine())
+        except Exception:
+            wine = False
+        return wine_spawn if wine else subprocess.Popen
+
+    def _note_attempt(self, python):
+        """Keep this attempt's verdict, so the report shows ALL of them.
+
+        ``last_error`` is last-wins by design, so three candidates failing
+        three different ways would otherwise reach the tester as one line.
+        A stop() in flight is not a failure and records nothing.
+        """
+        if self._stop.is_set():
+            return
+        with self._lock:
+            self._spawn_errors.append("%s: %s" % (_ascii(python),
+                                                  _ascii(self._last_error)))
+            del self._spawn_errors[:-3]
 
     def _vendor_zip_unix(self):
         base = self._bundle_dir
@@ -1274,6 +1482,10 @@ def _report_helper(snapshot):
                  % (_ascii(snapshot.xrender), _ascii(snapshot.damage),
                     _ascii(snapshot.shape), _ascii(snapshot.composite),
                     ("%sx%sx%s" % screen) if screen else "-"))
+    # One line per failed attempt: last_error alone hides the first two.
+    for index, attempt in enumerate(getattr(snapshot, "spawn_errors", ())
+                                    or (), 1):
+        lines.append("attempt %d: %s" % (index, _ascii(attempt)))
     return lines
 
 
