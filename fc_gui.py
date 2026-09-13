@@ -1459,6 +1459,18 @@ class FCToolGUI:
         # _preview_apply_hotkey_gate), and _preview_restart_hotkeys reads it so
         # a re-registration during a gated stretch registers nothing.
         self._preview_hotkeys_gated = False
+        # Consecutive not-EVE foreground samples seen by that gate. Read ONLY on
+        # the Wine path (see _preview_apply_hotkey_gate): Wine's
+        # GetForegroundWindow reads 0/stale for a tick either side of a switch,
+        # so a suspend there needs TWO misses in a row. Any EVE-focused sample
+        # zeroes it, and so does teardown. Dead on Windows.
+        self._preview_gate_miss = 0
+        # Monotonic deadline of the post-switch retop belt (0.0 = none owed).
+        # Windows-dead (the per-tick retop batch already runs there every
+        # tick); under Wine it is what re-arms that batch for a few ticks
+        # right after _preview_switch_to, healing a client the helper's
+        # _NET_ACTIVE_WINDOW activation raised back above the tiles.
+        self._preview_retop_until = 0.0
         self._preview_after_id = None
         self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
         # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
@@ -20616,6 +20628,16 @@ class FCToolGUI:
                 overlay.retop()
             except Exception:
                 pass
+        # Under Wine the tick's own per-tile retop batch is gated off (see
+        # _preview_native_tick_body — KWin already keeps the override-redirect
+        # tiles above the client, and restacking them 4x/s repaints black over
+        # the X11 preview child). But the helper's _NET_ACTIVE_WINDOW
+        # activation can still win the race and raise the just-activated
+        # client back above a tile within the next tick or two. Re-arm the
+        # tick's batch for a short belt so it heals that instead of leaving a
+        # tile buried until the user's next switch.
+        if getattr(self, "_preview_thumb_backend", None) is not None:
+            self._preview_retop_until = time.monotonic() + 0.75
         # A live topmost tooltip was just re-topped over by that batch — put it
         # back on top (see ui_helpers.relift_topmost_tooltips).
         try:
@@ -21631,8 +21653,30 @@ class FCToolGUI:
         were suspended surfaces through `_preview_surface_hotkey_problems` just
         like the enable path's collisions. A suspend registers nothing, so it
         has nothing to surface."""
-        want = (bool(cfg.get("hotkeys_eve_only", False))
-                and getattr(fg_info, "active_hwnd", None) is None)
+        eve_focused = getattr(fg_info, "active_hwnd", None) is not None
+        want = bool(cfg.get("hotkeys_eve_only", False)) and not eve_focused
+        # WINE DEBOUNCE (dead on Windows -- the backend is None there, so this is
+        # one comparison). Wine's GetForegroundWindow reads 0 (or the previous
+        # client) for a tick either side of every switch, so a single not-EVE
+        # sample suspended and the next tick resumed EVERY hotkey on EVERY swap:
+        # a real press then landed in the gap and did nothing. Under an X11
+        # backend a SUSPEND therefore needs TWO consecutive not-EVE samples,
+        # which costs at most one extra tick (<= 250 ms) before the keys go back
+        # to the desktop. The RESUME stays single-sample, so the fail-safe
+        # direction of this whole feature is unchanged, and the debounce is
+        # skipped unless `want` is True -- unticking the box while suspended
+        # still gives the keys back on the very next tick.
+        if eve_focused:
+            self._preview_gate_miss = 0
+        elif want and getattr(self, "_preview_thumb_backend", None) is not None:
+            # Clamped -- this is a "have we seen >=2 misses" latch, not a
+            # counter anyone reads for its magnitude, and an unclamped miss
+            # streak (e.g. hotkeys_eve_only left on for a whole idle session)
+            # would otherwise grow without bound.
+            self._preview_gate_miss = min(2, int(
+                getattr(self, "_preview_gate_miss", 0)) + 1)
+            if self._preview_gate_miss < 2:
+                return
         if want == bool(getattr(self, "_preview_hotkeys_gated", False)):
             return
         # Recorded BEFORE the call: _preview_restart_hotkeys reads it to decide
@@ -22661,13 +22705,42 @@ class FCToolGUI:
             # Settings checkbutton forces through it).
             if cfg.get("fit_height", False) and self._preview_tick_count % 8 == 0:
                 self._preview_fit_tile_heights(cfg, clients=cur)
-            for hwnd, tile in self._preview_tiles.items():
-                if hwnd in hidden:
-                    continue                                        # withdrawn — nothing to retop
-                tile.retop()
-            # ...and put any live topmost tooltip back on top of the batch we
-            # just re-topped over it (retop is HWND_TOPMOST without
-            # SWP_NOZORDER — see ui_helpers.relift_topmost_tooltips).
+            # The per-tick retop batch is WINDOWS-ONLY BY DEFAULT (backend
+            # None). retop() is SetWindowPos(HWND_TOPMOST) per tile: it
+            # re-stacks every tile to the head of the topmost band and
+            # reverses their relative order, which is what keeps a DWM
+            # thumbnail above a client that was just raised. Under Wine the
+            # tiles are override-redirect X11 windows that KWin already keeps
+            # above the clients, so a STEADY-STATE batch buys nothing there and
+            # costs plenty -- N restacks 4x/s, the order flipped every pass,
+            # and each restack repainting a body frame black over the X11
+            # preview child (that repaint is what made a dragged tile go
+            # black). This subsumes the in-gesture stand-down: a tile mid-drag
+            # only ever suffered from the batch under Wine.
+            # BUT: the helper's _NET_ACTIVE_WINDOW activation (window_activator
+            # Wine ladder) can still win the race and raise the activated
+            # client back above a tile a tick or two after a switch, and KWin
+            # alone does not correct that. _preview_switch_to arms
+            # `_preview_retop_until` for ~0.75s (~3 ticks) right after its own
+            # burst, so the batch also runs there -- belt, not steady state --
+            # to heal that specific window without paying the per-tick cost
+            # the rest of the time. Windows is byte-identical: the backend-None
+            # arm is unconditional there, same loop as ever, gesture or no
+            # gesture.
+            if (getattr(self, "_preview_thumb_backend", None) is None
+                    or time.monotonic() < getattr(
+                        self, "_preview_retop_until", 0.0)):
+                for hwnd, tile in self._preview_tiles.items():
+                    if hwnd in hidden:
+                        continue                                    # withdrawn — nothing to retop
+                    tile.retop()
+            # ...and put any live topmost tooltip back on top, UNCONDITIONALLY.
+            # Not just after the retop loop: place()/show() and the fit-height
+            # pass in the per-tile loop above re-assert HWND_TOPMOST too, so a
+            # tick that skipped the batch can still have buried the tip (retop is
+            # HWND_TOPMOST without SWP_NOZORDER — see
+            # ui_helpers.relift_topmost_tooltips). The invariant is "every batch
+            # ends with a relift", and the per-tile loop IS a batch.
             try:
                 relift_topmost_tooltips()
             except Exception:
@@ -22907,6 +22980,21 @@ class FCToolGUI:
             except Exception:
                 log.exception("[x11] preview backend factory failed")
                 self._preview_thumb_backend = None
+            if self._preview_thumb_backend is not None:
+                # INJECTION, not an import: window_activator stays the ONE
+                # module allowed to touch a client window and must keep
+                # importing clean on real Windows, so the X11 focus rung of
+                # its Wine ladder is handed to it here and cleared again in
+                # _preview_teardown. Kept OUTSIDE the factory's own try/except
+                # (own try/except below) so a raising injection can never be
+                # mistaken for a failed factory call and drop an otherwise-live
+                # backend -- a failure here just leaves activation on the
+                # default ladder instead of stranding the tiles.
+                try:
+                    window_activator.set_wine_activator(
+                        x11_thumbs.wine_activator(self._preview_thumb_backend))
+                except Exception:
+                    log.exception("[x11] wine activator injection failed")
             if self._preview_thumb_backend is None:
                 # Fail VISIBLE: the always-packed hotkey-status line is the one
                 # place a Linux user sees WHY every tile is about to strand.
@@ -23027,6 +23115,15 @@ class FCToolGUI:
         # the close so a raising backend can never be closed twice.
         be = getattr(self, "_preview_thumb_backend", None)
         self._preview_thumb_backend = None
+        # Un-register the X11 focus rung BEFORE the helper dies: window_activator
+        # would otherwise keep calling into a closed backend (total by contract,
+        # so it would only ever log a warning, but activation would silently stop
+        # working until the next enable). No-op on Windows, where nothing was
+        # ever registered.
+        try:
+            window_activator.set_wine_activator(None)
+        except Exception:
+            log.exception("[x11] clearing the Wine activator failed")
         if be is not None:
             try:
                 be.close()
@@ -23037,6 +23134,7 @@ class FCToolGUI:
         # happened mid-suspend cannot leave the next session refusing to
         # register against a service it never gated).
         self._preview_hotkeys_gated = False
+        self._preview_gate_miss = 0     # ...and its Wine debounce counter
 
     def _preview_tick(self):
         """Reschedule the native controller while native mode is active (mirrors
@@ -26129,6 +26227,10 @@ class FCToolGUI:
         # escape hatch out of it.
         if was_eve_only and not cfg.get("hotkeys_eve_only", False):
             self._preview_hotkeys_gated = False
+            # ...and its Wine debounce counter (_preview_apply_hotkey_gate):
+            # an untick-retick under Wine must need two fresh misses again,
+            # not inherit a stale near-threshold count from before the untick.
+            self._preview_gate_miss = 0
             if getattr(self, "_preview_hotkeys", None) is not None:
                 self._preview_restart_hotkeys()
         self._save_config()
