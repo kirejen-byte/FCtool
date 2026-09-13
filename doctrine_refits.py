@@ -51,11 +51,27 @@ ADD_GLYPH = "+"
 MISSING_LABEL = "(missing fit)"
 RESET_LABEL = "Reset refits to defaults"
 
+# Mirrors ``refit_command.MIN_HULL_PREFIX_LEN`` (same reasoning: below this a
+# hull-name word is a coin-flip). Kept as a LOCAL constant rather than an
+# import — this module is a leaf reused by the Doctrines/MOTD/Fleet panes and
+# must not pick up a dependency on the fleet-chat command engine to draw a
+# tooltip.
+_MIN_HULL_WORD_LEN = 3
+
 
 @dataclass(frozen=True)
 class RefitChip:
-    """One chip in a member row's refit strip."""
+    """One chip in a member row's refit strip.
+
+    ``index`` is the 1-based position in ``member.refits`` — ``refits[0]`` is
+    both index 1 and the default. That is a POSITION in the stored list, not a
+    fixed identity: the store's ``set_default_refit`` ("Make default") moves a
+    fit to ``refits[0]``, renumbering every chip after it. The chip, the
+    ``Refits ▾`` menu and the fleet-chat command all read that same list, so
+    whatever it currently says, they always agree on what "2" means.
+    """
     fit_id: str
+    index: int
     label: str
     active: bool
     is_default: bool
@@ -66,7 +82,8 @@ class RefitChip:
 class SlotSpec:
     """One cascade of the ``Refits ▾`` menu: a slot and its refits.
 
-    ``entries`` is ``(fit_id, label, active)`` in refit order.
+    ``entries`` is ``(fit_id, label, active)`` in refit order; ``label``
+    already carries the entry's 1-based refit number (``"1  Muninn Arty"``).
     """
     label: str
     entries: tuple[tuple[str, str, bool], ...]
@@ -131,16 +148,80 @@ def _fit_label(fit_id, fit) -> str:
             or str(fit_id)[:8])
 
 
-def _chip_tooltip(label, fit, is_default, availability_text) -> str:
-    """First line: the fit, its source and "default" joined by ``·``; then the
-    market availability line for THIS refit, when a snapshot covered it."""
+def _first_single_word_tag(member) -> str:
+    """The first tag that is itself ONE word, or ``""``.
+
+    ``refit_command`` reads only ``tokens[0]`` as a slot spec (§ the parser
+    splits on whitespace and treats one whitespace-delimited word as the
+    slot), so a multi-word tag like "Heavy Tackle" is not a thing an FC can
+    type as a single selector — it is skipped in favour of the next tag, or
+    the hull, rather than emitted as an unresolvable hint."""
+    for t in (getattr(member, "tags", None) or []):
+        text = _text(t)
+        if text and len(text.split()) == 1:
+            return text
+    return ""
+
+
+def _command_hull(member, get_fit) -> str:
+    """Hull name for the fleet-chat hint, degrading through the slot's refits
+    exactly as ``refit_command._slot_hull`` does: the ACTIVE fit's hull, else
+    the first refit (in order) whose fit resolves to a real hull name.
+
+    Deliberately NOT the module's own ``_slot_hull`` (used for the ``Refits ▾``
+    cascade label): that one shows ``(missing fit)`` rather than guess at a
+    label, because a wrong-looking cascade name is worse than an honest one.
+    Here the goal is a typable command, and ``refit_command`` itself would
+    already accept any of the slot's fits as identifying it — so the same
+    degrade is correct, not a guess. ``""`` when nothing in the slot has a
+    real hull name."""
+    for fid in [getattr(member, "fit_id", None)] + _refits_of(member):
+        if not fid:
+            continue
+        fit = _get(get_fit, fid)
+        hull = _text(getattr(fit, "hull_name", "")) if fit is not None else ""
+        if hull:
+            return hull
+    return ""
+
+
+def _command_hint(member, get_fit) -> str:
+    """The SINGLE token an FC types after ``refit`` for this slot — empty when
+    none exists (a missing/blank hull with no tag).
+
+    ``refit_command`` takes only the first whitespace-delimited token as a
+    slot spec, so a multi-word result is not typable as one thing: a
+    single-word tag wins outright (mirroring ``refit_command._slot_filter``'s
+    own precedence, tag before hull); otherwise the hull's first WORD, when it
+    clears the same length floor ``_slot_filter`` itself requires of a hull
+    prefix; otherwise the whole hull (rare — only when even its first word is
+    below that floor)."""
+    tag = _first_single_word_tag(member)
+    if tag:
+        return tag.lower()
+    hull = _command_hull(member, get_fit)
+    if not hull:
+        return ""
+    first_word = hull.split()[0] if hull.split() else hull
+    if len(first_word) >= _MIN_HULL_WORD_LEN:
+        return first_word.lower()
+    return hull.lower()
+
+
+def _chip_tooltip(hint, index, label, fit, is_default, availability_text) -> str:
+    """First line (when ``hint`` is non-empty): the exact fleet-chat command
+    for this refit. Then: the fit, its source and "default" joined by ``·``.
+    Then the market availability line for THIS refit, when a snapshot covered
+    it. ``hint`` is empty only when the whole slot has no real hull name to
+    offer — the command line is OMITTED rather than shown unresolvable."""
     parts = [label]
     source = _text(getattr(fit, "source", "")) if fit is not None else ""
     if source:
         parts.append(source)
     if is_default:
         parts.append("default")
-    lines = [" · ".join(parts)]
+    lines = [f"refit {hint} {index}"] if hint else []
+    lines.append(" · ".join(parts))
     if availability_text:
         lines.append(str(availability_text))
     return "\n".join(lines)
@@ -149,26 +230,30 @@ def _chip_tooltip(label, fit, is_default, availability_text) -> str:
 def chip_row(member, get_fit, availability: dict | None = None) -> list[RefitChip]:
     """The refit strip model for one member — ``[]`` for a plain member.
 
-    One chip per id in ``member.refits``, IN ORDER: ``[0]`` is the default and
-    ``member.fit_id`` is the active one. ``availability`` (optional) maps a fit
-    id to a ready-made market line, appended to that chip's tooltip.
+    One chip per id in ``member.refits``, IN ORDER: ``[0]`` is index 1 and the
+    default, and ``member.fit_id`` is the active one. ``availability``
+    (optional) maps a fit id to a ready-made market line, appended to that
+    chip's tooltip.
     """
     refits = _refits_of(member)
     if not refits:
         return []
     active_id = str(getattr(member, "fit_id", "") or "")
     avail = availability or {}
+    hint = _command_hint(member, get_fit)
     chips = []
-    for index, fit_id in enumerate(refits):
+    for index, fit_id in enumerate(refits, start=1):
         fit = _get(get_fit, fit_id)
         label = _fit_label(fit_id, fit)
-        is_default = index == 0
+        is_default = index == 1
         chips.append(RefitChip(
             fit_id=fit_id,
+            index=index,
             label=label,
             active=fit_id == active_id,
             is_default=is_default,
-            tooltip=_chip_tooltip(label, fit, is_default, avail.get(fit_id)),
+            tooltip=_chip_tooltip(hint, index, label, fit, is_default,
+                                  avail.get(fit_id)),
         ))
     return chips
 
@@ -202,6 +287,11 @@ def menu_spec(doctrine, get_fit) -> MenuSpec:
     is what tells the FC which Muninn row this is), or — for an untagged slot —
     with the active fit's name. Plain members are not listed and so never
     collide with anything.
+
+    Each entry's label carries its 1-based refit number ahead of the fit name
+    (``"1  Muninn Arty"``) — the same number the chip strip shows and
+    ``refit_command`` resolves for ``refit <slot> N`` — so ``build_refit_menu``
+    only has to prepend the active/inactive glyph.
     """
     slots = [m for m in _members(doctrine) if _refits_of(m)]
     hulls = [_slot_hull(m, get_fit) for m in slots]
@@ -215,8 +305,9 @@ def menu_spec(doctrine, get_fit) -> MenuSpec:
         if active_id != refits[0]:
             reset_enabled = True
         entries = tuple(
-            (fit_id, _fit_label(fit_id, _get(get_fit, fit_id)), fit_id == active_id)
-            for fit_id in refits
+            (fit_id, f"{index}  {_fit_label(fit_id, _get(get_fit, fit_id))}",
+             fit_id == active_id)
+            for index, fit_id in enumerate(refits, start=1)
         )
         label = hull
         if hull in clashing:
@@ -277,7 +368,7 @@ def _call(callback, *args):
 
 
 class RefitStrip(tk.Frame):
-    """The ``Refits: ● Muninn Arty ○ Muninn AC +`` sub-line of a member row.
+    """The ``Refits: 1 ● Muninn Arty 2 ○ Muninn AC +`` sub-line of a member row.
 
     Packed by the CALLER (the row owns its layout). Built once from a
     ``chip_row`` list; the Doctrines pane re-renders wholesale on every edit, so
@@ -369,7 +460,7 @@ class RefitStrip(tk.Frame):
         colours = self._palette_colours
         glyph = ACTIVE_GLYPH if chip.active else INACTIVE_GLYPH
         label = tk.Label(
-            self, text=f" {glyph} {chip.label} ", font=CHIP_FONT,
+            self, text=f" {chip.index} {glyph} {chip.label} ", font=CHIP_FONT,
             padx=_CHIP_PADX,
             # The active chip is inert, so it must NOT advertise a click.
             cursor="" if chip.active else "hand2",
