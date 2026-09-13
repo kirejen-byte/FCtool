@@ -15158,8 +15158,12 @@ class FCToolGUI:
         """Re-sync the composer's staging pill to the global default (config
         ``zkillboard.staging_system``) when it still holds the last auto-applied
         default — i.e. neither the user nor a template has set its own value.
-        Called on MOTD-tab show so a staging system configured (or changed) in
-        Settings after this tab was built is reflected without a restart.
+        Called (1) on MOTD-tab show, so a staging system configured before this
+        tab was ever built is reflected without a restart, and (2) from both
+        settings-write paths — ``_autosave_staging_system`` (autocomplete pick /
+        FocusOut) and the end of ``_save_settings`` (explicit Save) — so a
+        staging-system change made while the MOTD tab is already open is
+        reflected immediately instead of waiting on a fittings sub-tab switch.
 
         Never clobbers user/template input: only the FIRST ``staging_line`` pill
         whose name equals the remembered auto value is retargeted, and only when
@@ -30281,11 +30285,22 @@ class FCToolGUI:
         # to call unconditionally: it no-ops on an invalid path and on an
         # in-flight scan, and self.config was reloaded from disk just above.
         self._motd_scan_channels()
+        # Re-sync the MOTD composer's staging pill against the JUST-SAVED value.
+        # self.config was reloaded from disk above (line ~30243), and that
+        # reload carries the new staging_system because _save_config() wrote it
+        # to disk before the reload ran — so this reads the current value, not
+        # a stale in-memory one. No-ops when the pill is user/template-owned.
+        self._motd_sync_staging_default()
 
     def _autosave_staging_system(self, *args):
         val = self._staging_entry.get().strip()
         self.config.setdefault("zkillboard", {})["staging_system"] = val
         self._save_config()
+        # Settings' staging entry autosaves outside the main Save flow (select
+        # from the autocomplete, or FocusOut) — without this, the MOTD
+        # composer's staging pill only re-syncs on the next fittings sub-tab
+        # switch (see _motd_sync_staging_default's docstring).
+        self._motd_sync_staging_default()
 
     def _on_zkill_alert_sound_change(self, *args):
         """Persist the kill-alert sound pick immediately (mirrors
