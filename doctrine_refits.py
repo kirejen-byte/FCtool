@@ -51,16 +51,24 @@ ADD_GLYPH = "+"
 MISSING_LABEL = "(missing fit)"
 RESET_LABEL = "Reset refits to defaults"
 
+# Mirrors ``refit_command.MIN_HULL_PREFIX_LEN`` (same reasoning: below this a
+# hull-name word is a coin-flip). Kept as a LOCAL constant rather than an
+# import — this module is a leaf reused by the Doctrines/MOTD/Fleet panes and
+# must not pick up a dependency on the fleet-chat command engine to draw a
+# tooltip.
+_MIN_HULL_WORD_LEN = 3
+
 
 @dataclass(frozen=True)
 class RefitChip:
     """One chip in a member row's refit strip.
 
     ``index`` is the 1-based position in ``member.refits`` — ``refits[0]`` is
-    both index 1 and the default, by construction (never re-sorted). It is the
-    exact number an FC types in ``refit <slot> <index>`` (``refit_command.py``
-    resolves ``refits[N-1]``), so the chip, the ``Refits ▾`` menu and the
-    fleet-chat command always agree on what "2" means for a given slot.
+    both index 1 and the default. That is a POSITION in the stored list, not a
+    fixed identity: the store's ``set_default_refit`` ("Make default") moves a
+    fit to ``refits[0]``, renumbering every chip after it. The chip, the
+    ``Refits ▾`` menu and the fleet-chat command all read that same list, so
+    whatever it currently says, they always agree on what "2" means.
     """
     fit_id: str
     index: int
@@ -140,32 +148,80 @@ def _fit_label(fit_id, fit) -> str:
             or str(fit_id)[:8])
 
 
-def _command_hint(member, get_fit) -> str:
-    """The word an FC types after ``refit`` for this slot: the first tag,
-    lower-cased, else the active fit's hull name, lower-cased.
+def _first_single_word_tag(member) -> str:
+    """The first tag that is itself ONE word, or ``""``.
 
-    Mirrors ``refit_command._slot_filter``'s own precedence (an exact tag
-    match wins outright over a hull-name prefix) — this is not a second
-    opinion, it is the same rule stated for a tooltip instead of a chat
-    parser, so the string shown here is always one refit_command will
-    actually resolve back to this slot."""
-    tags = [t for t in (getattr(member, "tags", None) or []) if _text(t)]
-    if tags:
-        return _text(tags[0]).lower()
-    return _slot_hull(member, get_fit).lower()
+    ``refit_command`` reads only ``tokens[0]`` as a slot spec (§ the parser
+    splits on whitespace and treats one whitespace-delimited word as the
+    slot), so a multi-word tag like "Heavy Tackle" is not a thing an FC can
+    type as a single selector — it is skipped in favour of the next tag, or
+    the hull, rather than emitted as an unresolvable hint."""
+    for t in (getattr(member, "tags", None) or []):
+        text = _text(t)
+        if text and len(text.split()) == 1:
+            return text
+    return ""
+
+
+def _command_hull(member, get_fit) -> str:
+    """Hull name for the fleet-chat hint, degrading through the slot's refits
+    exactly as ``refit_command._slot_hull`` does: the ACTIVE fit's hull, else
+    the first refit (in order) whose fit resolves to a real hull name.
+
+    Deliberately NOT the module's own ``_slot_hull`` (used for the ``Refits ▾``
+    cascade label): that one shows ``(missing fit)`` rather than guess at a
+    label, because a wrong-looking cascade name is worse than an honest one.
+    Here the goal is a typable command, and ``refit_command`` itself would
+    already accept any of the slot's fits as identifying it — so the same
+    degrade is correct, not a guess. ``""`` when nothing in the slot has a
+    real hull name."""
+    for fid in [getattr(member, "fit_id", None)] + _refits_of(member):
+        if not fid:
+            continue
+        fit = _get(get_fit, fid)
+        hull = _text(getattr(fit, "hull_name", "")) if fit is not None else ""
+        if hull:
+            return hull
+    return ""
+
+
+def _command_hint(member, get_fit) -> str:
+    """The SINGLE token an FC types after ``refit`` for this slot — empty when
+    none exists (a missing/blank hull with no tag).
+
+    ``refit_command`` takes only the first whitespace-delimited token as a
+    slot spec, so a multi-word result is not typable as one thing: a
+    single-word tag wins outright (mirroring ``refit_command._slot_filter``'s
+    own precedence, tag before hull); otherwise the hull's first WORD, when it
+    clears the same length floor ``_slot_filter`` itself requires of a hull
+    prefix; otherwise the whole hull (rare — only when even its first word is
+    below that floor)."""
+    tag = _first_single_word_tag(member)
+    if tag:
+        return tag.lower()
+    hull = _command_hull(member, get_fit)
+    if not hull:
+        return ""
+    first_word = hull.split()[0] if hull.split() else hull
+    if len(first_word) >= _MIN_HULL_WORD_LEN:
+        return first_word.lower()
+    return hull.lower()
 
 
 def _chip_tooltip(hint, index, label, fit, is_default, availability_text) -> str:
-    """First line: the exact fleet-chat command for this refit. Second: the
-    fit, its source and "default" joined by ``·``. Then the market
-    availability line for THIS refit, when a snapshot covered it."""
+    """First line (when ``hint`` is non-empty): the exact fleet-chat command
+    for this refit. Then: the fit, its source and "default" joined by ``·``.
+    Then the market availability line for THIS refit, when a snapshot covered
+    it. ``hint`` is empty only when the whole slot has no real hull name to
+    offer — the command line is OMITTED rather than shown unresolvable."""
     parts = [label]
     source = _text(getattr(fit, "source", "")) if fit is not None else ""
     if source:
         parts.append(source)
     if is_default:
         parts.append("default")
-    lines = [f"refit {hint} {index}", " · ".join(parts)]
+    lines = [f"refit {hint} {index}"] if hint else []
+    lines.append(" · ".join(parts))
     if availability_text:
         lines.append(str(availability_text))
     return "\n".join(lines)
