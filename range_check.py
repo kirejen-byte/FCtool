@@ -142,8 +142,17 @@ log = get_logger(__name__)
 #: merge). Deliberately only these two keys — the toast hold and the per-sender
 #: cooldown are module constants, not config surface.
 DEFAULTS = {
-    "enabled": False,            # MASTER GATE — opt-in: it reacts to chat and
-                                 # draws over a client, so it starts OFF.
+    "enabled": True,             # MASTER GATE — ON by default (2026-09): it
+                                 # reacts only to the FC's OWN characters and
+                                 # draws over a client, same posture as
+                                 # `refit_command`/`ozone_watch` (both ON) —
+                                 # the owner wants it working out of the box.
+                                 # An install where the owner ever pressed
+                                 # Save in Settings has an explicit
+                                 # `range_check.enabled: false` PERSISTED
+                                 # (`_collect_range_check_settings` always
+                                 # writes the block) and keeps reading OFF —
+                                 # that is correct, not a bug; do not migrate it.
     "keyword": "range check",    # case-insensitive substring; BLANK = disabled
 }
 
@@ -160,7 +169,10 @@ def is_enabled(block) -> bool:
     the chat hookup must never re-derive it independently (that is how the
     implant reminder once shipped a ticked box over a feature that could not
     fire). Absent / ``None`` / malformed all inherit ``DEFAULTS['enabled']``
-    (False); never raises."""
+    (True); only an explicit, falsy ``enabled`` turns it off. Never raises.
+
+    An absent or malformed block reads as ARMED: the default is ON, so only
+    an explicit ``enabled: false`` disables the range check."""
     if not isinstance(block, dict):
         return bool(DEFAULTS["enabled"])
     return bool(block.get("enabled", DEFAULTS["enabled"]))

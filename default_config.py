@@ -259,19 +259,24 @@ DEFAULT_CONFIG = {
     # Blops, at JDC 5). Only the owner's OWN logged-in characters can trigger
     # it, so no fleet member can put a window on the owner's screen.
     #
-    # DEFAULT OFF, deliberately: it reacts to chat and draws over a live client,
-    # which is exactly the kind of surprise a user should opt into. While
-    # `enabled` is False the chat hook returns after ONE predicate call — no
-    # engine is built, no window is enumerated and no distance is computed.
+    # DEFAULT ON (2026-09): it reacts only to the owner's OWN logged-in
+    # characters and draws over a live client, the same posture as
+    # `refit_command`/`ozone_watch` (both ON) — the owner wants it working out
+    # of the box rather than opted into. While `enabled` is False the chat hook
+    # still returns after ONE predicate call — no engine is built, no window is
+    # enumerated and no distance is computed.
     #
     # A BLANK keyword disables the feature rather than matching every line, so
     # clearing the Settings field is a second, equivalent off switch. This block
     # is a key-for-key mirror of range_check.DEFAULTS (guarded by
     # tests/test_default_config.py) — fc_gui never names a default value itself,
     # and an existing config.json (never deep-merged) simply has no block, which
-    # range_check.is_enabled reads as "off".
+    # range_check.is_enabled reads as "on". An install where the owner ever
+    # pressed Save in Settings has an explicit `range_check.enabled: false`
+    # PERSISTED (`_collect_range_check_settings` always writes the block) and
+    # keeps reading OFF — that is correct behaviour, not a migration target.
     "range_check": {
-        "enabled": False,           # MASTER GATE (opt-in)
+        "enabled": True,            # MASTER GATE (on by default)
         "keyword": "range check",   # case-insensitive substring; BLANK = off
     },
     # Fleet-chat "refit" command (refit_command.py). Typing `refit <ship/role>
