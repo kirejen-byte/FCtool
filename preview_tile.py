@@ -522,6 +522,16 @@ class TileWindow:
         # can never be skipped.
         self._bottom_applied = None   # (text, color, size, w, body_h) or None
         self._location_applied = None # (text, color, size, w, body_h) or None
+        # The decloak BANNER has its own mirror: fc_gui's compose pass calls
+        # set_bottom_alert on EVERY tick for as long as the decloak window is
+        # live (seconds), and each call reconfigured the strip + the label and
+        # re-pushed the thumbnail rect — under Wine that repainted black over
+        # the preview child several times a second (field-reported flicker).
+        # Key = the WRITTEN values (drawn text, drawn font size, strip height)
+        # plus the tile geometry, so a resize or a re-fit always re-writes.
+        # Cleared by set_bottom_label (both the hide and the restore path) so
+        # the banner->normal restore can never be skipped, and by a TclError.
+        self._alert_applied = None    # (shown, drawn_size, strip_h, w, body_h)
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -740,7 +750,11 @@ class TileWindow:
         self._bottom_lbl = tk.Label(self._strip_bottom, text="", bg=bg_panel,
                                     fg=fg_text, anchor="w",
                                     font=("Consolas", 9, "bold"))
-        self._bottom_lbl.pack(side="left", fill="x", padx=(4, 4))
+        # expand=True so the label SPANS the strip: the normal activity label is
+        # anchor="w" (visually identical to the old left-packed label — the label
+        # bg matches the strip bg), while the decloak banner sets anchor="center"
+        # and is then centred across the whole tile width instead of hugging x=4.
+        self._bottom_lbl.pack(side="left", fill="x", expand=True, padx=(4, 4))
         self._bottom_visible = False   # True while the strip is packed/shown
         self._bottom_strip_h = STRIP_H  # last chosen (clamped) bottom-strip height
         self._bottom_alert = False     # True while the strip shows the decloak banner
@@ -2046,6 +2060,7 @@ class TileWindow:
                 self._push_thumb_rect()   # video reclaims the freed space
             self._bottom_alert = False    # strip is gone → no alert lingering
             self._bottom_applied = None   # nothing shown → next text must write
+            self._alert_applied = None    # ditto for the banner mirror
             return
         # ZERO-WRITE GUARD (see _bottom_applied): the compose pass re-pushes the
         # identical label for every tile on every ~250 ms tick. An unchanged push
@@ -2078,9 +2093,11 @@ class TileWindow:
         # Repaint back to the NORMAL panel bg (undo any prior hazard-yellow) and
         # clear the alert flag — this is the explicit banner->normal restore.
         self._bottom_alert = False
+        self._alert_applied = None        # a normal label always re-writes a banner
         try:
             self._strip_bottom.configure(height=strip_h, bg=self._bg_panel)
             self._bottom_lbl.configure(text=shown, fg=fill, bg=self._bg_panel,
+                                       anchor="w",
                                        font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
             self._bottom_applied = None   # never latch a failed write
@@ -2108,7 +2125,13 @@ class TileWindow:
 
         The compose pass calls this every tick while the decloak window is live;
         once the window expires it calls set_bottom_label (or set_bottom_label(''))
-        instead, which repaints the normal panel bg and clears the alert flag."""
+        instead, which repaints the normal panel bg and clears the alert flag.
+
+        ZERO-WRITE (see _alert_applied): because the compose pass re-pushes the
+        banner every ~250 ms tick for the whole decloak window, an UNCHANGED
+        banner must cost no widget configure and no _push_thumb_rect — the
+        repeated writes were repainting black over the preview child under
+        Wine (field-reported flicker)."""
         text = DECLOAK_BANNER_TEXT if not text else str(text)
         try:
             fsize = int(size) if size is not None else 9
@@ -2122,6 +2145,13 @@ class TileWindow:
         if self._body_h and self._body_h > 0:
             cap = max(STRIP_H, int(self._body_h * 0.40))
             strip_h = min(strip_h, cap)
+        # ZERO-WRITE GUARD (see _alert_applied): an unchanged re-push of the same
+        # banner on the same geometry costs NO widget configure and NO
+        # _push_thumb_rect. Placed before every state assignment below — in the
+        # unchanged case they are all already at these values anyway.
+        key = (shown, drawn_size, strip_h, self._w, self._body_h)
+        if self._bottom_visible and self._bottom_alert and key == self._alert_applied:
+            return
         self._bottom_strip_h = strip_h
         self._bottom_alert = True
         # The banner paints OVER the normal label; drop the zero-write mirror so
@@ -2129,10 +2159,15 @@ class TileWindow:
         self._bottom_applied = None
         try:
             self._strip_bottom.configure(height=strip_h, bg=_ALERT_BG)
+            # anchor="center": the banner is centred across the strip (the label
+            # spans it via expand=True), not left-hugging like the normal label.
             self._bottom_lbl.configure(text=shown, fg=_ALERT_FG, bg=_ALERT_BG,
+                                       anchor="center",
                                        font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
-            pass
+            self._alert_applied = None    # never latch a failed write
+        else:
+            self._alert_applied = key     # latch only AFTER the write succeeded
         if not self._bottom_visible:
             try:
                 self._strip_bottom.pack(side="bottom", fill="x")
