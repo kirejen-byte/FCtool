@@ -1176,6 +1176,24 @@ def _ozone_fill_cyno(info, generator_type_id, ozone, cfg):
     return cost
 
 
+def _preview_alert_border(peak_hex, started, now, steady):
+    """Pick this tick's damage/decloak border colour.
+
+    Windows keeps the ~2 Hz pulse (`preview_tile.pulse_color`) unchanged.
+    Under Wine (``steady`` True) the border holds at the flat PEAK colour
+    instead: TileWindow.set_border() only skips its Tk `configure` call when
+    the colour is UNCHANGED from the previous tick (its zero-write mirror),
+    so a pulsing value forces a real write -- and therefore a repaint of the
+    body frame -- every ~250 ms tick, which paints over the live X11 preview
+    child for one frame each time (field-confirmed 4x/s black flash during
+    damage/decloak alerts). A steady peak collapses those writes back down to
+    one, the same as every other unchanged-value tick.
+    """
+    if steady:
+        return peak_hex
+    return preview_tile.pulse_color(peak_hex, now - started, 0.5)
+
+
 class FCToolGUI:
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -22710,16 +22728,23 @@ class FCToolGUI:
                     # means the flash falls back to same-system-only.
                     _reach_map = getattr(self, "_preview_intel_reach", None)
                     _reach = _reach_map.get(key) if _reach_map else None
+                    # Wine-only: hold the alert border at the steady peak colour
+                    # instead of pulsing it (see _preview_alert_border) -- a new
+                    # colour every tick forces a repaint of the body frame over
+                    # the X11 preview child, which is what the pulse's 2 Hz was
+                    # flashing black. Windows (backend None) is byte-identical.
+                    _wine_steady = (getattr(self, "_preview_thumb_backend", None)
+                                    is not None)
                     if damaging:
                         peak = cfg.get("damage_flash_color", "#ff3b30")
                         started = self._preview_damage_since.get(key, now)
-                        tile.set_border(preview_tile.pulse_color(
-                            peak, now - started, 0.5))     # ~2 Hz soft pulse
+                        tile.set_border(_preview_alert_border(
+                            peak, started, now, _wine_steady))
                     elif decloaking:
                         peak = cfg.get("decloak_flash_color", "#ffcc00")
                         started = self._preview_decloak_since.get(key, now)
-                        tile.set_border(preview_tile.pulse_color(
-                            peak, now - started, 0.5))     # ~2 Hz soft yellow pulse
+                        tile.set_border(_preview_alert_border(
+                            peak, started, now, _wine_steady))
                     elif self._preview_should_flash(self._preview_intel, state, cfg,
                                                     time.monotonic(), reach=_reach):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
