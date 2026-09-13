@@ -1516,6 +1516,14 @@ class FCToolGUI:
         # not persisted (the intended incremental state). Any construction
         # failure (e.g. a ctypes hiccup) leaves the feature inert, not fatal.
         self._account_hint_cache = None
+        # Fit-height ON-default pin (owner refinement, 2026-09-13): MUST run
+        # before the first _preview_cfg() call anywhere in __init__ — that is
+        # the account_identity read two lines below this block, not the
+        # _preview_migrate_default_slots() call much later (~line 1560),
+        # which already runs after a _preview_cfg() call and so is too late a
+        # place for this one. See _preview_pin_fit_height_for_existing's
+        # docstring for what it protects and why it cannot use _preview_cfg().
+        self._preview_pin_fit_height_for_existing()
         try:
             self._account_map = eve_account.AccountMap(
                 win32=eve_account.real_win32(),
@@ -19640,13 +19648,20 @@ class FCToolGUI:
         # exactly fills the body and the black letterbox bands above and below it
         # disappear (see preview_layout.fit_body_h).
         # DEFAULT ON (owner decision, 2026-09-13): fresh installs get no black
-        # bars out of the box. An explicit saved `false` (a deliberate untick,
-        # or an existing config from before this change) is always respected —
-        # `_preview_cfg()` only materializes this default when the key is
-        # absent. The Settings "Fit height" CHECKBUTTON is the toggle; ticking
-        # it fits everything NOW, after which tiles that attach later fit
-        # themselves within ~2 s. Unticking it stops the auto-fit and hands
-        # corner-dragged heights back (it was a one-way door until then).
+        # bars out of the box. An explicit saved `false` (a deliberate untick)
+        # is always respected — `_preview_cfg()` only materializes this
+        # default when the key is absent. REFINED same day: the ON default
+        # must reach only setups without live native previews already —
+        # `_preview_pin_fit_height_for_existing()` (called at startup, before
+        # this default can ever materialize) writes an explicit `False` for
+        # any existing config already running native mode, so an upgrading
+        # user's tile heights never move out from under them; a fresh config,
+        # or one that turns native mode on for the FIRST time after this
+        # change, still gets True here. The Settings "Fit height" CHECKBUTTON
+        # is the toggle either way; ticking it fits everything NOW, after
+        # which tiles that attach later fit themselves within ~2 s. Unticking
+        # it stops the auto-fit and hands corner-dragged heights back (it was
+        # a one-way door until then).
         "fit_height": True,
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
@@ -28289,6 +28304,46 @@ class FCToolGUI:
                     if isinstance(entry, (list, tuple)) and len(entry) >= width:
                         block[slot] = list(entry)
                         break               # first answerable member wins
+
+    def _preview_pin_fit_height_for_existing(self):
+        """One-time pin (owner refinement, 2026-09-13): the `fit_height`
+        default flip (False -> True, see `_PREVIEW_DEFAULTS`) must reach ONLY
+        setups that never had it running — a user whose native FCPreview
+        tiles are already live keeps their EXACT current behavior; nothing
+        changes for them "from now on" means fresh setups only, not upgrades.
+
+        Reads the RAW `config["preview"]` dict WITHOUT going through
+        `_preview_cfg()` — that call materializes every `_PREVIEW_DEFAULTS`
+        key (including the new `fit_height: True`) into any config missing
+        it, which would destroy the exact evidence ("was this key ever
+        absent?") this method exists to check. Must therefore run BEFORE the
+        FIRST `_preview_cfg()` call anywhere in `__init__` — unlike
+        `_preview_migrate_default_slots` below (which runs fine after one,
+        since it only cares about explicit True/False, already-migrated
+        state), this call sits much earlier in `__init__`, right before the
+        AccountMap block whose `account_identity` read is that first call.
+
+        Pins (writes `fit_height = False`) only when ALL of: a preview block
+        already exists (a fresh install has none — nothing to protect), the
+        key was never explicitly saved (an explicit True or False, from
+        before or after this change, is left alone), and `mode == "native"`
+        (the only mode where a tile actually has a height on screen to
+        disturb — `off`/`eveo_labels` users gain nothing to protect and get
+        the new True default like a fresh install, the moment they ever
+        switch to native). No migration-marker key is needed: the key this
+        writes is the exact key it checks for absence, so a second call finds
+        the key present and does nothing — idempotent by construction, same
+        end-state guarantee as `_preview_migrate_default_slots`'s marker,
+        without one."""
+        pcfg = self.config.get("preview")
+        if not isinstance(pcfg, dict):
+            return
+        if "fit_height" in pcfg:
+            return
+        if pcfg.get("mode") != "native":
+            return
+        pcfg["fit_height"] = False
+        self._save_config()
 
     def _preview_migrate_default_slots(self):
         """One-time migration flipping `account_slots` / `account_slots_auto`
