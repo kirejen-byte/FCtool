@@ -1516,14 +1516,20 @@ class FCToolGUI:
         # not persisted (the intended incremental state). Any construction
         # failure (e.g. a ctypes hiccup) leaves the feature inert, not fatal.
         self._account_hint_cache = None
-        # Fit-height ON-default pin (owner refinement, 2026-09-13): MUST run
-        # before the first _preview_cfg() call anywhere in __init__ — that is
-        # the account_identity read two lines below this block, not the
-        # _preview_migrate_default_slots() call much later (~line 1560),
-        # which already runs after a _preview_cfg() call and so is too late a
-        # place for this one. See _preview_pin_fit_height_for_existing's
-        # docstring for what it protects and why it cannot use _preview_cfg().
-        self._preview_pin_fit_height_for_existing()
+        # Fit-height default migration (owner refinement, 2026-09-13): MUST
+        # run before the first call to `_preview_cfg` (no-parens, to dodge a
+        # self-referential text match in the ordering-guard test) anywhere in
+        # `__init__`. The first TEXTUAL one is the `aliases=lambda:` closure
+        # just below (deferred, not executed here); the first UNCONDITIONALLY
+        # EXECUTED one is the `account_identity` read a few lines further
+        # down. Either way this call has to come first — unlike
+        # `_preview_migrate_default_slots` below (which runs fine after one,
+        # since it only cares about explicit True/False, already-migrated
+        # state), this one needs to see the RAW config before that method can
+        # materialize anything into it. See
+        # `_preview_migrate_fit_height_default`'s docstring for what it
+        # protects and why it cannot go through the usual accessor.
+        self._preview_migrate_fit_height_default()
         try:
             self._account_map = eve_account.AccountMap(
                 win32=eve_account.real_win32(),
@@ -19648,20 +19654,31 @@ class FCToolGUI:
         # exactly fills the body and the black letterbox bands above and below it
         # disappear (see preview_layout.fit_body_h).
         # DEFAULT ON (owner decision, 2026-09-13): fresh installs get no black
-        # bars out of the box. An explicit saved `false` (a deliberate untick)
-        # is always respected — `_preview_cfg()` only materializes this
-        # default when the key is absent. REFINED same day: the ON default
-        # must reach only setups without live native previews already —
-        # `_preview_pin_fit_height_for_existing()` (called at startup, before
-        # this default can ever materialize) writes an explicit `False` for
-        # any existing config already running native mode, so an upgrading
-        # user's tile heights never move out from under them; a fresh config,
-        # or one that turns native mode on for the FIRST time after this
-        # change, still gets True here. The Settings "Fit height" CHECKBUTTON
-        # is the toggle either way; ticking it fits everything NOW, after
-        # which tiles that attach later fit themselves within ~2 s. Unticking
-        # it stops the auto-fit and hands corner-dragged heights back (it was
-        # a one-way door until then).
+        # bars out of the box. REFINED same day: this default must reach only
+        # setups that are NOT running native previews TODAY — an existing
+        # user with native tiles up keeps their exact current behavior, and
+        # everyone else (off/eveo_labels users, and brand-new installs) gets
+        # the new default the moment they turn native previews on.
+        # `_preview_migrate_fit_height_default()` (called once at startup,
+        # before this default can ever materialize) does the actual
+        # decision-preserving: for an existing config already in native mode
+        # it pins whatever the box effectively read as before (True/False
+        # left alone; absent -> False, the OLD default's value); for
+        # off/eveo_labels/no-mode configs it writes True outright, because
+        # any stored `false` there was `_preview_cfg()`'s OLD default being
+        # persisted on every startup since v5.0.0 — never a choice made with
+        # a native tile actually on screen. Gated on the `fit_height_migrated`
+        # marker (same shape as `account_slots_migrated`) so it runs exactly
+        # once; a config with no `preview` block at all (fresh install) is
+        # left untouched and gets this default straight from `_preview_cfg()`
+        # the first time anything reads it. Accepted edge: a user who
+        # deliberately unticked Fit height in native mode and then switched
+        # to off/eveo BEFORE upgrading gets True once on this migration and
+        # can untick it again. The Settings "Fit height" CHECKBUTTON is the
+        # toggle either way; ticking it fits everything NOW, after which
+        # tiles that attach later fit themselves within ~2 s. Unticking it
+        # stops the auto-fit and hands corner-dragged heights back (it was a
+        # one-way door until then).
         "fit_height": True,
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
@@ -28305,44 +28322,74 @@ class FCToolGUI:
                         block[slot] = list(entry)
                         break               # first answerable member wins
 
-    def _preview_pin_fit_height_for_existing(self):
-        """One-time pin (owner refinement, 2026-09-13): the `fit_height`
-        default flip (False -> True, see `_PREVIEW_DEFAULTS`) must reach ONLY
-        setups that never had it running — a user whose native FCPreview
-        tiles are already live keeps their EXACT current behavior; nothing
-        changes for them "from now on" means fresh setups only, not upgrades.
+    def _preview_migrate_fit_height_default(self):
+        """One-time migration (owner refinement, 2026-09-13, renamed from the
+        first cut's `_preview_pin_fit_height_for_existing`): the `fit_height`
+        default flip (False -> True, see `_PREVIEW_DEFAULTS`) must reach only
+        users who are NOT running native previews TODAY — someone with native
+        tiles already up keeps their exact current behavior; everyone else
+        (off/eveo_labels users, and fresh installs) gets the new default the
+        first time it matters to them.
+
+        FIRST-CUT BUG this replaced: an absence-check ("pin False only if the
+        key was never saved") looks right but isn't, because `_preview_cfg()`
+        has materialized AND persisted every `_PREVIEW_DEFAULTS` key —
+        including the OLD `fit_height: False` — into every saved config since
+        v5.0.0. So an existing off/eveo_labels user's config already carries
+        an explicit `"fit_height": false` that THEY never chose; an
+        absence-check would leave it alone forever, and the day they finally
+        turn native previews on they would silently get black bars, exactly
+        the outcome the owner ON-by-default decision meant for them to avoid.
+        A stored value is therefore not enough signal by itself — MODE is
+        what actually distinguishes "a real choice with a tile on screen"
+        from "the old default riding along for years unread."
 
         Reads the RAW `config["preview"]` dict WITHOUT going through
-        `_preview_cfg()` — that call materializes every `_PREVIEW_DEFAULTS`
-        key (including the new `fit_height: True`) into any config missing
-        it, which would destroy the exact evidence ("was this key ever
-        absent?") this method exists to check. Must therefore run BEFORE the
-        FIRST `_preview_cfg()` call anywhere in `__init__` — unlike
-        `_preview_migrate_default_slots` below (which runs fine after one,
-        since it only cares about explicit True/False, already-migrated
-        state), this call sits much earlier in `__init__`, right before the
-        AccountMap block whose `account_identity` read is that first call.
+        `_preview_cfg()` — that call would materialize+persist the new
+        default before this method could tell whether a native user's
+        current value was a real choice or the old default's echo. Must
+        therefore run BEFORE the FIRST `_preview_cfg()` call anywhere in
+        `__init__` (see the call site's comment for exactly which call that
+        is).
 
-        Pins (writes `fit_height = False`) only when ALL of: a preview block
-        already exists (a fresh install has none — nothing to protect), the
-        key was never explicitly saved (an explicit True or False, from
-        before or after this change, is left alone), and `mode == "native"`
-        (the only mode where a tile actually has a height on screen to
-        disturb — `off`/`eveo_labels` users gain nothing to protect and get
-        the new True default like a fresh install, the moment they ever
-        switch to native). No migration-marker key is needed: the key this
-        writes is the exact key it checks for absence, so a second call finds
-        the key present and does nothing — idempotent by construction, same
-        end-state guarantee as `_preview_migrate_default_slots`'s marker,
-        without one."""
+        Gated on the `fit_height_migrated` marker — the same shape as
+        `account_slots_migrated` on `_preview_migrate_default_slots` below,
+        deliberately NOT in `_PREVIEW_DEFAULTS` (a default would materialize
+        it into every config and the gate, which fires on its ABSENCE, would
+        never run) — so it runs EXACTLY ONCE per config, and a later
+        deliberate untick (or re-tick) is never re-migrated.
+
+        Decision table, run once:
+          - No `preview` block at all (fresh install): untouched, no marker
+            written — nothing to protect yet, and `_preview_cfg()` fills the
+            new True default the first time anything reads the block.
+          - `mode == "native"`: a tile already has a height on screen to
+            disturb, so today's effective value is preserved EXACTLY —
+            explicit True or False is left alone; an absent key is pinned to
+            False (the old default's value, i.e. what the user has actually
+            been living with).
+          - Anything else (`off`, `eveo_labels`, or a block with no `mode`):
+            no tile exists to disturb, so any stored value here — including
+            an explicit `false` — is the OLD default's echo, never a real
+            choice; this migration WRITES True outright, adopting the new
+            default for them.
+        Accepted edge (documented, not fixed): a user who deliberately
+        unticked Fit height while in native mode and then switched to
+        off/eveo_labels BEFORE upgrading to this build gets True once here
+        (indistinguishable from the old-default-echo case) and can untick it
+        again — a one-time, reversible nit, not a silent resize of a live
+        tile."""
         pcfg = self.config.get("preview")
         if not isinstance(pcfg, dict):
             return
-        if "fit_height" in pcfg:
+        if pcfg.get("fit_height_migrated"):
             return
-        if pcfg.get("mode") != "native":
-            return
-        pcfg["fit_height"] = False
+        if pcfg.get("mode") == "native":
+            if "fit_height" not in pcfg:
+                pcfg["fit_height"] = False
+        else:
+            pcfg["fit_height"] = True
+        pcfg["fit_height_migrated"] = True
         self._save_config()
 
     def _preview_migrate_default_slots(self):
