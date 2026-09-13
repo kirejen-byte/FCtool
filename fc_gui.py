@@ -1412,6 +1412,10 @@ class FCToolGUI:
         self._overlay = None
         self._overlay_states: dict = {}        # name_lower -> CharState (poller)
         self._overlay_state_ts: dict = {}      # name_lower -> monotonic fetch ts
+        # name_lower -> monotonic "do not re-ask /fleet/ before" stamp, set by
+        # a 404 (not in a fleet). POLLER-THREAD ONLY (written and read in
+        # _overlay_build_state); see _OVERLAY_FLEET_404_BACKOFF.
+        self._overlay_fleet_retry_at: dict = {}
         self._overlay_after_id = None
         self._overlay_poller = None            # Phase 2 daemon thread
         self._overlay_poller_stop = None       # threading.Event while running
@@ -19558,6 +19562,12 @@ class FCToolGUI:
     # shows the character changed systems since the prior pass, and always
     # on a character's first pass (no prior state yet).
     _OVERLAY_SHIP_EVERY_N = 3        # fetch ship every Nth locship pass
+    # A pilot who is not in a fleet 404s forever; re-asking on the ~30 s ship
+    # cadence spends ESI's shared error budget (~100 non-2xx / 60 s; a 420
+    # blocks ALL routes) for a chip that cannot appear. After a 404, don't
+    # re-ask that character for this long -- joining a fleet still lights the
+    # chip within ~2 min.
+    _OVERLAY_FLEET_404_BACKOFF = 120.0
 
     # ── Native preview hotkey responsiveness ───────────────────────────────
     # The native tick (250 ms with tiles, 2 s idle-probe) is far too coarse to
@@ -22857,6 +22867,7 @@ class FCToolGUI:
         self._overlay_stop_poller()
         self._overlay_states = {}
         self._overlay_state_ts = {}
+        self._overlay_fleet_retry_at = {}     # 404 backoff is session state too
         self._preview_layer_hp = {}
         self._preview_intel_reach = {}        # poller-written balls die with it
         # Which window belonged to which account is session state by design:
@@ -22940,6 +22951,7 @@ class FCToolGUI:
         self._overlay_stop_poller()
         self._overlay_states = {}
         self._overlay_state_ts = {}
+        self._overlay_fleet_retry_at = {}     # 404 backoff is session state too
         if self._overlay is not None:
             try:
                 self._overlay.set_labels([])
@@ -23054,15 +23066,52 @@ class FCToolGUI:
         # status (or a fault, or an auth without the seam) keeps the prior
         # value so a transient ESI error never blinks the chip off. No scope =
         # never call, chip stays empty.
+        #
+        # FIRST the FEATURE GATE -- the _preview_implant_refresh shape: native
+        # FCPreview mode AND the chip ticked, because the OFF feature must
+        # never pay the ESI budget (the chip's only consumer is the native
+        # caption pass). Gated off, `fleet_role` keeps its PRIOR value rather
+        # than clearing: nothing is drawing it, and re-clearing would only buy
+        # a blink when the box is re-ticked. A host with no `_preview_cfg` at
+        # all (the bare SimpleNamespace unit hosts) has no gate to read and
+        # falls through to the fetch -- the implant hook's own fail-soft.
+        # THEN the 404 backoff: a pilot who is not in a fleet answers 404 on
+        # every ship pass forever (~3/char/min, since `force_ship` is True on
+        # every online pass too), and ESI's error limit is ~100 non-2xx per
+        # 60 s across ALL routes. `_overlay_fleet_retry_at` is a poller-thread
+        # -only dict keyed by the same `key`; a 200 clears the entry, and any
+        # OTHER status or fault sets nothing, so a transient error retries on
+        # the normal cadence. Finally the character_id guard every sibling ESI
+        # method in esi_auth.py carries: a missing id would ask for
+        # /characters/None/fleet/, 404, and back off for nothing.
         if do_ship:
             try:
-                if auth.has_scope(_FLEET_SCOPE):
-                    body, status, _fhdrs = auth.esi_get_ex(
-                        f"/characters/{auth.character_id}/fleet/")
-                    if status == 200 and isinstance(body, dict):
-                        fleet_role = str(body.get("role") or "")
-                    elif status == 404:
-                        fleet_role = ""
+                gate_on = True
+                cfg_fn = getattr(self, "_preview_cfg", None)
+                if cfg_fn is not None:
+                    pcfg = cfg_fn()
+                    gate_on = (pcfg.get("mode") == "native" and bool(
+                        pcfg.get("show_role_chip",
+                                 FCToolGUI._PREVIEW_DEFAULTS["show_role_chip"])))
+                cid = getattr(auth, "character_id", None)
+                if gate_on and cid:
+                    retry_at = getattr(self, "_overlay_fleet_retry_at", None)
+                    if retry_at is None:
+                        retry_at = {}
+                        self._overlay_fleet_retry_at = retry_at
+                    now_fleet = time.monotonic()
+                    if (now_fleet >= retry_at.get(key, 0.0)
+                            and auth.has_scope(_FLEET_SCOPE)):
+                        body, status, _fhdrs = auth.esi_get_ex(
+                            f"/characters/{cid}/fleet/")
+                        if status == 200 and isinstance(body, dict):
+                            fleet_role = str(body.get("role") or "")
+                            retry_at.pop(key, None)
+                        elif status == 404:
+                            fleet_role = ""
+                            retry_at[key] = (
+                                now_fleet
+                                + FCToolGUI._OVERLAY_FLEET_404_BACKOFF)
             except Exception:
                 pass
         # Base layer HP for the damage-flash reference pool. Cached in
