@@ -74,14 +74,19 @@ def parse_hotkey(text: str) -> tuple[int, int]:
     if key not in _VK:
         raise ValueError(f"unknown key {key!r} in {text!r}")
     vk = _VK[key]
-    # MEASURED 2026-09-13: with NumLock on, holding Shift over a numpad key
-    # makes Windows send the NAV-cluster VK code instead of VK_NUMPAD*/
-    # VK_DECIMAL (the historical "Shift temporarily cancels NumLock" numpad
-    # behavior) — so RegisterHotKey(MOD_SHIFT, VK_NUMPAD*) can never fire.
-    # Control/Alt are unaffected and stay allowed.
-    if 0x60 <= vk <= 0x6F and mods & MOD_SHIFT:
+    # MEASURED 2026-09-13 (scancode injection): with NumLock on, holding
+    # Shift over a numpad DIGIT or Numpad. makes Windows send the
+    # NAV-cluster VK code instead of VK_NUMPAD*/VK_DECIMAL (the historical
+    # "Shift temporarily cancels NumLock" behavior) — with the Shift bit
+    # itself STRIPPED from the event — so RegisterHotKey(MOD_SHIFT,
+    # VK_NUMPAD*/VK_DECIMAL) can never fire. The operator keys (+ - * /) are
+    # NOT NumLock-multiplexed and are unaffected: Shift+NumpadAdd delivers
+    # VK_ADD with the Shift bit SET, same as any other key, so only digits
+    # and Decimal are rejected here. Control/Alt are unaffected for all of
+    # them and stay allowed.
+    if (vk in range(0x60, 0x6A) or vk == 0x6E) and mods & MOD_SHIFT:
         raise ValueError(
-            "Shift cannot be combined with a numpad key "
+            "Shift cannot be combined with a numpad digit or Numpad. "
             "(Windows sends the navigation keys instead)")
     return (mods, vk)
 
@@ -102,11 +107,18 @@ _EVENT_KEYSYMS = {
 # Windows Tk `event.state` "extended key" bit. MEASURED 2026-09-13 (real
 # win32 key events injected into a live Tk 8.6.15 root, py3.12 + py3.13): SET
 # on the dedicated main-block nav cluster (Home/End/PageUp/PageDown/arrows/
-# Insert/Delete) and on the right-hand Ctrl/Alt/Enter; CLEAR when the
-# identical keysym+keycode pair instead comes from the numpad with NumLock
-# off (numpad-7-as-Home sends keysym "Home", keycode 0x24 — same as the real
-# Home key — with this bit clear). It is the ONLY discriminator between the
-# two; keysym and keycode alone are ambiguous.
+# Insert/Delete) — and also SET on numpad `/` (VK_DIVIDE, 0x6F) and numpad
+# Enter (VK_RETURN, 0x0D) even though those originate from the numpad, so
+# this bit alone does not mean "not the numpad" in general, only for the
+# nav-cluster VK codes below. (Right-hand Ctrl/Alt/Enter are documented
+# Windows E0-scancode keys and would be expected to behave the same way —
+# not independently measured here.) CLEAR when a nav-cluster keysym+keycode
+# pair instead comes from the numpad with NumLock off (numpad-7-as-Home
+# sends keysym "Home", keycode 0x24 — same as the real Home key — with this
+# bit clear; numpad-5-as-Clear sends keysym "Clear", keycode 0x0C, with no
+# main-block equivalent at all). Within `_NUMPAD_NAV_VKS` it is the ONLY
+# discriminator between the dedicated main-block key and the numpad's
+# NumLock-off alias; keysym and keycode alone are ambiguous there.
 _EXTENDED_KEY = 0x40000
 
 # Numpad digit VK codes reachable via `event.keycode` (NumLock on; see the
@@ -201,18 +213,19 @@ def capture_hint(keysym: str, state: int = 0, keycode: "int | None" = None) -> s
     `state`/`keycode` default so existing (keysym-only) callers still get the
     generic message. When `keycode` names one of the numpad-shared nav VK
     codes (_NUMPAD_NAV_VKS) AND the extended bit is clear — i.e. event_to_hotkey
-    rejected this as a numpad key pressed with NumLock off — give a targeted
-    nudge instead of the generic "not a usable hotkey" line. (Shift is called
-    out in the message too: Windows is documented to substitute the same
-    nav-cluster VK codes when Shift is held over a numpad key even with
-    NumLock on — see parse_hotkey's Shift+numpad rejection — so a capture
-    landing here from that path gets the same actionable wording; this
-    inference was not independently re-measured the way the plain
-    NumLock-off case was.)"""
+    rejected this as a numpad DIGIT or Numpad. pressed with NumLock off (the
+    operator keys +-*/ never land in _NUMPAD_NAV_VKS, since they aren't
+    NumLock-multiplexed) — give a targeted nudge instead of the generic
+    "not a usable hotkey" line. Shift is called out too: Windows substitutes
+    this same nav-cluster VK the moment Shift is held over a numpad digit or
+    Numpad. even with NumLock on — see parse_hotkey's narrower Shift
+    rejection — so a capture landing here from that path gets the same
+    actionable wording; that Shift inference was not independently
+    re-measured the way the plain NumLock-off case was."""
     if (keycode is not None and keycode in _NUMPAD_NAV_VKS
             and not (state & _EXTENDED_KEY)):
-        return ("numpad keys work as hotkeys only with NumLock on and "
-                "without Shift; turn NumLock on and press again.")
+        return ("numpad digits and Numpad. work as hotkeys only with NumLock "
+                "on and without Shift; turn NumLock on and press again.")
     return f"'{keysym}' is not a usable hotkey — try again."
 
 
