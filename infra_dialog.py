@@ -43,7 +43,7 @@ from ui_theme import (
 )
 # Shared hover-tooltip helper (also a stdlib-only leaf) — replaces this dialog's
 # former bespoke ``_Tooltip`` class (OPTIMIZATION_REVIEW.md D9 dedupe).
-from ui_helpers import attach_tooltip
+from ui_helpers import attach_tooltip, center_over
 
 # Tree columns (order is the display order) and their header labels.
 #
@@ -179,6 +179,11 @@ class InfraManagerDialog(tk.Toplevel):
         self._build_toolbar()      # row 0
         self._build_body()         # row 1 (region panel + tree)
         self._build_statusbar()    # row 2
+
+        # Over the tool that opened it. ``geometry("980x560")`` above asks for a
+        # SIZE and no position, so without this Windows cascades the window --
+        # on a multi-monitor layout, into a corner nowhere near the app.
+        center_over(self, parent)
 
         self._search_var.trace_add("write", lambda *_a: self._apply_filter())
         self._reload_tree()
@@ -455,7 +460,7 @@ class InfraManagerDialog(tk.Toplevel):
         if not messagebox.askyesno(
                 "Delete structures",
                 f"Delete {count} structure{'s' if count != 1 else ''} from "
-                "the local database?"):
+                "the local database?", parent=self):
             return
         try:
             n = self.store.remove(keys)
@@ -476,7 +481,8 @@ class InfraManagerDialog(tk.Toplevel):
         count = len(keys)
         if not messagebox.askyesno(
                 "Mark dead",
-                f"Mark {count} structure{'s' if count != 1 else ''} dead?"):
+                f"Mark {count} structure{'s' if count != 1 else ''} dead?",
+                parent=self):
             return
         for k in keys:
             try:
@@ -636,6 +642,7 @@ class InfraManagerDialog(tk.Toplevel):
                    command=self._confirm_import).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=self._close_preview).pack(side=tk.RIGHT)
+        center_over(win, self)          # over the manager, not a screen corner
 
     def _confirm_import(self):
         text = getattr(self, "_preview_text", "")
@@ -699,6 +706,7 @@ class InfraManagerDialog(tk.Toplevel):
                    command=self._submit_manual).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.RIGHT)
+        center_over(win, self)          # over the manager, not a screen corner
 
     def _submit_manual(self):
         name = (self._manual_name_var.get() or "").strip()
@@ -773,6 +781,7 @@ class InfraManagerDialog(tk.Toplevel):
                    command=self._save_edit).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(btns, text="Cancel", style="Dark.TButton",
                    command=win.destroy).pack(side=tk.RIGHT)
+        center_over(win, self)          # over the manager, not a screen corner
 
     def _save_edit(self):
         entry = getattr(self, "_edit_entry", None)
