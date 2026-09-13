@@ -49,6 +49,7 @@ from ui_theme import (
 # (it carried the <Destroy> leak fix); the local name now aliases it so every
 # call site — and the ``_tooltip_text`` stash the tests assert — is unchanged.
 from ui_helpers import attach_tooltip as _attach_tooltip
+from ui_helpers import center_over
 
 _FONT = ("Consolas", 9)
 _FONT_SM = ("Consolas", 8)
@@ -166,6 +167,21 @@ def _fmt_iso(s) -> str:
         return datetime.fromisoformat(str(s)).strftime("%m-%d %H:%M")
     except (ValueError, TypeError):
         return str(s)
+
+
+def _owner_window(widget):
+    """The toplevel ``widget`` lives in, or ``widget`` itself if it has none.
+
+    This tab is a ``tk.Frame``: its ``winfo_geometry()`` is measured against its
+    own master, so handing it straight to ``ui_helpers.center_over`` would
+    centre a dialog on a rect near the screen origin -- the very corner the
+    centring exists to stop using. The main window is the honest parent.
+    Degrades to the widget for a stub host with no ``winfo_toplevel``.
+    """
+    try:
+        return widget.winfo_toplevel()
+    except Exception:
+        return widget
 
 
 # Baked-in explanation of why distribution is a stage-then-import-in-game dance
@@ -818,6 +834,11 @@ class OverviewTab(tk.Frame):
                                               padx=12, pady=12)
         ttk.Button(win, text="Close", style="Dark.TButton",
                    command=win.destroy).pack(pady=(0, 10))
+        # Over the tool, not wherever Windows cascades it. The centring owner
+        # measures the PARENT WINDOW, so hand it the toplevel: ``self`` is a
+        # Frame, whose winfo_geometry() is relative to its own master and would
+        # place this dialog near the screen origin.
+        center_over(win, _owner_window(self))
 
     # ── distribution: nickname / mark-imported / staged status ─────────────────
     def _save_nickname(self, account_id, value) -> None:

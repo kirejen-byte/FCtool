@@ -144,7 +144,7 @@ import ui_theme
 from app_path import bundle_dir
 from info_tile import STRIP_H as TILE_STRIP_H
 from info_tile import InfoTileWindow
-from ui_helpers import attach_tooltip, update_tooltip
+from ui_helpers import attach_tooltip, center_over, update_tooltip
 
 log = logging.getLogger(__name__)
 
@@ -4665,6 +4665,16 @@ def open_hud_settings(root, controller, host):
         variables[name].trace_add("write", handler)
     for key in TILE_SPECS:
         variables[f"tile_{key}"].trace_add("write", apply_tile(key))
+
+    # Place it over the tool, exactly once -- at the END of the build, so the
+    # window has its real size to centre (2026-09-12: the owner reported this
+    # popup still opening in the top-left corner; the centring pass that day
+    # covered fc_gui's own dialogs only, and this one lives here).
+    # ``make_modal`` is still deliberately not used (it would grab), so the
+    # placement helper is called directly -- it is the ONE placement owner.
+    # FIRST BUILD ONLY: the singleton re-open path above returns before this,
+    # so a window the user has dragged somewhere is never yanked back.
+    center_over(win, root)
 
     _SETTINGS_WINDOW = win
     return win
