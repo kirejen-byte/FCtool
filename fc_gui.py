@@ -146,6 +146,15 @@ import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
 from preview_tile import TileWindow
+# Linux (Proton/Wine) previews. Wine's dwmapi is a permanent E_NOTIMPL stub, so
+# under Wine the tiles' `dwm=` seam is handed a native X11 backend instead:
+# wine_detect reports the runtime facts (is_wine, unix paths, HWND -> X window
+# id) and x11_thumbs owns the helper process, the control channel and the
+# backend duck type. Both are INERT on Windows -- is_wine() is False there, so
+# make_backend is never called and every tile keeps getting dwm=None (the real
+# DWM singleton). Neither module imports Tk or fc_gui.
+import wine_detect
+import x11_thumbs
 # FC HUD info tiles — the preview tiles' content-carrying cousins (own chrome in
 # info_tile.py, engine + settings popup in info_tiles.py). Both modules are
 # fc_gui-free: everything they need arrives through the HudHost seams built in
@@ -1562,6 +1571,12 @@ class FCToolGUI:
         # ── Hide rules / per-char selection (Task C2) ───────────────────────
         self._preview_lost_focus_since = None  # tick_count focus was first lost (or None)
         self._preview_win32 = None             # foreground backend; None → lazy real singleton
+        # Thumbnail backend for the tiles' `dwm=` seam. None → dwm_thumbs' real
+        # DWM singleton, which is the Windows answer and the only one there.
+        # _preview_enable_native swaps in an X11ThumbBackend when (and only
+        # when) this process is running under Wine.
+        self._preview_thumb_backend = None     # injectable; None -> DWM
+        self._preview_backend_factory = x11_thumbs.make_backend  # injectable
         # Monitor pinning injectable backends (None → lazy real singletons).
         self._preview_monitor_win32 = None     # monitor enumeration (monitor_pin)
         self._preview_move_win32 = None        # window-move backend (window_activator)
@@ -19739,6 +19754,15 @@ class FCToolGUI:
         # is an explicit user override that wins over auto-detection (for friends
         # whose Documents/OneDrive layout the auto-detect ladder misses).
         "gamelogs_path": "",
+        # ── Linux (Proton/Wine) previews ────────────────────────────────────
+        # Read ONLY when this process is running under Wine; on Windows all
+        # three are inert. "auto" = start the native X11 helper when a Unix
+        # python3 is reachable, "off" = never start it (stay on DWM and let the
+        # tiles strand, which is today's Linux behaviour).
+        "linux_backend": "auto",     # "auto" | "off"
+        "linux_fps_cap": 30,         # per-thumbnail composite ceiling (damage-driven)
+        "linux_heartbeat_ms": 500,   # unconditional recomposite; repairs Wine's
+                                     # IncludeInferiors flushes over the child window
     }
 
     def _account_char_hint(self, account_id):
@@ -20175,6 +20199,12 @@ class FCToolGUI:
 
         tile = TileWindow(
             self.root, char_key, self._preview_palette(),
+            # Thumbnail backend. None (Windows, and Wine with the helper off)
+            # means dwm_thumbs' real DWM singleton -- the pre-feature path, byte
+            # for byte. getattr, not a plain attribute read: several harness
+            # hosts bind this method onto a SimpleNamespace that never ran
+            # __init__.
+            dwm=getattr(self, "_preview_thumb_backend", None),
             on_activate=lambda k, h=src_hwnd: self._preview_on_tile_activate(k, h),
             on_minimize=lambda k, h=src_hwnd: self._preview_on_tile_minimize(k, h),
             # Move/resize write-backs: pass the hwnd like activate/minimize/exclude
@@ -21688,6 +21718,83 @@ class FCToolGUI:
         except tk.TclError:
             pass
 
+    # ── Linux preview diagnostic (Wine only) ────────────────────────────────
+    # Three thin seams around x11_thumbs' report builder: a Tk-thread starter,
+    # a worker that does all the blocking work, and a Tk-thread presenter. The
+    # split exists because the probe blocks for ~5 s inside the helper and the
+    # readiness wait for up to 8 s more -- neither may ever run on the UI
+    # thread. On Windows the button is never built, so none of this is reached.
+
+    def _preview_linux_diag_start(self):
+        """Button command: disable the button and run the diagnostic off-thread."""
+        btn = getattr(self, "_preview_linux_diag_btn", None)
+        if btn is not None:
+            try:
+                btn.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+        threading.Thread(target=self._preview_linux_diag_worker,
+                         name="linux-preview-diag", daemon=True).start()
+
+    def _preview_linux_diag_worker(self):
+        """WORKER THREAD: collect facts, probe the helper, build the report.
+
+        Touches NO Tk - it reads only `_preview_thumb_backend` and a snapshot of
+        `_preview_clients` (both plain Python state) and hands the finished
+        ASCII string back through the dispatcher. Registered in
+        tests/test_no_worker_after.py::WORKER_METHODS. Total: any failure still
+        posts a string, so the button is always re-enabled."""
+        report = "Linux preview diagnostic failed - see fctool.log"
+        try:
+            facts = wine_detect.collect()
+            be = getattr(self, "_preview_thumb_backend", None)
+            clients = list(self._preview_clients.values())
+            if be is not None:
+                be.supervisor.wait_ready(8)
+                probe = x11_thumbs.run_probe(be, clients, seconds=5)
+                snap = be.supervisor.status_snapshot()
+                rows = x11_thumbs.probe_clients(be, clients)
+            else:
+                probe, snap, rows = {}, None, None
+            report = x11_thumbs.build_report(facts, snap, probe, clients=rows)
+            log.info("[x11] diagnostic report:\n%s", report)
+        except Exception:
+            log.exception("[x11] diagnostic failed")
+        self._post_ui(self._preview_linux_diag_show, report)
+
+    def _preview_linux_diag_show(self, report):
+        """Tk thread: clipboard + a read-only scrollable window, button back on.
+
+        REFERENCE window, not a decision: `grab=False`, because ANY grab_set()
+        deafens every FCPreview tile (map/preview.md)."""
+        btn = getattr(self, "_preview_linux_diag_btn", None)
+        if btn is not None:
+            try:
+                btn.config(state=tk.NORMAL)
+            except tk.TclError:
+                pass
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+        except Exception:
+            pass
+        try:
+            win = tk.Toplevel(self.root)
+            win.title("Linux preview diagnostic")
+            txt = scrolledtext.ScrolledText(
+                win, width=92, height=30, font=("Consolas", 9),
+                bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
+                wrap=tk.NONE)
+            txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 4))
+            txt.insert("1.0", report)
+            txt.config(state=tk.DISABLED)       # read-only; selection still works
+            tk.Label(win, text="Copied to the clipboard - paste it into your reply.",
+                     font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK,
+                     anchor=tk.W).pack(fill=tk.X, padx=8, pady=(0, 8))
+            make_modal(win, self.root, grab=False)
+        except Exception:
+            pass
+
     def _preview_state_for(self, key):
         """Staleness-checked CharState for a client key (lowercased char name),
         or None. Native parallel of _overlay_state_for: the poller snapshot if
@@ -22324,6 +22431,30 @@ class FCToolGUI:
         if preview_running():                      # EVE-O still open → refuse to fight it
             self._preview_retire_all_tiles()
             return "○ EVE-O Preview detected — close it to enable native previews"
+        # Linux/X11: while the helper is still coming up, do NOTHING this tick.
+        # X11ThumbBackend.register raises OSError instantly while not ready, so
+        # spawning now would strand every client against the bounded retry
+        # budget before the first frame is even possible. _preview_clients is
+        # deliberately NOT published here, so diff_clients still reports every
+        # client as `added` on the first tick after the helper reports ready --
+        # and _preview_tick_fails is untouched, because a starting helper is not
+        # a failing tick. Any other state (failed / stopped / ready / unknown)
+        # falls through to the normal body: failures must reach the user as
+        # stranded tiles plus the status prefix, not as a permanent wait.
+        _lin_be = getattr(self, "_preview_thumb_backend", None)
+        if _lin_be is not None:
+            try:
+                _lin_starting = (not _lin_be.ready
+                                 and _lin_be.supervisor.status_snapshot().state
+                                 == "starting")
+            except Exception:
+                _lin_starting = False
+            if _lin_starting:
+                # Linux-only, self-healing: while "starting" (bounded, <= ~24s)
+                # we return here BEFORE _preview_apply_hotkey_gate runs, so with
+                # hotkeys_eve_only ON the cold start stays SUSPENDED until the
+                # first fall-through tick re-evaluates the gate.
+                return "Linux previews: starting helper..."
         try:
             disabled = set(cfg.get("disabled_chars", []))
             clients = list(self._preview_find_clients())
@@ -22758,6 +22889,29 @@ class FCToolGUI:
                 self._preview_win32 = eve_client_tracker._real_win32()
             except Exception:
                 self._preview_win32 = None
+        # Linux/X11 thumbnail backend. Wine's DwmRegisterThumbnail is a
+        # permanent E_NOTIMPL stub, so under Wine the tiles are handed the
+        # native X11 helper instead of the DWM singleton. DEAD ON WINDOWS:
+        # is_wine() is False there, the factory is never called, and
+        # _preview_thumb_backend stays None (= today's behaviour, byte for
+        # byte). make_backend returns IMMEDIATELY with the helper still
+        # 'starting' -- the UI thread never pays a spawn budget -- so nothing
+        # here blocks; the tick gates real work on backend.ready.
+        _lin_cfg = self._preview_cfg()
+        if (getattr(self, "_preview_thumb_backend", None) is None
+                and _lin_cfg.get("linux_backend", "auto") != "off"
+                and wine_detect.is_wine()):
+            try:
+                self._preview_thumb_backend = self._preview_backend_factory(
+                    _lin_cfg, log)
+            except Exception:
+                log.exception("[x11] preview backend factory failed")
+                self._preview_thumb_backend = None
+            if self._preview_thumb_backend is None:
+                # Fail VISIBLE: the always-packed hotkey-status line is the one
+                # place a Linux user sees WHY every tile is about to strand.
+                self._preview_set_hotkey_status(
+                    "Linux previews: helper could not start - see fctool.log")
         # COLD START under "Hotkeys only while EVE is focused": begin SUSPENDED.
         # Nothing has sampled the foreground yet, and the fail-safe direction is
         # "the user's keys belong to whatever they are typing into" — so the
@@ -22867,6 +23021,17 @@ class FCToolGUI:
             except Exception:
                 pass
             self._preview_hotkeys = None
+        # The Linux/X11 helper dies with the mode, exactly like the hotkey
+        # service above: close() is idempotent and bounded (<= ~2 s), and the
+        # next enable builds a fresh backend + helper process. Cleared BEFORE
+        # the close so a raising backend can never be closed twice.
+        be = getattr(self, "_preview_thumb_backend", None)
+        self._preview_thumb_backend = None
+        if be is not None:
+            try:
+                be.close()
+            except Exception:
+                log.exception("[x11] preview backend close failed")
         # The focus gate is edge state on a service that no longer exists. Reset
         # it so the next enable re-evaluates from scratch (and so a teardown that
         # happened mid-suspend cannot leave the next session refusing to
@@ -25390,6 +25555,30 @@ class FCToolGUI:
         _tip(self._preview_hotkey_status_lbl,
              "Warnings about global hotkeys that could not be registered - "
              "usually another application already owns that key combination.")
+        # Linux preview diagnostic (Wine ONLY). With no local Linux rig, the
+        # external tester's clipboard report is the whole end-to-end evidence
+        # channel for the X11 backend. Created only under Wine, so the Windows
+        # panel keeps exactly the widgets it has today. Deliberately OUT of
+        # _preview_native_widgets (like the status label beside it): its enabled
+        # state is owned by the diagnostic run, not by the mode gate.
+        self._preview_linux_diag_btn = None
+        try:
+            _on_wine = bool(wine_detect.is_wine())
+        except Exception:
+            _on_wine = False
+        if _on_wine:
+            btnDiag = tk.Button(
+                rowHKStatus, text="Linux preview diagnostic...",
+                command=self._preview_linux_diag_start, font=("Consolas", 9),
+                fg=FG_TEXT, bg=BG_ENTRY, activebackground=BG_ENTRY,
+                activeforeground=FG_TEXT, relief=tk.FLAT, padx=8)
+            btnDiag.grid(row=0, column=1, sticky=tk.E, padx=(8, 0))
+            self._preview_linux_diag_btn = btnDiag
+            _tip(btnDiag,
+                 "Collects everything the Linux preview helper knows - host "
+                 "facts, helper state, every EVE window's X11 id and a 5 second "
+                 "live probe - copies it to the clipboard and shows it here. "
+                 "Paste it back to the developer; it contains no tokens.")
 
         # Reveal the starting category (and paint the buttons) now that every
         # frame exists and the always-visible status row is the pack anchor.
@@ -25671,7 +25860,22 @@ class FCToolGUI:
             return "◐ labelling EVE-O thumbnails"
         if preview_running():
             return "○ EVE-O Preview detected — close it to enable native tiles"
-        return getattr(self, "_preview_status", "") or "● native previews"
+        text = getattr(self, "_preview_status", "") or "● native previews"
+        # Linux/X11: name the backend and its helper state in FRONT of the
+        # tick's own status, so "0 tiles" is never mute about why. No backend
+        # (every Windows run) leaves the string untouched. ASCII only.
+        be = getattr(self, "_preview_thumb_backend", None)
+        if be is None:
+            return text
+        try:
+            snap = be.supervisor.status_snapshot()
+            state, last_error = snap.state, snap.last_error
+        except Exception:
+            state, last_error = "unknown", None
+        text = "Linux/X11 previews (%s) - %s" % (state, text)
+        if state == "failed" and last_error:
+            text += " - " + str(last_error)[:80]
+        return text
 
     def _preview_set_mode(self, new_mode: str):
         """Switch preview mode: tear down the old mode, persist, boot the new one.

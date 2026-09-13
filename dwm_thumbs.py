@@ -64,6 +64,14 @@ class _RealDwm:  # pragma: no cover — exercised by spike S1 + live use
     def register(self, dest_hwnd: int, src_hwnd: int) -> int:
         handle = wintypes.HANDLE()
         self._d.DwmRegisterThumbnail(dest_hwnd, src_hwnd, ctypes.byref(handle))
+        if not handle.value:
+            # restype=HRESULT already raises OSError on FAILED(hr); this closes
+            # the remaining hole, S_OK with a NULL out-param. A NULL handle
+            # would sail through every later Dwm* call and leave a silent BLACK
+            # tile; OSError is the contract _preview_spawn_tile already handles
+            # (destroy the tile, book the client as stranded). On real Windows
+            # this never fires -- it exists for stub implementations.
+            raise OSError("DwmRegisterThumbnail returned no handle")
         return handle.value
 
     def unregister(self, thumb: int) -> None:
