@@ -1546,6 +1546,53 @@ def _report_fctool():
     return lines
 
 
+def _csv_ints(values):
+    """``1,2,3,4`` for a sequence of numbers, ``-`` for anything empty."""
+    try:
+        text = ",".join(_ascii(v) for v in (values or ()))
+    except Exception:
+        return "-"
+    return text or "-"
+
+
+def _report_monitors(display):
+    """Wine's idea of the desktop, next to this process's DPI stance.
+
+    A DPI-UNAWARE process under a scaled desktop (KDE at 150%) is handed
+    SCALED geometry - a 1920x1080 panel reads as 1280x720 - and every monitor
+    pin then lands on the wrong rect, so the raw numbers ship verbatim.
+    """
+    if not isinstance(display, dict):
+        return ["error=%s" % (_ascii(display, default="unavailable"),)]
+    screen = display.get("sm_screen")
+    try:
+        screen_text = ("%sx%s" % (_ascii(screen[0]), _ascii(screen[1]))
+                       if screen else "-")
+    except Exception:
+        screen_text = "-"
+    lines = ["dpi=%s awareness=%s screen=%s virtual=%s"
+             % (_ascii(display.get("dpi_system")),
+                _ascii(display.get("dpi_awareness")),
+                screen_text,
+                _csv_ints(display.get("sm_virtual")))]
+    rows = display.get("monitors")
+    rows = rows if isinstance(rows, list) else []
+    for mon in rows[:MAX_REPORT_CLIENTS]:
+        if not isinstance(mon, dict):
+            continue
+        lines.append("%s rect=%s work=%s primary=%s"
+                     % (_ascii(mon.get("device"))[:40],
+                        _csv_ints(mon.get("rect")),
+                        _csv_ints(mon.get("work")),
+                        "yes" if mon.get("primary") else "no"))
+    if not rows:
+        lines.append("none")
+    error = display.get("error")
+    if error:
+        lines.append("error=%s" % (_ascii(error),))
+    return lines
+
+
 def _report_helper(snapshot):
     if snapshot is None:
         return ["state=none"]
@@ -1627,9 +1674,24 @@ def _merge_clients(clients, results):
 
 #: ``[activate]``'s second line: the app-side ladder, rendered as
 #: ``label=<window_activator timing key>``.
+#: ``fg_flip`` arrives LATE (its probe thread outlives the activate), so a
+#: report taken mid-switch renders it ``-`` -- that is the honest answer.
+#: ``-`` therefore means "not measured"; a probe that watched its whole
+#: window and never saw the foreground flip renders ``timeout`` instead.
 _ACTIVATE_LADDER = (("restore", "restore"), ("x11", "x11_activate"),
                     ("fg", "set_foreground"), ("confirm", "confirm"),
+                    ("fg_flip", "fg_flip_ms"),
                     ("total", "total_ms"), ("verdict", "verdict"))
+
+
+def _ladder_value(timing, key):
+    """One rung's text.  ``fg_flip`` is the one rung with THREE states: a
+    number, ``timeout`` (watched the full window, the foreground never
+    flipped - a finding) and ``-`` (not measured yet - silence)."""
+    value = timing.get(key)
+    if key == "fg_flip_ms" and value is None and timing.get("fg_flip_timeout"):
+        return "timeout"
+    return _ascii(value)
 
 
 def _activate_ladder_text():
@@ -1644,7 +1706,7 @@ def _activate_ladder_text():
         timing = window_activator.get_last_activate_timing()
         if not isinstance(timing, dict) or not timing:
             return "-"
-        return " ".join("%s=%s" % (label, _ascii(timing.get(key)))
+        return " ".join("%s=%s" % (label, _ladder_value(timing, key))
                         for label, key in _ACTIVATE_LADDER)
     except Exception:
         return "-"
@@ -1672,27 +1734,41 @@ def _scrub(text, secrets_seq):
     return text
 
 
-def build_report(facts, snapshot, probe_result, clients=None) -> str:
+def build_report(facts, snapshot, probe_result, clients=None,
+                 display=None) -> str:
     """The diagnostic text the Linux tester pastes back.
 
-    Fixed section order ``[fctool] [host] [helper] [clients] [probe] [stats]
-    [activate] [last_error]``, ASCII only, never longer than
+    Fixed section order ``[fctool] [host] [monitors] [helper] [clients]
+    [probe] [stats] [activate] [last_error]``, ASCII only, never longer than
     ``MAX_REPORT_BYTES``.  It
     carries no XAUTHORITY path and no client command line by construction:
     only the fields named below are ever rendered.  ``last_error`` is the one
     field whose text is not ours, so as a second line of defence every string
     in ``snapshot.redact`` (the one-shot auth tokens the supervisor issued) is
     replaced with ``<redacted>`` before the report is capped.
+
+    ``display`` is the injection seam for the ``[monitors]`` facts: a dict, a
+    callable returning one, or None for the live
+    :func:`wine_detect.display_facts`.  A failure there degrades that one
+    section to an ``error=`` line - the report itself never fails.
     """
     payload = probe_result if isinstance(probe_result, dict) else {}
     results = payload.get("results")
     results = results if isinstance(results, list) else []
     rows = clients if clients is not None else payload.get("clients")
     rows = _merge_clients(rows, results)
+    try:
+        display_facts = display() if callable(display) else display
+        if display_facts is None:
+            display_facts = wine_detect.display_facts()
+    except Exception as exc:
+        # A non-dict degrades the section to ONE error= line (below).
+        display_facts = "%s: %s" % (type(exc).__name__, exc)
 
     sections = [
         ("[fctool]", _report_fctool()),
         ("[host]", [_ascii(facts)]),
+        ("[monitors]", _report_monitors(display_facts)),
         ("[helper]", _report_helper(snapshot)),
         ("[clients]", _report_clients(rows)),
         ("[probe]", _report_probe(results)),

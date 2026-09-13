@@ -296,6 +296,167 @@ def find_unix_python(exists=os.path.exists) -> list:
     return found
 
 
+# --- display geometry + DPI stance ------------------------------------------
+
+#: GetSystemMetrics indices read here (SM_CXSCREEN..SM_CYVIRTUALSCREEN).
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+#: GetAwarenessFromDpiAwarenessContext / GetProcessDpiAwareness -> name.
+DPI_AWARENESS = {0: "unaware", 1: "system", 2: "per_monitor"}
+
+#: DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 - a pseudo-handle, not a
+#: pointer, and NOT distinguishable through GetAwarenessFromDpiAwarenessContext
+#: (which answers 2 for both per-monitor flavours), so it needs the explicit
+#: AreDpiAwarenessContextsEqual comparison.
+DPI_CONTEXT_PMV2 = -4
+
+
+def _system_metrics(user32, indices):
+    """``GetSystemMetrics`` for each index, or None when the export is gone."""
+    fn = _export(user32, "GetSystemMetrics")
+    if fn is None:
+        return None
+    try:
+        fn.argtypes = [ctypes.c_int]
+        fn.restype = ctypes.c_int
+        return tuple(int(fn(index)) for index in indices)
+    except Exception:
+        return None
+
+
+def _dpi_for_system(user32):
+    """System DPI (96 = unscaled), or None off a DPI-aware Windows/Wine."""
+    fn = _export(user32, "GetDpiForSystem")
+    if fn is None:
+        return None
+    try:
+        fn.argtypes = []
+        fn.restype = ctypes.c_uint
+        value = int(fn())
+    except Exception:
+        return None
+    return value or None
+
+
+def _process_dpi_awareness(shcore):
+    """shcore fallback for hosts without the per-thread context exports."""
+    fn = _export(shcore, "GetProcessDpiAwareness")
+    if fn is None:
+        return None
+    try:
+        value = ctypes.c_int(-1)
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        fn.restype = ctypes.c_long
+        if int(fn(None, ctypes.byref(value))) != 0:
+            return None
+        return DPI_AWARENESS.get(int(value.value), "unknown")
+    except Exception:
+        return None
+
+
+def _dpi_awareness(user32, shcore):
+    """This thread's DPI stance as a name, or None when nothing answers.
+
+    ``"unaware"`` is the interesting answer: Wine then hands the process
+    SCALED monitor rects under a scaled desktop session.
+    """
+    get_ctx = _export(user32, "GetThreadDpiAwarenessContext")
+    from_ctx = _export(user32, "GetAwarenessFromDpiAwarenessContext")
+    equal = _export(user32, "AreDpiAwarenessContextsEqual")
+    ctx = None
+    if get_ctx is not None:
+        try:
+            get_ctx.argtypes = []
+            get_ctx.restype = ctypes.c_void_p
+            ctx = get_ctx()
+        except Exception:
+            ctx = None
+    if ctx is not None and from_ctx is not None:
+        try:
+            from_ctx.argtypes = [ctypes.c_void_p]
+            from_ctx.restype = ctypes.c_int
+            name = DPI_AWARENESS.get(int(from_ctx(ctx)), "unknown")
+        except Exception:
+            name = None
+        if name is not None:
+            if equal is not None:
+                try:
+                    equal.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                    equal.restype = ctypes.c_int
+                    if equal(ctx, ctypes.c_void_p(DPI_CONTEXT_PMV2)):
+                        name = "pmv2"
+                except Exception:
+                    pass
+            return name
+    return _process_dpi_awareness(shcore)
+
+
+def _monitor_dicts(monitors):
+    """``(rows, error)`` - monitor_pin's enumerator flattened to plain dicts.
+
+    ``monitors`` may be a callable (the enumerator), an already-built sequence,
+    or None for the real ``monitor_pin.list_monitors()`` (imported lazily, so
+    this module still loads no DLL and no sibling module at import time).
+    """
+    try:
+        source = monitors
+        if source is None:
+            import monitor_pin  # lazy: never at import time
+            source = monitor_pin.list_monitors()
+        elif callable(source):
+            source = source()
+        rows = []
+        for mon in list(source or ()):
+            rows.append({
+                "device": _ascii(getattr(mon, "device", None)),
+                "rect": [int(v) for v in tuple(getattr(mon, "rect", ()) or ())],
+                "work": [int(v) for v in tuple(getattr(mon, "work", ()) or ())],
+                "primary": bool(getattr(mon, "primary", False)),
+            })
+        return rows, None
+    except Exception as exc:
+        return [], _ascii("%s: %s" % (type(exc).__name__, exc))
+
+
+def display_facts(user32=None, shcore=None, monitors=None) -> dict:
+    """What this process believes the displays are.  Never raises.
+
+    Field report (Wine 11 / KDE at 150%): monitor pinning moved clients to the
+    wrong place because a DPI-UNAWARE process is shown scaled geometry -
+    1920x1080 arrives as 1280x720 - so every number a pin decision rests on is
+    reported side by side: ``sm_screen`` (primary, GetSystemMetrics 0/1),
+    ``sm_virtual`` (the virtual desktop, metrics 76/77/78/79 =
+    origin x, origin y, width, height), ``dpi_system``, ``dpi_awareness`` and
+    the per-monitor rects monitor_pin itself enumerates.  Missing exports
+    render as None; a failing enumerator yields ``monitors == []`` plus an
+    ``"error"`` string rather than an exception.  Loads no DLL at import.
+    """
+    facts = {"sm_screen": None, "sm_virtual": None, "dpi_system": None,
+             "dpi_awareness": None, "monitors": []}
+    try:
+        u32 = user32 if user32 is not None else _load("user32")
+        sh = shcore if shcore is not None else _load("shcore")
+        facts["sm_screen"] = _system_metrics(u32, (SM_CXSCREEN, SM_CYSCREEN))
+        facts["sm_virtual"] = _system_metrics(
+            u32, (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+                  SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN))
+        facts["dpi_system"] = _dpi_for_system(u32)
+        facts["dpi_awareness"] = _dpi_awareness(u32, sh)
+        rows, error = _monitor_dicts(monitors)
+        facts["monitors"] = rows
+        if error:
+            facts["error"] = error
+    except Exception as exc:
+        facts["monitors"] = []
+        facts["error"] = _ascii("%s: %s" % (type(exc).__name__, exc))
+    return facts
+
+
 # --- snapshot ---------------------------------------------------------------
 
 @dataclass(frozen=True)

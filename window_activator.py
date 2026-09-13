@@ -51,11 +51,23 @@ dead rungs are skipped, and an unconfirmable switch returns the truthy sentinel
 is skipped too (``skip(x11)``): a second activation racing the EWMH one only
 buys a wineserver denial round trip -- ~100 ms of click-to-front lag in the
 field. Off Wine NOTHING here changes.
+
+The Wine ladder is also the only path that measures itself, and round 6 adds
+the segment nobody could see. The field numbers were: the app-side ladder
+0.5 ms, the helper's X request -> the client's FocusIn 14.6 ms, the PERCEIVED
+swap ~100 ms. Everything between FocusIn and the user seeing the client is
+Wine flipping the foreground from inside the EVE client's own message pump,
+so the only place it is observable is ``GetForegroundWindow`` some time AFTER
+activate returned. A short-lived daemon thread (``preview-fg-probe``, one at a
+time, Wine only) polls that read-only probe and folds ``fg_flip_ms`` into the
+timing dict of the activate it was started for. It never blocks the caller,
+never touches Tk, and cannot raise into anything.
 """
 from __future__ import annotations
 
 import ctypes
 import logging
+import threading
 import time
 from ctypes import wintypes
 
@@ -205,11 +217,17 @@ _SKIP_WINE = "skip(wine)"
 _SKIP_X11 = "skip(x11)"
 
 # The last WINE activate()'s per-rung milliseconds, plus "total_ms" and
-# "verdict" ("confirmed"/"issued"). Instrumentation for the Linux field
-# reports (rendered by x11_thumbs.build_report); the WINDOWS ladder never
-# writes it, so real Windows pays nothing for it. REPLACED wholesale, never
-# mutated in place, so a reader on another thread can never see half a ladder.
+# "verdict" ("confirmed"/"issued"), and later "fg_flip_ms" from the probe
+# below. Instrumentation for the Linux field reports (rendered by
+# x11_thumbs.build_report); the WINDOWS ladder never writes it, so real
+# Windows pays nothing for it. REPLACED wholesale, never mutated in place, so
+# a reader on another thread can never see half a ladder.
 last_activate_timing: dict = {}
+
+# Guards that wholesale replacement. TWO writers exist under Wine: the hotkey
+# thread running the ladder, and the foreground probe finishing a previous
+# switch.
+_timing_lock = threading.Lock()
 
 
 def get_last_activate_timing() -> dict:
@@ -218,7 +236,8 @@ def get_last_activate_timing() -> dict:
     Empty until one activate has run under Wine. Read-only by contract: the
     diagnostic report reads it from the UI thread while a hotkey writes it.
     """
-    return dict(last_activate_timing)
+    with _timing_lock:
+        return dict(last_activate_timing)
 
 
 def _ms_since(t0) -> float:
@@ -347,6 +366,103 @@ def _confirm_foreground(u, hwnd):
     return ok, "foreground=%s target=%s root=%s" % (fg, hwnd, root)
 
 
+# --------------------------------------------------------- foreground probe
+# The ONE segment the round-5 instrumentation could not see: Wine flips the
+# foreground from inside the EVE client's own message pump, long after the
+# ladder returned and after the helper has already seen the X FocusIn. So the
+# measurement has to outlive activate(). Constraints, all deliberate:
+#   * WINE ONLY -- real Windows starts no thread and pays nothing;
+#   * ONE probe at a time -- a second would race the first for the dict while
+#     measuring a switch the user is no longer looking at;
+#   * it NEVER blocks the caller (the hotkey thread must return immediately)
+#     and it touches ONLY the injected user32 read-only probes: no Tk, no
+#     window state, one DEBUG line at the end.
+_FG_PROBE_NAME = "preview-fg-probe"
+_FG_PROBE_INTERVAL_S = 0.005
+_FG_PROBE_TIMEOUT_S = 0.6
+
+_fg_probe_running = False
+
+
+def _record_fg_flip(owned, flip_ms):
+    """Fold one probe's answer into the timing dict it was started for.
+
+    Identity-guarded: a newer activate may already have replaced the module
+    dict, and writing this (older) switch's ms into it would misattribute the
+    number in the report. Replaces wholesale under the lock; ``owned`` itself
+    is never mutated. Returns True when the answer was recorded.
+    """
+    global last_activate_timing
+    with _timing_lock:
+        if last_activate_timing is not owned:
+            return False
+        merged = dict(owned)
+        merged["fg_flip_ms"] = flip_ms
+        if flip_ms is None:
+            merged["fg_flip_timeout"] = True
+        last_activate_timing = merged
+    return True
+
+
+def _fg_probe_body(u, hwnd, owned, t0, sleep=time.sleep,
+                   clock=time.perf_counter):
+    """Poll the read-only foreground until it is the target, or give up.
+
+    ``fg_flip_ms`` is measured from ``t0`` (the ladder's own start stamp), so
+    it is directly comparable with ``total_ms``. A timeout records
+    ``fg_flip_ms=None`` plus ``fg_flip_timeout=True`` -- "we watched and it
+    never came forward" is a different fact from "we never looked". Nothing in
+    here may raise: it runs on a thread nobody joins.
+    """
+    global _fg_probe_running
+    try:
+        flip_ms = None
+        while True:
+            confirmed, _detail = _confirm_foreground(u, hwnd)
+            elapsed = clock() - t0
+            if confirmed:
+                flip_ms = round(elapsed * 1000.0, 1)
+                break
+            if elapsed >= _FG_PROBE_TIMEOUT_S:
+                break
+            sleep(_FG_PROBE_INTERVAL_S)
+        _record_fg_flip(owned, flip_ms)
+        log.debug("activate foreground flip (wine): target=%s fg_flip_ms=%s",
+                  hwnd, flip_ms)
+    except Exception:
+        pass
+    finally:
+        with _timing_lock:
+            _fg_probe_running = False
+
+
+def _start_fg_probe(u, hwnd, owned, t0, sleep=time.sleep,
+                    clock=time.perf_counter):
+    """Start the foreground-flip probe. Never blocks, never raises.
+
+    Returns the thread, or None when one is already in flight (that probe is
+    left alone to finish) or the thread could not be started at all.
+    """
+    global _fg_probe_running
+    try:
+        with _timing_lock:
+            if _fg_probe_running:
+                return None
+            _fg_probe_running = True
+        try:
+            thread = threading.Thread(target=_fg_probe_body,
+                                      args=(u, hwnd, owned, t0, sleep, clock),
+                                      name=_FG_PROBE_NAME, daemon=True)
+            thread.start()
+        except Exception:
+            with _timing_lock:
+                _fg_probe_running = False
+            return None
+        return thread
+    except Exception:
+        return None
+
+
 def _log_failed_activate(hwnd, outcomes, detail):
     """One throttled, ASCII-only WARNING per unconfirmed activate.
 
@@ -399,7 +515,9 @@ def _activate_wine(hwnd, u):
     the normal case, so the old warning would fire on every single switch.
 
     Every rung is also timed into ``last_activate_timing`` (Wine only): the
-    Linux tester has no profiler, so the report IS the measurement.
+    Linux tester has no profiler, so the report IS the measurement. The ladder
+    closes by arming the foreground probe, which appends ``fg_flip_ms`` to
+    that same dict once (and if) the client actually comes forward.
     """
     outcomes = {name: "skip" for name in _WINE_RUNGS}
     for name in _WINE_SKIPPED:
@@ -433,7 +551,11 @@ def _activate_wine(hwnd, u):
     timing["total_ms"] = _ms_since(started)
     timing["verdict"] = "confirmed" if confirmed else "issued"
     global last_activate_timing
-    last_activate_timing = timing
+    with _timing_lock:
+        last_activate_timing = timing
+    # The switch is now the client's problem; the probe watches for it from
+    # its own thread so this one returns to the hotkey immediately.
+    _start_fg_probe(u, hwnd, timing, started)
     if confirmed:
         return True
     log.debug("activate issued (wine, foreground unconfirmable): %s; "
