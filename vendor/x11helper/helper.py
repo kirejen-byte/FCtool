@@ -95,6 +95,11 @@ REPAIR_FOLLOWUP_MS = 16
 #: already have focus, which is exactly the case a preview click is.
 ACTIVE_WINDOW_SOURCE_PAGER = 2
 
+#: How long an activation waits for the client's FocusIn before it is counted
+#: as missed.  Generous on purpose: this is instrumentation, and a swap the
+#: user perceives as slow is still far inside it.
+ACTIVATE_FOCUS_TIMEOUT_S = 2.0
+
 #: 'stats' cadence, and the longest the select() loop ever sleeps.
 STATS_INTERVAL_S = 5.0
 MAX_SELECT_TIMEOUT_S = 0.25
@@ -520,18 +525,23 @@ class XSession(object):
             raise self._as_call_error(exc, xid)
         return attrs.map_state == self._X.IsViewable
 
-    def select_structure(self, xid, expose=False):
-        """StructureNotify (and, with ``expose``, Expose) on a FOREIGN window.
+    def select_structure(self, xid, expose=False, focus=False):
+        """StructureNotify (plus ``expose`` / ``focus``) on a FOREIGN window.
 
         Event masks are per-client in X, so this never disturbs the owner
         (unlike SubstructureRedirect) and Wine never learns we asked.
-        ``change_attributes`` REPLACES this client's mask, so both bits go in
+        ``change_attributes`` REPLACES this client's mask, so every bit goes in
         ONE call -- selecting them one after the other would keep only the
-        second.
+        last.  So the SOURCE windows take ``StructureNotify|FocusChange`` (the
+        FocusIn is how we time an activation) and the TILES take
+        ``StructureNotify|Expose`` (the Wine-flush repair); neither ever gets
+        the other's bit implicitly.
         """
         mask = self._X.StructureNotifyMask
         if expose:
             mask |= self._X.ExposureMask
+        if focus:
+            mask |= self._X.FocusChangeMask
         self._checked(self._window(xid).change_attributes, event_mask=mask)
 
     def try_redirect_automatic(self, xid):
@@ -729,8 +739,8 @@ class XSession(object):
 
         ``("damage", xid)`` / ``("configure", xid, w, h)`` /
         ``("expose", xid)`` / ``("destroy", xid)`` /
-        ``("error", code, resource)``.  Anything else is dropped here so
-        HelperCore never sees an Xlib object.
+        ``("focus_in", xid)`` / ``("error", code, resource)``.  Anything else
+        is dropped here so HelperCore never sees an Xlib object.
 
         Expose is deliberately NOT batched on its ``count`` field: one tuple per
         event is cheap, and HelperCore coalesces a burst itself (_repair).
@@ -770,6 +780,24 @@ class XSession(object):
                 out.append(("expose", _xid_of(ev.window)))
             elif etype == X.DestroyNotify:
                 out.append(("destroy", _xid_of(ev.window)))
+            elif etype == X.FocusIn:
+                # The ONE event that says an activation actually landed: the
+                # WM never answers _NET_ACTIVE_WINDOW, so this is how the
+                # activate -> client-is-forward latency gets measured.  But
+                # not every FocusIn is that: a keyboard GRAB on a window that
+                # already has focus (the hotkey path takes one every press)
+                # fires mode=NotifyGrab/NotifyUngrab, and pointer-follows-
+                # focus WMs can fire detail=NotifyPointer/NotifyPointerRoot --
+                # neither means the client just became foreground, so only a
+                # NORMAL (or WhileGrabbed) mode with a non-pointer detail
+                # counts.  getattr() defaults keep older test doubles (no
+                # mode/detail attributes) working as "counted".
+                mode = getattr(ev, "mode", X.NotifyNormal)
+                detail = getattr(ev, "detail", X.NotifyAncestor)
+                if (mode in (X.NotifyNormal, X.NotifyWhileGrabbed)
+                        and detail not in (X.NotifyPointer,
+                                          X.NotifyPointerRoot)):
+                    out.append(("focus_in", _xid_of(ev.window)))
         out.extend(self._take_errors())
         return out
 
@@ -951,6 +979,13 @@ class HelperCore(object):
         #: 'activate' requests serviced.  Requests, never confirmations: the
         #: message is fire-and-forget and the WM never tells us what it did.
         self.activations = 0
+        #: Activation LATENCY instrumentation (round 5).  The WM answers
+        #: nothing, but the client's own FocusIn is observable: an activate
+        #: arms ``(src, t0)`` and the matching FocusIn stops the clock.
+        self._pending_activate = None
+        self.last_activate_ms = 0.0
+        self.activate_focus_seen = 0
+        self.activate_focus_missed = 0
         self.errors = 0
         self.started_ts = clock()
         self._next_stats_ts = self.started_ts + STATS_INTERVAL_S
@@ -1044,7 +1079,10 @@ class HelperCore(object):
         try:
             session.set_input_shape_empty(child)
             session.map(child)
-            session.select_structure(src)
+            # FocusChange on the SOURCE (never Expose -- an EVE client repaints
+            # constantly and we do not composite off its exposes): the FocusIn
+            # is what times an activation.
+            session.select_structure(src, focus=True)
             # Expose on the TILE is how the server tells us Wine just flushed
             # its own surface over our child; StructureNotify comes along for
             # the drag/resize case (one call -- the mask is replaced, not OR'd).
@@ -1231,6 +1269,24 @@ class HelperCore(object):
         """
         src = int(msg["src"])
         self.activations += 1
+        # Instrumentation, so it can never cost the focus: selecting
+        # FocusChange on the source is what lets the matching FocusIn time the
+        # swap, and a window that refuses the mask still gets activated.
+        try:
+            self.session.select_structure(src, expose=False, focus=True)
+        except XCallError:
+            pass
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+        if self._pending_activate is not None:
+            # A new activate always replaces the previous arm: the request
+            # it was waiting on will never get its own FocusIn now (only the
+            # window named by THIS activate can still answer), so count it
+            # missed here instead of letting it silently vanish -- otherwise
+            # seen + missed would undercount the true number of activations.
+            self.activate_focus_missed += 1
+        self._pending_activate = (src, self.clock())
         try:
             self.session.activate_window(src)
             # The nudge is the cosmetic half (hover state), so it runs AFTER
@@ -1265,6 +1321,8 @@ class HelperCore(object):
                 self._on_expose(int(ev[1]))
             elif kind == "destroy":
                 self._on_destroy(int(ev[1]))
+            elif kind == "focus_in":
+                self._on_focus_in(int(ev[1]))
             elif kind == "error":
                 self._on_x_error(ev[1], int(ev[2]) if len(ev) > 2 else 0)
         except Exception as exc:
@@ -1337,6 +1395,31 @@ class HelperCore(object):
             self._fail_thumb(thumb,
                              XCallError("source window 0x%x was destroyed"
                                         % (xid,), "bad_window", xid))
+
+    def _on_focus_in(self, xid):
+        """Stop the activation clock, if this FocusIn is the one we armed.
+
+        A FocusIn on any OTHER window is ordinary desktop traffic (the user
+        alt-tabbing, EVE's own child windows) and is ignored: only the window
+        the last activate named can answer for that activate.
+        """
+        pending = self._pending_activate
+        if pending is None or int(xid) != int(pending[0]):
+            return
+        self._pending_activate = None
+        elapsed_ms = (self.clock() - pending[1]) * 1000.0
+        self.last_activate_ms = round(max(0.0, elapsed_ms), 1)
+        self.activate_focus_seen += 1
+
+    def _expire_pending_activate(self, now):
+        """An activation the client never answered: count it, then disarm."""
+        pending = self._pending_activate
+        if pending is None:
+            return
+        if (now - pending[1]) < ACTIVATE_FOCUS_TIMEOUT_S:
+            return
+        self._pending_activate = None
+        self.activate_focus_missed += 1
 
     def _on_x_error(self, code, resource):
         self.errors += 1
@@ -1458,6 +1541,7 @@ class HelperCore(object):
                 if _is_display_dead(exc):
                     raise
                 self._fail_thumb(thumb, _as_internal(exc, "tick"))
+        self._expire_pending_activate(now)
         self._maybe_stats(now)
 
     def next_timeout(self, now=None):
@@ -1499,6 +1583,11 @@ class HelperCore(object):
                    # ignores every extra key, so this rides along safely.
                    "repairs": self.repairs,
                    "activations": self.activations,
+                   # Activation latency: the last measured click-to-FocusIn,
+                   # and how many activations were answered vs never were.
+                   "last_activate_ms": self.last_activate_ms,
+                   "activate_focus_seen": self.activate_focus_seen,
+                   "activate_focus_missed": self.activate_focus_missed,
                    "errors": self.errors,
                    "uptime_s": round(now - self.started_ts, 3)})
 

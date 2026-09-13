@@ -132,6 +132,12 @@ class HelperStatus:
     dropped: int = 0
     repairs: int = 0
     activations: int = 0
+    #: Activation latency as the HELPER measured it: the last
+    #: activate-to-FocusIn in ms, and how many activations the client answered
+    #: (``seen``) vs never did within the helper's timeout (``missed``).
+    last_activate_ms: float = 0.0
+    activate_focus_seen: int = 0
+    activate_focus_missed: int = 0
     uptime_s: float = 0.0
     last_error: Optional[str] = None
     spawn_attempts: int = 0
@@ -423,6 +429,9 @@ class HelperSupervisor(object):
         self._dropped = 0
         self._repairs = 0
         self._activations = 0
+        self._last_activate_ms = 0.0
+        self._activate_focus_seen = 0
+        self._activate_focus_missed = 0
         self._uptime_s = 0.0
         self._last_error = None
         self._spawn_attempts = 0
@@ -460,6 +469,9 @@ class HelperSupervisor(object):
                 dropped=self._dropped,
                 repairs=self._repairs,
                 activations=self._activations,
+                last_activate_ms=self._last_activate_ms,
+                activate_focus_seen=self._activate_focus_seen,
+                activate_focus_missed=self._activate_focus_missed,
                 uptime_s=self._uptime_s,
                 last_error=self._last_error,
                 spawn_attempts=self._spawn_attempts,
@@ -1097,10 +1109,19 @@ class HelperSupervisor(object):
                 if isinstance(value, int) and not isinstance(value, bool):
                     setattr(self, attr, value)
             for key, attr in (("repairs", "_repairs"),
-                              ("activations", "_activations")):
+                              ("activations", "_activations"),
+                              ("activate_focus_seen", "_activate_focus_seen"),
+                              ("activate_focus_missed",
+                               "_activate_focus_missed")):
                 total = _as_int(msg.get(key))
                 if total is not None:
                     setattr(self, attr, total)
+            # The one float the helper reports: a bool would pass isinstance
+            # (True is an int) and land in the report as 1.0 ms of nonsense.
+            activate_ms = msg.get("last_activate_ms")
+            if isinstance(activate_ms, (int, float)) \
+                    and not isinstance(activate_ms, bool):
+                self._last_activate_ms = float(activate_ms)
             uptime = msg.get("uptime_s")
             if isinstance(uptime, (int, float)) and not isinstance(uptime, bool):
                 self._uptime_s = float(uptime)
@@ -1604,6 +1625,41 @@ def _merge_clients(clients, results):
     return merged
 
 
+#: ``[activate]``'s second line: the app-side ladder, rendered as
+#: ``label=<window_activator timing key>``.
+_ACTIVATE_LADDER = (("restore", "restore"), ("x11", "x11_activate"),
+                    ("fg", "set_foreground"), ("confirm", "confirm"),
+                    ("total", "total_ms"), ("verdict", "verdict"))
+
+
+def _activate_ladder_text():
+    """The last Wine ``activate``'s per-rung ms, or ``-`` if there is none.
+
+    ``window_activator`` is imported LAZILY and the whole thing is guarded: a
+    diagnostic report must never be the thing that fails, and on a box where
+    no activate has run yet there is simply nothing to say.
+    """
+    try:
+        import window_activator
+        timing = window_activator.get_last_activate_timing()
+        if not isinstance(timing, dict) or not timing:
+            return "-"
+        return " ".join("%s=%s" % (label, _ascii(timing.get(key)))
+                        for label, key in _ACTIVATE_LADDER)
+    except Exception:
+        return "-"
+
+
+def _report_activate(snapshot):
+    """Activation latency from BOTH ends: what the helper saw on the wire
+    (activate -> the client's FocusIn) and what the app spent in the ladder."""
+    return ["last_ms=%s focus_seen=%s focus_missed=%s"
+            % (_ascii(getattr(snapshot, "last_activate_ms", 0.0)),
+               _ascii(getattr(snapshot, "activate_focus_seen", 0)),
+               _ascii(getattr(snapshot, "activate_focus_missed", 0))),
+            "ladder: %s" % (_activate_ladder_text(),)]
+
+
 def _scrub(text, secrets_seq):
     """Replace every secret in ``secrets_seq`` with ``<redacted>``.
 
@@ -1620,7 +1676,8 @@ def build_report(facts, snapshot, probe_result, clients=None) -> str:
     """The diagnostic text the Linux tester pastes back.
 
     Fixed section order ``[fctool] [host] [helper] [clients] [probe] [stats]
-    [last_error]``, ASCII only, never longer than ``MAX_REPORT_BYTES``.  It
+    [activate] [last_error]``, ASCII only, never longer than
+    ``MAX_REPORT_BYTES``.  It
     carries no XAUTHORITY path and no client command line by construction:
     only the fields named below are ever rendered.  ``last_error`` is the one
     field whose text is not ours, so as a second line of defence every string
@@ -1651,6 +1708,7 @@ def build_report(facts, snapshot, probe_result, clients=None) -> str:
                         _ascii(getattr(snapshot, "repairs", 0)),
                         _ascii(getattr(snapshot, "activations", 0)),
                         _ascii(getattr(snapshot, "uptime_s", 0)))]),
+        ("[activate]", _report_activate(snapshot)),
         ("[last_error]", [_ascii(getattr(snapshot, "last_error", None))]),
     ]
     redact = getattr(snapshot, "redact", ())

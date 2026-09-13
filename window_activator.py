@@ -47,7 +47,10 @@ So under Wine the real mechanism is an X11 ``_NET_ACTIVE_WINDOW`` (source=2,
 deny rule (this is EVE Preview Manager's mechanism). That callable is INJECTED
 via ``set_wine_activator`` (this module never imports the helper), the three
 dead rungs are skipped, and an unconfirmable switch returns the truthy sentinel
-``ISSUED`` rather than False. Off Wine NOTHING here changes.
+``ISSUED`` rather than False. When that callable succeeds, SetForegroundWindow
+is skipped too (``skip(x11)``): a second activation racing the EWMH one only
+buys a wineserver denial round trip -- ~100 ms of click-to-front lag in the
+field. Off Wine NOTHING here changes.
 """
 from __future__ import annotations
 
@@ -195,6 +198,32 @@ _WINE_RUNGS = ("is_iconic", "restore", _WINE_RUNG, "set_foreground",
                "alt_nudge", "set_foreground_retry", "switch_to_window")
 _WINE_SKIPPED = ("alt_nudge", "set_foreground_retry", "switch_to_window")
 _SKIP_WINE = "skip(wine)"
+# SetForegroundWindow is ALSO skipped when the X11 activator already took the
+# request (round 5): the wineserver's denial of the second, racing activation
+# is a cross-process round trip, and the field measured ~100 ms from click to
+# the client coming forward with both in flight.
+_SKIP_X11 = "skip(x11)"
+
+# The last WINE activate()'s per-rung milliseconds, plus "total_ms" and
+# "verdict" ("confirmed"/"issued"). Instrumentation for the Linux field
+# reports (rendered by x11_thumbs.build_report); the WINDOWS ladder never
+# writes it, so real Windows pays nothing for it. REPLACED wholesale, never
+# mutated in place, so a reader on another thread can never see half a ladder.
+last_activate_timing: dict = {}
+
+
+def get_last_activate_timing() -> dict:
+    """A COPY of the last Wine ``activate``'s ``{rung: ms, ...}`` timing.
+
+    Empty until one activate has run under Wine. Read-only by contract: the
+    diagnostic report reads it from the UI thread while a hotkey writes it.
+    """
+    return dict(last_activate_timing)
+
+
+def _ms_since(t0) -> float:
+    """Milliseconds since a ``time.perf_counter()`` stamp, 1 decimal."""
+    return round((time.perf_counter() - t0) * 1000.0, 1)
 
 
 class _Issued(int):
@@ -343,32 +372,73 @@ def _rung_text(outcomes, rungs):
                     for name in rungs)
 
 
+# Timing keys in log/report order: the rungs that were measured, then the
+# closing probe, the wall total and the verdict.
+_TIMING_ORDER = _WINE_RUNGS + ("confirm", "total_ms", "verdict")
+
+
+def _timing_text(timing):
+    """The ``name=ms`` half of the Wine DEBUG line (unmeasured rungs omitted)."""
+    return " ".join("%s=%s" % (name, timing[name])
+                    for name in _TIMING_ORDER if name in timing)
+
+
 def _activate_wine(hwnd, u):
-    """The Wine ladder: restore (posted) -> X11 activate -> one SetForeground.
+    """The Wine ladder: restore (posted) -> X11 activate -> SetForeground.
+
+    The SetForegroundWindow rung runs ONLY when the X11 activator was absent
+    or returned falsy. When the activator took the request, the EWMH
+    ``_NET_ACTIVE_WINDOW`` is already in flight and a SetForegroundWindow
+    behind it is a SECOND, racing activation -- one the wineserver denies over
+    a cross-process round trip, which is what the field measured as ~100 ms of
+    click-to-front lag (round 5). That rung then reads ``skip(x11)``.
 
     Returns True when the (stale-prone) probe happens to confirm the target
     anyway, else ``ISSUED``: the request WAS made and Wine simply cannot be
     asked yet. Never False and never a WARNING - under Wine "unconfirmed" is
     the normal case, so the old warning would fire on every single switch.
+
+    Every rung is also timed into ``last_activate_timing`` (Wine only): the
+    Linux tester has no profiler, so the report IS the measurement.
     """
     outcomes = {name: "skip" for name in _WINE_RUNGS}
     for name in _WINE_SKIPPED:
         outcomes[name] = _SKIP_WINE
+    timing = {}
+    started = time.perf_counter()
 
-    if _run_rung(outcomes, "is_iconic", lambda: u.is_iconic(hwnd)):
-        _run_rung(outcomes, "restore", lambda: _show(u, hwnd, SW_RESTORE))
+    def timed(name, fn):
+        t0 = time.perf_counter()
+        try:
+            return _run_rung(outcomes, name, fn)
+        finally:
+            timing[name] = _ms_since(t0)
+
+    if timed("is_iconic", lambda: u.is_iconic(hwnd)):
+        timed("restore", lambda: _show(u, hwnd, SW_RESTORE))
     activator = _wine_activator
+    x11_ok = False
     if activator is not None:
-        _run_rung(outcomes, _WINE_RUNG, lambda: activator(hwnd))
-    # Still worth one try: it is free when this process IS foreground (a tile
-    # click), and denied-but-harmless when it is not (a hotkey).
-    _run_rung(outcomes, "set_foreground", lambda: u.set_foreground(hwnd))
+        x11_ok = bool(timed(_WINE_RUNG, lambda: activator(hwnd)))
+    if x11_ok:
+        outcomes["set_foreground"] = _SKIP_X11
+    else:
+        # No activator (or it failed): this is the only rung left, and it is
+        # free when this process IS foreground (a tile click).
+        timed("set_foreground", lambda: u.set_foreground(hwnd))
 
+    probe_t0 = time.perf_counter()
     confirmed, detail = _confirm_foreground(u, hwnd)
+    timing["confirm"] = _ms_since(probe_t0)
+    timing["total_ms"] = _ms_since(started)
+    timing["verdict"] = "confirmed" if confirmed else "issued"
+    global last_activate_timing
+    last_activate_timing = timing
     if confirmed:
         return True
-    log.debug("activate issued (wine, foreground unconfirmable): %s; rungs: %s",
-              detail, _rung_text(outcomes, _WINE_RUNGS))
+    log.debug("activate issued (wine, foreground unconfirmable): %s; "
+              "rungs: %s; ms: %s", detail, _rung_text(outcomes, _WINE_RUNGS),
+              _timing_text(timing))
     return ISSUED
 
 
