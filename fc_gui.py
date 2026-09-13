@@ -1090,6 +1090,13 @@ _IMPLANT_TOOLTIP_BASE = (
 # uncommitted local line and is not this task's file to touch.
 _ASSETS_SCOPE = "esi-assets.read_assets.v1"
 
+# Scope backing the FCPreview caption ROLE CHIP: each own character reads its
+# OWN /characters/{id}/fleet/ (works whoever the fleet boss is -- the boss-only
+# /fleets/{id}/members/ roster is deliberately not used). A token without the
+# scope is skipped outright rather than left to 403, the same error-budget rule
+# the implant reminder and the ozone watch follow.
+_FLEET_SCOPE = "esi-fleets.read_fleet.v1"
+
 # "Watch my ozone": how long after the first observation a character's FIRST
 # sighting still reads as "FCTool just started" rather than "this pilot just
 # logged in". The poller's roster holds only CONNECTED characters, so a client
@@ -21990,23 +21997,33 @@ class FCToolGUI:
     }
 
     def _preview_role_chip(self, client):
-        """Fleet-role chip text for a client (B4): look the pilot up in the
-        fleet-template store by name and map its role to a short chip glyph.
+        """Fleet-role chip text for a client: the pilot's LIVE fleet role from
+        ESI, carried on the poller's CharState as `fleet_role` (set in
+        _overlay_build_state from /characters/{id}/fleet/) and mapped to a short
+        chip glyph.
 
-        Login screens and pilots with no named slot (or the squad_member role)
-        get an empty chip. Fails soft — any store error yields no chip."""
+        Deliberately NOT the saved fleet templates: a template slot says where a
+        pilot is PLANNED to sit, not where they are, and the seeded "Default"
+        template pins the primary character into a wing_commander slot — which
+        showed that tile a permanent "WC" whether or not they were in a fleet.
+        There is no template fallback for exactly that reason.
+
+        Login screens, a missing or STALE state snapshot (_preview_state_for
+        returns None past _OVERLAY_STALE_SECS), squad_member and any unknown
+        role all render no chip. Fails soft — any lookup error yields no chip."""
         if client.is_login or not client.char_name:
             return ""
+        state_for = getattr(self, "_preview_state_for", None)
+        if state_for is None:
+            return ""
         try:
-            from fleet_template_store import find_character_role
-            match = find_character_role(self.fleet_templates, client.char_name)
+            st = state_for(client.key)
         except Exception:
-            log.exception("[preview] role-chip lookup failed")
+            log.exception("[preview] role-chip state lookup failed")
             return ""
-        if match is None:
+        if st is None:
             return ""
-        role, _wing, _squad = match
-        return self._PREVIEW_ROLE_CHIP.get(role, "")
+        return self._PREVIEW_ROLE_CHIP.get(getattr(st, "fleet_role", "") or "", "")
 
     # ── B3: intel flash — own-log system index + tile-border alerts ──────────
     def _preview_intel_note(self, index, report, now):
@@ -22965,6 +22982,7 @@ class FCToolGUI:
         station_id = prior.station_id if prior else 0
         structure_id = prior.structure_id if prior else 0
         online = prior.online if prior else None
+        fleet_role = getattr(prior, "fleet_role", "") if prior else ""
 
         loc = {}
         try:
@@ -23010,7 +23028,8 @@ class FCToolGUI:
         # CharState deliberately does not carry it, so the payload is handed
         # straight to the hook below rather than re-fetched there.
         ship_payload = None
-        if force_ship or prior is None or sys_id != prior_sys_id:
+        do_ship = bool(force_ship or prior is None or sys_id != prior_sys_id)
+        if do_ship:
             try:
                 ship = auth.get_ship_type() or {}
                 if ship.get("ship_type_id"):
@@ -23024,6 +23043,26 @@ class FCToolGUI:
                                       or ship_type_name)
                     ship_group = ship_classes.get_group_name(ship_type_id) or ""
                     is_cap = bool(ship_classes.is_capital(ship_type_id))
+            except Exception:
+                pass
+        # LIVE fleet role for the FCPreview caption chip -- read with THIS
+        # character's own token, so it works whoever the fleet boss is. Rides
+        # the ship cadence (do_ship) on purpose: ESI caches
+        # /characters/{id}/fleet/ for 60 s server-side, so polling it faster
+        # than the ~30 s ship pass buys nothing but error budget. 200 = the
+        # live role; 404 = not in a fleet, which CLEARS the chip; any other
+        # status (or a fault, or an auth without the seam) keeps the prior
+        # value so a transient ESI error never blinks the chip off. No scope =
+        # never call, chip stays empty.
+        if do_ship:
+            try:
+                if auth.has_scope(_FLEET_SCOPE):
+                    body, status, _fhdrs = auth.esi_get_ex(
+                        f"/characters/{auth.character_id}/fleet/")
+                    if status == 200 and isinstance(body, dict):
+                        fleet_role = str(body.get("role") or "")
+                    elif status == 404:
+                        fleet_role = ""
             except Exception:
                 pass
         # Base layer HP for the damage-flash reference pool. Cached in
@@ -23099,7 +23138,8 @@ class FCToolGUI:
             ship_type_name=ship_type_name,
             ship_group=ship_group, is_capital=is_cap, solar_system_id=sys_id,
             system_name=sys_name, docked=docked,
-            station_id=station_id, structure_id=structure_id)
+            station_id=station_id, structure_id=structure_id,
+            fleet_role=fleet_role)
 
     # ── Implant-removal reminder wiring (default ON) ────────────────────────
     # The feature itself lives in implant_reminder.py (pure trigger/state engine,
