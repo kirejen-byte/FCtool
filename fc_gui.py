@@ -27377,7 +27377,7 @@ class FCToolGUI:
             combo = hotkey_service.event_to_hotkey(event.keysym, event.state)
             if combo is None:
                 win._error_lbl.config(
-                    text=f"'{event.keysym}' is not a usable hotkey — try again.",
+                    text=hotkey_service.capture_hint(event.keysym),
                     fg=FG_ORANGE)
                 return "break"
             entry = win._next_entry if capturing[0] == "next" else win._prev_entry

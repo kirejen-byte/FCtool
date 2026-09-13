@@ -27,6 +27,23 @@ _VK = {**{f"F{i}": 0x6F + i for i in range(1, 25)}}          # F1=0x70 … F24=0
 _VK.update({c: ord(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
 _VK.update({"SPACE": 0x20, "TAB": 0x09, "HOME": 0x24, "END": 0x23,
             "PGUP": 0x21, "PGDN": 0x22, "INSERT": 0x2D, "DELETE": 0x2E})
+# Numpad virtual-key codes (VK_NUMPAD0..VK_NUMPAD9 = 0x60..0x69, then the
+# operator keys). IMPORTANT Windows fact: RegisterHotKey fires on these codes
+# ONLY while NumLock is ON — with NumLock off, the SAME physical keys send the
+# nav-cluster codes (Home/End/arrows/etc, non-extended) instead, which is why
+# event_to_hotkey below must keep those NumLock-off keysyms rejected rather
+# than aliasing them to HOME/END (that would also fire for the main-block
+# keys). No NumpadEnter: VK_RETURN is shared with the main Enter key and
+# RegisterHotKey can't tell them apart. No +/-/*// symbol tokens either —
+# parse_hotkey splits on "+", so only the word spellings below are accepted.
+_VK.update({f"NUMPAD{i}": 0x60 + i for i in range(10)})       # NUMPAD0=0x60 … NUMPAD9=0x69
+_VK.update({"NUMPADMULTIPLY": 0x6A, "NUMPADADD": 0x6B,
+            "NUMPADSUBTRACT": 0x6D, "NUMPADDECIMAL": 0x6E, "NUMPADDIVIDE": 0x6F})
+# .NET `Keys` enum spellings EVE-O Preview writes into EVE-O-Preview.json
+# ("NumPad1" upper-cases to NUMPAD1 already via parse_hotkey; these four are
+# the ones that don't).
+_VK.update({"MULTIPLY": 0x6A, "ADD": 0x6B, "SUBTRACT": 0x6D,
+            "DECIMAL": 0x6E, "DIVIDE": 0x6F})
 _MODS = {"CTRL": MOD_CONTROL, "CONTROL": MOD_CONTROL,
          "ALT": MOD_ALT, "SHIFT": MOD_SHIFT}
 
@@ -62,6 +79,25 @@ _EVENT_KEYSYMS = {
     "Home": "HOME", "End": "END", "Insert": "INSERT", "Delete": "DELETE",
 }
 
+# Numpad operator keysyms → the canonical "Numpad<Op>" token (see _VK's
+# numpad block for the VK codes and the NumLock caveat). KP_Decimal is the
+# numeral-mode "." keysym, reported only while NumLock is ON — the same
+# condition RegisterHotKey needs for VK_DECIMAL to fire, so it maps cleanly.
+# KP_Delete is deliberately NOT mapped here: on Windows, Tk's win32 keyboard
+# handling reports the numpad "." key as KP_Delete precisely when NumLock is
+# OFF (VK_DELETE with the "extended" bit clear — the same extended-bit trick
+# that turns "7" into KP_Home, "0" into KP_Insert, etc off-NumLock). It is
+# the decimal key's NumLock-off twin, not an alternate spelling of the same
+# on-state key, so it falls through with every other NumLock-off nav keysym
+# and event_to_hotkey returns None for it (verified against Tk's documented
+# VK/extended-bit keysym mapping; no physical numpad was pressed to confirm
+# on this box).
+_EVENT_NUMPAD_OPS = {
+    "KP_Add": "NumpadAdd", "KP_Subtract": "NumpadSubtract",
+    "KP_Multiply": "NumpadMultiply", "KP_Divide": "NumpadDivide",
+    "KP_Decimal": "NumpadDecimal",
+}
+
 # Bare modifier / lock keysyms — a press of one of these alone is not a hotkey.
 _EVENT_MODIFIER_KEYSYMS = frozenset({
     "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
@@ -77,7 +113,15 @@ def event_to_hotkey(keysym: str, state: int) -> "str | None":
     Returns e.g. "Control+Shift+F4" for the capture widget. Bare modifier
     presses, unmapped keys, and anything parse_hotkey would reject all return
     None (the caller keeps waiting / shows an inline note). Every non-None
-    result is validated by round-tripping through parse_hotkey."""
+    result is validated by round-tripping through parse_hotkey.
+
+    Numpad NumLock caveat: `KP_0`..`KP_9` and `KP_Decimal` are reported ONLY
+    while NumLock is ON — the exact condition RegisterHotKey needs for its
+    VK_NUMPAD*/VK_DECIMAL codes to fire, so they map straight to "Numpad<n>"/
+    "NumpadDecimal". With NumLock OFF the same keys report as the nav-cluster
+    keysyms (`KP_Home`, `KP_End`, `KP_Up`, `KP_Insert`, `KP_Delete`, …) and
+    stay unmapped here (falling through to None) rather than being aliased to
+    HOME/END/etc, which would also fire for the dedicated main-block keys."""
     if not keysym or keysym in _EVENT_MODIFIER_KEYSYMS:
         return None
     key = None
@@ -89,6 +133,10 @@ def event_to_hotkey(keysym: str, state: int) -> "str | None":
         key = "F" + keysym[1:]
     elif keysym in _EVENT_KEYSYMS:
         key = _EVENT_KEYSYMS[keysym]
+    elif keysym.startswith("KP_") and keysym[3:].isdigit() and len(keysym) == 4:
+        key = "Numpad" + keysym[3:]                    # KP_0..KP_9, NumLock on
+    elif keysym in _EVENT_NUMPAD_OPS:
+        key = _EVENT_NUMPAD_OPS[keysym]
     if key is None:
         return None
     parts = [name for mask, name in _EVENT_MODS if state & mask]
@@ -104,6 +152,17 @@ def event_to_hotkey(keysym: str, state: int) -> "str | None":
 def format_error(code: int) -> str:
     return ("in use by another application" if code == 1409
             else f"registration failed (error {code})")
+
+
+def capture_hint(keysym: str) -> str:
+    """Message for the hotkey capture box after event_to_hotkey(keysym, ...)
+    returned None. A `KP_*` keysym here is one of the NumLock-off numpad
+    keysyms (see event_to_hotkey's docstring) — give that a targeted nudge
+    instead of the generic "not a usable hotkey" line."""
+    if keysym and keysym.startswith("KP_"):
+        return (f"'{keysym}' — numpad keys work as hotkeys only with NumLock "
+                "on; turn it on and press again.")
+    return f"'{keysym}' is not a usable hotkey — try again."
 
 
 class _RealBackend:  # pragma: no cover — exercised by spike S2 + live
