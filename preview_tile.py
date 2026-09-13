@@ -46,6 +46,14 @@ from dwm_thumbs import Thumbnail, aspect_fit
 STRIP_H = 20
 _MOVE_JITTER = 4          # left-release within this many px still counts as a click
 _CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
+# Drag-move coalescing window (ms), Linux/Wine backend ONLY. X11 delivers raw
+# pointer motion far faster than a compositor can redraw, and every per-motion
+# SetWindowPos under Wine expose-repaints each tile the move uncovers (black
+# body over the preview child until the next composite) -- so a drag strobed
+# EVERY tile. Under the Linux backend the motion handlers coalesce to at most
+# one placement per this window (last position wins, trailing move guaranteed on
+# release). On Windows the backend is None and the motion path is unchanged.
+_DRAG_MOVE_MS = 16
 # Minimum tile geometry is OWNED BY preview_layout (preview_layout.clamp_size)
 # — one definition shared with the fc_gui controller paths, which resolve and
 # apply sizes this module never sees. Aliased under the historical private names
@@ -348,6 +356,7 @@ class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRA
     SWP_NOMOVE = 0x0002
     SWP_NOSIZE = 0x0001
     SWP_NOZORDER = 0x0004
+    SWP_NOREDRAW = 0x0008
     SWP_NOACTIVATE = 0x0010
     SWP_FRAMECHANGED = 0x0020
     GA_ROOT = 2
@@ -410,14 +419,42 @@ class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRA
             self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOZORDER
             | self.SWP_NOACTIVATE | self.SWP_FRAMECHANGED)
 
-    def set_window_pos(self, hwnd: int, x: int, y: int, w: int, h: int) -> None:
-        self._user32.SetWindowPos(hwnd, self.HWND_TOPMOST, x, y, w, h,
-                                  self.SWP_NOACTIVATE)
+    def set_window_pos(self, hwnd: int, x: int, y: int, w: int, h: int,
+                       *, zorder: bool = True, redraw: bool = True) -> None:
+        """Place the tile. Defaults are the historical call (HWND_TOPMOST, no
+        NOZORDER / NOREDRAW) -- every existing call site is byte-identical.
+
+        zorder=False adds SWP_NOZORDER so the placement does NOT re-stack the
+        tile to the head of the topmost band (HWND_TOPMOST is still passed and is
+        ignored with NOZORDER); redraw=False adds SWP_NOREDRAW so the window
+        manager does not repaint the area the move uncovered. The per-motion drag
+        path uses both under Wine: re-stacking + repainting on every raw motion
+        event is what strobed every tile. The 250 ms tick's retop() re-asserts
+        TOPMOST afterwards, so the z-order is never actually lost."""
+        flags = (self.SWP_NOACTIVATE
+                 | (0 if zorder else self.SWP_NOZORDER)
+                 | (0 if redraw else self.SWP_NOREDRAW))
+        self._user32.SetWindowPos(hwnd, self.HWND_TOPMOST, x, y, w, h, flags)
 
     def retop(self, hwnd: int) -> None:
         self._user32.SetWindowPos(
             hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
             self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE)
+
+
+def _is_x11_backend(dwm) -> bool:
+    """True when the `dwm=` seam holds the native X11 (Wine) thumbnail backend
+    (x11_thumbs.X11ThumbBackend) rather than the Windows answer.
+
+    On Windows fc_gui ALWAYS passes dwm=None (dwm_thumbs' real DWM singleton is
+    resolved inside Thumbnail), so in production `dwm is not None` and this
+    predicate agree exactly -- the X11 backend is the only non-None one there.
+    The preview suites, however, inject a plain DWM-duck fake to record
+    register/update calls, and those tests pin the WINDOWS behaviour of every
+    path gated on this. So identify the real thing by the two members only it
+    carries: the helper `supervisor` and its `ready` gate."""
+    return (dwm is not None and hasattr(dwm, "supervisor")
+            and hasattr(dwm, "ready"))
 
 
 _REAL_TILE_WIN32 = None
@@ -440,6 +477,10 @@ class TileWindow:
         self._win32 = win32 or _real_tile_win32()
         self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
+        # True only under Proton/Wine's native X11 backend (see _is_x11_backend).
+        # Gates the Wine-only anti-flicker paths: coalesced drag placement
+        # (_drag_move) and the layered-window alpha clamp (_applied_alpha).
+        self._x11_backend = _is_x11_backend(dwm)
         self._key = char_key
         self._palette = palette
         self._on_activate = on_activate or (lambda k: None)
@@ -470,6 +511,17 @@ class TileWindow:
         self._caption_applied = None  # (name, chip) last written to the strip
         self._dot_color = None        # last fill written to the status dot
         self._border = _BORDER_UNSET  # last color written via set_border (see there)
+        # Bottom-strip / location-strip zero-write mirrors. The compose pass
+        # re-pushes the SAME label for every tile on every ~250 ms tick, and each
+        # push reconfigured two widgets AND called _push_thumb_rect (a DWM
+        # update) — under Wine that repainted black over the preview child 4x/s.
+        # The key carries the tile geometry too (w / body_h), because the drawn
+        # text and the strip height are BOTH functions of it: same text on a
+        # resized tile must re-fit. Latched only after a successful write;
+        # set_bottom_alert clears the label mirror so the banner->normal restore
+        # can never be skipped.
+        self._bottom_applied = None   # (text, color, size, w, body_h) or None
+        self._location_applied = None # (text, color, size, w, body_h) or None
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -521,6 +573,13 @@ class TileWindow:
         self._press_pos = None        # (x, y) tile position at press
         self._press_size = None       # (w, body_h) at press
         self._mode = None             # None | "move" | "resize"
+
+        # Drag-move coalescing (Linux/Wine backend only — see _DRAG_MOVE_MS and
+        # _drag_move). `_pending_move` is the LAST requested (x, y, w, h); the
+        # `after` id is the armed flush timer. Both stay None on Windows, where
+        # the motion handlers place immediately exactly as they always have.
+        self._pending_move = None
+        self._move_after_id = None
 
         # LEFT-drag-on-strip (title-bar) move state (BUG B). Separate from the
         # body left-click (activate) path and from the right-drag move path.
@@ -943,6 +1002,72 @@ class TileWindow:
                 continue
         return out
 
+    # ── drag placement (coalesced under the Linux/Wine backend) ──────────────
+    def _drag_move(self, x, y, w, h):
+        """Place the tile during a drag/resize gesture.
+
+        Windows (no X11 backend on the dwm= seam): immediate set_window_pos with
+        the historical flags — this path is unchanged.
+
+        Linux/Wine (X11 backend present): remember the position and arm a single
+        _DRAG_MOVE_MS flush. Later motions inside the window overwrite the
+        pending position (last one wins) without touching Win32, so a fast drag
+        costs at most ~60 placements/s instead of one per raw motion event. The
+        flush places with zorder=False, redraw=False — the tick's retop() puts
+        the tile back at the head of the topmost band."""
+        if not self._x11_backend:
+            self._win32.set_window_pos(self._hwnd, x, y, w, h)
+            return
+        self._pending_move = (x, y, w, h)
+        if self._move_after_id is not None:
+            return                      # a flush is already armed for this burst
+        try:
+            self._move_after_id = self.top.after(_DRAG_MOVE_MS,
+                                                 self._flush_pending_move)
+        except tk.TclError:
+            # No Tk timer available (destroyed/headless) → place immediately so a
+            # move can never be silently dropped.
+            self._move_after_id = None
+            self._flush_pending_move()
+
+    def _flush_pending_move(self):
+        """Apply the coalesced drag position (no-op when nothing is pending)."""
+        self._move_after_id = None
+        pend = self._pending_move
+        if pend is None:
+            return
+        self._pending_move = None
+        x, y, w, h = pend
+        self._win32.set_window_pos(self._hwnd, x, y, w, h,
+                                   zorder=False, redraw=False)
+
+    def _flush_drag_move(self):
+        """Cancel the armed flush and apply any pending position RIGHT NOW.
+
+        Every gesture-release path calls this BEFORE it computes the rect it
+        hands to on_move_end / on_resize_end, so the committed rect and the
+        window's real position can never disagree by one coalescing window."""
+        if self._move_after_id is not None:
+            try:
+                self.top.after_cancel(self._move_after_id)
+            except Exception:
+                pass
+            self._move_after_id = None
+        self._flush_pending_move()
+
+    def _drop_pending_move(self):
+        """Disarm any pending drag-move flush WITHOUT applying it — for paths
+        (hide()/destroy()) where the window may no longer be a valid target for
+        a placement call. self._pos already carries the latest coalesced
+        position, so nothing is lost by dropping the flush unapplied."""
+        if self._move_after_id is not None:
+            try:
+                self.top.after_cancel(self._move_after_id)
+            except Exception:
+                pass
+            self._move_after_id = None
+        self._pending_move = None
+
     def _on_strip_b1_press(self, event):
         # A press on an armed corner starts a resize, not a strip-move. Consume it
         # so neither the move nor the click-activate path runs for this gesture.
@@ -976,9 +1101,9 @@ class TileWindow:
         y = self._strip_press_pos[1] + dy
         x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
         self._pos = (x, y)
-        # SAME Win32 physical-px placement _on_b3_motion uses (GA_ROOT hwnd).
-        self._win32.set_window_pos(self._hwnd, x, y, self._w,
-                                   self._body_h + STRIP_H)
+        # SAME Win32 physical-px placement _on_b3_motion uses (GA_ROOT hwnd),
+        # through the drag path (immediate on Windows, coalesced under Wine).
+        self._drag_move(x, y, self._w, self._body_h + STRIP_H)
 
     def _on_strip_b1_release(self, event):
         if self._corner_resizing:
@@ -990,6 +1115,7 @@ class TileWindow:
             return
         if self._strip_moving:
             self._strip_moving = False
+            self._flush_drag_move()   # land any coalesced move BEFORE committing
             if self._lock_layout:
                 return
             dx = event.x_root - press[0]
@@ -1109,13 +1235,14 @@ class TileWindow:
         y = ay if self._corner in ("sw", "se") else ay - (body_h + STRIP_H)
         self._w, self._body_h = w, body_h
         self._pos = (x, y)
-        self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
+        self._drag_move(x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
 
     def _corner_release(self, event):
         if not self._corner_resizing:
             return
         self._corner_resizing = False
+        self._flush_drag_move()   # land any coalesced move BEFORE committing
         self._corner_anchor = None
         self._corner_press_root = None
         self._corner_press_size = None
@@ -1170,8 +1297,8 @@ class TileWindow:
             w, body_h = preview_layout.clamp_size(self._press_size[0] + dx,
                                                   self._press_size[1] + dy)
             self._w, self._body_h = w, body_h
-            self._win32.set_window_pos(self._hwnd, self._press_pos[0],
-                                       self._press_pos[1], w, body_h + STRIP_H)
+            self._drag_move(self._press_pos[0], self._press_pos[1],
+                            w, body_h + STRIP_H)
             self._push_thumb_rect()
         else:  # move
             if self._lock_layout:
@@ -1181,12 +1308,12 @@ class TileWindow:
             y = self._press_pos[1] + dy
             x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
             self._pos = (x, y)
-            self._win32.set_window_pos(self._hwnd, x, y, self._w,
-                                       self._body_h + STRIP_H)
+            self._drag_move(x, y, self._w, self._body_h + STRIP_H)
 
     def _on_b3_release(self, event):
         if self._press_root is None:
             return
+        self._flush_drag_move()   # land any coalesced move BEFORE committing
         dx = event.x_root - self._press_root[0]
         dy = event.y_root - self._press_root[1]
         mode = self._mode
@@ -1278,6 +1405,14 @@ class TileWindow:
             self.top.withdraw()
         except tk.TclError:
             pass
+        # A withdrawn Toplevel never delivers its button-release, so an
+        # in-progress gesture would otherwise latch in_gesture True forever
+        # (the native tick would stand its retop batch down for good). Drop
+        # any armed drag-move flush and clear the three in_gesture flags.
+        self._drop_pending_move()
+        self._press_root = None
+        self._strip_moving = False
+        self._corner_resizing = False
 
     def show(self):
         """Re-map a tile hidden by hide(). Idempotent; re-pushes the thumbnail rect
@@ -1391,6 +1526,20 @@ class TileWindow:
         except Exception:
             pass
 
+    def _applied_alpha(self, a):
+        """The alpha this tile will actually push to Tk for a requested value.
+
+        Identity on Windows. Under the Linux/Wine backend the value is capped at
+        0.99 so WS_EX_LAYERED never toggles (see set_alpha). Callers that compare
+        a request against the _alpha mirror MUST go through this, or a clamped
+        request looks permanently un-applied and re-fires every tick."""
+        if self._x11_backend:
+            try:
+                return min(a, 0.99)
+            except TypeError:
+                return a
+        return a
+
     def set_alpha(self, a):
         """Push the window alpha, skipping the write when it has not moved.
 
@@ -1416,7 +1565,16 @@ class TileWindow:
         ctor's _alpha mirror already starts at 1.0 (ctor, ~:368) —
         configure_hover(1.0, 1.0) on that first tick still fires
         _apply_resting_alpha -> set_alpha(1.0), lands on the skip path
-        (a == self._alpha), and the heal runs anyway."""
+        (a == self._alpha), and the heal runs anyway.
+
+        WINE CLAMP: under the Linux backend the APPLIED alpha never reaches 1.0
+        (capped at 0.99). Tk adds/removes WS_EX_LAYERED on the 1.0 boundary, and
+        Wine's layered-window transition dirties the whole surface — so a plain
+        hover (0.85 <-> 1.0) repainted the tile black over the preview child.
+        Staying layered makes the hover flip a pure alpha change. 0.99 is
+        visually indistinguishable from opaque. The mirror latches the APPLIED
+        value, so the guard above still short-circuits unchanged ticks."""
+        a = self._applied_alpha(a)
         if a == self._alpha:
             self._exclude_from_alt_tab()      # read-only compare; see above
             return
@@ -1481,10 +1639,23 @@ class TileWindow:
         target = (self._opacity_hover if (self._hovering or self._active)
                   else self._opacity_inactive)
         self.set_alpha(target)
-        self._resting_applied = (self._alpha == target)  # failed write leaves the mirror behind
+        # Compare against the APPLIED value (the Wine clamp caps 1.0 at 0.99) —
+        # a failed write still leaves the mirror behind and retries next tick.
+        self._resting_applied = (self._alpha == self._applied_alpha(target))
 
     def _dragging(self):
         return self._press_root is not None or self._mode is not None
+
+    @property
+    def in_gesture(self) -> bool:
+        """True while the user is actively dragging or resizing THIS tile:
+        a right-drag (move or resize), a caption strip left-drag past jitter, or
+        a corner resize. The native tick reads this to stand its whole retop
+        batch down for the duration — re-stacking every tile 4x/s while one is
+        being dragged is what made the others flicker under Wine."""
+        return bool(self._press_root is not None
+                    or self._strip_moving
+                    or self._corner_resizing)
 
     def _on_enter(self, _event):
         self._hovering = True
@@ -1874,6 +2045,13 @@ class TileWindow:
                 self._bottom_visible = False
                 self._push_thumb_rect()   # video reclaims the freed space
             self._bottom_alert = False    # strip is gone → no alert lingering
+            self._bottom_applied = None   # nothing shown → next text must write
+            return
+        # ZERO-WRITE GUARD (see _bottom_applied): the compose pass re-pushes the
+        # identical label for every tile on every ~250 ms tick. An unchanged push
+        # must cost NO widget configure and NO _push_thumb_rect.
+        key = (text, color, size, self._w, self._body_h)
+        if self._bottom_visible and key == self._bottom_applied:
             return
         # Resolve style. Fall back to the strip's default fg / the top-strip name
         # font size (9) when the caller passes nothing.
@@ -1905,7 +2083,9 @@ class TileWindow:
             self._bottom_lbl.configure(text=shown, fg=fill, bg=self._bg_panel,
                                        font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
-            pass
+            self._bottom_applied = None   # never latch a failed write
+        else:
+            self._bottom_applied = key    # latch only AFTER the write succeeded
         if not self._bottom_visible:
             try:
                 self._strip_bottom.pack(side="bottom", fill="x")
@@ -1944,6 +2124,9 @@ class TileWindow:
             strip_h = min(strip_h, cap)
         self._bottom_strip_h = strip_h
         self._bottom_alert = True
+        # The banner paints OVER the normal label; drop the zero-write mirror so
+        # the next set_bottom_label always repaints panel bg + normal fg back.
+        self._bottom_applied = None
         try:
             self._strip_bottom.configure(height=strip_h, bg=_ALERT_BG)
             self._bottom_lbl.configure(text=shown, fg=_ALERT_FG, bg=_ALERT_BG,
@@ -2089,6 +2272,11 @@ class TileWindow:
                     pass
                 self._location_visible = False
                 self._push_thumb_rect()   # video reclaims the freed space
+            self._location_applied = None  # nothing shown → next text must write
+            return
+        # ZERO-WRITE GUARD — same contract as set_bottom_label's.
+        key = (text, color, size, self._w, self._body_h)
+        if self._location_visible and key == self._location_applied:
             return
         fill = color if color else self._fg_text
         try:
@@ -2109,7 +2297,9 @@ class TileWindow:
             self._location_lbl.configure(text=shown, fg=fill,
                                          font=("Consolas", drawn_size, "bold"))
         except tk.TclError:
-            pass
+            self._location_applied = None   # never latch a failed write
+        else:
+            self._location_applied = key    # latch only AFTER the write succeeded
         if not self._location_visible:
             self._pack_location_lowest()
             self._location_visible = True
@@ -2164,6 +2354,14 @@ class TileWindow:
 
     def destroy(self):
         self.detach()
+        # Drop any armed drag-move flush: its callback would place a window that
+        # is about to stop existing (retire mid-drag is a real tick path). Also
+        # clear the in_gesture flags for the same reason as hide() — a destroyed
+        # Toplevel never delivers its release either.
+        self._drop_pending_move()
+        self._press_root = None
+        self._strip_moving = False
+        self._corner_resizing = False
         try:
             self.top.destroy()
         except tk.TclError:
