@@ -19639,15 +19639,15 @@ class FCToolGUI:
         # Auto-fit each tile's HEIGHT to its client's aspect ratio, so the video
         # exactly fills the body and the black letterbox bands above and below it
         # disappear (see preview_layout.fit_body_h).
-        # DEFAULT OFF, deliberately: switching it on by default would silently
-        # re-size every existing user's hand-arranged tile grid the first time
-        # they launched the new build — a layout they butted together tile by
-        # tile, changed underneath them with no action on their part. The
-        # Settings "Fit height" CHECKBUTTON is the explicit opt-in; ticking it
-        # fits everything NOW and sets this flag, after which tiles that attach
-        # later fit themselves within ~2 s. Unticking it stops the auto-fit and
-        # hands corner-dragged heights back (it was a one-way door until then).
-        "fit_height": False,
+        # DEFAULT ON (owner decision, 2026-09-13): fresh installs get no black
+        # bars out of the box. An explicit saved `false` (a deliberate untick,
+        # or an existing config from before this change) is always respected —
+        # `_preview_cfg()` only materializes this default when the key is
+        # absent. The Settings "Fit height" CHECKBUTTON is the toggle; ticking
+        # it fits everything NOW, after which tiles that attach later fit
+        # themselves within ~2 s. Unticking it stops the auto-fit and hands
+        # corner-dragged heights back (it was a one-way door until then).
+        "fit_height": True,
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
         "login_position": [5, 5],
@@ -21165,13 +21165,13 @@ class FCToolGUI:
         path). The fit pass issues its own single save when it changes anything,
         and _preview_apply_native_state has already saved the flag itself."""
         cfg = self._preview_cfg()
-        was = bool(cfg.get("fit_height", False))
+        was = bool(cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"]))
         self._preview_apply_native_state()   # writes fit_height + its shadow
         # Re-gate the Tile "h" Spinbox in BOTH directions: the fit pass owns tile
         # heights while the flag is on, so the box greys out; unticking hands it
         # back. One owner for that state (see _preview_sync_native_widgets).
         self._preview_sync_native_widgets()
-        if bool(cfg.get("fit_height", False)) and not was:
+        if bool(cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"])) and not was:
             self._preview_fit_tile_heights(cfg, force=True)
 
     def _preview_toggle_account_slots(self):
@@ -22559,7 +22559,7 @@ class FCToolGUI:
             # first so an off feature costs one dict lookup per tick and nothing
             # else, and the pass itself respects lock_layout (only ticking the
             # Settings checkbutton forces through it).
-            if cfg.get("fit_height", False) and self._preview_tick_count % 8 == 0:
+            if cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"]) and self._preview_tick_count % 8 == 0:
                 self._preview_fit_tile_heights(cfg, clients=cur)
             for hwnd, tile in self._preview_tiles.items():
                 if hwnd in hidden:
@@ -24832,7 +24832,7 @@ class FCToolGUI:
         # var rides _PREVIEW_NATIVE_VARS like every other native key, so the
         # apply/shadow machinery persists it.
         self._preview_fit_height_var = tk.BooleanVar(
-            value=bool(pcfg.get("fit_height", False)))
+            value=bool(pcfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"])))
         fitb = tk.Checkbutton(
             rowN, text="Fit height", variable=self._preview_fit_height_var,
             command=self._preview_toggle_fit_height, font=("Consolas", 10),
