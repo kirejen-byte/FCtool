@@ -159,6 +159,11 @@ _STRIP_CHAR_W_RATIO = 0.78
 # overflow's worth of glyphs, so it converges in one or two passes.
 _NAME_FIT_STEPS = 3
 
+# Sentinel for the set_border() zero-write mirror (see TileWindow.__init__'s
+# _border init). A module-level object() (not None) so the very first call —
+# including a first call with color=None — always performs the Tk write.
+_BORDER_UNSET = object()
+
 
 # ── damage-flash soft pulse ──────────────────────────────────────────────────
 # The damage flash PULSES: the border eases between a soft red and the peak
@@ -464,6 +469,7 @@ class TileWindow:
         self._excl_text = ""          # mirrors _excl_lbl's construction text ("")
         self._caption_applied = None  # (name, chip) last written to the strip
         self._dot_color = None        # last fill written to the status dot
+        self._border = _BORDER_UNSET  # last color written via set_border (see there)
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -1786,7 +1792,17 @@ class TileWindow:
         return self._excluded
 
     def set_border(self, color):
-        """Highlight/flash border via strip+body highlightbackground (None clears)."""
+        """Highlight/flash border via strip+body highlightbackground (None clears).
+
+        Zero-write on an unchanged tick (same shape as set_alpha, ~:1388):
+        fc_gui's per-tile ~250 ms tick calls this for every tile every tick
+        (`_preview_native_tick_body`), so an unchanged color must not re-hit
+        Tk's `configure` — on Wine this repaints black over the live X11
+        preview child window (field-confirmed strobing); on Windows it is
+        wasted GDI work. The mirror latches only AFTER the write succeeds, so
+        a TclError can never poison the guard into skipping a real update."""
+        if color == self._border:
+            return
         try:
             if color:
                 self._strip.configure(highlightthickness=2,
@@ -1799,7 +1815,9 @@ class TileWindow:
                 self._strip.configure(highlightthickness=0)
                 self._body.configure(highlightthickness=0)
         except tk.TclError:
-            pass
+            pass                               # never record a failed write
+        else:
+            self._border = color                # latch only AFTER the write succeeds
 
     # ── on-video activity label (caption-onvideo) ───────────────────────────
     def set_label_style(self, color=None, size=None, anchor=None):
