@@ -17,6 +17,18 @@
 #   * updates driven by XDamage RawRectangles, never a timer,
 #   * ZERO pixel bytes cross the wire: no GetImage, no readback, ever.
 #
+# Plus one repair path EPM never needed: Wine flushes a window's GDI surface
+# into the X window with an IncludeInferiors GC, which paints straight over our
+# child.  The server announces that as an Expose (or a ConfigureNotify when the
+# tile is dragged) on the TILE, so we select both on the destination window and
+# recomposite at once -- see HelperCore._repair.
+#
+# And one job that is not compositing at all: 'activate'.  A PE process under
+# Wine cannot make the wineserver hand the foreground to another client, so
+# clicking a tile goes out through THIS helper instead -- StackMode Above plus
+# an EWMH _NET_ACTIVE_WINDOW ClientMessage to the root, then EPM's one-pixel
+# synthetic MotionNotify so Wine re-evaluates hover.  See XSession.
+#
 # Constraints (Steam 'sniper' runtime ships Python 3.9):
 #
 #   * Python 3.9 syntax and APIs only -- no match, no runtime X | Y unions, no
@@ -69,6 +81,19 @@ DEFAULT_MIN_INTERVAL_MS = 33
 #: 'attach' may send 0 to mean "no heartbeat at all" (damage-driven only).
 DEFAULT_HEARTBEAT_MS = 500
 HEARTBEAT_DISABLED_MS = 0
+
+#: An Expose/ConfigureNotify on the TILE means Wine just flushed its own
+#: surface over our child.  The repair repaints immediately AND once more this
+#: many milliseconds later: Wine's flush runs on a different X connection, so it
+#: can land just after the immediate repaint and black the tile again.  It also
+#: bounds the repair rate -- every expose inside the window is one burst.
+REPAIR_FOLLOWUP_MS = 16
+
+#: EWMH's _NET_ACTIVE_WINDOW "source indication": 1 = a normal application,
+#: 2 = a PAGER or other direct user action.  EPM sends 2 and so do we -- a WM
+#: is entitled to IGNORE a source-1 request from a window that does not
+#: already have focus, which is exactly the case a preview click is.
+ACTIVE_WINDOW_SOURCE_PAGER = 2
 
 #: 'stats' cadence, and the longest the select() loop ever sleeps.
 STATS_INTERVAL_S = 5.0
@@ -258,6 +283,13 @@ class XSession(object):
         self._shape = None
         self._composite = None
         self._xrender = None
+        # Xlib.protocol.event, for the two SYNTHETIC events we send (the
+        # _NET_ACTIVE_WINDOW ClientMessage and the pointer nudge).
+        self._event = None
+        #: The _NET_ACTIVE_WINDOW atom, interned ONCE in open() -- interning
+        #: per activation would put a round trip on the hotkey path.  None
+        #: when the server refused to intern it (activation then errors).
+        self._net_active_window = None
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -271,11 +303,13 @@ class XSession(object):
             from Xlib.ext import composite as composite_mod
             from Xlib.ext import damage as damage_mod
             from Xlib.ext import shape as shape_mod
+            from Xlib.protocol import event as event_mod
             import xrender as xrender_mod
         except ImportError as exc:
             raise NoDisplayError("cannot import the vendored Xlib: %s" % (exc,))
 
         self._X = X_mod
+        self._event = event_mod
         self._xerror = error_mod
         self._damage = damage_mod
         self._shape = shape_mod
@@ -319,6 +353,16 @@ class XSession(object):
         except Exception as exc:
             raise MissingExtensionError("RENDER QueryPictFormats failed: %s"
                                         % (exc,), "no_render")
+
+        # Interned once, here: activation is a hotkey path and must not pay
+        # for an InternAtom round trip per press.  A server that cannot
+        # intern it is NOT fatal -- previews still work, only focus swaps
+        # report an error (see activate_window).
+        try:
+            self._net_active_window = int(disp.intern_atom("_NET_ACTIVE_WINDOW"))
+        except Exception as exc:
+            self._net_active_window = None
+            _log("cannot intern _NET_ACTIVE_WINDOW: %s" % (exc,))
 
         disp.set_error_handler(self._on_async_error)
         return self
@@ -476,11 +520,19 @@ class XSession(object):
             raise self._as_call_error(exc, xid)
         return attrs.map_state == self._X.IsViewable
 
-    def select_structure(self, xid):
-        """StructureNotify on a FOREIGN window.  Event masks are per-client in
-        X, so this never disturbs the owner (unlike SubstructureRedirect)."""
-        self._checked(self._window(xid).change_attributes,
-                      event_mask=self._X.StructureNotifyMask)
+    def select_structure(self, xid, expose=False):
+        """StructureNotify (and, with ``expose``, Expose) on a FOREIGN window.
+
+        Event masks are per-client in X, so this never disturbs the owner
+        (unlike SubstructureRedirect) and Wine never learns we asked.
+        ``change_attributes`` REPLACES this client's mask, so both bits go in
+        ONE call -- selecting them one after the other would keep only the
+        second.
+        """
+        mask = self._X.StructureNotifyMask
+        if expose:
+            mask |= self._X.ExposureMask
+        self._checked(self._window(xid).change_attributes, event_mask=mask)
 
     def try_redirect_automatic(self, xid):
         """Ask Composite to redirect this source window.
@@ -504,6 +556,101 @@ class XSession(object):
         except XCallError as exc:
             _log("composite redirect declined for 0x%x: %s" % (int(xid), exc.msg))
             return False
+        return True
+
+    # ---- activation -----------------------------------------------------
+
+    def activate_window(self, xid, timestamp=0):
+        """Give ``xid`` the foreground, EPM's way (see its src/x11/ops.rs).
+
+        TWO requests, both needed:
+
+        * ``ConfigureWindow(stack_mode=Above)`` -- several WMs (and Xwayland
+          in particular) raise nothing on _NET_ACTIVE_WINDOW alone, so the
+          client would take focus while staying buried.
+        * a ``_NET_ACTIVE_WINDOW`` ClientMessage to the ROOT with
+          ``SubstructureRedirect|SubstructureNotify`` -- that is the EWMH
+          request every WM listens for; sending it to the client itself would
+          go nowhere.
+
+        ``timestamp`` is 0 (CurrentTime) by design: Wine passes 0 itself, and
+        a stale non-zero stamp is precisely what makes a WM refuse the focus
+        under its focus-stealing-prevention rule.
+
+        The raise is fire-and-forget (a BadWindow there is the same news the
+        ClientMessage is about to deliver); the ClientMessage itself goes
+        through ``_checked`` so a dead or wrong window becomes an
+        ``XCallError`` the caller can report, instead of a silent no-focus.
+        Activation is a handful of requests per key press, never per frame.
+        """
+        if self._net_active_window is None:
+            raise XCallError("_NET_ACTIVE_WINDOW was never interned",
+                             "internal", xid)
+        X = self._X
+        try:
+            win = self._window(xid)
+            win.configure(stack_mode=X.Above)
+            message = self._event.ClientMessage(
+                window=win,
+                client_type=self._net_active_window,
+                data=(32, [ACTIVE_WINDOW_SOURCE_PAGER, int(timestamp),
+                           0, 0, 0]))
+            self._checked(
+                self._window(self.root()).send_event, message,
+                event_mask=(X.SubstructureRedirectMask
+                            | X.SubstructureNotifyMask))
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            raise self._as_call_error(exc, xid)
+        self.flush()
+        return True
+
+    def nudge_pointer(self, xid, timestamp=0):
+        """EPM's +-1 px synthetic MotionNotify, so Wine re-evaluates hover.
+
+        A programmatic activation gives the client focus without ever moving
+        the pointer, so Wine (and EVE inside it) keeps whatever hover state it
+        last saw -- under Xwayland the window comes up with a dead cursor.  A
+        SYNTHETIC MotionNotify one pixel off the pointer's real position is
+        the cure; a real ``WarpPointer`` is not, because it would drag the
+        user's cursor and is a no-op on Wayland anyway.
+
+        Skipped when the pointer is on another screen: the coordinates would
+        be meaningless there.  Returns True only when a nudge was sent.
+        """
+        X = self._X
+        win = self._window(xid)
+        try:
+            pointer = win.query_pointer()
+            if not getattr(pointer, "same_screen", 0):
+                return False
+            # Jitter AWAY from the edge so the nudged point stays inside the
+            # window; EPM picks the sign the same way.
+            jitter_x = -1 if int(pointer.win_x) > 0 else 1
+            jitter_y = -1 if int(pointer.win_y) > 0 else 1
+            motion = self._event.MotionNotify(
+                # 0 = Motion "Normal" (1 would be "Hint", which asks the
+                # client to come back and query the position itself).
+                detail=0,
+                time=int(timestamp),
+                root=_xid_of(pointer.root),
+                window=int(xid),
+                child=int(xid),
+                root_x=int(pointer.root_x) + jitter_x,
+                root_y=int(pointer.root_y) + jitter_y,
+                event_x=int(pointer.win_x) + jitter_x,
+                event_y=int(pointer.win_y) + jitter_y,
+                # No buttons held: a non-zero state would look like a DRAG.
+                state=0,
+                same_screen=1)
+            self._checked(win.send_event, motion,
+                          event_mask=X.PointerMotionMask)
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            raise self._as_call_error(exc, xid)
+        self.flush()
         return True
 
     # ---- RENDER ---------------------------------------------------------
@@ -581,8 +728,12 @@ class XSession(object):
         """Drain the queue into normalised tuples.
 
         ``("damage", xid)`` / ``("configure", xid, w, h)`` /
-        ``("destroy", xid)`` / ``("error", code, resource)``.  Anything else is
-        dropped here so HelperCore never sees an Xlib object.
+        ``("expose", xid)`` / ``("destroy", xid)`` /
+        ``("error", code, resource)``.  Anything else is dropped here so
+        HelperCore never sees an Xlib object.
+
+        Expose is deliberately NOT batched on its ``count`` field: one tuple per
+        event is cheap, and HelperCore coalesces a burst itself (_repair).
         """
         out = self._take_errors()
         try:
@@ -615,6 +766,8 @@ class XSession(object):
             if etype == X.ConfigureNotify:
                 out.append(("configure", _xid_of(ev.window),
                             int(ev.width), int(ev.height)))
+            elif etype == X.Expose:
+                out.append(("expose", _xid_of(ev.window)))
             elif etype == X.DestroyNotify:
                 out.append(("destroy", _xid_of(ev.window)))
         out.extend(self._take_errors())
@@ -735,7 +888,18 @@ class Thumb(object):
         self.damage = None
         self.last_composite_ts = 0.0
         self.dirty = False
+        #: When a follow-up repair composite is due (0.0 = none scheduled).
+        #: While it is set, this tile is already inside a repair burst, so
+        #: further exposes do NOT each fire their own immediate composite.
+        self.repair_due = 0.0
         self.last_size = (0, 0)
+        #: Last ConfigureNotify SIZE seen per window id, for the tile and the
+        #: child alike.  A configure that does not change the size is a pure
+        #: MOVE (the user dragging the tile) and needs no repair: the child is
+        #: a child, so it travels with its parent and nothing repaints over
+        #: it.  Seeded with the child's own size so our own move_resize does
+        #: not bounce back as a "change".
+        self.last_cfg_size = {self.child: self.size()}
         self.min_interval_ms = max(MIN_INTERVAL_FLOOR_MS, int(min_interval_ms))
         #: 0 means DISABLED (damage-driven only) -- it must not collapse to the
         #: minimum interval, which would be the busiest heartbeat of all.
@@ -781,6 +945,12 @@ class HelperCore(object):
         self.frames = 0
         self.damage_events = 0
         self.coalesced = 0
+        #: Composites driven by the Wine-flush repair path (immediate ones and
+        #: their follow-ups), reported in 'stats'.
+        self.repairs = 0
+        #: 'activate' requests serviced.  Requests, never confirmations: the
+        #: message is fire-and-forget and the WM never tells us what it did.
+        self.activations = 0
         self.errors = 0
         self.started_ts = clock()
         self._next_stats_ts = self.started_ts + STATS_INTERVAL_S
@@ -829,6 +999,8 @@ class HelperCore(object):
                 self._on_size(msg)
             elif mtype == proto.T_DETACH:
                 self._on_detach(msg)
+            elif mtype == proto.T_ACTIVATE:
+                self._on_activate(msg)
             elif mtype == proto.T_PROBE:
                 self._on_probe(msg)
             elif mtype == proto.T_QUIT:
@@ -873,6 +1045,10 @@ class HelperCore(object):
             session.set_input_shape_empty(child)
             session.map(child)
             session.select_structure(src)
+            # Expose on the TILE is how the server tells us Wine just flushed
+            # its own surface over our child; StructureNotify comes along for
+            # the drag/resize case (one call -- the mask is replaced, not OR'd).
+            session.select_structure(dst, expose=True)
             thumb.src_pic = session.create_source_picture(src)
             thumb.dst_pic = session.create_dest_picture(child)
             thumb.damage = session.damage_create(src)
@@ -995,6 +1171,9 @@ class HelperCore(object):
                 raise
             self._fail_thumb(thumb, _as_internal(exc, "_on_update"))
             return
+        # We resized the child ourselves and repaint it right below, so the
+        # ConfigureNotify it is about to echo back is not news.
+        thumb.last_cfg_size[thumb.child] = thumb.size()
         self.composite(thumb)
 
     def _on_visible(self, msg):
@@ -1037,6 +1216,38 @@ class HelperCore(object):
         self.send({"type": proto.T_SIZE, "id": thumb.id,
                    "w": int(src_w), "h": int(src_h)})
 
+    # ---- activate -------------------------------------------------------
+
+    def _on_activate(self, msg):
+        """Focus one EVE client, then nudge the pointer so Wine notices.
+
+        ``src`` is an X WINDOW id, not a thumbnail handle: a client with no
+        attached thumbnail can still be activated, so nothing is looked up in
+        ``self.thumbs`` here.  validate() has already proved ``src`` is an int.
+
+        Fire-and-forget: there is no reply type, because the WM is entitled to
+        refuse and never tells anyone.  Only a FAILURE goes back on the wire,
+        and with ``id: null`` -- an activate carries no thumbnail id to blame.
+        """
+        src = int(msg["src"])
+        self.activations += 1
+        try:
+            self.session.activate_window(src)
+            # The nudge is the cosmetic half (hover state), so it runs AFTER
+            # the focus and can never cost it: by the time it can fail, the
+            # EWMH request is already on the wire.
+            self.session.nudge_pointer(src)
+        except XCallError as exc:
+            self._error(None, exc.code, exc.msg)
+        except Exception as exc:
+            # Same rule as everywhere else: a dead display is the loop's
+            # business, one bad activate is not.
+            if _is_display_dead(exc):
+                raise
+            self._error(None, "internal",
+                        "activate 0x%x failed: %s: %s"
+                        % (src, type(exc).__name__, exc))
+
     # ---- events ---------------------------------------------------------
 
     def handle_event(self, ev):
@@ -1047,7 +1258,11 @@ class HelperCore(object):
             if kind == "damage":
                 self._on_damage(int(ev[1]))
             elif kind == "configure":
-                self._on_configure(int(ev[1]))
+                self._on_configure(int(ev[1]),
+                                   int(ev[2]) if len(ev) > 2 else 0,
+                                   int(ev[3]) if len(ev) > 3 else 0)
+            elif kind == "expose":
+                self._on_expose(int(ev[1]))
             elif kind == "destroy":
                 self._on_destroy(int(ev[1]))
             elif kind == "error":
@@ -1076,9 +1291,46 @@ class HelperCore(object):
                 thumb.dirty = True
                 self.coalesced += 1
 
-    def _on_configure(self, xid):
+    def _on_configure(self, xid, w=0, h=0):
         for thumb in self._by_src(xid):
             thumb.dirty = True
+        # A configure on the TILE repairs it the same way an Expose does --
+        # but ONLY when the tile actually RESIZED.  A pure move (the user
+        # dragging a tile around) sends a ConfigureNotify per mouse motion at
+        # an unchanged size, and repairing each one would be a composite burst
+        # per pixel of drag for no gain: the child rides along with its parent
+        # and nothing has painted over it.
+        now = self.clock()
+        size = (int(w), int(h))
+        for thumb in self._by_dst(xid):
+            if thumb.last_cfg_size.get(xid) == size:
+                continue
+            thumb.last_cfg_size[xid] = size
+            self._repair(thumb, now)
+
+    def _on_expose(self, xid):
+        """Wine flushed its GDI surface over our child -- repair it NOW."""
+        now = self.clock()
+        for thumb in self._by_dst(xid):
+            self._repair(thumb, now)
+
+    def _repair(self, thumb, now):
+        """One repair burst: composite immediately, then once more shortly.
+
+        Bypasses ``min_interval_ms`` on purpose -- a tile painted black by
+        Wine's flush must not stay black for up to a whole frame interval.  The
+        burst is bounded instead: while ``repair_due`` is still pending, every
+        further expose only marks the tile dirty, so a storm of exposes costs
+        two composites, not one per event.
+        """
+        if not thumb.visible:
+            return
+        if thumb.repair_due:
+            thumb.dirty = True
+            return
+        thumb.repair_due = now + REPAIR_FOLLOWUP_MS / 1000.0
+        self.repairs += 1
+        self.composite(thumb, now)
 
     def _on_destroy(self, xid):
         for thumb in self._by_src(xid):
@@ -1104,6 +1356,11 @@ class HelperCore(object):
 
     def _by_src(self, xid):
         return [t for t in list(self.thumbs.values()) if t.src == xid]
+
+    def _by_dst(self, xid):
+        """Thumbs whose TILE (or the child inside it) is ``xid``."""
+        return [t for t in list(self.thumbs.values())
+                if xid and xid in (t.dst, t.child)]
 
     # ---- compositing ----------------------------------------------------
 
@@ -1173,6 +1430,18 @@ class HelperCore(object):
             # that thumbnail, not the tick and not the helper.
             try:
                 if not thumb.visible:
+                    # A hidden tile is repaired when it is shown again.
+                    thumb.repair_due = 0.0
+                    continue
+                if thumb.repair_due:
+                    if now < thumb.repair_due:
+                        continue
+                    # The follow-up half of a repair burst: Wine's flush runs
+                    # on another X connection and can land just after the
+                    # immediate repaint, so this one ignores the interval too.
+                    thumb.repair_due = 0.0
+                    self.repairs += 1
+                    self.composite(thumb, now)
                     continue
                 elapsed_ms = (now - thumb.last_composite_ts) * 1000.0
                 if thumb.dirty:
@@ -1199,6 +1468,11 @@ class HelperCore(object):
         for thumb in self.thumbs.values():
             if not thumb.visible:
                 continue
+            if thumb.repair_due:
+                # A pending repair is the soonest thing there is: select()
+                # must wake for it even with the heartbeat disabled.
+                timeout = min(timeout, thumb.repair_due - now)
+                continue
             if thumb.dirty:
                 window_ms = thumb.min_interval_ms
             elif thumb.heartbeat_ms:
@@ -1220,6 +1494,11 @@ class HelperCore(object):
                    "frames": self.frames,
                    "damage_events": self.damage_events,
                    "coalesced": self.coalesced,
+                   # Not in the codec's required set for 'stats'; validate()
+                   # checks the required (and the few optional) fields and
+                   # ignores every extra key, so this rides along safely.
+                   "repairs": self.repairs,
+                   "activations": self.activations,
                    "errors": self.errors,
                    "uptime_s": round(now - self.started_ts, 3)})
 
