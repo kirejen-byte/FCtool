@@ -93,7 +93,9 @@ def is_wine(ntdll=None) -> bool:
 
     Decided by whether ntdll exports ``wine_get_version``.  The answer is
     cached for the process (the host cannot change mid-run); tests inject a
-    fake ``ntdll`` and clear the cache with :func:`reset_cache`.
+    fake ``ntdll`` and clear the cache with :func:`reset_cache`.  A transient
+    loader failure is cached the same way, as False - call
+    :func:`reset_cache` to force a re-probe.
     """
     global _IS_WINE
     if _IS_WINE is None:
@@ -270,7 +272,7 @@ def _win_spellings(unix):
     return ("\\\\?\\unix" + unix, "Z:" + unix.replace("/", "\\"))
 
 
-def find_unix_python(exists=os.path.exists):
+def find_unix_python(exists=os.path.exists) -> list:
     """Ordered Unix python3 interpreters that exist, in the Unix spelling.
 
     Each candidate is probed through BOTH Windows spellings; a candidate that
