@@ -906,11 +906,59 @@ def _deals_damage(view, type_id, *, unknown: bool) -> bool:
         return unknown
 
 
+def _fitted_module_type_ids(parsed) -> tuple[int, ...]:
+    """Every distinct fitted module type id, in fit order -- the candidate set
+    :func:`fit_ammo_types`' cargo filter asks :func:`_weapon_accepts` about.
+
+    Unlike :func:`_weapon_type_ids` (the ammo POLICY's own classifier), this
+    asks nothing about effects, state or dedup-by-weapon-group: an offline gun
+    can still be loaded (it just is not FIRING), and whether a module even IS a
+    weapon is exactly what ``_weapon_accepts``'s own "declares no chargeGroup"
+    answer already tells apart -- classifying twice would just be two chances
+    to disagree.
+    """
+    out: list = []
+    seen: set = set()
+    for parsed_module in (getattr(parsed, "modules", None) or ()):
+        try:
+            type_id = int(getattr(parsed_module, "type_id", None) or 0)
+        except (TypeError, ValueError):                  # pragma: no cover
+            continue
+        if type_id <= 0 or type_id in seen:
+            continue
+        seen.add(type_id)
+        out.append(type_id)
+    return tuple(out)
+
+
+def _weapon_accepts_or_unknown(weapon_type_id: int, charge_type_id: int) -> bool:
+    """Like :func:`_weapon_accepts`, except a weapon type the table has NO ROW
+    for answers "cannot say" -- which :func:`fit_ammo_types` treats as
+    accepting the charge, the same "hiding is worse" bias :func:`_deals_damage`
+    already uses for a damage-less-looking charge with no attribute row.
+
+    This is deliberately looser than ``_weapon_accepts`` itself, which a KNOWN
+    weapon type with no declared ``chargeGroup`` still refuses outright (see
+    its own docstring) -- that is a definite answer, not a missing one, and
+    ``_load_ammo_type`` needs it to stay definite.  Here the fit-detail
+    dropdown is deciding whether to SHOW a charge the pilot is carrying, and an
+    unreadable fitted module (a corrupt or not-yet-catalogued type) must not
+    quietly make that charge disappear.
+    """
+    try:
+        if not dogma_data.has_type(int(weapon_type_id)):
+            return True
+    except _LOOKUP_FAILURES:
+        return True
+    return _weapon_accepts(weapon_type_id, charge_type_id)
+
+
 def fit_ammo_types(parsed, dogma=None) -> list:
     """``[(charge type id, name), ...]`` -- every DISTINCT charge one fit
     carries, loaded into a weapon or sitting in cargo, in fit order.
 
-    The fit-detail ammo dropdown's per-fit half (owner ask 2026-09-12).  Four
+    The fit-detail ammo dropdown's per-fit half (owner ask 2026-09-12; narrowed
+    2026-09-12 to the owner's Quake/Tremor-in-an-autocannon-fit bug).  Five
     decisions, each of them a place this could be quietly wrong:
 
     * **AMMUNITION, not "category 8".**  A charge is listed only if it does
@@ -918,6 +966,17 @@ def fit_ammo_types(parsed, dogma=None) -> list:
       halves of the dropdown never disagree about what counts.  That is what
       keeps scripts, cap booster charges, nanite paste, probes and the command
       bursts out of a list the FC is picking ammunition from.
+    * **Damage-dealing AND loadable by a fitted weapon.**  A CARGO charge is
+      listed only when at least one fitted module in the fit could actually
+      load it -- group membership + size, the exact test
+      :func:`_load_ammo_type` uses (:func:`_weapon_accepts`, wrapped by
+      :func:`_weapon_accepts_or_unknown` for the unreadable-module case above).
+      Otherwise a fit carrying artillery ammo in cargo "in case it gets
+      re-fitted" onto an autocannon boat offered it in the dropdown as if it
+      would load -- it never would.  A LOADED charge needs no such check: it is
+      ammunition by construction, whatever sits in cargo beside it. A fit with
+      no weapon that declares any ``chargeGroup`` at all (no weapons fitted, or
+      none the table can describe) therefore lists only its loaded charges.
     * **Names come from the PARSED fit**, never from
       ``type_catalog.resolve_name``.  This is asked on the **Tk thread** (the
       combobox's values are rebuilt for every fit shown) and a resolve-name
@@ -936,7 +995,11 @@ def fit_ammo_types(parsed, dogma=None) -> list:
       would cost the whole detail pane.
 
     ``dogma`` injects the category view (defaults to :mod:`dogma_data`); it is
-    the seam the tests use, and the reason nothing here imports upward.
+    the seam the tests use, and the reason nothing here imports upward.  The
+    fitted-module loadability check always reads real :mod:`dogma_data`
+    (never ``dogma``) -- exactly as :func:`_weapon_accepts` and
+    :func:`_load_ammo_type` already do, so a test seeds the table through
+    ``dogma_data._seed_for_tests`` rather than the injected view.
     """
     view = dogma if dogma is not None else dogma_data
     out: list = []
@@ -956,6 +1019,7 @@ def fit_ammo_types(parsed, dogma=None) -> list:
         if (_is_charge(view, charge_id, unknown=True)
                 and _deals_damage(view, charge_id, unknown=True)):
             add(charge_id, getattr(parsed_module, "charge_name", ""))
+    weapon_ids = _fitted_module_type_ids(parsed)
     for stack in (getattr(parsed, "cargo", None) or ()):
         try:
             type_id = int(getattr(stack, "type_id", None) or 0)
@@ -963,9 +1027,13 @@ def fit_ammo_types(parsed, dogma=None) -> list:
             continue
         if type_id <= 0 or type_id in seen:
             continue
-        if (_is_charge(view, type_id, unknown=False)
+        if not (_is_charge(view, type_id, unknown=False)
                 and _deals_damage(view, type_id, unknown=True)):
-            add(type_id, getattr(stack, "name", ""))
+            continue
+        if not any(_weapon_accepts_or_unknown(weapon_id, type_id)
+                   for weapon_id in weapon_ids):
+            continue
+        add(type_id, getattr(stack, "name", ""))
     return out
 
 
