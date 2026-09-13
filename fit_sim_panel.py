@@ -105,8 +105,21 @@ AMMO_VALUES = tuple(AMMO_LABELS[mode] for mode in fit_sim_stats.AMMO_MODES)
 
 #: How a fit-specific charge entry reads when its name is already taken — by a
 #: policy label, or by another type id publishing the same name. Two identical
-#: rows in a readonly combobox are one unpickable row.
+#: rows in a readonly combobox are one unpickable row, and the type id is the
+#: one thing that is unique per entry by construction.
 AMMO_TYPE_DUP_LABEL = "{name} #{type_id}"
+
+#: Character cap on the ammo combobox's WIDTH (never on its values — ttk
+#: truncates only the closed entry, and the dropdown list still shows every
+#: name in full).
+#:
+#: MEASURED, this box, this font (Consolas 9), on the owner's display: the
+#: Stats header row requests ``7 × width + 319`` px, and the fittings detail
+#: canvas is 534 px at the app's own ``root.minsize(1000, 700)``. 30 chars
+#: requests 529 px and fits; 31 requests 536 and clips from the right. Without
+#: a cap a 33-character charge name asked for 557 px and a 42-character one for
+#: 620 — the box grew past the pane instead of the name being trimmed.
+AMMO_COMBO_MAX_CHARS = 30
 
 #: What ``as_fitted`` puts on the Ammo row: there is nothing to name, and an
 #: absent row would read as "no ammo" rather than "the pilot's own".
@@ -190,10 +203,13 @@ def ammo_type_labels(ammo_types) -> list:
     for type_id, name in (ammo_types or ()):
         type_id = int(type_id)
         label = str(name or "").strip() or f"type {type_id}"
-        if label in taken:
+        while label in taken:
+            # Always the type id, never padding: a trailing space would make
+            # two rows that READ identically, which is worse than the duplicate
+            # it was meant to break. The id is unique per entry, so one pass
+            # settles it; the loop is only for a name that already spells its
+            # own disambiguated form.
             label = AMMO_TYPE_DUP_LABEL.format(name=label, type_id=type_id)
-        while label in taken:                # pathological: a name that already
-            label += " "                     # reads like the disambiguated form
         taken.add(label)
         out.append((label, type_id))
     return out
@@ -220,6 +236,15 @@ def ammo_choice(label, ammo_types) -> str:
     A label this fit does not offer — the pick outliving the fit it was made
     on — therefore falls back to the DEFAULT policy rather than to a stale
     type id, which would simulate a charge nothing in this fit carries.
+
+    **A pick carries over between fits by LABEL, not by type id.** The widget
+    holds a string and nothing else, so "does this fit still offer my pick"
+    is asked of :func:`ammo_type_labels`' output — which means a charge whose
+    label was disambiguated in one fit (``"Scourge Rage #200"``) and not in the
+    next resolves to the same id only while both fits spell it the same way,
+    and otherwise falls back to the policy. That is the safe direction: a
+    silent re-resolve to a DIFFERENT id sharing the name would simulate a
+    charge the FC never picked.
     """
     for text, type_id in ammo_type_labels(ammo_types):
         if text == label:
@@ -590,17 +615,24 @@ class FitStatsPanel:
 
         Unlike the tier and discipline vocabularies, the ammo list is PER FIT
         (:func:`ammo_values`), so it is set after construction and again on
-        every request. The width rule follows it: a box narrower than its
-        longest offered value clips that value, and a charge name is routinely
-        longer than any policy label. An empty list falls back to the two
-        policies — the box is never left with nothing to pick.
+        every request. The width follows it — a box narrower than its longest
+        offered value clips that value, and a charge name is routinely longer
+        than any policy label — but only up to
+        :data:`AMMO_COMBO_MAX_CHARS`, beyond which the BOX would outgrow the
+        detail pane and be clipped from the right by the canvas instead. Past
+        the cap it is the closed entry's text that is truncated; ``values``
+        keeps every name in full, so the dropdown list still reads properly and
+        :func:`ammo_choice` still recognises what was picked.
+
+        An empty list falls back to the two policies — the box is never left
+        with nothing to pick.
 
         Purely the widget's values: the SELECTION lives in the caller's
         ``ammo_var``, and re-offering a list never fires ``on_change``.
         """
         values = [str(value) for value in (values or ())] or list(AMMO_VALUES)
-        self.ammo_combo.configure(values=values,
-                                  width=max(len(v) for v in values) + 1)
+        width = min(max(len(v) for v in values) + 1, AMMO_COMBO_MAX_CHARS)
+        self.ammo_combo.configure(values=values, width=width)
 
     # ── state ────────────────────────────────────────────────────────────
     def set_pending(self) -> None:

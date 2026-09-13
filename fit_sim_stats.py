@@ -512,12 +512,15 @@ class FitStats:
     #: and explains itself in :attr:`notes`, so the pane and the results cache
     #: agree on which answer this is.
     ammo: str = AMMO_AS_FITTED
-    #: ``((weapon type id, charge type id, charge name), ...)`` -- what was
-    #: LOADED that the pilot had not, one entry per weapon group in fit order.
-    #: Empty under ``as_fitted`` (nothing was assumed).  Under ``best_close`` a
-    #: weapon group the policy could not resolve is absent rather than listed
-    #: with the pilot's charge: it kept what the EFT loaded, and says so through
-    #: an ``unmodeled`` line.
+    #: ``((weapon type id, charge type id, charge name), ...)`` -- the charge
+    #: the policy or the request LOADED into each weapon group, in fit order.
+    #: It is what the numbers were computed with, NOT a diff against the EFT: a
+    #: group that already held that charge still appears, because the readout's
+    #: job is to say what it fired, not what changed.  Empty under
+    #: ``as_fitted`` (nothing was decided).  Under ``best_close`` a weapon group
+    #: the policy could not resolve is absent rather than listed with the
+    #: pilot's charge: it kept what the EFT loaded, and says so through an
+    #: ``unmodeled`` line.
     ammo_assumed: tuple[tuple[int, int, str], ...] = ()
     #: :attr:`ammo_assumed`'s shape, the other way round: the weapon groups a
     #: ``type:<id>`` request could NOT be loaded into (wrong charge group or
@@ -877,13 +880,44 @@ def _is_charge(view, type_id, *, unknown: bool) -> bool:
         return unknown
 
 
+def _deals_damage(view, type_id, *, unknown: bool) -> bool:
+    """Does this charge do damage at all?  The SAME question
+    :func:`_charge_candidates` asks -- ``_raw_damage_sum > 0``.
+
+    Category 8 is far wider than "ammunition": scripts, cap booster charges,
+    nanite paste, probes and the command-burst charges all live in it -- 194 of
+    the shipped table's 1,017 category-8 types do no damage at all.  MEASURED on
+    the owner's library before this filter existed: an Absolution offered eight
+    rows, every one a burst charge and every one "cannot load"; a Guardian
+    offered three, none of them ammunition.  Damage is what tells a charge a gun
+    fires from a charge a module consumes, and it is the filter the ammo POLICY
+    already trusts, so the dropdown and the policy disagree about nothing.
+
+    ``unknown`` is the answer when the table cannot say (no row, no attributes,
+    no table loaded yet).  Callers pass True: hiding a charge the pilot actually
+    carries is the worse failure of the two.
+    """
+    try:
+        attrs = view.type_attrs(int(type_id))
+        if not attrs:
+            return unknown
+        return _raw_damage_sum(attrs) > 0
+    except _LOOKUP_FAILURES:
+        return unknown
+
+
 def fit_ammo_types(parsed, dogma=None) -> list:
     """``[(charge type id, name), ...]`` -- every DISTINCT charge one fit
     carries, loaded into a weapon or sitting in cargo, in fit order.
 
-    The fit-detail ammo dropdown's per-fit half (owner ask 2026-09-12).  Three
+    The fit-detail ammo dropdown's per-fit half (owner ask 2026-09-12).  Four
     decisions, each of them a place this could be quietly wrong:
 
+    * **AMMUNITION, not "category 8".**  A charge is listed only if it does
+      damage (:func:`_deals_damage`) -- the ammo POLICY's own test, so the two
+      halves of the dropdown never disagree about what counts.  That is what
+      keeps scripts, cap booster charges, nanite paste, probes and the command
+      bursts out of a list the FC is picking ammunition from.
     * **Names come from the PARSED fit**, never from
       ``type_catalog.resolve_name``.  This is asked on the **Tk thread** (the
       combobox's values are rebuilt for every fit shown) and a resolve-name
@@ -919,7 +953,8 @@ def fit_ammo_types(parsed, dogma=None) -> list:
             continue
         if charge_id <= 0 or charge_id in seen:
             continue
-        if _is_charge(view, charge_id, unknown=True):
+        if (_is_charge(view, charge_id, unknown=True)
+                and _deals_damage(view, charge_id, unknown=True)):
             add(charge_id, getattr(parsed_module, "charge_name", ""))
     for stack in (getattr(parsed, "cargo", None) or ()):
         try:
@@ -928,7 +963,8 @@ def fit_ammo_types(parsed, dogma=None) -> list:
             continue
         if type_id <= 0 or type_id in seen:
             continue
-        if _is_charge(view, type_id, unknown=False):
+        if (_is_charge(view, type_id, unknown=False)
+                and _deals_damage(view, type_id, unknown=True)):
             add(type_id, getattr(stack, "name", ""))
     return out
 
