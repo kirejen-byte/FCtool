@@ -44,6 +44,9 @@ Two OWNER RULES shape the headline numbers (spec 4.1, recorded verbatim there):
   every weapon group, chosen from data and confirmed by SIMULATION (a
   kinetic-bonused hull picks its kinetic ammo by itself).  ``"as_fitted"`` keeps
   the pilot's own charges.  :attr:`FitStats.ammo_assumed` names what was chosen.
+  Beside the two policies, ``ammo="type:<id>"`` (:func:`ammo_for_type`) loads
+  ONE named charge everywhere it fits -- the owner's 2026-09-12 ask, which the
+  fit-detail dropdown fills from :func:`fit_ammo_types`.
 * **Drones.**  Drone damage joins the headline ``dps_total`` / ``volley`` ONLY
   when it is more than half the fit's raw total -- a primarily-drone ship.  The
   breakdown (:attr:`FitStats.dps_drone`) always reports it, and
@@ -327,6 +330,18 @@ AMMO_BEST_CLOSE = "best_close"
 AMMO_AS_FITTED = "as_fitted"
 AMMO_MODES = (AMMO_BEST_CLOSE, AMMO_AS_FITTED)
 
+#: The prefix that makes an ``ammo=`` argument name ONE charge type instead of
+#: a policy: ``"type:12608"``.  Owner ask 2026-09-12 -- "the dropdown should
+#: allow simulation of any type of ammo in cargo or loaded into guns on the
+#: fit".  Deliberately a STRING rather than a second parameter: ``ammo`` is
+#: already in the results-cache key, already validated in one place, and
+#: already threaded through every consumer, so a third kind of answer costs
+#: nothing but this spelling.  :data:`AMMO_MODES` stays the two POLICIES --
+#: everything that iterates the modes (the combobox's fixed half,
+#: ``fit_sim_panel.settings``' validation of the PERSISTED value) must keep
+#: seeing exactly two.
+AMMO_TYPE_PREFIX = "type:"
+
 #: ``chargeGroup1..5``.  NON-contiguous by CCP's own numbering (604, 605, 606,
 #: then 609, 610) -- a ``range(604, 609)`` would silently drop two of them, and
 #: a hybrid turret keeps its Charges in the ones a naive range misses.
@@ -491,15 +506,29 @@ class FitStats:
     #: strictly more than half the raw total.  A fit with no DPS at all is
     #: False -- there is nothing to be more than half of.
     drones_counted: bool = False
-    #: The ammo mode these numbers were computed under, one of
-    #: :data:`AMMO_MODES`.
+    #: What was ASKED FOR: one of :data:`AMMO_MODES`, or a ``type:<id>`` spec
+    #: naming one charge (:func:`is_ammo_type` reads it back).  The request, not
+    #: the outcome -- a type id this table cannot use still reports itself here
+    #: and explains itself in :attr:`notes`, so the pane and the results cache
+    #: agree on which answer this is.
     ammo: str = AMMO_AS_FITTED
-    #: ``((weapon type id, charge type id, charge name), ...)`` -- what
-    #: ``best_close`` ASSUMED, one entry per weapon group in fit order.  Empty
-    #: under ``as_fitted`` (nothing was assumed), and a weapon group the policy
-    #: could not resolve is absent rather than listed with the pilot's charge:
-    #: it kept what the EFT loaded, and says so through an ``unmodeled`` line.
+    #: ``((weapon type id, charge type id, charge name), ...)`` -- the charge
+    #: the policy or the request LOADED into each weapon group, in fit order.
+    #: It is what the numbers were computed with, NOT a diff against the EFT: a
+    #: group that already held that charge still appears, because the readout's
+    #: job is to say what it fired, not what changed.  Empty under
+    #: ``as_fitted`` (nothing was decided).  Under ``best_close`` a weapon group
+    #: the policy could not resolve is absent rather than listed with the
+    #: pilot's charge: it kept what the EFT loaded, and says so through an
+    #: ``unmodeled`` line.
     ammo_assumed: tuple[tuple[int, int, str], ...] = ()
+    #: :attr:`ammo_assumed`'s shape, the other way round: the weapon groups a
+    #: ``type:<id>`` request could NOT be loaded into (wrong charge group or
+    #: wrong size), each keeping the pilot's own charge.  A disclosure, never a
+    #: gap -- those guns are still firing something real, so it sets neither
+    #: ``partial`` nor an ``unmodeled`` line.  Always empty for both policy
+    #: modes: neither asks a question a weapon can refuse.
+    ammo_unloadable: tuple[tuple[int, int, str], ...] = ()
 
     def resists_map(self) -> dict:
         """``{layer: (em, th, kin, exp)}`` -- the dict view of
@@ -796,8 +825,149 @@ def _weapon_ranges(rows) -> tuple[WeaponRange, ...]:
 
 
 # ===========================================================================
-# ammo: choosing the best close-range non-T2 charge (spec 4.1.1)
+# ammo: the policy, the named-charge spec, and a fit's own charges
 # ===========================================================================
+
+def ammo_for_type(type_id: int) -> str:
+    """The ``ammo=`` argument that loads charge ``type_id`` wherever it fits.
+
+    The ONE place the spec is spelled, so :func:`is_ammo_type` is its exact
+    inverse and a consumer never hand-formats the prefix."""
+    return f"{AMMO_TYPE_PREFIX}{int(type_id)}"
+
+
+def is_ammo_type(ammo) -> int | None:
+    """The charge type id an ``ammo=`` argument names, or ``None``.
+
+    ``None`` for both policy modes and for anything malformed -- the caller
+    uses that to tell "a specific charge" from "a policy" and, in
+    :func:`simulate`, from "a caller bug".  Deliberately STRICT: ``int()``
+    would accept ``" 921"``, ``"+921"`` and a full-width digit string, none of
+    which any consumer produces, and every one of which would make two
+    spellings of one request two separate cache entries.  A non-positive id is
+    not a type, so it is not a spec either.
+    """
+    text = ammo if isinstance(ammo, str) else ""
+    if not text.startswith(AMMO_TYPE_PREFIX):
+        return None
+    digits = text[len(AMMO_TYPE_PREFIX):]
+    # ``isdecimal`` rather than ``isdigit``: the latter is True for superscript
+    # digits, which ``int()`` then rejects.
+    if not digits.isdecimal():
+        return None
+    try:
+        value = int(digits)
+    except ValueError:                                   # pragma: no cover
+        return None
+    return value or None
+
+
+#: The exceptions a dogma lookup can answer a question with: a missing or
+#: corrupt row (``KeyError``/``ValueError``), no table at all
+#: (``DogmaUnavailable``), or an injected view that does not answer the way the
+#: module does (``TypeError``/``AttributeError``).
+_LOOKUP_FAILURES = (KeyError, ValueError, TypeError, AttributeError,
+                    dogma_data.DogmaUnavailable)
+
+
+def _is_charge(view, type_id, *, unknown: bool) -> bool:
+    """Is ``type_id`` a category-8 charge?  ``unknown`` is the answer when the
+    table cannot say -- which is a DIFFERENT question per caller, so it has no
+    default."""
+    try:
+        return int(view.type_category(int(type_id))) == fit_sim.CATEGORY_CHARGE
+    except _LOOKUP_FAILURES:
+        return unknown
+
+
+def _deals_damage(view, type_id, *, unknown: bool) -> bool:
+    """Does this charge do damage at all?  The SAME question
+    :func:`_charge_candidates` asks -- ``_raw_damage_sum > 0``.
+
+    Category 8 is far wider than "ammunition": scripts, cap booster charges,
+    nanite paste, probes and the command-burst charges all live in it -- 194 of
+    the shipped table's 1,017 category-8 types do no damage at all.  MEASURED on
+    the owner's library before this filter existed: an Absolution offered eight
+    rows, every one a burst charge and every one "cannot load"; a Guardian
+    offered three, none of them ammunition.  Damage is what tells a charge a gun
+    fires from a charge a module consumes, and it is the filter the ammo POLICY
+    already trusts, so the dropdown and the policy disagree about nothing.
+
+    ``unknown`` is the answer when the table cannot say (no row, no attributes,
+    no table loaded yet).  Callers pass True: hiding a charge the pilot actually
+    carries is the worse failure of the two.
+    """
+    try:
+        attrs = view.type_attrs(int(type_id))
+        if not attrs:
+            return unknown
+        return _raw_damage_sum(attrs) > 0
+    except _LOOKUP_FAILURES:
+        return unknown
+
+
+def fit_ammo_types(parsed, dogma=None) -> list:
+    """``[(charge type id, name), ...]`` -- every DISTINCT charge one fit
+    carries, loaded into a weapon or sitting in cargo, in fit order.
+
+    The fit-detail ammo dropdown's per-fit half (owner ask 2026-09-12).  Four
+    decisions, each of them a place this could be quietly wrong:
+
+    * **AMMUNITION, not "category 8".**  A charge is listed only if it does
+      damage (:func:`_deals_damage`) -- the ammo POLICY's own test, so the two
+      halves of the dropdown never disagree about what counts.  That is what
+      keeps scripts, cap booster charges, nanite paste, probes and the command
+      bursts out of a list the FC is picking ammunition from.
+    * **Names come from the PARSED fit**, never from
+      ``type_catalog.resolve_name``.  This is asked on the **Tk thread** (the
+      combobox's values are rebuilt for every fit shown) and a resolve-name
+      MISS makes a synchronous ESI call -- worker-only by contract
+      (CODEBASE_MAP).  Every parser already carries a name for each charge and
+      cargo stack, so the labels cost nothing; a nameless one degrades to
+      ``type <id>`` rather than to an unpickable blank row.
+    * **A loaded charge is trusted, a cargo item is not.**  What sits in a
+      module's charge slot is ammunition by construction; what sits in cargo
+      could be a spare module, a drone or a script, so it needs the table's
+      category -- and when no table is loaded yet (the worker decodes it, and
+      the first paint can beat that) cargo simply contributes nothing.  The
+      list is refreshed on the next request, when the table is there.
+    * **Total.**  It is handed whatever the selected library row carries, on
+      the Tk thread, so a garbage fit yields ``[]`` and never a traceback that
+      would cost the whole detail pane.
+
+    ``dogma`` injects the category view (defaults to :mod:`dogma_data`); it is
+    the seam the tests use, and the reason nothing here imports upward.
+    """
+    view = dogma if dogma is not None else dogma_data
+    out: list = []
+    seen: set = set()
+
+    def add(type_id, name) -> None:
+        out.append((type_id, str(name or "").strip() or _default_name(type_id)))
+        seen.add(type_id)
+
+    for parsed_module in (getattr(parsed, "modules", None) or ()):
+        try:
+            charge_id = int(getattr(parsed_module, "charge_type_id", None) or 0)
+        except (TypeError, ValueError):                  # pragma: no cover
+            continue
+        if charge_id <= 0 or charge_id in seen:
+            continue
+        if (_is_charge(view, charge_id, unknown=True)
+                and _deals_damage(view, charge_id, unknown=True)):
+            add(charge_id, getattr(parsed_module, "charge_name", ""))
+    for stack in (getattr(parsed, "cargo", None) or ()):
+        try:
+            type_id = int(getattr(stack, "type_id", None) or 0)
+        except (TypeError, ValueError):                  # pragma: no cover
+            continue
+        if type_id <= 0 or type_id in seen:
+            continue
+        if (_is_charge(view, type_id, unknown=False)
+                and _deals_damage(view, type_id, unknown=True)):
+            add(type_id, getattr(stack, "name", ""))
+    return out
+
 
 def _type_attr(attrs: dict, attr_id: int) -> float:
     """One attribute off a RAW type-attribute mapping, dogma default filled.
@@ -851,6 +1021,48 @@ def _declared_charge_groups(weapon_type_id: int) -> tuple[int, ...]:
     return tuple(groups)
 
 
+def _charge_size_fits(weapon_size, charge_attrs: dict) -> bool:
+    """Does a charge's ``chargeSize`` match the weapon's?
+
+    The single owner of that question, shared by the POLICY's candidate filter
+    and the hand-picked charge's loadability test.  A weapon that publishes NO
+    size is not asking one -- launchers never do (a missile's size is its
+    group), so for them the filter is skipped rather than made to reject
+    everything.  Read raw, not default-filled: ``chargeSize``'s default is 0,
+    which is exactly the "publishes none" the skip is for.
+    """
+    if not weapon_size:
+        return True
+    return charge_attrs.get(ATTR["chargeSize"]) == weapon_size
+
+
+def _weapon_accepts(weapon_type_id: int, charge_type_id: int) -> bool:
+    """Can this weapon LOAD this charge?  Group + size + category 8, and
+    nothing else.
+
+    This is a question about what physically fits in the gun, NOT about what is
+    worth assuming: the meta-group, faction and raw-damage filters in
+    :func:`_charge_candidates` are the ``best_close`` POLICY's, and applying
+    them here would make the owner's own ask ("simulate any type of ammo in
+    cargo or loaded into guns") refuse the Tech II charge the pilot deliberately
+    picked.  A weapon that declares no ``chargeGroup`` at all accepts nothing:
+    the table cannot describe its ammunition, so it cannot be told to change it.
+    """
+    groups = _declared_charge_groups(weapon_type_id)
+    if not groups:
+        return False
+    try:
+        if dogma_data.type_category(charge_type_id) != fit_sim.CATEGORY_CHARGE:
+            return False
+        if dogma_data.type_group(charge_type_id) not in groups:
+            return False
+    except (KeyError, ValueError):
+        return False
+    return _charge_size_fits(
+        _type_attrs_or_empty(weapon_type_id).get(ATTR["chargeSize"]),
+        _type_attrs_or_empty(charge_type_id))
+
+
 def _charge_candidates(weapon_type_id: int) -> tuple[int, ...]:
     """The ``AMMO_CANDIDATES`` best close-range non-T2 charges for one weapon.
 
@@ -897,7 +1109,7 @@ def _charge_candidates(weapon_type_id: int) -> tuple[int, ...]:
             except (KeyError, ValueError):                # pragma: no cover
                 continue
             attrs = _type_attrs_or_empty(type_id)
-            if weapon_size and attrs.get(ATTR["chargeSize"]) != weapon_size:
+            if not _charge_size_fits(weapon_size, attrs):
                 continue
             damage = _raw_damage_sum(attrs)
             if damage <= 0:
@@ -1068,6 +1280,35 @@ def _choose_ammo(parsed: ParsedFit, name):
     assumed = tuple((type_id, chosen[type_id], name(chosen[type_id]))
                     for type_id in weapons if type_id in chosen)
     return chosen, unavailable, assumed
+
+
+def _load_ammo_type(parsed: ParsedFit, charge_type_id: int, name):
+    """``(charges, unloadable, assumed)`` for ``ammo="type:<id>"``.
+
+    No search and no simulation: the pilot already answered the question the
+    policy exists to answer, so this costs one ``_weapon_accepts`` per weapon
+    GROUP and the single evaluate ``as_fitted`` would have cost.
+
+    A group that cannot take the charge **keeps the pilot's own** rather than
+    falling back to the policy's pick: the readout must not half-answer a
+    request by quietly re-arming half the fit with something nobody asked for.
+    Those groups are named in ``unloadable`` -- a disclosure, not a gap, so it
+    never touches ``unmodeled`` or ``partial``: every gun in the fit is still
+    firing something real.  Offline weapons are not asked about at all (they
+    fire nothing), which is also why they are not a false "cannot load".
+    """
+    charge_name = name(charge_type_id)
+    charges: dict = {}
+    unloadable: list = []
+    assumed: list = []
+    for weapon_id in _weapon_type_ids(parsed):
+        row = (weapon_id, int(charge_type_id), charge_name)
+        if _weapon_accepts(weapon_id, charge_type_id):
+            charges[weapon_id] = int(charge_type_id)
+            assumed.append(row)
+        else:
+            unloadable.append(row)
+    return charges, tuple(unloadable), tuple(assumed)
 
 
 # ===========================================================================
@@ -1267,7 +1508,9 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
            name_of: Callable[[int], str] | None = None,
            ammo: str = AMMO_AS_FITTED,
            ammo_assumed: Sequence[tuple] = (),
-           ammo_unavailable: Sequence[int] = ()) -> FitStats:
+           ammo_unavailable: Sequence[int] = (),
+           ammo_unloadable: Sequence[tuple] = (),
+           ammo_note: str = "") -> FitStats:
     """Read DPS / volley / range / EHP off an ALREADY EVALUATED fit.
 
     ``fit`` must have been through :func:`fit_sim.evaluate` -- this function
@@ -1277,10 +1520,12 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     keeps a default, because nothing here is cached: a ``derive`` result is
     never shared with a caller that wanted different names.
 
-    ``ammo`` / ``ammo_assumed`` / ``ammo_unavailable`` are the ammo policy's
-    REPORT, not an instruction: by the time a fit reaches here its charges are
-    already whatever they are going to be.  The default says ``as_fitted``,
-    which is the truth for every caller that evaluated a fit itself.
+    ``ammo`` / ``ammo_assumed`` / ``ammo_unavailable`` / ``ammo_unloadable`` /
+    ``ammo_note`` are the ammo decision's REPORT, not an instruction: by the
+    time a fit reaches here its charges are already whatever they are going to
+    be.  The default says ``as_fitted``, which is the truth for every caller
+    that evaluated a fit itself.  ``ammo_note`` joins :attr:`FitStats.notes` --
+    a diagnostic ("the charge you named is not in this table"), not a gap.
 
     ``disciplines`` is what was ACTUALLY applied; ``links_unavailable`` names
     the disciplines that were asked for and could not be modelled (the tier's
@@ -1305,6 +1550,11 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         # simply has not stopped moving, so it never sets ``partial``.
         notes.append(f"evaluation hit the pass cap ({fit_sim.MAX_PASSES}) "
                      "— numbers may be off")
+    if ammo_note:
+        # A named charge this table cannot use. The numbers below are the
+        # DEFAULT policy's and entirely sound, so this is a note (diagnostic)
+        # rather than an unmodeled line (a gap that moved a number).
+        notes.append(ammo_note)
     if links_unavailable:
         # The links the caller asked for and did not get -- an honest "this
         # number is missing a boost" rather than a silently unboosted fit.
@@ -1378,6 +1628,10 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
         ammo_assumed=tuple((int(weapon_id), int(charge_id), str(charge_name))
                            for weapon_id, charge_id, charge_name
                            in ammo_assumed),
+        ammo_unloadable=tuple((int(weapon_id), int(charge_id),
+                               str(charge_name))
+                              for weapon_id, charge_id, charge_name
+                              in ammo_unloadable),
     )
 
 
@@ -1434,13 +1688,21 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
     ammo)``: the content hash is order-independent, so re-sorting a fit's
     modules is a cache HIT.
 
-    ``ammo`` is one of :data:`AMMO_MODES`.  The default ``"best_close"`` is the
-    owner's rule -- every weapon group is loaded with the highest-DPS
-    close-range non-Tech-II charge the table offers it, chosen by SIMULATING
-    the top :data:`AMMO_CANDIDATES` and keeping the winner, so a hull's own
+    ``ammo`` is one of :data:`AMMO_MODES` **or** a ``"type:<charge type id>"``
+    spec (:func:`ammo_for_type`).  The default ``"best_close"`` is the owner's
+    rule -- every weapon group is loaded with the highest-DPS close-range
+    non-Tech-II charge the table offers it, chosen by SIMULATING the top
+    :data:`AMMO_CANDIDATES` and keeping the winner, so a hull's own
     damage-type bonus picks its ammunition.  ``"as_fitted"`` keeps whatever the
-    EFT loaded.  Either way :attr:`FitStats.ammo` records which, and
-    ``best_close`` names every assumption in :attr:`FitStats.ammo_assumed`.
+    EFT loaded.  A ``type:<id>`` spec loads THAT charge into every weapon group
+    that can take it (owner ask 2026-09-12) -- Tech II included, since the
+    policy's tier filters are about what to ASSUME, not about what fits; a
+    group that cannot take it keeps the pilot's own charge and is named in
+    :attr:`FitStats.ammo_unloadable`.  A spec naming a type this table cannot
+    use degrades to ``best_close`` with a :attr:`FitStats.notes` line rather
+    than raising.  :attr:`FitStats.ammo` always records the REQUEST, and
+    whatever was loaded over the pilot's charges is named in
+    :attr:`FitStats.ammo_assumed`.
 
     ``name_of`` is REQUIRED and deliberately NOT part of the key.  The strings
     it renders are cached with the numbers, so whichever caller misses first
@@ -1489,9 +1751,11 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
         raise ValueError(
             f"unknown discipline mode {disciplines!r}; expected one of "
             f"{list(fit_sim_links.DISCIPLINE_MODES)}")
-    if ammo not in AMMO_MODES:
+    requested_type = is_ammo_type(ammo)
+    if ammo not in AMMO_MODES and requested_type is None:
         raise ValueError(f"unknown ammo mode {ammo!r}; expected one of "
-                         f"{list(AMMO_MODES)}")
+                         f"{list(AMMO_MODES)} or "
+                         f"'{AMMO_TYPE_PREFIX}<charge type id>'")
     if not dogma_data.is_loaded():
         raise dogma_data.DogmaUnavailable(
             "no dogma table loaded -- call dogma_data.load() from a worker "
@@ -1505,9 +1769,28 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
             _cache.move_to_end(key)
             return hit
 
-    if ammo == AMMO_BEST_CLOSE:
-        charges, ammo_unavailable, ammo_assumed = _choose_ammo(
-            parsed, _namer(name_of))
+    namer = _namer(name_of)
+    ammo_unloadable: tuple = ()
+    ammo_note = ""
+    if requested_type is not None and not _is_charge(dogma_data, requested_type,
+                                                     unknown=False):
+        # A well-formed spec naming a type this table does not carry, or one
+        # that is not a charge at all: a hand-edited config, or a request that
+        # outlived a table regeneration -- unreachable from the pane, whose
+        # list is built from the fit itself. The owner's DEFAULT is the right
+        # answer, said out loud rather than substituted in silence. ``ammo``
+        # itself is NOT rewritten: it is the cache key and the pane's own
+        # reading of which answer this is, and both must stay the REQUEST.
+        ammo_note = (f"{namer(requested_type)}: not a charge in this table "
+                     "— used the best close-range ammo instead")
+        requested_type = None
+    if requested_type is not None:
+        charges, ammo_unloadable, ammo_assumed = _load_ammo_type(
+            parsed, requested_type, namer)
+        ammo_unavailable = ()
+        effective = _reloaded(parsed, charges)
+    elif ammo == AMMO_BEST_CLOSE or ammo_note:
+        charges, ammo_unavailable, ammo_assumed = _choose_ammo(parsed, namer)
         effective = _reloaded(parsed, charges)
     else:
         ammo_unavailable, ammo_assumed = (), ()
@@ -1545,7 +1828,8 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
                    links=links, disciplines=applied,
                    links_unavailable=unavailable, name_of=name_of,
                    ammo=ammo, ammo_assumed=ammo_assumed,
-                   ammo_unavailable=ammo_unavailable)
+                   ammo_unavailable=ammo_unavailable,
+                   ammo_unloadable=ammo_unloadable, ammo_note=ammo_note)
 
     with _cache_lock:
         # A ``clear_cache`` that landed WHILE this was computing means the

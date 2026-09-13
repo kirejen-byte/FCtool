@@ -41,6 +41,14 @@ Load-bearing decisions, each a place this readout could be quietly wrong:
   :data:`AMMO_LABELS` translates in both directions and the two ends never
   meet: nothing outside this module writes a raw mode into the widget, and
   nothing writes a label into ``config["fittings"]["sim_ammo"]``.
+* **Only the two POLICIES persist.** The ammo box also offers every charge the
+  shown fit carries (owner ask 2026-09-12, :func:`ammo_values` over
+  ``fit_sim_stats.fit_ammo_types``), and picking one simulates a ``type:<id>``
+  spec — but a charge is a PER-FIT answer: it never reaches
+  ``config["fittings"]["sim_ammo"]``, which the fleet HUD reads too and which
+  has no fit to resolve a type id against. :func:`ammo_mode` is therefore
+  policy-only by construction, and :func:`ammo_choice` — the per-fit
+  translator — is a separate function rather than a smarter ``ammo_mode``.
 * **No ``grab_set``** — anywhere in this module. A grab in this one-Tk-process
   app deafens the FCPreview tiles (map/preview.md), and this is a passive
   readout inside an existing pane, not a dialog.
@@ -90,8 +98,28 @@ AMMO_LABELS = {
     fit_sim_stats.AMMO_AS_FITTED: "as fitted",
 }
 
-#: The combobox's ``values``, in :data:`fit_sim_stats.AMMO_MODES` order.
+#: The combobox's FIXED half, in :data:`fit_sim_stats.AMMO_MODES` order — the
+#: two policies, the DEFAULT first (owner rule: "'best close range' remains as
+#: default"). The fit's own charges follow, per fit, via :func:`ammo_values`.
 AMMO_VALUES = tuple(AMMO_LABELS[mode] for mode in fit_sim_stats.AMMO_MODES)
+
+#: How a fit-specific charge entry reads when its name is already taken — by a
+#: policy label, or by another type id publishing the same name. Two identical
+#: rows in a readonly combobox are one unpickable row, and the type id is the
+#: one thing that is unique per entry by construction.
+AMMO_TYPE_DUP_LABEL = "{name} #{type_id}"
+
+#: Character cap on the ammo combobox's WIDTH (never on its values — ttk
+#: truncates only the closed entry, and the dropdown list still shows every
+#: name in full).
+#:
+#: MEASURED, this box, this font (Consolas 9), on the owner's display: the
+#: Stats header row requests ``7 × width + 319`` px, and the fittings detail
+#: canvas is 534 px at the app's own ``root.minsize(1000, 700)``. 30 chars
+#: requests 529 px and fits; 31 requests 536 and clips from the right. Without
+#: a cap a 33-character charge name asked for 557 px and a 42-character one for
+#: 620 — the box grew past the pane instead of the name being trimmed.
+AMMO_COMBO_MAX_CHARS = 30
 
 #: What ``as_fitted`` puts on the Ammo row: there is nothing to name, and an
 #: absent row would read as "no ammo" rather than "the pilot's own".
@@ -99,6 +127,11 @@ AMMO_AS_FITTED_TEXT = "as fitted"
 
 #: Marks a charge the ammo POLICY chose rather than one the pilot loaded.
 AMMO_ASSUMED_MARK = "(assumed)"
+
+#: Marks a weapon group a hand-picked charge does not fit — wrong charge group
+#: or wrong size. The gun kept the pilot's own charge, and an FC reading the
+#: DPS is entitled to know the pick reached only part of the rack.
+AMMO_UNLOADABLE_MARK = "(cannot load)"
 
 #: Hover copy for the DPS row's raw total, completed with the number.
 DPS_RAW_TIP_PREFIX = "Raw total incl. drones: "
@@ -150,6 +183,73 @@ def ammo_mode(label) -> str:
         if text == label:
             return mode
     return DEFAULTS["sim_ammo"]
+
+
+def ammo_type_labels(ammo_types) -> list:
+    """``[(label, charge type id), ...]`` for one fit's own charges.
+
+    ``ammo_types`` is :func:`fit_sim_stats.fit_ammo_types`' output. Labels are
+    the charge NAMES — that is the vocabulary an FC picks in — and a name
+    already taken (by a policy label, or by an earlier type id publishing the
+    same name) gains its type id, because a readonly Combobox with two
+    identical rows is one row the second entry can never be selected from.
+
+    The single owner of the labelling: :func:`ammo_values` renders it and
+    :func:`ammo_choice` reads it back, so a label the widget shows is always a
+    label the choice function recognises.
+    """
+    taken = set(AMMO_VALUES)
+    out: list = []
+    for type_id, name in (ammo_types or ()):
+        type_id = int(type_id)
+        label = str(name or "").strip() or f"type {type_id}"
+        while label in taken:
+            # Always the type id, never padding: a trailing space would make
+            # two rows that READ identically, which is worse than the duplicate
+            # it was meant to break. The id is unique per entry, so one pass
+            # settles it; the loop is only for a name that already spells its
+            # own disambiguated form.
+            label = AMMO_TYPE_DUP_LABEL.format(name=label, type_id=type_id)
+        taken.add(label)
+        out.append((label, type_id))
+    return out
+
+
+def ammo_values(ammo_types) -> list:
+    """The ammo combobox's ``values``: the two policy modes (the DEFAULT first
+    of all), then one entry per charge this fit carries.
+
+    Owner ask 2026-09-12 — "add all the types of ammunition in a fit to the
+    dropdown, but have 'best close range' remain as default". A fit with no
+    ammunition at all offers exactly the two policies, so the box is never
+    empty and never opens on something other than the default.
+    """
+    return list(AMMO_VALUES) + [label for label, _tid
+                                in ammo_type_labels(ammo_types)]
+
+
+def ammo_choice(label, ammo_types) -> str:
+    """A combobox reading -> the ``fit_sim_stats.simulate`` ammo argument.
+
+    A charge entry becomes a ``type:<id>`` spec; anything else goes through
+    :func:`ammo_mode`, which keeps the two policies honest and refuses junk.
+    A label this fit does not offer — the pick outliving the fit it was made
+    on — therefore falls back to the DEFAULT policy rather than to a stale
+    type id, which would simulate a charge nothing in this fit carries.
+
+    **A pick carries over between fits by LABEL, not by type id.** The widget
+    holds a string and nothing else, so "does this fit still offer my pick"
+    is asked of :func:`ammo_type_labels`' output — which means a charge whose
+    label was disambiguated in one fit (``"Scourge Rage #200"``) and not in the
+    next resolves to the same id only while both fits spell it the same way,
+    and otherwise falls back to the policy. That is the safe direction: a
+    silent re-resolve to a DIFFERENT id sharing the name would simulate a
+    charge the FC never picked.
+    """
+    for text, type_id in ammo_type_labels(ammo_types):
+        if text == label:
+            return fit_sim_stats.ammo_for_type(type_id)
+    return ammo_mode(label)
 
 
 def settings(config) -> tuple:
@@ -306,21 +406,30 @@ def weapon_group_label(stats, weapon_type_id) -> str:
 
 
 def format_ammo_lines(stats) -> list:
-    """The Ammo row's lines — one per assumed weapon group, or the mode.
+    """The Ammo row's lines — one per weapon group, or the mode.
 
     ``as_fitted`` states itself in one line: the numbers came from the pilot's
     own charges, and an ABSENT row would read as "no ammo" rather than "not
-    assumed". ``best_close`` names every assumption instead, and contributes
-    nothing when it assumed nothing (a weaponless fit) — the weapons it could
+    assumed".
+
+    Every other answer — the ``best_close`` policy and a hand-picked
+    ``type:<id>`` alike — names what was loaded where, and contributes nothing
+    when nothing was loaded (a weaponless fit). The weapons the POLICY could
     find no charge for are already an ``Unmodeled`` line, so listing them here
-    too would double-report one gap.
+    too would double-report one gap; the groups a hand pick could not reach are
+    NOT a gap (they are still firing the pilot's own charge) and so are named
+    here and nowhere else — FIRST, because a refusal is what an FC reading the
+    DPS has to see before the assumptions.
     """
-    if str(getattr(stats, "ammo", "")) != fit_sim_stats.AMMO_BEST_CLOSE:
+    if str(getattr(stats, "ammo", "")) == fit_sim_stats.AMMO_AS_FITTED:
         return [AMMO_AS_FITTED_TEXT]
-    return [f"{weapon_group_label(stats, weapon_id)}: {charge_name} "
-            f"{AMMO_ASSUMED_MARK}"
-            for weapon_id, _charge_id, charge_name
-            in (getattr(stats, "ammo_assumed", None) or ())]
+    return [f"{weapon_group_label(stats, weapon_id)}: {charge_name} {mark}"
+            for rows, mark in (
+                (getattr(stats, "ammo_unloadable", None) or (),
+                 AMMO_UNLOADABLE_MARK),
+                (getattr(stats, "ammo_assumed", None) or (),
+                 AMMO_ASSUMED_MARK))
+            for weapon_id, _charge_id, charge_name in rows]
 
 
 def dps_tip(stats) -> str:
@@ -485,10 +594,10 @@ class FitStatsPanel:
         tk.Label(header, text="ammo", font=_VALUE_FONT, fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 3))
         self.ammo_combo = ttk.Combobox(
-            header, textvariable=ammo_var, values=list(AMMO_VALUES),
-            state="readonly",
-            width=max(len(v) for v in AMMO_VALUES) + 1,
-            font=_VALUE_FONT)
+            header, textvariable=ammo_var, state="readonly", font=_VALUE_FONT)
+        # The fixed half only; the caller re-offers this fit's own charges
+        # through set_ammo_values as soon as it knows them.
+        self.set_ammo_values(AMMO_VALUES)
         self.ammo_combo.pack(side=tk.LEFT)
         for combo in (self.tier_combo, self.disciplines_combo,
                       self.ammo_combo):
@@ -499,6 +608,31 @@ class FitStatsPanel:
         self._grid.grid_columnconfigure(1, weight=1)
 
         self.set_pending()
+
+    # ── options ──────────────────────────────────────────────────────────
+    def set_ammo_values(self, values) -> None:
+        """Re-offer the ammo combobox's values for the fit now shown.
+
+        Unlike the tier and discipline vocabularies, the ammo list is PER FIT
+        (:func:`ammo_values`), so it is set after construction and again on
+        every request. The width follows it — a box narrower than its longest
+        offered value clips that value, and a charge name is routinely longer
+        than any policy label — but only up to
+        :data:`AMMO_COMBO_MAX_CHARS`, beyond which the BOX would outgrow the
+        detail pane and be clipped from the right by the canvas instead. Past
+        the cap it is the closed entry's text that is truncated; ``values``
+        keeps every name in full, so the dropdown list still reads properly and
+        :func:`ammo_choice` still recognises what was picked.
+
+        An empty list falls back to the two policies — the box is never left
+        with nothing to pick.
+
+        Purely the widget's values: the SELECTION lives in the caller's
+        ``ammo_var``, and re-offering a list never fires ``on_change``.
+        """
+        values = [str(value) for value in (values or ())] or list(AMMO_VALUES)
+        width = min(max(len(v) for v in values) + 1, AMMO_COMBO_MAX_CHARS)
+        self.ammo_combo.configure(values=values, width=width)
 
     # ── state ────────────────────────────────────────────────────────────
     def set_pending(self) -> None:
