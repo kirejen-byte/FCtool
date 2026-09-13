@@ -251,6 +251,10 @@ class XSession(object):
         self._X = None
         self._xerror = None
         self._damage = None
+        # The event code DAMAGE was registered under (see open()); damage
+        # events are matched on THIS, never on a class -- see next_events().
+        self._damage_code = None
+        self._damage_cls_name = "DamageNotify"
         self._shape = None
         self._composite = None
         self._xrender = None
@@ -297,6 +301,11 @@ class XSession(object):
         if not disp.has_extension("DAMAGE"):
             raise MissingExtensionError("the X server has no DAMAGE extension",
                                         "no_damage")
+        self._damage_code = self._query_damage_code(disp)
+        if self._damage_code is None:
+            raise MissingExtensionError(
+                "the X server registered no DamageNotify event code",
+                "no_damage")
         if not disp.has_extension("SHAPE"):
             raise MissingExtensionError("the X server has no SHAPE extension",
                                         "internal")
@@ -313,6 +322,40 @@ class XSession(object):
 
         disp.set_error_handler(self._on_async_error)
         return self
+
+    def _query_damage_code(self, disp):
+        """The wire event code the server's DAMAGE extension was given.
+
+        python-xlib does NOT deliver ``Xlib.ext.damage.DamageNotify``
+        instances: ``Display.extension_add_event()`` registers a CLONE of the
+        class (``type(evt.__name__, evt.__bases__, evt.__dict__.copy())`` with
+        a fresh ``_code``) and the protocol decoder builds every event from
+        that clone, so ``isinstance(ev, damage.DamageNotify)`` is ALWAYS False.
+        The event code is the only stable identity -- this reads it back out of
+        the ``extension_event`` DictWrapper the registration populated, and
+        falls back to asking the server for the extension's first event code.
+
+        Returns None when neither source can name it.
+        """
+        code = None
+        try:
+            code = getattr(disp.extension_event, self._damage_cls_name)
+        except Exception:
+            code = None
+        if code is None:
+            try:
+                info = disp.query_extension("DAMAGE")
+            except Exception:
+                info = None
+            first = getattr(info, "first_event", None)
+            if first is not None:
+                code = first + self._damage.DamageNotifyCode
+        if code is None:
+            return None
+        try:
+            return int(code) & 0x7f
+        except (TypeError, ValueError):
+            return None
 
     def close(self):
         disp, self.display = self.display, None
@@ -559,10 +602,16 @@ class XSession(object):
             except Exception as exc:
                 _log("next_event failed: %s" % (exc,))
                 break
-            if isinstance(ev, self._damage.DamageNotify):
+            etype = getattr(ev, "type", None)
+            # Damage is matched on the EVENT CODE, never with isinstance():
+            # the decoded object is an instance of the anonymous clone
+            # extension_add_event() registered, NOT of damage.DamageNotify
+            # (see _query_damage_code) -- an isinstance test here silently
+            # dropped every damage event and left the previews repainting on
+            # the heartbeat alone.  The class-name check is belt and braces.
+            if self._is_damage_event(ev, etype):
                 out.append(("damage", _xid_of(ev.drawable)))
                 continue
-            etype = getattr(ev, "type", None)
             if etype == X.ConfigureNotify:
                 out.append(("configure", _xid_of(ev.window),
                             int(ev.width), int(ev.height)))
@@ -570,6 +619,16 @@ class XSession(object):
                 out.append(("destroy", _xid_of(ev.window)))
         out.extend(self._take_errors())
         return out
+
+    def _is_damage_event(self, ev, etype):
+        """True for a decoded DamageNotify, matched by code then by name."""
+        if self._damage_code is not None and etype is not None:
+            try:
+                if (int(etype) & 0x7f) == self._damage_code:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return type(ev).__name__ == self._damage_cls_name
 
     # ---- error plumbing -------------------------------------------------
 
