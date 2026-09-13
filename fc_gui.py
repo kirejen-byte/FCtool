@@ -27374,10 +27374,11 @@ class FCToolGUI:
                 return "break"
             if event.keysym in hotkey_service._EVENT_MODIFIER_KEYSYMS:
                 return "break"                # bare modifier → keep waiting
-            combo = hotkey_service.event_to_hotkey(event.keysym, event.state)
+            keycode = getattr(event, "keycode", None)
+            combo = hotkey_service.event_to_hotkey(event.keysym, event.state, keycode)
             if combo is None:
                 win._error_lbl.config(
-                    text=hotkey_service.capture_hint(event.keysym),
+                    text=hotkey_service.capture_hint(event.keysym, event.state, keycode),
                     fg=FG_ORANGE)
                 return "break"
             entry = win._next_entry if capturing[0] == "next" else win._prev_entry

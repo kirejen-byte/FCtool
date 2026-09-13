@@ -28,14 +28,24 @@ _VK.update({c: ord(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
 _VK.update({"SPACE": 0x20, "TAB": 0x09, "HOME": 0x24, "END": 0x23,
             "PGUP": 0x21, "PGDN": 0x22, "INSERT": 0x2D, "DELETE": 0x2E})
 # Numpad virtual-key codes (VK_NUMPAD0..VK_NUMPAD9 = 0x60..0x69, then the
-# operator keys). IMPORTANT Windows fact: RegisterHotKey fires on these codes
-# ONLY while NumLock is ON — with NumLock off, the SAME physical keys send the
-# nav-cluster codes (Home/End/arrows/etc, non-extended) instead, which is why
-# event_to_hotkey below must keep those NumLock-off keysyms rejected rather
-# than aliasing them to HOME/END (that would also fire for the main-block
-# keys). No NumpadEnter: VK_RETURN is shared with the main Enter key and
-# RegisterHotKey can't tell them apart. No +/-/*// symbol tokens either —
-# parse_hotkey splits on "+", so only the word spellings below are accepted.
+# operator keys). IMPORTANT Windows fact, MEASURED 2026-09-13 by injecting
+# real win32 key events into a live Tk 8.6.15 root (py3.12 + py3.13): Windows
+# Tk never emits `KP_*` keysyms at all — a numpad digit with NumLock ON
+# arrives as the PLAIN digit keysym (e.g. "1") with `event.keycode` set to
+# the VK_NUMPAD* code, and the operator keys arrive as ordinary symbol
+# keysyms ("plus"/"minus"/"asterisk"/"slash"/"period") with their own
+# keycodes. `event.keycode` is therefore the ONLY way to tell a numpad press
+# from the main-row digit/symbol it shares a keysym with — see
+# event_to_hotkey, which decides by keycode first. RegisterHotKey fires on
+# these VK codes ONLY while NumLock is ON — with NumLock off, the SAME
+# physical keys send the nav-cluster VK codes (Home/End/arrows/Insert/
+# Delete/Clear) instead, indistinguishable from the dedicated main-block key
+# except by the "extended" state bit (see _EXTENDED_KEY below), which is why
+# event_to_hotkey rejects a numpad-with-NumLock-off press outright rather
+# than aliasing it to HOME/END/etc. No NumpadEnter: VK_RETURN is shared with
+# the main Enter key and RegisterHotKey can't tell them apart either. No
+# +/-/*// symbol tokens in the parser — parse_hotkey splits on "+", so only
+# the word spellings below are accepted.
 _VK.update({f"NUMPAD{i}": 0x60 + i for i in range(10)})       # NUMPAD0=0x60 … NUMPAD9=0x69
 _VK.update({"NUMPADMULTIPLY": 0x6A, "NUMPADADD": 0x6B,
             "NUMPADSUBTRACT": 0x6D, "NUMPADDECIMAL": 0x6E, "NUMPADDIVIDE": 0x6F})
@@ -63,7 +73,17 @@ def parse_hotkey(text: str) -> tuple[int, int]:
     key = parts[-1]
     if key not in _VK:
         raise ValueError(f"unknown key {key!r} in {text!r}")
-    return (mods, _VK[key])
+    vk = _VK[key]
+    # MEASURED 2026-09-13: with NumLock on, holding Shift over a numpad key
+    # makes Windows send the NAV-cluster VK code instead of VK_NUMPAD*/
+    # VK_DECIMAL (the historical "Shift temporarily cancels NumLock" numpad
+    # behavior) — so RegisterHotKey(MOD_SHIFT, VK_NUMPAD*) can never fire.
+    # Control/Alt are unaffected and stay allowed.
+    if 0x60 <= vk <= 0x6F and mods & MOD_SHIFT:
+        raise ValueError(
+            "Shift cannot be combined with a numpad key "
+            "(Windows sends the navigation keys instead)")
+    return (mods, vk)
 
 
 # Tk `event.state` modifier bit masks ON WINDOWS. Only these three are real
@@ -79,24 +99,34 @@ _EVENT_KEYSYMS = {
     "Home": "HOME", "End": "END", "Insert": "INSERT", "Delete": "DELETE",
 }
 
-# Numpad operator keysyms → the canonical "Numpad<Op>" token (see _VK's
-# numpad block for the VK codes and the NumLock caveat). KP_Decimal is the
-# numeral-mode "." keysym, reported only while NumLock is ON — the same
-# condition RegisterHotKey needs for VK_DECIMAL to fire, so it maps cleanly.
-# KP_Delete is deliberately NOT mapped here: on Windows, Tk's win32 keyboard
-# handling reports the numpad "." key as KP_Delete precisely when NumLock is
-# OFF (VK_DELETE with the "extended" bit clear — the same extended-bit trick
-# that turns "7" into KP_Home, "0" into KP_Insert, etc off-NumLock). It is
-# the decimal key's NumLock-off twin, not an alternate spelling of the same
-# on-state key, so it falls through with every other NumLock-off nav keysym
-# and event_to_hotkey returns None for it (verified against Tk's documented
-# VK/extended-bit keysym mapping; no physical numpad was pressed to confirm
-# on this box).
-_EVENT_NUMPAD_OPS = {
-    "KP_Add": "NumpadAdd", "KP_Subtract": "NumpadSubtract",
-    "KP_Multiply": "NumpadMultiply", "KP_Divide": "NumpadDivide",
-    "KP_Decimal": "NumpadDecimal",
+# Windows Tk `event.state` "extended key" bit. MEASURED 2026-09-13 (real
+# win32 key events injected into a live Tk 8.6.15 root, py3.12 + py3.13): SET
+# on the dedicated main-block nav cluster (Home/End/PageUp/PageDown/arrows/
+# Insert/Delete) and on the right-hand Ctrl/Alt/Enter; CLEAR when the
+# identical keysym+keycode pair instead comes from the numpad with NumLock
+# off (numpad-7-as-Home sends keysym "Home", keycode 0x24 — same as the real
+# Home key — with this bit clear). It is the ONLY discriminator between the
+# two; keysym and keycode alone are ambiguous.
+_EXTENDED_KEY = 0x40000
+
+# Numpad digit VK codes reachable via `event.keycode` (NumLock on; see the
+# _VK numpad block above for the measured facts this rests on).
+_NUMPAD_VK_DIGITS = range(0x60, 0x6A)          # VK_NUMPAD0..VK_NUMPAD9
+# Numpad operator VK codes → the canonical "Numpad<Op>" token.
+_NUMPAD_VK_OPS = {
+    0x6A: "NumpadMultiply", 0x6B: "NumpadAdd", 0x6D: "NumpadSubtract",
+    0x6E: "NumpadDecimal", 0x6F: "NumpadDivide",
 }
+# Nav-cluster VK codes the numpad ALSO sends when NumLock is off (PgUp/PgDn/
+# End/Home/Left/Up/Right/Down/Insert/Delete/Clear-for-5) — ambiguous with the
+# main-block key at the same VK code except for _EXTENDED_KEY (see above). A
+# press of one of these with the extended bit clear is a numpad key with
+# NumLock off: unbindable (RegisterHotKey's VK_NUMPAD*/VK_DECIMAL codes only
+# fire with NumLock on), so event_to_hotkey rejects it outright instead of
+# silently aliasing it to HOME/END/etc — which would also fire for the
+# dedicated main-block keys.
+_NUMPAD_NAV_VKS = frozenset({0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                             0x2D, 0x2E, 0x0C})
 
 # Bare modifier / lock keysyms — a press of one of these alone is not a hotkey.
 _EVENT_MODIFIER_KEYSYMS = frozenset({
@@ -106,37 +136,47 @@ _EVENT_MODIFIER_KEYSYMS = frozenset({
 })
 
 
-def event_to_hotkey(keysym: str, state: int) -> "str | None":
+def event_to_hotkey(keysym: str, state: int, keycode: "int | None" = None) -> "str | None":
     """Build a parse_hotkey-valid string from a Tk key event, or None.
 
     `keysym` is `event.keysym`, `state` is `event.state` (Windows Tk masks).
-    Returns e.g. "Control+Shift+F4" for the capture widget. Bare modifier
-    presses, unmapped keys, and anything parse_hotkey would reject all return
-    None (the caller keeps waiting / shows an inline note). Every non-None
-    result is validated by round-tripping through parse_hotkey.
+    `keycode` is `event.keycode` (the raw VK code) — optional and defaulting
+    to None for backward compatibility; every existing 2-arg call site keeps
+    working exactly as before (numpad detection below is skipped entirely
+    when keycode is None). Returns e.g. "Control+Shift+F4" for the capture
+    widget. Bare modifier presses, unmapped keys, and anything parse_hotkey
+    would reject all return None (the caller keeps waiting / shows an inline
+    note). Every non-None result is validated by round-tripping through
+    parse_hotkey.
 
-    Numpad NumLock caveat: `KP_0`..`KP_9` and `KP_Decimal` are reported ONLY
-    while NumLock is ON — the exact condition RegisterHotKey needs for its
-    VK_NUMPAD*/VK_DECIMAL codes to fire, so they map straight to "Numpad<n>"/
-    "NumpadDecimal". With NumLock OFF the same keys report as the nav-cluster
-    keysyms (`KP_Home`, `KP_End`, `KP_Up`, `KP_Insert`, `KP_Delete`, …) and
-    stay unmapped here (falling through to None) rather than being aliased to
-    HOME/END/etc, which would also fire for the dedicated main-block keys."""
+    Numpad detection is keycode-FIRST, decided before the ordinary
+    alphanumeric/keysym branches: Windows Tk never emits `KP_*` keysyms
+    (measured fact, see _VK's numpad comment) — a numpad digit with NumLock
+    on arrives as the PLAIN digit/symbol keysym, identical to the main-row
+    key, so `keycode` (the VK code) is the only reliable discriminator. A
+    numpad key pressed with NumLock OFF sends the same VK code as a
+    main-block nav key (Home/End/etc); `_EXTENDED_KEY` in `state` is what
+    tells them apart, and the NumLock-off numpad case returns None outright
+    (RegisterHotKey's VK_NUMPAD*/VK_DECIMAL codes only fire with NumLock on)."""
     if not keysym or keysym in _EVENT_MODIFIER_KEYSYMS:
         return None
     key = None
-    if len(keysym) == 1 and keysym.isalpha():
-        key = keysym.upper()
-    elif len(keysym) == 1 and keysym.isdigit():
-        key = keysym
-    elif keysym[0] in "Ff" and keysym[1:].isdigit():   # F1..F24 (range checked below)
-        key = "F" + keysym[1:]
-    elif keysym in _EVENT_KEYSYMS:
-        key = _EVENT_KEYSYMS[keysym]
-    elif keysym.startswith("KP_") and keysym[3:].isdigit() and len(keysym) == 4:
-        key = "Numpad" + keysym[3:]                    # KP_0..KP_9, NumLock on
-    elif keysym in _EVENT_NUMPAD_OPS:
-        key = _EVENT_NUMPAD_OPS[keysym]
+    if keycode is not None:
+        if keycode in _NUMPAD_VK_DIGITS:
+            key = "Numpad" + str(keycode - 0x60)
+        elif keycode in _NUMPAD_VK_OPS:
+            key = _NUMPAD_VK_OPS[keycode]
+        elif keycode in _NUMPAD_NAV_VKS and not (state & _EXTENDED_KEY):
+            return None                    # numpad nav key, NumLock off: unbindable
+    if key is None:
+        if len(keysym) == 1 and keysym.isalpha():
+            key = keysym.upper()
+        elif len(keysym) == 1 and keysym.isdigit():
+            key = keysym
+        elif keysym[0] in "Ff" and keysym[1:].isdigit():   # F1..F24 (range checked below)
+            key = "F" + keysym[1:]
+        elif keysym in _EVENT_KEYSYMS:
+            key = _EVENT_KEYSYMS[keysym]
     if key is None:
         return None
     parts = [name for mask, name in _EVENT_MODS if state & mask]
@@ -154,14 +194,25 @@ def format_error(code: int) -> str:
             else f"registration failed (error {code})")
 
 
-def capture_hint(keysym: str) -> str:
-    """Message for the hotkey capture box after event_to_hotkey(keysym, ...)
-    returned None. A `KP_*` keysym here is one of the NumLock-off numpad
-    keysyms (see event_to_hotkey's docstring) — give that a targeted nudge
-    instead of the generic "not a usable hotkey" line."""
-    if keysym and keysym.startswith("KP_"):
-        return (f"'{keysym}' — numpad keys work as hotkeys only with NumLock "
-                "on; turn it on and press again.")
+def capture_hint(keysym: str, state: int = 0, keycode: "int | None" = None) -> str:
+    """Message for the hotkey capture box after
+    event_to_hotkey(keysym, state, keycode) returned None.
+
+    `state`/`keycode` default so existing (keysym-only) callers still get the
+    generic message. When `keycode` names one of the numpad-shared nav VK
+    codes (_NUMPAD_NAV_VKS) AND the extended bit is clear — i.e. event_to_hotkey
+    rejected this as a numpad key pressed with NumLock off — give a targeted
+    nudge instead of the generic "not a usable hotkey" line. (Shift is called
+    out in the message too: Windows is documented to substitute the same
+    nav-cluster VK codes when Shift is held over a numpad key even with
+    NumLock on — see parse_hotkey's Shift+numpad rejection — so a capture
+    landing here from that path gets the same actionable wording; this
+    inference was not independently re-measured the way the plain
+    NumLock-off case was.)"""
+    if (keycode is not None and keycode in _NUMPAD_NAV_VKS
+            and not (state & _EXTENDED_KEY)):
+        return ("numpad keys work as hotkeys only with NumLock on and "
+                "without Shift; turn NumLock on and press again.")
     return f"'{keysym}' is not a usable hotkey — try again."
 
 
