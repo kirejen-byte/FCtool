@@ -17365,7 +17365,14 @@ class FCToolGUI:
         if enabled:
             self._fit_sim_tier_var.set(tier)
             self._fit_sim_disc_var.set(disciplines)
-            self._fit_sim_ammo_var.set(fit_sim_panel.ammo_label(ammo))
+            if self._fit_sim_ammo_var.get() in fit_sim_panel.AMMO_VALUES:
+                # A POLICY pick is the config's to own, so it is re-read here
+                # like the tier and the discipline. A per-fit CHARGE pick is
+                # not in the config at all, so it is left standing and
+                # ``_fit_sim_request`` decides whether the fit now shown still
+                # carries that charge — re-selecting one fitting must not
+                # silently throw the pick away.
+                self._fit_sim_ammo_var.set(fit_sim_panel.ammo_label(ammo))
             self._fit_sim_panel = fit_sim_panel.FitStatsPanel(
                 parent, tier_var=self._fit_sim_tier_var,
                 disciplines_var=self._fit_sim_disc_var,
@@ -17462,10 +17469,28 @@ class FCToolGUI:
             return
         self._fit_sim_gen += 1
         _enabled, tier, disciplines, ammo = fit_sim_panel.settings(self.config)
+        # The ammo combobox offers THIS fit's own charges beside the two
+        # policy modes (owner ask 2026-09-12), so its values are rebuilt per
+        # request. Cheap enough for the Tk thread and deliberately not worker
+        # work: fit_ammo_types walks the parsed fit and asks the ALREADY
+        # loaded table for a category — it never decodes, never simulates and
+        # never raises (no table yet simply means a shorter list).
+        ammo_types = fit_sim_stats.fit_ammo_types(fit.parsed)
+        values = fit_sim_panel.ammo_values(ammo_types)
+        panel.set_ammo_values(values)
+        label = self._fit_sim_ammo_var.get()
+        if label not in values:
+            # The pick was a charge this fit does not carry (the usual way:
+            # another fit was selected). Fall back to the PERSISTED policy —
+            # a readonly Combobox holding a value its list no longer offers
+            # renders blank, which reads as a broken widget.
+            label = fit_sim_panel.ammo_label(ammo)
+            self._fit_sim_ammo_var.set(label)
         panel.set_pending()
         threading.Thread(
             target=self._fit_sim_worker,
-            args=(self._fit_sim_gen, fit.parsed, tier, disciplines, ammo),
+            args=(self._fit_sim_gen, fit.parsed, tier, disciplines,
+                  fit_sim_panel.ammo_choice(label, ammo_types)),
             daemon=True).start()
 
     def _fit_sim_worker(self, gen, parsed, tier, disciplines, ammo):
@@ -17514,12 +17539,19 @@ class FCToolGUI:
 
         The ammo combobox shows a LABEL and the config stores a MODE, so the
         var goes back through ``fit_sim_panel.ammo_mode`` — writing the label
-        would hand ``fit_sim_stats.simulate`` a value it raises on."""
+        would hand ``fit_sim_stats.simulate`` a value it raises on.
+
+        Only the two POLICY modes persist. The box also lists this fit's own
+        charges, and picking one is a PER-FIT answer: writing it into
+        ``fittings.sim_ammo`` would outlive the fit and reach the fleet HUD,
+        which has no fit to resolve a charge against — so a charge pick leaves
+        the stored policy exactly as it was and only re-requests."""
         fit_cfg = self.config.setdefault("fittings", {})
         fit_cfg["sim_links_tier"] = self._fit_sim_tier_var.get()
         fit_cfg["sim_links_disciplines"] = self._fit_sim_disc_var.get()
-        fit_cfg["sim_ammo"] = fit_sim_panel.ammo_mode(
-            self._fit_sim_ammo_var.get())
+        ammo_label = self._fit_sim_ammo_var.get()
+        if ammo_label in fit_sim_panel.AMMO_VALUES:
+            fit_cfg["sim_ammo"] = fit_sim_panel.ammo_mode(ammo_label)
         try:
             self._save_config()
         except Exception:
