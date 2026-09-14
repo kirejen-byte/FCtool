@@ -247,6 +247,40 @@ def matches_keyword(body, keyword) -> bool:
     return needle in str(body or "").lower()
 
 
+def _keyword_tail_start(body, keyword) -> int | None:
+    """Offset just PAST the FIRST occurrence of ``keyword`` in ``body``, or
+    ``None`` when the keyword is blank or absent.
+
+    Exactly the case-insensitive, anywhere-in-the-line notion of a match
+    ``matches_keyword`` uses -- ONE owner for "where does the command end", so
+    the tail can never disagree with the gate that fired the report."""
+    needle = str(keyword or "").strip().lower()
+    if not needle:
+        return None
+    at = str(body or "").lower().find(needle)
+    if at < 0:
+        return None
+    return at + len(needle)
+
+
+def keyword_tail(body, keyword) -> str | None:
+    """Everything the FC typed AFTER the range-check keyword, or ``None``.
+
+    ``keyword_tail("hey range check svm", "range check")`` -> ``" svm"``. A
+    blank keyword, or one the body does not carry, gives ``None`` (not ""), so
+    "no command on this line" and "the command with nothing after it" stay
+    distinguishable.
+
+    The command TAIL is the one place in a chat line where a bare string is a
+    system name by construction: the FC asked for a range check and then named
+    the system. ``extract_systems`` takes that as the evidence the general
+    prose gates cannot have (owner rule, 2026-09-13)."""
+    start = _keyword_tail_start(body, keyword)
+    if start is None:
+        return None
+    return str(body or "")[start:]
+
+
 def should_fire(sender, body, *, keyword, own_keys, last_fired=None,
                 now=None, cooldown_s=COOLDOWN_SECONDS) -> bool:
     """Should this chat line pop a range check? Pure — nothing is mutated.
@@ -522,6 +556,67 @@ def _partial_match(name, catalogue) -> tuple:
     return None, substr_hits > 1
 
 
+#: Punctuation an FC wraps around a name in the command tail. ``SYSTEM_TOKEN_RE``
+#: already refuses to take commas, quotes and brackets INTO a token, so this is
+#: a belt-and-braces trim of a leading/trailing dash ("svm-" typed mid-thought)
+#: -- internal dashes are load-bearing and are never touched.
+_TAIL_STRIP = "-'\"`.,;:!?()[]{}<>"
+
+
+def tail_token(word) -> str:
+    """One command-tail word, stripped of the punctuation around it."""
+    return str(word or "").strip().strip(_TAIL_STRIP)
+
+
+def tail_candidate(token, catalogue) -> tuple:
+    """``(resolved_name | None, ambiguous)`` for ONE command-tail token.
+
+    The owner's rule, 2026-09-13, and the whole reason it can be this simple:
+    **after the range-check keyword there is no prose to protect against.** The
+    FC typed the command and then typed the system, so the length/casing/
+    position evidence ``plain_phrase_is_a_reference`` exists to weigh is not
+    needed here -- ``svm``, ``Svm``, ``SVM``, ``svm-3``, ``p-zm`` and ``gatew``
+    all name SVM-3K / P-ZMZV / Gateway, whatever their length or casing, iff
+    they name exactly ONE system.
+
+      1. EXACT case-insensitive catalogue hit wins, as everywhere else.
+      2. Otherwise a case-insensitive PREFIX scan: exactly ONE candidate is the
+         answer, two or more is ``ambiguous`` (a DISCLOSURE, never a
+         resolution -- see ``_partial_match``), none is silence. An unknown
+         word is still not a system: ``range check the fleet`` must name
+         nothing rather than invent something.
+      3. A pure jump-count shape ("2-3", "5-10") never PREFIX-matches, the one
+         gate kept from the general path: FCs type counts constantly and a
+         false link REPLACES the whole source list. An exact name of that
+         shape would still resolve at step 1.
+
+    O(catalogue) per tail token, bailing out the moment the prefix count is
+    provably ambiguous -- the tail is a handful of words and the catalogue is
+    built ONCE per call, so this never becomes the per-window scan the general
+    path was measured (and gated) for."""
+    text = str(token or "").strip()
+    if not text:
+        return None, False
+    try:
+        exact = catalogue.get(text.lower())
+    except AttributeError:
+        return None, False
+    if exact is not None:
+        return exact, False
+    if _NUMBER_RANGE_RE.match(text):
+        return None, False
+    needle = text.lower()
+    hits = 0
+    cand = None
+    for lower, original in catalogue.items():
+        if lower.startswith(needle):
+            hits += 1
+            cand = original
+            if hits > 1:
+                return None, True
+    return (cand, False) if hits == 1 else (None, False)
+
+
 def _as_ref(value, resolve=None) -> SystemRef | None:
     """Accept a ``SystemRef``, a bare system id, a NAME, or a ``(name, id)`` pair.
 
@@ -781,7 +876,7 @@ def _refused_ref(phrase, *, sentence_initial, catalogue=None) -> IgnoredRef | No
                                    sentence_initial=sentence_initial))
 
 
-def extract_systems(body, resolve=None) -> SystemMentions:
+def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
     """System names mentioned in a chat body, in order of first appearance.
 
     Same shape as the shipped intel detection (``intel_stream._system_spans``):
@@ -843,9 +938,30 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     configured sources without a word, on a line that named real systems, is
     the one answer this module may not give. A fragment matching NOTHING stays
     silent: an unknown word is not a system, and calling it "ignored" would be
-    a different lie."""
+    a different lie.
+
+    **After the keyword, a bare string IS a system name** (owner rule,
+    2026-09-13, overruling the ALL-CAPS shape above as the general answer):
+    "If there is a range check command before a string, it should be attempted
+    to be matched to a system name. If there is only one, it should match
+    regardless of how long the string is." Pass the configured ``keyword`` and
+    every whitespace-separated token AFTER its first occurrence gets that
+    second chance -- exact name first, then a unique case-insensitive PREFIX
+    over the K-space catalogue (``tail_candidate``), with no length, casing or
+    position gate at all: ``range check svm`` / ``Svm`` / ``SVM`` / ``svm-3``
+    reach SVM-3K and ``range check gatew`` reaches Gateway. Ambiguity is still
+    disclosed rather than guessed (``P-Z`` over P-ZMZV and P-ZWKH) and only for
+    a SYSTEM-SHAPED token, so filler words an FC wraps the name in ("to",
+    "vs", "the") stay silent instead of becoming an ignored-line of their own.
+    The ALL-CAPS abbreviation rule above is what still covers text BEFORE the
+    keyword and every ``keyword=None`` caller, so omitting the argument is
+    byte-for-byte the pre-2026-09-13-tail behaviour."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
+    # Where the COMMAND TAIL begins, or None when the caller named no keyword
+    # (or the body does not carry it) -- in which case nothing below changes
+    # and this function behaves exactly as it did before the tail rule.
+    tail_start = _keyword_tail_start(text, keyword)
 
     def _sentence_initial(index):
         """Does English force a capital on ``words[index]`` regardless of what
@@ -946,6 +1062,32 @@ def extract_systems(body, resolve=None) -> SystemMentions:
                 phrase = partial_name   # safe now -- the gate already ran
             hit = (phrase, sid, size, canon)
             break
+        if hit is None and tail_start is not None and words[i][1] >= tail_start:
+            # The COMMAND TAIL (owner rule, 2026-09-13). Nothing the general
+            # sweep recognised sits at this position, and this word came after
+            # the keyword -- so the FC typed it as the system they want checked.
+            # No length/casing/position gate: a unique prefix IS the answer.
+            # Any accepted token clears ``miss`` with it, and the id-dedupe at
+            # the end of this function drops a disclosure the tail resolved.
+            token = tail_token(words[i][0])
+            cand, tail_ambiguous = tail_candidate(token, _catalogue())
+            if cand is not None:
+                # Re-resolved through the INJECTED resolver, never taken from
+                # the table directly -- the same contract the partial path
+                # keeps, so an unaware or raising resolver still yields no
+                # match and only the CANDIDATE spelling comes from the table.
+                tail_sid = _resolve_id(cand, resolver)
+                if tail_sid is not None:
+                    hit = (cand, tail_sid, 1, system_coords.get_name(tail_sid))
+            elif (tail_ambiguous and miss is None
+                  and is_system_shaped(token)
+                  and len(token) >= MIN_PARTIAL_SHAPED_PREFIX_LEN):
+                # "P-Z" named two real systems and this cannot tell which:
+                # falling back to the configured stagings without a word is the
+                # one answer this module may not give. A plain-letters
+                # ambiguous token ("to", "the") is filler, not a half-typed
+                # name, and says nothing.
+                miss = IgnoredRef(token, None, "")
         if hit is None:
             # Nothing was taken at this index, so a refusal here is a real drop
             # and the FC gets told. A refusal UNDER an accepted shorter window

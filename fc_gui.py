@@ -24217,7 +24217,7 @@ class FCToolGUI:
                 return
             report = range_check.build_report(
                 self._range_check_target(key),
-                range_check.extract_systems(body),
+                range_check.extract_systems(body, keyword=keyword),
                 sources=range_check.resolve_sources(self.config),
                 distance_fn=self._range_check_distance_fn())
             self._post_ui(self._range_check_show_toast, report,
