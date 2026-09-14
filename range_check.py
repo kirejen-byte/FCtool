@@ -470,7 +470,7 @@ class _PrefixCatalogue(dict):
     (``py -3.12``, this box): 900 ``_partial_match`` calls plus 300
     ``tail_candidate`` calls issued **6.58 million** ``str.startswith`` calls
     and the whole extraction took **0.75 s** on the chat worker thread. The
-    bisect makes each prefix stage O(log n) and the same line takes **0.05 s**.
+    bisect makes each prefix stage O(log n) and the same line takes **0.18 s**.
     Nothing about the ANSWERS changes -- the helpers below fall back to the
     linear scan for a plain dict, which is what every direct caller (and every
     test that hands one in) passes."""
@@ -655,10 +655,11 @@ def tail_candidate(token, catalogue) -> tuple:
          resolution -- see ``_partial_match``), none is silence. An unknown
          word is still not a system: ``range check the fleet`` must name
          nothing rather than invent something.
-      3. A pure jump-count shape ("2-3", "5-10") never PREFIX-matches, the one
-         gate kept from the general path: FCs type counts constantly and a
-         false link REPLACES the whole source list. An exact name of that
-         shape would still resolve at step 1.
+      3. A pure jump-count shape ("2-3", "5-10") or a bare count ("10", "5")
+         never PREFIX-matches, the one gate kept from the general path: FCs
+         type counts constantly and a false link REPLACES the whole source
+         list -- ``range check 10`` must not silently become 10UZ-P. An exact
+         name of either shape would still resolve at step 1.
 
     O(catalogue) per tail token, bailing out the moment the prefix count is
     provably ambiguous -- the tail is a handful of words and the catalogue is
@@ -673,7 +674,7 @@ def tail_candidate(token, catalogue) -> tuple:
         return None, False
     if exact is not None:
         return exact, False
-    if _NUMBER_RANGE_RE.match(text):
+    if _NUMBER_RANGE_RE.match(text) or text.isdigit():
         return None, False
     hits = _prefix_hits(catalogue, text.lower())
     if len(hits) == 1:
