@@ -19891,6 +19891,13 @@ class FCToolGUI:
         "linux_fps_cap": 30,         # per-thumbnail composite ceiling (damage-driven)
         "linux_heartbeat_ms": 500,   # unconditional recomposite; repairs Wine's
                                      # IncludeInferiors flushes over the child window
+        # Keep-above kill switch. Wine upgrades a shown tile to a MANAGED X
+        # window, and KWin/Mutter lift the ACTIVE fullscreen client above the
+        # keep-above layer -- so the helper makes each tile a WM_TRANSIENT_FOR
+        # child of the focused client, the one hint that crosses layers.
+        # "auto" = on, "off" = spawn the helper with --no-transient. Inert on
+        # Windows like the four above.
+        "linux_transient_for": "auto",   # "auto" | "off"
     }
 
     def _account_char_hint(self, account_id):

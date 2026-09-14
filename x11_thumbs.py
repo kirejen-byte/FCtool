@@ -155,6 +155,11 @@ class HelperStatus:
     last_activate_ms: float = 0.0
     activate_focus_seen: int = 0
     activate_focus_missed: int = 0
+    #: WM_TRANSIENT_FOR keep-above: whether the helper has the mechanism on
+    #: at all ("on"/"off"), and how many property writes it has cost.  "-"
+    #: until the first ``stats`` lands.
+    transient: str = "-"
+    transient_writes: int = 0
     uptime_s: float = 0.0
     last_error: Optional[str] = None
     spawn_attempts: int = 0
@@ -466,7 +471,7 @@ class HelperSupervisor(object):
     """Owns the helper process, the control socket and the reader thread."""
 
     def __init__(self, spawn=None, listen_factory=None, facts=None,
-                 bundle_dir=None, log=None):
+                 bundle_dir=None, log=None, transient_for=True):
         #: None means "decide at spawn time" (see :meth:`_default_spawn`):
         #: the Wine verdict is a DLL probe, which must not run at import.
         self._spawn = spawn
@@ -474,6 +479,10 @@ class HelperSupervisor(object):
         self._facts = facts
         self._bundle_dir = bundle_dir or app_path.bundle_dir
         self._log = log if log is not None else globals()["log"]
+        #: False adds ``--no-transient`` to the helper's argv: the kill switch
+        #: for the WM_TRANSIENT_FOR keep-above (preview.linux_transient_for
+        #: == "off").  Read at spawn time only, so it is per-helper-process.
+        self._transient_for = bool(transient_for)
 
         self._lock = threading.Lock()          # guards every snapshot field
         self._send_lock = threading.Lock()     # serialises sendall
@@ -492,6 +501,8 @@ class HelperSupervisor(object):
         self._last_activate_ms = 0.0
         self._activate_focus_seen = 0
         self._activate_focus_missed = 0
+        self._transient = "-"
+        self._transient_writes = 0
         self._uptime_s = 0.0
         self._last_error = None
         self._spawn_attempts = 0
@@ -534,6 +545,8 @@ class HelperSupervisor(object):
                 last_activate_ms=self._last_activate_ms,
                 activate_focus_seen=self._activate_focus_seen,
                 activate_focus_missed=self._activate_focus_missed,
+                transient=self._transient,
+                transient_writes=self._transient_writes,
                 uptime_s=self._uptime_s,
                 last_error=self._last_error,
                 spawn_attempts=self._spawn_attempts,
@@ -849,8 +862,13 @@ class HelperSupervisor(object):
         argv = [python, "-c", BOOTSTRAP,
                 "--host", "127.0.0.1",
                 "--port", str(port),
-                "--token", token,
-                "--vendor", vendor]
+                "--token", token]
+        if not self._transient_for:
+            # BEFORE --vendor, always: BOOTSTRAP reads the vendor zip path off
+            # the END of argv (sys.argv[-1]) to seed sys.path, so that pair
+            # must stay last no matter what else goes on the line.
+            argv.append("--no-transient")
+        argv += ["--vendor", vendor]
         spawn = self._spawn
         if spawn is None:
             spawn = self._default_spawn()
@@ -1189,10 +1207,16 @@ class HelperSupervisor(object):
                               ("activations", "_activations"),
                               ("activate_focus_seen", "_activate_focus_seen"),
                               ("activate_focus_missed",
-                               "_activate_focus_missed")):
+                               "_activate_focus_missed"),
+                              ("transient_writes", "_transient_writes")):
                 total = _as_int(msg.get(key))
                 if total is not None:
                     setattr(self, attr, total)
+            # The one STRING the helper reports: "on"/"off" for the keep-above
+            # kill switch.  Anything else is ignored rather than rendered.
+            mode = msg.get("transient")
+            if mode in ("on", "off"):
+                self._transient = mode
             # The one float the helper reports: a bool would pass isinstance
             # (True is an int) and land in the report as 1.0 ms of nonsense.
             activate_ms = msg.get("last_activate_ms")
@@ -1848,8 +1872,10 @@ def wine_activator(backend):
 def make_backend(cfg, log=None):
     """Build the Wine-side backend and start the helper OFF-thread.
 
-    ``cfg`` is the materialised preview config; only ``linux_fps_cap`` and
-    ``linux_heartbeat_ms`` are read.  Returns None ONLY when this is not a
+    ``cfg`` is the materialised preview config; only ``linux_fps_cap``,
+    ``linux_heartbeat_ms`` and ``linux_transient_for`` are read (the last one
+    is a kill switch: "off" spawns the helper with ``--no-transient`` and the
+    WM_TRANSIENT_FOR keep-above never runs).  Returns None ONLY when this is not a
     Wine process - the one verdict that costs nothing - and then nothing at
     all was started.  Otherwise the backend comes back immediately with its
     supervisor still ``starting``: the caller gates real work on
@@ -1878,9 +1904,19 @@ def make_backend(cfg, log=None):
     except Exception:
         heartbeat = 500
     heartbeat = max(50, heartbeat)
-    logger.info("[x11] starting helper (fps_cap=%s heartbeat_ms=%s)",
-                _ascii(cap), _ascii(heartbeat))
-    supervisor = HelperSupervisor(facts=None, log=logger)
+    # Anything but the literal "off" keeps the keep-above on: an unreadable
+    # or unknown value must never be the thing that hides the tiles again.
+    try:
+        transient = str(cfg.get("linux_transient_for", "auto") or "auto")
+    except Exception:
+        transient = "auto"
+    transient_for = transient.strip().lower() != "off"
+    logger.info("[x11] starting helper (fps_cap=%s heartbeat_ms=%s "
+                "transient_for=%s)",
+                _ascii(cap), _ascii(heartbeat),
+                _ascii("on" if transient_for else "off"))
+    supervisor = HelperSupervisor(facts=None, log=logger,
+                                  transient_for=transient_for)
     supervisor.start()
     return X11ThumbBackend(supervisor, min_interval_ms=max(1, 1000 // cap),
                            heartbeat_ms=heartbeat)
@@ -2093,6 +2129,44 @@ def _report_probe(results):
     return lines or ["none"]
 
 
+def _report_wm(snapshot, payload):
+    """``[wm]``: the keep-above mode, and what the WM actually did to each tile.
+
+    The premise the WM_TRANSIENT_FOR fix rests on -- Wine upgrading the tiles
+    from override-redirect to MANAGED windows, which is what puts them under
+    the compositor's active-window layer -- is MEASURED here rather than
+    assumed: ``or=1`` would mean the tiles are still unmanaged on that box and
+    the whole diagnosis is wrong.  Rows come from the probe (read-only), so
+    they are ``none`` until one has run.
+    """
+    lines = ["mode=%s writes=%s"
+             % (_ascii(getattr(snapshot, "transient", "-")),
+                _ascii(getattr(snapshot, "transient_writes", 0)))]
+    rows = payload.get("wm") if isinstance(payload, dict) else None
+    rows = rows if isinstance(rows, list) else []
+    shown = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if shown >= MAX_REPORT_CLIENTS:
+            lines.append("... %d more" % (len(rows) - shown,))
+            break
+        shown += 1
+        state = row.get("state")
+        state = ",".join(_ascii(s) for s in state) if isinstance(state, list) \
+            else "-"
+        lines.append("dst=%s or=%s state=%s transient_for=%s%s"
+                     % (_ascii(row.get("dst")),
+                        _ascii(row.get("override_redirect")),
+                        state or "-",
+                        _ascii(row.get("transient_for")),
+                        (" error=%s" % (_ascii(row.get("error")),))
+                        if row.get("error") else ""))
+    if not shown:
+        lines.append("none")
+    return lines
+
+
 def _merge_clients(clients, results):
     """Fold each probe result into the client entry sharing its X id."""
     by_src = {}
@@ -2185,7 +2259,7 @@ def build_report(facts, snapshot, probe_result, clients=None,
     """The diagnostic text the Linux tester pastes back.
 
     Fixed section order ``[fctool] [host] [monitors] [helper] [clients]
-    [probe] [stats] [activate] [last_error]``, ASCII only, never longer than
+    [probe] [wm] [stats] [activate] [last_error]``, ASCII only, never longer than
     ``MAX_REPORT_BYTES``.  It
     carries no XAUTHORITY path and no client command line by construction:
     only the fields named below are ever rendered.  ``last_error`` is the one
@@ -2223,6 +2297,7 @@ def build_report(facts, snapshot, probe_result, clients=None,
         ("[helper]", _report_helper(snapshot)),
         ("[clients]", _report_clients(rows)),
         ("[probe]", _report_probe(results)),
+        ("[wm]", _report_wm(snapshot, payload)),
         ("[stats]", ["frames=%s damage=%s tile_damage=%s coalesced=%s "
                      "errors=%s "
                      "malformed=%s dropped=%s repairs=%s activations=%s "

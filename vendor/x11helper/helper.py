@@ -131,7 +131,7 @@ CONNECT_TIMEOUT_S = 10.0
 RECV_CHUNK = 65536
 
 _USAGE = ("usage: helper.py --host H --port N --token T "
-          "[--vendor PATH] [--display D]")
+          "[--vendor PATH] [--display D] [--no-transient]")
 
 
 def _log(text):
@@ -219,13 +219,18 @@ class Options(object):
         self.token = ""
         self.vendor = ""
         self.display = None
+        #: WM_TRANSIENT_FOR keep-above (see HelperCore._retarget_transients).
+        #: --no-transient is the kill switch: the whole mechanism becomes a
+        #: no-op, which is how a tester isolates it from everything else.
+        self.transient = True
 
 
 def parse_args(argv):
     """Parse the helper's argv (without argv[0]).  Raises UsageError.
 
-    Every flag takes a value: probing is a 'probe' MESSAGE, so there is no
-    --probe switch to parse (FCTool never passed one).
+    Every flag takes a value EXCEPT the boolean --no-transient: probing is a
+    'probe' MESSAGE, so there is no --probe switch to parse (FCTool never
+    passed one).
     """
     opts = Options()
     items = list(argv or ())
@@ -234,6 +239,12 @@ def parse_args(argv):
     seen_token = False
     while index < len(items):
         arg = items[index]
+        # The ONE valueless flag: checked before the "needs a value" guard so
+        # it may also be the last argument on the line.
+        if arg == "--no-transient":
+            opts.transient = False
+            index += 1
+            continue
         if index + 1 >= len(items):
             raise UsageError("%s needs a value\n%s" % (arg, _USAGE))
         value = items[index + 1]
@@ -320,6 +331,11 @@ class XSession(object):
         #: per activation would put a round trip on the hotkey path.  None
         #: when the server refused to intern it (activation then errors).
         self._net_active_window = None
+        # Xlib.Xatom, for the predefined WM_TRANSIENT_FOR / WINDOW / ATOM ids.
+        self._Xatom = None
+        #: name -> atom cache for the DIAGNOSTIC reads only (_NET_WM_STATE and
+        #: the state atoms it returns).  Never on a per-frame path.
+        self._atoms = {}
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -328,6 +344,7 @@ class XSession(object):
         handler.  Raises NoDisplayError / AuthError / MissingExtensionError."""
         try:
             from Xlib import X as X_mod
+            from Xlib import Xatom as xatom_mod
             from Xlib import display as display_mod
             from Xlib import error as error_mod
             from Xlib.ext import composite as composite_mod
@@ -339,6 +356,7 @@ class XSession(object):
             raise NoDisplayError("cannot import the vendored Xlib: %s" % (exc,))
 
         self._X = X_mod
+        self._Xatom = xatom_mod
         self._event = event_mod
         self._xerror = error_mod
         self._damage = damage_mod
@@ -714,6 +732,22 @@ class XSession(object):
             raise self._as_call_error(exc, xid)
         return attrs.map_state == self._X.IsViewable
 
+    def is_viewable(self, xid):
+        """``viewable()`` made TOTAL: any X error reads as "not viewable".
+
+        The keep-above's replacement-parent search asks this about a window
+        that may have just been destroyed under it, and there the honest
+        answer to a BadWindow is False -- not an exception that would strand
+        the tiles pointing at an iconified client.  A dead DISPLAY still
+        propagates: that is the run loop's business, as everywhere else.
+        """
+        try:
+            return bool(self.viewable(xid))
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            return False
+
     def select_structure(self, xid, expose=False, focus=False):
         """StructureNotify (plus ``expose`` / ``focus``) on a FOREIGN window.
 
@@ -732,6 +766,82 @@ class XSession(object):
         if focus:
             mask |= self._X.FocusChangeMask
         self._checked(self._window(xid).change_attributes, event_mask=mask)
+
+    # ---- WM hints -------------------------------------------------------
+
+    def set_transient_for(self, dst, parent):
+        """Declare the tile ``dst`` a transient child of the client ``parent``.
+
+        The ONE hint that crosses a compositor's stacking LAYERS.  Wine turns
+        a tile into a MANAGED X window the first time it is shown without
+        NOACTIVATE (a one-way upgrade), and KWin/Mutter then lift the ACTIVE
+        fullscreen client into a layer ABOVE keep-above -- so
+        _NET_WM_STATE_ABOVE is not enough and a re-stack (``retop``) is a
+        no-op on an unchanged rect.  A transient is stacked with its parent
+        instead of against it, which is what puts the tiles back on top.
+        """
+        self._checked(self._window(int(dst)).set_wm_transient_for,
+                      self._window(int(parent)))
+
+    def clear_transient_for(self, dst):
+        """Drop the tile's WM_TRANSIENT_FOR.
+
+        Needed whenever the parent is about to stop being a legal one: most
+        WMs MINIMISE a transient with its parent, and a managed Wine tile
+        comes back WS_MINIMIZEd, so the property must never point at an
+        iconified or dead client.
+        """
+        self._checked(self._window(int(dst)).delete_property,
+                      self._Xatom.WM_TRANSIENT_FOR)
+
+    def _atom(self, name):
+        """Intern ``name`` once.  0 when the server refused (diagnostic only)."""
+        atom = self._atoms.get(name)
+        if atom is None:
+            try:
+                atom = int(self.display.intern_atom(name))
+            except Exception as exc:
+                _log("cannot intern %s: %s" % (name, exc))
+                atom = 0
+            self._atoms[name] = atom
+        return atom
+
+    def window_wm_info(self, xid):
+        """DIAGNOSTIC read-only facts about one window.  Never raises.
+
+        ``{"dst", "override_redirect", "state" (a list of _NET_WM_STATE atom
+        NAMES), "transient_for"}`` plus ``"error"`` for whichever half the
+        server refused.  This is what MEASURES the managed-vs-override-redirect
+        premise on the tester's box instead of assuming it.
+        """
+        info = {"dst": int(xid), "override_redirect": None,
+                "state": [], "transient_for": 0}
+        win = self._window(xid)
+        try:
+            info["override_redirect"] = bool(
+                self._window(xid).get_attributes().override_redirect)
+        except Exception as exc:
+            info["error"] = _describe(exc)
+        state_atom = self._atom("_NET_WM_STATE")
+        if state_atom:
+            try:
+                prop = win.get_full_property(state_atom, self._Xatom.ATOM)
+                for value in (getattr(prop, "value", None) or ()):
+                    info["state"].append(self._atom_name(value))
+            except Exception as exc:
+                info.setdefault("error", _describe(exc))
+        try:
+            parent = win.get_wm_transient_for()
+            info["transient_for"] = _xid_of(parent)
+        except Exception as exc:
+            info.setdefault("error", _describe(exc))
+        return info
+
+    def _atom_name(self, atom):
+        try:
+            return _ascii(self.display.get_atom_name(int(atom)))
+        except Exception:
+            return "0x%x" % (int(atom),)
 
     def try_redirect_automatic(self, xid):
         """Ask Composite to redirect this source window.
@@ -927,7 +1037,7 @@ class XSession(object):
         """Drain the queue into normalised tuples.
 
         ``("damage", xid, (x, y, w, h))`` / ``("configure", xid, w, h)`` /
-        ``("expose", xid)`` / ``("destroy", xid)`` /
+        ``("expose", xid)`` / ``("destroy", xid)`` / ``("unmap", xid)`` /
         ``("focus_in", xid)`` / ``("error", code, resource)``.  Anything else
         is dropped here so HelperCore never sees an Xlib object.
 
@@ -984,6 +1094,12 @@ class XSession(object):
                             int(ev.width), int(ev.height)))
             elif etype == X.Expose:
                 out.append(("expose", _xid_of(ev.window)))
+            elif etype == X.UnmapNotify:
+                # A client being minimised/withdrawn.  The mask that carries
+                # it (StructureNotify) is already selected on every source --
+                # this is what stops a tile staying transient for an
+                # ICONIFIED parent, which most WMs would minimise it with.
+                out.append(("unmap", _xid_of(ev.window)))
             elif etype == X.DestroyNotify:
                 out.append(("destroy", _xid_of(ev.window)))
             elif etype == X.FocusIn:
@@ -1192,6 +1308,11 @@ class Thumb(object):
         self.heartbeat_ms = (HEARTBEAT_DISABLED_MS if heartbeat_ms <= 0
                              else max(self.min_interval_ms, heartbeat_ms))
         self.visible = True
+        #: Mirror of this tile's WM_TRANSIENT_FOR, so an unchanged parent
+        #: WRITES NOTHING (the set_border zero-write pattern).  0 = "we have
+        #: not set one", which is also the state of a freshly shown tile, so
+        #: a clear with nothing to clear costs no round trip either.
+        self.transient_for = 0
         #: probe mode owns the destination window and must destroy it too.
         self.owns_dst = bool(owns_dst)
 
@@ -1220,7 +1341,7 @@ class HelperCore(object):
     """
 
     def __init__(self, session, transport, clock=time.monotonic,
-                 sleep=time.sleep):
+                 sleep=time.sleep, transient=True):
         self.session = session
         self.transport = transport
         self.clock = clock
@@ -1251,6 +1372,15 @@ class HelperCore(object):
         self.started_ts = clock()
         self._next_stats_ts = self.started_ts + STATS_INTERVAL_S
         self._probe_counts = None
+        #: WM_TRANSIENT_FOR keep-above.  ``--no-transient`` turns the whole
+        #: mechanism off so a tester can isolate it.
+        self.transient = bool(transient)
+        #: The source window every attached tile is currently transient FOR
+        #: (None = none).  One parent for all tiles: what has to end up on top
+        #: is the ACTIVE client, and a tile is not owned by the client it
+        #: shows.
+        self._transient_parent = None
+        self.transient_writes = 0
         #: sources already offered to Composite (asked once, never again).
         self._redirected = set()
         #: Deadline for the deferred RandR re-push (see _on_screen_change());
@@ -1379,6 +1509,10 @@ class HelperCore(object):
             self._error(tid, exc.code, exc.msg)
             return
         self.thumbs[tid] = thumb
+        # A tile spawned after the last activation joins the current parent,
+        # or it would be the one tile the active client still buries.
+        if self._transient_parent is not None:
+            self._write_transient(thumb, self._transient_parent)
         try:
             src_w, src_h = self.session.geometry(thumb.src)[2:4]
         except XCallError as exc:
@@ -1397,6 +1531,10 @@ class HelperCore(object):
         if thumb is not None:
             self._release(thumb)
             self._forget_redirect(thumb.src)
+            # The tile that showed the current parent is gone; if no other
+            # tile still shows it, the hint has to move or go.
+            if not self._by_src(thumb.src):
+                self._drop_transient_parent(thumb.src)
         # A detach for an id we never had (or already dropped after an error)
         # is answered anyway: the app is entitled to its reply either way.
         self.send({"type": proto.T_DETACHED, "id": tid})
@@ -1414,8 +1552,115 @@ class HelperCore(object):
                 return
         self._redirected.discard(src)
 
+    # ---- WM_TRANSIENT_FOR keep-above ------------------------------------
+
+    def _retarget_transients(self, src):
+        """Make every attached tile a transient child of the source ``src``.
+
+        Called optimistically at 'activate' (before the WM has acted), on any
+        FocusIn for a source we already show (alt-tab, an in-game window
+        swap), and for one tile at 'attach' (a tile spawned later joins the
+        current parent).  Per tile, per call: an UNCHANGED parent writes
+        nothing, and one tile's failure never stops the others.
+        """
+        if not self.transient:
+            return
+        src = int(src)
+        if src <= 0:
+            return
+        self._transient_parent = src
+        for thumb in list(self.thumbs.values()):
+            # Probe windows (negative ids) are the helper's own, off-screen
+            # and short-lived: giving them a parent would only risk the WM
+            # minimising a window the user cannot see anyway.
+            if thumb.id >= 0:
+                self._write_transient(thumb, src)
+
+    def _write_transient(self, thumb, parent):
+        """One tile's WM_TRANSIENT_FOR write: mirrored, error-isolated.
+
+        ``parent`` 0 means "clear it".  A failed write leaves the mirror
+        alone, so the next trigger retries rather than believing a lie.
+        """
+        if not self.transient:
+            return
+        parent = int(parent or 0)
+        if int(thumb.transient_for) == parent:
+            return
+        try:
+            if parent:
+                self.session.set_transient_for(thumb.dst, parent)
+            else:
+                self.session.clear_transient_for(thumb.dst)
+        except XCallError as exc:
+            _log("WM_TRANSIENT_FOR on 0x%x: %s" % (thumb.dst, exc.msg))
+            return
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            _log("WM_TRANSIENT_FOR on 0x%x: %s"
+                 % (thumb.dst, _describe(exc)))
+            return
+        thumb.transient_for = parent
+        self.transient_writes += 1
+
+    def _clear_transients(self):
+        """No legal parent left: drop the hint from every tile."""
+        self._transient_parent = None
+        for thumb in list(self.thumbs.values()):
+            self._write_transient(thumb, 0)
+
+    def _drop_transient_parent(self, xid):
+        """The current parent went away (unmapped, detached, destroyed).
+
+        THE minimise-with-parent hazard: most WMs minimise a transient along
+        with its parent, and a managed Wine tile comes back WS_MINIMIZEd --
+        so the property must never be left pointing at an iconified client.
+
+        The replacement is therefore chosen only among sources that are
+        VIEWABLE right now.  "Another attached source" is not enough: under
+        ``minimize_inactive`` every other client is already iconified, so
+        minimising the active one would re-point the tiles straight at a
+        minimised sibling and the WM would minimise them anyway -- the exact
+        hazard this exists to avoid.  Nothing viewable = clear, every time.
+        """
+        parent = self._transient_parent
+        if parent is None or int(xid) != int(parent):
+            return
+        gone = int(xid)
+        candidates = []
+        for thumb in list(self.thumbs.values()):
+            if thumb.id >= 0 and thumb.src != gone \
+                    and thumb.src not in candidates:
+                candidates.append(thumb.src)
+        for src in candidates:
+            # Asked per candidate, in attach order, and only until one says
+            # yes: this runs on a minimise, never on a frame.
+            if self._source_viewable(src):
+                self._retarget_transients(src)
+                return
+        self._clear_transients()
+
+    def _source_viewable(self, src):
+        """Is this source mapped and visible?  Any failure reads as "no".
+
+        Guarded HERE as well as in XSession: the session is an injection seam,
+        and a replacement parent nobody can vouch for must never be chosen.
+        """
+        try:
+            return bool(self.session.is_viewable(src))
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            _log("is_viewable 0x%x: %s" % (int(src), _describe(exc)))
+            return False
+
     def _release(self, thumb):
         """Free every X resource of ``thumb``.  Never raises."""
+        # The keep-above hint goes FIRST: the tile window outlives the helper
+        # (FCTool owns it), so a WM_TRANSIENT_FOR left behind would keep
+        # minimising it with a client nobody is tracking any more.
+        self._write_transient(thumb, 0)
         session = self.session
         for pic in (thumb.src_pic, thumb.dst_pic):
             if pic is not None:
@@ -1554,6 +1799,10 @@ class HelperCore(object):
         except Exception as exc:
             if _is_display_dead(exc):
                 raise
+        # OPTIMISTIC, before the WM acts: the client is about to be raised
+        # into the active-fullscreen layer, and the tiles ride up with it
+        # only if they are already its transients when that happens.
+        self._retarget_transients(src)
         if self._pending_activate is not None:
             # A new activate always replaces the previous arm: the request
             # it was waiting on will never get its own FocusIn now (only the
@@ -1632,6 +1881,8 @@ class HelperCore(object):
                                    int(ev[3]) if len(ev) > 3 else 0)
             elif kind == "expose":
                 self._on_expose(int(ev[1]))
+            elif kind == "unmap":
+                self._on_unmap(int(ev[1]))
             elif kind == "destroy":
                 self._on_destroy(int(ev[1]))
             elif kind == "focus_in":
@@ -1784,19 +2035,39 @@ class HelperCore(object):
         self.repairs += 1
         self.composite(thumb, now)
 
+    def _on_unmap(self, xid):
+        """A window was unmapped: minimised, withdrawn or on its way out.
+
+        The thumbnails themselves are untouched (an unmapped source simply
+        stops damaging, and composite() already skips unviewable sources) --
+        this exists ONLY so the keep-above hint stops naming a client the WM
+        has just iconified.
+        """
+        self._drop_transient_parent(xid)
+
     def _on_destroy(self, xid):
         for thumb in self._by_src(xid):
             self._fail_thumb(thumb,
                              XCallError("source window 0x%x was destroyed"
                                         % (xid,), "bad_window", xid))
+        # After the tiles are gone, so the replacement parent is chosen from
+        # the sources that are actually still there.
+        self._drop_transient_parent(xid)
 
     def _on_focus_in(self, xid):
-        """Stop the activation clock, if this FocusIn is the one we armed.
+        """Re-point the tiles, and stop the activation clock if this is ours.
 
-        A FocusIn on any OTHER window is ordinary desktop traffic (the user
-        alt-tabbing, EVE's own child windows) and is ignored: only the window
-        the last activate named can answer for that activate.
+        TWO independent jobs on one event.  The keep-above hint follows ANY
+        focus-in on a source we already show -- alt-tab and in-game window
+        swaps never go through 'activate', and those are exactly the cases
+        the field bug showed tiles vanishing behind the client.
+
+        The LATENCY half is unchanged: a FocusIn on any other window is
+        ordinary desktop traffic and only the window the last activate named
+        can answer for that activate.
         """
+        if self._by_src(int(xid)):
+            self._retarget_transients(xid)
         pending = self._pending_activate
         if pending is None or int(xid) != int(pending[0]):
             return
@@ -1991,6 +2262,10 @@ class HelperCore(object):
                    "last_activate_ms": self.last_activate_ms,
                    "activate_focus_seen": self.activate_focus_seen,
                    "activate_focus_missed": self.activate_focus_missed,
+                   # Keep-above: whether the mechanism is on at all, and how
+                   # many property writes it has actually cost.
+                   "transient": "on" if self.transient else "off",
+                   "transient_writes": self.transient_writes,
                    "errors": self.errors,
                    "uptime_s": round(now - self.started_ts, 3)})
 
@@ -2072,7 +2347,30 @@ class HelperCore(object):
                 if self.thumbs.pop(thumb.id, None) is not None:
                     self._release(thumb)
         self.send({"type": proto.T_PROBE_RESULT, "results": results,
+                   "wm": self._wm_rows(),
+                   "transient": "on" if self.transient else "off",
                    "round_trip_ms": self._round_trip_ms()})
+
+    def _wm_rows(self):
+        """One read-only WM row per REAL tile, for the report's [wm] section.
+
+        This is what measures the premise the whole keep-above fix rests on:
+        whether Wine has upgraded the tiles to MANAGED windows, what
+        _NET_WM_STATE they carry, and who they are transient for right now.
+        Never raises and never writes.
+        """
+        rows = []
+        for thumb in sorted((t for t in self.thumbs.values() if t.id >= 0),
+                            key=lambda t: t.id):
+            try:
+                row = self.session.window_wm_info(thumb.dst)
+            except Exception as exc:
+                if _is_display_dead(exc):
+                    raise
+                row = {"dst": thumb.dst, "error": _describe(exc)}
+            row["id"] = thumb.id
+            rows.append(row)
+        return rows
 
     def _destroy_quietly(self, xid):
         """Destroy one helper-owned window; a failure here is only a log."""
@@ -2113,6 +2411,10 @@ class HelperCore(object):
     # ---- shutdown -------------------------------------------------------
 
     def shutdown(self):
+        # _release() clears each tile's WM_TRANSIENT_FOR on the way out: the
+        # tiles outlive this process, and a hint left behind would minimise
+        # them with an EVE client nothing is tracking any more.
+        self._transient_parent = None
         for tid in list(self.thumbs.keys()):
             thumb = self.thumbs.pop(tid, None)
             if thumb is not None:
@@ -2301,7 +2603,7 @@ def main(argv=None):
                            "%s: %s" % (type(exc).__name__, exc),
                            EXIT_NO_DISPLAY)
 
-    core = HelperCore(session, transport)
+    core = HelperCore(session, transport, transient=opts.transient)
     code = EXIT_OK
     try:
         # Inside the guard: build_hello QUERIES the server, so it can die too,
