@@ -392,6 +392,18 @@ MIN_PARTIAL_SHAPED_PREFIX_LEN = 3
 #: short abbreviations are safe; substring-only short fragments are not, so
 #: the two stages carry different floors (2026-08-25 split floor).
 MIN_PARTIAL_SHAPED_SUBSTR_LEN = 4
+#: A LETTERS-only fragment this short is eligible for PREFIX matching too --
+#: but only against a SHAPED candidate. An FC abbreviating a null-sec system
+#: types the letters that lead it and drops the dash tail ("SVM" for SVM-3K,
+#: the owner's own prior staging, field-reported 2026-09-13: the report
+#: silently answered about the CURRENT staging instead), and a fragment whose
+#: one candidate carries a digit or a dash cannot be the English word it looks
+#: like -- ``Gate`` still refuses, because ``Gateway`` is letters-only and the
+#: 5-character letters floor above owns that class. The casing gate
+#: (``plain_phrase_is_a_reference``, ``MIN_PLAIN_ABBREV_LEN``) is the second
+#: half of this: a shaped name is spelled in CAPS, so only a CAPS fragment
+#: matches its lead character for character, and prose never does.
+MIN_PARTIAL_ABBREV_LEN = 3
 
 
 def resolve_partial_name(name, catalogue) -> str | None:
@@ -400,7 +412,11 @@ def resolve_partial_name(name, catalogue) -> str | None:
     lowered ONCE by the caller (``extract_systems`` builds it once per call,
     never per phrase, so this function never lowers a catalogue entry itself
     -- only the typed name; ``2026-08-24``, fleet-chat partial name matching,
-    revised the same day after a false-positive/perf review, F1-F3/F5).
+    revised the same day after a false-positive/perf review, F1-F3/F5). For
+    the same reason, ``_refused_ref``'s own catalogue lookup (2026-09-13) is
+    gated to abbreviation-shaped single words before it ever scans -- a full
+    catalogue walk per REFUSED phrase, unbounded, measured at 60-148 ms per
+    prose line.
     Returns the ONE catalogue name ``name`` identifies, or ``None``. Any
     non-dict-like catalogue (``None`` included) degrades to ``None`` rather
     than raising -- the same "every failure mode is unresolved" contract
@@ -418,7 +434,11 @@ def resolve_partial_name(name, catalogue) -> str | None:
       3. A LETTERS-ONLY phrase (no digit, no dash) needs length >=
          ``MIN_PARTIAL_LETTERS_LEN`` and gets PREFIX matching only -- never
          substring (kills "Gate"/"LOST"/"DEAD"/"FAST" while still catching
-         "Amama" -> "Amamake").
+         "Amama" -> "Amamake"). BELOW that floor it still gets one PREFIX
+         chance, down to ``MIN_PARTIAL_ABBREV_LEN``, but ONLY if the single
+         candidate is itself SHAPED: "SVM" reaches SVM-3K, "Gate" still
+         cannot reach Gateway (2026-09-13, the owner's "range check SVM"
+         answering about the current staging instead).
       4. A SHAPED phrase (digit or dash present, not a pure jump-count) gets
          PREFIX matching at length >= ``MIN_PARTIAL_SHAPED_PREFIX_LEN`` (3, so
          "1dh" -> 1DH-SX resolves), then -- only if prefix found NOTHING --
@@ -431,23 +451,47 @@ def resolve_partial_name(name, catalogue) -> str | None:
     repeated ``.lower()``, no separate substring pass when prefix already
     decided the answer); bails out as soon as the prefix count is provably
     ambiguous, since nothing later in the scan can undo that."""
+    return _partial_match(name, catalogue)[0]
+
+
+def _partial_match(name, catalogue) -> tuple:
+    """``(resolved_name | None, ambiguous)`` -- the scan itself, carrying the
+    one fact ``resolve_partial_name``'s ``str | None`` return cannot: whether
+    the fragment matched SEVERAL real systems.
+
+    That distinction is a DISCLOSURE, not a resolution. An ambiguous fragment
+    ("P-Z" over P-ZMZV and P-ZWKH) means the FC named something real and the
+    report is about to fall back to the configured stagings regardless -- the
+    silence ``ignored_line`` exists to break. A fragment that matched NOTHING
+    is not a disclosure: this module does not get to call an unknown word a
+    system. Ambiguity is reported for the stage that actually decided the
+    answer -- a prefix that hit twice, or (prefix empty) a substring that did
+    -- and never for a fragment refused by a length/shape gate before the
+    scan, which named nothing at all."""
     text = str(name or "").strip()
     if not text:
-        return None
+        return None, False
     try:
         exact = catalogue.get(text.lower())
     except AttributeError:
-        return None
+        return None, False
     if exact is not None:
-        return exact
+        return exact, False
     if _NUMBER_RANGE_RE.match(text):
-        return None
+        return None, False
     shaped = is_system_shaped(text)
     # The early gate uses the PREFIX floor -- a 3-char shaped phrase is still
-    # eligible to enter the scan (for prefix matching only, per substr_ok).
+    # eligible to enter the scan (for prefix matching only, per substr_ok), and
+    # so is a 3-char letters-only ABBREVIATION (for a shaped candidate only,
+    # per abbrev_only).
     if len(text) < (MIN_PARTIAL_SHAPED_PREFIX_LEN if shaped
-                    else MIN_PARTIAL_LETTERS_LEN):
-        return None
+                    else MIN_PARTIAL_ABBREV_LEN):
+        return None, False
+    # A letters-only fragment under the letters floor is an FC's shorthand for
+    # a SHAPED name or it is nothing: prefix only, and the one candidate must
+    # carry a digit or a dash. Keeps "Gate" -> Gateway refused while "SVM"
+    # reaches SVM-3K.
+    abbrev_only = not shaped and len(text) < MIN_PARTIAL_LETTERS_LEN
     needle = text.lower()
     # Substring matching carries the STRICTER shaped floor, so a 3-char shaped
     # phrase does prefix-matching only and never substring-matches mid-name.
@@ -466,10 +510,16 @@ def resolve_partial_name(name, catalogue) -> str | None:
             substr_hits += 1
             substr_cand = original
     if prefix_hits == 1:
-        return prefix_cand
-    if prefix_hits or not shaped:
-        return None
-    return substr_cand if substr_hits == 1 else None
+        if abbrev_only and not is_system_shaped(prefix_cand):
+            return None, False
+        return prefix_cand, False
+    if prefix_hits:
+        return None, True           # 2+ prefix candidates: really ambiguous
+    if not shaped:
+        return None, False
+    if substr_hits == 1:
+        return substr_cand, False
+    return None, substr_hits > 1
 
 
 def _as_ref(value, resolve=None) -> SystemRef | None:
@@ -531,6 +581,17 @@ _SYSTEM_SHAPED_RE = re.compile(r"[0-9-]")
 #: them by orders of magnitude — ``Jan`` alone was 1,748 of 21,008 matches over
 #: the owner's 304k-message Fleet history, every one of them a date.
 MIN_PLAIN_NAME_LEN = 4
+#: The ONE thing allowed under ``MIN_PLAIN_NAME_LEN``: an ALL-CAPS letters-only
+#: fragment of 3+ characters, the shape of an FC abbreviating a null-sec system
+#: ("SVM" for SVM-3K). It buys nothing on its own — a three-letter letters-only
+#: NAME is still refused in every casing, because the exact-spelling rule below
+#: then demands ``Hek``/``Jan``/``Usi`` and an all-caps phrase is not that. It
+#: only lets the fragment reach ``resolve_partial_name``, where
+#: ``MIN_PARTIAL_ABBREV_LEN`` requires the one candidate to be SHAPED, and the
+#: prefix-casing rule below then requires the fragment to match that candidate's
+#: lead CHARACTER FOR CHARACTER — which a shaped (upper-case) name grants only
+#: to an upper-case fragment. Prose, whatever its length, never gets there.
+MIN_PLAIN_ABBREV_LEN = 3
 #: What ends a sentence, so English capitalises the NEXT word whatever it is.
 _SENTENCE_END_RE = re.compile(r"[.!?\n\r]")
 
@@ -539,6 +600,17 @@ def is_system_shaped(phrase) -> bool:
     """Does the phrase carry a digit or a dash — the shape of a null/lowsec
     system name? Those are accepted on sight; nothing in English collides."""
     return bool(_SYSTEM_SHAPED_RE.search(str(phrase or "")))
+
+
+def is_abbrev_shaped(phrase) -> bool:
+    """Is this the shape of an FC's typed ABBREVIATION — ALL CAPS, letters
+    only, ``MIN_PLAIN_ABBREV_LEN``+ characters ("SVM", "PZM")?
+
+    The only evidence that gets a phrase under ``MIN_PLAIN_NAME_LEN``. It is
+    weak on its own and is never used on its own: see that constant."""
+    text = str(phrase or "")
+    return (len(text) >= MIN_PLAIN_ABBREV_LEN and text.isupper()
+            and text.isalpha())
 
 
 def plain_phrase_is_a_reference(phrase, *, sentence_initial,
@@ -555,7 +627,10 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     Three pieces of evidence, none of them a word list to maintain:
 
     * **Length** — below ``MIN_PLAIN_NAME_LEN`` the English words swamp the
-      systems (the measurement is on that constant).
+      systems (the measurement is on that constant). The single exception is
+      an ALL-CAPS ``is_abbrev_shaped`` fragment, which still has to clear every
+      rule below — and does so only as the CAPS lead of a shaped name it
+      abbreviates, never as a name in its own right (``MIN_PLAIN_ABBREV_LEN``).
     * **Casing** — a system pasted from the game, or typed as the proper noun it
       is, carries the game's own spelling; chat prose does not (``toon`` vs
       ``Toon``). An all-lowercase phrase is prose. When the bundled table can
@@ -582,7 +657,7 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     CHARACTER, so a shouted ``GATEW`` is refused exactly as a shouted exact
     ``EXIT`` is, while ``Amama`` still reaches ``Amamake`` (2026-08-24, F4)."""
     text = str(phrase or "")
-    if len(text) < MIN_PLAIN_NAME_LEN:
+    if len(text) < MIN_PLAIN_NAME_LEN and not is_abbrev_shaped(text):
         return False
     if text == text.lower():
         return False
@@ -640,13 +715,21 @@ def _retype_hint(phrase, canonical, *, sentence_initial) -> str:
     canon = str(canonical or "")
     if not canon or canon == text:
         return ""
+    # A SHAPED canonical never faces this gate at all — a digit or a dash is
+    # accepted on sight, in any casing, at any position — so "type it as
+    # SVM-3K" is advice that works even where the refused ABBREVIATION could
+    # not be fixed by retyping (line-leading, 2026-09-13). Only a partial hit
+    # can produce a shaped canonical for a refused plain phrase, which is why
+    # this could not arise before.
+    if is_system_shaped(canon):
+        return canon
     if not plain_phrase_is_a_reference(canon, sentence_initial=sentence_initial,
                                        canonical=canon):
         return ""
     return canon
 
 
-def _refused_ref(phrase, *, sentence_initial) -> IgnoredRef | None:
+def _refused_ref(phrase, *, sentence_initial, catalogue=None) -> IgnoredRef | None:
     """``IgnoredRef`` for a refused phrase the BUNDLED table names; else None.
 
     Deliberately ``system_coords.resolve_name`` and never the injected resolver.
@@ -659,11 +742,40 @@ def _refused_ref(phrase, *, sentence_initial) -> IgnoredRef | None:
     The consequence, stated so nobody has to rediscover it: a caller injecting a
     resolver that knows MORE systems than the bundled table gets the accepted
     half from their resolver and the refused half from the table. Under-
-    disclosure, which is the safe direction for a dim advisory line."""
+    disclosure, which is the safe direction for a dim advisory line.
+
+    ``catalogue`` (the caller's ``{lower: original}`` K-space dict) extends the
+    mirror to PARTIAL spellings: ``range check svm`` is refused for casing and
+    names no system the table can look up EXACTLY, so before 2026-09-13 it
+    produced the configured-sources report with no tell at all — the very shape
+    the accepted half learned to resolve that day. The candidate is found the
+    same way the accepted half finds it, so the two halves cannot disagree
+    about what ``svm`` meant, and the retype hint is the spelling that WOULD
+    have been taken (``SVM-3K``, shaped, so it bypasses this gate entirely)."""
     sid = _resolve_id(phrase, system_coords.resolve_name)
+    canon = ""
     if sid is None:
-        return None
-    canon = system_coords.get_name(sid) or ""
+        if not catalogue:
+            return None
+        # The catalogue scan is O(catalogue) per call, so it only runs for a
+        # phrase actually SHAPED like a miscased abbreviation -- one word, no
+        # space, letters only, 3-4 characters. Without this gate every refused
+        # phrase on a line paid the full 5,485-entry scan (up to 3 windows per
+        # word position), measured at 60 ms for a 41-word prose line and
+        # 148 ms for a 92-word one -- the disclosure is not worth that on
+        # ordinary chat text that was never an abbreviation to begin with.
+        text = str(phrase or "")
+        if not (" " not in text and text.isalpha()
+                and MIN_PARTIAL_ABBREV_LEN <= len(text) <= MIN_PLAIN_NAME_LEN):
+            return None
+        candidate = _partial_match(phrase, catalogue)[0]
+        if candidate is None:
+            return None
+        sid = _resolve_id(candidate, system_coords.resolve_name)
+        if sid is None:
+            return None
+        canon = candidate
+    canon = canon or system_coords.get_name(sid) or ""
     return IgnoredRef(str(phrase), sid,
                       _retype_hint(phrase, canon,
                                    sentence_initial=sentence_initial))
@@ -716,7 +828,22 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     "3-FKCZ" when it is the only K-space name starting with it; an ambiguous
     or ineligible fragment falls through exactly like an unknown one does
     today; a name that resolves EXACTLY is never second-guessed even when it
-    is also a prefix of others."""
+    is also a prefix of others.
+
+    **A short ALL-CAPS abbreviation is a partial too** (2026-09-13): the owner
+    typed ``range check SVM`` for SVM-3K and got the configured-staging report
+    — which, with the FC sitting in that staging, read "same system - cannot
+    jump within a system" about a system they had not named. Three characters
+    now reach the partial matcher (``MIN_PLAIN_ABBREV_LEN``) and resolve there
+    only against a SHAPED candidate (``MIN_PARTIAL_ABBREV_LEN``), so the
+    fragment must be the CAPS lead of a null-sec name. Both halves of the
+    silence are covered: a MISCASED partial (``svm``) is disclosed by
+    ``_refused_ref`` off the same catalogue, and an AMBIGUOUS one (``P-Z`` over
+    P-ZMZV and P-ZWKH) becomes an id-less ``IgnoredRef`` — falling back to the
+    configured sources without a word, on a line that named real systems, is
+    the one answer this module may not give. A fragment matching NOTHING stays
+    silent: an unknown word is not a system, and calling it "ignored" would be
+    a different lie."""
     text = str(body or "")
     resolver = system_coords.resolve_name if resolve is None else resolve
 
@@ -733,8 +860,20 @@ def extract_systems(body, resolve=None) -> SystemMentions:
     out: list[SystemRef] = []
     ignored: list[IgnoredRef] = []
     seen: set[int] = set()
-    refused: set[int] = set()
+    refused: set = set()
     catalogue = None            # lazy: only built if an exact match ever fails
+
+    def _catalogue():
+        """The ``{lower: original}`` K-space catalogue, built ONCE per call (F3)
+        and shared by both halves of the sweep — the accepted one resolving a
+        partial spelling and the refused one disclosing it. Lazily, because a
+        line whose every phrase resolves exactly never needs it."""
+        nonlocal catalogue
+        if catalogue is None:
+            catalogue = {nm.lower(): nm for nm in
+                         system_coords.get_kspace_name_to_id()}
+        return catalogue
+
     i, n = 0, len(words)
     while i < n:
         hit = None
@@ -752,10 +891,12 @@ def extract_systems(body, resolve=None) -> SystemMentions:
             if plain and not plain_phrase_is_a_reference(
                     phrase, sentence_initial=initial):
                 if miss is None:
-                    miss = _refused_ref(phrase, sentence_initial=initial)
+                    miss = _refused_ref(phrase, sentence_initial=initial,
+                                        catalogue=_catalogue())
                 continue
             sid = _resolve_id(phrase, resolver)
             partial_name = None         # set only by a successful partial hit
+            ambiguous = False           # ...and by a fragment naming SEVERAL
             if sid is None:
                 # A typed name that does not resolve EXACTLY gets one more
                 # chance: a length/shape-eligible, unique prefix/substring hit
@@ -769,16 +910,23 @@ def extract_systems(body, resolve=None) -> SystemMentions:
                 # (the fc_gui call site gates on keyword + own-char +
                 # cooldown before ever calling it), never per ordinary
                 # chat line (see ``resolve_partial_name``, F3).
-                if catalogue is None:
-                    catalogue = {nm.lower(): nm for nm in
-                                 system_coords.get_kspace_name_to_id()}
-                partial = resolve_partial_name(phrase, catalogue)
+                partial, ambiguous = _partial_match(phrase, _catalogue())
                 if partial is not None and partial.lower() != phrase.lower():
                     partial_sid = _resolve_id(partial, resolver)
                     if partial_sid is not None:
                         sid = partial_sid
                         partial_name = partial
             if sid is None:
+                # An AMBIGUOUS abbreviation named real systems and this could
+                # not tell which ("P-Z" over P-ZMZV and P-ZWKH). Dropping it
+                # silently hands back the configured-sources report — the exact
+                # shape of "you named nothing" — for a line that named plenty.
+                # Single tokens only: a 2/3-word window that half-matches is
+                # not something the FC typed as a name. No id, because there is
+                # no ONE system to claim, and no retype hint, because only the
+                # FC knows which they meant.
+                if ambiguous and size == 1 and miss is None:
+                    miss = IgnoredRef(phrase, None, "")
                 continue
             canon = system_coords.get_name(sid)
             # ...and the half that needs the id: the game's own spelling.
@@ -802,9 +950,15 @@ def extract_systems(body, resolve=None) -> SystemMentions:
             # Nothing was taken at this index, so a refusal here is a real drop
             # and the FC gets told. A refusal UNDER an accepted shorter window
             # is not a drop — something from this position was used.
-            if miss is not None and miss.system_id not in refused:
-                refused.add(miss.system_id)
-                ignored.append(miss)
+            # De-duplicated by system id, or — for an ambiguous fragment, which
+            # HAS no id — by its own spelling, so one such fragment cannot
+            # swallow the disclosure of every other one on the line.
+            if miss is not None:
+                key = (miss.system_id if miss.system_id is not None
+                       else ("phrase", str(miss.phrase or "").lower()))
+                if key not in refused:
+                    refused.add(key)
+                    ignored.append(miss)
             i += 1
             continue
         phrase, sid, size, canon = hit
