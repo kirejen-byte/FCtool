@@ -1124,7 +1124,9 @@ _PREVIEW_IMPLANT_LOG_EVERY_S = 300.0
 # the status line and into this hover, to make room for "Watch my ozone").
 _IMPLANT_TOOLTIP_BASE = (
     "Pops up a brief message over the EVE client reminding you to "
-    "remove your implants when you dock at your staging system.")
+    "remove your implants when you dock at your staging system -- and "
+    "when a character logs in wearing implants worth pulling, wherever "
+    "it is.")
 
 # Scope backing "Watch my ozone". The assets pull is the only ESI call the
 # feature makes; a token without the scope is skipped outright rather than left
@@ -9878,7 +9880,19 @@ class FCToolGUI:
         if not isinstance(block, dict):
             block = implant_reminder.normalize_config(None)
             self.config["implant_reminder"] = block
-        block["enabled"] = bool(self._implant_enabled_var.get())
+        on = bool(self._implant_enabled_var.get())
+        block["enabled"] = on
+        # Turning the feature ON is the STARTUP case: the whole roster is
+        # already there and none of it just logged in. While the feature was
+        # off the hook returned at the master gate and recorded nothing, but
+        # _implant_prune kept the samples alive, so the first pass after
+        # re-enabling would compare a fresh sample against an arbitrarily old
+        # one. Clearing them restarts the login grace window with them -- the
+        # gap "Watch my ozone" paid for on the other side of this same ridge.
+        if on:
+            rem = getattr(self, "_implant_reminder", None)
+            if rem is not None:
+                rem.reset_logins()
         self._save_config()
 
     def _implant_staging_status(self):
@@ -9897,7 +9911,9 @@ class FCToolGUI:
         come from one resolution. The line had to shrink to make room for the
         "Watch my ozone" tick on the same row, and it is the half nobody reads
         twice -- the rung matters exactly once, when the answer surprises you,
-        which is precisely a hover.
+        which is precisely a hover. Text amended 2026-09-14 to "Fires at login,
+        and when you dock in X" -- the login trigger shipped the same day and
+        the line was silently incomplete without it.
 
         Returns ``(text, colour, detail)``."""
         try:
@@ -9916,7 +9932,7 @@ class FCToolGUI:
         # override has only an id. rung names the config key that won, so a
         # surprising answer says WHERE it came from.
         where = target.label or f"structure {target.value}"
-        return (f"Fires when you dock in {where}", FG_DIM,
+        return (f"Fires at login, and when you dock in {where}", FG_DIM,
                 f"Staging resolved from {target.rung}.")
 
     def _refresh_implant_staging_label(self):
@@ -23418,16 +23434,6 @@ class FCToolGUI:
         except Exception:
             pass
 
-        # Implant-removal reminder: fed the SAME location payload (no second
-        # ESI call). Deliberately outside the block above so a reminder fault
-        # can never swallow the system-name resolution, and getattr-guarded
-        # because the unit tests bind this builder onto bare SimpleNamespace
-        # hosts (house pattern -- see _preview_tick's gamelog-status hook).
-        if loc:
-            _ir = getattr(self, "_implant_reminder_observe", None)
-            if _ir is not None:
-                _ir(auth, name, loc)
-
         # FCPreview major-implant icon: keep this character's verdict fresh on
         # the SAME pass. Deliberately NOT gated on `loc` -- what is in the
         # pilot's head does not depend on the location call having answered --
@@ -23584,6 +23590,20 @@ class FCToolGUI:
         if _oz is not None:
             _oz(key, name, loc, online, ship_payload, auth, time.monotonic())
 
+        # "Save my implants": the SAME location payload as ever (no second ESI
+        # call) plus the fresh `online`, because the reminder grew a second
+        # trigger -- the LOGIN edge (2026-09-14) -- and that one reads exactly
+        # the signal the ozone watch above reads. Which is why the hook moved
+        # down here from the location block: one call per pass carrying both
+        # triggers' inputs, rather than a second hook with its own idea of what
+        # a login is. It is called even when /location answered nothing (the
+        # login trigger does not need a location); the engine is the thing that
+        # knows a dock edge needs one. getattr-guarded for the bare
+        # SimpleNamespace test hosts, the house pattern of the hooks above.
+        _ir = getattr(self, "_implant_reminder_observe", None)
+        if _ir is not None:
+            _ir(auth, name, loc, online, time.monotonic())
+
         return overlay_rules.CharState(
             character_id=getattr(auth, "character_id", 0) or 0, name=name,
             online=online, ship_type_id=ship_type_id,
@@ -23596,12 +23616,21 @@ class FCToolGUI:
     # ── Implant-removal reminder wiring (default ON) ────────────────────────
     # The feature itself lives in implant_reminder.py (pure trigger/state engine,
     # Tk-free) and client_toast.py (the transient over-client window). fc_gui owns
-    # only the two seams that must touch app state: the poller-thread hook below
-    # -- called from _overlay_build_state with the /location payload already in
-    # hand, so dock detection costs ZERO extra ESI -- and the Tk-thread toast
-    # raise it marshals to via _post_ui.
+    # only the seams that must touch app state: the poller-thread hook below
+    # -- called from _overlay_build_state with the /location payload and the
+    # /online/ answer already in hand, so neither of its two triggers costs an
+    # extra ESI call -- the roster sweep beside it, and the Tk-thread toast raise
+    # it marshals to via _post_ui.
+    #
+    # TWO triggers share that one hook (owner, 2026-09-14): the original DOCK
+    # edge (docked at staging with implants worth pulling) and the LOGIN edge
+    # ("logs in with valuable implants", wherever the character is). The login
+    # edge is the SAME one "Watch my ozone" reads a few lines up -- one notion of
+    # "login", not two -- and when it fires it silences the dock trigger for the
+    # docking the pilot logged in at, so a login at staging is one toast.
 
-    def _implant_reminder_observe(self, auth, name, loc):
+    def _implant_reminder_observe(self, auth, name, loc, online=None,
+                                  now=None):
         """Poller-thread hook: advance the reminder for ONE character.
 
         Runs on the ESI poll thread and touches no Tk (the engine's on_remind
@@ -23617,7 +23646,13 @@ class FCToolGUI:
         here that silently disagreed with the tick for every config shape except
         an explicit enabled:True/False, most importantly the absent block that is
         the ordinary upgrade case: box ticked, reminder dead. It stays a cheap
-        predicate on purpose -- this runs per character per poll."""
+        predicate on purpose -- this runs per character per poll.
+
+        ``online`` and ``now`` feed the LOGIN trigger (2026-09-14) and are the
+        only new inputs it takes: the same ``/online/`` answer the ozone watch
+        reads, carried forward by the caller when a pass did not ask. The two
+        toast flavours are two callbacks rather than a flag, so the engine's
+        original three-argument on_remind contract is untouched."""
         try:
             if not implant_reminder.is_enabled(
                     self.config.get("implant_reminder")):
@@ -23631,10 +23666,31 @@ class FCToolGUI:
                     implants_provider=lambda a: a.get_implants(),
                     on_remind=lambda k, n, names: self._post_ui(
                         self._implant_show_toast, k, n, names),
+                    on_login_remind=lambda k, n, names: self._post_ui(
+                        self._implant_show_toast, k, n, names, True),
                     resolve_system_name=system_coords.resolve_name)
-            rem.observe((name or "").strip().lower(), name, loc, auth)
+            rem.observe((name or "").strip().lower(), name, loc, auth,
+                        online=online, now=now)
         except Exception:
             log.exception("[implant] reminder hook failed")
+
+    def _implant_prune(self, keys):
+        """Drop the reminder's LOGIN state for every character not in ``keys``
+        (the poller's CURRENT roster). Called once per poller pass, on the
+        poller thread, beside the ozone watch's own sweep.
+
+        A closed client is simply never polled again -- ESI reports no logout --
+        so the roster's own arithmetic is the logout signal, and without it a
+        pilot who logs out and back in would get no second reminder. Nothing to
+        do while the feature has never run: the engine is built lazily by the
+        hook above, and no engine means no state. Tk-free, marshals nothing,
+        never raises."""
+        try:
+            rem = self._implant_reminder
+            if rem is not None:
+                rem.prune(keys)
+        except Exception:
+            log.exception("[implant] roster prune failed")
 
     # ── FCPreview major-implant icon: the verdict the tile tooltip reads ─────
     # Same poll pass as the reminder above, and for the same reason: the ESI
@@ -23767,8 +23823,12 @@ class FCToolGUI:
             log.exception("[implant] client enumeration failed")
         return None
 
-    def _implant_show_toast(self, key, char_name, names):
+    def _implant_show_toast(self, key, char_name, names, login=False):
         """Tk-thread: raise the transient over-client toast for ONE character.
+
+        ``login`` picks the copy -- the login trigger's "logged in - ..."
+        line instead of the dock trigger's -- and nothing else: same title,
+        same placement, same duration, same one-at-a-time rule.
 
         DELIBERATE DIVERGENCE from _preview_on_decloak: there is NO
         foreground-suppression here. The decloak alert suppresses when the
@@ -23796,9 +23856,11 @@ class FCToolGUI:
             cfg = implant_reminder.normalize_config(
                 self.config.get("implant_reminder"))
             rem = self._implant_reminder
+            body = (implant_reminder.login_toast_body(char_name, names)
+                    if login else
+                    implant_reminder.toast_body(char_name, names))
             toast = client_toast.ClientToast(
-                self.root, implant_reminder.TOAST_TITLE,
-                implant_reminder.toast_body(char_name, names),
+                self.root, implant_reminder.TOAST_TITLE, body,
                 seconds=cfg.get("toast_seconds", 12.0),
                 on_dismiss=lambda: setattr(self, "_implant_toast", None),
                 on_snooze=(lambda: rem.snooze(key)) if rem is not None else None)
@@ -24940,6 +25002,11 @@ class FCToolGUI:
                 _ozp = getattr(self, "_ozone_prune", None)
                 if _ozp is not None:
                     _ozp(names)
+                # "Save my implants" keeps login state off the same roster --
+                # a client that is gone is a character that logged out.
+                _imp = getattr(self, "_implant_prune", None)
+                if _imp is not None:
+                    _imp(names)
                 if not names:
                     stop.wait(1.0)
                     continue

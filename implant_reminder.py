@@ -604,6 +604,24 @@ HOLD = "hold"              # still docked at staging, already reminded
 PRIMED = "primed"          # first sighting, already docked: arm, do NOT nag
 CLEAR = "clear"            # not at staging: latch released, re-armed
 SUPPRESSED = "suppressed"  # snoozed / per-character disabled
+LOGIN = "login"            # login edge carrying valuable implants
+
+#: How long the engine must have been WATCHING before a character's FIRST
+#: sighting may read as a login (seconds, on the same monotonic clock the
+#: latch uses).
+#:
+#: The login trigger has exactly the problem "Watch my ozone" already solved
+#: in fc_gui, and is answered the same way on purpose (one notion of "login",
+#: not two): the ESI poller's roster is built from CONNECTED clients, so a
+#: client sitting at the login screen is never polled and the strict
+#: offline->online transition is nearly unreachable -- a character logging in
+#: mid-session simply APPEARS. A first sighting is therefore the real login
+#: signal, and this window is what stops the whole roster reading as a login
+#: burst in the first seconds after FCTool starts (or after the feature is
+#: switched on). Mirrors fc_gui's _OZONE_LOGIN_GRACE_S; the error direction is
+#: the owner's standing one for this feature -- at worst one extra toast,
+#: never a silently eaten reminder.
+LOGIN_GRACE_S = 120.0
 
 
 @dataclass
@@ -669,8 +687,33 @@ class ReminderState:
     #: after a minute-long blackout, against a silently-eaten reminder.
     blind_gap_s: float = 60.0
 
+    #: Grace window for the LOGIN machine's first-sighting rule (see
+    #: ``LOGIN_GRACE_S`` and ``observe_login``).
+    login_grace_s: float = LOGIN_GRACE_S
+
     _latches: dict = field(default_factory=dict)
     _snoozed: set = field(default_factory=set)
+
+    # -- LOGIN machine state (2026-09-14) -----------------------------------
+    # Deliberately NOT folded into _CharLatch: the dock machine reads 'have I
+    # ever seen this character' as ``key not in self._latches`` and answers a
+    # first sighting with PRIMED (arm, do NOT nag). A login observation that
+    # created the latch entry first would turn that first sighting into an
+    # ordinary poll and could FIRE the dock toast on top of the login one --
+    # the exact double-toast this feature must not produce.
+    #: key -> the last ``online`` sample seen (True / False / None while the
+    #: poller has never answered for that character).
+    _online: dict = field(default_factory=dict)
+    #: keys whose CURRENT login has already been answered. Cleared by an
+    #: observed logout, by ``prune`` (the client is gone) and by
+    #: ``reset_logins``; that is what makes the reminder fire again after a
+    #: logout -> login round trip, and only then.
+    _login_done: set = field(default_factory=set)
+    #: Monotonic stamp of the first ``observe_login`` call = 'the engine
+    #: started watching'. The grace window is measured from here, not from
+    #: process start, so switching the feature on mid-session gets the same
+    #: protection a cold start gets.
+    _started_at: float = None
 
     # -- queries ------------------------------------------------------------
     def is_snoozed(self, key: str) -> bool:
@@ -750,6 +793,110 @@ class ReminderState:
         # re-arm above).
         latch.attempts += 1
         return FIRE
+
+    # -- the LOGIN machine --------------------------------------------------
+    def observe_login(self, key: str, online, disabled=(), now=None) -> str:
+        """Advance ONE character's LOGIN machine by one poll; returns a verb.
+
+        ``online`` is this pass's ``/online/`` answer (``None`` = the poller did
+        not ask on this pass, which carries the previous sample forward -- an
+        ESI hiccup must never fabricate an edge, the rule the dock side follows
+        too). A login is:
+
+        * a strict ``False -> True`` online transition; OR
+        * this character's FIRST sighting, once the engine has been watching for
+          longer than ``login_grace_s`` (see ``LOGIN_GRACE_S`` for why the
+          strict rule alone is nearly unreachable in practice).
+
+        FIRE is returned at most once per login: the answer is remembered until
+        an observed logout (``True -> False``), a ``prune`` (the client closed)
+        or ``reset_logins``. A snoozed or per-character-disabled pilot is marked
+        answered rather than left pending, so un-snoozing mid-session cannot
+        fire retroactively -- the dock machine's own rule."""
+        k = str(key or "").strip().lower()
+        if not k:
+            return CLEAR
+        ts = time.monotonic() if now is None else float(now)
+        if self._started_at is None:
+            self._started_at = ts
+        first_sighting = k not in self._online
+        prev = self._online.get(k)
+        cur = prev if online is None else bool(online)
+        self._online[k] = cur
+        if prev is True and cur is False:
+            # An observed logout re-arms the trigger, and does nothing else.
+            self._login_done.discard(k)
+            return CLEAR
+        logged_in = ((prev is False and cur is True)
+                     or (first_sighting
+                         and (ts - self._started_at) > self.login_grace_s))
+        if not logged_in:
+            return CLEAR
+        off = {str(d).strip().lower() for d in (disabled or ())}
+        if k in off or k in self._snoozed:
+            self._login_done.add(k)
+            return SUPPRESSED
+        if k in self._login_done:
+            # Belt-and-braces: unreachable given the arithmetic above. Every
+            # path that can set membership in _login_done (SUPPRESSED, or the
+            # FIRE below) also returns immediately, and the only way OUT of
+            # _login_done is the True -> False CLEAR branch, which returns
+            # before reaching here too -- so a poll can never fall through to
+            # find its own key already marked. Kept as a defensive floor
+            # rather than deleted, in case a future edit adds a path in.
+            return HOLD
+        self._login_done.add(k)
+        return FIRE
+
+    def mark_reminded(self, key: str, dock=None, now=None) -> None:
+        """Tell the DOCK machine this character has already been reminded for
+        whatever dock it is sitting in right now.
+
+        The login path calls it so a pilot who logs in already docked at staging
+        gets ONE toast, not two: the dock machine then finds a latch set at this
+        very dock identity and answers HOLD on its next poll instead of FIRE.
+        Harmless when the character is in space -- the identity is empty and the
+        first not-at-staging poll releases the latch anyway."""
+        k = str(key or "").strip().lower()
+        if not k:
+            return
+        latch = self._latches.setdefault(k, _CharLatch())
+        latch.latched = True
+        latch.attempts = 0
+        latch.dock = dock_identity(dock)
+        latch.seen = time.monotonic() if now is None else float(now)
+
+    def prune(self, keys) -> list:
+        """Drop the LOGIN state of every character not in ``keys`` (the poller's
+        current roster); returns the keys dropped.
+
+        A closed client simply stops being polled -- ESI never reports the
+        logout -- so without this the "already answered" mark would outlive the
+        session it belongs to and a genuine re-login would be silent. The dock
+        machine's latches are deliberately left alone: they are released by
+        their own staleness rules, and dropping them here would only widen this
+        method's blast radius.
+
+        The cost of a roster blip (a character briefly missing from one pass) is
+        one extra toast on the next sighting -- this feature's chosen error
+        direction, and the same trade ``_ozone_prune`` makes."""
+        live = {str(k or "").strip().lower() for k in (keys or ())}
+        gone = [k for k in self._online if k not in live]
+        for k in gone:
+            self._online.pop(k, None)
+            self._login_done.discard(k)
+        return gone
+
+    def reset_logins(self) -> None:
+        """Forget every login sample and the grace anchor with it.
+
+        Switching the feature ON is the startup case: the whole roster is
+        already there and none of it just logged in. Clearing the samples
+        without restarting the grace clock would trade a stale sample for a
+        login burst -- the lesson "Watch my ozone" paid for."""
+        self._online.clear()
+        self._login_done.clear()
+        self._started_at = None
 
     def retry_fetch(self, key: str) -> bool:
         """Release the latch after a FAILED implant fetch so the next poll tries
@@ -953,15 +1100,47 @@ def summary_labels(names) -> tuple:
     Empty / garbage input answers ``()`` — the caller reads that as "no icon".
     Returns a TUPLE: the poller publishes it into a dict the Tk tick reads
     without a lock, and an immutable value is what makes that safe. Pure."""
-    _listed, counts, first_seen = _bucket_census(names)
-    if not counts:
-        return ()
+    return _labels_of(names)
+
+
+def _ordered_buckets(counts, first_seen, kinds=None):
+    """The deterministic bucket order both label builders use. Pure.
+
+    Sets first (grade, then member count, then the pilot's own slot order),
+    then ``_SUMMARY_BUCKET_ORDER``. ``kinds`` narrows the result WITHOUT
+    changing the order, so a narrowed list is always a subsequence of the full
+    one — the login toast can never word a bucket differently from the tooltip
+    that names the same clone."""
     sets = sorted((k for k in counts if k[0] == "set"),
                   key=lambda k: (-_GRADE_RANK.get(k[1].casefold(), 0),
                                  -counts[k], first_seen[k]))
     rest = [k for kind in _SUMMARY_BUCKET_ORDER
             for k in counts if k[0] == kind]
-    return tuple(_bucket_label(k, counts[k]) for k in sets + rest)
+    keys = sets + rest
+    if kinds is not None:
+        keys = [k for k in keys if k[0] in kinds]
+    return keys
+
+
+def _labels_of(names, kinds=None) -> tuple:
+    _listed, counts, first_seen = _bucket_census(names)
+    if not counts:
+        return ()
+    return tuple(_bucket_label(k, counts[k])
+                 for k in _ordered_buckets(counts, first_seen, kinds))
+
+
+def login_labels(names) -> tuple:
+    """The login toast's word list. Pure.
+
+    Owner spec, 2026-09-14: the login toast should name the clone the same way
+    the tooltip does -- "the EXISTING summary labels" -- so a pilot never sees
+    the dock/tooltip flavour call a clone one thing and the login flavour call
+    it another. This is exactly ``summary_labels``, kept as its own name so
+    the login call sites read as "the login toast's words" rather than an
+    unexplained reuse of the tooltip's function. ``()`` when the clone carries
+    nothing this module buckets."""
+    return summary_labels(names)
 
 
 def toast_body(char_name: str, names) -> str:
@@ -1013,6 +1192,33 @@ def toast_body(char_name: str, names) -> str:
     return f"{who} — {head}"
 
 
+def login_toast_body(char_name: str, names) -> str:
+    """One-line body for the LOGIN toast: "<who> logged in - <what>".
+
+    Owner ask, 2026-09-14: "implement the save my implants pop-up at character
+    login if the character logs in with valuable implants". The wording keeps
+    the dock toast's shape (who first, one line, no list) and swaps its "you
+    just docked" framing for the login one, so the two are told apart at a
+    glance over the client.
+
+    CAPPED like the dock toast: only the first ``login_labels`` entry is named
+    outright, with an "+N more" tail for the rest, never every label joined by
+    " + ". ``ClientToast`` is a fixed-width single-line body (no wrap) and the
+    old join-everything copy measured 420-630 px against a ~412 px usable
+    width for ordinary multi-bucket clones -- it clipped. The toast TITLE
+    ("Implants still plugged in") already tells the pilot what to do about it,
+    so the body no longer repeats the instruction. Pure."""
+    who = str(char_name or "").strip() or "This character"
+    labels = login_labels(names)
+    if not labels:
+        return f"{who} logged in with implants."
+    body = f"{who} logged in - {labels[0]}"
+    extra = len(labels) - 1
+    if extra > 0:
+        body += f" +{extra} more"
+    return body
+
+
 # ── orchestrator (poller-thread side; Tk-free) ───────────────────────────────
 
 class ImplantReminder:
@@ -1025,17 +1231,27 @@ class ImplantReminder:
     ``resolve_system_name`` -> name -> solar_system_id (``system_coords``);
     ``implants_provider(a)``-> list[int] of the ACTIVE clone's implant type ids
                                for the ESIAuth ``a``, or None on failure;
-    ``on_remind(key, name, implant_names)`` -> show the toast. The CALLER is
-                               responsible for marshalling this onto the Tk
+    ``on_remind(key, name, implant_names)`` -> show the DOCK toast. The CALLER
+                               is responsible for marshalling this onto the Tk
                                thread; ``observe`` runs on the poller thread.
+    ``on_login_remind(...)``-> the same, for the LOGIN toast, which words its
+                               body differently (``login_toast_body``). Optional
+                               and defaults to ``on_remind``: a caller that does
+                               not care about the flavour keeps the old
+                               three-argument contract exactly, which is why the
+                               flavour is a second callback and not a fourth
+                               argument on the first one.
 
-    ``observe`` is the only method the poller calls, and it never raises."""
+    ``observe`` is the only method the poller calls per pass (``prune`` is
+    called once per pass for the whole roster), and it never raises."""
 
     def __init__(self, config_provider, implants_provider, on_remind,
-                 resolve_system_name=None, table=None, clock=None):
+                 resolve_system_name=None, table=None, clock=None,
+                 on_login_remind=None):
         self._config_provider = config_provider
         self._implants_provider = implants_provider
         self._on_remind = on_remind
+        self._on_login_remind = on_login_remind or on_remind
         self._resolve_system_name = resolve_system_name
         self._table = table                 # None -> lazily loaded from the SDE
         # Monotonic source for the latch's blackout check. Injectable so the
@@ -1091,6 +1307,28 @@ class ImplantReminder:
     def last_names(self, key: str) -> list:
         return list(self._last_names.get(str(key or "").strip().lower(), ()))
 
+    def prune(self, keys) -> list:
+        """Drop the login state of every character not on the poller's current
+        roster. Called once per poll pass, on the poller thread; never raises.
+
+        This is what makes "log out, log back in, get reminded again" work: a
+        closed client is never polled again, so the logout itself is invisible
+        to ESI and only its absence from the roster reports it."""
+        try:
+            with self._lock:
+                return self._state.prune(keys)
+        except Exception:
+            log.exception("[implant] roster prune failed")
+            return []
+
+    def reset_logins(self) -> None:
+        """Forget every login sample (the feature was just switched ON)."""
+        try:
+            with self._lock:
+                self._state.reset_logins()
+        except Exception:
+            log.exception("[implant] login reset failed")
+
     # -- diagnostics -------------------------------------------------------
     def _log_target_once(self, target: StagingTarget) -> bool:
         """Announce the resolved staging the FIRST time the enabled feature sees
@@ -1118,16 +1356,88 @@ class ImplantReminder:
         return True
 
     # -- the poller hook ---------------------------------------------------
-    def observe(self, char_key: str, char_name: str, loc, auth) -> str:
+    def _valuable_names(self, char_key: str, auth, cfg):
+        """Fetch + classify this character's implants. ``None`` = the fetch
+        itself failed (the caller decides whether that is worth a retry); ``[]``
+        = it answered, and nothing in the head is worth a toast."""
+        ids = None
+        try:
+            ids = self._implants_provider(auth)
+        except Exception:
+            log.exception("[implant] implants fetch failed for %s", char_key)
+        if ids is None:
+            return None
+        return classify(ids, self.table(), cfg)
+
+    def _announce(self, char_key: str, char_name: str, names, login=False):
+        """Record what was reminded and hand it to the flavour's callback.
+
+        One line per REMINDER, not per poll. "It did not fire" was unfalsifiable
+        while the only thing this module ever logged was the staging
+        resolution; a fire that reached the toast layer must leave a trace.
+        ASCII only -- this box's console is cp1252."""
+        self._last_names[str(char_key or "").strip().lower()] = list(names)
+        log.info("[implant] reminding %s (%s): %d implant(s) worth pulling",
+                 char_key, "login" if login else "dock", len(names))
+        cb = self._on_login_remind if login else self._on_remind
+        cb(char_key, char_name, names)
+
+    def observe(self, char_key: str, char_name: str, loc, auth,
+                online=None, now=None) -> str:
         """Advance one character with a freshly-polled ESI location payload.
 
         Called from the ESI poller thread once per location poll per character.
         Returns the state verb (for tests/logging). Never raises: any failure
         degrades to ``CLEAR`` so a broken reminder can never take the poller
-        down with it."""
+        down with it.
+
+        TWO triggers share this one call, in this order:
+
+        * the LOGIN edge (owner, 2026-09-14) -- "logs in with valuable
+          implants", wherever the character is, docked or not, staging or not.
+          It needs no staging resolution and no location at all, only
+          ``online``; see ``ReminderState.observe_login``. When it fires it
+          MARKS the dock latch (``mark_reminded``) and returns ``LOGIN``
+          without running the dock machine on that pass, so a pilot who logs in
+          already docked at staging gets exactly one toast -- the login one
+          wins, and the dock trigger stays quiet for that docking UNLESS a
+          ``/location`` blackout longer than ``blind_gap_s`` (60 s) follows:
+          the dock machine's own staleness rule (a gap that long "means the
+          engine was not watching and cannot claim they stayed put") then
+          re-arms the same latch and lets it FIRE once more, the pre-existing
+          blind-gap trade-off this docstring used to gloss over;
+        * the DOCK edge -- the original trigger, unchanged. It runs only when
+          this pass actually carried a location: a failed ``/location`` must
+          never read as "not at staging" and release a latch (the caller used
+          to enforce that by not calling at all, and the login edge is the
+          reason the call is now unconditional).
+
+        ``online`` is this pass's ``/online/`` answer or ``None`` when the
+        poller did not ask; ``now`` is a monotonic stamp (both optional, so the
+        pre-login four-argument call still behaves exactly as it did)."""
         try:
             cfg = self.config()
             if not cfg.get("enabled"):
+                return CLEAR
+            ts = self._clock() if now is None else float(now)
+
+            with self._lock:
+                verb = self._state.observe_login(
+                    char_key, online, cfg.get("disabled_chars", ()), now=ts)
+            if verb == FIRE:
+                names = self._valuable_names(char_key, auth, cfg)
+                # A failed fetch is NOT retried on the login edge: the edge is
+                # gone by the next pass, and the dock trigger still covers the
+                # pilot the moment they come home. Nothing worth pulling is the
+                # ordinary answer for most clones and is simply silent.
+                if names:
+                    self._announce(char_key, char_name, names, login=True)
+                    with self._lock:
+                        self._state.mark_reminded(
+                            char_key, dock_state(loc) if loc else None, now=ts)
+                    return LOGIN
+
+            if not loc:
                 return CLEAR
             target = resolve_staging(self._root_config(),
                                      self._resolve_system_name,
@@ -1140,31 +1450,18 @@ class ImplantReminder:
             with self._lock:
                 verb = self._state.observe(char_key, staging,
                                            cfg.get("disabled_chars", ()),
-                                           dock=state, now=self._clock())
+                                           dock=state, now=ts)
             if verb != FIRE:
                 return verb
 
-            ids = None
-            try:
-                ids = self._implants_provider(auth)
-            except Exception:
-                log.exception("[implant] implants fetch failed for %s", char_key)
-            if ids is None:
+            names = self._valuable_names(char_key, auth, cfg)
+            if names is None:
                 with self._lock:
                     self._state.retry_fetch(char_key)
                 return CLEAR
-
-            names = classify(ids, self.table(), cfg)
             if not names:
                 return HOLD          # nothing worth pulling; stay latched
-            self._last_names[str(char_key or "").strip().lower()] = list(names)
-            # One line per dock, not per poll. "It did not fire" was
-            # unfalsifiable while the only thing this module ever logged was
-            # the staging resolution; a fire that reached the toast layer must
-            # leave a trace. ASCII only -- this box's console is cp1252.
-            log.info("[implant] reminding %s: %d implant(s) worth pulling",
-                     char_key, len(names))
-            self._on_remind(char_key, char_name, names)
+            self._announce(char_key, char_name, names)
             return FIRE
         except Exception:
             log.exception("[implant] observe failed for %s", char_key)
