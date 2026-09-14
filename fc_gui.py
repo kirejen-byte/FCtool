@@ -1133,6 +1133,13 @@ _IMPLANT_TOOLTIP_BASE = (
 # uncommitted local line and is not this task's file to touch.
 _ASSETS_SCOPE = "esi-assets.read_assets.v1"
 
+# Scope backing the FCPreview caption ROLE CHIP: each own character reads its
+# OWN /characters/{id}/fleet/ (works whoever the fleet boss is -- the boss-only
+# /fleets/{id}/members/ roster is deliberately not used). A token without the
+# scope is skipped outright rather than left to 403, the same error-budget rule
+# the implant reminder and the ozone watch follow.
+_FLEET_SCOPE = "esi-fleets.read_fleet.v1"
+
 # "Watch my ozone": how long after the first observation a character's FIRST
 # sighting still reads as "FCTool just started" rather than "this pilot just
 # logged in". The poller's roster holds only CONNECTED characters, so a client
@@ -1466,6 +1473,10 @@ class FCToolGUI:
         self._overlay = None
         self._overlay_states: dict = {}        # name_lower -> CharState (poller)
         self._overlay_state_ts: dict = {}      # name_lower -> monotonic fetch ts
+        # name_lower -> monotonic "do not re-ask /fleet/ before" stamp, set by
+        # a 404 (not in a fleet). POLLER-THREAD ONLY (written and read in
+        # _overlay_build_state); see _OVERLAY_FLEET_404_BACKOFF.
+        self._overlay_fleet_retry_at: dict = {}
         self._overlay_after_id = None
         self._overlay_poller = None            # Phase 2 daemon thread
         self._overlay_poller_stop = None       # threading.Event while running
@@ -1578,6 +1589,20 @@ class FCToolGUI:
         # not persisted (the intended incremental state). Any construction
         # failure (e.g. a ctypes hiccup) leaves the feature inert, not fatal.
         self._account_hint_cache = None
+        # Fit-height default migration (owner refinement, 2026-09-13): MUST
+        # run before the first call to `_preview_cfg` (no-parens, to dodge a
+        # self-referential text match in the ordering-guard test) anywhere in
+        # `__init__`. The first TEXTUAL one is the `aliases=lambda:` closure
+        # just below (deferred, not executed here); the first UNCONDITIONALLY
+        # EXECUTED one is the `account_identity` read a few lines further
+        # down. Either way this call has to come first — unlike
+        # `_preview_migrate_default_slots` below (which runs fine after one,
+        # since it only cares about explicit True/False, already-migrated
+        # state), this one needs to see the RAW config before that method can
+        # materialize anything into it. See
+        # `_preview_migrate_fit_height_default`'s docstring for what it
+        # protects and why it cannot go through the usual accessor.
+        self._preview_migrate_fit_height_default()
         try:
             self._account_map = eve_account.AccountMap(
                 win32=eve_account.real_win32(),
@@ -15241,8 +15266,12 @@ class FCToolGUI:
         """Re-sync the composer's staging pill to the global default (config
         ``zkillboard.staging_system``) when it still holds the last auto-applied
         default — i.e. neither the user nor a template has set its own value.
-        Called on MOTD-tab show so a staging system configured (or changed) in
-        Settings after this tab was built is reflected without a restart.
+        Called (1) on MOTD-tab show, so a staging system configured before this
+        tab was ever built is reflected without a restart, and (2) from both
+        settings-write paths — ``_autosave_staging_system`` (autocomplete pick /
+        FocusOut) and the end of ``_save_settings`` (explicit Save) — so a
+        staging-system change made while the MOTD tab is already open is
+        reflected immediately instead of waiting on a fittings sub-tab switch.
 
         Never clobbers user/template input: only the FIRST ``staging_line`` pill
         whose name equals the remembered auto value is retargeted, and only when
@@ -19630,6 +19659,12 @@ class FCToolGUI:
     # shows the character changed systems since the prior pass, and always
     # on a character's first pass (no prior state yet).
     _OVERLAY_SHIP_EVERY_N = 3        # fetch ship every Nth locship pass
+    # A pilot who is not in a fleet 404s forever; re-asking on the ~30 s ship
+    # cadence spends ESI's shared error budget (~100 non-2xx / 60 s; a 420
+    # blocks ALL routes) for a chip that cannot appear. After a 404, don't
+    # re-ask that character for this long -- joining a fleet still lights the
+    # chip within ~2 min.
+    _OVERLAY_FLEET_404_BACKOFF = 120.0
 
     # ── Native preview hotkey responsiveness ───────────────────────────────
     # The native tick (250 ms with tiles, 2 s idle-probe) is far too coarse to
@@ -19701,15 +19736,33 @@ class FCToolGUI:
         # Auto-fit each tile's HEIGHT to its client's aspect ratio, so the video
         # exactly fills the body and the black letterbox bands above and below it
         # disappear (see preview_layout.fit_body_h).
-        # DEFAULT OFF, deliberately: switching it on by default would silently
-        # re-size every existing user's hand-arranged tile grid the first time
-        # they launched the new build — a layout they butted together tile by
-        # tile, changed underneath them with no action on their part. The
-        # Settings "Fit height" CHECKBUTTON is the explicit opt-in; ticking it
-        # fits everything NOW and sets this flag, after which tiles that attach
-        # later fit themselves within ~2 s. Unticking it stops the auto-fit and
-        # hands corner-dragged heights back (it was a one-way door until then).
-        "fit_height": False,
+        # DEFAULT ON (owner decision, 2026-09-13): fresh installs get no black
+        # bars out of the box. REFINED same day: this default must reach only
+        # setups that are NOT running native previews TODAY — an existing
+        # user with native tiles up keeps their exact current behavior, and
+        # everyone else (off/eveo_labels users, and brand-new installs) gets
+        # the new default the moment they turn native previews on.
+        # `_preview_migrate_fit_height_default()` (called once at startup,
+        # before this default can ever materialize) does the actual
+        # decision-preserving: for an existing config already in native mode
+        # it pins whatever the box effectively read as before (True/False
+        # left alone; absent -> False, the OLD default's value); for
+        # off/eveo_labels/no-mode configs it writes True outright, because
+        # any stored `false` there was `_preview_cfg()`'s OLD default being
+        # persisted on every startup since v5.0.0 — never a choice made with
+        # a native tile actually on screen. Gated on the `fit_height_migrated`
+        # marker (same shape as `account_slots_migrated`) so it runs exactly
+        # once; a config with no `preview` block at all (fresh install) is
+        # left untouched and gets this default straight from `_preview_cfg()`
+        # the first time anything reads it. Accepted edge: a user who
+        # deliberately unticked Fit height in native mode and then switched
+        # to off/eveo BEFORE upgrading gets True once on this migration and
+        # can untick it again. The Settings "Fit height" CHECKBUTTON is the
+        # toggle either way; ticking it fits everything NOW, after which
+        # tiles that attach later fit themselves within ~2 s. Unticking it
+        # stops the auto-fit and hands corner-dragged heights back (it was a
+        # one-way door until then).
+        "fit_height": True,
         "opacity_inactive": 0.85, "opacity_hover": 1.0,
         "layouts": {}, "sizes": {},
         "login_position": [5, 5],
@@ -21259,13 +21312,13 @@ class FCToolGUI:
         path). The fit pass issues its own single save when it changes anything,
         and _preview_apply_native_state has already saved the flag itself."""
         cfg = self._preview_cfg()
-        was = bool(cfg.get("fit_height", False))
+        was = bool(cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"]))
         self._preview_apply_native_state()   # writes fit_height + its shadow
         # Re-gate the Tile "h" Spinbox in BOTH directions: the fit pass owns tile
         # heights while the flag is on, so the box greys out; unticking hands it
         # back. One owner for that state (see _preview_sync_native_widgets).
         self._preview_sync_native_widgets()
-        if bool(cfg.get("fit_height", False)) and not was:
+        if bool(cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"])) and not was:
             self._preview_fit_tile_heights(cfg, force=True)
 
     def _preview_toggle_account_slots(self):
@@ -22200,23 +22253,33 @@ class FCToolGUI:
     }
 
     def _preview_role_chip(self, client):
-        """Fleet-role chip text for a client (B4): look the pilot up in the
-        fleet-template store by name and map its role to a short chip glyph.
+        """Fleet-role chip text for a client: the pilot's LIVE fleet role from
+        ESI, carried on the poller's CharState as `fleet_role` (set in
+        _overlay_build_state from /characters/{id}/fleet/) and mapped to a short
+        chip glyph.
 
-        Login screens and pilots with no named slot (or the squad_member role)
-        get an empty chip. Fails soft — any store error yields no chip."""
+        Deliberately NOT the saved fleet templates: a template slot says where a
+        pilot is PLANNED to sit, not where they are, and the seeded "Default"
+        template pins the primary character into a wing_commander slot — which
+        showed that tile a permanent "WC" whether or not they were in a fleet.
+        There is no template fallback for exactly that reason.
+
+        Login screens, a missing or STALE state snapshot (_preview_state_for
+        returns None past _OVERLAY_STALE_SECS), squad_member and any unknown
+        role all render no chip. Fails soft — any lookup error yields no chip."""
         if client.is_login or not client.char_name:
             return ""
+        state_for = getattr(self, "_preview_state_for", None)
+        if state_for is None:
+            return ""
         try:
-            from fleet_template_store import find_character_role
-            match = find_character_role(self.fleet_templates, client.char_name)
+            st = state_for(client.key)
         except Exception:
-            log.exception("[preview] role-chip lookup failed")
+            log.exception("[preview] role-chip state lookup failed")
             return ""
-        if match is None:
+        if st is None:
             return ""
-        role, _wing, _squad = match
-        return self._PREVIEW_ROLE_CHIP.get(role, "")
+        return self._PREVIEW_ROLE_CHIP.get(getattr(st, "fleet_role", "") or "", "")
 
     # ── B3: intel flash — own-log system index + tile-border alerts ──────────
     def _preview_intel_note(self, index, report, now):
@@ -22773,7 +22836,7 @@ class FCToolGUI:
             # first so an off feature costs one dict lookup per tick and nothing
             # else, and the pass itself respects lock_layout (only ticking the
             # Settings checkbutton forces through it).
-            if cfg.get("fit_height", False) and self._preview_tick_count % 8 == 0:
+            if cfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"]) and self._preview_tick_count % 8 == 0:
                 self._preview_fit_tile_heights(cfg, clients=cur)
             # The per-tick retop batch is WINDOWS-ONLY BY DEFAULT (backend
             # None). retop() is SetWindowPos(HWND_TOPMOST) per tile: it
@@ -23168,6 +23231,7 @@ class FCToolGUI:
         self._overlay_stop_poller()
         self._overlay_states = {}
         self._overlay_state_ts = {}
+        self._overlay_fleet_retry_at = {}     # 404 backoff is session state too
         self._preview_layer_hp = {}
         self._preview_intel_reach = {}        # poller-written balls die with it
         # Which window belonged to which account is session state by design:
@@ -23283,6 +23347,7 @@ class FCToolGUI:
         self._overlay_stop_poller()
         self._overlay_states = {}
         self._overlay_state_ts = {}
+        self._overlay_fleet_retry_at = {}     # 404 backoff is session state too
         if self._overlay is not None:
             try:
                 self._overlay.set_labels([])
@@ -23325,6 +23390,7 @@ class FCToolGUI:
         station_id = prior.station_id if prior else 0
         structure_id = prior.structure_id if prior else 0
         online = prior.online if prior else None
+        fleet_role = getattr(prior, "fleet_role", "") if prior else ""
 
         loc = {}
         try:
@@ -23370,7 +23436,8 @@ class FCToolGUI:
         # CharState deliberately does not carry it, so the payload is handed
         # straight to the hook below rather than re-fetched there.
         ship_payload = None
-        if force_ship or prior is None or sys_id != prior_sys_id:
+        do_ship = bool(force_ship or prior is None or sys_id != prior_sys_id)
+        if do_ship:
             try:
                 ship = auth.get_ship_type() or {}
                 if ship.get("ship_type_id"):
@@ -23384,6 +23451,63 @@ class FCToolGUI:
                                       or ship_type_name)
                     ship_group = ship_classes.get_group_name(ship_type_id) or ""
                     is_cap = bool(ship_classes.is_capital(ship_type_id))
+            except Exception:
+                pass
+        # LIVE fleet role for the FCPreview caption chip -- read with THIS
+        # character's own token, so it works whoever the fleet boss is. Rides
+        # the ship cadence (do_ship) on purpose: ESI caches
+        # /characters/{id}/fleet/ for 60 s server-side, so polling it faster
+        # than the ~30 s ship pass buys nothing but error budget. 200 = the
+        # live role; 404 = not in a fleet, which CLEARS the chip; any other
+        # status (or a fault, or an auth without the seam) keeps the prior
+        # value so a transient ESI error never blinks the chip off. No scope =
+        # never call, chip stays empty.
+        #
+        # FIRST the FEATURE GATE -- the _preview_implant_refresh shape: native
+        # FCPreview mode AND the chip ticked, because the OFF feature must
+        # never pay the ESI budget (the chip's only consumer is the native
+        # caption pass). Gated off, `fleet_role` keeps its PRIOR value rather
+        # than clearing: nothing is drawing it, and re-clearing would only buy
+        # a blink when the box is re-ticked. A host with no `_preview_cfg` at
+        # all (the bare SimpleNamespace unit hosts) has no gate to read and
+        # falls through to the fetch -- the implant hook's own fail-soft.
+        # THEN the 404 backoff: a pilot who is not in a fleet answers 404 on
+        # every ship pass forever (~3/char/min, since `force_ship` is True on
+        # every online pass too), and ESI's error limit is ~100 non-2xx per
+        # 60 s across ALL routes. `_overlay_fleet_retry_at` is a poller-thread
+        # -only dict keyed by the same `key`; a 200 clears the entry, and any
+        # OTHER status or fault sets nothing, so a transient error retries on
+        # the normal cadence. Finally the character_id guard every sibling ESI
+        # method in esi_auth.py carries: a missing id would ask for
+        # /characters/None/fleet/, 404, and back off for nothing.
+        if do_ship:
+            try:
+                gate_on = True
+                cfg_fn = getattr(self, "_preview_cfg", None)
+                if cfg_fn is not None:
+                    pcfg = cfg_fn()
+                    gate_on = (pcfg.get("mode") == "native" and bool(
+                        pcfg.get("show_role_chip",
+                                 FCToolGUI._PREVIEW_DEFAULTS["show_role_chip"])))
+                cid = getattr(auth, "character_id", None)
+                if gate_on and cid:
+                    retry_at = getattr(self, "_overlay_fleet_retry_at", None)
+                    if retry_at is None:
+                        retry_at = {}
+                        self._overlay_fleet_retry_at = retry_at
+                    now_fleet = time.monotonic()
+                    if (now_fleet >= retry_at.get(key, 0.0)
+                            and auth.has_scope(_FLEET_SCOPE)):
+                        body, status, _fhdrs = auth.esi_get_ex(
+                            f"/characters/{cid}/fleet/")
+                        if status == 200 and isinstance(body, dict):
+                            fleet_role = str(body.get("role") or "")
+                            retry_at.pop(key, None)
+                        elif status == 404:
+                            fleet_role = ""
+                            retry_at[key] = (
+                                now_fleet
+                                + FCToolGUI._OVERLAY_FLEET_404_BACKOFF)
             except Exception:
                 pass
         # Base layer HP for the damage-flash reference pool. Cached in
@@ -23459,7 +23583,8 @@ class FCToolGUI:
             ship_type_name=ship_type_name,
             ship_group=ship_group, is_capital=is_cap, solar_system_id=sys_id,
             system_name=sys_name, docked=docked,
-            station_id=station_id, structure_id=structure_id)
+            station_id=station_id, structure_id=structure_id,
+            fleet_role=fleet_role)
 
     # ── Implant-removal reminder wiring (default ON) ────────────────────────
     # The feature itself lives in implant_reminder.py (pure trigger/state engine,
@@ -25103,7 +25228,7 @@ class FCToolGUI:
         # var rides _PREVIEW_NATIVE_VARS like every other native key, so the
         # apply/shadow machinery persists it.
         self._preview_fit_height_var = tk.BooleanVar(
-            value=bool(pcfg.get("fit_height", False)))
+            value=bool(pcfg.get("fit_height", FCToolGUI._PREVIEW_DEFAULTS["fit_height"])))
         fitb = tk.Checkbutton(
             rowN, text="Fit height", variable=self._preview_fit_height_var,
             command=self._preview_toggle_fit_height, font=("Consolas", 10),
@@ -27656,10 +27781,11 @@ class FCToolGUI:
                 return "break"
             if event.keysym in hotkey_service._EVENT_MODIFIER_KEYSYMS:
                 return "break"                # bare modifier → keep waiting
-            combo = hotkey_service.event_to_hotkey(event.keysym, event.state)
+            keycode = getattr(event, "keycode", None)
+            combo = hotkey_service.event_to_hotkey(event.keysym, event.state, keycode)
             if combo is None:
                 win._error_lbl.config(
-                    text=f"'{event.keysym}' is not a usable hotkey — try again.",
+                    text=hotkey_service.capture_hint(event.keysym, event.state, keycode),
                     fg=FG_ORANGE)
                 return "break"
             entry = win._next_entry if capturing[0] == "next" else win._prev_entry
@@ -28717,6 +28843,76 @@ class FCToolGUI:
                     if isinstance(entry, (list, tuple)) and len(entry) >= width:
                         block[slot] = list(entry)
                         break               # first answerable member wins
+
+    def _preview_migrate_fit_height_default(self):
+        """One-time migration (owner refinement, 2026-09-13, renamed from the
+        first cut's `_preview_pin_fit_height_for_existing`): the `fit_height`
+        default flip (False -> True, see `_PREVIEW_DEFAULTS`) must reach only
+        users who are NOT running native previews TODAY — someone with native
+        tiles already up keeps their exact current behavior; everyone else
+        (off/eveo_labels users, and fresh installs) gets the new default the
+        first time it matters to them.
+
+        FIRST-CUT BUG this replaced: an absence-check ("pin False only if the
+        key was never saved") looks right but isn't, because `_preview_cfg()`
+        has materialized AND persisted every `_PREVIEW_DEFAULTS` key —
+        including the OLD `fit_height: False` — into every saved config since
+        v5.0.0. So an existing off/eveo_labels user's config already carries
+        an explicit `"fit_height": false` that THEY never chose; an
+        absence-check would leave it alone forever, and the day they finally
+        turn native previews on they would silently get black bars, exactly
+        the outcome the owner ON-by-default decision meant for them to avoid.
+        A stored value is therefore not enough signal by itself — MODE is
+        what actually distinguishes "a real choice with a tile on screen"
+        from "the old default riding along for years unread."
+
+        Reads the RAW `config["preview"]` dict WITHOUT going through
+        `_preview_cfg()` — that call would materialize+persist the new
+        default before this method could tell whether a native user's
+        current value was a real choice or the old default's echo. Must
+        therefore run BEFORE the FIRST `_preview_cfg()` call anywhere in
+        `__init__` (see the call site's comment for exactly which call that
+        is).
+
+        Gated on the `fit_height_migrated` marker — the same shape as
+        `account_slots_migrated` on `_preview_migrate_default_slots` below,
+        deliberately NOT in `_PREVIEW_DEFAULTS` (a default would materialize
+        it into every config and the gate, which fires on its ABSENCE, would
+        never run) — so it runs EXACTLY ONCE per config, and a later
+        deliberate untick (or re-tick) is never re-migrated.
+
+        Decision table, run once:
+          - No `preview` block at all (fresh install): untouched, no marker
+            written — nothing to protect yet, and `_preview_cfg()` fills the
+            new True default the first time anything reads the block.
+          - `mode == "native"`: a tile already has a height on screen to
+            disturb, so today's effective value is preserved EXACTLY —
+            explicit True or False is left alone; an absent key is pinned to
+            False (the old default's value, i.e. what the user has actually
+            been living with).
+          - Anything else (`off`, `eveo_labels`, or a block with no `mode`):
+            no tile exists to disturb, so any stored value here — including
+            an explicit `false` — is the OLD default's echo, never a real
+            choice; this migration WRITES True outright, adopting the new
+            default for them.
+        Accepted edge (documented, not fixed): a user who deliberately
+        unticked Fit height while in native mode and then switched to
+        off/eveo_labels BEFORE upgrading to this build gets True once here
+        (indistinguishable from the old-default-echo case) and can untick it
+        again — a one-time, reversible nit, not a silent resize of a live
+        tile."""
+        pcfg = self.config.get("preview")
+        if not isinstance(pcfg, dict):
+            return
+        if pcfg.get("fit_height_migrated"):
+            return
+        if pcfg.get("mode") == "native":
+            if "fit_height" not in pcfg:
+                pcfg["fit_height"] = False
+        else:
+            pcfg["fit_height"] = True
+        pcfg["fit_height_migrated"] = True
+        self._save_config()
 
     def _preview_migrate_default_slots(self):
         """One-time migration flipping `account_slots` / `account_slots_auto`
@@ -30828,11 +31024,22 @@ class FCToolGUI:
         # to call unconditionally: it no-ops on an invalid path and on an
         # in-flight scan, and self.config was reloaded from disk just above.
         self._motd_scan_channels()
+        # Re-sync the MOTD composer's staging pill against the JUST-SAVED value.
+        # self.config was reloaded from disk above (line ~30243), and that
+        # reload carries the new staging_system because _save_config() wrote it
+        # to disk before the reload ran — so this reads the current value, not
+        # a stale in-memory one. No-ops when the pill is user/template-owned.
+        self._motd_sync_staging_default()
 
     def _autosave_staging_system(self, *args):
         val = self._staging_entry.get().strip()
         self.config.setdefault("zkillboard", {})["staging_system"] = val
         self._save_config()
+        # Settings' staging entry autosaves outside the main Save flow (select
+        # from the autocomplete, or FocusOut) — without this, the MOTD
+        # composer's staging pill only re-syncs on the next fittings sub-tab
+        # switch (see _motd_sync_staging_default's docstring).
+        self._motd_sync_staging_default()
 
     def _on_zkill_alert_sound_change(self, *args):
         """Persist the kill-alert sound pick immediately (mirrors

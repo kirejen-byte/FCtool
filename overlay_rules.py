@@ -31,6 +31,12 @@ class CharState:
     # structure_id; never both.
     station_id: int = 0
     structure_id: int = 0
+    # LIVE fleet role from ESI (/characters/{id}/fleet/): one of
+    # 'fleet_commander' | 'wing_commander' | 'squad_commander' | 'squad_member'.
+    # '' = not in a fleet, no scope, or not yet known. The FCPreview caption
+    # role chip reads THIS -- never the saved fleet templates, which describe
+    # where a pilot is PLANNED to sit, not where they actually are.
+    fleet_role: str = ""
 
 
 @dataclass
