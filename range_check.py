@@ -112,6 +112,7 @@ through ``FCToolGUI._post_ui``.
 """
 from __future__ import annotations
 
+import bisect
 import re
 import time
 import tkinter as tk
@@ -405,6 +406,23 @@ def _resolve_id(name, resolve):
     return sid if sid > 0 else None
 
 
+def _table_name(system_id) -> str:
+    """``system_coords.get_name`` hardened to "a name, or ``""``".
+
+    The bundled table is shipped data and ``system_coords._load`` already
+    swallows a corrupt file, so this is belt-and-braces -- but it is the last
+    outside fact this module still read BARE, and the module's whole contract is
+    that an outside fact degrades rather than raises. The consequence of a raise
+    is invisible rather than loud: ``extract_systems`` runs on the chat worker
+    under ``fc_gui._range_check_observe``'s blanket ``except``, so the only
+    symptom an FC sees is a toast that never appears."""
+    try:
+        return system_coords.get_name(system_id) or ""
+    except Exception:
+        log.debug("range_check: get_name(%r) failed", system_id, exc_info=True)
+        return ""
+
+
 #: FCs type jump COUNTS constantly ("2-3 out", "5-10 min") and no real system
 #: name is a bare digit range -- excluded from partial matching outright,
 #: whatever its length (2026-08-24 false-positive fix, F2).
@@ -438,6 +456,60 @@ MIN_PARTIAL_SHAPED_SUBSTR_LEN = 4
 #: half of this: a shaped name is spelled in CAPS, so only a CAPS fragment
 #: matches its lead character for character, and prose never does.
 MIN_PARTIAL_ABBREV_LEN = 3
+
+
+class _PrefixCatalogue(dict):
+    """The ``{lower_name: original_name}`` catalogue with a sorted key list.
+
+    A plain ``dict`` to every reader -- ``.get``, ``.items()`` and ``in`` are
+    untouched -- plus ONE extra operation: ``prefix_hits``, a ``bisect`` over
+    the sorted keys instead of a 5,485-entry ``startswith`` scan.
+
+    It exists because both partial-matching stages are prefix scans and both
+    run per WORD. Measured on a 2,001-character line with 300 tail tokens
+    (``py -3.12``, this box): 900 ``_partial_match`` calls plus 300
+    ``tail_candidate`` calls issued **6.58 million** ``str.startswith`` calls
+    and the whole extraction took **0.75 s** on the chat worker thread. The
+    bisect makes each prefix stage O(log n) and the same line takes **0.05 s**.
+    Nothing about the ANSWERS changes -- the helpers below fall back to the
+    linear scan for a plain dict, which is what every direct caller (and every
+    test that hands one in) passes."""
+
+    __slots__ = ("_keys",)
+
+    def __init__(self, mapping=()):
+        super().__init__(mapping)
+        self._keys = sorted(self)
+
+    def prefix_hits(self, needle, limit=2) -> list:
+        """Up to ``limit`` original names whose lowered form starts with
+        ``needle``. ``limit`` is 2 because every caller only ever asks "one, or
+        more than one" -- a third candidate changes no answer."""
+        keys = self._keys
+        i = bisect.bisect_left(keys, needle)
+        out = []
+        while i < len(keys) and len(out) < limit and keys[i].startswith(needle):
+            out.append(self[keys[i]])
+            i += 1
+        return out
+
+
+def _prefix_hits(catalogue, needle, limit=2) -> list:
+    """``prefix_hits`` off a ``_PrefixCatalogue``, else the linear equivalent.
+
+    ONE definition of "which catalogue names start with this", so the fast and
+    the fallback path cannot answer differently -- and so ``tail_candidate(tok,
+    {"jita": "Jita"})`` keeps working for every caller holding a plain dict."""
+    fast = getattr(catalogue, "prefix_hits", None)
+    if fast is not None:
+        return fast(needle, limit)
+    out = []
+    for lower, original in catalogue.items():
+        if lower.startswith(needle):
+            out.append(original)
+            if len(out) >= limit:
+                break
+    return out
 
 
 def resolve_partial_name(name, catalogue) -> str | None:
@@ -530,27 +602,25 @@ def _partial_match(name, catalogue) -> tuple:
     # Substring matching carries the STRICTER shaped floor, so a 3-char shaped
     # phrase does prefix-matching only and never substring-matches mid-name.
     substr_ok = shaped and len(text) >= MIN_PARTIAL_SHAPED_SUBSTR_LEN
-    prefix_hits = 0
-    prefix_cand = None
+    prefix = _prefix_hits(catalogue, needle)
+    if len(prefix) == 1:
+        if abbrev_only and not is_system_shaped(prefix[0]):
+            return None, False
+        return prefix[0], False
+    if prefix:
+        return None, True           # 2+ prefix candidates: really ambiguous
+    if not (shaped and substr_ok):
+        return None, False
+    # Only reached when the prefix stage found NOTHING, so no entry here can
+    # start with the needle and a bare ``in`` test is exactly the old ``elif``.
     substr_hits = 0
     substr_cand = None
     for lower, original in catalogue.items():
-        if lower.startswith(needle):
-            prefix_hits += 1
-            prefix_cand = original
-            if prefix_hits > 1:
-                break            # already ambiguous; substring is now moot
-        elif substr_ok and needle in lower:
+        if needle in lower:
             substr_hits += 1
             substr_cand = original
-    if prefix_hits == 1:
-        if abbrev_only and not is_system_shaped(prefix_cand):
-            return None, False
-        return prefix_cand, False
-    if prefix_hits:
-        return None, True           # 2+ prefix candidates: really ambiguous
-    if not shaped:
-        return None, False
+            if substr_hits > 1:
+                break            # 2+ is 2+; nothing later can undo it
     if substr_hits == 1:
         return substr_cand, False
     return None, substr_hits > 1
@@ -605,16 +675,54 @@ def tail_candidate(token, catalogue) -> tuple:
         return exact, False
     if _NUMBER_RANGE_RE.match(text):
         return None, False
-    needle = text.lower()
-    hits = 0
-    cand = None
-    for lower, original in catalogue.items():
-        if lower.startswith(needle):
-            hits += 1
-            cand = original
-            if hits > 1:
-                return None, True
-    return (cand, False) if hits == 1 else (None, False)
+    hits = _prefix_hits(catalogue, text.lower())
+    if len(hits) == 1:
+        return hits[0], False
+    return (None, True) if hits else (None, False)
+
+
+def tail_disclosable(token, *, lone) -> bool:
+    """Is an UNRESOLVED command-tail token worth naming on the report?
+
+    The owner's field bug, stated exactly (2026-09-14): ``range check SMV`` --
+    one character off SVM-3K -- matched nothing, said nothing, and produced the
+    configured-staging report. With the FC sitting in staging that read "same
+    system - cannot jump within a system" about a system they never named, and
+    nothing anywhere on the toast said the word they typed had been dropped.
+    Falling back to the configured sources is fine; falling back WITHOUT A WORD
+    on a line whose whole point was a system name is the silence this module
+    exists to refuse.
+
+    Two shapes earn the disclosure, and nothing else does:
+
+    * **system-SHAPED** (a digit or a dash, ``MIN_PARTIAL_SHAPED_PREFIX_LEN``+
+      characters): ``P-ZMVZ``, ``svn-3k``. No English word looks like that, so
+      it was typed as a name whatever else is on the line.
+    * **the ONLY token after the keyword**: ``range check SMV``. An FC who typed
+      the command and then exactly one word typed that word as the system. A
+      token in a CROWD of tail words is not that -- ``range check the fleet`` is
+      prose, and "ignored in message: the" would be a different lie (the
+      disclosure's own standing rule, see ``extract_systems``).
+
+    Numbers are excluded on both paths. FCs type jump counts constantly
+    ("2-3 out", "5 jumps", "10") and a count is shaped by construction, so
+    without this a routine ``range check 2-3 jumps out`` would grow a permanent
+    "2-3 (not a known system)" tail. An exact system NAME of that shape never
+    reaches here -- it resolved.
+
+    The residual, named rather than hidden: a lone prose word (``range check
+    now``) is disclosed as "not a known system". That is the price of the lone
+    rule and it is the cheap direction -- one dim advisory line about a word the
+    FC did type, versus the silent wrong-system answer it replaces."""
+    text = str(token or "").strip()
+    if not text:
+        return False
+    if text.isdigit() or _NUMBER_RANGE_RE.match(text):
+        return False
+    if lone:
+        return True
+    return (is_system_shaped(text)
+            and len(text) >= MIN_PARTIAL_SHAPED_PREFIX_LEN)
 
 
 def _as_ref(value, resolve=None) -> SystemRef | None:
@@ -643,7 +751,7 @@ def _as_ref(value, resolve=None) -> SystemRef | None:
     if isinstance(value, int) and not isinstance(value, bool):
         if not _is_id(value):
             return None
-        return SystemRef(system_coords.get_name(value) or "", value)
+        return SystemRef(_table_name(value), value)
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -766,6 +874,16 @@ def plain_phrase_is_a_reference(phrase, *, sentence_initial,
     return True
 
 
+#: Why a COMMAND-TAIL token was named but not used, rendered by
+#: ``ignored_line`` in place of the (impossible) retype hint. Plain ASCII: every
+#: note in this module can reach ``log.*`` and this box's console is cp1252.
+#: "SMV" alone on the ignored line reads as a system the report dropped; "SMV
+#: (not a known system)" is what actually happened, and it is the difference
+#: between "retype it" and "the report answered about something else".
+REASON_UNKNOWN = "not a known system"
+REASON_AMBIGUOUS = "several systems match"
+
+
 @dataclass(frozen=True)
 class IgnoredRef:
     """A letters-only phrase the gate REFUSED that names a real system anyway.
@@ -774,10 +892,16 @@ class IgnoredRef:
     opposite verdict. ``retype`` is the spelling that WOULD have been taken, or
     "" when no retyping helps at all — a three-letter name is refused however it
     is spelled and so is a sentence-initial one, so advising a fix there would
-    be a lie, and this module does not get to lie about its own rules."""
+    be a lie, and this module does not get to lie about its own rules.
+
+    ``reason`` is the OTHER half of that honesty, for the entries that name no
+    system at all (``system_id is None``): a command-tail token that matched
+    NOTHING (``REASON_UNKNOWN``) or SEVERAL (``REASON_AMBIGUOUS``). Defaulted
+    and last, so every existing positional construction is untouched."""
     phrase: str
     system_id: int | None = None
     retype: str = ""
+    reason: str = ""
 
 
 class SystemMentions(list):
@@ -870,7 +994,7 @@ def _refused_ref(phrase, *, sentence_initial, catalogue=None) -> IgnoredRef | No
         if sid is None:
             return None
         canon = candidate
-    canon = canon or system_coords.get_name(sid) or ""
+    canon = canon or _table_name(sid)
     return IgnoredRef(str(phrase), sid,
                       _retype_hint(phrase, canon,
                                    sentence_initial=sentence_initial))
@@ -949,10 +1073,23 @@ def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
     second chance -- exact name first, then a unique case-insensitive PREFIX
     over the K-space catalogue (``tail_candidate``), with no length, casing or
     position gate at all: ``range check svm`` / ``Svm`` / ``SVM`` / ``svm-3``
-    reach SVM-3K and ``range check gatew`` reaches Gateway. Ambiguity is still
-    disclosed rather than guessed (``P-Z`` over P-ZMZV and P-ZWKH) and only for
-    a SYSTEM-SHAPED token, so filler words an FC wraps the name in ("to",
-    "vs", "the") stay silent instead of becoming an ignored-line of their own.
+    reach SVM-3K and ``range check gatew`` reaches Gateway.
+
+    **A tail token that resolves to nothing is DISCLOSED, not dropped**
+    (2026-09-14, the owner's edge-case pass). ``range check SMV`` -- one
+    character off SVM-3K -- used to match nothing, say nothing, and hand back
+    the configured-staging report; with the FC sitting in that staging it read
+    "same system - cannot jump within a system" about a system they had not
+    named. Two shapes of unresolved token now become an id-less ``IgnoredRef``
+    carrying a ``reason``, exactly as an ambiguous one already did: a
+    system-SHAPED token (``P-ZMVZ``, ``svn-3k``) anywhere in the tail, and ANY
+    token when it is the ONLY word after the keyword (``SMV``). The rule and
+    its residual live on ``tail_disclosable``; the short version is that a lone
+    word after the command was typed as a system, while a word in a crowd
+    ("range check the fleet") is prose and still says nothing -- and a jump
+    count ("2-3", "10") says nothing on either path. Ambiguity is disclosed on
+    the same two shapes rather than guessed (``P-Z`` over P-ZMZV and P-ZWKH).
+
     The ALL-CAPS abbreviation rule above is what still covers text BEFORE the
     keyword and every ``keyword=None`` caller, so omitting the argument is
     byte-for-byte the pre-2026-09-13-tail behaviour."""
@@ -973,6 +1110,12 @@ def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
 
     words = [(m.group(0), m.start(), m.end())
              for m in SYSTEM_TOKEN_RE.finditer(text)]
+    # Exactly ONE word after the keyword? Then that word IS the system the FC
+    # named, and an unresolved one is disclosed rather than dropped in silence
+    # (``tail_disclosable``). Counted once, from the same word list the sweep
+    # walks, so the two can never disagree about what a "token" is.
+    lone_tail = (tail_start is not None
+                 and sum(1 for _w, s, _e in words if s >= tail_start) == 1)
     out: list[SystemRef] = []
     ignored: list[IgnoredRef] = []
     seen: set[int] = set()
@@ -986,8 +1129,20 @@ def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
         line whose every phrase resolves exactly never needs it."""
         nonlocal catalogue
         if catalogue is None:
-            catalogue = {nm.lower(): nm for nm in
-                         system_coords.get_kspace_name_to_id()}
+            try:
+                names = system_coords.get_kspace_name_to_id()
+            except Exception:
+                # An unreadable bundled table degrades to "no partial and no
+                # command-tail matching" -- exact resolution through the
+                # INJECTED resolver still works, so the report still answers.
+                # A raise here would escape into the chat worker, where
+                # fc_gui's blanket ``except`` turns it into a toast that simply
+                # never appears: the invisible failure, not the loud one.
+                log.warning("range_check: K-space catalogue unavailable - "
+                            "partial and command-tail matching disabled",
+                            exc_info=True)
+                names = ()
+            catalogue = _PrefixCatalogue({nm.lower(): nm for nm in names})
         return catalogue
 
     i, n = 0, len(words)
@@ -1042,9 +1197,9 @@ def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
                 # no ONE system to claim, and no retype hint, because only the
                 # FC knows which they meant.
                 if ambiguous and size == 1 and miss is None:
-                    miss = IgnoredRef(phrase, None, "")
+                    miss = IgnoredRef(phrase, None, "", REASON_AMBIGUOUS)
                 continue
-            canon = system_coords.get_name(sid)
+            canon = _table_name(sid)
             # ...and the half that needs the id: the game's own spelling.
             # Runs against the ORIGINAL typed ``phrase`` even for a partial
             # hit (``partial_name or canon`` as the canonical) -- rewriting
@@ -1078,16 +1233,19 @@ def extract_systems(body, resolve=None, keyword=None) -> SystemMentions:
                 # match and only the CANDIDATE spelling comes from the table.
                 tail_sid = _resolve_id(cand, resolver)
                 if tail_sid is not None:
-                    hit = (cand, tail_sid, 1, system_coords.get_name(tail_sid))
-            elif (tail_ambiguous and miss is None
-                  and is_system_shaped(token)
-                  and len(token) >= MIN_PARTIAL_SHAPED_PREFIX_LEN):
-                # "P-Z" named two real systems and this cannot tell which:
-                # falling back to the configured stagings without a word is the
-                # one answer this module may not give. A plain-letters
-                # ambiguous token ("to", "the") is filler, not a half-typed
-                # name, and says nothing.
-                miss = IgnoredRef(token, None, "")
+                    hit = (cand, tail_sid, 1, _table_name(tail_sid))
+            elif miss is None and tail_disclosable(token, lone=lone_tail):
+                # The token named SEVERAL systems ("P-Z" over P-ZMZV and
+                # P-ZWKH) or NONE at all ("SMV", one character off SVM-3K) --
+                # and either way, falling back to the configured stagings
+                # without a word is the one answer this module may not give.
+                # ``tail_disclosable`` owns which tokens earn the line: filler
+                # in a crowd of tail words ("to", "the") and jump counts
+                # ("2-3") still say nothing. No id (there is no ONE system to
+                # claim) and no retype hint (only the FC knows what they meant)
+                # -- the ``reason`` carries what actually happened instead.
+                miss = IgnoredRef(token, None, "", REASON_AMBIGUOUS
+                                  if tail_ambiguous else REASON_UNKNOWN)
         if hit is None:
             # Nothing was taken at this index, so a refusal here is a real drop
             # and the FC gets told. A refusal UNDER an accepted shorter window
@@ -1537,7 +1695,8 @@ def _ignored_refs(raw, linked_refs) -> tuple:
         if sid is not None:
             seen.add(sid)
         out.append(item if isinstance(item, IgnoredRef) else IgnoredRef(
-            phrase, sid, str(getattr(item, "retype", "") or "")))
+            phrase, sid, str(getattr(item, "retype", "") or ""),
+            str(getattr(item, "reason", "") or "")))
     return tuple(out)
 
 
@@ -1701,6 +1860,25 @@ def row_note(row) -> str:
     return ""
 
 
+#: How much of ONE name or phrase either disclosure line spells out before it
+#: clips. Every real system name is well inside it (the longest K-space name is
+#: 14 characters); a 500-character token an FC pasted after the keyword is not,
+#: and one of those makes the toast measure past ``MAX_W`` -- where it is not
+#: the long word that is lost but the whole line, clipped at the window edge
+#: with no ellipsis to say so. Clipping HERE keeps the rest of the line
+#: readable, which is the half that carries the meaning.
+MAX_DISCLOSED_CHARS = 32
+
+
+def _clip(text) -> str:
+    """``text`` cut to ``MAX_DISCLOSED_CHARS`` with an ASCII ellipsis (the
+    disclosure lines are log-safe and this box's console is cp1252)."""
+    out = str(text or "")
+    if len(out) <= MAX_DISCLOSED_CHARS:
+        return out
+    return out[:MAX_DISCLOSED_CHARS - 3] + "..."
+
+
 #: Lead-in for the provenance line. Plain ASCII: it can reach ``log.*``.
 PROVENANCE_PREFIX = "sources from message: "
 #: How many linked names are spelled out before the line summarises the rest.
@@ -1727,7 +1905,7 @@ def provenance_line(report) -> str:
             sid = getattr(ref, "system_id", None)
             text = f"system {sid}" if sid else ""
         if text:
-            names.append(text)
+            names.append(_clip(text))
     if not names:
         return ""
     shown = names[:MAX_PROVENANCE_NAMES]
@@ -1740,6 +1918,8 @@ def provenance_line(report) -> str:
 IGNORED_PREFIX = "ignored in message: "
 #: How the line advises a fix, when one exists (see ``_retype_hint``).
 RETYPE_HINT = "{} (type it as {})"
+#: How the line explains an entry no retyping can fix (see ``REASON_UNKNOWN``).
+REASON_HINT = "{} ({})"
 #: How many refused phrases are spelled out. Deliberately below the provenance
 #: cap: each entry can carry a "(type it as X)" tail, so three is already a
 #: long line on a window that must stay glanceable.
@@ -1771,8 +1951,16 @@ def ignored_line(report) -> str:
         phrase = str(getattr(entry, "phrase", "") or "").strip()
         if not phrase:
             continue
+        phrase = _clip(phrase)
         retype = str(getattr(entry, "retype", "") or "").strip()
-        items.append(RETYPE_HINT.format(phrase, retype) if retype else phrase)
+        if retype:
+            items.append(RETYPE_HINT.format(phrase, _clip(retype)))
+            continue
+        # No retyping fixes a token that named nothing (or named several), so
+        # the entry says WHY instead of offering advice that cannot work.
+        reason = str(getattr(entry, "reason", "") or "").strip()
+        items.append(REASON_HINT.format(phrase, _clip(reason))
+                     if reason else phrase)
     if not items:
         return ""
     shown = items[:MAX_IGNORED_NAMES]
