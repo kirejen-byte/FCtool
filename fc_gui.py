@@ -1117,6 +1117,17 @@ _PREVIEW_IMPLANT_REFRESH_S = 150.0
 # re-arms the report). Same shape as _PREVIEW_FAST_DRAIN_LOG_EVERY_S.
 _PREVIEW_IMPLANT_LOG_EVERY_S = 300.0
 
+# Floor cadence of the Windows per-tick retop batch (uptime perf, 2026-09-17).
+# `tile.retop()` is SetWindowPos(HWND_TOPMOST) and the batch used to run on
+# EVERY 250 ms tick: six tiles = 24 desktop-compositor restacks per second for
+# the whole session, which is the most plausible cause of the field report that
+# the rest of the machine slowed down while FCTool was open. The batch now runs
+# only when it can change anything (post-switch belt / foreground change / tile
+# churn) plus this heartbeat, which keeps a worst-case burial self-healing
+# within ~2 s instead of ~250 ms. The tooltip RELIFT stays unconditional — see
+# _preview_native_tick_body.
+_PREVIEW_RETOP_HEARTBEAT_S = 2.0
+
 # "Save my implants" ⓘ help text, first sentence. ONE owner, because it is
 # written twice: attach_tooltip stashes it at build time and
 # _refresh_implant_staging_label re-stashes it with the live staging DETAIL
@@ -1536,6 +1547,14 @@ class FCToolGUI:
         # right after _preview_switch_to, healing a client the helper's
         # _NET_ACTIVE_WINDOW activation raised back above the tiles.
         self._preview_retop_until = 0.0
+        # Retop-gate state (uptime perf, 2026-09-17). The Windows batch runs on
+        # change or on the _PREVIEW_RETOP_HEARTBEAT_S heartbeat, never on every
+        # tick: monotonic ts of the last batch, the raw foreground hwnd it last
+        # saw, and the hidden-tile set it last saw (a change in any of those is
+        # a reason to re-stack).
+        self._preview_last_retop_mono = 0.0
+        self._preview_last_fg_hwnd = None
+        self._preview_last_hidden = frozenset()
         self._preview_after_id = None
         self._preview_fast_drain_after_id = None  # dedicated low-latency drain loop
         # (key, foreground_hwnd_at_switch, monotonic_ts) of the last HOTKEY-driven
@@ -1581,6 +1600,12 @@ class FCToolGUI:
         self._preview_caption_memo = None
         self._config_rev = 0                    # bumped in _save_config; memo key
         self._preview_find_clients = eve_client_tracker.find_clients  # injectable
+        # ONE desktop window sweep per tick, shared by the EVE-O gate and the
+        # client lookup (uptime perf, 2026-09-17). Injectable seam, mirroring
+        # `_preview_find_clients`; the tick passes the snapshot on only to a
+        # callable that advertises `_accepts_snapshot`, so a no-arg fake keeps
+        # working and a host without this seam behaves exactly as before.
+        self._preview_snapshot_windows = eve_client_tracker.snapshot_windows
         # The one ground-truth account<->character map for this GUI (design §4),
         # fed by per-PID command-line probing and read by the preview tick via
         # eve_client_tracker.enrich_clients. Real collaborators; the sidecar
@@ -1651,6 +1676,11 @@ class FCToolGUI:
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
         self._preview_gamelog = None           # GamelogMonitor (lazy, native only)
+        # Last character set pushed to that monitor (frozenset | None = never
+        # pushed / monitor swapped). The tick re-computes the scope every pass
+        # but only hands it over when it CHANGED — see
+        # _preview_sync_gamelog_scope.
+        self._preview_gamelog_scope_last = None
         self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
         self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
         self._preview_damage_since = {}        # char key -> monotonic ts the pulse started
@@ -22585,9 +22615,15 @@ class FCToolGUI:
         client OR one of our own windows (tiles / the main FCTool window);
         `.external_hwnd` = the foreground hwnd when it is NEITHER an EVE client NOR
         one of ours (else None) — the Ctrl+Shift+Left "switch back" target (C4).
+        `.fg_hwnd` = the RAW foreground hwnd this probe saw, whatever it belongs
+        to (None when unknown: no backend, a raising probe, or 0) — the retop
+        gate's change detector, which must fire for a foreground change to ANY
+        window, not just to a tracked client. Same single probe as everything
+        else here; no extra Win32 call.
         Fails soft to focused=True (never hide on an errored probe)."""
         from types import SimpleNamespace
-        info = SimpleNamespace(active_hwnd=None, focused=True, external_hwnd=None)
+        info = SimpleNamespace(active_hwnd=None, focused=True, external_hwnd=None,
+                               fg_hwnd=None)
         w = getattr(self, "_preview_win32", None)
         if w is None:
             return info
@@ -22597,6 +22633,7 @@ class FCToolGUI:
             return info
         if not fg:
             return info
+        info.fg_hwnd = fg
         if fg in cur:
             info.active_hwnd = fg
             info.focused = True
@@ -22619,9 +22656,33 @@ class FCToolGUI:
 
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
+        # ONE desktop window sweep for the whole tick (uptime perf, 2026-09-17).
+        # The EVE-O gate and the client lookup each used to run their own full
+        # EnumWindows pass — a Python ctypes callback per top-level window,
+        # twice, four times a second, for the whole session. `snapshot_windows`
+        # takes (hwnd, raw title) for the visible top-levels once; both helpers
+        # then read it and neither enumerates. The seam is absent on the
+        # synthetic tick-test hosts (and a failing sweep degrades to None),
+        # in which case both helpers enumerate for themselves exactly as before.
+        snap = None
+        _snap_fn = getattr(self, "_preview_snapshot_windows", None)
+        if _snap_fn is not None:
+            try:
+                snap = _snap_fn()
+            except Exception:
+                log.debug("[preview] window snapshot failed; falling back to "
+                          "per-helper enumeration", exc_info=True)
+                snap = None
         # Cheap by design: the window signals run per tick, but the ~12 ms
         # process snapshot behind them is time-cached inside eveo_tracker (PV1).
-        if preview_running():                      # EVE-O still open → refuse to fight it
+        # `snapshot=` only goes to a callable that advertises it takes one, so
+        # the tick suite's no-arg `preview_running` fakes stay valid.
+        _eveo_gate = preview_running
+        _eveo_open = (_eveo_gate(snapshot=snap)
+                      if snap is not None
+                      and getattr(_eveo_gate, "_accepts_snapshot", False)
+                      else _eveo_gate())
+        if _eveo_open:                             # EVE-O still open → refuse to fight it
             self._preview_retire_all_tiles()
             return "○ EVE-O Preview detected — close it to enable native previews"
         # Linux/X11: while the helper is still coming up, do NOTHING this tick.
@@ -22650,7 +22711,15 @@ class FCToolGUI:
                 return "Linux previews: starting helper..."
         try:
             disabled = set(cfg.get("disabled_chars", []))
-            clients = list(self._preview_find_clients())
+            # Same compatibility rule as the EVE-O gate above: hand the shared
+            # sweep only to a seam that advertises it accepts one (production's
+            # eve_client_tracker.find_clients does; the tick suite's no-arg
+            # fakes do not and are called exactly as before).
+            _find = self._preview_find_clients
+            clients = list(_find(snapshot=snap)
+                           if snap is not None
+                           and getattr(_find, "_accepts_snapshot", False)
+                           else _find())
             # Ground-truth account identity (design §5): observe() probes new
             # PIDs and caches, then each client is re-stamped with its account
             # id. ONE seam, so account_id / identity reach every downstream
@@ -22880,16 +22949,45 @@ class FCToolGUI:
             # `_preview_retop_until` for ~0.75s (~3 ticks) right after its own
             # burst, so the batch also runs there -- belt, not steady state --
             # to heal that specific window without paying the per-tick cost
-            # the rest of the time. Windows is byte-identical: the backend-None
-            # arm is unconditional there, same loop as ever, gesture or no
-            # gesture.
-            if (getattr(self, "_preview_thumb_backend", None) is None
-                    or time.monotonic() < getattr(
-                        self, "_preview_retop_until", 0.0)):
+            # the rest of the time. A drag still never stands the batch down on
+            # Windows (gesture or no gesture) — `TileWindow.in_gesture` is read
+            # by nobody here.
+            #
+            # ...AND, on Windows, only when the batch can change something
+            # (uptime perf, 2026-09-17). SetWindowPos(HWND_TOPMOST) per tile per
+            # tick is 4 desktop-compositor restacks per tile per second for the
+            # whole session — six tiles = 24/s, felt by every other app. A
+            # steady state where nothing moved cannot bury a tile, so the batch
+            # now runs on a CHANGE or on a slow heartbeat:
+            #   (a) the post-switch belt is armed (`_preview_retop_until`),
+            #   (b) the raw foreground hwnd moved since the last tick (whatever
+            #       was raised may now sit above a tile),
+            #   (c) this tick churned tiles — added / re-keyed, or the hidden
+            #       set moved (a show() re-enters the topmost band),
+            #   (d) `_PREVIEW_RETOP_HEARTBEAT_S` since the last batch, so any
+            #       burial we cannot observe still heals within ~2 s.
+            # The Linux/Wine arm is unchanged: the batch is stood down there
+            # except inside the belt (see the (e4) invariant in map/preview.md).
+            _now_mono = time.monotonic()
+            _fg_hwnd = getattr(fg_info, "fg_hwnd", None)
+            _hidden_now = frozenset(hidden)
+            _belt = _now_mono < getattr(self, "_preview_retop_until", 0.0)
+            _churned = (bool(added) or bool(retitled)
+                        or _hidden_now != getattr(self, "_preview_last_hidden",
+                                                  frozenset()))
+            _fg_moved = _fg_hwnd != getattr(self, "_preview_last_fg_hwnd", None)
+            _heartbeat = (_now_mono - getattr(self, "_preview_last_retop_mono",
+                                              0.0)) >= _PREVIEW_RETOP_HEARTBEAT_S
+            _windows_arm = getattr(self, "_preview_thumb_backend", None) is None
+            if _belt or (_windows_arm
+                         and (_fg_moved or _churned or _heartbeat)):
                 for hwnd, tile in self._preview_tiles.items():
                     if hwnd in hidden:
                         continue                                    # withdrawn — nothing to retop
                     tile.retop()
+                self._preview_last_retop_mono = _now_mono
+            self._preview_last_fg_hwnd = _fg_hwnd
+            self._preview_last_hidden = _hidden_now
             # ...and put any live topmost tooltip back on top, UNCONDITIONALLY.
             # Not just after the retop loop: place()/show() and the fit-height
             # pass in the per-tile loop above re-assert HWND_TOPMOST too, so a
@@ -22968,9 +23066,14 @@ class FCToolGUI:
                 logs_dir=logs_dir)
             mon.start()
             self._preview_gamelog = mon
+            # A brand-new monitor tracks everything until told otherwise, so the
+            # change-gated scope sync must not inherit the previous monitor's
+            # memo (see _preview_sync_gamelog_scope).
+            self._preview_gamelog_scope_last = None
         except Exception:
             log.exception("[preview] gamelog monitor failed to start")
             self._preview_gamelog = None
+            self._preview_gamelog_scope_last = None
 
     def _preview_effective_gamelogs_dir(self):
         """Resolve the Gamelogs directory the monitor should watch, and how.
@@ -23065,7 +23168,15 @@ class FCToolGUI:
     def _preview_sync_gamelog_scope(self):
         """Restrict the GamelogMonitor to the shown (checked) character set so
         damage scanning follows the same pilots the user chose to preview
-        (Task C2). No-op when the monitor isn't running. Fails soft."""
+        (Task C2). No-op when the monitor isn't running. Fails soft.
+
+        CHANGE-GATED (uptime perf, 2026-09-17): the tick calls this every 250 ms
+        but the scope moves only when a client appears/disappears or the user
+        ticks a box, so the monitor is handed a new set only when the computed
+        scope actually differs from the last one pushed
+        (`_preview_gamelog_scope_last`, a frozenset; None = never pushed). The
+        memo is reset wherever the monitor is created or dropped, so a fresh
+        monitor always gets an explicit first push."""
         mon = getattr(self, "_preview_gamelog", None)
         if mon is None:
             return
@@ -23073,7 +23184,11 @@ class FCToolGUI:
             shown = self._preview_shown_chars(
                 self._preview_all_known_chars(),
                 self._preview_cfg().get("disabled_chars", []))
+            scope = frozenset(shown)
+            if scope == getattr(self, "_preview_gamelog_scope_last", None):
+                return
             mon.set_tracked_characters(shown)
+            self._preview_gamelog_scope_last = scope
         except Exception:
             log.exception("[preview] gamelog scope sync failed")
 
@@ -23085,6 +23200,9 @@ class FCToolGUI:
             except Exception:
                 pass
             self._preview_gamelog = None
+            # Next monitor starts with no scope pushed (see
+            # _preview_sync_gamelog_scope).
+            self._preview_gamelog_scope_last = None
 
     def _preview_enable_native(self):
         # An explicit "enable native previews" click deserves a fresh probe,
@@ -35418,11 +35536,17 @@ $bmp.Dispose()
         # the callback — verified against the real monitor in
         # tests/test_intel_always_on.py — so a line the FC sees on four accounts
         # still reaches _on_intel_message exactly once.
+        # Its OWN state file: a ChatMonitor rewrites the whole sidecar from its
+        # own in-memory positions, so sharing chat_monitor_state.json with the
+        # fleet monitor meant each flush erased the other's positions — and the
+        # shutdown pair in _stop_monitoring (chat flush, then the intel stop's
+        # flush) made that deterministic.
         self._intel_monitor = ChatMonitor(
             logs_path=logs_path,
             poll_interval=self.config.get("poll_interval_seconds", 1.0),
             listener_filter=None,
             channel_filters=list(channels),
+            state_path=chat_monitor.INTEL_STATE_FILE_PATH,
         )
         self._intel_monitor.on_message(self._on_intel_message)
         self._intel_source_key = key

@@ -776,17 +776,17 @@ class TileWindow:
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
 
-        # On-video activity label (RETIRED): the DWM compositor draws each tile's
-        # live thumbnail OVER any child widget inside the thumbnail rect, so this
-        # child Canvas was occluded, and routing the label through a separate
-        # topmost overlay caused massive in-game FPS drops. The activity label now
-        # renders in the bottom strip (see set_bottom_label). This canvas + the
-        # _draw_video_label path are kept as dead code so references never break;
-        # set_video_label is now a no-op.
-        self._label_canvas = tk.Canvas(
-            self._body, bg="#000000", highlightthickness=0, bd=0,
-            width=1, height=1)
-        self._label_placed = False
+        # On-video activity label (RETIRED, and its widget DELETED 2026-09-17):
+        # the DWM compositor draws each tile's live thumbnail OVER any child
+        # widget inside the thumbnail rect, so the child Canvas that used to
+        # live here was occluded, and routing the label through a separate
+        # topmost overlay caused massive in-game FPS drops. The activity label
+        # renders in the bottom strip (see set_bottom_label). The canvas and its
+        # `_draw_video_label` painter were kept as dead code "so references
+        # never break" — but `set_label_style` still ran the painter (a
+        # Canvas.delete("all") on a never-placed canvas) for every tile on every
+        # 250 ms tick, so both are gone. `set_video_label` /
+        # `video_label_text()` keep their signatures and the text stash.
 
         # caption text mirror for tests / logging (badge overrides name display)
         self._name = ""
@@ -2009,7 +2009,13 @@ class TileWindow:
         """Push the on-video label style from config['overlay'] (color=fill,
         size=font_size, anchor=corner). Editing these in settings and calling
         this on every existing tile makes style edits update live (fixes bug
-        (ii)). Re-draws the current label with the new style immediately."""
+        (ii)).
+
+        STORE-ONLY: no Tk work at all. It used to end by calling the retired
+        `_draw_video_label`, i.e. a Canvas.delete("all") on a never-placed
+        canvas — for every tile on every 250 ms tick, because
+        `_preview_style_tile` calls this from the tick (removed 2026-09-17
+        together with that canvas)."""
         if color is not None:
             self._label_color = color
         if size is not None:
@@ -2019,7 +2025,6 @@ class TileWindow:
                 pass
         if anchor is not None:
             self._label_anchor = anchor
-        self._draw_video_label()
 
     def set_video_label(self, text):
         """RETIRED no-op. The on-video label drew over the DWM thumbnail (which
@@ -2369,23 +2374,6 @@ class TileWindow:
         strip / black text), False once a normal label or hide restores it — for
         tests/logging."""
         return bool(self._bottom_visible and self._bottom_alert)
-
-    def _draw_video_label(self):
-        """RETIRED. The on-video label is gone (DWM-occluded + the topmost-overlay
-        workaround lagged the game); the activity label now renders in the bottom
-        strip. This is kept as a defensive no-op that only ever ensures the dead
-        _label_canvas stays unplaced — it must NEVER draw over the video again.
-        (set_label_style still calls it; that call is harmless.)"""
-        cv = getattr(self, "_label_canvas", None)
-        if cv is None:
-            return
-        try:
-            cv.delete("all")
-            if getattr(self, "_label_placed", False):
-                cv.place_forget()
-        except tk.TclError:
-            pass
-        self._label_placed = False
 
     def destroy(self):
         self.detach()

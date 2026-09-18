@@ -72,14 +72,58 @@ def _char_from_title(title: str) -> str | None:
 _IMAGE_NAME_BUFFER_SIZES: tuple[int, ...] = (260, 1024, 32768)
 
 
-def find_clients(win32=None) -> list[ClientWindow]:
+# A shared sweep of the desktop's VISIBLE top-level windows: (hwnd, RAW title).
+# Titles are raw because every consumer owns its own title rule (this module
+# normalizes the em-dash, eveo_tracker matches its own prefixes).
+WindowSnapshot = list[tuple[int, str]]
+
+
+def snapshot_windows(win32=None) -> WindowSnapshot:
+    """ONE EnumWindows pass -> [(hwnd, raw title)] for the visible top-levels.
+
+    The native preview tick used to pay TWO full sweeps per 250 ms tick (this
+    module's `find_clients` and `eveo_tracker.preview_running`), each running a
+    Python ctypes callback for every top-level window on the desktop. The tick
+    takes this snapshot once and hands it to both (`find_clients(snapshot=...)`,
+    `eveo_tracker.preview_running(snapshot=...)`). Exactly one `is_visible` and
+    one `get_title` per window, and never raises: a window that dies mid-sweep
+    is skipped, and a failing enumeration yields an empty list (callers then
+    behave as if no window existed, which is also what a failed sweep meant
+    before)."""
     w = win32 or _real_win32()
-    out = []
-    for hwnd in w.enum_windows():
+    out: WindowSnapshot = []
+    try:
+        hwnds = w.enum_windows()
+    except Exception:
+        return out
+    for hwnd in hwnds:
         try:
             if not w.is_visible(hwnd):
                 continue
-            title = _normalize(w.get_title(hwnd))
+            out.append((int(hwnd), w.get_title(hwnd) or ""))
+        except Exception:
+            continue                      # window died mid-enumeration — skip
+    return out
+
+
+def find_clients(win32=None, snapshot: "WindowSnapshot | None" = None) -> list[ClientWindow]:
+    """EVE client windows. With `snapshot` (from `snapshot_windows`) the shared
+    sweep replaces this function's own enumeration — visibility and title come
+    from the snapshot, every remaining predicate (title parse incl. em-dash
+    normalization, owner exe, rect, iconic, pid) is read per candidate exactly
+    as before."""
+    w = win32 or _real_win32()
+    out = []
+    # (hwnd, title) pairs; title None = "read it yourself" (no snapshot given).
+    items = ([(h, None) for h in w.enum_windows()] if snapshot is None
+             else list(snapshot))
+    for hwnd, snap_title in items:
+        try:
+            if snap_title is None:
+                if not w.is_visible(hwnd):
+                    continue
+                snap_title = w.get_title(hwnd)
+            title = _normalize(snap_title)
             char = _char_from_title(title)
             if char is None:
                 continue
@@ -92,6 +136,12 @@ def find_clients(win32=None) -> list[ClientWindow]:
         except Exception:
             continue  # window died mid-enumeration — skip
     return out
+
+
+# Marker read by fc_gui's `_preview_find_clients` seam: only a callable that
+# advertises this gets handed the tick's shared snapshot, so the tick keeps
+# working with the 350+ existing no-arg test fakes.
+find_clients._accepts_snapshot = True
 
 
 def enrich_clients(clients: list["ClientWindow"], account_map) -> list["ClientWindow"]:

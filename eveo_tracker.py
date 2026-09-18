@@ -348,24 +348,36 @@ def _preview_process_running_cached(win32) -> bool:
     return val
 
 
-def _window_signals(win32) -> bool:
+def _window_signals(win32, snapshot=None) -> bool:
     """Signals 1 and 2 (any Eve-O thumbnail / the Eve-O main window) in ONE
     EnumWindows pass instead of two, stopping at the first hit.
+
+    With `snapshot` — `eve_client_tracker.snapshot_windows`' [(hwnd, raw title)]
+    list, taken ONCE per preview tick and shared with the client tracker — this
+    pass enumerates nothing at all: the snapshot already filtered on visibility
+    and carries the titles.
 
     Predicates are unchanged — thumb-ness is still decided by `_is_thumb`, the
     single owner of that rule. Visibility and title are read once per window
     and used to pre-filter, which cannot hide anything `_is_thumb` would have
     accepted (it rejects invisible windows and titles without TITLE_PREFIX
     itself). Never raises."""
-    try:
-        hwnds = win32.enum_windows()
-    except Exception:
-        return False
-    for hwnd in hwnds:
+    if snapshot is None:
         try:
-            if not win32.is_visible(hwnd):
-                continue
-            title = win32.get_title(hwnd) or ""
+            hwnds = win32.enum_windows()
+        except Exception:
+            return False
+        items = [(h, None) for h in hwnds]
+    else:
+        items = list(snapshot)
+    for hwnd, snap_title in items:
+        try:
+            if snap_title is None:
+                if not win32.is_visible(hwnd):
+                    continue
+                title = win32.get_title(hwnd) or ""
+            else:
+                title = snap_title or ""
         except Exception:
             continue
         # Signal 2: the Eve-O Preview main window (no clients previewed yet).
@@ -379,7 +391,7 @@ def _window_signals(win32) -> bool:
     return False
 
 
-def preview_running(win32=None) -> bool:
+def preview_running(win32=None, snapshot=None) -> bool:
     """True iff Eve-O Preview appears to be running via ANY of three signals:
       1. at least one thumbnail window is present, OR
       2. its main window (a visible top-level titled exactly 'EVE-O Preview')
@@ -393,13 +405,23 @@ def preview_running(win32=None) -> bool:
     snapshot per _PROCESS_PROBE_INTERVAL_S — because this is called 4x/s
     (while tiles are on screen; 0.5x/s while blocked/idle) from the native
     preview tick on the Tk thread while the answer changes at most once or
-    twice a session. Never raises; returns False on any failure."""
+    twice a session. Never raises; returns False on any failure.
+
+    `snapshot` is the preview tick's ONE shared window sweep
+    (`eve_client_tracker.snapshot_windows`): when given, signals 1-2 read it
+    instead of enumerating again. Signal 3 is untouched (its own probe, still
+    time-cached, and only reached when 1-2 say no)."""
     if win32 is None:
         if sys.platform != "win32":
             return False
         win32 = _real_win32()
-    if _window_signals(win32):
+    if _window_signals(win32, snapshot):
         return True
     # Fallback: the process is running even though every window is hidden
     # (thumbnails suppressed AND the main window minimised to tray). Cached.
     return _preview_process_running_cached(win32)
+
+
+# Marker read by fc_gui's tick: only a callable that advertises this is handed
+# the shared snapshot, so the tick keeps working with no-arg test fakes.
+preview_running._accepts_snapshot = True
