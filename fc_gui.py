@@ -231,6 +231,17 @@ if _APP_DIR_DECISION.get("reason") == "exe-dir-read-only":
         "will NOT be read from there.",
         _APP_DIR_DECISION.get("exe_dir"), _APP_DIR_DECISION.get("probe_error"),
         _APP_DIR_DECISION.get("dir"))
+# Both folders hold config/tokens: the exe's folder wins, the other set is
+# ignored from here on. Say so with both paths -- a user who signed in twice
+# (once per folder) otherwise sees characters silently "disappear".
+if (_APP_DIR_DECISION.get("reason") == "exe-dir-has-data"
+        and _APP_DIR_DECISION.get("fallback_has_data")):
+    log.warning(
+        "[app_dir] TWO data sets found: using the exe's folder (%s) and "
+        "IGNORING config/ESI tokens in %s. Anything saved there will not be "
+        "read; move or delete that copy once you have confirmed which one you "
+        "want.",
+        _APP_DIR_DECISION.get("dir"), _APP_DIR_DECISION.get("fallback_dir"))
 try:
     print(_APP_DIR_LINE)
 except Exception:

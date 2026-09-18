@@ -102,7 +102,8 @@ def app_dir() -> str:
     """Return the directory for the app's WRITABLE data (config, ESI tokens,
     caches, chat-monitor state).
 
-    Frozen exe, in order:
+    Frozen exe, in order — **data wins wherever it lives**, and only a pair of
+    empty folders is settled by a write probe:
 
     1. **The exe's folder when it already holds our data** (``config.json`` or
        any ``esi_tokens_*.json``) — no probe, no conditions. A folder holding
@@ -111,11 +112,21 @@ def app_dir() -> str:
        second, empty copy. (Field bug, v6.2.0: one failed probe sent users to an
        empty ``%LOCALAPPDATA%\\FCTool`` — default config, no tokens, and the log
        that could have explained it written there too.)
-    2. **The exe's folder when a RETRIED write probe succeeds** (portable
-       install) — preserves the existing portable layout, no migration.
-    3. **Otherwise** a per-user dir under ``%LOCALAPPDATA%\\FCTool``, created on
+    2. **The ``%LOCALAPPDATA%\\FCTool`` fallback when IT holds our data** and the
+       exe's folder holds none — no probe. This is the same field bug through
+       the other door: a first run that fell back (probe blocked) and then
+       signed in has the user's ONLY config and tokens down there, so a probe
+       that succeeds today must not send them to the empty exe folder and lose
+       the lot a second time.
+    3. **The exe's folder when a RETRIED write probe succeeds** (portable
+       install) — both folders are empty, so this is a fresh install and the
+       portable layout is preserved with no migration.
+    4. **Otherwise** a per-user dir under ``%LOCALAPPDATA%\\FCTool``, created on
        demand, so a genuinely read-only install (e.g. ``C:\\Program Files``)
        still saves tokens and config.
+
+    When BOTH folders hold data the exe's folder wins (rule 1) and
+    ``fallback_has_data`` flags the second, ignored set for the startup log.
 
     Running from source: the directory containing this module.
 
@@ -127,44 +138,52 @@ def app_dir() -> str:
         return _resolved_app_dir
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
+        data = _user_data_dir()
         if _has_user_data(exe_dir):
+            # Both may hold data; the exe dir wins and the flag names the
+            # second set so the startup log can warn about it.
             _resolved_app_dir = exe_dir
             _decision = _make_decision(exe_dir, "exe-dir-has-data", exe_dir,
-                                       probe_error=None,
-                                       fallback_has_data=False)
+                                       data, probe_error=None,
+                                       fallback_has_data=_has_user_data(data))
+        elif _has_user_data(data):
+            # The exe dir is empty and the fallback is not: this user's data
+            # lives down there. Never probe — there is nothing to decide.
+            _resolved_app_dir = data
+            _decision = _make_decision(data, "fallback-has-data", exe_dir,
+                                       data, probe_error=None,
+                                       fallback_has_data=True)
         elif _is_dir_writable(exe_dir):
             _resolved_app_dir = exe_dir
             _decision = _make_decision(exe_dir, "exe-dir-writable", exe_dir,
-                                       probe_error=_last_probe_error,
-                                       fallback_has_data=_has_user_data(
-                                           _user_data_dir()))
+                                       data, probe_error=_last_probe_error,
+                                       fallback_has_data=False)
         else:
-            data = _user_data_dir()
-            fallback_has_data = _has_user_data(data)
             try:
                 os.makedirs(data, exist_ok=True)
             except Exception:
                 pass
             _resolved_app_dir = data
             _decision = _make_decision(data, "exe-dir-read-only", exe_dir,
-                                       probe_error=_last_probe_error,
-                                       fallback_has_data=fallback_has_data)
+                                       data, probe_error=_last_probe_error,
+                                       fallback_has_data=False)
     else:
         here = os.path.dirname(os.path.abspath(__file__))
         _resolved_app_dir = here
-        _decision = _make_decision(here, "source", "", probe_error=None,
+        _decision = _make_decision(here, "source", "", "", probe_error=None,
                                    fallback_has_data=False)
     return _resolved_app_dir
 
 
-def _make_decision(path: str, reason: str, exe_dir: str, probe_error,
-                   fallback_has_data: bool) -> dict:
+def _make_decision(path: str, reason: str, exe_dir: str, fallback_dir: str,
+                   probe_error, fallback_has_data: bool) -> dict:
     return {
         "dir": path,
         "reason": reason,
         "probe_error": probe_error,
         "fallback_has_data": bool(fallback_has_data),
         "exe_dir": exe_dir,
+        "fallback_dir": fallback_dir,
     }
 
 
@@ -173,15 +192,19 @@ def app_dir_decision() -> dict:
     that has not happened yet. Keys:
 
     - ``dir``: the chosen directory (identical to ``app_dir()``).
-    - ``reason``: ``"exe-dir-has-data"`` | ``"exe-dir-writable"`` |
-      ``"exe-dir-read-only"`` | ``"source"``.
+    - ``reason``: ``"exe-dir-has-data"`` | ``"fallback-has-data"`` |
+      ``"exe-dir-writable"`` | ``"exe-dir-read-only"`` | ``"source"``.
     - ``probe_error``: text of the last write-probe failure, or None. Set on a
       read-only verdict, and also on a RECOVERED failure (the retry succeeded) —
-      a near miss worth having in the log.
-    - ``fallback_has_data``: the ``%LOCALAPPDATA%`` dir holds config/tokens
-      while the exe dir has none. Informational: it does not change the choice,
-      but it names a forked data set.
+      a near miss worth having in the log. None whenever data settled the
+      choice, because then nothing was probed.
+    - ``fallback_has_data``: the ``%LOCALAPPDATA%`` dir holds config/tokens.
+      True for ``"fallback-has-data"`` (where it MADE the choice) and for an
+      ``"exe-dir-has-data"`` run where both folders hold a set — there the exe
+      dir wins and this flags the second, ignored copy for the log.
     - ``exe_dir``: the exe's folder (empty when running from source).
+    - ``fallback_dir``: the ``%LOCALAPPDATA%\\FCTool`` path, chosen or not
+      (empty when running from source), so the log line can name both folders.
 
     A copy, so a caller that stashes it cannot mutate the module's record.
     Nothing here logs — this module runs at import, before logging exists; the
