@@ -22662,13 +22662,20 @@ class FCToolGUI:
         # twice, four times a second, for the whole session. `snapshot_windows`
         # takes (hwnd, raw title) for the visible top-levels once; both helpers
         # then read it and neither enumerates. The seam is absent on the
-        # synthetic tick-test hosts (and a failing sweep degrades to None),
-        # in which case both helpers enumerate for themselves exactly as before.
+        # synthetic tick-test hosts, and a sweep that FAILS -- by raising, or by
+        # returning an empty list, which is exactly what `snapshot_windows` does
+        # when EnumWindows fails -- degrades to None; in every one of those cases
+        # both helpers enumerate for themselves exactly as before this seam
+        # existed. An EMPTY snapshot must never be handed on: `find_clients`
+        # would find zero clients, `diff_clients` would report every client
+        # removed, and the tick would retire every tile (flicker + a DWM
+        # re-registration) for one tick. A legitimately empty sweep is
+        # impossible anyway -- FCTool's own root is a visible top-level window.
         snap = None
         _snap_fn = getattr(self, "_preview_snapshot_windows", None)
         if _snap_fn is not None:
             try:
-                snap = _snap_fn()
+                snap = _snap_fn() or None
             except Exception:
                 log.debug("[preview] window snapshot failed; falling back to "
                           "per-helper enumeration", exc_info=True)
