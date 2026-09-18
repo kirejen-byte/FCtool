@@ -1650,6 +1650,15 @@ class FCToolGUI:
         self._preview_tick_count = 0           # drives the 8-tick re-letterbox check
         self._preview_tick_fails = 0           # consecutive failed ticks (BUG A guard)
         self._preview_last_key = ""            # last-activated char key (cycle anchor)
+        # The active-HIGHLIGHT anchor, and deliberately NOT the same thing as
+        # _preview_last_key above: the hwnd of the last client the user
+        # activated through us, LOGIN/character-select windows included. A
+        # login window has no char key (`.key` is ""), so keying the highlight
+        # on _preview_last_key could never light one up; the hwnd can, and it
+        # survives the login->character retitle because the window is the same.
+        # _preview_last_key stays char-only (cycle anchor + minimize-inactive
+        # prev-key), so nothing downstream ever sees a login identity in it.
+        self._preview_active_hwnd = None
         # E3: memoized (key, bundle) for _preview_compose_captions so the doctrine
         # object + hull->tag index + overlay rules are rebuilt only on change, not
         # every ~250 ms tick. Invalidated via _config_rev (any config save, which
@@ -20584,16 +20593,24 @@ class FCToolGUI:
         idx = len(self._preview_tiles)
         return (10 + idx * 24, 10 + idx * 24, w, body_h)
 
-    def _preview_style_tile(self, tile, ident, cfg):
+    def _preview_style_tile(self, tile, ident, cfg, active=None):
         """Apply opacity + hover-zoom config and the active flag to one tile
         (Task C1). Guarded so recording fakes without these hooks stay no-ops.
 
         `ident` is the tile's IDENTITY (design §9.4), not its char key: for a
-        logged-in char the two are equal so the active-flag / exclusion-badge
-        comparisons below are byte-identical, while an accounted login tile
-        (identity login:<id>) now reflects its own cycle exclusion. A login
-        identity never equals _preview_last_key (only ever a char key or ""), so
-        set_active stays False for logins exactly as before."""
+        logged-in char the two are equal so the exclusion-badge comparison below
+        is byte-identical, while an accounted login tile (identity login:<id>)
+        reflects its own cycle exclusion.
+
+        `active` is the tick's hwnd-keyed answer to "is this the active client's
+        tile?" (the foreground EVE client, else the last one activated through
+        us, else `_preview_last_key`'s window). Passing it explicitly is what
+        lets a LOGIN tile rest at hover opacity like any other active tile: a
+        login identity is `login:<acct>` or "" and can never equal
+        `_preview_last_key`, which is char-only by design. `active=None` (the
+        default, used by the spawn path and by any host that has no tick answer
+        yet) keeps the legacy identity-vs-`_preview_last_key` computation, so
+        every other caller is unchanged."""
         conf_hover = getattr(tile, "configure_hover", None)
         if conf_hover is not None:
             conf_hover(inactive=float(cfg.get("opacity_inactive", 0.85)),
@@ -20605,7 +20622,9 @@ class FCToolGUI:
                       anchor=str(cfg.get("zoom_anchor", "nw")))
         set_active = getattr(tile, "set_active", None)
         if set_active is not None:
-            set_active(bool(ident) and ident == self._preview_last_key)
+            if active is None:
+                active = bool(ident) and ident == self._preview_last_key
+            set_active(bool(active))
         # caption-onvideo: push the on-video label style from config['overlay']
         # (color/font_size/anchor) so a freshly-spawned tile already matches the
         # saved settings; live edits go through _overlay_apply_style → all tiles.
@@ -20836,6 +20855,12 @@ class FCToolGUI:
                     break
         if not client.is_login:
             self._preview_last_key = client.key
+        # ...and the highlight anchor, which DOES follow a login: the user just
+        # asked for that window, so its tile is the active one until something
+        # else takes the foreground. Keyed by hwnd because a login has no char
+        # key; it also means the highlight survives the login->character
+        # retitle (same window, same hwnd).
+        self._preview_active_hwnd = client.hwnd
         window_activator.activate(client.hwnd)
         # BUG A (occlusion): the just-activated EVE client jumps to the top of the
         # z-order. Without an immediate re-assert the tiles vanish behind it for up
@@ -22831,14 +22856,26 @@ class FCToolGUI:
             # the probe actually saw an external window (never clobber to None).
             if getattr(fg_info, "external_hwnd", None):
                 self._preview_last_external_hwnd = fg_info.external_hwnd
-            # C4: which live EVE client counts as "active" for the highlight border.
-            # Prefer the polled foreground client this tick; fall back to the last
-            # activation anchor so a highlight persists between foreground probes.
-            active_key = None
+            # C4: which live EVE client counts as "active" for the highlight
+            # border (and for the tile's resting hover opacity). HWND-keyed, not
+            # key-keyed: every login/character-select window shares the char key
+            # "", so a key comparison can only ever answer "no" for a login tile
+            # — this is what kept the highlight character-only. Three sources,
+            # in order: the polled foreground client this tick; else the last
+            # window activated through us (`_preview_active_hwnd`, login
+            # included) while it is still live; else the window belonging to
+            # `_preview_last_key`, which preserves the pre-login-highlight
+            # fallback exactly. getattr-guarded for the bare synthetic hosts.
+            active_hwnd = None
             if getattr(fg_info, "active_hwnd", None) in cur:
-                active_key = cur[fg_info.active_hwnd].key
+                active_hwnd = fg_info.active_hwnd
+            elif getattr(self, "_preview_active_hwnd", None) in cur:
+                active_hwnd = self._preview_active_hwnd
             elif self._preview_last_key:
-                active_key = self._preview_last_key
+                for _h, _c in cur.items():
+                    if _c.key == self._preview_last_key:
+                        active_hwnd = _h
+                        break
             hidden, self._preview_lost_focus_since = self._preview_visibility(
                 cur, fg_info, cfg, self._preview_tick_count,
                 self._preview_lost_focus_since)
@@ -22862,8 +22899,11 @@ class FCToolGUI:
                     # C1: keep opacity/zoom config + active flag current. The
                     # active tile (last-activated client) rests at hover opacity.
                     # Identity (not key) so a login tile reflects its own C4
-                    # exclusion; identical for chars (identity == key).
-                    self._preview_style_tile(tile, client.identity, cfg)
+                    # exclusion; identical for chars (identity == key). The
+                    # active flag comes from the tick's hwnd answer above so a
+                    # login tile can be active too.
+                    self._preview_style_tile(tile, client.identity, cfg,
+                                             active=(hwnd == active_hwnd))
                     # Heal a login tile whose ground-truth account resolved only
                     # AFTER it spawned (the AV-delayed probe): the diff never
                     # re-keys a login (its `.key` stays "" through the account
@@ -22892,10 +22932,11 @@ class FCToolGUI:
                     state = (None if client.is_login
                              else self._preview_state_for(client.key))
                     # C4/P12: highlight the active client's tile (steady frame).
+                    # HWND equality, so the character-select/login screen gets
+                    # the same frame as a logged-in pilot (owner ask).
                     highlight = (cfg.get("highlight_color", "#00d4ff")
                                  if (cfg.get("highlight_active", True)
-                                     and not client.is_login
-                                     and client.key == active_key)
+                                     and hwnd == active_hwnd)
                                  else None)
                     # Border precedence is fixed + deterministic:
                     #   damage flash > DECLOAK flash > intel flash > highlight > none.
@@ -23428,6 +23469,11 @@ class FCToolGUI:
         self._preview_spawn_retry = {}
         self._preview_retire_all_tiles()
         self._preview_clients = {}
+        # The active-highlight anchor is an HWND, i.e. session state: hwnds do
+        # not survive a mode bounce, and a stale one could only ever match a
+        # recycled window. _preview_last_key deliberately survives (it is the
+        # cycle anchor and a char key, not a window).
+        self._preview_active_hwnd = None
         self._preview_stop_gamelog()          # B6: stop the damage-flash source
         # Stop the ESI poller and clear its outputs (symmetry with
         # _overlay_teardown; also covers _preview_disable_session). A mode
