@@ -22,6 +22,45 @@ import system_coords
 
 log = get_logger(__name__)
 
+# ONE keep-alive HTTP session for every fetch in this module.
+#
+# Every fetch used to call module-level `requests.get`, which opens a fresh
+# connection -- a full TCP + TLS handshake -- per request. The poll loop asks
+# R2Z2 for a sequence number and then for each killmail, so that was one
+# handshake per killmail: measured on the owner's box (2026-09-17), the zKill
+# poll thread burned 293 CPU-seconds in 47 minutes with 28% of its active
+# samples inside `ssl_wrap_socket`. A session keeps the connection pool alive
+# across fetches, so the handshake is paid once per connection instead.
+#
+# The session is built LAZILY, so importing this module opens nothing, and it
+# carries `HEADERS` so individual call sites no longer pass them. The lazy
+# construction is lock-protected so two threads cannot race in and build two
+# sessions; concurrent GETs are then served by the session's own urllib3
+# connection pool. This seam introduces no new sharing of its own -- the R2Z2
+# fetches still run only on the poll thread.
+#
+# `_http_get` is ALSO the single patch seam the test suite stubs: `requests.get`
+# must not be called anywhere in this module.
+_session_lock = threading.Lock()
+_http_session: requests.Session | None = None
+
+
+def _session() -> requests.Session:
+    """Return the module's lazily created keep-alive session."""
+    global _http_session
+    with _session_lock:
+        if _http_session is None:
+            sess = requests.Session()
+            sess.headers.update(HEADERS)
+            _http_session = sess
+        return _http_session
+
+
+def _http_get(url: str, **kw):
+    """Single HTTP GET seam for this module (keep-alive, `HEADERS` applied)."""
+    return _session().get(url, **kw)
+
+
 R2Z2_BASE = "https://r2z2.zkillboard.com/ephemeral"
 
 # Kills older than this are rejected. zKillboard accepts manually-posted
@@ -148,7 +187,7 @@ def resolve_name(entity_id: int, category: str = "solar_system") -> str:
         }
         url = endpoints.get(category, endpoints["solar_system"])
         rate_limit("esi")
-        resp = requests.get(url, timeout=5, headers=HEADERS)
+        resp = _http_get(url, timeout=5)
         if resp.ok:
             name = resp.json().get("name", str(entity_id))
             _name_cache[key] = name
@@ -195,17 +234,16 @@ def get_region_for_system(system_id: int) -> int | None:
         return cached
     try:
         rate_limit("esi")
-        resp = requests.get(
-            f"{ESI_BASE}/universe/systems/{system_id}/",
-            timeout=5, headers=HEADERS
+        resp = _http_get(
+            f"{ESI_BASE}/universe/systems/{system_id}/", timeout=5
         )
         if resp.ok:
             constellation_id = resp.json().get("constellation_id")
             if constellation_id:
                 rate_limit("esi")
-                resp2 = requests.get(
+                resp2 = _http_get(
                     f"{ESI_BASE}/universe/constellations/{constellation_id}/",
-                    timeout=5, headers=HEADERS
+                    timeout=5
                 )
                 if resp2.ok:
                     region_id = resp2.json().get("region_id")
@@ -687,10 +725,7 @@ class ZKillMonitor:
     def _get_current_sequence(self) -> int | None:
         """Fetch the current sequence number from R2Z2."""
         try:
-            resp = requests.get(
-                f"{R2Z2_BASE}/sequence.json",
-                headers=HEADERS, timeout=10
-            )
+            resp = _http_get(f"{R2Z2_BASE}/sequence.json", timeout=10)
             if resp.ok:
                 return resp.json().get("sequence", None)
         except Exception as e:
@@ -720,9 +755,8 @@ class ZKillMonitor:
         """
         for attempt in range(2):
             try:
-                resp = requests.get(
-                    f"{R2Z2_BASE}/{sequence_id}.json",
-                    headers=HEADERS, timeout=10
+                resp = _http_get(
+                    f"{R2Z2_BASE}/{sequence_id}.json", timeout=10
                 )
                 if resp.ok:
                     return resp.json()
