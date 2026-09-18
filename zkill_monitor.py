@@ -6,6 +6,7 @@ Filters by region, alliance, system, and engagement size.
 R2Z2 docs: https://github.com/zKillboard/zKillboard/wiki/API-(R2Z2)
 """
 
+import http.cookiejar
 import json
 import threading
 import time
@@ -22,7 +23,7 @@ import system_coords
 
 log = get_logger(__name__)
 
-# ONE keep-alive HTTP session for every fetch in this module.
+# ONE keep-alive HTTP session PER THREAD for every fetch in this module.
 #
 # Every fetch used to call module-level `requests.get`, which opens a fresh
 # connection -- a full TCP + TLS handshake -- per request. The poll loop asks
@@ -32,28 +33,38 @@ log = get_logger(__name__)
 # samples inside `ssl_wrap_socket`. A session keeps the connection pool alive
 # across fetches, so the handshake is paid once per connection instead.
 #
-# The session is built LAZILY, so importing this module opens nothing, and it
-# carries `HEADERS` so individual call sites no longer pass them. The lazy
-# construction is lock-protected so two threads cannot race in and build two
-# sessions; concurrent GETs are then served by the session's own urllib3
-# connection pool. This seam introduces no new sharing of its own -- the R2Z2
-# fetches still run only on the poll thread.
+# The session is THREAD-LOCAL, not module-global. This module's helpers really
+# are called from several threads -- the zKill poll thread, the IntelResolver
+# worker and the fc_gui wormhole-search worker all reach `resolve_name`, and
+# `esi_auth` / the loss reconciler's injected resolver do too -- and a
+# `requests.Session` is NOT thread-safe: its cookie jar is mutated without a
+# lock, and r2z2.zkillboard.com sits behind Cloudflare (which sets `__cf_bm`),
+# so two concurrent GETs through one shared session can raise
+# `RuntimeError: dictionary changed size during iteration` from inside
+# requests. One session per thread keeps the whole keep-alive win where it was
+# measured -- the poll thread, the 293 CPU-second hog, fetches on its own
+# session for the process's lifetime -- while sharing no mutable state across
+# threads. Each is built LAZILY on that thread's first fetch, so importing this
+# module opens nothing, and carries `HEADERS` so individual call sites no
+# longer pass them.
 #
 # `_http_get` is ALSO the single patch seam the test suite stubs: `requests.get`
 # must not be called anywhere in this module.
-_session_lock = threading.Lock()
-_http_session: requests.Session | None = None
+_tls = threading.local()
 
 
 def _session() -> requests.Session:
-    """Return the module's lazily created keep-alive session."""
-    global _http_session
-    with _session_lock:
-        if _http_session is None:
-            sess = requests.Session()
-            sess.headers.update(HEADERS)
-            _http_session = sess
-        return _http_session
+    """Return this thread's lazily created keep-alive session."""
+    sess = getattr(_tls, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers.update(HEADERS)
+        # Store and replay nothing: every fetch here was cookie-free before the
+        # session existed, and a jar that never fills cannot be raced either.
+        sess.cookies.set_policy(
+            http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+        _tls.session = sess
+    return sess
 
 
 def _http_get(url: str, **kw):
