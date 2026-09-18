@@ -121,15 +121,17 @@ class ChatLogFile:
         # cadence. Recomputed by ChatMonitor after every discovery pass.
         self.pinned: bool = False
         # False = this file may never HOLD a pin (and never counts as its
-        # group's newest). Set for a header-less file while a listener filter is
-        # active: its group key is (prefix, "") — a group of one that nothing
-        # can ever displace — so pinning it would make it immortally fast and
-        # immune to the DISCOVERY_MAX_IDLE_S cutoff. On the owner's box that was
-        # a 2014 log. It is still TRACKED when recent enough; it just competes
-        # for nothing.
+        # group's newest). Set for a header-LESS file (no Listener line), whose
+        # group key is (channel, "") — a group nothing with a real listener can
+        # ever join — so a pin there would make it immortally fast and immune
+        # to the DISCOVERY_MAX_IDLE_S cutoff. On the owner's box that was a
+        # 2014 log. Two cases, both in _discover_files: always under a listener
+        # filter (the group is a group of one by construction), and without one
+        # only once the file is idle past the cutoff. It is still TRACKED when
+        # recent enough; it just competes for nothing.
         self.pinnable: bool = True
-        # Channel-prefix + listener identity used for pin selection; set by
-        # ChatMonitor at track time ((prefix, listener) - see _group_key).
+        # Channel + listener identity used for pin selection; set by
+        # ChatMonitor at track time ((channel, listener) - see _group_key).
         self.group_key: tuple[str, str] = ("", "")
         # "Which session is this" ordering within the group, computed ONCE at
         # track time (ChatMonitor._pin_rank). Cached deliberately: it is a pure
@@ -667,7 +669,7 @@ class ChatMonitor:
     _DIR_RESCAN_INTERVAL_SECONDS = 300.0
 
     def _group_key(self, filepath: str, listener: str | None) -> tuple[str, str]:
-        """(channel prefix as matched, listener) — the pin selection scope.
+        """(real channel name, listener) — the pin selection scope.
 
         One group per channel per character, so a multi-boxer's newest copy of
         each tracked channel is pinned independently (the intel monitor runs
@@ -675,21 +677,39 @@ class ChatMonitor:
         Both halves are lowercased because every filter in this module matches
         case-insensitively.
 
-        The prefix is the LONGEST configured filter the basename starts with,
-        never the first one that happens to match: ``channel_filters`` is a
-        user-ordered list and overlapping entries are ordinary (``["Delve",
-        "Delve Intel"]``). Taking the first match merged two real channels into
-        one group, where they then competed for a single pin — one of the two
-        tracked channels silently lost its always-fast newest file.
+        The channel half is the REAL channel name carried by the basename — the
+        text before the session stamp — NOT the configured filter that matched
+        it. A filter is a PREFIX, so a file belonging to a DIFFERENT channel
+        whose name merely extends one (``channel_filters=["Delve"]`` and a file
+        ``Delve Intel_20260917_120000_1.txt``) would otherwise join the tracked
+        channel's group; with the newer stamp it then takes the pin and the
+        tracked ``Delve_…`` log drops to the 30 s tier — the exact failure the
+        pin exists to prevent. The configured prefix survives only as the
+        FALLBACK, for a name that carries no stamp at all (longest match, since
+        ``channel_filters`` is a user-ordered list and overlapping entries are
+        ordinary).
+
+        Trade-off, deliberately accepted: keying on the real name yields MORE
+        groups, and therefore more pinned (always-fast) files, than keying on
+        the filter did. But each of those pins is then a genuine channel's
+        newest log rather than whichever prefix-sharing stranger sorted last,
+        which is what the owner's 1 s guarantee is actually about.
         """
-        basename = os.path.basename(filepath).lower()
+        basename = os.path.basename(filepath)
+        stamp = SESSION_STAMP_PATTERN.search(basename)
+        if stamp:
+            channel = basename[:stamp.start()].rstrip("_").strip().lower()
+            if channel:
+                return (channel, (listener or "").strip().lower())
+        lowered_base = basename.lower()
         prefix = ""
         candidates = list(self.channel_filters or [])
         if self.channel_filter:
             candidates.append(self.channel_filter)
         for candidate in candidates:
             lowered = (candidate or "").lower()
-            if lowered and basename.startswith(lowered) and len(lowered) > len(prefix):
+            if (lowered and lowered_base.startswith(lowered)
+                    and len(lowered) > len(prefix)):
                 prefix = lowered
         return (prefix, (listener or "").strip().lower())
 
@@ -806,8 +826,22 @@ class ChatMonitor:
             try:
                 with open(filepath, "rb") as f:
                     header_bytes = f.read(4096)
-                header = header_bytes.decode("utf-16-le", errors="replace")
-                log_file._parse_header(header.split("\n"))
+                if not header_bytes:
+                    # ZERO BYTES is not an answer, it is a race: the directory
+                    # mtime bumps at CreateFile, so a poll can land between
+                    # EVE creating the log and EVE writing its header. Treating
+                    # that as "read fine, no Listener line" was permanent
+                    # damage: the file was tracked with channel_name="" and
+                    # listener="" and _header_parsed=True (so the tail never
+                    # re-parsed), pinnable=False under a listener filter — so
+                    # the CURRENT fleet log lost the pin to the previous
+                    # session's, then dropped to the 30 s tier once its
+                    # ACTIVE_WINDOW_S ran out. Fall into the retry budget
+                    # instead; the header lands within milliseconds.
+                    header_ok = False
+                else:
+                    header = header_bytes.decode("utf-16-le", errors="replace")
+                    log_file._parse_header(header.split("\n"))
             except OSError:
                 header_ok = False
 
@@ -835,15 +869,6 @@ class ChatMonitor:
                     self._ignored.add(filepath)
                     continue
 
-            # A header we read fine that carries no Listener line, while a
-            # listener filter is active, is an unattributable log: it lands in
-            # the group (prefix, "") that nothing else can ever join, so a pin
-            # there would be permanent and would exempt it from the idle cutoff
-            # forever. It competes for nothing and falls through to the
-            # DISCOVERY_MAX_IDLE_S rule below like any other file.
-            if self.listener_filter and not log_file.listener:
-                log_file.pinnable = False
-
             try:
                 st = os.stat(filepath)
                 st_size = st.st_size
@@ -853,6 +878,25 @@ class ChatMonitor:
                 st_size = 0
                 st_ino = 0
                 st_mtime = 0.0
+
+            # A header we read fine that carries no Listener line is an
+            # unattributable log, and it lands in the group (channel, "") — a
+            # group nothing with a real listener can ever join. A pin there is
+            # therefore effectively permanent AND exempts the file from the
+            # DISCOVERY_MAX_IDLE_S cutoff forever, which on the owner's box
+            # kept a truncated 2014 log immortally fast. Two cases:
+            #   * a listener filter is active (the fleet monitor): it may never
+            #     hold a pin at all — the group is a group of one by
+            #     construction;
+            #   * no listener filter (the intel monitor): (channel, "") is a
+            #     legitimate group, so it may hold a pin — but only while it
+            #     is RECENT. Past the idle cutoff it competes for nothing and
+            #     falls through to the cutoff rule below like any other file.
+            if not log_file.listener:
+                if self.listener_filter:
+                    log_file.pinnable = False
+                elif (now_wall - st_mtime) > DISCOVERY_MAX_IDLE_S:
+                    log_file.pinnable = False
 
             log_file.group_key = self._group_key(filepath, log_file.listener)
             log_file.pin_rank = self._pin_rank(filepath)
