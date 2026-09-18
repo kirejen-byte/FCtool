@@ -1303,9 +1303,11 @@ class FCToolGUI:
         self._channels: channel_store.Registry = channel_store.load(self.config)
         self.chat_monitor: ChatMonitor | None = None
         # The fleet tail's listener-AGNOSTIC twin, used by the range check
-        # alone so the command works from any of the owner's characters (see
-        # _setup_modules). Polled by _chat_poll_loop only while the feature is
-        # on; every other fleet-chat consumer stays on self.chat_monitor.
+        # alone so the command works from any of the owner's characters. Built
+        # by _build_range_monitor (called from _setup_modules, and again from
+        # _on_tracked_character_change when this is still absent). Polled by
+        # _chat_poll_loop on every pass; every other fleet-chat consumer stays
+        # on self.chat_monitor.
         self._range_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
         # Re-entry guard for the "Import from EVE" (ESI in-game fittings) flow.
@@ -31608,6 +31610,9 @@ class FCToolGUI:
                 monitor = self.chat_monitor
                 if monitor:
                     monitor.poll()
+            except Exception:
+                pass
+            try:
                 # The range check's listener-agnostic twin, polled from this
                 # same thread so nothing new is spawned — and polled on EVERY
                 # pass, deliberately ungated. A master-gate check here looks
@@ -31621,6 +31626,10 @@ class FCToolGUI:
                 # check discards lines as they arrive and nothing accumulates.
                 # getattr: a host built before __init__ reached the attribute
                 # must still get its tracked-tail poll.
+                # Separate try from the tracked poll above: chat_monitor.poll()
+                # runs its callbacks INLINE, so an exception raised out of one
+                # of those (_on_chat_message and friends) must not skip this
+                # poll and freeze the range tail's read positions.
                 range_monitor = getattr(self, "_range_monitor", None)
                 if range_monitor:
                     range_monitor.poll()
@@ -31650,9 +31659,9 @@ class FCToolGUI:
         self._post_ui(self._check_role_letters, msg)
         # The fleet-chat RANGE CHECK is deliberately NOT here any more
         # (2026-09-18): it rides its own listener-agnostic tail, registered in
-        # _setup_modules on self._range_monitor, so the command works from any
-        # of the owner's characters and not only the tracked one. Calling it
-        # from here as well would fire the same line twice.
+        # _build_range_monitor on self._range_monitor, so the command works
+        # from any of the owner's characters and not only the tracked one.
+        # Calling it from here as well would fire the same line twice.
         #
         # Fleet-chat refit command, LAST on purpose: it is the only consumer
         # here that can do real work (a window read, then a doctrine
