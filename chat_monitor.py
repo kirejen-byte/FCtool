@@ -102,6 +102,26 @@ STATE_FLUSH_INTERVAL_S = 30.0
 # added to ChatMonitor._ignored, so a later real rescan picks it up again.
 _HEADER_RETRY_ATTEMPTS = 3
 
+# OneDrive (and any Windows cloud-sync provider) leaves "cloud-only" files in
+# the folder: a directory entry with no local body. `os.stat` answers fine and
+# reports a recall attribute, but EVERY `open()` on one raises OSError — a
+# failed hydration request that also pokes OneDrive.exe. Measured on the
+# owner's OneDrive-hosted Chatlogs dir 2026-09-17: 1,098 of 4,784 `Fleet*.txt`
+# were cloud-only (observed st_file_attributes 0x400020), and probing their
+# headers spent ~4 s of the poll thread per rescan pass — each one re-probed
+# _HEADER_RETRY_ATTEMPTS times as a "transient" unreadable header. A cloud-only
+# file cannot be a log EVE is currently writing (EVE writes locally, and a
+# written file is hydrated), so discovery recognises them from the stat it
+# already takes and skips them WITHOUT opening: no header read, no retry
+# budget. A non-Windows stat_result has no `st_file_attributes`, so the
+# getattr default of 0 leaves every POSIX candidate unaffected.
+_CLOUD_PLACEHOLDER_ATTRS = (
+    0x00400000        # FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: dehydrated body,
+                      #   reading it triggers a network recall
+    | 0x00040000      # FILE_ATTRIBUTE_RECALL_ON_OPEN: even opening it recalls
+    | 0x00001000      # FILE_ATTRIBUTE_OFFLINE: body not immediately available
+)
+
 
 class ChatLogFile:
     """Tracks a single chat log file, remembering byte-offset read position."""
@@ -806,9 +826,11 @@ class ChatMonitor:
 
         now_wall = time.time()
 
-        # Pass 1: probe every NOT-yet-known candidate exactly once — its 4 KB
-        # header (for the listener) and ONE stat (mtime/size/inode). Files
-        # already tracked or already in _ignored never reach this.
+        # Pass 1: probe every NOT-yet-known candidate exactly once — ONE stat
+        # (attributes/mtime/size/inode) and then its 4 KB header (for the
+        # listener). Files already tracked or already in _ignored never reach
+        # this. The stat comes FIRST so a cloud-only placeholder is recognised
+        # and skipped before anything tries to open it.
         candidates: list[tuple] = []
         for filepath in all_files:
             if filepath in self._tracked_files or filepath in self._ignored:
@@ -817,6 +839,30 @@ class ChatMonitor:
             if self.channel_filter:
                 if not basename.lower().startswith(self.channel_filter.lower()):
                     continue
+
+            try:
+                st = os.stat(filepath)
+                st_size = st.st_size
+                st_ino = getattr(st, "st_ino", 0) or 0
+                st_mtime = getattr(st, "st_mtime", 0.0) or 0.0
+                st_attrs = getattr(st, "st_file_attributes", 0) or 0
+            except OSError:
+                st_size = 0
+                st_ino = 0
+                st_mtime = 0.0
+                st_attrs = 0
+
+            # A cloud-only placeholder (see _CLOUD_PLACEHOLDER_ATTRS): every
+            # open() on it fails, so the header probe would burn its whole
+            # retry budget on it every rescan, poking the sync engine each
+            # time. It cannot be a log EVE is writing, so ignore it outright —
+            # and drop any retry budget it accumulated before this stat, or the
+            # glob-free retry pass would keep it alive for the process's life.
+            if st_attrs & _CLOUD_PLACEHOLDER_ATTRS:
+                self._header_retry.pop(filepath, None)
+                self._ignored.add(filepath)
+                continue
+
             log_file = ChatLogFile(filepath)
 
             # Parse the header up front so the listener filter can be applied.
@@ -868,16 +914,6 @@ class ChatMonitor:
                 if log_file.listener.lower() != self.listener_filter.lower():
                     self._ignored.add(filepath)
                     continue
-
-            try:
-                st = os.stat(filepath)
-                st_size = st.st_size
-                st_ino = getattr(st, "st_ino", 0) or 0
-                st_mtime = getattr(st, "st_mtime", 0.0) or 0.0
-            except OSError:
-                st_size = 0
-                st_ino = 0
-                st_mtime = 0.0
 
             # A header we read fine that carries no Listener line is an
             # unattributable log, and it lands in the group (channel, "") — a
