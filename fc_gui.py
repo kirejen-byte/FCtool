@@ -32982,6 +32982,25 @@ class FCToolGUI:
                                    fg=FG_DIM, bg=BG_PANEL, anchor=tk.W)
         location_label.pack(side=tk.LEFT, padx=(2, 0))
 
+        # Row state dict, built HERE (not at the end of this function) so the
+        # location click handler can close over it. The handler is bound ONCE,
+        # right here, and reads the CURRENT system out of it; the 15s
+        # `_apply_fleet_locations` pass only WRITES `location_system` and never
+        # re-binds. Re-binding per pass leaked one Tcl command plus its
+        # closure per located pilot forever, because tkinter's `unbind(seq)`
+        # without a funcid never calls `deletecommand` (3.12 and 3.13).
+        info = {"location_system": None}
+
+        def open_location(_event=None, _info=info):
+            sys_name = _info.get("location_system")
+            if not sys_name:
+                return
+            webbrowser.open(
+                f"https://evemaps.dotlan.net/system/{sys_name.replace(' ', '_')}"
+            )
+        location_label.bind("<Button-1>", open_location)
+        info["location_click"] = open_location   # test seam
+
         # Per-person remove control. Pack RIGHT first so it reserves its
         # space at the right edge before the note entry is packed LEFT.
         def remove_person(_sender=sender, _slot=slot, _row=row):
@@ -33038,12 +33057,13 @@ class FCToolGUI:
         note_entry.bind("<FocusOut>", on_note_focus_out)
         show_placeholder()  # start in placeholder state (field is empty)
 
-        slot["people"][sender] = {
+        info.update({
             "timestamp": timestamp,
             "note_var": note_var,
             "row": row,
             "location_label": location_label,
-        }
+        })
+        slot["people"][sender] = info
         self._update_role_count_label(slot)
 
     def _update_role_count_label(self, slot):
@@ -33730,7 +33750,13 @@ class FCToolGUI:
         self._log_zkill_only_losses()
 
     def _apply_fleet_locations(self, locations: dict[str, tuple[str, str, str]]):
-        """Update location labels for all role tracker members."""
+        """Update location labels for all role tracker members.
+
+        Runs every ~15s. It must NEVER bind or unbind anything: the row's
+        `<Button-1>` handler is bound once in `_add_person_to_slot` and reads
+        `info["location_system"]`, which is the only click-relevant state this
+        pass writes. (A rebind per pass leaked a Tcl command + closure per
+        located pilot — `unbind(seq)` without a funcid never deletes it.)"""
         self._fleet_locations_cache = locations
         for slot in self._role_slots:
             for sender, info in slot["people"].items():
@@ -33745,16 +33771,13 @@ class FCToolGUI:
                         display = f"({' - '.join(parts)})"
                         if ship_name:
                             display += f" [{ship_name}]"
+                        info["location_system"] = sys_name
                         loc_label.config(
                             text=display,
                             fg=FG_ACCENT, cursor="hand2"
                         )
-                        loc_label.unbind("<Button-1>")
-                        loc_label.bind("<Button-1>",
-                            lambda e, s=sys_name: webbrowser.open(
-                                f"https://evemaps.dotlan.net/system/{s.replace(' ', '_')}"
-                            ))
                     else:
+                        info["location_system"] = None
                         loc_label.config(text="", cursor="")
 
     def _clear_role_slot(self, slot):
