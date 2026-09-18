@@ -57,6 +57,15 @@ from app_path import app_dir
 
 STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state.json")
 
+# The INTEL monitor is a second, independent ChatMonitor (listener_filter=None,
+# many channel prefixes) over the same directory, and it MUST NOT share the
+# fleet monitor's sidecar: each instance loads the file once at construction and
+# rewrites it whole from its own _persisted_state, so two monitors on one path
+# overwrite each other's positions on every flush — including the shutdown
+# flush, where fc_gui persists the chat positions and the intel stop immediately
+# replaces the file with the intel ones. Separate files, no shared writer.
+INTEL_STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state_intel.json")
+
 # Dedupe TTL - drop duplicate messages (same channel/ts/sender/body) seen within this window.
 DEDUPE_TTL_SECONDS = 60.0
 
@@ -87,6 +96,11 @@ DISCOVERY_MAX_IDLE_S = 7 * 86400
 # only a replay optimisation, so an interval plus an explicit flush at shutdown
 # (ChatMonitor.flush_state) loses nothing that matters.
 STATE_FLUSH_INTERVAL_S = 30.0
+# How many times a path whose header could not be OPENED is re-probed before it
+# falls back to the ordinary rescan cadence. Bounded so a permanently
+# unreadable file cannot turn the retry into a per-poll cost; it is still never
+# added to ChatMonitor._ignored, so a later real rescan picks it up again.
+_HEADER_RETRY_ATTEMPTS = 3
 
 
 class ChatLogFile:
@@ -106,9 +120,23 @@ class ChatLogFile:
         # True for the newest file of its group: always polled at the fast
         # cadence. Recomputed by ChatMonitor after every discovery pass.
         self.pinned: bool = False
+        # False = this file may never HOLD a pin (and never counts as its
+        # group's newest). Set for a header-less file while a listener filter is
+        # active: its group key is (prefix, "") — a group of one that nothing
+        # can ever displace — so pinning it would make it immortally fast and
+        # immune to the DISCOVERY_MAX_IDLE_S cutoff. On the owner's box that was
+        # a 2014 log. It is still TRACKED when recent enough; it just competes
+        # for nothing.
+        self.pinnable: bool = True
         # Channel-prefix + listener identity used for pin selection; set by
         # ChatMonitor at track time ((prefix, listener) - see _group_key).
         self.group_key: tuple[str, str] = ("", "")
+        # "Which session is this" ordering within the group, computed ONCE at
+        # track time (ChatMonitor._pin_rank). Cached deliberately: it is a pure
+        # function of the filename for every real EVE log, and for the rare
+        # stamp-less name it freezes the mtime we saw at discovery rather than
+        # letting a later AV/cloud touch reorder the group.
+        self.pin_rank: tuple = ()
         # Byte offset into the file (not character offset). We always read in "rb".
         self._last_pos: int = 0
         # Trailing partial text we decoded but haven't emitted because no newline was
@@ -219,10 +247,17 @@ class ChatLogFile:
                 # Only a half byte available - nothing to do.
                 return messages
 
-            # New bytes arrived: this file is live, so remember WHEN from the
-            # stat we already performed (never a second stat - the whole point
-            # of the tiering is to stop stat'ing quiet files).
-            self.last_mtime = st_mtime
+            # New bytes arrived: this file is live, so remember WHEN. The stat
+            # we already performed supplies the timestamp (never a second stat -
+            # the whole point of the tiering is to stop stat'ing quiet files),
+            # but it is FLOORED AT NOW: we have just witnessed bytes arriving,
+            # which is a stronger statement than anything the recorded mtime can
+            # make. A clock-skewed source (OneDrive and other cloud-sync agents
+            # write back timestamps from another machine) can hand back an mtime
+            # minutes in the past, and a file whose mtime lands more than
+            # ACTIVE_WINDOW_S behind would fall straight back to the slow tier
+            # after every single read while it is actively being written.
+            self.last_mtime = max(st_mtime, time.time())
 
             text = raw.decode("utf-16-le", errors="replace")
 
@@ -493,6 +528,15 @@ class ChatMonitor:
         # only exclude what it positively read (the find_current_session_file
         # rule), so a transiently unopenable log is retried on the next scan.
         self._ignored: set[str] = set()
+        # Paths whose 4 KB header could not be OPENED (the transient AV /
+        # cloud-sync failure class this box demonstrably has) mapped to the
+        # re-probe attempts they have left. These are NEVER ignored — the
+        # listener filter can only exclude what it positively read — and they
+        # are re-probed on the next poll WITHOUT a directory glob, because the
+        # likeliest moment for a transient open failure is the instant EVE
+        # creates the log we most need (fleet join), and the mtime gate would
+        # otherwise make us wait out the 300 s backstop for it.
+        self._header_retry: dict[str, int] = {}
         self._callbacks: list[Callable[[ChatMessage], None]] = []
         self._running = False
 
@@ -630,35 +674,56 @@ class ChatMonitor:
         with ``listener_filter=None`` and takes the listener from the header).
         Both halves are lowercased because every filter in this module matches
         case-insensitively.
+
+        The prefix is the LONGEST configured filter the basename starts with,
+        never the first one that happens to match: ``channel_filters`` is a
+        user-ordered list and overlapping entries are ordinary (``["Delve",
+        "Delve Intel"]``). Taking the first match merged two real channels into
+        one group, where they then competed for a single pin — one of the two
+        tracked channels silently lost its always-fast newest file.
         """
         basename = os.path.basename(filepath).lower()
         prefix = ""
-        for candidate in (self.channel_filters or []):
+        candidates = list(self.channel_filters or [])
+        if self.channel_filter:
+            candidates.append(self.channel_filter)
+        for candidate in candidates:
             lowered = (candidate or "").lower()
-            if lowered and basename.startswith(lowered):
-                prefix = lowered
-                break
-        if not prefix and self.channel_filter:
-            lowered = self.channel_filter.lower()
-            if basename.startswith(lowered):
+            if lowered and basename.startswith(lowered) and len(lowered) > len(prefix):
                 prefix = lowered
         return (prefix, (listener or "").strip().lower())
 
     @staticmethod
-    def _pin_rank(mtime: float, filepath: str) -> tuple:
-        """Ordering for "newest in the group": mtime, then path as a
-        deterministic tiebreak (lexicographically greatest wins)."""
-        return (mtime, filepath)
+    def _pin_rank(filepath: str) -> tuple:
+        """Ordering for "newest in the group" — the FILENAME STAMP, not mtime.
+
+        Delegates to :func:`_session_sort_key`, whose docstring carries the
+        reason: mtime records whatever last TOUCHED a log, and AV scanners,
+        backup and cloud-sync agents all bump files EVE stopped writing months
+        ago. Ranking by mtime therefore handed the pin to whichever ancient log
+        was touched most recently — measured on the owner's box, a 2014 file
+        took the pin and the real current-session log dropped to the slow tier,
+        which is the exact failure the pin exists to prevent.
+
+        A consequence worth stating: the rank does not move when a file receives
+        BYTES, so a sibling that starts talking can never steal the pin from a
+        file with a newer filename stamp (it is promoted to the fast tier on its
+        own merits by ``last_mtime``, which is all activity should buy).
+        """
+        return _session_sort_key(filepath)
 
     def _repin_groups(self) -> None:
         """Pin the newest tracked file of every group, unpin the rest.
 
         A newly created file that becomes its group's newest takes the pin over
-        and the previous holder drops back to the ordinary tier rules.
+        and the previous holder drops back to the ordinary tier rules. A file
+        flagged ``pinnable = False`` never competes (see ChatLogFile).
         """
         best: dict[tuple[str, str], tuple] = {}
         for filepath, log_file in self._tracked_files.items():
-            rank = self._pin_rank(log_file.last_mtime, filepath)
+            if not log_file.pinnable:
+                continue
+            rank = log_file.pin_rank
             current = best.get(log_file.group_key)
             if current is None or rank > current[0]:
                 best[log_file.group_key] = (rank, filepath)
@@ -675,7 +740,12 @@ class ChatMonitor:
         a stable mtime means there is no new file to discover. A long backstop
         interval still forces an occasional full re-glob as a safety net. This
         keeps the common idle poll off the GIL-heavy glob that otherwise stalls the
-        Tk main thread when the Chatlogs folder holds tens of thousands of files."""
+        Tk main thread when the Chatlogs folder holds tens of thousands of files.
+
+        One exception to the gate: when a previous scan could not OPEN a
+        candidate's header, this runs a glob-free "retry only" pass over exactly
+        those paths, so a transient open failure on a just-created log costs one
+        poll instead of a whole backstop interval."""
         now_monotonic = time.monotonic()
         try:
             dir_mtime = os.path.getmtime(self.logs_path)
@@ -686,23 +756,33 @@ class ChatMonitor:
         within_backstop = (
             (now_monotonic - self._last_full_scan_monotonic)
             < self._DIR_RESCAN_INTERVAL_SECONDS)
+        retry_only = False
         if unchanged and within_backstop:
-            return  # directory unchanged since last scan — no new files to find
-        self._last_dir_mtime = dir_mtime
-        self._last_full_scan_monotonic = now_monotonic
-
-        # If multiple channel filters are set, glob each one separately (much faster)
-        # Glob once and match channel prefixes case-INSENSITIVELY so a
-        # case-sensitive filesystem (Linux) behaves like Windows.
-        all_txt = glob.glob(os.path.join(self.logs_path, "*.txt"))
-        if self.channel_filters:
-            prefixes = tuple(p.lower() for p in self.channel_filters)
-            all_files = [
-                fp for fp in all_txt
-                if os.path.basename(fp).lower().startswith(prefixes)
-            ]
+            if not self._header_retry:
+                return  # directory unchanged since last scan — nothing to find
+            # No new files, but a header we could not open last time is still
+            # owed a retry. Re-probe exactly those paths through the normal
+            # pipeline — no glob, so this costs nothing at directory scale.
+            retry_only = True
         else:
-            all_files = all_txt
+            self._last_dir_mtime = dir_mtime
+            self._last_full_scan_monotonic = now_monotonic
+
+        if retry_only:
+            all_files = sorted(self._header_retry)
+        else:
+            # If multiple channel filters are set, glob each one separately (much faster)
+            # Glob once and match channel prefixes case-INSENSITIVELY so a
+            # case-sensitive filesystem (Linux) behaves like Windows.
+            all_txt = glob.glob(os.path.join(self.logs_path, "*.txt"))
+            if self.channel_filters:
+                prefixes = tuple(p.lower() for p in self.channel_filters)
+                all_files = [
+                    fp for fp in all_txt
+                    if os.path.basename(fp).lower().startswith(prefixes)
+                ]
+            else:
+                all_files = all_txt
 
         now_wall = time.time()
 
@@ -720,22 +800,49 @@ class ChatMonitor:
             log_file = ChatLogFile(filepath)
 
             # Parse the header up front so the listener filter can be applied.
+            # The three outcomes are kept apart (the _header_listener rule):
+            # unreadable / readable-but-listener-less / a name.
+            header_ok = True
             try:
                 with open(filepath, "rb") as f:
                     header_bytes = f.read(4096)
                 header = header_bytes.decode("utf-16-le", errors="replace")
                 log_file._parse_header(header.split("\n"))
             except OSError:
-                pass
+                header_ok = False
+
+            if not header_ok:
+                # Could not READ it — so we know nothing, and the filter can
+                # only exclude what it positively read. NEVER ignored: budget a
+                # re-probe instead (bounded, so a permanently unreadable file
+                # cannot turn into a per-poll retry) and leave it untracked so
+                # the retry actually re-reads the header. Tracking it blind
+                # would fix a wrong group key and an unknowable listener in
+                # place for the monitor's whole life.
+                left = self._header_retry.get(filepath, _HEADER_RETRY_ATTEMPTS)
+                if left > 1:
+                    self._header_retry[filepath] = left - 1
+                else:
+                    self._header_retry.pop(filepath, None)
+                continue
+            self._header_retry.pop(filepath, None)
 
             # If a listener (character) filter is set, skip files from other
             # characters — and REMEMBER them, so no later rescan re-reads this
-            # header. A file whose header could not be read has an empty
-            # listener and is kept (retried), never ignored.
+            # header.
             if self.listener_filter and log_file.listener:
                 if log_file.listener.lower() != self.listener_filter.lower():
                     self._ignored.add(filepath)
                     continue
+
+            # A header we read fine that carries no Listener line, while a
+            # listener filter is active, is an unattributable log: it lands in
+            # the group (prefix, "") that nothing else can ever join, so a pin
+            # there would be permanent and would exempt it from the idle cutoff
+            # forever. It competes for nothing and falls through to the
+            # DISCOVERY_MAX_IDLE_S rule below like any other file.
+            if self.listener_filter and not log_file.listener:
+                log_file.pinnable = False
 
             try:
                 st = os.stat(filepath)
@@ -748,29 +855,38 @@ class ChatMonitor:
                 st_mtime = 0.0
 
             log_file.group_key = self._group_key(filepath, log_file.listener)
+            log_file.pin_rank = self._pin_rank(filepath)
             log_file.last_mtime = st_mtime
             candidates.append((filepath, log_file, st_size, st_ino, st_mtime))
 
-        # Pass 2: newest (mtime, path) per group across the new candidates AND
-        # the files already tracked, so a long-idle newcomer with a newer
-        # sibling is correctly recognised as NOT its group's newest.
+        # Pass 2: newest-by-FILENAME-STAMP per group (_pin_rank) across the new
+        # candidates AND the files already tracked, so a long-idle newcomer with
+        # a newer sibling is correctly recognised as NOT its group's newest.
+        # Files that may not hold a pin are excluded outright — they must not be
+        # able to claim a group's "newest" slot and so escape the idle cutoff.
         newest: dict[tuple[str, str], tuple] = {}
-        for filepath, log_file in self._tracked_files.items():
-            rank = self._pin_rank(log_file.last_mtime, filepath)
-            if rank > newest.get(log_file.group_key, ()):
-                newest[log_file.group_key] = rank
-        for filepath, log_file, _size, _ino, st_mtime in candidates:
-            rank = self._pin_rank(st_mtime, filepath)
-            if rank > newest.get(log_file.group_key, ()):
-                newest[log_file.group_key] = rank
+        for _filepath, log_file in self._tracked_files.items():
+            if not log_file.pinnable:
+                continue
+            if log_file.pin_rank > newest.get(log_file.group_key, ()):
+                newest[log_file.group_key] = log_file.pin_rank
+        for _filepath, log_file, _size, _ino, _st_mtime in candidates:
+            if not log_file.pinnable:
+                continue
+            if log_file.pin_rank > newest.get(log_file.group_key, ()):
+                newest[log_file.group_key] = log_file.pin_rank
 
         for filepath, log_file, st_size, st_ino, st_mtime in candidates:
             # A file nobody has written to in DISCOVERY_MAX_IDLE_S is dead
             # history — unless it is its group's newest, which is the one file
-            # that must stay live even when it looks ancient.
+            # that must stay live even when it looks ancient. "Idle" is an mtime
+            # question (has anything touched this at all), while "newest" is a
+            # filename-stamp question (which session is current); the two scales
+            # are deliberately different.
             if ((now_wall - st_mtime) > DISCOVERY_MAX_IDLE_S
-                    and self._pin_rank(st_mtime, filepath)
-                    != newest.get(log_file.group_key)):
+                    and (not log_file.pinnable
+                         or log_file.pin_rank
+                         != newest.get(log_file.group_key))):
                 self._ignored.add(filepath)
                 continue
 
