@@ -7,23 +7,88 @@ Bundled assets (sounds, templates) live in sys._MEIPASS.
 
 import os
 import sys
+import time
 
 
 _APP_DATA_SUBDIR = "FCTool"
 _resolved_app_dir = None   # cached: the writability probe is wasteful per-call
+_decision = None           # cached: HOW app_dir() chose (see app_dir_decision)
+_last_probe_error = None   # text of the last write-probe failure, or None
+
+#: A single failed probe is not proof of a read-only folder — see
+#: :func:`_is_dir_writable`.
+_PROBE_ATTEMPTS = 3
+_PROBE_BACKOFF_S = 0.2
+
+#: Indirection so tests can neutralise the backoff without touching `time`.
+_sleep = time.sleep
+
+#: Files that make a folder OURS. A folder holding either of these is a data
+#: folder we (or a previous run) already wrote, whatever a probe says today.
+_CONFIG_NAME = "config.json"
+_TOKENS_PREFIX = "esi_tokens_"
+_TOKENS_SUFFIX = ".json"
 
 
-def _is_dir_writable(path: str) -> bool:
-    """True if we can create the dir (if needed) and write+remove a probe file."""
+def _has_user_data(path: str) -> bool:
+    """True if ``path`` already holds this app's user data — ``config.json`` or
+    any ``esi_tokens_*.json``. Never raises: an unreadable or missing directory
+    is simply 'no data here'."""
     try:
-        os.makedirs(path, exist_ok=True)
-        probe = os.path.join(path, ".fctool_write_test")
-        with open(probe, "w") as fh:
-            fh.write("")
-        os.remove(probe)
-        return True
+        if os.path.isfile(os.path.join(path, _CONFIG_NAME)):
+            return True
+        with os.scandir(path) as entries:
+            for entry in entries:
+                name = entry.name
+                if (name.startswith(_TOKENS_PREFIX)
+                        and name.endswith(_TOKENS_SUFFIX)):
+                    return True
     except Exception:
         return False
+    return False
+
+
+def _probe_once(path: str) -> None:
+    """One write probe: create the dir if needed, then write and remove a probe
+    file. Raises on any failure — the caller decides whether one failure is
+    decisive. The probe name carries this process's pid so a stale probe left
+    by a crashed run can never collide with ours."""
+    os.makedirs(path, exist_ok=True)
+    probe = os.path.join(path, ".fctool_write_test.%d" % os.getpid())
+    with open(probe, "w") as fh:
+        fh.write("")
+    os.remove(probe)
+
+
+def _is_dir_writable(path: str, attempts: int = _PROBE_ATTEMPTS,
+                     sleep=None) -> bool:
+    """True if we can create the dir (if needed) and write+remove a probe file.
+
+    RETRIED, because one failure is not proof of a read-only folder: Windows
+    Controlled Folder Access sizing up a brand-new unrecognised exe, an AV
+    first-run scan still holding the probe file when ``os.remove`` runs, or a
+    OneDrive lock all fail once and succeed a moment later — and treating that
+    as "read-only" used to strand the user's whole data set (see
+    :func:`app_dir`). Returns True on the FIRST success; the text of the last
+    failure is kept in ``_last_probe_error`` for the startup log line.
+    """
+    global _last_probe_error
+    _last_probe_error = None
+    if sleep is None:
+        sleep = _sleep
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            _probe_once(path)
+            return True
+        except Exception as exc:
+            _last_probe_error = "%s: %s" % (type(exc).__name__, exc)
+        if attempt + 1 < attempts:
+            try:
+                sleep(_PROBE_BACKOFF_S)
+            except Exception:
+                pass
+    return False
 
 
 def _user_data_dir() -> str:
@@ -37,30 +102,93 @@ def app_dir() -> str:
     """Return the directory for the app's WRITABLE data (config, ESI tokens,
     caches, chat-monitor state).
 
-    - Frozen exe in a WRITABLE folder (portable install): the folder next to the
-      .exe — preserves the existing portable layout (no migration for current
-      users).
-    - Frozen exe in a READ-ONLY folder (e.g. C:\\Program Files): a per-user dir
-      under %LOCALAPPDATA%\\FCTool, created on demand, so token/config saves do
-      not fail with 'Permission denied'.
-    - Running from source: the directory containing this module.
+    Frozen exe, in order:
+
+    1. **The exe's folder when it already holds our data** (``config.json`` or
+       any ``esi_tokens_*.json``) — no probe, no conditions. A folder holding
+       our data IS our folder; a save that later fails surfaces through the
+       normal save-failure path instead of silently forking the data set onto a
+       second, empty copy. (Field bug, v6.2.0: one failed probe sent users to an
+       empty ``%LOCALAPPDATA%\\FCTool`` — default config, no tokens, and the log
+       that could have explained it written there too.)
+    2. **The exe's folder when a RETRIED write probe succeeds** (portable
+       install) — preserves the existing portable layout, no migration.
+    3. **Otherwise** a per-user dir under ``%LOCALAPPDATA%\\FCTool``, created on
+       demand, so a genuinely read-only install (e.g. ``C:\\Program Files``)
+       still saves tokens and config.
+
+    Running from source: the directory containing this module.
 
     Resolved once and cached (the location cannot change during a run, and a
-    writability probe on every call would be wasteful)."""
-    global _resolved_app_dir
+    writability probe on every call would be wasteful). How it chose is
+    available from :func:`app_dir_decision`."""
+    global _resolved_app_dir, _decision
     if _resolved_app_dir is not None:
         return _resolved_app_dir
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
-        if _is_dir_writable(exe_dir):
+        if _has_user_data(exe_dir):
             _resolved_app_dir = exe_dir
+            _decision = _make_decision(exe_dir, "exe-dir-has-data", exe_dir,
+                                       probe_error=None,
+                                       fallback_has_data=False)
+        elif _is_dir_writable(exe_dir):
+            _resolved_app_dir = exe_dir
+            _decision = _make_decision(exe_dir, "exe-dir-writable", exe_dir,
+                                       probe_error=_last_probe_error,
+                                       fallback_has_data=_has_user_data(
+                                           _user_data_dir()))
         else:
             data = _user_data_dir()
-            os.makedirs(data, exist_ok=True)
+            fallback_has_data = _has_user_data(data)
+            try:
+                os.makedirs(data, exist_ok=True)
+            except Exception:
+                pass
             _resolved_app_dir = data
+            _decision = _make_decision(data, "exe-dir-read-only", exe_dir,
+                                       probe_error=_last_probe_error,
+                                       fallback_has_data=fallback_has_data)
     else:
-        _resolved_app_dir = os.path.dirname(os.path.abspath(__file__))
+        here = os.path.dirname(os.path.abspath(__file__))
+        _resolved_app_dir = here
+        _decision = _make_decision(here, "source", "", probe_error=None,
+                                   fallback_has_data=False)
     return _resolved_app_dir
+
+
+def _make_decision(path: str, reason: str, exe_dir: str, probe_error,
+                   fallback_has_data: bool) -> dict:
+    return {
+        "dir": path,
+        "reason": reason,
+        "probe_error": probe_error,
+        "fallback_has_data": bool(fallback_has_data),
+        "exe_dir": exe_dir,
+    }
+
+
+def app_dir_decision() -> dict:
+    """Return a COPY of how :func:`app_dir` chose its folder, resolving it if
+    that has not happened yet. Keys:
+
+    - ``dir``: the chosen directory (identical to ``app_dir()``).
+    - ``reason``: ``"exe-dir-has-data"`` | ``"exe-dir-writable"`` |
+      ``"exe-dir-read-only"`` | ``"source"``.
+    - ``probe_error``: text of the last write-probe failure, or None. Set on a
+      read-only verdict, and also on a RECOVERED failure (the retry succeeded) —
+      a near miss worth having in the log.
+    - ``fallback_has_data``: the ``%LOCALAPPDATA%`` dir holds config/tokens
+      while the exe dir has none. Informational: it does not change the choice,
+      but it names a forked data set.
+    - ``exe_dir``: the exe's folder (empty when running from source).
+
+    A copy, so a caller that stashes it cannot mutate the module's record.
+    Nothing here logs — this module runs at import, before logging exists; the
+    one caller (fc_gui, right after ``get_logger``) writes the line."""
+    if _resolved_app_dir is None or _decision is None:
+        app_dir()
+    return dict(_decision or {})
 
 
 def bundle_dir() -> str:

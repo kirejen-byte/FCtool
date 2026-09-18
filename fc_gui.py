@@ -97,7 +97,7 @@ from cyno_check import analyze_character as cyno_analyze_character
 from eve_paths import resolve_eve_logs_path, gamelogs_dir_for
 from default_config import DEFAULT_CONFIG
 import tts_helper
-from app_path import app_dir
+from app_path import app_dir, app_dir_decision
 import ship_classes
 import charge_tracker
 import command_bursts
@@ -207,6 +207,34 @@ import overview_templates
 from overview_store import OverviewStore
 
 log = get_logger(__name__)
+
+# Which folder this install reads and writes — config, ESI tokens, caches — and
+# WHY. app_path decides once, at import, and cannot log it itself (it runs
+# before logging exists), so the line is written here, immediately after the
+# file handler is attached. fctool.log lives in app_dir() too, so the log a user
+# sends back is written wherever this decision put it: without the line, an
+# install that fell back to %LOCALAPPDATA% looks, from the user's own folder,
+# exactly like an app that lost their tokens (v6.2.0 field bug). Printed as well
+# — the console build shows stdout.
+_APP_DIR_DECISION = app_dir_decision()
+_APP_DIR_LINE = (
+    "[app_dir] data folder: %s (reason=%s, exe_dir=%s, probe_error=%s, "
+    "fallback_has_data=%s)" % (
+        _APP_DIR_DECISION.get("dir"), _APP_DIR_DECISION.get("reason"),
+        _APP_DIR_DECISION.get("exe_dir"), _APP_DIR_DECISION.get("probe_error"),
+        _APP_DIR_DECISION.get("fallback_has_data")))
+log.info(_APP_DIR_LINE)
+if _APP_DIR_DECISION.get("reason") == "exe-dir-read-only":
+    log.warning(
+        "[app_dir] cannot write next to the exe (%s) after repeated tries: "
+        "%s -- using %s instead. Config and ESI tokens in the exe's folder "
+        "will NOT be read from there.",
+        _APP_DIR_DECISION.get("exe_dir"), _APP_DIR_DECISION.get("probe_error"),
+        _APP_DIR_DECISION.get("dir"))
+try:
+    print(_APP_DIR_LINE)
+except Exception:
+    pass
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
