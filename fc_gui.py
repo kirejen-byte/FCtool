@@ -1302,6 +1302,11 @@ class FCToolGUI:
         # cached_discovered still backs the Settings picker's suggestions.
         self._channels: channel_store.Registry = channel_store.load(self.config)
         self.chat_monitor: ChatMonitor | None = None
+        # The fleet tail's listener-AGNOSTIC twin, used by the range check
+        # alone so the command works from any of the owner's characters (see
+        # _setup_modules). Polled by _chat_poll_loop only while the feature is
+        # on; every other fleet-chat consumer stays on self.chat_monitor.
+        self._range_monitor: ChatMonitor | None = None
         self.xup_counter: XUpCounter | None = None
         # Re-entry guard for the "Import from EVE" (ESI in-game fittings) flow.
         # Set True for the duration of a single import so a second click while
@@ -24342,10 +24347,17 @@ class FCToolGUI:
         _range_check_distance_fn). Doing that work here costs a delayed chat
         poll; doing it on the Tk thread would freeze the whole app.
 
-        Rides the EXISTING fleet tail -- self.chat_monitor, already filtered to
-        the fleet channel by channel_filter -- rather than a second ChatMonitor
-        over the same directory, which would be a second per-poll glob of the
-        chat-log folder (the invariant that says no monitor may do that).
+        Rides its OWN fleet tail -- self._range_monitor, the fleet channel with
+        NO listener filter (see _setup_modules) -- so the command works from any
+        of the owner's characters rather than only the tracked one. That is the
+        owner's 2026-09-18 decision, and the field case behind it: the tracked
+        character was not in the fleet, so the listener-filtered tail never saw
+        the log the command was typed into. Every other fleet-chat consumer
+        stays on the tracked tail. The invariant that says no monitor may glob
+        the chat-log directory per poll is satisfied the way the intel monitor
+        (already a second monitor over that directory) satisfies it: discovery
+        is gated on the directory's mtime with a 300 s backstop, and the poll
+        loop skips this monitor entirely while the feature is switched off.
 
         Gate order, cheapest first, and every one of them a place this feature
         must NOT fire:
@@ -31352,6 +31364,10 @@ class FCToolGUI:
                              "flush_state", None)
         if callable(chat_flush):
             chat_flush()
+        range_flush = getattr(getattr(self, "_range_monitor", None),
+                              "flush_state", None)
+        if callable(range_flush):
+            range_flush()
         if logs_path and os.path.isdir(logs_path):
             channel = xup_cfg.get("channel_name", "Fleet")
             tracked_char = self.config.get("tracked_character", "") or None
@@ -31362,6 +31378,39 @@ class FCToolGUI:
                 listener_filter=tracked_char,
             )
             self.chat_monitor.on_message(self._on_chat_message)
+            # The range check's own tail: the SAME fleet channel with NO
+            # listener filter, so a command typed on any of the owner's
+            # characters is seen even when the tracked character is not in that
+            # fleet (the owner's field case: only Tyreece Arkan was in fleet,
+            # tracked was Securitas Protector, and nothing happened). Every
+            # other consumer of fleet chat -- the x-up counter, the charge
+            # tracker, the links backfill -- deliberately stays on the tracked
+            # tail above.
+            #
+            # A second monitor rather than dropping the filter from the one
+            # above: _poll_once de-duplicates (channel, ts, sender, body)
+            # BEFORE the callbacks, so a shared listener-agnostic tail would
+            # hand each line to the x-up counter once per fleet-sharing alt's
+            # copy being read first, and routing by msg.listener after the
+            # dedupe would drop lines whenever the tracked character's copy was
+            # not read first. Its own state file for the fleet/intel reason
+            # (a monitor rewrites the sidecar whole from its own positions),
+            # and pin_max_idle_s because with no listener filter EVERY
+            # character that has ever had a Fleet log forms its own pin group:
+            # without the bound each retired alt would buy a permanent 1 s
+            # stat. The per-poll-glob invariant holds as it does for the intel
+            # monitor -- discovery is directory-mtime gated with a 300 s
+            # backstop -- and _chat_poll_loop polls this one only while the
+            # feature is switched on.
+            self._range_monitor = ChatMonitor(
+                logs_path=logs_path,
+                poll_interval=self.config.get("poll_interval_seconds", 1.0),
+                channel_filter=channel,
+                listener_filter=None,
+                state_path=chat_monitor.RANGE_STATE_FILE_PATH,
+                pin_max_idle_s=chat_monitor.DISCOVERY_MAX_IDLE_S,
+            )
+            self._range_monitor.on_message(self._range_check_observe)
             # This method also runs on every Settings->Save, so charge the
             # one-shot backfill budget only when the log universe actually
             # changed — see _links_backfill_key in __init__.
@@ -31373,6 +31422,7 @@ class FCToolGUI:
             self._chat_status.config(text=f"CHAT: ON{char_label}", fg=FG_GREEN)
         else:
             self.chat_monitor = None
+            self._range_monitor = None
             # No readable logs path: a budget charged by the PREVIOUS config
             # must not outlive it, or the poller reads a log the settings in
             # force say nothing about.
@@ -31493,6 +31543,16 @@ class FCToolGUI:
         chat_flush = getattr(self.chat_monitor, "flush_state", None)
         if callable(chat_flush):
             chat_flush()
+        # The range check's own tail, polled by the same (now stopped) thread:
+        # same reasoning, same two calls. stop() is inert for poll()-driven use
+        # beyond its own flush, so this is safe on the Settings->Save path that
+        # rebuilds the monitor moments later.
+        range_monitor = getattr(self, "_range_monitor", None)
+        if range_monitor is not None:
+            range_flush = getattr(range_monitor, "flush_state", None)
+            if callable(range_flush):
+                range_flush()
+            range_monitor.stop()
         if self.zkill_monitor:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
@@ -31524,6 +31584,18 @@ class FCToolGUI:
                 monitor = self.chat_monitor
                 if monitor:
                     monitor.poll()
+                # The range check's listener-agnostic twin, polled from this
+                # same thread so nothing new is spawned. Gated on the feature's
+                # OWN master predicate, re-read every pass (the Settings
+                # checkbox autosaves and a Save replaces the whole dict), so a
+                # switched-off range check costs exactly one predicate call per
+                # second instead of a second discovery pass over the Chatlogs
+                # folder. getattr: a host built before __init__ reached the
+                # attribute must still get its tracked-tail poll.
+                if range_check.is_enabled(self.config.get("range_check")):
+                    range_monitor = getattr(self, "_range_monitor", None)
+                    if range_monitor:
+                        range_monitor.poll()
             except Exception:
                 pass
             # Wait on the event, never time.sleep: a stop wakes the thread
@@ -31548,16 +31620,18 @@ class FCToolGUI:
             self._schedule_booster_refresh()
         # Check role tracker letters (must run on main thread for UI updates)
         self._post_ui(self._check_role_letters, msg)
-        # Fleet-chat range check (default OFF), riding the SAME tail rather than
-        # a second ChatMonitor on the same directory — the glob-guard invariant.
-        # LAST on purpose: it is the only consumer here that can do real work
-        # (a window read, then LY distances), and nothing above it may wait on
-        # that. Inert in one predicate call while the feature is switched off.
-        self._range_check_observe(msg)
-        # Fleet-chat refit command, on the same tail and with the same
-        # own-character gate. After the range check because it is the more
-        # expensive of the two on a matching line (it resolves a doctrine),
-        # and because a line can only ever be one of the two.
+        # The fleet-chat RANGE CHECK is deliberately NOT here any more
+        # (2026-09-18): it rides its own listener-agnostic tail, registered in
+        # _setup_modules on self._range_monitor, so the command works from any
+        # of the owner's characters and not only the tracked one. Calling it
+        # from here as well would fire the same line twice.
+        #
+        # Fleet-chat refit command, LAST on purpose: it is the only consumer
+        # here that can do real work (a window read, then a doctrine
+        # resolution), and nothing above it may wait on that. Inert in one
+        # predicate call while the feature is switched off. It stays on the
+        # TRACKED tail by the owner's decision ("Ok to keep other fleet chat
+        # tracking to the tracked character").
         self._refit_observe(msg)
 
     def _on_xup_update(self, state: XUpState):

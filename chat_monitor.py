@@ -66,6 +66,13 @@ STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state.json")
 # replaces the file with the intel ones. Separate files, no shared writer.
 INTEL_STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state_intel.json")
 
+# The RANGE monitor is a third, independent ChatMonitor: the fleet channel with
+# listener_filter=None, so a "range check" typed on ANY of the owner's
+# characters is seen even when the tracked character is not in that fleet. Same
+# rule as above — its own sidecar, because a monitor rewrites the state file
+# whole from its own positions.
+RANGE_STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state_range.json")
+
 # Dedupe TTL - drop duplicate messages (same channel/ts/sender/body) seen within this window.
 DEDUPE_TTL_SECONDS = 60.0
 
@@ -524,12 +531,29 @@ class ChatMonitor:
                  listener_filter: str | None = None,
                  channel_filters: list[str] | None = None,
                  state_path: str | None = None,
-                 dedupe_ttl: float = DEDUPE_TTL_SECONDS):
+                 dedupe_ttl: float = DEDUPE_TTL_SECONDS,
+                 pin_max_idle_s: float | None = None):
         self.logs_path = logs_path
         self.poll_interval = poll_interval
         self.channel_filter = channel_filter
         self.channel_filters = channel_filters  # Multiple channel prefixes
         self.listener_filter = listener_filter  # Character name to track
+        # Upper bound on how idle a group's newest file may be and still hold
+        # the always-fast pin. ``None`` = today's unconditional pin, which is
+        # what the tracked-character fleet monitor and the intel monitor want:
+        # both are scoped to channels/characters the owner is using NOW, and
+        # FCTool is routinely open before EVE, so the newest file is where the
+        # next line will land however old it looks.
+        #
+        # A LISTENER-AGNOSTIC tail cannot afford that. The range-check monitor
+        # tails the fleet channel for every character that has ever had one (17
+        # on the owner's box), so each retired alt would otherwise buy a
+        # permanent 1 s stat for a log last written in 2024. With a limit, a
+        # group's newest file is pinned only while `(now - mtime) <= limit`;
+        # past it the file is simply not pinned and falls under the ordinary
+        # tier/cutoff rules (with the limit set to DISCOVERY_MAX_IDLE_S, that
+        # means the idle cutoff ignores it like any other dead log).
+        self.pin_max_idle_s = pin_max_idle_s
         self._tracked_files: dict[str, ChatLogFile] = {}
         # New-file discovery gate (see _discover_files). Re-globbing the EVE
         # Chatlogs directory is O(files-in-dir) and that directory accumulates one
@@ -752,16 +776,35 @@ class ChatMonitor:
         """
         return _session_sort_key(filepath)
 
+    def _pin_allowed(self, mtime: float, now_wall: float) -> bool:
+        """May a file this idle hold its group's pin? (``pin_max_idle_s``.)
+
+        ``None`` (the default, and both pre-existing monitors) always says yes,
+        so their behaviour is unchanged. The mtime handed in is always the
+        CACHED one — asking the filesystem here would reintroduce the per-file
+        per-pass stat the tiering exists to remove.
+        """
+        limit = self.pin_max_idle_s
+        if limit is None:
+            return True
+        return (now_wall - mtime) <= float(limit)
+
     def _repin_groups(self) -> None:
         """Pin the newest tracked file of every group, unpin the rest.
 
         A newly created file that becomes its group's newest takes the pin over
         and the previous holder drops back to the ordinary tier rules. A file
-        flagged ``pinnable = False`` never competes (see ChatLogFile).
+        flagged ``pinnable = False`` never competes (see ChatLogFile), and
+        neither does one idle past ``pin_max_idle_s`` — so a group whose newest
+        file is stale ends up with no pin at all rather than handing it down to
+        an even older sibling.
         """
+        now_wall = time.time()
         best: dict[tuple[str, str], tuple] = {}
         for filepath, log_file in self._tracked_files.items():
             if not log_file.pinnable:
+                continue
+            if not self._pin_allowed(log_file.last_mtime, now_wall):
                 continue
             rank = log_file.pin_rank
             current = best.get(log_file.group_key)
@@ -944,14 +987,22 @@ class ChatMonitor:
         # a newer sibling is correctly recognised as NOT its group's newest.
         # Files that may not hold a pin are excluded outright — they must not be
         # able to claim a group's "newest" slot and so escape the idle cutoff.
+        # A file the pin-idle bound (pin_max_idle_s) excludes is left out here
+        # too: it may neither claim its group's "newest" slot — which would
+        # exempt it from the cutoff below — nor deny that slot to a live
+        # sibling with an older filename stamp.
         newest: dict[tuple[str, str], tuple] = {}
         for _filepath, log_file in self._tracked_files.items():
             if not log_file.pinnable:
                 continue
+            if not self._pin_allowed(log_file.last_mtime, now_wall):
+                continue
             if log_file.pin_rank > newest.get(log_file.group_key, ()):
                 newest[log_file.group_key] = log_file.pin_rank
-        for _filepath, log_file, _size, _ino, _st_mtime in candidates:
+        for _filepath, log_file, _size, _ino, st_mtime in candidates:
             if not log_file.pinnable:
+                continue
+            if not self._pin_allowed(st_mtime, now_wall):
                 continue
             if log_file.pin_rank > newest.get(log_file.group_key, ()):
                 newest[log_file.group_key] = log_file.pin_rank
@@ -963,8 +1014,12 @@ class ChatMonitor:
             # question (has anything touched this at all), while "newest" is a
             # filename-stamp question (which session is current); the two scales
             # are deliberately different.
+            # ...and "its group's newest" is the PINNABLE newest: a file the
+            # pin-idle bound excludes cannot buy the exemption either (stated
+            # explicitly rather than relying on its absence from `newest`).
             if ((now_wall - st_mtime) > DISCOVERY_MAX_IDLE_S
                     and (not log_file.pinnable
+                         or not self._pin_allowed(st_mtime, now_wall)
                          or log_file.pin_rank
                          != newest.get(log_file.group_key))):
                 self._ignored.add(filepath)
