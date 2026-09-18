@@ -60,6 +60,34 @@ STATE_FILE_PATH = os.path.join(app_dir(), "chat_monitor_state.json")
 # Dedupe TTL - drop duplicate messages (same channel/ts/sender/body) seen within this window.
 DEDUPE_TTL_SECONDS = 60.0
 
+# ── Tiered polling (2026-09-17 uptime-performance work) ─────────────────────
+#
+# A lived-in Chatlogs folder accumulates one file per channel per session
+# forever: the owner's fleet monitor tracked 2,606 `Fleet_*` files and os.stat'ed
+# every one of them once a second (0.5-1.2 s per pass at 462 us/stat), while
+# 2,419 of them had not been written to in 180 days and 18 in the last week.
+# Tracking a file therefore no longer means polling it every second:
+#
+#   FAST tier - activity within ACTIVE_WINDOW_S, plus the PINNED newest file of
+#     every group. Polled at the caller's cadence (1 s), exactly as before, so
+#     message latency for a live log is unchanged. The newest file of a group is
+#     ALWAYS fast however idle it looks (owner's decision): FCTool is routinely
+#     open before EVE, and that file is where the next line will land.
+#   SLOW tier - everything else. Read once every IDLE_POLL_INTERVAL_S and NOT
+#     stat'ed in between; a read that finds new bytes promotes it back to fast.
+#
+# Files idle past DISCOVERY_MAX_IDLE_S are not tracked at all unless they are
+# their group's newest, and a file the filters reject is remembered in
+# ChatMonitor._ignored so a rescan never re-reads its header.
+ACTIVE_WINDOW_S = 600.0
+IDLE_POLL_INTERVAL_S = 30.0
+DISCOVERY_MAX_IDLE_S = 7 * 86400
+# Interval between state-file writes. The 37 KB sidecar used to be rewritten
+# (atomically, so fsync'd) on every pass that saw a chat line; positions are
+# only a replay optimisation, so an interval plus an explicit flush at shutdown
+# (ChatMonitor.flush_state) loses nothing that matters.
+STATE_FLUSH_INTERVAL_S = 30.0
+
 
 class ChatLogFile:
     """Tracks a single chat log file, remembering byte-offset read position."""
@@ -68,6 +96,19 @@ class ChatLogFile:
         self.filepath = filepath
         self.channel_name = ""
         self.listener = ""
+        # Tiering state (see the module-level note). ``last_mtime`` is the wall
+        # clock mtime of the last read that found NEW BYTES (seeded from the
+        # discovery stat), never a bare "somebody touched the file" stamp — an
+        # AV scanner or a cloud-sync agent bumps mtime on logs EVE stopped
+        # writing months ago. ``next_poll_at`` is a time.monotonic() deadline.
+        self.last_mtime: float = 0.0
+        self.next_poll_at: float = 0.0
+        # True for the newest file of its group: always polled at the fast
+        # cadence. Recomputed by ChatMonitor after every discovery pass.
+        self.pinned: bool = False
+        # Channel-prefix + listener identity used for pin selection; set by
+        # ChatMonitor at track time ((prefix, listener) - see _group_key).
+        self.group_key: tuple[str, str] = ("", "")
         # Byte offset into the file (not character offset). We always read in "rb".
         self._last_pos: int = 0
         # Trailing partial text we decoded but haven't emitted because no newline was
@@ -137,6 +178,7 @@ class ChatLogFile:
             st = os.stat(self.filepath)
             st_size = st.st_size
             st_ino = getattr(st, "st_ino", 0) or 0
+            st_mtime = getattr(st, "st_mtime", 0.0) or 0.0
 
             # Sample tail bytes immediately before our last read position. If the
             # file was rewritten, these bytes will differ from what we recorded.
@@ -176,6 +218,11 @@ class ChatLogFile:
             if not raw:
                 # Only a half byte available - nothing to do.
                 return messages
+
+            # New bytes arrived: this file is live, so remember WHEN from the
+            # stat we already performed (never a second stat - the whole point
+            # of the tiering is to stop stat'ing quiet files).
+            self.last_mtime = st_mtime
 
             text = raw.decode("utf-16-le", errors="replace")
 
@@ -436,6 +483,16 @@ class ChatMonitor:
         # since the last scan, with a long safety-net interval as a backstop.
         self._last_dir_mtime: float | None = None
         self._last_full_scan_monotonic: float = 0.0
+        # Paths that matched the prefix glob but were REJECTED at discovery: a
+        # different listener, or idle past DISCOVERY_MAX_IDLE_S with a newer
+        # sibling holding their group. A rescan skips these without opening
+        # them — re-reading every rejected file's 4 KB header is what made the
+        # backstop re-glob cost 3-4 s on the owner's box. Bounded by the number
+        # of prefix-matched files, not by the whole directory. A file whose
+        # header could not be READ is deliberately NOT ignored: the filter can
+        # only exclude what it positively read (the find_current_session_file
+        # rule), so a transiently unopenable log is retried on the next scan.
+        self._ignored: set[str] = set()
         self._callbacks: list[Callable[[ChatMessage], None]] = []
         self._running = False
 
@@ -477,6 +534,46 @@ class ChatMonitor:
 
     def stop(self):
         self._running = False
+        # The per-pass flush is throttled (STATE_FLUSH_INTERVAL_S), so the
+        # positions of the last interval only survive a teardown because of
+        # this. stop() is inert for poll()-driven use otherwise, which is why
+        # fc_gui also calls flush_state() where it drops a monitor without
+        # stopping it (a tracked-character change, a Settings->Save rebuild).
+        self.flush_state()
+
+    def flush_state(self) -> None:
+        """Persist the tail positions NOW if anything is pending (no throttle).
+
+        The explicit "we are going away" seam: called by :meth:`stop` and by
+        fc_gui at shutdown and wherever a live monitor is replaced. Safe to
+        call from another thread than the poller — ``_save_state`` snapshots
+        the dict before serialising it.
+        """
+        if not self._state_dirty:
+            return
+        self._save_state()
+        self._last_state_flush = time.time()
+        self._state_dirty = False
+
+    def tier_of(self, filepath: str) -> str:
+        """``"fast"`` or ``"slow"`` for a tracked path (observability seam).
+
+        Fast = pinned (its group's newest) or new bytes seen within
+        ACTIVE_WINDOW_S. An untracked or ignored path reads as ``"slow"``:
+        nothing polls it at all.
+        """
+        log_file = self._tracked_files.get(filepath)
+        if log_file is None:
+            return "slow"
+        return "fast" if self._is_fast(log_file, time.time()) else "slow"
+
+    @staticmethod
+    def _is_fast(log_file: "ChatLogFile", now_wall: float) -> bool:
+        """Tier decision. Uses the CACHED mtime by design — asking the
+        filesystem here would reintroduce the per-file per-pass stat that the
+        tiering exists to remove."""
+        return (log_file.pinned
+                or (now_wall - log_file.last_mtime) < ACTIVE_WINDOW_S)
 
     def get_available_listeners(self, max_age_days: int = 7) -> list[str]:
         """Scan log files to find all character names (listeners) with fleet channels.
@@ -518,9 +615,56 @@ class ChatMonitor:
     # Backstop: force a full directory re-glob at least this often even when the
     # directory mtime looks unchanged, so a new file is still discovered on any
     # exotic filesystem whose directory mtime does not advance on file creation
-    # (or when two events land within one mtime tick). 60 s bounds worst-case
-    # new-channel latency while cutting the per-second glob by ~60x.
-    _DIR_RESCAN_INTERVAL_SECONDS = 60.0
+    # (or when two events land within one mtime tick). The interval is 300 s
+    # rather than the original 60 s because the mtime gate already catches every
+    # real creation: this only has to cover a filesystem that does not move the
+    # directory mtime at all, and each firing walks the whole Chatlogs folder
+    # (3-4 s on the owner's 54,667-file directory before the ignore set).
+    _DIR_RESCAN_INTERVAL_SECONDS = 300.0
+
+    def _group_key(self, filepath: str, listener: str | None) -> tuple[str, str]:
+        """(channel prefix as matched, listener) — the pin selection scope.
+
+        One group per channel per character, so a multi-boxer's newest copy of
+        each tracked channel is pinned independently (the intel monitor runs
+        with ``listener_filter=None`` and takes the listener from the header).
+        Both halves are lowercased because every filter in this module matches
+        case-insensitively.
+        """
+        basename = os.path.basename(filepath).lower()
+        prefix = ""
+        for candidate in (self.channel_filters or []):
+            lowered = (candidate or "").lower()
+            if lowered and basename.startswith(lowered):
+                prefix = lowered
+                break
+        if not prefix and self.channel_filter:
+            lowered = self.channel_filter.lower()
+            if basename.startswith(lowered):
+                prefix = lowered
+        return (prefix, (listener or "").strip().lower())
+
+    @staticmethod
+    def _pin_rank(mtime: float, filepath: str) -> tuple:
+        """Ordering for "newest in the group": mtime, then path as a
+        deterministic tiebreak (lexicographically greatest wins)."""
+        return (mtime, filepath)
+
+    def _repin_groups(self) -> None:
+        """Pin the newest tracked file of every group, unpin the rest.
+
+        A newly created file that becomes its group's newest takes the pin over
+        and the previous holder drops back to the ordinary tier rules.
+        """
+        best: dict[tuple[str, str], tuple] = {}
+        for filepath, log_file in self._tracked_files.items():
+            rank = self._pin_rank(log_file.last_mtime, filepath)
+            current = best.get(log_file.group_key)
+            if current is None or rank > current[0]:
+                best[log_file.group_key] = (rank, filepath)
+        winners = {filepath for _rank, filepath in best.values()}
+        for filepath, log_file in self._tracked_files.items():
+            log_file.pinned = filepath in winners
 
     def _discover_files(self):
         """Find chat log files matching the channel and listener filters.
@@ -560,8 +704,14 @@ class ChatMonitor:
         else:
             all_files = all_txt
 
+        now_wall = time.time()
+
+        # Pass 1: probe every NOT-yet-known candidate exactly once — its 4 KB
+        # header (for the listener) and ONE stat (mtime/size/inode). Files
+        # already tracked or already in _ignored never reach this.
+        candidates: list[tuple] = []
         for filepath in all_files:
-            if filepath in self._tracked_files:
+            if filepath in self._tracked_files or filepath in self._ignored:
                 continue
             basename = os.path.basename(filepath)
             if self.channel_filter:
@@ -578,21 +728,54 @@ class ChatMonitor:
             except OSError:
                 pass
 
-            # If a listener (character) filter is set, skip files from other characters
+            # If a listener (character) filter is set, skip files from other
+            # characters — and REMEMBER them, so no later rescan re-reads this
+            # header. A file whose header could not be read has an empty
+            # listener and is kept (retried), never ignored.
             if self.listener_filter and log_file.listener:
                 if log_file.listener.lower() != self.listener_filter.lower():
+                    self._ignored.add(filepath)
                     continue
 
-            # Seed position. For a previously-seen file, resume from persisted state;
-            # otherwise jump to EOF so we don't replay a day's history.
             try:
                 st = os.stat(filepath)
                 st_size = st.st_size
                 st_ino = getattr(st, "st_ino", 0) or 0
+                st_mtime = getattr(st, "st_mtime", 0.0) or 0.0
             except OSError:
                 st_size = 0
                 st_ino = 0
+                st_mtime = 0.0
 
+            log_file.group_key = self._group_key(filepath, log_file.listener)
+            log_file.last_mtime = st_mtime
+            candidates.append((filepath, log_file, st_size, st_ino, st_mtime))
+
+        # Pass 2: newest (mtime, path) per group across the new candidates AND
+        # the files already tracked, so a long-idle newcomer with a newer
+        # sibling is correctly recognised as NOT its group's newest.
+        newest: dict[tuple[str, str], tuple] = {}
+        for filepath, log_file in self._tracked_files.items():
+            rank = self._pin_rank(log_file.last_mtime, filepath)
+            if rank > newest.get(log_file.group_key, ()):
+                newest[log_file.group_key] = rank
+        for filepath, log_file, _size, _ino, st_mtime in candidates:
+            rank = self._pin_rank(st_mtime, filepath)
+            if rank > newest.get(log_file.group_key, ()):
+                newest[log_file.group_key] = rank
+
+        for filepath, log_file, st_size, st_ino, st_mtime in candidates:
+            # A file nobody has written to in DISCOVERY_MAX_IDLE_S is dead
+            # history — unless it is its group's newest, which is the one file
+            # that must stay live even when it looks ancient.
+            if ((now_wall - st_mtime) > DISCOVERY_MAX_IDLE_S
+                    and self._pin_rank(st_mtime, filepath)
+                    != newest.get(log_file.group_key)):
+                self._ignored.add(filepath)
+                continue
+
+            # Seed position. For a previously-seen file, resume from persisted state;
+            # otherwise jump to EOF so we don't replay a day's history.
             key = self._state_key(filepath)
             prior = self._persisted_state.get(key)
             resume_pos = st_size  # default: skip to EOF for unknown files
@@ -612,22 +795,47 @@ class ChatMonitor:
 
             log_file._last_pos = resume_pos
             log_file._last_ino = st_ino
+            # A file discovered already idle has just consumed its stat and has
+            # nothing pending (its tail sits at EOF), so hand it a full slow
+            # slot rather than reading it on this pass. Pinning is applied
+            # below and overrides this anyway.
+            if (not self._is_fast(log_file, now_wall)) and resume_pos >= st_size:
+                log_file.next_poll_at = now_monotonic + IDLE_POLL_INTERVAL_S
 
             self._tracked_files[filepath] = log_file
 
+        # The newest tracked file of each group is always polled at the fast
+        # cadence; a new session file takes the pin over from its predecessor.
+        self._repin_groups()
+
     def _poll_once(self) -> list[ChatMessage]:
-        """Single poll cycle: discover new files and read new messages."""
+        """Single poll cycle: discover new files and read the due ones.
+
+        "Due" is the tiering rule (see the module-level note): pinned files and
+        files with recent activity are read every pass; everything else is read
+        once per IDLE_POLL_INTERVAL_S and is not even stat'ed in between, since
+        the stat that decides the tier is the CACHED one from its last read.
+        """
         self._discover_files()
         all_messages: list[ChatMessage] = []
-        had_activity = False
 
         # Evict stale dedupe entries once per poll.
         self._evict_dedupe()
 
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+
         for log_file in self._tracked_files.values():
+            fast = self._is_fast(log_file, now_wall)
+            if not fast and now_monotonic < log_file.next_poll_at:
+                continue            # slow tier, not its slot: no stat, no read
             raw_messages = log_file.read_new_lines()
+            if not fast:
+                # Next slot is measured from the read we just did, whether or
+                # not it found anything. A read that DID find new bytes has
+                # refreshed last_mtime, so the file is fast again regardless.
+                log_file.next_poll_at = now_monotonic + IDLE_POLL_INTERVAL_S
             if raw_messages:
-                had_activity = True
                 # Update persisted state for this file.
                 self._persisted_state[self._state_key(log_file.filepath)] = {
                     "last_pos": log_file._last_pos,
@@ -641,9 +849,13 @@ class ChatMonitor:
                     continue
                 all_messages.append(msg)
 
-        # Flush state: after any activity, or periodically every ~30s.
+        # Flush state on an INTERVAL, never per active pass: the sidecar was
+        # rewritten (atomically, so fsync'd) on every pass that saw a chat line,
+        # which during a busy fleet meant a 37 KB fsync every second. Positions
+        # are a replay optimisation, and flush_state() covers the teardown.
         now = time.time()
-        if self._state_dirty and (had_activity or (now - self._last_state_flush) > 30.0):
+        if (self._state_dirty
+                and (now - self._last_state_flush) >= STATE_FLUSH_INTERVAL_S):
             self._save_state()
             self._last_state_flush = now
             self._state_dirty = False
@@ -703,9 +915,13 @@ class ChatMonitor:
             pass
         try:
             # Preserve the original compact (no-indent) JSON formatting.
+            # dict() is a C-level copy (atomic under the GIL): flush_state() can
+            # be called from the Tk thread while the poll thread is mutating
+            # _persisted_state, and serialising the live dict would then raise
+            # "dictionary changed size during iteration".
             atomic_write_json(
                 self._state_path,
-                self._persisted_state,
+                dict(self._persisted_state),
                 indent=None,
                 ensure_ascii=True,
             )

@@ -30378,6 +30378,13 @@ class FCToolGUI:
         if logs_path and os.path.isdir(logs_path):
             channel = self.config.get("xup", {}).get("channel_name", "Fleet")
             tracked_char = new_tracked or None
+            # The monitor about to be dropped may hold up to
+            # chat_monitor.STATE_FLUSH_INTERVAL_S of unpersisted tail positions
+            # (the flush is throttled); persist them before replacing it.
+            chat_flush = getattr(getattr(self, "chat_monitor", None),
+                                 "flush_state", None)
+            if callable(chat_flush):
+                chat_flush()
             # Replace existing chat monitor in-place so _chat_poll_loop keeps working
             self.chat_monitor = ChatMonitor(
                 logs_path=logs_path,
@@ -31212,6 +31219,14 @@ class FCToolGUI:
 
         # Chat Monitor
         logs_path = self.config.get("eve_logs_path", "")
+        # This also runs on every Settings->Save, which REPLACES the monitor:
+        # flush the outgoing one's tail positions first (the per-pass flush is
+        # throttled), or its successor re-tails what it already delivered.
+        # Guarded — there is no monitor yet on the __init__ pass.
+        chat_flush = getattr(getattr(self, "chat_monitor", None),
+                             "flush_state", None)
+        if callable(chat_flush):
+            chat_flush()
         if logs_path and os.path.isdir(logs_path):
             channel = xup_cfg.get("channel_name", "Fleet")
             tracked_char = self.config.get("tracked_character", "") or None
@@ -31345,6 +31360,14 @@ class FCToolGUI:
         if (t is not None and t.is_alive()
                 and t is not threading.current_thread()):
             t.join(timeout=2.0)
+        # Persist the tail positions now that the poller has stopped: the
+        # per-pass state flush is throttled (chat_monitor.STATE_FLUSH_INTERVAL_S),
+        # so without this the last interval of positions dies here and the next
+        # monitor re-tails — and re-delivers — up to that much of every file.
+        # Guarded: chat_monitor is None with no readable logs path.
+        chat_flush = getattr(self.chat_monitor, "flush_state", None)
+        if callable(chat_flush):
+            chat_flush()
         if self.zkill_monitor:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
