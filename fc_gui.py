@@ -219,10 +219,11 @@ log = get_logger(__name__)
 _APP_DIR_DECISION = app_dir_decision()
 _APP_DIR_LINE = (
     "[app_dir] data folder: %s (reason=%s, exe_dir=%s, probe_error=%s, "
-    "fallback_has_data=%s)" % (
+    "fallback_has_data=%s, writable=%s)" % (
         _APP_DIR_DECISION.get("dir"), _APP_DIR_DECISION.get("reason"),
         _APP_DIR_DECISION.get("exe_dir"), _APP_DIR_DECISION.get("probe_error"),
-        _APP_DIR_DECISION.get("fallback_has_data")))
+        _APP_DIR_DECISION.get("fallback_has_data"),
+        _APP_DIR_DECISION.get("writable")))
 log.info(_APP_DIR_LINE)
 if _APP_DIR_DECISION.get("reason") == "exe-dir-read-only":
     log.warning(
@@ -242,6 +243,16 @@ if (_APP_DIR_DECISION.get("reason") == "exe-dir-has-data"
         "read; move or delete that copy once you have confirmed which one you "
         "want.",
         _APP_DIR_DECISION.get("dir"), _APP_DIR_DECISION.get("fallback_dir"))
+# The data folder is ours to read but NOT to write: the app starts, shows the
+# real config and characters, and then every save fails quietly (_save_config
+# only logs, and app_log swallows a file-handler failure). Windows Controlled
+# Folder Access does exactly this until the user allows the exe.
+if not _APP_DIR_DECISION.get("writable", True):
+    log.warning(
+        "[app_dir] FCTool found your data in %s but cannot write there (%s); "
+        "settings and sign-ins will not be saved until the folder is writable "
+        "(Windows Ransomware protection: allow FCTool.exe).",
+        _APP_DIR_DECISION.get("dir"), _APP_DIR_DECISION.get("probe_error"))
 try:
     print(_APP_DIR_LINE)
 except Exception:

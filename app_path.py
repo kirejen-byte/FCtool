@@ -28,18 +28,29 @@ _sleep = time.sleep
 _CONFIG_NAME = "config.json"
 _TOKENS_PREFIX = "esi_tokens_"
 _TOKENS_SUFFIX = ".json"
+#: The pre-multi-character token file (``esi_auth.TOKEN_FILE``). Still the only
+#: sign-in an install upgraded from an old version may have, so a folder holding
+#: it is just as much OUR folder as one holding ``esi_tokens_<name>.json``.
+_LEGACY_TOKENS_NAME = "esi_tokens.json"
+
+#: Name prefix of the write-probe file (see :func:`_probe_once`). Everything
+#: starting with it is ours and disposable — including v6.2.0's fixed-name
+#: ``.fctool_write_test``, left behind whenever a crash beat ``os.remove``.
+_PROBE_PREFIX = ".fctool_write_test"
 
 
 def _has_user_data(path: str) -> bool:
-    """True if ``path`` already holds this app's user data — ``config.json`` or
-    any ``esi_tokens_*.json``. Never raises: an unreadable or missing directory
-    is simply 'no data here'."""
+    """True if ``path`` already holds this app's user data — ``config.json``,
+    the legacy ``esi_tokens.json`` or any ``esi_tokens_*.json``. Never raises:
+    an unreadable or missing directory is simply 'no data here'."""
     try:
         if os.path.isfile(os.path.join(path, _CONFIG_NAME)):
             return True
         with os.scandir(path) as entries:
             for entry in entries:
                 name = entry.name
+                if name == _LEGACY_TOKENS_NAME:
+                    return True
                 if (name.startswith(_TOKENS_PREFIX)
                         and name.endswith(_TOKENS_SUFFIX)):
                     return True
@@ -48,13 +59,33 @@ def _has_user_data(path: str) -> bool:
     return False
 
 
+def _sweep_stale_probes(path: str) -> None:
+    """Best-effort removal of probe files an earlier run left behind (a crash
+    or a kill between the write and the ``os.remove``, or v6.2.0's fixed-name
+    probe). Purely cosmetic — the app works with them there — so every failure
+    is swallowed: this must never turn a writable folder into a failed run."""
+    try:
+        mine = "%s.%d" % (_PROBE_PREFIX, os.getpid())
+        with os.scandir(path) as entries:
+            for entry in entries:
+                name = entry.name
+                if name == mine or not name.startswith(_PROBE_PREFIX):
+                    continue
+                try:
+                    os.remove(os.path.join(path, name))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _probe_once(path: str) -> None:
     """One write probe: create the dir if needed, then write and remove a probe
     file. Raises on any failure — the caller decides whether one failure is
     decisive. The probe name carries this process's pid so a stale probe left
     by a crashed run can never collide with ours."""
     os.makedirs(path, exist_ok=True)
-    probe = os.path.join(path, ".fctool_write_test.%d" % os.getpid())
+    probe = os.path.join(path, "%s.%d" % (_PROBE_PREFIX, os.getpid()))
     with open(probe, "w") as fh:
         fh.write("")
     os.remove(probe)
@@ -80,6 +111,7 @@ def _is_dir_writable(path: str, attempts: int = _PROBE_ATTEMPTS,
     for attempt in range(attempts):
         try:
             _probe_once(path)
+            _sweep_stale_probes(path)
             return True
         except Exception as exc:
             _last_probe_error = "%s: %s" % (type(exc).__name__, exc)
@@ -105,19 +137,26 @@ def app_dir() -> str:
     Frozen exe, in order — **data wins wherever it lives**, and only a pair of
     empty folders is settled by a write probe:
 
-    1. **The exe's folder when it already holds our data** (``config.json`` or
-       any ``esi_tokens_*.json``) — no probe, no conditions. A folder holding
-       our data IS our folder; a save that later fails surfaces through the
-       normal save-failure path instead of silently forking the data set onto a
-       second, empty copy. (Field bug, v6.2.0: one failed probe sent users to an
-       empty ``%LOCALAPPDATA%\\FCTool`` — default config, no tokens, and the log
-       that could have explained it written there too.)
+    1. **The exe's folder when it already holds our data** (``config.json``,
+       ``esi_tokens.json`` or any ``esi_tokens_*.json``) — no conditions. A
+       folder holding our data IS our folder; a save that later fails surfaces
+       through the normal save-failure path instead of silently forking the data
+       set onto a second, empty copy. (Field bug, v6.2.0: one failed probe sent
+       users to an empty ``%LOCALAPPDATA%\\FCTool`` — default config, no tokens,
+       and the log that could have explained it written there too.)
     2. **The ``%LOCALAPPDATA%\\FCTool`` fallback when IT holds our data** and the
-       exe's folder holds none — no probe. This is the same field bug through
-       the other door: a first run that fell back (probe blocked) and then
-       signed in has the user's ONLY config and tokens down there, so a probe
-       that succeeds today must not send them to the empty exe folder and lose
-       the lot a second time.
+       exe's folder holds none. This is the same field bug through the other
+       door: a first run that fell back (probe blocked) and then signed in has
+       the user's ONLY config and tokens down there, so a probe that succeeds
+       today must not send them to the empty exe folder and lose the lot a
+       second time.
+
+       Both data rules still RUN the retried probe on the folder they picked,
+       purely to report it (``writable``/``probe_error``): the probe can no
+       longer move us, but a folder that is PERMANENTLY blocked — Controlled
+       Folder Access until the user allows the exe — reads the tokens fine and
+       then fails every save with nothing in any log to say so, because
+       ``fctool.log`` lives in that same folder.
     3. **The exe's folder when a RETRIED write probe succeeds** (portable
        install) — both folders are empty, so this is a fresh install and the
        portable layout is preserved with no migration.
@@ -141,42 +180,57 @@ def app_dir() -> str:
         data = _user_data_dir()
         if _has_user_data(exe_dir):
             # Both may hold data; the exe dir wins and the flag names the
-            # second set so the startup log can warn about it.
+            # second set so the startup log can warn about it. The probe runs
+            # anyway — it cannot change the choice, only REPORT it: a folder
+            # that is permanently blocked (Controlled Folder Access) reads the
+            # tokens fine and fails every save silently otherwise.
             _resolved_app_dir = exe_dir
+            # Probe FIRST, into a local: `_last_probe_error` is only meaningful
+            # once the probe has run.
+            writable = _is_dir_writable(exe_dir)
             _decision = _make_decision(exe_dir, "exe-dir-has-data", exe_dir,
-                                       data, probe_error=None,
-                                       fallback_has_data=_has_user_data(data))
+                                       data,
+                                       probe_error=_last_probe_error,
+                                       fallback_has_data=_has_user_data(data),
+                                       writable=writable)
         elif _has_user_data(data):
             # The exe dir is empty and the fallback is not: this user's data
-            # lives down there. Never probe — there is nothing to decide.
+            # lives down there. The probe cannot move us — same report-only
+            # role as above.
             _resolved_app_dir = data
+            writable = _is_dir_writable(data)
             _decision = _make_decision(data, "fallback-has-data", exe_dir,
-                                       data, probe_error=None,
-                                       fallback_has_data=True)
+                                       data, probe_error=_last_probe_error,
+                                       fallback_has_data=True,
+                                       writable=writable)
         elif _is_dir_writable(exe_dir):
             _resolved_app_dir = exe_dir
             _decision = _make_decision(exe_dir, "exe-dir-writable", exe_dir,
                                        data, probe_error=_last_probe_error,
-                                       fallback_has_data=False)
+                                       fallback_has_data=False, writable=True)
         else:
             try:
                 os.makedirs(data, exist_ok=True)
             except Exception:
                 pass
             _resolved_app_dir = data
+            # `writable` describes the CHOSEN dir and the fallback was never
+            # probed, so it stays True: the failure that matters here is the
+            # exe dir's, and it already has its own warning.
             _decision = _make_decision(data, "exe-dir-read-only", exe_dir,
                                        data, probe_error=_last_probe_error,
-                                       fallback_has_data=False)
+                                       fallback_has_data=False, writable=True)
     else:
         here = os.path.dirname(os.path.abspath(__file__))
         _resolved_app_dir = here
         _decision = _make_decision(here, "source", "", "", probe_error=None,
-                                   fallback_has_data=False)
+                                   fallback_has_data=False, writable=True)
     return _resolved_app_dir
 
 
 def _make_decision(path: str, reason: str, exe_dir: str, fallback_dir: str,
-                   probe_error, fallback_has_data: bool) -> dict:
+                   probe_error, fallback_has_data: bool,
+                   writable: bool = True) -> dict:
     return {
         "dir": path,
         "reason": reason,
@@ -184,6 +238,7 @@ def _make_decision(path: str, reason: str, exe_dir: str, fallback_dir: str,
         "fallback_has_data": bool(fallback_has_data),
         "exe_dir": exe_dir,
         "fallback_dir": fallback_dir,
+        "writable": bool(writable),
     }
 
 
@@ -195,9 +250,15 @@ def app_dir_decision() -> dict:
     - ``reason``: ``"exe-dir-has-data"`` | ``"fallback-has-data"`` |
       ``"exe-dir-writable"`` | ``"exe-dir-read-only"`` | ``"source"``.
     - ``probe_error``: text of the last write-probe failure, or None. Set on a
-      read-only verdict, and also on a RECOVERED failure (the retry succeeded) —
-      a near miss worth having in the log. None whenever data settled the
-      choice, because then nothing was probed.
+      read-only verdict, on a RECOVERED failure (the retry succeeded — a near
+      miss worth having in the log), and on a data-branch folder that failed its
+      report-only probe.
+    - ``writable``: the CHOSEN folder passed its retried write probe. False only
+      where the chosen folder was probed and failed — i.e. a data branch whose
+      folder we can read but not write (the app runs, nothing ever saves). True
+      for ``"source"`` and for ``"exe-dir-read-only"``, where the chosen folder
+      was never probed (there the exe dir's failure is the one that matters, and
+      it has ``probe_error`` and its own warning).
     - ``fallback_has_data``: the ``%LOCALAPPDATA%`` dir holds config/tokens.
       True for ``"fallback-has-data"`` (where it MADE the choice) and for an
       ``"exe-dir-has-data"`` run where both folders hold a set — there the exe
@@ -209,9 +270,16 @@ def app_dir_decision() -> dict:
     A copy, so a caller that stashes it cannot mutate the module's record.
     Nothing here logs — this module runs at import, before logging exists; the
     one caller (fc_gui, right after ``get_logger``) writes the line."""
-    if _resolved_app_dir is None or _decision is None:
+    if _resolved_app_dir is None:
         app_dir()
-    return dict(_decision or {})
+    if _decision is None:
+        # The dir was resolved without a decision being recorded (a test reset,
+        # or a future caller that sets the cache directly). Never hand back an
+        # empty dict — the log line would read `dir=None` and name no folder at
+        # all, which is exactly the blindness this record exists to cure.
+        return _make_decision(_resolved_app_dir or "", "unknown", "", "",
+                              probe_error=None, fallback_has_data=False)
+    return dict(_decision)
 
 
 def bundle_dir() -> str:
