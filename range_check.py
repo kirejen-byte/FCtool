@@ -1499,9 +1499,14 @@ LABEL_BLOPS = "Blops"
 #: display scaling upward the rightmost cells were clipped at the window edge
 #: with no tell. The ceiling is now scaled by the same factor
 #: (``client_toast.scaled_bounds``; the live value is ``RangeToast.max_size``),
-#: and across a 0.01-step sweep of tk scaling 1.0..3.0 the slack under that
-#: ceiling never drops below 24px ABOVE the baseline — tightest at 1.509,
-#: where the Consolas 9pt advance steps 7px -> 8px.
+#: and RE-MEASURED 2026-09-19 over a 0.01-step sweep of tk scaling 1.0..4.0
+#: (plus a 0.001-step pass over 1.330..1.760) the slack under that ceiling
+#: never drops below the 17px it already has AT the baseline. Above the
+#: baseline it is still 17px at 1.334 — the ceiling's rounding has not yet
+#: ticked past 760 while the grid is unchanged at 743 — and the tightest
+#: trough at a CONTENT step is 20px at 1.501, where the Consolas 9pt advance
+#: steps 7px -> 8px and the grid jumps 751 -> 836 (the runners-up are 24px at
+#: 1.509 and 41px at 1.390).
 #:
 #: A FIFTH hull is a deliberate layout call even so: the 17px of baseline
 #: slack is the binding constraint and it is the SMALLEST slack anywhere on
@@ -1900,6 +1905,14 @@ def row_note(row) -> str:
 #: the long word that is lost but the whole line, clipped at the window edge
 #: with no ellipsis to say so. Clipping HERE keeps the rest of the line
 #: readable, which is the half that carries the meaning.
+#:
+#: This clip is a GLANCEABILITY bound, not the fitting one, and 2026-09-19
+#: measurement says so: a line may carry ``MAX_PROVENANCE_NAMES`` clipped
+#: names (234 chars = 1,196px of 7pt text at the 96-dpi baseline) or
+#: ``MAX_IGNORED_NAMES`` clipped phrases each with a clipped retype tail (268
+#: chars = 1,366px), both far past a 760px ceiling that no clip-per-name can
+#: bring back. What keeps a disclosure line ON SCREEN is the render-side
+#: ``wraplength`` in ``RangeToast._build``.
 MAX_DISCLOSED_CHARS = 32
 
 
@@ -2076,6 +2089,16 @@ _GRID_SPAN = _COL_DISTANCE + 1
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
 _FONT = "Consolas"
+#: Horizontal distance between a packed disclosure label's TEXT and the toast's
+#: own measured width, so ``_build`` can turn the effective ceiling into a
+#: ``wraplength``. MEASURED 2026-09-19, and px at every scaling (a bare Tk
+#: screen distance is pixels — only fonts and ``p`` units follow tk scaling):
+#: the Label's own 6px of border + internal padding, its 8+8 ``pack`` padx
+#: inside ``inner``, ``inner``'s own 1+1 padx for the accent border, and the
+#: +2 ``_measure`` adds = 26px. One more px on top, so a line that wraps
+#: exactly at the limit still lands STRICTLY inside the ceiling instead of on
+#: it — ``size == max_size`` is this window's word for "clamped", i.e. clipped.
+_DISCLOSURE_WRAP_INSET_PX = 27
 
 
 class RangeToast:
@@ -2123,6 +2146,14 @@ class RangeToast:
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         self._clickable.extend([self.top, inner])
 
+        # The effective ceiling is resolved BEFORE the widgets exist, not in
+        # ``_measure`` after them: the two disclosure lines WRAP at it (see
+        # ``_build``), and a wraplength cannot be applied to a label that has
+        # already been laid out and measured. It is also what makes
+        # ``max_size`` safe to read at any point in this object's life,
+        # including after ``_measure``'s TclError path returns the floors.
+        self._max_w, self._max_h = scaled_bounds(self.top, MAX_W, MAX_H)
+
         self._build(inner, accent, max_rows)
 
         # Measure while STILL WITHDRAWN — an idle flush here cannot flash the
@@ -2150,21 +2181,36 @@ class RangeToast:
         rule.pack(fill="x", padx=8)
         self._clickable.append(rule)
 
+        # Both disclosure lines WRAP at the effective ceiling instead of being
+        # cut off by the window edge. ``_clip`` bounds ONE name at
+        # ``MAX_DISCLOSED_CHARS``, but a line carries up to
+        # ``MAX_PROVENANCE_NAMES`` of them (or ``MAX_IGNORED_NAMES`` phrases
+        # each with a "(type it as X)" tail), and MEASURED 2026-09-19 the
+        # longest such line is 234 / 268 characters = 1,196px / 1,366px of 7pt
+        # text at the 96-dpi baseline against a 760px ceiling — clipped at
+        # EVERY display scaling, the ceiling scaled or not, and what is lost
+        # is the end of the line with no ellipsis to say so. A wraplength
+        # cures it by construction: a line that fits is laid out exactly as
+        # before, one that does not spills onto a second row (the height has
+        # ~320px of slack where the width has 17px). ``justify="left"`` is
+        # already the house style for these labels, so a wrapped line reads as
+        # a continuation rather than as centred prose.
+        wrap = max(1, self._max_w - _DISCLOSURE_WRAP_INSET_PX)
         # Directly under the title, because it explains the table below it: a
         # report whose sources came from the message must SAY so, degraded or
         # not (see ``provenance_line``).
         provenance = provenance_line(report)
         if provenance:
-            self._label(inner, provenance, FG_DIM, size=7).pack(
-                fill="x", padx=8, pady=(3, 0))
+            self._label(inner, provenance, FG_DIM, size=7,
+                        wraplength=wrap).pack(fill="x", padx=8, pady=(3, 0))
         # Its mirror, same dim treatment and the same header slot, so it
         # survives a degraded report: what the message named and the gate
         # refused. Never red/green — in this window those two colours mean
         # out-of-range / in-range and nothing else, and this is an advisory.
         ignored = ignored_line(report)
         if ignored:
-            self._label(inner, ignored, FG_DIM, size=7).pack(
-                fill="x", padx=8, pady=(3, 0))
+            self._label(inner, ignored, FG_DIM, size=7,
+                        wraplength=wrap).pack(fill="x", padx=8, pady=(3, 0))
 
         body = tk.Frame(inner, bg=BG_PANEL)
         body.pack(fill="both", expand=True, padx=8, pady=(4, 0))
@@ -2254,13 +2300,13 @@ class RangeToast:
         Measuring keeps the two in the same relationship rather than hard-coding
         a box the content may not fit in.
 
-        ``MAX_W``/``MAX_H`` are the 96-dpi figures, so the ceiling is resolved
-        through ``scaled_bounds`` FIRST: the labels are point-sized and grow
-        with the monitor, and a fixed px ceiling turns that growth into a
-        silently clipped hull verdict from ~125% Windows scaling upward. The
-        result is cached on the instance and published as ``max_size``, so a
-        caller (and a test) can tell "fits" from "clamped"."""
-        self._max_w, self._max_h = scaled_bounds(self.top, MAX_W, MAX_H)
+        ``MAX_W``/``MAX_H`` are the 96-dpi figures, so the ceiling this floors
+        against is the DPI-scaled one resolved in ``__init__`` (before
+        ``_build``, which wraps the disclosure lines at it): the labels are
+        point-sized and grow with the monitor, and a fixed px ceiling turns
+        that growth into a silently clipped hull verdict from ~125% Windows
+        scaling upward. It is published as ``max_size``, so a caller (and a
+        test) can tell "fits" from "clamped"."""
         try:
             self.top.update_idletasks()
             w = int(self.top.winfo_reqwidth())

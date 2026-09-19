@@ -137,7 +137,13 @@ def dpi_scale(widget, baseline=BASELINE_SCALING):
     try:
         scaling = float(widget.tk.call("tk", "scaling"))
         base = float(baseline)
-    except Exception:
+    except (AttributeError, TypeError, ValueError, RuntimeError, tk.TclError):
+        # The documented cases, each named: no ``tk`` attribute (None, a stub,
+        # a fake widget) -> AttributeError; a destroyed widget or a foreign
+        # interpreter -> tk.TclError; Tkinter called off the main loop ->
+        # RuntimeError; a junk scaling string or a junk baseline -> ValueError
+        # / TypeError. Narrow, but still total for everything this seam can
+        # actually be handed.
         return 1.0
     if not math.isfinite(scaling) or scaling <= 0:
         return 1.0
@@ -160,16 +166,22 @@ def scaled_bounds(widget, max_w, max_h, baseline=BASELINE_SCALING):
     Scaling the ceiling by the same factor the fonts scale by keeps the
     ceiling doing its ONE job — stopping absurd content (a 500-char pasted
     token, a long config string) growing a screen-wide window — without it
-    also clipping the content it was sized to fit. Across a 0.01-step sweep of
-    tk scaling 1.0..3.0 the range toast's slack under the scaled ceiling never
-    drops below 24px ABOVE the baseline (tightest at 1.509, where the Consolas
-    9pt advance steps 7px -> 8px); at and below the baseline every number is
-    unchanged, including the shipped 17px of 4-column slack.
+    also clipping the content it was sized to fit. RE-MEASURED 2026-09-19 over
+    a 0.01-step sweep of tk scaling 1.0..4.0 (plus a 0.001-step pass over
+    1.330..1.760): the range toast's 4-column slack under the scaled ceiling
+    never drops below the 17px it already has AT the baseline, which is the
+    smallest slack anywhere on the sweep. Above the baseline it is still 17px
+    at 1.334 — the ceiling's rounding has not yet ticked past 760 while the
+    grid is unchanged at 743 — and the tightest trough at a CONTENT step is
+    20px at 1.501, where the Consolas 9pt advance steps 7px -> 8px and the
+    grid jumps 751 -> 836. At and below the baseline every number is
+    unchanged.
 
     Chosen over a font-metric signal (the 9pt advance's ratio to its baseline
     px) by measurement: the toast's dim 7pt and bold 11pt labels step at
     DIFFERENT scalings than the 9pt grid, so the advance ratio leaves as
-    little as 9px of slack (at 1.391) where the linear factor leaves 95px.
+    little as 9px of slack (at 1.391, where its ceiling is still 760 against
+    751px of content) where the linear factor leaves 42px.
 
     Junk bounds degrade to 1 rather than raising (see ``dpi_scale``)."""
     k = dpi_scale(widget, baseline)
