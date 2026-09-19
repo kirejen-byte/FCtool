@@ -53,14 +53,16 @@ from ui_theme import BG_PANEL, BORDER_COLOR, FG_ACCENT, FG_DIM, FG_TEXT
 #: long title, 3 long lines, ``MAX_OPTIONS`` long option labels + overflow +
 #: hint): 460px at tk scaling 1.333, 512px at 1.5, 566px at 1.667, 674px at
 #: 2.0, 782px at 2.333, 998px at 3.0 — all clear of the SCALED ceiling (760 /
-#: 854 / 951 / 1139 / 1327 / 1708), whereas the old fixed 760 first clips at
-#: tk scaling 2.23 (content 782px; 728px at 2.22, the step below). This toast
+#: 854 / 951 / 1139 / 1331 / 1708; 1331 rather than 1330 because Tcl keeps a
+#: REQUESTED 2.333 as 2.335632), whereas the old fixed 760 first clips at tk
+#: scaling 2.23 (content 782px; 728px at 2.22, the step below). This toast
 #: has far more headroom than ``RangeToast``: its content is one column of
 #: text, not a grid — the tightest slack anywhere on a 0.01-step sweep of
-#: 1.0..3.2 is 300px, at the baseline. Its option rows are deliberately NOT
-#: wrapped the way ``RangeToast``'s disclosure lines are: a row is a CLICK
-#: TARGET whose whole width is bound, and the ceiling clamping an absurd
-#: caller label is the shipped behaviour
+#: 1.0..3.2 is 292px, at tk scaling 1.41 (content 512px under an 804px
+#: ceiling); the baseline's 300px is only the third-tightest. Its option rows
+#: are deliberately NOT wrapped the way ``RangeToast``'s disclosure lines are:
+#: a row is a CLICK TARGET whose whole width is bound, and the ceiling
+#: clamping an absurd caller label is the shipped behaviour
 #: (``test_the_ceiling_still_bites_an_absurd_option_label``). The FLOORS are
 #: deliberately not scaled.
 MIN_W, MAX_W = 260, 760

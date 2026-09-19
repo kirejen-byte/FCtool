@@ -131,7 +131,7 @@ def dpi_scale(widget, baseline=BASELINE_SCALING):
 
     TOTAL by design. This runs inside a toast constructor, reached from the
     chat worker's marshalled UI callback, where a raise costs the FC the whole
-    answer: a dead widget, a foreign/unreadable interpreter or a junk scaling
+    answer: a dead interpreter, a foreign/unreadable one or a junk scaling
     (non-numeric, NaN, inf, <= 0) all degrade to 1.0 — the unscaled constants,
     i.e. exactly the behaviour that shipped before this helper existed."""
     try:
@@ -139,11 +139,11 @@ def dpi_scale(widget, baseline=BASELINE_SCALING):
         base = float(baseline)
     except (AttributeError, TypeError, ValueError, RuntimeError, tk.TclError):
         # The documented cases, each named: no ``tk`` attribute (None, a stub,
-        # a fake widget) -> AttributeError; a destroyed widget or a foreign
-        # interpreter -> tk.TclError; Tkinter called off the main loop ->
-        # RuntimeError; a junk scaling string or a junk baseline -> ValueError
-        # / TypeError. Narrow, but still total for everything this seam can
-        # actually be handed.
+        # a fake widget) -> AttributeError; a destroyed INTERPRETER (the root
+        # torn down under the widget) or a foreign one -> tk.TclError;
+        # Tkinter called off the main loop -> RuntimeError; a junk scaling
+        # string or a junk baseline -> ValueError / TypeError. Narrow, but
+        # still total for everything this seam can actually be handed.
         return 1.0
     if not math.isfinite(scaling) or scaling <= 0:
         return 1.0
@@ -170,12 +170,13 @@ def scaled_bounds(widget, max_w, max_h, baseline=BASELINE_SCALING):
     a 0.01-step sweep of tk scaling 1.0..4.0 (plus a 0.001-step pass over
     1.330..1.760): the range toast's 4-column slack under the scaled ceiling
     never drops below the 17px it already has AT the baseline, which is the
-    smallest slack anywhere on the sweep. Above the baseline it is still 17px
-    at 1.334 — the ceiling's rounding has not yet ticked past 760 while the
-    grid is unchanged at 743 — and the tightest trough at a CONTENT step is
-    20px at 1.501, where the Consolas 9pt advance steps 7px -> 8px and the
-    grid jumps 751 -> 836. At and below the baseline every number is
-    unchanged.
+    smallest slack anywhere on the sweep. Above the baseline the tightest
+    point is 18px, at the first scaling Tcl actually keeps above it (1.33596 —
+    a REQUEST of 1.334 is quantised straight back onto the baseline on this
+    box, since ``tk scaling`` round-trips through the screen's integer mm) —
+    and the tightest trough at a CONTENT step is 20px at 1.501, where the
+    Consolas 9pt advance steps 7px -> 8px and the grid jumps 751 -> 836. At
+    and below the baseline every number is unchanged.
 
     Chosen over a font-metric signal (the 9pt advance's ratio to its baseline
     px) by measurement: the toast's dim 7pt and bold 11pt labels step at

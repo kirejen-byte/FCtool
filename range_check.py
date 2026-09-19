@@ -1502,11 +1502,13 @@ LABEL_BLOPS = "Blops"
 #: and RE-MEASURED 2026-09-19 over a 0.01-step sweep of tk scaling 1.0..4.0
 #: (plus a 0.001-step pass over 1.330..1.760) the slack under that ceiling
 #: never drops below the 17px it already has AT the baseline. Above the
-#: baseline it is still 17px at 1.334 — the ceiling's rounding has not yet
-#: ticked past 760 while the grid is unchanged at 743 — and the tightest
-#: trough at a CONTENT step is 20px at 1.501, where the Consolas 9pt advance
-#: steps 7px -> 8px and the grid jumps 751 -> 836 (the runners-up are 24px at
-#: 1.509 and 41px at 1.390).
+#: baseline the tightest point is 18px, at the first scaling Tcl actually
+#: keeps above it (1.33596 — a REQUEST of 1.334 is quantised straight back
+#: onto the baseline on this box, since ``tk scaling`` round-trips through the
+#: screen's integer mm) — and the tightest trough at a CONTENT step is 20px at
+#: 1.501, where the Consolas 9pt advance steps 7px -> 8px and the grid jumps
+#: 751 -> 836 (the runners-up AT A CONTENT STEP are 24px at 1.509 and 42px at
+#: 1.390).
 #:
 #: A FIFTH hull is a deliberate layout call even so: the 17px of baseline
 #: slack is the binding constraint and it is the SMALLEST slack anywhere on
@@ -1908,10 +1910,11 @@ def row_note(row) -> str:
 #:
 #: This clip is a GLANCEABILITY bound, not the fitting one, and 2026-09-19
 #: measurement says so: a line may carry ``MAX_PROVENANCE_NAMES`` clipped
-#: names (234 chars = 1,196px of 7pt text at the 96-dpi baseline) or
-#: ``MAX_IGNORED_NAMES`` clipped phrases each with a clipped retype tail (268
-#: chars = 1,366px), both far past a 760px ceiling that no clip-per-name can
-#: bring back. What keeps a disclosure line ON SCREEN is the render-side
+#: names (234 chars: 1,170px of 7pt text at the 96-dpi baseline, a 1,196px
+#: toast with its 26px of chrome) or ``MAX_IGNORED_NAMES`` clipped phrases
+#: each with a clipped retype tail (268 chars: 1,340px of text, a 1,366px
+#: toast), both far past a 760px ceiling that no clip-per-name can bring
+#: back. What keeps a disclosure line ON SCREEN is the render-side
 #: ``wraplength`` in ``RangeToast._build``.
 MAX_DISCLOSED_CHARS = 32
 
@@ -2186,15 +2189,17 @@ class RangeToast:
         # ``MAX_DISCLOSED_CHARS``, but a line carries up to
         # ``MAX_PROVENANCE_NAMES`` of them (or ``MAX_IGNORED_NAMES`` phrases
         # each with a "(type it as X)" tail), and MEASURED 2026-09-19 the
-        # longest such line is 234 / 268 characters = 1,196px / 1,366px of 7pt
-        # text at the 96-dpi baseline against a 760px ceiling — clipped at
-        # EVERY display scaling, the ceiling scaled or not, and what is lost
-        # is the end of the line with no ellipsis to say so. A wraplength
-        # cures it by construction: a line that fits is laid out exactly as
-        # before, one that does not spills onto a second row (the height has
-        # ~320px of slack where the width has 17px). ``justify="left"`` is
-        # already the house style for these labels, so a wrapped line reads as
-        # a continuation rather than as centred prose.
+        # longest such line is 234 / 268 characters = 1,170px / 1,340px of 7pt
+        # text at the 96-dpi baseline — a 1,196px / 1,366px toast once the
+        # 26px of chrome ``_DISCLOSURE_WRAP_INSET_PX`` itemises is added —
+        # against a 760px ceiling, clipped at EVERY display scaling, the
+        # ceiling scaled or not, and what is lost is the end of the line with
+        # no ellipsis to say so. A wraplength cures it by construction: a line
+        # that fits is laid out exactly as before, one that does not spills
+        # onto a second row (the height has ~320px of slack where the width
+        # has 17px). ``justify="left"`` is already the house style for these
+        # labels, so a wrapped line reads as a continuation rather than as
+        # centred prose.
         wrap = max(1, self._max_w - _DISCLOSURE_WRAP_INSET_PX)
         # Directly under the title, because it explains the table below it: a
         # report whose sources came from the message must SAY so, degraded or
