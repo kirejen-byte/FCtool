@@ -23,8 +23,9 @@ Load-bearing decisions, each one a place this feature can be silently wrong:
   blank keyword — only for an ABSENT one.
 * **Ranges come from ``jump_range.JumpRangeChecker.SHIP_RANGES`` — the CLASS
   dict — read live.** Those values are already the JDC-5 (max) ranges: hull base
-  x 2.0, i.e. Titan 6.0, Dreadnought 7.0, Black Ops 8.0. This module
-  deliberately does NOT route through ``JumpRangeChecker(custom_ranges=...)``
+  x 2.0, i.e. Titan 6.0, Dreadnought 7.0, Command Carrier 7.5, Black Ops 8.0.
+  This module deliberately does NOT route through
+  ``JumpRangeChecker(custom_ranges=...)``
   and reads NO per-hull range out of config: that config key currently drives
   nothing at all in the app, and a config persisted before v2.8.1 can still
   carry pre-fix values that would silently override a corrected default and
@@ -1452,17 +1453,28 @@ def resolve_sources(config, resolve=None) -> SourceLists:
 
 # ── range maths ──────────────────────────────────────────────────────────────
 
-#: The three hulls the summary answers for, each a different reach at JDC 5 —
+#: The four hulls the summary answers for, each a different reach at JDC 5 —
 #: which is the entire point of showing a column per hull. ``Capital`` is the
 #: dreadnought range (7.0 LY), the hull that reaches where a titan (6.0) falls
-#: short; ``Blops`` is the Black Ops battleship (8.0 LY — 4.0 base x 2.0), which
-#: out-reaches both, and what it brings when it arrives is a covert bridge for
-#: the rest of its gang — a threat question neither capital column answers.
+#: short; ``Command Carrier`` (7.5 LY — 3.75 base x 2.0) reaches past both
+#: capital columns and stops short of the Black Ops; ``Blops`` is the Black
+#: Ops battleship (8.0 LY — 4.0 base x 2.0), which out-reaches all three, and
+#: what it brings when it arrives is a covert bridge for the rest of its gang
+#: — a threat question none of the other columns answer.
 HULL_TITAN = "Titan"
 HULL_CAPITAL = "Dreadnought"
+#: The command carrier hull — its own ``SHIP_RANGES`` key, distinct from both
+#: "Carrier" and "Force Auxiliary" (each 7.0 LY, same as the Dreadnought) —
+#: at JDC-5 range 7.5 LY (3.75 base x 2.0), between the dreadnought and the
+#: Black Ops. Owner-approved label below ("CC") abbreviates it to buy back
+#: the width a fourth column costs — see the ceiling note beside
+#: ``HULL_COLUMNS``.
+HULL_CMD_CARRIER = "Command Carrier"
 HULL_BLOPS = "Black Ops"
 LABEL_TITAN = "Titan"
 LABEL_CAPITAL = "Capital"
+#: Owner-approved abbreviation (not "Cmd Carrier") — see ``HULL_CMD_CARRIER``.
+LABEL_CMD_CARRIER = "CC"
 #: The house's own short form — the Jump Range tab and the map's character
 #: filter both already say "Blops", and the cell has to stay glanceable.
 LABEL_BLOPS = "Blops"
@@ -1471,15 +1483,25 @@ LABEL_BLOPS = "Blops"
 #: all derived from this one tuple, so a hull cannot be half-added.
 #:
 #: That covers the DATA layer only — the RENDER layer has a measured ceiling
-#: this tuple cannot see. Toast width scales with column count (measured: 2
-#: cols 616px, 3 cols 690px, 4 cols 760px — exactly ``MAX_W``): each hull
-#: column costs ~70-74px against the ~70px of margin still free at 3 columns,
-#: so a fourth hull would land AT the cap with no slack left, and the
-#: worst-case content in
-#: ``test_the_third_column_still_fits_the_window_it_has_to_stay_readable``
-#: would start clipping. A fourth hull is therefore a deliberate ``MAX_W`` /
-#: layout call, not a free edit of this tuple alone.
+#: this tuple cannot see. MEASURED 2026-09-19 on this box (96 dpi, tk scaling
+#: 1.333): 2 cols 616px, 3 cols 690px, 4 cols 743px with the Command Carrier
+#: column abbreviated to "CC" — 17px of slack under ``MAX_W`` (760). The
+#: retired "4 cols 760px" figure was a CLAMPED reading, not real slack:
+#: ``_measure`` floors/ceils against ``MAX_W``, and a full-name 4th column
+#: ("Cmd Carrier") measures 806px RAW, which reads back as 760 — the clamp
+#: hid the real content width. These pixel figures are DPI-specific (labels
+#: are sized in points, so width scales with tk's scaling factor); a sweep
+#: over tk scaling of 3-col/4-col-CC px — 1.0: 522/565, 1.333: 690/743,
+#: 1.5: 696/751, 1.75: 864/929, 2.0: 951/1022 — shows the ``MAX_W`` clamp
+#: already bites from ~125% Windows display scaling (tk scaling ~1.67:
+#: 783/844) upward at 3 columns and above, a pre-existing ceiling this
+#: change did not introduce. A FIFTH hull is unlikely to fit even
+#: abbreviated at today's 96 dpi baseline — see
+#: ``test_the_fourth_column_still_fits_the_window_it_has_to_stay_readable``
+#: and MEASURE before adding one; do not assume the slack holds at another
+#: scaling.
 HULL_COLUMNS = ((LABEL_TITAN, HULL_TITAN), (LABEL_CAPITAL, HULL_CAPITAL),
+                (LABEL_CMD_CARRIER, HULL_CMD_CARRIER),
                 (LABEL_BLOPS, HULL_BLOPS))
 #: The ``SHIP_RANGES`` keys of ``HULL_COLUMNS``, in the same order.
 HULLS = tuple(hull for _label, hull in HULL_COLUMNS)
@@ -1489,7 +1511,8 @@ HULLS = tuple(hull for _label, hull in HULL_COLUMNS)
 #: this replaced was correct for a dreadnought, generous for a titan and a
 #: silent UNDER-report for a Black Ops, and under-reporting is the dangerous
 #: direction for a feature answering "who can reach me".
-_FALLBACK_LY = {HULL_TITAN: 6.0, HULL_CAPITAL: 7.0, HULL_BLOPS: 8.0}
+_FALLBACK_LY = {HULL_TITAN: 6.0, HULL_CAPITAL: 7.0, HULL_CMD_CARRIER: 7.5,
+                HULL_BLOPS: 8.0}
 #: For a hull this module does not answer for at all: the widest range it knows,
 #: so an unknown hull over-reports (safe) rather than under-reports. Derived, so
 #: it cannot fall behind the table above.
@@ -2030,10 +2053,10 @@ MAX_WARNINGS = 3
 #: ``columnspan`` stopping short of it).
 _COL_DISTANCE = len(HULL_COLUMNS) + 1
 _GRID_SPAN = _COL_DISTANCE + 1
-#: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit). A 4th
-#: ``HULL_COLUMNS`` entry measures to 760px — this ceiling exactly, zero
-#: slack — see the layout-ceiling note beside ``HULL_COLUMNS`` before adding
-#: one.
+#: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit). At 96
+#: dpi / tk scaling 1.333 the 4th (Command Carrier, "CC") column measures
+#: 743px, 17px of slack under this ceiling — DPI-specific, see the
+#: measurement + scaling-sweep note beside ``HULL_COLUMNS`` before adding a 5th.
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
 _FONT = "Consolas"
