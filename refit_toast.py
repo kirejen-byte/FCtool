@@ -37,11 +37,26 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from client_toast import ALPHA, FADE_MS, FADE_STEPS, RETOP_MS, place_over
+from client_toast import (ALPHA, FADE_MS, FADE_STEPS, RETOP_MS, place_over,
+                          scaled_bounds)
 from ui_theme import BG_PANEL, BORDER_COLOR, FG_ACCENT, FG_DIM, FG_TEXT
 
-#: Toast box bounds in px. Same class of window as ``RangeToast``'s, so the two
-#: land on the client at the same scale.
+#: Toast box bounds in px at the BASELINE display scaling (96 dpi / tk scaling
+#: 1.333). Same class of window as ``RangeToast``'s, so the two land on the
+#: client at the same scale — including the ceiling's DPI treatment: every
+#: label here is sized in POINTS, so the content grows with the monitor's dpi
+#: and the CEILINGS are scaled to match at runtime by
+#: ``client_toast.scaled_bounds`` (the live value is ``RefitToast.max_size``).
+#: Without that, an option row is clipped at the window edge on a high-dpi
+#: display and reads as a DIFFERENT fit — the one wrong answer a click-to-swap
+#: toast must not give. Measured 2026-09-19 for the widest realistic toast (a
+#: long title, 3 long lines, ``MAX_OPTIONS`` long option labels + overflow +
+#: hint): 460px at tk scaling 1.333, 512px at 1.5, 566px at 1.667, 674px at
+#: 2.0, 782px at 2.333, 998px at 3.0 — all clear of the SCALED ceiling (760 /
+#: 854 / 951 / 1139 / 1331 / 1708), whereas the old fixed 760 started clipping
+#: from ~2.3 upward. This toast has far more headroom than ``RangeToast``: its
+#: content is one column of text, not a grid. The FLOORS are deliberately not
+#: scaled.
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
 #: Hold before the fade begins, matching the range check's feel.
@@ -158,17 +173,24 @@ class RefitToast:
         self._dismissers.append(hint)
 
     def _measure(self):
-        """Content size in px, floored and capped. See ``RangeToast._measure``:
-        Tk lays out in logical px while ``set_window_pos`` takes physical px,
-        and measuring keeps the two in the relationship the shipped toasts
-        already assume."""
+        """Content size in px, floored and capped at the DPI-SCALED ceiling.
+        See ``RangeToast._measure``: Tk lays out in logical px while
+        ``set_window_pos`` takes physical px, and measuring keeps the two in
+        the relationship the shipped toasts already assume.
+
+        ``MAX_W``/``MAX_H`` are the 96-dpi figures, so the ceiling is resolved
+        through ``scaled_bounds`` FIRST — the labels are point-sized and grow
+        with the monitor. The result is cached and published as ``max_size``,
+        so "fits" and "clamped" are tellable apart."""
+        self._max_w, self._max_h = scaled_bounds(self.top, MAX_W, MAX_H)
         try:
             self.top.update_idletasks()
             w = int(self.top.winfo_reqwidth())
             h = int(self.top.winfo_reqheight())
         except tk.TclError:                                # pragma: no cover
             return MIN_W, MIN_H
-        return (max(MIN_W, min(w + 2, MAX_W)), max(MIN_H, min(h + 2, MAX_H)))
+        return (max(MIN_W, min(w + 2, self._max_w)),
+                max(MIN_H, min(h + 2, self._max_h)))
 
     # ── internals (mirror ClientToast / RangeToast) ──────────────────────────
     def _restyle(self):
@@ -246,6 +268,14 @@ class RefitToast:
     @property
     def size(self):
         return (self._w, self._h)
+
+    @property
+    def max_size(self):
+        """The EFFECTIVE ``(width, height)`` ceiling this toast was measured
+        against — ``(MAX_W, MAX_H)`` scaled for the display's tk scaling.
+        ``size == max_size`` on an axis means the content was CLAMPED there
+        (clipped at the window edge); ``size < max_size`` means it fits."""
+        return (self._max_w, self._max_h)
 
     def current_alpha(self):
         return self._alpha

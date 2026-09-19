@@ -125,7 +125,8 @@ import jump_range
 import system_coords
 from app_log import get_logger
 from chat_monitor import MESSAGE_PATTERN
-from client_toast import ALPHA, FADE_MS, FADE_STEPS, RETOP_MS, place_over
+from client_toast import (ALPHA, FADE_MS, FADE_STEPS, RETOP_MS, place_over,
+                          scaled_bounds)
 # The token shape of an EVE system name (letters, digits, dashes) has ONE
 # definition in this project — intel_stream's. Reused, never re-typed, so a
 # future correction there reaches this parser too.
@@ -1484,22 +1485,30 @@ LABEL_BLOPS = "Blops"
 #:
 #: That covers the DATA layer only — the RENDER layer has a measured ceiling
 #: this tuple cannot see. MEASURED 2026-09-19 on this box (96 dpi, tk scaling
-#: 1.333): 2 cols 616px, 3 cols 690px, 4 cols 743px with the Command Carrier
-#: column abbreviated to "CC" — 17px of slack under ``MAX_W`` (760). The
-#: retired "4 cols 760px" figure was a CLAMPED reading, not real slack:
-#: ``_measure`` floors/ceils against ``MAX_W``, and a full-name 4th column
-#: ("Cmd Carrier") measures 806px RAW, which reads back as 760 — the clamp
-#: hid the real content width. These pixel figures are DPI-specific (labels
-#: are sized in points, so width scales with tk's scaling factor); a sweep
-#: over tk scaling of 3-col/4-col-CC px — 1.0: 522/565, 1.333: 690/743,
-#: 1.5: 696/751, 1.75: 864/929, 2.0: 951/1022 — shows the ``MAX_W`` clamp
-#: already bites from ~125% Windows display scaling (tk scaling ~1.67:
-#: 783/844) upward at 3 columns and above, a pre-existing ceiling this
-#: change did not introduce. A FIFTH hull is unlikely to fit even
-#: abbreviated at today's 96 dpi baseline — see
-#: ``test_the_fourth_column_still_fits_the_window_it_has_to_stay_readable``
-#: and MEASURE before adding one; do not assume the slack holds at another
-#: scaling.
+#: 1.333 — the BASELINE every px constant here was measured at): 2 cols 616px,
+#: 3 cols 690px, 4 cols 743px with the Command Carrier column abbreviated to
+#: "CC" — 17px of slack under ``MAX_W`` (760). The retired "4 cols 760px"
+#: figure was a CLAMPED reading, not real slack: ``_measure`` floors/ceils
+#: against the ceiling, and a full-name 4th column ("Cmd Carrier") measures
+#: 806px RAW, which reads back as 760 — the clamp hid the real content width.
+#:
+#: These pixel figures are DPI-specific: labels are sized in POINTS, so the
+#: grid's width scales with tk scaling (= dpi/72) — 3-col/4-col-CC px go
+#: 1.0: 522/565, 1.333: 690/743, 1.5: 696/751, 1.667: 783/844, 1.75: 864/929,
+#: 2.0: 951/1022. Until 2026-09-19 the CEILING did not, so from ~125% Windows
+#: display scaling upward the rightmost cells were clipped at the window edge
+#: with no tell. The ceiling is now scaled by the same factor
+#: (``client_toast.scaled_bounds``; the live value is ``RangeToast.max_size``),
+#: and across a 0.01-step sweep of tk scaling 1.0..3.0 the slack under that
+#: ceiling never drops below 24px ABOVE the baseline — tightest at 1.509,
+#: where the Consolas 9pt advance steps 7px -> 8px.
+#:
+#: A FIFTH hull is a deliberate layout call even so: the 17px of baseline
+#: slack is the binding constraint and it is the SMALLEST slack anywhere on
+#: the sweep, so a column that does not fit at 96 dpi does not fit anywhere.
+#: See ``test_the_fourth_column_still_fits_the_window_it_has_to_stay_readable``
+#: (baseline) and ``test_the_row_grid_is_never_clipped_at_any_display_scaling``
+#: (the sweep), and MEASURE before adding one.
 HULL_COLUMNS = ((LABEL_TITAN, HULL_TITAN), (LABEL_CAPITAL, HULL_CAPITAL),
                 (LABEL_CMD_CARRIER, HULL_CMD_CARRIER),
                 (LABEL_BLOPS, HULL_BLOPS))
@@ -2053,10 +2062,17 @@ MAX_WARNINGS = 3
 #: ``columnspan`` stopping short of it).
 _COL_DISTANCE = len(HULL_COLUMNS) + 1
 _GRID_SPAN = _COL_DISTANCE + 1
-#: Size floor/ceiling in px (see ``RangeToast._measure`` on the unit). At 96
-#: dpi / tk scaling 1.333 the 4th (Command Carrier, "CC") column measures
-#: 743px, 17px of slack under this ceiling — DPI-specific, see the
-#: measurement + scaling-sweep note beside ``HULL_COLUMNS`` before adding a 5th.
+#: Size floor/ceiling in px at the BASELINE display scaling (96 dpi / tk
+#: scaling 1.333 — see ``RangeToast._measure`` on the unit). The ceilings are
+#: scaled UP at runtime by ``client_toast.scaled_bounds``, because every label
+#: here is sized in POINTS and so grows with the monitor's dpi while a fixed px
+#: ceiling would not: the effective ceiling is ``RangeToast.max_size``, and
+#: that — not ``MAX_W``/``MAX_H`` — is what a measurement should be compared
+#: against anywhere but a 96-dpi box. At the baseline the 4th (Command
+#: Carrier, "CC") column measures 743px, 17px of slack under 760; see the
+#: measurement + scaling-sweep note beside ``HULL_COLUMNS`` before adding a
+#: 5th. The FLOORS are deliberately NOT scaled: they exist to stop a two-line
+#: toast looking like a sliver, which is a px judgement, not a text one.
 MIN_W, MAX_W = 260, 760
 MIN_H, MAX_H = 60, 560
 _FONT = "Consolas"
@@ -2230,20 +2246,29 @@ class RangeToast:
                 row=line, column=1, columnspan=_GRID_SPAN - 1, sticky="w")
 
     def _measure(self):
-        """Content size in px, floored/capped.
+        """Content size in px, floored and capped at the DPI-SCALED ceiling.
 
         Tk lays out in logical px while ``set_window_pos`` takes physical px;
         the shipped ``ClientToast`` has the same one-unit assumption (its fixed
         430x78 box is treated as physical while its labels are laid out by Tk).
         Measuring keeps the two in the same relationship rather than hard-coding
-        a box the content may not fit in."""
+        a box the content may not fit in.
+
+        ``MAX_W``/``MAX_H`` are the 96-dpi figures, so the ceiling is resolved
+        through ``scaled_bounds`` FIRST: the labels are point-sized and grow
+        with the monitor, and a fixed px ceiling turns that growth into a
+        silently clipped hull verdict from ~125% Windows scaling upward. The
+        result is cached on the instance and published as ``max_size``, so a
+        caller (and a test) can tell "fits" from "clamped"."""
+        self._max_w, self._max_h = scaled_bounds(self.top, MAX_W, MAX_H)
         try:
             self.top.update_idletasks()
             w = int(self.top.winfo_reqwidth())
             h = int(self.top.winfo_reqheight())
         except tk.TclError:                                # pragma: no cover
             return MIN_W, MIN_H
-        return (max(MIN_W, min(w + 2, MAX_W)), max(MIN_H, min(h + 2, MAX_H)))
+        return (max(MIN_W, min(w + 2, self._max_w)),
+                max(MIN_H, min(h + 2, self._max_h)))
 
     # ── internals (mirrors ClientToast) ──────────────────────────────────────
     def _restyle(self):
@@ -2309,6 +2334,17 @@ class RangeToast:
     @property
     def size(self):
         return (self._w, self._h)
+
+    @property
+    def max_size(self):
+        """The EFFECTIVE ``(width, height)`` ceiling this toast was measured
+        against — ``(MAX_W, MAX_H)`` scaled for the display's tk scaling.
+
+        ``size == max_size`` on an axis means the content was CLAMPED there
+        (and is therefore clipped at the window edge); ``size < max_size``
+        means it fits. Comparing a measurement against the bare ``MAX_W``
+        constant only says anything on a 96-dpi box."""
+        return (self._max_w, self._max_h)
 
     def current_alpha(self):
         return self._alpha

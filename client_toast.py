@@ -38,6 +38,7 @@ a fake and never touch ctypes.
 """
 from __future__ import annotations
 
+import math
 import tkinter as tk
 
 from ui_theme import BG_PANEL, FG_DIM, FG_TEXT, FG_YELLOW
@@ -109,6 +110,79 @@ def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H):
     x = max(left, min(x, right - w))
     y = max(top, min(y, bottom - h))
     return (x, y)
+
+
+#: ``tk scaling`` on a 96-dpi box — Windows at 100% display scaling, which is
+#: where EVERY px constant in this module and in its two sibling toasts
+#: (``range_check.RangeToast``, ``refit_toast.RefitToast``) was MEASURED. Tk
+#: sets its scaling from the monitor's dpi (pixels per point = dpi/72) and
+#: FCTool is Per-Monitor-DPI-Aware-V2, so on a 125%/150% display it is 1.667 /
+#: 2.0 and every point-sized label is that much wider.
+BASELINE_SCALING = 96.0 / 72.0
+
+
+def dpi_scale(widget, baseline=BASELINE_SCALING):
+    """How much wider ``widget``'s point-sized text is than at ``baseline``.
+
+    A ONE-WAY ratchet: never below 1.0. Below the baseline nothing is shrunk —
+    a smaller ceiling would clip content the shipped constants have always
+    fitted, and it would quietly change the meaning of every ``<= MAX_W``
+    assertion in the suite on a 96-dpi box.
+
+    TOTAL by design. This runs inside a toast constructor, reached from the
+    chat worker's marshalled UI callback, where a raise costs the FC the whole
+    answer: a dead widget, a foreign/unreadable interpreter or a junk scaling
+    (non-numeric, NaN, inf, <= 0) all degrade to 1.0 — the unscaled constants,
+    i.e. exactly the behaviour that shipped before this helper existed."""
+    try:
+        scaling = float(widget.tk.call("tk", "scaling"))
+        base = float(baseline)
+    except Exception:
+        return 1.0
+    if not math.isfinite(scaling) or scaling <= 0:
+        return 1.0
+    if not math.isfinite(base) or base <= 0:
+        return 1.0
+    return max(1.0, scaling / base)
+
+
+def scaled_bounds(widget, max_w, max_h, baseline=BASELINE_SCALING):
+    """``(max_w, max_h)`` in px, grown for ``widget``'s display scaling.
+
+    The toasts' size ceilings are FIXED px while their labels are sized in
+    POINTS, so the content grows with the monitor's dpi and the ceiling does
+    not: measured on the range toast's widest realistic report, the row grid
+    goes 743px at tk scaling 1.333, 844px at 1.667 (125% Windows scaling) and
+    1,022px at 2.0 (150%) against a 760px ceiling — from ~125% upward the
+    rightmost hull verdicts and the distance are eaten by the window edge,
+    over a live client, with no ellipsis to say so.
+
+    Scaling the ceiling by the same factor the fonts scale by keeps the
+    ceiling doing its ONE job — stopping absurd content (a 500-char pasted
+    token, a long config string) growing a screen-wide window — without it
+    also clipping the content it was sized to fit. Across a 0.01-step sweep of
+    tk scaling 1.0..3.0 the range toast's slack under the scaled ceiling never
+    drops below 24px ABOVE the baseline (tightest at 1.509, where the Consolas
+    9pt advance steps 7px -> 8px); at and below the baseline every number is
+    unchanged, including the shipped 17px of 4-column slack.
+
+    Chosen over a font-metric signal (the 9pt advance's ratio to its baseline
+    px) by measurement: the toast's dim 7pt and bold 11pt labels step at
+    DIFFERENT scalings than the 9pt grid, so the advance ratio leaves as
+    little as 9px of slack (at 1.391) where the linear factor leaves 95px.
+
+    Junk bounds degrade to 1 rather than raising (see ``dpi_scale``)."""
+    k = dpi_scale(widget, baseline)
+    return (_scaled(max_w, k), _scaled(max_h, k))
+
+
+def _scaled(value, k):
+    """One bound, scaled to a positive int. Junk floors at 1 px."""
+    try:
+        out = int(round(float(value) * k))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, out)
 
 
 class ClientToast:
