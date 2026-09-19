@@ -2909,7 +2909,12 @@ class FCToolGUI:
         with no client on screen: the owner just CLICKED a row, so something
         must appear. The intel tile's own rect is the fallback anchor —
         `place_over` takes EDGES, so the (x, y, w, h) the controller hands over
-        is converted here.
+        is converted here FIRST, then the toast is built, and only then is the
+        anchor computed — from the toast's ACTUAL `size` (the width/height
+        passed in are design px at 96 dpi; the constructor scales them for the
+        display). That order is deliberate: `place_over` is pure and total, so
+        nothing between the constructor and `show` can raise and strand a
+        built-but-never-shown toast in `_hud_detail_toast`.
 
         One pop-up at a time (a newer click replaces the older), the rule both
         shipped toasts follow. REFERENCE class: it never grabs — a grab in this
@@ -2922,21 +2927,21 @@ class FCToolGUI:
                 prev.dismiss()
                 self._hud_detail_toast = None
             text = str(body or "")
-            width = client_toast.DEFAULT_W
-            height = client_toast.height_for(text.count("\n") + 1)
-            fallback = None
             try:
                 tx, ty, tw, th = (int(v) for v in tile_rect)
-                fallback = client_toast.place_over(
-                    (tx, ty, tx + tw, ty + th), width, height)
+                edges = (tx, ty, tx + tw, ty + th)
             except (TypeError, ValueError, OverflowError):
-                fallback = None
+                edges = None
             toast = client_toast.ClientToast(
                 self.root, str(title or ""), text,
                 seconds=info_tiles.INTEL_DETAIL_SECONDS,
-                width=width, height=height, hint="click to dismiss",
+                width=client_toast.DEFAULT_W,
+                height=client_toast.height_for(text.count("\n") + 1),
+                hint="click to dismiss",
                 on_dismiss=lambda: setattr(self, "_hud_detail_toast", None))
             self._hud_detail_toast = toast
+            fallback = (client_toast.place_over(edges, *toast.size)
+                        if edges is not None else None)
             toast.show(self._hud_intel_client_rect(), fallback)
         except Exception:
             log.exception("[hud] intel detail pop-up failed")

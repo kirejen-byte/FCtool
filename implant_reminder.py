@@ -1203,9 +1203,13 @@ def login_toast_body(char_name: str, names) -> str:
 
     CAPPED like the dock toast: only the first ``login_labels`` entry is named
     outright, with an "+N more" tail for the rest, never every label joined by
-    " + ". ``ClientToast`` is a fixed-width single-line body (no wrap) and the
-    old join-everything copy measured 420-630 px against a ~412 px usable
-    width for ordinary multi-bucket clones -- it clipped. The toast TITLE
+    " + ". ``ClientToast``'s body is ONE line and does not wrap (the window
+    scales its box with the display's dpi, but never its line count), and the
+    old join-everything copy measured 420-630 px against the 406 px of text a
+    430 px box holds at 96 dpi for ordinary multi-bucket clones -- it clipped.
+    A long enough character name still can: 37 characters, EVE's maximum,
+    overruns by ~150 px on a 96-dpi box whatever this function does, which is
+    the cap's floor, not its failure. The toast TITLE
     ("Implants still plugged in") already tells the pilot what to do about it,
     so the body no longer repeats the instruction. Pure."""
     who = str(char_name or "").strip() or "This character"

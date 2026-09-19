@@ -307,11 +307,16 @@ INTEL_STATUS_MIN_CHARS = 12
 #:   12 s is a dock-time nag with a different urgency;
 #: * how wide the body wraps, in CHARACTERS. The host's window is
 #:   ``client_toast.DEFAULT_W`` (430 px) and its body font is Consolas 9,
-#:   measured at 7 px per glyph on this box, leaving 412 px of text once the
-#:   1 px accent border and the 8 px padding on each side are gone: 58 glyphs
-#:   fit in 406, 60 would overrun. The wrap is CHARACTER-counted rather than
-#:   pixel-measured on purpose -- it keeps this module Tk-free, and Consolas is
-#:   monospaced, so the two agree.
+#:   measured at 7 px per glyph on this box, leaving 412 px for the body label
+#:   once the 1 px accent border and the 8 px padding on each side are gone --
+#:   406 px of text, the label spending the other 6 on its own border and
+#:   padding: 58 glyphs fit in 406 exactly, 60 would overrun. The wrap is
+#:   CHARACTER-counted rather than pixel-measured on purpose -- it keeps this
+#:   module Tk-free, and Consolas is monospaced, so the two agree. Those are
+#:   96-dpi figures, and they keep holding above it: glyph and box scale
+#:   TOGETHER, because ``ClientToast`` sizes its window from the display's
+#:   ``tk scaling`` (MEASURED 2026-09-19 over a 0.01-step sweep of 1.0..4.0 --
+#:   this wrap never overruns the window it is given).
 INTEL_DETAIL_SECONDS = 8.0
 INTEL_DETAIL_WRAP = 58
 #: Row-pool geometry, MEASURED 2026-08-15 on this box (96 dpi, tk scaling

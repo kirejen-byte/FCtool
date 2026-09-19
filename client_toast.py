@@ -43,8 +43,15 @@ import tkinter as tk
 
 from ui_theme import BG_PANEL, FG_DIM, FG_TEXT, FG_YELLOW
 
-#: Default toast box in PHYSICAL px. Wide enough for a character name plus three
-#: implant names, short enough to stay out of the way of the client's HUD.
+#: Default toast box in DESIGN px — the PHYSICAL size on a 96-dpi box (``tk
+#: scaling`` 1.333), which is where it was measured. Wide enough for a character
+#: name plus three implant names, short enough to stay out of the way of the
+#: client's HUD. The CONSTRUCTOR scales this — and any ``width=``/``height=`` a
+#: caller passes — for the display's ``tk scaling``, because every label here is
+#: POINT-sized and so grows with the monitor while a fixed px box would not (see
+#: ``ClientToast._size_for_display``). ``place_over`` and ``height_for`` stay in
+#: design px, pure, and unchanged by any of it; ``ClientToast.size`` is the
+#: physical box that came out.
 DEFAULT_W = 430
 DEFAULT_H = 78
 #: One re-assert of the topmost band, ~1 s after showing, in case another
@@ -61,10 +68,11 @@ ALPHA = 0.94
 #: caller that wires no snooze (the FC HUD's intel pop-up) must pass its own
 #: hint, or the toast advertises a "not this session" nobody implemented.
 DEFAULT_HINT = "click to dismiss  ·  right-click: not this session"
-#: One BODY line's height in px -- Consolas 9's line space on this box,
-#: measured, not guessed. ``DEFAULT_H`` already carries one such line (plus the
-#: title, the hint and the 1 px accent border), so a multi-line body costs this
-#: much per EXTRA line. See ``height_for``.
+#: One BODY line's height in DESIGN px -- Consolas 9's line space on this box
+#: at the 96-dpi baseline, measured, not guessed. ``DEFAULT_H`` already carries
+#: one such line (plus the title, the hint and the 1 px accent border), so a
+#: multi-line body costs this much per EXTRA line. Scaled with the rest of the
+#: box by the constructor, like ``DEFAULT_H`` itself. See ``height_for``.
 BODY_LINE_PX = 14
 
 
@@ -117,7 +125,8 @@ def place_over(client_rect, w=DEFAULT_W, h=DEFAULT_H):
 #: (``range_check.RangeToast``, ``refit_toast.RefitToast``) was MEASURED. Tk
 #: sets its scaling from the monitor's dpi (pixels per point = dpi/72) and
 #: FCTool is Per-Monitor-DPI-Aware-V2, so on a 125%/150% display it is 1.667 /
-#: 2.0 and every point-sized label is that much wider.
+#: 2.0 and every point-sized label is that much wider — which is why all THREE
+#: toasts size themselves against this ratio rather than against bare px.
 BASELINE_SCALING = 96.0 / 72.0
 
 
@@ -198,6 +207,17 @@ def _scaled(value, k):
     return max(1, out)
 
 
+#: Ceiling on the MEASURED growth in ``_size_for_display``, in design px at the
+#: 96-dpi baseline — the same pair both sibling toasts use (``range_check``,
+#: ``refit_toast``), deliberately shared so the three cannot each grow a
+#: differently-absurd window over a live client. Run through ``scaled_bounds``
+#: per toast; the live value is ``ClientToast.max_size``. It bounds the GROWTH
+#: only and is floored at the caller's own scaled box, so a legitimately tall
+#: request (``height_for`` of a 40-line intel report) is never cut down to it.
+MAX_W = 760
+MAX_H = 560
+
+
 class ClientToast:
     """One transient over-client message. Tk-thread only.
 
@@ -254,12 +274,65 @@ class ClientToast:
             w.bind("<Button-3>", self._on_right_click)
 
         # Resolve the REAL top-level hwnd and style it BEFORE the first map, so
-        # the toast is never briefly Alt-Tab-able / activatable.
+        # the toast is never briefly Alt-Tab-able / activatable. The same idle
+        # flush is what the size below measures on — it runs while STILL
+        # WITHDRAWN, so it cannot flash the window, and show() must not flush at
+        # all (see its comment on the one-frame-flash trap).
         self.top.update_idletasks()
+        self._size_for_display()
         self._hwnd = self._win32.get_root_hwnd(self.top.winfo_id())
         self._restyle()
 
     # ── internals ────────────────────────────────────────────────────────────
+    def _size_for_display(self):
+        """Turn the caller's DESIGN px box into this display's PHYSICAL one.
+
+        Called exactly once, from the constructor. Two steps, and the second
+        only ever grows the box:
+
+        * scale it LINEARLY by ``dpi_scale`` — the labels are point-sized and
+          grow with the monitor's dpi while a fixed px box does not;
+        * ABOVE the baseline only, grow it to what the labels actually
+          requested, bounded by ``max_size``.
+
+        Why the second step exists, MEASURED 2026-09-19 over a 0.01-step sweep
+        of ``tk scaling`` 1.0..4.0 (a fresh interpreter per point — tuple-font
+        caches are per-interpreter — reading back the scaling Tcl KEPT, which
+        is quantised) against the longest body each of the three shipped
+        callers can produce: the linear box alone is 1px SHORT of the FC HUD's
+        intel pop-up at a requested 1.51 (kept 1.5085), where the Consolas 9pt
+        advance steps 7px -> 8px and the 58-glyph wrap jumps 430px -> 488px
+        against a 487px box; a 14-line one's HEIGHT runs 8px short there, 1-6px
+        short at five more points up to 1.63, and meets the box with ZERO slack
+        at three others up to 1.96, because ``BODY_LINE_PX`` scales smoothly
+        while a font's line space steps. The
+        implant and ozone bodies need no help — above the baseline the linear
+        box alone leaves the login body >= 15px of width (tightest at 1.51),
+        the dock body >= 87px, the ozone body >= 157px and all three >= 5px of
+        height. WITH the growth step, not one of the eight bodies swept is
+        clipped at any of the 267 scalings above the baseline.
+
+        At or below the baseline ``dpi_scale`` is exactly 1.0, ``_scaled`` is
+        the identity on an int, and the growth step is skipped — so the stored
+        box is the caller's own ints byte for byte, and a body that overflows
+        the shipped 430x78 on a 96-dpi box still clips exactly as it always
+        has. Total, like the helpers it is built on: a measurement that raises
+        leaves the linear box."""
+        k = dpi_scale(self.top)
+        w, h = _scaled(self._w, k), _scaled(self._h, k)
+        # Floored at the caller's own scaled box: the ceiling is here to stop
+        # ABSURD CONTENT growing a screen-wide window, not to cut down a box
+        # the caller deliberately asked for.
+        self._max_w = max(w, _scaled(MAX_W, k))
+        self._max_h = max(h, _scaled(MAX_H, k))
+        if k > 1.0:
+            try:
+                w = max(w, min(int(self.top.winfo_reqwidth()), self._max_w))
+                h = max(h, min(int(self.top.winfo_reqheight()), self._max_h))
+            except tk.TclError:                            # pragma: no cover
+                pass
+        self._w, self._h = w, h
+
     def _restyle(self):
         """(Re-)assert WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE on our own hwnd.
         Idempotent in the backend, so re-asserting after every alpha change is
@@ -313,6 +386,35 @@ class ClientToast:
     @property
     def hwnd(self):
         return self._hwnd
+
+    @property
+    def size(self):
+        """The toast's ACTUAL ``(width, height)`` in physical px.
+
+        NOT the ``width=``/``height=`` the caller passed: those are design px
+        at the 96-dpi baseline and this is what they became on this display
+        (see ``_size_for_display``). A caller that needs to position the toast
+        itself — the FC HUD computes a fallback anchor with ``place_over`` —
+        must measure with THIS, or it centres a box of the wrong size."""
+        return (self._w, self._h)
+
+    @property
+    def max_size(self):
+        """The effective ``(width, height)`` growth ceiling — ``(MAX_W,
+        MAX_H)`` scaled for this display, floored at the caller's own scaled
+        box.
+
+        ``size == max_size`` on an axis USUALLY means the measured growth was
+        CLAMPED there, i.e. absurd content is clipped at the window edge — but
+        it is a hint, not a test, and it fails in both directions. At or below
+        the baseline there is no growth step at all, so an over-long body in
+        a box under the ceiling clips there (exactly as it shipped) without
+        the two ever being equal. And the two ARE equal with nothing clamped
+        anywhere when the caller's own scaled box already reaches the scaled
+        ceiling — a ``height_for`` of a 40-line intel report does — because
+        the floor raised ``max_size`` to ``size``, not because the growth was
+        cut down to it."""
+        return (self._max_w, self._max_h)
 
     def current_alpha(self):
         """Last requested window alpha (mirror for tests / logging)."""
