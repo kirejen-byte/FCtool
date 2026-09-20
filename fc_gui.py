@@ -24406,7 +24406,10 @@ class FCToolGUI:
         neither feature can dismiss the other's window. With no client rect
         there is nothing sensible to sit over, so the toast is skipped rather
         than parked at a guessed screen position -- logged, because a silent
-        skip is indistinguishable from a missed edge."""
+        skip is indistinguishable from a missed edge. The title names the
+        character (ozone_watch.toast_title), since with several clients open
+        -- tiled, overlapping, or seen only at a glance -- a bare "Ozone"
+        does not say which one."""
         try:
             prev = self._ozone_toast
             if prev is not None:
@@ -24423,7 +24426,7 @@ class FCToolGUI:
                 return
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
             toast = client_toast.ClientToast(
-                self.root, ozone_watch.TOAST_TITLE, body,
+                self.root, ozone_watch.toast_title(char_name), body,
                 seconds=cfg["toast_seconds"],
                 on_dismiss=lambda: setattr(self, "_ozone_toast", None))
             self._ozone_toast = toast

@@ -817,8 +817,26 @@ def verdict(cargo, cost, min_activations) -> Verdict:
     return Verdict(fire, lights, text)
 
 
-#: Toast title. Short by design — the toast is placed over a live client.
+#: Toast title prefix, and the fallback title when a character name is
+#: unavailable. Short by design — see ``toast_title`` for the full title.
 TOAST_TITLE = "Ozone"
+
+
+def toast_title(char_name) -> str:
+    """``"Ozone - {char_name}"`` — e.g. "Ozone - Securitas Protector".
+
+    With several clients open -- tiled, overlapping, or seen only at a
+    glance -- a bare "Ozone" does not say WHICH character is low, so the
+    title names them. Falls back to plain ``TOAST_TITLE`` when ``char_name``
+    is blank, ``None``, or otherwise unusable. Never raises — a non-``str``
+    is coerced with ``str()`` first."""
+    try:
+        name = str(char_name or "").strip()
+        if not name:
+            return TOAST_TITLE
+        return f"{TOAST_TITLE} - {name}"
+    except Exception:                                       # pragma: no cover
+        return TOAST_TITLE
 
 
 def toast_body(hull_name, cargo, cost, min_activations) -> str:
@@ -827,11 +845,11 @@ def toast_body(hull_name, cargo, cost, min_activations) -> str:
     "0 ozone - 0 activations left".
 
     Mentions neither the hull, the generator, "lights" (the internal count,
-    yes; the word, no), nor "need N" — the toast title and the client it
-    floats over already identify the ship. ``hull_name`` and
-    ``min_activations`` are accepted for API stability but are unused by the
-    body (``min_activations`` still gates ``verdict()``'s ``fire`` decision
-    upstream, just not this string). Never raises."""
+    yes; the word, no), nor "need N" — the toast title (naming the
+    character) and the client it floats over already identify the ship.
+    ``hull_name`` and ``min_activations`` are accepted for API stability but
+    are unused by the body (``min_activations`` still gates ``verdict()``'s
+    ``fire`` decision upstream, just not this string). Never raises."""
     if not isinstance(cargo, ShipCargo):
         cargo = EMPTY_CARGO
     return verdict(cargo, cost, min_activations).text
