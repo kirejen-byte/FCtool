@@ -33161,13 +33161,15 @@ class FCToolGUI:
         finally:
             menu.grab_release()
 
-    def _prompt_role_preset(self, initial):
+    def _prompt_role_preset(self, initial, validate=None):
         """Modal edit dialog for one role preset.
 
         ``initial`` is ``(letter, title, cap)``. Returns the validated
         ``(letter, title, cap)`` (cap None = no cap) or None on Cancel/Escape.
-        Field problems (see ``_parse_role_preset_fields``) are warned about and
-        the dialog stays open."""
+        Field problems (see ``_parse_role_preset_fields``) and, when given,
+        ``validate(letter, title, cap)`` errors (a message str; None = OK —
+        e.g. a label collision) are warned about and the dialog stays open, so
+        the typed input is kept."""
         letter0, title0, cap0 = initial
         win = tk.Toplevel(self.root)
         win.title("Edit preset")
@@ -33205,6 +33207,8 @@ class FCToolGUI:
         def _ok():
             parsed, err = _parse_role_preset_fields(
                 vars_[0].get(), vars_[1].get(), vars_[2].get())
+            if not err and validate is not None:
+                err = validate(*parsed)
             if err:
                 messagebox.showwarning("Edit preset", err, parent=win)
                 return
@@ -33240,33 +33244,34 @@ class FCToolGUI:
         except (IndexError, TypeError):
             return
         _label, letter, title, cap = current
-        res = self._prompt_role_preset((letter, title, cap))
+        builtin = tuple(_ROLE_BUILTIN_PRESETS[index])
+
+        def _resolve(triple):
+            triple = tuple(triple)
+            if triple == builtin[1:]:
+                return builtin
+            return (_role_preset_label(*triple),) + triple
+
+        def _validate(v_letter, v_title, v_cap):
+            new = _resolve((v_letter, v_title, v_cap))
+            if tuple(new) == tuple(current):
+                return None  # Unchanged is always acceptable.
+            taken = self._role_preset_label_taken(new[0], skip_index=index)
+            if taken:
+                return f"'{new[0]}' is already used by {taken}."
+            return None
+
+        # The collision check runs INSIDE the dialog (keeps the typed input).
+        res = self._prompt_role_preset((letter, title, cap), validate=_validate)
         if res is None:
             return  # Cancelled.
-        new_letter, new_title, new_cap = res
-        builtin = tuple(_ROLE_BUILTIN_PRESETS[index])
-        if (new_letter, new_title, new_cap) == builtin[1:]:
-            new = builtin
-        else:
-            new = (_role_preset_label(new_letter, new_title, new_cap),
-                   new_letter, new_title, new_cap)
+        new = _resolve(res)
         if tuple(new) == tuple(current):
             return  # No change.
-        new_label = new[0]
-        for j, other in enumerate(self._default_presets):
-            if j != index and other[0] == new_label:
-                messagebox.showwarning(
-                    "Edit preset",
-                    f"'{new_label}' matches another built-in preset.",
-                    parent=self.root)
-                return
-        for p in self.config.get("custom_role_presets", []) or []:
-            if isinstance(p, dict) and p.get("label") == new_label:
-                messagebox.showwarning(
-                    "Edit preset",
-                    f"A custom preset named '{new_label}' already exists.",
-                    parent=self.root)
-                return
+        err = _validate(*new[1:])  # Belt-and-braces (dialog already checked).
+        if err:
+            messagebox.showwarning("Edit preset", err, parent=self.root)
+            return
         presets = list(self._default_presets)
         presets[index] = new
         self._set_default_presets(presets)
@@ -33275,9 +33280,34 @@ class FCToolGUI:
         """Put the shipped built-in preset ``index`` back (slots untouched)."""
         if not self._default_preset_overridden(index):
             return
+        builtin = tuple(_ROLE_BUILTIN_PRESETS[index])
+        taken = self._role_preset_label_taken(builtin[0], skip_index=index)
+        if taken:
+            messagebox.showwarning(
+                "Restore preset",
+                f"'{builtin[0]}' is already used by {taken} — rename or "
+                "delete that preset first.",
+                parent=self.root)
+            return
         presets = list(self._default_presets)
-        presets[index] = tuple(_ROLE_BUILTIN_PRESETS[index])
+        presets[index] = builtin
         self._set_default_presets(presets)
+
+    def _role_preset_label_taken(self, label, *, skip_index=None):
+        """Which preset already shows button ``label``, if any?
+
+        Checks the live built-in row (except ``skip_index``, the entry being
+        edited/restored) and every custom preset. Returns a description of the
+        conflicting preset ("another built-in preset" / "a custom preset") or
+        None when ``label`` is free. Single owner of the no-duplicate-labels
+        rule for Edit… AND Restore built-in."""
+        for j, other in enumerate(self._default_presets):
+            if j != skip_index and other[0] == label:
+                return "another built-in preset"
+        for p in self.config.get("custom_role_presets", []) or []:
+            if isinstance(p, dict) and p.get("label") == label:
+                return "a custom preset"
+        return None
 
     def _set_default_presets(self, presets):
         """Adopt ``presets`` as the live built-in row, persist and rebuild.
