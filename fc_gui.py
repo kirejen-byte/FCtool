@@ -4154,13 +4154,16 @@ class FCToolGUI:
         tie_cb = tk.Checkbutton(
             xup_label_row, text="= DPS", variable=self._xup_tie_var,
             font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, padx=0,
+            bd=0, highlightthickness=0,
             selectcolor=BG_ENTRY, activebackground=BG_PANEL,
             activeforeground=FG_YELLOW, command=self._on_xup_tie_toggle)
         tie_cb.pack(side=tk.LEFT, padx=(4, 0))
         self._xup_tie_cb = tie_cb
         self._tip_widget(tie_cb, self._XUP_TIE_TOOLTIP)
+        # Restore the remembered choice only (box + greyed spinner). The tie
+        # itself is armed by _setup_modules once the counter exists — there is
+        # none yet here, and _xup_status / _xup_canvas are built further down.
         self._xup_sync_tie_widgets()
-        self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None))
 
         # width=-7 (a 7-char MINIMUM, never a truncation) instead of the ttk
         # 11-char default: pays back most of the checkbox's width, which at the
@@ -31522,6 +31525,10 @@ class FCToolGUI:
     def _setup_modules(self):
         # Fleet Management
         xup_cfg = self.config.get("xup", {})
+        # Read BEFORE the counter is replaced: a tied target with no aggregate
+        # to re-tie to carries across a Settings->Save (see below).
+        prev_xup_threshold = getattr(
+            getattr(self, "xup_counter", None), "threshold", None)
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
             fire_word=xup_cfg.get("fire_word", "FIRE"),
@@ -31533,7 +31540,7 @@ class FCToolGUI:
         )
         # A Settings->Save rebuilds the counter at the MANUAL threshold; while
         # "= DPS" is ticked, re-tie it to the last aggregate straight away.
-        self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None))
+        self._xup_retie_rebuilt_counter(prev_xup_threshold)
 
         # Chat Monitor
         logs_path = self.config.get("eve_logs_path", "")
@@ -32771,7 +32778,8 @@ class FCToolGUI:
         "Ties the x-up target to the number of DPS ships currently in fleet "
         "(doctrine DPS-tagged fits when a doctrine is active; every fitted "
         "hull otherwise). Updates with each fleet poll. Untick to set the "
-        "target by hand.")
+        "target by hand. Needs your primary character to be fleet boss (the "
+        "fleet roster is boss-only); otherwise the target stays where it was.")
 
     def _xup_tie_enabled(self) -> bool:
         """Is the x-up target tied to the DPS count? Config is the truth."""
@@ -32826,16 +32834,53 @@ class FCToolGUI:
         ``vm.modeled`` is the fleet_stats rule-4 pilot count — the SAME number
         the Fleet DPS headline is built from, so the two never disagree. No vm
         (failed / cleared aggregate) or a zero count (no fleet data) leaves the
-        last target standing rather than thrashing it down to 1."""
+        last target standing rather than thrashing it down to 1.
+
+        A target drop that makes the fleet READY (a DPS pilot who had not x'd
+        left) fires the SAME alert the chat path does -- ``_flash_ready``:
+        sound + title flash + ``>>> FLEET READY!`` log. XUpCounter only fires
+        ``on_ready`` on a flip a message causes, and ``was_ready`` then stays
+        True, so without this the READY is silent for the rest of the round.
+        True->False (the fleet grew) needs no alert.
+
+        Returns True when the vm carried a usable count (the target now equals
+        it), False when the tie is off or there was no data to tie to."""
         if not self._xup_tie_enabled() or vm is None:
-            return
+            return False
         try:
             n = int(vm.modeled)
         except (AttributeError, TypeError, ValueError, OverflowError):
-            return
+            return False
         if n < 1:
+            return False
+        counter = getattr(self, "xup_counter", None)
+        was_ready = bool(counter is not None and counter.state.is_ready)
+        if (self._xup_set_threshold(n) and not was_ready
+                and counter.state.is_ready
+                and getattr(self, "_xup_status", None) is not None):
+            self._flash_ready(counter.state)
+        return True
+
+    def _xup_retie_rebuilt_counter(self, prev_threshold):
+        """Re-arm the tie on a counter ``_setup_modules`` just rebuilt at the
+        MANUAL threshold (startup, or every Settings->Save). Tk thread only.
+
+        With an aggregate it re-ties straight away. Without one (no fleet /
+        not boss / failed aggregate) the tie's rule is "no data -> unchanged":
+        the OLD counter's tied target carries across, and the greyed spinner
+        keeps showing it. No old counter (the startup pass) -> the manual
+        value, spinner synced to it."""
+        if not self._xup_tie_enabled():
             return
-        self._xup_set_threshold(n)
+        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None)):
+            return
+        carry = self._xup_manual_threshold()
+        if prev_threshold is not None:
+            try:
+                carry = max(1, int(prev_threshold))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        self._xup_set_threshold(carry)
 
     def _on_xup_tie_toggle(self):
         """The "= DPS" checkbox: remember it, then tie or restore the target."""
