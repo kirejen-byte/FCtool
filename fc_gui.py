@@ -14191,8 +14191,10 @@ class FCToolGUI:
             _stop_chk,
             "While Auto-update MOTD is armed, if the FC character leaves the "
             "staging system set in the composer above, auto-updating turns "
-            "itself OFF (one-way — re-tick Auto-update MOTD to resume). Does "
-            "nothing if no staging system is set.")
+            "itself OFF for the rest of this session (one-way — re-tick "
+            "Auto-update MOTD to resume). Your remembered on/off choice is "
+            "left alone, so restarting FCTool resumes it too. Does nothing if "
+            "no staging system is set.")
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
             bg=BG_PANEL, cursor="question_arrow")
@@ -16638,6 +16640,15 @@ class FCToolGUI:
         hand. _motd_link_state is advanced to "ok" only when the link is
         actually enabled — while it is off the state is left alone so the
         indicator keeps reading "not linked".
+
+        KNOWN, ACCEPTED CONSEQUENCE of that conditional: after an automatic
+        disarm the indicator keeps reading "○ stopped — FC left staging" /
+        "○ link dropped (push failed)" even once the FC pushes by hand again,
+        because _motd_update_link_indicator checks those two terminal states
+        BEFORE its not-enabled early return and the old unconditional "ok"
+        used to clear them. That is correct: the label describes the LINK,
+        which really is still stopped, not the manual push. Re-ticking
+        Auto-update MOTD resets the state to "waiting" and clears it.
         """
         if getattr(self, "_motd_link_enabled", False):
             self._motd_link_state = "ok"
