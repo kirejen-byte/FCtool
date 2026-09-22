@@ -33380,8 +33380,10 @@ class FCToolGUI:
         it after the fact changed nothing but the counter's colour. Now, when
         the effective cap (`role_cap.effective_cap`: box ticked AND a positive
         integer) is below the head-count, the BOTTOM pilots — the last entries
-        of `slot["people"]`, i.e. the most recently added — leave, last one
-        first, until the count fits. The pilots who were there first keep
+        of `slot["people"]`, i.e. the most recently added — leave, in their
+        listed order, until the count fits: when room runs short it is the
+        newest who fall out, and pilots moved together keep their relative
+        order in the receiving group. The pilots who were there first keep
         their place. Each evictee goes to the "next identical group": the
         next slot with the SAME key letter that has room, searching forward
         from this slot and wrapping round (`role_cap.find_overflow_slot`, with
@@ -33393,9 +33395,11 @@ class FCToolGUI:
         or a blank / 0 / non-numeric cap moves nobody — the pass then only
         repaints the counter.
 
-        A same-letter slot that already lists the pilot is never a
-        destination (the chat routing never double-lists a pilot within a
-        letter, so that only arises after a hand-edited key letter).
+        An evictee already listed in ANOTHER same-letter slot is simply
+        dropped from this one (dim log, "already in ..."), never moved, so no
+        pilot ends up listed twice (the chat routing never double-lists a
+        pilot within a letter, so that only arises after a hand-edited key
+        letter).
 
         Tk thread only: reached solely from the cap Entry's <Return> /
         <FocusOut> bindings and the Cap checkbox's command, so there is no
@@ -33427,9 +33431,13 @@ class FCToolGUI:
                         other["cap_enabled_var"].get(), other["cap_var"].get())
                     return role_cap.has_room(len(other["people"]), other_cap)
 
-                # Bottom-up: the last-added pilot moves first, so the order in
-                # which evictees land in a receiving group is deterministic.
-                for sender in reversed(list(people)[-excess:]):
+                want = letter.strip().lower()
+                # The bottom `excess` pilots, in their listed order: the
+                # earlier evictee takes the first free seat, so when room runs
+                # short the NEWEST fall out, and moved pilots keep their
+                # relative order. The list is a snapshot, so popping from
+                # `people` while iterating is safe.
+                for sender in list(people)[-excess:]:
                     info = people.pop(sender)
                     note_var = info.get("note_var")
                     note = note_var.get() if note_var is not None else None
@@ -33439,6 +33447,20 @@ class FCToolGUI:
                         loc_look = {k: loc_label.cget(k)
                                     for k in ("text", "fg", "cursor")}
                     info["row"].destroy()
+
+                    twin = next(
+                        (s for i, s in enumerate(slots)
+                         if i != idx and want
+                         and s["letter_var"].get().strip().lower() == want
+                         and sender in s["people"]), None)
+                    if twin is not None:
+                        twin_title = (twin["title_var"].get().strip()
+                                      or letter.strip().upper())
+                        self._append_xup_log(
+                            f"[{stamp}] {sender} <- {title} "
+                            f"(cap lowered to {cap}, already in "
+                            f"{twin_title})\n", "dim")
+                        continue
 
                     dest_i = role_cap.find_overflow_slot(
                         letters, idx, letter,
