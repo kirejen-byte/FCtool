@@ -99,6 +99,9 @@ from default_config import DEFAULT_CONFIG
 import tts_helper
 from app_path import app_dir, app_dir_decision
 import ship_classes
+# Role Tracker cap enforcement after the fact (pure decisions; the row moving
+# is _apply_role_cap). Stdlib only, imports no fc_gui.
+import role_cap
 import charge_tracker
 import command_bursts
 # Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
@@ -33119,7 +33122,7 @@ class FCToolGUI:
         if has_preset_cap:
             cap_var.set(str(cap))
 
-        def toggle_cap():
+        def toggle_cap(apply=True):
             if cap_enabled_var.get():
                 cap_label.pack(side=tk.LEFT)
                 cap_entry.pack(side=tk.LEFT, padx=(0, 4))
@@ -33127,6 +33130,12 @@ class FCToolGUI:
                 cap_label.pack_forget()
                 cap_entry.pack_forget()
                 cap_var.set("")
+            # A user toggle re-applies the cap to the people ALREADY listed:
+            # ticking ON over a too-small value moves the bottom ones on;
+            # ticking OFF moves nobody and just repaints "n/cap" back to "n".
+            # The build-time call below passes apply=False (no `slot` yet).
+            if apply:
+                self._apply_role_cap(slot)
 
         cap_cb = tk.Checkbutton(top_row, text="Cap",
                                  variable=cap_enabled_var,
@@ -33138,7 +33147,13 @@ class FCToolGUI:
 
         # Show cap widgets if preset provided a cap value
         if has_preset_cap:
-            toggle_cap()
+            toggle_cap(apply=False)
+
+        # An edited cap is applied on Enter / leaving the field — NOT via a
+        # cap_var trace: typing "10" passes through "1", and a per-keystroke
+        # apply would evict all but one pilot on the way to the real value.
+        cap_entry.bind("<Return>", lambda _e: self._apply_role_cap(slot))
+        cap_entry.bind("<FocusOut>", lambda _e: self._apply_role_cap(slot))
 
         def remove_slot():
             slot_frame.destroy()
@@ -33224,8 +33239,12 @@ class FCToolGUI:
                 frame.grid(row=i, column=0, columnspan=2,
                            sticky="nsew", padx=2, pady=2)
 
-    def _add_person_to_slot(self, slot, sender, timestamp):
-        """Add a person row to a role slot with their own note field."""
+    def _add_person_to_slot(self, slot, sender, timestamp, note=None):
+        """Add a person row to a role slot with their own note field.
+
+        ``note`` pre-fills the note field — used when `_apply_role_cap` moves a
+        pilot between groups. Only a REAL note is carried: None, "" or the
+        greyed placeholder leave the field in its placeholder state."""
         if sender in slot["people"]:
             return  # Already listed
 
@@ -33327,6 +33346,9 @@ class FCToolGUI:
         note_entry.bind("<FocusIn>", on_note_focus_in)
         note_entry.bind("<FocusOut>", on_note_focus_out)
         show_placeholder()  # start in placeholder state (field is empty)
+        if note and note != NOTE_PLACEHOLDER:
+            clear_placeholder()        # real-note colour (FG_ORANGE)
+            note_var.set(note)         # limit_note still caps it at 30
 
         info.update({
             "timestamp": timestamp,
@@ -33350,6 +33372,102 @@ class FCToolGUI:
             except ValueError:
                 pass
         slot["count_label"].config(text=str(count), fg=FG_ACCENT)
+
+    def _apply_role_cap(self, slot):
+        """Enforce a slot's cap on the pilots ALREADY in it (owner rule).
+
+        The cap used to be consulted only when someone was ADDED, so lowering
+        it after the fact changed nothing but the counter's colour. Now, when
+        the effective cap (`role_cap.effective_cap`: box ticked AND a positive
+        integer) is below the head-count, the BOTTOM pilots — the last entries
+        of `slot["people"]`, i.e. the most recently added — leave, last one
+        first, until the count fits. The pilots who were there first keep
+        their place. Each evictee goes to the "next identical group": the
+        next slot with the SAME key letter that has room, searching forward
+        from this slot and wrapping round (`role_cap.find_overflow_slot`, with
+        the chat routing's own room test). The pilot keeps their original
+        timestamp, a real note (never the placeholder) and the last known
+        location. With no identical group free they leave the tracker. Every
+        move / removal is logged to the x-up log, stamped in EVE time (UTC)
+        like the chat-routed lines around it. Raising the cap, unticking Cap,
+        or a blank / 0 / non-numeric cap moves nobody — the pass then only
+        repaints the counter.
+
+        A same-letter slot that already lists the pilot is never a
+        destination (the chat routing never double-lists a pilot within a
+        letter, so that only arises after a hand-edited key letter).
+
+        Tk thread only: reached solely from the cap Entry's <Return> /
+        <FocusOut> bindings and the Cap checkbox's command, so there is no
+        `_post_ui` marshalling. It must never raise into those Tk callbacks —
+        failures are logged, like `remove_person`'s.
+        """
+        try:
+            slots = self._role_slots
+            idx = next((i for i, s in enumerate(slots) if s is slot), None)
+            if idx is None:
+                return  # slot already removed (a <FocusOut> after its X)
+            people = slot["people"]
+            cap = role_cap.effective_cap(slot["cap_enabled_var"].get(),
+                                         slot["cap_var"].get())
+            excess = role_cap.evictions(len(people), cap)
+            touched = [slot]
+            if excess:
+                letter = slot["letter_var"].get()
+                letters = [s["letter_var"].get() for s in slots]
+                title = (slot["title_var"].get().strip()
+                         or letter.strip().upper())
+                stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+                def room(i, _sender):
+                    other = slots[i]
+                    if _sender in other["people"]:
+                        return False
+                    other_cap = role_cap.effective_cap(
+                        other["cap_enabled_var"].get(), other["cap_var"].get())
+                    return role_cap.has_room(len(other["people"]), other_cap)
+
+                # Bottom-up: the last-added pilot moves first, so the order in
+                # which evictees land in a receiving group is deterministic.
+                for sender in reversed(list(people)[-excess:]):
+                    info = people.pop(sender)
+                    note_var = info.get("note_var")
+                    note = note_var.get() if note_var is not None else None
+                    loc_label = info.get("location_label")
+                    loc_look = None
+                    if loc_label is not None:
+                        loc_look = {k: loc_label.cget(k)
+                                    for k in ("text", "fg", "cursor")}
+                    info["row"].destroy()
+
+                    dest_i = role_cap.find_overflow_slot(
+                        letters, idx, letter,
+                        lambda i, _s=sender: room(i, _s))
+                    if dest_i is None:
+                        self._append_xup_log(
+                            f"[{stamp}] {sender} <- {title} "
+                            f"(cap lowered to {cap}, removed)\n", "dim")
+                        continue
+                    dest = slots[dest_i]
+                    self._add_person_to_slot(dest, sender, info.get("timestamp"),
+                                             note=note)
+                    moved = dest["people"].get(sender)
+                    if moved is not None and loc_look is not None:
+                        # Keep the known location visible until the next 15 s
+                        # _apply_fleet_locations pass (which never re-binds).
+                        moved["location_system"] = info.get("location_system")
+                        moved["location_label"].config(**loc_look)
+                    dest_title = (dest["title_var"].get().strip()
+                                  or letter.strip().upper())
+                    self._append_xup_log(
+                        f"[{stamp}] {sender}: {title} -> {dest_title} "
+                        f"(cap lowered)\n", "role")
+                    if not any(t is dest for t in touched):
+                        touched.append(dest)
+            for s in touched:
+                self._update_role_count_label(s)
+        except Exception:
+            log.exception("Failed to apply the cap of a role slot")
 
     def _arm_fleet_refresh(self, delay_ms):
         """(Re)arm the ONE pending fleet-location poll. MAIN THREAD ONLY.
