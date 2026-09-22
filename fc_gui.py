@@ -847,6 +847,96 @@ def _motd_link_initial_state(config) -> bool:
         return False
 
 
+# The Role Tracker's BUILT-IN preset buttons (row 1), each
+# ``(label, letter, title, cap)``. The owner can edit them in place (right-click
+# a button); an edited set is persisted as ``config["default_role_presets"]``
+# and ``_role_default_presets`` decides at Fleet-tab build time which list wins.
+# "Restore built-in" puts the matching tuple from HERE back.
+_ROLE_BUILTIN_PRESETS = (
+    ("C-Cyno", "c", "Cyno", None),
+    ("D-Dictors", "d", "Dictors", None),
+    ("F-Fax 3", "f", "FAX", 3),
+    ("Z-Defenders-8", "z", "Defenders", 8),
+    ("1-Dreads-10", "1", "Dreads", 10),
+)
+
+# Mirrors the role slot's key Entry (``width=2``): a preset key is 1-2 chars.
+_ROLE_PRESET_LETTER_MAX = 2
+
+
+def _role_preset_label(letter, title, cap) -> str:
+    """A role preset's button label, built exactly the way
+    ``_save_role_as_preset`` builds it: ``LETTER-Title`` plus ``-cap`` when a
+    cap is set."""
+    label = f"{letter.upper()}-{title}"
+    if cap is not None:
+        label += f"-{cap}"
+    return label
+
+
+def _parse_role_preset_fields(letter, title, cap_text):
+    """Validate the role-preset edit dialog's three fields.
+
+    Returns ``((letter, title, cap), None)`` on success or ``(None, message)``
+    naming the first problem: the key must be 1-2 non-blank characters, the
+    role name non-blank, the cap blank (no cap) or a positive whole number.
+    Surrounding whitespace is stripped from every field."""
+    letter = str(letter or "").strip()
+    title = str(title or "").strip()
+    cap_text = str(cap_text or "").strip()
+    if not letter:
+        return None, "The key cannot be blank."
+    if len(letter) > _ROLE_PRESET_LETTER_MAX:
+        return None, (f"The key must be at most {_ROLE_PRESET_LETTER_MAX} "
+                      "characters.")
+    if not title:
+        return None, "The role name cannot be blank."
+    cap = None
+    if cap_text:
+        if not cap_text.isdigit() or int(cap_text) <= 0:
+            return None, "The cap must be blank or a positive whole number."
+        cap = int(cap_text)
+    return (letter, title, cap), None
+
+
+def _role_default_presets(config, builtin=_ROLE_BUILTIN_PRESETS) -> list:
+    """The Role Tracker's built-in preset list at Fleet-tab build time.
+
+    Uses ``config["default_role_presets"]`` (written only when the owner edits
+    a built-in preset: a list of ``{label, letter, title, cap}`` dicts in the
+    built-in order) when it is WELL-FORMED — a list of exactly ``len(builtin)``
+    dicts, each with a non-blank string ``letter`` and ``title`` and a ``cap``
+    that is None or a positive int. Anything else (missing key, non-list,
+    wrong length, one bad entry) falls back to ``builtin`` WHOLESALE — never a
+    half-merge. A blank/missing label is rebuilt from the other fields. Never
+    raises: a damaged config must not stop the Fleet tab from building."""
+    fallback = [tuple(p) for p in builtin]
+    try:
+        stored = config.get("default_role_presets") if isinstance(
+            config, dict) else None
+        if not isinstance(stored, list) or len(stored) != len(fallback):
+            return fallback
+        out = []
+        for p in stored:
+            if not isinstance(p, dict):
+                return fallback
+            letter, title, cap = p.get("letter"), p.get("title"), p.get("cap")
+            if not isinstance(letter, str) or not letter.strip():
+                return fallback
+            if not isinstance(title, str) or not title.strip():
+                return fallback
+            if cap is not None and (isinstance(cap, bool)
+                                    or not isinstance(cap, int) or cap <= 0):
+                return fallback
+            label = p.get("label")
+            if not isinstance(label, str) or not label.strip():
+                label = _role_preset_label(letter, title, cap)
+            out.append((label, letter, title, cap))
+        return out
+    except Exception:
+        return fallback
+
+
 def _filter_cap_entries(entries, only_region: str) -> list:
     """Filter capability asset entries down to a single region.
 
@@ -4221,13 +4311,10 @@ class FCToolGUI:
         self._preset_row2 = tk.Frame(preset_container, bg=BG_DARK)
         # Row 2 only packed when custom presets exist
 
-        self._default_presets = [
-            ("C-Cyno", "c", "Cyno", None),
-            ("D-Dictors", "d", "Dictors", None),
-            ("F-Fax 3", "f", "FAX", 3),
-            ("Z-Defenders-8", "z", "Defenders", 8),
-            ("1-Dreads-10", "1", "Dreads", 10),
-        ]
+        # Built-in presets, or the owner's edited set when one is saved
+        # (right-click a built-in button; see _edit_default_preset).
+        self._default_presets = _role_default_presets(
+            getattr(self, "config", None), _ROLE_BUILTIN_PRESETS)
         self._preset_frame = preset_row1
         self._MAX_CUSTOM_PRESETS = 8
         self._rebuild_preset_buttons()
@@ -32856,11 +32943,15 @@ class FCToolGUI:
             w.destroy()
         self._preset_row2.pack_forget()
 
-        # Row 1: Default presets
-        for label, letter, title, cap in self._default_presets:
-            ttk.Button(self._preset_frame, text=label, style="Dark.TButton",
-                       command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c)
-                       ).pack(side=tk.LEFT, padx=2)
+        # Row 1: Default presets. Right-click = edit / restore menu.
+        for idx, (label, letter, title, cap) in enumerate(self._default_presets):
+            btn = ttk.Button(
+                self._preset_frame, text=label, style="Dark.TButton",
+                command=lambda l=letter, t=title, c=cap: self._add_role_preset(l, t, c))
+            btn.pack(side=tk.LEFT, padx=2)
+            btn.bind("<Button-3>",
+                     lambda e, i=idx: self._show_default_preset_menu(e, i))
+            self._tip_widget(btn, "Right-click to edit or restore this preset")
 
         # Row 2: Custom presets + Clear button
         custom = self.config.get("custom_role_presets", [])
@@ -33041,6 +33132,168 @@ class FCToolGUI:
                 "Rename preset",
                 "Could not rename the preset. See the log for details.",
                 parent=self.root)
+
+    # ── Built-in (row 1) preset editing ──────────────────────────────────────
+    # A preset is a TEMPLATE for new role slots: editing or restoring one never
+    # touches a slot already on screen.
+
+    def _default_preset_overridden(self, index) -> bool:
+        """True when built-in preset ``index`` differs from the shipped one."""
+        try:
+            return (tuple(self._default_presets[index])
+                    != tuple(_ROLE_BUILTIN_PRESETS[index]))
+        except (IndexError, TypeError):
+            return False
+
+    def _show_default_preset_menu(self, event, index):
+        """Right-click menu on a built-in preset button: Edit… / Restore."""
+        menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        menu.add_command(label="Edit…",
+                         command=lambda: self._edit_default_preset(index))
+        menu.add_command(
+            label="Restore built-in",
+            command=lambda: self._restore_default_preset(index),
+            state=(tk.NORMAL if self._default_preset_overridden(index)
+                   else tk.DISABLED))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _prompt_role_preset(self, initial):
+        """Modal edit dialog for one role preset.
+
+        ``initial`` is ``(letter, title, cap)``. Returns the validated
+        ``(letter, title, cap)`` (cap None = no cap) or None on Cancel/Escape.
+        Field problems (see ``_parse_role_preset_fields``) are warned about and
+        the dialog stays open."""
+        letter0, title0, cap0 = initial
+        win = tk.Toplevel(self.root)
+        win.title("Edit preset")
+        win.configure(bg=BG_DARK)
+        win.resizable(False, False)
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except tk.TclError:
+            pass
+        result = {"value": None}
+
+        form = tk.Frame(win, bg=BG_DARK)
+        form.pack(fill=tk.X, padx=12, pady=(12, 4))
+        fields = (("Key:", letter0, 4),
+                  ("Role name:", title0, 24),
+                  ("Cap (blank = none):", "" if cap0 is None else str(cap0), 6))
+        vars_ = []
+        entries = []
+        for row, (text, value, width) in enumerate(fields):
+            tk.Label(form, text=text, font=("Consolas", 10), fg=FG_TEXT,
+                     bg=BG_DARK).grid(row=row, column=0, sticky=tk.W,
+                                      padx=(0, 8), pady=2)
+            var = tk.StringVar(value=value)
+            entry = tk.Entry(form, textvariable=var, font=("Consolas", 10),
+                             bg=BG_ENTRY, fg=FG_WHITE,
+                             insertbackground=FG_WHITE, width=width,
+                             borderwidth=1, relief=tk.RIDGE)
+            entry.grid(row=row, column=1, sticky=tk.W, pady=2)
+            vars_.append(var)
+            entries.append(entry)
+        entries[1].focus_set()
+        entries[1].icursor(tk.END)
+
+        def _ok():
+            parsed, err = _parse_role_preset_fields(
+                vars_[0].get(), vars_[1].get(), vars_[2].get())
+            if err:
+                messagebox.showwarning("Edit preset", err, parent=win)
+                return
+            result["value"] = parsed
+            win.destroy()
+
+        def _cancel():
+            win.destroy()
+
+        btns = tk.Frame(win, bg=BG_DARK)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+        ttk.Button(btns, text="OK", style="Green.TButton",
+                   command=_ok).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Cancel", style="Dark.TButton",
+                   command=_cancel).pack(side=tk.RIGHT)
+        for entry in entries:
+            entry.bind("<Return>", lambda e: _ok())
+        win.bind("<Escape>", lambda e: _cancel())
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        center_over(win, self.root)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _edit_default_preset(self, index):
+        """Edit built-in preset ``index`` (key, role name, cap) and remember it.
+
+        The label is rebuilt like a custom preset's (``LETTER-Title[-cap]``); a
+        label colliding with ANOTHER built-in or with any custom preset is
+        refused. Values equal to the shipped preset restore it verbatim.
+        Existing role slots are NOT changed — a preset only seeds NEW slots."""
+        try:
+            current = self._default_presets[index]
+        except (IndexError, TypeError):
+            return
+        _label, letter, title, cap = current
+        res = self._prompt_role_preset((letter, title, cap))
+        if res is None:
+            return  # Cancelled.
+        new_letter, new_title, new_cap = res
+        builtin = tuple(_ROLE_BUILTIN_PRESETS[index])
+        if (new_letter, new_title, new_cap) == builtin[1:]:
+            new = builtin
+        else:
+            new = (_role_preset_label(new_letter, new_title, new_cap),
+                   new_letter, new_title, new_cap)
+        if tuple(new) == tuple(current):
+            return  # No change.
+        new_label = new[0]
+        for j, other in enumerate(self._default_presets):
+            if j != index and other[0] == new_label:
+                messagebox.showwarning(
+                    "Edit preset",
+                    f"'{new_label}' matches another built-in preset.",
+                    parent=self.root)
+                return
+        for p in self.config.get("custom_role_presets", []) or []:
+            if isinstance(p, dict) and p.get("label") == new_label:
+                messagebox.showwarning(
+                    "Edit preset",
+                    f"A custom preset named '{new_label}' already exists.",
+                    parent=self.root)
+                return
+        presets = list(self._default_presets)
+        presets[index] = new
+        self._set_default_presets(presets)
+
+    def _restore_default_preset(self, index):
+        """Put the shipped built-in preset ``index`` back (slots untouched)."""
+        if not self._default_preset_overridden(index):
+            return
+        presets = list(self._default_presets)
+        presets[index] = tuple(_ROLE_BUILTIN_PRESETS[index])
+        self._set_default_presets(presets)
+
+    def _set_default_presets(self, presets):
+        """Adopt ``presets`` as the live built-in row, persist and rebuild.
+
+        ``config["default_role_presets"]`` holds the FULL list while any entry
+        differs from the shipped built-ins, and is dropped once every entry is
+        back to built-in."""
+        self._default_presets = [tuple(p) for p in presets]
+        if self._default_presets == [tuple(p) for p in _ROLE_BUILTIN_PRESETS]:
+            self.config.pop("default_role_presets", None)
+        else:
+            self.config["default_role_presets"] = [
+                {"label": label, "letter": letter, "title": title, "cap": cap}
+                for label, letter, title, cap in self._default_presets]
+        self._save_config()
+        self._rebuild_preset_buttons()
 
     def _add_role_preset(self, letter: str, title: str, cap: int | None):
         """Add a pre-configured role slot, auto-numbering if duplicates exist."""
