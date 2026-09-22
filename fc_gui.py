@@ -818,14 +818,33 @@ def build_linux_screenshot_cmds(wayland, available, x, y, w, h, out_path):
 def _motd_link_initial_state(config) -> bool:
     """Initial state of the MOTD auto-update link at tab build.
 
-    Always False, by design. The link is session-scoped: it must be turned on
-    deliberately each session. Persisting it and restoring it on startup caused
-    the app to push a freshly-opened (default) MOTD over the fleet's real one
-    before the FC had set anything up, so any persisted ``motd_link`` value is
-    intentionally ignored. ``config`` is accepted (and unused) to document that
-    the decision does not depend on it and to pin this behavior in tests.
+    Restores the owner's remembered choice from
+    ``config["fittings"]["motd_link"]``: the "Auto-update MOTD" checkbox is a
+    persisted preference, not a per-session one, and only the owner's explicit
+    toggle ever writes it. Defaults to False when the key, the ``fittings``
+    block or the config itself is missing or malformed — this never raises,
+    because a damaged config must not stop the MOTD tab from building.
+
+    ACCEPTED TRADEOFF — deliberate, not an oversight. Persisting this was
+    removed once because of a real bug: with the link restored ON at launch the
+    autopush loop can compute the MOTD from the freshly-opened tab's default
+    state and push that default over the fleet's REAL MOTD, since
+    ``_motd_last_pushed_markup`` is None on a fresh launch and the first tick
+    therefore reads as "changed". The owner was shown this exact risk and chose
+    full persistence anyway, because the box turning itself back on was the
+    worse annoyance. Do NOT "fix" it with a mitigation that changes those
+    semantics — no armed-but-held-until-the-first-manual-Set latch, no reading
+    the fleet's current MOTD to seed the baseline.
     """
-    return False
+    try:
+        if not isinstance(config, dict):
+            return False
+        fittings = config.get("fittings")
+        if not isinstance(fittings, dict):
+            return False
+        return bool(fittings.get("motd_link", False))
+    except Exception:
+        return False
 
 
 def _filter_cap_entries(entries, only_region: str) -> list:
@@ -13921,7 +13940,9 @@ class FCToolGUI:
         self._motd_staging_autofilled_value = (
             self.config.get("zkillboard", {}).get("staging_system", "") or "").strip()
 
-        # Linked-MOTD auto-push state (session-scoped; always OFF at startup).
+        # Linked-MOTD auto-push state. The on/off choice is REMEMBERED across
+        # restarts (config["fittings"]["motd_link"]); everything else here is
+        # session-scoped bookkeeping. See _motd_link_initial_state.
         self._motd_link_enabled = _motd_link_initial_state(self.config)
         self._motd_last_push_ts = None
         self._motd_last_check_ts = None
@@ -14180,9 +14201,9 @@ class FCToolGUI:
                      "and re-pushes it to your fleet whenever the composition/"
                      "deltas change. The counter is seconds since the last "
                      "check. Requires you to be the current fleet boss; only "
-                     "re-pushes when the text actually changes. Switches on "
-                     "automatically after you 'Set as fleet MOTD' once this "
-                     "session (startup stays off); toggle it off any time.")
+                     "re-pushes when the text actually changes. Your on/off "
+                     "choice is remembered and restored the next time FCTool "
+                     "starts; toggle it off any time.")
         self._motd_link_indicator.bind(
             "<Enter>", lambda e, t=_link_tip: self._show_tooltip(e, t))
         self._motd_link_indicator.bind("<Leave>", lambda e: self._hide_tooltip())
@@ -16586,9 +16607,11 @@ class FCToolGUI:
                 self._motd_fleet_status.config(
                     text="MOTD set successfully (204).", fg=FG_GREEN)
                 self._auto_select_fleet_doctrine(pushed_doctrine)
-                # First successful manual push this session arms the auto-update
-                # link (startup stays OFF; see _motd_link_initial_state).
-                self._motd_arm_link(markup)
+                # Record the push so an already-armed autopush loop sees it as
+                # already-synced. It does NOT touch the Auto-update checkbox —
+                # that is the owner's remembered choice (see
+                # _motd_link_initial_state).
+                self._motd_record_manual_push(markup)
             else:
                 detail = (f"\n\n{err}" if err else
                           "\n\nESI rejected the request (403 if you are no "
@@ -16600,23 +16623,24 @@ class FCToolGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _motd_arm_link(self, markup):
-        """Arm the auto-update link after a successful manual "Set as fleet
-        MOTD" push. Main-thread only.
+    def _motd_record_manual_push(self, markup):
+        """Record a successful manual "Set as fleet MOTD" push. Main-thread only.
 
-        The link is session-scoped (never persisted, always OFF at startup — see
-        _motd_link_initial_state). But once the FC has deliberately pushed a MOTD
-        this session, keeping it in sync no longer risks clobbering the fleet's
-        real MOTD with a default, so a successful first manual push switches
-        auto-update ON without an extra click. Records the just-pushed markup and
-        timestamp so the autopush loop treats it as already-synced and does not
-        immediately re-push the identical text. The user can still toggle it off.
+        This is bookkeeping ONLY — it never changes the Auto-update checkbox.
+        The on/off state is the owner's remembered preference (persisted by
+        _motd_toggle_link, restored by _motd_link_initial_state), and a manual
+        Set is not a request to turn auto-update on; re-ticking the box after
+        every manual push was exactly the behaviour the owner asked us to stop.
+
+        The markup + timestamps it records ARE load-bearing: an already-armed
+        autopush loop compares against _motd_last_pushed_markup, so without
+        them the very next tick would re-push text that was just pushed by
+        hand. _motd_link_state is advanced to "ok" only when the link is
+        actually enabled — while it is off the state is left alone so the
+        indicator keeps reading "not linked".
         """
-        self._motd_link_enabled = True
-        var = getattr(self, "_motd_link_var", None)
-        if var is not None:
-            var.set(True)
-        self._motd_link_state = "ok"
+        if getattr(self, "_motd_link_enabled", False):
+            self._motd_link_state = "ok"
         self._motd_last_pushed_markup = markup
         self._motd_last_push_ts = time.monotonic()
         self._motd_last_check_ts = time.monotonic()
@@ -16625,11 +16649,19 @@ class FCToolGUI:
     def _motd_toggle_link(self):
         """Enable/disable linked auto-push of the MOTD.
 
-        The link is session-scoped and intentionally NOT persisted: on the next
-        launch it must start OFF so a freshly-opened (default) MOTD is never
-        pushed over the fleet's real one. See _motd_link_initial_state."""
+        The owner's explicit toggle is the ONLY writer of the remembered
+        preference config["fittings"]["motd_link"], which
+        _motd_link_initial_state restores at the next launch (tradeoff
+        documented there). Automatic disarms — leave-staging, hard push failure
+        — deliberately do NOT persist False: they stop the live session, they
+        do not change what the owner asked for."""
         self._motd_link_enabled = bool(self._motd_link_var.get())
         self._motd_link_state = "waiting" if self._motd_link_enabled else "off"
+        self.config.setdefault("fittings", {})["motd_link"] = self._motd_link_enabled
+        try:
+            self._save_config()
+        except Exception:
+            pass
         if self._motd_link_enabled:
             import time
             self._motd_last_check_ts = time.monotonic()
@@ -16716,12 +16748,18 @@ class FCToolGUI:
             elif reason == "left_staging":
                 # FC left the staging system → disarm the link (one-way; re-tick
                 # Auto-update MOTD to resume). Mirrors the hard-failure disarm.
+                # SESSION ONLY — do NOT persist False here. The remembered
+                # config["fittings"]["motd_link"] is the owner's LAST EXPLICIT
+                # toggle; an automatic disarm must not rewrite their choice.
                 self._motd_link_enabled = False
                 if getattr(self, "_motd_link_var", None) is not None:
                     self._motd_link_var.set(False)
                 self._motd_link_state = "left_staging"
             else:
                 # Hard failure (e.g. 403) — drop the link so we stop hammering ESI.
+                # SESSION ONLY — do NOT persist False here. The remembered
+                # config["fittings"]["motd_link"] is the owner's LAST EXPLICIT
+                # toggle; an automatic disarm must not rewrite their choice.
                 self._motd_link_enabled = False
                 if getattr(self, "_motd_link_var", None) is not None:
                     self._motd_link_var.set(False)

@@ -420,4 +420,8 @@ DEFAULT_CONFIG = {
     #   * "motd_budget", "motd_link_interval_s", "motd_stop_leave_staging",
     #     "logi_channel" — the length ceiling, auto-update interval, leave-staging
     #     guard toggle, and remembered default logi channel.
+    #   * "motd_link" — remembered state of the "Auto-update MOTD" checkbox
+    #     (default False). Written ONLY by the user's explicit toggle; the
+    #     automatic disarms (leave-staging / push failure) stop the live session
+    #     without rewriting it.
 }
