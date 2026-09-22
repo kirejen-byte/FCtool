@@ -32,6 +32,8 @@ DEFAULT_CONFIG = {
         "threshold": 50,
         "channel_name": "Fleet",
         "case_sensitive": False,
+        # Fleet tab "= DPS": x-up target follows the fleet's DPS-ship count.
+        "tie_to_dps": False,
     },
     "zkillboard": {
         "enabled": True,

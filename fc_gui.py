@@ -4141,16 +4141,35 @@ class FCToolGUI:
             font=("Consolas", 14, "bold"), width=4,
             bg=BG_ENTRY, fg=FG_YELLOW, insertbackground=FG_WHITE,
             buttonbackground=BG_PANEL, borderwidth=1, relief=tk.FLAT,
+            disabledbackground=BG_PANEL, disabledforeground=FG_DIM,
             command=self._on_threshold_change,
         )
         self._threshold_spin.pack(side=tk.LEFT)
         self._threshold_spin.bind("<Return>", lambda e: self._on_threshold_change())
         self._threshold_spin.bind("<FocusOut>", lambda e: self._on_threshold_change())
 
-        ttk.Button(xup_label_row, text="Reset", style="Red.TButton",
+        # "= DPS": tie the target to the fleet's DPS-ship count (remembered in
+        # config["xup"]["tie_to_dps"]; the manual threshold is kept untouched).
+        self._xup_tie_var = tk.BooleanVar(value=self._xup_tie_enabled())
+        tie_cb = tk.Checkbutton(
+            xup_label_row, text="= DPS", variable=self._xup_tie_var,
+            font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, padx=0,
+            selectcolor=BG_ENTRY, activebackground=BG_PANEL,
+            activeforeground=FG_YELLOW, command=self._on_xup_tie_toggle)
+        tie_cb.pack(side=tk.LEFT, padx=(4, 0))
+        self._xup_tie_cb = tie_cb
+        self._tip_widget(tie_cb, self._XUP_TIE_TOOLTIP)
+        self._xup_sync_tie_widgets()
+        self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None))
+
+        # width=-7 (a 7-char MINIMUM, never a truncation) instead of the ttk
+        # 11-char default: pays back most of the checkbox's width, which at the
+        # 1000x700 minsize comes straight out of the LOSSES section beside it.
+        ttk.Button(xup_label_row, text="Reset", style="Red.TButton", width=-7,
                    command=self._reset_xup).pack(side=tk.LEFT, padx=(8, 10))
         ttk.Button(xup_label_row, text="Remove…", style="Dark.TButton",
-                   command=self._open_remove_xup_dialog).pack(side=tk.LEFT, padx=(0, 8))
+                   width=-7, command=self._open_remove_xup_dialog
+                   ).pack(side=tk.LEFT, padx=(0, 8))
 
         self._xup_status = tk.Label(xup_label_row, text="Waiting for fleet chat...",
                                      font=("Consolas", 10, "bold"),
@@ -31512,6 +31531,9 @@ class FCToolGUI:
             on_fire=self._on_xup_fire,
             on_update=self._on_xup_update,
         )
+        # A Settings->Save rebuilds the counter at the MANUAL threshold; while
+        # "= DPS" is ticked, re-tie it to the last aggregate straight away.
+        self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None))
 
         # Chat Monitor
         logs_path = self.config.get("eve_logs_path", "")
@@ -32094,6 +32116,11 @@ class FCToolGUI:
         # so it is repainted here, after the VM is stored (a reader reached
         # from the repaint must never see the previous aggregate).
         self._refresh_fleet_dps_label(vm)
+        # "= DPS" x-up target follows the stored aggregate (no-op untied).
+        # getattr-guarded: this runs on bare test hosts that predate the tie.
+        tie = getattr(self, "_xup_apply_dps_tie", None)
+        if tie is not None:
+            tie(vm)
 
     def _refresh_fleet_dps_label(self, vm):
         """Repaint the composition page's DPS/volley headline. Tk thread only.
@@ -32446,8 +32473,30 @@ class FCToolGUI:
 
     # ── UI Update Methods ────────────────────────────────────────────────────
 
-    def _update_xup_display(self, state: XUpState):
-        threshold = self.config.get("xup", {}).get("threshold", 50)
+    def _xup_live_threshold(self) -> int:
+        """The x-up target in force: the COUNTER's threshold, never config's.
+
+        Config holds the user's MANUAL target; in "= DPS" tied mode the counter
+        follows the fleet instead, so a config read would paint the wrong bar and
+        log the wrong "n/m" (the `_hud_xup_snapshot` invariant). Config is only
+        the fallback when no counter exists yet."""
+        counter = getattr(self, "xup_counter", None)
+        if counter is not None:
+            try:
+                return max(1, int(counter.threshold))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                pass
+        try:
+            return max(1, int(self.config.get("xup", {}).get("threshold", 50)))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 50
+
+    def _update_xup_display(self, state: XUpState, log_xup: bool = True):
+        """Repaint the x-up row. ``log_xup=False`` = a repaint caused by the
+        TARGET moving (the "= DPS" tie), which must not re-log the last x-up:
+        ``last_xup_was_new`` outlives the message that set it (and outlives a
+        FIRE's clear, where the log lookup would KeyError)."""
+        threshold = self._xup_live_threshold()
         self._xup_count_label.config(text=str(state.count))
 
         # Update progress bar
@@ -32475,7 +32524,7 @@ class FCToolGUI:
             self._xup_count_label.config(fg=FG_ACCENT)
 
         # Log only new unique x-ups (skip duplicate x's from the same pilot)
-        if state.last_xup_sender and state.last_xup_was_new:
+        if log_xup and state.last_xup_sender and state.last_xup_was_new:
             ts = state.xups[state.last_xup_sender]
             self._append_xup_log(
                 f"[{ts.strftime('%H:%M:%S')}] {state.last_xup_sender} x'd up  "
@@ -32483,7 +32532,7 @@ class FCToolGUI:
             )
 
     def _flash_ready(self, state: XUpState):
-        threshold = self.config.get("xup", {}).get("threshold", 50)
+        threshold = self._xup_live_threshold()
         self._xup_status.config(text="READY TO FIRE!", fg=FG_GREEN)
         self._append_xup_log(
             f"\n>>> FLEET READY! {state.count}/{threshold} x-ups <<<\n\n", "ready"
@@ -32694,6 +32743,11 @@ class FCToolGUI:
 
     def _on_threshold_change(self):
         """Update the x-up threshold live."""
+        if self._xup_tie_enabled():
+            # Tied to the DPS count: the spinner is disabled, but a <Return> or
+            # <FocusOut> can still arrive — and would otherwise write the TIED
+            # value into the user's remembered manual target.
+            return
         try:
             new_val = int(self._threshold_var.get())
             if new_val < 1:
@@ -32706,6 +32760,96 @@ class FCToolGUI:
             # Re-evaluate ready state
             self.xup_counter.state.is_ready = self.xup_counter.state.count >= new_val
             self._update_xup_display(self.xup_counter.state)
+
+    # ── X-up target tied to the fleet's DPS-ship count ("= DPS") ────────────
+    # Tk thread only: the toggle is a Tk callback and _apply_fleet_stats is
+    # already marshalled through _post_ui. config["xup"]["tie_to_dps"] is the
+    # remembered switch; config["xup"]["threshold"] stays the MANUAL target and
+    # is never written by a tied update — the counter carries the live value.
+
+    _XUP_TIE_TOOLTIP = (
+        "Ties the x-up target to the number of DPS ships currently in fleet "
+        "(doctrine DPS-tagged fits when a doctrine is active; every fitted "
+        "hull otherwise). Updates with each fleet poll. Untick to set the "
+        "target by hand.")
+
+    def _xup_tie_enabled(self) -> bool:
+        """Is the x-up target tied to the DPS count? Config is the truth."""
+        try:
+            return self.config.get("xup", {}).get("tie_to_dps", False) is True
+        except AttributeError:
+            return False
+
+    def _xup_manual_threshold(self) -> int:
+        """The user's remembered hand-set target (config), clamped >= 1."""
+        try:
+            return max(1, int(self.config.get("xup", {}).get("threshold", 50)))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 50
+
+    def _xup_set_threshold(self, value) -> bool:
+        """Drive the counter + spinner to ``value``; repaint only on change.
+
+        Returns True when the counter's threshold actually moved. Never writes
+        config — callers decide whether the value is the manual target."""
+        value = max(1, int(value))
+        var = getattr(self, "_threshold_var", None)
+        if var is not None:
+            try:
+                if var.get() != str(value):
+                    var.set(str(value))
+            except tk.TclError:
+                pass
+        counter = getattr(self, "xup_counter", None)
+        if not counter or counter.threshold == value:
+            return False
+        counter.threshold = value
+        counter.state.is_ready = counter.state.count >= value
+        if getattr(self, "_xup_count_label", None) is not None:
+            self._update_xup_display(counter.state, log_xup=False)
+        return True
+
+    def _xup_sync_tie_widgets(self):
+        """Grey the spinner while tied so the user cannot fight the fleet."""
+        spin = getattr(self, "_threshold_spin", None)
+        if spin is None:
+            return
+        try:
+            spin.config(state="disabled" if self._xup_tie_enabled()
+                        else "normal")
+        except tk.TclError:
+            pass
+
+    def _xup_apply_dps_tie(self, vm):
+        """Follow the fleet's DPS-ship count while tied. Tk thread only.
+
+        ``vm.modeled`` is the fleet_stats rule-4 pilot count — the SAME number
+        the Fleet DPS headline is built from, so the two never disagree. No vm
+        (failed / cleared aggregate) or a zero count (no fleet data) leaves the
+        last target standing rather than thrashing it down to 1."""
+        if not self._xup_tie_enabled() or vm is None:
+            return
+        try:
+            n = int(vm.modeled)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return
+        if n < 1:
+            return
+        self._xup_set_threshold(n)
+
+    def _on_xup_tie_toggle(self):
+        """The "= DPS" checkbox: remember it, then tie or restore the target."""
+        on = bool(self._xup_tie_var.get())
+        self.config.setdefault("xup", {})["tie_to_dps"] = on
+        try:
+            self._save_config()
+        except Exception:
+            log.debug("[xup] could not persist tie_to_dps", exc_info=True)
+        self._xup_sync_tie_widgets()
+        if on:
+            self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None))
+        else:
+            self._xup_set_threshold(self._xup_manual_threshold())
 
     def _reset_xup(self):
         if self.xup_counter:
