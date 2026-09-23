@@ -940,6 +940,29 @@ def _role_default_presets(config, builtin=_ROLE_BUILTIN_PRESETS) -> list:
         return fallback
 
 
+_ROLE_AREA_BASE_HEIGHT = 300    # px at tk scaling 96/72 (the tuned layout)
+_TK_BASE_SCALING = 96.0 / 72.0
+
+
+def _role_area_height(scaling) -> int:
+    """Height (px) of the Fleet tab's fixed Role Tracker area at `scaling`.
+
+    300 px at tk scaling <= 96/72; above that it shrinks by base/scaling
+    (1.51 -> 265). Every other row on the tab grows with the fonts while this
+    one is a fixed px count, so at 1.51 the growth came entirely out of the
+    only expanding slave: the Fleet Composition ship list went to 1 px at the
+    1000x700 minsize. Never grows above 300 (1.33 layout untouched); a bad
+    value falls back to 300 (never raises)."""
+    try:
+        s = float(scaling)
+    except (TypeError, ValueError):
+        return _ROLE_AREA_BASE_HEIGHT
+    if not s > _TK_BASE_SCALING:     # also catches NaN
+        return _ROLE_AREA_BASE_HEIGHT
+    return min(_ROLE_AREA_BASE_HEIGHT,
+               round(_ROLE_AREA_BASE_HEIGHT * _TK_BASE_SCALING / s))
+
+
 def _filter_cap_entries(entries, only_region: str) -> list:
     """Filter capability asset entries down to a single region.
 
@@ -4379,8 +4402,17 @@ class FCToolGUI:
         # Role tracker container — bounded height so it never displaces
         # Fleet Composition / Specialized Roles below. Scrolls if roles overflow.
         # Uses a 2-column grid when role count crosses the threshold.
+        # Scaled DOWN above tk scaling 96/72 (_role_area_height): at the
+        # owner's 1.51 a fixed 300 left the ship list 1 px at 1000x700.
+        # Measured (real styles, 1000x700 / 1200x900): 1.33 unchanged
+        # (18 / 218 px); 1.51 comp_scroll_outer 1 -> 29 / 194 -> 229 px.
+        # Guard: tests/test_fleet_tab_height_styled.py.
         self._ROLE_2COL_THRESHOLD = 3
-        self._ROLE_AREA_MAX_HEIGHT = 300  # pixels
+        try:
+            _scaling = self.root.tk.call("tk", "scaling")
+        except Exception:
+            _scaling = None
+        self._ROLE_AREA_MAX_HEIGHT = _role_area_height(_scaling)  # pixels
 
         role_outer = tk.Frame(tab, bg=BG_DARK, height=self._ROLE_AREA_MAX_HEIGHT)
         role_outer.pack(fill=tk.X, padx=10, pady=2)
