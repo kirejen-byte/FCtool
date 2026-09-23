@@ -941,6 +941,7 @@ def _role_default_presets(config, builtin=_ROLE_BUILTIN_PRESETS) -> list:
 
 
 _ROLE_AREA_BASE_HEIGHT = 300    # px at tk scaling 96/72 (the tuned layout)
+_ROLE_AREA_MIN_HEIGHT = 184     # px floor: ~2 role-card rows at tk scaling 2.0
 _TK_BASE_SCALING = 96.0 / 72.0
 
 
@@ -948,19 +949,23 @@ def _role_area_height(scaling) -> int:
     """Height (px) of the Fleet tab's fixed Role Tracker area at `scaling`.
 
     300 px at tk scaling <= 96/72; above that it shrinks by base/scaling
-    (1.51 -> 265). Every other row on the tab grows with the fonts while this
-    one is a fixed px count, so at 1.51 the growth came entirely out of the
-    only expanding slave: the Fleet Composition ship list went to 1 px at the
-    1000x700 minsize. Never grows above 300 (1.33 layout untouched); a bad
-    value falls back to 300 (never raises)."""
+    (1.51 -> 265, 2.0 -> 200). Every other row on the tab grows with the fonts
+    while this one is a fixed px count, so at 1.51 the growth came entirely
+    out of the only expanding slave: the Fleet Composition ship list went to
+    1 px at the 1000x700 minsize. The result is clamped to [184, 300]: never
+    above 300 (1.33 layout untouched), never below 184 (~2 card rows at 2.0;
+    a huge or infinite scaling would otherwise collapse the area to 0). A bad
+    value (junk, None, NaN, <= 96/72, -inf) falls back to 300 (never
+    raises)."""
     try:
         s = float(scaling)
     except (TypeError, ValueError):
         return _ROLE_AREA_BASE_HEIGHT
     if not s > _TK_BASE_SCALING:     # also catches NaN
         return _ROLE_AREA_BASE_HEIGHT
-    return min(_ROLE_AREA_BASE_HEIGHT,
-               round(_ROLE_AREA_BASE_HEIGHT * _TK_BASE_SCALING / s))
+    return max(_ROLE_AREA_MIN_HEIGHT,
+               min(_ROLE_AREA_BASE_HEIGHT,
+                   round(_ROLE_AREA_BASE_HEIGHT * _TK_BASE_SCALING / s)))
 
 
 def _filter_cap_entries(entries, only_region: str) -> list:
@@ -4268,7 +4273,7 @@ class FCToolGUI:
         # Left: X-UP section
         xup_section = tk.Frame(status_frame, bg=BG_PANEL)
         xup_section.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6),
-                         pady=6)
+                         pady=3)
 
         xup_label_row = tk.Frame(xup_section, bg=BG_PANEL)
         xup_label_row.pack(fill=tk.X)
@@ -4278,7 +4283,8 @@ class FCToolGUI:
 
         self._xup_count_label = tk.Label(xup_label_row, text="0",
                                           font=("Consolas", 22, "bold"),
-                                          fg=FG_ACCENT, bg=BG_PANEL)
+                                          fg=FG_ACCENT, bg=BG_PANEL,
+                                          bd=0, pady=0)
         self._xup_count_label.pack(side=tk.LEFT)
 
         tk.Label(xup_label_row, text="/",
@@ -4404,8 +4410,10 @@ class FCToolGUI:
         # Uses a 2-column grid when role count crosses the threshold.
         # Scaled DOWN above tk scaling 96/72 (_role_area_height): at the
         # owner's 1.51 a fixed 300 left the ship list 1 px at 1000x700.
-        # Measured (real styles, 1000x700 / 1200x900): 1.33 unchanged
-        # (18 / 218 px); 1.51 comp_scroll_outer 1 -> 29 / 194 -> 229 px.
+        # Measured (real styles, 1000x700 / 1200x900): this alone took 1.51's
+        # comp_scroll_outer 1 -> 29 / 194 -> 229 px; with the four 6 px label
+        # trims (x-up section, count label, drawer toggle, Ship Type header)
+        # it is 42 / 242 at 1.33 and 53 / 253 at 1.51 (2 / 10 full rows).
         # Guard: tests/test_fleet_tab_height_styled.py.
         self._ROLE_2COL_THRESHOLD = 3
         try:
@@ -4646,7 +4654,7 @@ class FCToolGUI:
         comp_header = tk.Frame(comp_left, bg=BG_PANEL)
         comp_header.pack(fill=tk.X, padx=8)
         tk.Label(comp_header, text="Ship Type", font=("Consolas", 8),
-                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT)
+                 fg=FG_DIM, bg=BG_PANEL, bd=0, pady=0).pack(side=tk.LEFT)
 
         # Scrollable container for fleet composition rows (up to 10 ship rows
         # can exceed the panel's height at the app's minsize — mirrors the
@@ -4894,7 +4902,7 @@ class FCToolGUI:
         self._xup_log_toggle_btn = tk.Label(
             xup_log_header, text="▶ X-Up Log",
             font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_PANEL,
-            cursor="hand2",
+            cursor="hand2", bd=0, pady=0,
         )
         self._xup_log_toggle_btn.pack(side=tk.LEFT)
         self._xup_log_toggle_btn.bind(
