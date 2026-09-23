@@ -58,7 +58,8 @@ NON_COMPOSITION_TAGS: dict[str, str] = {
 # Titan, Supercarrier, Carrier, Dreadnought, Force Auxiliary, Lancer
 # Dreadnought, Command Carrier. Read LIVE by effective_exemptions() for every
 # never-customized doctrine (exemptions None); a doctrine whose exemptions were
-# saved from the editor holds its own explicit list and does not see changes here.
+# saved from the editor holds its own explicit list and does not see changes here
+# (a saved copy of the pre-5120 set is upgraded once — see below).
 STANDARD_EXEMPTIONS: list[dict] = [
     {"kind": "group", "id": 833, "name": "Force Recon Ship"},
     {"kind": "group", "id": 30, "name": "Titan"},
@@ -69,6 +70,52 @@ STANDARD_EXEMPTIONS: list[dict] = [
     {"kind": "group", "id": 4594, "name": "Lancer Dreadnought"},
     {"kind": "group", "id": 5120, "name": "Command Carrier"},
 ]
+
+# The standard set EXACTLY as it shipped before group 5120 (Command Carrier)
+# joined it (2026-09-22). A frozen historical literal, never a default: the
+# Exemptions editor persists the whole seeded list on Save even with no edits,
+# so saved doctrines can hold a copy of this old set and would never see the
+# new entry. fittings_store recognises that copy (once, schema-version gated)
+# via upgrade_pre_command_carrier_exemptions. Do NOT derive it from
+# STANDARD_EXEMPTIONS or edit it when the standard set changes.
+STANDARD_EXEMPTIONS_PRE_COMMAND_CARRIER: list[dict] = [
+    {"kind": "group", "id": 833, "name": "Force Recon Ship"},
+    {"kind": "group", "id": 30, "name": "Titan"},
+    {"kind": "group", "id": 659, "name": "Supercarrier"},
+    {"kind": "group", "id": 547, "name": "Carrier"},
+    {"kind": "group", "id": 485, "name": "Dreadnought"},
+    {"kind": "group", "id": 1538, "name": "Force Auxiliary"},
+    {"kind": "group", "id": 4594, "name": "Lancer Dreadnought"},
+]
+_COMMAND_CARRIER_GROUP_ID = 5120
+
+
+def upgrade_pre_command_carrier_exemptions(exemptions) -> list[dict] | None:
+    """A NEW list = ``exemptions`` + the Command Carrier entry when
+    ``exemptions`` is exactly the pre-5120 standard set, else None (leave it).
+
+    "Exactly" = a list of the same length whose (kind, id) pairs equal the old
+    set's, in any order; names are ignored. Anything else — None, a customised
+    list, a duplicate entry, a non-list value, a non-dict entry, a missing or
+    non-int id — returns None. Total: never raises."""
+    if (not isinstance(exemptions, list)
+            or len(exemptions) != len(STANDARD_EXEMPTIONS_PRE_COMMAND_CARRIER)):
+        return None
+    keys = set()
+    for entry in exemptions:
+        if not isinstance(entry, dict):
+            return None
+        kind, eid = entry.get("kind"), entry.get("id")
+        if (not isinstance(kind, str) or isinstance(eid, bool)
+                or not isinstance(eid, int)):
+            return None
+        keys.add((kind, eid))
+    if keys != {(e["kind"], e["id"])
+                for e in STANDARD_EXEMPTIONS_PRE_COMMAND_CARRIER}:
+        return None
+    cc = next(e for e in STANDARD_EXEMPTIONS
+              if e.get("id") == _COMMAND_CARRIER_GROUP_ID)
+    return [dict(e) for e in exemptions] + [dict(cc)]
 
 
 def effective_exemptions(doctrine) -> list[dict]:
