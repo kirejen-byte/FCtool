@@ -77,6 +77,8 @@ COMMAND_DESTROYERS = {
     37481,  # Pontifex  (Armor + Information)
     37482,  # Stork     (Shield + Information)
     37483,  # Magus     (Armor + Skirmish)
+    52254,  # Draugur
+    89649,  # Outrider
 }
 
 LOGISTICS_CRUISERS = {
@@ -85,6 +87,8 @@ LOGISTICS_CRUISERS = {
     11978,  # Scimitar
     11985,  # Basilisk
     49713,  # Zarmazd (Triglavian)
+    32790,  # Etana
+    42245,  # Rabisu
 }
 
 LOGISTICS_FRIGATES = {
@@ -114,6 +118,7 @@ TACTICAL_DESTROYERS = {
     34828,  # Jackdaw
     34317,  # Confessor
     35683,  # Hecate
+    89808,  # Skua
 }
 
 INTERDICTORS = {
@@ -144,6 +149,8 @@ HICS = {
     12013,  # Broadsword
     12017,  # Devoter
     12021,  # Phobos
+    35781,  # Fiend
+    60764,  # Laelaps
 }
 
 FAX = {
@@ -178,6 +185,8 @@ TITANS = {
     23773,  # Ragnarok
     42241,  # Molok
     45649,  # Komodo
+    78576,  # Azariel
+    42126,  # Vanquisher
 }
 
 BLACK_OPS = {
@@ -186,6 +195,7 @@ BLACK_OPS = {
     22436,  # Widow
     22440,  # Panther
     44996,  # Marshal
+    85236,  # Python
 }
 
 # Capsules (pods) — group 29. Used by the Fleet Management "Kick Pods" action.
