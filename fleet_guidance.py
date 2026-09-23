@@ -54,8 +54,11 @@ NON_COMPOSITION_TAGS: dict[str, str] = {
 # size without being part of the composition target). Each entry is a tagged-union
 # dict; see fit_models.Doctrine.exemptions for the format. Force Recon (group 833)
 # plus every capital group (granular, matching ship_classes.CAPITAL_GROUP_IDS's
-# ship-class groups): Titan, Supercarrier, Carrier, Dreadnought, Force Auxiliary,
-# Lancer Dreadnought.
+# combat groups — the haulers 513/902 and the Rorqual 883 are not listed):
+# Titan, Supercarrier, Carrier, Dreadnought, Force Auxiliary, Lancer
+# Dreadnought, Command Carrier. Read LIVE by effective_exemptions() for every
+# never-customized doctrine (exemptions None); a doctrine whose exemptions were
+# saved from the editor holds its own explicit list and does not see changes here.
 STANDARD_EXEMPTIONS: list[dict] = [
     {"kind": "group", "id": 833, "name": "Force Recon Ship"},
     {"kind": "group", "id": 30, "name": "Titan"},
@@ -64,6 +67,7 @@ STANDARD_EXEMPTIONS: list[dict] = [
     {"kind": "group", "id": 485, "name": "Dreadnought"},
     {"kind": "group", "id": 1538, "name": "Force Auxiliary"},
     {"kind": "group", "id": 4594, "name": "Lancer Dreadnought"},
+    {"kind": "group", "id": 5120, "name": "Command Carrier"},
 ]
 
 

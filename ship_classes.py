@@ -416,8 +416,10 @@ def is_tackle(type_id: int) -> bool:
 
 # Canonical EVE Ship category (category_id 6) groups. Hardcoded so d-scan
 # filtering doesn't depend on a per-type ESI category lookup. Must EQUAL the
-# category-6 groups in the bundled fit_types.json (guarded by
-# tests/test_ship_classes_ids.py — a regenerated catalog names any new group).
+# category-6 groups in the bundled fit_types.json EXCEPT group 29 Capsule —
+# pods are deliberately NOT ships here (d-scan counts ships, not pods; owner
+# decision 2026-09-22). Guarded by tests/test_ship_classes_ids.py — a
+# regenerated catalog names any new group.
 _SHIP_GROUP_IDS_KNOWN: set[int] = {
     GROUP_COMMAND_SHIPS,
     GROUP_COMMAND_DESTROYERS,
@@ -441,9 +443,9 @@ _SHIP_GROUP_IDS_KNOWN: set[int] = {
     28, 380, 463, 543, 941, 1283,
     # Faction / utility / event
     894, 1202, 1972,
-    # Capsule, Shuttle, Corvette (rookie ships), Prototype Exploration Ship
-    # (Zephyr), Expedition Command Ship (Odysseus), Special Edition Yachts
-    29, 31, 237, 1022, 4902, 5087,
+    # Shuttle, Corvette (rookie ships), Prototype Exploration Ship (Zephyr),
+    # Expedition Command Ship (Odysseus), Special Edition Yachts
+    31, 237, 1022, 4902, 5087,
 }
 
 # Cache for ESI group-id lookups (separate from `_group_cache` so it's
@@ -498,12 +500,14 @@ _KNOWN_SHIP_TYPE_IDS: set[int] = (
     | COMMAND_CARRIERS
     | CAPITAL_INDUSTRIALS
     | BLACK_OPS
-    | CAPSULE_TYPE_IDS
 )
 
 
 def is_ship_type(type_id: int) -> bool:
-    """Return True if type_id is a ship hull, False for structures/drones/etc."""
+    """Return True if type_id is a ship hull, False for structures/drones/etc.
+    and for capsules (pods are not counted as ships — see
+    _SHIP_GROUP_IDS_KNOWN; Kick Pods reads CAPSULE_TYPE_IDS directly and loss
+    tracking keeps its own loss_tracker.CAPSULE_TYPE_IDS)."""
     if type_id in _KNOWN_SHIP_TYPE_IDS:
         return True
     if classify_ship(type_id) is not None:
