@@ -38,7 +38,7 @@ class ChatMessage:
 # Header format:
 #   Channel ID:      fleet_1213112261803
 #   Channel Name:    Fleet
-#   Listener:        Securitas Protector
+#   Listener:        Some Pilot
 #   Session started: 2026.03.25 20:38:13
 #
 # Message format (each line starts with BOM \ufeff):

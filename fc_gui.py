@@ -31698,7 +31698,7 @@ class FCToolGUI:
         with NO listener filter, so a command typed on any of the owner's
         characters is seen even when the tracked character is not in that fleet
         (the owner's field case: only Tyreece Arkan was in fleet, tracked was
-        Securitas Protector, and nothing happened). Every other consumer of
+        Some Pilot, and nothing happened). Every other consumer of
         fleet chat -- the x-up counter, the charge tracker, the links backfill
         -- deliberately stays on the tracked tail.
 

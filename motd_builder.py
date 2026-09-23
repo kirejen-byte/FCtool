@@ -97,8 +97,8 @@ def char_link(character_id: int, name: str, type_id: int = CHAR_SHOWINFO_TYPE_ID
     Uses the generic character group ``type_id`` (default
     :data:`CHAR_SHOWINFO_TYPE_ID`)::
 
-        char_link(90000001, "Securitas Protector")
-        -> "<url=showinfo:1377//90000001>Securitas Protector</url>"
+        char_link(90000001, "Some Pilot")
+        -> "<url=showinfo:1377//90000001>Some Pilot</url>"
     """
     return f"<url=showinfo:{type_id}//{character_id}>{name}</url>"
 
