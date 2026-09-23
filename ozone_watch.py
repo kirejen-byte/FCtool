@@ -823,7 +823,7 @@ TOAST_TITLE = "Ozone"
 
 
 def toast_title(char_name) -> str:
-    """``"Ozone - {char_name}"`` — e.g. "Ozone - Securitas Protector".
+    """``"Ozone - {char_name}"`` — e.g. "Ozone - Some Pilot".
 
     With several clients open -- tiled, overlapping, or seen only at a
     glance -- a bare "Ozone" does not say WHICH character is low, so the
