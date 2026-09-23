@@ -128,12 +128,20 @@ INTERDICTORS = {
     22464,  # Flycatcher
 }
 
+# All Force Recons (group 833) — every hull in the group is cyno-capable
+# (normal or covert), so this set is the whole group's roster, not a curated
+# subset.
 CYNO_SHIPS = {
     11957,  # Falcon
     11963,  # Rapier
     11969,  # Arazu
     11965,  # Pilgrim
     44995,  # Enforcer
+    33395,  # Moracha
+    33675,  # Chameleon
+    45531,  # Victor
+    48635,  # Tiamat
+    85229,  # Cobra
 }
 
 WEB_SHIPS = {
@@ -162,6 +170,8 @@ FAX = {
     45645,  # Loggerhead
 }
 
+# Dreadnoughts (group 485) plus Lancer Dreadnoughts (group 4594) — Lancers
+# count as dreads for fleet-composition purposes.
 DREADNOUGHTS = {
     19720,  # Revelation
     19722,  # Naglfar
@@ -176,6 +186,10 @@ DREADNOUGHTS = {
     73792,  # Moros Navy Issue
     73793,  # Phoenix Navy Issue
     73787,  # Naglfar Fleet Issue
+    77281,  # Hubris
+    77283,  # Bane
+    77284,  # Karura
+    77288,  # Valravn
 }
 
 TITANS = {
