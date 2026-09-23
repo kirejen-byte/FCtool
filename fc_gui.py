@@ -4226,9 +4226,21 @@ class FCToolGUI:
 
         threshold = self.config.get("xup", {}).get("threshold", 50)
 
+        # PACK ORDER IS WIDTH PRIORITY in this row (pack starves whatever is
+        # packed last). At the 1000x700 minsize the row over-commits, so the
+        # fixed-size controls are packed first and exactly ONE free-text label
+        # flexes: the Losses status text (anchor=W, so its head -- the count --
+        # stays and only the tail is clipped; the tooltip carries the detail).
+        # Before this ordering the ⚙ gear (Reset Losses / Test Audio) and the
+        # Losses Source dropdown were packed last and got 1-3 px. Guard:
+        # tests/test_xup_status_row_width.py (real ttk styles + real gear).
+        # Settings gear (overflow menu for Test Audio / Reset Losses) -- FIRST.
+        self._build_status_bar_menu(status_frame)
+
         # Left: X-UP section
         xup_section = tk.Frame(status_frame, bg=BG_PANEL)
-        xup_section.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=6)
+        xup_section.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 6),
+                         pady=6)
 
         xup_label_row = tk.Frame(xup_section, bg=BG_PANEL)
         xup_label_row.pack(fill=tk.X)
@@ -4286,7 +4298,11 @@ class FCToolGUI:
                    width=-7, command=self._open_remove_xup_dialog
                    ).pack(side=tk.LEFT, padx=(0, 8))
 
-        self._xup_status = tk.Label(xup_label_row, text="Waiting for fleet chat...",
+        # Short on purpose: this text stays up until the first x-up (it is not
+        # a chat-connection indicator) and every px it requests comes out of
+        # the Losses section at the minsize. Old "Waiting for fleet chat..."
+        # = 181 px at tk scaling 1.33.
+        self._xup_status = tk.Label(xup_label_row, text="No x-ups yet",
                                      font=("Consolas", 10, "bold"),
                                      fg=FG_DIM, bg=BG_PANEL)
         self._xup_status.pack(side=tk.LEFT, padx=(5, 0))
@@ -4299,12 +4315,11 @@ class FCToolGUI:
         tk.Frame(status_frame, bg=BORDER_COLOR, width=1
                  ).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=4)
 
-        # Right: LOSSES section (filled in by _build_loss_bar)
+        # Right: LOSSES section (filled in further down, after the Role Tracker)
         self._loss_section = tk.Frame(status_frame, bg=BG_PANEL)
-        self._loss_section.pack(side=tk.LEFT, padx=10, pady=6)
-
-        # Settings gear (overflow menu for Test Audio / Reset Losses)
-        self._build_status_bar_menu(status_frame)
+        # Inner paddings trimmed 10 -> 6/4 (the gear label carries its own
+        # padx=10): 14 px back for the Losses text at the minsize.
+        self._loss_section.pack(side=tk.LEFT, padx=(6, 4), pady=6)
 
         # ── Role Tracker Section ──────────────────────────────────────────────
         role_header = tk.Frame(tab, bg=BG_DARK)
@@ -4404,8 +4419,14 @@ class FCToolGUI:
         tk.Label(self._loss_section, text="LOSSES:",
                  font=("Consolas", 10, "bold"),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
+        # Audio / Source: / dropdown live in their own frame packed RIGHT and
+        # BEFORE the status label, so when the section is squeezed the label
+        # (packed last, anchor=W) loses its tail and the controls keep their
+        # full request. Visual order is unchanged: LOSSES: text Audio Source: [v]
+        loss_controls = tk.Frame(self._loss_section, bg=BG_PANEL)
+        loss_controls.pack(side=tk.RIGHT)
         self._loss_status_label = tk.Label(
-            self._loss_section, text="(waiting for fleet)",
+            self._loss_section, text="(no fleet yet)", anchor=tk.W,
             font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow",
         )
         self._loss_status_label.pack(side=tk.LEFT, padx=(0, 10))
@@ -4430,9 +4451,12 @@ class FCToolGUI:
             self.config["loss_audio_enabled"] = self._loss_audio_enabled
             self._save_config()
 
-        tk.Checkbutton(self._loss_section, text="Audio",
+        # bd=0/highlightthickness=0/padx=0 like the "= DPS" box: same look on
+        # this dark panel, a few px less of a row that over-commits.
+        tk.Checkbutton(loss_controls, text="Audio",
                        variable=self._loss_audio_var,
-                       font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL,
+                       font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, padx=0,
+                       bd=0, highlightthickness=0,
                        selectcolor=BG_ENTRY, activebackground=BG_PANEL,
                        activeforeground=FG_YELLOW,
                        command=_on_loss_audio_toggle,
@@ -4440,11 +4464,11 @@ class FCToolGUI:
 
         # Loss source (config loss_tracking.source). Persists immediately,
         # mirroring the Audio toggle above — no Save-Settings round trip.
-        tk.Label(self._loss_section, text="Source:", font=("Consolas", 9),
+        tk.Label(loss_controls, text="Source:", font=("Consolas", 9),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 2))
         self._loss_source_var = tk.StringVar(value=self._loss_reconciler.source)
         _loss_src_combo = ttk.Combobox(
-            self._loss_section, textvariable=self._loss_source_var,
+            loss_controls, textvariable=self._loss_source_var,
             state="readonly", values=list(loss_reconciler.SOURCE_MODES),
             width=7, font=("Consolas", 9))
         _loss_src_combo.pack(side=tk.LEFT)
@@ -32880,7 +32904,9 @@ class FCToolGUI:
 
     def _show_fire(self, state: XUpState):
         self._xup_count_label.config(text="0", fg=FG_RED)
-        self._xup_status.config(text=f"FIRE #{state.fire_count} - Counter Reset", fg=FG_RED)
+        # Short: it stays up until the next x-up and its width comes out of the
+        # Losses section at the minsize (old "- Counter Reset" = 174 px at 1.33).
+        self._xup_status.config(text=f"FIRE #{state.fire_count} - Reset", fg=FG_RED)
         self._append_xup_log(
             f"\n>>> FIRE #{state.fire_count} CALLED - COUNTER RESET <<<\n\n", "fire"
         )
