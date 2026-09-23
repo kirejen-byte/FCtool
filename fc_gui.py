@@ -11026,7 +11026,7 @@ class FCToolGUI:
                 info["ship_type_id"] = ship_type_id
                 info["ship_item_id"] = ship_item_id
                 # The SDE's own fitting restriction (ozone_watch.is_cyno_hull),
-                # not the five-hull ship_classes.CYNO_SHIPS this used to test:
+                # not the ship_classes.CYNO_SHIPS this used to test:
                 # bombers, HICs, blops, T3Cs, Ventures and haulers can all mount
                 # a generator and every one of them was silently skipped here.
                 # BOTH ids -- a Venture's group is not cyno-capable at large.
