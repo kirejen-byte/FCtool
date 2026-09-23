@@ -32676,7 +32676,12 @@ class FCToolGUI:
         # Log only new unique x-ups (skip duplicate x's from the same pilot),
         # exactly once, via the counter's one-shot consume.
         counter = getattr(self, "xup_counter", None)
-        if counter is not None:
+        # Only consume when this repaint's state IS the counter's live state --
+        # a manual Reset rebinds counter.state to a fresh XUpState, so a stale
+        # repaint queued against the old state must not steal the next x-up's
+        # pending line (that repaint's own follow-up, against the live state,
+        # logs it instead).
+        if counter is not None and state is counter.state:
             pending = counter.take_new_xup()
             if pending is not None:
                 sender, ts = pending
