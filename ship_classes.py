@@ -203,6 +203,37 @@ TITANS = {
     42126,  # Vanquisher
 }
 
+# Carriers (group 547).
+CARRIERS = {
+    23757,  # Archon
+    23911,  # Thanatos
+    23915,  # Chimera
+    24483,  # Nidhoggur
+}
+
+# Supercarriers (group 659).
+SUPERCARRIERS = {
+    3514,   # Revenant
+    22852,  # Hel
+    23913,  # Nyx
+    23917,  # Wyvern
+    23919,  # Aeon
+    42125,  # Vendetta
+}
+
+# Command Carriers (group 5120) — Cradle of War, June 2026.
+COMMAND_CARRIERS = {
+    92822,  # Salvation
+    92823,  # Simurgh
+    92824,  # Gaia
+    92825,  # Ymir
+}
+
+# Capital Industrial Ships (group 883) — the Rorqual is the whole group.
+CAPITAL_INDUSTRIALS = {
+    28352,  # Rorqual
+}
+
 BLACK_OPS = {
     22428,  # Redeemer
     22430,  # Sin
@@ -384,7 +415,11 @@ def is_tackle(type_id: int) -> bool:
 # ── Ship-type predicate ─────────────────────────────────────────────────────
 
 # Canonical EVE Ship category (category_id 6) groups. Hardcoded so d-scan
-# filtering doesn't depend on a per-type ESI category lookup.
+# filtering doesn't depend on a per-type ESI category lookup. Must EQUAL the
+# category-6 groups in the bundled fit_types.json EXCEPT group 29 Capsule —
+# pods are deliberately NOT ships here (d-scan counts ships, not pods; owner
+# decision 2026-09-22). Guarded by tests/test_ship_classes_ids.py — a
+# regenerated catalog names any new group.
 _SHIP_GROUP_IDS_KNOWN: set[int] = {
     GROUP_COMMAND_SHIPS,
     GROUP_COMMAND_DESTROYERS,
@@ -402,12 +437,15 @@ _SHIP_GROUP_IDS_KNOWN: set[int] = {
     # Cyno-capable covert hulls (Covert Ops 830, Stealth Bomber 834);
     # Force Recon 833, T3C 963, HIC 894 already covered above/below.
     GROUP_COVERT_OPS, GROUP_STEALTH_BOMBER,
-    # Capital classes
-    547, 1538, 485, 4594, 513, 883, 902, 659, 30,
+    # Capital classes (5120 = Command Carrier)
+    547, 1538, 485, 4594, 513, 883, 902, 659, 30, 5120,
     # Industrial / mining / hauling (visible on d-scan; treat as ships)
     28, 380, 463, 543, 941, 1283,
     # Faction / utility / event
     894, 1202, 1972,
+    # Shuttle, Corvette (rookie ships), Prototype Exploration Ship (Zephyr),
+    # Expedition Command Ship (Odysseus), Special Edition Yachts
+    31, 237, 1022, 4902, 5087,
 }
 
 # Cache for ESI group-id lookups (separate from `_group_cache` so it's
@@ -457,12 +495,19 @@ _KNOWN_SHIP_TYPE_IDS: set[int] = (
     | FAX
     | DREADNOUGHTS
     | TITANS
+    | CARRIERS
+    | SUPERCARRIERS
+    | COMMAND_CARRIERS
+    | CAPITAL_INDUSTRIALS
     | BLACK_OPS
 )
 
 
 def is_ship_type(type_id: int) -> bool:
-    """Return True if type_id is a ship hull, False for structures/drones/etc."""
+    """Return True if type_id is a ship hull, False for structures/drones/etc.
+    and for capsules (pods are not counted as ships — see
+    _SHIP_GROUP_IDS_KNOWN; Kick Pods reads CAPSULE_TYPE_IDS directly and loss
+    tracking keeps its own loss_tracker.CAPSULE_TYPE_IDS)."""
     if type_id in _KNOWN_SHIP_TYPE_IDS:
         return True
     if classify_ship(type_id) is not None:
@@ -486,7 +531,9 @@ def is_ship_type(type_id: int) -> bool:
 #   513  Freighter
 #   1538 Force Auxiliary (FAX)
 #   4594 Lancer Dreadnought
-CAPITAL_GROUP_IDS: set[int] = {30, 485, 547, 659, 883, 902, 513, 1538, 4594}
+#   5120 Command Carrier (Cradle of War, June 2026)
+CAPITAL_GROUP_IDS: set[int] = {30, 485, 547, 659, 883, 902, 513, 1538, 4594,
+                               5120}
 
 # group_id -> group name cache (separate namespace from the type->group caches).
 _group_name_cache: dict[int, str | None] = {}

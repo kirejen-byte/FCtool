@@ -69,7 +69,23 @@ from fit_models import (
 
 log = get_logger(__name__)
 
-SCHEMA_VERSION = 1
+# Library (and .fctdoc share) format version, written by save()/export.
+#   1 — original format.
+#   2 (2026-09-22) — no shape change; marks the one-time Command Carrier
+#       exemption migration as done (see FittingsStore.load / import_share).
+SCHEMA_VERSION = 2
+
+# Oldest stored version that no longer needs the Command Carrier migration.
+_CC_EXEMPTIONS_MIGRATED_VERSION = 2
+
+
+def _stored_schema_version(data: dict) -> int:
+    """The ``schema_version`` a library/share payload claims; a missing or
+    non-int value (incl. a bool) counts as 1, the original format."""
+    version = data.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return 1
+    return version
 
 # Load-time tag renames applied to legacy libraries (old tag -> new tag). Three
 # default role tags were shortened: "Logistics" -> "Logi" (so preview labels read
@@ -197,7 +213,11 @@ class FittingsStore:
         here: every consumer already treats an unresolvable ``get_fit`` as a
         tolerated case (skip in `fleet_composer`/`fleet_guidance`, an explicit
         "(missing fit ...)" label in the GUI), so leaving it as-is is
-        consistent with existing behavior."""
+        consistent with existing behavior.
+
+        In-memory migrations run after the entries load (never a write): the
+        tag renames every time, and — for a library stored below version 2 —
+        the one-time Command Carrier exemption upgrade."""
         with self._lock:
             if not os.path.exists(self.path):
                 self._fits = {}
@@ -273,6 +293,32 @@ class FittingsStore:
             tags = data.get("tags")
             self._tags = list(tags) if tags else list(DEFAULT_TAGS)
             self._migrate_tags()
+            if _stored_schema_version(data) < _CC_EXEMPTIONS_MIGRATED_VERSION:
+                self._migrate_command_carrier_exemptions()
+
+    def _migrate_command_carrier_exemptions(self) -> None:
+        """Give every doctrine whose SAVED exemptions are still exactly the
+        pre-5120 standard set the Command Carrier entry (owner, 2026-09-22:
+        "exempt Command Carriers like other capitals").
+
+        Runs only for a library stored below version 2. Purely in-memory, like
+        ``_migrate_tags``: load() never writes. Until the next save() this
+        re-runs on every launch to the same result — safe because every
+        exemptions edit goes through a mutator followed by save(), and that
+        save writes version 2 together with the user's list, so the migration
+        can never re-run over a choice the user made (e.g. removing Command
+        Carriers again). None, customised and malformed lists are untouched
+        (see fleet_guidance.upgrade_pre_command_carrier_exemptions)."""
+        upgraded_n = 0
+        for doctrine in self._doctrines.values():
+            upgraded = fleet_guidance.upgrade_pre_command_carrier_exemptions(
+                doctrine.exemptions)
+            if upgraded is not None:
+                doctrine.exemptions = upgraded
+                upgraded_n += 1
+        if upgraded_n:
+            log.info("Fittings library: added the Command Carrier exemption to "
+                     "%d doctrine(s) still on the old default list.", upgraded_n)
 
     def _migrate_tags(self) -> None:
         """Rewrite legacy role tags (``_TAG_RENAMES``) across the loaded library.
@@ -1088,8 +1134,18 @@ class FittingsStore:
                 fits_added += 1
 
             existing_names = {d.name for d in self._doctrines.values()}
+            # A share exported by a pre-v2 build may carry a frozen copy of the
+            # pre-5120 standard exemption list: upgrade it exactly as load()
+            # does. A v2+ share's list is the exporter's deliberate choice.
+            migrate_cc = (_stored_schema_version(payload)
+                          < _CC_EXEMPTIONS_MIGRATED_VERSION)
             for raw_doctrine in payload.get("doctrines") or []:
                 incoming = doctrine_from_dict(raw_doctrine)
+                if migrate_cc:
+                    upgraded = fleet_guidance.upgrade_pre_command_carrier_exemptions(
+                        incoming.exemptions)
+                    if upgraded is not None:
+                        incoming.exemptions = upgraded
                 new_id = uuid4().hex
                 incoming.id = new_id
                 incoming.name = self._unique_name(incoming.name, existing_names)

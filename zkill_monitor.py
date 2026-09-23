@@ -19,6 +19,7 @@ from rate_limiter import rate_limit
 
 from app_log import get_logger
 from esi_constants import ESI_BASE, ESI_HEADERS as HEADERS
+import ship_classes
 import system_coords
 
 log = get_logger(__name__)
@@ -111,14 +112,21 @@ def is_kill_stale(km: dict, max_age: timedelta = MAX_KILL_AGE,
         return False
 
 
-# Capital ship type IDs grouped by class for breakdown display
-CAPITAL_CLASSES: dict[str, set[int]] = {
-    "Dreads": {19720, 19722, 19724, 19726, 42241, 42243, 45647, 52907},
-    "Carriers": {23757, 23911, 23915, 24483, 42245, 42246},
-    "FAX": {37604, 37605, 37606, 37607},
-    "Supers": {3514, 3628, 22852, 23913, 23917, 23919, 42125, 42126},
-    "Titans": {671, 3764, 11567, 23773, 42242, 45649},
-    "Rorquals": {28352},
+# Capital ship type IDs grouped by class for breakdown display. DERIVED from
+# the ship_classes whole-group sets (each guarded against the bundled SDE by
+# tests/test_ship_classes_ids.py) — never hand-keep ids here: the old literal
+# had drifted (Molok under Dreads, Dagon under Titans, Vanquisher under Supers,
+# a Rabisu and a Caedes counted as Carriers). Lancer Dreadnoughts count as
+# Dreads (owner decision). Buckets are disjoint, so dict order never changes
+# classify_capital's answer; the display sorts the breakdown by count.
+CAPITAL_CLASSES: dict[str, frozenset[int]] = {
+    "Dreads": frozenset(ship_classes.DREADNOUGHTS),
+    "Carriers": frozenset(ship_classes.CARRIERS),
+    "FAX": frozenset(ship_classes.FAX),
+    "Supers": frozenset(ship_classes.SUPERCARRIERS),
+    "Titans": frozenset(ship_classes.TITANS),
+    "Rorquals": frozenset(ship_classes.CAPITAL_INDUSTRIALS),
+    "Command Carriers": frozenset(ship_classes.COMMAND_CARRIERS),
 }
 # Flat set for quick membership checks
 CAPITAL_TYPE_IDS: set[int] = set()
