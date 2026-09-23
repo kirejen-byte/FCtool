@@ -682,20 +682,31 @@ def read_channel_id(logs_path: str, channel_name: str) -> str | None:
 
 # ── D-Scan Parsing ───────────────────────────────────────────────────────────
 
-# Capital ship names for dscan classification
+# Capital ship names for dscan classification. A LITERAL on purpose (no catalog
+# I/O at import), but it must be exactly the catalog names of the
+# ship_classes capital sets — DREADNOUGHTS (incl. Lancers), CARRIERS,
+# COMMAND_CARRIERS, FAX, SUPERCARRIERS, TITANS, CAPITAL_INDUSTRIALS — which
+# tests/test_capital_classes.py asserts through the bundled fit_types.json.
+# Matching is an exact, case-sensitive whole-cell compare.
 CAPITAL_SHIP_NAMES = {
     # Dreadnoughts
     "Revelation", "Naglfar", "Moros", "Phoenix",
-    "Chemosh", "Caiman", "Zirnitra", "Bane",
+    "Chemosh", "Caiman", "Zirnitra", "Vehement", "Sarathiel",
+    "Revelation Navy Issue", "Moros Navy Issue", "Phoenix Navy Issue",
+    "Naglfar Fleet Issue",
+    # Lancer Dreadnoughts (count as dreads)
+    "Hubris", "Bane", "Karura", "Valravn",
     # Carriers
     "Archon", "Thanatos", "Nidhoggur", "Chimera",
-    "Vanguard", "Lif",
+    # Command Carriers
+    "Salvation", "Simurgh", "Gaia", "Ymir",
     # FAX
-    "Apostle", "Ninazu", "Lif", "Minokawa",
+    "Apostle", "Ninazu", "Lif", "Minokawa", "Dagon", "Loggerhead",
     # Supercarriers
     "Aeon", "Nyx", "Hel", "Wyvern", "Vendetta", "Revenant",
     # Titans
     "Avatar", "Erebus", "Ragnarok", "Leviathan", "Molok", "Komodo",
+    "Azariel", "Vanquisher",
     # Rorqual
     "Rorqual",
 }
