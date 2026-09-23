@@ -69,6 +69,12 @@ class XUpCounter:
             self.state.fire_count += 1
             self.state.xups.clear()
             self.state.is_ready = False
+            # The "newest x-up" pointer would otherwise survive the clear and
+            # dangle: a later lookup of last_xup_sender in state.xups raises
+            # KeyError (the FIRE-repaint bug). Nothing is pending to log after
+            # a FIRE, so drop the pointer here.
+            self.state.last_xup_sender = ""
+            self.state.last_xup_was_new = False
             if self.on_fire:
                 self.on_fire(self.state)
             if self.on_update:
@@ -100,8 +106,43 @@ class XUpCounter:
             return False
         del self.state.xups[name]
         self.state.is_ready = self.state.count >= self.threshold
+        # Removing the pilot the "newest x-up" pointer names would otherwise
+        # dangle exactly like a FIRE clear (KeyError on the next lookup); drop
+        # the pointer only when it names THIS pilot, so removing some other,
+        # earlier x-upper does not swallow a still-pending log line.
+        if self.state.last_xup_sender == name:
+            self.state.last_xup_sender = ""
+            self.state.last_xup_was_new = False
         return True
 
     def reset(self):
         """Manual reset."""
         self.state = XUpState()
+
+    def take_new_xup(self):
+        """Consume the pending "new x-up" flag exactly once.
+
+        Returns ``(sender, timestamp)`` the first time it is called after a
+        genuinely new x-up, and ``None`` on every call after (until the next
+        new x-up sets the flag again) -- so a caller that repaints several
+        times for one x-up (or for an unrelated reason, e.g. the "= DPS" tie
+        moving the target) logs it exactly once.
+
+        ``process_message`` runs on the chat-poll thread while a GUI repaint
+        that calls this runs on the Tk thread; this is tolerant of a torn
+        read (a concurrent FIRE/remove clearing the pointer mid-call) and
+        never raises -- it returns None instead.
+        """
+        if not self.state.last_xup_was_new:
+            return None
+        sender = self.state.last_xup_sender
+        self.state.last_xup_was_new = False
+        if not sender:
+            return None
+        try:
+            ts = self.state.xups.get(sender)
+        except Exception:
+            ts = None
+        if ts is None:
+            return None
+        return (sender, ts)

@@ -32637,11 +32637,15 @@ class FCToolGUI:
         except (AttributeError, TypeError, ValueError, OverflowError):
             return 50
 
-    def _update_xup_display(self, state: XUpState, log_xup: bool = True):
-        """Repaint the x-up row. ``log_xup=False`` = a repaint caused by the
-        TARGET moving (the "= DPS" tie), which must not re-log the last x-up:
-        ``last_xup_was_new`` outlives the message that set it (and outlives a
-        FIRE's clear, where the log lookup would KeyError)."""
+    def _update_xup_display(self, state: XUpState):
+        """Repaint the x-up row.
+
+        The "newest x-up" log line is logged via ``XUpCounter.take_new_xup()``,
+        a ONE-SHOT consume of the counter's pending-new-xup flag -- so however
+        many times this repaints for the same x-up (the "= DPS" tie moving the
+        target, a manual threshold edit, ...) the line is written exactly once,
+        and a FIRE or a removal of that same pilot clears the pointer on the
+        counter side, so this can never KeyError."""
         threshold = self._xup_live_threshold()
         self._xup_count_label.config(text=str(state.count))
 
@@ -32669,13 +32673,17 @@ class FCToolGUI:
             self._xup_status.config(text="Forming...", fg=FG_ACCENT)
             self._xup_count_label.config(fg=FG_ACCENT)
 
-        # Log only new unique x-ups (skip duplicate x's from the same pilot)
-        if log_xup and state.last_xup_sender and state.last_xup_was_new:
-            ts = state.xups[state.last_xup_sender]
-            self._append_xup_log(
-                f"[{ts.strftime('%H:%M:%S')}] {state.last_xup_sender} x'd up  "
-                f"({state.count}/{threshold})\n", "xup"
-            )
+        # Log only new unique x-ups (skip duplicate x's from the same pilot),
+        # exactly once, via the counter's one-shot consume.
+        counter = getattr(self, "xup_counter", None)
+        if counter is not None:
+            pending = counter.take_new_xup()
+            if pending is not None:
+                sender, ts = pending
+                self._append_xup_log(
+                    f"[{ts.strftime('%H:%M:%S')}] {sender} x'd up  "
+                    f"({state.count}/{threshold})\n", "xup"
+                )
 
     def _flash_ready(self, state: XUpState):
         threshold = self._xup_live_threshold()
@@ -32953,7 +32961,7 @@ class FCToolGUI:
         counter.threshold = value
         counter.state.is_ready = counter.state.count >= value
         if getattr(self, "_xup_count_label", None) is not None:
-            self._update_xup_display(counter.state, log_xup=False)
+            self._update_xup_display(counter.state)
         return True
 
     def _xup_sync_tie_widgets(self):
