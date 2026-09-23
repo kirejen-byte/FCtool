@@ -98,11 +98,11 @@ T1_LOGI_FRIGATES = {
     590,    # Inquisitor
     592,    # Navitas
     582,    # Bantam
-    598,    # Burst
+    599,    # Burst
 }
 
 T1_LOGI_CRUISERS = {
-    72811,  # Rodiva
+    49712,  # Rodiva
     625,    # Augoror
     634,    # Exequror
     620,    # Osprey
@@ -118,16 +118,16 @@ TACTICAL_DESTROYERS = {
 
 INTERDICTORS = {
     22456,  # Sabre
-    22452,  # Flycatcher
+    22452,  # Heretic
     22460,  # Eris
-    22464,  # Heretic
+    22464,  # Flycatcher
 }
 
 CYNO_SHIPS = {
     11957,  # Falcon
-    11969,  # Rapier
-    11971,  # Arazu
-    11959,  # Pilgrim
+    11963,  # Rapier
+    11969,  # Arazu
+    11965,  # Pilgrim
     44995,  # Enforcer
 }
 
@@ -151,6 +151,8 @@ FAX = {
     37606,  # Lif
     37605,  # Minokawa
     37607,  # Ninazu
+    42242,  # Dagon
+    45645,  # Loggerhead
 }
 
 DREADNOUGHTS = {
@@ -159,9 +161,10 @@ DREADNOUGHTS = {
     19724,  # Moros
     19726,  # Phoenix
     52907,  # Zirnitra
-    42241,  # Chemosh
-    42243,  # Caiman
-    45647,  # Vehement
+    42243,  # Chemosh
+    45647,  # Caiman
+    42124,  # Vehement
+    87381,  # Sarathiel
     73790,  # Revelation Navy Issue
     73792,  # Moros Navy Issue
     73793,  # Phoenix Navy Issue
@@ -173,15 +176,15 @@ TITANS = {
     3764,   # Leviathan
     11567,  # Avatar
     23773,  # Ragnarok
-    42242,  # Molok
+    42241,  # Molok
     45649,  # Komodo
 }
 
 BLACK_OPS = {
-    22428,  # Sin
-    22430,  # Widow
-    22436,  # Panther
-    22440,  # Redeemer
+    22428,  # Redeemer
+    22430,  # Sin
+    22436,  # Widow
+    22440,  # Panther
     44996,  # Marshal
 }
 
