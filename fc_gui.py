@@ -4230,11 +4230,16 @@ class FCToolGUI:
         # packed last). At the 1000x700 minsize the row over-commits, so the
         # fixed-size controls are packed first and exactly ONE free-text label
         # flexes: the Losses status text (anchor=W, so its head -- the count --
-        # stays and only the tail is clipped; the tooltip carries the detail).
-        # Before this ordering the ⚙ gear (Reset Losses / Test Audio) and the
-        # Losses Source dropdown were packed last and got 1-3 px. Guard:
-        # tests/test_xup_status_row_width.py (real ttk styles + real gear).
-        # Settings gear (overflow menu for Test Audio / Reset Losses) -- FIRST.
+        # stays and only the tail is clipped; hovering it shows the FULL live
+        # text above the scope explainer). Before this ordering the ⚙ gear and
+        # the Losses Source dropdown were packed last and got 1-3 px. The loss
+        # COUNT is live combat info and the controls are set-once, so the
+        # label also carries its own "Losses:" prefix (no separate LOSSES:
+        # label) and the Audio toggle lives in the gear menu: at tk scaling
+        # 1.51 / 1000x700 that is the difference between 3-53 px and >=131 px
+        # of loss text. Guard: tests/test_xup_status_row_width.py (real ttk
+        # styles + real gear).
+        # Settings gear (Reset Losses / Audio alerts / Test Audio) -- FIRST.
         self._build_status_bar_menu(status_frame)
 
         # Left: X-UP section
@@ -4416,23 +4421,23 @@ class FCToolGUI:
         self._role_slots: list[dict] = []
 
         # ── Fleet Loss Tracker (inline in status bar) ────────────────────────
-        tk.Label(self._loss_section, text="LOSSES:",
-                 font=("Consolas", 10, "bold"),
-                 fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(0, 5))
-        # Audio / Source: / dropdown live in their own frame packed RIGHT and
-        # BEFORE the status label, so when the section is squeezed the label
-        # (packed last, anchor=W) loses its tail and the controls keep their
-        # full request. Visual order is unchanged: LOSSES: text Audio Source: [v]
+        # No separate "LOSSES:" label: every writer of _loss_status_label
+        # already starts its text with "Losses:", so the fixed label only
+        # repeated the word and took its width from the flexing count. The
+        # Source: / dropdown live in their own frame packed RIGHT and BEFORE
+        # the status label, so when the section is squeezed the label (packed
+        # last, anchor=W) loses its tail and the dropdown keeps its full
+        # request. Visual order: Losses: text  Source: [v]
         loss_controls = tk.Frame(self._loss_section, bg=BG_PANEL)
         loss_controls.pack(side=tk.RIGHT)
         self._loss_status_label = tk.Label(
-            self._loss_section, text="(no fleet yet)", anchor=tk.W,
+            self._loss_section, text="Losses: —", anchor=tk.W,
             font=("Consolas", 10), fg=FG_DIM, bg=BG_PANEL, cursor="question_arrow",
         )
         self._loss_status_label.pack(side=tk.LEFT, padx=(0, 10))
         # Static copy covering every scope the label can show — the shared
         # leak-proof helper, never a bespoke tooltip Toplevel.
-        attach_tooltip(self._loss_status_label, (
+        _loss_tip_scope = (
             "Mainline Fleet: tackle losses (frigs, dessies, ceptors, AFs, EAFs, T3Ds)\n"
             "are ignored — only major ship losses count toward alerts.\n"
             "Support Fleet: all losses count. Mode is auto-detected from fleet comp.\n"
@@ -4442,7 +4447,14 @@ class FCToolGUI:
             "covers ONLY the characters authenticated in FCTool — it is NOT the whole\n"
             "fleet's losses, and a loss anywhere else in New Eden by one of your own\n"
             "characters lands in it too."
-        ))
+        )
+        # The label's tail is clipped at the minsize, so the tip leads with the
+        # label's LIVE text: re-worded on <Enter>, bound BEFORE attach_tooltip
+        # so it runs before the tip's own <Enter> reads `_tooltip_text`.
+        self._loss_status_label.bind(
+            "<Enter>", lambda e, w=self._loss_status_label: update_tooltip(
+                w, f"{w.cget('text')}\n\n{_loss_tip_scope}"), add="+")
+        attach_tooltip(self._loss_status_label, _loss_tip_scope)
 
         self._loss_audio_var = tk.BooleanVar(value=self._loss_audio_enabled)
 
@@ -4451,19 +4463,13 @@ class FCToolGUI:
             self.config["loss_audio_enabled"] = self._loss_audio_enabled
             self._save_config()
 
-        # bd=0/highlightthickness=0/padx=0 like the "= DPS" box: same look on
-        # this dark panel, a few px less of a row that over-commits.
-        tk.Checkbutton(loss_controls, text="Audio",
-                       variable=self._loss_audio_var,
-                       font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, padx=0,
-                       bd=0, highlightthickness=0,
-                       selectcolor=BG_ENTRY, activebackground=BG_PANEL,
-                       activeforeground=FG_YELLOW,
-                       command=_on_loss_audio_toggle,
-                       ).pack(side=tk.LEFT)
+        # The Audio toggle is a checkbutton in the ⚙ menu
+        # (_build_status_bar_menu), same var + same command: it is set-once,
+        # and inline it cost the live loss count ~65 px at the minsize.
+        self._loss_audio_toggle = _on_loss_audio_toggle
 
         # Loss source (config loss_tracking.source). Persists immediately,
-        # mirroring the Audio toggle above — no Save-Settings round trip.
+        # mirroring the Audio toggle (⚙ menu) — no Save-Settings round trip.
         tk.Label(loss_controls, text="Source:", font=("Consolas", 9),
                  fg=FG_DIM, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 2))
         self._loss_source_var = tk.StringVar(value=self._loss_reconciler.source)
@@ -34271,14 +34277,29 @@ class FCToolGUI:
                              fg=FG_DIM, bg=BG_PANEL, cursor="hand2", padx=10, pady=4)
         gear_btn.pack(side=tk.RIGHT)
 
-        def show_menu(event=None):
+        def build_menu():
             menu = tk.Menu(self.root, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
                            activebackground=FG_ACCENT, activeforeground=BG_DARK)
             menu.add_command(label="Reset Losses", command=self._reset_loss_tracker)
             menu.add_separator()
+            # Moved here from the status row (it starved the live loss count
+            # at the minsize). Same BooleanVar + same handler as the old inline
+            # checkbox, both made by _build_xup_tab after this gear is packed
+            # -- read at click time, so absent only on a partial build.
+            audio_var = getattr(self, "_loss_audio_var", None)
+            if audio_var is not None:
+                menu.add_checkbutton(label="Audio alerts", variable=audio_var,
+                                     command=self._loss_audio_toggle,
+                                     selectcolor=FG_TEXT)
             menu.add_command(label="Test Audio Alert",
                              command=lambda: tts_helper.speak(
                                  "Ten percent of fleet lost"))
+            return menu
+
+        gear_btn._build_menu = build_menu     # test seam (no tk_popup needed)
+
+        def show_menu(event=None):
+            menu = build_menu()
             try:
                 x = gear_btn.winfo_rootx()
                 y = gear_btn.winfo_rooty() + gear_btn.winfo_height()
