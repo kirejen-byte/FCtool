@@ -80,11 +80,17 @@ The helpers:
 ``normalize_hex_color(value, default)``
     Pure colour-read normaliser: ``#rgb``/``#rrggbb`` -> lowercase
     ``#rrggbb``, anything else -> the caller's per-key ``default``.
+
+``make_color_swatch(parent, var, default, *, title, on_change)``
+    A small flat button painted with a ``StringVar``'s colour: left-click
+    opens the stock colour dialog, right-click resets to ``default``. No
+    variable traces — see its docstring.
 """
 from __future__ import annotations
 
 import logging
 import tkinter as tk
+from tkinter import colorchooser
 
 import ui_theme
 
@@ -997,3 +1003,96 @@ def normalize_hex_color(value, default):
     if len(digits) == 3:
         digits = "".join(ch * 2 for ch in digits)
     return "#" + digits.lower()
+
+
+# ── colour swatches ─────────────────────────────────────────────────────────
+def make_color_swatch(parent, var, default, *, title, on_change):
+    """A small flat ``tk.Button`` whose face IS the colour in ``var``.
+
+    Returns the Button, built but NOT packed — the caller owns layout (and
+    tooltips: the helper never binds ``<Enter>``/``<Leave>``, which the
+    caller's tooltip binder owns; a plain ``bind()`` there would replace it).
+
+    * The face is ``normalize_hex_color(var.get(), default)``, so a
+      hand-edited garbage value shows the key's own default. Building never
+      WRITES the var: an untouched swatch must stay indistinguishable from its
+      config mirror (fc_gui's apply skips controls that have not moved).
+    * Left-click (``command``) opens ``colorchooser.askcolor`` over the
+      button's toplevel, starting from the current colour. OK stores the
+      NORMALISED hex in ``var``, repaints and calls ``on_change()``; Cancel
+      (``(None, None)``) or a ``tk.TclError`` from the dialog changes nothing.
+      Measured 2026-09-26 on this box: the dialog disables only its owner
+      (the main window) — Tk ``after`` jobs keep running at full rate and a
+      separate unowned Toplevel (an FCPreview tile) stays enabled.
+    * Right-click resets ``var`` to ``default``, repaints and calls
+      ``on_change()``. The same callable is exposed as
+      ``button._fctool_reset`` — a TEST SEAM, because ``event_generate``
+      reaches nothing on an unmapped widget (``docs/agents/map/facts.md``).
+    * A DISABLED swatch ignores both gestures (Tk already refuses a disabled
+      button's command; the reset checks the state itself), matching every
+      other control greyed outside its mode.
+    * No Tcl variable trace: the swatch writes ``var`` on a gesture and never
+      observes it (the trace-closure leak class). A var changed elsewhere is
+      not repainted — the caller owns that var's other writers.
+    * ``on_change`` failures are swallowed and logged, as in
+      ``make_glyph_button``: this runs inside a Tk callback, where an escaping
+      exception costs the user a traceback dialog.
+    """
+    def _current():
+        try:
+            raw = var.get()
+        except tk.TclError:
+            raw = None
+        return normalize_hex_color(raw, default)
+
+    colour = _current()
+    # Same face as fc_gui's overlay "Color" button (width=3, RIDGE, Consolas
+    # 10), so the swatch sits on a settings row at the row's own height.
+    btn = tk.Button(parent, text="", width=3, font=("Consolas", 10),
+                    relief=tk.RIDGE, bd=1, bg=colour, activebackground=colour,
+                    cursor="hand2")
+
+    def _disabled():
+        try:
+            return str(btn.cget("state")) == "disabled"
+        except tk.TclError:
+            return True                     # a dead widget does nothing
+
+    def _store(new):
+        try:
+            var.set(new)
+            btn.configure(bg=new, activebackground=new)
+        except tk.TclError:
+            return
+        if not callable(on_change):
+            return
+        try:
+            on_change()
+        except Exception:
+            log.warning("color swatch on_change failed", exc_info=True)
+
+    def _pick():
+        if _disabled():
+            return
+        try:
+            result = colorchooser.askcolor(initialcolor=_current(),
+                                           parent=btn.winfo_toplevel(),
+                                           title=title)
+        except tk.TclError:
+            return
+        try:
+            chosen = result[1]
+        except (TypeError, IndexError, KeyError):
+            return
+        if chosen:
+            _store(normalize_hex_color(chosen, default))
+
+    def _reset(_event=None):
+        if _disabled():
+            return
+        _store(default)
+
+    btn.configure(command=_pick)
+    btn.bind("<Button-3>", _reset, add="+")
+    btn._fctool_reset = _reset
+    return btn

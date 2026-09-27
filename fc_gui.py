@@ -329,7 +329,8 @@ from ui_theme import (
 # unmapped, so the placement is applied at map time with no visible jump.
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
                         relift_topmost_tooltips, center_over,
-                        make_glyph_button, normalize_hex_color)
+                        make_glyph_button, normalize_hex_color,
+                        make_color_swatch)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -20200,9 +20201,11 @@ class FCToolGUI:
         "intel_flash_jumps": _PREVIEW_INTEL_JUMPS_DEFAULT,
         "doctrine_tag_captions": True,       # caveat #4 (Task B1)
         "damage_flash": True,                # caveat #3 / P1 (Task B6)
-        # Default mode is 'any' (log-only, no HP/ESI gate): flash on ANY windowed
-        # incoming damage. 'threshold' keeps the pct-of-reference behaviour but
-        # degrades to any-damage when HP is unknown (never a silent no-flash).
+        # Since 2026-09-26 the mode gates NPC (orange) damage ONLY — player
+        # damage always flashes red, in either mode. Default 'any' (log-only,
+        # no HP/ESI gate): orange on ANY windowed NPC damage. 'threshold' keeps
+        # the pct-of-reference behaviour for NPC damage but degrades to
+        # any-damage when HP is unknown (never a silent no-flash).
         "damage_flash_mode": "any",
         "damage_flash_pct": 10, "damage_flash_window_s": 5,
         "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest",
@@ -25955,9 +25958,12 @@ class FCToolGUI:
         w.append(_lbl_ij)
         _tip(_lbl_ij, _intel_tip)
 
-        # B6: damage flash — tile border pulses red when windowed incoming
-        # damage from your OWN combat Gamelogs crosses a % of base hull HP.
-        # Default ON. Native-mode only (eveo_labels has no tiles to flash).
+        # B6: damage flash — tile border pulses on incoming damage read from
+        # your OWN combat Gamelogs: RED for player hits (always, in either
+        # mode), ORANGE for NPC hits (gated by the "Flash on" mode and the
+        # "NPC damage" toggle; 2026-09-26). Colours and toggle live in the row
+        # below the tuning row. Default ON. Native-mode only (eveo_labels has
+        # no tiles to flash).
         self._preview_damage_flash_var = tk.BooleanVar(
             value=bool(pcfg.get("damage_flash", True)))
         cbdf = tk.Checkbutton(
@@ -25967,9 +25973,9 @@ class FCToolGUI:
             activeforeground=FG_TEXT)
         cbdf.grid(row=0, column=3, padx=(0, 16))
         w.append(cbdf)
-        _tip(cbdf, "Pulse a preview's border red when that character takes "
-                   "incoming damage in your own combat logs (tune it in the row "
-                   "below).")
+        _tip(cbdf, "Pulse a preview's border when that character takes incoming "
+                   "damage in your own combat logs — red for players, orange for "
+                   "NPCs (tune it in the rows below).")
 
         # Decloak alert — when one of YOUR chars is decloaked (proximity or a
         # Mobile Observatory), read from your own combat logs, its tile flashes
@@ -26005,9 +26011,10 @@ class FCToolGUI:
 
         # ── Alerts ▸ row 2 (native): damage-flash tuning ─────────────────────
         # Mode picks 'Any damage' (log-only default; no HP/ESI gate) or
-        # 'Threshold' (pct-of-reference). The pct + reference controls are shown
-        # ONLY in threshold mode; window/cooldown apply to both (window is also
-        # the pulse hold). All live-applied.
+        # 'Threshold' (pct-of-reference) — for NPC damage only since
+        # 2026-09-26; player hits always pulse red. The pct + reference
+        # controls are shown ONLY in threshold mode; window/cooldown apply to
+        # both (window is also the pulse hold). All live-applied.
         rowN3 = tk.Frame(cat_alerts, bg=BG_DARK)
         rowN3.pack(fill=tk.X, pady=2)
 
@@ -26031,8 +26038,9 @@ class FCToolGUI:
                                    self._preview_apply_native_state()))
         w.append(mode_combo)
         _tip(mode_combo,
-             "Any damage: pulse on any incoming hit from your combat logs. "
-             "Threshold: pulse only once damage passes a % of the ship's HP.")
+             "Which NPC hits pulse orange. Any damage: every NPC hit in your "
+             "combat logs. Threshold: only once NPC damage passes a % of the "
+             "ship's HP. Player hits always pulse red.")
 
         # pct label+spin (threshold-only; grid_remove'd in any mode below).
         self._preview_dmg_pct_lbl = tk.Label(rowN3, text="Flash %",
@@ -26048,8 +26056,8 @@ class FCToolGUI:
         spct.grid(row=0, column=3, padx=(0, 12))
         self._preview_dmg_pct_spin = spct
         w.append(spct)
-        _tip(spct, "Threshold mode only: how much damage (as a % of the reference "
-                   "HP) within the window triggers a pulse.")
+        _tip(spct, "Threshold mode only: how much NPC damage (as a % of the "
+                   "reference HP) within the window triggers an orange pulse.")
 
         tk.Label(rowN3, text="Window s", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
@@ -26101,7 +26109,53 @@ class FCToolGUI:
         # Apply initial threshold-only visibility from the loaded mode.
         self._preview_apply_dmg_mode_visibility()
 
-        # ── Alerts ▸ row 3 (native): Gamelogs source ─────────────────────────
+        # ── Alerts ▸ row 3 (native): NPC damage toggle + border colours ──────
+        # All three ride _PREVIEW_NATIVE_VARS. The swatch (ui_helpers) writes
+        # the NORMALISED hex into its var and live-applies; the tick normalises
+        # again on read (hand-edited configs never pass through a swatch), so
+        # the vars are SEEDED normalised too — never raising on garbage.
+        rowDmgColor = tk.Frame(cat_alerts, bg=BG_DARK)
+        rowDmgColor.pack(fill=tk.X, pady=2)
+        self._preview_dmg_npc_var = tk.BooleanVar(
+            value=bool(pcfg.get("damage_flash_npc", True)))
+        cbnpc = tk.Checkbutton(
+            rowDmgColor, text="NPC damage", variable=self._preview_dmg_npc_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbnpc.grid(row=0, column=0, padx=(0, 16))
+        w.append(cbnpc)
+        self._preview_dmg_npc_check = cbnpc
+        _tip(cbnpc, "Also pulse the border ORANGE when NPCs (rats, sentries, "
+                    "Triglavians…) hit that character. Red player-damage flashes "
+                    "are unaffected. Only while 'Damage flash' is on.")
+
+        def _dmg_swatch(col, text, key, default, who):
+            """Label + swatch at `col`/`col + 1`; returns (StringVar, swatch)."""
+            sw_tip = (f"Click to choose the {who} damage color. Right-click to "
+                      f"reset to {default}.")
+            lbl = tk.Label(rowDmgColor, text=text, font=("Consolas", 10),
+                           fg=FG_TEXT, bg=BG_DARK)
+            lbl.grid(row=0, column=col, padx=(0, 4), sticky=tk.W)
+            _tip(lbl, sw_tip)
+            var = tk.StringVar(value=normalize_hex_color(pcfg.get(key), default))
+            sw = make_color_swatch(rowDmgColor, var, default,
+                                   title=f"{who[:1].upper()}{who[1:]} damage color",
+                                   on_change=self._preview_apply_native_state)
+            sw.grid(row=0, column=col + 1, padx=(0, 16))
+            w.append(sw)
+            _tip(sw, sw_tip)
+            return var, sw
+
+        self._preview_dmg_color_var, self._preview_dmg_color_swatch = _dmg_swatch(
+            1, "Player color", "damage_flash_color",
+            damage_flash.PLAYER_COLOR_DEFAULT, "player")
+        (self._preview_dmg_npc_color_var,
+         self._preview_dmg_npc_color_swatch) = _dmg_swatch(
+            3, "NPC color", "damage_flash_npc_color",
+            damage_flash.NPC_COLOR_DEFAULT, "NPC")
+
+        # ── Alerts ▸ row 4 (native): Gamelogs source ─────────────────────────
         # Damage flash AND decloak both read EVE's combat Gamelogs, so a
         # missing/empty/mis-detected folder kills BOTH silently (the friend-box
         # bug). Show the EFFECTIVE folder (an override, else auto-detected beside
@@ -26822,6 +26876,12 @@ class FCToolGUI:
         ("_preview_dmg_window_var", "damage_flash_window_s", int),
         ("_preview_dmg_cooldown_var", "damage_flash_cooldown_s", int),
         ("_preview_dmg_ref_var", "damage_flash_reference", str),
+        # The NPC-damage row (2026-09-26). The colour vars hold a NORMALISED
+        # hex, so an untouched swatch over a hand-edited value never differs
+        # from its snapshot and never writes (the tick normalises on read).
+        ("_preview_dmg_npc_var", "damage_flash_npc", bool),
+        ("_preview_dmg_color_var", "damage_flash_color", str),
+        ("_preview_dmg_npc_color_var", "damage_flash_npc_color", str),
         ("_preview_decloak_flash_var", "decloak_flash", bool),
         ("_preview_decloak_audio_var", "decloak_audio", bool),
         ("_preview_account_slots_var", "account_slots", bool),
