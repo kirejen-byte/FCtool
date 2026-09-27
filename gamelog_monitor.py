@@ -34,6 +34,25 @@ thread off that archive:
     header read at seed. Older files are registered at EOF with the read
     DEFERRED and are resolved lazily if they ever show a sign of life.
 
+Damage source classification (2026-09-26 — orange NPC vs red player flash):
+every DamageEvent carries `source` = "player" | "npc" | "unknown", decided on
+the poll thread from the log line alone (no ESI, no bundled NPC table).
+Measured over the owner's local archive (648,626 incoming-damage lines,
+2021-2026, spec 2026-09-26-npc-vs-player-damage-flash §2):
+  * a bracketed attacker `Name[TICKER](Ship)` was ALWAYS a player — hulls,
+    player structures, player drones (521,227 lines, no NPC ever seen in it);
+  * a BARE attacker `Name` was overwhelmingly an NPC (127,399 lines): NPC
+    turrets write NO weapon segment, NPC missiles name the CHARGE;
+  * bare PLAYERS do exist (ballpark lag in 100+-ship fights, unresolved drone
+    owners, bombs) and every one of them carried a weapon segment — every bare
+    line with a NON-missile weapon was a player. Bare + missile charge is
+    ambiguous from the line alone (player missiles name the charge too), so a
+    bounded, session-only memory of names seen bracketed on ANY tailed
+    character settles it (see classify_damage_source).
+The final " - " segment is always one of six hit-quality words
+(HIT_QUALITIES). An unrecognised final word is KEPT as the weapon, so a parse
+surprise fails toward "player" (red) — never toward silencing a hostile.
+
 ENGLISH CLIENT ONLY: the `(combat) … from` keyword match assumes the English
 localization. Localized clients use translated keywords and are out of scope
 for v1 (documented in the settings fine print).
@@ -82,6 +101,26 @@ DAMAGE_IN_FALLBACK_RE = re.compile(
     r"\(combat\)\s*<.*?><b>(?P<dmg>\d+).*?>\s*from\b",
     re.IGNORECASE,
 )
+
+# ── Damage source classification (see the module docstring) ─────────────────
+# The last " - " segment of an incoming-damage line is the hit quality. This is
+# the WHOLE vocabulary observed in 648,626 real lines ("misses you completely"
+# is not damage and never reaches here). Compared case-insensitively.
+HIT_QUALITIES = frozenset(
+    {"Hits", "Penetrates", "Smashes", "Grazes", "Glances Off", "Wrecks"})
+_HIT_QUALITIES_CF = frozenset(q.casefold() for q in HIT_QUALITIES)
+
+# A player attacker renders as `Name[TICKER](Ship)` — one bracket pair, one
+# paren pair, measured on every bracketed line of a 310k-line sample. The
+# ticker may be empty; the name may not. Character names cannot contain
+# brackets, so `[^\[\]]` bounds the name without guessing its alphabet.
+_PLAYER_ATTACKER_RE = re.compile(
+    r"^\s*(?P<name>[^\[\]]*?)\s*\[[^\[\]]*\]\s*\(.*\)\s*$", re.DOTALL)
+
+# A missile-ish weapon (the CHARGE is what the log names): NPC missile users
+# write one, NPC turret users write none. "Bomb" is deliberately NOT here —
+# bombs are player-only, and a bare bomber is a player whose name lagged.
+_MISSILE_WEAPON_RE = re.compile(r"\b(?:missile|torpedo|rocket)s?\b", re.IGNORECASE)
 
 # ── Decloak notify line (English client) ─────────────────────────────────────
 # EVE writes a (notify) line to the character's OWN Gamelog the instant their
@@ -155,10 +194,18 @@ _CYNO_DOCKING_RE = re.compile(
 
 @dataclass(frozen=True)
 class DamageEvent:
+    """One incoming-damage line for one tailed character.
+
+    ``source`` is ``"player"`` / ``"npc"`` / ``"unknown"`` from
+    :func:`classify_damage_source`. It is the LAST field and defaults to
+    ``"unknown"`` so every pre-classification 4-argument construction keeps
+    working; a consumer must treat ``"unknown"`` exactly like ``"player"`` (the
+    fail-safe direction — an unclassifiable hit is never quietly downgraded)."""
     timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
     character_name: str     # from the file's "Listener:" header
     amount: int
     attacker: str           # raw "Name[CORP](Ship)" blob, may be "" via fallback
+    source: str = "unknown"  # "player" | "npc" | "unknown"
 
 
 @dataclass(frozen=True)
@@ -180,9 +227,30 @@ class CynoActiveEvent:
     generator_name: str     # e.g. "Covert Cynosural Field Generator I", verbatim
 
 
-def parse_damage_line(line: str):
-    """Return (dmg:int, attacker:str) for an INCOMING combat line, else None.
+def _weapon_of(tail: str) -> str:
+    """The weapon named by the text after the attacker's closing ``</b>``.
 
+    Tags are stripped (the measured tail is ``<font size=10><color=…>TEXT``),
+    the text is split on ``" - "`` into stripped non-empty segments, and the
+    LAST segment is dropped iff it is a hit-quality word. What remains is
+    re-joined with ``" - "`` (a weapon name may itself contain one) — ``""``
+    when nothing remains, which is how an NPC turret hit reads. An unrecognised
+    final word is kept AS the weapon: the fail-safe direction (see
+    classify_damage_source rule 4)."""
+    segments = [s.strip() for s in _TAG_RE.sub("", tail).split(" - ")]
+    segments = [s for s in segments if s]
+    if segments and segments[-1].casefold() in _HIT_QUALITIES_CF:
+        segments.pop()
+    return " - ".join(segments)
+
+
+def parse_damage_detail(line: str):
+    """Return ``(dmg:int, attacker:str, weapon:str)`` for an INCOMING combat
+    line, else None.
+
+    ``weapon`` is ``""`` when the line names none (NPC turrets) — see
+    _weapon_of. The fallback regex (a client variant the full pattern misses;
+    0 hits in the measured archive) knows neither party: ``(dmg, "", "")``.
     Outgoing ('to'), mining, notify, and malformed lines all yield None.
     """
     if not line or "(combat)" not in line:
@@ -190,16 +258,79 @@ def parse_damage_line(line: str):
     m = DAMAGE_IN_RE.search(line)
     if m:
         try:
-            return (int(m.group("dmg")), m.group("attacker").strip())
+            dmg = int(m.group("dmg"))
         except (TypeError, ValueError):
             return None
+        return (dmg, m.group("attacker").strip(), _weapon_of(line[m.end():]))
     m = DAMAGE_IN_FALLBACK_RE.search(line)
     if m:
         try:
-            return (int(m.group("dmg")), "")
+            return (int(m.group("dmg")), "", "")
         except (TypeError, ValueError):
             return None
     return None
+
+
+def parse_damage_line(line: str):
+    """Return (dmg:int, attacker:str) for an INCOMING combat line, else None.
+
+    Outgoing ('to'), mining, notify, and malformed lines all yield None.
+    Thin delegate kept for its callers/tests: the first two elements of
+    :func:`parse_damage_detail`.
+    """
+    hit = parse_damage_detail(line)
+    return None if hit is None else hit[:2]
+
+
+def player_name_of(attacker):
+    """Casefolded character name of a ``Name[TICKER](Ship)`` attacker blob —
+    the part before ``[``, stripped — else None (a bare/empty/malformed blob).
+
+    An empty ticker (``Name[](Ship)``) is still the player shape. Never raises."""
+    if not attacker or not isinstance(attacker, str):
+        return None
+    m = _PLAYER_ATTACKER_RE.match(attacker)
+    if not m:
+        return None
+    name = m.group("name").strip()
+    return name.casefold() if name else None
+
+
+def classify_damage_source(attacker, weapon, known_players) -> str:
+    """``"player"`` / ``"npc"`` / ``"unknown"`` for one incoming-damage hit.
+
+    Pure, never raises. ``known_players`` is anything answering ``in`` with a
+    casefolded name (the monitor passes its bounded session memory). First
+    matching rule wins (the measured basis is in the module docstring):
+      6. no attacker at all (the fallback regex) → "unknown" — checked FIRST so
+         the rules below never see an empty name;
+      1. ``Name[TICKER](Ship)`` → "player" (hulls, structures, drones);
+      2. bare name already seen bracketed this session → "player";
+      3. bare, no weapon segment → "npc" (NPC turrets);
+      4. bare, a weapon that is NOT a missile/torpedo/rocket → "player"
+         (drones, turrets, smartbombs, bombs — no NPC was ever seen here);
+      5. bare, a missile-ish weapon → "npc" (NPCs name the charge).
+    Rule 5 is the one ambiguous call (a lagged player missile boat reads the
+    same); rule 2 is what rescues it once the name has been seen bracketed."""
+    name = attacker.strip() if isinstance(attacker, str) else ""
+    if not name:
+        return "unknown"
+    if player_name_of(name) is not None:
+        return "player"
+    try:
+        if name.casefold() in known_players:
+            return "player"
+    except Exception:
+        # A memory that cannot answer `in` (None, wrong type) knows nobody —
+        # the shape rules below still decide, and this must never raise on
+        # the poll thread.
+        pass
+    w = weapon.strip() if isinstance(weapon, str) else ""
+    if not w:
+        return "npc"
+    if _MISSILE_WEAPON_RE.search(w) is None:
+        return "player"
+    return "npc"
 
 
 def parse_decloak_line(line: str):
@@ -354,7 +485,16 @@ class GamelogMonitor:
     Gamelogs dir + per-file tailer with rotation/truncation detection. The
     ONLY substantive differences are UTF-8 decode + no byte-alignment on the
     read position.
+
+    Each DamageEvent is classified (``source``) on the poll thread, against a
+    bounded session memory of player names seen bracketed on ANY tailed file.
     """
+
+    # Bound on the seen-bracketed player-name memory (see _remember_player).
+    # A 100+-ship fight shows a few hundred distinct attackers; 2,048 keeps a
+    # long session's worth of them for well under 1 MB. A class attribute so
+    # tests can shrink it.
+    _KNOWN_PLAYERS_CAP = 2048
 
     def __init__(self, on_event, logs_dir=None, state_path=STATE_FILE_PATH,
                  poll_interval=1.0, on_decloak=None, on_cyno_active=None):
@@ -390,6 +530,16 @@ class GamelogMonitor:
         # Set of lowercased character names with a live preview tile; None means
         # "track everything" (before the tick has told us otherwise).
         self._tracked: set[str] | None = None
+        # Casefolded names of attackers seen in the bracketed PLAYER shape,
+        # used as an insertion-ordered set (values are None; oldest first,
+        # re-sighting moves a name to the end). ONE memory shared across every
+        # tailed character, so a gang seen bracketed on one alt classifies as
+        # players where it renders bare on another. Bounded by
+        # _KNOWN_PLAYERS_CAP. Read and written ONLY on the poll thread (inside
+        # poll_file), so it needs no lock. These are THIRD-PARTY player names:
+        # session-only — never persisted (the state file holds tail positions
+        # only) and never logged. Not path-scoped, so set_logs_dir keeps it.
+        self._known_players: dict[str, None] = {}
         # Daemon thread / stop-event fields (mirror ChatMonitor).
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -427,6 +577,8 @@ class GamelogMonitor:
         self._fingerprints.clear()
         self._buffers.clear()
         self._listeners.clear()
+        # _known_players is deliberately NOT cleared: player names are not
+        # path-scoped, and it is poll-thread-owned (this runs on the Tk thread).
         self._last_dir_mtime = None
         self._last_full_scan_monotonic = 0.0
         self._status = probe_status(self._logs_dir)
@@ -726,6 +878,20 @@ class GamelogMonitor:
                                       self._listeners, self._tracked,
                                       scanning=True)
 
+    def _remember_player(self, name: str) -> None:
+        """Record a casefolded bracket-confirmed player name (poll thread only).
+
+        Insert or move-to-end, then evict oldest-first beyond
+        _KNOWN_PLAYERS_CAP — so an attacker still shooting is always the LAST
+        to be evicted (least-recently-seen goes first). Never persisted, never
+        logged."""
+        known = self._known_players
+        known.pop(name, None)            # re-sighting refreshes recency
+        known[name] = None
+        cap = max(1, int(self._KNOWN_PLAYERS_CAP))
+        while len(known) > cap:
+            del known[next(iter(known))]     # dicts iterate oldest-first
+
     def poll_file(self, path):
         """One tailing pass over `path`. UTF-8, NO byte alignment.
 
@@ -734,8 +900,10 @@ class GamelogMonitor:
           - read_start = self._positions.get(path, 0)   # NOT `& ~1`
           - decode raw bytes as UTF-8
           - new position = read_start + len(consumed raw bytes)
-        For each COMPLETE line, parse_damage_line(); on a hit, emit a
-        DamageEvent(timestamp=_ts_of(line), character_name=listener, ...). The
+        For each COMPLETE line, parse_damage_detail(); on a hit, a bracketed
+        (player-shape) attacker is remembered FIRST, then a
+        DamageEvent(timestamp=_ts_of(line), character_name=listener, ...,
+        source=classify_damage_source(...)) is emitted. The
         SAME line is also run through parse_decloak_line() (short-circuited on a
         cheap substring); on a hit a DecloakEvent is emitted via on_decloak, and
         again through parse_cyno_active_line() for on_cyno_active. Both extra
@@ -798,12 +966,21 @@ class GamelogMonitor:
         lines = text.split("\n")
         self._buffers[path] = lines.pop()            # trailing partial line
         for ln in lines:
-            hit = parse_damage_line(ln)
+            hit = parse_damage_detail(ln)
             if hit is not None:
-                dmg, attacker = hit
+                dmg, attacker, weapon = hit
+                # Learn a bracket-confirmed player BEFORE classifying, so the
+                # memory is current for this line and every later one — on this
+                # file and on every other tailed character's.
+                confirmed = player_name_of(attacker)
+                if confirmed is not None:
+                    self._remember_player(confirmed)
+                source = classify_damage_source(attacker, weapon,
+                                                self._known_players)
                 self._on_event(DamageEvent(timestamp=_ts_of(ln),
                                            character_name=listener,
-                                           amount=dmg, attacker=attacker))
+                                           amount=dmg, attacker=attacker,
+                                           source=source))
             # Decloak notify (same pass; short-circuited inside parse_decloak_line
             # so it's ~free on the overwhelming majority of lines).
             if self._on_decloak is not None:
