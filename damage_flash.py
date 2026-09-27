@@ -63,7 +63,8 @@ class-agnostic boolean predicate is retired. Because the tick reads this
 inside its per-tile try — an exception here retires a live preview tile —
 every cfg value is coerced defensively (a hand-edited config must never
 raise): numeric keys that are not a FINITE number — garbage, an overflowing
-int literal, inf / NaN — take the key's default (_finite_or).
+int literal, inf / NaN — take the key's default (_finite_or), and a
+non-positive window does too (it would silently switch the flash off).
 
 HP values (threshold mode) are BASE dogma hull HP (fitted ships have more) — the
 UI labels this as an approximation.
@@ -172,9 +173,17 @@ def _coerce_window_s(cfg) -> float:
     "garbage", 10**400, "inf" ...; see _finite_or). The tracker is the ONE
     owner of this coercion — it sizes both the windowed sums AND each hold
     (fc_gui's tick stopped reading the key when it cut over to
-    flash_state()). `or 5` is right HERE (a 0 s window is meaningless) but
-    NOT for the cooldown below."""
-    return _finite_or(cfg.get("damage_flash_window_s", 5) or 5, 5.0)
+    flash_state()).
+
+    A NON-POSITIVE window (0, "0", -3, "-3", -0.0) also falls back to 5.0:
+    the strict prune would drop every hit and each hold would end the
+    instant it arms, i.e. damage flash silently OFF — exactly the
+    silent-suppression class this module exists to prevent. The Window
+    spinbox clamps only its arrow buttons, so a typed "-3" does reach here.
+    That rejection is right HERE but NOT for the cooldown below (0 = re-arm
+    on every read is valid there)."""
+    window_s = _finite_or(cfg.get("damage_flash_window_s", 5), 5.0)
+    return window_s if window_s > 0 else 5.0
 
 
 def _coerce_cooldown_s(cfg) -> float:
