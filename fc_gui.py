@@ -1254,10 +1254,25 @@ def _preview_intel_radius(cfg) -> int:
     maintenance, and the settings write-back — because a Spinbox's from_/to
     bounds its ARROWS only (typed text reaches the var verbatim) and
     config.json is hand-editable. Anything unparseable falls back to the
-    default rather than disabling the feature."""
+    default rather than disabling the feature.
+
+    OverflowError joins TypeError/ValueError in that same "unparseable ->
+    default" bucket (2026-09-26 fix round): a hand-edited Infinity/-Infinity
+    token survives json.load as a non-finite float, and int() of THAT raises
+    OverflowError rather than ValueError -- previously uncaught, raising here
+    at Settings-build time (this is also the intel-jumps Spinbox's seed) and
+    on every subsequent poller/tick read. Deliberately NOT reusing
+    damage_flash.finite_or here: finite_or would also catch a merely-HUGE but
+    perfectly valid int (10**400) and divert it to the default (2) instead of
+    the MAX (7) — but int() itself never raises on a big int (Python ints are
+    arbitrary-precision), so that case already falls through to the clamp
+    below unchanged, exactly like the existing 8->7 / 99->7 rows
+    (test_intel_radius_helper_clamps_every_shape). Folding it into this
+    except would make a hand-edited overflow and a merely-too-big value read
+    identically, which they do not today."""
     try:
         radius = int(cfg.get("intel_flash_jumps", _PREVIEW_INTEL_JUMPS_DEFAULT))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         radius = _PREVIEW_INTEL_JUMPS_DEFAULT
     return max(0, min(_PREVIEW_INTEL_JUMPS_MAX, radius))
 
@@ -20855,8 +20870,18 @@ class FCToolGUI:
         every other caller is unchanged."""
         conf_hover = getattr(tile, "configure_hover", None)
         if conf_hover is not None:
-            conf_hover(inactive=float(cfg.get("opacity_inactive", 0.85)),
-                       hover=float(cfg.get("opacity_hover", 1.0)))
+            # 2026-09-26 fix round: unlike tile_w/tile_body_h, opacity has no
+            # boot-time heal anywhere (preview_layout.heal_preview_sizes only
+            # touches size keys) -- a hand-edited opacity_inactive/opacity_hover
+            # used to raise HERE every tick, inside the per-tile try, retiring
+            # that one tile forever (the garbage is never written back). Same
+            # policy as the Settings seed for this key (finite_or -> the
+            # _PREVIEW_DEFAULTS value), so a garbage config now just renders at
+            # the ordinary default instead of never rendering that tile at all.
+            conf_hover(inactive=damage_flash.finite_or(
+                           cfg.get("opacity_inactive", 0.85), 0.85),
+                       hover=damage_flash.finite_or(
+                           cfg.get("opacity_hover", 1.0), 1.0))
         conf_zoom = getattr(tile, "configure_zoom", None)
         if conf_zoom is not None:
             conf_zoom(enabled=bool(cfg.get("zoom_enabled", False)),
@@ -21326,9 +21351,22 @@ class FCToolGUI:
         through here, so flooring the result via preview_layout.clamp_size
         (the ONE definition, shared with preview_tile's drag paths) is what
         makes a sub-minimum stored size unable to reach a window. Clamping is
-        idempotent, so a value that is already legal is returned untouched."""
-        gw = int(cfg.get("tile_w", 384))
-        gh = int(cfg.get("tile_body_h", 216))
+        idempotent, so a value that is already legal is returned untouched.
+
+        2026-09-26 fix round: a hand-edited tile_w/tile_body_h (non-numeric,
+        overflowing, non-finite) used to raise HERE, inside the tick's
+        per-tile try (fc_gui's `except Exception: ... self._preview_retire_tile`)
+        -- not a startup crash, but every tile fails every tick forever (the
+        garbage is never written back, by design). The pre-existing
+        `int(...)` pre-cast is gone, not replaced with `finite_or`: raw
+        garbage now reaches `clamp_size` -> `_floor_int` directly, the SAME
+        garbage-to-MIN_TILE_W/MIN_TILE_BODY_H policy `preview_layout.
+        heal_preview_sizes` already applies to these exact keys elsewhere, so
+        a malformed value floors instead of falling back to the 384/216
+        defaults (finite_or's fallback would have silently disagreed with the
+        heal's own floor for the identical key)."""
+        gw = cfg.get("tile_w", 384)
+        gh = cfg.get("tile_body_h", 216)
         if cfg.get("uniform_size", True):
             return preview_layout.clamp_size(gw, gh)
         override = (cfg.get("sizes", {}) or {}).get(
@@ -25601,7 +25639,21 @@ class FCToolGUI:
         row2.pack(fill=tk.X, pady=2)
         tk.Label(row2, text="Size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
-        self._overlay_size_var = tk.IntVar(value=int(cfg.get("font_size", 11)))
+        # Same class of startup-crash gap as the preview twins below, one
+        # config namespace over (overlay.font_size, not preview.*): a
+        # hand-edited value used to raise this int() at Settings-build time.
+        # finite_or -> the existing 11 default, displayed only. UNLIKE the
+        # preview panel's _PREVIEW_NATIVE_VARS, this row has no shadow/_put
+        # skip-rule at all -- _overlay_apply_style unconditionally writes
+        # `cfg["font_size"] = int(self._overlay_size_var.get())` on EVERY
+        # call, including one triggered by the sibling color/anchor controls
+        # on this same row. So the garbage survives only until the build
+        # completes; touching ANYTHING on this row (not just Size) persists
+        # the now-coerced 11, exactly as it would if the user had typed 11
+        # themselves. That is pre-existing (this fix changes only what a
+        # garbage value DISPLAYS as, not this row's write-back shape).
+        self._overlay_size_var = tk.IntVar(
+            value=int(damage_flash.finite_or(cfg.get("font_size", 11), 11.0)))
         size_spin = tk.Spinbox(
             row2, from_=8, to=24, width=4, textvariable=self._overlay_size_var,
             font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
