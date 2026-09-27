@@ -48,7 +48,13 @@ Measured over the owner's local archive (648,626 incoming-damage lines,
     line with a NON-missile weapon was a player. Bare + missile charge is
     ambiguous from the line alone (player missiles name the charge too), so a
     bounded, session-only memory of names seen bracketed on ANY tailed
-    character settles it (see classify_damage_source).
+    character settles it (see classify_damage_source);
+  * EXCEPT a T2 charge (Rage / Fury / Javelin / Precision): a replay over
+    651,916 incoming lines found 19/19 bare lines naming one came from
+    bracket-confirmed players (18 from a name seen bracketed only on a LATER
+    day — out of any session memory's reach), and 0 NPC lines carried a T2
+    charge (NPCs fire plain, faction or Abyssal/Triglavian charges). So a
+    bare T2 missile charge is "player" outright.
 The final " - " segment is always one of six hit-quality words
 (HIT_QUALITIES). An unrecognised final word is KEPT as the weapon, so a parse
 surprise fails toward "player" (red) — never toward silencing a hostile.
@@ -120,7 +126,16 @@ _PLAYER_ATTACKER_RE = re.compile(
 # A missile-ish weapon (the CHARGE is what the log names): NPC missile users
 # write one, NPC turret users write none. "Bomb" is deliberately NOT here —
 # bombs are player-only, and a bare bomber is a player whose name lagged.
-_MISSILE_WEAPON_RE = re.compile(r"\b(?:missile|torpedo|rocket)s?\b", re.IGNORECASE)
+# Plurals included ("Torpedoes" — the `e` is why `torpedo` needs its own tail).
+_MISSILE_WEAPON_RE = re.compile(
+    r"\b(?:missiles?|torpedo(?:e?s)?|rockets?)\b", re.IGNORECASE)
+
+# A T2 missile CHARGE (Rage / Fury / Javelin / Precision), matched as a whole
+# word. NPCs fire plain, faction ("Caldari Navy …", "Guristas …") or
+# Abyssal/Triglavian charges — never a T2 one — so a bare attacker naming one
+# is a player whose name lagged (see classify_damage_source rule 4b).
+_T2_MISSILE_CHARGE_RE = re.compile(
+    r"\b(?:rage|fury|javelin|precision)\b", re.IGNORECASE)
 
 # ── Decloak notify line (English client) ─────────────────────────────────────
 # EVE writes a (notify) line to the character's OWN Gamelog the instant their
@@ -309,9 +324,14 @@ def classify_damage_source(attacker, weapon, known_players) -> str:
       3. bare, no weapon segment → "npc" (NPC turrets);
       4. bare, a weapon that is NOT a missile/torpedo/rocket → "player"
          (drones, turrets, smartbombs, bombs — no NPC was ever seen here);
-      5. bare, a missile-ish weapon → "npc" (NPCs name the charge).
-    Rule 5 is the one ambiguous call (a lagged player missile boat reads the
-    same); rule 2 is what rescues it once the name has been seen bracketed."""
+      4b. bare, a missile-ish weapon naming a T2 CHARGE (a whole-word
+         Rage / Fury / Javelin / Precision) → "player" (no NPC ever fired
+         one; every such bare line came from a bracket-confirmed player);
+      5. bare, any other missile-ish weapon → "npc" (NPCs name the charge).
+    Rule 5 is the one ambiguous call (a lagged player firing T1 / faction
+    missiles reads the same); rule 2 rescues it once the name has been seen
+    bracketed, rule 4b whenever the charge is T2 — even for a name only ever
+    seen bracketed LATER, which no session memory can reach."""
     name = attacker.strip() if isinstance(attacker, str) else ""
     if not name:
         return "unknown"
@@ -329,6 +349,8 @@ def classify_damage_source(attacker, weapon, known_players) -> str:
     if not w:
         return "npc"
     if _MISSILE_WEAPON_RE.search(w) is None:
+        return "player"
+    if _T2_MISSILE_CHARGE_RE.search(w) is not None:
         return "player"
     return "npc"
 
