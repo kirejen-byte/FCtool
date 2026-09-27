@@ -20628,7 +20628,16 @@ class FCToolGUI:
         if self._overlay is None:
             cfg = self._overlay_cfg()
             self._overlay = OverlayWindow(self.root, {
-                "font_size": cfg.get("font_size", 11),
+                # eveo_overlay.OverlayWindow.__init__ does its own bare
+                # int(palette.get("font_size", 11)) (eveo_overlay.py, NOT
+                # edited here) — a hand-edited garbage font_size raises
+                # there, and _overlay_enable's try/except catches it, logs,
+                # and disables the WHOLE overlay for the session (contained,
+                # but a real feature loss for something this small). Coerce
+                # HERE, at the one fc_gui call site, with the same policy as
+                # every other font_size seed/read in this file.
+                "font_size": int(damage_flash.finite_or(
+                    cfg.get("font_size", 11), 11.0)),
                 "color": cfg.get("color", "#ffffff"),
                 "anchor": cfg.get("anchor", "top-left"),
             })
@@ -21361,18 +21370,26 @@ class FCToolGUI:
         makes a sub-minimum stored size unable to reach a window. Clamping is
         idempotent, so a value that is already legal is returned untouched.
 
-        2026-09-26 fix round: a hand-edited tile_w/tile_body_h (non-numeric,
-        overflowing, non-finite) used to raise HERE, inside the tick's
-        per-tile try (fc_gui's `except Exception: ... self._preview_retire_tile`)
-        -- not a startup crash, but every tile fails every tick forever (the
-        garbage is never written back, by design). The pre-existing
-        `int(...)` pre-cast is gone, not replaced with `finite_or`: raw
-        garbage now reaches `clamp_size` -> `_floor_int` directly, the SAME
+        2026-09-26 fix round, CORRECTED 2026-09-27: the pre-existing
+        `int(...)` pre-cast on tile_w/tile_body_h is gone (raw garbage now
+        reaches `clamp_size` -> `_floor_int` directly, the SAME
         garbage-to-MIN_TILE_W/MIN_TILE_BODY_H policy `preview_layout.
-        heal_preview_sizes` already applies to these exact keys elsewhere, so
-        a malformed value floors instead of falling back to the 384/216
-        defaults (finite_or's fallback would have silently disagreed with the
-        heal's own floor for the identical key)."""
+        heal_preview_sizes` already applies to these exact keys elsewhere —
+        not `finite_or`, whose 384/216 fallback would have silently
+        disagreed with the heal's own floor for the identical key). This is
+        DEFENCE IN DEPTH, not a fix for a live-reachable crash: the only
+        gateway to the tick that reaches this method is
+        `_preview_enable_native`, and it unconditionally calls
+        `preview_layout.heal_preview_sizes(self._preview_cfg())` (and
+        `_save_config()`s the result) BEFORE its own trailing
+        `self._preview_tick()` — so by the time any tile is ever placed,
+        tile_w/tile_body_h are already sane. The prior round's docstring
+        overstated this as "every tile fails every tick forever"; that
+        fate belongs to opacity_inactive/opacity_hover instead (see
+        `_preview_style_tile`), which have no equivalent boot-time heal
+        anywhere. The guard here protects a hypothetical future caller that
+        reaches this choke point without going through that heal, not
+        today's actual boot path."""
         gw = cfg.get("tile_w", 384)
         gh = cfg.get("tile_body_h", 216)
         if cfg.get("uniform_size", True):
@@ -21595,8 +21612,19 @@ class FCToolGUI:
         live = self._preview_clients if clients is None else clients
         by_hwnd = {c.hwnd: c for c in live.values()}
         try:
+            # OverflowError joins the tuple 2026-09-27: a hand-edited
+            # Infinity/-Infinity now SURVIVES the Settings build (the seed
+            # fix a few thousand lines below), which makes this cast
+            # reachable with a non-finite float for the first time. THIS
+            # try sits OUTSIDE the tick's per-tile try (it runs once, before
+            # any tile is iterated) -- an uncaught raise here fails the
+            # WHOLE tick, worse than one retired tile: after 5 consecutive
+            # tick failures _preview_disable_session() turns native
+            # previews off entirely. Keeping the existing fallback (11)
+            # and the existing caught types; only widening what falls into
+            # that same bucket.
             font_size = int(self._overlay_cfg().get("font_size", 11))
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError, OverflowError):
             font_size = 11
         faults = [0]
 
@@ -22579,8 +22607,14 @@ class FCToolGUI:
         # (set_bottom_label) — never over it — so no topmost overlay is driven.
         bottom_color = ocfg.get("color", "#ffffff")
         try:
+            # OverflowError joins the tuple 2026-09-27 (same reason as
+            # _preview_fit_tile_heights's identical guard): a hand-edited
+            # Infinity/-Infinity now survives the Settings build, and THIS
+            # cast runs OUTSIDE the tick's per-tile try -- once, before any
+            # tile is iterated -- so an uncaught raise here fails the WHOLE
+            # tick, not one tile.
             bottom_size = int(ocfg.get("font_size", 11))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             bottom_size = 11
         # Decloak hazard banner: while a char's decloak window (edge-armed in
         # _preview_on_decloak) is live, its label strip shows the DECLOAKED banner
@@ -25789,12 +25823,28 @@ class FCToolGUI:
         tk.Label(rowN, text="Tile size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
         # A hand-edited tile_w can be non-numeric/overflowing/non-finite
-        # (same class of gap as the damage-flash seeds below); reuse
-        # damage_flash.finite_or so this int() cannot raise either — a
-        # garbage value displays as the 384 default, verbatim in config
-        # until the user actually moves this control (shadow/_put skip-rule).
+        # (same class of gap as the damage-flash seeds below). 2026-09-27:
+        # NOT finite_or (that was the first cut, and it disagreed with
+        # itself) -- floor it through preview_layout.clamp_size, the SAME
+        # public helper every tile placement/resize already floors through
+        # (preview_layout.heal_preview_sizes uses the identical policy on
+        # this exact key at boot). finite_or's 384 fallback would have
+        # DISPLAYED 384 for garbage while every tile actually rendered at
+        # the 120 floor the very next heal -- the row would disagree with
+        # itself the moment the user touched anything, the neighbouring
+        # height box already uses the floor rule (full_h), and
+        # _preview_resolve_size's own docstring below rejects finite_or for
+        # this key for the identical reason. The body_h argument is a
+        # throwaway (clamp_size floors width and height independently) --
+        # only [0] (the floored width) is used. The Spinbox's OWN from_=160
+        # then clamps a sub-160 floor up again at widget-creation time
+        # (measured Tk fact — from_/to bounds MORE than the arrows for the
+        # INITIAL value), so a garbage tile_w now displays 160, matching
+        # what heal_preview_sizes would floor it to give or take that one
+        # widget-native clamp.
         self._preview_tilew_var = tk.IntVar(
-            value=int(damage_flash.finite_or(pcfg.get("tile_w", 384), 384.0)))
+            value=preview_layout.clamp_size(
+                pcfg.get("tile_w", 384), preview_layout.MIN_TILE_BODY_H)[0])
         sw = tk.Spinbox(rowN, from_=160, to=960, increment=16, width=4,
                         textvariable=self._preview_tilew_var, font=("Consolas", 10),
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
@@ -26139,9 +26189,15 @@ class FCToolGUI:
         # Same policy as the pct seed above (damage_flash.coerce_window_s).
         # coerce_window_s can return a sub-1 value (a hand-edited "0.5" is a
         # finite, positive float — not garbage), which int() would truncate
-        # to 0 and the Spinbox's from_=1 would silently reject; floor the
-        # DISPLAYED int at 1 so the box always shows something inside its own
-        # range (the stored cfg value is untouched either way).
+        # to 0. CORRECTION (2026-09-27, measured): a Spinbox's from_/to does
+        # NOT "silently reject" an out-of-range INITIAL textvariable value —
+        # it CLAMPS it up to from_ the instant the widget is built
+        # (`tk.Spinbox(from_=8, to=24, textvariable=IntVar(value=5))` ->
+        # var.get() == 8, verified standalone; the tile_w seed below leans on
+        # this same fact instead of fighting it). So this Spinbox's own
+        # from_=1 would already float a 0 up to 1 on its own. `max(1, ...)`
+        # is kept anyway — explicit, self-documenting intent beats relying on
+        # a widget-creation quirk a future reader has no reason to expect.
         self._preview_dmg_window_var = tk.IntVar(
             value=max(1, int(damage_flash.coerce_window_s(pcfg))))
         swin = tk.Spinbox(rowN3, from_=1, to=60, width=4,
