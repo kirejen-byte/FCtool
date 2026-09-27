@@ -41,15 +41,29 @@ starts with the first live hold of either class and survives re-arms AND
 red<->orange changes (the colour switches, the rhythm doesn't restart); it
 is cleared once both holds have expired — and ALSO at the start of any read
 that finds no hold live, because the tick does not read a character while
-damage flash is off, on the login screen or while its tile is retired, so a
-hold can expire unobserved and must not hand its stale clock to the next one.
+damage flash is off, on the login screen, while its tile is retired or while
+its tile is hidden by a hide rule (hide-active / hide-login /
+hide-on-lost-focus), so a hold can expire unobserved and must not hand its
+stale clock to the next one.
+
+Cooldown vs window under a CONTINUOUS stream of one class: cooldown < window
+(the defaults, 3 < 5) re-arms while the hold is still live, so the clock
+never restarts mid-stream. cooldown == window re-opens the cooldown at the
+very instant the hold ends (both are last arm + window): that read finds no
+hold live at its start (unless the other class holds), drops the clock and
+re-arms in the SAME read, so the pulse restarts at its peak once per
+window. That is a one-frame phase shift of at most the read's lateness past
+`until`, invisible on an exact tick grid with a whole-second window (the old
+clock is then on a whole 0.5 s pulse period too). cooldown > window leaves a
+real gap of cooldown - window with no hold (kind None) before each re-arm.
 
 Since 2026-09-26 the tracker OWNS all hold bookkeeping (fc_gui's former
 per-character hold-end / pulse-start dicts are gone) and the legacy
 class-agnostic boolean predicate is retired. Because the tick reads this
 inside its per-tile try — an exception here retires a live preview tile —
 every cfg value is coerced defensively (a hand-edited config must never
-raise).
+raise): numeric keys that are not a FINITE number — garbage, an overflowing
+int literal, inf / NaN — take the key's default (_finite_or).
 
 HP values (threshold mode) are BASE dogma hull HP (fitted ships have more) — the
 UI labels this as an approximation.
@@ -60,6 +74,7 @@ dicts, _retention_s) are single-threaded BY THAT INVARIANT — a future
 off-thread caller must add locking."""
 from __future__ import annotations
 
+import math
 from collections import defaultdict, deque
 
 # Default border colours, single-sourced here (fc_gui's _PREVIEW_DEFAULTS and
@@ -133,39 +148,51 @@ def _hit_class(source) -> str:
     return "npc" if source == "npc" else "player"
 
 
+def _finite_or(value, fallback: float) -> float:
+    """float(value) when that is a FINITE number, else `fallback`. The shared
+    core of the three cfg coercers below. It catches everything float() can
+    raise on a hand-edited JSON value — TypeError (None, a list), ValueError
+    ("abc") and OverflowError (an int literal of >= 309 digits such as
+    10**400, which neither of the other two covers) — and it also rejects
+    the non-finite floats that parse cleanly: "inf", "nan", a 400-digit
+    numeric string, and the NaN / Infinity / 1e400 tokens json.load accepts.
+    Deciding with those is silently wrong rather than loud (an infinite
+    window holds red forever after one hit, a NaN pct matches nothing, an
+    infinite cooldown never re-arms), so they take the key's default too."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return f if math.isfinite(f) else fallback
+
+
 def _coerce_window_s(cfg) -> float:
     """damage_flash_window_s, coerced defensively: a hand-edited config can
-    carry a non-numeric value ("5", None, "garbage"). The tracker is the ONE
+    carry a non-numeric, overflowing or non-finite value ("5", None,
+    "garbage", 10**400, "inf" ...; see _finite_or). The tracker is the ONE
     owner of this coercion — it sizes both the windowed sums AND each hold
     (fc_gui's tick stopped reading the key when it cut over to
     flash_state()). `or 5` is right HERE (a 0 s window is meaningless) but
     NOT for the cooldown below."""
-    try:
-        return float(cfg.get("damage_flash_window_s", 5) or 5)
-    except (TypeError, ValueError):
-        return 5.0
+    return _finite_or(cfg.get("damage_flash_window_s", 5) or 5, 5.0)
 
 
 def _coerce_cooldown_s(cfg) -> float:
     """damage_flash_cooldown_s for flash_state(). 0 is a VALID stored cooldown
     (the Settings spinbox starts at 0 = re-arm on every read), so NEVER
     `float(value or 3)` — that would silently turn 0 into 3. Only a value
-    float() rejects (garbage string, None, a list ...) falls back to 3.0."""
-    try:
-        return float(cfg.get("damage_flash_cooldown_s", 3))
-    except (TypeError, ValueError):
-        return 3.0
+    that is not a finite number (garbage string, None, a list, 10**400,
+    "inf", NaN ...; see _finite_or) falls back to 3.0."""
+    return _finite_or(cfg.get("damage_flash_cooldown_s", 3), 3.0)
 
 
 def _coerce_pct(cfg) -> float:
     """damage_flash_pct for the NPC threshold. The Settings spinbox stores an
-    int, but a hand-edited value ("20", None, "abc", a list ...) must never
-    raise here — the tick would retire a live tile on every NPC hit.
-    Anything float() rejects falls back to the 10 % default."""
-    try:
-        return float(cfg.get("damage_flash_pct", 10))
-    except (TypeError, ValueError):
-        return 10.0
+    int, but a hand-edited value ("20", None, "abc", a list, 10**400, NaN
+    ...) must never raise here — the tick would retire a live tile on every
+    NPC hit. Anything that is not a finite number (see _finite_or) falls
+    back to the 10 % default."""
+    return _finite_or(cfg.get("damage_flash_pct", 10), 10.0)
 
 
 def _reference_pool(hp: dict, reference: str):
@@ -285,8 +312,9 @@ class DamageFlashTracker:
         self._note_reader_window(window_s)
         # No hold live at the START of this read -> the pulse clock is stale:
         # the tick skips a character while damage flash is off, on the login
-        # screen or while its tile is retired, so a hold can expire with no
-        # read to clear `_since`. Drop it so a new hold starts a FRESH clock.
+        # screen, or while its tile is retired or hidden by a hide rule, so a
+        # hold can expire with no read to clear `_since`. Drop it so a new
+        # hold starts a FRESH clock.
         # (Evaluating the holds here also drops expired entries; _arm below
         # rewrites any hold it arms, and cooldowns read _arm_at, not _until.)
         if not (self._hold_live((char_key, "player"), now)
