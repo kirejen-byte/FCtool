@@ -63,8 +63,13 @@ class-agnostic boolean predicate is retired. Because the tick reads this
 inside its per-tile try — an exception here retires a live preview tile —
 every cfg value is coerced defensively (a hand-edited config must never
 raise): numeric keys that are not a FINITE number — garbage, an overflowing
-int literal, inf / NaN — take the key's default (_finite_or), and a
+int literal, inf / NaN — take the key's default (finite_or), and a
 non-positive window does too (it would silently switch the flash off).
+`coerce_pct` / `coerce_window_s` / `coerce_cooldown_s` and `finite_or` are
+PUBLIC (2026-09-26 fix round): the Settings-panel seed casts
+(fc_gui._build_preview_section) reuse this exact policy so a hand-edited
+damage_flash_pct/window_s/cooldown_s can never crash the Settings build
+either — see docs/agents/map/preview.md.
 
 HP values (threshold mode) are BASE dogma hull HP (fitted ships have more) — the
 UI labels this as an approximation.
@@ -149,17 +154,19 @@ def _hit_class(source) -> str:
     return "npc" if source == "npc" else "player"
 
 
-def _finite_or(value, fallback: float) -> float:
+def finite_or(value, fallback: float) -> float:
     """float(value) when that is a FINITE number, else `fallback`. The shared
-    core of the three cfg coercers below. It catches everything float() can
-    raise on a hand-edited JSON value — TypeError (None, a list), ValueError
-    ("abc") and OverflowError (an int literal of >= 309 digits such as
-    10**400, which neither of the other two covers) — and it also rejects
-    the non-finite floats that parse cleanly: "inf", "nan", a 400-digit
-    numeric string, and the NaN / Infinity / 1e400 tokens json.load accepts.
-    Deciding with those is silently wrong rather than loud (an infinite
-    window holds red forever after one hit, a NaN pct matches nothing, an
-    infinite cooldown never re-arms), so they take the key's default too."""
+    core of the three cfg coercers below (and of any other hand-edited-config
+    seed that needs the same policy — e.g. fc_gui's Settings-panel casts). It
+    catches everything float() can raise on a hand-edited JSON value —
+    TypeError (None, a list), ValueError ("abc") and OverflowError (an int
+    literal of >= 309 digits such as 10**400, which neither of the other two
+    covers) — and it also rejects the non-finite floats that parse cleanly:
+    "inf", "nan", a 400-digit numeric string, and the NaN / Infinity / 1e400
+    tokens json.load accepts. Deciding with those is silently wrong rather
+    than loud (an infinite window holds red forever after one hit, a NaN pct
+    matches nothing, an infinite cooldown never re-arms), so they take the
+    key's default too."""
     try:
         f = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -167,13 +174,14 @@ def _finite_or(value, fallback: float) -> float:
     return f if math.isfinite(f) else fallback
 
 
-def _coerce_window_s(cfg) -> float:
+def coerce_window_s(cfg) -> float:
     """damage_flash_window_s, coerced defensively: a hand-edited config can
     carry a non-numeric, overflowing or non-finite value ("5", None,
-    "garbage", 10**400, "inf" ...; see _finite_or). The tracker is the ONE
+    "garbage", 10**400, "inf" ...; see finite_or). The tracker is the ONE
     owner of this coercion — it sizes both the windowed sums AND each hold
     (fc_gui's tick stopped reading the key when it cut over to
-    flash_state()).
+    flash_state()). PUBLIC so the Settings-panel seed (fc_gui.
+    _build_preview_section) can share the exact same policy.
 
     A NON-POSITIVE window (0, "0", -3, "-3", -0.0) also falls back to 5.0:
     the strict prune would drop every hit and each hold would end the
@@ -182,26 +190,29 @@ def _coerce_window_s(cfg) -> float:
     spinbox clamps only its arrow buttons, so a typed "-3" does reach here.
     That rejection is right HERE but NOT for the cooldown below (0 = re-arm
     on every read is valid there)."""
-    window_s = _finite_or(cfg.get("damage_flash_window_s", 5), 5.0)
+    window_s = finite_or(cfg.get("damage_flash_window_s", 5), 5.0)
     return window_s if window_s > 0 else 5.0
 
 
-def _coerce_cooldown_s(cfg) -> float:
+def coerce_cooldown_s(cfg) -> float:
     """damage_flash_cooldown_s for flash_state(). 0 is a VALID stored cooldown
     (the Settings spinbox starts at 0 = re-arm on every read), so NEVER
     `float(value or 3)` — that would silently turn 0 into 3. Only a value
     that is not a finite number (garbage string, None, a list, 10**400,
-    "inf", NaN ...; see _finite_or) falls back to 3.0."""
-    return _finite_or(cfg.get("damage_flash_cooldown_s", 3), 3.0)
+    "inf", NaN ...; see finite_or) falls back to 3.0. PUBLIC so the
+    Settings-panel seed (fc_gui._build_preview_section) can share the exact
+    same policy."""
+    return finite_or(cfg.get("damage_flash_cooldown_s", 3), 3.0)
 
 
-def _coerce_pct(cfg) -> float:
+def coerce_pct(cfg) -> float:
     """damage_flash_pct for the NPC threshold. The Settings spinbox stores an
     int, but a hand-edited value ("20", None, "abc", a list, 10**400, NaN
     ...) must never raise here — the tick would retire a live tile on every
-    NPC hit. Anything that is not a finite number (see _finite_or) falls
-    back to the 10 % default."""
-    return _finite_or(cfg.get("damage_flash_pct", 10), 10.0)
+    NPC hit. Anything that is not a finite number (see finite_or) falls
+    back to the 10 % default. PUBLIC so the Settings-panel seed (fc_gui.
+    _build_preview_section) can share the exact same policy."""
+    return finite_or(cfg.get("damage_flash_pct", 10), 10.0)
 
 
 def _reference_pool(hp: dict, reference: str):
@@ -289,7 +300,7 @@ class DamageFlashTracker:
         if cfg.get("damage_flash_mode", "any") == "threshold":
             pool = _reference_pool(hp, cfg.get("damage_flash_reference", "weakest"))
             if pool is not None:
-                return npc_sum >= pool * (_coerce_pct(cfg) / 100.0)
+                return npc_sum >= pool * (coerce_pct(cfg) / 100.0)
         return True
 
     def _arm(self, char_key, cls, now, window_s, cooldown_s) -> None:
@@ -317,7 +328,7 @@ class DamageFlashTracker:
         module docstring for the per-class rules."""
         # Coerce BEFORE the stretch so both it and the sums see the coerced
         # value — a garbage window must never raise (see the module notes).
-        window_s = _coerce_window_s(cfg)
+        window_s = coerce_window_s(cfg)
         self._note_reader_window(window_s)
         # No hold live at the START of this read -> the pulse clock is stale:
         # the tick skips a character while damage flash is off, on the login
@@ -330,7 +341,7 @@ class DamageFlashTracker:
                 or self._hold_live((char_key, "npc"), now)):
             self._since.pop(char_key, None)
         player_sum, npc_sum = self._windowed_sums(char_key, now, window_s)
-        cooldown_s = _coerce_cooldown_s(cfg)
+        cooldown_s = coerce_cooldown_s(cfg)
         # Player damage: arms red in BOTH modes, no threshold.
         if player_sum > 0:
             self._arm(char_key, "player", now, window_s, cooldown_s)

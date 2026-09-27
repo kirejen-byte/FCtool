@@ -25728,7 +25728,13 @@ class FCToolGUI:
         # so replacing the old "Tile w" label is what pays for the extra box.
         tk.Label(rowN, text="Tile size", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
-        self._preview_tilew_var = tk.IntVar(value=int(pcfg.get("tile_w", 384)))
+        # A hand-edited tile_w can be non-numeric/overflowing/non-finite
+        # (same class of gap as the damage-flash seeds below); reuse
+        # damage_flash.finite_or so this int() cannot raise either — a
+        # garbage value displays as the 384 default, verbatim in config
+        # until the user actually moves this control (shadow/_put skip-rule).
+        self._preview_tilew_var = tk.IntVar(
+            value=int(damage_flash.finite_or(pcfg.get("tile_w", 384), 384.0)))
         sw = tk.Spinbox(rowN, from_=160, to=960, increment=16, width=4,
                         textvariable=self._preview_tilew_var, font=("Consolas", 10),
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
@@ -25794,8 +25800,11 @@ class FCToolGUI:
 
         tk.Label(rowN, text="Inactive opacity", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=5, padx=(0, 4), sticky=tk.W)
+        # Same class of gap as tile_w above: a hand-edited opacity_inactive
+        # can be non-numeric/overflowing/non-finite; finite_or already
+        # returns a plain float, so this needs no int() floor.
         self._preview_opacity_var = tk.DoubleVar(
-            value=float(pcfg.get("opacity_inactive", 0.85)))
+            value=damage_flash.finite_or(pcfg.get("opacity_inactive", 0.85), 0.85))
         so = tk.Spinbox(rowN, from_=0.2, to=1.0, increment=0.05, width=5,
                         textvariable=self._preview_opacity_var, font=("Consolas", 10),
                         bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
@@ -26047,7 +26056,13 @@ class FCToolGUI:
                                              font=("Consolas", 10), fg=FG_TEXT,
                                              bg=BG_DARK)
         self._preview_dmg_pct_lbl.grid(row=0, column=2, padx=(0, 4), sticky=tk.W)
-        self._preview_dmg_pct_var = tk.IntVar(value=int(pcfg.get("damage_flash_pct", 10)))
+        # int() of coerce_pct's return can never raise: the tracker's coercer
+        # already resolved a hand-edited garbage/overflow/non-finite value to
+        # a finite float (see damage_flash.coerce_pct / finite_or) — the
+        # Settings seed reuses that exact policy so the BUILD can't crash on
+        # the same config the tick already tolerates (known gap, closed
+        # 2026-09-26).
+        self._preview_dmg_pct_var = tk.IntVar(value=int(damage_flash.coerce_pct(pcfg)))
         spct = tk.Spinbox(rowN3, from_=1, to=100, width=4,
                           textvariable=self._preview_dmg_pct_var, font=("Consolas", 10),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
@@ -26061,8 +26076,14 @@ class FCToolGUI:
 
         tk.Label(rowN3, text="Window s", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=4, padx=(0, 4), sticky=tk.W)
+        # Same policy as the pct seed above (damage_flash.coerce_window_s).
+        # coerce_window_s can return a sub-1 value (a hand-edited "0.5" is a
+        # finite, positive float — not garbage), which int() would truncate
+        # to 0 and the Spinbox's from_=1 would silently reject; floor the
+        # DISPLAYED int at 1 so the box always shows something inside its own
+        # range (the stored cfg value is untouched either way).
         self._preview_dmg_window_var = tk.IntVar(
-            value=int(pcfg.get("damage_flash_window_s", 5)))
+            value=max(1, int(damage_flash.coerce_window_s(pcfg))))
         swin = tk.Spinbox(rowN3, from_=1, to=60, width=4,
                           textvariable=self._preview_dmg_window_var, font=("Consolas", 10),
                           bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
@@ -26075,8 +26096,11 @@ class FCToolGUI:
 
         tk.Label(rowN3, text="Cooldown s", font=("Consolas", 10), fg=FG_TEXT,
                  bg=BG_DARK).grid(row=0, column=6, padx=(0, 4), sticky=tk.W)
+        # Same policy (damage_flash.coerce_cooldown_s); 0 is a VALID cooldown
+        # and the Spinbox's from_=0 accepts it, so no floor is needed here
+        # (unlike the window seed above).
         self._preview_dmg_cooldown_var = tk.IntVar(
-            value=int(pcfg.get("damage_flash_cooldown_s", 3)))
+            value=int(damage_flash.coerce_cooldown_s(pcfg)))
         scd = tk.Spinbox(rowN3, from_=0, to=60, width=4,
                          textvariable=self._preview_dmg_cooldown_var, font=("Consolas", 10),
                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE,
