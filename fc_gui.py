@@ -31752,7 +31752,7 @@ class FCToolGUI:
         The range check's tail is the SAME fleet channel as ``chat_monitor``
         with NO listener filter, so a command typed on any of the owner's
         characters is seen even when the tracked character is not in that fleet
-        (the owner's field case: only Tyreece Arkan was in fleet, tracked was
+        (the owner's field case: only Another Pilot was in fleet, tracked was
         Some Pilot, and nothing happened). Every other consumer of
         fleet chat -- the x-up counter, the charge tracker, the links backfill
         -- deliberately stays on the tracked tail.
