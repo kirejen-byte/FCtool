@@ -20898,8 +20898,16 @@ class FCToolGUI:
         set_style = getattr(tile, "set_label_style", None)
         if set_style is not None:
             ocfg = self._overlay_cfg()
+            # 2026-09-26 fix round: a hand-edited overlay.font_size now
+            # SURVIVES the Settings build (see the seed fix a few thousand
+            # lines below), which makes THIS read newly reachable with
+            # garbage that used to be impossible to save in the first place
+            # -- same per-tile-try failure mode as opacity_inactive above
+            # (retires this one tile every tick, forever, since the garbage
+            # is never written back). Same policy as the Settings seed:
+            # finite_or -> the 11 default.
             set_style(color=ocfg.get("color", "#ffffff"),
-                      size=int(ocfg.get("font_size", 11)),
+                      size=int(damage_flash.finite_or(ocfg.get("font_size", 11), 11.0)),
                       anchor=ocfg.get("anchor", "top-left"))
         # BUG B: keep the tile's lock_layout flag in lockstep with config so a
         # live toggle gates drag-moves without respawning the tile.
