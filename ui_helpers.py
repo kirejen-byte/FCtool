@@ -76,6 +76,10 @@ The helpers:
     ``widget._tooltip_text`` LIVE at hover time rather than closing over the
     string it was attached with, and this helper is simply the supported way to
     re-stash it — bind ONCE, re-stash as often as the data changes.
+
+``normalize_hex_color(value, default)``
+    Pure colour-read normaliser: ``#rgb``/``#rrggbb`` -> lowercase
+    ``#rrggbb``, anything else -> the caller's per-key ``default``.
 """
 from __future__ import annotations
 
@@ -965,3 +969,31 @@ def make_glyph_button(parent, glyph, tooltip, callback, *, palette=None,
     lbl._glyph_press = _press
     lbl._glyph_release = _release
     return lbl
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def normalize_hex_color(value, default):
+    """``"#rgb"`` / ``"#rrggbb"`` -> lowercase ``"#rrggbb"``; anything else ->
+    ``default``, returned UNCHANGED.
+
+    The one read-side normaliser for colours a user can hand-edit into the
+    config (2026-09-26: the FCPreview player/NPC damage borders). The leading
+    ``#`` is required and surrounding whitespace is allowed. Tk colour NAMES
+    (``"red"``), ``#rrggbbaa``, non-strings and ``None`` all fall back —
+    deliberately to the CALLER'S per-key default, so a garbage NPC colour
+    reads as the NPC default instead of masquerading as some other alert's
+    colour. The digit check is an explicit set: ``int(x, 16)`` would also
+    accept ``"_"`` separators and a ``"0x"`` prefix. Pure; never raises.
+    """
+    if not isinstance(value, str):
+        return default
+    text = value.strip()
+    digits = text[1:]
+    if (not text.startswith("#") or len(digits) not in (3, 6)
+            or not all(ch in _HEX_DIGITS for ch in digits)):
+        return default
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    return "#" + digits.lower()

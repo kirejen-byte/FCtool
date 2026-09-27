@@ -329,7 +329,7 @@ from ui_theme import (
 # unmapped, so the placement is applied at map time with no visible jump.
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
                         relift_topmost_tooltips, center_over,
-                        make_glyph_button)
+                        make_glyph_button, normalize_hex_color)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -1888,9 +1888,8 @@ class FCToolGUI:
         # _preview_sync_gamelog_scope.
         self._preview_gamelog_scope_last = None
         self._preview_layer_hp = {}            # char key -> {shield,armor,hull} | None (poller-written)
-        self._preview_damage_until = {}        # char key -> monotonic ts the red hold ends
-        self._preview_damage_since = {}        # char key -> monotonic ts the pulse started
-        # ── Decloak alert (mirror of the damage-flash state) ────────────────
+        # (the tracker above owns the per-class damage holds + pulse clock)
+        # ── Decloak alert (edge-armed in _preview_on_decloak) ───────────────
         self._preview_decloak_until = {}       # char key -> monotonic ts the yellow hold ends
         self._preview_decloak_since = {}       # char key -> monotonic ts the pulse started
         self._preview_decloak_audio_at = 0.0   # last monotonic ts the "Decloaked" cue played
@@ -20207,7 +20206,11 @@ class FCToolGUI:
         "damage_flash_mode": "any",
         "damage_flash_pct": 10, "damage_flash_window_s": 5,
         "damage_flash_cooldown_s": 3, "damage_flash_reference": "weakest",
-        "damage_flash_color": "#ff3b30",
+        # Border colours: PLAYER damage (red) and NPC damage (orange; the
+        # damage_flash_npc toggle gates it). damage_flash owns both hexes.
+        "damage_flash_color": damage_flash.PLAYER_COLOR_DEFAULT,
+        "damage_flash_npc": True,
+        "damage_flash_npc_color": damage_flash.NPC_COLOR_DEFAULT,
         # ── Decloak alert (native only) ─────────────────────────────────────
         # When one of the user's own chars is decloaked (proximity or Mobile
         # Observatory), read from that char's OWN Gamelog, the tile flashes
@@ -22734,13 +22737,16 @@ class FCToolGUI:
         The monitor polls on its own daemon thread and marshals here via
         root.after(0, ...), so this runs on the Tk thread — safe to touch the
         damage tracker (single Tk-thread writer). Keyed by lowercased char name,
-        the same join key used for layouts/ESI states/tiles."""
+        the same join key used for layouts/ESI states/tiles. The classifier's
+        `source` (player | npc | unknown) rides along; the tracker treats
+        anything but "npc" as player damage."""
         try:
             key = (getattr(ev, "character_name", "") or "").strip().lower()
             if not key:
                 return
             self._preview_damage.add(key, getattr(ev, "amount", 0),
-                                     time.monotonic())
+                                     time.monotonic(),
+                                     source=getattr(ev, "source", "unknown"))
         except Exception:
             log.exception("[preview] damage ingest failed")
 
@@ -23156,15 +23162,14 @@ class FCToolGUI:
                     self._preview_apply_tile_size(hwnd, tile, client.key, cfg)
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
-                    # B3: flash the border red while the pilot's system carries a
-                    # fresh hostile intel note; otherwise fall through to the
-                    # next border source so the flash expires on its own once the
-                    # note ages out or clears. Border precedence is deterministic
-                    # (plan §B6): damage flash > intel flash > active highlight >
-                    # none. The active-highlight border (P12/C4) is the lowest
-                    # non-empty source: the active EVE client's tile gets a steady
-                    # highlight-colour frame, but a live damage/intel flash always
-                    # overrides it this tick.
+                    # Border precedence is fixed + deterministic (2026-09-26):
+                    #   PLAYER damage red > DECLOAK yellow > NPC damage orange >
+                    #   intel flash > active highlight > none.
+                    # A hostile player's hit is the most urgent signal; a decloak
+                    # is urgent AND short-lived, so it outranks routine NPC damage
+                    # (ratting orange must never mask a decloak). Each flash
+                    # expires on its own and falls through to the next source;
+                    # the steady active-client highlight (P12/C4) is the lowest.
                     state = (None if client.is_login
                              else self._preview_state_for(client.key))
                     # C4/P12: highlight the active client's tile (steady frame).
@@ -23174,39 +23179,22 @@ class FCToolGUI:
                                  if (cfg.get("highlight_active", True)
                                      and hwnd == active_hwnd)
                                  else None)
-                    # Border precedence is fixed + deterministic:
-                    #   damage flash > DECLOAK flash > intel flash > highlight > none.
-                    # Damage flash: a fresh should_flash (re)arms a hold that runs
-                    # `window_s` past the last hit (seeded in _preview_damage_until)
-                    # so the pulse holds while damage keeps landing and fades once
-                    # it stops. While the hold is live the border PULSES between a
-                    # soft red and the peak colour (~2 Hz) via preview_tile.pulse_color,
-                    # stepped by elapsed = now - pulse_start (seeded in
-                    # _preview_damage_since). Damage wins even if the highlight would
-                    # otherwise claim the border this same tick.
+                    # Damage flash: the tracker owns the per-class holds and ONE
+                    # pulse clock per character -- flash_state() -> (kind, since),
+                    # kind "player" | "npc" | None (see damage_flash). While a
+                    # hold is live the border PULSES (~2 Hz, pulse_color) stepped
+                    # by now - since, so orange -> red keeps the rhythm.
                     now = time.monotonic()
                     key = client.key
-                    damaging = False
+                    dmg_kind = dmg_since = None
                     if cfg.get("damage_flash", True) and not client.is_login:
-                        hp = self._preview_layer_hp.get(key)
-                        hold_s = float(cfg.get("damage_flash_window_s", 5) or 5)
-                        if self._preview_damage.should_flash(key, hp, cfg, now):
-                            self._preview_damage_until[key] = now + hold_s
-                            # Start (or keep) the pulse clock; don't reset it on a
-                            # re-arm so the pulse phase stays continuous.
-                            self._preview_damage_since.setdefault(key, now)
-                        until = self._preview_damage_until.get(key)
-                        if until is not None:
-                            if now < until:
-                                damaging = True
-                            else:
-                                self._preview_damage_until.pop(key, None)
-                                self._preview_damage_since.pop(key, None)
+                        dmg_kind, dmg_since = self._preview_damage.flash_state(
+                            key, self._preview_layer_hp.get(key), cfg, now)
                     # DECLOAK flash: the window is edge-armed in _preview_on_decloak
                     # (until = now + decloak_flash_secs, pulse start seeded then).
                     # Here we only read the live window, expire it, and — while
-                    # live — pulse the border YELLOW. Sits JUST BELOW damage red:
-                    # if both are active this tick, damage wins (checked first).
+                    # live — pulse the border YELLOW (below player red, above NPC
+                    # orange in the chain below).
                     decloaking = False
                     if cfg.get("decloak_flash", True) and not client.is_login:
                         d_until = self._preview_decloak_until.get(key)
@@ -23231,16 +23219,23 @@ class FCToolGUI:
                     # flashing black. Windows (backend None) is byte-identical.
                     _wine_steady = (getattr(self, "_preview_thumb_backend", None)
                                     is not None)
-                    if damaging:
-                        peak = cfg.get("damage_flash_color", "#ff3b30")
-                        started = self._preview_damage_since.get(key, now)
+                    # Damage colours are normalised to each kind's OWN default (a
+                    # garbage NPC colour must never read as player red).
+                    if dmg_kind == "player":
+                        peak = normalize_hex_color(cfg.get("damage_flash_color"),
+                                                   damage_flash.PLAYER_COLOR_DEFAULT)
                         tile.set_border(_preview_alert_border(
-                            peak, started, now, _wine_steady))
+                            peak, dmg_since, now, _wine_steady))
                     elif decloaking:
                         peak = cfg.get("decloak_flash_color", "#ffcc00")
                         started = self._preview_decloak_since.get(key, now)
                         tile.set_border(_preview_alert_border(
                             peak, started, now, _wine_steady))
+                    elif dmg_kind == "npc":
+                        peak = normalize_hex_color(cfg.get("damage_flash_npc_color"),
+                                                   damage_flash.NPC_COLOR_DEFAULT)
+                        tile.set_border(_preview_alert_border(
+                            peak, dmg_since, now, _wine_steady))
                     elif self._preview_should_flash(self._preview_intel, state, cfg,
                                                     time.monotonic(), reach=_reach):
                         tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
