@@ -900,9 +900,12 @@ def _parse_role_preset_fields(letter, title, cap_text):
         return None, "The role name cannot be blank."
     cap = None
     if cap_text:
-        if not cap_text.isdigit() or int(cap_text) <= 0:
+        try:  # isdecimal: exactly what int() accepts (isdigit takes "²")
+            cap = int(cap_text) if cap_text.isdecimal() else 0
+        except ValueError:  # beyond the int-parsing digit limit
+            cap = 0
+        if cap <= 0:
             return None, "The cap must be blank or a positive whole number."
-        cap = int(cap_text)
     return (letter, title, cap), None
 
 
@@ -13124,7 +13127,10 @@ class FCToolGUI:
             else:
                 def _int(s):
                     s = (s or "").strip()
-                    return int(s) if s.isdigit() else None
+                    try:  # isdecimal: exactly what int() accepts
+                        return int(s) if s.isdecimal() else None
+                    except ValueError:
+                        return None
                 self.fittings.set_member_ideal(
                     doctrine_id, fit_id, mode, _int(min_var.get()), _int(max_var.get()))
             self.fittings.save()
@@ -33527,7 +33533,10 @@ class FCToolGUI:
                 parent=self.root)
             return
         cap_str = slot["cap_var"].get().strip()
-        cap = int(cap_str) if cap_str.isdigit() else None
+        try:  # isdecimal: exactly what int() accepts
+            cap = int(cap_str) if cap_str.isdecimal() else None
+        except ValueError:
+            cap = None
 
         # Build label: letter-Title or letter-Title-cap
         label = f"{letter.upper()}-{title}"
