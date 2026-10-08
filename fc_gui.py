@@ -457,7 +457,7 @@ INTEL_SWEEP_EVERY_LINES = 100
 # callback, which is right for fleet chat — there the stamp is part of a line's
 # identity. For intel it is not: two EVE clients tailing the same channel write
 # the same message with stamps a second apart often enough to matter. Measured
-# on the owner's real Intel.WOMP logs: 8 surplus deliveries / 216 events (3.7%)
+# on real Intel.ABCD-style logs: 8 surplus deliveries / 216 events (3.7%)
 # on 2026-08-15 and 5 / 40 (12.5%) on 2026-08-13 — each surplus a duplicate HUD
 # row, a duplicate preview flash, a duplicate map pulse and a DOUBLED intel
 # ping. This stage keys on (channel, sender, sha1(body)) — the same line
@@ -37118,7 +37118,7 @@ $bmp.Dispose()
         :meth:`_passes_view_filter`.
 
         The gate is still needed, only moved: ``channel_filters`` matches by
-        filename PREFIX, so a tracked "Intel" also tails "Intel.WOMP" files.
+        filename PREFIX, so a tracked "Intel" also tails "Intel.ABCD" files.
 
         That refusal is the one place intel can now go missing without a trace,
         so it says so once per channel name (2026-08-16). This gate reads the

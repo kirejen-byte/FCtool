@@ -19,7 +19,7 @@ meanings (``tracked`` = the legacy intel list, ``cached_discovered`` = the
 
     config["channels"] = {
         "registry": [
-            {"name": "Intel.WOMP", "tags": ["Intel"]},
+            {"name": "Intel.ABCD", "tags": ["Intel"]},
             {"name": "Cap Chain", "tags": ["Cap chain", "Links"]},
         ]
     }
