@@ -367,5 +367,523 @@ def result_lines(run, n_newcomers: int = 0) -> tuple[str, str | None]:
 
 
 # ── Tk shell ─────────────────────────────────────────────────────────────────
-# (the dialog - `open_dialog` - lands here in a later bite; nothing above this
-# line uses Tk, and nothing below it may be needed by the core)
+# Nothing above this line uses Tk, and nothing below it is needed by the core.
+# The dialog's imports are kept down here with it so the boundary stays visible
+# in the file (the slide_confirm.py shape).
+import tkinter as tk                                              # noqa: E402
+import tkinter.font as tkfont                                     # noqa: E402
+from tkinter import ttk                                           # noqa: E402
+
+from slide_confirm import SlideToConfirm                          # noqa: E402
+from ui_helpers import make_modal                                 # noqa: E402
+from ui_theme import (                                            # noqa: E402
+    BG_DARK, BG_ENTRY, BORDER_COLOR, FG_ACCENT, FG_GREEN, FG_RED, FG_TEXT,
+    FG_YELLOW,
+)
+
+#: The watch cadence: one ``CloseRun.tick()`` per poll. A target needs TWO
+#: not-the-same readings on two ticks, so the fastest "all closed" is two
+#: polls (~1 s) after confirm - it is never instant, by design.
+POLL_MS = 500
+#: How long "Closed N clients." stays up before the dialog closes itself.
+AUTO_CLOSE_MS = 2500
+
+PHASE_CONFIRM = "confirm"       # the question; the application grab is held
+PHASE_CLOSING = "closing"       # requests sent, grab released, watching
+PHASE_DONE = "done"             # the watch is over (or it failed)
+
+#: The CONFIRM body line (wording: docs/eve_reference/mechanics.md).
+IN_SPACE_WARNING = (
+    "Closing a client in space is NOT a Safe Log Off - the ship stays in "
+    "space until its log-off timer ends (5 min after NPC aggression, 15 min "
+    "after capsuleer aggression).")
+_CLOSING_BODY = (
+    "Each listed client was asked to close. Watching for them to exit - "
+    "Dismiss stops the watch, it does not undo anything.")
+_ERROR_TITLE = "Close Clients stopped early."
+_ERROR_BODY = (
+    "Something went wrong and FCTool stopped watching. Clients that were "
+    "already asked to close may still be closing - check them, then dismiss "
+    "this window.")
+
+# Positive sizes are POINTS: every font below follows ``tk scaling``, and the
+# slide sizes itself the same way, so the whole dialog scales together.
+_TITLE_FONT = ("Consolas", 12, "bold")
+_BODY_FONT = ("Consolas", 10)
+_LIST_FONT = ("Consolas", 9)
+
+_BODY_CHARS = 60        # the title/body wrap at about this many body characters
+_COL_GAP_CHARS = 3      # gap between the two list columns, in "0" widths
+_LIST_PADX = 8          # the list's inner padding, px
+_WHEEL_LINES = 3        # list lines per wheel notch
+
+
+class _CloseDialog:
+    """The dialog's controller: three phases on ONE Toplevel.
+
+    Built by ``open_dialog`` and hung on the window as ``win._cc`` - the test
+    seam, and the only state the feature has (the host keeps nothing but a
+    reference to the live window).
+
+      ``phase``        ``"confirm"`` / ``"closing"`` / ``"done"``
+      ``slide``        the ``SlideToConfirm``; None once confirmed
+      ``list_text``    the read-only ``tk.Text`` holding the list
+      ``scrollbar``    its ``ttk.Scrollbar``, or None when everything fits
+      ``button``       the one button: "Cancel", then "Dismiss"
+      ``title_label`` / ``body_label``   the two text lines
+      ``run``          the ``CloseRun``; None until confirm
+      ``error``        None, or the exception TYPE name once a step failed
+      ``cancel()``     Cancel / Dismiss / Escape / the window X - one path
+      ``confirm()``    what the slide calls; the ONLY way to ``close_window``
+      ``tick()``       one poll step, without scheduling the next
+
+    THE ONLY ROAD TO ``close_window`` IS THE SLIDE. Nothing in here binds a
+    key, there is no default button, and the one button only ever closes this
+    dialog. Escape, the X and the button all run ``cancel``, which sends
+    nothing in any phase.
+
+    WHAT IS LISTED IS WHAT IS ASKED. The clients are snapshotted once, at
+    open; the rows are drawn from that snapshot and ``confirm`` walks the SAME
+    snapshot. The fresh ``find_clients()`` taken at confirm is only ever
+    COUNTED (how many started since) - a client the user was never shown is
+    never asked to close.
+
+    THE GRAB ENDS AT CONFIRM. While it is a question this is a DECISION
+    dialog and holds the application grab. A Tk grab is app-wide, though: as
+    long as it is held, every FCPreview tile and focus hotkey is dead to the
+    FC. Once the requests are out there is nothing left to decide, and the
+    watch can run for 15 s - so ``confirm`` releases the grab whatever else
+    happens in it, including when it fails.
+
+    The dialog OWNS its timer. At most one ``after`` job is pending at a time
+    (the poll, or the auto-close - never both); it is cancelled on any cancel
+    and on the window's own ``<Destroy>``, and every callback checks the
+    window is still there first, so a late one is a no-op.
+    """
+
+    def __init__(self, win, listed, *, find_clients, still_same, close_window,
+                 log, clock):
+        self.win = win
+        self._listed = listed
+        self._find_clients = find_clients
+        self._still_same = still_same
+        self._close_window = close_window
+        self._logger = log
+        self._slide_clock = clock               # None = the slide's default
+        self._clock = clock or time.monotonic
+        self.phase = PHASE_CONFIRM
+        self.run = None
+        self.error = None
+        self.slide = self.list_text = self.scrollbar = None
+        self.button = self.title_label = self.body_label = None
+        self._list_wrap = self._list_font = None
+        self._n_new = 0
+        self._job = None                        # the ONE pending after id
+        self._dead = False
+
+    # ── build ────────────────────────────────────────────────────────────────
+    def build(self):
+        win = self.win
+        # A Font belongs to its interpreter and dies with the Python object,
+        # so the one used after the build (DONE re-measures the list) is kept.
+        self._list_font = tkfont.Font(root=win, font=_LIST_FONT)
+        header = header_text(self._listed)
+
+        frame = tk.Frame(win, bg=BG_DARK, padx=18, pady=16,
+                         highlightbackground=BORDER_COLOR,
+                         highlightthickness=1)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Pack order is space priority, so the two controls go in FIRST, from
+        # the bottom up. The row cap is what keeps the dialog short; this is
+        # only the second line of defence - Tk clamps a toplevel to the screen
+        # height, and on a very small screen it is then the LIST that gives,
+        # never the slide or the button.
+        btn_row = tk.Frame(frame, bg=BG_DARK)
+        btn_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(14, 0))
+        self.button = ttk.Button(btn_row, text="Cancel", style="Dark.TButton",
+                                 command=self.cancel)
+        self.button.pack(side=tk.RIGHT)
+        self.slide = SlideToConfirm(frame, slide_text(len(self._listed)),
+                                    self.confirm, clock=self._slide_clock)
+        # No fill / expand: the canvas's requested size IS the track.
+        self.slide.pack(side=tk.BOTTOM, pady=(14, 0))
+
+        self.title_label = tk.Label(frame, text=header, font=_TITLE_FONT,
+                                    fg=FG_RED, bg=BG_DARK, anchor=tk.W,
+                                    justify=tk.LEFT)
+        self.title_label.pack(side=tk.TOP, fill=tk.X)
+        self.body_label = tk.Label(frame, text=IN_SPACE_WARNING,
+                                   font=_BODY_FONT, fg=FG_TEXT, bg=BG_DARK,
+                                   anchor=tk.W, justify=tk.LEFT)
+        self.body_label.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        # ONE read-only Text, not a Listbox: a Listbox has no tab stops, and
+        # the second column has to sit at a PIXEL position (see _show_list).
+        self._list_wrap = tk.Frame(frame, bg=BG_ENTRY,
+                                   highlightbackground=BORDER_COLOR,
+                                   highlightthickness=1)
+        self.list_text = tk.Text(
+            self._list_wrap, font=_LIST_FONT, wrap="none", height=1, width=1,
+            bg=BG_ENTRY, fg=FG_TEXT, cursor="arrow", takefocus=0,
+            borderwidth=0, highlightthickness=0, padx=_LIST_PADX, pady=4,
+            exportselection=False, selectbackground=BG_ENTRY,
+            selectforeground=FG_TEXT, inactiveselectbackground=BG_ENTRY)
+        self.list_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        list_px = self._show_list(describe(self._listed))
+
+        # Wrap in PIXELS measured from the fonts (a bare wraplength number is
+        # px and would not follow tk scaling): wide enough that the header
+        # never wraps, and never narrower than the list or the slide.
+        wrap_px = max(
+            tkfont.Font(root=win, font=_BODY_FONT).measure("0") * _BODY_CHARS,
+            tkfont.Font(root=win, font=_TITLE_FONT).measure(header),
+            list_px, self.slide.geo.track_w)
+        self.title_label.configure(wraplength=wrap_px)
+        self.body_label.configure(wraplength=wrap_px)
+
+        # add="+" on the toplevel, always: make_modal's <Escape>, the slide's
+        # <FocusOut> reset and the host's own <Destroy> all live there, and a
+        # plain bind() REPLACES every handler on its sequence.
+        win.bind("<MouseWheel>", self._on_wheel, add="+")
+        win.bind("<Destroy>", self._on_destroy, add="+")
+        # Focus rests on Cancel: the only key that does anything here (Space
+        # on the focused button, or Escape) backs OUT.
+        self.button.focus_set()
+
+    # ── the list ─────────────────────────────────────────────────────────────
+    def _show_list(self, rows) -> int:
+        """Draw ``rows`` into the list and size it to them; returns the px
+        width the text needs. No rows hides the list altogether.
+
+        The height is EXACTLY the visible row count (1 client = 1 line), and
+        in two-column mode the right cell starts at a pixel TAB STOP measured
+        from the widest left cell. Never space padding: a CJK or emoji name
+        is not one cell wide even in a fixed-width font, so padded columns
+        would not line up. The width comes from the same pixel measurements
+        (rounded UP to the Text's character unit, the width of "0"), so
+        nothing is cut off and the dialog is no wider than it has to be.
+        """
+        rows = list(rows)
+        cols, visible, scroll = list_layout(len(rows))
+        lines = format_rows(rows, cols)
+        measure = self._list_font.measure
+        unit = max(1, measure("0"))
+        left_px = max([measure(left) for left, _right in lines] or [0])
+        right_px = max([measure(right) for _left, right in lines] or [0])
+        if cols > 1:
+            tab_px = left_px + _COL_GAP_CHARS * unit
+            tabs, need_px = (tab_px,), tab_px + right_px
+        else:
+            tabs, need_px = (), left_px
+
+        text = self.list_text
+        # Filled while NORMAL: insert/delete on a disabled Text are silent
+        # no-ops, so the toggle around a refill is load-bearing.
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", "\n".join(
+            left + ("\t" + right if right else "") for left, right in lines))
+        text.configure(state="disabled", tabs=tabs, height=max(1, visible),
+                       width=max(1, -(-need_px // unit)))
+        text.yview_moveto(0.0)
+        self._set_scrollbar(scroll)
+
+        if not rows:
+            self._list_wrap.pack_forget()
+        elif not self._list_wrap.winfo_manager():
+            self._list_wrap.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
+        return need_px + 2 * _LIST_PADX
+
+    def _set_scrollbar(self, wanted):
+        """A scrollbar exists ONLY while two full columns do not fit."""
+        if wanted and self.scrollbar is None:
+            self.scrollbar = ttk.Scrollbar(self._list_wrap, orient=tk.VERTICAL,
+                                           command=self.list_text.yview)
+            self.list_text.configure(yscrollcommand=self.scrollbar.set)
+            self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y,
+                                before=self.list_text)
+        elif not wanted and self.scrollbar is not None:
+            bar, self.scrollbar = self.scrollbar, None
+            self.list_text.configure(yscrollcommand="")
+            bar.destroy()
+
+    def _pointer_over_list(self, event) -> bool:
+        try:
+            widget = self.win.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            return False
+        while widget is not None and widget is not self.win:
+            if widget is self._list_wrap:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _on_wheel(self, event):
+        """Wheel anywhere in the dialog: scroll the list if the POINTER is
+        over it, and never let the gesture leave the dialog.
+
+        Bound on the toplevel because the focus sits on the button, and
+        whether Windows hands the wheel to the focused widget or to the one
+        under the pointer is not settled (map/facts.md) - this makes either
+        answer scroll the list. When the event DID go to the Text or its
+        scrollbar, their class bindings (which run before the toplevel's)
+        have scrolled already, so nothing is added here. The "break" keeps
+        the app's global wheel router from scrolling a tab behind the dialog.
+        """
+        if (self.scrollbar is not None
+                and event.widget is not self.list_text
+                and event.widget is not self.scrollbar
+                and self._pointer_over_list(event)):
+            try:
+                delta = int(event.delta)
+                steps = -int(delta / 120) or (-1 if delta > 0 else 1)
+                if delta:
+                    self.list_text.yview_scroll(steps * _WHEEL_LINES, "units")
+            except (AttributeError, TypeError, ValueError, tk.TclError):
+                pass
+        return "break"
+
+    # ── small helpers ────────────────────────────────────────────────────────
+    def _alive(self) -> bool:
+        if self._dead:
+            return False
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _set_lines(self, title, body, colour):
+        self.title_label.configure(text=title, fg=colour)
+        self.body_label.configure(text=body or "")
+        if not body:
+            self.body_label.pack_forget()       # no blank line under the title
+        elif not self.body_label.winfo_manager():
+            self.body_label.pack(side=tk.TOP, fill=tk.X, pady=(8, 0),
+                                 after=self.title_label)
+
+    def _drop_slide(self):
+        slide, self.slide = self.slide, None
+        if slide is not None:
+            slide.destroy()
+
+    def _release_grab(self):
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
+
+    def _log(self, level, message, *args):
+        """Best effort, ASCII, COUNTS ONLY: never a character name or a window
+        title (the log is the thing people paste into bug reports), and a
+        logger that raises must not break the dialog."""
+        if self._logger is None:
+            return
+        try:
+            getattr(self._logger, level)(message, *args)
+        except Exception:
+            pass
+
+    def _schedule(self, delay_ms, callback):
+        self._cancel_job()
+        if self._alive():
+            self._job = self.win.after(delay_ms, callback)
+
+    def _cancel_job(self):
+        job, self._job = self._job, None
+        if job is not None:
+            try:
+                self.win.after_cancel(job)
+            except Exception:
+                pass
+
+    def _on_destroy(self, event):
+        # <Destroy> reaches the toplevel's bindings for every descendant too
+        # (the slide is destroyed at confirm): only the window's own counts.
+        if event.widget is not self.win:
+            return
+        self._dead = True
+        self._cancel_job()
+
+    # ── the one exit ─────────────────────────────────────────────────────────
+    def cancel(self):
+        """Cancel, Dismiss, Escape and the window X. Sends nothing, in any
+        phase: before confirm nothing has been asked of any client, and after
+        it this only stops the watch - it cannot undo a request."""
+        if self.phase == PHASE_CLOSING and self.run is not None:
+            self._log_counts("watch dismissed")
+        self._cancel_job()
+        self._release_grab()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+    # ── confirm: the slide's callback ────────────────────────────────────────
+    def confirm(self):
+        """Ask every LISTED client to close, then start watching.
+
+        One-shot (the slide is too; this guards the direct call). The grab is
+        released in a ``finally``: whatever happens to the requests, the app
+        must get its tiles and hotkeys back, and a failure must leave an
+        error line and a working Dismiss - never a stuck, grabbing window.
+        """
+        if self.phase != PHASE_CONFIRM or not self._alive():
+            return
+        try:
+            try:
+                self._n_new = self._count_newcomers()
+                outcomes = close_listed(self._listed,
+                                        still_same=self._still_same,
+                                        close_window=self._close_window)
+                self.run = CloseRun(outcomes, still_same=self._still_same,
+                                    clock=self._clock)
+            finally:
+                self._release_grab()
+            self._enter_closing(outcomes)
+        except Exception as exc:
+            self._fail(exc)
+
+    def _count_newcomers(self) -> int:
+        """Clients that started after the list was drawn - counted, reported,
+        never closed. A snapshot that cannot be taken is "none": this number
+        only adds a sentence to the result, it decides nothing."""
+        try:
+            fresh = list(self._find_clients() or ())
+            return len(newcomers(self._listed, fresh))
+        except Exception:
+            return 0
+
+    def _enter_closing(self, outcomes):
+        self.phase = PHASE_CLOSING
+        self._drop_slide()
+        self.button.configure(text="Dismiss")
+        self._show_progress()
+        statuses = [outcome.status for outcome in outcomes]
+        self._log("info",
+                  "Close Clients: requested - listed=%d posted=%d gone=%d "
+                  "failed=%d newcomers=%d",
+                  len(statuses), statuses.count(POSTED), statuses.count(GONE),
+                  statuses.count(FAILED), self._n_new)
+        self._schedule(POLL_MS, self._poll)
+
+    def _show_progress(self):
+        self._set_lines("Closing... %d of %d closed"
+                        % (self.run.closed_count, self.run.total),
+                        _CLOSING_BODY, FG_ACCENT)
+
+    # ── the watch ────────────────────────────────────────────────────────────
+    def _poll(self):
+        """The ``after`` loop: one ``tick``, then the next poll while the
+        watch is still on. A callback that outlived its window does nothing."""
+        self._cancel_job()      # spent when the timer ran this; harmless then
+        if not self._alive():
+            return
+        if self.tick() == PHASE_CLOSING:
+            self._schedule(POLL_MS, self._poll)
+
+    def tick(self) -> str:
+        """ONE poll step - no scheduling; returns the phase afterwards.
+
+        A no-op outside the CLOSING phase and on a dead window, so a stray
+        late call can neither restart a finished watch nor raise."""
+        if (self.phase != PHASE_CLOSING or self.run is None
+                or not self._alive()):
+            return self.phase
+        try:
+            if self.run.tick() == "done":
+                self._enter_done()
+            else:
+                self._show_progress()
+        except Exception as exc:
+            self._fail(exc)
+        return self.phase
+
+    def _enter_done(self):
+        self.phase = PHASE_DONE
+        self._cancel_job()      # the watch is over, whoever ran the last tick
+        headline, detail = result_lines(self.run, self._n_new)
+        survivors = self.run.survivors
+        self._set_lines(headline, detail,
+                        FG_YELLOW if survivors else FG_GREEN)
+        # The list now answers "what is STILL open?" - only the survivors,
+        # or nothing at all.
+        self._show_list(describe(survivors))
+        self._log_counts("finished")
+        if not survivors and not detail:
+            # Nothing left to read or to do: get out of the FC's way.
+            self._schedule(AUTO_CLOSE_MS, self._auto_close)
+
+    def _auto_close(self):
+        self._cancel_job()
+        if self._alive():
+            self.cancel()
+
+    def _log_counts(self, what):
+        run = self.run
+        self._log("info",
+                  "Close Clients: %s - listed=%d closed=%d still_open=%d "
+                  "newcomers=%d",
+                  what, run.total, run.closed_count,
+                  run.total - run.closed_count, self._n_new)
+
+    def _fail(self, exc):
+        """A step raised: stop, say so, stay dismissable. Only the exception
+        TYPE is logged - its message could carry a window title."""
+        self.phase = PHASE_DONE
+        self.error = type(exc).__name__
+        self._cancel_job()
+        self._log("error", "Close Clients: stopped on an internal error (%s)",
+                  self.error)
+        try:
+            self._drop_slide()
+            self._set_lines(_ERROR_TITLE, _ERROR_BODY, FG_RED)
+            self.button.configure(text="Dismiss")
+        except Exception:
+            pass        # a dying window: Escape and the X still cancel
+
+
+def open_dialog(parent, clients, *, find_clients, still_same, close_window,
+                log=None, clock=None):
+    """Open the "Close Clients" dialog over ``parent``; returns its Toplevel.
+
+    ``clients``       the snapshot to list AND to close (``.hwnd``, ``.pid``,
+                      ``.char_name``, ``.is_login``); copied here, so nothing
+                      the caller does to its list afterwards changes either.
+    ``find_clients``  zero-argument callable returning a fresh snapshot;
+                      called once, at confirm, only to COUNT newcomers.
+    ``still_same``    ``fn(client) -> bool``: is that window still that client?
+    ``close_window``  ``fn(hwnd) -> int``: ask ONE window to close; 0 = posted.
+                      Reached only from the slide's confirm.
+    ``log``           optional logger (``.info`` / ``.error``); counts only.
+    ``clock``         optional monotonic-seconds callable shared by the slide's
+                      arm delay and the watch's deadline. Tests inject a fake.
+
+    One dialog, three phases (``_CloseDialog``): CONFIRM - the list, the
+    in-space warning, the slide and a Cancel button, under the application
+    grab; CLOSING - "Closing... k of N closed", grab released; DONE - closes
+    itself when everything went, otherwise stays and lists what is still open.
+
+    The window is created and handed to ``make_modal`` in THIS function: that
+    is the shape ``tests/test_dialog_placement.py`` looks for (the dialog opens
+    centred over the tool), and ``make_modal`` supplies transient, the grab
+    and Escape = cancel. The window X is wired to the same cancel explicitly -
+    ``make_modal`` binds Escape only. The caller owns the one-dialog-at-a-time
+    guard and may bind the returned window with ``add="+"``.
+    """
+    listed = tuple(clients)
+    win = tk.Toplevel(parent)
+    win.title("Close Clients")
+    win.resizable(False, False)
+    ctl = _CloseDialog(win, listed, find_clients=find_clients,
+                       still_same=still_same, close_window=close_window,
+                       log=log, clock=clock)
+    make_modal(win, parent, on_cancel=ctl.cancel)
+    win.protocol("WM_DELETE_WINDOW", ctl.cancel)
+    try:
+        ctl.build()
+    except Exception:
+        ctl.cancel()        # never leave a half-built window holding the grab
+        raise
+    win._cc = ctl
+    return win
