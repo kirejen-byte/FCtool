@@ -89,10 +89,17 @@ class StagingListItem(NameListItem):
     position. replace: the target list becomes the file's names in file order, each of them
     is taken out of the other list, and the names that left the target are ``removed``.
     Every name that came out of the other list gives a note,
-    ``"<name> moved from <other> to <target>"``.
+    ``"<name> moved from <other> to <target>"``, and is ``added`` when the target did not
+    hold it and ``updated`` when it did (it sat in both lists) - in both modes.
 
     A stored list that is not a list counts as empty, and entries that are not names are
-    dropped - with a warning. The other list is rewritten only when a name actually left it.
+    dropped - with a warning. The target list is rewritten without such entries even when
+    the file adds no name to it; the other list is rewritten only when a name actually left
+    it.
+
+    The payload is cleaned again here. A name that no longer resolves (the system table
+    failed to load) is left out with a warning, and when no name resolves at all nothing is
+    written and the item is ``skipped``.
     """
 
     modes = ("merge", "replace")
@@ -125,8 +132,11 @@ class StagingListItem(NameListItem):
 
     def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
         result = ItemResult(self.id)
-        incoming, _ = self._clean(payload, ctx)
+        incoming, problems = self._clean(payload, ctx)
+        result.warnings.extend(problems)        # what this second cleaning left out
         if not incoming:                        # nothing usable never blanks a list
+            if problems:                        # (an empty list is simply nothing to do)
+                result.status = "skipped"
             return result
         target, other = self.target, _OTHER[self.target]
 
@@ -151,9 +161,9 @@ class StagingListItem(NameListItem):
                 mine = spelling.get(_key(name))
                 if mine is None:
                     result.added.append(name)
-                elif mine == name:
+                elif mine == name and _key(name) not in in_other:
                     result.unchanged.append(name)
-                else:
+                else:                           # another spelling, or it sat in both lists
                     result.updated.append(name)
                 if _key(name) in in_other:
                     friendly, hostile = mutate_staging_lists(
@@ -178,8 +188,8 @@ class StagingListItem(NameListItem):
                             for name in incoming if _key(name) in in_other)
 
         for kind in (target, other):
-            if after[kind] == before[kind]:
-                continue                        # also keeps an untouched damaged list as it is
+            if after[kind] == before[kind] and not (kind == target and damage[target]):
+                continue                        # an untouched damaged OTHER list stays as it is
             if state.config is None:            # a missing config.json: created on first write
                 state.config = {}
             set_path(state.config, STAGING_PATHS[kind], after[kind])

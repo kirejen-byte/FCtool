@@ -16,8 +16,9 @@ Rules of this module
   that one top-level block (sibling keys inside it are kept) and touches nothing else - the
   legacy ``intel_channels`` block in particular is left exactly as it was.
 * Nothing here needs a character or the network (spec 9.1). A market STRUCTURE is the one
-  value that does: it is never written here - both ids go to 0 ("market not configured")
-  and one ``verify_structure`` task is queued for after the restart (spec 13).
+  value that does: it is never written here - one ``verify_structure`` task is queued for
+  after the restart (spec 13). Until then the importer's own station or structure is kept
+  when the market system is unchanged, and unset ("market not configured") when it changed.
 * ``validate`` builds a clean payload from scratch and never raises; ``apply`` cleans what
   it is given once more, so a payload that skipped validation still cannot write a
   wrong-typed value. A value that is not in the payload is never read or written.
@@ -52,6 +53,7 @@ _MAX_ID = 2 ** 63 - 1                           # every EVE id fits a signed 64-
 _SHOWN = 5                                      # ids quoted in one problem line
 
 _VERIFY_NOTE = "verified after restart"
+_KEEP_NOTE = "verified after restart - your current market pick stays until then"
 _PICK_NOTE = "pick a station or structure in Settings"
 
 
@@ -141,7 +143,9 @@ class _ChannelsItem(Item):
         junk = long_names = repeats = extra = clipped = 0
         for entry in payload:
             raw = entry.get("name") if isinstance(entry, dict) else None
-            name = clean_text(raw, MAX_CHANNEL_NAME + 1) if isinstance(raw, str) else ""
+            # Measured BEFORE any clip: a clip right-strips, which would hide the overflow
+            # of a name whose 101st character is a space.
+            name = clean_text(raw, len(raw)) if isinstance(raw, str) else ""
             if not name:
                 junk += 1
                 continue
@@ -221,15 +225,22 @@ class _ChannelsItem(Item):
         for record in records:
             name = record["name"]
             before = registry.get(name)
-            outcome = registry.merge(name, record["tags"])
+            # A channel the importer feeds to Intelligence Fusion keeps its spelling: the
+            # ingest gate is case-sensitive, and only the fusion item may re-spell it.
+            feeds_intel = before is not None and before.has_tag(channel_store.TAG_INTEL)
+            outcome = registry.merge(name, record["tags"], adopt_spelling=not feeds_intel)
+            respelled = before is not None and before.name != name
             if outcome == "added":
                 result.added.append(name)
             elif outcome == "updated":
                 result.updated.append(name)
-                if before is not None and before.name != name:
+                if respelled and not feeds_intel:
                     result.notes.append(f"'{before.name}' is now spelled '{name}'")
             else:
                 result.unchanged.append(name)
+            if respelled and feeds_intel:
+                result.notes.append(f"{name}: kept your spelling '{before.name}' "
+                                    f"(it feeds Intelligence Fusion)")
         if result.added or result.updated:
             channel_store.save(_writable(state), registry)
         return result.settle()
@@ -244,6 +255,30 @@ _STATION_ID, _STATION_NAME = "staging_station_id", "staging_station_name"
 _STRUCTURE_ID, _STRUCTURE_NAME = "staging_structure_id", "staging_structure_name"
 _MARKET_KEYS = (_SYSTEM_ID, _SYSTEM_NAME, _REGION_ID, _STATION_ID, _STATION_NAME,
                 _STRUCTURE_ID, _STRUCTURE_NAME)
+# (id key, name key, the word for it in a note)
+_OWN_STATION = (_STATION_ID, _STATION_NAME, "station")
+_OWN_STRUCTURE = (_STRUCTURE_ID, _STRUCTURE_NAME, "structure")
+
+
+def _whole(value):
+    """``value`` as a whole number, or ``None``. A hand-edited config may hold an id as
+    text or as a float; a switch is not an id. Never raises."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _same_system(current, system) -> bool:
+    """Is the stored market system the one of ``system`` (a clean payload system)? By id
+    after coercion, or by name ignoring case - deliberately tolerant: calling a system
+    "changed" unsets the importer's station and structure."""
+    if _whole(current.get(_SYSTEM_ID)) == system["id"]:
+        return True
+    name = current.get(_SYSTEM_NAME)
+    return isinstance(name, str) and name.strip().casefold() == system["name"].casefold()
 
 
 def _is_station_id(value) -> bool:
@@ -411,7 +446,7 @@ class _MarketStagingItem(Item):
         system, station, structure = clean["system"], clean["station"], clean["structure"]
         if system["id"] <= 0:
             result.status = "skipped"
-            result.skipped.append("system")
+            result.skipped.extend(row.key for row in self.records(clean))
             result.warnings.append(f"{self.label}: '{system['name']}' is not a known system")
             result.attention.append(Attention(
                 self.sections[0], self.id,
@@ -428,11 +463,18 @@ class _MarketStagingItem(Item):
                 set_path(_writable(state), (_MARKET, key), value)
                 written.add(key)
 
-        def clear(*keys):
-            for key in keys:
-                put(key, "" if key.endswith("_name") else 0)
+        def unset(*places):
+            """Zero the importer's own station and / or structure, and say which one went."""
+            for id_key, name_key, what in places:
+                old_id, old_name = _whole(current.get(id_key)), current.get(name_key)
+                put(id_key, 0)
+                put(name_key, "")
+                if old_id is not None and old_id > 0:       # there was one to lose
+                    shown = clean_text(old_name if isinstance(old_name, str) else "",
+                                       MAX_PLACE_NAME) or old_id
+                    result.notes.append(f"your {what} '{shown}' was unset")
 
-        system_changed = not _same(current.get(_SYSTEM_ID, ABSENT), system["id"])
+        system_changed = not _same_system(current, system)
         put(_SYSTEM_ID, system["id"])
         put(_SYSTEM_NAME, system["name"])
         put(_REGION_ID, system["region_id"])
@@ -452,7 +494,7 @@ class _MarketStagingItem(Item):
             put(_STATION_ID, station["id"])
             if station["name"] or not same_station:     # a blank name never erases a good one
                 put(_STATION_NAME, station["name"])
-            clear(_STRUCTURE_ID, _STRUCTURE_NAME)
+            unset(_OWN_STRUCTURE)
             if written - before:
                 result.updated.append("station")
                 result.notes.append(f"Station: {self._place_text(station)}")
@@ -462,19 +504,22 @@ class _MarketStagingItem(Item):
             if _same(current.get(_STRUCTURE_ID, ABSENT), structure["id"]):
                 result.unchanged.append("structure")    # already the importer's: nothing more
             else:
-                # Not written here: whether THIS user's character can reach the structure is
-                # only known after one ESI call. Until then the market is "not configured".
-                clear(_STATION_ID, _STATION_NAME, _STRUCTURE_ID, _STRUCTURE_NAME)
-                if written - before:
-                    result.updated.append("structure")
+                # Never written here: whether THIS user's character can reach the structure
+                # is only known after one ESI call. Meanwhile a pick in the same system is
+                # KEPT (a re-import must not cost a member who cannot dock there the pick
+                # that works for them); one in another system is unset - the market is
+                # "not configured" until the verification.
+                if system_changed:
+                    unset(_OWN_STATION, _OWN_STRUCTURE)
+                (result.updated if written - before else result.unchanged).append("structure")
                 result.tasks.append({"kind": "verify_structure",
                                      "structure_id": structure["id"],
                                      "name": structure["name"],
                                      "system_id": system["id"],
                                      "attempts": 0})
-                result.notes.append(_VERIFY_NOTE)
+                result.notes.append(_VERIFY_NOTE if system_changed else _KEEP_NOTE)
         elif system_changed:
-            clear(_STATION_ID, _STATION_NAME, _STRUCTURE_ID, _STRUCTURE_NAME)
+            unset(_OWN_STATION, _OWN_STRUCTURE)
             result.notes.append(_PICK_NOTE)
         return result.settle()
 
@@ -633,7 +678,7 @@ class _InfraScanItem(Item):
             return
         if infra is None:
             state.infra = {"version": INFRA_VERSION, "entries": {}, _REGIONS_KEY: new,
-                           "scan_state": {}}
+                           "scan_state": {"regions": {}, "systems": {}}}   # as the store saves
         else:
             infra[_REGIONS_KEY] = new
         result.updated.append(_REGIONS_KEY)

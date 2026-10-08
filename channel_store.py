@@ -310,7 +310,7 @@ class Registry:
         self._channels[idx] = Channel(name=clean, tags=current.tags)
         return True
 
-    def merge(self, name, tags=()) -> str:
+    def merge(self, name, tags=(), *, adopt_spelling: bool = True) -> str:
         """Fold a channel into the registry: add it, or bring an existing entry up to date.
 
         Returns ``"added"``, ``"updated"`` or ``"unchanged"``. This is how an imported group
@@ -322,6 +322,10 @@ class Registry:
           its tags become the union, the existing ones first, through :func:`normalize_tags`.
           ``"updated"`` when either changed, else ``"unchanged"``. Position is preserved.
         * A blank or non-string name -> ``"unchanged"``.
+
+        ``adopt_spelling=False`` leaves the spelling of an EXISTING entry alone (its tags are
+        still unioned): for a caller that must not re-spell a channel the owner already
+        feeds to a case-sensitive consumer. A new channel is spelled as given either way.
         """
         clean = _clean(name)
         if not clean:
@@ -333,7 +337,7 @@ class Registry:
         current = self._channels[idx]
         merged = normalize_tags(tuple(current.tags) + normalize_tags(tags))
         changed = False
-        if current.name != clean:
+        if adopt_spelling and current.name != clean:
             changed = self.rename(current.name, clean)
         if merged != tuple(current.tags):
             self.set_tags(clean, merged)
