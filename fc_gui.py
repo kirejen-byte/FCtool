@@ -2882,12 +2882,30 @@ class FCToolGUI:
     def _save_intel_filter(self):
         """Persist the intel filter to config (lightweight write, no restart).
 
-        ``self._intel_filter`` is the same dict object as
-        ``config["intel_filter"]`` so it is already current; this just flushes
+        Re-attaches the live ``self._intel_filter`` to ``config["intel_filter"]``
+        (a no-op while they are already the same object), then flushes
         config.json. The display filter reads config live, so no module reload
         is needed (mirrors _save_staging_systems)."""
         self.config["intel_filter"] = self._intel_filter
         self._save_config()
+
+    def _rebind_intel_filter(self):
+        """Restore the invariant ``self._intel_filter is self.config["intel_filter"]``.
+
+        Call wherever ``self.config`` is replaced (``_save_settings``). The
+        graft goes config <- live object, NOT the reverse: the filter panel
+        and its handlers hold ``self._intel_filter`` and its sub-dicts by
+        reference, so re-pointing the attribute would strand them. Only when
+        there is no live filter yet is it bound from the config. Never raises.
+        """
+        cfg = getattr(self, "config", None)
+        if not isinstance(cfg, dict):
+            return
+        flt = getattr(self, "_intel_filter", None)
+        if isinstance(flt, dict):
+            cfg["intel_filter"] = flt
+        elif isinstance(cfg.get("intel_filter"), dict):
+            self._intel_filter = cfg["intel_filter"]
 
     # ── FC HUD (info tiles) ───────────────────────────────────────────────────
 
@@ -5774,8 +5792,9 @@ class FCToolGUI:
         """Open the modal-ish coalition manager (create/rename/delete coalitions
         and edit their member alliances/corporations).
 
-        All mutations write ``config["coalitions"]`` and persist via
-        :meth:`_save_config`; rename/delete also propagate into
+        Membership edits write ``config["coalitions"]`` and persist via
+        :meth:`_save_config`; rename/delete persist via
+        :meth:`_save_intel_filter` and also propagate into
         ``config["intel_filter"]["parties"]["coalitions"]`` (the filter's
         selected-coalitions list) and refresh the filter panel listbox.
         After any create/rename/delete/member change the parties Coalition
@@ -6007,7 +6026,8 @@ class FCToolGUI:
              "coalitions": []})
         par["coalitions"] = rename_coalition_in_selection(
             par.get("coalitions", []), old, new)
-        self._save_config()
+        # Save via the filter path so the selection edit is re-attached to config.
+        self._save_intel_filter()
         self._refresh_coalition_pickers()
         self._refresh_intel_filter_lists()
         self._cm_refresh_list(select=new)
@@ -6038,7 +6058,8 @@ class FCToolGUI:
             if anyone_var is not None:
                 anyone_var.set(True)
                 self._sync_parties_enabled()
-        self._save_config()
+        # Save via the filter path so the selection edit is re-attached to config.
+        self._save_intel_filter()
         self._refresh_coalition_pickers()
         self._refresh_intel_filter_lists()
         self._cm_selected_name = None
@@ -31792,6 +31813,11 @@ class FCToolGUI:
         # restart; a running fusion session picks up new channel_filters on its
         # next toggle).
         self._channels = channel_store.load(self.config)
+        # The intel filter is a third holder, but the fix-up runs the other way:
+        # the live self._intel_filter is grafted INTO the new config, so the
+        # alert gate (reads config["intel_filter"]) and the filter panel (holds
+        # the object and its sub-dicts by reference) keep sharing one dict.
+        self._rebind_intel_filter()
         # HudHost holds the same kind of second reference (see comment above).
         if getattr(self, "_hud_host", None) is not None:
             self._hud_host.config = self.config
