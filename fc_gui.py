@@ -102,6 +102,9 @@ import ship_classes
 # Role Tracker cap enforcement after the fact (pure decisions; the row moving
 # is _apply_role_cap). Stdlib only, imports no fc_gui.
 import role_cap
+# Role Tracker preset helpers: pure, shared with the group-configuration items
+# (which run before any window exists). Aliased back under their old names below.
+import role_presets
 import charge_tracker
 import command_bursts
 # Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
@@ -765,94 +768,17 @@ def _motd_link_initial_state(config) -> bool:
         return False
 
 
-# The Role Tracker's BUILT-IN preset buttons (row 1), each
-# ``(label, letter, title, cap)``. The owner can edit them in place (right-click
-# a button); an edited set is persisted as ``config["default_role_presets"]``
-# and ``_role_default_presets`` decides at Fleet-tab build time which list wins.
-# "Restore built-in" puts the matching tuple from HERE back.
-_ROLE_BUILTIN_PRESETS = (
-    ("C-Cyno", "c", "Cyno", None),
-    ("D-Dictors", "d", "Dictors", None),
-    ("F-Fax 3", "f", "FAX", 3),
-    ("Z-Defenders-8", "z", "Defenders", 8),
-    ("1-Dreads-10", "1", "Dreads", 10),
-)
-
-# Mirrors the role slot's key Entry (``width=2``): a preset key is 1-2 chars.
-_ROLE_PRESET_LETTER_MAX = 2
-
-
-def _role_preset_label(letter, title, cap) -> str:
-    """A role preset's button label, built exactly the way
-    ``_save_role_as_preset`` builds it: ``LETTER-Title`` plus ``-cap`` when a
-    cap is set."""
-    label = f"{letter.upper()}-{title}"
-    if cap is not None:
-        label += f"-{cap}"
-    return label
-
-
-def _parse_role_preset_fields(letter, title, cap_text):
-    """Validate the role-preset edit dialog's three fields.
-
-    Returns ``((letter, title, cap), None)`` on success or ``(None, message)``
-    naming the first problem: the key must be 1-2 non-blank characters, the
-    role name non-blank, the cap blank (no cap) or a positive whole number.
-    Surrounding whitespace is stripped from every field."""
-    letter = str(letter or "").strip()
-    title = str(title or "").strip()
-    cap_text = str(cap_text or "").strip()
-    if not letter:
-        return None, "The key cannot be blank."
-    if len(letter) > _ROLE_PRESET_LETTER_MAX:
-        return None, (f"The key must be at most {_ROLE_PRESET_LETTER_MAX} "
-                      "characters.")
-    if not title:
-        return None, "The role name cannot be blank."
-    cap = None
-    if cap_text:
-        if not cap_text.isdigit() or int(cap_text) <= 0:
-            return None, "The cap must be blank or a positive whole number."
-        cap = int(cap_text)
-    return (letter, title, cap), None
-
-
-def _role_default_presets(config, builtin=_ROLE_BUILTIN_PRESETS) -> list:
-    """The Role Tracker's built-in preset list at Fleet-tab build time.
-
-    Uses ``config["default_role_presets"]`` (written only when the owner edits
-    a built-in preset: a list of ``{label, letter, title, cap}`` dicts in the
-    built-in order) when it is WELL-FORMED — a list of exactly ``len(builtin)``
-    dicts, each with a non-blank string ``letter`` and ``title`` and a ``cap``
-    that is None or a positive int. Anything else (missing key, non-list,
-    wrong length, one bad entry) falls back to ``builtin`` WHOLESALE — never a
-    half-merge. A blank/missing label is rebuilt from the other fields. Never
-    raises: a damaged config must not stop the Fleet tab from building."""
-    fallback = [tuple(p) for p in builtin]
-    try:
-        stored = config.get("default_role_presets") if isinstance(
-            config, dict) else None
-        if not isinstance(stored, list) or len(stored) != len(fallback):
-            return fallback
-        out = []
-        for p in stored:
-            if not isinstance(p, dict):
-                return fallback
-            letter, title, cap = p.get("letter"), p.get("title"), p.get("cap")
-            if not isinstance(letter, str) or not letter.strip():
-                return fallback
-            if not isinstance(title, str) or not title.strip():
-                return fallback
-            if cap is not None and (isinstance(cap, bool)
-                                    or not isinstance(cap, int) or cap <= 0):
-                return fallback
-            label = p.get("label")
-            if not isinstance(label, str) or not label.strip():
-                label = _role_preset_label(letter, title, cap)
-            out.append((label, letter, title, cap))
-        return out
-    except Exception:
-        return fallback
+# The Role Tracker's preset helpers live in ``role_presets`` (moved verbatim);
+# these five private names are the SAME objects. ``_ROLE_BUILTIN_PRESETS`` holds
+# the built-in preset buttons (row 1), each ``(label, letter, title, cap)``. The
+# owner can edit them in place (right-click a button); an edited set is persisted
+# as ``config["default_role_presets"]`` and ``_role_default_presets`` decides at
+# Fleet-tab build time which list wins.
+_ROLE_BUILTIN_PRESETS = role_presets.BUILTIN_PRESETS
+_ROLE_PRESET_LETTER_MAX = role_presets.LETTER_MAX
+_role_preset_label = role_presets.preset_label
+_parse_role_preset_fields = role_presets.parse_preset_fields
+_role_default_presets = role_presets.default_presets
 
 
 _ROLE_AREA_BASE_HEIGHT = 300    # px at tk scaling 96/72 (the tuned layout)
