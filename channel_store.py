@@ -310,6 +310,36 @@ class Registry:
         self._channels[idx] = Channel(name=clean, tags=current.tags)
         return True
 
+    def merge(self, name, tags=()) -> str:
+        """Fold a channel into the registry: add it, or bring an existing entry up to date.
+
+        Returns ``"added"``, ``"updated"`` or ``"unchanged"``. This is how an imported group
+        configuration lands a channel, so it only ever ADDS: no entry and no tag is removed.
+
+        * No entry with that name (case-insensitive) -> :meth:`add`, ``"added"``.
+        * An entry exists -> its spelling becomes ``name``'s when the two differ (the chat-log
+          ingest gate is case-sensitive, so the incoming spelling is the one that works), and
+          its tags become the union, the existing ones first, through :func:`normalize_tags`.
+          ``"updated"`` when either changed, else ``"unchanged"``. Position is preserved.
+        * A blank or non-string name -> ``"unchanged"``.
+        """
+        clean = _clean(name)
+        if not clean:
+            return "unchanged"
+        idx = self._index_of(clean)
+        if idx is None:
+            self.add(clean, tags)
+            return "added"
+        current = self._channels[idx]
+        merged = normalize_tags(tuple(current.tags) + normalize_tags(tags))
+        changed = False
+        if current.name != clean:
+            changed = self.rename(current.name, clean)
+        if merged != tuple(current.tags):
+            self.set_tags(clean, merged)
+            changed = True
+        return "updated" if changed else "unchanged"
+
     # ── serialization ────────────────────────────────────────────────────────
 
     def to_block(self) -> dict:
