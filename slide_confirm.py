@@ -27,10 +27,27 @@ The contract — every rule is here because its absence is an accident path:
   that button lands on whatever the new dialog put under the pointer. The
   delay runs from the FIRST ``<Map>`` only (``arm()`` is idempotent) — a later
   re-map must not re-open or extend the window, and a control that never
-  mapped is never armed at all.
+  mapped is never armed at all. The check FAILS CLOSED: it is written "refuse
+  unless elapsed >= delay", so a clock that returns NaN or runs backwards can
+  never arm the control early. The model refuses, at construction, a
+  threshold outside ``(0, 1]`` (0 would let a bare click confirm) and a
+  negative arm delay, for the same reason.
 * **The handle follows the pointer with the grab offset preserved**, clamped
   to the track. Without the offset the handle would jump by up to its own
   width at the press, which is free progress nobody dragged.
+* **Straying vertically CANCELS the drag.** While the button is held the
+  pointer must stay within ``DRIFT_TRACKS`` (2) track heights above or below
+  the track — with ``h`` the track height, ``-2*h <= y < 3*h``. A motion
+  outside that band cancels: the handle snaps home, and the drag does NOT
+  resume when the pointer comes back with the button still down — the user
+  must press the handle again. WHY: Tk keeps delivering ``<B1-Motion>`` to
+  the pressed widget wherever the pointer goes, and the handle is clamped to
+  the track, so without this rule "pull the mouse away to bail out" CONFIRMED
+  whenever the pull happened to go right (measured before the rule: a release
+  800 px below the track, 600 px above it, or flung to +3000,+900 all
+  confirmed). The band is in track heights, so it scales with the font and
+  ``tk scaling``, and is wide enough that an ordinary sloppy sideways drag
+  never trips it.
 * **Confirm fires on RELEASE, with progress >= 0.9.** Never on motion: the
   user can drag all the way, think better of it, drag back and let go.
   Progress is the LAST DRAG position — the release event's own coordinates are
@@ -38,8 +55,9 @@ The contract — every rule is here because its absence is an accident path:
   cannot push a short drag over the line.
 * **Everything else resets to 0**: a release short of the threshold, a press
   while already pressed (a release was lost — the gesture is no longer one
-  continuous drag), a focus loss mid-drag (alt-tab, a toast, another dialog).
-  A half-dragged handle is never left "primed" for a later nudge to finish.
+  continuous drag), a vertical stray (above), a focus loss mid-drag (alt-tab,
+  a toast, another dialog). A half-dragged handle is never left "primed" for
+  a later nudge to finish.
 * **One-shot.** Confirm LOCKS the model; no later press, drag, release or
   cancel changes it, so ``on_confirm`` runs at most once per control.
   ``on_confirm`` is the LAST statement of the release path because the caller
@@ -82,6 +100,10 @@ IGNORED = "ignored"
 THRESHOLD = 0.9
 #: Seconds after the first map during which presses are ignored.
 ARM_DELAY_S = 0.4
+#: How far the pointer may stray above or below the track during a drag, in
+#: TRACK HEIGHTS, before the drag is cancelled (module docstring: "Straying
+#: vertically cancels").
+DRIFT_TRACKS = 2
 
 #: Minimum handle travel, in px AT ``REF_SCALING`` — scaled proportionally
 #: with the live ``tk scaling`` (spec §5: >= 160 px at scaling 1.33).
@@ -101,6 +123,10 @@ class SlideModel:
     ``arm()`` starts the arm delay (first call wins); until ``arm_delay_s`` has
     passed on ``clock``, every press is refused. A model that is never armed
     never accepts a press.
+
+    ``threshold`` must be in ``(0, 1]`` and ``arm_delay_s`` must be ``>= 0``
+    (``ValueError`` otherwise). Every range check here is written as "refuse
+    unless provably inside", so a NaN fails it — the model fails CLOSED.
     """
 
     def __init__(self, track_px, handle_px, *, threshold=THRESHOLD,
@@ -109,6 +135,14 @@ class SlideModel:
             raise ValueError(
                 f"slide needs 0 < handle_px < track_px "
                 f"(got handle_px={handle_px!r}, track_px={track_px!r})")
+        # threshold 0 would make a bare click (progress 0 >= 0) a confirm, and
+        # one above 1 could never be reached; NaN fails the chained compare.
+        if not (0 < threshold <= 1):
+            raise ValueError(
+                f"slide needs 0 < threshold <= 1 (got {threshold!r})")
+        if not (arm_delay_s >= 0):
+            raise ValueError(
+                f"slide needs arm_delay_s >= 0 (got {arm_delay_s!r})")
         self._track_px = track_px
         self._handle_px = handle_px
         self._travel = track_px - handle_px
@@ -134,6 +168,16 @@ class SlideModel:
     def travel(self):
         """How far the handle can move: ``track_px - handle_px``."""
         return self._travel
+
+    @property
+    def threshold(self):
+        """The progress a release must have reached to confirm, in (0, 1]."""
+        return self._threshold
+
+    @property
+    def arm_delay_s(self):
+        """Seconds after the first ``arm()`` during which presses are refused."""
+        return self._arm_delay_s
 
     @property
     def handle_x(self):
@@ -174,8 +218,13 @@ class SlideModel:
         if self._pressed:
             self._home()
             return False
-        if (self._armed_at is None
-                or self._clock() - self._armed_at < self._arm_delay_s):
+        if self._armed_at is None:
+            return False
+        # FAIL CLOSED: "refuse unless elapsed >= delay", never "refuse if
+        # elapsed < delay" — a NaN elapsed (a broken clock) compares False
+        # both ways, and only this spelling refuses it. A clock that ran
+        # backwards gives a negative elapsed and is refused by either.
+        if not (self._clock() - self._armed_at >= self._arm_delay_s):
             return False
         if not self._handle_x <= x < self._handle_x + self._handle_px:
             return False
@@ -208,7 +257,9 @@ class SlideModel:
 
     def cancel(self) -> None:
         """Abandon any drag in progress and send the handle home (focus loss,
-        an off-handle press mid-drag). A no-op once locked."""
+        a vertical stray, an off-row press mid-drag). The press is dropped
+        with it, so further ``drag`` calls do nothing until a NEW press lands
+        on the handle. A no-op once locked."""
         if not self._locked:
             self._home()
 
@@ -315,6 +366,13 @@ class SlideToConfirm(tk.Canvas):
     """
 
     def __init__(self, parent, text, on_confirm, *, clock=None):
+        # FIRST, before anything that can raise: destroy() reads these two.
+        # tk.Canvas.__init__ registers the instance in parent.children BEFORE
+        # it creates the Tcl widget, so a constructor that raises part-way
+        # leaves a half-built instance the parent's destroy() cascade will
+        # still call destroy() on. (Plain attributes set before
+        # super().__init__ survive it — tkinter has no __setattr__ hook.)
+        self._focus_top = self._focus_funcid = None
         # A Font belongs to its interpreter and is deleted when the Python
         # object is collected — built per widget and kept on self.
         self._font = tkfont.Font(root=parent, family=_FONT_FAMILY,
@@ -385,7 +443,17 @@ class SlideToConfirm(tk.Canvas):
         self._redraw()
 
     def _on_drag(self, event):
-        self.model.drag(event.x)
+        # Tk delivers <B1-Motion> to the pressed widget wherever the pointer
+        # is, so "pulled away" has to be decided here (module docstring:
+        # "Straying vertically cancels"). Chained compare: a NaN y fails it
+        # and cancels — fail closed.
+        h = self.geo.track_h
+        if -DRIFT_TRACKS * h <= event.y < (1 + DRIFT_TRACKS) * h:
+            self.model.drag(event.x)
+        else:
+            # Drops the press too: coming back with the button still held
+            # does not resume the drag — the handle must be pressed again.
+            self.model.cancel()
         self._redraw()
 
     def _on_release(self, _event=None):
@@ -418,12 +486,19 @@ class SlideToConfirm(tk.Canvas):
     def destroy(self):
         """Take this control's ``<FocusOut>`` handler off the toplevel (it is
         longer-lived when a dialog swaps the slide for a status line), then
-        destroy. Funcid-scoped, so the toplevel's other handlers survive."""
-        top, funcid = self._focus_top, self._focus_funcid
-        self._focus_top = self._focus_funcid = None
-        if top is not None and funcid:
-            try:
+        destroy. Funcid-scoped, so the toplevel's other handlers survive.
+
+        TOTAL: nothing in the unbind half may stop ``super().destroy()``. A
+        ``destroy()`` that raises aborts the PARENT's destroy cascade, and in
+        the dialog that leaves an undismissable toplevel holding the
+        application grab. So it tolerates a half-built instance (the two
+        attributes are set first thing in ``__init__``) and swallows whatever
+        the unbind raises — a dead toplevel, a funcid already gone."""
+        try:
+            top, funcid = self._focus_top, self._focus_funcid
+            self._focus_top = self._focus_funcid = None
+            if top is not None and funcid:
                 top.unbind("<FocusOut>", funcid)
-            except tk.TclError:
-                pass
+        except Exception:
+            pass
         super().destroy()
