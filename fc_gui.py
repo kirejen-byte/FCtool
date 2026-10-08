@@ -137,6 +137,9 @@ import fleet_composer
 import eve_client_tracker
 import eve_account
 import window_activator
+# "Close Clients" (Fleet tab): list + slide-to-confirm dialog + watch. Imports
+# no fc_gui / ctypes -- _close_all_clients injects its collaborators.
+import close_clients
 import preview_layout
 # Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
 # cycle-groups dialog's RoleCriteriaPanel editor (pure core + Tk shell in one
@@ -4373,18 +4376,50 @@ class FCToolGUI:
         # ── Role Tracker Section ──────────────────────────────────────────────
         role_header = tk.Frame(tab, bg=BG_DARK)
         role_header.pack(fill=tk.X, padx=10, pady=(4, 2))
-        tk.Label(role_header, text="Role Tracker", font=("Consolas", 10, "bold"),
-                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT)
-        tk.Label(role_header, text="(not case sensitive)", font=("Consolas", 8),
-                 fg=FG_DIM, bg=BG_DARK).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(role_header, text="+ Add Role", style="Dark.TButton",
+        # PACK ORDER IS WIDTH PRIORITY, and this row is over-committed at the
+        # minsize (measured, real styles: at tk scaling 1.51 / 1000 px Kick
+        # Pods got 1 of 110 px while it was packed near the end). Pack starves
+        # whatever was packed LAST, so the order is:
+        #   1. the RIGHT group -- Screenshot, Fleet Templates, Kick Pods, Close
+        #      Clients. side=RIGHT lays out right-to-left, so on screen that is
+        #      … [Close Clients] [Kick Pods] [Fleet Templates] [Screenshot]
+        #   2. the LEFT group, in reading order;
+        #   3. the transient screenshot status text, LAST.
+        # A squeeze therefore lands on the status text, then on the TAIL of the
+        # left group (Expand All, then Collapse All) -- never on Kick Pods or
+        # Close Clients: a red button must not be the one clipped to a sliver.
+        # (1.51 / 1000 px is still 100 px short; Expand All pays.)
+        # width=-len(text) on every label shorter than ttk's 11-char default
+        # is a MINIMUM, not a truncation (precedent: the x-up Reset above);
+        # with the old dim "(not case sensitive)" label folded into a tooltip
+        # it is what makes the row fit, exactly, at 1.33 / 1000 px.
+        # Guard: tests/test_role_header_width.py (real ttk styles).
+        ttk.Button(role_header, text="Screenshot", style="Dark.TButton", width=-10,
+                   command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
+                   command=self._open_fleet_templates).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(role_header, text="Kick Pods", style="Red.TButton", width=-9,
+                   command=self._kick_pods_from_fleet).pack(side=tk.RIGHT, padx=3)
+        close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",
+                               command=self._close_all_clients)
+        close_btn.pack(side=tk.RIGHT, padx=3)
+        attach_tooltip(close_btn, "Close every running EVE client (asks first).")
+        role_title = tk.Label(role_header, text="Role Tracker",
+                              font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_DARK)
+        role_title.pack(side=tk.LEFT)
+        attach_tooltip(role_title,
+                       "Role keys typed in fleet chat are not case sensitive.")
+        ttk.Button(role_header, text="+ Add Role", style="Dark.TButton", width=-10,
                    command=self._add_role_slot).pack(side=tk.LEFT, padx=8)
-        ttk.Button(role_header, text="Reset All", style="Red.TButton",
+        ttk.Button(role_header, text="Reset All", style="Red.TButton", width=-9,
                    command=self._reset_all_roles).pack(side=tk.LEFT, padx=3)
         ttk.Button(role_header, text="Collapse All", style="Dark.TButton",
                    command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(role_header, text="Expand All", style="Dark.TButton",
+        ttk.Button(role_header, text="Expand All", style="Dark.TButton", width=-10,
                    command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
+        self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
+                                          fg=FG_GREEN, bg=BG_DARK)
+        self._screenshot_link.pack(side=tk.RIGHT, padx=5)
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -4407,18 +4442,6 @@ class FCToolGUI:
         self._preset_frame = preset_row1
         self._MAX_CUSTOM_PRESETS = 8
         self._rebuild_preset_buttons()
-        ttk.Button(role_header, text="Screenshot", style="Dark.TButton",
-                   command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
-                   command=self._open_fleet_templates).pack(side=tk.RIGHT, padx=3)
-        # Kick Pods lives with the right-hand group. Right-packing lays out
-        # right-to-left, so packing it last places it left of Fleet Templates:
-        #   … [Kick Pods] [Fleet Templates] [Screenshot]
-        ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
-                   command=self._kick_pods_from_fleet).pack(side=tk.RIGHT, padx=3)
-        self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
-                                          fg=FG_GREEN, bg=BG_DARK)
-        self._screenshot_link.pack(side=tk.RIGHT, padx=5)
 
         # Role tracker container — bounded height so it never displaces
         # Fleet Composition / Specialized Roles below. Scrolls if roles overflow.
@@ -35033,6 +35056,52 @@ class FCToolGUI:
         dlg.grab_set()
         dlg.wait_window()
         return result["value"]
+
+    def _close_all_clients(self):
+        """Role-header "Close Clients": ask every running EVE client to close.
+
+        Wiring only: close_clients owns the dialog, window_activator the one
+        close request (reachable only through the dialog's slide). Tk-thread
+        only; all state is read HERE, at click time -- the Fleet-tab harnesses
+        build the tab on object.__new__."""
+        dlg = getattr(self, "_close_clients_dlg", None)
+        try:
+            if dlg is not None and dlg.winfo_exists():
+                dlg.lift()
+                dlg.focus_force()
+                return
+        except tk.TclError:
+            pass                          # a destroyed dialog: open a new one
+        self._close_clients_dlg = None
+        find = (getattr(self, "_preview_find_clients", None)
+                or eve_client_tracker.find_clients)
+        ok = [("OK", "Dark.TButton", None)]
+        try:
+            clients = list(find())
+        except Exception:                 # the real backend raises off Windows
+            self._themed_modal(
+                "Close Clients",
+                "Closing EVE clients is not available on this platform.",
+                buttons=ok, accent=FG_YELLOW)
+            return
+        if not clients:
+            self._themed_modal("Close Clients", "No EVE clients are running.",
+                               buttons=ok, accent=FG_ACCENT)
+            return
+
+        def _forget(event):               # <Destroy> fires for children too
+            if event.widget is self._close_clients_dlg:
+                self._close_clients_dlg = None
+        try:
+            dlg = close_clients.open_dialog(
+                self.root, clients, find_clients=find,
+                still_same=eve_client_tracker.still_same_client,
+                close_window=window_activator.close_window, log=log)
+            dlg.bind("<Destroy>", _forget, add="+")
+        except Exception:
+            log.exception("Close Clients: the dialog could not be opened")
+            return
+        self._close_clients_dlg = dlg
 
     def _kick_pods_from_fleet(self):
         """Kick every fleet member currently in a Capsule (pod). Boss-only, confirmed."""
