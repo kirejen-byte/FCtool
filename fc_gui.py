@@ -138,7 +138,7 @@ import eve_client_tracker
 import eve_account
 import window_activator
 # "Close Clients" (Fleet tab): list + slide-to-confirm dialog + watch. Imports
-# no fc_gui / ctypes -- _close_all_clients injects its collaborators.
+# no fc_gui / ctypes -- the button's click handler injects its collaborators.
 import close_clients
 import preview_layout
 # Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
@@ -4376,50 +4376,64 @@ class FCToolGUI:
         # ── Role Tracker Section ──────────────────────────────────────────────
         role_header = tk.Frame(tab, bg=BG_DARK)
         role_header.pack(fill=tk.X, padx=10, pady=(4, 2))
-        # PACK ORDER IS WIDTH PRIORITY, and this row is over-committed at the
-        # minsize (measured, real styles: at tk scaling 1.51 / 1000 px Kick
-        # Pods got 1 of 110 px while it was packed near the end). Pack starves
-        # whatever was packed LAST, so the order is:
-        #   1. the RIGHT group -- Screenshot, Fleet Templates, Kick Pods, Close
-        #      Clients. side=RIGHT lays out right-to-left, so on screen that is
-        #      … [Close Clients] [Kick Pods] [Fleet Templates] [Screenshot]
-        #   2. the LEFT group, in reading order;
-        #   3. the transient screenshot status text, LAST.
-        # A squeeze therefore lands on the status text, then on the TAIL of the
-        # left group (Expand All, then Collapse All) -- never on Kick Pods or
-        # Close Clients: a red button must not be the one clipped to a sliver.
-        # (1.51 / 1000 px is still 100 px short; Expand All pays.)
+        # TWO ORDERS, kept apart on purpose.
+        # CREATION order is the keyboard Tab order (= stacking order): the
+        # row's original one, with the new Close Clients button last.
+        # PACK order is WIDTH PRIORITY: pack starves whatever was packed LAST,
+        # and this row is over-committed at the minsize (measured, real
+        # styles: Kick Pods got 1 of 110 px at tk scaling 1.51 / 1000 px while
+        # it was packed near the end). Under a squeeze the row gives up, in
+        # this order: the transient screenshot status text, Expand All,
+        # Collapse All, then Close Clients (the newest button, and the one
+        # behind a slide-to-confirm) -- and only after those anything the row
+        # had before it, so no older red button is worse off than it was.
+        # Measured: up to tk scaling 1.51 nothing but the status text and
+        # Expand All is ever clipped; at 2.0 / 1000 px Close Clients is down to
+        # 79 of 165 px while Kick Pods and Reset All keep their full width.
+        # side=RIGHT lays out right-to-left and each widget takes an edge of
+        # what REMAINS of the row, so on screen it still reads
+        #   Role Tracker [+ Add Role] [Reset All] [Collapse All] [Expand All]
+        #     … <status> [Close Clients] [Kick Pods] [Fleet Templates] [Screenshot]
         # width=-len(text) on every label shorter than ttk's 11-char default
         # is a MINIMUM, not a truncation (precedent: the x-up Reset above);
         # with the old dim "(not case sensitive)" label folded into a tooltip
         # it is what makes the row fit, exactly, at 1.33 / 1000 px.
         # Guard: tests/test_role_header_width.py (real ttk styles).
-        ttk.Button(role_header, text="Screenshot", style="Dark.TButton", width=-10,
-                   command=self._take_screenshot).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(role_header, text="Fleet Templates", style="Dark.TButton",
-                   command=self._open_fleet_templates).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(role_header, text="Kick Pods", style="Red.TButton", width=-9,
-                   command=self._kick_pods_from_fleet).pack(side=tk.RIGHT, padx=3)
-        close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",
-                               command=self._close_all_clients)
-        close_btn.pack(side=tk.RIGHT, padx=3)
-        attach_tooltip(close_btn, "Close every running EVE client (asks first).")
         role_title = tk.Label(role_header, text="Role Tracker",
                               font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_DARK)
-        role_title.pack(side=tk.LEFT)
         attach_tooltip(role_title,
                        "Role keys typed in fleet chat are not case sensitive.")
-        ttk.Button(role_header, text="+ Add Role", style="Dark.TButton", width=-10,
-                   command=self._add_role_slot).pack(side=tk.LEFT, padx=8)
-        ttk.Button(role_header, text="Reset All", style="Red.TButton", width=-9,
-                   command=self._reset_all_roles).pack(side=tk.LEFT, padx=3)
-        ttk.Button(role_header, text="Collapse All", style="Dark.TButton",
-                   command=lambda: self._set_all_roles_collapsed(True)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(role_header, text="Expand All", style="Dark.TButton", width=-10,
-                   command=lambda: self._set_all_roles_collapsed(False)).pack(side=tk.LEFT, padx=3)
+        add_btn = ttk.Button(role_header, text="+ Add Role", style="Dark.TButton",
+                             width=-10, command=self._add_role_slot)
+        reset_btn = ttk.Button(role_header, text="Reset All", style="Red.TButton",
+                               width=-9, command=self._reset_all_roles)
+        collapse_btn = ttk.Button(
+            role_header, text="Collapse All", style="Dark.TButton",
+            command=lambda: self._set_all_roles_collapsed(True))
+        expand_btn = ttk.Button(
+            role_header, text="Expand All", style="Dark.TButton", width=-10,
+            command=lambda: self._set_all_roles_collapsed(False))
+        shot_btn = ttk.Button(role_header, text="Screenshot", style="Dark.TButton",
+                              width=-10, command=self._take_screenshot)
+        templates_btn = ttk.Button(role_header, text="Fleet Templates",
+                                   style="Dark.TButton",
+                                   command=self._open_fleet_templates)
+        kick_btn = ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
+                              width=-9, command=self._kick_pods_from_fleet)
+        close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",
+                               command=self._close_all_clients)
+        attach_tooltip(close_btn, "Close every running EVE client (asks first).")
         self._screenshot_link = tk.Label(role_header, text="", font=("Consolas", 9),
                                           fg=FG_GREEN, bg=BG_DARK)
-        self._screenshot_link.pack(side=tk.RIGHT, padx=5)
+        for _w, _side, _padx in (                # first packed = last to give way
+                (shot_btn, tk.RIGHT, 3), (templates_btn, tk.RIGHT, 3),
+                (kick_btn, tk.RIGHT, 3),
+                (role_title, tk.LEFT, 0), (add_btn, tk.LEFT, 8),
+                (reset_btn, tk.LEFT, 3),
+                (close_btn, tk.RIGHT, 3),
+                (collapse_btn, tk.LEFT, 3), (expand_btn, tk.LEFT, 3),
+                (self._screenshot_link, tk.RIGHT, 5)):
+            _w.pack(side=_side, padx=_padx)
 
         # Preset role buttons — row 1: defaults, row 2: custom
         preset_container = tk.Frame(tab, bg=BG_DARK)
@@ -35067,8 +35081,8 @@ class FCToolGUI:
         dlg = getattr(self, "_close_clients_dlg", None)
         try:
             if dlg is not None and dlg.winfo_exists():
-                dlg.lift()
-                dlg.focus_force()
+                dlg.lift()    # focus back on ITS button, so Space still works
+                (dlg.focus_lastfor() or dlg).focus_force()
                 return
         except tk.TclError:
             pass                          # a destroyed dialog: open a new one
@@ -35078,7 +35092,9 @@ class FCToolGUI:
         ok = [("OK", "Dark.TButton", None)]
         try:
             clients = list(find())
-        except Exception:                 # the real backend raises off Windows
+        except Exception as exc:          # the real backend raises off Windows
+            log.warning("Close Clients: the client snapshot failed (%s)",
+                        type(exc).__name__)
             self._themed_modal(
                 "Close Clients",
                 "Closing EVE clients is not available on this platform.",
@@ -35100,6 +35116,9 @@ class FCToolGUI:
             dlg.bind("<Destroy>", _forget, add="+")
         except Exception:
             log.exception("Close Clients: the dialog could not be opened")
+            self._themed_modal(
+                "Close Clients", "The Close Clients dialog could not be opened. "
+                "See fctool.log.", buttons=ok, accent=FG_RED)
             return
         self._close_clients_dlg = dlg
 
