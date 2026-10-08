@@ -23,6 +23,22 @@ Compliance envelope (spec §4) is unchanged: focus APIs only, verification is
 strictly read-only (GetForegroundWindow / GetAncestor), and no input is injected
 beyond the pre-existing ALT-nudge into our own queue.
 
+ONE deliberate exception to "focus APIs only" (owner-approved; close-all-clients
+spec §3): ``close_window`` posts ``WM_CLOSE`` to a client's top-level window.
+That is a window-management close REQUEST — what a window's own close button
+ends in — and it is not input: no key, no click, nothing addressed to anything
+INSIDE the client. The client decides what to do with it (exit, or put up its
+own "quit?" prompt, which is never answered from here). The binding behind it,
+``_RealUser32.post_close``, takes the hwnd and NOTHING else: the message and
+both of its parameters are hard-coded, so it cannot be repurposed to deliver
+anything but that one request. It is reachable only from ``close_window``,
+which is reachable only from the slide-confirmed Close Clients dialog — never
+from a hotkey, a timer, a chat command or any other automatic path, never
+re-posted, never followed by a force-kill. ``close_window`` also refuses the
+handle values Win32 would fan out to every top-level window on the desktop
+(``_BROADCAST_HWNDS``) before the backend is ever reached. Source tests pin
+the binding, the token count, and that nothing in this module calls either.
+
 UNDER WINE the ladder is DIFFERENT, because four of its rungs are provably
 useless or harmful there (all source-verified against Wine, 2026-09-13):
 
@@ -91,6 +107,18 @@ GA_ROOT = 2
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 
+# The ONE message this module ever posts (module docstring, "ONE deliberate
+# exception"): a close REQUEST to a top-level window.
+WM_CLOSE = 0x0010
+
+# Handle values the message functions do NOT treat as one window: 0xFFFF is
+# HWND_BROADCAST (every top-level window on the desktop), and the all-ones
+# handle is taken as a broadcast too by at least Wine's implementation. A close
+# request must never be able to reach either, so close_window refuses them (and
+# 0 / negatives, which are not single windows) before any backend is touched.
+# Compared on the low 32 bits — the significant part of a handle on Win64.
+_BROADCAST_HWNDS = frozenset((0xFFFF, 0xFFFFFFFF))
+
 
 class _WINDOWPLACEMENT(ctypes.Structure):  # pragma: no cover — live only
     _fields_ = [("length", wintypes.UINT),
@@ -135,6 +163,12 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
         u.GetForegroundWindow.restype = wintypes.HWND
         u.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
         u.GetAncestor.restype = wintypes.HWND
+        # The close REQUEST behind close_window; post_close is its only caller.
+        # argtypes are load-bearing (an undeclared HWND is truncated to 32 bits
+        # on Win64, and LPARAM/WPARAM are pointer-sized).
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+        u.PostMessageW.restype = wintypes.BOOL
         self._u = u
 
     def is_iconic(self, hwnd):
@@ -185,6 +219,17 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
         l, t, r, b = normal_rect
         wp.rcNormalPosition = wintypes.RECT(int(l), int(t), int(r), int(b))
         self._u.SetWindowPlacement(hwnd, ctypes.byref(wp))
+
+    # Takes the hwnd and NOTHING else: the message and both of its parameters
+    # are literals here, so this binding can only ever ask a window to close.
+    # 0 = posted; otherwise the Win32 error (5 = access denied, e.g. an
+    # elevated client; 1400 = no such window), or -1 when Windows named none.
+    # Source-pinned by tests/test_window_activator.py — do not add parameters.
+    def post_close(self, hwnd):
+        ctypes.set_last_error(0)
+        if self._u.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+            return 0
+        return ctypes.get_last_error() or -1
 
 
 _real = None
@@ -638,3 +683,33 @@ def move_window(hwnd: int, x: int, y: int, w: int, h: int, win32=None) -> None:
         u.set_window_placement(hwnd, show_cmd, (x, y, x + w, y + h))
     else:
         u.set_window_pos(hwnd, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER)
+
+
+def close_window(hwnd: int, win32=None) -> int:
+    """Ask ONE top-level window to close (posts ``WM_CLOSE``); never waits.
+
+    A close REQUEST and nothing more — see the module docstring's "ONE
+    deliberate exception". Returns ``0`` when the request was posted (which
+    says nothing about whether the window then closed: the caller watches for
+    that), otherwise the Win32 error code, or ``-1`` when there is none to
+    report. ``-1`` also covers the two cases in which nothing is sent at all:
+
+      * ``hwnd`` is not a single real window handle — 0, negative, not a
+        number, or one of ``_BROADCAST_HWNDS``;
+      * the backend has no ``post_close`` (an injected double, an older duck
+        type) — the ``_show`` getattr-fallback, so a missing method can never
+        raise out of the dialog.
+
+    One call posts at most one request to at most one window. There is no
+    retry, no escalation and no force-kill here or anywhere behind it.
+    """
+    try:
+        hwnd = int(hwnd)
+    except (TypeError, ValueError):
+        return -1
+    if hwnd <= 0 or (hwnd & 0xFFFFFFFF) in _BROADCAST_HWNDS:
+        return -1
+    fn = getattr(win32 or _real_user32(), "post_close", None)
+    if fn is None:
+        return -1
+    return int(fn(hwnd))
