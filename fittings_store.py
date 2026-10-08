@@ -30,6 +30,13 @@ de-dupes fits by `fit_content_hash` (identical parsed content reuses the local
 fit) and remaps ids so incoming doctrine memberships point at the right local
 fit.
 
+The group configuration has a second, stricter way in beside that one, and
+never through it: `validate_share` (module level, total) turns any payload of
+that shape into a clean one or a refusal, and `merge_share` merges a clean
+payload BY NAME — a doctrine the library already has is updated in place (or
+kept), where `import_share` always adds a suffixed copy. `export_doctrines` and
+`import_share` themselves are frozen: `.fctdoc` files work exactly as before.
+
 Thread-safe: every public method that touches `_fits`/`_doctrines`/`_tags` is
 synchronized under an internal `threading.RLock` (mirrors `InfraStore`), so a
 worker-thread ESI push (`push_fit_to_character`) racing a Tk-thread edit cannot
@@ -47,6 +54,7 @@ import json
 import os
 import shutil
 import threading
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import NamedTuple
 from uuid import uuid4
@@ -173,6 +181,321 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Share validation + merge result (the group-configuration path) ────────────
+
+# The most one payload may carry through `validate_share` / `merge_share`. Far
+# above any real library; over either cap the payload is REFUSED, not trimmed.
+MAX_SHARE_FITS = 5000
+MAX_SHARE_DOCTRINES = 500
+# Member tags: a longer tag, and any tag past the count, is dropped (reported).
+MAX_SHARE_TAG_LEN = 40
+MAX_SHARE_MEMBER_TAGS = 12
+
+
+@dataclass
+class MergeResult:
+    """What `merge_share` did, as NAMES (the import report lists them).
+
+    Fits are named as the library calls them, once each: `fits_added` under
+    the incoming name, `fits_reused` under the local name the content already
+    had; a fit declined together with a skipped doctrine is in neither.
+    Doctrines land in exactly one of the four `doctrines_*` lists.
+    `members_dropped` lines read ``"<doctrine> / <fit>: <why>"`` and are
+    recorded only for a doctrine that was written. `orphaned_fits` are local
+    fits a replaced doctrine used before and nothing uses now (kept, never
+    deleted). `tags_added` are member tags appended to the vocabulary."""
+
+    fits_added: list[str] = field(default_factory=list)
+    fits_reused: list[str] = field(default_factory=list)
+    doctrines_added: list[str] = field(default_factory=list)
+    doctrines_updated: list[str] = field(default_factory=list)
+    doctrines_skipped: list[str] = field(default_factory=list)
+    doctrines_unchanged: list[str] = field(default_factory=list)
+    members_dropped: list[str] = field(default_factory=list)
+    orphaned_fits: list[str] = field(default_factory=list)
+    tags_added: list[str] = field(default_factory=list)
+
+
+_FIT_TEXT_FIELDS = ("name", "hull_name", "source", "raw_text", "dna", "notes",
+                    "created", "modified")
+
+
+def _share_text(value) -> str:
+    """Stored text: a str as it is, a stored null as "". Anything else raises."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("not text")
+    return value
+
+
+def _share_int(value, optional: bool = False):
+    """A real int (a JSON true/false is not a number here), or None where a
+    stored null is legal. Anything else raises."""
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("not a number")
+    return value
+
+
+def _share_fit(raw) -> dict:
+    """One incoming fit as a clean `fit_to_dict` dict; raises on anything this
+    build could not store as a fit.
+
+    `fit_from_dict` decides the shape; on top of it every field must have the
+    type the library holds, because a merged fit is written to the library
+    verbatim. Type IDS are not looked up — a hull or module no build knows
+    travels as it is. In-game fitting ids never travel (and are dropped before
+    parsing, so a garbage value there cannot cost the fit)."""
+    if not isinstance(raw, dict):
+        raise ValueError("not an object")
+    fit = fit_from_dict({**raw, "esi_fitting_ids": {}})
+    if not isinstance(fit.id, str) or not fit.id:
+        raise ValueError("no id")
+    for attr in _FIT_TEXT_FIELDS:
+        setattr(fit, attr, _share_text(getattr(fit, attr)))
+    _share_int(fit.hull_type_id)
+    parsed = fit.parsed
+    _share_int(parsed.ship_type_id)
+    parsed.ship_name = _share_text(parsed.ship_name)
+    if parsed.name_hint is not None:
+        _share_text(parsed.name_hint)
+    for module in parsed.modules:
+        _share_int(module.type_id)
+        module.name = _share_text(module.name)
+        _share_int(module.charge_type_id, optional=True)
+        if module.charge_name is not None:
+            _share_text(module.charge_name)
+        if not isinstance(module.slot, str) or not isinstance(module.offline, bool):
+            raise ValueError("not a module")
+    for stack in (*parsed.drones, *parsed.cargo):
+        _share_int(stack.type_id)
+        stack.name = _share_text(stack.name)
+        _share_int(stack.quantity, optional=True)    # a stored null is real data
+    for subsystem in parsed.subsystems:
+        _share_int(subsystem)
+    fit_content_hash(parsed)       # the merge de-dupes on it: it must compute
+    return fit_to_dict(fit)
+
+
+def _share_seed_target(value) -> int | None:
+    """A seed target (0 = "don't seed" is a real value); garbage = inherit."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _share_exemption_ok(entry) -> bool:
+    """A tagged-union exemption entry: a `kind`, and a well-typed id / name
+    when it carries them."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
+        return False
+    eid, name = entry.get("id"), entry.get("name")
+    if eid is not None and (isinstance(eid, bool) or not isinstance(eid, int)):
+        return False
+    return name is None or isinstance(name, str)
+
+
+_EXEMPTION_KEYS = ("kind", "id", "name")
+
+
+def _share_member_tags(raw_tags) -> tuple[list[str], bool]:
+    """One slot's tags as they may be stored, plus whether a bound cut any.
+
+    Text only, stripped, blank ones dropped; legacy names renamed and
+    duplicates folded AFTER stripping. A tag over `MAX_SHARE_TAG_LEN` is
+    dropped whole (cut short it would be a tag nobody chose), and so is every
+    tag past the first `MAX_SHARE_MEMBER_TAGS`. Not a list => no tags (the
+    model's `list()` would turn a stray string into one tag per character)."""
+    if not isinstance(raw_tags, list):
+        return [], False
+    stripped = [t.strip() for t in raw_tags if isinstance(t, str)]
+    tags = _migrate_tag_list(
+        [t for t in stripped if t and len(t) <= MAX_SHARE_TAG_LEN])
+    cut = (any(len(t) > MAX_SHARE_TAG_LEN for t in stripped)
+           or len(tags) > MAX_SHARE_MEMBER_TAGS)
+    return tags[:MAX_SHARE_MEMBER_TAGS], cut
+
+
+def _share_doctrine(
+    raw, fit_ids: set[str], migrate_cc: bool
+) -> tuple[dict, int, bool]:
+    """One incoming doctrine as a clean `doctrine_to_dict` dict, plus how many
+    of its slots named a fit that is not in the file, plus whether a tag bound
+    cut any member tag (`_share_member_tags`). Raises when it is not a
+    doctrine (`doctrine_from_dict` refuses it, or it has no name).
+
+    The name is stored stripped. A slot keeps every fit that IS in the file:
+    an unknown refit is dropped, an unknown active fit hands the slot to its
+    first surviving refit, and a slot with nothing left is dropped. The
+    store's own slot shape is restored on the way (`fit_id in refits`, no
+    duplicates, one fit = a plain member). Which refit is active, hulls and
+    cross-slot collisions are `merge_share`'s business. Wrong-typed optional
+    fields fall back to their defaults."""
+    if not isinstance(raw, dict):
+        raise ValueError("not an object")
+    doctrine = doctrine_from_dict(raw)
+    if not isinstance(doctrine.name, str) or not doctrine.name.strip():
+        raise ValueError("no name")
+    doctrine.name = doctrine.name.strip()
+    for attr in ("id", "description", "created", "modified"):
+        if not isinstance(getattr(doctrine, attr), str):
+            setattr(doctrine, attr, "")
+    doctrine.seed_target = _share_seed_target(doctrine.seed_target)
+
+    exemptions = doctrine.exemptions
+    if isinstance(exemptions, list):
+        # Rebuilt from the keys an entry is made of: whatever else the file
+        # hung on one (nested objects, NaN) never reaches the library.
+        kept = [{key: e[key] for key in _EXEMPTION_KEYS if e.get(key) is not None}
+                for e in exemptions if _share_exemption_ok(e)]
+        # A list that was ALL garbage is no statement; [] means "exempt nothing".
+        exemptions = kept if (kept or not exemptions) else None
+    else:
+        exemptions = None
+    if migrate_cc:
+        # A pre-v2 payload may carry a frozen copy of the pre-5120 default
+        # list: upgrade it exactly as load() and import_share do.
+        upgraded = fleet_guidance.upgrade_pre_command_carrier_exemptions(exemptions)
+        if upgraded is not None:
+            exemptions = upgraded
+    doctrine.exemptions = exemptions
+
+    members: list[DoctrineMember] = []
+    missing = 0
+    tags_cut = False
+    for index, (member, raw_member) in enumerate(
+            zip(doctrine.members, raw.get("members") or [])):
+        # Read the tags off the RAW member (see _share_member_tags).
+        member.tags, cut = _share_member_tags(raw_member.get("tags"))
+        tags_cut = tags_cut or cut
+        if isinstance(member.order, bool) or not isinstance(member.order, int):
+            member.order = index
+        if not isinstance(member.ideal_mode, str):
+            member.ideal_mode = None
+        for attr in ("ideal_min", "ideal_max"):
+            value = getattr(member, attr)
+            if isinstance(value, bool) or not isinstance(value, int):
+                setattr(member, attr, None)
+        member.seed_target = _share_seed_target(member.seed_target)
+
+        known = [f for f in member.refits if isinstance(f, str) and f in fit_ids]
+        refits = list(dict.fromkeys(known))
+        active_known = isinstance(member.fit_id, str) and member.fit_id in fit_ids
+        if len(known) != len(member.refits) or not active_known:
+            missing += 1
+        if active_known:
+            if refits and member.fit_id not in refits:
+                refits.insert(0, member.fit_id)      # as _normalise_slot does
+        elif refits:
+            member.fit_id = refits[0]
+        else:
+            continue
+        member.refits = refits if len(refits) > 1 else []
+        members.append(member)
+    doctrine.members = members
+    return doctrine_to_dict(doctrine), missing, tags_cut
+
+
+def validate_share(payload) -> tuple[dict | None, list[str]]:
+    """Check a share payload (`.fctdoc`-shaped: ``{schema_version, fits[],
+    doctrines[]}``, either list optional) before it may be merged.
+
+    Returns ``(clean, problems)``. `clean` is None when the payload is refused
+    as a whole — then `problems` is the one reason: ``"not a fittings
+    payload"``, ``"made with a newer fittings format"``, ``"too many fits"`` or
+    ``"too many doctrines"``. Otherwise `clean` is a NEW payload
+    ``{"schema_version": SCHEMA_VERSION, "fits": [...], "doctrines": [...]}``
+    holding only what survived, and `problems` says what did not:
+
+    * a fit that is not a fit (or repeats an id) — ``"fit <n>: ..."``, by its
+      1-based position; every surviving fit has ``esi_fitting_ids == {}``;
+    * a doctrine that is not a doctrine — ``"doctrine <n>: ..."``;
+    * a doctrine whose name (stripped) an earlier one in the file already has
+      — ``"doctrine <n>: duplicate name '<name>'"``; the later one is DROPPED,
+      so a merge by name is well-defined and can never land on some other
+      doctrine of the importer's;
+    * a slot naming a fit that is not in the file — one line per slot (see
+      `_share_doctrine`; a doctrine left with no member is kept);
+    * member tags over a bound (`MAX_SHARE_TAG_LEN`, `MAX_SHARE_MEMBER_TAGS`)
+      — dropped, one line per doctrine.
+
+    Doctrine names and member tags are stored stripped, legacy tag names are
+    renamed, exemption entries keep only `kind` / `id` / `name`, and a pre-v2
+    payload's default exemption list is upgraded as `import_share` does.
+
+    TOTAL: any input, never raises, never edits `payload`. Idempotent:
+    ``validate_share(clean) == (clean, [])``."""
+    try:
+        return _validate_share(payload)
+    except Exception:                                 # the contract, not a hope
+        return None, ["not a fittings payload"]
+
+
+def _validate_share(payload) -> tuple[dict | None, list[str]]:
+    if not isinstance(payload, dict):
+        return None, ["not a fittings payload"]
+    version = payload.get("schema_version")
+    if (isinstance(version, int) and not isinstance(version, bool)
+            and version > SCHEMA_VERSION):
+        return None, ["made with a newer fittings format"]
+    raw_fits = payload.get("fits")
+    if not isinstance(raw_fits, list):
+        raw_fits = []
+    raw_doctrines = payload.get("doctrines")
+    if not isinstance(raw_doctrines, list):
+        raw_doctrines = []
+    if len(raw_fits) > MAX_SHARE_FITS:
+        return None, ["too many fits"]
+    if len(raw_doctrines) > MAX_SHARE_DOCTRINES:
+        return None, ["too many doctrines"]
+
+    problems: list[str] = []
+    fits: list[dict] = []
+    fit_ids: set[str] = set()
+    for index, raw in enumerate(raw_fits, 1):
+        try:
+            entry = _share_fit(raw)
+            if entry["id"] in fit_ids:
+                raise ValueError("repeated id")
+        except Exception:
+            problems.append(f"fit {index}: not a valid fit")
+            continue
+        fit_ids.add(entry["id"])
+        fits.append(entry)
+
+    migrate_cc = _stored_schema_version(payload) < _CC_EXEMPTIONS_MIGRATED_VERSION
+    doctrines: list[dict] = []
+    seen_names: set[str] = set()
+    for index, raw in enumerate(raw_doctrines, 1):
+        try:
+            entry, missing, tags_cut = _share_doctrine(raw, fit_ids, migrate_cc)
+        except Exception:
+            problems.append(f"doctrine {index}: not a valid doctrine")
+            continue
+        name = entry["name"]
+        if name in seen_names:
+            # One doctrine per name: the merge matches by name, so the second
+            # copy would overwrite the first. The earlier one stands.
+            problems.append(f"doctrine {index}: duplicate name '{name}'")
+            continue
+        seen_names.add(name)
+        problems.extend(
+            [f"{name}: a slot names a fit that is not in the file"] * missing)
+        if tags_cut:
+            problems.append(
+                f"{name}: member tags dropped (at most {MAX_SHARE_MEMBER_TAGS} "
+                f"per member, {MAX_SHARE_TAG_LEN} characters each)")
+        doctrines.append(entry)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "fits": fits,
+        "doctrines": doctrines,
+    }, problems
+
+
 class FittingsStore:
     """In-memory fit/doctrine library backed by an atomic JSON file.
 
@@ -220,9 +543,7 @@ class FittingsStore:
         the one-time Command Carrier exemption upgrade."""
         with self._lock:
             if not os.path.exists(self.path):
-                self._fits = {}
-                self._doctrines = {}
-                self._tags = list(DEFAULT_TAGS)
+                self.load_data(None)
                 return
             try:
                 with open(self.path, encoding="utf-8") as f:
@@ -249,6 +570,33 @@ class FittingsStore:
                         self.path,
                         backup,
                     )
+                self.load_data(None)
+                return
+            if data is None:
+                # A file holding a bare JSON `null` is a wrong-shaped library,
+                # not a missing one. None is load_data's "empty library" signal,
+                # so passing it through would turn this file into a silent empty
+                # store; it keeps failing the way every other non-object top
+                # level ([], 5, "x") does, exactly as it did before load_data
+                # existed — down to what it leaves behind in a store that was
+                # already populated: the fits were reset before `data.get`
+                # raised, the doctrines and tags had not been reached.
+                self._fits = {}
+                raise AttributeError("'NoneType' object has no attribute 'get'")
+            self.load_data(data)
+
+    def load_data(self, data: dict | None) -> None:
+        """Load the library from an already-parsed payload — everything
+        `load` does once the file has been read, and nothing that touches a
+        file (`self.path` is only named in log lines).
+
+        ``None`` is "no library": empty, with the default tag vocabulary.
+        A dict is read exactly as `load` reads the file's JSON object:
+        per-entry tolerance, then the in-memory migrations. `dump` is the
+        inverse. The group-configuration import uses the pair to run a library
+        through the store without a file of its own."""
+        with self._lock:
+            if data is None:
                 self._fits = {}
                 self._doctrines = {}
                 self._tags = list(DEFAULT_TAGS)
@@ -337,6 +685,20 @@ class FittingsStore:
                 if new_tags != member.tags:
                     member.tags = new_tags
 
+    def dump(self) -> dict:
+        """The payload `save` writes, as a fresh structure: the library file's
+        JSON object, keys in file order. A read — no revision bump, no write.
+        `load_data` is the inverse."""
+        with self._lock:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "fits": {fid: fit_to_dict(fit) for fid, fit in self._fits.items()},
+                "doctrines": {
+                    did: doctrine_to_dict(d) for did, d in self._doctrines.items()
+                },
+                "tags": list(self._tags),
+            }
+
     def save(self) -> None:
         """Atomically persist the library (temp file + fsync + os.replace).
 
@@ -351,14 +713,7 @@ class FittingsStore:
             # already been mutated by the caller, so the revision must advance even
             # if persistence later fails — consumers memoise off in-memory state.
             self._rev += 1
-            payload = {
-                "schema_version": SCHEMA_VERSION,
-                "fits": {fid: fit_to_dict(fit) for fid, fit in self._fits.items()},
-                "doctrines": {
-                    did: doctrine_to_dict(d) for did, d in self._doctrines.items()
-                },
-                "tags": list(self._tags),
-            }
+            payload = self.dump()
             parent = os.path.dirname(self.path)
             if parent and not os.path.isdir(parent):
                 os.makedirs(parent, exist_ok=True)
@@ -1216,6 +1571,215 @@ class FittingsStore:
                 doctrines_added += 1
 
             return ImportSummary(fits_added, fits_reused, doctrines_added)
+
+    # ── Group-configuration merge (beside import_share, never through it) ─────
+
+    def merge_share(
+        self, payload: dict, *, on_conflict: str = "theirs"
+    ) -> MergeResult:
+        """Merge a share payload into the library BY NAME, all or nothing.
+
+        The payload goes through `validate_share` first; one it refuses as a
+        whole raises ``ValueError`` with the reason and nothing is touched.
+        After that `_fits`, `_doctrines` and `_tags` are snapshotted, and
+        restored before re-raising if anything below fails — the library is
+        either merged or exactly as it was. Does NOT save: the caller does.
+
+        * **Fits** — a fit whose content hash a local fit already has is that
+          local fit (its id, its name, its in-game fitting ids); any other is
+          added under a new id. Two incoming fits with one content are one.
+          Under "mine", a fit that ONLY skipped doctrines name is declined
+          with them — not added, not reported; a fit a written doctrine
+          names, or no doctrine at all, is handled as always.
+        * **Doctrines** — matched by exact name against the FIRST local
+          doctrine of that name. No match: added under a new id. A match and
+          ``on_conflict`` "mine" (blanks and case aside): skipped. A match
+          otherwise ("theirs", the default, and any other value): replaced in
+          place — the local `id` and `created` stay, so everything holding
+          the doctrine by id or by name still finds it — unless nothing
+          differs. Which refit of a slot is ACTIVE is the importer's own
+          state and no difference (`_same_slots`).
+        * **Slots** — fit ids are remapped. A fit an earlier slot of the same
+          doctrine already flies is dropped from the later one; a refit on
+          another hull than the slot's first surviving fit is dropped; on a
+          doctrine that is WRITTEN the active fit is the first survivor (the
+          default: a share does not carry which refit someone happened to
+          have active); one survivor is a plain member; none drops the slot.
+          `order` travels as it is.
+        * **Tags** — a member tag the vocabulary lacks is appended to it
+          (otherwise the next tag edit would strip it silently).
+
+        Slot drops, new tags and orphans are reported for doctrines this call
+        WROTE; a skipped or unchanged doctrine reports nothing. See
+        `MergeResult`."""
+        clean, problems = validate_share(payload)
+        if clean is None:
+            raise ValueError(problems[0] if problems else "not a fittings payload")
+        keep_mine = str(on_conflict).strip().lower() == "mine"
+        result = MergeResult()
+        with self._lock:
+            snapshot = (copy.deepcopy(self._fits), copy.deepcopy(self._doctrines),
+                        list(self._tags))
+            try:
+                stamp = _now()
+
+                # Doctrines are matched by name, first local match.
+                first_by_name: dict[str, Doctrine] = {}
+                for local in self._doctrines.values():
+                    first_by_name.setdefault(local.name, local)
+
+                # "Keep mine" declines a doctrine whole: the fits only such
+                # doctrines name (as a slot's fit or a refit) stay out too,
+                # or they would land in the library as orphans.
+                declined: set[str] = set()         # payload fit ids
+                if keep_mine:
+                    wanted: set[str] = set()
+                    for raw_doctrine in clean["doctrines"]:
+                        named = (declined if raw_doctrine["name"] in first_by_name
+                                 else wanted)
+                        for raw_member in raw_doctrine["members"]:
+                            named.add(raw_member["fit_id"])
+                            named.update(raw_member.get("refits") or ())
+                    declined -= wanted
+
+                # Fits: content-hash de-dupe against the library and each other.
+                local_by_hash: dict[str, str] = {}
+                for local_id, local_fit in self._fits.items():
+                    local_by_hash.setdefault(
+                        fit_content_hash(local_fit.parsed), local_id)
+                id_map: dict[str, str] = {}        # payload fit id -> local fit id
+                names: dict[str, str] = {}         # payload fit id -> its own name
+                reported: set[str] = set()         # local ids already in the result
+                for raw_fit in clean["fits"]:
+                    if raw_fit["id"] in declined:
+                        continue
+                    incoming = fit_from_dict(raw_fit)
+                    names[incoming.id] = incoming.name
+                    content = fit_content_hash(incoming.parsed)
+                    local_id = local_by_hash.get(content)
+                    if local_id is None:
+                        local_id = uuid4().hex
+                        id_map[incoming.id] = local_id
+                        incoming.id = local_id
+                        incoming.esi_fitting_ids = {}
+                        incoming.created = incoming.modified = stamp
+                        self._fits[local_id] = incoming
+                        local_by_hash[content] = local_id
+                        reported.add(local_id)
+                        result.fits_added.append(incoming.name)
+                        continue
+                    id_map[incoming.id] = local_id
+                    if local_id not in reported:
+                        reported.add(local_id)
+                        result.fits_reused.append(self._fits[local_id].name)
+
+                # Doctrines.
+                released: list[str] = []           # fits replaced doctrines flew
+                for raw_doctrine in clean["doctrines"]:
+                    incoming = doctrine_from_dict(raw_doctrine)
+                    local = first_by_name.get(incoming.name)
+                    if local is not None and keep_mine:
+                        result.doctrines_skipped.append(incoming.name)
+                        continue
+                    dropped: list[str] = []
+                    members = self._merge_slots(incoming, id_map, names, dropped)
+                    if local is None:
+                        incoming.id = uuid4().hex
+                        incoming.members = members
+                        incoming.created = incoming.modified = stamp
+                        self._doctrines[incoming.id] = incoming
+                        first_by_name[incoming.name] = incoming
+                        result.doctrines_added.append(incoming.name)
+                    elif (local.description == incoming.description
+                          and self._same_slots(local.members, members)
+                          and local.exemptions == incoming.exemptions
+                          and local.seed_target == incoming.seed_target):
+                        result.doctrines_unchanged.append(incoming.name)
+                        continue
+                    else:
+                        released.extend(doctrine_fit_ids(local, True))
+                        local.name = incoming.name
+                        local.description = incoming.description
+                        local.members = members
+                        local.exemptions = incoming.exemptions
+                        local.seed_target = incoming.seed_target
+                        local.modified = stamp
+                        result.doctrines_updated.append(incoming.name)
+                    result.members_dropped.extend(dropped)
+                    for member in members:
+                        for tag in member.tags:
+                            if tag not in self._tags:
+                                self._tags.append(tag)
+                                result.tags_added.append(tag)
+
+                if released:
+                    in_use: set[str] = set()
+                    for doctrine in self._doctrines.values():
+                        in_use.update(doctrine_fit_ids(doctrine, True))
+                    for fit_id in dict.fromkeys(released):
+                        fit = self._fits.get(fit_id)
+                        if fit is not None and fit_id not in in_use:
+                            result.orphaned_fits.append(fit.name)
+            except BaseException:
+                self._fits, self._doctrines, self._tags = snapshot
+                raise
+        return result
+
+    def _merge_slots(
+        self, incoming: Doctrine, id_map: dict[str, str],
+        names: dict[str, str], dropped: list[str],
+    ) -> list[DoctrineMember]:
+        """`incoming`'s slots remapped onto local fit ids, by `merge_share`'s
+        slot rules; every fit left out for a reason is appended to `dropped`.
+
+        `dataclasses.replace` carries every other slot field across, so a
+        field added to `DoctrineMember` later travels without being named
+        here (the field-drop hazard `import_share` documents)."""
+        slots: list[DoctrineMember] = []
+        claimed: set[str] = set()                  # local ids earlier slots fly
+        for member in incoming.members:
+            survivors: list[str] = []
+            hull = None
+            for old_id in (member.refits or [member.fit_id]):
+                local_id = id_map.get(old_id)
+                if local_id is None or local_id in survivors:
+                    continue                       # not in the file / its own twin
+                label = f"{incoming.name} / {names.get(old_id, '')}"
+                if local_id in claimed:
+                    dropped.append(f"{label}: same fit as an earlier slot")
+                    continue
+                fit_hull = self._fits[local_id].hull_type_id
+                if not survivors:
+                    hull = fit_hull
+                elif fit_hull != hull:
+                    dropped.append(f"{label}: refit on another hull")
+                    continue
+                survivors.append(local_id)
+            if not survivors:
+                continue
+            claimed.update(survivors)
+            slots.append(replace(
+                member,
+                fit_id=survivors[0],
+                tags=_migrate_tag_list(member.tags),
+                refits=survivors if len(survivors) > 1 else [],
+            ))
+        return slots
+
+    @staticmethod
+    def _same_slots(mine: list[DoctrineMember], theirs: list[DoctrineMember]) -> bool:
+        """Whether a local doctrine's slots already ARE the incoming ones.
+
+        Which refit of a slot is active is not compared: a share does not
+        carry it (`_merge_slots` always hands over the first), it is the
+        importer's own state, so on its own it is no reason to rewrite the
+        doctrine and reset it. Only a sound local slot gets that pass — one
+        whose active fit is not among its refits differs, and the rewrite
+        normalises it."""
+        return len(mine) == len(theirs) and all(
+            (replace(a, fit_id=b.fit_id) == b and a.fit_id in a.refits)
+            if a.refits else a == b
+            for a, b in zip(mine, theirs))
 
     @staticmethod
     def _unique_name(name: str, existing: set[str]) -> str:
