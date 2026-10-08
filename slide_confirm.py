@@ -30,8 +30,9 @@ The contract — every rule is here because its absence is an accident path:
   mapped is never armed at all. The check FAILS CLOSED: it is written "refuse
   unless elapsed >= delay", so a clock that returns NaN or runs backwards can
   never arm the control early. The model refuses, at construction, a
-  threshold outside ``(0, 1]`` (0 would let a bare click confirm) and a
-  negative arm delay, for the same reason.
+  threshold outside ``(0, 1]`` (0 would let a bare click confirm), a
+  negative arm delay, and — for either — anything that is not a finite real
+  number (NaN, an infinity, a ``bool``, a string), for the same reason.
 * **The handle follows the pointer with the grab offset preserved**, clamped
   to the track. Without the offset the handle would jump by up to its own
   width at the press, which is free progress nobody dragged.
@@ -48,16 +49,26 @@ The contract — every rule is here because its absence is an accident path:
   confirmed). The band is in track heights, so it scales with the font and
   ``tk scaling``, and is wide enough that an ordinary sloppy sideways drag
   never trips it.
+  **A RELEASE outside the band cancels too**, with or without a motion event
+  before it. WHY: Tk does not guarantee a ``<B1-Motion>`` between the last
+  in-band motion and the button-up — under a grab it can deliver
+  ``<ButtonRelease-1>`` at a new point with no motion in between, and after
+  a lost button-up it manufactures a release at wherever the pointer then
+  is — so a band rule that lived in the motion handler alone let "drag
+  across, then let go far away" CONFIRM. One helper (``_in_band``) answers
+  for both handlers, so the two can never disagree about where the band is.
 * **Confirm fires on RELEASE, with progress >= 0.9.** Never on motion: the
   user can drag all the way, think better of it, drag back and let go.
-  Progress is the LAST DRAG position — the release event's own coordinates are
-  deliberately not consulted, so a release carrying a stale or odd position
-  cannot push a short drag over the line.
+  Progress is the LAST DRAG position. The release event's own position is
+  consulted ONLY TO CANCEL (its ``y``, against the band above) — never to
+  move the handle, so a release carrying a stale or odd position cannot push
+  a short drag over the line. A release that carries no position at all
+  (``None``, or an event without ``y``) is judged on the last drag alone.
 * **Everything else resets to 0**: a release short of the threshold, a press
   while already pressed (a release was lost — the gesture is no longer one
-  continuous drag), a vertical stray (above), a focus loss mid-drag (alt-tab,
-  a toast, another dialog). A half-dragged handle is never left "primed" for
-  a later nudge to finish.
+  continuous drag), a vertical stray in motion or at the release (above), a
+  focus loss mid-drag (alt-tab, a toast, another dialog). A half-dragged
+  handle is never left "primed" for a later nudge to finish.
 * **One-shot.** Confirm LOCKS the model; no later press, drag, release or
   cancel changes it, so ``on_confirm`` runs at most once per control.
   ``on_confirm`` is the LAST statement of the release path because the caller
@@ -112,6 +123,21 @@ MIN_TRAVEL_PX = 160
 REF_SCALING = 1.33
 
 
+def _finite_number(name, value):
+    """``value`` if it is a finite real number; ``ValueError`` otherwise.
+
+    A ``bool`` is refused although it is an ``int`` (``threshold=True`` would
+    read as 1), and so is anything that is not an ``int`` or ``float`` — which
+    would otherwise surface later as a ``TypeError`` from a comparison. The
+    chained compare is False for NaN and for both infinities, and never
+    overflows on a huge ``int``."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not (-math.inf < value < math.inf)):
+        raise ValueError(
+            f"slide needs a finite number for {name} (got {value!r})")
+    return value
+
+
 class SlideModel:
     """The gesture state machine — pure: no Tk, and no time but ``clock()``.
 
@@ -124,9 +150,11 @@ class SlideModel:
     passed on ``clock``, every press is refused. A model that is never armed
     never accepts a press.
 
-    ``threshold`` must be in ``(0, 1]`` and ``arm_delay_s`` must be ``>= 0``
-    (``ValueError`` otherwise). Every range check here is written as "refuse
-    unless provably inside", so a NaN fails it — the model fails CLOSED.
+    ``threshold`` must be in ``(0, 1]`` and ``arm_delay_s`` must be ``>= 0``,
+    and both must be finite real numbers — not NaN, not an infinity, not a
+    ``bool``, not a string (``ValueError`` otherwise, in every case). Every
+    range check here is written as "refuse unless provably inside", so a NaN
+    fails it — the model fails CLOSED.
     """
 
     def __init__(self, track_px, handle_px, *, threshold=THRESHOLD,
@@ -135,6 +163,8 @@ class SlideModel:
             raise ValueError(
                 f"slide needs 0 < handle_px < track_px "
                 f"(got handle_px={handle_px!r}, track_px={track_px!r})")
+        _finite_number("threshold", threshold)
+        _finite_number("arm_delay_s", arm_delay_s)
         # threshold 0 would make a bare click (progress 0 >= 0) a confirm, and
         # one above 1 could never be reached; NaN fails the chained compare.
         if not (0 < threshold <= 1):
@@ -358,8 +388,10 @@ class SlideToConfirm(tk.Canvas):
 
     Test seams (an API, not a tidy-up target): ``model`` and the handlers
     ``_on_map`` / ``_on_press`` / ``_on_drag`` / ``_on_release`` /
-    ``_on_focus_out``, each taking an event that needs only ``.x`` / ``.y``;
-    ``handle_rect()``; ``geo``; the item ids ``_track_id``, ``_trail_id``,
+    ``_on_focus_out``, each taking an event that needs only ``.x`` / ``.y``
+    (``_on_release`` reads ``.y`` alone, and also takes ``None`` or an event
+    without one — "no position"); ``handle_rect()``; ``geo``; the item ids
+    ``_track_id``, ``_trail_id``,
     ``_label_id``, ``_handle_id``, ``_glyph_id``. Handlers are driven directly
     in tests: ``<Map>`` never fires under a withdrawn root and
     ``event_generate`` reaches no unmapped widget (map/facts.md).
@@ -442,13 +474,22 @@ class SlideToConfirm(tk.Canvas):
             self.model.cancel()
         self._redraw()
 
+    def _in_band(self, y) -> bool:
+        """Is pointer ``y`` inside the vertical band a held drag may use —
+        ``DRIFT_TRACKS`` track heights above or below the track?
+
+        THE band test: ``_on_drag`` and ``_on_release`` both ask here and
+        nowhere else, so the two can never disagree. Chained compare,
+        answered as "provably inside": a NaN ``y`` fails it, and the caller
+        cancels — fail closed."""
+        h = self.geo.track_h
+        return -DRIFT_TRACKS * h <= y < (1 + DRIFT_TRACKS) * h
+
     def _on_drag(self, event):
         # Tk delivers <B1-Motion> to the pressed widget wherever the pointer
         # is, so "pulled away" has to be decided here (module docstring:
-        # "Straying vertically cancels"). Chained compare: a NaN y fails it
-        # and cancels — fail closed.
-        h = self.geo.track_h
-        if -DRIFT_TRACKS * h <= event.y < (1 + DRIFT_TRACKS) * h:
+        # "Straying vertically cancels").
+        if self._in_band(event.y):
             self.model.drag(event.x)
         else:
             # Drops the press too: coming back with the button still held
@@ -456,7 +497,18 @@ class SlideToConfirm(tk.Canvas):
             self.model.cancel()
         self._redraw()
 
-    def _on_release(self, _event=None):
+    def _on_release(self, event=None):
+        # A release that is ITSELF outside the band is a pulled-away release,
+        # whether or not a <B1-Motion> got there first: Tk does not guarantee
+        # a motion event before the button-up (module docstring). The release
+        # position is consulted ONLY to cancel — never to move the handle, so
+        # it cannot help a short drag over the line. No position at all (None,
+        # or an event without ``y``) = judged on the last drag alone.
+        # cancel() BEFORE release(): the press is dropped, so release() then
+        # answers "ignored" and nothing confirms.
+        y = getattr(event, "y", None)
+        if y is not None and not self._in_band(y):
+            self.model.cancel()
         verdict = self.model.release()
         self._redraw()
         if verdict == CONFIRM:
