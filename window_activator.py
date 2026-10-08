@@ -3,7 +3,7 @@ Focus-change ladder verified vs EVE-O (SetForegroundWindow+restore is its entire
 mechanism) + documented SetForegroundWindow rules (caller received last input =
 allowed, which is our click/hotkey situation). ALT-nudge injects an ALT press into
 OUR OWN input queue only — never targeted at any client window. AttachThreadInput
-deliberately omitted (deadlock-prone). One call = one focus change; no exceptions.
+deliberately omitted (deadlock-prone). One ``activate`` = one focus change, always.
 
 ``activate`` is HONEST about the outcome (it used to ``return True`` on every
 path, which made a failed switch invisible, unretried and unlogged while the
@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import operator
 import threading
 import time
 from ctypes import wintypes
@@ -116,7 +117,11 @@ WM_CLOSE = 0x0010
 # handle is taken as a broadcast too by at least Wine's implementation. A close
 # request must never be able to reach either, so close_window refuses them (and
 # 0 / negatives, which are not single windows) before any backend is touched.
-# Compared on the low 32 bits — the significant part of a handle on Win64.
+# Compared on the low 32 bits — the significant part of a handle on Win64, and
+# what is left of a wider number once it is narrowed to one. For the same
+# reason close_window also refuses anything whose low 32 bits are ZERO (a wrap
+# onto NULL: posted there, the message is a thread message to FCTool itself
+# and the post reports success) and anything wider than 64 bits.
 _BROADCAST_HWNDS = frozenset((0xFFFF, 0xFFFFFFFF))
 
 
@@ -694,22 +699,37 @@ def close_window(hwnd: int, win32=None) -> int:
     that), otherwise the Win32 error code, or ``-1`` when there is none to
     report. ``-1`` also covers the two cases in which nothing is sent at all:
 
-      * ``hwnd`` is not a single real window handle — 0, negative, not a
-        number, or one of ``_BROADCAST_HWNDS``;
+      * ``hwnd`` is not ONE real window handle. Only a true integer is
+        accepted — nothing is coerced, so a float, a string and a bool are
+        refused — and it must be positive, fit in 64 bits, and have low 32
+        bits (the significant part of a handle) that are neither zero nor one
+        of ``_BROADCAST_HWNDS``. A number that would WRAP onto NULL or onto a
+        broadcast handle when narrowed is refused like the value it wraps to;
       * the backend has no ``post_close`` (an injected double, an older duck
         type) — the ``_show`` getattr-fallback, so a missing method can never
         raise out of the dialog.
 
+    Every refusal happens before a backend is even looked up, and the same
+    way on Windows and under Wine (there is no Wine branch in here). An
+    injected ``win32`` is used whenever one was given, falsy or not: only
+    ``None`` means the real backend.
+
     One call posts at most one request to at most one window. There is no
     retry, no escalation and no force-kill here or anywhere behind it.
     """
+    if isinstance(hwnd, bool):                 # an int subclass, not a handle
+        return -1
     try:
-        hwnd = int(hwnd)
-    except (TypeError, ValueError):
+        hwnd = operator.index(hwnd)            # true integers only: no coercion
+    except TypeError:
         return -1
-    if hwnd <= 0 or (hwnd & 0xFFFFFFFF) in _BROADCAST_HWNDS:
+    if hwnd <= 0 or hwnd >> 64:
         return -1
-    fn = getattr(win32 or _real_user32(), "post_close", None)
+    low = hwnd & 0xFFFFFFFF
+    if low == 0 or low in _BROADCAST_HWNDS:
+        return -1
+    u = win32 if win32 is not None else _real_user32()
+    fn = getattr(u, "post_close", None)
     if fn is None:
         return -1
     return int(fn(hwnd))
