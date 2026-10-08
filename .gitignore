@@ -32,6 +32,15 @@ fit_types_cache.json
 # owner's REAL alliance/corp ID -> ticker data resolved from ESI; must never be
 # committable (it is user data, not source).
 owner_tickers.json
+# Group configuration (group_state.py / palette.py): the active palette, the
+# import history + attention flags, the staged-import protocol files, the
+# pre-import backups and exported group files. All user data, never source.
+ui_palette.json
+group_config_state.json
+group_import_pending.json
+group_import_applying.json
+backups/
+*.fctg
 
 # Runtime log (rotating file handler in app_log.py)
 fctool.log
