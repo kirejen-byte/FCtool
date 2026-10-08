@@ -701,10 +701,12 @@ def close_window(hwnd: int, win32=None) -> int:
 
       * ``hwnd`` is not ONE real window handle. Only a true integer is
         accepted — nothing is coerced, so a float, a string and a bool are
-        refused — and it must be positive, fit in 64 bits, and have low 32
-        bits (the significant part of a handle) that are neither zero nor one
-        of ``_BROADCAST_HWNDS``. A number that would WRAP onto NULL or onto a
-        broadcast handle when narrowed is refused like the value it wraps to;
+        refused, and so is an object whose ``__index__`` raises (whatever it
+        raises: nothing propagates) — and it must be positive, fit in 64
+        bits, and have low 32 bits (the significant part of a handle) that
+        are neither zero nor one of ``_BROADCAST_HWNDS``. A number that would
+        WRAP onto NULL or onto a broadcast handle when narrowed is refused
+        like the value it wraps to;
       * the backend has no ``post_close`` (an injected double, an older duck
         type) — the ``_show`` getattr-fallback, so a missing method can never
         raise out of the dialog.
@@ -721,7 +723,7 @@ def close_window(hwnd: int, win32=None) -> int:
         return -1
     try:
         hwnd = operator.index(hwnd)            # true integers only: no coercion
-    except TypeError:
+    except Exception:                          # also an __index__ that raises
         return -1
     if hwnd <= 0 or hwnd >> 64:
         return -1

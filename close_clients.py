@@ -31,7 +31,10 @@ not-the-same readings taken on two different ticks (a ``GONE`` outcome from
 ``close_listed`` is the first of the two); any reading that says "still there",
 and any check that raises, starts the count again. The report errs toward
 "still open": a target with only ONE such reading when the deadline passes is
-reported as still open, never as closed.
+reported as still open, never as closed. Two readings defend against a
+TRANSIENT blind read only: a failure to read that lasts two polls still reads
+as closed, because the production predicate folds "cannot read the title" into
+False.
 
 Identity is the WINDOW, not the label: a listed login screen that has since
 become a character is still the listed window and is still closed; a handle
@@ -260,7 +263,8 @@ class CloseRun:
 
       * a ``GONE`` outcome is the FIRST of the two readings, not a verdict:
         ``closed_count`` is 0 straight after construction even when every
-        outcome is ``GONE``, and such a run is done on its first tick;
+        outcome is ``GONE``, and such a run can be done on its first tick
+        (it is, when every one of them reads not-the-same again);
       * a ``POSTED`` or ``FAILED`` target that goes away needs two ticks
         (a ``FAILED`` one is watched like any other);
       * gone, then seen again, then gone: two MORE ticks;
@@ -366,6 +370,49 @@ def result_lines(run, n_newcomers: int = 0) -> tuple[str, str | None]:
     return headline, detail
 
 
+def closing_line(outcomes) -> str:
+    """ONE sentence for the watch phase: what was ACTUALLY asked at confirm.
+
+    Counted from the outcomes, so it never claims a request that did not go
+    out - the line is on screen for the whole watch, and "every client was
+    asked" is false exactly when the reader most needs the truth (nothing
+    could be posted to an elevated client; everything had already exited):
+
+      * every one ``POSTED``  -> ``Asked all 25 listed clients to close.``
+        (``Asked the listed client to close.`` for one);
+      * some ``POSTED``       -> ``Asked 3 of 5 listed clients to close (1
+        already gone, 1 could not be asked).``;
+      * none, any ``FAILED``  -> ``No close request could be sent.`` (with
+        the same bracket when some were already gone);
+      * none, all ``GONE``    -> ``The listed clients were already gone.``
+    """
+    statuses = [outcome.status for outcome in outcomes]
+    total = len(statuses)
+    posted = statuses.count(POSTED)
+    gone = statuses.count(GONE)
+    failed = statuses.count(FAILED)
+    if not total:
+        return "No client was listed."
+    if posted == total:
+        if total == 1:
+            return "Asked the listed client to close."
+        return "Asked all %d listed clients to close." % total
+    notes = []
+    if gone:
+        notes.append("%d already gone" % gone)
+    if failed:
+        notes.append("%d could not be asked" % failed)
+    why = " (%s)" % ", ".join(notes) if notes else ""
+    if posted:
+        return "Asked %d of %d listed clients to close%s." % (posted, total,
+                                                              why)
+    if failed:
+        return "No close request could be sent%s." % (why if gone else "")
+    if total == 1:
+        return "The listed client was already gone."
+    return "The listed clients were already gone."
+
+
 # ── Tk shell ─────────────────────────────────────────────────────────────────
 # Nothing above this line uses Tk, and nothing below it is needed by the core.
 # The dialog's imports are kept down here with it so the boundary stays visible
@@ -397,9 +444,11 @@ IN_SPACE_WARNING = (
     "Closing a client in space is NOT a Safe Log Off - the ship stays in "
     "space until its log-off timer ends (5 min after NPC aggression, 15 min "
     "after capsuleer aggression).")
-_CLOSING_BODY = (
-    "Each listed client was asked to close. Watching for them to exit - "
-    "Dismiss stops the watch, it does not undo anything.")
+#: The CLOSING body is ``closing_line(outcomes)`` (what was really asked) and
+#: then this, which is true whatever the outcomes were.
+_CLOSING_NOTE = (
+    "FCTool is watching - Dismiss stops the watch, it does not undo "
+    "anything.")
 _ERROR_TITLE = "Close Clients stopped early."
 _ERROR_BODY = (
     "Something went wrong and FCTool stopped watching. Clients that were "
@@ -415,7 +464,8 @@ _LIST_FONT = ("Consolas", 9)
 _BODY_CHARS = 60        # the title/body wrap at about this many body characters
 _COL_GAP_CHARS = 3      # gap between the two list columns, in "0" widths
 _LIST_PADX = 8          # the list's inner padding, px
-_WHEEL_LINES = 3        # list lines per wheel notch
+_LIST_BORDER = 1        # the 1 px frame drawn round the list
+_LABEL_EXTRA_PX = 6     # a tk.Label asks for its text + 6 px (padx 1, bd 2)
 
 
 class _CloseDialog:
@@ -434,7 +484,8 @@ class _CloseDialog:
       ``run``          the ``CloseRun``; None until confirm
       ``error``        None, or the exception TYPE name once a step failed
       ``cancel()``     Cancel / Dismiss / Escape / the window X - one path
-      ``confirm()``    what the slide calls; the ONLY way to ``close_window``
+      ``confirm()``    what the slide calls; the ONLY way to ``close_window``,
+                       and it runs ONCE (latched before the first request)
       ``tick()``       one poll step, without scheduling the next
 
     THE ONLY ROAD TO ``close_window`` IS THE SLIDE. Nothing in here binds a
@@ -455,10 +506,24 @@ class _CloseDialog:
     watch can run for 15 s - so ``confirm`` releases the grab whatever else
     happens in it, including when it fails.
 
+    ONE WIDTH FOR ALL THREE PHASES. The text changes under the FC's pointer
+    (question -> progress -> result) and the list shrinks or goes; the window
+    must not jump sideways with them. ``build`` works out one content width -
+    wide enough for the widest wrapped line, the slide, and the list with ANY
+    subset of its rows - and an invisible strut holds it. Only the HEIGHT
+    follows the content.
+
+    THE DIALOG CLOSES ITSELF IN EXACTLY ONE CASE: every listed client closed
+    AND there is nothing else to read. "All closed, but a client started after
+    the list was made" does NOT auto-close - that sentence is the only notice
+    the FC gets that a client is still running, so it stays until dismissed.
+    So does any result with a client still open, and any failure.
+
     The dialog OWNS its timer. At most one ``after`` job is pending at a time
     (the poll, or the auto-close - never both); it is cancelled on any cancel
     and on the window's own ``<Destroy>``, and every callback checks the
-    window is still there first, so a late one is a no-op.
+    window is still there first, so a late one is a no-op - a stray poll after
+    the watch is over touches nothing, the pending auto-close included.
     """
 
     def __init__(self, win, listed, *, find_clients, still_same, close_window,
@@ -478,8 +543,11 @@ class _CloseDialog:
         self.button = self.title_label = self.body_label = None
         self._list_wrap = self._list_font = None
         self._n_new = 0
+        self._closing_body = ""                 # set at confirm
         self._job = None                        # the ONE pending after id
         self._dead = False
+        self._confirmed = False                 # confirm() is one-shot
+        self._dismiss_logged = False            # "watch dismissed": once
 
     # ── build ────────────────────────────────────────────────────────────────
     def build(self):
@@ -522,7 +590,7 @@ class _CloseDialog:
         # the second column has to sit at a PIXEL position (see _show_list).
         self._list_wrap = tk.Frame(frame, bg=BG_ENTRY,
                                    highlightbackground=BORDER_COLOR,
-                                   highlightthickness=1)
+                                   highlightthickness=_LIST_BORDER)
         self.list_text = tk.Text(
             self._list_wrap, font=_LIST_FONT, wrap="none", height=1, width=1,
             bg=BG_ENTRY, fg=FG_TEXT, cursor="arrow", takefocus=0,
@@ -541,6 +609,14 @@ class _CloseDialog:
             list_px, self.slide.geo.track_w)
         self.title_label.configure(wraplength=wrap_px)
         self.body_label.configure(wraplength=wrap_px)
+        # ... and that IS the content width, in every phase: nothing in the
+        # dialog asks for more (a label is its wrapped text + a fixed margin;
+        # list_px covers the list box for any subset of the rows), and this
+        # strut asks for exactly that much whatever the texts shrink to.
+        # Without it the window follows its widest wrapped line, so "Closed
+        # 25 clients." collapsed it to a stub with Dismiss somewhere else.
+        tk.Frame(frame, width=wrap_px + _LABEL_EXTRA_PX, height=1,
+                 bg=BG_DARK).pack(side=tk.TOP, after=self.body_label)
 
         # add="+" on the toplevel, always: make_modal's <Escape>, the slide's
         # <FocusOut> reset and the host's own <Destroy> all live there, and a
@@ -554,7 +630,7 @@ class _CloseDialog:
     # ── the list ─────────────────────────────────────────────────────────────
     def _show_list(self, rows) -> int:
         """Draw ``rows`` into the list and size it to them; returns the px
-        width the text needs. No rows hides the list altogether.
+        width to RESERVE for the list box. No rows hides the list altogether.
 
         The height is EXACTLY the visible row count (1 client = 1 line), and
         in two-column mode the right cell starts at a pixel TAB STOP measured
@@ -562,7 +638,14 @@ class _CloseDialog:
         is not one cell wide even in a fixed-width font, so padded columns
         would not line up. The width comes from the same pixel measurements
         (rounded UP to the Text's character unit, the width of "0"), so
-        nothing is cut off and the dialog is no wider than it has to be.
+        nothing is cut off and the list is no wider than it has to be.
+
+        The RETURNED width is what the whole box (text, padding, border and
+        the scrollbar when there is one) asks for with these rows OR ANY
+        SUBSET OF THEM: the widest row is allowed for in both columns. DONE
+        redraws the list with only the survivors, which fall into the columns
+        differently - two long names that shared a column can end up side by
+        side - and the dialog's one width (``build``) has to hold then too.
         """
         rows = list(rows)
         cols, visible, scroll = list_layout(len(rows))
@@ -593,7 +676,13 @@ class _CloseDialog:
             self._list_wrap.pack_forget()
         elif not self._list_wrap.winfo_manager():
             self._list_wrap.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
-        return need_px + 2 * _LIST_PADX
+        widest = max(left_px, right_px)
+        reserve_px = (2 * widest + _COL_GAP_CHARS * unit if cols > 1
+                      else widest)
+        bar_px = (self.scrollbar.winfo_reqwidth()
+                  if self.scrollbar is not None else 0)
+        return (-(-reserve_px // unit) * unit + 2 * _LIST_PADX
+                + 2 * _LIST_BORDER + bar_px)
 
     def _set_scrollbar(self, wanted):
         """A scrollbar exists ONLY while two full columns do not fit."""
@@ -608,40 +697,18 @@ class _CloseDialog:
             self.list_text.configure(yscrollcommand="")
             bar.destroy()
 
-    def _pointer_over_list(self, event) -> bool:
-        try:
-            widget = self.win.winfo_containing(event.x_root, event.y_root)
-        except Exception:
-            return False
-        while widget is not None and widget is not self.win:
-            if widget is self._list_wrap:
-                return True
-            widget = getattr(widget, "master", None)
-        return False
+    def _on_wheel(self, _event):
+        """The wheel never leaves the dialog; scrolling the list is Tk's job.
 
-    def _on_wheel(self, event):
-        """Wheel anywhere in the dialog: scroll the list if the POINTER is
-        over it, and never let the gesture leave the dialog.
-
-        Bound on the toplevel because the focus sits on the button, and
-        whether Windows hands the wheel to the focused widget or to the one
-        under the pointer is not settled (map/facts.md) - this makes either
-        answer scroll the list. When the event DID go to the Text or its
-        scrollbar, their class bindings (which run before the toplevel's)
-        have scrolled already, so nothing is added here. The "break" keeps
-        the app's global wheel router from scrolling a tab behind the dialog.
+        Tk hands a wheel event to the widget under the POINTER, whichever
+        window Windows addressed it to (measured on this Tk, 8.6.15, with the
+        focus on the button). So over the list it is the Text's - or the
+        scrollbar's - own class binding that scrolls, once, and anywhere else
+        in the dialog there is nothing to scroll: no scrolling code belongs
+        here. A class binding does not consume the event, though, and the
+        app's global wheel router sits on the "all" tag behind this toplevel's
+        - the "break" keeps it from scrolling a tab behind the dialog.
         """
-        if (self.scrollbar is not None
-                and event.widget is not self.list_text
-                and event.widget is not self.scrollbar
-                and self._pointer_over_list(event)):
-            try:
-                delta = int(event.delta)
-                steps = -int(delta / 120) or (-1 if delta > 0 else 1)
-                if delta:
-                    self.list_text.yview_scroll(steps * _WHEEL_LINES, "units")
-            except (AttributeError, TypeError, ValueError, tk.TclError):
-                pass
         return "break"
 
     # ── small helpers ────────────────────────────────────────────────────────
@@ -709,8 +776,14 @@ class _CloseDialog:
     def cancel(self):
         """Cancel, Dismiss, Escape and the window X. Sends nothing, in any
         phase: before confirm nothing has been asked of any client, and after
-        it this only stops the watch - it cannot undo a request."""
-        if self.phase == PHASE_CLOSING and self.run is not None:
+        it this only stops the watch - it cannot undo a request.
+
+        Safe to call again, and on a window that is already gone: the "watch
+        dismissed" line is logged ONCE per dialog (latched before the logger
+        runs), however many times this is called."""
+        if (self.phase == PHASE_CLOSING and self.run is not None
+                and not self._dismiss_logged):
+            self._dismiss_logged = True
             self._log_counts("watch dismissed")
         self._cancel_job()
         self._release_grab()
@@ -723,13 +796,21 @@ class _CloseDialog:
     def confirm(self):
         """Ask every LISTED client to close, then start watching.
 
-        One-shot (the slide is too; this guards the direct call). The grab is
-        released in a ``finally``: whatever happens to the requests, the app
-        must get its tiles and hotkeys back, and a failure must leave an
-        error line and a working Dismiss - never a stuck, grabbing window.
+        ONE-SHOT, and latched BEFORE anything is sent: the phase only moves
+        on once every request is out, so it cannot be the guard - a
+        collaborator that let the event loop run mid-send (and with it a
+        second confirm) would have every window asked twice. The latch is
+        never cleared, so no later phase, failure or stray call can send
+        again. A window that is already gone sends nothing either.
+
+        The grab is released in a ``finally``: whatever happens to the
+        requests, the app must get its tiles and hotkeys back, and a failure
+        must leave an error line and a working Dismiss - never a stuck,
+        grabbing window.
         """
-        if self.phase != PHASE_CONFIRM or not self._alive():
+        if self._confirmed or not self._alive():
             return
+        self._confirmed = True
         try:
             try:
                 self._n_new = self._count_newcomers()
@@ -756,6 +837,7 @@ class _CloseDialog:
 
     def _enter_closing(self, outcomes):
         self.phase = PHASE_CLOSING
+        self._closing_body = "%s %s" % (closing_line(outcomes), _CLOSING_NOTE)
         self._drop_slide()
         self.button.configure(text="Dismiss")
         self._show_progress()
@@ -770,15 +852,17 @@ class _CloseDialog:
     def _show_progress(self):
         self._set_lines("Closing... %d of %d closed"
                         % (self.run.closed_count, self.run.total),
-                        _CLOSING_BODY, FG_ACCENT)
+                        self._closing_body, FG_ACCENT)
 
     # ── the watch ────────────────────────────────────────────────────────────
     def _poll(self):
         """The ``after`` loop: one ``tick``, then the next poll while the
-        watch is still on. A callback that outlived its window does nothing."""
-        self._cancel_job()      # spent when the timer ran this; harmless then
-        if not self._alive():
+        watch is still on. A callback that outlived its window - or its watch
+        - does NOTHING: once the watch is over the one pending job is the
+        auto-close, and a stray poll must not cancel it."""
+        if self.phase != PHASE_CLOSING or not self._alive():
             return
+        self._cancel_job()      # spent when the timer ran this; harmless then
         if self.tick() == PHASE_CLOSING:
             self._schedule(POLL_MS, self._poll)
 
@@ -811,7 +895,9 @@ class _CloseDialog:
         self._show_list(describe(survivors))
         self._log_counts("finished")
         if not survivors and not detail:
-            # Nothing left to read or to do: get out of the FC's way.
+            # Nothing left to read or to do: get out of the FC's way. With
+            # a detail line (all closed, but a client started after the list
+            # was made) the dialog STAYS - nothing else would tell the FC.
             self._schedule(AUTO_CLOSE_MS, self._auto_close)
 
     def _auto_close(self):
@@ -862,7 +948,10 @@ def open_dialog(parent, clients, *, find_clients, still_same, close_window,
     One dialog, three phases (``_CloseDialog``): CONFIRM - the list, the
     in-space warning, the slide and a Cancel button, under the application
     grab; CLOSING - "Closing... k of N closed", grab released; DONE - closes
-    itself when everything went, otherwise stays and lists what is still open.
+    itself only when every listed client closed and no client started after
+    the list was made; otherwise it stays (listing what is still open, or
+    saying that a newcomer was left running) until dismissed. The window
+    keeps ONE width through all three.
 
     The window is created and handed to ``make_modal`` in THIS function: that
     is the shape ``tests/test_dialog_placement.py`` looks for (the dialog opens
