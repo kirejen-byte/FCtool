@@ -21,6 +21,7 @@ from __future__ import annotations
 BG_DARK = "#1a1a2e"       # window / dialog base
 BG_PANEL = "#16213e"      # framed panels, bars, menus
 BG_ENTRY = "#0f3460"      # entry / text / listbox fields
+BG_SELECT = "#1a5a90"     # hover / selection fill
 
 # ── Foregrounds ─────────────────────────────────────────────────────────────────
 FG_TEXT = "#e0e0e0"       # primary body text
@@ -38,7 +39,7 @@ FG_UNDER = "#ff6666"      # underline / soft-alert accent
 BORDER_COLOR = "#2a2a4a"  # rules, separators, frame borders
 
 __all__ = [
-    "BG_DARK", "BG_PANEL", "BG_ENTRY",
+    "BG_DARK", "BG_PANEL", "BG_ENTRY", "BG_SELECT",
     "FG_TEXT", "FG_DIM", "FG_ACCENT", "FG_GREEN", "FG_RED", "FG_ORANGE",
     "FG_YELLOW", "FG_WHITE", "FG_MAGENTA", "FG_UNDER",
     "BORDER_COLOR",
