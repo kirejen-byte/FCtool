@@ -59,6 +59,15 @@ _OFFLINE_RE = re.compile(r"\s*/offline\s*$", re.IGNORECASE)
 _MUTATION_REF_RE = re.compile(r"\s*\[\d+\]\s*$")  # trailing mutaplasmid ref, e.g. " [1]"
 _DNA_RE = re.compile(r"^\d+(:[\d;_]*)*::")
 
+# Bounds the fit's fitted modules in total; a DNA stack past it goes to cargo.
+MAX_DNA_MODULE_STACK = 255
+
+
+def _clip(token: str, limit: int = 40) -> str:
+    """Shorten a DNA token echoed in a warning so it stays one readable line."""
+    return token if len(token) <= limit else token[:limit] + "..."
+
+
 # Rack order EFT exporters emit blocks in, used only as a fallback when the
 # catalog has no slot for a module type.
 _RACK_ORDER = [SLOT_LOW, SLOT_MED, SLOT_HIGH, SLOT_RIG, SLOT_SUBSYSTEM]
@@ -268,7 +277,7 @@ def parse_dna(text: str, catalog) -> ParseResult:
             try:
                 qty = int(qty_part)
             except ValueError:
-                warnings.append(f"Invalid DNA quantity: {token!r}")
+                warnings.append(f"Invalid DNA quantity: {_clip(token)!r}")
                 continue
         else:
             # A bare id with no quantity — a T3 subsystem reference.
@@ -285,7 +294,7 @@ def parse_dna(text: str, catalog) -> ParseResult:
         try:
             type_id = int(id_part)
         except ValueError:
-            warnings.append(f"Invalid DNA type id: {token!r}")
+            warnings.append(f"Invalid DNA type id: {_clip(token)!r}")
             continue
 
         name = catalog.resolve_name(type_id) or str(type_id)
@@ -307,6 +316,13 @@ def parse_dna(text: str, catalog) -> ParseResult:
         else:
             # A fitted module — expand the stack into individual instances.
             slot = catalog.slot_of(type_id) or ""
+            if qty > MAX_DNA_MODULE_STACK or len(modules) + qty > MAX_DNA_MODULE_STACK:
+                # No hull fits this many in total; never expand an oversized fit.
+                cargo.append(CargoStack(type_id, name, qty))
+                warnings.append(
+                    f"DNA stack too large to be fitted, kept as cargo: {_clip(token)!r}"
+                )
+                continue
             for _ in range(qty):
                 modules.append(
                     ParsedModule(type_id=type_id, name=name, slot=slot)
