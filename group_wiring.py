@@ -136,6 +136,7 @@ CLOSE_GLYPH = chr(0x2715)
 # -- timing ----------------------------------------------------------------------
 BOOT_REPORT_MS = 1500                   # the result of this start's import opens then
 VERIFY_BOOT_MS = 6000                   # the structure check runs then, and after a sign-in
+WRITE_RETRY_MS = 1000                   # a refused side-file write is tried once more then
 
 _LABEL_FONT = ("Consolas", 10)
 _HINT_FONT = ("Consolas", 9)
@@ -375,6 +376,7 @@ class GroupConfigMixin:
     _group_toc_flagged = ()             # the TOC rows that carry a mark
     _group_toc_spacer = None
     _group_verify_inflight = False
+    _group_start_seen = None            # the start's one snapshot of the side file
     # SESSION memory of the structure check - what the side file may have failed to take:
     _group_market_user_set = False      # the user set the market themselves: adopt nothing
     _group_reason_shown = None          # (structure id, reason) of the line raised last
@@ -418,27 +420,38 @@ class GroupConfigMixin:
             pass
 
     # -- the Settings section ------------------------------------------------------------
-    def _group_status_text(self) -> str:
+    def _group_overview(self):
+        """ONE read of the side file for everything a start asks of it - the engine's
+        ``overview``: tag, attention, tasks, the import in effect (with its stamp), and
+        whether the install is fresh. ``None`` when the engine beside this module has no
+        such function (or it failed): every reader then asks its single helper."""
+        ask = getattr(group_apply, "overview", None)
+        seen = _quiet(ask, self._group_dir(), getattr(self, "config", None)) \
+            if callable(ask) else None
+        return seen if isinstance(seen, dict) else None
+
+    def _group_applied(self, seen=None):
+        """The import in effect - ``{"name", "revision", ...}``, with ``at`` when it is
+        known - or ``None``."""
+        if seen is None:
+            seen = self._group_overview()
+        applied = seen.get("applied") if seen is not None \
+            else _quiet(group_apply.applied_bundle, self._group_dir())
+        return applied if isinstance(applied, dict) else None
+
+    def _group_status_text(self, seen=None) -> str:
         """Nothing imported / the import in use / work staged for the next start.
 
-        Reads the side file. The staged file can hold a whole group file: it is looked
-        for by name and never opened."""
-        folder = self._group_dir()
-        if _quiet(os.path.isfile, os.path.join(folder, group_state.PENDING_FILE),
+        Reads the side file (once; not at all with a snapshot ``seen``). The staged file
+        can hold a whole group file: it is looked for by name and never opened."""
+        if _quiet(os.path.isfile, os.path.join(self._group_dir(), group_state.PENDING_FILE),
                   default=False):
             return status_text(True, None)
-        bundle = _quiet(group_apply.applied_bundle, folder)
-        if not isinstance(bundle, dict):
+        applied = self._group_applied(seen)
+        if applied is None:
             return status_text(False, None)
-        day = ""
-        for entry in _quiet(group_apply.history, folder, default=None) or ():
-            if isinstance(entry, dict) and entry.get("status") == "applied" \
-                    and not entry.get("restored"):         # the entry applied_bundle chose
-                stamp = entry.get("at")
-                if isinstance(stamp, str) and _ISO_DAY.fullmatch(stamp[:10]):
-                    day = stamp[:10]
-                break
-        name, revision = bundle.get("name"), bundle.get("revision")
+        name, revision, stamp = applied.get("name"), applied.get("revision"), applied.get("at")
+        day = stamp[:10] if isinstance(stamp, str) and _ISO_DAY.fullmatch(stamp[:10]) else ""
         return status_text(False, (name if isinstance(name, str) else "",
                                    revision if type(revision) is int else 0, day))
 
@@ -462,10 +475,14 @@ class GroupConfigMixin:
             log.exception("group configuration: the Settings section could not be built")
 
     def _group_build_section(self, parent) -> None:
+        # The start's ONE read of the side file. This section is built inside the main
+        # window's own build; the pass right after it (_group_after_build_ui) takes the
+        # same snapshot for the offer, the tag line, the marks and the queued check.
+        seen = self._group_start_seen = self._group_overview()
         self._add_section(parent, SECTION_TITLE, toc_title=TOC_TITLE)
         body = tk.Frame(parent, bg=BG_DARK)
         body.pack(fill=tk.X, padx=20, pady=2)
-        status = tk.Label(body, text=self._group_status_text(), font=_LABEL_FONT, fg=FG_TEXT,
+        status = tk.Label(body, text=self._group_status_text(seen), font=_LABEL_FONT, fg=FG_TEXT,
                           bg=BG_DARK, justify=tk.LEFT, anchor=tk.W,
                           wraplength=_chars_px(body, _LABEL_FONT, _WRAP_CHARS))
         status.pack(anchor=tk.W)
@@ -484,7 +501,8 @@ class GroupConfigMixin:
         row.pack(anchor=tk.W, pady=(2, 0))
         tk.Label(row, text=TAG_LABEL, font=_LABEL_FONT, fg=FG_TEXT, bg=BG_DARK
                  ).pack(side=tk.LEFT)
-        stored = _quiet(group_apply.get_tag, self._group_dir(), default="")
+        stored = seen.get("tag") if seen is not None \
+            else _quiet(group_apply.get_tag, self._group_dir(), default="")
         var = tk.StringVar(master=parent, value=stored if isinstance(stored, str) else "")
         entry = tk.Entry(row, textvariable=var, width=TAG_ENTRY_CHARS, font=_LABEL_FONT,
                          bg=BG_ENTRY, fg=FG_WHITE, insertbackground=FG_WHITE, borderwidth=1,
@@ -605,14 +623,16 @@ class GroupConfigMixin:
                 pass
 
     # -- the first-run offer -------------------------------------------------------------
-    def _build_group_welcome(self) -> None:
+    def _build_group_welcome(self, seen=None) -> None:
         """One strip above the tabs while the install is fresh (spec 9.1): a frame in the
-        main window. Showing it writes nothing."""
+        main window. Showing it writes nothing. ``seen``: the start's snapshot."""
         notebook = getattr(self, "notebook", None)
         if notebook is None or _alive(self._group_welcome_strip) is not None:
             return
-        if not _quiet(group_apply.is_fresh, self._group_dir(),
-                      getattr(self, "config", None), default=False):
+        fresh = seen.get("fresh") if seen is not None \
+            else _quiet(group_apply.is_fresh, self._group_dir(),
+                        getattr(self, "config", None), default=False)
+        if fresh is not True:
             return
         strip = tk.Frame(notebook.master, bg=BG_PANEL)
         try:
@@ -662,24 +682,27 @@ class GroupConfigMixin:
             except tk.TclError:
                 pass
 
-    def _group_tag_tip(self) -> str:
-        bundle = _quiet(group_apply.applied_bundle, self._group_dir())
+    def _group_tag_tip(self, seen=None) -> str:
+        bundle = seen.get("applied") if seen is not None \
+            else _quiet(group_apply.applied_bundle, self._group_dir())
         if isinstance(bundle, dict) and bundle.get("name") \
                 and type(bundle.get("revision")) is int:
             return "Group configuration: %s r%d" % (bundle["name"], bundle["revision"])
         return TAG_TIP
 
-    def _group_tag_refresh(self) -> None:
+    def _group_tag_refresh(self, seen=None) -> None:
         """Draw, redraw or remove the "by <tag>" line under the logo (spec 10.4).
 
         The line never makes the logo block wider than the word "FCTool": the title row
-        measures its slaves, and with no tag the block must be exactly the bare label."""
+        measures its slaves, and with no tag the block must be exactly the bare label.
+        ``seen``: the start's snapshot; without it the side file is read."""
         logo = _alive(getattr(self, "_title_logo", None))
         if logo is None:
             return
         try:
             label = _alive(self._title_tag_label)
-            tag = _quiet(group_apply.get_tag, self._group_dir(), default="")
+            tag = seen.get("tag") if seen is not None \
+                else _quiet(group_apply.get_tag, self._group_dir(), default="")
             brand = next((child for child in logo.pack_slaves() if child is not label), None)
             text = ""
             if isinstance(tag, str) and tag and brand is not None:
@@ -699,7 +722,7 @@ class GroupConfigMixin:
             if int(label.winfo_reqwidth()) > int(brand.winfo_reqwidth()):
                 self._group_tag_drop()                  # never wider, whatever the font did
                 return
-            update_tooltip(label, self._group_tag_tip())
+            update_tooltip(label, self._group_tag_tip(seen))
         except tk.TclError:
             return
 
@@ -802,17 +825,36 @@ class GroupConfigMixin:
         if root is not None and isinstance(report, dict) and not report.get("seen"):
             root.after(BOOT_REPORT_MS, self._group_open_boot_report)
 
-    def _group_verify_schedule(self) -> None:
-        self.root.after(VERIFY_BOOT_MS, self._group_verify_kick)
+    def _group_verify_schedule(self, seen=None) -> None:
+        """The structure check, a few seconds into the session - when one is queued. (A
+        check is only ever queued by an import, and that was applied before this start;
+        a sign-in asks on its own.)"""
+        queued = seen.get("tasks") if seen is not None \
+            else _quiet(group_apply.tasks, self._group_dir())
+        if verify_task(queued) is not None:
+            self.root.after(VERIFY_BOOT_MS, self._group_verify_kick)
 
     def _group_after_build_ui(self) -> None:
         """Called once, right after the main window is built: the offer, the tag line, the
         marks, the result of this start's import, the structure check. No step can stop
-        the app from starting."""
-        for step in ("_build_group_welcome", "_group_tag_refresh", "_group_attention_refresh",
-                     "_group_show_boot_report", "_group_verify_schedule"):
+        the app from starting.
+
+        The side file is read ONCE for a whole start: the snapshot the Settings section
+        took while the window was built serves every step here (a start that built no
+        section takes its own). It is dropped afterwards - what happens later in the
+        session reads the file through the single helpers, as it is then."""
+        seen, self._group_start_seen = self._group_start_seen, None
+        if seen is None:
+            seen = self._group_overview()
+        for step, wants_seen in (("_build_group_welcome", True), ("_group_tag_refresh", True),
+                                 ("_group_attention_refresh", True),
+                                 ("_group_show_boot_report", False),
+                                 ("_group_verify_schedule", True)):
             try:
-                getattr(self, step)()
+                if wants_seen:
+                    getattr(self, step)(seen)
+                else:
+                    getattr(self, step)()
             except Exception:
                 log.exception("group configuration: %s failed", step)
 
@@ -869,11 +911,13 @@ class GroupConfigMixin:
         banner._group_reason = reason
         self._group_banners[section] = banner
 
-    def _group_attention_refresh(self) -> None:
+    def _group_attention_refresh(self, seen=None) -> None:
         """Show the attention flags of the side file: the mark on the Settings tab, the
         mark and the orange colour on the flagged TOC rows, one orange line per flagged
-        section. Reads only; what is not built yet is skipped."""
-        flags = _quiet(group_apply.attention, self._group_dir())
+        section. Reads only; what is not built yet is skipped. ``seen``: the start's
+        snapshot; without it the flags are read."""
+        flags = seen.get("attention") if seen is not None \
+            else _quiet(group_apply.attention, self._group_dir())
         flags = flags if isinstance(flags, list) else []
         sections = flagged_sections(flags)
         if not isinstance(getattr(self, "_group_banners", None), dict):
@@ -946,14 +990,50 @@ class GroupConfigMixin:
         The session remembers the pick on its own: dropping the check can fail (the side
         file in use), and its answer must not replace what the user just chose."""
         self._group_market_user_set = True
+        self._group_write(self._group_drop_check)
+        if self._group_has_flag(SECTION_MARKET):
+            self._group_attention_clear(SECTION_MARKET)
+
+    # -- writes to the side file that may be refused -------------------------------------
+    def _group_write(self, write) -> bool:
+        """Run ``write()`` - one change of the side file through an engine helper, which
+        answers ``None`` / ``True`` (stored) or an explicit ``False`` (not stored: the file
+        is in use). -> whether it was stored.
+
+        A refusal gets ONE more try about a second later (``_group_write_again``), and
+        that try's answer is final: never a loop. ``write`` decides by what is true when
+        it RUNS, so a retry never puts back what the user changed meanwhile. Without a
+        window, or with one that is closing, no retry is owed."""
+        if _quiet(write, default=False) is not False:
+            return True
+        root = getattr(self, "root", None)
+        try:
+            if root is not None:
+                root.after(WRITE_RETRY_MS, self._group_write_again, write)
+        except Exception:               # the app is closing: the timer was refused
+            pass
+        return False
+
+    def _group_write_again(self, write) -> None:
+        """The one retry of a refused write; what it stored shows at once."""
+        if _alive(getattr(self, "root", None)) is None:
+            return
+        if _quiet(write, default=False) is not False:
+            try:
+                self._group_attention_refresh()
+            except Exception:
+                pass
+
+    def _group_drop_check(self):
+        """Take the structure check off the queue, by what is queued NOW. -> the helper's
+        answer; ``None`` when no check is queued (nothing was written)."""
         folder = self._group_dir()
         queued = _quiet(group_apply.tasks, folder)
         queued = queued if isinstance(queued, list) else []
         kept = without_verify_tasks(queued)
-        if len(kept) != len(queued):
-            _quiet(group_apply.set_tasks, folder, kept)
-        if self._group_has_flag(SECTION_MARKET):
-            self._group_attention_clear(SECTION_MARKET)
+        if len(kept) == len(queued):
+            return None
+        return group_apply.set_tasks(folder, kept)
 
     def _group_staging_picked(self) -> None:
         """The user set the staging system."""
@@ -1021,7 +1101,7 @@ class GroupConfigMixin:
         current = _same_check(queued, task)
         if self._group_market_user_set or not current:
             if current:                 # it could not be dropped at the pick: once more
-                _quiet(group_apply.set_tasks, folder, without_verify_tasks(queued))
+                self._group_write(self._group_drop_check)
             log.info("group structure check: dropped, %s", word)
             return
         # int(): the stored id may be a whole float after a hand edit.
@@ -1029,7 +1109,7 @@ class GroupConfigMixin:
         reachable = word in ("ok", "renamed") and structure_id > 0
         if reachable and self._group_market_moved(task):
             self._group_market_user_set = True
-            _quiet(group_apply.set_tasks, folder, without_verify_tasks(queued))
+            self._group_write(self._group_drop_check)
             shown = self._group_shown_reason(task, structure_id)
             if shown and self._group_line_showing(folder, shown):
                 # "... will be set once your character is signed in": no longer true
@@ -1049,21 +1129,41 @@ class GroupConfigMixin:
             self._group_call("_auto_market_rescan_if_needed")
         left = group_verify.after_verdict(task, verdict)
         reason = group_verify.attention_reason(task, verdict)
+
+        # The two writes, each as a function of what is true when it RUNS: a write that is
+        # refused (the side file in use) is tried once more a second later, and by then
+        # the user may have picked a market of their own.
+        def put_flag():
+            if self._group_market_user_set:
+                return None
+            answer = group_apply.add_attention(folder, SECTION_MARKET, MARKET_ITEM, reason)
+            if answer is not False:
+                self._group_reason_shown = (structure_id, reason)
+            return answer
+
+        read_already = [queued]
+
+        def put_task():
+            now = read_already.pop() if read_already else _quiet(group_apply.tasks, folder)
+            now = now if isinstance(now, list) else []
+            if self._group_market_user_set or not _same_check(now, task):
+                return None
+            remaining = [left if _is_verify(entry) else entry for entry in now]
+            return group_apply.set_tasks(folder, [entry for entry in remaining
+                                                  if entry is not None])
+
         if reason:
             dismissed = self._group_shown_reason(task, structure_id) == reason \
                 and not self._group_line_showing(folder, reason)
             # Only an explicit False means "not stored" (the helper answers None or a bool):
             # a line nobody saw must not count as shown.
-            if dismissed or _quiet(group_apply.add_attention, folder, SECTION_MARKET,
-                                   MARKET_ITEM, reason, default=False) is not False:
+            if dismissed or self._group_write(put_flag):
                 self._group_reason_shown = (structure_id, reason)
                 if _is_verify(left) and left.get("reason_shown") != reason:
                     left = dict(left, reason_shown=reason)
         elif reachable:
             _quiet(group_apply.clear_attention, folder, SECTION_MARKET)
-        remaining = [left if _is_verify(entry) else entry for entry in queued]
-        _quiet(group_apply.set_tasks, folder, [entry for entry in remaining
-                                              if entry is not None])
+        self._group_write(put_task)
         self._group_attention_refresh()
         log.info("group structure check: %s", word)
 

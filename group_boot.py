@@ -276,9 +276,12 @@ def _summary(report) -> str:
 
 
 def _note_missing_items(result) -> None:
-    """One log line when item modules of this build failed to load (a broken frozen build):
-    the import was applied with what is left of the registry, and its report cannot say so.
-    ``group_items`` is only looked up - a start never imports the engine to ask this."""
+    """One log line when item modules of this build failed to load (a broken frozen build).
+    The engine REFUSES to apply on such a build: the staged import ends ``failed``, it is
+    cleared, nothing is changed, and the report's sentence is
+    ``group_apply.MSG_INCOMPLETE``. This line is the log's half of that: it names the
+    missing modules by their code names. ``group_items`` is only looked up - a start never
+    imports the engine to ask this."""
     try:
         failures = getattr(sys.modules.get("group_items"), "LOAD_FAILURES", None)
         if not isinstance(failures, (list, tuple)):

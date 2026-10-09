@@ -167,6 +167,14 @@ def _texts(value, limit=MAX_LINE) -> list:
                               if isinstance(entry, str)) if line]
 
 
+def _more_of(line):
+    """What a count line - ``"and <n> more"``, the line that ends a bounded list - stands
+    for: ``n``. ``None`` for every other line, and for anything that is not text. The ONE
+    reader of that line in this module."""
+    counted = _MORE_LINE.fullmatch(line) if isinstance(line, str) else None
+    return int(counted.group(1)) if counted else None
+
+
 def _capped(lines, limit) -> list:
     """``lines`` cut to ``limit`` lines plus one last ``"and <n> more"``. A count line that
     is cut away is added up, not counted as one line."""
@@ -174,9 +182,20 @@ def _capped(lines, limit) -> list:
         return list(lines)
     more = 0
     for line in lines[limit:]:
-        counted = _MORE_LINE.fullmatch(line)
-        more += int(counted.group(1)) if counted else 1
+        counted = _more_of(line)
+        more += 1 if counted is None else counted
     return list(lines[:limit]) + [f"and {more} more"]
+
+
+def _listed(value) -> int:
+    """How many entries a list of a result STOOD for. The engine stores bounded lists - the
+    first entries, then one last count line - so a list is counted as its entries plus what
+    that last line says. Only the LAST entry can be the count: the engine writes it there
+    and nowhere else (and a real name spelled that way, stored last, cannot be told from
+    it - the engine owns that line)."""
+    entries = _as_list(value)
+    more = _more_of(entries[-1]) if entries else None
+    return len(entries) if more is None else len(entries) - 1 + more
 
 
 def _merged(lines, limit=MAX_NOTE_LINES) -> list:
@@ -186,9 +205,9 @@ def _merged(lines, limit=MAX_NOTE_LINES) -> list:
     items nobody could tell what they count - but added to that last one."""
     kept, seen, more = [], set(), 0
     for line in lines:
-        counted = _MORE_LINE.fullmatch(line)
-        if counted:
-            more += int(counted.group(1))
+        counted = _more_of(line)
+        if counted is not None:
+            more += counted
         elif line not in seen:
             seen.add(line)
             if len(kept) < limit:
@@ -878,7 +897,7 @@ def _change_text(item, result, words, failed, clip) -> str:
         if item is None or item.kind == "value":    # a value item says "<old> -> <new>"
             text = _show("; ".join(_notes_of(result)), clip)
         if not text:
-            sizes = [len(_as_list(getattr(result, name, ()))) for name in _CHANGE_LISTS]
+            sizes = [_listed(getattr(result, name, ())) for name in _CHANGE_LISTS]
             text = ", ".join(word.format(n=size)
                              for word, size in zip(words, sizes) if size) or words[4]
         return text
@@ -3189,6 +3208,8 @@ class _Controller:
                 path = ""
             finally:
                 self._picking = False
+            if self._closed:            # the window was closed while the question was up
+                return False
             if not path or not isinstance(path, str):
                 return False
         if self.page != "import":
