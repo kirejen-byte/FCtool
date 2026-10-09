@@ -9103,6 +9103,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
             log.tag_add("intel_click_flash", pos, end)
             log.tag_config("intel_click_flash",
                            background=FG_ACCENT, foreground=BG_DARK)
+            # The flash must stay visible over a selection.
+            log.tag_raise("intel_click_flash")
         except Exception:
             pass
         finally:
@@ -37416,6 +37418,8 @@ $bmp.Dispose()
             ch_tag = f"chan_{len(self._intel_chan_tags)}"
             self._intel_chan_tags[msg.channel] = ch_tag
             log.tag_config(ch_tag, foreground=self._channel_color(msg.channel))
+            # A new tag outranks `sel` until `sel` is raised again.
+            log.tag_raise("sel")
         log.tag_add(ch_tag, ch_start, ch_end)
 
         log.insert("end", f"  {msg.sender} > ")
