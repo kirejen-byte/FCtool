@@ -52,6 +52,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import threading
 from dataclasses import dataclass, field, replace
@@ -190,6 +191,41 @@ MAX_SHARE_DOCTRINES = 500
 # Member tags: a longer tag, and any tag past the count, is dropped (reported).
 MAX_SHARE_TAG_LEN = 40
 MAX_SHARE_MEMBER_TAGS = 12
+# ...and one payload may bring this many DIFFERENT member tags; a later one is
+# dropped from every member that carries it. Without it the per-member bound
+# still lets one file grow the vocabulary by tens of thousands of entries.
+MAX_SHARE_TAGS = 100
+# Text. A fit or doctrine NAME over the first is not a name: the entry is
+# dropped. A fit's EFT text over the second: the fit is dropped. Notes and a
+# description over it are cleared, never cut short. All reported.
+MAX_SHARE_NAME = 200
+MAX_SHARE_TEXT = 20_000
+# Shape. A doctrine with more slots is dropped before any of them is built; a
+# slot keeps its first refits (the rest are dropped, counted). Without them one
+# file could list the same 5,000 refits in every one of 400 doctrines.
+MAX_SHARE_SLOTS = 200
+MAX_SHARE_REFITS = 50
+# A drone / cargo stack of more units than this (or of fewer than none) is not
+# a fit: the fit is dropped.
+MAX_SHARE_QUANTITY = 1_000_000
+
+# What a NAME may not hold on this path. The app writes a fit's hull name, its
+# name and (when it cannot re-encode one) its stored DNA into the fleet MOTD's
+# markup as they are -- `<url=fitting:{dna}>{name}</url>` -- so a "<", a ">" or
+# a control character (category Cc: U+0000-001F, U+007F-009F) in one of them
+# would be markup in the MOTD of whoever imported it. A DNA is digits and its
+# three separators, nothing else.
+_SHARE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_SHARE_DNA = re.compile(r"[0-9:;_]*")
+_SHARE_MARKUP_LINES = {
+    "angle": "holds < or > - rename it to share it",
+    "control": "holds a control character - rename it to share it",
+}
+_SHARE_LABEL_MAX = 60               # of a name quoted in a problem line
+
+
+class _TooManySlots(ValueError):
+    """A doctrine over `MAX_SHARE_SLOTS` (raised before its slots are built)."""
 
 
 @dataclass
@@ -320,21 +356,30 @@ def _share_member_tags(raw_tags) -> tuple[list[str], bool]:
 
 def _share_doctrine(
     raw, fit_ids: set[str], migrate_cc: bool
-) -> tuple[dict, int, bool]:
+) -> tuple[dict, int, bool, int, int]:
     """One incoming doctrine as a clean `doctrine_to_dict` dict, plus how many
-    of its slots named a fit that is not in the file, plus whether a tag bound
-    cut any member tag (`_share_member_tags`). Raises when it is not a
-    doctrine (`doctrine_from_dict` refuses it, or it has no name).
+    of its slots were DROPPED because no fit of theirs is in the file, plus
+    whether a tag bound cut any member tag (`_share_member_tags`), plus how
+    many refits were over `MAX_SHARE_REFITS`, plus how many fits the slots
+    that STAY named that are not in the file (a refit, or the active fit of
+    a slot that goes on with another). Raises when it is not a doctrine
+    (`doctrine_from_dict` refuses it, or it has no name) and, BEFORE any slot
+    is built, `_TooManySlots` when it lists more than `MAX_SHARE_SLOTS`.
 
     The name is stored stripped. A slot keeps every fit that IS in the file:
     an unknown refit is dropped, an unknown active fit hands the slot to its
     first surviving refit, and a slot with nothing left is dropped. The
     store's own slot shape is restored on the way (`fit_id in refits`, no
-    duplicates, one fit = a plain member). Which refit is active, hulls and
+    duplicates, one fit = a plain member). A slot keeps its first
+    `MAX_SHARE_REFITS` refits; when the active fit was among the ones cut,
+    the slot flies its first refit. Which refit is active, hulls and
     cross-slot collisions are `merge_share`'s business. Wrong-typed optional
     fields fall back to their defaults."""
     if not isinstance(raw, dict):
         raise ValueError("not an object")
+    raw_members = raw.get("members")
+    if isinstance(raw_members, list) and len(raw_members) > MAX_SHARE_SLOTS:
+        raise _TooManySlots("too many slots")
     doctrine = doctrine_from_dict(raw)
     if not isinstance(doctrine.name, str) or not doctrine.name.strip():
         raise ValueError("no name")
@@ -365,6 +410,8 @@ def _share_doctrine(
     members: list[DoctrineMember] = []
     missing = 0
     tags_cut = False
+    refits_cut = 0
+    refits_missing = 0
     for index, (member, raw_member) in enumerate(
             zip(doctrine.members, raw.get("members") or [])):
         # Read the tags off the RAW member (see _share_member_tags).
@@ -383,19 +430,29 @@ def _share_doctrine(
         known = [f for f in member.refits if isinstance(f, str) and f in fit_ids]
         refits = list(dict.fromkeys(known))
         active_known = isinstance(member.fit_id, str) and member.fit_id in fit_ids
-        if len(known) != len(member.refits) or not active_known:
-            missing += 1
+        # What the slot names that is not in the file: its refit entries, and
+        # an active fit that is not one of them.
+        lost = len(member.refits) - len(known)
+        if not active_known and member.fit_id not in member.refits:
+            lost += 1
         if active_known:
             if refits and member.fit_id not in refits:
                 refits.insert(0, member.fit_id)      # as _normalise_slot does
         elif refits:
             member.fit_id = refits[0]
         else:
+            missing += 1                             # the SLOT is left out
             continue
+        refits_missing += lost                       # the slot stays, with less
+        if len(refits) > MAX_SHARE_REFITS:
+            refits_cut += len(refits) - MAX_SHARE_REFITS
+            del refits[MAX_SHARE_REFITS:]
+            if member.fit_id not in refits:
+                member.fit_id = refits[0]
         member.refits = refits if len(refits) > 1 else []
         members.append(member)
     doctrine.members = members
-    return doctrine_to_dict(doctrine), missing, tags_cut
+    return doctrine_to_dict(doctrine), missing, tags_cut, refits_cut, refits_missing
 
 
 def validate_share(payload) -> tuple[dict | None, list[str]]:
@@ -411,15 +468,57 @@ def validate_share(payload) -> tuple[dict | None, list[str]]:
 
     * a fit that is not a fit (or repeats an id) — ``"fit <n>: ..."``, by its
       1-based position; every surviving fit has ``esi_fitting_ids == {}``;
-    * a doctrine that is not a doctrine — ``"doctrine <n>: ..."``;
+    * a fit whose name is over `MAX_SHARE_NAME` or whose EFT text is over
+      `MAX_SHARE_TEXT` — dropped, ``"fit <n>: ..."``; notes over
+      `MAX_SHARE_TEXT` are cleared (the fit stays), ``"fit <n>: notes
+      dropped ..."``;
+    * a fit or a doctrine with any OTHER string over its bound — dropped,
+      ``"fit <n>: a text field is too long"`` / ``"<name>: a text field is
+      too long"``: `dna` may be as long as `MAX_SHARE_TEXT`, every remaining
+      string at any depth (hull, module, charge, drone and cargo names, slot,
+      source, stamps, ids, ideal mode, exemption kind / name) at most
+      `MAX_SHARE_NAME` (`_share_strings_fit`);
+    * a fit or a doctrine with a ``<``, a ``>`` or a control character in any
+      of those NAME strings (its own name, a member tag and the hull name
+      included; the EFT text, notes and a description are not names) —
+      dropped, ``"fit <n> (<name>): holds < or > - rename it to share it"``
+      / ``"doctrine <n> (<name>): ..."`` (``"holds a control character"``
+      when that is all it holds): the app writes fit and hull names into the
+      MOTD markup as they are (`_share_markup`). Checked before the
+      duplicate-name rule, so such a doctrine never claims its name;
+    * a fit whose stored `dna` is not digits and ``:`` ``;`` ``_`` only —
+      dropped, ``"fit <n> (<name>): its DNA is not a fit DNA"`` (the same
+      reason: the stored DNA can end up inside a link);
+    * a fit with a drone / cargo quantity below 0 or over
+      `MAX_SHARE_QUANTITY` — dropped, ``"fit <n> (<name>): a quantity is out
+      of range"``;
+    * a doctrine with more than `MAX_SHARE_SLOTS` slots — dropped before a
+      slot is built, ``"doctrine <n> (<name>): more than 200 slots"``;
+    * a doctrine that is not a doctrine, or whose name (stripped) is over
+      `MAX_SHARE_NAME` — ``"doctrine <n>: ..."``;
     * a doctrine whose name (stripped) an earlier one in the file already has
       — ``"doctrine <n>: duplicate name '<name>'"``; the later one is DROPPED,
       so a merge by name is well-defined and can never land on some other
       doctrine of the importer's;
-    * a slot naming a fit that is not in the file — one line per slot (see
-      `_share_doctrine`; a doctrine left with no member is kept);
+    * a description over `MAX_SHARE_TEXT` — cleared (the doctrine stays),
+      ``"<name>: description dropped ..."``;
+    * slots with no fit in the file — dropped, ONE counted line per
+      doctrine, ``"<name>: <n> slots naming a fit that is not in the file
+      left out"`` (see `_share_doctrine`; a doctrine left with no member is
+      kept);
+    * refits (or an active fit) not in the file, of a slot that STAYS on
+      another of its fits — dropped from the slot, ONE counted line per
+      doctrine, ``"<name>: <n> refits naming a fit that is not in the file
+      left out"``: no slot was left out, and the line does not say so;
+    * refits past the first `MAX_SHARE_REFITS` of a slot — dropped, ONE
+      counted line per doctrine;
     * member tags over a bound (`MAX_SHARE_TAG_LEN`, `MAX_SHARE_MEMBER_TAGS`)
-      — dropped, one line per doctrine.
+      — dropped, one line per doctrine;
+    * member tags past the first `MAX_SHARE_TAGS` DIFFERENT ones of the file,
+      counted over the doctrines that are kept, in file order — each dropped
+      whole from every member that carries it, ONE line for the payload.
+
+    Text over a limit is never cut short: it is kept whole or not at all.
 
     Doctrine names and member tags are stored stripped, legacy tag names are
     renamed, exemption entries keep only `kind` / `id` / `name`, and a pre-v2
@@ -431,6 +530,88 @@ def validate_share(payload) -> tuple[dict | None, list[str]]:
         return _validate_share(payload)
     except Exception:                                 # the contract, not a hope
         return None, ["not a fittings payload"]
+
+
+# The fields of a fit / doctrine record that hold a TEXT (up to
+# `MAX_SHARE_TEXT`). Every other string in one is a name, an id, a stamp or a
+# tag, and is bounded by `MAX_SHARE_NAME`.
+_SHARE_LONG_TEXT = frozenset(("raw_text", "notes", "description", "dna"))
+
+
+def _share_strings_fit(record: dict) -> bool:
+    """Whether every string VALUE of a cleaned fit / doctrine dict is within
+    its bound: the record's own `_SHARE_LONG_TEXT` fields `MAX_SHARE_TEXT`,
+    any other string at any depth `MAX_SHARE_NAME`. One walk instead of a
+    check per field, so a string slot added to the models later is bounded
+    without being named here."""
+    pending = []
+    for key, value in record.items():
+        if isinstance(value, str):
+            limit = MAX_SHARE_TEXT if key in _SHARE_LONG_TEXT else MAX_SHARE_NAME
+            if len(value) > limit:
+                return False
+        else:
+            pending.append(value)
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if len(value) > MAX_SHARE_NAME:
+                return False
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+    return True
+
+
+def _share_markup(record: dict) -> str:
+    """Whether a NAME string of a cleaned fit / doctrine dict holds markup:
+    ``"angle"`` (a ``<`` or a ``>`` somewhere), ``"control"`` (control
+    characters only) or ``""``. The walk of `_share_strings_fit`: every
+    string value at any depth except the record's own `_SHARE_LONG_TEXT`
+    fields - the texts are not link material, and `dna` has its own rule."""
+    found = ""
+    pending = [value for key, value in record.items()
+               if key not in _SHARE_LONG_TEXT]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if "<" in value or ">" in value:
+                return "angle"
+            if not found and _SHARE_CONTROL.search(value):
+                found = "control"
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+    return found
+
+
+def _share_label(kind: str, index: int, name) -> str:
+    """``"fit 3 (Alpha Fit)"`` for a problem line: the record's position and
+    its name - control characters removed, clipped. No usable name: the
+    position alone."""
+    shown = ""
+    if isinstance(name, str):
+        shown = _SHARE_CONTROL.sub("", name[:4 * _SHARE_LABEL_MAX]).strip()
+        shown = shown[:_SHARE_LABEL_MAX].rstrip()
+    return f"{kind} {index} ({shown})" if shown else f"{kind} {index}"
+
+
+def _share_quantities_ok(entry: dict) -> bool:
+    """Whether every stack quantity of a cleaned fit dict is None (a stored
+    null) or within ``0 .. MAX_SHARE_QUANTITY``."""
+    parsed = entry["parsed"]
+    for section in ("modules", "drones", "cargo"):
+        for stack in parsed.get(section) or ():
+            quantity = stack.get("quantity")
+            if quantity is not None and not 0 <= quantity <= MAX_SHARE_QUANTITY:
+                return False
+    return True
+
+
+def _counted(count: int, one: str, many: str) -> str:
+    return f"{count} {one if count == 1 else many}"
 
 
 def _validate_share(payload) -> tuple[dict | None, list[str]]:
@@ -462,32 +643,119 @@ def _validate_share(payload) -> tuple[dict | None, list[str]]:
         except Exception:
             problems.append(f"fit {index}: not a valid fit")
             continue
+        if len(entry["name"]) > MAX_SHARE_NAME:
+            problems.append(
+                f"fit {index}: name longer than {MAX_SHARE_NAME} characters")
+            continue
+        if len(entry["raw_text"]) > MAX_SHARE_TEXT:
+            problems.append(
+                f"fit {index}: fit text longer than {MAX_SHARE_TEXT} characters")
+            continue
+        notes_over = len(entry["notes"]) > MAX_SHARE_TEXT
+        if notes_over:
+            entry["notes"] = ""
+        if not _share_strings_fit(entry):
+            # Dropped whole; a slot that names it is reported below as naming
+            # a fit that is not in the file.
+            problems.append(f"fit {index}: a text field is too long")
+            continue
+        # Link material (see `_SHARE_CONTROL`): names, then the stored DNA.
+        marked = _share_markup(entry)
+        if marked:
+            problems.append(f"{_share_label('fit', index, entry['name'])}: "
+                            f"{_SHARE_MARKUP_LINES[marked]}")
+            continue
+        if _SHARE_DNA.fullmatch(entry["dna"]) is None:
+            problems.append(f"{_share_label('fit', index, entry['name'])}: "
+                            "its DNA is not a fit DNA")
+            continue
+        if not _share_quantities_ok(entry):
+            problems.append(f"{_share_label('fit', index, entry['name'])}: "
+                            "a quantity is out of range")
+            continue
+        if notes_over:
+            problems.append(f"fit {index}: notes dropped (longer than "
+                            f"{MAX_SHARE_TEXT} characters)")
         fit_ids.add(entry["id"])
         fits.append(entry)
 
     migrate_cc = _stored_schema_version(payload) < _CC_EXEMPTIONS_MIGRATED_VERSION
     doctrines: list[dict] = []
     seen_names: set[str] = set()
+    seen_tags: set[str] = set()         # the file's different member tags
+    tags_over = False
     for index, raw in enumerate(raw_doctrines, 1):
         try:
-            entry, missing, tags_cut = _share_doctrine(raw, fit_ids, migrate_cc)
+            entry, missing, tags_cut, refits_cut, refits_missing = \
+                _share_doctrine(raw, fit_ids, migrate_cc)
+        except _TooManySlots:
+            problems.append(f"{_share_label('doctrine', index, raw.get('name'))}: "
+                            f"more than {MAX_SHARE_SLOTS} slots")
+            continue
         except Exception:
             problems.append(f"doctrine {index}: not a valid doctrine")
             continue
         name = entry["name"]
+        if len(name) > MAX_SHARE_NAME:
+            # Before the duplicate check: its line would quote the name back.
+            problems.append(
+                f"doctrine {index}: name longer than {MAX_SHARE_NAME} characters")
+            continue
+        marked = _share_markup(entry)
+        if marked:
+            # Also before the duplicate check, for the same reason - and so
+            # that a doctrine dropped here never claims its name.
+            problems.append(f"{_share_label('doctrine', index, name)}: "
+                            f"{_SHARE_MARKUP_LINES[marked]}")
+            continue
         if name in seen_names:
             # One doctrine per name: the merge matches by name, so the second
             # copy would overwrite the first. The earlier one stands.
             problems.append(f"doctrine {index}: duplicate name '{name}'")
             continue
+        description_over = len(entry["description"]) > MAX_SHARE_TEXT
+        if description_over:
+            entry["description"] = ""
+        if not _share_strings_fit(entry):
+            # Before the name is taken: a later doctrine of this name stands.
+            problems.append(f"{name}: a text field is too long")
+            continue
         seen_names.add(name)
-        problems.extend(
-            [f"{name}: a slot names a fit that is not in the file"] * missing)
+        if description_over:
+            problems.append(f"{name}: description dropped (longer than "
+                            f"{MAX_SHARE_TEXT} characters)")
+        if missing:
+            # ONE line, counted: a line per slot was 900,000 lines for one
+            # hand-made doctrine before the slot bound existed.
+            problems.append(f"{name}: {_counted(missing, 'slot', 'slots')} naming "
+                            "a fit that is not in the file left out")
+        if refits_missing:
+            # A slot that only lost a refit is still there: never "a slot".
+            problems.append(
+                f"{name}: {_counted(refits_missing, 'refit', 'refits')} naming "
+                "a fit that is not in the file left out")
+        if refits_cut:
+            problems.append(
+                f"{name}: {_counted(refits_cut, 'refit', 'refits')} over the "
+                f"limit of {MAX_SHARE_REFITS} per slot left out")
         if tags_cut:
             problems.append(
                 f"{name}: member tags dropped (at most {MAX_SHARE_MEMBER_TAGS} "
                 f"per member, {MAX_SHARE_TAG_LEN} characters each)")
+        for member in entry["members"]:
+            kept: list[str] = []
+            for tag in member["tags"]:
+                if tag not in seen_tags:
+                    if len(seen_tags) >= MAX_SHARE_TAGS:
+                        tags_over = True
+                        continue
+                    seen_tags.add(tag)
+                kept.append(tag)
+            member["tags"] = kept
         doctrines.append(entry)
+    if tags_over:
+        problems.append(f"member tags dropped (at most {MAX_SHARE_TAGS} "
+                        "different tags per file)")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1575,7 +1843,8 @@ class FittingsStore:
     # ── Group-configuration merge (beside import_share, never through it) ─────
 
     def merge_share(
-        self, payload: dict, *, on_conflict: str = "theirs"
+        self, payload: dict, *, on_conflict: str = "theirs",
+        validated: bool = False,
     ) -> MergeResult:
         """Merge a share payload into the library BY NAME, all or nothing.
 
@@ -1584,6 +1853,12 @@ class FittingsStore:
         After that `_fits`, `_doctrines` and `_tags` are snapshotted, and
         restored before re-raising if anything below fails — the library is
         either merged or exactly as it was. Does NOT save: the caller does.
+
+        ``validated=True`` is for a caller that hands over the CLEAN payload
+        `validate_share` just gave it: the method then skips its own
+        validation (a large file was validated three times on its way in).
+        Anything else passed that way is still merged all or nothing — it
+        raises and the library is as it was — but nothing here cleans it.
 
         * **Fits** — a fit whose content hash a local fit already has is that
           local fit (its id, its name, its in-game fitting ids); any other is
@@ -1612,9 +1887,13 @@ class FittingsStore:
         Slot drops, new tags and orphans are reported for doctrines this call
         WROTE; a skipped or unchanged doctrine reports nothing. See
         `MergeResult`."""
-        clean, problems = validate_share(payload)
-        if clean is None:
-            raise ValueError(problems[0] if problems else "not a fittings payload")
+        if validated:
+            clean = payload
+        else:
+            clean, problems = validate_share(payload)
+            if clean is None:
+                raise ValueError(
+                    problems[0] if problems else "not a fittings payload")
         keep_mine = str(on_conflict).strip().lower() == "mine"
         result = MergeResult()
         with self._lock:
@@ -1675,6 +1954,7 @@ class FittingsStore:
 
                 # Doctrines.
                 released: list[str] = []           # fits replaced doctrines flew
+                vocabulary = set(self._tags)       # one build, not a scan per tag
                 for raw_doctrine in clean["doctrines"]:
                     incoming = doctrine_from_dict(raw_doctrine)
                     local = first_by_name.get(incoming.name)
@@ -1708,7 +1988,8 @@ class FittingsStore:
                     result.members_dropped.extend(dropped)
                     for member in members:
                         for tag in member.tags:
-                            if tag not in self._tags:
+                            if tag not in vocabulary:
+                                vocabulary.add(tag)
                                 self._tags.append(tag)
                                 result.tags_added.append(tag)
 
@@ -1739,10 +2020,11 @@ class FittingsStore:
         claimed: set[str] = set()                  # local ids earlier slots fly
         for member in incoming.members:
             survivors: list[str] = []
+            kept: set[str] = set()                 # `survivors`, for the lookup
             hull = None
             for old_id in (member.refits or [member.fit_id]):
                 local_id = id_map.get(old_id)
-                if local_id is None or local_id in survivors:
+                if local_id is None or local_id in kept:
                     continue                       # not in the file / its own twin
                 label = f"{incoming.name} / {names.get(old_id, '')}"
                 if local_id in claimed:
@@ -1755,6 +2037,7 @@ class FittingsStore:
                     dropped.append(f"{label}: refit on another hull")
                     continue
                 survivors.append(local_id)
+                kept.add(local_id)
             if not survivors:
                 continue
             claimed.update(survivors)
