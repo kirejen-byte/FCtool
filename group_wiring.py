@@ -78,7 +78,7 @@ import group_verify
 import palette
 from app_path import app_dir, app_dir_decision
 from app_version import APP_VERSION
-from group_bundle import MAX_TAG
+from group_bundle import MAX_TAG, clean_tag
 from ui_helpers import attach_tooltip, make_glyph_button, update_tooltip
 from ui_theme import (
     BG_DARK, BG_ENTRY, BG_PANEL, FG_ACCENT, FG_DIM, FG_GREEN, FG_ORANGE, FG_TEXT, FG_WHITE,
@@ -102,6 +102,9 @@ TAG_ENTRY_CHARS = 12
 MSG_INSTALLING = "An update is installing - try again in a moment."    # group_config_ui
 MSG_PALETTE_LATER = "Colours change the next time FCTool starts."      # palette_ui.NOTE
 MSG_PALETTE_FAILED = "The colour palette could not be saved."
+MSG_NO_RESTART = ("FCTool could not restart - close it and start it again to see the new "
+                  "colours.")
+MSG_TAG_NOT_SAVED = "The group tag could not be saved - try again in a moment."
 
 # -- the first-run offer -------------------------------------------------------
 WELCOME_TEXT = ("New here? If your group gave you a settings file, import it to set FCTool "
@@ -372,7 +375,9 @@ class GroupConfigMixin:
     _group_toc_flagged = ()             # the TOC rows that carry a mark
     _group_toc_spacer = None
     _group_verify_inflight = False
-    _group_picking = False              # a file question of ours is open
+    # SESSION memory of the structure check - what the side file may have failed to take:
+    _group_market_user_set = False      # the user set the market themselves: adopt nothing
+    _group_reason_shown = None          # (structure id, reason) of the line raised last
 
     # -- small tools --------------------------------------------------------------------
     def _group_dir(self) -> str:
@@ -398,6 +403,17 @@ class GroupConfigMixin:
             return
         try:
             label.configure(text=text, fg=colour)
+        except tk.TclError:
+            pass
+
+    def _group_unsay(self, text) -> None:
+        """Take ``text`` out of that label again - only while it is what the label shows."""
+        label = getattr(self, "_save_status", None)
+        if label is None:
+            return
+        try:
+            if str(label.cget("text")) == text:
+                label.configure(text="")
         except tk.TclError:
             pass
 
@@ -495,8 +511,16 @@ class GroupConfigMixin:
                                   parent=parent)
 
     def _group_edit_palette(self, parent, roles, on_done):
-        """The palette editor on a draft of the group window. One editor at a time."""
+        """The palette editor on a draft of the group window. One editor at a time: while
+        one is open - the local one, or an earlier draft - it is brought to the front, and
+        THIS request is answered as cancelled, so that whoever asked is not left waiting
+        for an editor that never opened."""
         if self._group_raise(self._palette_window) is not None:
+            try:
+                on_done({"action": "cancel", "roles": None,
+                         "name": palette.preset_name(roles)})
+            except Exception:
+                log.warning("colour palette: the caller's on_done failed", exc_info=True)
             return
         self._group_track_palette(
             _palette_ui().open_editor(parent, roles, on_done=on_done, mode="draft"))
@@ -546,12 +570,8 @@ class GroupConfigMixin:
                     controller.show_report(report)      # show_page alone marks nothing seen
                 else:
                     controller.show_page(view)
-                if pick and not self._group_picking:
-                    self._group_picking = True
-                    try:
-                        controller.choose_file()
-                    finally:
-                        self._group_picking = False
+                if pick:
+                    controller.choose_file()            # it asks one question at a time
             except Exception:
                 log.warning("group window: the page could not be shown", exc_info=True)
             return win
@@ -687,7 +707,10 @@ class GroupConfigMixin:
         """The Settings field was left or confirmed: store the tag, show what is stored.
 
         The tag lives in the feature's side file, not in the app's config - Save Settings
-        does not read this field."""
+        does not read this field. ``set_tag`` answers the tag that IS stored: anything but
+        the cleaned new one means it was not saved (the side file is in use). Then the
+        field keeps what was typed - theirs to try again with - and the status label says
+        so; the line under the logo shows the stored tag either way."""
         var = self._group_tag_var
         if var is None:
             return
@@ -695,15 +718,17 @@ class GroupConfigMixin:
             typed = var.get()
         except tk.TclError:
             return
-        folder = self._group_dir()
-        stored = _quiet(group_apply.set_tag, folder, typed)
-        if not isinstance(stored, str):
-            stored = _quiet(group_apply.get_tag, folder, default="") or ""
-        try:
-            if typed != stored:
-                var.set(stored)         # cleaned - or the old one, when it was not saved
-        except tk.TclError:
-            pass
+        wanted = clean_tag(typed)
+        stored = _quiet(group_apply.set_tag, self._group_dir(), typed, default=False)
+        if isinstance(stored, str) and stored == wanted:
+            try:
+                if typed != stored:
+                    var.set(stored)     # as it was cleaned
+            except tk.TclError:
+                pass
+            self._group_unsay(MSG_TAG_NOT_SAVED)
+        else:
+            self._group_say(MSG_TAG_NOT_SAVED)
         self._group_tag_refresh()
 
     # -- the palette editor --------------------------------------------------------------
@@ -758,8 +783,12 @@ class GroupConfigMixin:
             return
         if action == "apply_later":
             self._group_say(MSG_PALETTE_LATER, FG_GREEN)
-        elif self._group_call("_restart_app") is not True:
-            self._group_say(MSG_INSTALLING)
+            return
+        # True: the window is closing. False: the app refused (an update is installing).
+        # Anything else - no answer, or it raised - is a restart that did not happen.
+        answer = self._group_call("_restart_app")
+        if answer is not True:
+            self._group_say(MSG_INSTALLING if answer is False else MSG_NO_RESTART)
 
     # -- after the start -----------------------------------------------------------------
     def _group_open_boot_report(self) -> None:
@@ -815,8 +844,10 @@ class GroupConfigMixin:
                 pass
 
     def _group_banner_show(self, section, anchor, text) -> None:
-        """The orange line of a flagged section: under its header - or, for a section that
-        is anchored on its first row instead of a header, on top of that row."""
+        """The orange line of a flagged section, packed right AFTER the section's anchor -
+        its header, or its first row where a section has no header. Never before it:
+        "Open in Settings" scrolls the anchor to the top of the view, and a line above it
+        would be scrolled out by that very jump."""
         banner = _alive(self._group_banners.get(section))
         if banner is not None:
             banner._group_reason.configure(text=text)
@@ -831,10 +862,7 @@ class GroupConfigMixin:
                               lambda section=section: self._group_attention_clear(section),
                               palette={"BG_PANEL": BG_DARK}
                               ).pack(side=tk.LEFT, padx=(8, 0), anchor=tk.N)
-            if isinstance(anchor, tk.Label):
-                banner.pack(fill=tk.X, padx=20, pady=(0, 4), after=anchor)
-            else:
-                banner.pack(fill=tk.X, padx=20, pady=2, before=anchor)
+            banner.pack(fill=tk.X, padx=20, pady=(0, 4), after=anchor)
         except tk.TclError:
             banner.destroy()
             return
@@ -913,7 +941,11 @@ class GroupConfigMixin:
 
     def _group_market_picked(self) -> None:
         """The user picked a market structure or station: the group's own structure is
-        not asked about any more, and the Market flag goes."""
+        not asked about any more, and the Market flag goes.
+
+        The session remembers the pick on its own: dropping the check can fail (the side
+        file in use), and its answer must not replace what the user just chose."""
+        self._group_market_user_set = True
         folder = self._group_dir()
         queued = _quiet(group_apply.tasks, folder)
         queued = queued if isinstance(queued, list) else []
@@ -931,8 +963,9 @@ class GroupConfigMixin:
     # -- the structure check -------------------------------------------------------------
     def _group_verify_kick(self) -> None:
         """Start the check of the group's market structure - 6 s after the start and after
-        every sign-in. Nothing happens while one runs, or when none is queued."""
-        if self._group_verify_inflight:
+        every sign-in. Nothing happens while one runs, when none is queued, or once the
+        user set the market themselves in this session."""
+        if self._group_verify_inflight or self._group_market_user_set:
             return
         task = verify_task(_quiet(group_apply.tasks, self._group_dir()))
         if task is None:
@@ -967,8 +1000,17 @@ class GroupConfigMixin:
     def _group_verify_done(self, task, verdict) -> None:
         """Tk thread: act on the verdict of one structure check (plan rule 14).
 
-        A verdict for a task that is not queued any more is dropped whole: the user
-        picked a structure or a station meanwhile, and their pick stands."""
+        The user's own market always stands. A verdict is dropped whole - nothing
+        persisted, no line raised - when its task is not queued any more (a station or
+        structure pick dropped it), when the user picked one in this session (even if the
+        task could not be dropped then), and, for a reachable structure, when the app's
+        market system is no longer the one the group file set: a system pick, or an id
+        typed into the advanced fields, drops no task, and the group's structure under
+        another system is a market that does not exist.
+
+        A line the user dismissed stays away: the task remembers the reason it showed
+        (``reason_shown``), and the same reason is not raised a second time once its line
+        is gone. Another outcome raises its own line."""
         self._group_verify_inflight = False
         outcome = verdict.outcome if isinstance(verdict, group_verify.Verdict) else None
         word = outcome if isinstance(outcome, str) and outcome in group_verify.OUTCOMES \
@@ -976,12 +1018,24 @@ class GroupConfigMixin:
         folder = self._group_dir()
         queued = _quiet(group_apply.tasks, folder)
         queued = queued if isinstance(queued, list) else []
-        if not _same_check(queued, task):
+        current = _same_check(queued, task)
+        if self._group_market_user_set or not current:
+            if current:                 # it could not be dropped at the pick: once more
+                _quiet(group_apply.set_tasks, folder, without_verify_tasks(queued))
             log.info("group structure check: dropped, %s", word)
             return
         # int(): the stored id may be a whole float after a hand edit.
         structure_id = _quiet(int, task.get("structure_id"), default=0)
         reachable = word in ("ok", "renamed") and structure_id > 0
+        if reachable and self._group_market_moved(task):
+            self._group_market_user_set = True
+            _quiet(group_apply.set_tasks, folder, without_verify_tasks(queued))
+            shown = self._group_shown_reason(task, structure_id)
+            if shown and self._group_line_showing(folder, shown):
+                # "... will be set once your character is signed in": no longer true
+                self._group_attention_clear(SECTION_MARKET)
+            log.info("group structure check: dropped, %s", word)
+            return
         if reachable:
             self._group_call("_market_persist_keys",
                              staging_structure_id=structure_id,
@@ -994,16 +1048,55 @@ class GroupConfigMixin:
             self._group_call("_refresh_market_status_labels")
             self._group_call("_auto_market_rescan_if_needed")
         left = group_verify.after_verdict(task, verdict)
+        reason = group_verify.attention_reason(task, verdict)
+        if reason:
+            dismissed = self._group_shown_reason(task, structure_id) == reason \
+                and not self._group_line_showing(folder, reason)
+            # Only an explicit False means "not stored" (the helper answers None or a bool):
+            # a line nobody saw must not count as shown.
+            if dismissed or _quiet(group_apply.add_attention, folder, SECTION_MARKET,
+                                   MARKET_ITEM, reason, default=False) is not False:
+                self._group_reason_shown = (structure_id, reason)
+                if _is_verify(left) and left.get("reason_shown") != reason:
+                    left = dict(left, reason_shown=reason)
+        elif reachable:
+            _quiet(group_apply.clear_attention, folder, SECTION_MARKET)
         remaining = [left if _is_verify(entry) else entry for entry in queued]
         _quiet(group_apply.set_tasks, folder, [entry for entry in remaining
                                               if entry is not None])
-        reason = group_verify.attention_reason(task, verdict)
-        if reason:
-            _quiet(group_apply.add_attention, folder, SECTION_MARKET, MARKET_ITEM, reason)
-        elif reachable:
-            _quiet(group_apply.clear_attention, folder, SECTION_MARKET)
         self._group_attention_refresh()
         log.info("group structure check: %s", word)
+
+    def _group_market_moved(self, task) -> bool:
+        """Whether the app's market system is no longer the one the task was queued for.
+        A task that names no system has nothing to be compared with; anything in the
+        config that is not that id - another system, none, junk - counts as moved."""
+        wanted = task.get("system_id") if isinstance(task, dict) else None
+        if type(wanted) is not int or wanted <= 0:
+            return False
+        config = getattr(self, "config", None)
+        market = config.get("market") if isinstance(config, dict) else None
+        stored = market.get("staging_system_id") if isinstance(market, dict) else None
+        try:
+            return int(stored or 0) != wanted
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _group_shown_reason(self, task, structure_id) -> str:
+        """The reason whose line this check raised last: kept in the task, and for the
+        session where the task could not be written."""
+        shown = task.get("reason_shown") if isinstance(task, dict) else None
+        if isinstance(shown, str) and shown:
+            return shown
+        memory = self._group_reason_shown
+        return memory[1] if memory is not None and memory[0] == structure_id else ""
+
+    def _group_line_showing(self, folder, reason) -> bool:
+        """Whether a Market flag with exactly this reason exists."""
+        flags = _quiet(group_apply.attention, folder)
+        return any(isinstance(flag, dict) and flag.get("section") == SECTION_MARKET
+                   and flag.get("reason") == reason
+                   for flag in (flags if isinstance(flags, list) else ()))
 
 
 # -- the hooks the app's existing methods call ---------------------------------

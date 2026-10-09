@@ -1688,6 +1688,7 @@ class _Controller:
         self.page = None
         self.mode = "copy"
         self._closed = False
+        self._picking = False           # the file question of choose_file is open
         self._job, self._waiting, self._idle = None, set(), None
         self._building = False          # the editor is being filled: its vars edit nothing
         self._meta_traces = []          # (variable, trace name): removed when the window goes
@@ -3175,11 +3176,19 @@ class _Controller:
         if self._closed:
             return False
         if path is None:
+            # One question at a time. The native dialog disables THIS window only: the
+            # main window stays enabled, and its "Import a group file..." buttons call in
+            # here again while the question is up. That call returns quietly.
+            if self._picking:
+                return False
+            self._picking = True
             try:
                 path = filedialog.askopenfilename(parent=self.win, title="Import a group file",
                                                   filetypes=FILE_TYPES)
             except tk.TclError:
                 path = ""
+            finally:
+                self._picking = False
             if not path or not isinstance(path, str):
                 return False
         if self.page != "import":
