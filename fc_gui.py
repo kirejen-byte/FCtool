@@ -2814,11 +2814,16 @@ class FCToolGUI:
 
         class _Adapter:
             def resolve_names(self, type_ids):
-                try:
-                    rows = gui.esi_auth.esi_post_public(
-                        "/universe/names/", list(type_ids)) or []
-                except Exception:
+                # 400 / 404 = ESI's definite "no such id" -> {}; every other
+                # non-answer RAISES so TypeCatalog treats it as a failure.
+                if gui.esi_auth is None:
+                    raise RuntimeError("no esi_auth")
+                rows, status = gui.esi_auth.esi_post_public_ex(
+                    "/universe/names/", list(type_ids))
+                if status in (400, 404):
                     return {}
+                if status != 200 or not isinstance(rows, list):
+                    raise RuntimeError("names lookup failed: %s" % status)
                 out = {}
                 for r in rows:
                     if isinstance(r, dict) and "id" in r:

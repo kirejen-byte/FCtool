@@ -915,6 +915,27 @@ class ESIAuth:
             log.exception("[ESI] public POST %s failed", path)
         return None
 
+    @staticmethod
+    def esi_post_public_ex(path: str, body) -> tuple[dict | list | None, int | None]:
+        """Status-aware sibling of ``esi_post_public`` -> ``(body, status)``.
+
+        Same URL, headers, timeout and rate limiting. ``body`` is the parsed
+        JSON for an OK response and ``None`` otherwise (a non-OK error body is
+        not parsed). ``status`` is the HTTP status, or ``None`` when no
+        response was received (network error / exception)."""
+        url = ESI_BASE + path
+        headers = {**HEADERS, "Content-Type": "application/json"}
+        status = None
+        try:
+            rate_limit('esi')
+            resp = requests.post(url, json=body, headers=headers, timeout=10)
+            status = resp.status_code
+            if resp.ok:
+                return resp.json(), status
+        except Exception:
+            log.exception("[ESI] public POST %s failed", path)
+        return None, status
+
     # ── Character Info ───────────────────────────────────────────────────────
 
     # TTL for the get_location()/get_ship_type() per-instance memo (B3). ESI's

@@ -57,11 +57,17 @@ SHIP_CATEGORY_ID = 6
 NEGATIVE_TTL_S = 600
 # A FAILURE (adapter raised / returned a non-dict) is retried much sooner than a
 # definite miss, so a start-up network blip doesn't hide a real new type. NOTE:
-# the app's own ESI adapter flattens EVERY failure (network error, 404, 420,
-# 5xx, no account) into an empty answer, so in the app every miss arrives as
-# DEFINITE (600 s); the 30 s path only runs for an adapter that raises or
-# returns a non-dict. An empty ``{}`` answer is a definite miss.
+# the app's own ESI adapter returns an empty ``{}`` (a definite miss, 600 s)
+# for ESI's 404 and 400 (a malformed id); it RAISES for everything else
+# (network error, 420, 5xx, no account), so an outage takes the 30 s failure
+# path. An id outside the type-id range (1..0x7FFFFFFF) is never asked at all.
+# A failure also trips a catalogue-wide outage breaker (``_down_until``): no
+# unknown-id lookup is attempted (nor the id remembered) for a window that
+# starts at NEGATIVE_FAIL_TTL_S and doubles with each consecutive failure
+# (30, 60, 120, 240 s, capped at BREAKER_MAX_S). Any answered call (hit or
+# definite miss) resets it, so an outage costs few blocking calls, not one per id.
 NEGATIVE_FAIL_TTL_S = 30
+BREAKER_MAX_S = 300
 NEGATIVE_MAX = 5000
 # Miss budget (token bucket, MISSES only): at most MISS_BURST lookups may END in
 # a miss back-to-back, then one more per MISS_REFILL_S. While it is spent an
@@ -179,6 +185,11 @@ class TypeCatalog:
         self._miss_burst = float(MISS_BURST)
         self._miss_tokens = self._miss_burst
         self._miss_at: float | None = None
+        # Outage breaker: monotonic time before which no unknown-id lookup is
+        # attempted (set by a FAILURE; under _resolve_lock).
+        self._down_until: float = 0.0
+        self._down_fails = 0
+        self._down_window = float(NEGATIVE_FAIL_TTL_S)
 
         # In-memory mirror of the on-disk cache file's raw content (str(type_id)
         # -> entry), seeded by _load_cache() below and kept in sync by every
@@ -452,8 +463,17 @@ class TypeCatalog:
         acceptable.
 
         Misses are remembered in the in-memory negative cache (``_neg``), and
-        misses are rate-limited by the token-bucket miss budget (MISS_BURST)."""
+        misses are rate-limited by the token-bucket miss budget (MISS_BURST).
+
+        An id that cannot be an EVE type id (not an int, or outside
+        1..0x7FFFFFFF) is answered ``None`` without asking, remembering or
+        spending budget. A FAILURE arms the catalogue-wide outage breaker: for
+        a window that grows with consecutive failures (30, 60, 120, 240 s, capped
+        at BREAKER_MAX_S) no lookup is attempted and no id is remembered; any
+        answered call (hit or definite miss) resets it."""
         if self._esi is None:
+            return None
+        if type(type_id) is not int or not 0 < type_id <= 0x7FFFFFFF:
             return None
         # Remembered miss still fresh: answer without the lock or the network.
         until = self._neg.get(type_id)
@@ -467,9 +487,25 @@ class TypeCatalog:
             until = self._neg.get(type_id)
             if until is not None and self._now() < until:
                 return None
+            # Breaker closed only while the remaining time is within the current
+            # window (a clock set back cannot hold it shut).
+            # (+1 s absorbs the float ulp of (now + window) - now and a lookup
+            # in the same coarse clock tick as the failure.)
+            if 0.0 < self._down_until - self._now() <= self._down_window + 1.0:
+                return None   # outage window: no ask, id not remembered
             if not self._miss_budget_left():
                 return None
             entry, definite = self._ask_esi(type_id)
+            if not definite:
+                self._down_window = float(min(
+                    NEGATIVE_FAIL_TTL_S * (2 ** min(self._down_fails, 8)),
+                    BREAKER_MAX_S))
+                self._down_fails += 1
+                self._down_until = self._now() + self._down_window
+            else:
+                self._down_until = 0.0
+                self._down_fails = 0
+                self._down_window = float(NEGATIVE_FAIL_TTL_S)
             if entry is None:
                 self._miss_tokens -= 1.0
                 self._remember_miss(
