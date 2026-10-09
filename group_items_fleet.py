@@ -36,6 +36,9 @@ Rules of this module
   the ``templates`` list and nothing else.
 * ``validate`` builds a clean payload from scratch and never raises; ``apply`` cleans what
   it is given once more. Nothing here needs a character or the network (spec 9.1).
+* ``export_notes(state, ctx=None)`` (custom presets and templates) lists what an EXPORT of
+  this setup leaves out - a hook the engine calls for the builder; it writes nothing and
+  names no pilot.
 * ``ROLE_VALUES``, ``CONDITION_TYPES``, ``PACING_RANGES`` and ``LIVE_NAME_LEN`` MIRROR
   ``fleet_template_window`` (a Tk module) and ``fleet_esi`` (the network stack); neither is
   importable here. ``tests/test_group_items_fleet.py`` holds the mirrors equal.
@@ -74,6 +77,7 @@ MAX_SLOTS = 256                                 # per squad
 MAX_RULES = 500                                 # per template
 _MAX_LABEL = 200                                # a preset's button label
 _MAX_PRIORITY = 1_000_000
+MAX_NOTES = 50                                  # export notes of one item; then "and <n> more"
 
 _PRESETS_PATH = ("custom_role_presets",)
 _BUILTIN_PATH = ("default_role_presets",)
@@ -120,22 +124,54 @@ def _name(value) -> str:
 
 # -- role presets ---------------------------------------------------------------
 
-def _preset_from(raw):
-    """One preset entry from a FILE -> a clean preset, or ``None``.
+def _capped(lines) -> list:
+    """At most ``MAX_NOTES`` lines; what is over becomes one last ``"and <n> more"``."""
+    lines = list(lines)
+    if len(lines) <= MAX_NOTES:
+        return lines
+    return lines[:MAX_NOTES] + [f"and {len(lines) - MAX_NOTES} more"]
+
+
+def _refusal(entry) -> str:
+    """Why the edit dialog's field rule refuses ``entry`` (its text fields cleaned), in the
+    dialog's own words: ``"the key must be at most 2 characters"``. For an export note."""
+    try:
+        letter, title, cap = entry.get("letter"), entry.get("title"), entry.get("cap")
+        if not isinstance(letter, str) or not isinstance(title, str):
+            return "the key or the role name is not text"
+        _parsed, message = role_presets.parse_preset_fields(
+            letter, title, "" if cap is None else str(cap))
+        if isinstance(message, str) and message.strip():
+            reason = message.strip().rstrip(".")
+            return reason[:1].lower() + reason[1:]
+    except Exception:
+        pass
+    return "not a usable preset"
+
+
+def _judge(raw):
+    """One preset entry -> ``(clean preset | None, why it is refused)``.
 
     The text fields lose their control characters and are clipped before the Fleet tab's
     own rule (``role_presets.clean_preset``) judges the entry. Cleaning a clean preset
     gives it back unchanged."""
     if not isinstance(raw, dict):
-        return None
+        return None, "not a preset"
     entry = {"cap": raw.get("cap")}
     for key, limit in (("label", _MAX_LABEL), ("letter", 16), ("title", MAX_NAME)):
         value = raw.get(key)
         entry[key] = clean_text(value, limit) if isinstance(value, str) else value
     preset = role_presets.clean_preset(entry)
-    if preset is None or len(preset["label"]) > _MAX_LABEL:
-        return None
-    return preset
+    if preset is None:
+        return None, _refusal(entry)
+    if len(preset["label"]) > _MAX_LABEL:
+        return None, f"a label longer than {_MAX_LABEL} characters"
+    return preset, ""
+
+
+def _preset_from(raw):
+    """One preset entry from a FILE -> a clean preset, or ``None`` (see ``_judge``)."""
+    return _judge(raw)[0]
 
 
 def _preset_detail(preset) -> str:
@@ -242,6 +278,39 @@ class _RolePresetsItem(Item):
         if not isinstance(stored, list):
             return ABSENT
         return self._clean(stored)[0] or ABSENT
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder, ``"<label>: left out (<reason>)"``: the presets of my row
+        that ``export`` leaves out. Most often one the edit dialog's field rule refuses -
+        the Fleet tab's own "save as preset" is laxer (a three-character key, a cap of 0);
+        also a label used earlier in the row and whatever is past the first ``CUSTOM_MAX``.
+        The walk is ``_clean``'s own, entry by entry. Entries that are not dicts are no
+        presets and get no line. Never raises; at most ``MAX_NOTES`` lines and
+        ``"and <n> more"``."""
+        try:
+            stored = get_path(_view(state), _PRESETS_PATH)
+            if not isinstance(stored, list):
+                return []
+            lines, seen = [], set()
+            for raw in stored:
+                if not isinstance(raw, dict):
+                    continue
+                preset, why = _judge(raw)
+                if preset is None:
+                    shown = _name(raw.get("label")) or "a preset without a label"
+                else:
+                    shown, key = preset["label"], role_presets.label_key(preset["label"])
+                    if key in seen:
+                        why = "its label is used earlier in the row"
+                    elif len(seen) >= role_presets.CUSTOM_MAX:
+                        why = f"only the first {role_presets.CUSTOM_MAX} presets are kept"
+                    else:
+                        seen.add(key)
+                        continue
+                lines.append(f"{shown}: left out ({why})")
+            return _capped(lines)
+        except Exception:
+            return []
 
     def validate(self, payload, ctx):
         presets, problems = self._clean(payload)
@@ -777,8 +846,10 @@ class _TemplatesItem(Item):
     never_saved = ("Named pilots in slots", "Rules that name a character",
                    "Your saved character list")
 
-    def _clean_list(self, raw, version):
-        """A list of raw templates -> ``(clean templates, problems)``, one per name."""
+    def _clean_list(self, raw, version, left=None):
+        """A list of raw templates -> ``(clean templates, problems)``, one per name.
+        ``left``, when given a list, receives the reason line of every template that is
+        left out whole (``"<name>: left out (<reason>)"``), without the item's label."""
         templates, problems, seen, junk = [], [], set(), 0
         for entry in raw:
             if not isinstance(entry, dict):
@@ -788,10 +859,14 @@ class _TemplatesItem(Item):
             data = _clean_template(entry, version, lines)
             problems.extend(f"{self.label} - {line}" for line in lines)
             if data is None:
+                if left is not None:
+                    left.extend(lines)
                 continue
             if data["name"] in seen:
                 problems.append(f"{self.label} - {data['name']}: listed twice, "
                                 f"the first is kept")
+                if left is not None:
+                    left.append(f"{data['name']}: left out (another template has this name)")
                 continue
             seen.add(data["name"])
             templates.append(data)
@@ -818,22 +893,49 @@ class _TemplatesItem(Item):
     def _payload(templates):
         return {"version": fts.SCHEMA_VERSION, "templates": templates} if templates else ABSENT
 
-    def export(self, state, ctx):
+    def _exported(self, state):
+        """My templates as they travel -> ``(templates, notes)``. ``notes`` are the lines of
+        ``export_notes``: what was left out, never WHO (a note names a template)."""
         data = getattr(state, "templates", None)
         if not isinstance(data, dict):          # missing or unreadable
-            return ABSENT
+            return [], []
         version, raw = _file_version(data), data.get("templates")
         if version > fts.SCHEMA_VERSION or not isinstance(raw, list):
-            return ABSENT
-        templates = self._clean_list(raw, version)[0][:MAX_TEMPLATES]
+            return [], []
+        notes = []
+        templates = self._clean_list(raw, version, notes)[0]
+        over = len(templates) - MAX_TEMPLATES
+        if over > 0:                            # a file holds no more: ``_clean`` refuses it
+            templates = templates[:MAX_TEMPLATES]
+            notes.append(f"{over} template(s) left out (at most {MAX_TEMPLATES} per file)")
         # Decision D4, one step further than ``scrub_template``: a ``character`` rule whose
         # type was changed afterwards still holds the pilot's name as its value.
         pilots = _known_pilots(data)
         if pilots:
             for template in templates:
-                template["rules"] = [rule for rule in template["rules"]
-                                     if rule["condition"]["value"].casefold() not in pilots]
-        return self._payload(templates)
+                kept = [rule for rule in template["rules"]
+                        if rule["condition"]["value"].casefold() not in pilots]
+                gone = len(template["rules"]) - len(kept)
+                if gone:
+                    notes.append(f"{template['name']}: {gone} rule(s) naming a pilot left out")
+                template["rules"] = kept
+        return templates, notes
+
+    def export(self, state, ctx):
+        return self._payload(self._exported(state)[0])
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: ``"<template>: left out (<reason>)"`` for a template of
+        mine that does not travel (it breaks a limit, a wing or squad of it has no visible
+        name, or an earlier template of mine has its name); ``"<n> template(s) left out (at
+        most 200 per file)"`` for those past ``MAX_TEMPLATES``; and ``"<template>: <n>
+        rule(s) naming a pilot left out"`` for rules whose VALUE is a pilot my file knows.
+        (Rules of the ``character`` kind are not counted: ``never_saved`` says they never
+        travel.) Never raises; at most ``MAX_NOTES`` lines and ``"and <n> more"``."""
+        try:
+            return _capped(self._exported(state)[1])
+        except Exception:
+            return []
 
     def validate(self, payload, ctx):
         templates, problems = self._clean(payload)

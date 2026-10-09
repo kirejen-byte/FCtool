@@ -31,18 +31,26 @@ Rules of this module
 * "Keep mine" keeps a DEFINITION. A stored value that is not a dict is nothing to keep: the
   file's definition replaces it under either choice.
 * ``intel.filter`` works in a fixed order: (a) resolve the coalitions the filter names, on a
-  copy; (b) refuse a filter that would match every party, BEFORE anything is written;
-  (c) write. A skipped filter therefore leaves the setup exactly as it was. The test in
-  (b) is the app's own - ``intel_filter.expand_parties`` yields no id - so a filter that
-  names only coalitions without a single usable member is refused as well.
+  copy; (b) refuse a filter that would match every party or every place, BEFORE anything
+  is written; (c) write. A skipped filter therefore leaves the setup exactly as it was.
+  The party test in (b) is the app's own - ``intel_filter.expand_parties`` yields no id -
+  so a filter that names only coalitions without a single usable member is refused as
+  well. The place test is its twin: ``anywhere`` off and not one usable system or region.
 * A ``location`` / ``parties`` section that lists something but has no usable match-all
   flag (``anywhere`` / ``anyone``) is a RESTRICTION: the flag reads as off, with a problem
-  line. It never comes to mean "anywhere" / "anyone".
+  line. It never comes to mean "anywhere" / "anyone" - also when every listed entry is
+  unusable: the guard in (b) then skips the filter.
+* ``export_notes(state, ctx=None)`` (coalitions and filter) lists what an EXPORT of this
+  setup leaves out; ``reconcile(payloads)`` settles a file that defines one coalition
+  twice. Both are hooks the engine calls; neither writes anything.
 * EXPORT mirrors what the filter panel effectively uses: ``config.json`` can hold a
   ``min_pilots`` / ``max_jumps`` outside the spinbox range, and the alert gate reads the
   spinbox, which holds the nearest bound. Such a whole number is exported as that bound,
   never as the standard value. IMPORT never clamps: a file's out-of-range number takes
-  the standard value, with a problem line.
+  the standard value, with a problem line. In the same way a section the panel stored
+  with its match-all flag OFF and nothing listed - which the app reads as "anywhere" /
+  "anyone" - is exported with the flag on, and an export note says so; the import guards
+  are unchanged, so a hand-made file in that shape is still skipped.
 * Nothing here needs a character or the network (spec 9.1).
 * ``validate`` builds a clean payload from scratch and never raises; ``apply`` cleans what
   it is given once more, so a payload that skipped validation still cannot write a
@@ -103,9 +111,13 @@ MAX_CHANNELS = MAX_LIST                         # spec section 5: 500 channels
 MAX_CHANNEL_NAME = 100
 _MAX_ID = 2 ** 63 - 1                           # every EVE id fits a signed 64-bit integer
 _ANY_LENGTH = 1_000_000
+MAX_NOTES = 50                                  # export notes of one item; then "and <n> more"
+_SHOWN_NAME = 40                                # characters of an over-long name a note shows
 
 FLAG_SEEDED = "coalitions_seeded"               # boot flag (exact name)
 EVERY_PARTY = "the filter would match every party"
+NO_LOCATION = "the filter's location list has no usable entry"
+COALITIONS_ID, FILTER_ID = "intel.coalitions", "intel.filter"
 
 _COALITIONS = "coalitions"                      # the config key AND the payload key
 _FILTER = "intel_filter"
@@ -228,30 +240,58 @@ def clean_coalition(raw):
     return _members(raw)[0] if isinstance(raw, dict) else None
 
 
-def _clean_coalitions(raw, label):
+def _long_name(raw):
+    """``raw`` as a note shows it when it is a coalition name over the limit (its first 40
+    characters and ``...``), else ``None``."""
+    if not isinstance(raw, str):
+        return None
+    text = clean_text(raw, _ANY_LENGTH)
+    return f"{text[:_SHOWN_NAME]}..." if len(text) > MAX_COALITION_NAME else None
+
+
+def _capped(lines) -> list:
+    """At most ``MAX_NOTES`` lines; what is over becomes one last ``"and <n> more"``."""
+    lines = list(lines)
+    if len(lines) <= MAX_NOTES:
+        return lines
+    return lines[:MAX_NOTES] + [f"and {len(lines) - MAX_NOTES} more"]
+
+
+def _clean_coalitions(raw, label, fold=True, left=None):
     """``{name: definition}`` from an untrusted dict. -> ``(coalitions, problems)``. Total.
 
     Names are cleaned and 1-80 characters. ``North`` and ``north`` are ONE name, as they
     are to the app's coalition manager (``same_name``): the first one counts and keeps its
     spelling. A definition must be a dict that carries at least one of its two lists. At
     most ``MAX_COALITIONS`` survive.
+
+    ``fold=False`` is for reading THIS setup's own keys the way the app's matcher reads
+    them - exactly: ``North`` and ``north`` are then two keys, and only an exact repeat
+    (two keys that clean to one name) is dropped. ``left``, when given a list, receives
+    what an export note names: ``("long", shown name)`` for a name over the limit and
+    ``("twin", name, the first name of that spelling)`` for a repeat.
     """
     if not isinstance(raw, dict):
         return {}, [f"{label}: not a set of coalitions"]
-    clean, taken = {}, set()
+    key_of = _fold if fold else str
+    clean, taken = {}, {}                           # taken: compare key -> the name kept
     bad_names = bad_definitions = repeats = extra = lost = over = 0
     for key, value in raw.items():
         name = _name(key, MAX_COALITION_NAME)
         if name is None:
             bad_names += 1
-        elif _fold(name) in taken:
+            if left is not None and _long_name(key) is not None:
+                left.append(("long", _long_name(key)))
+        elif key_of(name) in taken:
             repeats += 1
+            if left is not None:
+                left.append(("twin", name, taken[key_of(name)]))
         elif not isinstance(value, dict) or not any(part in value for part in _MEMBER_KEYS):
             bad_definitions += 1
         elif len(clean) >= MAX_COALITIONS:
             extra += 1
         else:
-            taken.add(_fold(name))
+            taken[key_of(name)] = name
             clean[name], dropped, past = _members(value)
             lost += dropped
             over += past
@@ -358,6 +398,29 @@ class _CoalitionsItem(Item):
             return ABSENT
         return _clean_coalitions(stored, self.label)[0] or ABSENT
 
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: the coalitions of this setup that ``export`` leaves out
+        because of their NAME - a key that is the same name as an earlier one to the app's
+        manager (an old config can hold such twins; another setup cannot), and a name over
+        80 characters. Never raises; at most ``MAX_NOTES`` lines and ``"and <n> more"``."""
+        try:
+            stored = _view(state).get(_COALITIONS)
+            if not isinstance(stored, dict):
+                return []
+            left = []
+            _clean_coalitions(stored, self.label, left=left)
+            lines = []
+            for kind, name, *first in left:
+                if kind == "twin":
+                    lines.append(f"{self.label}: '{name}' is left out - FCTool reads it as "
+                                 f"the same name as '{first[0]}'")
+                else:
+                    lines.append(f"{self.label}: '{name}' has a name over "
+                                 f"{MAX_COALITION_NAME} characters and is left out")
+            return _capped(lines)
+        except Exception:
+            return []
+
     def validate(self, payload, ctx):
         clean, problems = _clean_coalitions(payload, self.label)
         return (clean or ABSENT), problems
@@ -410,13 +473,18 @@ def _clean_filter(raw, label, clamp=False):
     silently takes its default, a wrong-typed or out-of-range one takes its default with a
     problem line. One exception, so that a list can never come to mean "everything": a
     match-all flag (``anywhere`` / ``anyone``) that is missing or not a bool BESIDE a
-    non-empty list reads as off, with a problem line. The block shares nothing with ``raw``
-    or with ``DEFAULT_FILTER``.
+    non-empty list reads as off, with a problem line. It is the RAW list that counts -
+    something was listed, even when not one entry of it survives the cleaning (the app
+    itself reads a text id, for one). The block shares nothing with ``raw`` or with
+    ``DEFAULT_FILTER``.
 
-    ``clamp`` is for EXPORT only - reading this setup's own block: a whole number outside
-    its range becomes the nearest bound, without a problem line, because that is the number
-    the filter panel's spinbox (and so the alert gate) holds for it. A file's number is
-    never clamped.
+    ``clamp`` is for EXPORT only - reading this setup's own block the way the app uses it:
+    a whole number outside its range becomes the nearest bound, without a problem line,
+    because that is the number the filter panel's spinbox (and so the alert gate) holds for
+    it; and the coalition names are de-duplicated by their EXACT spelling, because the
+    app's matcher looks a name up as it is written (``North`` and ``north`` are two keys of
+    this setup until ``_FilterItem._stored`` has seen which of them is one). A file's
+    number is never clamped and a file's names are one name per manager name.
     """
     if not isinstance(raw, dict) or not any(key in raw for key in DEFAULT_FILTER):
         return None, [f"{label}: no filter in it"]
@@ -440,13 +508,14 @@ def _clean_filter(raw, label, clamp=False):
             odd(where)
         return DEFAULT_FILTER[part][key]
 
-    def match_all(source, part, key, lists, where):
-        """The section's match-all flag, read AFTER its lists."""
+    def match_all(source, part, title, key, list_keys, where):
+        """The section's match-all flag. ``list_keys`` name the section's lists in ``raw``."""
         if type(source.get(key)) is bool:
             return source[key]
-        if any(lists):                          # something is listed: a restriction
-            odd(part, f"'{key}' was {'not a yes or no' if key in source else 'missing'}"
-                      " - read as a restricted list")
+        if any(isinstance(source.get(name), list) and source[name] for name in list_keys):
+            # Something is listed, usable or not: a restriction.
+            odd(title, f"'{key}' was {'not a yes or no' if key in source else 'missing'}"
+                       " - read as a restricted list")
             return False
         if key in source:
             odd(where)
@@ -481,17 +550,18 @@ def _clean_filter(raw, label, clamp=False):
         if not isinstance(source[key], list):
             odd(where, "is not a list; it is left empty")
             return []
+        key_of = str if clamp else _fold        # this setup's own names: exact (see above)
         kept, seen, bad, extra = [], set(), 0, 0
         for entry in source[key]:
             name = _name(entry, MAX_COALITION_NAME)
             if name is None:
                 bad += 1
-            elif _fold(name) in seen:           # one coalition, named twice
+            elif key_of(name) in seen:          # one coalition, named twice
                 continue
             elif len(kept) >= MAX_COALITIONS:
                 extra += 1
             else:
-                seen.add(_fold(name))
+                seen.add(key_of(name))
                 kept.append(name)
         if bad:
             odd(where, _count(bad, "entry that is not a name",
@@ -516,14 +586,14 @@ def _clean_filter(raw, label, clamp=False):
     block = {                                   # the app's own key order
         "combine": combine,
         "location": {
-            "anywhere": match_all(location, "location", "anywhere", (systems, regions),
-                                  "Anywhere"),
+            "anywhere": match_all(location, "location", "Location", "anywhere",
+                                  ("systems", "regions"), "Anywhere"),
             "systems": systems,
             "regions": regions,
         },
         "parties": {
-            "anyone": match_all(parties, "parties", "anyone",
-                                (alliances, corporations, coalitions), "Anyone"),
+            "anyone": match_all(parties, "parties", "Parties", "anyone",
+                                ("alliances", "corporations", "coalitions"), "Anyone"),
             "alliances": alliances,
             "corporations": corporations,
             "coalitions": coalitions,
@@ -541,6 +611,16 @@ def _clean_filter(raw, label, clamp=False):
         },
     }
     return block, problems
+
+
+def _no_party(parties, coalitions) -> bool:
+    """The guard's question, asked of any parties block: does the app find not one alliance
+    or corporation id in it? Total: a block the app's own expansion cannot read (a coalition
+    name that is a list, say) is not "no party" - nothing is decided on it."""
+    try:
+        return not any(intel_filter.expand_parties(parties, coalitions))
+    except Exception:
+        return False
 
 
 def _entity_names(*lists) -> list:
@@ -609,18 +689,84 @@ class _FilterItem(Item):
         return {_FILTER_ROW: block, _COALITIONS: definitions}, problems
 
     def _stored(self, state):
-        """This setup's filter FOR EXPORT: ``(block, definitions, names without a
-        definition)``, or ``None`` when there is no filter block. A stored number outside
-        the panel's range travels as the number the panel effectively uses."""
+        """This setup's filter FOR EXPORT: ``(block, definitions, notes)``, or ``None`` when
+        there is no filter block. A stored number outside the panel's range travels as the
+        number the panel effectively uses.
+
+        The coalition names are resolved the way the app's matcher resolves them: a name
+        counts when it is EXACTLY a key of this setup's coalitions (a spelling that is no
+        key - left behind by a rename that only changed capitals, say - is dead to the app
+        too). Of the names that do count, one per manager name travels - the first: another
+        setup cannot hold ``North`` and ``north`` side by side. ``notes`` says what was left
+        out: a name without a definition, the second of two such twins, a name over the
+        limit. It also says what will READ differently on the other side: a name that means
+        my second twin (importers get the first, the one the Coalitions item exports), and
+        a match-all flag exported as on (``_widen``)."""
         config = _view(state)
-        block, _ = _clean_filter(config.get(_FILTER), self.label, clamp=True)
+        raw = config.get(_FILTER)
+        block, _ = _clean_filter(raw, self.label, clamp=True)
         if block is None:
             return None
-        local, _ = _clean_coalitions(config.get(_COALITIONS), self.label)
-        named = block["parties"]["coalitions"]
-        definitions = {name: local[name] for name in named if name in local}
-        block["parties"]["coalitions"] = [name for name in named if name in definitions]
-        return block, definitions, [name for name in named if name not in definitions]
+        parties = raw.get("parties")
+        raw_names = parties.get("coalitions") if isinstance(parties, dict) else None
+        notes = [f"{self.label}: coalition '{shown}' has a name over {MAX_COALITION_NAME} "
+                 f"characters and is left out"
+                 for shown in map(_long_name, raw_names if isinstance(raw_names, list) else ())
+                 if shown is not None]
+        local, _ = _clean_coalitions(config.get(_COALITIONS), self.label, fold=False)
+        # What the Coalitions item exports: my FIRST key of each manager name.
+        travels, _ = _clean_coalitions(config.get(_COALITIONS), self.label)
+        first = {_fold(key): key for key in travels}
+        definitions, taken = {}, {}                 # taken: manager name -> the name kept
+        for name in block["parties"]["coalitions"]:
+            if name not in local:
+                notes.append(f"{self.label}: coalition '{name}' has no definition here "
+                             f"and is left out")
+            elif _fold(name) in taken:
+                notes.append(f"{self.label}: coalition '{name}' is left out - FCTool reads "
+                             f"it as the same name as '{taken[_fold(name)]}'")
+            else:
+                taken[_fold(name)] = name
+                definitions[name] = local[name]
+                twin = first.get(_fold(name))
+                if (twin is not None and twin != name
+                        and not _same_definition(travels[twin], local[name])):
+                    # In one file the Coalitions entry wins (``reconcile``).
+                    notes.append(f"{self.label}: coalition '{name}' shares its name with "
+                                 f"'{twin}' in this setup - importers will get '{twin}'")
+        block["parties"]["coalitions"] = list(definitions)
+        notes.extend(self._widen(block, definitions, raw, config.get(_COALITIONS)))
+        return block, definitions, notes
+
+    def _widen(self, block, definitions, raw, stored_coalitions) -> list:
+        """EXPORT only, like the number clamp: a section whose match-all flag is off while
+        nothing is listed in it. The panel can store that ("Anywhere" / "Anyone" unticked,
+        nothing added) and the app then matches every place / everybody - while an importer's
+        guard would skip such a file. So the flag travels as ``True``, what the filter
+        means, with one note per section. Changes ``block``; returns the notes.
+
+        Never a wider filter than the exporter's own: a section that only the APP can read
+        an entry of (a text id, say - the cleaner drops it) is a restriction to the app and
+        stays off. For the parties both views are asked the guard's question
+        (``intel_filter.expand_parties`` yields no id): the block as it travels and the
+        block as it is stored."""
+        notes = []
+        location, parties = block["location"], block["parties"]
+        raw_location, raw_parties = raw.get("location"), raw.get("parties")
+        listed = isinstance(raw_location, dict) and any(
+            isinstance(raw_location.get(key), list) and raw_location[key]
+            for key in ("systems", "regions"))
+        if not location["anywhere"] and not listed \
+                and not (location["systems"] or location["regions"]):
+            location["anywhere"] = True
+            notes.append(f"{self.label}: Location has 'Anywhere' off but nothing listed - "
+                         f"FCTool treats that as anywhere, and it is exported that way")
+        if not parties["anyone"] and _no_party(parties, definitions) \
+                and _no_party(raw_parties, stored_coalitions):
+            parties["anyone"] = True
+            notes.append(f"{self.label}: Parties has 'Anyone' off but nothing listed - "
+                         f"FCTool treats that as anyone, and it is exported that way")
+        return notes
 
     def export(self, state, ctx):
         stored = self._stored(state)
@@ -628,14 +774,15 @@ class _FilterItem(Item):
             return ABSENT
         return {_FILTER_ROW: stored[0], _COALITIONS: stored[1]}
 
-    def export_notes(self, state, ctx) -> list:
-        """Lines for the builder: the coalitions the filter names that have no definition in
-        this setup. They are left out of the exported filter (the app ignores them too)."""
-        stored = self._stored(state)
-        if stored is None:
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: the coalitions this setup's filter names that ``export``
+        leaves out (see ``_stored``). Never raises; at most ``MAX_NOTES`` lines and
+        ``"and <n> more"``."""
+        try:
+            stored = self._stored(state)
+            return [] if stored is None else _capped(stored[2])
+        except Exception:
             return []
-        return [f"{self.label}: coalition '{name}' has no definition here and is left out"
-                for name in stored[2]]
 
     def validate(self, payload, ctx):
         return self._clean(payload)
@@ -698,13 +845,20 @@ class _FilterItem(Item):
                 kept.append(key)
         parties["coalitions"] = kept
 
-        # (b) The guard, before any write. The app expands the parties to ids and, with
+        # (b) The guards, before any write. The app expands the parties to ids and, with
         # "anyone" off and not one id, treats the filter as "no constraint": it would alert
-        # on everybody. A coalition NAME without a usable member is no party.
+        # on everybody. A coalition NAME without a usable member is no party. The same for
+        # the location: "anywhere" off with no system and no region is "anywhere" to the app.
+        refused = []
+        location = block["location"]
+        if not location["anywhere"] and not (location["systems"] or location["regions"]):
+            refused.append(NO_LOCATION)
         alliance_ids, corp_ids = intel_filter.expand_parties(parties, working)
         if not parties["anyone"] and not (alliance_ids or corp_ids):
+            refused.append(EVERY_PARTY)
+        if refused:
             return ItemResult(self.id, status="skipped", skipped=[_FILTER_ROW],
-                              warnings=result.warnings + [EVERY_PARTY])
+                              warnings=result.warnings + refused)
 
         # (c) Write: the coalitions first (only when a kept name needs them), then the block.
         if result.added or result.updated or (seeded and kept):
@@ -721,6 +875,47 @@ class _FilterItem(Item):
             result.updated.append(_FILTER_ROW)
             result.notes.append("Filter: replaced by the group's")
         return result.settle()
+
+
+# -- one file, two definitions of one coalition ---------------------------------
+
+def reconcile(payloads) -> list:
+    """The file-level pass over the clean payloads of ONE file (``{item id: payload}``).
+
+    A file can define a coalition twice: in the Coalitions item and among the definitions
+    the filter item carries for the names it uses. When the two differ (the same name to
+    the app's manager, other members) the file would never settle - each item would
+    overwrite the other's definition on every apply. The Coalitions entry is the one that
+    counts: the filter item's own copy is taken out of its payload, with one line each,
+    ``"<name>: defined twice in the file - the Coalitions entry is used"`` (the name as the
+    Coalitions item spells it). The filter still NAMES the coalition; applied after the
+    Coalitions item, it finds that definition in the setup.
+
+    Changes ``payloads`` in place and returns the problem lines. Total: either id may be
+    absent, anything that is not in a clean payload's shape is left exactly as it is, never
+    raises.
+    """
+    try:
+        coalitions, wrapped = payloads.get(COALITIONS_ID), payloads.get(FILTER_ID)
+        if not isinstance(coalitions, dict) or not isinstance(wrapped, dict):
+            return []
+        embedded = wrapped.get(_COALITIONS)
+        if not isinstance(embedded, dict):
+            return []
+        stay, lines = {}, []
+        for name, definition in embedded.items():
+            key = _twin(coalitions, name) if isinstance(name, str) else None
+            theirs = clean_coalition(definition)
+            if (key is None or theirs is None or clean_coalition(coalitions[key]) is None
+                    or _same_definition(coalitions[key], theirs)):
+                stay[name] = definition
+            else:
+                lines.append(f"{key}: defined twice in the file - the Coalitions entry is used")
+        if lines:
+            payloads[FILTER_ID] = {**wrapped, _COALITIONS: stay}
+        return lines
+    except Exception:
+        return []
 
 
 # -- intel.fusion_channels ------------------------------------------------------
@@ -847,9 +1042,9 @@ class _FusionChannelsItem(Item):
 
 ITEMS = (
     _CoalitionsItem(
-        id="intel.coalitions", label="Coalitions", order=10),
+        id=COALITIONS_ID, label="Coalitions", order=10),
     _FilterItem(
-        id="intel.filter", label="Intel filter", order=20),
+        id=FILTER_ID, label="Intel filter", order=20),
     ConfigFieldsItem(
         id="intel.alerts", label="Alert mute and ping", order=30,
         fields=(

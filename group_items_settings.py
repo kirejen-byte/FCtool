@@ -272,13 +272,27 @@ def _whole(value):
 
 
 def _same_system(current, system) -> bool:
-    """Is the stored market system the one of ``system`` (a clean payload system)? By id
-    after coercion, or by name ignoring case - deliberately tolerant: calling a system
-    "changed" unsets the importer's station and structure."""
-    if _whole(current.get(_SYSTEM_ID)) == system["id"]:
-        return True
+    """Is the stored market system the one of ``system`` (a clean payload system)?
+
+    The stored ID decides whenever it is a positive whole number (after coercion: a
+    hand-edited config may hold it as text or as a float) - the market scans by id, so a
+    setup whose name says one system while its ids are another's IS on that other system.
+    Only a setup without a usable id is judged by its name, ignoring case - deliberately
+    tolerant there: calling a system "changed" unsets the importer's station and structure."""
+    stored_id = _whole(current.get(_SYSTEM_ID))
+    if stored_id is not None and stored_id > 0:
+        return stored_id == system["id"]
     name = current.get(_SYSTEM_NAME)
     return isinstance(name, str) and name.strip().casefold() == system["name"].casefold()
+
+
+def _has_pick(current) -> bool:
+    """Whether the stored market holds a station or a structure of its own (an id above 0)."""
+    for id_key in (_STATION_ID, _STRUCTURE_ID):
+        place_id = _whole(current.get(id_key))
+        if place_id is not None and place_id > 0:
+            return True
+    return False
 
 
 def _is_station_id(value) -> bool:
@@ -517,7 +531,9 @@ class _MarketStagingItem(Item):
                                      "name": structure["name"],
                                      "system_id": system["id"],
                                      "attempts": 0})
-                result.notes.append(_VERIFY_NOTE if system_changed else _KEEP_NOTE)
+                # "your current market pick stays" only to a setup that has one to keep
+                result.notes.append(_KEEP_NOTE if not system_changed and _has_pick(current)
+                                    else _VERIFY_NOTE)
         elif system_changed:
             unset(_OWN_STATION, _OWN_STRUCTURE)
             result.notes.append(_PICK_NOTE)

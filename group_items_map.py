@@ -7,7 +7,9 @@
     lives in ONE of the two lists, so landing a name in one list takes it out of the other
     (the Jump Range tab's own rule, ``staging_lists.mutate_staging_lists``): each item
     therefore declares BOTH paths. The hostile item runs after the friendly one, so a system
-    that a file names in both lists ends hostile.
+    that a file names in both lists ends hostile - and ``reconcile`` (the engine's pass over
+    one file's payloads) takes such a name out of the friendly payload beforehand, so that a
+    second apply of the same file changes nothing.
 
 ``map.projection``
     The map's threat / friendly projection settings: five typed fields under
@@ -199,10 +201,53 @@ class StagingListItem(NameListItem):
         return result
 
 
+FRIENDLY_ID, HOSTILE_ID = "jump.friendly_stagings", "jump.hostile_stagings"
+
+
+def reconcile(payloads) -> list:
+    """The file-level pass over the clean payloads of ONE file (``{item id: payload}``).
+
+    A file that names a system in BOTH staging lists would never settle: on every apply the
+    friendly item pulls the system back and the hostile item moves it again. So such a name
+    is taken out of the friendly payload - it counts as hostile (spec 6.4) - with one line
+    each, ``"<name> is in both staging lists - kept as hostile"``; a friendly payload emptied
+    that way is removed from ``payloads``. Names are compared the way the lists themselves
+    compare them (``_key``); the line carries the hostile list's spelling.
+
+    Changes ``payloads`` in place and returns the problem lines. Total: either id may be
+    absent, anything that is not a list of names is left exactly as it is, never raises.
+    """
+    try:
+        friendly, hostile = payloads.get(FRIENDLY_ID), payloads.get(HOSTILE_ID)
+        if not isinstance(friendly, list) or not isinstance(hostile, list):
+            return []
+        kept_as = {}                            # compare key -> the hostile list's spelling
+        for name in hostile:
+            if isinstance(name, str):
+                kept_as.setdefault(_key(name), name)
+        stay, lines = [], []
+        for name in friendly:
+            if isinstance(name, str) and _key(name) in kept_as:
+                line = f"{kept_as[_key(name)]} is in both staging lists - kept as hostile"
+                if line not in lines:
+                    lines.append(line)
+            else:
+                stay.append(name)
+        if not lines:
+            return []
+        if stay:
+            payloads[FRIENDLY_ID] = stay
+        else:
+            del payloads[FRIENDLY_ID]
+        return lines
+    except Exception:
+        return []
+
+
 ITEMS = (
-    StagingListItem(id="jump.friendly_stagings", label="Friendly staging systems",
+    StagingListItem(id=FRIENDLY_ID, label="Friendly staging systems",
                     order=10, target="friendly"),
-    StagingListItem(id="jump.hostile_stagings", label="Hostile staging systems",
+    StagingListItem(id=HOSTILE_ID, label="Hostile staging systems",
                     order=20, target="hostile"),
     ConfigFieldsItem(
         id="map.projection", label="Threat and friendly projection", order=10,

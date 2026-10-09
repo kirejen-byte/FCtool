@@ -64,10 +64,15 @@ def parse_preset_fields(letter, title, cap_text):
     if cap_text:
         # ``str.isdecimal``, not ``str.isdigit``: the latter is also true for
         # characters such as a superscript two, which ``int`` then refuses with
-        # a ValueError. ``int`` reads every decimal digit, ASCII or not.
-        if not cap_text.isdecimal() or int(cap_text) <= 0:
+        # a ValueError. ``int`` reads every decimal digit, ASCII or not - up to
+        # its parsing limit: a digit string longer than that (4,300 digits by
+        # default) makes it raise as well, and is "not a number" like the rest.
+        try:
+            cap = int(cap_text) if cap_text.isdecimal() else 0
+        except ValueError:
+            cap = 0
+        if cap <= 0:
             return None, "The cap must be blank or a positive whole number."
-        cap = int(cap_text)
     return (letter, title, cap), None
 
 
