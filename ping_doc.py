@@ -13,7 +13,8 @@ How a template becomes text (:func:`resolve`):
     1. Runs are emitted in order. Free text is emitted VERBATIM -- no escaping
        (Discord markdown is the user's to type) and any styling stored on a
        ``TextRun`` is ignored.
-    2. Lines are split on ``\\n`` inside text runs. A line that holds at least
+    2. Lines are split on ``\\n`` inside text runs (``\\r\\n`` and a bare
+       ``\\r`` count as ``\\n``). A line that holds at least
        one pill, ALL of whose pills are empty, is dropped whole -- its label
        text and its newline included -- with one warning per dropped kind.
     3. A line with some empty and some filled pills keeps the filled ones; the
@@ -23,13 +24,15 @@ How a template becomes text (:func:`resolve`):
     5. Trailing newlines are removed. An empty document yields ``""``.
 
 Every value arrives as its final display string (``PingValues.when`` is
-formatted by the caller); ``""`` means "nothing to show".
+formatted by the caller); ``""`` means "nothing to show", and so does any value
+that is not a string.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from motd_doc import TextRun, TokenLabel, TokenRun, _ellip, doc_from_json
+from motd_doc import (TextRun, TokenLabel, TokenRun, _ellip, _style_color, _style_size,
+                      doc_from_json)
 
 __all__ = ["PING_KINDS", "FIELD_LABELS", "PingValues", "PingText",
            "default_doc", "resolve", "chip_label", "clean_doc"]
@@ -95,20 +98,30 @@ def _is_ping_kind(kind) -> bool:
 
 
 def _value(kind, values) -> str:
-    """The display string for ``kind``; ``""`` for an unknown kind or no value."""
+    """The display string for ``kind``; ``""`` for an unknown kind or no value.
+
+    A value that is not a string counts as EMPTY: a wiring mistake (an
+    ``(id, name)`` tuple, ``False``) must never be printed into a ping.
+    """
     if not _is_ping_kind(kind):
         return ""
     value = getattr(values, kind, "")
-    if value is None:
-        return ""
-    return value if isinstance(value, str) else str(value)
+    return value if isinstance(value, str) else ""
 
 
 def _plain(text) -> str:
-    """A text run's text as a string (a hand-edited template may store ``null`` / a number)."""
+    """Text as a string with ``\\n`` line ends -- the ONE text normaliser.
+
+    ``None`` is ``""`` and any other non-string its ``str()`` (a hand-edited
+    template may store ``null`` / a number); ``\\r\\n`` and a bare ``\\r``
+    become ``\\n``. :func:`clean_doc` applies it to stored text; :func:`resolve`
+    applies it too, so runs built by hand cannot raise or hide a line end.
+    """
     if text is None:
         return ""
-    return text if isinstance(text, str) else str(text)
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _lines(doc) -> list:
@@ -141,10 +154,18 @@ def resolve(doc: list, values: PingValues) -> PingText:
     warnings: list = []
     omitted: list = []
     for parts in _lines(doc):
-        kinds = [payload for is_pill, payload in parts if is_pill]
-        pieces = [_value(payload, values) if is_pill else payload
-                  for is_pill, payload in parts]
-        dropped = bool(kinds) and not any(_value(kind, values) for kind in kinds)
+        pieces: list = []
+        kinds: list = []
+        filled = False
+        for is_pill, payload in parts:
+            if is_pill:
+                value = _value(payload, values)      # looked up once per pill
+                kinds.append(payload)
+                filled = filled or bool(value)
+                pieces.append(value)
+            else:
+                pieces.append(payload)
+        dropped = bool(kinds) and not filled
         for kind in kinds:
             if not _is_ping_kind(kind):
                 _add_once(warnings, f"Unsupported pill ignored: {kind}")
@@ -175,24 +196,60 @@ def chip_label(kind: str, values: PingValues) -> TokenLabel:
 
 # --- stored JSON -> runs --------------------------------------------------
 
+def _clean_style(style) -> dict:
+    """The usable part of a stored text style; junk costs the style, never the text."""
+    if not isinstance(style, dict):
+        return {}
+    out: dict = {}
+    color = _style_color(style.get("color"))
+    if color is not None:
+        out["color"] = color
+    for key in ("bold", "italic", "underline"):
+        if style.get(key) is True:
+            out[key] = True
+    size = _style_size(style.get("size"))
+    if size is not None:
+        out["size"] = size
+    return out
+
+
+def _clean_item(item) -> "dict | None":
+    """One stored item in a form :func:`motd_doc.doc_from_json` cannot choke on, or None."""
+    if not isinstance(item, dict):
+        return None
+    form = item.get("t")
+    if form == "text":
+        return {"t": "text", "text": _plain(item.get("text")),
+                "style": _clean_style(item.get("style"))}
+    if form == "token":
+        kind = item.get("kind")
+        if not isinstance(kind, str) or not kind:
+            return None
+        params = item.get("params")
+        return {"t": "token", "kind": kind,
+                "params": params if isinstance(params, dict) else {}}
+    return None
+
+
 def clean_doc(data) -> list:
     """Tolerant loader for a stored template: always returns RUNS, never JSON.
 
     Anything that is not a list gives :func:`default_doc`. A list is loaded
-    through :func:`motd_doc.doc_from_json` item by item: only dict items whose
-    ``t`` is ``"text"`` or ``"token"`` are read, and an item the loader cannot
-    read (hand-edited ``params`` / ``style`` of the wrong type) is skipped
-    rather than raised on. ``[]`` stays ``[]`` -- an intentionally empty
-    template. Unknown pill kinds are kept verbatim; :func:`resolve` reports them.
+    through :func:`motd_doc.doc_from_json`, over its dict items whose ``t`` is
+    ``"text"`` or ``"token"`` (anything else is skipped); ``[]`` stays ``[]`` --
+    an intentionally empty template. Its output goes to a Tk Text widget and
+    back into the config, so every item is NORMALISED on the way through:
+
+    * a text item's ``text`` is always a ``str`` with ``\\n`` line ends
+      (:func:`_plain`); a style that is not a dict, or a junk value inside one,
+      costs that styling only -- the text is never lost;
+    * a token item with a missing, empty or non-string ``kind`` is dropped;
+      ``params`` that are not a dict become ``{}`` and the pill is KEPT (a pill
+      that vanished would leave its label behind with no warning).
+
+    Unknown pill kinds are kept verbatim; :func:`resolve` reports them.
     """
     if not isinstance(data, list):
         return default_doc()
-    runs: list = []
-    for item in data:
-        if not isinstance(item, dict) or item.get("t") not in ("text", "token"):
-            continue
-        try:
-            runs.extend(doc_from_json([item]))
-        except (AttributeError, TypeError, ValueError):
-            continue
-    return runs
+    items = [clean for clean in map(_clean_item, data) if clean is not None]
+    return doc_from_json(items)
