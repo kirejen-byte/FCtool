@@ -77,12 +77,20 @@ class MarkupEditor(tk.Frame):
     * :meth:`set_markup` — replace the content from an EVE markup string.
     * :meth:`on_change` — register a callback fired (debounced by the caller) on
       any content or formatting change.
+
+    ``style_toolbar`` (keyword-only, default ``True`` = the behaviour every
+    existing caller gets): pass ``False`` to build NONE of the colour / B / I / U
+    / size / clear controls. The formatting methods (:meth:`apply_color`,
+    :meth:`toggle_bold` and the rest) stay callable; only the controls are absent,
+    and no toolbar strip exists until a subclass asks for one
+    (:meth:`_ensure_toolbar`).
     """
 
     def __init__(self, master, height=3, on_change=None,
                  bg_panel=_BG_PANEL, bg_entry=_BG_ENTRY, fg_text=_FG_TEXT,
                  fg_white=_FG_WHITE, fg_accent=_FG_ACCENT, border=_BORDER,
-                 button_style="Dark.TButton", **kwargs):
+                 button_style="Dark.TButton", *,
+                 style_toolbar: bool = True, **kwargs):
         super().__init__(master, bg=bg_panel, **kwargs)
         self._bg_panel = bg_panel
         self._bg_entry = bg_entry
@@ -105,7 +113,9 @@ class MarkupEditor(tk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        self._build_toolbar()
+        self._toolbar = None            # the row-0 strip; see _ensure_toolbar
+        if style_toolbar:
+            self._build_toolbar()
 
         self.text = tk.Text(
             self, height=height, wrap=tk.WORD,
@@ -130,10 +140,21 @@ class MarkupEditor(tk.Frame):
 
     # ── construction helpers ────────────────────────────────────────────────
 
+    def _ensure_toolbar(self):
+        """Return the toolbar strip (row 0), creating and placing it on first use.
+
+        The ONE owner of the strip. :meth:`_build_toolbar` fills it with the style
+        controls; a subclass adding controls of its own asks here, so it also gets
+        a strip when ``style_toolbar=False`` built none."""
+        if self._toolbar is None:
+            bar = tk.Frame(self, bg=self._bg_panel)
+            bar.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+            self._toolbar = bar
+        return self._toolbar
+
     def _build_toolbar(self):
         """Build the compact formatting toolbar (row 0)."""
-        bar = tk.Frame(self, bg=self._bg_panel)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        bar = self._ensure_toolbar()
 
         # Colour swatches.
         for label, hexcolor in _PALETTE:

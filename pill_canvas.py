@@ -67,6 +67,15 @@ GLYPHS = {
 }
 _DEFAULT_GLYPH = "◆"
 
+# The kinds :meth:`PillCanvas._build_param_body` builds a real editor for. Every
+# other kind (fit / char / the doctrine kinds / a kind this module has never
+# heard of) falls through to its read-only info body - and is the set an
+# ``on_pill_activate`` callback takes over. Kept equal to that method's
+# ``if kind ...`` chain by tests/test_pill_canvas_seams.py (AST drift guard).
+PARAM_EDITOR_KINDS = frozenset({
+    "tag_line", "staging_line", "system", "channel", "channel_line", "fc_line",
+})
+
 _BASE_FAMILY = "Consolas"
 _BASE_SIZE = 11              # mirrors markup_editor._BASE_SIZE (the "no size tag" size)
 _CHIP_FONT = ("Consolas", 9)
@@ -91,6 +100,20 @@ class PillCanvas(MarkupEditor):
     :meth:`cancel_drag_feedback`, :meth:`undo_model` / :meth:`redo_model`,
     :meth:`accept_trigger` / :meth:`dismiss_trigger`, and the
     :meth:`get_markup` / :meth:`set_markup` legacy-compat overrides.
+
+    Opt-in seams (keyword-only; the defaults ARE the MOTD composer's behaviour,
+    which passes none of them) for a second host that edits its own pill kinds:
+
+    * ``style_toolbar=False`` - build none of the inherited colour / B / I / U /
+      size / clear controls. The undo / redo buttons are still built.
+    * ``kind_glyphs`` - a ``{kind: glyph}`` overlay consulted BEFORE the module
+      :data:`GLYPHS` for this instance only. Copied at construction; the module
+      table is never written.
+    * ``on_pill_activate(kind, params)`` - called (with a copy of the params) when
+      the user activates a pill whose kind has no built-in parameter editor
+      (:data:`PARAM_EDITOR_KINDS`): double-click, Return with the caret against
+      the selected pill, or the chip menu's Edit entry. Replaces the read-only
+      info window for those kinds; kinds WITH an editor are unaffected.
     """
 
     def __init__(self, master, resolve_label: Callable,
@@ -100,14 +123,24 @@ class PillCanvas(MarkupEditor):
                  doctrine_tags: Callable = lambda: [],
                  on_change=None,
                  on_trigger: Callable = None,
-                 height=14, **kw):
-        super().__init__(master, height=height, on_change=on_change, **kw)
+                 height=14, *,
+                 # -- opt-in host seams (see the class docstring) --
+                 style_toolbar: bool = True,
+                 kind_glyphs: "dict | None" = None,
+                 on_pill_activate: "Callable[[str, dict], None] | None" = None,
+                 **kw):
+        super().__init__(master, height=height, on_change=on_change,
+                         style_toolbar=style_toolbar, **kw)
         self._resolve_label = resolve_label
         self._system_completions = system_completions
         self._system_labels = system_labels
         self._channel_completions = channel_completions
         self._doctrine_tags = doctrine_tags
         self._on_trigger = on_trigger
+
+        # Opt-in host seams. Empty overlay + no callback = the MOTD composer.
+        self._kind_glyphs = dict(kind_glyphs or {})
+        self._on_pill_activate = on_pill_activate
 
         # name (embedded-window pathname) -> TokenRun / chip Frame
         self._pills: dict = {}
@@ -147,10 +180,9 @@ class PillCanvas(MarkupEditor):
 
     def _add_undo_buttons(self):
         """Add ⟲/⟳ buttons to the inherited toolbar, packed after "clear"."""
-        slaves = self.grid_slaves(row=0, column=0)
-        if not slaves:
-            return
-        bar = slaves[0]
+        # The inherited strip - or, under style_toolbar=False, a fresh one that
+        # holds these two buttons alone.
+        bar = self._ensure_toolbar()
         common = dict(font=_CHIP_FONT, bg=self._bg_entry, fg=self._fg_text,
                       activebackground=self._fg_accent, activeforeground=BG_DARK,
                       bd=1, relief=tk.RIDGE, cursor="hand2", width=2)
@@ -313,9 +345,17 @@ class PillCanvas(MarkupEditor):
         self._style_chip(frame, run, self._resolve_label(run))
         return frame
 
+    def _glyph_for(self, kind) -> str:
+        """The chip glyph for ``kind``: this instance's ``kind_glyphs`` overlay
+        first, then the module :data:`GLYPHS`, then the default."""
+        overlay = self._kind_glyphs
+        if kind in overlay:
+            return overlay[kind]
+        return GLYPHS.get(kind, _DEFAULT_GLYPH)
+
     def _style_chip(self, frame, run, label):
         """Apply ``label`` (a TokenLabel) to an existing chip — no widget churn."""
-        glyph = GLYPHS.get(run.kind, _DEFAULT_GLYPH)
+        glyph = self._glyph_for(run.kind)
         prefix = "" if label.resolved else "!"
         frame._pill_main.config(text=f"{prefix}{glyph} {label.text}",
                                 fg=FG_WHITE if label.resolved else FG_DIM)
@@ -858,9 +898,31 @@ class PillCanvas(MarkupEditor):
         self._drop_chip_move(d["name"], event.x_root, event.y_root)
         return "break"
 
+    def _activate_pill(self, name):
+        """The ONE dispatch for "the user activated pill ``name``" - double-click,
+        Return with the caret against the selected pill, the chip menu's Edit entry.
+
+        With no ``on_pill_activate`` callback (the MOTD composer) this is exactly
+        :meth:`_open_param_editor`. With one, a pill whose kind has no built-in
+        editor (not in :data:`PARAM_EDITOR_KINDS`) goes to the callback as
+        ``(kind, dict(params))`` - a copy, so the host cannot edit the document
+        through it - and no window is opened; every other pill still gets its
+        editor. A raising callback is logged, never propagated into the Tk
+        binding (the ``on_trigger`` precedent)."""
+        callback = self._on_pill_activate
+        if callback is not None:
+            run = self._pills.get(name)
+            if run is not None and run.kind not in PARAM_EDITOR_KINDS:
+                try:
+                    callback(run.kind, dict(run.params or {}))
+                except Exception:
+                    _LOG.exception("on_pill_activate callback raised")
+                return None
+        return self._open_param_editor(name)
+
     def _chip_double(self, event, name):
         self._chip_drag = None
-        self._open_param_editor(name)
+        self._activate_pill(name)
         return "break"
 
     def _chip_menu(self, event, name):
@@ -870,7 +932,7 @@ class PillCanvas(MarkupEditor):
                        activebackground=FG_ACCENT, activeforeground=BG_DARK,
                        bd=1, relief=tk.FLAT)
         menu.add_command(label="Edit…",
-                         command=lambda: self._open_param_editor(name))
+                         command=lambda: self._activate_pill(name))
         menu.add_command(label="Convert to plain text",
                          command=lambda: self._convert_to_text(name))
         menu.add_command(label="Remove", command=lambda: self._remove_pill(name))
@@ -1139,7 +1201,7 @@ class PillCanvas(MarkupEditor):
         # and try to make a new line" bug).
         if self._selected_pill:
             if self._insert_adjacent_to(self._selected_pill):
-                self._open_param_editor(self._selected_pill)
+                self._activate_pill(self._selected_pill)
                 return "break"
             self._clear_pill_selection()
         # A newline is a text edit; open/extend the undo burst (Return is more
