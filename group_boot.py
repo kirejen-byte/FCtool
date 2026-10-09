@@ -7,26 +7,42 @@ its first application import::
     if __name__ == "__main__":
         group_boot.run()
 
-So ``run`` works before the app exists: no window, no logger, no store, no monitor - and no
-module that has read a colour from ``ui_theme``. It does three things, in this order:
+So ``run`` works before the app exists: no window, no store, no monitor - and no module
+that has read a colour from ``ui_theme``. It does three things, in this order:
 
 1. **Stale bundle.** A frozen process that inherited another build's extraction folder
    (``self_update.inherited_stale_meipass()``) is only a stub - ``main()`` starts a clean
-   copy and that copy does the work. The stub touches nothing: palette ``"skipped"``.
+   copy and that copy does the work. The stub touches nothing: palette ``"skipped"``, and
+   one log line that says so. NOT when ``FCTOOL_REEXEC=1`` is set: then
+   ``self_update.reexec_if_inherited()`` starts nothing more and ``main()`` goes on as the
+   app in this very process - there is no clean copy to leave the work to, so it is done
+   here (one log line as well).
 2. **The staged import.** Only when the pending or the applying file is there:
    ``group_apply.apply_pending(folder)``. Everything that boots afterwards reads files that
    already hold the import. (One start can spend seconds here when another FCTool is still
    closing, or is applying the same import - ``apply_pending`` waits for it.)
+
+   One process is never waited for: the updater's watcher. After an update the OLD build's
+   process stays alive until this build reports that it booted - which it does seconds
+   after its window is up, long after this hook. Work that process staged would make this
+   start sit for ``apply_pending``'s whole wait before any window and then be told
+   "another FCTool window is still open". So when the update marker says ``launched`` and
+   the staged work names that process as its writer, the hook looks at the process ONCE:
+   still alive -> ``deferred`` at once, with ``MSG_AFTER_UPDATE`` as the message and a log
+   line; the work stays staged for the next start. The watcher is NOT taken for gone - its
+   leftover threads can still save settings.
 3. **The palette.** ``palette.load(folder)`` and ``palette.install(ui_theme, roles)`` - also
    when step 2 failed or raised. ``FCTOOL_DEFAULT_PALETTE=1`` in the environment skips it
-   (the way back from a palette someone cannot read). ``ui_theme`` is imported HERE and not
-   earlier, so every later ``from ui_theme import X`` picks the palette up by itself.
+   (the way back from a palette someone cannot read; one log line). ``ui_theme`` is imported
+   HERE and not earlier, so every later ``from ui_theme import X`` picks the palette up by
+   itself.
 
 ``run`` NEVER raises and never shows anything: whatever goes wrong - a module that cannot be
 imported, a broken file, a full disk, an ``apply_pending`` that raises although it promises
-not to - the app still starts, on the stock colours if need be. Each failure is ONE line in
-the result's ``log`` (ASCII, counts and type names only, never a name from a file); the app
-writes those lines to its own log once it has one (``log_lines``).
+not to - the app still starts, on the stock colours if need be. Each failure, and each step
+that was skipped, is ONE line in the result's ``log`` (ASCII, counts, type names and module
+names only, never a name from a file). ``run`` itself writes to no logger; the app writes
+those lines to its own log once its window is being built (``log_lines``).
 
 The result, also kept as ``LAST``::
 
@@ -39,20 +55,25 @@ The result, also kept as ``LAST``::
 are in use); ``skipped`` - the palette step did not run (the switch, the stub, no folder).
 
 A plain start does not pay for the feature. Importing this module imports nothing but ``os``
-and does nothing - every test imports ``fc_gui``, and the hook must not run then. ``run``
-fetches what a step needs when the step needs it: ``group_apply`` - and with it
-``group_state``, the whole engine and every item - ONLY when one of the two protocol files
-is there. That is why the two names are held here a second time (``_PENDING_FILE``,
+and ``sys`` and does nothing - every test imports ``fc_gui``, and the hook must not run
+then. ``run`` fetches what a step needs when the step needs it: ``group_apply`` - and with
+it ``group_state``, the whole engine and every item - ONLY when one of the two protocol
+files is there. That is why the two names are held here a second time (``_PENDING_FILE``,
 ``_APPLYING_FILE``): importing ``group_state`` for them cost 51-65 ms on every start.
 ``tests/test_group_boot.py`` pins both against ``group_state``. A plain start asks whether
 the two files are there, asks for the palette file, and is done.
 
-Files (owner rule A2): nothing in this module opens a file. ``palette.load`` reads the
-palette file; ``apply_pending`` reaches the five state files, the three protocol files and
-``backups``. No sign-in file, no character map, no cache.
+Files (owner rule A2): this module opens no file itself. What its steps open:
+``palette.load`` reads the palette file; ``apply_pending`` reaches the five state files, the
+three protocol files and ``backups``; and - only in a frozen build, only when something is
+staged - ``self_update.read_marker`` reads the updater's marker. One more file is opened on
+the way, by nobody's intent: ``import self_update`` (step 1) pulls in ``update_check``,
+whose module-level logger sets logging up and opens the app's log. The app's first import
+would do the same a moment later. No sign-in file, no character map, no cache.
 """
 
 import os
+import sys
 
 
 #: The result of the one ``run`` of this process; ``None`` until the hook ran - and for good
@@ -62,12 +83,22 @@ LAST = None
 #: Set to ``1`` to start on the stock colours whatever the stored palette holds.
 PALETTE_ENV = "FCTOOL_DEFAULT_PALETTE"
 
+#: What the report says when the start that follows an update leaves the staged work for
+#: the next start (module docstring, step 2): for an import, for a restore.
+MSG_AFTER_UPDATE = ("FCTool was just updated. Your group import is applied the next time "
+                    "FCTool starts.",
+                    "FCTool was just updated. Your previous settings are restored the next "
+                    "time FCTool starts.")
+
 #: Mirrors of ``group_state.PENDING_FILE`` / ``group_state.APPLYING_FILE`` (see the module
 #: docstring; a test holds them equal). Looked for in THIS order - pending first: a claim
 #: renames pending -> applying, so a start that misses the one finds the other.
 _PENDING_FILE = "group_import_pending.json"
 _APPLYING_FILE = "group_import_applying.json"
 _STAGED = (_PENDING_FILE, _APPLYING_FILE)
+
+_MAX_MODULES = 8        # _note_missing_items: how many module names its one line carries
+_MAX_NAME = 40          # ... and how long one of them may be
 
 _TAKEN = False          # take_report: the report of LAST was handed out
 
@@ -96,8 +127,18 @@ def _note(result, line) -> None:
         pass
 
 
+def _env(environ, name):
+    """``environ[name]`` (``os.environ`` when ``environ`` is ``None``), or ``None`` - also
+    for an ``environ`` that is no mapping."""
+    try:
+        source = os.environ if environ is None else environ
+        return source.get(name)
+    except Exception:
+        return None
+
+
 def _run(app_dir, theme, environ, result) -> None:
-    if _stale_bundle(result):                                           # step 1
+    if _stale_bundle(environ, result):                                  # step 1
         return
     root = _folder(app_dir, result)
     if root is None:
@@ -106,13 +147,24 @@ def _run(app_dir, theme, environ, result) -> None:
     result["palette"] = _install_palette(root, theme, environ, result)  # step 3
 
 
-def _stale_bundle(result) -> bool:
-    """Is this the updater's inherited-mode stub? A check that fails is "no": a start that
-    does nothing because a check broke would be worse than the stub doing the work."""
+def _stale_bundle(environ, result) -> bool:
+    """Is this the updater's inherited-mode stub, about to hand over to a clean copy? A
+    check that fails is "no": a start that does nothing because a check broke would be
+    worse than the stub doing the work. "No" as well for the process that was itself
+    started by such a stub (``FCTOOL_REEXEC=1``): nothing is started after it, it IS the
+    app. Either way a stale bundle is one log line - a start that skips its work, or does
+    it out of a doomed folder, is never silent."""
     try:
         import self_update
 
-        return self_update.inherited_stale_meipass() is True
+        if self_update.inherited_stale_meipass() is not True:
+            return False
+        if _env(environ, self_update.REEXEC_ENV) == "1":
+            _note(result, "group boot: stale bundle, but no clean copy follows this process "
+                          "- doing the start work")
+            return False
+        _note(result, "group boot: skipped - this process only starts a clean copy of FCTool")
+        return True
     except Exception as exc:
         _note(result, "group boot: stale-bundle check failed (%s)" % type(exc).__name__)
         return False
@@ -140,15 +192,21 @@ def _folder(app_dir, result):
 def _apply(root, result):
     """Step 2 -> the report, or ``None`` when nothing was staged or nothing usable came
     back. Nothing of the feature is imported unless one of the two files is there."""
+    met = []                            # _watcher_wait: the updater's watcher is still alive
     try:
         if not any(_there(os.path.join(root, name)) for name in _STAGED):
             return None
         import group_apply
 
-        report = group_apply.apply_pending(root)
+        wait = _wait_after_update(result, met)
+        if wait is None:
+            report = group_apply.apply_pending(root)
+        else:
+            report = group_apply.apply_pending(root, wait=wait)
     except Exception as exc:
         _note(result, "group import: %s" % type(exc).__name__)
         return None
+    _note_missing_items(result)
     if report is None:
         return None
     if not isinstance(report, dict):
@@ -156,6 +214,11 @@ def _apply(root, result):
         return None
     for line in _clean_lines(report.get("log")):
         _note(result, line)
+    if met and report.get("status") == "deferred":
+        restore = report.get("kind") == "restore"
+        report = dict(report, message=MSG_AFTER_UPDATE[1 if restore else 0])
+        _note(result, "%s FCTool was just updated - applied at the next start"
+              % _prefix(report))
     _note(result, _summary(report))
     return report
 
@@ -173,6 +236,11 @@ def _there(path) -> bool:
     return True
 
 
+def _prefix(report) -> str:
+    """How a log line about this report begins: by what was staged."""
+    return "group restore:" if report.get("kind") == "restore" else "group import:"
+
+
 def _summary(report) -> str:
     """One line for the app's log: the outcome and counts - never a name from the file."""
     status = report.get("status")
@@ -181,12 +249,98 @@ def _summary(report) -> str:
     items = report.get("items")
     items = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
     failed = sum(1 for item in items if item.get("status") == "failed")
-    return "group import: %s (%d items, %d failed)" % (status, len(items), failed)
+    return "%s %s (%d items, %d failed)" % (_prefix(report), status, len(items), failed)
+
+
+def _note_missing_items(result) -> None:
+    """One log line when item modules of this build failed to load (a broken frozen build):
+    the import was applied with what is left of the registry, and its report cannot say so.
+    ``group_items`` is only looked up - a start never imports the engine to ask this."""
+    try:
+        failures = getattr(sys.modules.get("group_items"), "LOAD_FAILURES", None)
+        if not isinstance(failures, (list, tuple)):
+            return
+        names = set()
+        for entry in failures:
+            name = entry[0] if isinstance(entry, (list, tuple)) and entry else None
+            if isinstance(name, str) and name.isascii() and name.isidentifier() \
+                    and len(name) <= _MAX_NAME:
+                names.add(name)             # a module's code name, nothing out of a file
+        if not names:
+            return
+        names = sorted(names)
+        more = len(names) - _MAX_MODULES
+        _note(result, "group import: this build is missing item modules: %s%s"
+              % (", ".join(names[:_MAX_MODULES]), " (+%d more)" % more if more > 0 else ""))
+    except Exception:
+        pass
+
+
+# -- the start that follows an update (module docstring, step 2) ---------------
+
+def _staging_dir() -> str:
+    """Where the updater keeps its marker: ``<exe folder>/updates`` for a frozen build, else
+    ``""`` - from source there is no updater. The rule of ``FCToolGUI._update_staging_dir``;
+    a test holds the two together."""
+    if not getattr(sys, "frozen", False):
+        return ""
+    return os.path.join(os.path.dirname(sys.executable), "updates")
+
+
+def _update_watcher(result):
+    """The pid of the updater's watcher - the OLD build's process, alive until this build
+    reports that it booted - or ``None`` when this start does not follow an update: no
+    marker, a marker in another state than ``launched``, or one that names no other
+    process. A marker that cannot be looked for is ``None`` and one log line."""
+    try:
+        staging = _staging_dir()
+        if not staging:
+            return None
+        import self_update
+
+        marker = self_update.read_marker(self_update.marker_path(staging))
+        if marker is None or marker.state != "launched":
+            return None
+        pid = marker.old_pid
+        return pid if type(pid) is int and pid > 0 and pid != os.getpid() else None
+    except Exception as exc:
+        _note(result, "group boot: update marker not read (%s)" % type(exc).__name__)
+        return None
+
+
+def _wait_after_update(result, met):
+    """The ``wait`` to hand to ``apply_pending`` at the start that follows an update, or
+    ``None`` - then ``apply_pending`` is called exactly as on any other start."""
+    watcher = _update_watcher(result)
+    if watcher is None:
+        return None
+    # group_apply is loaded by now, and group_state with it: looked up, not imported.
+    wait_for_exit = getattr(sys.modules.get("group_state"), "wait_for_exit", None)
+    if not callable(wait_for_exit):
+        return None
+    return _watcher_wait(watcher, wait_for_exit, met)
+
+
+def _watcher_wait(watcher, wait_for_exit, met):
+    """``wait(pid, started) -> bool`` ("that process is gone") for ``apply_pending``: the
+    engine's own ``wait_for_exit`` for every process but ``watcher``. That one gets ONE look
+    and no waiting - gone is gone (the work is applied), alive is "not gone" at once and
+    its pid is appended to ``met``."""
+    def wait(pid, started=None):
+        if type(pid) is int and pid == watcher:
+            if wait_for_exit(pid, started, 0):
+                return True
+            met.append(pid)
+            return False
+        return wait_for_exit(pid, started)
+
+    return wait
 
 
 def _install_palette(root, theme, environ, result) -> str:
     """Step 3 -> the palette status. Nothing is installed unless everything worked."""
-    if _stock_palette_wanted(environ):
+    if _env(environ, PALETTE_ENV) == "1":
+        _note(result, "group boot: stock colours - %s is set" % PALETTE_ENV)
         return "skipped"
     try:
         import palette
@@ -206,14 +360,6 @@ def _install_palette(root, theme, environ, result) -> str:
     except Exception as exc:
         _note(result, "group boot: palette not installed (%s)" % type(exc).__name__)
         return "invalid"
-
-
-def _stock_palette_wanted(environ) -> bool:
-    try:
-        source = os.environ if environ is None else environ
-        return source.get(PALETTE_ENV) == "1"
-    except Exception:
-        return False
 
 
 def _clean_lines(lines) -> list:
@@ -258,4 +404,3 @@ def log_lines() -> list:
         return _clean_lines(LAST["log"])
     except Exception:
         return []
-

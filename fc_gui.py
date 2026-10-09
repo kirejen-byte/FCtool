@@ -1338,8 +1338,11 @@ class FCToolGUI:
         # entering live mode; without this each does its own ESI round-trip.
         # (ts_monotonic, info_dict_or_None); see _cached_fleet_info.
         self._fleet_info_cache = None
-        # Group configuration: the boot hook (top of this file) ran before any
-        # logger existed -- take its report and write the lines it kept.
+        # Group configuration: the boot hook (top of this file) ran before this
+        # window existed and logs nothing itself -- take its report and write
+        # the lines it kept. (A logger existed by then: the hook's own
+        # `import self_update` sets logging up and opens fctool.log, a moment
+        # before the first application import after the hook would.)
         self._plain_restart_after_close = False   # main() reads this after mainloop
         self._group_boot_report = group_boot.take_report()
         for _boot_line in group_boot.log_lines():
@@ -4031,6 +4034,16 @@ class FCToolGUI:
         is installing it refuses (False); once one is ready, the updater's own
         restart is the one that runs. Returns True when the window is closing.
         """
+        # Right after an update the old build still watches for this build's
+        # "booted" mark (written 3 s after start-up) and reads an exit before
+        # it as a boot crash: it would roll the update back. Write the mark
+        # now -- a second write changes nothing.
+        try:
+            mark_booted = getattr(self, "_mark_update_booted", None)
+            if callable(mark_booted):
+                mark_booted()
+        except Exception:
+            pass
         self._save_config()
         state = getattr(self, "_update_install_state", "idle")
         if state == "installing":
@@ -14223,9 +14236,10 @@ class FCToolGUI:
         self._motd_last_check_ts = None
         self._motd_last_pushed_markup = None
         self._motd_link_state = "off"
-        # A group import applied at this start added or changed MOTD templates
-        # (boot flag): a remembered ON starts OFF. SESSION ONLY, like the
-        # automatic disarms in _motd_maybe_autopush -- the remembered
+        # A group import applied at this start added or updated a doctrine
+        # (its fits) or a MOTD template (boot flag) -- either changes what
+        # the next push would send: a remembered ON starts OFF. SESSION ONLY,
+        # like the automatic disarms in _motd_maybe_autopush -- the remembered
         # config["fittings"]["motd_link"] is not written; re-ticking resumes.
         # A remembered OFF is left exactly as it is: no state, no notice.
         if self._motd_link_enabled and group_boot.boot_flag("motd_disarm"):
@@ -14478,12 +14492,16 @@ class FCToolGUI:
             "Auto-update MOTD to resume). Your remembered on/off choice is "
             "left alone, so restarting FCTool resumes it too. Does nothing if "
             "no staging system is set.")
-        # wraplength: only the group-import notice is longer than 30 characters;
-        # it wraps instead of widening the row past the pane (898 px on one line).
+        # wraplength: only the group-import notice is longer than 28 characters;
+        # it wraps instead of widening the row past the pane (it is 81 characters
+        # long). One pixel short of 29 characters: no line of the notice is
+        # wider than the widest other state (28 characters), and that state
+        # keeps most of a character of room before it would wrap itself.
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
             bg=BG_PANEL, cursor="question_arrow", justify=tk.LEFT,
-            wraplength=tkfont.Font(root=link_row, font=("Consolas", 8)).measure("0" * 30))
+            wraplength=tkfont.Font(root=link_row,
+                                   font=("Consolas", 8)).measure("0" * 29) - 1)
         self._motd_link_indicator.pack(side=tk.LEFT, padx=2)
         _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
                      "and re-pushes it to your fleet whenever the composition/"
@@ -17092,7 +17110,7 @@ class FCToolGUI:
             return
         if state == "group_import":
             ind.config(text="Auto-update is off for this session: a group file "
-                            "added MOTD templates.", fg=FG_YELLOW)
+                            "changed fits or MOTD templates.", fg=FG_YELLOW)
             return
         if not getattr(self, "_motd_link_enabled", False):
             ind.config(text="○ not linked", fg=FG_DIM)

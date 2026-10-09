@@ -16,6 +16,10 @@ waits for the process that staged it).
 
 * frozen (``sys.frozen``): the exe alone, in the exe's folder;
 * from source: the interpreter plus the ABSOLUTE path of the script, in the script's folder.
+  That path is worked out ONCE, when this module is imported (``SCRIPT``): ``FCTool.bat``
+  starts ``python fc_gui.py``, and a relative name resolved at relaunch time would follow
+  whatever the working folder is by then - to a file that is not there, started all the
+  same. The argument list is handed over as a list, so a path with spaces is one argument.
 
 ``relaunch`` hands that to ``popen`` detached (``self_update.CREATION_FLAGS``), and a frozen
 child gets ``self_update.clean_child_env()``: a onefile exe passes its extraction folder to
@@ -39,19 +43,40 @@ def _text(value, what) -> str:
     return value
 
 
+def _script_at_import():
+    """The absolute path of the script this process was started with (``sys.argv[0]``), or
+    ``None`` when there is none to name. Never raises."""
+    try:
+        argv = sys.argv
+        if not isinstance(argv, list) or not argv:
+            return None
+        return os.path.abspath(_text(argv[0], "the script"))
+    except Exception:
+        return None
+
+
+#: The script to start again, absolute, as the working folder was when this module was
+#: imported (fc_gui imports it at start-up). ``None``: this process has no script.
+SCRIPT = _script_at_import()
+
+
 def relaunch_argv(*, frozen=None, executable=None, script=None):
     """``(argv, cwd)`` that starts this program again.
 
     ``frozen`` defaults to ``sys.frozen``, ``executable`` to ``sys.executable``, ``script``
-    to ``sys.argv[0]``. ``cwd`` is always an absolute folder. Raises ``TypeError`` for a
-    path that is no text; ``relaunch`` turns that into ``False``.
+    to ``SCRIPT`` - the script of this process, resolved when the module was imported. A
+    ``script`` that is handed in is made absolute now. ``cwd`` is always an absolute folder.
+    Raises ``TypeError`` for a path that is no text; ``relaunch`` turns that into ``False``.
     """
     if frozen is None:
         frozen = getattr(sys, "frozen", False)
     program = _text(sys.executable if executable is None else executable, "the program")
     if frozen:
         return [program], os.path.dirname(os.path.abspath(program))
-    source = os.path.abspath(_text(sys.argv[0] if script is None else script, "the script"))
+    if script is None:
+        source = _text(SCRIPT, "the script")
+    else:
+        source = os.path.abspath(_text(script, "the script"))
     return [program, source], os.path.dirname(source)
 
 
