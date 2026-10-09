@@ -14,7 +14,8 @@ Rules of this module
 * Every item writes ONLY the paths it declares (spec 6.7): the allowlist test is built from
   ``paths``. ``channel_store.save`` stays the only writer of the channels block; it rebinds
   that one top-level block (sibling keys inside it are kept) and touches nothing else - the
-  legacy ``intel_channels`` block in particular is left exactly as it was.
+  legacy ``intel_channels`` block in particular is left exactly as it was. The one key it
+  writes inside the block is ``registry``, so ``channels.registry`` is the declared path.
 * Nothing here needs a character or the network (spec 9.1). A market STRUCTURE is the one
   value that does: it is never written here - one ``verify_structure`` task is queued for
   after the restart (spec 13). Until then the importer's own station or structure is kept
@@ -133,7 +134,8 @@ class _ChannelsItem(Item):
 
     kind = "collection"
     files = ("config",)
-    paths = (("config", (channel_store.CONFIG_KEY,)),)
+    # `channels.registry`, not the whole block: the one key `channel_store.save` writes
+    paths = (("config", (channel_store.CONFIG_KEY, channel_store.REGISTRY_KEY)),)
 
     def _clean(self, payload):
         """-> ``(records, problems)``. Total."""

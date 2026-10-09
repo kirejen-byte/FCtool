@@ -22,6 +22,10 @@ Rules of this module
   (absent means untouched).
 * The name a file carries is clamped by ``palette.clean_name`` before it is written, as
   ``palette.save`` clamps it: the palette file can never outgrow what ``palette.load`` reads.
+* A preset's name is a claim about the colours, so a file cannot make it: a carried name
+  that is a preset's (or "Custom"), in any case, is replaced by what the colours ARE -
+  ``palette.preset_name``. Arbitrary colours are never shown as "Navy (stock)". Any other
+  name ("Team colours") is the file's to give, also to colours that equal a preset.
 * ``validate`` builds a clean payload from scratch and never raises; ``apply`` checks what
   it is given once more, so a payload that skipped validation still cannot write a palette
   that fails a rule.
@@ -46,6 +50,12 @@ def _key_set(keys) -> set:
         return {key for key in keys if isinstance(key, str)}
     except TypeError:
         return set()
+
+
+def _preset_labels() -> frozenset:
+    """The names only ``palette.preset_name`` may give, case-folded: every preset's, and the
+    one it gives colours that are no preset ("Custom")."""
+    return frozenset(name.casefold() for name in (*palette.PRESETS, palette.preset_name(None)))
 
 
 def _roles_in_effect(stored):
@@ -87,7 +97,11 @@ class _PaletteItem(Item):
         roles, problems = palette.validate(raw)
         if roles is None:
             return ABSENT, [f"{self.label}: {sentence}" for sentence in problems]
-        name = palette.clean_name(payload.get("name")) or palette.preset_name(roles)
+        name = palette.clean_name(payload.get("name"))
+        if not name or name.casefold() in _preset_labels():
+            # No name of its own - or one that is a preset's (or "Custom"): the file does
+            # not get to say WHICH preset its colours are. The colours do.
+            name = palette.preset_name(roles)
         return {"name": name, "roles": roles}, []
 
     def export(self, state, ctx):

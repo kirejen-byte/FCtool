@@ -23,7 +23,7 @@ shared palette from making someone's FCTool unreadable.
 
 Everything the boot hook or a validator reaches (``normalize_hex``,
 ``relative_luminance``, ``contrast``, ``problems``, ``validate``, ``load``,
-``preset_name``, ``clean_name``) is TOTAL — garbage in, a clean value out,
+``preset_name``, ``clean_name``) is TOTAL - garbage in, a clean value out,
 never an exception.
 ``install`` is total over its ``roles`` argument only: a ``theme_module`` that is
 ``None`` or lacks attributes is the caller's error. ``save`` and ``reset`` are

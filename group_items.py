@@ -44,8 +44,10 @@ Contracts the item modules rely on
 * ``apply_bundle`` MUTATES the state it is given and returns that same object. Hand it
   ``state.copy()`` to keep the original - ``preview`` does exactly that.
 * The payloads handed to ``apply_bundle`` are the output of ``validate_bundle``.
-* A rule that spans two items of one module lives in that module's ``reconcile(payloads)``
-  (see ``validate_bundle``); what an export leaves out is said by ``export_notes``.
+* A rule that spans two items of one module lives in that module's ``reconcile(payloads)``,
+  with the ids of those items in a tuple ``RECONCILES`` beside it (see ``validate_bundle``:
+  the hook is handed, and the engine snapshots, only what the tuple names); what an export
+  leaves out is said by ``export_notes``.
 * The lines an item says are bounded by the engine (``MAX_PROBLEMS``, ``MAX_RESULT_LINES``):
   an item need not count them.
 
@@ -1353,12 +1355,20 @@ def validate_bundle(bundle, ctx=None):
 
     After every payload has been validated comes the RECONCILE pass, for rules that span
     items: each item module that has an item registered and defines a module-level
-    ``reconcile(payloads) -> [problem lines]`` is called, in registry order, with the dict
-    of clean payloads (item id -> payload). It may change a payload in place or delete a
-    key (that item is then not in the result, as if the file had not carried it). A
-    ``reconcile`` that raises is contained: one problem line, and the payloads are exactly
-    what they were before it was called. It cannot add an item: after each call only
-    registered item ids with a payload are kept.
+    ``reconcile(payloads) -> [problem lines]`` is called, in registry order, with a dict of
+    clean payloads (item id -> payload). It may change a payload in place, put another in
+    its place or delete a key (that item is then not in the result, as if the file had
+    not carried it). A ``reconcile`` that raises is contained: one problem line, and the
+    payloads are exactly what they were before it was called. It cannot add an item: after
+    each call only the ids it was handed are kept, each with a payload.
+
+    WHICH payloads a hook is handed is the module's to say, with a module-level tuple of
+    item ids next to the hook: ``RECONCILES = ("jump.friendly_stagings", ...)``. The hook
+    then gets a dict of just those (the ones the file carries; with none of them it is not
+    called), only those are snapshotted for the undo, and whatever else it puts into that
+    dict is ignored - it cannot reach a payload it does not name. A module without the
+    tuple gets EVERY payload, and pays for it: the undo snapshot is a deep copy of all of
+    them, which on a file at the size limit took longer than validating it.
 
     The problems are BOUNDED, whatever the file holds: the first ``MAX_PROBLEMS`` lines,
     then one last line ``"and <n> more"``. What explains the file comes first - the
@@ -1414,8 +1424,8 @@ def validate_bundle(bundle, ctx=None):
         more += say(lines)
         if clean is not ABSENT and clean is not None:
             payloads[item_id] = clean
-    for label, reconcile in _reconcilers() if payloads else ():
-        payloads, lines = _reconciled(payloads, label, reconcile, items)
+    for label, reconcile, owned in _reconcilers() if payloads else ():
+        payloads, lines = _reconciled(payloads, label, reconcile, items, owned)
         more += say(lines)
     more += say(unknown)
     if more:
@@ -1423,16 +1433,31 @@ def validate_bundle(bundle, ctx=None):
     return payloads, problems
 
 
+def _owned_ids(module):
+    """What a module's ``RECONCILES`` names: a tuple of item ids (each once, in the order
+    given, anything that is not text left out), or ``None`` when the module has no such
+    tuple - a string (the tuple that lost its comma) is not one."""
+    named = getattr(module, "RECONCILES", None)
+    if not isinstance(named, (tuple, list)):
+        return None
+    return tuple(dict.fromkeys(item_id for item_id in named if isinstance(item_id, str)))
+
+
 def _reconcilers() -> list:
-    """``[(label, reconcile)]``: the module-level ``reconcile`` hook of every loaded item
-    module (``group_items_*``) that has at least one of its ``ITEMS`` in the registry, in
-    the registry order of that item. ``label`` names the module to the importer: the
-    category of that first item.
+    """``[(label, reconcile, owned)]``: the module-level ``reconcile`` hook of every loaded
+    item module (``group_items_*``) that has at least one of its ``ITEMS`` in the registry,
+    in the registry order of that item. ``label`` names the module to the importer: the
+    category of that first item. ``owned`` is the tuple of item ids the module's
+    ``RECONCILES`` names, or ``None`` when it names none (the hook is then handed every
+    payload - see ``validate_bundle``).
 
     The modules are found in ``sys.modules`` - where a plain ``import`` in
     ``_load_item_modules`` put them - and never imported from here, by name or otherwise.
-    A module whose items are not registered (an isolated registry in a test) is not asked.
+    So the registry is asked for FIRST: before its first call in a process no item module
+    is in ``sys.modules`` at all, and this function used to answer "no hook". A module
+    whose items are not registered (an isolated registry in a test) is not asked.
     """
+    items = registry()                          # loads the item modules: before the scan
     owners = {}
     for name, module in list(sys.modules.items()):
         if module is None or not isinstance(name, str) \
@@ -1442,33 +1467,53 @@ def _reconcilers() -> list:
         if not callable(hook) or not isinstance(own, (tuple, list)):
             continue
         for item in own:
-            owners.setdefault(id(item), (name, hook))
+            owners.setdefault(id(item), (name, hook, _owned_ids(module)))
     found, seen = [], set()
-    for item in registry():
-        name, hook = owners.get(id(item), (None, None))
+    for item in items:
+        name, hook, owned = owners.get(id(item), (None, None, None))
         if hook is not None and name not in seen:
             seen.add(name)
-            found.append((CATEGORY_LABELS.get(item.category, item.category), hook))
+            found.append((CATEGORY_LABELS.get(item.category, item.category), hook, owned))
     return found
 
 
-def _reconciled(payloads, label, reconcile, items):
+def _reconciled(payloads, label, reconcile, items, owned=None):
     """Run one ``reconcile`` hook. -> ``(payloads, lines)``.
 
-    The hook gets the real dict and may edit it. When it raises, the dict it half-edited
-    is thrown away and the snapshot taken before the call is returned with one problem
-    line. Afterwards only registered ids with a payload are kept, in registry order."""
+    ``owned`` is ``None`` - the hook is handed the dict of ALL payloads - or the ids it
+    names: it is then handed a dict of just those the file carries, and is not called when
+    the file carries none. Either way the payloads it is handed are the real ones (a
+    change made in place counts) and are deep-copied first: when the hook raises, what it
+    half-did is thrown away and they are exactly as they were, with one problem line. A
+    snapshot that cannot be taken means the hook is not run. Afterwards only ids the hook
+    was handed are kept, each with a payload; what it added is ignored. The result is in
+    registry order."""
+    if owned is None:
+        handed = payloads
+    else:
+        handed = {item_id: payloads[item_id] for item_id in owned if item_id in payloads}
+        if not handed:
+            return payloads, []
     try:
-        before = deepcopy(payloads)             # nested edits must be undone too
+        before = deepcopy(handed)               # nested edits must be undone too
     except Exception as exc:                    # cannot be put back: the hook is not run
         return payloads, [f"{label}: could not be cross-checked ({type(exc).__name__})"]
     try:
-        lines = reconcile(payloads)
+        lines = reconcile(handed)
+        after = handed
     except Exception as exc:
-        return before, [f"{label}: could not be cross-checked ({type(exc).__name__})"]
-    kept = {item_id: payloads[item_id] for item_id in items
-            if item_id in payloads and payloads[item_id] is not ABSENT
-            and payloads[item_id] is not None}
+        lines = [f"{label}: could not be cross-checked ({type(exc).__name__})"]
+        after = before
+    kept = {}
+    for item_id in items:                       # registry order
+        if item_id in before:                   # the hook's to change, or to drop
+            payload = after.get(item_id, ABSENT)
+        elif owned is not None:                 # not handed to it: as it was
+            payload = payloads.get(item_id, ABSENT)
+        else:                                   # not in the file: a hook adds no item
+            payload = ABSENT
+        if payload is not ABSENT and payload is not None:
+            kept[item_id] = payload
     return kept, lines
 
 

@@ -202,6 +202,9 @@ class StagingListItem(NameListItem):
 
 
 FRIENDLY_ID, HOSTILE_ID = "jump.friendly_stagings", "jump.hostile_stagings"
+# What `reconcile` works on: the engine hands it - and snapshots for its undo - only these
+# payloads (group_items.validate_bundle), not every payload of the file.
+RECONCILES = (FRIENDLY_ID, HOSTILE_ID)
 
 
 def reconcile(payloads) -> list:

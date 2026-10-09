@@ -10,7 +10,8 @@ Rules of this module
 * Every item writes ONLY the paths it declares (spec 6.7): the allowlist test is built from
   ``paths``. ``channel_store.save`` stays the only writer of the channels block; it rebinds
   that one top-level block (sibling keys inside it are kept) and touches nothing else - the
-  legacy ``intel_channels`` block in particular is left exactly as it was.
+  legacy ``intel_channels`` block in particular is left exactly as it was. The one key it
+  writes inside the block is ``registry``, so ``channels.registry`` is the declared path.
 * The filter block this module writes is ALWAYS complete and well-typed: every key of
   ``DEFAULT_FILTER``, ``location`` and ``parties`` as dicts, every list entry an
   ``{"id": int, "name": str}`` dict. The intel panel reads those shapes without checking
@@ -118,6 +119,9 @@ FLAG_SEEDED = "coalitions_seeded"               # boot flag (exact name)
 EVERY_PARTY = "the filter would match every party"
 NO_LOCATION = "the filter's location list has no usable entry"
 COALITIONS_ID, FILTER_ID = "intel.coalitions", "intel.filter"
+# What `reconcile` works on: the engine hands it - and snapshots for its undo - only these
+# payloads (group_items.validate_bundle), not every payload of the file.
+RECONCILES = (COALITIONS_ID, FILTER_ID)
 
 _COALITIONS = "coalitions"                      # the config key AND the payload key
 _FILTER = "intel_filter"
@@ -932,7 +936,8 @@ class _FusionChannelsItem(Item):
 
     kind = "collection"
     files = ("config",)
-    paths = (("config", (channel_store.CONFIG_KEY,)),)
+    # `channels.registry`, not the whole block: the one key `channel_store.save` writes
+    paths = (("config", (channel_store.CONFIG_KEY, channel_store.REGISTRY_KEY)),)
     modes = ("merge", "replace")
 
     def _clean(self, payload):
