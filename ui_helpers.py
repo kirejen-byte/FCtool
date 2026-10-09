@@ -85,6 +85,10 @@ The helpers:
     A small flat button painted with a ``StringVar``'s colour: left-click
     opens the stock colour dialog, right-click resets to ``default``. No
     variable traces — see its docstring.
+
+``make_split_button(parent, text, *, style, command, arrow_command, arrow_tooltip="", bg=None)``
+    A main ttk button fused flush to a narrow ``ARROW_GLYPH`` (the house small
+    down-arrow) button; returns a Frame carrying ``.main`` and ``.arrow``.
 """
 from __future__ import annotations
 
@@ -1113,7 +1117,9 @@ def make_split_button(parent, text, *, style, command, arrow_command,
     NAME ``style``; this helper defines no style and no colours. The two sit
     side by side with no padding between them. ``arrow_tooltip`` is attached
     to the arrow with ``attach_tooltip`` when non-empty. The frame's
-    background is ``bg`` when given, else the parent's.
+    background is ``bg`` when given, else the parent's. A ttk parent has no
+    ``bg`` option, so a caller under one should pass ``bg`` (the fallback is
+    ``ui_theme.BG_DARK``).
     """
     if bg is None:
         try:
