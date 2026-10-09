@@ -29,6 +29,16 @@ uses is reported.
     keeps the name as its value). ``cached_characters`` is read for that one comparison
     only; it and ``ui`` never go into a group file and are never written.
 
+``fleet.specialized_roles``
+    The custom Specialized Role categories, ``config["specialized_roles_custom"]``: at most
+    ``spec_roles.MAX_CUSTOM`` entries ``{title, type_ids, tags, threshold}``, shown on the
+    Fleet tab after the ten built-in sections. ``spec_roles`` owns the shape: every entry
+    passes ``spec_roles.clean_category``, and two entries are the same category when their
+    titles have one ``spec_roles.title_key`` (equal ignoring case and invisible characters).
+    A category is hull type ids, doctrine tags and a number, but its title (28 characters)
+    and its tags (40 each) are free text, and this item cannot know whether one holds a
+    pilot's name; the Create window's whole-file own-name sweep is the guard.
+
 Rules of this module
 --------------------
 * Every item writes ONLY the path it declares (spec 6.7). The templates item creates a
@@ -36,15 +46,15 @@ Rules of this module
   the ``templates`` list and nothing else.
 * ``validate`` builds a clean payload from scratch and never raises; ``apply`` cleans what
   it is given once more. Nothing here needs a character or the network (spec 9.1).
-* ``export_notes(state, ctx=None)`` (custom presets and templates) lists what an EXPORT of
-  this setup leaves out - a hook the engine calls for the builder; it writes nothing and
-  names no pilot.
+* ``export_notes(state, ctx=None)`` (custom presets, templates and custom categories) lists
+  what an EXPORT of this setup leaves out - a hook the engine calls for the builder; it
+  writes nothing and names no pilot.
 * ``ROLE_VALUES``, ``CONDITION_TYPES``, ``PACING_RANGES`` and ``LIVE_NAME_LEN`` MIRROR
   ``fleet_template_window`` (a Tk module) and ``fleet_esi`` (the network stack); neither is
   importable here. ``tests/test_group_items_fleet.py`` holds the mirrors equal.
 
-Pure: stdlib, ``group_bundle``, ``group_items``, ``fleet_template_store`` and
-``role_presets`` only. No Tk, no ``ui_theme``, no ``fc_gui`` - this module runs in the
+Pure: stdlib, ``group_bundle``, ``group_items``, ``fleet_template_store``, ``role_presets``
+and ``spec_roles`` only. No Tk, no ``ui_theme``, no ``fc_gui`` - this module runs in the
 boot hook.
 """
 
@@ -52,6 +62,7 @@ from dataclasses import asdict
 
 import fleet_template_store as fts
 import role_presets
+import spec_roles
 from group_bundle import MAX_NAME, clean_tag, clean_text
 from group_items import ABSENT, Item, ItemResult, Record, del_path, get_path, set_path, value_text
 
@@ -81,6 +92,7 @@ MAX_NOTES = 50                                  # export notes of one item; then
 
 _PRESETS_PATH = ("custom_role_presets",)
 _BUILTIN_PATH = ("default_role_presets",)
+_CATEGORIES_PATH = (spec_roles.CONFIG_KEY,)     # "specialized_roles_custom"
 _DEFAULT_ROLE = ROLE_VALUES[0]
 _PRESET_KEYS = ("label", "letter", "title", "cap")
 _CONTENT_KEYS = ("wings", "rules", "settings")  # a template apart from name, id and doctrine
@@ -1025,4 +1037,242 @@ class _TemplatesItem(Item):
         return result.settle()
 
 
-ITEMS = (_BuiltinPresetsItem(), _RolePresetsItem(), _TemplatesItem())      # in ``order``
+# -- custom Specialized Role categories -----------------------------------------
+
+# What ``spec_roles.normalize`` makes of one entry of a list (``_judged``).
+_KEPT, _UNUSABLE, _TWICE, _OVER = "kept", "unusable", "twice", "over"
+
+
+def _judged(raw) -> list:
+    """Every entry of a list of categories, judged the way ``spec_roles.normalize`` reads
+    the list: ``[(index, entry, category | None, title key, verdict)]``.
+
+    ``_KEPT`` - one of the categories the list MEANS (the entries ``normalize`` returns, in
+    its order: the ``category`` of the kept rows IS ``normalize(raw)``); ``_UNUSABLE`` -
+    ``spec_roles.clean_category`` refuses it (``category`` is ``None``, the key ``""``);
+    ``_TWICE`` - its title has the key of an earlier kept one; ``_OVER`` - a usable category
+    past the first ``spec_roles.MAX_CUSTOM``. An unusable entry uses up no place. Total for
+    a list (``spec_roles`` is)."""
+    rows, seen = [], set()
+    for index, entry in enumerate(raw):
+        category = spec_roles.clean_category(entry)
+        if category is None:
+            rows.append((index, entry, None, "", _UNUSABLE))
+            continue
+        key = spec_roles.title_key(category["title"])
+        if key in seen:
+            verdict = _TWICE
+        elif len(seen) >= spec_roles.MAX_CUSTOM:
+            verdict = _OVER
+        else:
+            seen.add(key)
+            verdict = _KEPT
+        rows.append((index, entry, category, key, verdict))
+    return rows
+
+
+def _stored_title(entry) -> str:
+    """The title of an entry ``spec_roles`` refuses, as a section header would show it
+    (cleaned by ``spec_roles``' own title rule, through a probe category), or ``""`` when
+    it has none."""
+    if not isinstance(entry, dict):
+        return ""
+    probe = spec_roles.clean_category({"title": entry.get("title"), "type_ids": [1]})
+    return probe["title"] if probe else ""
+
+
+def _category_detail(category) -> str:
+    """``"3 hulls, 2 tags, min 5"`` - a part with nothing to say is left out."""
+    parts = []
+    if category["type_ids"]:
+        parts.append(_count(len(category["type_ids"]), "hull", "hulls"))
+    if category["tags"]:
+        parts.append(_count(len(category["tags"]), "tag", "tags"))
+    if category["threshold"] is not None:
+        parts.append(f"min {category['threshold']}")
+    return ", ".join(parts)
+
+
+class _SpecRolesItem(Item):
+    """The custom Specialized Role categories.
+
+    A category of the file and one of mine are THE SAME when their titles have one
+    ``spec_roles.title_key``. "Mine" are the categories my stored list MEANS - what
+    ``spec_roles.normalize`` reads out of it, which is what the Fleet tab shows.
+
+    merge: a category I have is replaced in its place (``theirs``) or left (``mine``); equal
+    content is ``unchanged`` whatever the choice. A new one is appended, in file order,
+    while I have fewer than ``MAX_CUSTOM``; each of the rest is ``skipped`` with a warning.
+    replace: the list becomes the file's; categories of mine that are not in the file are
+    ``removed``.
+
+    An import never deletes (spec 4): a merge leaves EVERY entry of my stored list exactly
+    as it is, in its place - an entry ``spec_roles`` ignores, extra keys, whatever is past
+    the twelfth - except the one entry a ``theirs`` conflict replaces. (Unlike the preset
+    row nothing needs dropping: the Fleet tab reads this list through ``normalize`` and an
+    odd entry cannot hurt it.) A stored value that is not a list counts as empty, with a
+    warning. A payload with nothing usable changes nothing.
+    """
+
+    id = "fleet.specialized_roles"
+    label = "Custom Specialized Role categories"
+    kind = "collection"
+    files = ("config",)
+    paths = (("config", _CATEGORIES_PATH),)
+    order = 40
+    modes = ("merge", "replace")
+    conflicts = True
+
+    def _clean(self, payload):
+        """-> ``(categories, problems)``: ``spec_roles.normalize(payload)`` and why the rest
+        was left out. At most ``MAX_CUSTOM``, one per title key. Total."""
+        if not isinstance(payload, list):
+            return [], [f"{self.label}: not a list of categories"]
+        categories, first, twice, bad, over = [], {}, [], 0, 0
+        for _index, _entry, category, key, verdict in _judged(payload):
+            if verdict == _KEPT:
+                first[key] = category["title"]
+                categories.append(category)
+            elif verdict == _TWICE:
+                if first[key] not in twice:     # at most MAX_CUSTOM different lines
+                    twice.append(first[key])
+            elif verdict == _OVER:
+                over += 1
+            else:
+                bad += 1
+        problems = [f"{self.label} - {title}: listed twice, the first is kept"
+                    for title in twice]
+        if bad:
+            odd = _count(bad, "entry that is not a usable category",
+                         "entries that are not usable categories")
+            problems.append(f"{self.label}: {odd} left out")
+        if over:
+            problems.append(f"{self.label}: only the first {spec_roles.MAX_CUSTOM} categories "
+                            f"are kept ({over} left out)")
+        return categories, problems
+
+    def export(self, state, ctx):
+        stored = get_path(getattr(state, "config", None), _CATEGORIES_PATH)
+        return spec_roles.normalize(stored) or ABSENT
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder, ``"<title>: left out (<reason>)"``: the categories of my
+        list that ``export`` leaves out - one ``spec_roles`` cannot use (no visible title,
+        or neither a hull nor a tag), one whose title is used earlier in the list, and
+        whatever is past the first ``MAX_CUSTOM``. Entries that are not dicts are no
+        categories and get no line. Never raises; at most ``MAX_NOTES`` lines and
+        ``"and <n> more"``."""
+        try:
+            stored = get_path(_view(state), _CATEGORIES_PATH)
+            if not isinstance(stored, list):
+                return []
+            lines = []
+            for _index, entry, category, _key, verdict in _judged(stored):
+                if verdict == _KEPT or not isinstance(entry, dict):
+                    continue
+                if verdict == _TWICE:
+                    shown, why = category["title"], "its title is used earlier in the list"
+                elif verdict == _OVER:
+                    shown = category["title"]
+                    why = f"only the first {spec_roles.MAX_CUSTOM} categories are kept"
+                else:
+                    shown = _stored_title(entry)
+                    why = ("it names no hull and no tag" if shown
+                           else "it has no visible title")
+                    shown = shown or "a category without a title"
+                lines.append(f"{shown}: left out ({why})")
+            return _capped(lines)
+        except Exception:
+            return []
+
+    def validate(self, payload, ctx):
+        categories, problems = self._clean(payload)
+        return (categories or ABSENT), problems
+
+    def records(self, payload) -> list:
+        return [Record(category["title"], category["title"], _category_detail(category))
+                for category in self._clean(payload)[0]]
+
+    def summary(self, payload) -> str:
+        return _count(len(self._clean(payload)[0]), "category", "categories")
+
+    def lines(self, payload) -> list:
+        return [(category["title"], _category_detail(category))
+                for category in self._clean(payload)[0]]
+
+    def subset(self, payload, keys):
+        wanted = _key_set(keys)
+        return [category for category in self._clean(payload)[0]
+                if category["title"] in wanted] or ABSENT
+
+    def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
+        result = ItemResult(self.id)
+        incoming, _ = self._clean(payload)      # new dicts and lists: mine to store
+        if not incoming:                        # nothing usable never blanks the list
+            return result
+        stored = get_path(_view(state), _CATEGORIES_PATH)
+        if isinstance(stored, list):
+            new = list(stored)                  # my entries AS STORED, every one of them
+        else:
+            new = []
+            if stored is not None:
+                result.warnings.append(f"{self.label}: your saved list could not be read "
+                                       f"and counts as empty")
+        mine = {}                               # title key -> (place in my list, as it reads)
+        past = {}                               # usable categories past the twelfth, by key
+        for index, _entry, category, key, verdict in _judged(new):
+            if verdict == _KEPT:
+                mine[key] = (index, category)
+            elif verdict == _OVER:
+                past.setdefault(key, category["title"])
+
+        if mode == "replace":
+            arriving = set()
+            for category in incoming:
+                title, key = category["title"], spec_roles.title_key(category["title"])
+                arriving.add(key)
+                held = mine.get(key)
+                if held is None:
+                    result.added.append(title)
+                elif held[1] == category:
+                    result.unchanged.append(title)
+                else:
+                    result.updated.append(title)
+            result.removed.extend(category["title"] for key, (_index, category) in mine.items()
+                                  if key not in arriving)
+            # the categories past the twelfth are gone too, though the Fleet tab never showed them
+            result.removed.extend(title for key, title in past.items()
+                                  if key not in arriving and key not in mine)
+            new = incoming
+            changed = bool(result.added or result.updated or result.removed) or new != stored
+        else:
+            for category in incoming:
+                title, key = category["title"], spec_roles.title_key(category["title"])
+                held = mine.get(key)
+                if held is not None:
+                    if held[1] == category:
+                        result.unchanged.append(title)
+                    elif conflict == "mine":
+                        result.skipped.append(title)
+                    else:
+                        new[held[0]] = category
+                        mine[key] = (held[0], category)
+                        result.updated.append(title)
+                elif len(mine) < spec_roles.MAX_CUSTOM:
+                    mine[key] = (len(new), category)
+                    new.append(category)
+                    result.added.append(title)
+                else:
+                    result.skipped.append(title)
+                    result.warnings.append(f"{title}: skipped (at most "
+                                           f"{spec_roles.MAX_CUSTOM} custom categories)")
+            changed = bool(result.added or result.updated)
+
+        if changed:
+            set_path(_writable(state), _CATEGORIES_PATH, new)
+            result.status = "applied"
+        return result
+
+
+ITEMS = (_BuiltinPresetsItem(), _RolePresetsItem(), _TemplatesItem(),
+         _SpecRolesItem())                      # in ``order``
