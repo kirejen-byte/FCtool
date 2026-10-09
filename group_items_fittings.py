@@ -23,23 +23,31 @@ What never travels (owner privacy rule; scrubbed on export AND again on import):
 * which refit a slot happened to have active - a slot travels on its default, ``refits[0]``;
 * a MOTD template's ``fc`` (the FC's character name), a pinned-FC pill (it becomes "follow
   the selected FC"), ``legacy_fits`` and every pill kind this build does not know;
-* a pill whose params hold ``<``, ``>`` or a control character, or a fit pill whose ``dna``
-  is not a DNA (or holds a number of more than nine digits): the app writes pill params into
-  the MOTD markup as they are (free text is escaped, pills are not), so such a pill would be
-  markup in the importer's fleet MOTD. How MANY units a DNA names is not bounded here - a
-  capital fit carries fuel and ammunition by the hundred thousand: what the app builds for a
-  DNA it renders is bounded by the parser (``fit_parser.parse_dna``);
-* a library fit or doctrine with ``<``, ``>`` or a control character in a name, or a fit
-  whose stored DNA is not one. Pills are NOT the only way file text reaches the markup: the
-  app labels the fit links of a tag line with the fit's hull name (else its name), gives a
-  refit-following pill the active fit's name, and falls back to the stored DNA when it
-  cannot rebuild one - none of them escaped. ``fittings_store.validate_share`` is what
-  closes that (it drops such a fit or doctrine whole); the items here only call it;
+* a pill with a control character in it, or a fit pill whose ``dna`` is not a DNA (or
+  holds a number of more than nine digits). A ``<`` or a ``>`` in a pill's text travels,
+  as it does in a library name: every text of a pill is a link label or a lookup key, the
+  renderer escapes it, and the app itself builds a tag line for a doctrine tagged
+  ``>>DPS<<``. How MANY units a DNA names is not bounded here - a capital fit carries
+  fuel and ammunition by the hundred thousand: what the app builds for a DNA it renders
+  is bounded by the parser (``fit_parser.parse_dna``);
+* a library fit or doctrine with a control character in a name, a number out of range, or
+  a fit whose stored DNA is not one (the app falls back to the stored DNA as a link's
+  target when it cannot rebuild one). A ``<`` or a ``>`` in a library name travels: the
+  app labels the fit links of a tag line with the fit's hull name (else its name) and
+  gives a refit-following pill the active fit's name, and the renderer escapes every
+  label. ``fittings_store.validate_share`` owns these rules (it drops such a fit or
+  doctrine whole and says which string was at fault); the items here only call it;
 * ``fittings.motd_link`` and ``fittings.motd_recent_tokens`` - never read, never written.
 
+Who the FC is, is also the IMPORTER's to keep ("absent means untouched"): a template they
+already have keeps its own ``fc`` and its own pinned-FC pills when the group's version
+replaces its text, and differing only in them is no difference - importing your own export
+changes nothing.
+
 An export carries only what an import would accept: the doctrines and the fits items run
-their own payload through ``validate_share``, the templates through the scrub, and
-``export_notes`` names what that left out.
+their own payload through ``validate_share`` (which is also what empties
+``esi_fitting_ids``), the templates through the scrub, and ``export_notes`` names what
+that left out.
 
 A ``char`` pill - a character link the author placed in the MOTD text by hand - is content
 and travels as written; the own-name sweep that runs before a file is saved covers the
@@ -52,6 +60,7 @@ Pure: stdlib, ``fittings_store``, ``motd_doc``, ``group_bundle`` and ``group_ite
 No Tk, no ``ui_theme``, no ``fc_gui`` - this module runs in the boot hook.
 """
 
+import copy
 import json
 import re
 
@@ -180,20 +189,29 @@ def _file_keys(state, section) -> list:
     return [key for key in entries if isinstance(key, str)] if isinstance(entries, dict) else []
 
 
-def _scrub_fit(fit) -> dict:
-    return dict(fit, esi_fitting_ids={})
-
-
-def _scrub_doctrine(doctrine) -> dict:
-    """A doctrine as it travels: every slot with refits is on its default."""
-    members = []
+def _scrub_doctrine(doctrine):
+    """-> ``(doctrine, strays)``: a doctrine as it travels - every slot with refits is on
+    its default, ``refits[0]`` - and how many of those slots had an active fit that is
+    NOT one of their refits (a hand-edited library; the store would never leave one).
+    Such a fit is no part of the slot as it travels (to the store it is a fit outside
+    doctrines, and the fits item carries it as one): the builder is told."""
+    members, strays = [], 0
     for member in _dicts(doctrine.get("members")):
         member = dict(member)
         refits = member.get("refits")
         if isinstance(refits, list) and refits:
+            if member.get("fit_id") not in refits:
+                strays += 1
             member["fit_id"] = refits[0]
         members.append(member)
-    return dict(doctrine, members=members)
+    return dict(doctrine, members=members), strays
+
+
+def _stray_fits_note(strays) -> str:
+    if strays == 1:
+        return "1 slot whose active fit is not one of its refits saved on its first refit"
+    return (f"{strays} slots whose active fit is not one of their refits saved on their "
+            f"first refit")
 
 
 def _slot_fit_ids(member) -> list:
@@ -290,16 +308,25 @@ class TagCategoriesItem(_LibraryItem):
     order = 10
     paths = (("fittings", ("tags",)), _STAMP)
 
-    def export(self, state, ctx):
-        if getattr(state, "fittings", None) is None:
-            return ABSENT
-        store, _reason = _open_library(state)
-        if store is None:
-            return ABSENT
+    def _exported(self, state):
+        """-> ``(tags, notes)``: this setup's vocabulary as it travels, and what the
+        cleaning left out of it (the cut at ``MAX_TAGS``, a tag that is too long). Total."""
         try:
-            return _clean_tags(store.tags, self.label)[0] or ABSENT
+            if getattr(state, "fittings", None) is None:
+                return [], []
+            store, _reason = _open_library(state)
+            if store is None:
+                return [], []
+            return _clean_tags(store.tags, self.label)
         except Exception:
-            return ABSENT
+            return [], []
+
+    def export(self, state, ctx):
+        return self._exported(state)[0] or ABSENT
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: the tags of this setup that are left out of the file."""
+        return self._exported(state)[1]
 
     def validate(self, payload, ctx):
         tags, problems = _clean_tags(payload, self.label)
@@ -383,14 +410,28 @@ class DoctrinesItem(_LibraryItem):
             # scrubbing happens on the dict it returns (its `exported_at` stamp is left
             # out too: the same setup must export the same payload twice).
             shared = store.export_doctrines(_file_keys(state, "doctrines"))
-            doctrines = [_scrub_doctrine(d) for d in _dicts(shared.get("doctrines"))]
-            if not doctrines:
+            scrubbed = [_scrub_doctrine(d) for d in _dicts(shared.get("doctrines"))]
+            if not scrubbed:
                 return ABSENT, []
             # ... and then through the import's own check: what is saved is exactly what
-            # an importer will accept, and what is not is said (`export_notes`).
-            return self.validate({"schema_version": shared.get("schema_version"),
-                                  "fits": [_scrub_fit(f) for f in _dicts(shared.get("fits"))],
-                                  "doctrines": doctrines}, None)
+            # an importer will accept, and what is not is said (`export_notes`). That
+            # check is also what empties every fit's `esi_fitting_ids`.
+            payload, notes = self.validate(
+                {"schema_version": shared.get("schema_version"),
+                 "fits": _dicts(shared.get("fits")),
+                 "doctrines": [doctrine for doctrine, _strays in scrubbed]}, None)
+            # A slot whose active fit is not one of its refits was put on its default by
+            # the scrub: said for each doctrine that is in the file (one that is not has
+            # its own line). Told apart by id - a library can hold two of one name, and
+            # only the first of them travels.
+            saved = {d.get("id"): _name_of(d) for d in payload["doctrines"]} \
+                if payload is not ABSENT else {}
+            for doctrine, strays in scrubbed:
+                doctrine_id = doctrine.get("id")
+                if strays and isinstance(doctrine_id, str) and doctrine_id in saved:
+                    notes.append(f"{self.label}: {clean_text(saved[doctrine_id], MAX_NAME)}: "
+                                 f"{_stray_fits_note(strays)}")
+            return payload, notes
         except Exception:
             return ABSENT, []
 
@@ -399,7 +440,9 @@ class DoctrinesItem(_LibraryItem):
 
     def export_notes(self, state, ctx=None) -> list:
         """Lines for the builder: the fits and doctrines of this setup that are left out
-        of the file (a name with ``<`` or ``>`` in it, ...), as an import would say it."""
+        of the file (a control character in a name, a number out of range, ...), as an
+        import would say it - and the active fit of a hand-edited slot that is not one of
+        the slot's refits (``_scrub_doctrine``)."""
         return self._exported(state)[1]
 
     def validate(self, payload, ctx):
@@ -502,11 +545,12 @@ class FitsItem(_LibraryItem):
             named = set()
             for doctrine in store.list_doctrines():
                 named.update(fittings_store.doctrine_fit_ids(doctrine, True))
-            fits = [_scrub_fit(fit_to_dict(store.get_fit(fit_id)))
+            fits = [fit_to_dict(store.get_fit(fit_id))
                     for fit_id in _file_keys(state, "fits")
                     if fit_id not in named and store.get_fit(fit_id) is not None]
             if not fits:
                 return ABSENT, []
+            # The import's own check: it is also what empties `esi_fitting_ids`.
             return self.validate(
                 {"schema_version": fittings_store.SCHEMA_VERSION, "fits": fits}, None)
         except Exception:
@@ -600,42 +644,41 @@ _HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 _STYLE_FLAGS = ("bold", "italic", "underline")
 _MAX_FONT_SIZE = 100
 
-# What a pill param may not hold. The app's resolver escapes free text, but writes a pill's
-# params as they are - ``<url=fitting:{dna}>{name}</url>``, ``<url=showinfo:1377//{id}>
-# {name}</url>``, ``{label}: <url=joinChannel:...>{name}</url>`` - into the MOTD the
-# importer pushes to their fleet. ``<``, ``>`` and every control character (category Cc:
-# U+0000-001F, U+007F-009F) are refused; a DNA is digits and its three separators.
-_MARKUP = re.compile(r"[<>\x00-\x1f\x7f-\x9f]")
+# What a pill may not hold. Every TEXT of a pill is a link label or a lookup key - a
+# character / fit / system / channel name, a tag, a channel line's label - and the renderer
+# escapes each of them (``motd_builder``, ``motd_doc``): a ``<`` or a ``>`` in one is text
+# and travels, exactly as it does in a library name. The app itself builds a tag line for a
+# doctrine tagged ``>>DPS<<``. What stays refused is the rule the store has for a name - no
+# control character (category Cc: U+0000-001F, U+007F-009F) - and, for a fit pill, a
+# ``dna`` that is not a link target: digits and its three separators, no number of more
+# than nine digits (``fittings_store._share_dna_numbers_ok`` - how MANY units it names is
+# not bounded: the app's parser decides what it builds for them).
+_PILL_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _DNA = re.compile(r"[0-9:;_]+")
 # Free text is escaped, so it carries no markup - but a control character (other than the
 # newline and the tab a text is made of) has no place in a MOTD either: removed, and said.
 _TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
-# No number in a DNA - a type id or a quantity - may have more than this many digits: a
-# longer one is not a number a fit holds. (The quantities themselves are NOT bounded: the
-# app's parser decides what it builds for them.)
-_MAX_DNA_DIGITS = 9
-_DNA_NUMBER = re.compile(r"[0-9_]+")
 # A character id the game could have issued (and a number every JSON reader keeps exact).
 _MAX_CHAR_ID = 2 ** 53
 
+# Why a pill is left out (``_pill_fault``), and how a line says it for one and for many.
+_PILL_LINES = {
+    "control": ("1 pill with a control character in it left out",
+                "{} pills with a control character in them left out"),
+    "link": ("1 fit pill whose link is not a fit link left out",
+             "{} fit pills whose link is not a fit link left out"),
+}
 
-def _dna_numbers_ok(dna) -> bool:
-    """Whether every number of a DNA string (already known to be digits and separators)
-    has at most ``_MAX_DNA_DIGITS`` digits. The parser reads ``1_000`` as 1000, so a ``_``
-    inside a number is skipped, not a separator."""
-    return all(len(number.replace("_", "")) <= _MAX_DNA_DIGITS
-               for number in _DNA_NUMBER.findall(dna))
 
-
-def _has_markup(value) -> bool:
+def _has_control(value) -> bool:
     """Whether any string in ``value`` - a pill's params: every value at any depth, and
-    every key - holds a character of ``_MARKUP``. Not recursive: any nesting is walked."""
+    every key - holds a control character. Not recursive: any nesting is walked."""
     pending = [value]
     while pending:
         value = pending.pop()
         if isinstance(value, str):
-            if _MARKUP.search(value):
+            if _PILL_CONTROL.search(value):
                 return True
         elif isinstance(value, dict):
             pending.extend(value)
@@ -645,18 +688,19 @@ def _has_markup(value) -> bool:
     return False
 
 
-def _pill_may_travel(kind, params) -> bool:
-    """False for a pill that would put markup into the MOTD: any param string with a
-    ``_MARKUP`` character (also in a param this build would leave behind - the pill is not
-    what its author's build made), or a fit pill carrying a ``dna`` that is not one, or
-    one with a number of more than nine digits in it (``_dna_numbers_ok``)."""
-    if _has_markup(params):
-        return False
+def _pill_fault(kind, params) -> str:
+    """Why a pill does not travel, or ``""`` when it does: ``"control"`` - a control
+    character in any param string (also in a param this build would leave behind, and in
+    a param's name); ``"link"`` - a fit pill carrying a ``dna`` that is not one, or one
+    with a number of more than nine digits in it."""
+    if _has_control(params):
+        return "control"
     if kind == "fit" and isinstance(params, dict) and "dna" in params:
         dna = params["dna"]
-        return (isinstance(dna, str) and _DNA.fullmatch(dna) is not None
-                and _dna_numbers_ok(dna))
-    return True
+        if not (isinstance(dna, str) and _DNA.fullmatch(dna) is not None
+                and fittings_store._share_dna_numbers_ok(dna)):
+            return "link"
+    return ""
 
 
 def _clean_params(kind, params) -> dict:
@@ -692,13 +736,13 @@ def _clean_style(style) -> dict:
 
 
 def _clean_doc(raw):
-    """A document's JSON runs, rebuilt from scratch. -> ``(runs, marked, controls)``: text
-    runs with their known style keys, pills of a kind this build knows with their known
-    params. Everything else is left out; ``marked`` counts the known pills left out because
-    they carried markup (``_pill_may_travel``), ``controls`` says whether a control
-    character was removed from a text run (``_TEXT_CONTROL``). The runs have been through
-    ``doc_from_json`` -> ``doc_to_json``."""
-    runs, marked, controls = [], 0, False
+    """A document's JSON runs, rebuilt from scratch. -> ``(runs, left_out, controls)``:
+    text runs with their known style keys, pills of a kind this build knows with their
+    known params. Everything else is left out; ``left_out`` counts, by reason, the known
+    pills that do not travel (``_pill_fault``: ``{"control": n, "link": n}``),
+    ``controls`` says whether a control character was removed from a text run
+    (``_TEXT_CONTROL``). The runs have been through ``doc_from_json`` -> ``doc_to_json``."""
+    runs, left_out, controls = [], dict.fromkeys(_PILL_LINES, 0), False
     for run in raw:
         if not isinstance(run, dict):
             continue
@@ -706,8 +750,9 @@ def _clean_doc(raw):
             kind = run.get("kind")
             if isinstance(kind, str) and kind in motd_doc.TOKEN_KINDS:
                 params = run.get("params")
-                if not _pill_may_travel(kind, params):
-                    marked += 1
+                fault = _pill_fault(kind, params)
+                if fault:
+                    left_out[fault] += 1
                     continue
                 runs.append({"t": "token", "kind": kind,
                              "params": _clean_params(kind, params)})
@@ -719,7 +764,7 @@ def _clean_doc(raw):
                 if shown:
                     runs.append({"t": "text", "text": shown,
                                  "style": _clean_style(run.get("style"))})
-    return motd_doc.doc_to_json(motd_doc.doc_from_json(runs)), marked, controls
+    return motd_doc.doc_to_json(motd_doc.doc_from_json(runs)), left_out, controls
 
 
 def _doctrine_name(value) -> str:
@@ -765,17 +810,17 @@ def _scrub_motd(entry, legacy):
         # the app does when it loads one, legacy tag names renamed with the store's table.
         raw = motd_doc.doc_to_json(motd_doc.from_legacy_fields(
             entry, tag_renames=fittings_store._TAG_RENAMES))
-    doc, marked, controls = _clean_doc(raw)
+    doc, left_out, controls = _clean_doc(raw)
     if not doc:
         # Under "theirs" an empty document would blank the importer's same-named template.
         return None, [f"{label}: {_NOTHING_LEFT}"]
     if len(json.dumps(doc, ensure_ascii=False)) > MAX_MOTD_DOC_CHARS:
         return None, []
     said = []
-    if marked == 1:
-        said.append(f"{label}: 1 pill with markup in it left out")
-    elif marked:
-        said.append(f"{label}: {marked} pills with markup in them left out")
+    for fault, (one, many) in _PILL_LINES.items():      # counted, and WHY is said
+        count = left_out[fault]
+        if count:
+            said.append(f"{label}: " + (one if count == 1 else many.format(count)))
     if controls:
         said.append(f"{label}: control characters removed")
     return {"name": name, "doctrine": doctrine, "version": 2, "doc": doc}, said
@@ -793,7 +838,7 @@ def scrub_motd(entry, legacy=False):
 
     -> ``{"name", "doctrine", "version": 2, "doc"}``: no ``fc``, no ``legacy_fits``; a
     pinned-FC pill follows the selected FC; pills of an unknown kind are gone, and so are
-    pills that carry markup (``_pill_may_travel``). ``name`` is cleaned and clipped to
+    pills that do not travel (``_pill_fault``). ``name`` is cleaned and clipped to
     ``MAX_NAME``; ``doctrine`` is only stripped, as the store strips a doctrine's name, so
     the two always match.
 
@@ -894,16 +939,74 @@ def _library_doctrine_names(state):
             if isinstance(entry, dict) and isinstance(entry.get("name"), str)}
 
 
+# -- MOTD templates: the importer's own FC -----------------------------------
+#
+# A file never carries who the FC is: the export blanks a template's ``fc`` and turns
+# every FC line into "follow the selected FC". So for a template the importer already has,
+# "absent means untouched" - their FC name and their pinned-FC pills are theirs to keep.
+
+_FC_FOLLOWS = {"source": "selected"}        # an FC line as it travels (``_clean_params``)
+
+
+def _is_fc_line(run) -> bool:
+    return isinstance(run, dict) and run.get("t") == "token" and run.get("kind") == "fc_line"
+
+
+def _is_pinned_fc(run) -> bool:
+    params = run.get("params")
+    return isinstance(params, dict) and params.get("source") == "pinned"
+
+
+def _doc_as_it_travels(doc):
+    """A stored document with every FC line as a file would carry it - what an incoming
+    document is compared with, so that an FC the importer pinned is no difference (and
+    re-importing your own export changes nothing). Anything but a list is as it is."""
+    if not isinstance(doc, list):
+        return doc
+    return [{"t": "token", "kind": "fc_line", "params": dict(_FC_FOLLOWS)}
+            if _is_fc_line(run) else run for run in doc]
+
+
+def _keep_my_fc(mine, theirs):
+    """-> ``(document, cleared)``: the group's document ``theirs`` with the importer's
+    pinned FC kept. FC lines are matched in order - their first with mine first, ... - and
+    where mine is pinned, that pill (as it is stored) takes the place of theirs.
+    ``cleared`` is True when a pinned FC line of mine has no FC line of theirs to stay
+    on: keeping it is not possible, and the caller says so. ``theirs`` is not edited."""
+    own = [run for run in mine if _is_fc_line(run)] if isinstance(mine, list) else []
+    document, taken = [], 0
+    for run in theirs:
+        if _is_fc_line(run):
+            if taken < len(own) and _is_pinned_fc(own[taken]):
+                run = copy.deepcopy(own[taken])
+            taken += 1
+        document.append(run)
+    return document, any(_is_pinned_fc(run) for run in own[taken:])
+
+
+def _is_row_key(hint, base) -> bool:
+    """Whether ``hint`` is a record key ``_named_rows`` gives a template whose own key is
+    ``base``: ``base`` itself, or ``base#<n>`` with ``<n>`` in ASCII digits (a
+    digit-LIKE character - a superscript two - is not a row number)."""
+    if hint == base:
+        return True
+    number = hint[len(base) + 1:]
+    return hint.startswith(base + "#") and number.isascii() and number.isdigit()
+
+
 class MotdsItem(Item):
     """MOTD templates, ``[{"name", "doctrine", "version": 2, "doc"}]``.
 
     A template is known by ``(doctrine, name)``. Import: a new one is appended after the
     importer's own with a blank ``fc``; one they already have gets the group's document
-    ("theirs": its own ``fc`` stays, its ``legacy_fits`` - the fallback fit links of the
-    document that is replaced - go), or is left alone ("mine", read as the store reads it:
-    blanks and case aside). Only ``fittings.saved_motds`` is written. Any template added or
-    updated sets the boot flag ``motd_disarm``: the next start begins with Auto-update MOTD
-    off for the session, so a template nobody has read yet is not pushed on a cold launch.
+    ("theirs": its own ``fc`` and its own pinned-FC pills stay - ``_keep_my_fc`` - and its
+    ``legacy_fits``, the fallback fit links of the document that is replaced, go), or is
+    left alone ("mine", read as the store reads it: blanks and case aside). A template that
+    differs from the group's only in who its FC is, is unchanged; a pinned FC that cannot
+    be kept - the group's version has no FC line for it - is said in a warning. Only
+    ``fittings.saved_motds`` is written. Any template added or updated sets the boot flag
+    ``motd_disarm``: the next start begins with Auto-update MOTD off for the session, so a
+    template nobody has read yet is not pushed on a cold launch.
 
     The record key is ``"<doctrine> / <name>"``; two templates that spell the same key
     (``"A / B"`` + ``"C"`` and ``"A"`` + ``"B / C"``) get ``#2``, ``#3`` as doctrines do.
@@ -967,7 +1070,8 @@ class MotdsItem(Item):
 
     def export_notes(self, state, ctx=None) -> list:
         """Lines for the builder: the templates and pills of this setup that are left out
-        of the file (a pill with markup in it, a template with nothing left, ...)."""
+        of the file (a pill with a control character in it, a fit pill whose link is not
+        one, a template with nothing left, ...)."""
         try:
             return self._exported(state)[1]
         except Exception:
@@ -1025,10 +1129,7 @@ class MotdsItem(Item):
         kept, used = [], set()
         for _key, entry in rows:
             hint = by_identity.get((entry["doctrine"], entry["name"]))
-            base = _motd_key(entry)
-            if hint is None or hint in used or not (
-                    hint == base or (hint.startswith(base + "#")
-                                     and hint[len(base) + 1:].isdigit())):
+            if hint is None or hint in used or not _is_row_key(hint, _motd_key(entry)):
                 return rows
             used.add(hint)
             kept.append((hint, entry))
@@ -1070,16 +1171,24 @@ class MotdsItem(Item):
             else:
                 local = saved[index]
                 version = local.get("version")
-                if (type(version) is int and version == 2 and local.get("doc") == entry["doc"]
+                # Who the FC is, is never in a file: not compared (`_doc_as_it_travels`).
+                if (type(version) is int and version == 2
+                        and _doc_as_it_travels(local.get("doc")) == entry["doc"]
                         and not local.get("legacy_fits")):
                     result.unchanged.append(key)
                     continue
+                document, cleared = _keep_my_fc(local.get("doc"), entry["doc"])
                 local = saved[index] = dict(local)      # its own `fc` and the rest stay
-                local["doc"] = entry["doc"]
+                local["doc"] = document                 # ... and so does a pinned FC
                 local["version"] = 2
                 # The old document's fallback fit links would render under the new one.
                 local.pop("legacy_fits", None)
                 result.updated.append(key)
+                if cleared:
+                    # Each name as a problem line quotes one: clipped, nothing invisible.
+                    shown = " / ".join(fittings_store._share_shown(entry[part])
+                                       for part in ("doctrine", "name"))
+                    result.warnings.append(f"{shown}: your pinned FC was cleared")
             landed.append(entry)
 
         if not landed:
@@ -1101,15 +1210,43 @@ class MotdsItem(Item):
 class MotdSettingsItem(ConfigFieldsItem):
     """The MOTD length limit and the remembered logi channel.
 
-    The channel name ends up in a channel pill, and a pill's params are written into the
-    MOTD markup as they are: a name with ``<``, ``>`` or a control character is refused
+    The channel name is the NAME of the default MOTD's channel line, and the pill rule
+    (``_PILL_CONTROL``) is the rule here too: a name with a control character is refused
     whole (never cleaned into something else) - by ``validate``, by ``apply`` and by
-    ``export``, which all clean a value through this one method."""
+    ``export``, which all clean a value through this one method. ``export_notes`` says
+    when this setup's own channel is left out for it. A ``<`` or a ``>`` travels: the
+    renderer escapes the name, and it is never part of the link's target.
+
+    A channel that CHANGES sets the boot flag ``motd_disarm``, as a new template does."""
 
     def _clean_field(self, fld, value, ctx, keep_unknown=False):
-        if fld.key == "logi_channel" and isinstance(value, str) and _MARKUP.search(value):
-            return ABSENT, ["has characters a channel name cannot have"]    # never quoted
+        if fld.key == "logi_channel" and isinstance(value, str) \
+                and _PILL_CONTROL.search(value):
+            return ABSENT, ["holds a control character"]        # the value is never quoted
         return super()._clean_field(fld, value, ctx, keep_unknown=keep_unknown)
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: this setup's logi channel, when the rule above leaves
+        it out of the file. Total."""
+        try:
+            config = getattr(state, "config", None)
+            notes = []
+            for fld in self.fields:
+                raw = get_path(config, fld.path, ABSENT) if isinstance(config, dict) \
+                    else ABSENT
+                if fld.key == "logi_channel" and isinstance(raw, str) \
+                        and _PILL_CONTROL.search(raw):
+                    notes.extend(self._line(fld, reason)
+                                 for reason in self._clean_field(fld, raw, ctx)[1])
+            return notes
+        except Exception:
+            return []
+
+    def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
+        result = super().apply(state, payload, mode, conflict, ctx)
+        if "logi_channel" in result.updated:
+            result.flags["motd_disarm"] = True
+        return result
 
 
 # ── The items ───────────────────────────────────────────────────────────────

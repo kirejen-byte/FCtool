@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import threading
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import NamedTuple
@@ -208,19 +209,34 @@ MAX_SHARE_REFITS = 50
 # A drone / cargo stack of more units than this (or of fewer than none) is not
 # a fit: the fit is dropped.
 MAX_SHARE_QUANTITY = 1_000_000
+# Numbers. A type / ship / group id is 1 .. MAX_SHARE_ID (a negative ship id
+# renders `fitting:-5:...`); an ideal count, a seed target and a slot's order
+# are 0 .. MAX_SHARE_COUNT (a 4,299-digit ideal put a 4,299-digit delta in the
+# MOTD and made the fleet guidance raise). Outside it the fit / the doctrine is
+# dropped.
+MAX_SHARE_ID = 999_999_999
+MAX_SHARE_COUNT = 1_000_000
 
-# What a NAME may not hold on this path. The app writes a fit's hull name, its
-# name and (when it cannot re-encode one) its stored DNA into the fleet MOTD's
-# markup as they are -- `<url=fitting:{dna}>{name}</url>` -- so a "<", a ">" or
-# a control character (category Cc: U+0000-001F, U+007F-009F) in one of them
-# would be markup in the MOTD of whoever imported it. A DNA is digits and its
-# three separators, nothing else.
+# What a NAME may not hold on this path: a control character (category Cc:
+# U+0000-001F, U+007F-009F - the tab and the line ends included). The app
+# writes a fit's hull name and its name into the fleet MOTD as link LABELS;
+# the renderer escapes every label (`motd_builder._label`), so a "<" or a ">"
+# in a name is text and travels - a control character has no place in a
+# one-line label, in a list row or in a problem line. The stored DNA is a link
+# TARGET (written when the app cannot re-encode one): digits and its three
+# separators, nothing else.
 _SHARE_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SHARE_DNA = re.compile(r"[0-9:;_]*")
-_SHARE_MARKUP_LINES = {
-    "angle": "holds < or > - rename it to share it",
-    "control": "holds a control character - rename it to share it",
-}
+# ... and no number in it - a type id, a quantity - has more than this many
+# digits: a longer one is not a number a fit holds, and a stored DNA of 4,299
+# nines would be written into the MOTD as it is. (How MANY units a DNA names
+# is not bounded: the app's parser decides what it builds for them.)
+MAX_SHARE_DNA_DIGITS = 9
+_SHARE_DNA_NUMBER = re.compile(r"[0-9_]+")
+# Notes are a TEXT - lines and tabs are what it is made of - but not Tk-only:
+# `push_fit_to_character` sends `notes[:500]` to the game as the fitting's
+# description. Any other control character clears them.
+_SHARE_TEXT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SHARE_LABEL_MAX = 60               # of a name quoted in a problem line
 
 
@@ -324,11 +340,12 @@ def _share_seed_target(value) -> int | None:
 
 def _share_exemption_ok(entry) -> bool:
     """A tagged-union exemption entry: a `kind`, and a well-typed id / name
-    when it carries them."""
+    when it carries them (an id is ``1 .. MAX_SHARE_ID``)."""
     if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
         return False
     eid, name = entry.get("id"), entry.get("name")
-    if eid is not None and (isinstance(eid, bool) or not isinstance(eid, int)):
+    if eid is not None and (isinstance(eid, bool) or not isinstance(eid, int)
+                            or not 1 <= eid <= MAX_SHARE_ID):
         return False
     return name is None or isinstance(name, str)
 
@@ -466,40 +483,60 @@ def validate_share(payload) -> tuple[dict | None, list[str]]:
     ``{"schema_version": SCHEMA_VERSION, "fits": [...], "doctrines": [...]}``
     holding only what survived, and `problems` says what did not:
 
-    * a fit that is not a fit (or repeats an id) — ``"fit <n>: ..."``, by its
-      1-based position; every surviving fit has ``esi_fitting_ids == {}``;
+    A record that is DROPPED is named ``"fit <n> (<name>)"`` / ``"doctrine <n>
+    (<name>)"`` - its 1-based position and its name, clipped, control
+    characters removed (`_share_label`; the position alone when it has no
+    usable name) - and the line says WHAT about it is at fault:
+
+    * a fit that is not a fit (or repeats an id) - ``"fit <n> (<name>): not a
+      valid fit"``; every surviving fit has ``esi_fitting_ids == {}``;
     * a fit whose name is over `MAX_SHARE_NAME` or whose EFT text is over
-      `MAX_SHARE_TEXT` — dropped, ``"fit <n>: ..."``; notes over
-      `MAX_SHARE_TEXT` are cleared (the fit stays), ``"fit <n>: notes
-      dropped ..."``;
-    * a fit or a doctrine with any OTHER string over its bound — dropped,
-      ``"fit <n>: a text field is too long"`` / ``"<name>: a text field is
-      too long"``: `dna` may be as long as `MAX_SHARE_TEXT`, every remaining
-      string at any depth (hull, module, charge, drone and cargo names, slot,
-      source, stamps, ids, ideal mode, exemption kind / name) at most
-      `MAX_SHARE_NAME` (`_share_strings_fit`);
-    * a fit or a doctrine with a ``<``, a ``>`` or a control character in any
-      of those NAME strings (its own name, a member tag and the hull name
-      included; the EFT text, notes and a description are not names) —
-      dropped, ``"fit <n> (<name>): holds < or > - rename it to share it"``
-      / ``"doctrine <n> (<name>): ..."`` (``"holds a control character"``
-      when that is all it holds): the app writes fit and hull names into the
-      MOTD markup as they are (`_share_markup`). Checked before the
-      duplicate-name rule, so such a doctrine never claims its name;
-    * a fit whose stored `dna` is not digits and ``:`` ``;`` ``_`` only —
-      dropped, ``"fit <n> (<name>): its DNA is not a fit DNA"`` (the same
-      reason: the stored DNA can end up inside a link);
+      `MAX_SHARE_TEXT` - dropped, ``"...: name longer than ..."`` / ``"...:
+      fit text longer than ..."``;
+    * notes over `MAX_SHARE_TEXT`, or holding a control character other than
+      the newline and the tab (`_SHARE_TEXT_CONTROL`: the app sends notes to
+      the game as a fitting's description) - CLEARED (the fit stays), ``"fit
+      <n> (<name>): notes dropped (...)"``;
+    * a fit or a doctrine with any OTHER string over its bound - dropped,
+      ``"...: a module name is too long"``, the string named as
+      `_SHARE_STRING_NAMES` calls it: `dna` may be as long as
+      `MAX_SHARE_TEXT`, every remaining string at any depth (hull, module,
+      charge, drone and cargo names, slot, source, stamps, ids, ideal mode,
+      exemption kind / name) at most `MAX_SHARE_NAME` (`_share_strings_fit`);
+    * a fit or a doctrine with a control character in any of those NAME
+      strings (its own name, a member tag and the hull name included; the EFT
+      text, notes and a description are not names) - dropped, ``"...: its
+      hull name holds a control character"`` (`_share_control`). A ``<`` or a
+      ``>`` in a name is text and travels: the app writes fit and hull names
+      into the MOTD as link labels, and the renderer escapes every label.
+      Checked before the twin rule, so such a doctrine never claims its name;
+    * a fit whose stored `dna` is not digits and ``:`` ``;`` ``_`` only -
+      dropped, ``"...: its DNA is not a fit DNA"`` (the stored DNA can end up
+      as a link's target) - or holds a number of more than
+      `MAX_SHARE_DNA_DIGITS` digits, ``"...: its saved link holds a number of
+      more than 9 digits"``;
+    * a fit with a type id outside ``1 .. MAX_SHARE_ID`` (ship, module,
+      charge, drone, cargo, subsystem; its own `hull_type_id` may be 0) -
+      dropped, ``"...: a type id is out of range"``;
     * a fit with a drone / cargo quantity below 0 or over
-      `MAX_SHARE_QUANTITY` — dropped, ``"fit <n> (<name>): a quantity is out
-      of range"``;
-    * a doctrine with more than `MAX_SHARE_SLOTS` slots — dropped before a
+      `MAX_SHARE_QUANTITY` - dropped, ``"...: a quantity is out of range"``;
+    * a doctrine with more than `MAX_SHARE_SLOTS` slots - dropped before a
       slot is built, ``"doctrine <n> (<name>): more than 200 slots"``;
     * a doctrine that is not a doctrine, or whose name (stripped) is over
-      `MAX_SHARE_NAME` — ``"doctrine <n>: ..."``;
+      `MAX_SHARE_NAME` - ``"...: not a valid doctrine"`` / ``"...: name
+      longer than ..."``;
+    * a doctrine with an ideal count, a seed target or a slot order outside
+      ``0 .. MAX_SHARE_COUNT`` - dropped, ``"...: an ideal count is out of
+      range"`` (a NEGATIVE seed target is garbage and reads as "inherit", as
+      a wrong-typed one does; an exemption whose id is outside ``1 ..
+      MAX_SHARE_ID`` is no exemption entry);
     * a doctrine whose name (stripped) an earlier one in the file already has
-      — ``"doctrine <n>: duplicate name '<name>'"``; the later one is DROPPED,
-      so a merge by name is well-defined and can never land on some other
-      doctrine of the importer's;
+      - ``"doctrine <n> (<name>): name used by an earlier doctrine"``; the
+      later one is DROPPED, so a merge by name is well-defined and can never
+      land on some other doctrine of the importer's;
+
+    What follows is said about a doctrine that STAYS, by its name:
+
     * a description over `MAX_SHARE_TEXT` — cleared (the doctrine stays),
       ``"<name>: description dropped ..."``;
     * slots with no fit in the file — dropped, ONE counted line per
@@ -564,38 +601,116 @@ def _share_strings_fit(record: dict) -> bool:
     return True
 
 
-def _share_markup(record: dict) -> str:
-    """Whether a NAME string of a cleaned fit / doctrine dict holds markup:
-    ``"angle"`` (a ``<`` or a ``>`` somewhere), ``"control"`` (control
-    characters only) or ``""``. The walk of `_share_strings_fit`: every
+def _share_control(record: dict) -> bool:
+    """Whether a NAME string of a cleaned fit / doctrine dict holds a control
+    character (`_SHARE_CONTROL`). The walk of `_share_strings_fit`: every
     string value at any depth except the record's own `_SHARE_LONG_TEXT`
-    fields - the texts are not link material, and `dna` has its own rule."""
-    found = ""
+    fields - the texts are not names (notes have a rule of their own), and
+    `dna` is checked against its alphabet. A ``<`` or a ``>`` is no fault:
+    the renderer escapes a label."""
     pending = [value for key, value in record.items()
                if key not in _SHARE_LONG_TEXT]
     while pending:
         value = pending.pop()
         if isinstance(value, str):
-            if "<" in value or ">" in value:
-                return "angle"
-            if not found and _SHARE_CONTROL.search(value):
-                found = "control"
+            if _SHARE_CONTROL.search(value):
+                return True
         elif isinstance(value, dict):
             pending.extend(value.values())
         elif isinstance(value, (list, tuple)):
             pending.extend(value)
-    return found
+    return False
+
+
+# What a problem line calls a string of a fit / doctrine record, by the keys
+# that lead to it (an entry of a list goes by its list's key). A string that
+# is not listed is "a text field".
+_SHARE_STRING_NAMES = {
+    ("id",): "its id",
+    ("name",): "its name",
+    ("hull_name",): "its hull name",
+    ("source",): "its source",
+    ("dna",): "its DNA",
+    ("parsed", "ship_name"): "its ship name",
+    ("parsed", "name_hint"): "the name in its fit text",
+    ("parsed", "modules", "name"): "a module name",
+    ("parsed", "modules", "slot"): "a module slot",
+    ("parsed", "modules", "charge_name"): "a charge name",
+    ("parsed", "drones", "name"): "a drone name",
+    ("parsed", "cargo", "name"): "a cargo name",
+    ("members", "tags"): "a tag",
+    ("members", "ideal_mode"): "an ideal mode",
+    ("exemptions", "kind"): "an exemption kind",
+    ("exemptions", "name"): "an exemption name",
+}
+
+
+def _share_string_at_fault(record: dict, at_fault) -> str:
+    """What a problem line calls the FIRST string of a cleaned fit / doctrine
+    dict - in the record's own order - for which ``at_fault(top_key, text)`` is
+    true: ``"a module name"``, ``"its hull name"``, ... (`_SHARE_STRING_NAMES`),
+    or ``"a text field"``. A refusal says WHICH string it is about: "rename
+    the fit" does not help when a module name is the one. Only called for a
+    record already known to be refused, so its cost is not on the common path."""
+    pending = [((key,), value) for key, value in reversed(list(record.items()))]
+    while pending:
+        path, value = pending.pop()
+        if isinstance(value, str):
+            if at_fault(path[0], value):
+                return _SHARE_STRING_NAMES.get(path, "a text field")
+        elif isinstance(value, dict):
+            pending.extend((path + (key,), item)
+                           for key, item in reversed(list(value.items())))
+        elif isinstance(value, (list, tuple)):
+            pending.extend((path, item) for item in reversed(value))
+    return "a text field"
+
+
+def _share_too_long(top_key: str, text: str) -> bool:
+    limit = MAX_SHARE_TEXT if top_key in _SHARE_LONG_TEXT else MAX_SHARE_NAME
+    return len(text) > limit
+
+
+def _share_has_control(top_key: str, text: str) -> bool:
+    return (top_key not in _SHARE_LONG_TEXT
+            and _SHARE_CONTROL.search(text) is not None)
+
+
+def _share_dna_numbers_ok(dna: str) -> bool:
+    """Whether every number of a DNA string (already known to be digits and
+    separators) has at most `MAX_SHARE_DNA_DIGITS` digits. The parser reads
+    ``1_000`` as 1000, so a ``_`` inside a number is skipped, not a separator.
+    The one owner of the rule: a stored DNA here, a fit pill's in the group
+    items."""
+    return all(len(number.replace("_", "")) <= MAX_SHARE_DNA_DIGITS
+               for number in _SHARE_DNA_NUMBER.findall(dna))
+
+
+def _share_shown(name) -> str:
+    """A name as a problem line QUOTES it: at most `_SHARE_LABEL_MAX`
+    characters, and neither a control character (category Cc) nor a FORMAT
+    character (Cf: a bidi override, a zero-width space) among them - a quoted
+    name must not be able to reorder or hide part of the line it sits in.
+    ``""`` for anything that is not text."""
+    if not isinstance(name, str):
+        return ""
+    shown = "".join(ch for ch in name[:4 * _SHARE_LABEL_MAX]
+                    if unicodedata.category(ch) not in ("Cc", "Cf")).strip()
+    return shown[:_SHARE_LABEL_MAX].rstrip()
 
 
 def _share_label(kind: str, index: int, name) -> str:
     """``"fit 3 (Alpha Fit)"`` for a problem line: the record's position and
-    its name - control characters removed, clipped. No usable name: the
-    position alone."""
-    shown = ""
-    if isinstance(name, str):
-        shown = _SHARE_CONTROL.sub("", name[:4 * _SHARE_LABEL_MAX]).strip()
-        shown = shown[:_SHARE_LABEL_MAX].rstrip()
+    its name as `_share_shown` quotes one. No usable name: the position
+    alone."""
+    shown = _share_shown(name)
     return f"{kind} {index} ({shown})" if shown else f"{kind} {index}"
+
+
+def _share_raw_label(kind: str, index: int, raw) -> str:
+    """`_share_label` for a record that never became one: its name is read
+    off the raw entry, when that is an object at all."""
+    return _share_label(kind, index, raw.get("name") if isinstance(raw, dict) else None)
 
 
 def _share_quantities_ok(entry: dict) -> bool:
@@ -608,6 +723,43 @@ def _share_quantities_ok(entry: dict) -> bool:
             if quantity is not None and not 0 <= quantity <= MAX_SHARE_QUANTITY:
                 return False
     return True
+
+
+def _share_ids_ok(entry: dict) -> bool:
+    """Whether every type id of a cleaned fit dict is ``1 .. MAX_SHARE_ID``:
+    the ship, each module and its charge (None = no charge), each drone and
+    cargo stack, each subsystem. The fit's own `hull_type_id` may also be 0 -
+    what a fit stored without the key loads as."""
+    parsed = entry["parsed"]
+    ids = [parsed["ship_type_id"], *(parsed.get("subsystems") or ())]
+    for module in parsed.get("modules") or ():
+        ids.append(module["type_id"])
+        if module.get("charge_type_id") is not None:
+            ids.append(module["charge_type_id"])
+    for section in ("drones", "cargo"):
+        ids.extend(stack["type_id"] for stack in parsed.get(section) or ())
+    return (0 <= entry["hull_type_id"] <= MAX_SHARE_ID
+            and all(1 <= type_id <= MAX_SHARE_ID for type_id in ids))
+
+
+def _share_number_at_fault(entry: dict) -> str:
+    """What is out of ``0 .. MAX_SHARE_COUNT`` in a cleaned doctrine dict:
+    ``"a seed target"`` (the doctrine's or a slot's), ``"an ideal count"``,
+    ``"a slot order"`` - or ``""``. A number that is not there (None: inherit,
+    no ideal) is fine."""
+    def out(value) -> bool:
+        return value is not None and not 0 <= value <= MAX_SHARE_COUNT
+
+    if out(entry.get("seed_target")):
+        return "a seed target"
+    for member in entry["members"]:
+        if out(member.get("ideal_min")) or out(member.get("ideal_max")):
+            return "an ideal count"
+        if out(member.get("seed_target")):
+            return "a seed target"
+        if out(member["order"]):
+            return "a slot order"
+    return ""
 
 
 def _counted(count: int, one: str, many: str) -> str:
@@ -641,41 +793,52 @@ def _validate_share(payload) -> tuple[dict | None, list[str]]:
             if entry["id"] in fit_ids:
                 raise ValueError("repeated id")
         except Exception:
-            problems.append(f"fit {index}: not a valid fit")
+            problems.append(f"{_share_raw_label('fit', index, raw)}: not a valid fit")
             continue
+        # Every line below names the fit (clipped, control characters removed)
+        # and what about it is at fault - never a bare position.
+        label = _share_label("fit", index, entry["name"])
         if len(entry["name"]) > MAX_SHARE_NAME:
             problems.append(
-                f"fit {index}: name longer than {MAX_SHARE_NAME} characters")
+                f"{label}: name longer than {MAX_SHARE_NAME} characters")
             continue
         if len(entry["raw_text"]) > MAX_SHARE_TEXT:
             problems.append(
-                f"fit {index}: fit text longer than {MAX_SHARE_TEXT} characters")
+                f"{label}: fit text longer than {MAX_SHARE_TEXT} characters")
             continue
-        notes_over = len(entry["notes"]) > MAX_SHARE_TEXT
-        if notes_over:
+        notes_dropped = ""
+        if len(entry["notes"]) > MAX_SHARE_TEXT:
+            notes_dropped = f"longer than {MAX_SHARE_TEXT} characters"
+        elif _SHARE_TEXT_CONTROL.search(entry["notes"]):
+            notes_dropped = "they hold a control character"
+        if notes_dropped:
             entry["notes"] = ""
         if not _share_strings_fit(entry):
             # Dropped whole; a slot that names it is reported below as naming
             # a fit that is not in the file.
-            problems.append(f"fit {index}: a text field is too long")
+            what = _share_string_at_fault(entry, _share_too_long)
+            problems.append(f"{label}: {what} is too long")
             continue
-        # Link material (see `_SHARE_CONTROL`): names, then the stored DNA.
-        marked = _share_markup(entry)
-        if marked:
-            problems.append(f"{_share_label('fit', index, entry['name'])}: "
-                            f"{_SHARE_MARKUP_LINES[marked]}")
+        # Names (see `_SHARE_CONTROL`), then the stored DNA, then the numbers.
+        if _share_control(entry):
+            what = _share_string_at_fault(entry, _share_has_control)
+            problems.append(f"{label}: {what} holds a control character")
             continue
         if _SHARE_DNA.fullmatch(entry["dna"]) is None:
-            problems.append(f"{_share_label('fit', index, entry['name'])}: "
-                            "its DNA is not a fit DNA")
+            problems.append(f"{label}: its DNA is not a fit DNA")
+            continue
+        if not _share_dna_numbers_ok(entry["dna"]):
+            problems.append(f"{label}: its saved link holds a number of more "
+                            f"than {MAX_SHARE_DNA_DIGITS} digits")
+            continue
+        if not _share_ids_ok(entry):
+            problems.append(f"{label}: a type id is out of range")
             continue
         if not _share_quantities_ok(entry):
-            problems.append(f"{_share_label('fit', index, entry['name'])}: "
-                            "a quantity is out of range")
+            problems.append(f"{label}: a quantity is out of range")
             continue
-        if notes_over:
-            problems.append(f"fit {index}: notes dropped (longer than "
-                            f"{MAX_SHARE_TEXT} characters)")
+        if notes_dropped:
+            problems.append(f"{label}: notes dropped ({notes_dropped})")
         fit_ids.add(entry["id"])
         fits.append(entry)
 
@@ -693,32 +856,40 @@ def _validate_share(payload) -> tuple[dict | None, list[str]]:
                             f"more than {MAX_SHARE_SLOTS} slots")
             continue
         except Exception:
-            problems.append(f"doctrine {index}: not a valid doctrine")
+            problems.append(
+                f"{_share_raw_label('doctrine', index, raw)}: not a valid doctrine")
             continue
         name = entry["name"]
+        # A doctrine that is DROPPED is named by its position and its name
+        # (clipped, control characters removed); one that stays, by its name.
+        label = _share_label("doctrine", index, name)
         if len(name) > MAX_SHARE_NAME:
-            # Before the duplicate check: its line would quote the name back.
+            # Before the twin check: an over-long name is no name to be a twin of.
             problems.append(
-                f"doctrine {index}: name longer than {MAX_SHARE_NAME} characters")
+                f"{label}: name longer than {MAX_SHARE_NAME} characters")
             continue
-        marked = _share_markup(entry)
-        if marked:
-            # Also before the duplicate check, for the same reason - and so
-            # that a doctrine dropped here never claims its name.
-            problems.append(f"{_share_label('doctrine', index, name)}: "
-                            f"{_SHARE_MARKUP_LINES[marked]}")
+        if _share_control(entry):
+            # Also before the twin check, so that a doctrine dropped here
+            # never claims its name.
+            what = _share_string_at_fault(entry, _share_has_control)
+            problems.append(f"{label}: {what} holds a control character")
+            continue
+        out_of_range = _share_number_at_fault(entry)
+        if out_of_range:
+            problems.append(f"{label}: {out_of_range} is out of range")
             continue
         if name in seen_names:
             # One doctrine per name: the merge matches by name, so the second
             # copy would overwrite the first. The earlier one stands.
-            problems.append(f"doctrine {index}: duplicate name '{name}'")
+            problems.append(f"{label}: name used by an earlier doctrine")
             continue
         description_over = len(entry["description"]) > MAX_SHARE_TEXT
         if description_over:
             entry["description"] = ""
         if not _share_strings_fit(entry):
             # Before the name is taken: a later doctrine of this name stands.
-            problems.append(f"{name}: a text field is too long")
+            what = _share_string_at_fault(entry, _share_too_long)
+            problems.append(f"{label}: {what} is too long")
             continue
         seen_names.add(name)
         if description_over:
