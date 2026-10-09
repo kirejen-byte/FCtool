@@ -1115,7 +1115,7 @@ class _SpecRolesItem(Item):
     """
 
     id = "fleet.specialized_roles"
-    label = "Custom Specialized Role categories"
+    label = "Custom Specialized Roles"
     kind = "collection"
     files = ("config",)
     paths = (("config", _CATEGORIES_PATH),)

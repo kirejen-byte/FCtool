@@ -52,10 +52,9 @@ from group_bundle import CATEGORIES, CATEGORY_LABELS, clean_tag, clean_text
 from group_items import ABSENT, NOT_SUPPORTED, ItemResult, Options
 
 
-# Three boxes of ONE width in the tree's font (Consolas 9 falls back to the same symbol font
-# for all three: 12 px at tk scaling 1.33, 14 px at 1.51), so a label never shifts sideways
-# when its box changes. A narrower "partial" (the squared minus is 10 / 11 px) did.
-GLYPH = {"on": "☑", "off": "☐", "partial": "☒"}
+# The partial glyph is the approved mock's; it is 2-3 px narrower than the ballot boxes in
+# the fallback font, and that is accepted.
+GLYPH = {"on": "☑", "off": "☐", "partial": "▣"}
 
 ROOT_ID = "*"
 TAG_ID = "meta.tag"                     # the same id as group_apply.TAG_ITEM
@@ -1275,6 +1274,8 @@ MSG_STAGED = "The import is staged - it is applied the next time FCTool starts."
 MSG_RESTORE_STAGED = "The restore is staged - it is applied the next time FCTool starts."
 MSG_RESTART_REFUSED = ("An update is installing - FCTool cannot restart right now. What is "
                        "staged is applied at the next start.")
+MSG_UPDATE_FIRST = ("An update is ready: this restart installs it first, and the import is "
+                    "applied the next time FCTool starts after that.")
 MSG_CANCELLED = "The pending {what} was cancelled."
 MSG_NOTHING_PENDING = "Nothing is pending."
 MSG_NOT_CANCELLED = ("The pending {what} could not be cancelled - it is still applied at the "
@@ -1317,11 +1318,11 @@ _TREE_ROWS = 6                          # rows a tree ASKS for; the window gives
 _TREE_CHARS = 30                        # the tree column's starting width, in characters
 _DETAIL_CHARS = 30                      # the right pane's starting width
 _IMPORT_TREE_ROWS = 3                   # the Import page's: its warnings box asks for more
-_HEADER_LINES = 3                       # the Import page's header box
+_HEADER_LINES = (2, 4)                  # the Import page's header box: whole lines, within
 _WARN_LINES = (2, 6)                    # ... and its warnings box: as tall as its text, within
 _WARN_LINES_SHORT = 4                   # ... its most on a page shorter than _ROOMY_PAGE lines
 _ROOMY_PAGE = 28
-_ATTENTION_LINES = 4                    # the History page's attention list
+_ATTENTION_LINES = (1, 4)               # the History page's attention list: whole lines, within
 _DETAIL_LINES = 4                       # a page's text box, as it asks
 _EDITOR_DETAIL_LINES = (3, 5)           # the Create page's, under an editor: five lines, three
 _ROOMY_PANE = 18                        # ... where the pane is shorter than this many lines
@@ -1409,6 +1410,12 @@ def _warn_height(lines, most=_WARN_LINES[1]) -> int:
     single line ("No warnings."), otherwise as many as there are - at least two, at most
     ``most`` (six). Whole lines: the box never ends in half of one."""
     return 1 if lines <= 1 else max(_WARN_LINES[0], min(most, lines))
+
+
+def _box_height(lines, least, most) -> int:
+    """The lines a text box asks for when its text has ``lines`` of them: that many, within
+    ``least`` .. ``most``. Whole lines: the box never ends in half of one."""
+    return max(least, min(most, lines))
 
 
 class _TreeView:
@@ -1717,6 +1724,8 @@ class _Controller:
         self._preview, self._extra_rows, self._import_unusable = {}, [], {}
         self._refusal = ""              # why the chosen file was refused (the reader's words)
         self._warn_count = 0            # the lines the warnings box holds
+        self._header_count = 1          # ... the Import header box
+        self._attention_count = 1       # ... the History attention box
 
         # History
         self.report = report if isinstance(report, dict) else None
@@ -2062,6 +2071,9 @@ class _Controller:
         self._line(page, "scope", LINE_SCOPE, FG_DIM).pack(side=tk.BOTTOM, fill=tk.X)
         self._line(page, "backup", LINE_BACKUP, FG_TEXT).pack(side=tk.BOTTOM, fill=tk.X,
                                                               pady=(6, 0))
+        # Made now, packed (above the backup line) only while an update waits and a file is
+        # chosen (_paint_update_notice).
+        self._line(page, "update_first", MSG_UPDATE_FIRST, FG_ORANGE)
         # The warnings box: packed only while it has something to say (_paint_import), and
         # as tall as that is. Its headings have no spacing of their own, so that the box
         # holds WHOLE lines; where a line wraps, the box is measured again (_size_warnings).
@@ -2075,8 +2087,10 @@ class _Controller:
         row.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         self._button(row, "choose", "Choose file...", self.choose_file).pack(
             side=tk.LEFT, anchor=tk.N, padx=(0, 8))
-        frame, self.header_text = self._text_box(row, height=_HEADER_LINES)
+        frame, self.header_text = self._text_box(row, height=_HEADER_LINES[1])
         frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.header_text.tag_configure("title", spacing3=0)     # whole lines (_size_header)
+        self.header_text.bind("<Configure>", self._size_header, add="+")
 
         paned = self._paned(page)
         view = _TreeView(paned, (("in_file", HEAD_IN_FILE, 18), ("happens", HEAD_HAPPENS, 22)),
@@ -2111,6 +2125,9 @@ class _Controller:
         self._wrapping(tk.Label(banner, textvariable=self.banner_var, font=_HINT_FONT,
                                 fg=FG_WHITE, bg=BG_PANEL)).pack(side=tk.LEFT, fill=tk.X,
                                                                 expand=True)
+        # Under the text and the buttons while an update waits (_paint_history).
+        self.banner_notice = self._wrapping(tk.Label(
+            banner, text=MSG_UPDATE_FIRST, font=_HINT_FONT, fg=FG_ORANGE, bg=BG_PANEL))
         self.banner = banner            # packed above the lists while something is staged
 
         paned = self._paned(page)
@@ -2128,10 +2145,12 @@ class _Controller:
         self._button(row, "dismiss", "Dismiss", self._dismiss_selected).pack(side=tk.LEFT)
         # One paragraph per flag, wrapped: a reason is a whole sentence, and a list box
         # would cut it at the pane's edge. A click picks the paragraph.
-        frame, self.attention_text = self._text_box(left, height=_ATTENTION_LINES)
+        frame, self.attention_text = self._text_box(left, height=_ATTENTION_LINES[1])
         frame.pack(side=tk.BOTTOM, fill=tk.X)
+        # No spacing between paragraphs: the box holds WHOLE lines (_size_attention).
         self.attention_text.tag_configure("flag", foreground=FG_ORANGE, lmargin2=14,
-                                          spacing1=1, spacing3=2)
+                                          spacing1=0, spacing3=0)
+        self.attention_text.bind("<Configure>", self._size_attention, add="+")
         self.attention_text.tag_configure("picked", background=BG_SELECT,
                                           foreground=FG_WHITE)
         self.attention_text.bind("<Button-1>", self._on_attention_press, add="+")
@@ -3327,6 +3346,9 @@ class _Controller:
             else:
                 parts.append((NO_FILE_CHOSEN, "dim"))
         self._write(self.header_text, parts)
+        self._header_count = 1 + sum(text.count("\n") for text, _tags in parts)
+        self._size_header()
+        self._paint_update_notice(repack=False)
         lines = []
         if self.warnings:
             lines.append(("Warnings", "head"))
@@ -3344,7 +3366,7 @@ class _Controller:
             if lines:                               # an empty box is no box at all
                 self._size_warnings()
                 self._warn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0),
-                                      after=self.lines["backup"])
+                                      after=self._bottom_anchor())
             else:
                 self._warn_frame.pack_forget()
         except tk.TclError:
@@ -3362,15 +3384,70 @@ class _Controller:
         box, lines, most = self.warn_text, self._warn_count, _WARN_LINES[1]
         try:
             if lines and box.winfo_ismapped() and box.winfo_width() > 1:
-                shown = box.tk.call(box._w, "count", "-displaylines", "1.0", "end-1c")
-                lines = max(lines, int(shown) + 1)
+                lines = self._shown_lines(box, lines)
                 page = self.pages["import"].winfo_height()
                 if page < _ROOMY_PAGE * self._hint_font.metrics("linespace"):
                     most = _WARN_LINES_SHORT
-            wanted = _warn_height(lines, most)
-            if int(box.cget("height")) != wanted:
-                box.configure(height=wanted)
+            self._set_height(box, _warn_height(lines, most))
         except (tk.TclError, TypeError, ValueError):
+            pass
+
+    @staticmethod
+    def _shown_lines(box, lines) -> int:
+        """``lines`` or - where a long line wraps in the mapped ``box`` - the lines SHOWN
+        (the widget is asked)."""
+        if lines and box.winfo_ismapped() and box.winfo_width() > 1:
+            shown = box.tk.call(box._w, "count", "-displaylines", "1.0", "end-1c")
+            return max(lines, int(shown) + 1)
+        return lines
+
+    @staticmethod
+    def _set_height(box, wanted) -> None:
+        if int(box.cget("height")) != wanted:
+            box.configure(height=wanted)
+
+    def _size_header(self, _event=None) -> None:
+        """The Import header box, like the warnings box (``_size_warnings``): as tall as its
+        text in whole lines, two to four."""
+        try:
+            lines = self._shown_lines(self.header_text, self._header_count)
+            self._set_height(self.header_text, _box_height(lines, *_HEADER_LINES))
+        except (tk.TclError, TypeError, ValueError):
+            pass
+
+    def _size_attention(self, _event=None) -> None:
+        """The History attention box: whole lines, one to four."""
+        try:
+            lines = self._shown_lines(self.attention_text, self._attention_count)
+            self._set_height(self.attention_text, _box_height(lines, *_ATTENTION_LINES))
+        except (tk.TclError, TypeError, ValueError):
+            pass
+
+    def _bottom_anchor(self):
+        """The widget the warnings box sits directly above: the update notice while it
+        shows, else the backup line."""
+        notice = self.lines["update_first"]
+        return notice if notice.winfo_manager() == "pack" else self.lines["backup"]
+
+    def _update_ready(self) -> bool:
+        return self._ask_host("update_state", default="") == "ready"
+
+    def _paint_update_notice(self, repack=True) -> None:
+        """Show the update sentence on the Import page - above the backup line - while an
+        update waits and a file is chosen, else hide it. The warnings box is kept above it."""
+        notice = self.lines["update_first"]
+        show = self.bundle is not None and self._update_ready()
+        try:
+            if show == (notice.winfo_manager() == "pack"):
+                return
+            if show:
+                notice.pack(side=tk.BOTTOM, fill=tk.X, after=self.lines["backup"])
+            else:
+                notice.pack_forget()
+            if repack and self._warn_frame.winfo_manager() == "pack":
+                self._warn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0),
+                                      after=self._bottom_anchor())
+        except tk.TclError:
             pass
 
     def _render_import(self) -> None:
@@ -3543,6 +3620,7 @@ class _Controller:
         """Enable or disable the two apply buttons and say why. ``quiet``: only when the
         answer changed - the status line is not touched otherwise."""
         enabled, reason, kind = self._apply_state()
+        self._paint_update_notice()
         try:
             if quiet and enabled == (str(self.apply_btn.cget("state")) == tk.NORMAL):
                 return enabled
@@ -3652,6 +3730,11 @@ class _Controller:
                 self.buttons["cancel_pending"].configure(text=label, width=-len(label))
                 self.banner.pack(side=tk.TOP, fill=tk.X, pady=(0, 8),
                                  before=self._history_paned)
+                if self._update_ready():
+                    self.banner_notice.pack(side=tk.BOTTOM, fill=tk.X,
+                                            before=self.buttons["cancel_pending"])
+                else:
+                    self.banner_notice.pack_forget()
             listed = self.history_list
             listed.delete(*listed.get_children(""))
             for index, entry in enumerate(self.imports):
@@ -3684,11 +3767,13 @@ class _Controller:
         if not 0 <= self._attention_sel < len(flags):
             self._attention_sel = 0
         lines = [_attention_line(flag.get("section"), flag.get("reason")) for flag in flags]
+        self._attention_count = max(1, len(lines))
         parts = [(line + ("\n" if index < len(lines) - 1 else ""),
                   ("flag", "picked") if index == self._attention_sel else "flag")
                  for index, line in enumerate(lines)]
         self._write(self.attention_text, parts or [("Nothing needs your attention.", "dim")],
                     subject="attention")
+        self._size_attention()
 
     def select_attention(self, index) -> bool:
         """Pick one of the attention flags - the one ``Open in Settings`` and ``Dismiss``
