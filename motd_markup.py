@@ -110,9 +110,15 @@ def hex_to_eve_color(hex_str: str, alpha: str = "ff") -> str:
 _TOKEN_RE = re.compile(r"<([^>]*)>|([^<]+)")
 
 # Parsed tag forms (matched case-insensitively against the inner tag text).
+# A size is 1-9 ASCII digits, so the int() in _tag_kind can never raise. `\d+`
+# also matched other scripts' digits and, unbounded, let pasted or pulled
+# markup walk int() past its 4,300-digit parsing limit -- out of a parser that
+# promises never to raise. Anything else is "no usable size": neither pattern
+# matches and the tag falls through to the unknown-tag path (stripped, inner
+# text kept).
 _COLOR_OPEN_RE = re.compile(r"^(?:font)?color\s*=\s*(.+)$", re.IGNORECASE)
-_FONT_SIZE_RE = re.compile(r"^font\s+size\s*=\s*(\d+)\s*$", re.IGNORECASE)
-_FONTSIZE_RE = re.compile(r"^fontsize\s*=\s*(\d+)\s*$", re.IGNORECASE)
+_FONT_SIZE_RE = re.compile(r"^font\s+size\s*=\s*([0-9]{1,9})\s*$", re.IGNORECASE)
+_FONTSIZE_RE = re.compile(r"^fontsize\s*=\s*([0-9]{1,9})\s*$", re.IGNORECASE)
 _URL_OPEN_RE = re.compile(r"^url\s*=\s*(.+)$", re.IGNORECASE)
 
 

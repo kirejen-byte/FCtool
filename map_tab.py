@@ -1715,7 +1715,11 @@ class MapTab:
         # samples loop lag through non-map phases too (H2/H4 comparator).
         _env = os.environ.get("FCTOOL_MAP_TELEMETRY", "")
         _tele_on = bool(telemetry) or (_env not in ("", "0", "false", "False"))
-        _maxlen = int(_env) if _env.isdigit() and int(_env) > 1 else 2000
+        # isdecimal(), never isdigit(): the latter is True for digit-like
+        # characters int() refuses. The length bound keeps int() inside its
+        # parsing limit, so this line cannot raise out of the constructor.
+        _maxlen = (int(_env) if _env.isdecimal() and len(_env) <= 9
+                   and int(_env) > 1 else 2000)
         self._tele = MapTelemetry(maxlen=_maxlen) if _tele_on else None
         self._tele_applied_this_tick = False
         self._tele_lag_last: float | None = None

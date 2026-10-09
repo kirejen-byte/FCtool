@@ -74,6 +74,11 @@ MIN_FRAGMENT_LEN = 3
 #: Minimum length of a hull-name PREFIX used as a slot filter (the
 #: ``range_check.MIN_PARTIAL_SHAPED_PREFIX_LEN`` floor, same reasoning).
 MIN_HULL_PREFIX_LEN = 3
+#: Most digits an all-digit selector may have and still be a refit NUMBER (a
+#: 1-based pick among one slot's refits -- a handful). Longer is a name
+#: fragment like any other non-number; it also keeps ``int()`` far from its
+#: 4,300-digit parsing limit on player chat text.
+MAX_NUMBER_DIGITS = 4
 
 #: The word that means "put every slot back on its default refit".
 RESET_WORD = "reset"
@@ -507,11 +512,17 @@ def _resolve_selector(tokens, candidates, get_fit) -> Resolution:
     ``isascii()`` guards the ``int()``: ``str.isdigit`` is True for '²' and
     '②', which ``int()`` then refuses with a ValueError. This runs on the chat
     poll thread against arbitrary player text, so that would be an exception
-    escaping ``resolve`` rather than a resolution saying no."""
+    escaping ``resolve`` rather than a resolution saying no.
+
+    The length bound closes the other way ``int()`` refuses: more than 4,300
+    digits. A refit number is a 1-based pick among one slot's few refits, so
+    more than ``MAX_NUMBER_DIGITS`` digits is not one -- it is read as any
+    other non-number is, a name fragment."""
     if not tokens:
         return _error("missing refit number or name")
     selector = " ".join(tokens)
-    if selector.isascii() and selector.isdigit():
+    if (selector.isascii() and selector.isdigit()
+            and len(selector) <= MAX_NUMBER_DIGITS):
         return _resolve_number(int(selector), candidates, get_fit)
     return _resolve_fragment(selector, candidates, get_fit)
 

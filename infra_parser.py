@@ -94,9 +94,13 @@ class ParseResult:
 
 
 # ── Regexes ──────────────────────────────────────────────────────────────────
-RE_A_HREF = re.compile(r'<a\s+href="showinfo:(\d+)//(\d+)"[^>]*>(.*?)</a>', re.I | re.S)
-RE_URL = re.compile(r'<url=showinfo:(\d+)//(\d+)>(.*?)</url>', re.I | re.S)
-RE_SMT = re.compile(r'^[ \t]*(\d{9,})[ \t]+(.+?)[ \t]+-->[ \t]+(.+?)[ \t]*$', re.M)
+# Every id group is capped at 19 digits (an EVE id fits; no real one comes
+# close), so the int() calls in parse_clipboard can never meet int()'s
+# 4,300-digit parsing limit on pasted text. A longer run of digits simply does
+# not match: that link / line is not one, exactly like a non-numeric id.
+RE_A_HREF = re.compile(r'<a\s+href="showinfo:(\d{1,19})//(\d{1,19})"[^>]*>(.*?)</a>', re.I | re.S)
+RE_URL = re.compile(r'<url=showinfo:(\d{1,19})//(\d{1,19})>(.*?)</url>', re.I | re.S)
+RE_SMT = re.compile(r'^[ \t]*(\d{9,19})[ \t]+(.+?)[ \t]+-->[ \t]+(.+?)[ \t]*$', re.M)
 PLAIN_SPLIT = re.compile(r'\s{2,}|\r?\n')
 
 _UNPARSED_CAP = 50

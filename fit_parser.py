@@ -12,8 +12,12 @@ Turns pasted EVE fit text into a `ParsedFit`. Two input formats:
 - **DNA** — a flat `shipID:typeID[_];qty:…::` bag of items; slot position is not
   encoded, so items route to slots via the catalog.
 
-Parsing is permissive: an unresolved item becomes a non-fatal `warning`; only a
-missing or invalid header raises `FitParseError`. Pure logic, Tk-free,
+Parsing is permissive: an unresolved item becomes a non-fatal `warning`.
+`FitParseError` is raised only for text that cannot be read as a fit: empty
+text, a missing or invalid header (EFT) or ship id (DNA), an unknown hull, and
+-- in `parse_eft` only -- an item quantity `int()` cannot read (more than 4,300
+digits). `parse_dna` warns about an unusable quantity and carries on.
+Pure logic, Tk-free,
 network-free — all type resolution goes through the injected `catalog`.
 """
 
@@ -175,7 +179,14 @@ def parse_eft(text: str, catalog) -> ParseResult:
             item_match = _ITEM_QTY_RE.match(line)
             if item_match:
                 name = item_match.group("name").strip()
-                qty = int(item_match.group("qty"))
+                try:
+                    qty = int(item_match.group("qty"))
+                except ValueError as exc:
+                    # Only a run of digits past int()'s parsing limit (4,300)
+                    # gets here; callers catch FitParseError, not ValueError.
+                    raise FitParseError(
+                        f"Invalid item quantity: {_clip(line)!r}"
+                    ) from exc
                 type_id = catalog.resolve_id(name)
                 if type_id is None:
                     warnings.append(f"Unknown item: {name}")

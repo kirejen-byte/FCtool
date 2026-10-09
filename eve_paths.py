@@ -303,7 +303,11 @@ def list_core_user_files(settings_dir):
     out = []
     for path in glob.glob(os.path.join(settings_dir, "core_user_*.dat")):
         stem = os.path.basename(path)[len("core_user_"):-len(".dat")]
-        if stem.isdigit():
+        # isascii() first: isdigit() alone is also True for digit-like
+        # characters int() refuses (superscript two) -- an odd name is junk.
+        # An EVE id fits in 19 digits; the bound also keeps int() inside its
+        # parsing limit (4,300 digits).
+        if stem.isascii() and stem.isdigit() and len(stem) <= 19:
             out.append((int(stem), path))
     return sorted(out)
 
@@ -319,6 +323,6 @@ def list_core_char_files(settings_dir):
     out = []
     for path in glob.glob(os.path.join(settings_dir, "core_char_*.dat")):
         stem = os.path.basename(path)[len("core_char_"):-len(".dat")]
-        if stem.isdigit():
+        if stem.isascii() and stem.isdigit() and len(stem) <= 19:
             out.append((int(stem), path))
     return sorted(out)
