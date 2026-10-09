@@ -11,7 +11,7 @@ The Discord ping keeps everything it remembers in ONE top-level config block::
       "doctrine_text": "Check MOTD",
       "when_format": "time_countdown",          # one of WHEN_FORMATS
       "basic": [...],                           # the basic template; absent = the built-in one
-      "default_picks": {"fleet_type": "CTA"},   # the picks used with no doctrine selected
+      "default_picks": {"fleet_type": "CTA"},   # the picks used with NO doctrine selected
       "doctrines": {
         "<doctrine id>": {"doc": [...],         # its own template; absent = use the basic one
                           "picks": {"comms": "Op 1"}}
@@ -32,19 +32,32 @@ The rules every method keeps:
   fresh object, never a list that lives in the config.
 * **The block is only made by a change.** It appears on the first call that changes
   something, as ``{"version": 1}`` plus what was written - every key is optional and the
-  getters supply the rest. ``save()`` runs exactly once per such call. A call that would
-  only restate what is already in force (the stored value again, or - where nothing is
-  stored yet - the value already read back) writes nothing and does not save.
+  getters supply the rest. ``save()`` runs exactly once per such call, after the write.
+* **What is no change.** For a list, a text and the When format, "nothing stored" and "the
+  default" are the same thing, so a call that leaves the value read back as it was writes
+  nothing and does not save (choosing the default again does not create the block). A PICK
+  is different: an explicit pick is stored even when it equals the value shown by fallback
+  - that is how a doctrine is pinned against a later reorder of the list - and is skipped
+  only when that field already stores exactly that value. A template is skipped only when
+  its slot already stores an equal list.
 * **Junk found in the config is read around, never raised on.** A wrong-typed block, table,
   entry or value counts as absent. It is replaced only when a change has to write through
   it; junk beside the written key stays as it is.
 * **A wrong name from the caller is a programmer error:** an unknown list kind, pick field,
-  text key or When format, a non-list where a list is due, a non-text pick or text - each is
-  a ``ValueError`` and changes nothing.
+  text key or When format, a non-list where a list is due, a non-text pick, text or item
+  name, a bare string where ids are due - each is a ``ValueError`` and changes nothing.
 
-Picks are stored one field at a time. A doctrine answers a field from its own picks, else
-from ``default_picks``; the answer is then checked against the lists as they are NOW, so a
-pick that names a removed item falls back on the way out while the stored pick is left be.
+Picks are stored one field at a time, and a doctrine reads ONLY its own: ``default_picks``
+answers for "no doctrine selected" and for nothing else, so a change made with no doctrine
+selected never re-targets a doctrine. A stored pick is checked against the lists as they
+are NOW: it names a list item whatever its capitals and is read back in the LIST's
+spelling; a field with nothing stored, or naming an item that is gone, falls back - fleet
+type and comms to the list's first item (``""`` for an empty list), location to
+``STAGING``, doctrine to ``"text"`` - while the stored pick is left be.
+
+Items, texts and picks are cleaned the same way: every run of whitespace (newlines and
+tabs too) becomes one space, control codes are removed, the ends are stripped and the
+result is cut to ``MAX_CHARS``. ``STAGING`` is never a ``locations`` item.
 """
 from __future__ import annotations
 
@@ -65,6 +78,7 @@ MAX_CHARS = 80
 PICK_FIELDS = ("fleet_type", "location", "doctrine", "comms")
 DOCTRINE_MODES = ("text", "name")
 
+_PICK_FIELD_OF_KIND = {"fleet_types": "fleet_type", "locations": "location", "comms": "comms"}
 _DEFAULT_WHEN_FORMAT = "time_countdown"
 _DEFAULT_DOCTRINE_MODE = "text"
 
@@ -79,18 +93,37 @@ class Picks:
 
 # -- cleaning -------------------------------------------------------------------------------
 
+def _is_dropped(char: str) -> bool:
+    """A code that is never part of a stored line: C0 / DEL / C1 controls, lone surrogates."""
+    code = ord(char)
+    return code < 32 or 127 <= code < 160 or 0xD800 <= code < 0xE000
+
+
 def _clean_text(value) -> str:
-    """One stored line: stripped and cut to MAX_CHARS; anything that is not text is ``""``."""
+    """One stored line; anything that is not text is ``""``.
+
+    Whitespace of every sort (newline and tab included) turns into a space BEFORE the
+    control codes go, so two words split by a newline stay two words; runs of spaces then
+    become one, the ends are stripped and the line is cut to MAX_CHARS.
+    """
     if not isinstance(value, str):
         return ""
-    return value.strip()[:MAX_CHARS].rstrip()
+    spaced = "".join(" " if char.isspace() else char
+                     for char in value if char.isspace() or not _is_dropped(char))
+    return " ".join(spaced.split())[:MAX_CHARS].rstrip()
 
 
-def _clean_items(items) -> list:
-    """A shared list: clean items, blanks dropped, one spelling per name, first MAX_ITEMS."""
+def _clean_items(items, kind: str) -> list:
+    """A shared list: clean items, blanks dropped, one spelling per name, first MAX_ITEMS.
+
+    The sentinel ``STAGING`` is no ``locations`` item - a pick of it means the live staging
+    system, so an item spelled that way could never be chosen.
+    """
     kept, seen = [], set()
     if not isinstance(items, (list, tuple)):
         return kept
+    if kind == "locations":
+        seen.add(STAGING.casefold())
     for item in items:
         text = _clean_text(item)
         folded = text.casefold()
@@ -106,6 +139,15 @@ def _clean_items(items) -> list:
 def _require(name, allowed, what) -> None:
     if not isinstance(name, str) or name not in allowed:
         raise ValueError("unknown %s: %r" % (what, name))
+
+
+def _match(value: str, items: list) -> Optional[str]:
+    """The item ``value`` names, capitals aside, in the LIST's spelling; ``None`` = no item."""
+    folded = value.casefold()
+    for item in items:
+        if item.casefold() == folded:
+            return item
+    return None
 
 
 def _doctrine_key(doctrine_id) -> Optional[str]:
@@ -145,33 +187,27 @@ def _items(block: dict, kind: str) -> list:
     fallback = list(DEFAULT_FLEET_TYPES) if kind == "fleet_types" else []
     if not isinstance(stored, list):
         return fallback
-    items = _clean_items(stored)
+    items = _clean_items(stored, kind)
     # A stored EMPTY list is the user's own choice and stays empty. A list that held only
     # junk is damage, not a choice.
     return items if items or not stored else fallback
 
 
 def _picks(block: dict, key: Optional[str]) -> Picks:
-    sources = (_stored_picks(block, key), _stored_picks(block, None))
-
-    def stored(field: str) -> str:
-        for source in sources:
-            value = source.get(field)
-            if isinstance(value, str):
-                return _clean_text(value)
-        return ""
+    """The picks of ONE holder - a doctrine's own, or ``default_picks`` for no doctrine."""
+    holder = _stored_picks(block, key)
 
     def from_list(field: str, kind: str) -> str:
         items = _items(block, kind)
-        value = stored(field)
-        if value in items:
-            return value
+        found = _match(_clean_text(holder.get(field)), items)
+        if found is not None:
+            return found
         return items[0] if items else ""
 
-    location = stored("location")
-    if location != STAGING and location not in _items(block, "locations"):
-        location = STAGING
-    doctrine = stored("doctrine")
+    location = _clean_text(holder.get("location"))
+    if location != STAGING:
+        location = _match(location, _items(block, "locations")) or STAGING
+    doctrine = _clean_text(holder.get("doctrine"))
     if doctrine not in DOCTRINE_MODES:
         doctrine = _DEFAULT_DOCTRINE_MODE
     return Picks(fleet_type=from_list("fleet_type", "fleet_types"), location=location,
@@ -193,17 +229,6 @@ def _own_template(block: dict, key: Optional[str]):
     """A doctrine's own template (the stored list itself), or ``None``."""
     doc = _entry(block, key).get("doc")
     return doc if isinstance(doc, list) else None
-
-
-def _in_force(holder: dict, key: str, new, read_back) -> bool:
-    """Would storing ``new`` under ``holder[key]`` only restate what is already there?
-
-    A stored value is compared as stored. Where nothing is stored yet, ``new`` is compared
-    with what a reader gets today - so choosing the default again does not create the block.
-    """
-    if key in holder:
-        return holder[key] == new
-    return read_back == new
 
 
 # -- writing --------------------------------------------------------------------------------
@@ -249,13 +274,47 @@ class PingStore:
         _require(kind, LIST_KINDS, "list kind")
         if not isinstance(items, (list, tuple)):
             raise ValueError("%s must be a list, not %r" % (kind, items))
-        new = _clean_items(items)
+        new = _clean_items(items, kind)            # a fresh list: never the caller's own
         cfg = self._get_config()
-        block = _block(cfg)
-        if _in_force(block, kind, new, _items(block, kind)):
+        if _items(_block(cfg), kind) == new:
             return
         _open_block(cfg)[kind] = new
         self._save()
+
+    def rename_item(self, kind: str, old: str, new: str) -> bool:
+        """Rename one list item in place and re-point every stored pick of it, in ONE save.
+
+        ``False`` (nothing written, no save) when ``old`` is not an item, ``new`` cleans to
+        nothing, or ``new`` is another item's name. Names are matched capitals aside, as a
+        pick is. Without this a rename would orphan every doctrine's pick of the old name.
+        """
+        _require(kind, LIST_KINDS, "list kind")
+        if not isinstance(old, str) or not isinstance(new, str):
+            raise ValueError("an item name must be text, not %r / %r" % (old, new))
+        cfg = self._get_config()
+        items = _items(_block(cfg), kind)
+        old_item = _match(_clean_text(old), items)
+        cleaned = _clean_items([new], kind)
+        if old_item is None or not cleaned:
+            return False
+        new_item = cleaned[0]
+        if _match(new_item, items) not in (None, old_item):
+            return False
+        if new_item == old_item:
+            return True                             # its own name again: nothing to write
+        items[items.index(old_item)] = new_item
+        block = _open_block(cfg)
+        block[kind] = items
+        field = _PICK_FIELD_OF_KIND[kind]
+        folded = old_item.casefold()
+        holders = [block.get("default_picks")]
+        holders += [_as_dict(entry).get("picks")
+                    for entry in _as_dict(block.get("doctrines")).values()]
+        for picks in holders:
+            if isinstance(picks, dict) and _clean_text(picks.get(field)).casefold() == folded:
+                picks[field] = new_item
+        self._save()
+        return True
 
     # -- picks ------------------------------------------------------------------------------
 
@@ -271,9 +330,9 @@ class PingStore:
             _require(new, DOCTRINE_MODES, "doctrine mode")
         key = _doctrine_key(doctrine_id)
         cfg = self._get_config()
-        block = _block(cfg)
-        if _in_force(_stored_picks(block, key), field, new, getattr(_picks(block, key), field)):
-            return
+        holder = _stored_picks(_block(cfg), key)
+        if field in holder and holder[field] == new:
+            return                                  # only a STORED equal value is no change
         block = _open_block(cfg)
         if key is None:
             target = _open(block, "default_picks")
@@ -300,16 +359,17 @@ class PingStore:
         """Store a doctrine's own template; with no doctrine, the basic template."""
         if not isinstance(doc_json, list):
             raise ValueError("a template must be a list, not %r" % (doc_json,))
+        new = copy.deepcopy(doc_json)       # first: a copy that fails leaves nothing half-made
         key = _doctrine_key(doctrine_id)
         cfg = self._get_config()
         block = _block(cfg)
         holder, slot = (block, "basic") if key is None else (_entry(block, key), "doc")
-        if slot in holder and holder[slot] == doc_json:
+        if slot in holder and holder[slot] == new:
             return
         target = _open_block(cfg)
         if key is not None:
             target = _open(_open(target, "doctrines"), key)
-        target[slot] = copy.deepcopy(doc_json)
+        target[slot] = new
         self._save()
 
     def reset_template(self, doctrine_id) -> None:
@@ -329,6 +389,9 @@ class PingStore:
 
     def inheriting_count(self, doctrine_ids: Iterable) -> int:
         """How many of these ids have no template of their own."""
+        if isinstance(doctrine_ids, str):
+            raise ValueError("doctrine ids must be a list of ids, not one string: %r"
+                             % (doctrine_ids,))
         block = _block(self._get_config())
         return sum(1 for doctrine_id in doctrine_ids
                    if _own_template(block, _doctrine_key(doctrine_id)) is None)
@@ -345,13 +408,8 @@ class PingStore:
             raise ValueError("%s must be text, not %r" % (key, value))
         new = _clean_text(value)
         cfg = self._get_config()
-        block = _block(cfg)
-        if key in block:
-            same = block[key] == new
-        else:
-            same = _text(block, key) == (new or TEXT_DEFAULTS[key])
-        if same:
-            return
+        if _text(_block(cfg), key) == (new or TEXT_DEFAULTS[key]):
+            return                                  # blank, absent and the default are one
         _open_block(cfg)[key] = new
         self._save()
 
@@ -361,8 +419,7 @@ class PingStore:
     def set_when_format(self, preset: str) -> None:
         _require(preset, WHEN_FORMATS, "When format")
         cfg = self._get_config()
-        block = _block(cfg)
-        if _in_force(block, "when_format", preset, _when_format(block)):
+        if _when_format(_block(cfg)) == preset:
             return
         _open_block(cfg)["when_format"] = preset
         self._save()
