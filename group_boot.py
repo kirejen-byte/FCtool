@@ -27,7 +27,9 @@ that has read a colour from ``ui_theme``. It does three things, in this order:
    One process is never waited for, and no staged work is begun while it lives: the
    updater's watcher. After an update the OLD build's process stays alive until this build reports
    that it booted - which it does seconds after its window is up, long after this hook.
-   Its leftover threads can still save settings, over whatever is applied now; and work
+   Its window is closed, but it is still the old build's code running, background threads
+   and all, and this hook has no way to see whether any of that still writes a settings
+   file - so it does not bet on it: nothing is applied under it. And work
    that process staged itself would make this start sit for ``apply_pending``'s whole wait
    before any window and then be told "another FCTool window is still open". So when the
    update marker is this start's own (below), the hook looks at that process ONCE, where

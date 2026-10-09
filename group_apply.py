@@ -46,11 +46,12 @@ One applier at a time: claim, backup, write and record all run inside
 work (step 3, up to eight seconds) happens BEFORE the lock is taken; under the lock the
 pending file is looked at again, and when it names another writer than the one that was
 waited for, the lock is given up and that one is waited for first. While another FCTool
-holds the lock it is asked for again every ``group_state.POLL_S`` seconds: for at most
-``APPLIER_WAIT`` seconds while no applying file is there (nobody is applying - a helper, a
-stage, a start a moment before its claim), and for up to ``APPLYING_WAIT`` seconds while
-one is: an apply is in flight, and a start that went on now would read files that are half
-old and half new. Then the answer is ``deferred`` and nothing was touched. A run
+holds the lock it is asked for again every ``group_state.POLL_S`` seconds, for up to
+``APPLYING_WAIT`` seconds, as long as there is staged work to do - a pending file or an
+applying file: the holder is a start before its claim or in the middle of its writes, and
+a start that went on now would read the old files, or files half old and half new, with
+the other FCTool still at them. Then the answer is ``deferred`` and nothing was touched
+(with neither file there, there is nothing to wait for: ``None``). A run
 that raises is rolled back inside the lock as well. The helpers that edit the side file
 (``set_tag``, ``add_attention`` ...) take the same lock; they wait for it up to
 ``EDIT_WAIT`` seconds (they run on the Tk thread), and write nothing when another FCTool
@@ -151,11 +152,13 @@ TAG_ITEM = "meta.tag"                   # the pseudo-result of the group tag
 FLAGS = ("coalitions_seeded", "motd_disarm")
 STATUSES = ("applied", "unchanged", "failed", "deferred", "restored", "interrupted_restored")
 RESTORE_ATTEMPTS = 3                    # starts that try to put one backup back, in all
-APPLIER_WAIT = 8.0                      # seconds a start waits for the apply lock while no
-#                                         applying file is there (nobody is applying)...
-APPLYING_WAIT = 60.0                    # ...and while one is: an apply is in flight elsewhere
+APPLYING_WAIT = 60.0                    # seconds a start waits for the apply lock while there
+#                                         is staged work to do: another FCTool is at it
+APPLIER_WAIT = APPLYING_WAIT            # the older name of that ONE limit (it was 8 seconds,
+#                                         for a lock held before the claim: too short)
 EDIT_WAIT = 0.5                         # seconds a side-file helper waits for the apply lock
 MAX_EXPORTS = 50                        # export names remembered (the newest)
+MAX_TASKS = 20                          # queued tasks kept (the newest)
 VERIFY_TASK = "verify_structure"
 TOKEN_FILES = "esi_tokens*.json"        # looked for by NAME only
 
@@ -198,6 +201,10 @@ _MSG_DEFERRED = ("Another FCTool window is still open - the import will be appli
                  "next start.",
                  "Another FCTool window is still open - your previous settings will be "
                  "restored at the next start.")
+_MSG_CHANGING = ("The staged import kept changing while FCTool was starting. It is applied "
+                 "the next time FCTool starts.",
+                 "The staged restore kept changing while FCTool was starting. Your previous "
+                 "settings are restored the next time FCTool starts.")
 _MSG_NOT_CLAIMED = ("The staged import could not be started - it will be tried at the next "
                     "start.",
                     "The staged restore could not be started - it will be tried at the next "
@@ -499,13 +506,15 @@ def _store_tag(side, tag) -> None:
         side.pop("tag", None)
 
 
-def _edit_side(app_dir, change, *, same=False) -> bool:
+def _edit_side(app_dir, change, *, same=False, busy=None) -> bool:
     """Read the side file, let ``change(side)`` edit it, write it back. ``change`` returns
     ``False`` for "nothing to write" - the answer is ``same`` then. True when the file was
     written; False when it could not be. Never raises.
 
     A side file that is in use is NOT written (the strict read raises ``StateBusyError``):
-    what would go back is the empty one with this single edit in it.
+    what would go back is the empty one with this single edit in it. ``busy``, a list,
+    gets one entry then - the caller knows that the file was looked at and could not be
+    read, and need not look again.
 
     All of it happens inside ``group_state.apply_lock`` - and not at all while another
     FCTool holds that lock: an apply that finishes between this read and this write would
@@ -522,7 +531,12 @@ def _edit_side(app_dir, change, *, same=False) -> bool:
         for look in range(_EDIT_TRIES + 1):
             with group_state.apply_lock(root) as held:
                 if held:
-                    side = group_state.read_sidecar(root, strict=True)
+                    try:
+                        side = group_state.read_sidecar(root, strict=True)
+                    except StateBusyError:
+                        if isinstance(busy, list):
+                            busy.append(True)
+                        return False
                     if change(side) is False:
                         return same
                     return bool(group_state.write_sidecar(root, side))
@@ -592,7 +606,9 @@ def _merge_attention(stored, incoming) -> list:
 def _merge_tasks(stored, incoming) -> list:
     """Add ``incoming`` tasks. At most ONE ``verify_structure`` task exists: a new one
     replaces any older one and keeps its ``attempts`` only for the same structure. A task
-    that is already listed word for word is not listed twice."""
+    that is already listed word for word is not listed twice. And the list is bounded:
+    ``MAX_TASKS`` at most - the oldest tasks go first, the structure check never (it is
+    the one task the app acts on today, and there is only one of it)."""
     merged = [task for task in stored if isinstance(task, dict)]
     for task in incoming:
         if not isinstance(task, dict):
@@ -611,6 +627,11 @@ def _merge_tasks(stored, incoming) -> list:
         elif task in merged:
             continue
         merged.append(task)
+    spare = len(merged) - MAX_TASKS
+    for task in list(merged) if spare > 0 else ():
+        if spare > 0 and task.get("kind") != VERIFY_TASK:
+            merged.remove(task)
+            spare -= 1
     return merged
 
 
@@ -638,20 +659,31 @@ def set_tag(app_dir, tag) -> str:
     """Store the tag (cleaned by ``group_bundle.clean_tag``: at most ``group_bundle.MAX_TAG``
     characters, nothing invisible; blank - and anything that is no ``str`` - clears it).
 
-    -> the cleaned tag when it is stored now. When it could not be stored - the side file
-    cannot be written, or another FCTool is applying an import at this moment - the answer
-    is what ``get_tag`` reads afterwards: the OLD tag, or ``""`` when the side file cannot
-    even be read right now (in use). So ``set_tag(x) != clean_tag(x)`` means "not saved"."""
+    -> the cleaned tag when it is stored now (or is the stored one already). When it could
+    not be stored - the side file cannot be written, or another FCTool is applying an
+    import at this moment - the answer is what ``get_tag`` would read: the OLD tag, or
+    ``""`` when the side file cannot even be read right now (in use). So
+    ``set_tag(x) != clean_tag(x)`` means "not saved".
+
+    The side file is read ONCE for all of that. This runs on the Tk thread, and a file
+    that another program holds costs every read most of a second: the old tag is what the
+    edit's own read saw, and a read that was refused is not tried a second time."""
     cleaned = _tag(tag)
+    seen, busy = [], []
 
     def change(side):
-        if _side_tag(side) == cleaned and (cleaned or "tag" not in side):
+        seen.append(_side_tag(side))
+        if seen[0] == cleaned and (cleaned or "tag" not in side):
             return False
         _store_tag(side, cleaned)
 
-    if _edit_side(app_dir, change):
+    if _edit_side(app_dir, change, same=True, busy=busy):
         return cleaned
-    return get_tag(app_dir)
+    if seen:                            # read, and not written: the tag is the old one
+        return seen[0]
+    if busy:                            # there, and not to be read now: as get_tag says
+        return ""
+    return get_tag(app_dir)             # the lock was never ours: nothing was read yet
 
 
 # -- staging -----------------------------------------------------------------
@@ -963,15 +995,22 @@ def _apply(app_dir, ctx, wait, txn):
     is waited for, ``_MAX_WRITERS`` times at most. A build that is missing item modules
     waits for nobody: it clears the staged import under the lock.
 
+    A wait that answers "still running" ends the start with ``deferred`` - unless the work
+    is gone by then (the FCTool that staged it has cancelled it meanwhile): then there is
+    nothing to promise, and the look starts over. A start that meets a new writer every
+    time it has waited for one gives up after ``_MAX_WRITERS`` and says that.
+
     While another FCTool holds the lock, ask again every ``POLL_S`` seconds - and start
-    from scratch once it is free: what was staged may be done by then. ``deferred``, with
-    nothing touched, after ``APPLIER_WAIT`` seconds while NO applying file is there, and
-    after ``APPLYING_WAIT`` seconds while one is: then an apply is in flight in the other
-    FCTool - it takes about a second, and a start that gave up meanwhile booted on files
-    half old and half new. Seconds of ``_sleep`` or seconds on ``_clock``, whichever is
-    reached first: a look at a protocol file that is in use takes a second by itself. When
-    the short wait runs out the applying file is looked for once more - the holder may
-    have claimed just now.
+    from scratch once it is free: what was staged may be done by then. As long as there is
+    staged work to do - a pending file OR an applying file - the holder is another start
+    that is about to claim, or is writing: it is waited for, ``APPLYING_WAIT`` seconds at
+    most, then the answer is ``deferred`` with nothing touched. ONE limit: no helper holds
+    the lock for seconds, so a shorter one for "no applying file yet" has no case - and a
+    start that gave up before the holder's claim read the old files while the holder
+    went on to write the new ones. With neither file there, there is nothing to wait
+    for (``None``). Seconds of ``_sleep`` or seconds on ``_clock``, whichever is reached
+    first: a look at a protocol file that is in use takes a second by itself; the count
+    starts when the wait for the writer is over.
 
     The unlocked look reads the PENDING file first, then the applying file. A claim renames
     pending -> applying, so whoever misses the pending file finds the applying file; read
@@ -991,9 +1030,15 @@ def _apply(app_dir, ctx, wait, txn):
                 and not (pending["kind"] == "import" and _incomplete()):
             kind, meta = pending["kind"], _peek_meta(pending)           # step 3
             txn["kind"], txn["meta"] = kind, meta
-            exited = _writer_gone(wait, pending)
-            if not exited or len(gone) >= _MAX_WRITERS:
+            if not _writer_gone(wait, pending):
+                # Still running. The work may have been cancelled while this start waited:
+                # "will be applied at the next start" is said only of work that is there.
+                looks += 1
+                if looks <= _MAX_WRITERS and group_state.read_pending(app_dir) is None:
+                    continue
                 return _report("deferred", kind, _worded(_MSG_DEFERRED, kind), meta=meta)
+            if len(gone) >= _MAX_WRITERS:       # each one gone, and always another: enough
+                return _report("deferred", kind, _worded(_MSG_CHANGING, kind), meta=meta)
             gone.add(writer)
             waited, began = 0.0, _clock()       # the wait for the LOCK starts here
         again = False
@@ -1010,13 +1055,12 @@ def _apply(app_dir, ctx, wait, txn):
             looks += 1
             if looks > _MAX_WRITERS:    # staged again and again: the next start's business
                 kind = _kind(txn["kind"])
-                return _report("deferred", kind, _worded(_MSG_DEFERRED, kind),
+                return _report("deferred", kind, _worded(_MSG_CHANGING, kind),
                                meta=txn["meta"])
             continue
-        limit = APPLIER_WAIT if leftover is None else APPLYING_WAIT
-        if waited >= limit or _clock() - began >= limit:
-            if leftover is None and group_state.read_applying(app_dir) is not None:
-                continue                # claimed at this very moment: the long wait counts
+        # Held elsewhere, and there IS staged work (a pending or an applying file was read
+        # above): another start is before its claim, or writing. One limit for both.
+        if waited >= APPLYING_WAIT or _clock() - began >= APPLYING_WAIT:
             staged = pending if leftover is None else leftover
             kind = _kind(staged.get("kind"))
             return _report("deferred", kind, _worded(_MSG_BUSY, kind), meta=_peek_meta(staged))
@@ -1226,19 +1270,97 @@ def _set_the_tag(entry) -> bool:
         for item in (listed if isinstance(listed, list) else ()))
 
 
+def _same_import(entry, applied) -> bool:
+    """Is history ``entry`` the import that ``applied`` (``_applied``'s keys) names?"""
+    bundle = entry.get("bundle")
+    bundle = _meta_dict(bundle) if isinstance(bundle, dict) else _no_meta()
+    return entry.get("status") == "applied" \
+        and (bundle["name"], bundle["revision"]) == (applied["name"], applied["revision"]) \
+        and (not applied["at"] or _text(entry.get("at")) == applied["at"])
+
+
+def _take_back(side, entry, files, changed, stamp) -> list:
+    """The backup of history ``entry`` was put back - ``files`` are as they were just
+    before that import. Mark in the history what that did, and return the entries that are
+    no longer in effect (``entry`` first, then newer ones, oldest first):
+
+    * ``entry`` itself is ``restored``;
+    * so is every LATER import all of whose changed files (``changed``: backup name ->
+      the file names that backup holds) are among ``files``: its changes went with them. A
+      later import that changed any other file is still in effect - its backup is not the
+      one that was put back;
+    * and the other way round: the import that was in effect just before ``entry``
+      (``applied_before``) and was restored SINCE - its backup went back earlier, this one
+      is newer - is in effect AGAIN when one of its files is among ``files``: what was put
+      back now is the file as that import left it. Its ``restored`` mark goes, and its
+      tag comes back if the tag in use is still the one from before it."""
+    listed = side["imports"]
+    place = next((index for index, old in enumerate(listed) if old is entry), len(listed))
+    entry["restored"] = stamp
+    undone = [entry]
+    for later in listed[place + 1:]:
+        held = changed.get(later.get("backup")) if isinstance(later.get("backup"), str) \
+            else None
+        if later.get("status") == "applied" and not later.get("restored") and held \
+                and set(held) <= set(files):
+            later["restored"] = stamp
+            undone.append(later)
+    before = _applied(entry.get("applied_before"))
+    for earlier in reversed(listed[:place]) if before is not None else ():
+        if earlier.get("restored") and _same_import(earlier, before):
+            held = changed.get(earlier.get("backup")) \
+                if isinstance(earlier.get("backup"), str) else None
+            if held and not set(held).isdisjoint(files):
+                del earlier["restored"]
+                if _set_the_tag(earlier) \
+                        and _side_tag(side) == _tag(earlier.get("tag_before")):
+                    _store_tag(side, _tag(earlier.get("tag")))
+            break
+    return undone
+
+
+def _tag_before(side, entry) -> str:
+    """The tag to put back when the import of ``entry`` is taken back and its own tag is
+    still in use: the one from before it (``tag_before``) - unless THAT one was set by an
+    import that is itself restored by now; then the one from before that import, and so
+    on. A tag that was typed by hand in between is nobody's to take back: it stays."""
+    tag, walked = _tag(entry.get("tag_before")), [entry]
+    while tag:
+        setter = next((old for old in reversed(side["imports"])
+                       if old.get("restored") and _set_the_tag(old)
+                       and _tag(old.get("tag")) == tag
+                       and not any(old is seen for seen in walked)), None)
+        if setter is None:
+            break
+        walked.append(setter)
+        tag = _tag(setter.get("tag_before"))
+    return tag
+
+
+def _newest_in_effect(side):
+    """``_applied`` of the newest applied import in the history that is not restored, or
+    ``None``."""
+    for entry in map(_history_entry, reversed(side["imports"])):
+        if entry["status"] == "applied" and not entry.get("restored"):
+            return _applied(dict(entry["bundle"], tag=entry["tag"], at=entry["at"]))
+    return None
+
+
 def _restore(app_dir, protocol, txn, side) -> dict:
     """Step 5: put a backup back - and take back what the import that made it left in the
-    side file:
+    side file (``_take_back`` has the rules for the history):
 
-    * the tag - ``tag_before`` goes back only when that import SET the tag and the tag in
-      use is still the one it set. A tag that was typed by hand afterwards, or set by a
-      later import, stays;
-    * what is in effect (``applied``, read by ``applied_bundle``) becomes what was in
-      effect before that import, as its entry recorded it (``applied_before``) - nothing,
-      for an entry that does not say (written by an older build, or edited);
-    * and, when ``config.json`` is among the restored files, the attention flags it raised
-      and every ``verify_structure`` task (that worker would write the group's structure
-      into the settings the user just took back).
+    * what is in effect (``applied``, read by ``applied_bundle``) is, afterwards, the
+      newest applied import of the history that is not restored - nothing, when there is
+      none. A backup holds the files ITS import changed, so restoring an older one takes a
+      later import along only when that one changed nothing else;
+    * the tag - for each import that is no longer in effect now: when it SET the tag and
+      the tag in use is still the one it set, the tag from before it goes back
+      (``_tag_before``). A tag that was typed by hand afterwards, or set by an import that
+      is still in effect, stays;
+    * and, when ``config.json`` is among the restored files, the attention flags those
+      imports raised and every ``verify_structure`` task (that worker would write the
+      group's structure into the settings the user just took back).
 
     A backup that is damaged (``_put_back``) is not restored in part: nothing is changed,
     and the report says so."""
@@ -1265,6 +1387,9 @@ def _restore(app_dir, protocol, txn, side) -> dict:
                            outcome, missing, side=side)
     txn.update(committed=True, backup=name)
     report = _report("restored", "restore", _MSG_RESTORED, meta=meta, backup=name)
+    # Which files each import changed: the files its backup holds (one listing, made here).
+    changed = {backup.get("name"): [held["name"] for held in backup["files"]]
+               for backup in _quiet(group_state.list_backups, app_dir, default=None) or ()}
 
     def change(side, _kept):
         config_back = _CONFIG_FILE in files
@@ -1272,12 +1397,12 @@ def _restore(app_dir, protocol, txn, side) -> dict:
             side["tasks"] = [task for task in side["tasks"] if task.get("kind") != VERIFY_TASK]
         if entry is None:
             return
-        entry["restored"] = report["at"]            # that import is no longer in effect
-        if entry.get("status") == "applied":        # a failed one never was in effect
-            side["applied"] = _applied(entry.get("applied_before"))
-        if _set_the_tag(entry) and _side_tag(side) == _tag(entry.get("tag")):
-            _store_tag(side, _tag(entry.get("tag_before")))
-        added = _added_attention(entry) if config_back else ()
+        undone = _take_back(side, entry, files, changed, report["at"])
+        side["applied"] = _newest_in_effect(side)
+        for old in reversed(undone):                # the newest first
+            if _set_the_tag(old) and _side_tag(side) == _tag(old.get("tag")):
+                _store_tag(side, _tag_before(side, old))
+        added = set().union(*map(_added_attention, undone)) if config_back else ()
         if added:
             side["attention"] = [flag for flag in _merge_attention(side["attention"], ())
                                  if (flag["section"], flag["item_id"]) not in added]
@@ -1613,18 +1738,12 @@ def _applied_now(side):
     side file that has none yet (an older build wrote it), the newest applied import of
     the history that was not restored since. An ``applied`` without its stamp gets the
     ``at`` of the newest applied history entry of that name and revision, if there is one."""
-    entries = [entry for entry in map(_history_entry, reversed(side["imports"]))
-               if entry["status"] == "applied"]
     if "applied" not in side:
-        for entry in entries:
-            if not entry.get("restored"):
-                return _applied(dict(entry["bundle"], tag=entry["tag"], at=entry["at"]))
-        return None
+        return _newest_in_effect(side)
     applied = _applied(side["applied"])
     if applied is not None and not applied["at"]:
-        for entry in entries:
-            if (entry["bundle"]["name"], entry["bundle"]["revision"]) \
-                    == (applied["name"], applied["revision"]):
+        for entry in map(_history_entry, reversed(side["imports"])):
+            if _same_import(entry, applied):
                 applied["at"] = entry["at"]
                 break
     return applied
@@ -1650,9 +1769,10 @@ def _side_applied(side):
 
 def applied_bundle(app_dir):
     """``{"name", "revision", "tag"}`` of the import that is in effect, or ``None``: the
-    import applied last - or, after a restore, the one that was in effect before the
-    import whose backup was put back (restoring an OLDER backup takes every later import
-    with it; nothing is in effect when that entry does not say what was)."""
+    import applied last - or, after a restore, the newest applied import of the history
+    that is not restored. A backup holds only the files its import changed: restoring an
+    OLDER backup takes a later import with it when every file that one changed is among
+    them, and leaves it in effect when it changed anything else (``_take_back``)."""
     side = _quiet(group_state.read_sidecar, app_dir)
     return _quiet(_side_applied, side) if isinstance(side, dict) else None
 
