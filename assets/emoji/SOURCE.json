@@ -1,0 +1,61 @@
+{
+  "counts": {
+    "alt": 1252,
+    "emoji": 3807,
+    "extra_shortcodes": 8,
+    "fully_qualified": 3781,
+    "letters": 26,
+    "shortcodes": 5948,
+    "source_sequences_not_in_table": 0,
+    "tiles": 3807
+  },
+  "emoji_version": "16.0",
+  "inputs": {
+    "emoji_test": {
+      "bytes": 640215,
+      "license": "Unicode-3.0",
+      "sha256": "24f0c534e86cf142e2496953e8f0e46a3e702392911eddcd29c6cced85139697",
+      "url": "https://unicode.org/Public/emoji/16.0/emoji-test.txt"
+    },
+    "shortcodes": {
+      "bytes": 126448,
+      "license": "MIT",
+      "member": "package/esm/mod.js",
+      "member_sha256": "a5b30737c34b55713c1ca94b08e5a6a1121c69a2f3db25d0fb7d7d683196a17d",
+      "package": "discord-emoji",
+      "sha256": "8e6eec9ebfc23126281aa2123f28b27854a154d16f3029b97af55857c4826c10",
+      "url": "https://registry.npmjs.org/discord-emoji/-/discord-emoji-2.5.3.tgz",
+      "version": "2.5.3"
+    },
+    "twemoji": {
+      "bytes": 3550165,
+      "files": 3807,
+      "license": "CC-BY-4.0",
+      "listing_bytes": 1012704,
+      "listing_sha256": "fbfbc903c592b74d841fbc860f164a4ea332bf36673a2ed695a472cb1e754360",
+      "listing_url": "https://data.jsdelivr.com/v1/packages/gh/jdecked/twemoji@16.0.1?structure=flat",
+      "manifest_sha256": "323fc3f05e514f0af4be8ffc1d5a18313382eab417cd8150a917b79374eafffd",
+      "repository": "jdecked/twemoji",
+      "url_pattern": "https://cdn.jsdelivr.net/gh/jdecked/twemoji@16.0.1/assets/72x72/<name>.png",
+      "version": "16.0.1"
+    }
+  },
+  "outputs": {
+    "assets/emoji/twemoji_22.png": {
+      "bytes": 570251,
+      "sha256": "548be905f26df2b2c7d4f6495978136dddda8858776011a02d5b438435e972f8"
+    },
+    "combined_bytes": 638555,
+    "emoji_table.json.gz": {
+      "bytes": 68304,
+      "sha256": "c6d7ca1acf2b620d22d170d01e5c1b12b27c8e7374f261648b493c8fdd995506"
+    }
+  },
+  "palette": "256",
+  "pillow_version": "12.2.0",
+  "sheet_format": "PNG, 8-bit palette + tRNS, not interlaced, every scanline filter 0",
+  "skin_tone_tiles": true,
+  "tool": "tools/build_emoji_pack.py",
+  "tool_version": 1,
+  "zlib_version": "1.3.1"
+}
