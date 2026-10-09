@@ -16,21 +16,33 @@ that has read a colour from ``ui_theme``. It does three things, in this order:
    one log line that says so. NOT when ``FCTOOL_REEXEC=1`` is set: then
    ``self_update.reexec_if_inherited()`` starts nothing more and ``main()`` goes on as the
    app in this very process - there is no clean copy to leave the work to, so it is done
-   here (one log line as well).
+   here (one log line as well). One case is known and accepted: a stub whose clean
+   re-exec fails to spawn carries on as the app with the hook skipped - stock colours for
+   that session, a staged import kept and applied at the next start.
 2. **The staged import.** Only when the pending or the applying file is there:
    ``group_apply.apply_pending(folder)``. Everything that boots afterwards reads files that
    already hold the import. (One start can spend seconds here when another FCTool is still
    closing, or is applying the same import - ``apply_pending`` waits for it.)
 
-   One process is never waited for: the updater's watcher. After an update the OLD build's
-   process stays alive until this build reports that it booted - which it does seconds
-   after its window is up, long after this hook. Work that process staged would make this
-   start sit for ``apply_pending``'s whole wait before any window and then be told
-   "another FCTool window is still open". So when the update marker says ``launched`` and
-   the staged work names that process as its writer, the hook looks at the process ONCE:
-   still alive -> ``deferred`` at once, with ``MSG_AFTER_UPDATE`` as the message and a log
-   line; the work stays staged for the next start. The watcher is NOT taken for gone - its
-   leftover threads can still save settings.
+   One process is never waited for, and no staged work is begun while it lives: the
+   updater's watcher. After an update the OLD build's process stays alive until this build reports
+   that it booted - which it does seconds after its window is up, long after this hook.
+   Its leftover threads can still save settings, over whatever is applied now; and work
+   that process staged itself would make this start sit for ``apply_pending``'s whole wait
+   before any window and then be told "another FCTool window is still open". So when the
+   update marker is this start's own (below), the hook looks at that process ONCE, where
+   ``apply_pending`` asks whether the process that staged the work is gone - whoever that
+   was: still alive -> ``deferred`` at once, with ``MSG_AFTER_UPDATE`` as the message and
+   a log line; the work stays staged for the next start. Gone -> the apply goes on as on
+   any other start, its own wait for the process that staged the work included. (That
+   question is the only place the hook has a say: a run that was interrupted and left its
+   applying file behind is finished or undone by ``apply_pending`` before it is asked.)
+
+   The marker is believed only when it says ``launched``, names another process, names the
+   version that is running (compared the way the updater compares it) and was stamped
+   within the updater's watch plus ``_MARKER_MARGIN_S``. Anything else is a leftover or
+   somebody else's - an update to another version, a marker that is days old and whose pid
+   belongs to an unrelated process by now - and this start is an ordinary one.
 3. **The palette.** ``palette.load(folder)`` and ``palette.install(ui_theme, roles)`` - also
    when step 2 failed or raised. ``FCTOOL_DEFAULT_PALETTE=1`` in the environment skips it
    (the way back from a palette someone cannot read; one log line). ``ui_theme`` is imported
@@ -97,6 +109,11 @@ _PENDING_FILE = "group_import_pending.json"
 _APPLYING_FILE = "group_import_applying.json"
 _STAGED = (_PENDING_FILE, _APPLYING_FILE)
 
+#: How long past the updater's watch (``self_update.RELAUNCH_WATCH_S``) a ``launched``
+#: marker is still taken for this start's own. Generous: a cold start of a new build takes
+#: half a minute; after that the pid in it may be anybody's.
+_MARKER_MARGIN_S = 600.0
+
 _MAX_MODULES = 8        # _note_missing_items: how many module names its one line carries
 _MAX_NAME = 40          # ... and how long one of them may be
 
@@ -151,9 +168,15 @@ def _stale_bundle(environ, result) -> bool:
     """Is this the updater's inherited-mode stub, about to hand over to a clean copy? A
     check that fails is "no": a start that does nothing because a check broke would be
     worse than the stub doing the work. "No" as well for the process that was itself
-    started by such a stub (``FCTOOL_REEXEC=1``): nothing is started after it, it IS the
-    app. Either way a stale bundle is one log line - a start that skips its work, or does
-    it out of a doomed folder, is never silent."""
+    started by such a stub (``FCTOOL_REEXEC=1``) and still runs out of a stale bundle:
+    nothing is started after it, it IS the app - one log line, because it does the work
+    out of a doomed folder. A healthy process that merely inherited the variable (the
+    updater's ``clean_child_env`` hands it on to every descendant) says nothing.
+
+    The stub's own line is kept as well, but a genuine stub leaves in ``main()`` before
+    anything writes these lines to the app's log. The line gets there in ONE case: the
+    stub's clean re-exec failed to spawn, so the stub carries on as the app with the
+    hook skipped (module docstring, step 1)."""
     try:
         import self_update
 
@@ -290,8 +313,9 @@ def _staging_dir() -> str:
 def _update_watcher(result):
     """The pid of the updater's watcher - the OLD build's process, alive until this build
     reports that it booted - or ``None`` when this start does not follow an update: no
-    marker, a marker in another state than ``launched``, or one that names no other
-    process. A marker that cannot be looked for is ``None`` and one log line."""
+    marker, a marker in another state than ``launched``, one that names no other process,
+    one for another version than the running one, or one that is not fresh (module
+    docstring, step 2). A marker that cannot be looked for is ``None`` and one log line."""
     try:
         staging = _staging_dir()
         if not staging:
@@ -302,10 +326,29 @@ def _update_watcher(result):
         if marker is None or marker.state != "launched":
             return None
         pid = marker.old_pid
-        return pid if type(pid) is int and pid > 0 and pid != os.getpid() else None
+        if type(pid) is not int or pid <= 0 or pid == os.getpid():
+            return None
+        import app_version              # loaded already: self_update imports it
+
+        # The updater's own comparison (mark_booted, startup_housekeeping): "v1.2" is 1.2.0.
+        if self_update._same_version(marker.expected_tag, app_version.APP_VERSION) is not True:
+            return None
+        return pid if _fresh(marker.ts, self_update.RELAUNCH_WATCH_S) else None
     except Exception as exc:
         _note(result, "group boot: update marker not read (%s)" % type(exc).__name__)
         return None
+
+
+def _fresh(stamp, watch_s) -> bool:
+    """Was the marker stamped (``time.time()``) while its watcher can still be watching -
+    within ``watch_s`` plus ``_MARKER_MARGIN_S`` before now? A stamp that is no number, not
+    finite, or in the future is not fresh."""
+    import time
+
+    if type(stamp) not in (int, float) or type(watch_s) not in (int, float):
+        return False
+    age = time.time() - stamp
+    return 0.0 <= age <= watch_s + _MARKER_MARGIN_S    # False for NaN and both infinities
 
 
 def _wait_after_update(result, met):
@@ -322,16 +365,21 @@ def _wait_after_update(result, met):
 
 
 def _watcher_wait(watcher, wait_for_exit, met):
-    """``wait(pid, started) -> bool`` ("that process is gone") for ``apply_pending``: the
-    engine's own ``wait_for_exit`` for every process but ``watcher``. That one gets ONE look
-    and no waiting - gone is gone (the work is applied), alive is "not gone" at once and
-    its pid is appended to ``met``."""
+    """``wait(pid, started) -> bool`` ("the process that staged the work is gone") for
+    ``apply_pending``. Whoever staged it, ``watcher`` gets ONE look and no waiting first:
+    alive is "not gone" at once, and its pid is appended to ``met`` - no staged work is
+    begun while the old build lives. Only when the watcher is gone is the question the engine
+    asked answered, by the engine's own ``wait_for_exit`` (not asked again for the watcher
+    itself: gone is gone).
+
+    The look is at the pid alone: the marker records no start time for it. That is what
+    ``_fresh`` is for - a pid is only believed for minutes."""
     def wait(pid, started=None):
-        if type(pid) is int and pid == watcher:
-            if wait_for_exit(pid, started, 0):
-                return True
-            met.append(pid)
+        if not wait_for_exit(watcher, None, 0):
+            met.append(watcher)
             return False
+        if type(pid) is int and pid == watcher:
+            return True
         return wait_for_exit(pid, started)
 
     return wait

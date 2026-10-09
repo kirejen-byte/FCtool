@@ -28,8 +28,13 @@ THIS process's temporary folder, which is deleted when this process exits. A chi
 from source inherits the environment unchanged.
 
 It never raises: a restart that could not be started is ``False``, and the app has closed
-normally either way. The module imports only the standard library at the top - fc_gui
-imports it at start-up; ``self_update`` is fetched when a relaunch actually happens.
+normally either way. From source that includes a script that is no file (``python -c``
+leaves ``-c`` as the script; a checkout can be moved while the app runs): the interpreter
+would start, find nothing to run and exit, so nothing is started. A frozen build starts
+its exe and is never asked for a script.
+
+The module imports only the standard library at the top - fc_gui imports it at start-up;
+``self_update`` is fetched when a relaunch actually happens.
 """
 
 import os
@@ -81,8 +86,9 @@ def relaunch_argv(*, frozen=None, executable=None, script=None):
 
 
 def relaunch(*, popen=subprocess.Popen, frozen=None, executable=None, script=None) -> bool:
-    """Start this program again; ``True`` when ``popen`` returned, ``False`` on any failure.
-    Never raises. Call it only after the window closed normally."""
+    """Start this program again; ``True`` when ``popen`` returned, ``False`` on any failure
+    - and, from source, when the script (``SCRIPT``, or ``script``) is no file: ``popen`` is
+    not called then. Never raises. Call it only after the window closed normally."""
     try:
         import self_update
 
@@ -90,6 +96,8 @@ def relaunch(*, popen=subprocess.Popen, frozen=None, executable=None, script=Non
             frozen = getattr(sys, "frozen", False)
         frozen = bool(frozen)
         argv, cwd = relaunch_argv(frozen=frozen, executable=executable, script=script)
+        if not frozen and not os.path.isfile(argv[1]):
+            return False                # a command that cannot start is not a restart
         popen(argv, cwd=cwd, close_fds=True, creationflags=self_update.CREATION_FLAGS,
               env=self_update.clean_child_env() if frozen else None)
         return True

@@ -4049,7 +4049,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         # Right after an update the old build still watches for this build's
         # "booted" mark (written 3 s after start-up) and reads an exit before
         # it as a boot crash: it would roll the update back. Write the mark
-        # now -- a second write changes nothing.
+        # now -- a second write only re-stamps the mark's time (harmless).
         try:
             mark_booted = getattr(self, "_mark_update_booted", None)
             if callable(mark_booted):
