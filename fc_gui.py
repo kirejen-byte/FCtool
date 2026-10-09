@@ -370,6 +370,10 @@ from update_dialog import UpdateDialog
 # Plain restart (group configuration, colour palette): start the SAME program
 # again after a clean close. Not the updater -- no marker, no watchdog.
 import app_restart
+# Group configuration inside the main window (Settings section, first-run
+# offer, tag under the logo, attention marks, structure check): the mixin
+# FCToolGUI inherits. Everything of the feature lives there, not here.
+import group_wiring
 
 # ── Main-thread UI dispatcher ──────────────────────────────────────────────────
 # How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
@@ -1274,7 +1278,7 @@ def _preview_alert_border(peak_hex, started, now, steady):
     return preview_tile.pulse_color(peak_hex, now - started, 0.5)
 
 
-class FCToolGUI:
+class FCToolGUI(group_wiring.GroupConfigMixin):
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
         self.root = tk.Tk()
@@ -1921,6 +1925,9 @@ class FCToolGUI:
         self._load_system_names_async()
 
         self._build_ui()
+        # Group configuration: the first-run offer, the tag under the logo, the
+        # attention marks, this start's import result and the structure check.
+        self._group_after_build_ui()
         # Arm the main-thread UI dispatcher drain now that the notebook exists.
         # From here on, background workers marshal UI work through _post_ui /
         # _post_ui_after and this loop applies it on the main thread. Armed before
@@ -3377,8 +3384,13 @@ class FCToolGUI:
         title_frame = tk.Frame(parent, bg=BG_DARK, pady=8)
         title_frame.pack(fill=tk.X)
         self._title_frame = title_frame
-        tk.Label(title_frame, text="FCTool", font=("Consolas", 18, "bold"),
-                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.LEFT, padx=15)
+        # The logo block: a frame so the group tag ("by <tag>", group_wiring)
+        # can sit under the word. With no tag it requests exactly what the bare
+        # label did -- the notice fitting below measures this row's slaves.
+        self._title_logo = tk.Frame(title_frame, bg=BG_DARK)
+        self._title_logo.pack(side=tk.LEFT, padx=15)
+        tk.Label(self._title_logo, text="FCTool", font=("Consolas", 18, "bold"),
+                 fg=FG_ACCENT, bg=BG_DARK).pack(side=tk.TOP)
         # The one piece of pure DECORATION in the row, and therefore the first
         # element to yield when the update notice needs width. Held as an
         # attribute for exactly that reason -- see _set_update_link_yield.
@@ -8560,6 +8572,7 @@ class FCToolGUI:
                     # degraded banner — auto-rescan to clear it honestly (and
                     # refresh the market status/button either way).
                     self._market_after_reauth()
+                    group_wiring.signed_in(self)    # a group's structure check
                     return
 
             # New character — add to accounts list
@@ -8584,6 +8597,7 @@ class FCToolGUI:
             # A new (or newly-primary) character can also unlatch a cached
             # structure-degraded market snapshot — same auto-heal as re-auth.
             self._market_after_reauth()
+            group_wiring.signed_in(self)            # a group's structure check
         else:
             self._esi_status_label.config(
                 text=f"Login failed: {info}", fg=FG_RED
@@ -19499,6 +19513,9 @@ class FCToolGUI:
         # list is present, _add_section records each header into it.
         self._settings_toc_anchors = []
 
+        # ── Group configuration (group_wiring) — the first section ───────────
+        self._build_group_settings(scroll_frame)
+
         # ── EVE Logs Path ────────────────────────────────────────────────────
         self._add_section(scroll_frame, "EVE Chat Logs", toc_title="Chat Logs")
         path_frame = tk.Frame(scroll_frame, bg=BG_DARK)
@@ -30011,7 +30028,7 @@ class FCToolGUI:
 
             def _leave(_e, r=row):
                 if r.cget("fg") != FG_ACCENT:
-                    r.configure(fg=FG_DIM)
+                    r.configure(fg=group_wiring.toc_idle_fg(self, r))
 
             def _click(_e, w=widget):
                 self._settings_toc_jump(canvas, scroll_frame, w)
@@ -30144,7 +30161,8 @@ class FCToolGUI:
                 else:
                     break
             for i, (row, _widget) in enumerate(rows):
-                row.configure(fg=FG_ACCENT if i == active_idx else FG_DIM)
+                row.configure(fg=FG_ACCENT if i == active_idx
+                              else group_wiring.toc_idle_fg(self, row))
         except (tk.TclError, IndexError, ZeroDivisionError):
             return
 
@@ -30978,6 +30996,7 @@ class FCToolGUI:
             _persist["staging_structure_id"] = 0
             _persist["staging_structure_name"] = ""
         self._market_persist_keys(**_persist)
+        group_wiring.market_picked(self, chosen)    # the user's pick stands
 
     def _market_find_structures(self):
         """'Find structures…' → authed structure search for the chosen staging
@@ -31115,6 +31134,7 @@ class FCToolGUI:
             _persist["staging_station_id"] = 0
             _persist["staging_station_name"] = ""
         self._market_persist_keys(**_persist)
+        group_wiring.market_picked(self, chosen)    # the user's pick stands
 
     def _market_clear_structure_selection(self):
         """Reset the structure picker to its '(none)' placeholder and zero its id
@@ -31929,6 +31949,7 @@ class FCToolGUI:
         # composer's staging pill only re-syncs on the next fittings sub-tab
         # switch (see _motd_sync_staging_default's docstring).
         self._motd_sync_staging_default()
+        group_wiring.staging_saved(self, val)       # clears a group's Tracking mark
 
     def _on_zkill_alert_sound_change(self, *args):
         """Persist the kill-alert sound pick immediately (mirrors
@@ -35101,17 +35122,20 @@ class FCToolGUI:
 
     def _themed_modal(self, title, message, *,
                       buttons=(("OK", "Dark.TButton", None),), accent=FG_ACCENT,
-                      detail_items=None):
+                      detail_items=None, parent=None):
         """A dark-themed modal dialog matching the app (replaces tkinter.messagebox).
 
         `buttons` is a sequence of (label, ttk_style, result); they are packed
         right-to-left, so the FIRST entry is the rightmost (primary) button.
         Returns the chosen result, or None if the dialog is closed/escaped.
-        Blocks until dismissed (modal), like messagebox."""
-        dlg = tk.Toplevel(self.root)
+        Blocks until dismissed (modal), like messagebox. `parent` is the window
+        the question belongs to (default: the main window) -- a question asked
+        from another window of ours must open over THAT window, not behind it."""
+        parent = self.root if parent is None else parent
+        dlg = tk.Toplevel(parent)
         dlg.title(title)
         dlg.configure(bg=BG_DARK)
-        dlg.transient(self.root)
+        dlg.transient(parent)
         dlg.resizable(False, False)
         result = {"value": None}
 
@@ -35158,7 +35182,7 @@ class FCToolGUI:
         # work-area clamp for the monitor the app is actually on, and no
         # update_idletasks() that MAPS the dialog at the window manager's
         # position before moving it (the visible-jump class in map/facts.md).
-        center_over(dlg, self.root)
+        center_over(dlg, parent)
         dlg.grab_set()
         dlg.wait_window()
         return result["value"]
