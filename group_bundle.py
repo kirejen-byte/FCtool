@@ -30,7 +30,8 @@ A consumer compares whole strings or uses ``note.partition(":")`` - never a posi
 list, and never a prefix test (a category may be NAMED "checksum" or "more").
 
 The writers (:func:`dumps`, :func:`write_file`) raise the same :class:`BundleError` for a
-bundle whose file a reader would refuse as ``too_deep`` or ``bad_envelope``.
+bundle whose file a reader would refuse as ``too_deep`` or ``bad_envelope``;
+:func:`write_file` also refuses one whose file would be ``too_big``.
 
 Pure: stdlib and ``app_io`` only. No Tk, no config, no network.
 """
@@ -155,7 +156,24 @@ def clean_text(value, max_len=MAX_NAME) -> str:
         limit = max(0, int(max_len))
     except (TypeError, ValueError, OverflowError):
         limit = MAX_NAME
-    return text.translate(_REMOVED_CHARS).strip()[:limit].rstrip()
+    # ``str.translate(text, ...)``, not ``text.translate(...)``: ``str()`` hands back a str
+    # SUBCLASS as it is when a ``__str__`` returns one, and its own methods need not be the
+    # real ones. What comes out of this call is a plain str, so the rest can be chained.
+    return str.translate(text, _REMOVED_CHARS).strip()[:limit].rstrip()
+
+
+def has_visible(text) -> bool:
+    """Whether ``text`` holds at least one character a reader can SEE: a letter, number,
+    punctuation mark or symbol - other than the few that Unicode files as such and that
+    draw as nothing (``_BLANK_LOOKING``). Zero-width and bidi marks, separators, a
+    combining mark with nothing under it and plain blanks are not visible.
+
+    The one owner of that rule: the tag (:func:`clean_tag`) and every text field of the
+    item engine use it. Total; anything that is not text has nothing visible."""
+    if not isinstance(text, str):
+        return False
+    return any(unicodedata.category(ch)[0] in _TAG_VISIBLE_CLASSES and ch not in _BLANK_LOOKING
+               for ch in text)
 
 
 def _text_or_number(value):
@@ -186,10 +204,7 @@ def clean_tag(value) -> str:
     text = "".join(ch for ch in text
                    if unicodedata.category(ch) not in _TAG_REMOVED_CATEGORIES)
     text = clean_text(text, MAX_TAG)      # again: the removal may have uncovered whitespace
-    if not any(unicodedata.category(ch)[0] in _TAG_VISIBLE_CLASSES and ch not in _BLANK_LOOKING
-               for ch in text):
-        return ""
-    return text
+    return text if has_visible(text) else ""
 
 
 def checksum(categories) -> str:
@@ -409,16 +424,22 @@ def read_file(path):
         raise BundleError("not_a_bundle", _UNREADABLE)      # before anything is touched
     limit = MAX_FILE_BYTES
     try:
-        size = os.path.getsize(path)
-    except (OSError, TypeError, ValueError):
-        raise BundleError("not_a_bundle", _UNREADABLE) from None
-    if size > limit:
-        raise BundleError("too_big")        # refused before the file is opened
-    try:
+        # ANY failure of the path is "could not be read": an ``os.PathLike`` runs its own
+        # ``__fspath__`` here, and that may raise anything at all.
+        try:
+            size = os.path.getsize(path)
+        except MemoryError:
+            raise
+        except Exception:
+            raise BundleError("not_a_bundle", _UNREADABLE) from None
+        if size > limit:
+            raise BundleError("too_big")    # refused before the file is opened
         try:
             with open(path, "rb") as f:
                 raw = f.read(limit + 1)
-        except (OSError, TypeError, ValueError):
+        except MemoryError:
+            raise
+        except Exception:
             raise BundleError("not_a_bundle", _UNREADABLE) from None
         if len(raw) > limit:                # it grew between the size check and the read
             raise BundleError("too_big")
@@ -427,18 +448,34 @@ def read_file(path):
         raise BundleError("too_big") from None
 
 
+def _file_size(text) -> int:
+    """How many bytes ``text`` takes as the file :func:`write_file` makes of it: UTF-8, and
+    every line break as this platform writes one (``atomic_write_json`` opens the file in
+    text mode, so on Windows each ``\\n`` becomes two bytes)."""
+    return len(text.encode("utf-8")) + text.count("\n") * (len(os.linesep) - 1)
+
+
 def write_file(path, bundle) -> None:
     """Write atomically. Failures propagate; the target is then left as it was.
 
-    Raises :class:`BundleError` (``bad_envelope``, ``too_deep``), before any file is made, for
-    a bundle whose file a reader would refuse.
+    Raises :class:`BundleError` (``bad_envelope``, ``too_deep``, ``too_big``), before any file
+    is made, for a bundle whose file a reader would refuse. ``too_big`` is judged on the
+    bytes the file will HAVE - ASCII-escaped, with this platform's line endings - so a file
+    this function wrote is never over the limit :func:`read_file` applies.
     """
-    atomic_write_json(path, _envelope_to_write(bundle), indent=1)
+    envelope = _envelope_to_write(bundle)
+    # The same text atomic_write_json writes (indent and ASCII escaping as in dumps()).
+    if _file_size(json.dumps(envelope, indent=1, ensure_ascii=True)) > MAX_FILE_BYTES:
+        raise BundleError("too_big")
+    atomic_write_json(path, envelope, indent=1)
 
 
 def default_filename(meta) -> str:
-    # No dash or dot at either end: a leading dot hides the file, Windows trims a trailing one.
-    stem = _UNSAFE_FILENAME.sub("-", clean_text(getattr(meta, "name", ""))).strip("-.")
+    # The name by the rule the reader and the writer apply to it (text or a plain number,
+    # never the repr of something else). No dash or dot at either end: a leading dot hides
+    # the file, Windows trims a trailing one.
+    name = clean_text(_text_or_number(getattr(meta, "name", None)))
+    stem = _UNSAFE_FILENAME.sub("-", name).strip("-.")
     if not _LETTER_OR_DIGIT.search(stem):
         stem = "group-config"               # blank, or punctuation only ("...", "_")
     elif stem.split(".", 1)[0].upper() in _DEVICE_NAMES:

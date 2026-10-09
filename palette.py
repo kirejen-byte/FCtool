@@ -23,7 +23,8 @@ shared palette from making someone's FCTool unreadable.
 
 Everything the boot hook or a validator reaches (``normalize_hex``,
 ``relative_luminance``, ``contrast``, ``problems``, ``validate``, ``load``,
-``preset_name``) is TOTAL — garbage in, a clean value out, never an exception.
+``preset_name``, ``clean_name``) is TOTAL — garbage in, a clean value out,
+never an exception.
 ``install`` is total over its ``roles`` argument only: a ``theme_module`` that is
 ``None`` or lacks attributes is the caller's error. ``save`` and ``reset`` are
 user actions and report failure by raising.
@@ -119,12 +120,22 @@ SELECTION_VS_FIELD_MIN = 1.3   # a selected row must stand out from the list
 
 FILE = "ui_palette.json"
 # A real palette file is a few hundred bytes. ``load`` runs at boot on a file
-# anyone may have dropped in, so it never reads (or parses) more than this.
+# anyone may have dropped in, so it never PARSES more than this - and never
+# reads more than one byte beyond it (the byte that shows the file is larger).
 MAX_FILE_BYTES = 64 * 1024
+# The palette's display name. ``save`` clamps it (``clean_name``), so a file
+# this module writes is always far below ``MAX_FILE_BYTES``: without the clamp
+# a long name made a file that ``load`` refused at the next start.
+MAX_NAME = 80
 
 _BACKGROUNDS = ("window", "panel", "field")
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _NOT_A_PALETTE = "not a palette"
+# Removed from a name: every control character (C0, DEL, C1), the line and
+# paragraph separators, and the surrogate code points (a surrogate in a str is
+# always a lone one, and it cannot be encoded as UTF-8).
+_NAME_REMOVED = dict.fromkeys(list(range(0x20)) + list(range(0x7F, 0xA0))
+                              + [0x2028, 0x2029] + list(range(0xD800, 0xE000)))
 
 
 # ── Colours ──────────────────────────────────────────────────────────────────
@@ -260,6 +271,21 @@ def preset_name(roles):
     return "Custom"
 
 
+def clean_name(value):
+    """A palette's display name as it is stored: ONE line, control characters
+    removed, stripped, at most ``MAX_NAME`` characters. Anything that is not
+    text is ``""``.
+
+    The same answers as ``group_bundle.clean_text(value, MAX_NAME)`` for text
+    (and stricter on C1 controls and line separators) - re-stated here because
+    this module imports nothing of the project but ``app_io``. Total; cleaning
+    a clean name changes nothing; the result always encodes as UTF-8.
+    """
+    if not isinstance(value, str):
+        return ""
+    return str.translate(value, _NAME_REMOVED).strip()[:MAX_NAME].rstrip()
+
+
 # ── The file: {"version": 1, "name": str, "roles": {...}} ────────────────────
 def load(app_dir):
     """Read the stored palette -> ``(roles, status)``.
@@ -275,7 +301,9 @@ def load(app_dir):
     """
     try:
         # One bounded read (not a size check, then a read): the file cannot grow
-        # in between, and at most MAX_FILE_BYTES + 1 bytes ever reach memory.
+        # in between. It asks for the limit PLUS ONE byte: a file of exactly
+        # MAX_FILE_BYTES is still read whole, and that one extra byte is how a
+        # larger file is told from it - nothing beyond it ever reaches memory.
         with open(os.path.join(app_dir, FILE), "rb") as f:
             raw = f.read(MAX_FILE_BYTES + 1)
         if len(raw) > MAX_FILE_BYTES:
@@ -299,14 +327,17 @@ def load(app_dir):
 def save(app_dir, roles, name=""):
     """Validate, then write ``ui_palette.json`` atomically. A palette that fails
     a rule raises ``ValueError`` (carrying the sentences) and writes nothing; an
-    I/O failure propagates with the previous file intact."""
+    I/O failure propagates with the previous file intact.
+
+    ``name`` is stored through ``clean_name``: one line of at most ``MAX_NAME``
+    characters (``""`` when it is not text), so the file written here can
+    never be larger than ``MAX_FILE_BYTES`` and be refused by ``load``."""
     clean, found = validate(roles)
     if clean is None:
         raise ValueError("palette not saved: " + "; ".join(found))
     atomic_write_json(
         os.path.join(app_dir, FILE),
-        {"version": 1, "name": name if isinstance(name, str) else "",
-         "roles": clean},
+        {"version": 1, "name": clean_name(name), "roles": clean},
         indent=1)
 
 
