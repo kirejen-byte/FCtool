@@ -17,8 +17,19 @@ docs/superpowers/specs/2026-07-21-motd-composer-redesign-design.md §4):
     free text AND escaped labels (tag / doctrine names) alike. Correspondingly
     every path that parses markup INTO the model (legacy header/footer migration,
     imported MOTDs) runs ``html.unescape`` on text so a round-trip never
-    double-escapes. Fit / character / system / channel *names* are emitted raw
-    inside their links, exactly as :func:`motd_builder.build_motd` does.
+    double-escapes. Fit / character / system / channel *names* are link LABELS
+    and are escaped the same way, by the :mod:`motd_builder` link builders
+    (``fitting_link`` / ``char_link`` / ``system_link`` / ``channel_text``):
+    a name is data, and written raw it could close its own link and open
+    another. Those builders also VALIDATE the link target (fit DNA, character /
+    system id, channel id): a pill whose target is not one renders as its
+    escaped plain label with no link, and is UNRESOLVED -- one warning line,
+    counted, and its chip (:func:`token_label`) says so. (A ``channel`` pill
+    with no id is plain text by design and is not.) A text run's colour and
+    size are written inside a tag too, so only ``#rrggbb`` and an int size in
+    1..999 are handed to the writer. :func:`_runs_from_markup` unescapes a
+    link's label exactly as it unescapes free text, so render, parse, render
+    is a fixed point and a pill gets its ORIGINAL name back.
 
 Resolution walk: runs are emitted in order. Free text is escaped then wrapped in
 its style via :func:`motd_markup.segments_to_markup`; ``\n`` becomes ``<br>``.
@@ -33,6 +44,7 @@ non-empty body then gets the same envelope as ``build_motd``: a leading
 from __future__ import annotations
 
 import html
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -44,6 +56,9 @@ from motd_builder import (
     char_link,
     delta_markup,
     fitting_link,
+    is_valid_dna,
+    is_valid_id,
+    parse_id,
     system_link,
 )
 from motd_markup import Segment, parse_markup, segments_to_markup
@@ -182,7 +197,14 @@ def _finalize_fit(dna: str, name: str, ctx: ResolveContext):
     DNA, looks up the ideal-fleet delta by the parsed ship type, and emits
     ``fitting_link(canon, name) + delta_markup(delta)``. An unparseable DNA keeps
     the raw DNA and drops the delta (today's behavior).
+
+    ``fitting_link`` escapes the label and refuses a target that is not fit DNA
+    (a stored ``fit.dna`` reaches here verbatim when ``to_dna`` raises), in
+    which case the result is the escaped label alone. A ``dna`` that is not even
+    a string (a hand-edited template) never reaches the injected providers.
     """
+    if not isinstance(dna, str):
+        return fitting_link(dna, name), 0, False
     dna, name = _refit_substitute(dna, name, ctx)
     parsed = ctx.parse_fit(dna)
     canon = ctx.canonical_dna(dna, parsed)
@@ -190,8 +212,51 @@ def _finalize_fit(dna: str, name: str, ctx: ResolveContext):
     return fitting_link(canon, name) + delta_markup(delta), delta, parsed is not None
 
 
-def _join_fits(fits, ctx: ResolveContext) -> str:
-    return " | ".join(_finalize_fit(dna, name, ctx)[0] for dna, name in fits)
+# --- a pill that renders WITHOUT its link ---------------------------------
+#
+# The link builders refuse a target that is not one (a character pill with no
+# id, a fit whose DNA is not fit DNA, ...) and hand back the escaped label
+# alone. That pill is UNRESOLVED: markup, warnings and chip must agree --
+# link written <=> no warning <=> chip resolved. ``_resolve_token`` reports it
+# here; ``token_label`` mirrors the same target tests for the chip.
+
+def _linked(markup: str) -> bool:
+    """True when a link builder wrote its link.
+
+    Reliable because labels are escaped: a refused target's result is the
+    escaped label (or ``""``), which can never start with the open tag.
+    """
+    return markup.startswith("<url=")
+
+
+def _no_link_warning(what: str, name, why: str) -> str:
+    """The ONE warning line for a pill shown as plain text (name clipped --
+    every warning shares a single Tk label)."""
+    return f"{what} '{_ellip(name)}' {why} — shown as plain text"
+
+
+def _fit_markup(dna, name, ctx: ResolveContext):
+    """``(markup, warnings)`` for one fit link -- :func:`_finalize_fit` plus the
+    no-link report. The warning names the label the MOTD actually shows (the
+    ACTIVE refit's when the pill follows one)."""
+    markup = _finalize_fit(dna, name, ctx)[0]
+    if _linked(markup):
+        return markup, []
+    if isinstance(dna, str):
+        name = _refit_substitute(dna, name, ctx)[1]
+    return markup, [_no_link_warning("Fit", name, "is not a fit link")]
+
+
+def _join_fits(fits, ctx: ResolveContext):
+    """``(markup, warnings)`` for a line of fits: the links joined by `` | ``
+    and one warning per fit that rendered without its link."""
+    parts: list = []
+    warns: list = []
+    for dna, name in fits:
+        markup, w = _fit_markup(dna, name, ctx)
+        parts.append(markup)
+        warns.extend(w)
+    return " | ".join(parts), warns
 
 
 # --- token resolution -----------------------------------------------------
@@ -207,21 +272,33 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
     kind, p = run.kind, run.params
 
     if kind == "char":
-        return char_link(p.get("id"), p.get("name", "")), [], 0
+        name = p.get("name", "")
+        markup = char_link(p.get("id"), name)
+        if not _linked(markup):
+            return markup, [_no_link_warning("Character", name,
+                                             "has no character id")], 1
+        return markup, [], 0
 
     if kind == "fit":
-        # A fit ALWAYS resolves: an unparseable DNA keeps the raw DNA and drops
-        # the delta (§4.2 "DNA unparseable → raw DNA kept, no delta"; §9 "degrades
-        # to … raw DNA"). It is never counted unresolved / rendered stale merely
-        # because the type-catalog could not parse it.
-        markup, _delta, _ok = _finalize_fit(p.get("dna", ""), p.get("name", ""), ctx)
-        return markup, [], 0
+        # A DNA-SHAPED fit always resolves: an unparseable DNA keeps the raw DNA
+        # and drops the delta (§4.2 "DNA unparseable → raw DNA kept, no delta";
+        # §9 "degrades to … raw DNA"). It is never counted unresolved / rendered
+        # stale merely because the type-catalog could not parse it. A target
+        # that is not fit DNA at all is refused by ``fitting_link``: the pill
+        # renders as its escaped label with NO link, and that IS unresolved --
+        # one warning, counted (``_fit_markup``).
+        markup, warns = _fit_markup(p.get("dna", ""), p.get("name", ""), ctx)
+        return markup, warns, len(warns)
 
     if kind == "system":
         name = p.get("name", "")
         sid = ctx.resolve_system(name)
         if sid is not None:
-            return system_link(sid, name), [], 0
+            markup = system_link(sid, name)
+            if not _linked(markup):     # the resolver handed back a non-id
+                return markup, [_no_link_warning("System", name,
+                                                 "has no system id")], 1
+            return markup, [], 0
         return _escape(name), [], 1  # degrade to plain text, stale
 
     if kind == "channel":
@@ -236,14 +313,22 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
         else:
             cid, name = ctx.fc_selected if ctx.fc_selected else (None, None)
         if cid is not None and name:
-            return f"FC: {char_link(cid, name)}", [], 0
+            link = char_link(cid, name)
+            if not _linked(link):
+                return f"FC: {link}", [_no_link_warning("FC", name,
+                                                        "has no character id")], 1
+            return f"FC: {link}", [], 0
         return "", [_FC_WARN], 1
 
     if kind == "staging_line":
         name = p.get("name", "")
         sid = ctx.resolve_system(name)
         if sid is not None:
-            return f"Staging: {system_link(sid, name)}", [], 0
+            link = system_link(sid, name)
+            if not _linked(link):       # the resolver handed back a non-id
+                return f"Staging: {link}", [_no_link_warning(
+                    "Staging system", name, "has no system id")], 1
+            return f"Staging: {link}", [], 0
         return "", [f"Staging system '{name}' did not resolve to a known system — "
                     "the staging line was omitted."], 1
 
@@ -257,11 +342,13 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
         tag = p.get("tag", "")
         fits = (ctx.fits_by_tag(compact) or {}).get(tag) or []
         if fits:
-            return f"{_escape(tag)}: {_join_fits(fits, ctx)}", [], 0
+            joined, warns = _join_fits(fits, ctx)
+            return f"{_escape(tag)}: {joined}", warns, len(warns)
         # empty tag: fall back to the legacy fits at the FIRST empty tag_line.
         if fallback_active and not fallback_state[0]:
             fallback_state[0] = True
-            return f"Fits: {_join_fits(ctx.legacy_fits or [], ctx)}", [], 0
+            joined, warns = _join_fits(ctx.legacy_fits or [], ctx)
+            return f"Fits: {joined}", warns, len(warns)
         if fallback_active:
             return "", [], 0  # remaining empty tag_lines: silent (fits already shown)
         return "", [f"{tag} pill unresolved — its line was omitted"], 1
@@ -279,11 +366,14 @@ def _resolve_token(run: TokenRun, ctx: ResolveContext, compact: bool,
             return "", [_DOCTRINE_WARN], 1
         fbt = ctx.fits_by_tag(compact) or {}
         lines = [f"Doctrine: {_escape(d.name)}"]
+        warns: list = []
         for tag in _ordered_tags(list(fbt.keys())):
             fits = fbt.get(tag) or []
             if fits:
-                lines.append(f"{_escape(tag)}: {_join_fits(fits, ctx)}")
-        return LINE_BREAK.join(lines), [], 0
+                joined, tag_warns = _join_fits(fits, ctx)
+                warns.extend(tag_warns)
+                lines.append(f"{_escape(tag)}: {joined}")
+        return LINE_BREAK.join(lines), warns, len(warns)
 
     # Unknown kind (saved by a newer version) → skip with a warning.
     return "", [f"Unknown token kind '{kind}' — skipped"], 1
@@ -308,6 +398,37 @@ def _has_tag_fit_content(doc: Doc, ctx: ResolveContext, compact: bool) -> bool:
     return False
 
 
+# --- text-run style values --------------------------------------------------
+#
+# The markup writer puts a run's colour and size INSIDE a tag
+# (``<color=0xff..>`` / ``<fontsize=..>``), so they are link-grade data: a saved
+# or shared template holding ``"size": "14><url=joinChannel:...>JOIN</url>"``
+# would push a working link. Only a real colour / a real size is handed on;
+# anything else is dropped for that run (its text still renders, unstyled).
+# What the importer can hand over: a colour is always ``#rrggbb`` (lowercase);
+# a size is an int from 0 up to nine digits (``motd_markup`` accepts
+# ``[0-9]{1,9}``). The renderer keeps sizes 1..999 and drops the rest -- so an
+# imported ``<fontsize=0>`` or ``<fontsize=5000>`` run re-renders unsized.
+
+_STYLE_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+_STYLE_SIZE_MAX = 999
+
+
+def _style_color(color) -> "str | None":
+    """``color`` when it is exactly ``#rrggbb`` (ASCII hex), else None."""
+    if isinstance(color, str) and _STYLE_COLOR_RE.fullmatch(color) is not None:
+        return color
+    return None
+
+
+def _style_size(size) -> "int | None":
+    """``size`` when it is an ``int`` (never a ``bool``) in 1..999, else None."""
+    if isinstance(size, int) and not isinstance(size, bool) \
+            and 1 <= size <= _STYLE_SIZE_MAX:
+        return size
+    return None
+
+
 # --- resolution walk ------------------------------------------------------
 
 def resolve(doc: Doc, ctx: ResolveContext, compact: bool = False) -> ResolvedMotd:
@@ -316,8 +437,13 @@ def resolve(doc: Doc, ctx: ResolveContext, compact: bool = False) -> ResolvedMot
     Free text is escaped and style-wrapped; tokens resolve per §4.2. Omitted
     line/block tokens leave no blank line and never a dangling break. The
     non-empty body is wrapped exactly like :func:`motd_builder.build_motd`
-    (leading ``<br>`` + white colour). Returns the markup, any warnings, and the
-    count of stale/omitted tokens (drives the warn label; never gates push).
+    (leading ``<br>`` + white colour). Returns the markup, EVERY warning line,
+    and ``unresolved``: one per omitted line/block token, one per stale inline
+    token, one per pill rendered without its link -- and for a line of fits
+    (``tag_line``, the legacy ``Fits:`` line, ``doctrine_block``) one per
+    REFUSED FIT, so a single token can add several. It drives the warn label
+    (through :func:`warning_lines`, which caps what is displayed) and never
+    gates a push.
     """
     warnings: list = []
     unresolved = 0
@@ -348,8 +474,11 @@ def resolve(doc: Doc, ctx: ResolveContext, compact: bool = False) -> ResolvedMot
                 if i:
                     newline()
                 if piece:
-                    seg = Segment(text=piece, color=run.color, bold=run.bold,
-                                  italic=run.italic, underline=run.underline, size=run.size)
+                    # colour / size go INSIDE a tag: only validated values pass
+                    seg = Segment(text=piece, color=_style_color(run.color),
+                                  bold=run.bold, italic=run.italic,
+                                  underline=run.underline,
+                                  size=_style_size(run.size))
                     emit(segments_to_markup([seg]))
         elif isinstance(run, TokenRun):
             markup, warns, unres = _resolve_token(run, ctx, compact, fallback_active, fallback_state)
@@ -363,15 +492,99 @@ def resolve(doc: Doc, ctx: ResolveContext, compact: bool = False) -> ResolvedMot
     body = "".join(parts)
     if not body:
         return ResolvedMotd(markup="", warnings=warnings, unresolved=unresolved)
-    return ResolvedMotd(markup=f"<color=0xffffffff>{LINE_BREAK}{body}</color>",
+    return ResolvedMotd(markup=f"{_ENVELOPE_HEAD}{body}{_ENVELOPE_TAIL}",
                         warnings=warnings, unresolved=unresolved)
+
+
+# The envelope :func:`resolve` puts around every non-empty body (byte-identical
+# to ``build_motd``'s: white colour + a leading line break). ONE owner for the
+# three strings, because the importer below must recognise exactly what the
+# renderer writes.
+_ENVELOPE_HEAD = f"<color=0xffffffff>{LINE_BREAK}"
+_ENVELOPE_TAIL = "</color>"
+_ENVELOPE_COLOR = "#ffffff"     # what parse_markup reports for the head's colour
+
+
+def _styled_chars(segments, default_color=None) -> list:
+    """Flatten parsed segments to one entry per character -- ``(char, style)``,
+    or ``None`` for a line break -- so two parses can be compared without caring
+    how adjacent same-style runs happened to be merged."""
+    out: list = []
+    for seg in segments:
+        if seg.newline:
+            out.append(None)
+            continue
+        style = (seg.color or default_color, seg.bold, seg.italic, seg.underline,
+                 seg.size, seg.link)
+        out.extend((ch, style) for ch in seg.text)
+    return out
+
+
+def _strip_envelope(markup: str) -> str:
+    """``markup`` without :func:`resolve`'s envelope -- or unchanged.
+
+    Importing a MOTD this tool rendered used to turn the envelope into CONTENT
+    (a leading ``\\n`` run, and every text run pinned white), so each
+    render -> import -> render round grew a blank first line. The envelope is
+    dropped only when it is exactly the renderer's: the text starts with the
+    head and ends with the tail, the body is non-empty, and -- checked on the
+    PARSE, not the text -- the whole markup means precisely "a line break, then
+    the body with white as its default colour". A white frame that closes early
+    (``<color=0xffffffff><br>a</color>b``), another colour, or a missing close
+    is somebody's own styling and is left alone. Nothing a user typed can match:
+    typed text is escaped, so it never forms the head.
+    """
+    if not isinstance(markup, str):
+        # Not ours to judge: handed on as it came. ``parse_markup`` reads any
+        # FALSY value (None, "") as "no markup" -> an empty document; a truthy
+        # non-string is not tolerated there and still raises.
+        return markup
+    if not (markup.startswith(_ENVELOPE_HEAD) and markup.endswith(_ENVELOPE_TAIL)):
+        return markup
+    body = markup[len(_ENVELOPE_HEAD):len(markup) - len(_ENVELOPE_TAIL)]
+    if not body:
+        return markup
+    if _styled_chars(parse_markup(markup)) != \
+            [None] + _styled_chars(parse_markup(body), _ENVELOPE_COLOR):
+        return markup
+    return body
 
 
 # --- chip labels ----------------------------------------------------------
 
 def _ellip(text: str, limit: int = 40) -> str:
-    """Truncate ``text`` to ``limit`` chars, ending in ``…`` when cut."""
+    """Truncate ``text`` to ``limit`` chars, ending in ``…`` when cut.
+
+    A non-string (a hand-edited template's ``"name": null`` / a number) is
+    clipped as its ``str()`` -- the label the link builders write for it -- so
+    neither a chip refresh nor a warning line can raise on one.
+    """
+    if not isinstance(text, str):
+        text = str(text)
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# --- the warning label ----------------------------------------------------
+
+WARNING_LINES_SHOWN = 6
+
+
+def warning_lines(warnings, limit: int = WARNING_LINES_SHOWN) -> list:
+    """The warning lines to DISPLAY: de-duplicated, capped, with a count.
+
+    :func:`resolve` reports one line per unresolved pill, and the composer shows
+    them all in ONE wrapped label -- unbounded, that label pushes the editor off
+    the window and its layout cost grows quadratically. So: duplicates collapse
+    (first-seen order kept), at most ``limit`` distinct lines are shown, and the
+    rest become a single ``"+<n> more"`` line counting the distinct lines left
+    out. Pure; never mutates or stores ``warnings`` -- callers that need the
+    full list keep their own (``ResolvedMotd.warnings`` is always complete).
+    """
+    distinct = list(dict.fromkeys(str(w) for w in (warnings or ())))
+    limit = max(0, limit)
+    if len(distinct) <= limit:
+        return distinct
+    return distinct[:limit] + [f"+{len(distinct) - limit} more"]
 
 
 def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
@@ -384,16 +597,37 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
         return TokenLabel(_ellip(kind), False,
                           "unknown token kind (saved by a newer version?)")
 
+    # A pill whose link builder will refuse the target renders as plain text:
+    # its chip is UNRESOLVED and the tooltip says there is no link and why --
+    # the same target tests ``_resolve_token`` reports a warning for.
+
     if kind == "char":
         name = p.get("name", "")
+        if not is_valid_id(p.get("id")):
+            return TokenLabel(_ellip(name), False,
+                              f"no character id — shown as plain text: {name}")
         return TokenLabel(_ellip(name), True, f"resolves to character link: {name}")
 
     if kind == "fit":
         name, dna = p.get("name", ""), p.get("dna", "")
+        no_link = f"not a fit link — shown as plain text: {name}"
+        if not isinstance(dna, str):
+            # A hand-edited template: never DNA, and (as in _finalize_fit) it
+            # never reaches the injected providers.
+            return TokenLabel(_ellip(name), False, no_link)
         parsed = ctx.parse_fit(dna)
         ok = parsed is not None
         delta = ctx.deltas.get(parsed.ship_type_id, 0) if ok else 0
         sub = _refit_substitute(dna, name, ctx)
+        # Is a LINK written at all? Mirror :func:`_finalize_fit`: the target is
+        # the canonical form of the (refit-substituted) DNA, and ``fitting_link``
+        # refuses one that is not fit DNA. Such a pill renders as its plain
+        # label, so the chip is UNRESOLVED (stale style) and must not say
+        # "link kept". A DNA-shaped string the catalog cannot parse is not this
+        # case: its link IS written and the chip stays solid (below).
+        target_parsed = parsed if sub[0] == dna else ctx.parse_fit(sub[0])
+        if not is_valid_dna(ctx.canonical_dna(sub[0], target_parsed)):
+            return TokenLabel(_ellip(name), False, no_link, delta)
         if sub != (dna, name):
             # The pill is LITERAL on disk but its link resolves to the slot's
             # ACTIVE refit (§13), so the tooltip must not name a fit the MOTD
@@ -411,7 +645,11 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
 
     if kind == "system":
         name = p.get("name", "")
-        ok = ctx.resolve_system(name) is not None
+        sid = ctx.resolve_system(name)
+        ok = sid is not None
+        if ok and not is_valid_id(sid):     # the resolver handed back a non-id
+            return TokenLabel(_ellip(name), False,
+                              f"no system id — shown as plain text: {name}")
         tip = f"resolves to system link: {name}" if ok else \
             f"system '{name}' did not resolve — shown as plain text"
         return TokenLabel(_ellip(name), ok, tip)
@@ -423,18 +661,31 @@ def token_label(tok: TokenRun, ctx: ResolveContext) -> TokenLabel:
                           f"resolves to channel: {name}" if ok else "channel has no name — omitted")
 
     if kind == "fc_line":
+        # Exactly ``_resolve_token``'s reading, for BOTH sources: the line is
+        # rendered only with an id that is not None AND a non-empty name;
+        # otherwise it is OMITTED and the chip says so (a selected FC of
+        # ``(None, "Bob")`` or ``(7, "")`` is an omitted line, not a plain-text
+        # one and not a resolved one).
         if p.get("source") == "pinned":
-            name, ok = p.get("name") or "", p.get("id") is not None and bool(p.get("name"))
+            cid, name = p.get("id"), p.get("name")
         else:
-            ok = bool(ctx.fc_selected)
-            name = ctx.fc_selected[1] if ctx.fc_selected else ""
+            cid, name = ctx.fc_selected if ctx.fc_selected else (None, None)
+        ok = cid is not None and bool(name)
+        name = name or ""
         text = f"FC: {name}" if ok else "FC"
+        if ok and not is_valid_id(cid):     # the line renders, the link does not
+            return TokenLabel(_ellip(text), False,
+                              f"no character id — shown as plain text: FC: {name}")
         tip = f"resolves to: FC: {name}" if ok else "no FC selected — line omitted"
         return TokenLabel(_ellip(text), ok, tip)
 
     if kind == "staging_line":
         name = p.get("name", "")
-        ok = ctx.resolve_system(name) is not None
+        sid = ctx.resolve_system(name)
+        ok = sid is not None
+        if ok and not is_valid_id(sid):     # the line renders, the link does not
+            return TokenLabel(_ellip(f"Staging: {name}"), False,
+                              f"no system id — shown as plain text: Staging: {name}")
         tip = f"resolves to: Staging: {name}" if ok else \
             f"system '{name}' did not resolve — line omitted"
         return TokenLabel(_ellip(f"Staging: {name}"), ok, tip)
@@ -592,6 +843,10 @@ def _runs_from_markup(markup: str) -> list:
         if seg.newline:
             runs.append(TextRun("\n"))
             continue
+        # ONE unescape for both uses of the segment text: free text, and a
+        # link's LABEL (a pill's ``name``). It is the exact inverse of the
+        # ``_escape`` the serialiser applies to both, so a name such as
+        # ``A & B`` comes back as itself and never grows an ``&amp;amp;``.
         name = html.unescape(seg.text)
         if seg.link is not None:
             tok = _link_to_token(seg.link, name)
@@ -697,8 +952,13 @@ def _link_to_token(target: str, name: str) -> "TokenRun | None":
             type_str, id_str = (s.strip() for s in rest.split("//", 1))
             if type_str == "5":  # Solar System typeID → system (id re-resolved at compose)
                 return TokenRun("system", {"name": name})
-            if id_str.isdigit():  # character (self-contained id kept)
-                return TokenRun("char", {"id": int(id_str), "name": name})
+            # character (self-contained id kept). ``parse_id`` accepts exactly
+            # what ``char_link`` will write back (ASCII digits, 1..MAX_EVE_ID)
+            # and never raises: a superscript digit, an over-long digit string
+            # or a zero is "not an id" and the link stays plain text.
+            cid = parse_id(id_str)
+            if cid is not None:
+                return TokenRun("char", {"id": cid, "name": name})
         return None
     if target.startswith("joinChannel:"):
         return TokenRun("channel", {"name": name})
@@ -713,8 +973,12 @@ def from_parsed_motd(raw_markup: str) -> Doc:
     ``\\n`` TextRun. Line/block structure is not reverse-engineered (line-level
     fidelity only). Shares :func:`_runs_from_markup` with the legacy migration
     path, so header/footer links and imported links resolve identically.
+
+    The renderer's own envelope (white colour + leading break) is dropped first
+    (:func:`_strip_envelope`) -- :func:`resolve` adds it back -- so importing a
+    MOTD this tool rendered and rendering it again is a fixed point.
     """
-    return _runs_from_markup(raw_markup)
+    return _runs_from_markup(_strip_envelope(raw_markup))
 
 
 # --- JSON persistence -----------------------------------------------------

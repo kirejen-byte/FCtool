@@ -27,10 +27,11 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from tkinter import ttk
 from typing import Callable
 
+from motd_builder import is_valid_id
 from ui_helpers import attach_tooltip
 from ui_theme import (
     BG_DARK,
@@ -159,6 +160,39 @@ def _glyph_for(kind: str):
 
 def _item_name(item: PaletteItem) -> str:
     return item.params.get("name") or item.label
+
+
+def adopt_esi_ids(items, esi_rows) -> list:
+    """Local character rows, each id-less one given the id ESI found for its name.
+
+    A local "tracked" row is a NAME with no character id, and the Characters
+    group de-duplicates streamed ESI rows against the local names -- which used
+    to drop the only row that carried the id, so the inserted pill could not
+    link. The local row is still the one shown (same label, same meta); it only
+    gains ``params["id"]`` from the first ESI row of the same name (compared
+    like the de-duplication: case-blind) whose id is a real one
+    (:func:`motd_builder.is_valid_id`).
+
+    Never overwrites an id a row already has, never touches a non-``char`` row,
+    and never mutates what the provider returned: an adopting row is a COPY. A
+    name ESI does not know stays id-less (plain text + the unresolved chip is
+    then the honest result). Pure.
+    """
+    ids: dict = {}
+    for row in (esi_rows or ()):
+        if row.kind != "char":
+            continue
+        cid = row.params.get("id")
+        if is_valid_id(cid):
+            ids.setdefault(_item_name(row).lower(), cid)    # the FIRST id wins
+    out = []
+    for item in (items or ()):
+        if item.kind == "char" and not is_valid_id(item.params.get("id")):
+            cid = ids.get(_item_name(item).lower())
+            if cid is not None:
+                item = replace(item, params={**item.params, "id": cid})
+        out.append(item)
+    return out
 
 
 def _ellipsize(text: str, n: int = 24) -> str:
@@ -1382,7 +1416,9 @@ class MotdPalette(tk.Frame):
         for group, items, hidden in sliced:
             if group == "Characters":
                 seen_chars = True
-                items = list(items) + signage_rows()
+                # the local row is kept; an id-less one adopts the id of the
+                # ESI duplicate that the de-dupe in signage_rows() drops
+                items = adopt_esi_ids(items, self._esi_rows) + signage_rows()
             out.append((group, items, hidden))
         if not seen_chars:
             rows = signage_rows()

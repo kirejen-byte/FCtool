@@ -16626,7 +16626,8 @@ class FCToolGUI:
             # Non-blocking warnings: the resolver's warnings (stale/omitted pills,
             # unresolvable staging) plus the compaction / over-budget / long-link
             # notices, joined into the warn label.
-            warns = list(getattr(self, "_motd_resolved_warnings", []) or [])
+            warns = motd_doc.warning_lines(
+                getattr(self, "_motd_resolved_warnings", []))
             if compacted:
                 warns.append("Shortened fit names to ship class to fit the MOTD "
                              "length limit.")
@@ -16691,12 +16692,21 @@ class FCToolGUI:
         self._motd_link_seq = 0
         rendered.delete("1.0", tk.END)
 
+        # DISPLAY-ONLY unescape: the markup carries free text and link labels
+        # escaped (&amp; &lt; &gt;), and EVE shows them decoded, so the preview
+        # must too. Same html.unescape the importer uses (motd_doc), applied
+        # once per segment. ``markup`` itself - what is pushed, counted against
+        # the budget and copied - is never touched here. (Function-local
+        # import: this is the only place fc_gui needs the html module.)
+        import html
+
         for seg in motd_markup.parse_markup(markup or ""):
             if seg.newline:
                 rendered.insert(tk.END, "\n")
                 continue
             if not seg.text:
                 continue
+            shown = html.unescape(seg.text)
             is_link = seg.link is not None
             tag = self._motd_render_tag(
                 seg.color, seg.bold, seg.italic, seg.underline, seg.size,
@@ -16706,7 +16716,7 @@ class FCToolGUI:
                 # link run shows its own target; the style tag handles the look.
                 link_tag = "lnk%d" % self._motd_link_seq
                 self._motd_link_seq += 1
-                rendered.insert(tk.END, seg.text, (tag, link_tag))
+                rendered.insert(tk.END, shown, (tag, link_tag))
                 target = seg.link
                 rendered.tag_bind(
                     link_tag, "<Enter>",
@@ -16714,7 +16724,7 @@ class FCToolGUI:
                 rendered.tag_bind(
                     link_tag, "<Leave>", lambda e: self._hide_tooltip())
             else:
-                rendered.insert(tk.END, seg.text, (tag,))
+                rendered.insert(tk.END, shown, (tag,))
 
         rendered.config(state=tk.DISABLED)
 
