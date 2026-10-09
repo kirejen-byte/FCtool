@@ -13,6 +13,8 @@ clamped onto the virtual desktop — see :meth:`AutocompleteEntry._screen_edges`
 
 import tkinter as tk
 
+from ui_theme import BG_ENTRY, BG_SELECT, FG_TEXT, FG_WHITE
+
 #: How long to wait, after a window that was holding the input focus loses it,
 #: before asking whether the WHOLE APPLICATION lost it. Windows defocuses the
 #: old window BEFORE focusing the new one, so an immediate probe reads "nothing
@@ -146,10 +148,10 @@ class AutocompleteEntry(tk.Entry):
             self._lb = tk.Listbox(
                 self._listbox,
                 font=("Consolas", 10),
-                bg="#0f3460",
-                fg="#e0e0e0",
-                selectbackground="#1a5a90",
-                selectforeground="#ffffff",
+                bg=BG_ENTRY,
+                fg=FG_TEXT,
+                selectbackground=BG_SELECT,
+                selectforeground=FG_WHITE,
                 borderwidth=1,
                 relief=tk.RIDGE,
                 activestyle="none",

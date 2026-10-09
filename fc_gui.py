@@ -333,7 +333,7 @@ def _apply_dpi_awareness(pref: str, user32=None) -> None:
 # module scope, so `fc_gui.BG_DARK` (and every sibling) still resolves for callers
 # and tests.
 from ui_theme import (
-    BG_DARK, BG_PANEL, BG_ENTRY,
+    BG_DARK, BG_PANEL, BG_ENTRY, BG_SELECT,
     FG_TEXT, FG_DIM, FG_ACCENT, FG_GREEN, FG_RED, FG_ORANGE,
     FG_YELLOW, FG_WHITE, FG_MAGENTA, FG_UNDER,
     BORDER_COLOR,
@@ -3235,7 +3235,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         style.configure("Dark.TButton", background=BG_ENTRY, foreground=FG_TEXT,
                          font=self._btn_font, borderwidth=1, padding=(8, 4))
         style.map("Dark.TButton",
-                  background=[("active", "#1a5a90")],
+                  background=[("active", BG_SELECT)],
                   foreground=[("active", FG_WHITE)])
         style.configure("Green.TButton", background="#006644", foreground=FG_WHITE,
                          font=self._btn_font_bold, padding=(8, 4))
@@ -3263,7 +3263,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
             fieldbackground=BG_ENTRY, background=BG_ENTRY, foreground=FG_TEXT,
             arrowcolor=FG_TEXT, bordercolor=BORDER_COLOR,
             lightcolor=BG_ENTRY, darkcolor=BG_ENTRY,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
             font=("Consolas", 9),
         )
         style.map(
@@ -3292,7 +3292,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
             )
             style.map(
                 _sb,
-                background=[("active", "#1a5a90"), ("disabled", BG_PANEL)],
+                background=[("active", BG_SELECT), ("disabled", BG_PANEL)],
                 arrowcolor=[("active", FG_WHITE), ("disabled", FG_DIM)],
             )
 
@@ -3307,7 +3307,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         )
         style.map(
             "Dark.Treeview",
-            background=[("selected", "#1a5a90")],
+            background=[("selected", BG_SELECT)],
             foreground=[("selected", FG_WHITE)],
         )
         style.configure(
@@ -3326,7 +3326,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         # so the options apply to every popup app-wide.
         self.root.option_add("*TCombobox*Listbox.background", BG_ENTRY)
         self.root.option_add("*TCombobox*Listbox.foreground", FG_WHITE)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", "#1a5a90")
+        self.root.option_add("*TCombobox*Listbox.selectBackground", BG_SELECT)
         self.root.option_add("*TCombobox*Listbox.selectForeground", FG_WHITE)
         self.root.option_add("*TCombobox*Listbox.font", "Consolas 9")
 
@@ -4811,7 +4811,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         spec_top_row = tk.Frame(self._spec_roles_frame, bg=BG_PANEL)
         spec_top_row.pack(fill=tk.X, padx=4, pady=(0, 2))
         tk.Label(spec_top_row, text="\u26a0 Red = insufficient numbers",
-                 font=("Consolas", 8), fg="#ff6666", bg=BG_PANEL
+                 font=("Consolas", 8), fg=FG_UNDER, bg=BG_PANEL
                  ).pack(side=tk.LEFT, anchor=tk.W)
         # Persistent container created once; only its children are rebuilt by
         # _render_coverage_strip on each poll.
@@ -4912,7 +4912,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._xup_log = scrolledtext.ScrolledText(
             self._xup_log_body, height=4, font=("Consolas", 9),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
-            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
+            wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
         self._xup_log.pack(fill=tk.X, padx=10, pady=(0, 6))
@@ -4922,6 +4923,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._xup_log.tag_config("ready", foreground=FG_YELLOW, font=("Consolas", 10, "bold"))
         self._xup_log.tag_config("dim", foreground=FG_DIM)
         self._xup_log.tag_config("role", foreground=FG_MAGENTA)
+        self._xup_log.tag_raise("sel")
 
         # Paint the empty-state coverage strip (all ✗) on startup.
         self._schedule_booster_refresh()
@@ -5782,7 +5784,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
 
         self._cm_listbox = tk.Listbox(
             left, height=12, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
             borderwidth=1, relief=tk.RIDGE, activestyle="none",
             exportselection=False,
         )
@@ -5817,7 +5819,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
 
         self._cm_members_listbox = tk.Listbox(
             right, height=10, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
             borderwidth=1, relief=tk.RIDGE, activestyle="none",
             exportselection=False,
         )
@@ -6564,7 +6566,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._zkill_log = scrolledtext.ScrolledText(
             left_frame, height=30, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
-            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
+            wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
         self._zkill_log.pack(fill=tk.BOTH, expand=True)
@@ -6607,7 +6610,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._intel_log = scrolledtext.ScrolledText(
             self._intel_right_frame, height=30, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
-            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
+            wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
         self._intel_log.pack(fill=tk.BOTH, expand=True)
@@ -6622,6 +6626,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._zkill_log.tag_config("dim", foreground=FG_DIM)
         self._zkill_log.tag_config("fused", foreground=FG_YELLOW,
                                     font=("Consolas", 11, "bold"))
+        # Tk's `sel` tag has the LOWEST priority: raise it so selected text
+        # shows selectforeground instead of its tag colour.
+        self._zkill_log.tag_raise("sel")
 
         # Configure text tags for intel log
         for log in (self._intel_log,):
@@ -6657,6 +6664,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                            font=("Consolas", 10, "bold"))
             log.tag_config("name_neutral", foreground=FG_YELLOW)
             log.tag_config("name_unknown", foreground=FG_DIM)
+            log.tag_raise("sel")
 
         # Initialize the standings age label now that the cache has been loaded.
         self._update_standings_label()
@@ -6807,7 +6815,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                  ).pack(anchor=tk.W)
         self._friendly_listbox = tk.Listbox(
             friendly_col, height=5, font=("Consolas", 10),
-            bg=BG_ENTRY, fg=FG_GREEN, selectbackground="#1a5a90",
+            bg=BG_ENTRY, fg=FG_GREEN, selectbackground=BG_SELECT,
             selectforeground=FG_WHITE, highlightthickness=1,
             highlightbackground=BORDER_COLOR, borderwidth=1, relief=tk.RIDGE,
             activestyle="none", exportselection=False,
@@ -7044,7 +7052,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._wh_log = scrolledtext.ScrolledText(
             tab, height=20, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
-            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
+            wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE
         )
         self._wh_log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -7062,6 +7071,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._wh_log.tag_config("warn", foreground=FG_RED)
         self._wh_log.tag_config("ansiblex", foreground=FG_MAGENTA,
                                  font=("Consolas", 10, "bold"))
+        self._wh_log.tag_raise("sel")
 
     def _do_wh_route(self):
         origin = self._wh_origin.get().strip()
@@ -7729,7 +7739,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         else:
             # Color the count based on threshold
             if threshold is not None:
-                count_color = "#ff6666" if total < threshold else FG_GREEN
+                count_color = FG_UNDER if total < threshold else FG_GREEN
             else:
                 count_color = FG_DIM
             count_label.config(text=f"({total})", fg=count_color)
@@ -7892,7 +7902,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
             btn = tk.Button(
                 self._wh_waypoint_frame, text=system,
                 font=("Consolas", 9, "bold"), fg=fg, bg=BG_ENTRY,
-                activebackground="#1a5a90", activeforeground=FG_WHITE,
+                activebackground=BG_SELECT, activeforeground=FG_WHITE,
                 borderwidth=1, relief=tk.RIDGE, cursor="hand2",
                 command=lambda s=system: self._set_destination_or_copy(s),
             )
@@ -13698,7 +13708,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
 
         listbox = tk.Listbox(
             win, font=("Consolas", 10), bg=BG_ENTRY, fg=FG_TEXT,
-            selectbackground="#1a5a90", selectforeground=FG_WHITE,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
             borderwidth=1, relief=tk.RIDGE, activestyle="none",
             exportselection=False)
         listbox.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 4))
@@ -35500,7 +35510,7 @@ $bmp.Dispose()
         ttk scrollbars themed in the style block above.
         """
         st.vbar.configure(
-            bg=BG_ENTRY, troughcolor=BG_DARK, activebackground="#1a5a90",
+            bg=BG_ENTRY, troughcolor=BG_DARK, activebackground=BG_SELECT,
             highlightbackground=BG_DARK, highlightcolor=BG_DARK,
             highlightthickness=0, borderwidth=0, relief="flat",
             elementborderwidth=0,
@@ -35686,7 +35696,7 @@ $bmp.Dispose()
         sys_btn = tk.Button(
             self._zkill_log, text=f"{alert.system_name}{region_str}",
             font=("Consolas", 10, "bold"), fg=FG_ACCENT, bg=BG_ENTRY,
-            activebackground="#1a5a90", activeforeground=FG_WHITE,
+            activebackground=BG_SELECT, activeforeground=FG_WHITE,
             borderwidth=1, relief=tk.RIDGE, cursor="hand2",
             command=lambda s=alert.system_name: self._set_destination_or_copy(s),
         )
@@ -35723,7 +35733,7 @@ $bmp.Dispose()
         # zKillboard link button
         zkill_btn = tk.Button(
             self._zkill_log, text="zKillboard", font=("Consolas", 8, "bold"),
-            fg=FG_ACCENT, bg=BG_ENTRY, activebackground="#1a5a90",
+            fg=FG_ACCENT, bg=BG_ENTRY, activebackground=BG_SELECT,
             activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
             cursor="hand2",
             command=lambda u=alert.zkill_url: self._open_url(u),
@@ -35735,7 +35745,7 @@ $bmp.Dispose()
         if alert.dotlan_url:
             dotlan_btn = tk.Button(
                 self._zkill_log, text="Dotlan", font=("Consolas", 8, "bold"),
-                fg=FG_ORANGE, bg=BG_ENTRY, activebackground="#1a5a90",
+                fg=FG_ORANGE, bg=BG_ENTRY, activebackground=BG_SELECT,
                 activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
                 cursor="hand2",
                 command=lambda u=alert.dotlan_url: self._open_url(u),
@@ -35747,7 +35757,7 @@ $bmp.Dispose()
         if alert.zkill_related_url:
             related_btn = tk.Button(
                 self._zkill_log, text="Related Kills", font=("Consolas", 8, "bold"),
-                fg=FG_RED, bg=BG_ENTRY, activebackground="#1a5a90",
+                fg=FG_RED, bg=BG_ENTRY, activebackground=BG_SELECT,
                 activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
                 cursor="hand2",
                 command=lambda u=alert.zkill_related_url: self._open_url(u),
@@ -35759,7 +35769,7 @@ $bmp.Dispose()
         if alert.warbeacon_url:
             wb_btn = tk.Button(
                 self._zkill_log, text="WarBeacon BR", font=("Consolas", 8, "bold"),
-                fg="#e040fb", bg=BG_ENTRY, activebackground="#1a5a90",
+                fg="#e040fb", bg=BG_ENTRY, activebackground=BG_SELECT,
                 activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
                 cursor="hand2",
                 command=lambda u=alert.warbeacon_url: self._open_url(u),
@@ -35775,7 +35785,7 @@ $bmp.Dispose()
         # shown (ungated, unlike Navigate/Titan-Bridge which need a staging system).
         map_btn = tk.Button(
             self._zkill_log, text="▸ Map", font=("Consolas", 8, "bold"),
-            fg=FG_ACCENT, bg=BG_ENTRY, activebackground="#1a5a90",
+            fg=FG_ACCENT, bg=BG_ENTRY, activebackground=BG_SELECT,
             activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
             cursor="hand2",
             command=lambda sid=alert.system_id: self._focus_map_on_kill(sid),
@@ -35788,7 +35798,7 @@ $bmp.Dispose()
         if staging:
             dest_btn = tk.Button(
                 self._zkill_log, text="Navigate", font=("Consolas", 8, "bold"),
-                fg=FG_YELLOW, bg=BG_ENTRY, activebackground="#1a5a90",
+                fg=FG_YELLOW, bg=BG_ENTRY, activebackground=BG_SELECT,
                 activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
                 cursor="hand2",
                 command=lambda s=alert.system_name: self._navigate_wh_route(s),
@@ -35799,7 +35809,7 @@ $bmp.Dispose()
             # "Titan Bridge?" button -> fills Jump Range tab
             range_btn = tk.Button(
                 self._zkill_log, text="Titan Bridge?", font=("Consolas", 8, "bold"),
-                fg=FG_GREEN, bg=BG_ENTRY, activebackground="#1a5a90",
+                fg=FG_GREEN, bg=BG_ENTRY, activebackground=BG_SELECT,
                 activeforeground=FG_WHITE, borderwidth=1, relief=tk.RIDGE,
                 cursor="hand2",
                 command=lambda s=alert.system_name: self._navigate_jump_range(s),
@@ -35931,7 +35941,8 @@ $bmp.Dispose()
         self._cyno_result = scrolledtext.ScrolledText(
             self._cyno_body, height=8, font=("Consolas", 10),
             bg=BG_ENTRY, fg=FG_TEXT, insertbackground=FG_TEXT,
-            selectbackground="#1a5a90", wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BG_SELECT, selectforeground=FG_WHITE,
+            wrap=tk.WORD, state=tk.DISABLED,
             borderwidth=1, relief=tk.RIDGE,
         )
         self._cyno_result.pack(fill=tk.X, padx=10, pady=(0, 6))
@@ -35947,6 +35958,7 @@ $bmp.Dispose()
             lambda e: self._cyno_result.config(cursor=""))
         self._cyno_result.tag_bind(
             "cyno_link", "<Button-1>", self._cyno_open_latest)
+        self._cyno_result.tag_raise("sel")
 
     def _toggle_cyno_drawer(self):
         self._cyno_drawer_expanded = not self._cyno_drawer_expanded
