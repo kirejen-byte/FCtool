@@ -15,6 +15,14 @@ docs/superpowers/specs/2026-06-16-fitting-doctrine-motd-design.md §3.4/§3.5):
     Channel link   player:   <url=joinChannel:player_{id}//None//None>{name}</url>
                    built-in: <url=joinChannel:{id}>{name}</url>   (positive id)
 
+Labels and targets are DATA (a fit / character / system / channel name, a stored
+DNA, an id from a chat-log header), so no link builder writes either raw: every
+link LABEL is escaped with ``_escape``, and every link TARGET is validated
+(``is_valid_dna``, ``is_valid_id``, the ``_CHANNEL_ID_RE`` channel-id pattern) --
+a link whose target fails renders as its escaped label alone, with no link. The
+importers (``parse_motd`` here, ``motd_doc``'s from-markup parser) unescape a
+label exactly once, so a name round-trips unchanged.
+
 The server truncates a MOTD around ~3,000 raw-markup characters, and markup
 counts toward that budget, so ``estimate_length`` measures the raw markup length
 and ``MOTD_BUDGET_DEFAULT`` is the conservative ceiling callers warn against.
@@ -68,6 +76,82 @@ def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# --- link labels + link targets -------------------------------------------
+#
+# A link is ``<url=TARGET>LABEL</url>``. Both halves are built from DATA -- a
+# fit / character / system / channel name out of a doctrine file, a pasted EFT
+# block or an imported fleet MOTD; a stored DNA; an id read from a chat-log
+# header -- so neither may be written raw: a fit named
+# ``X</url> <url=joinChannel:...>JOIN FLEET COMMS</url>`` used to inject a
+# working link into the MOTD the FC then pushed to the whole fleet.
+#
+# The rule every link builder below follows:
+#   * the LABEL always goes through :func:`_escape` (the free-text escape --
+#     there is exactly one), so a name with none of ``& < >`` is byte-identical
+#     to what was always written;
+#   * the TARGET is validated against its grammar, and a target that fails is
+#     never written: the builder returns the ESCAPED LABEL as plain text -- no
+#     link, never half a link, never an exception.
+
+# Fit DNA: type ids and quantities joined by ``:`` and ``;``, plus ``_`` for an
+# unfitted (cargo) module. ASCII only -- ``[0-9]`` in a ``str`` pattern would
+# NOT match other scripts' digits, and ``fullmatch`` refuses a trailing newline.
+_DNA_RE = re.compile(r"[0-9:;_]+")
+
+# A chat-channel id is an opaque token from the chat-log header (a negative
+# integer for a player channel, a small positive one for a built-in, possibly a
+# word / hex form in some clients). The joinChannel target grammar separates
+# with ``:`` and ``//`` and the tag ends at ``>``, so a token may hold none of
+# those -- nor whitespace, control characters or anything else outside this set.
+_CHANNEL_ID_RE = re.compile(r"-?[A-Za-z0-9][A-Za-z0-9_-]*")
+
+# EVE ids are signed 64-bit integers; nothing larger can be an id.
+MAX_EVE_ID = 2 ** 63 - 1
+
+
+def _label(text) -> str:
+    """The escaped LABEL of a link (or of the plain text a refused link becomes).
+
+    ``text`` is normally a ``str``; a hand-edited template can hold anything, so
+    a non-string is rendered as its ``str()`` -- what the old f-string wrote --
+    rather than raising out of :func:`_escape`.
+    """
+    return _escape(text if isinstance(text, str) else str(text))
+
+
+def is_valid_dna(dna) -> bool:
+    """True when ``dna`` is a non-empty ``str`` made only of ``0-9 : ; _``."""
+    return isinstance(dna, str) and _DNA_RE.fullmatch(dna) is not None
+
+
+def is_valid_id(value) -> bool:
+    """True when ``value`` can be a character / type / system id in a link:
+    an ``int`` (never a ``bool``) in ``1..MAX_EVE_ID``. A digit STRING, a float
+    and a huge positive int are all "not an id"."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 0 < value <= MAX_EVE_ID)
+
+
+def parse_id(text) -> "int | None":
+    """The id spelled by ``text`` (ASCII decimal digits only), or None.
+
+    The read-side twin of :func:`is_valid_id`, for an id taken out of markup.
+    ``str.isdigit()`` must not gate the ``int()``: it is True for digit-like
+    characters ``int()`` refuses (superscript two), and ``int()`` also refuses
+    a digit string past its length limit. The length cap (``MAX_EVE_ID`` has 19
+    digits) keeps the conversion bounded; anything else is simply not an id.
+    """
+    if not isinstance(text, str) or not (0 < len(text) <= 19):
+        return None
+    if not (text.isascii() and text.isdecimal()):
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if is_valid_id(value) else None
+
+
 def fitting_link(dna: str, name: str) -> str:
     """Build a self-contained in-game fitting link from a fit's DNA.
 
@@ -76,8 +160,14 @@ def fitting_link(dna: str, name: str) -> str:
 
         fitting_link("12015:2185;5::", "Arty Muninn")
         -> "<url=fitting:12015:2185;5::>Arty Muninn</url>"
+
+    The label is escaped; a ``dna`` that is not fit DNA (:func:`is_valid_dna`)
+    yields the escaped label alone, with no link.
     """
-    return f"<url=fitting:{dna}>{name}</url>"
+    label = _label(name)
+    if not is_valid_dna(dna):
+        return label
+    return f"<url=fitting:{dna}>{label}</url>"
 
 
 # Delta colour markup for the MOTD ideal-fleet feedback. Positive delta = under
@@ -99,8 +189,14 @@ def char_link(character_id: int, name: str, type_id: int = CHAR_SHOWINFO_TYPE_ID
 
         char_link(90000001, "Some Pilot")
         -> "<url=showinfo:1377//90000001>Some Pilot</url>"
+
+    The label is escaped; when ``character_id`` or ``type_id`` is not an id
+    (:func:`is_valid_id`) the escaped label is returned alone, with no link.
     """
-    return f"<url=showinfo:{type_id}//{character_id}>{name}</url>"
+    label = _label(name)
+    if not (is_valid_id(character_id) and is_valid_id(type_id)):
+        return label
+    return f"<url=showinfo:{type_id}//{character_id}>{label}</url>"
 
 
 def system_link(system_id: int, name: str) -> str:
@@ -111,8 +207,14 @@ def system_link(system_id: int, name: str) -> str:
 
         system_link(30000142, "Jita")
         -> "<url=showinfo:5//30000142>Jita</url>"
+
+    The label is escaped; a ``system_id`` that is not an id
+    (:func:`is_valid_id`) yields the escaped label alone, with no link.
     """
-    return f"<url=showinfo:5//{system_id}>{name}</url>"
+    label = _label(name)
+    if not is_valid_id(system_id):
+        return label
+    return f"<url=showinfo:5//{system_id}>{label}</url>"
 
 
 def channel_text(name: str, channel_id: str | int | None = None) -> str:
@@ -140,24 +242,37 @@ def channel_text(name: str, channel_id: str | int | None = None) -> str:
         -> "<url=joinChannel:player_-84651075//None//None>Cap Chain Alpha</url>"
         channel_text("Help", channel_id=2)
         -> "<url=joinChannel:2>Help</url>"
+
+    The name is escaped in BOTH forms (plain text is markup too). The channel
+    NAME is never part of the link target -- only the id is -- and the id is
+    data read from a chat-log header, so it is validated: an ``int`` (not a
+    ``bool``) or a string whose core token is letters / digits / ``_`` / ``-``
+    with an optional leading minus (``_CHANNEL_ID_RE``). Anything else -- a
+    ``<``, ``>``, ``/``, ``:``, whitespace, a control character, a tuple-shaped
+    header value -- is not a channel id and the result is the escaped name
+    alone, with no link.
     """
-    if channel_id is None:
-        return name
+    label = _label(name)
+    if channel_id is None or isinstance(channel_id, bool) \
+            or not isinstance(channel_id, (str, int)):
+        return label
 
     id_str = str(channel_id).strip()
     if not id_str:
-        return name
+        return label
 
     is_player = id_str.startswith("-") or id_str.startswith("player_")
+    # Normalise to the bare core id (strip a leading "player_" if present).
+    core = id_str[len("player_"):] if id_str.startswith("player_") else id_str
+    if _CHANNEL_ID_RE.fullmatch(core) is None:
+        return label
     if is_player:
-        # Normalise to the bare core id (strip a leading "player_" if present).
-        core = id_str[len("player_"):] if id_str.startswith("player_") else id_str
         if CHANNEL_LINK_COMPOUND:
-            return f"<url=joinChannel:player_{core}//None//None>{name}</url>"
-        return f"<url=joinChannel:{core}>{name}</url>"
+            return f"<url=joinChannel:player_{core}//None//None>{label}</url>"
+        return f"<url=joinChannel:{core}>{label}</url>"
 
     # Built-in / positive id: always the bare form.
-    return f"<url=joinChannel:{id_str}>{name}</url>"
+    return f"<url=joinChannel:{id_str}>{label}</url>"
 
 
 def _ordered_tags(tags: list[str]) -> list[str]:
@@ -198,6 +313,12 @@ def build_motd(
     * an optional ``Logi: <channel_text>`` line — clickable when ``channel_id``
       is supplied (see :func:`channel_text`), plain text otherwise,
     * optional ``footer`` free text.
+
+    Every NAME (FC, staging system, fit, channel) is a link label and is
+    escaped by its link builder; a link whose target is not valid (a ``dna``
+    that is not fit DNA, an id that is not an id) degrades to the escaped name
+    as plain text. ``header`` / ``footer`` are the caller's own markup and are
+    passed through untouched.
 
     Each fit tuple is ``(dna, name)`` or ``(dna, name, delta)`` where the
     optional ``delta`` is an integer emitted as separate colored text AFTER the
@@ -326,21 +447,29 @@ def parse_motd(markup: str) -> dict:
         for m in _FITTING_RE.finditer(normalized)
     ]
 
+    # The id groups are ``\d+`` -- any length, any script's digits -- so they go
+    # through :func:`parse_id`, never a bare ``int()`` (which raises on a digit
+    # string past its length limit). A link whose id is not an id is skipped,
+    # exactly as if it were not a showinfo link; the first REAL one still wins.
     fc = None
-    char_match = _SHOWINFO_RE.search(normalized)
-    if char_match is not None:
-        fc = {
-            "name": html.unescape(char_match.group("name")),
-            "character_id": int(char_match.group("cid")),
-        }
+    for char_match in _SHOWINFO_RE.finditer(normalized):
+        cid = parse_id(char_match.group("cid"))
+        if cid is not None:
+            fc = {
+                "name": html.unescape(char_match.group("name")),
+                "character_id": cid,
+            }
+            break
 
     staging = None
-    staging_match = _STAGING_RE.search(normalized)
-    if staging_match is not None:
-        staging = {
-            "system_id": int(staging_match.group("sid")),
-            "name": html.unescape(staging_match.group("name")),
-        }
+    for staging_match in _STAGING_RE.finditer(normalized):
+        sid = parse_id(staging_match.group("sid"))
+        if sid is not None:
+            staging = {
+                "system_id": sid,
+                "name": html.unescape(staging_match.group("name")),
+            }
+            break
 
     channel = None
     channel_match = _CHANNEL_RE.search(normalized)

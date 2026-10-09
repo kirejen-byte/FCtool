@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -46,6 +47,37 @@ CATEGORY_NAMES: dict[int, str] = {
 }
 
 SHIP_CATEGORY_ID = 6
+
+# In-memory negative cache for ids ESI could not resolve: a hit is cached
+# forever, but a miss used to be re-asked on EVERY lookup, so a fitting-DNA
+# string of bogus ids meant hundreds of synchronous round trips per parse.
+# A miss is remembered for NEGATIVE_TTL_S (so a type released after the bundle
+# was built, or a transient network failure, is retried) and the memory is
+# bounded to NEGATIVE_MAX entries, oldest dropped first. Never persisted.
+NEGATIVE_TTL_S = 600
+# A FAILURE (adapter raised / returned a non-dict) is retried much sooner than a
+# definite miss, so a start-up network blip doesn't hide a real new type. NOTE:
+# the app's own ESI adapter returns an empty ``{}`` (a definite miss, 600 s)
+# for ESI's 404 and 400 (a malformed id); it RAISES for everything else
+# (network error, 420, 5xx, no account), so an outage takes the 30 s failure
+# path. An id outside the type-id range (1..0x7FFFFFFF) is never asked at all.
+# A failure also trips a catalogue-wide outage breaker (``_down_until``): no
+# unknown-id lookup is attempted (nor the id remembered) for a window that
+# starts at NEGATIVE_FAIL_TTL_S and doubles with each consecutive failure
+# (30, 60, 120, 240 s, capped at BREAKER_MAX_S). Any answered call (hit or
+# definite miss) resets it, so an outage costs few blocking calls, not one per id.
+NEGATIVE_FAIL_TTL_S = 30
+BREAKER_MAX_S = 300
+NEGATIVE_MAX = 5000
+# Miss budget (token bucket, MISSES only): at most MISS_BURST lookups may END in
+# a miss back-to-back, then one more per MISS_REFILL_S. While it is spent an
+# unknown id is answered None WITHOUT asking and WITHOUT being remembered: a
+# budget-skipped id is asked again on a later lookup when a token is free, and
+# ids earlier in the same text are tried first. A hit never spends it, so a batch of
+# genuinely new types resolves in full, while the FIRST parse of a DNA string
+# of bogus ids costs at most MISS_BURST round trips.
+MISS_BURST = 8
+MISS_REFILL_S = 5.0
 
 # SDE ship groupID -> display name, for every ship group present in the bundled
 # fit_types.json. The names are the authoritative ESI /universe/groups/{id}/
@@ -143,6 +175,21 @@ class TypeCatalog:
         # ``prime()`` takes the same lock around its own register+write section
         # (see ``prime``) so the two writers can never interleave either.
         self._resolve_lock = threading.Lock()
+
+        # type_id -> monotonic expiry of a remembered ESI miss (insertion
+        # ordered, so the oldest entry is first). Reads are single dict ops;
+        # every mutation happens under _resolve_lock. ``_now`` is a test seam.
+        self._neg: dict[int, float] = {}
+        self._now = time.monotonic
+        # Miss budget state (see MISS_BURST); mutated under _resolve_lock only.
+        self._miss_burst = float(MISS_BURST)
+        self._miss_tokens = self._miss_burst
+        self._miss_at: float | None = None
+        # Outage breaker: monotonic time before which no unknown-id lookup is
+        # attempted (set by a FAILURE; under _resolve_lock).
+        self._down_until: float = 0.0
+        self._down_fails = 0
+        self._down_window = float(NEGATIVE_FAIL_TTL_S)
 
         # In-memory mirror of the on-disk cache file's raw content (str(type_id)
         # -> entry), seeded by _load_cache() below and kept in sync by every
@@ -388,6 +435,7 @@ class TypeCatalog:
                         continue
                     entry = {"n": name, "c": None, "g": None, "s": None}
                     self._register(tid, entry)
+                    self._neg.pop(tid, None)
                     new_entries[tid] = entry
                 if new_entries:
                     self._write_cache_entries(new_entries)
@@ -412,30 +460,99 @@ class TypeCatalog:
         inside the lock means an id resolved by a peer while this thread waited is
         returned without a second ESI call (and keeps the disk write single-writer).
         This is a rare path (an unknown id), so the coarse lock's contention is
-        acceptable."""
+        acceptable.
+
+        Misses are remembered in the in-memory negative cache (``_neg``), and
+        misses are rate-limited by the token-bucket miss budget (MISS_BURST).
+
+        An id that cannot be an EVE type id (not an int, or outside
+        1..0x7FFFFFFF) is answered ``None`` without asking, remembering or
+        spending budget. A FAILURE arms the catalogue-wide outage breaker: for
+        a window that grows with consecutive failures (30, 60, 120, 240 s, capped
+        at BREAKER_MAX_S) no lookup is attempted and no id is remembered; any
+        answered call (hit or definite miss) resets it."""
         if self._esi is None:
+            return None
+        if type(type_id) is not int or not 0 < type_id <= 0x7FFFFFFF:
+            return None
+        # Remembered miss still fresh: answer without the lock or the network.
+        until = self._neg.get(type_id)
+        if until is not None and self._now() < until:
             return None
         with self._resolve_lock:
             # A peer thread may have resolved this id while we waited on the lock.
             existing = self._by_id.get(type_id)
             if existing is not None:
                 return existing
-            try:
-                resolved = self._esi.resolve_names([type_id])
-            except Exception:
+            until = self._neg.get(type_id)
+            if until is not None and self._now() < until:
                 return None
-            if not isinstance(resolved, dict):
+            # Breaker closed only while the remaining time is within the current
+            # window (a clock set back cannot hold it shut).
+            # (+1 s absorbs the float ulp of (now + window) - now and a lookup
+            # in the same coarse clock tick as the failure.)
+            if 0.0 < self._down_until - self._now() <= self._down_window + 1.0:
+                return None   # outage window: no ask, id not remembered
+            if not self._miss_budget_left():
                 return None
-            info = resolved.get(type_id)
-            if info is None:
+            entry, definite = self._ask_esi(type_id)
+            if not definite:
+                self._down_window = float(min(
+                    NEGATIVE_FAIL_TTL_S * (2 ** min(self._down_fails, 8)),
+                    BREAKER_MAX_S))
+                self._down_fails += 1
+                self._down_until = self._now() + self._down_window
+            else:
+                self._down_until = 0.0
+                self._down_fails = 0
+                self._down_window = float(NEGATIVE_FAIL_TTL_S)
+            if entry is None:
+                self._miss_tokens -= 1.0
+                self._remember_miss(
+                    type_id, NEGATIVE_TTL_S if definite else NEGATIVE_FAIL_TTL_S)
                 return None
-            name = info.get("name")
-            if not isinstance(name, str) or not name:
-                return None
-            entry = {"n": name, "c": None, "g": None, "s": None}
+            self._neg.pop(type_id, None)
             self._register(type_id, entry)
             self._write_cache_entry(type_id, entry)
             return entry
+
+    def _ask_esi(self, type_id: int) -> tuple[dict | None, bool]:
+        """One ESI lookup -> ``(entry, definite)``. ``entry`` is ``None`` on a
+        miss; ``definite`` is True when ESI answered (id absent / no usable
+        name) and False for a failure (adapter raised or returned a non-dict)."""
+        try:
+            resolved = self._esi.resolve_names([type_id])
+        except Exception:
+            return None, False
+        if not isinstance(resolved, dict):
+            return None, False
+        info = resolved.get(type_id)
+        if not isinstance(info, dict):
+            return None, True
+        name = info.get("name")
+        if not isinstance(name, str) or not name:
+            return None, True
+        return {"n": name, "c": None, "g": None, "s": None}, True
+
+    def _miss_budget_left(self) -> bool:
+        """Refill the miss budget for the time elapsed; True when one more
+        lookup may be made. Caller must hold self._resolve_lock."""
+        now = self._now()
+        if self._miss_at is not None:
+            self._miss_tokens = min(
+                self._miss_burst,
+                self._miss_tokens
+                + max(0.0, now - self._miss_at) / MISS_REFILL_S)
+        self._miss_at = now
+        return self._miss_tokens >= 1.0
+
+    def _remember_miss(self, type_id: int, ttl: float) -> None:
+        """Record an ESI miss for ``ttl`` seconds, dropping the oldest inserted
+        entries when over NEGATIVE_MAX. Caller must hold self._resolve_lock."""
+        self._neg.pop(type_id, None)  # re-insert at the newest end
+        while len(self._neg) >= NEGATIVE_MAX:
+            del self._neg[next(iter(self._neg))]
+        self._neg[type_id] = self._now() + ttl
 
     def _write_cache_entry(self, type_id: int, entry: dict) -> None:
         """Merge one resolved entry into the on-disk cache (atomic temp+replace).

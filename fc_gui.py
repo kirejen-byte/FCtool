@@ -477,7 +477,7 @@ INTEL_SWEEP_EVERY_LINES = 100
 # callback, which is right for fleet chat — there the stamp is part of a line's
 # identity. For intel it is not: two EVE clients tailing the same channel write
 # the same message with stamps a second apart often enough to matter. Measured
-# on the owner's real Intel.WOMP logs: 8 surplus deliveries / 216 events (3.7%)
+# on real Intel.ABCD-style logs: 8 surplus deliveries / 216 events (3.7%)
 # on 2026-08-15 and 5 / 40 (12.5%) on 2026-08-13 — each surplus a duplicate HUD
 # row, a duplicate preview flash, a duplicate map pulse and a DOUBLED intel
 # ping. This stage keys on (channel, sender, sha1(body)) — the same line
@@ -2676,11 +2676,16 @@ class FCToolGUI:
 
         class _Adapter:
             def resolve_names(self, type_ids):
-                try:
-                    rows = gui.esi_auth.esi_post_public(
-                        "/universe/names/", list(type_ids)) or []
-                except Exception:
+                # 400 / 404 = ESI's definite "no such id" -> {}; every other
+                # non-answer RAISES so TypeCatalog treats it as a failure.
+                if gui.esi_auth is None:
+                    raise RuntimeError("no esi_auth")
+                rows, status = gui.esi_auth.esi_post_public_ex(
+                    "/universe/names/", list(type_ids))
+                if status in (400, 404):
                     return {}
+                if status != 200 or not isinstance(rows, list):
+                    raise RuntimeError("names lookup failed: %s" % status)
                 out = {}
                 for r in rows:
                     if isinstance(r, dict) and "id" in r:
@@ -13136,7 +13141,10 @@ class FCToolGUI:
             else:
                 def _int(s):
                     s = (s or "").strip()
-                    return int(s) if s.isdigit() else None
+                    try:  # isdecimal: exactly what int() accepts
+                        return int(s) if s.isdecimal() else None
+                    except ValueError:
+                        return None
                 self.fittings.set_member_ideal(
                     doctrine_id, fit_id, mode, _int(min_var.get()), _int(max_var.get()))
             self.fittings.save()
@@ -16643,7 +16651,8 @@ class FCToolGUI:
             # Non-blocking warnings: the resolver's warnings (stale/omitted pills,
             # unresolvable staging) plus the compaction / over-budget / long-link
             # notices, joined into the warn label.
-            warns = list(getattr(self, "_motd_resolved_warnings", []) or [])
+            warns = motd_doc.warning_lines(
+                getattr(self, "_motd_resolved_warnings", []))
             if compacted:
                 warns.append("Shortened fit names to ship class to fit the MOTD "
                              "length limit.")
@@ -16708,12 +16717,21 @@ class FCToolGUI:
         self._motd_link_seq = 0
         rendered.delete("1.0", tk.END)
 
+        # DISPLAY-ONLY unescape: the markup carries free text and link labels
+        # escaped (&amp; &lt; &gt;), and EVE shows them decoded, so the preview
+        # must too. Same html.unescape the importer uses (motd_doc), applied
+        # once per segment. ``markup`` itself - what is pushed, counted against
+        # the budget and copied - is never touched here. (Function-local
+        # import: this is the only place fc_gui needs the html module.)
+        import html
+
         for seg in motd_markup.parse_markup(markup or ""):
             if seg.newline:
                 rendered.insert(tk.END, "\n")
                 continue
             if not seg.text:
                 continue
+            shown = html.unescape(seg.text)
             is_link = seg.link is not None
             tag = self._motd_render_tag(
                 seg.color, seg.bold, seg.italic, seg.underline, seg.size,
@@ -16723,7 +16741,7 @@ class FCToolGUI:
                 # link run shows its own target; the style tag handles the look.
                 link_tag = "lnk%d" % self._motd_link_seq
                 self._motd_link_seq += 1
-                rendered.insert(tk.END, seg.text, (tag, link_tag))
+                rendered.insert(tk.END, shown, (tag, link_tag))
                 target = seg.link
                 rendered.tag_bind(
                     link_tag, "<Enter>",
@@ -16731,7 +16749,7 @@ class FCToolGUI:
                 rendered.tag_bind(
                     link_tag, "<Leave>", lambda e: self._hide_tooltip())
             else:
-                rendered.insert(tk.END, seg.text, (tag,))
+                rendered.insert(tk.END, shown, (tag,))
 
         rendered.config(state=tk.DISABLED)
 
@@ -33554,7 +33572,10 @@ class FCToolGUI:
                 parent=self.root)
             return
         cap_str = slot["cap_var"].get().strip()
-        cap = int(cap_str) if cap_str.isdigit() else None
+        try:  # isdecimal: exactly what int() accepts
+            cap = int(cap_str) if cap_str.isdecimal() else None
+        except ValueError:
+            cap = None
 
         # Build label: letter-Title or letter-Title-cap
         label = f"{letter.upper()}-{title}"
@@ -37136,7 +37157,7 @@ $bmp.Dispose()
         :meth:`_passes_view_filter`.
 
         The gate is still needed, only moved: ``channel_filters`` matches by
-        filename PREFIX, so a tracked "Intel" also tails "Intel.WOMP" files.
+        filename PREFIX, so a tracked "Intel" also tails "Intel.ABCD" files.
 
         That refusal is the one place intel can now go missing without a trace,
         so it says so once per channel name (2026-08-16). This gate reads the

@@ -12,8 +12,12 @@ Turns pasted EVE fit text into a `ParsedFit`. Two input formats:
 - **DNA** — a flat `shipID:typeID[_];qty:…::` bag of items; slot position is not
   encoded, so items route to slots via the catalog.
 
-Parsing is permissive: an unresolved item becomes a non-fatal `warning`; only a
-missing or invalid header raises `FitParseError`. Pure logic, Tk-free,
+Parsing is permissive: an unresolved item becomes a non-fatal `warning`.
+`FitParseError` is raised only for text that cannot be read as a fit: empty
+text, a missing or invalid header (EFT) or ship id (DNA), an unknown hull, and
+-- in `parse_eft` only -- an item quantity `int()` cannot read (more than 4,300
+digits). `parse_dna` warns about an unusable quantity and carries on.
+Pure logic, Tk-free,
 network-free — all type resolution goes through the injected `catalog`.
 """
 
@@ -58,6 +62,15 @@ _ITEM_QTY_RE = re.compile(r"^(?P<name>.+?)\s+x(?P<qty>\d+)$")
 _OFFLINE_RE = re.compile(r"\s*/offline\s*$", re.IGNORECASE)
 _MUTATION_REF_RE = re.compile(r"\s*\[\d+\]\s*$")  # trailing mutaplasmid ref, e.g. " [1]"
 _DNA_RE = re.compile(r"^\d+(:[\d;_]*)*::")
+
+# Bounds the fit's fitted modules in total; a DNA stack past it goes to cargo.
+MAX_DNA_MODULE_STACK = 255
+
+
+def _clip(token: str, limit: int = 40) -> str:
+    """Shorten a DNA token echoed in a warning so it stays one readable line."""
+    return token if len(token) <= limit else token[:limit] + "..."
+
 
 # Rack order EFT exporters emit blocks in, used only as a fallback when the
 # catalog has no slot for a module type.
@@ -166,7 +179,14 @@ def parse_eft(text: str, catalog) -> ParseResult:
             item_match = _ITEM_QTY_RE.match(line)
             if item_match:
                 name = item_match.group("name").strip()
-                qty = int(item_match.group("qty"))
+                try:
+                    qty = int(item_match.group("qty"))
+                except ValueError as exc:
+                    # Only a run of digits past int()'s parsing limit (4,300)
+                    # gets here; callers catch FitParseError, not ValueError.
+                    raise FitParseError(
+                        f"Invalid item quantity: {_clip(line)!r}"
+                    ) from exc
                 type_id = catalog.resolve_id(name)
                 if type_id is None:
                     warnings.append(f"Unknown item: {name}")
@@ -268,7 +288,7 @@ def parse_dna(text: str, catalog) -> ParseResult:
             try:
                 qty = int(qty_part)
             except ValueError:
-                warnings.append(f"Invalid DNA quantity: {token!r}")
+                warnings.append(f"Invalid DNA quantity: {_clip(token)!r}")
                 continue
         else:
             # A bare id with no quantity — a T3 subsystem reference.
@@ -285,7 +305,7 @@ def parse_dna(text: str, catalog) -> ParseResult:
         try:
             type_id = int(id_part)
         except ValueError:
-            warnings.append(f"Invalid DNA type id: {token!r}")
+            warnings.append(f"Invalid DNA type id: {_clip(token)!r}")
             continue
 
         name = catalog.resolve_name(type_id) or str(type_id)
@@ -307,6 +327,13 @@ def parse_dna(text: str, catalog) -> ParseResult:
         else:
             # A fitted module — expand the stack into individual instances.
             slot = catalog.slot_of(type_id) or ""
+            if qty > MAX_DNA_MODULE_STACK or len(modules) + qty > MAX_DNA_MODULE_STACK:
+                # No hull fits this many in total; never expand an oversized fit.
+                cargo.append(CargoStack(type_id, name, qty))
+                warnings.append(
+                    f"DNA stack too large to be fitted, kept as cargo: {_clip(token)!r}"
+                )
+                continue
             for _ in range(qty):
                 modules.append(
                     ParsedModule(type_id=type_id, name=name, slot=slot)

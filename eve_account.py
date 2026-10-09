@@ -101,8 +101,11 @@ def parse_launcher_data(cmdline: str) -> int | None:
     # ``isdigit()`` alone rejects "", "-5", "notanumber" but is also True for
     # non-ASCII digits: superscripts like "²" make int() raise, and
     # Arabic-Indic digits silently parse. Require ASCII too so this is an
-    # all-ASCII-decimal string and int() cannot raise.
-    return int(field) if field.isascii() and field.isdigit() else None
+    # all-ASCII-decimal string and int() cannot raise. The length bound closes
+    # int()'s other refusal (more than 4,300 digits): an account id fits in 19.
+    return (int(field)
+            if field.isascii() and field.isdigit() and len(field) <= 19
+            else None)
 
 
 def account_id_for_pid(pid: int, win32) -> int | None:

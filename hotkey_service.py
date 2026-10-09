@@ -183,9 +183,13 @@ def event_to_hotkey(keysym: str, state: int, keycode: "int | None" = None) -> "s
     if key is None:
         if len(keysym) == 1 and keysym.isalpha():
             key = keysym.upper()
-        elif len(keysym) == 1 and keysym.isdigit():
+        # ASCII digits only: isdigit() alone is also True for digit-like
+        # characters (superscript two, other scripts' digits) that are not key
+        # names the hotkey backend can register.
+        elif len(keysym) == 1 and keysym.isascii() and keysym.isdecimal():
             key = keysym
-        elif keysym[0] in "Ff" and keysym[1:].isdigit():   # F1..F24 (range checked below)
+        elif (keysym[0] in "Ff" and keysym[1:].isascii()
+              and keysym[1:].isdecimal()):       # F1..F24 (range checked below)
             key = "F" + keysym[1:]
         elif keysym in _EVENT_KEYSYMS:
             key = _EVENT_KEYSYMS[keysym]

@@ -184,7 +184,11 @@ def _account_id_from_path(path):
     stem = os.path.basename(path)
     if stem.startswith("core_user_") and stem.endswith(".dat"):
         mid = stem[len("core_user_"):-len(".dat")]
-        if mid.isdigit():
+        # isascii() first: isdigit() alone is also True for digit-like
+        # characters int() refuses (same idiom as eve_account's account ids).
+        # An EVE id fits in 19 digits; longer is "no account id", and the
+        # bound keeps int() inside its parsing limit (4,300 digits).
+        if mid.isascii() and mid.isdigit() and len(mid) <= 19:
             return int(mid)
     return None
 

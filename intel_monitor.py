@@ -714,15 +714,38 @@ CAPITAL_SHIP_NAMES = {
 
 # Regex for extracting ship rows from Alliance Auth intel tool HTML tables
 # Matches: <td>ShipName</td> ... <td>Count</td> patterns in table rows
+# The middle cells are matched with a TEMPERED dot, (?:(?!</t[dr]>|<tr\b).)*,
+# so one cell can never run past its own </td>, the row's </tr>, or the next
+# row's <tr (a row that never closes). The lazy `.*?` it replaces could: on
+# rows with no numeric last cell it backtracked across every later cell and
+# row (x8.5 per extra row -- an 8-row, 528-character page did not finish in
+# 20 s), and a row whose count was not a number borrowed the NEXT row's count.
+# Each alternative is pinned by a test; a cell may still hold any other markup.
 _HTML_TABLE_ROW = re.compile(
     r"<tr[^>]*>\s*<td[^>]*>(?:<[^>]+>)*\s*([^<]+?)\s*(?:</[^>]+>)*</td>"
-    r"(?:\s*<td[^>]*>.*?</td>)*?"
+    r"(?:\s*<td[^>]*>(?:(?!</t[dr]>|<tr\b).)*</td>)*?"
     r"\s*<td[^>]*>\s*(\d+)\s*</td>\s*</tr>",
     re.IGNORECASE | re.DOTALL,
 )
 
 # Detect whether text is HTML
 _IS_HTML = re.compile(r"<\s*(?:html|head|body|table|div)\b", re.IGNORECASE)
+
+
+def _dscan_count(text: str) -> "int | None":
+    """A d-scan count cell as an int, or None when it is not a number.
+
+    The cell is third-party page content. ``str.isdigit()`` cannot gate
+    ``int()``: it is True for digit-LIKE characters ``int()`` refuses
+    (superscript two, circled digits). ``isdecimal()`` is exactly the set
+    ``int()`` accepts. More than 9 digits is not a ship count either: the
+    bound keeps ``int()`` inside its parsing limit (4,300 digits) AND keeps
+    the summed total printable -- two 4,300-digit counts add up to a total
+    ``make_dscan_summary`` could not format. A cell that is not a count is
+    skipped like any other non-number row."""
+    if not text.isdecimal() or len(text) > 9:
+        return None
+    return int(text)
 
 
 def parse_dscan_text(text: str) -> dict:
@@ -762,7 +785,9 @@ def parse_dscan_text(text: str) -> dict:
         match = re.match(r"^(.+?)\s{2,}(\d+)$", line)
         if match:
             ship_name = match.group(1).strip()
-            count = int(match.group(2))
+            count = _dscan_count(match.group(2))
+            if count is None:
+                continue
             ships[ship_name] = ships.get(ship_name, 0) + count
             total += count
             if ship_name in CAPITAL_SHIP_NAMES:
@@ -816,8 +841,8 @@ def _parse_dscan_html(html: str) -> dict:
                     # Strip HTML tags from ship name
                     name = re.sub(r"<[^>]+>", "", cells[0]).strip()
                     count_text = re.sub(r"<[^>]+>", "", cells[-1]).strip()
-                    if name and count_text.isdigit():
-                        count = int(count_text)
+                    count = _dscan_count(count_text)
+                    if name and count is not None:
                         ships[name] = ships.get(name, 0) + count
                         total += count
                         if name in CAPITAL_SHIP_NAMES:
@@ -833,8 +858,8 @@ def _parse_dscan_html(html: str) -> dict:
     for row_match in _HTML_TABLE_ROW.finditer(html):
         name = re.sub(r"<[^>]+>", "", row_match.group(1)).strip()
         count_text = row_match.group(2).strip()
-        if name and count_text.isdigit() and not name.startswith("Ship"):
-            count = int(count_text)
+        count = _dscan_count(count_text)
+        if name and count is not None and not name.startswith("Ship"):
             ships[name] = ships.get(name, 0) + count
             total += count
             if name in CAPITAL_SHIP_NAMES:
