@@ -47,6 +47,9 @@ Rules
 * Nothing here takes the application input hold and nothing waits: the two windows it opens
   are built by their own modules (``group_config_ui``, ``palette_ui``), the offer is a frame
   in the main window, and a question goes through the host's own dialog with a parent.
+* Those two modules are imported when a window is first opened, never with this module
+  (``_window_module``, ``_palette_ui``): an ordinary start does not pay for a window
+  nobody opened.
 * The data folder is written only when the user DID something (typed a tag, closed the
   offer, dismissed a mark, applied colours) or a structure check ended. Building the
   section, the offer, the tag line and the marks only reads the feature's own side file -
@@ -70,11 +73,9 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 import group_apply
-import group_config_ui
 import group_state
 import group_verify
 import palette
-import palette_ui
 from app_path import app_dir, app_dir_decision
 from app_version import APP_VERSION
 from group_bundle import MAX_TAG
@@ -96,8 +97,10 @@ STATUS_PENDING = "Import pending - restart to apply."
 TAG_LABEL = "Group tag"
 TAG_HINT = 'shown as "FCTool by ..." at the top left (blank = none)'
 TAG_ENTRY_CHARS = 12
-MSG_INSTALLING = group_config_ui.MSG_INSTALLING
-MSG_PALETTE_LATER = palette_ui.NOTE
+# Two sentences of the window modules, written out: those modules are not imported until
+# a window is opened (see _window_module). A test keeps each equal to its original.
+MSG_INSTALLING = "An update is installing - try again in a moment."    # group_config_ui
+MSG_PALETTE_LATER = "Colours change the next time FCTool starts."      # palette_ui.NOTE
 MSG_PALETTE_FAILED = "The colour palette could not be saved."
 
 # -- the first-run offer -------------------------------------------------------
@@ -114,7 +117,10 @@ ELLIPSIS = chr(0x2026)
 # -- attention -----------------------------------------------------------------
 MARK = chr(0x26A0)                      # the warning sign
 SETTINGS_TAB = "  Settings  "
-SETTINGS_TAB_MARKED = "  " + MARK + " Settings  "
+# The sign takes the place of three of the four blanks: the tab strip is already wider
+# than the smallest window at a large text size, and the mark must not add to that
+# (measured, real styles: +4 px at tk scaling 1.33, +5 px at 1.51; a test holds it to 6).
+SETTINGS_TAB_MARKED = MARK + " Settings "
 SECTION_MARKET = "Market"
 SECTION_TRACKING = "Tracking"
 # The sections an item of a group file can flag (every ``Item.sections`` of the registry;
@@ -280,6 +286,23 @@ def _same_check(queued, task) -> bool:
     current = verify_task(queued)
     return current is not None and isinstance(task, dict) \
         and current.get("structure_id") == task.get("structure_id")
+
+
+# -- the two window modules, on demand -----------------------------------------
+# An ordinary start opens neither window, so neither module is imported with this one:
+# each is imported by the first call that needs it. Everything in this module reaches
+# them through these two functions and nowhere else.
+
+def _window_module():
+    """``group_config_ui`` - the Group configuration window and its ``GroupHost``."""
+    import group_config_ui
+    return group_config_ui
+
+
+def _palette_ui():
+    """``palette_ui`` - the colour palette editor."""
+    import palette_ui
+    return palette_ui
 
 
 # -- small Tk tools ------------------------------------------------------------
@@ -476,12 +499,12 @@ class GroupConfigMixin:
         if self._group_raise(self._palette_window) is not None:
             return
         self._group_track_palette(
-            palette_ui.open_editor(parent, roles, on_done=on_done, mode="draft"))
+            _palette_ui().open_editor(parent, roles, on_done=on_done, mode="draft"))
 
     def _group_host(self):
         """Everything the Group configuration window needs from the app. What can change
         while the window is open is read when the window asks, not now."""
-        return group_config_ui.GroupHost(
+        return _window_module().GroupHost(
             app_dir=self._group_dir(),
             app_version=APP_VERSION,
             flush_config=lambda: self._group_call("_save_config"),
@@ -533,8 +556,9 @@ class GroupConfigMixin:
                 log.warning("group window: the page could not be shown", exc_info=True)
             return win
         try:
-            win = group_config_ui.open_window(getattr(self, "root", None), self._group_host(),
-                                              view=view, report=report, pick=pick)
+            win = _window_module().open_window(getattr(self, "root", None),
+                                               self._group_host(), view=view,
+                                               report=report, pick=pick)
         except Exception:
             log.warning("group window: it could not be opened", exc_info=True)
             return None
@@ -704,9 +728,9 @@ class GroupConfigMixin:
         stored = loaded[0] if isinstance(loaded, tuple) and loaded else None
         roles = dict(stored) if isinstance(stored, dict) else dict(palette.DEFAULT)
         try:
-            win = palette_ui.open_editor(getattr(self, "root", None), roles,
-                                         on_done=self._group_palette_done, mode="local",
-                                         name=palette.preset_name(roles))
+            win = _palette_ui().open_editor(getattr(self, "root", None), roles,
+                                            on_done=self._group_palette_done, mode="local",
+                                            name=palette.preset_name(roles))
         except Exception:
             log.warning("colour palette: the editor could not be opened", exc_info=True)
             return None
