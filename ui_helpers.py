@@ -90,7 +90,7 @@ from __future__ import annotations
 
 import logging
 import tkinter as tk
-from tkinter import colorchooser
+from tkinter import colorchooser, ttk
 
 import ui_theme
 
@@ -1096,3 +1096,36 @@ def make_color_swatch(parent, var, default, *, title, on_change):
     btn.bind("<Button-3>", _reset, add="+")
     btn._fctool_reset = _reset
     return btn
+
+
+#: The small down-arrow the house draws on its dropdown affordances (the
+#: ``Refits`` chips, the map ``drawer`` buttons). Built at runtime so no
+#: non-ASCII character is typed into source.
+ARROW_GLYPH = chr(0x25BE)
+
+
+def make_split_button(parent, text, *, style, command, arrow_command,
+                      arrow_tooltip="", bg=None):
+    """A main ``ttk.Button`` fused flush to a narrow arrow ``ttk.Button``.
+
+    Returns a ``tk.Frame`` carrying ``.main`` (the ``text`` button) and
+    ``.arrow`` (the ``ARROW_GLYPH`` button, width 2). Both use the ttk style
+    NAME ``style``; this helper defines no style and no colours. The two sit
+    side by side with no padding between them. ``arrow_tooltip`` is attached
+    to the arrow with ``attach_tooltip`` when non-empty. The frame's
+    background is ``bg`` when given, else the parent's.
+    """
+    if bg is None:
+        try:
+            bg = parent.cget("bg")
+        except tk.TclError:
+            bg = ui_theme.BG_DARK
+    frame = tk.Frame(parent, bg=bg, bd=0, highlightthickness=0)
+    frame.main = ttk.Button(frame, text=text, style=style, command=command)
+    frame.arrow = ttk.Button(frame, text=ARROW_GLYPH, style=style, width=2,
+                             command=arrow_command)
+    frame.main.pack(side="left", padx=0, pady=0)
+    frame.arrow.pack(side="left", padx=0, pady=0)
+    if arrow_tooltip:
+        attach_tooltip(frame.arrow, str(arrow_tooltip))
+    return frame
