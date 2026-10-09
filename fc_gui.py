@@ -44,6 +44,13 @@ if sys.platform == "win32":
     else:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# Group configuration boot hook (group_boot.py): applies a staged group import,
+# then installs the colour palette onto ui_theme. It MUST stay above the first
+# application import -- everything below binds ui_theme colours by value.
+import group_boot
+if __name__ == "__main__":
+    group_boot.run()
+
 import chat_monitor
 import intel_filter
 import intel_monitor
@@ -360,6 +367,9 @@ from app_version import APP_VERSION
 # main(). Neither module imports fc_gui.
 import self_update
 from update_dialog import UpdateDialog
+# Plain restart (group configuration, colour palette): start the SAME program
+# again after a clean close. Not the updater -- no marker, no watchdog.
+import app_restart
 
 # ── Main-thread UI dispatcher ──────────────────────────────────────────────────
 # How often (ms) FCToolGUI._drain_ui_q re-arms itself to apply queued worker->UI
@@ -1328,6 +1338,12 @@ class FCToolGUI:
         # entering live mode; without this each does its own ESI round-trip.
         # (ts_monotonic, info_dict_or_None); see _cached_fleet_info.
         self._fleet_info_cache = None
+        # Group configuration: the boot hook (top of this file) ran before any
+        # logger existed -- take its report and write the lines it kept.
+        self._plain_restart_after_close = False   # main() reads this after mainloop
+        self._group_boot_report = group_boot.take_report()
+        for _boot_line in group_boot.log_lines():
+            log.info("%s", _boot_line)
         self.config = self._load_config()
         # One-time migration of the config-driven intel filter + coalition seed
         # (synchronous part; the Triumvirate. id is resolved off-thread later,
@@ -2539,6 +2555,14 @@ class FCToolGUI:
             self.config["coalitions"] = intel_filter.build_default_coalitions()
             self._coalitions_need_triumvirate = True
             changed = True
+        # A group import applied at THIS start seeded the block (boot flag): the
+        # Triumvirate. follow-up is still owed -- but only while "The
+        # Initiative." is the app's own seed. The flag can be set while the
+        # GROUP's definition is stored; the follow-up must not add to that.
+        elif (group_boot.boot_flag("coalitions_seeded")
+              and self.config["coalitions"].get("The Initiative.")
+              == intel_filter.build_default_coalitions()["The Initiative."]):
+            self._coalitions_need_triumvirate = True
 
         if "intel_filter" not in self.config or not isinstance(
             self.config.get("intel_filter"), dict
@@ -3993,6 +4017,31 @@ class FCToolGUI:
         """
         self._relaunch_after_close = True
         self._on_close()
+
+    def _restart_app(self) -> bool:
+        """Plain restart: save, close normally, then main() starts FCTool again.
+
+        For changes that are only read at start-up (a staged group import, a
+        colour palette). It never competes with the updater: while an update
+        is installing it refuses (False); once one is ready, the updater's own
+        restart is the one that runs. Returns True when the window is closing.
+        """
+        self._save_config()
+        state = getattr(self, "_update_install_state", "idle")
+        if state == "installing":
+            return False
+        if state == "ready":
+            self._request_restart()
+            return True
+        self._plain_restart_after_close = True
+        try:
+            self._on_close()
+        except Exception:
+            # The window is still open: a later, ordinary close must not
+            # start FCTool again.
+            self._plain_restart_after_close = False
+            raise
+        return True
 
     def _set_update_status(self, text):
         """Write one line under the Settings update checkbox, if it is built."""
@@ -14166,6 +14215,14 @@ class FCToolGUI:
         self._motd_last_check_ts = None
         self._motd_last_pushed_markup = None
         self._motd_link_state = "off"
+        # A group import applied at this start added or changed MOTD templates
+        # (boot flag): a remembered ON starts OFF. SESSION ONLY, like the
+        # automatic disarms in _motd_maybe_autopush -- the remembered
+        # config["fittings"]["motd_link"] is not written; re-ticking resumes.
+        # A remembered OFF is left exactly as it is: no state, no notice.
+        if self._motd_link_enabled and group_boot.boot_flag("motd_disarm"):
+            self._motd_link_enabled = False
+            self._motd_link_state = "group_import"
 
         # ── Master split: composer (left) | preview (right) ──────────────────
         body = tk.Frame(tab, bg=BG_DARK)
@@ -14413,9 +14470,12 @@ class FCToolGUI:
             "Auto-update MOTD to resume). Your remembered on/off choice is "
             "left alone, so restarting FCTool resumes it too. Does nothing if "
             "no staging system is set.")
+        # wraplength: only the group-import notice is longer than 30 characters;
+        # it wraps instead of widening the row past the pane (898 px on one line).
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
-            bg=BG_PANEL, cursor="question_arrow")
+            bg=BG_PANEL, cursor="question_arrow", justify=tk.LEFT,
+            wraplength=tkfont.Font(root=link_row, font=("Consolas", 8)).measure("0" * 30))
         self._motd_link_indicator.pack(side=tk.LEFT, padx=2)
         _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
                      "and re-pushes it to your fleet whenever the composition/"
@@ -17011,6 +17071,10 @@ class FCToolGUI:
             return
         if state == "error":
             ind.config(text="○ link dropped (push failed)", fg=FG_RED)
+            return
+        if state == "group_import":
+            ind.config(text="Auto-update is off for this session: a group file "
+                            "added MOTD templates.", fg=FG_YELLOW)
             return
         if not getattr(self, "_motd_link_enabled", False):
             ind.config(text="○ not linked", fg=FG_DIM)
@@ -39631,6 +39695,14 @@ def main():
                                                app._update_staging_dir())
             except Exception:
                 pass                # we are on the way out either way
+        elif (app is not None and code == 0
+                and getattr(app, "_plain_restart_after_close", False)):
+            # Plain restart (_restart_app): the window closed normally, so start
+            # the same program once more. Never after a crash (restart loop).
+            try:
+                app_restart.relaunch()
+            except Exception:
+                pass
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
