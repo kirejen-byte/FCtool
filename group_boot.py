@@ -21,7 +21,7 @@ that has read a colour from ``ui_theme``. It does three things, in this order:
    that session, a staged import kept and applied at the next start.
 2. **The staged import.** Only when the pending or the applying file is there:
    ``group_apply.apply_pending(folder)``. Everything that boots afterwards reads files that
-   already hold the import. (One start can spend seconds here when another FCTool is still
+   already hold the import. (One start can spend up to a minute here when another FCTool is still
    closing, or is applying the same import - ``apply_pending`` waits for it.)
 
    One process is never waited for, and no staged work is begun while it lives: the

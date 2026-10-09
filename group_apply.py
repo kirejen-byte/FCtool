@@ -187,6 +187,9 @@ _STORED_KEEP = (50, 10, 0)              # _kept: entries of one list, the first 
 _STORED_BYTES = 64 * 1024               # ...this many bytes of JSON for one stored report
 _STORED_CLIP = 500                      # characters of one stored name or line
 _UNLISTED = ("attention", "tasks")      # _kept: lists of an item that hold no text
+_STATE_NAMES = tuple(FILE_NAMES.values())       # the files a record can be about (_held)
+_BACKUP_CLIP = 64                       # ...and how long a backup's name in it may be
+_TAG_LOG = 40                           # entries of the tag's history kept (_log_tag)
 _DEFAULT_WAIT = group_state.wait_for_exit       # apply_pending's own `wait` (_writer_gone)
 _CONTINUE = object()                    # _resume: the leftover is gone, go on with step 2
 _AGAIN = object()                       # _apply_locked: give the lock up and look again
@@ -675,7 +678,10 @@ def set_tag(app_dir, tag) -> str:
         seen.append(_side_tag(side))
         if seen[0] == cleaned and (cleaned or "tag" not in side):
             return False
+        held = _held(side)              # a tag typed by hand goes into the tag's history:
+        events = _tag_events(side, held)        # a later restore leaves it alone (_restore)
         _store_tag(side, cleaned)
+        _log_tag(side, events, _live(side, held), cleaned)
 
     if _edit_side(app_dir, change, same=True, busy=busy):
         return cleaned
@@ -875,9 +881,9 @@ def _unrestored(app_dir, protocol, kind, meta, backup, why, outcome, missing, *,
             or not isinstance(protocol, dict):
         change = None
         if outcome != "gone" and kind == "import" and backup:
-            def change(side, kept):     # the tag was never touched
-                side["imports"] = (side["imports"]
-                                   + [_entry(kept, tag="", tag_before="")])[-HISTORY_KEEP:]
+            def change(side, kept):     # the tag was never touched; `under`: what every
+                side["imports"] = (side["imports"] + [_entry(     # file holds - see _held
+                    kept, tag="", tag_before="", under=_held(side))])[-HISTORY_KEEP:]
         return _finish(app_dir, report, token=_token(protocol), side=side, change=change)
     kept = dict(protocol)
     kept["restore_attempts"] = tried
@@ -1237,8 +1243,8 @@ def _record_damaged(app_dir, side) -> dict:
         report = _report("failed", "import", _MSG_RECORD_DAMAGED, backup=newest)
 
         def change(side, kept):
-            side["imports"] = (side["imports"]
-                               + [_entry(kept, tag="", tag_before="")])[-HISTORY_KEEP:]
+            side["imports"] = (side["imports"] + [_entry(
+                kept, tag="", tag_before="", under=_held(side))])[-HISTORY_KEEP:]
 
     report = _finish(app_dir, report, side=side, change=change)
     if report["log"]:                   # it is still there: the report must not hide that
@@ -1270,71 +1276,148 @@ def _set_the_tag(entry) -> bool:
         for item in (listed if isinstance(listed, list) else ()))
 
 
-def _same_import(entry, applied) -> bool:
-    """Is history ``entry`` the import that ``applied`` (``_applied``'s keys) names?"""
-    bundle = entry.get("bundle")
-    bundle = _meta_dict(bundle) if isinstance(bundle, dict) else _no_meta()
-    return entry.get("status") == "applied" \
-        and (bundle["name"], bundle["revision"]) == (applied["name"], applied["revision"]) \
-        and (not applied["at"] or _text(entry.get("at")) == applied["at"])
+# -- the record: what each file holds, and who set the tag --------------------------------
+#
+# Which imports are in effect after a restore is RECORDED, never worked out afterwards:
+#
+# * ``side["on_disk"]`` - state file name -> the backups of the imports whose change that
+#   file holds, oldest first (a backup's name stands for its import);
+# * ``entry["under"]`` - in the history entry of an import: for each file it changed, that
+#   list as it was just before (for a ``failed`` entry: of every file - which files its
+#   backup holds is not known where it is written);
+# * ``side["tag_log"]`` - the tag's history, oldest first: ``{"tag", "by"}``, ``by`` the
+#   backup of the import that set it, ``""`` for a tag typed by hand (or set by an import
+#   that changed no file).
+#
+# An import pushes its backup onto the lists of the files it changed; a restore puts
+# ``under`` back for the files its backup held. An import is IN EFFECT while one of the
+# files it changed still holds its change: the ``restored`` marks, the import "in use"
+# (the newest in effect) and the tag (the last entry of the log that counts: typed by
+# hand, or set by an import in effect) all follow from that - in any order of restores,
+# with any number of imports. An import that changed no file is never "restored".
+#
+# A side file an earlier build wrote has none of the three, and it keeps working: an import
+# without ``under`` is marked restored when its OWN backup is put back and not otherwise;
+# the files that backup put back count as holding no recorded change from then on (they are
+# as they were before any record began); and the tag's history is read out of the history
+# entries (``tag`` / ``tag_before``), an import counting while it is not marked restored.
+# Every new import and restore records, so such a file grows into a recorded one.
+
+def _held(side) -> dict:
+    """``side["on_disk"]``, cleaned: state file name -> backups, oldest first (the newest
+    ``HISTORY_KEEP`` of them). Total: only the five file names, only short text."""
+    stored, held = side.get("on_disk"), {}
+    for name in _STATE_NAMES if isinstance(stored, dict) else ():
+        stack = stored.get(name)
+        if isinstance(stack, list):
+            held[name] = [backup for backup in stack
+                          if isinstance(backup, str) and 0 < len(backup) <= _BACKUP_CLIP
+                          ][-HISTORY_KEEP:]
+    return held
 
 
-def _take_back(side, entry, files, changed, stamp) -> list:
-    """The backup of history ``entry`` was put back - ``files`` are as they were just
-    before that import. Mark in the history what that did, and return the entries that are
-    no longer in effect (``entry`` first, then newer ones, oldest first):
-
-    * ``entry`` itself is ``restored``;
-    * so is every LATER import all of whose changed files (``changed``: backup name ->
-      the file names that backup holds) are among ``files``: its changes went with them. A
-      later import that changed any other file is still in effect - its backup is not the
-      one that was put back;
-    * and the other way round: the import that was in effect just before ``entry``
-      (``applied_before``) and was restored SINCE - its backup went back earlier, this one
-      is newer - is in effect AGAIN when one of its files is among ``files``: what was put
-      back now is the file as that import left it. Its ``restored`` mark goes, and its
-      tag comes back if the tag in use is still the one from before it."""
-    listed = side["imports"]
-    place = next((index for index, old in enumerate(listed) if old is entry), len(listed))
-    entry["restored"] = stamp
-    undone = [entry]
-    for later in listed[place + 1:]:
-        held = changed.get(later.get("backup")) if isinstance(later.get("backup"), str) \
-            else None
-        if later.get("status") == "applied" and not later.get("restored") and held \
-                and set(held) <= set(files):
-            later["restored"] = stamp
-            undone.append(later)
-    before = _applied(entry.get("applied_before"))
-    for earlier in reversed(listed[:place]) if before is not None else ():
-        if earlier.get("restored") and _same_import(earlier, before):
-            held = changed.get(earlier.get("backup")) \
-                if isinstance(earlier.get("backup"), str) else None
-            if held and not set(held).isdisjoint(files):
-                del earlier["restored"]
-                if _set_the_tag(earlier) \
-                        and _side_tag(side) == _tag(earlier.get("tag_before")):
-                    _store_tag(side, _tag(earlier.get("tag")))
-            break
-    return undone
+def _on_disk(entry, held):
+    """Does one of the files the import of ``entry`` changed still hold its change?
+    ``None`` for an entry that does not say which files it changed: an import that changed
+    none (a tag alone), an entry of an earlier build."""
+    under, backup = entry.get("under"), entry.get("backup")
+    if not isinstance(under, dict) or not under or not (isinstance(backup, str) and backup):
+        return None
+    return any(backup in held.get(name, ()) for name in under if isinstance(name, str))
 
 
-def _tag_before(side, entry) -> str:
-    """The tag to put back when the import of ``entry`` is taken back and its own tag is
-    still in use: the one from before it (``tag_before``) - unless THAT one was set by an
-    import that is itself restored by now; then the one from before that import, and so
-    on. A tag that was typed by hand in between is nobody's to take back: it stays."""
-    tag, walked = _tag(entry.get("tag_before")), [entry]
-    while tag:
-        setter = next((old for old in reversed(side["imports"])
-                       if old.get("restored") and _set_the_tag(old)
-                       and _tag(old.get("tag")) == tag
-                       and not any(old is seen for seen in walked)), None)
-        if setter is None:
-            break
-        walked.append(setter)
-        tag = _tag(setter.get("tag_before"))
+def _live(side, held) -> set:
+    """The backups of the imports in effect: those a file's record holds, and those of the
+    applied history entries that are not marked restored (an entry without a record has
+    only its mark to go by)."""
+    live = {backup for stack in held.values() for backup in stack}
+    for entry in side["imports"]:
+        backup = entry.get("backup")
+        if entry.get("status") == "applied" and not entry.get("restored") \
+                and isinstance(backup, str) and backup:
+            live.add(backup)
+    return live
+
+
+def _tag_of(events, live) -> str:
+    """The tag a log says is in use: that of its last entry that counts."""
+    tag = ""
+    for event in events:
+        if not event["by"] or event["by"] in live:
+            tag = event["tag"]
     return tag
+
+
+def _tag_events(side, held) -> list:
+    """The tag's history as ``[{"tag", "by"}, ...]`` - ``side["tag_log"]``, cleaned; for a
+    side file without one, read out of the history entries: before every import that set
+    the tag, the tag it found when no entry before it explains that one, then its own.
+
+    And always true to the tag that IS in use: when the log does not arrive at it - it was
+    changed where nothing is logged - that tag is the newest entry, as typed by hand."""
+    stored = side.get("tag_log")
+    if isinstance(stored, list):
+        events = [{"tag": _tag(event.get("tag")),
+                   "by": event["by"] if isinstance(event.get("by"), str) else ""}
+                  for event in stored[-_TAG_LOG:] if isinstance(event, dict)]
+    else:
+        events, last = [], ""
+        for entry in side["imports"]:
+            if _set_the_tag(entry):
+                before, backup = _tag(entry.get("tag_before")), entry.get("backup")
+                if before != last:
+                    events.append({"tag": before, "by": ""})
+                last = _tag(entry.get("tag"))
+                events.append({"tag": last, "by": backup if isinstance(backup, str) else ""})
+    current = _side_tag(side)
+    if _tag_of(events, _live(side, held)) != current:
+        events.append({"tag": current, "by": ""})
+    return events
+
+
+def _log_tag(side, events, live, tag=None, by="") -> None:
+    """Store the tag's history - with one more entry, when ``tag`` is given: set by the
+    import whose backup is ``by``, or typed by hand. A tag typed over a typed one replaces
+    it; a log longer than ``_TAG_LOG`` loses its oldest entries to ONE that says what they
+    come to (with the imports in effect now)."""
+    if tag is not None:
+        if not by and events and not events[-1]["by"]:
+            events.pop()
+        events.append({"tag": tag, "by": by})
+    spare = len(events) - _TAG_LOG
+    if spare > 0:
+        events[:spare + 1] = [{"tag": _tag_of(events[:spare + 1], live), "by": ""}]
+    side["tag_log"] = events
+
+
+def _take_back(side, entry, files, stamp) -> list:
+    """The backup of history ``entry`` was put back - ``files`` are as they were just
+    before that import (``entry`` is ``None`` for a backup the history does not know).
+    Each of them holds again what was under that import (``under``; nothing recorded, for
+    an entry that does not say), and every applied import is ``restored`` or not by whether
+    a file still holds its change - ALL of them, earlier and later ones: one that went with
+    its last file is marked, one whose change is back in a file is un-marked. An entry
+    without a record keeps the mark it has; ``entry`` itself is marked whatever it says.
+    -> the entries that were in effect and are not any more, oldest first."""
+    listed = [old for old in side["imports"] if old.get("status") == "applied"]
+    was = {id(old) for old in listed if not old.get("restored")}
+    held = _held(side)
+    under = entry.get("under") if entry is not None else None
+    for name in files:
+        stack = under.get(name) if isinstance(under, dict) else None
+        if name in _STATE_NAMES:
+            held[name] = [backup for backup in stack if isinstance(backup, str)
+                          ][-HISTORY_KEEP:] if isinstance(stack, list) else []
+    side["on_disk"] = held
+    for old in listed:
+        there = _on_disk(old, held)
+        if there:
+            old.pop("restored", None)
+        elif there is False and not old.get("restored"):
+            old["restored"] = stamp
+    if entry is not None:
+        entry["restored"] = stamp
+    return [old for old in listed if id(old) in was and old.get("restored")]
 
 
 def _newest_in_effect(side):
@@ -1347,20 +1430,24 @@ def _newest_in_effect(side):
 
 
 def _restore(app_dir, protocol, txn, side) -> dict:
-    """Step 5: put a backup back - and take back what the import that made it left in the
-    side file (``_take_back`` has the rules for the history):
+    """Step 5: put a backup back - and bring the side file's bookkeeping in line with what
+    the files hold now. All of it follows from the RECORD (the comment above ``_held``):
 
-    * what is in effect (``applied``, read by ``applied_bundle``) is, afterwards, the
-      newest applied import of the history that is not restored - nothing, when there is
-      none. A backup holds the files ITS import changed, so restoring an older one takes a
-      later import along only when that one changed nothing else;
-    * the tag - for each import that is no longer in effect now: when it SET the tag and
-      the tag in use is still the one it set, the tag from before it goes back
-      (``_tag_before``). A tag that was typed by hand afterwards, or set by an import that
-      is still in effect, stays;
-    * and, when ``config.json`` is among the restored files, the attention flags those
-      imports raised and every ``verify_structure`` task (that worker would write the
-      group's structure into the settings the user just took back).
+    * the record of each restored file is what was under that import; every applied
+      import is ``restored`` or not by whether a file still holds its change
+      (``_take_back``). So a later import goes along when its last file went back, an
+      earlier one comes back when a file holds its change again, and two restores add up;
+    * what is in effect (``applied``, read by ``applied_bundle``) is the newest applied
+      import of the history that is not restored - nothing, when there is none;
+    * the tag is the one of the newest entry of the tag's history that counts: typed by
+      hand, or set by an import that is in effect. So a tag goes back only with the import
+      that set it - not because another import, one that is still in effect, set the same
+      text - and a tag that was typed by hand after it stays;
+    * and, when ``config.json`` is among the restored files, the attention flags of the
+      imports that are no longer in effect and every ``verify_structure`` task (that
+      worker would write the group's structure into the settings the user just took back).
+
+    An import that changed no file - a tag alone - has no backup and is never restored.
 
     A backup that is damaged (``_put_back``) is not restored in part: nothing is changed,
     and the report says so."""
@@ -1387,22 +1474,20 @@ def _restore(app_dir, protocol, txn, side) -> dict:
                            outcome, missing, side=side)
     txn.update(committed=True, backup=name)
     report = _report("restored", "restore", _MSG_RESTORED, meta=meta, backup=name)
-    # Which files each import changed: the files its backup holds (one listing, made here).
-    changed = {backup.get("name"): [held["name"] for held in backup["files"]]
-               for backup in _quiet(group_state.list_backups, app_dir, default=None) or ()}
 
     def change(side, _kept):
         config_back = _CONFIG_FILE in files
         if config_back:
             side["tasks"] = [task for task in side["tasks"] if task.get("kind") != VERIFY_TASK]
-        if entry is None:
-            return
-        undone = _take_back(side, entry, files, changed, report["at"])
+        events = _tag_events(side, _held(side))     # the tag's history, as it is BEFORE
+        went = _take_back(side, entry, files, report["at"])
+        live = _live(side, side["on_disk"])
         side["applied"] = _newest_in_effect(side)
-        for old in reversed(undone):                # the newest first
-            if _set_the_tag(old) and _side_tag(side) == _tag(old.get("tag")):
-                _store_tag(side, _tag_before(side, old))
-        added = set().union(*map(_added_attention, undone)) if config_back else ()
+        _store_tag(side, _tag_of(events, live))
+        _log_tag(side, events, live)
+        if entry is not None and not any(old is entry for old in went):
+            went.append(entry)                      # a failed one, or one long restored
+        added = set().union(*map(_added_attention, went)) if config_back else ()
         if added:
             side["attention"] = [flag for flag in _merge_attention(side["attention"], ())
                                  if (flag["section"], flag["item_id"]) not in added]
@@ -1529,15 +1614,24 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
     def change(side, kept):
         side["attention"] = _merge_attention(side["attention"], new_attention)
         side["tasks"] = _merge_tasks(side["tasks"], new_tasks)
-        # What was in effect before this import goes into its entry (like `tag_before`): a
-        # restore of its backup puts that back.
+        # The record (the comment above `_held`): what each file this import changed held
+        # before goes into its entry, its backup onto those files' lists, and the tag it
+        # set into the tag's history. A restore - of this backup or any other - goes by it.
+        held = _held(side)
+        events = _tag_events(side, held)            # ...as it is BEFORE this import
+        under = {FILE_NAMES[key]: list(held.get(FILE_NAMES[key], ())) for key in changed} \
+            if backup else {}
+        for name, stack in under.items():
+            held[name] = (stack + [backup])[-HISTORY_KEEP:]
+        side["on_disk"] = held
         entry = _entry(kept, tag=file_tag, tag_before=tag_before,
-                       applied_before=_applied_now(side))
+                       applied_before=_applied_now(side), under=under)
         side["imports"] = (side["imports"] + [entry])[-HISTORY_KEEP:]
         side["applied"] = {"name": meta["name"], "revision": meta["revision"],
                            "tag": file_tag, "at": _text(kept.get("at"))}
         if new_tag is not None:
             _store_tag(side, new_tag)
+        _log_tag(side, events, _live(side, held), new_tag, backup)
 
     if _remember(app_dir, report, token=token, side=side, change=change):
         txn["recorded"] = True          # new files AND their record: nothing takes it back
@@ -1703,8 +1797,11 @@ def history(app_dir) -> list:
     side file kept of the import's report (``_kept``: long lists end in ``"and <n> more"``)
     without ``seen``, plus ``tag`` (the file's tag), ``tag_before``, ``applied_before``
     (what was in effect before that import - ``applied_bundle``'s keys and ``at``, when it
-    had been applied - or ``None``) and - once its backup was restored - ``restored``
-    (when).
+    had been applied - or ``None``; kept for the record, no restore goes by it), ``under``
+    (per file the import changed, what that file held before - the record a restore DOES
+    go by, see ``_held``) and ``restored`` (when) - while no file holds that import's
+    change: its own backup was put back, or another one's that took its last file along.
+    The mark goes again when a later restore brings its change back.
 
     Entries with the status ``failed`` are imports whose files may be a mix - one that could
     not be put back after ``RESTORE_ATTEMPTS`` starts, one whose backup or recovery record
@@ -1743,7 +1840,8 @@ def _applied_now(side):
     applied = _applied(side["applied"])
     if applied is not None and not applied["at"]:
         for entry in map(_history_entry, reversed(side["imports"])):
-            if _same_import(entry, applied):
+            if entry["status"] == "applied" and (applied["name"], applied["revision"]) \
+                    == (entry["bundle"]["name"], entry["bundle"]["revision"]):
                 applied["at"] = entry["at"]
                 break
     return applied
@@ -1770,9 +1868,9 @@ def _side_applied(side):
 def applied_bundle(app_dir):
     """``{"name", "revision", "tag"}`` of the import that is in effect, or ``None``: the
     import applied last - or, after a restore, the newest applied import of the history
-    that is not restored. A backup holds only the files its import changed: restoring an
-    OLDER backup takes a later import with it when every file that one changed is among
-    them, and leaves it in effect when it changed anything else (``_take_back``)."""
+    that is not restored. An import is in effect - not restored - while one of the files it
+    changed still holds its change; which file holds what is recorded with every import
+    and every restore (``_held``, ``_take_back``), so that holds for any order of restores."""
     side = _quiet(group_state.read_sidecar, app_dir)
     return _quiet(_side_applied, side) if isinstance(side, dict) else None
 
