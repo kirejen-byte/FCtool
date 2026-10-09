@@ -17,8 +17,9 @@ reaches exactly these names inside the ``app_dir`` it is handed (spec 6.7 and 7.
 
 Nothing else is ever opened: no sign-in file, no character map, no cache, no monitor state.
 Backup manifests and the pending file are data anyone can edit, so a manifest can only ever
-name one of the five state files (its ``name`` field is ignored, the file name comes from the
-key) and a backup name can only ever be a folder this module could have created.
+name one of the five state files (the file name comes from the key; a ``name`` field that
+says anything else makes the manifest unusable) and a backup name can only ever be a folder
+this module could have created.
 
 Who raises what
 ---------------
@@ -33,7 +34,9 @@ job says so, because carrying on in silence would lose settings:
   ``cancel_pending`` while the apply lock is held elsewhere: nothing was staged, nothing
   cancelled;
 * ``ValueError`` - a programming error: a value that is no file content, an unknown file key;
-* ``FileNotFoundError`` - ``restore_backup`` for a backup without a usable manifest;
+* ``FileNotFoundError`` - ``restore_backup`` for a backup that is not there; its subclass
+  ``BackupDamagedError`` for one whose manifest is there and not usable (see "A manifest is
+  usable whole, or not at all");
 * ``StateBusyError`` (``.file``) - the file is THERE and could not be opened right now:
   ``restore_backup`` for the manifest, ``read_sidecar(strict=True)`` for the side file.
 
@@ -63,10 +66,22 @@ what a retry a moment later reads fine. A file that turns up between a failed op
 look whether it exists (a stage landing at that instant) is tried again as well, never called
 damaged; and so is one that could not be read for want of memory - that passes, too.
 
-A manifest and the side file are not read beyond ``MAX_SMALL_FILE_BYTES``. The pending and
+A manifest and the side file are not read beyond ``MAX_SMALL_FILE_BYTES`` - and the side
+file is not WRITTEN beyond it either (``write_sidecar`` answers ``False`` and leaves the
+file that is there): what was written can always be read back. The pending and
 the applying file hold a whole group file and have ``MAX_PENDING_BYTES``; they are written
 compact, and work that would not fit is refused when it is staged (``StateTooBigError``) -
 not staged and then called damaged at the next start.
+
+A manifest is usable whole, or not at all
+-----------------------------------------
+A manifest is a file anyone can edit, and a restore of PART of one is a mix of two states
+that would be reported as complete. So one entry that is not exactly what ``make_backup``
+writes - no dict, a key that is none of the five files or is listed twice, a ``name`` that
+is not that key's file, an ``existed`` that is no boolean, a copied file without its
+sha256 - makes the whole manifest unusable; so does an empty file list, and so does a copy
+of a state file in the backup folder that the manifest does not vouch for. Such a backup is
+not listed, and ``restore_backup`` raises ``BackupDamagedError`` before it touches anything.
 
 One applier at a time
 ---------------------
@@ -75,6 +90,9 @@ A rename is no mutual exclusion on Windows: two processes started within a milli
 yields ``True`` when this thread of this process holds the lock of that folder and ``False``
 when another process or thread does. It never raises and never waits; it is re-entrant; on
 Windows it is a named mutex, which the system releases when its owner dies (no stale lock).
+The mutex lives in the ``Local\\`` namespace: it is one lock per folder for the processes of
+ONE logon session, not for the whole machine - an FCTool that another signed-in user (or a
+service) runs on the same folder does not see it.
 ``claim_pending`` takes it itself around the rename, returns ``None`` when it is held
 elsewhere, and never replaces an applying file that is already there. A caller that applies
 should hold ``apply_lock`` for the whole apply and treat ``False`` as "another FCTool is at
@@ -106,6 +124,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -139,8 +158,9 @@ MAX_PENDING_BYTES = 2 * MAX_FILE_BYTES + 65536
 POLL_S = 0.25               # wait_for_exit
 DEFAULT_WAIT_S = 8.0
 
-_READ_ATTEMPTS = 3          # a refused open of a state file (not a missing file)
-_READ_DELAY_S = 0.1
+_READ_ATTEMPTS = 3          # a refused open of a state file (not a missing file), when it
+_READ_DELAY_S = 0.1         # is only READ - the backup's copy of it has the writers' budget
+_LOCK_PID_CHARS = 10        # a pid in the lock file: at most 2**32 - 1
 _MAX_WAIT_S = 300.0
 _MAX_SAME_SECOND = 1000
 _MAX_SUFFIX = 999999        # what _BACKUP_NAME can still read back
@@ -155,8 +175,12 @@ _TEMP_STALE_S = 3600.0      # a temp sibling this old belongs to no write that s
 _EXTENDED = "\\\\?\\"         # the prefix of an extended-length Windows path
 _NO_NAME_CHARS = frozenset('*?"<>|:')   # no Windows file name holds one of these
 _MSG_APPLYING = "an import is being applied - try again in a moment"
+_MSG_NO_NAME = "too many backups share one name - remove the newest folder in backups"
 
-_BACKUP_NAME = re.compile(re.escape(BACKUP_PREFIX) + r"(\d{8}-\d{6})(?:-(\d{1,6}))?")
+# ASCII digits only: a folder named with other digits is not one this module made, and its
+# "time" must never be handed on to a new backup's name.
+_BACKUP_NAME = re.compile(re.escape(BACKUP_PREFIX)
+                          + r"([0-9]{8}-[0-9]{6})(?:-([0-9]{1,6}))?")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 # What a killed write of one of this module's files leaves beside it: the five state files
 # (a restore here, and the app's own writer, name their temp files alike), the pending and
@@ -214,6 +238,12 @@ class StateBusyError(Exception):
     def __init__(self, file):
         super().__init__("%s is in use" % (file,))
         self.file = file
+
+
+class BackupDamagedError(FileNotFoundError):
+    """The backup's folder and its manifest are there, and the manifest is not usable: it
+    was read and does not parse, or one of its entries is not what ``make_backup`` writes
+    (this build's, at least). Nothing was touched, and trying again will not help."""
 
 
 # -- paths and raw reads -----------------------------------------------------
@@ -310,11 +340,12 @@ def _read_json(path, sleep, **budget):
         return UNREADABLE
 
 
-def _read_small(path, sleep, limit=None):
+def _read_small(path, sleep, limit=None, encoding="utf-8"):
     """``_read_json`` for the four small files: the writers' retry budget, and a size cap
     (``MAX_SMALL_FILE_BYTES`` unless ``limit`` says otherwise)."""
     return _read_json(path, sleep, attempts=WRITE_ATTEMPTS, delay=WRITE_DELAY_S,
-                      limit=MAX_SMALL_FILE_BYTES if limit is None else limit)
+                      limit=MAX_SMALL_FILE_BYTES if limit is None else limit,
+                      encoding=encoding)
 
 
 def _digest(path) -> str:
@@ -389,7 +420,9 @@ def _remove_retrying(path, sleep) -> bool:
     return False
 
 
-def _replace_retrying(source, target, sleep) -> bool:
+def _replace_retrying(source, target, sleep, hopeless=None) -> bool:
+    """``os.replace``, tried again while it is refused. ``hopeless()`` is asked once, after
+    the first refusal: True ends it there, without a wait."""
     for attempt in range(WRITE_ATTEMPTS):
         try:
             os.replace(source, target)
@@ -397,8 +430,26 @@ def _replace_retrying(source, target, sleep) -> bool:
         except FileNotFoundError:
             return False
         except OSError:
+            if attempt == 0 and hopeless is not None and hopeless():
+                return False
             if attempt < WRITE_ATTEMPTS - 1:
                 sleep(WRITE_DELAY_S)
+    return False
+
+
+def _refuses_writes(root) -> bool:
+    """Whether the folder refuses even a NEW file (access denied) - a folder this process
+    may not write to at all, not a file that something holds for a moment. Asked with a
+    temp sibling of the applying file, which is removed again."""
+    probe = os.path.join(root, "%s.%d.%d.tmp" % (APPLYING_FILE, os.getpid(),
+                                                 next(_TMP_COUNTER)))
+    try:
+        os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    _remove_quiet(probe)
     return False
 
 
@@ -491,9 +542,16 @@ def _default_config() -> dict:
     return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
-def load_state(app_dir, *, sleep=time.sleep) -> State:
+def load_state(app_dir, *, sleep=time.sleep, busy_out=None) -> State:
     """Read the five files. ``config.json`` missing -> the app's defaults; a missing side file
-    -> ``None``; anything that exists and is not a readable JSON object -> ``UNREADABLE``."""
+    -> ``None``; anything that exists and is not a readable JSON object -> ``UNREADABLE``.
+
+    ``busy_out``: a list, or nothing. To it are appended the keys (``"config"``,
+    ``"fittings"``, ``"templates"``, ``"infra"``, ``"palette"``) of the files that are THERE
+    and could not be opened or taken in within the retry budget - held open by another
+    program, or no memory for them right now. Their value is ``UNREADABLE`` like that of a
+    damaged file, but the condition passes: a caller can try again later instead of giving
+    up. A file that opens and does not parse is not among them."""
     values = {}
     for key, name in FILE_NAMES.items():
         try:
@@ -502,6 +560,8 @@ def load_state(app_dir, *, sleep=time.sleep) -> State:
                                encoding="utf-8-sig" if key == "palette" else "utf-8")
         except ValueError:                      # app_dir is no path: nothing may be written
             value = UNREADABLE
+        if value is _BUSY and isinstance(busy_out, list):
+            busy_out.append(key)
         if value is _MISSING:
             value = _default_config() if key == "config" else None
         elif not isinstance(value, dict):
@@ -609,16 +669,18 @@ def _backup_keys(keys) -> list:
     return wanted
 
 
-def _new_backup_folder(root, moment, last_by_name=False):
-    """Create and return ``(name, path)`` of a fresh backup folder; a taken name gets -2, -3.
+def _new_backup_folder(root, moment):
+    """Create and return ``(name, path)`` of a fresh backup folder.
 
-    The suffix only ever grows within one second: a lower one that a prune freed is not
-    handed out again, or the newest backup would sort as the oldest and be pruned next. The
-    data folder itself is never created here - a backup of a folder that is not there is a
-    mistake, not a first run.
+    The name sorts after EVERY entry of the backup pattern that is there - folder, file or
+    link: it carries the clock's second, or the newest second among those entries when the
+    clock is behind that, and within a second the next suffix (-2, -3). So the order of the
+    names is the order the backups were made in, whatever the clock did in between. The
+    suffix only ever grows: a lower one that a prune freed is not handed out again.
+    ``FileExistsError`` when the last suffix of that second is taken.
 
-    ``last_by_name``: the name must sort after every name that is there, whatever the clock
-    says - it then takes the newest of their seconds, with the next suffix."""
+    The data folder itself is never created here - a backup of a folder that is not there
+    is a mistake, not a first run."""
     if not os.path.isdir(root):
         raise FileNotFoundError(root)
     parent = os.path.join(root, BACKUP_DIR)
@@ -627,9 +689,7 @@ def _new_backup_folder(root, moment, last_by_name=False):
     except FileExistsError:
         pass
     there = [match for match in map(_BACKUP_NAME.fullmatch, os.listdir(parent)) if match]
-    stamp = moment.strftime("%Y%m%d-%H%M%S")
-    if last_by_name:
-        stamp = max([stamp] + [match.group(1) for match in there])
+    stamp = max([moment.strftime("%Y%m%d-%H%M%S")] + [match.group(1) for match in there])
     base = BACKUP_PREFIX + stamp
     highest = 0
     for match in there:
@@ -648,8 +708,10 @@ def _new_backup_folder(root, moment, last_by_name=False):
 
 def _copy_retrying(source, target, sleep) -> bool:
     """Copy ``source``; False when there is no such file. Raises ``OSError`` when it is there
-    and cannot be copied."""
-    for attempt in range(_READ_ATTEMPTS):
+    and cannot be copied - after the budget a WRITE gets (``WRITE_ATTEMPTS`` tries,
+    ``WRITE_DELAY_S`` apart): this copy is made after the claim, where giving up fails the
+    import, and a sync tool that holds the file for half a second is no reason for that."""
+    for attempt in range(WRITE_ATTEMPTS):
         try:
             shutil.copy2(source, target)
             return True
@@ -658,9 +720,9 @@ def _copy_retrying(source, target, sleep) -> bool:
                 raise
             return False
         except OSError:
-            if attempt == _READ_ATTEMPTS - 1:
+            if attempt == WRITE_ATTEMPTS - 1:
                 raise
-            sleep(_READ_DELAY_S)
+            sleep(WRITE_DELAY_S)
     return False
 
 
@@ -707,19 +769,22 @@ def make_backup(app_dir, keys, *, label, now=None, sleep=time.sleep) -> str:
     strength of half a backup. A data folder that does not exist is NOT created
     (``StateWriteError``). An unknown key raises ``ValueError``.
 
-    The manifest carries ``seq``, one more than the highest of the backups that are there:
-    the order they were made in, whatever the clock said (``prune_backups`` and
-    ``list_backups`` go by it). When a manifest that is there is in use, the highest is not
-    known: ``seq`` is then ``null`` and the backup is ranked by its NAME - which is, for that
-    case alone, made to sort after every backup folder that is there (the newest of their
-    seconds, next suffix, should the clock have gone back), so that it never ranks below a
-    backup made before it. ``created`` is what the clock said, always."""
+    The backup made last is always the first one listed and the last one pruned, whatever
+    the clock did. Two things say so. The folder's NAME sorts after every backup folder that
+    is there: it is the clock's second, or - when the clock is behind the newest folder -
+    that folder's second with the next suffix (``created`` in the manifest is what the clock
+    said, always). And the manifest carries ``seq``, one more than the highest that is
+    there - ``null`` when a manifest is in use and the highest cannot be read; such a backup
+    is ranked by its name alone. When no name is left (the newest folder carries the last
+    suffix there is) nothing is made: ``StateWriteError`` says to remove that folder."""
     root = _writable_root(app_dir, BACKUP_DIR)
     wanted = _backup_keys(keys)
     moment = _as_utc(now)
     seq = _next_seq(os.path.join(root, BACKUP_DIR), sleep)
     try:
-        name, folder = _new_backup_folder(root, moment, last_by_name=seq is None)
+        name, folder = _new_backup_folder(root, moment)
+    except FileExistsError as exc:              # the one case: no suffix left for that second
+        raise StateWriteError(BACKUP_DIR, _MSG_NO_NAME) from exc
     except OSError as exc:
         raise StateWriteError(BACKUP_DIR) from exc
     failing = MANIFEST_FILE
@@ -784,34 +849,43 @@ def _read_manifest(folder, sleep):
     """``{label, created, seq, files}`` rebuilt from the manifest; ``None`` when there is
     none or it is not usable; ``_BUSY`` when it is there and could not be opened.
 
-    The manifest is a file on disk: every entry is rebuilt from scratch. Only the five state
-    files can be named, each once (a key listed twice keeps its first entry only, and loses
-    that too when it is malformed), ``existed`` must be a real boolean - anything else could
-    turn into a delete - and a copied file must carry its sha256. ``seq`` is a positive int
-    or ``None``."""
+    The manifest is a file on disk: every entry is rebuilt from scratch, and the manifest
+    is usable WHOLE or not at all (the module docstring says why). Only the five state
+    files can be named, each once and by its own file name; ``existed`` must be a real
+    boolean - anything else could turn into a delete - and a copied file must carry its
+    sha256. One entry that is not like that, or no entry at all, and the answer is ``None``.
+    The same when the folder holds a copy of a state file that the manifest does not list
+    as copied: restoring "everything in the manifest" would leave that file out - or, for
+    an entry that says the file did not exist, DELETE the live one. ``seq`` is a positive
+    int or ``None``."""
     data = _read_small(os.path.join(folder, MANIFEST_FILE), sleep)
     if data is _BUSY:
         return _BUSY
     if not isinstance(data, dict) or not isinstance(data.get("files"), list):
         return None
-    entries, seen = [], set()
+    entries, copied = [], set()
     for entry in data["files"]:
         if not isinstance(entry, dict):
-            continue
+            return None
         key = entry.get("key")
-        if not isinstance(key, str) or key not in FILE_NAMES or key in seen:
-            continue
-        seen.add(key)
+        if not isinstance(key, str) or key not in FILE_NAMES \
+                or entry.get("name") != FILE_NAMES[key] \
+                or any(known["key"] == key for known in entries):
+            return None
         existed, digest = entry.get("existed"), entry.get("sha256")
         if existed is True:
             if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-                continue
+                return None
+            copied.add(FILE_NAMES[key])
         elif existed is False:
             digest = None
         else:
-            continue
+            return None
         entries.append({"key": key, "name": FILE_NAMES[key], "existed": existed,
                         "sha256": digest})
+    if not entries or any(name not in copied and os.path.lexists(os.path.join(folder, name))
+                          for name in FILE_NAMES.values()):
+        return None
     seq = data.get("seq")
     if type(seq) is not int or not 0 < seq < _MAX_SEQ:
         seq = None
@@ -874,8 +948,10 @@ def restore_backup(app_dir, name, *, sleep=time.sleep) -> list:
     was complete.
 
     Raises ``FileNotFoundError`` when ``name`` is no backup (a link or junction in a backup's
-    place is none) or its manifest is not usable, and ``StateBusyError`` when the manifest is
-    there but could not be opened right now.
+    place is none) or has no manifest; its subclass ``BackupDamagedError`` when the manifest
+    is there and not usable - one entry that is not what ``make_backup`` writes is enough,
+    nothing is restored "as far as it goes"; and ``StateBusyError`` when the manifest is
+    there but could not be opened right now. In all three cases no file was touched.
 
     The caller holds ``apply_lock``: two restores at once, or a restore beside an apply,
     would mix two states (the temp files a killed write left are swept here as well)."""
@@ -886,6 +962,8 @@ def restore_backup(app_dir, name, *, sleep=time.sleep) -> list:
     if manifest is _BUSY:
         raise StateBusyError(MANIFEST_FILE)
     if manifest is None:
+        if folder is not None and os.path.lexists(os.path.join(folder, MANIFEST_FILE)):
+            raise BackupDamagedError("the manifest of backup %r is not usable" % (name,))
         raise FileNotFoundError("no backup manifest for %r" % (name,))
     root = os.path.dirname(os.path.dirname(folder))
     _sweep_temp_files(root)                     # what a restore that was killed left behind
@@ -915,15 +993,16 @@ def _backup_states(parent, sleep) -> list:
     """``[(name, state, manifest | None)]`` for the backup folders, newest first - the one
     ranking, for the listing and for pruning alike. The rule:
 
-    * all folders are put in the order of their NAMES (time, then suffix), newest first;
+    * all folders are put in the order of their NAMES (time, then suffix), newest first.
+      ``make_backup`` names every backup after the newest folder that is there, so for the
+      backups this build makes that IS the order they were made in - also for one whose
+      manifest is in use right now, or whose ``seq`` is ``null``;
     * the backups whose manifest carries a ``seq`` are then re-dealt among the places THEY
-      hold, highest ``seq`` first: among themselves they rank by the order they were made
-      in, even when the clock was set back in between;
-    * a folder without a readable ``seq`` - a manifest in use or damaged, none at all, or a
-      backup made while another manifest was in use (``seq: null``) - keeps the place its
-      name gives it. Such a backup gets a name that sorts after every folder that was there
-      (``make_backup``), and every backup made later that carries a ``seq`` carries a higher
-      one than all before it - so it never ranks below a backup made before it."""
+      hold, highest ``seq`` first. For this build's backups that changes nothing; it puts
+      right the ones an earlier build named by the clock alone, after the clock was set
+      back;
+    * a folder without a readable ``seq`` - a manifest in use or damaged, none at all, a
+      ``seq`` of ``null`` - keeps the place its name gives it."""
     found = []
     for name in _backup_names(parent):
         folder = os.path.join(parent, name)
@@ -1004,7 +1083,9 @@ def read_sidecar(app_dir, *, strict=False, sleep=time.sleep) -> dict:
         path = _path(app_dir, STATE_FILE)
     except ValueError:
         return side
-    stored = _read_small(path, sleep)
+    # With or without a byte order mark: a file someone opened and saved in an editor must
+    # not read as "damaged" - the next write would replace it with the empty one.
+    stored = _read_small(path, sleep, encoding="utf-8-sig")
     if stored is _BUSY and strict:
         raise StateBusyError(STATE_FILE)
     if not isinstance(stored, dict):
@@ -1026,11 +1107,22 @@ def read_sidecar(app_dir, *, strict=False, sleep=time.sleep) -> dict:
 
 
 def write_sidecar(app_dir, data) -> bool:
-    """Write the side file atomically. False on any failure; never raises."""
+    """Write the side file atomically. False on any failure; never raises.
+
+    False as well - and nothing is written, the file that is there stays - when the file
+    would come out larger than ``read_sidecar`` reads (``MAX_SMALL_FILE_BYTES``): a side
+    file that was written can always be read back. Written larger, it would read as the
+    empty one from then on, and the next write would replace history, tag and exports."""
     if not isinstance(data, dict):
         return False
     try:
-        atomic_write_json(_path(app_dir, STATE_FILE), data, indent=_PROTOCOL_INDENT)
+        path = _path(app_dir, STATE_FILE)
+        # What atomic_write_json puts on the disk: this text (pure ASCII), each line end
+        # as the system writes it.
+        text = json.dumps(data, indent=_PROTOCOL_INDENT, ensure_ascii=True)
+        if len(text) + text.count("\n") * (len(os.linesep) - 1) > MAX_SMALL_FILE_BYTES:
+            return False
+        atomic_write_json(path, data, indent=_PROTOCOL_INDENT)
     except Exception:
         return False
     return True
@@ -1090,7 +1182,7 @@ def _lock_file_stale(path) -> bool:
             text = handle.read(32).strip()
     except (OSError, ValueError):
         return False
-    if text.isdigit():
+    if text.isascii() and text.isdecimal() and len(text) <= _LOCK_PID_CHARS:
         pid = int(text)
         # Our own pid, yet no thread of this process holds the lock (the caller looked):
         # an earlier process with this number left it.
@@ -1177,7 +1269,12 @@ def apply_lock(app_dir):
     (``Local\\FCToolGroupImport-<16 hex of the folder's sha256>``) - the system releases it
     when its owner dies, so there is no stale lock - and elsewhere the lock file
     ``group_import.lock`` holding the owner's pid, removed on the way out and taken over when
-    that process is gone."""
+    that process is gone.
+
+    ``Local\\`` is the namespace of ONE logon session: the mutex shuts out every other
+    FCTool this user runs on the folder, not one that runs in another session (a second
+    signed-in user, a service). That is not a lock for the whole machine, and is not meant
+    to be one - the data folder belongs to one user."""
     key, held = None, False
     try:
         name, path = _lock_identity(app_dir)
@@ -1330,7 +1427,11 @@ def claim_pending(app_dir, *, sleep=time.sleep):
             return None
         if value is _BUSY:
             return _protocol(value)
-        if not _replace_retrying(pending, applying, sleep):
+        # A rename that is refused is tried again - unless the folder refuses every write
+        # (not even a new file can be made in it): then no wait helps, at this start or
+        # the next, and the answer is given at once.
+        if not _replace_retrying(pending, applying, sleep,
+                                 hopeless=lambda: _refuses_writes(root)):
             return None
     return _protocol(value)
 
@@ -1367,9 +1468,13 @@ def finish_applying(app_dir, *, sleep=time.sleep) -> bool:
 # -- waiting for the process that staged the work ----------------------------
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87   # what OpenProcess says for a pid that names no process
+_ERROR_NO_MORE_FILES = 18       # what Process32NextW says at the end of the process list
+_TH32CS_SNAPPROCESS = 0x2
+_MAX_PATH = 260
 _STILL_ACTIVE = 259
 _kernel32 = None
+_process_entry = None           # the PROCESSENTRY32W structure, made at the first use
 
 
 def _win32():
@@ -1380,6 +1485,11 @@ def _win32():
     if _kernel32 is None:
         lib = ctypes.WinDLL("kernel32", use_last_error=True)
         filetime_p = ctypes.POINTER(wintypes.FILETIME)
+        lib.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        lib.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        for walk in (lib.Process32FirstW, lib.Process32NextW):
+            walk.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+            walk.restype = wintypes.BOOL
         lib.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
         lib.OpenProcess.restype = wintypes.HANDLE
         lib.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
@@ -1406,12 +1516,15 @@ def _win_process(pid):
     """``(running, creation_time | None)`` for a Windows pid.
 
     A process that has exited can still be opened while anyone holds a handle on it, so
-    "opens" is not "runs": the exit code decides. A process that exists and may not be queried
-    (access denied) counts as running, with no creation time."""
+    "opens" is not "runs": the exit code decides. A process that cannot be opened is GONE
+    only when the system says there is none of that number; any other refusal - access
+    denied, no memory, no handles left - says nothing about it, and it counts as running,
+    with no creation time: "gone" lets a sweep delete a temp file, "running" only makes it
+    wait."""
     lib, wintypes = _win32()
     handle = lib.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return ctypes.get_last_error() == _ERROR_ACCESS_DENIED, None
+        return ctypes.get_last_error() != _ERROR_INVALID_PARAMETER, None
     try:
         code = wintypes.DWORD()
         if not lib.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -1456,12 +1569,132 @@ def _pid_running(pid) -> bool:
     return True
 
 
-def _writer_alive(pid, started) -> bool:
+def _entry_type(wintypes):
+    """The ``PROCESSENTRY32W`` structure (made once)."""
+    global _process_entry
+    if _process_entry is None:
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD),
+                        ("pcPriClassBase", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+                        ("szExeFile", wintypes.WCHAR * _MAX_PATH)]
+        _process_entry = ProcessEntry
+    return _process_entry
+
+
+def _image_of(pid):
+    """The image name of process ``pid`` as the system's process list has it ("fctool.exe",
+    "svchost.exe" - lower-cased, no folder): ``""`` when the list holds no such pid,
+    ``None`` when there is no list to be had (any failure, and every system but Windows).
+
+    A Toolhelp snapshot: it needs NO rights on the process it names - which is the point,
+    it is asked about processes that refuse to be opened. Never raises. (The seam of
+    ``_same_image``: a test hands in its own pid -> image table here.)"""
+    if os.name != "nt":
+        return None
+    try:
+        lib, wintypes = _win32()
+        snapshot = lib.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            entry = _entry_type(wintypes)()
+            entry.dwSize = ctypes.sizeof(entry)
+            more = lib.Process32FirstW(snapshot, ctypes.byref(entry))
+            if not more:
+                return None
+            while more:
+                if entry.th32ProcessID == pid:
+                    return str(entry.szExeFile).lower() or None
+                more = lib.Process32NextW(snapshot, ctypes.byref(entry))
+            # The walk ended: at the end of the list - or on an error, which is no answer.
+            return "" if ctypes.get_last_error() == _ERROR_NO_MORE_FILES else None
+        finally:
+            lib.CloseHandle(snapshot)
+    except Exception:
+        return None
+
+
+def _base_name(image) -> str:
+    """The lower-cased file name of an image name or path; ``""`` for what is no text."""
+    if not isinstance(image, str):
+        return ""
+    return image.replace("/", "\\").rsplit("\\", 1)[-1].strip().lower()
+
+
+def process_image(pid):
+    """The image name of the running process ``pid`` - lower-cased, no folder: "fctool.exe"
+    for a frozen FCTool, "python.exe" / "pythonw.exe" from source - as the system's process
+    list has it, or ``None`` when that cannot be told. For THIS process there is always an
+    answer: without a process list, the file name of ``sys.executable``.
+
+    Staged with the pid and the start time, it lets a later start tell the process that
+    staged the work from a stranger that was handed its pid (``_writer_alive``)."""
+    if not _valid_pid(pid):
+        return None
+    try:
+        listed = _image_of(pid)
+    except Exception:
+        listed = None
+    if listed:
+        return _base_name(listed) or None
+    if pid == os.getpid():
+        return _base_name(sys.executable) or None
+    return None
+
+
+def _own_image() -> str:
+    """This process's image name (``process_image``), ``""`` when even that is unknown."""
+    return process_image(os.getpid()) or ""
+
+
+def _same_image(pid, image) -> bool:
+    """A process runs under ``pid`` and cannot be asked who it is. Is it still the one that
+    staged the work? The process list says what image it runs (no rights needed):
+
+    * the image that was staged with the work (``image``; for work staged without one - an
+      older pending file - the image of THIS process: the writer was an FCTool like it),
+      compared without regard to case -> yes. An FCTool that cannot be opened (elevated,
+      another user's) still blocks: that is the bias, and it stays;
+    * another image -> no: the pid was handed to something else since;
+    * the list holds no such pid -> no: there is no such process;
+    * no list to be had, or nothing to compare with -> yes. No proof, no "gone"."""
+    try:
+        listed = _image_of(pid)
+    except Exception:
+        listed = None
+    if listed is None:
+        return True
+    if not listed:
+        return False
+    wanted = _base_name(image) or _base_name(_own_image())
+    return not wanted or _base_name(listed) == wanted
+
+
+def _writer_alive(pid, started, image=None) -> bool:
     """The default probe: the process exists and - when its start time is known - is the very
-    process that staged the work, not a later one that was given the same pid."""
-    if type(started) is int:
-        return process_started(pid) == started
-    return _pid_running(pid)
+    process that staged the work, not a later one that was given the same pid.
+
+    A process that OPENS is judged as ever: by its start time when one was staged, and by
+    the pid alone when none was (``started`` is ``None``: whatever runs under the pid counts
+    as the writer). ``image`` plays no part then.
+
+    A process that cannot be ASKED (it does not open: access denied, no memory, no handles
+    left) is not thereby gone - the bias of ``_win_process``: only "there is no process of
+    that number" means gone. It is not thereby the writer either: on a usual desktop nearly
+    half of all processes refuse to be opened, and a pid is handed out again once its
+    process is gone. ``_same_image`` tells the two apart, with ``image`` - the image name
+    staged with the work - and the system's process list. On other systems than Windows
+    there is no such list, and whatever runs under the pid counts, as before."""
+    created = process_started(pid)
+    if created is not None:             # it opens, and it runs
+        return created == started if type(started) is int else True
+    if not _pid_running(pid):
+        return False
+    return _same_image(pid, image)
 
 
 def _wait_limit(timeout_s) -> float:
@@ -1472,16 +1705,22 @@ def _wait_limit(timeout_s) -> float:
 
 
 def wait_for_exit(pid, started=None, timeout_s=DEFAULT_WAIT_S, *, probe=None,
-                  sleep=time.sleep) -> bool:
+                  sleep=time.sleep, image=None) -> bool:
     """Wait until process ``pid`` (started at ``started``) is gone; False when it is still
     there after ``timeout_s``. True at once for no pid, a non-int and this process itself.
 
     ``probe(pid, started) -> bool`` says "alive"; it is asked every ``POLL_S`` seconds and an
-    exception from it counts as not alive. The wait is counted in ``sleep`` calls."""
+    exception from it counts as not alive. The wait is counted in ``sleep`` calls.
+
+    ``image``: for the default probe - the image name that was staged with the work
+    (``process_image`` of the writer), by which a process that cannot be opened is told
+    from a stranger that was handed the writer's pid; without one, this process's own
+    image name is what the writer is taken to have run (``_writer_alive``)."""
     if type(pid) is not int or pid <= 0 or pid == os.getpid():
         return True
     if probe is None:
-        probe = _writer_alive
+        def probe(pid, started):
+            return _writer_alive(pid, started, image)
     limit = _wait_limit(timeout_s)
     waited = 0.0
     while True:
