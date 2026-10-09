@@ -114,6 +114,7 @@ class MarkupEditor(tk.Frame):
         self.rowconfigure(1, weight=1)
 
         self._toolbar = None            # the row-0 strip; see _ensure_toolbar
+        self._size_var = None           # the size dropdown's label; toolbar-only
         if style_toolbar:
             self._build_toolbar()
 
@@ -406,8 +407,10 @@ class MarkupEditor(tk.Frame):
         except (TypeError, ValueError):
             return
         self.apply_size(n)
-        # Reset the dropdown label back to its placeholder.
-        self._size_var.set("size")
+        # Reset the dropdown label back to its placeholder (there is no dropdown
+        # when style_toolbar=False built no toolbar).
+        if self._size_var is not None:
+            self._size_var.set("size")
 
     def apply_size(self, n: int):
         """Apply font size ``n`` to the selection, replacing any other size."""

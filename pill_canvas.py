@@ -90,6 +90,27 @@ _CARET_NAV_KEYS = frozenset({
 })
 
 
+def _post_menu_at(menu, x_root, y_root) -> None:
+    """Post a minted-per-click ``menu`` at the pointer and OWN its lifetime.
+
+    The pointer-anchored twin of :func:`doctrine_refits.post_menu_under` (that
+    one anchors under a button, so its shape does not fit a right-click menu; the
+    teardown is the same, deliberately). The chip menu is built fresh on every
+    right-click, so without a teardown each click leaked one Tk menu for the life
+    of the canvas. Two details are load-bearing, both from fc_gui's cured
+    ``_post_menu``: the destroy hangs off ``<Unmap>`` (fired when Tk unposts the
+    menu), is armed BEFORE the popup, and is DEFERRED 100 ms - an immediate
+    destroy races Tk's idle-scheduled command invocation and swallows the click;
+    and ``grab_release`` runs in a ``finally``, so a menu that fails to post never
+    leaves the pointer grabbed. Do NOT pass a long-lived menu.
+    """
+    menu.bind("<Unmap>", lambda ev: menu.after(100, menu.destroy))
+    try:
+        menu.tk_popup(x_root, y_root)
+    finally:
+        menu.grab_release()
+
+
 class PillCanvas(MarkupEditor):
     """A :class:`MarkupEditor` with embedded live-token pills + a model + own undo.
 
@@ -126,8 +147,8 @@ class PillCanvas(MarkupEditor):
                  height=14, *,
                  # -- opt-in host seams (see the class docstring) --
                  style_toolbar: bool = True,
-                 kind_glyphs: "dict | None" = None,
-                 on_pill_activate: "Callable[[str, dict], None] | None" = None,
+                 kind_glyphs: dict | None = None,
+                 on_pill_activate: Callable[[str, dict], None] | None = None,
                  **kw):
         super().__init__(master, height=height, on_change=on_change,
                          style_toolbar=style_toolbar, **kw)
@@ -152,6 +173,7 @@ class PillCanvas(MarkupEditor):
         self._redo_stack: list = []
         self._burst_open = False           # a text-typing burst is in progress
         self._burst_after = None           # after-id of the debounce timer
+        self._destroyed = False            # set by the canvas's own <Destroy>
 
         # Drag / drop-caret state.
         self._chip_drag = None
@@ -181,19 +203,27 @@ class PillCanvas(MarkupEditor):
     def _add_undo_buttons(self):
         """Add ⟲/⟳ buttons to the inherited toolbar, packed after "clear"."""
         # The inherited strip - or, under style_toolbar=False, a fresh one that
-        # holds these two buttons alone.
+        # holds these two buttons alone. A fresh strip is born AFTER the Text, so
+        # it is lowered to the front of the stacking order (= keyboard traversal
+        # order, as on a default canvas) and its first button drops the 6 px gap
+        # that separates it from "clear". Neither applies to the inherited strip.
+        lone = self._toolbar is None
         bar = self._ensure_toolbar()
+        if lone:
+            bar.lower()
         common = dict(font=_CHIP_FONT, bg=self._bg_entry, fg=self._fg_text,
                       activebackground=self._fg_accent, activeforeground=BG_DARK,
                       bd=1, relief=tk.RIDGE, cursor="hand2", width=2)
         self._undo_btn = tk.Button(bar, text="⟲", command=self.undo_model, **common)
-        self._undo_btn.pack(side=tk.LEFT, padx=(6, 1))
+        self._undo_btn.pack(side=tk.LEFT, padx=1 if lone else (6, 1))
         attach_tooltip(self._undo_btn, "Undo (Ctrl+Z)")
         self._redo_btn = tk.Button(bar, text="⟳", command=self.redo_model, **common)
         self._redo_btn.pack(side=tk.LEFT, padx=1)
         attach_tooltip(self._redo_btn, "Redo (Ctrl+Y)")
 
     def _bind_canvas_events(self):
+        # The canvas's own teardown: cancels the pending burst timer.
+        self.bind("<Destroy>", self._on_canvas_destroy, add="+")
         t = self.text
         t.bind("<Button-1>", self._on_text_click, add="+")
         t.bind("<KeyPress>", self._on_keypress, add="+")
@@ -697,14 +727,32 @@ class PillCanvas(MarkupEditor):
                 self.after_cancel(self._burst_after)
             except Exception:
                 pass
+            self._burst_after = None
+        if self._destroyed:
+            return                       # a dead canvas never arms a timer
         try:
             self._burst_after = self.after(_TEXT_BURST_MS, self._close_burst)
         except tk.TclError:
             self._burst_after = None
 
     def _close_burst(self):
+        if self._destroyed:
+            return                       # fired against a dead canvas: no-op
         self._burst_open = False
         self._burst_after = None
+
+    def _on_canvas_destroy(self, event=None):
+        """The canvas's own ``<Destroy>``: cancel the pending burst timer.
+
+        Without this a canvas destroyed within ``_TEXT_BURST_MS`` of a keystroke
+        left its ``after`` id pending, to fire later against a dead widget. Only
+        the event for the canvas ITSELF counts - a ``<Destroy>`` that reaches this
+        binding for any other widget (a chip, a child, a host re-binding) must not
+        end a live burst."""
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        self._destroyed = True
+        self._flush_burst()
 
     def _flush_burst(self):
         if self._burst_after is not None:
@@ -936,10 +984,7 @@ class PillCanvas(MarkupEditor):
         menu.add_command(label="Convert to plain text",
                          command=lambda: self._convert_to_text(name))
         menu.add_command(label="Remove", command=lambda: self._remove_pill(name))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        _post_menu_at(menu, event.x_root, event.y_root)
         return "break"
 
     def _create_ghost(self, name):
