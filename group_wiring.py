@@ -372,6 +372,7 @@ class GroupConfigMixin:
     _group_status_label = None
     _group_tag_var = None
     _group_tag_entry = None
+    _group_tag_shown = ""               # the text the field was last known to hold
     _title_tag_label = None
     _group_toc_flagged = ()             # the TOC rows that carry a mark
     _group_toc_spacer = None
@@ -516,6 +517,7 @@ class GroupConfigMixin:
         tk.Label(row, text=TAG_HINT, font=_HINT_FONT, fg=FG_DIM, bg=BG_DARK
                  ).pack(side=tk.LEFT, padx=(8, 0))
         self._group_tag_var, self._group_tag_entry = var, entry
+        self._group_tag_shown = var.get()
 
     # -- the host of the window ----------------------------------------------------------
     def _group_own_names(self) -> list:
@@ -733,13 +735,16 @@ class GroupConfigMixin:
         does not read this field. ``set_tag`` answers the tag that IS stored: anything but
         the cleaned new one means it was not saved (the side file is in use). Then the
         field keeps what was typed - theirs to try again with - and the status label says
-        so; the line under the logo shows the stored tag either way."""
+        so; the line under the logo shows the stored tag either way. Only a CHANGE is
+        stored: a field left as it was shown never writes (it may not show what is stored)."""
         var = self._group_tag_var
         if var is None:
             return
         try:
             typed = var.get()
         except tk.TclError:
+            return
+        if typed == self._group_tag_shown:
             return
         wanted = clean_tag(typed)
         stored = _quiet(group_apply.set_tag, self._group_dir(), typed, default=False)
@@ -749,6 +754,7 @@ class GroupConfigMixin:
                     var.set(stored)     # as it was cleaned
             except tk.TclError:
                 pass
+            self._group_tag_shown = stored
             self._group_unsay(MSG_TAG_NOT_SAVED)
         else:
             self._group_say(MSG_TAG_NOT_SAVED)
