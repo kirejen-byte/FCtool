@@ -50,6 +50,7 @@ class Env:
 class Composed:
     text: str                 # what goes on the clipboard; "" = nothing to copy
     warnings: list            # human sentences, in document order
+    omitted: list             # ping kinds whose line was left out (from PingText.omitted)
     values: ping_doc.PingValues
     when_unix: "int | None"   # the time this text was composed for; None = Now
 
@@ -118,29 +119,43 @@ def compose(store, env: Env, when_unix, now_unix: int, *, doc=None) -> Composed:
     values = values_for(store, env, when_unix, now_unix)
     runs = template_for(store, env) if doc is None else doc
     result = ping_doc.resolve(runs, values)
-    return Composed(result.text, list(result.warnings), values, when_unix)
+    return Composed(result.text, list(result.warnings), list(result.omitted), values,
+                    when_unix)
 
 
 def summary(composed: Composed, *, consumed_when, now_unix: int) -> tuple:
     """The status line after a copy: ``(text, "ok" | "warn")``.
 
-    ``consumed_when`` is what :meth:`WhenSession.consume` returned for this copy. The text
-    reports, first match: a time that was used up, else the first warning, else the fleet
-    type. The level is ``"warn"`` for an empty ping, for any warning, and for a used-up
-    time that had already passed.
+    ``consumed_when`` is what :meth:`WhenSession.consume` returned for this copy. An empty
+    ping is its own sentence. Otherwise the line is ``Ping copied`` and up to three parts:
+
+    1. the time that was used up - marked ``(already passed)`` when it was behind
+       ``now_unix`` - or, with none, the fleet type and ``When: Now``;
+    2. ``left out: <Label>, <Label>`` for the fields whose line was dropped;
+    3. ``N more warning(s)`` for the warnings part 2 does not account for (an unsupported
+       pill, say).
+
+    The level is ``"warn"`` for an empty ping, when part 2 or 3 is there, and for a used-up
+    time that had already passed - so a yellow line always says why.
     """
     if not composed.text:
         return _NOTHING_TO_COPY, "warn"
-    warnings = list(composed.warnings or ())
+    separator = " %s " % _DOT
     passed = consumed_when is not None and consumed_when < now_unix
-    level = "warn" if warnings or passed else "ok"
     if consumed_when is not None:
-        detail = "When was %s; it is back to Now" % eve_label(consumed_when, now_unix)
-    elif warnings:
-        detail = str(warnings[0])
-        if len(warnings) > 1:
-            detail += " (+%d more)" % (len(warnings) - 1)
+        parts = ["When was %s%s; it is back to Now"
+                 % (eve_label(consumed_when, now_unix), " (already passed)" if passed else "")]
     else:
         fleet_type = composed.values.fleet_type
-        detail = "%s %s When: Now" % (fleet_type, _DOT) if fleet_type else "When: Now"
-    return "Ping copied %s %s" % (_DASH, detail), level
+        parts = [fleet_type, "When: Now"] if fleet_type else ["When: Now"]
+    level = "warn" if passed else "ok"
+    omitted = list(composed.omitted or ())
+    if omitted:
+        parts.append("left out: " + ", ".join(
+            ping_doc.FIELD_LABELS.get(kind, str(kind)) for kind in omitted))
+        level = "warn"
+    more = len(composed.warnings or ()) - len(omitted)
+    if more > 0:
+        parts.append("1 more warning" if more == 1 else "%d more warnings" % more)
+        level = "warn"
+    return "Ping copied %s %s" % (_DASH, separator.join(parts)), level
